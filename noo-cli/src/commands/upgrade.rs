@@ -3140,10 +3140,14 @@ fn newest_published_stack_tag() -> Option<String> {
 /// per-commit Gateway workflow and lands minutes before the rest, so
 /// gateway alone reported v0.2.11 while the images run was still queued
 /// and `noo upgrade --stack` walked into "not found" for four services
-/// (host8, 2026-09-03). trellion-intel is built last, so it is the
-/// strongest single signal, but the intersection is the honest one.
+/// (host8, 2026-09-03). The intersection is the honest signal.
+///
+/// CORE images only. The stack release is core-only: the licensed add-ons
+/// (trellion-intel, evolve) are released from their own repositories with
+/// their own lock, so a stack tag never carries them. Listing one here made
+/// every core-only tag look unpublished and `--stack` could never roll to it.
 const STACK_IMAGES: &[&str] = &[
-    "gateway", "worker", "trellion", "trellion-intel", "node-agent",
+    "gateway", "worker", "trellion", "node-agent",
     "sandbox", "postgres-pgvector",
 ];
 
@@ -3156,10 +3160,15 @@ fn ghcr_complete_stack_tags() -> Option<Vec<String>> {
         .build()
         .into();
     let basic = docker_registry_basic("ghcr.io");
+    complete_stack_tags(|image| ghcr_image_tags(&agent, basic.as_deref(), image))
+}
+
+/// The tags every `STACK_IMAGES` image carries, given a per-image tag lister.
+/// None when any image cannot be listed (unknown, not "no tags").
+fn complete_stack_tags(mut list: impl FnMut(&str) -> Option<Vec<String>>) -> Option<Vec<String>> {
     let mut common: Option<std::collections::BTreeSet<String>> = None;
     for image in STACK_IMAGES {
-        let tags = ghcr_image_tags(&agent, basic.as_deref(), image)?;
-        let set: std::collections::BTreeSet<String> = tags.into_iter().collect();
+        let set: std::collections::BTreeSet<String> = list(image)?.into_iter().collect();
         common = Some(match common {
             None => set,
             Some(c) => c.intersection(&set).cloned().collect(),
@@ -3830,6 +3839,36 @@ mod tests {
             "registry unknown: the newest published tag is the one to mention"
         );
     }
+    /// A core-only stack tag (no add-on image carries it) counts as published
+    /// once every core image has it; the add-ons are never asked about.
+    #[test]
+    fn a_core_only_tag_is_complete() {
+        let mut asked: Vec<String> = Vec::new();
+        let tags = super::complete_stack_tags(|image| {
+            asked.push(image.to_string());
+            Some(match image {
+                // The per-commit gateway push lands ahead of the rest.
+                "gateway" => vec!["v0.6.0".into(), "v0.6.1".into()],
+                "trellion-intel" | "evolve" => vec!["v0.5.0".into()],
+                _ => vec!["v0.5.9".into(), "v0.6.0".into()],
+            })
+        })
+        .expect("every image listed");
+        assert_eq!(tags, vec!["v0.6.0".to_string()]);
+        for addon in ["trellion-intel", "trellion-evolve", "evolve"] {
+            assert!(!asked.iter().any(|a| a == addon), "{addon} is an add-on, not a stack image");
+            assert!(!super::STACK_IMAGES.contains(&addon));
+        }
+        assert!(asked.iter().any(|a| a == "trellion"), "trellion is a core image");
+    }
+
+    /// One image the registry cannot list makes the answer unknown, never an
+    /// empty "nothing is published".
+    #[test]
+    fn an_unlistable_image_makes_completeness_unknown() {
+        assert_eq!(super::complete_stack_tags(|i| (i != "worker").then(|| vec!["v0.6.0".into()])), None);
+    }
+
     use super::{first_noo_on_path, local_agent_name, target_triple_for, version_less_than, running_gateway_tag};
 
     fn ids(v: &[&str]) -> std::collections::HashSet<String> {
