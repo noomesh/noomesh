@@ -125,6 +125,8 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "entitlement", "verify"], "<token>", "Verify a token offline against this build's entitlement key"),
     (&["security", "release-sign"], "<file> [--seed-file <path>] [--out <file.sig>]", "Hidden: sign sha256sums.txt with the release key (CI only)"),
     (&["security", "release-verify"], "<file> [<file.sig>]", "Verify a release manifest signature against the keys baked into this build"),
+    (&["security", "addon-lock", "sign"], "--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--registry <root>] --seed-file <path|-> --out <path>", "Hidden: sign an add-on lock with the add-on's own key (add-on CI only)"),
+    (&["security", "addon-lock", "verify"], "<path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>]", "Verify a signed add-on lock against the add-on's keys and registry root"),
     (&["security", "secrets", "tidy"], "[-y|--yes]", "Thin the store to secrets only: move config to .env, drop retired keys, blank .env copies"),
     (&["security", "secrets", "audit"], "[--sops-file <path>] [--env-file <path>]", "Compare env.sops against .env by digest and report findings (no values shown)"),
     (&["security", "secrets", "resync"], "<key>... | --all [--dry-run] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]", "Make Postgres role passwords match the values already in the SOPS store"),
