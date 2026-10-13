@@ -266,7 +266,7 @@ def test_gh_not_logged_in_and_private_says_both(tmp_path: Path) -> None:
 
 
 def test_tokens_are_redacted(tmp_path: Path) -> None:
-    tok = "ghp_" + "A1b2C3d4E5f6G7h8I9j0"
+    tok = "ghp_" + "A1b2C3d4E5f6G7h8I9j0"  # leak-ok: synthetic token, exercises redaction
     (tmp_path / "bin").mkdir()
     _fake_gh(tmp_path / "bin", [(1, f"HTTP 401: Bad credentials {tok}")])
     srv = _Server([(404, {}, b"")])
