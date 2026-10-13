@@ -32,6 +32,7 @@ pub mod entitlement;
 #[cfg(has_entitlement_signer)]
 pub mod entitlement_signer;
 pub mod release_sign;
+pub mod addon_lock_cmd;
 pub mod doctor;
 pub mod tailnet_policy;
 pub(crate) mod tailnet_merge;
@@ -405,6 +406,7 @@ pub use entitlement::*;
 #[cfg(has_entitlement_signer)]
 pub use entitlement_signer::*;
 pub use release_sign::*;
+pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addons::{addons_disable, addons_enable, addons_list};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;

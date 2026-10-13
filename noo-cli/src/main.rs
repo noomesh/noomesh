@@ -47,6 +47,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::ptr_arg)]
 
+mod addon_lock;
 mod auth;
 mod catalog;
 mod child_stdin;
@@ -526,6 +527,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "entitlement", "verify"], commands::entitlement_verify),
     (&["security", "release-sign"], commands::release_sign),
     (&["security", "release-verify"], commands::release_verify),
+    (&["security", "addon-lock", "sign"], commands::security_addon_lock_sign),
+    (&["security", "addon-lock", "verify"], commands::security_addon_lock_verify),
     (&["security", "secrets", "audit"], commands::secrets_audit),
     (&["security", "secrets", "tidy"], commands::secrets_tidy),
     (&["security", "secrets", "resync"], commands::secrets_resync),
@@ -661,7 +664,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
 /// (`scripts/lib-bind-sources.sh`) — see `commands::bind_sources`.
 ///
 /// Also hidden: vendor/CI-only verbs a customer never runs (`security
-/// entitlement keygen|issue`, `security release-sign`), and `security pki
+/// entitlement keygen|issue`, `security release-sign`, `security addon-lock
+/// sign`), and `security pki
 /// rotate`, a pure alias of `security pki issue` (same certificate call).
 /// All still dispatch and answer `--help`.
 const HIDDEN_NATIVE: &[&[&str]] = &[
@@ -682,6 +686,7 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["security", "entitlement", "keygen"],
     &["security", "entitlement", "issue"],
     &["security", "release-sign"],
+    &["security", "addon-lock", "sign"],
     &["security", "pki", "rotate"],
 ];
 
@@ -1967,10 +1972,11 @@ const SOURCES: &[(&str, &str)] = &[
     /// off the customer's help and tab-completion; their usage rows say so.
     #[test]
     fn vendor_only_verbs_and_the_pki_rotate_alias_are_hidden_but_still_dispatch() {
-        let hidden: [&[&str]; 4] = [
+        let hidden: [&[&str]; 5] = [
             &["security", "entitlement", "keygen"],
             &["security", "entitlement", "issue"],
             &["security", "release-sign"],
+            &["security", "addon-lock", "sign"],
             &["security", "pki", "rotate"],
         ];
         for h in hidden {
@@ -1979,7 +1985,7 @@ const SOURCES: &[(&str, &str)] = &[
             let (_, about) = usage::lookup(h).expect("usage row");
             assert!(about.starts_with("Hidden:"), "{h:?}: {about}");
         }
-        for shown in [&["security", "entitlement", "install"][..], &["security", "release-verify"], &["security", "pki", "issue"], &["security", "user", "enable"]] {
+        for shown in [&["security", "entitlement", "install"][..], &["security", "release-verify"], &["security", "addon-lock", "verify"], &["security", "pki", "issue"], &["security", "user", "enable"]] {
             assert!(!is_hidden_native(shown), "{shown:?} is customer-facing");
             assert!(NATIVE.iter().any(|(w, _)| *w == shown), "{shown:?}");
         }
