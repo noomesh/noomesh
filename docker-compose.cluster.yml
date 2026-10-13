@@ -1,0 +1,3033 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Docker Compose v2 - Cluster Node Template
+name: noomesh
+# Deploy this to each cluster node with different profiles
+
+# ── Reusable log-rotation cap ────────────────────────────────────
+# Without this, the json-file driver accumulates unbounded logs in
+# /var/lib/docker/containers/*/-json.log inside WSL — and ext4 never
+# returns the freed blocks to the host's .vhdx, so the disk image
+# grows monotonically until you `wsl --shutdown` + diskpart-compact.
+# Caps each container at 3 × 50MB = 150MB of stdout/stderr.
+# Override per-service if a particular component genuinely needs more.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+# ── Image floor for the file-backed secret wiring ─────────────────────────
+# This file hands the gateway and the worker `<NAME>_FILE` pointers and no
+# plain values. An image older than the readers would see neither and boot
+# with no JWT secret, no DB password, no NATS credential — an outage, not
+# a degradation. The launcher (scripts/lib-dist.sh `require_secrets_floor`,
+# run by noomesh-start.sh --dist and noomesh-restart.sh) and
+# `noo upgrade --stack` REFUSE to run this file against a stack tag that
+# sorts below this one. It is the first stack tag whose gateway, worker and
+# add-on images read every name this file points at through `secret_env`.
+# tests/test_compose_secret_files.py pins it, and checks the tagged floor's
+# manifests against every pointer here.
+x-noo-secrets-floor: stack-v0.2.103
+
+services:
+  # Shared Python dependency base, NON-ML tier — built ONCE
+  # per pyproject.toml change, consumed by sandbox as its FROM (and by
+  # deps-base as ITS FROM). No torch, no noo-trellion.
+  # Not a runtime service; profile "build-only" excludes it from start.
+  # Build explicitly with: docker compose build deps-core
+  deps-core:
+    profiles: ["build-only"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.deps-core
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/deps-core:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_CORE:-}
+    pull_policy: build
+    # Never started — the FROM line in downstream Dockerfiles is what
+    # actually consumes it. command: just ensures `up` doesn't try.
+    command: ["true"]
+    restart: "no"
+
+  # Shared Python dependency base, ML tier — FROM deps-core plus the ML
+  # extras and the vendored noo-trellion. Consumed by trellion only.
+  # Build deps-core first: docker compose build deps-core deps-base
+  # (compose does not order builds by FROM; the rebuild script does.)
+  deps-base:
+    profiles: ["build-only"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.deps-base
+      args:
+        DEPS_CORE: ${NOO_IMAGE_PREFIX:-noomesh}/deps-core:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_CORE:-}
+      additional_contexts:
+        trellion: ${TRELLION_PATH:-../trellion}
+        # trellion's pinned dependency (Dockerfile.deps-base checks the commit).
+        trellion_protocols: ${TRELLION_PROTOCOLS_PATH:-../trellion-protocols}
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/deps-base:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_BASE:-}
+    pull_policy: build
+    # Never started — the FROM line in downstream Dockerfiles is what
+    # actually consumes it. command: just ensures `up` doesn't try.
+    command: ["true"]
+    restart: "no"
+
+  # Sandbox-capability base image — default `container.image` for capability
+  # manifests (contract: SKILL_INPUT env in, JSON on stdout, /skill mount).
+  # Not a runtime service; capability containers are launched ad hoc by the
+  # node-agent. Built here so `noo stack rebuild` produces it on the
+  # controller; ship to workers with `noo cluster sync-images`.
+  sandbox-base:
+    profiles: ["build-only"]
+    build:
+      context: .
+      dockerfile: node-agent-go/internal/docker/sandbox-base.Dockerfile
+    image: noo-sandbox-base:latest
+    pull_policy: build
+    command: ["true"]
+    restart: "no"
+
+  # Gateway (controller node only)
+  gateway:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway-rust
+      # NO `additional_contexts: trellion`. It was here so the final stage
+      # could `COPY --from=trellion` and pip-install the memory subsystem from
+      # the sibling repo — a stage this image no longer has. Since an earlier change
+      # step 5 the runtime carries no Python dependency stack at all, and
+      # `grep -c 'from=trellion' docker/Dockerfile.gateway-rust` is 0.
+      #
+      # Removing it is not cosmetic: a declared build context must RESOLVE, so
+      # this made `noo stack rebuild gateway` require ../trellion to exist
+      # on disk for a build that never reads it — and it is why the CI job
+      # could not simply build the whole image.
+      #
+      # deps-base and trellion still declare it, correctly; they are the
+      # ones that install from that source. (sandbox dropped it with the
+      # deps-core split, an earlier change — its base no longer bakes
+      # noo-trellion in.)
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/gateway:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_GATEWAY:-}
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-gateway
+    profiles: ["controller", "standalone"]
+    # The gateway runs as uid 65532 (nonroot), but ./.noo-host-spool is owned by
+    # the host operator (uid/gid 1000). With no shared group the gateway cannot
+    # write command files, so every host-spool action — notably the 6-hourly
+    # database_backup — fails with EACCES. Add the host gid as a supplementary
+    # group; the spool dir is group-writable (2775). Override NOO_HOST_GID if
+    # the operator account isn't gid 1000.
+    group_add:
+      - "${NOO_HOST_GID:-1000}"
+    ports:
+      # NOO_BIND_ADDR (H-N2/N3/N5): host interface every cluster-plane port binds to.
+      # Defaults to 0.0.0.0 (non-breaking). Set NOO_BIND_ADDR=<tailnet-ip> in .env to
+      # confine NATS/node-agent/Grafana/exporters/gateway to the Tailscale
+      # overlay. There is no public tunnel any more — the tailnet (and LAN
+      # /mDNS) is the only way in. See .env.example.
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_GATEWAY:-8080}:8080"
+      # No MCP port. The operator door is `/mcp/operator` on the gateway
+      # port above, credential mandatory. The plain-HTTP listener this used
+      # to publish on 127.0.0.1:3100 was removed in stack-v0.2.40 (§3f R38):
+      # loopback was not a boundary for a box that also runs CI runners and
+      # a cluster network full of containers.
+    # Tier-1 secrets arrive as FILES, never as environment (file-backed
+    # secrets, 2026-09-29; docs/security/secrets.md). Each entry below is
+    # copied into the container at CREATE time as /run/secrets/<target>,
+    # 0400 to 65532 (the image's `nonroot`), from the launcher's process
+    # environment — the top-level `secrets:` block names the variable, so
+    # there is no host file to leave lying about and nothing in Config.Env
+    # for `docker inspect` to print. The matching `<NAME>_FILE` lines in
+    # `environment:` point the reader (gateway-rust/src/secret_env.rs) at
+    # each file; `${NAME:+…}` sets the pointer only when the store holds a
+    # value, so an optional secret that is unset stays unset.
+    # tests/test_compose_secret_files.py (G1/G2) pins both halves.
+    secrets:
+      - { source: noo_jwt_secret, target: noo_jwt_secret, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_cluster_secret, target: noo_cluster_secret, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_controller_secret, target: noo_controller_secret, uid: "65532", gid: "65532", mode: 0400 }
+      # The browser container's door key: the gateway signs
+      # its browser-route calls with it and hands it to the browser
+      # containers it starts on nodes.
+      - { source: noo_browser_key, target: noo_browser_key, uid: "65532", gid: "65532", mode: 0400 }
+      # Every bus-principal audience key: the gateway is
+      # the one signer, so it holds all three; each verifier below holds
+      # only its own (gateway-rust/src/bus_principal.rs AUDIENCES).
+      - { source: noo_bus_key_worker, target: noo_bus_key_worker, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_bus_key_trellion, target: noo_bus_key_trellion, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_bus_key_trellion_intel, target: noo_bus_key_trellion_intel, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_admin_password, target: noo_admin_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_tailscale_oauth_client_secret, target: noo_tailscale_oauth_client_secret, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_tailscale_api_key, target: noo_tailscale_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_agent_review_key, target: noo_agent_review_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_agent_signing_key, target: noo_agent_signing_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_jwt_signing_key, target: noo_jwt_signing_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_entitlement, target: noo_entitlement, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_app_db_password, target: noo_app_db_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_evolve_db_password, target: noo_evolve_db_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_evolve_ddl_password, target: noo_evolve_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_trellion_db_password, target: noo_trellion_db_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_trellion_ddl_password, target: noo_trellion_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: nats_gateway_password, target: nats_gateway_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: pgpass_gateway, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
+      # Tier-2 provider and channel credentials — the
+      # same delivery; `secret_env` reads each through its `<NAME>_FILE`.
+      - { source: anthropic_api_key, target: anthropic_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: openai_api_key, target: openai_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_api_key, target: google_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: tavily_api_key, target: tavily_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: brave_search_api_key, target: brave_search_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+    environment:
+      - DEV_MODE=${DEV_MODE:-}
+      # The controller's OWN identity, and it must be stable across container
+      # recreates. Without it `agent_messages::controller_node()` falls through
+      # to `HOSTNAME`, which docker sets to the container id — a new value every
+      # recreate.
+      #
+      # That is not cosmetic. `tasks::spawn_ready_watcher` resumes "what THIS
+      # controller was running" by matching that name, so a recreate orphans
+      # every in-flight task: the resume no longer recognises them and they sit
+      # stale forever. Observed with five tasks pinned to `86c47f153ae0`, a
+      # container that no longer exists, while the live one called itself
+      # `90417b3f1220`. The stale alert then advises "restart the node's
+      # harness" and names a container id nobody can act on.
+      - NOO_CONTROLLER_HOSTNAME=${NODE_ID:-controller}
+      # Tracing filter for the Rust gateway (EnvFilter::try_from_default_env).
+      # Lets an operator raise the level on one module to diagnose a live
+      # issue WITHOUT a rebuild, e.g.
+      #   RUST_LOG=info,noo_gateway::routes::external=debug
+      #
+      # The default MUST be a real filter. An empty RUST_LOG is NOT the same
+      # as an unset one: EnvFilter parses "" as zero directives and silences
+      # almost everything, so `${RUST_LOG:-}` would turn logging OFF while
+      # looking like a no-op. That happened on 2026-07-29 and cost a
+      # debugging session — the gateway ran fine and said nothing at all.
+      #
+      # Env changes need a container RECREATE, not a restart.
+      - RUST_LOG=${RUST_LOG:-info}
+      # Password for the non-superuser `noo_app` role that migration 033
+      # creates (RLS prerequisite). Value lives in
+      # secrets/env.sops.
+      #
+      # This passthrough is REQUIRED, not optional: the gateway's env is an
+      # explicit ${VAR} allowlist, so without this line the variable is
+      # invisible inside the container no matter what env.sops holds — and
+      # 033 refuses to invent a default, so it fails and the gateway
+      # crash-loops. That is exactly what happened when 033 first merged
+      # without this line (reverted in #299, re-landed here).
+      #
+      # Migration-time only. This does NOT switch the gateway onto the role;
+      # changing DATABASE_URL is a deliberate operator step, because a
+      # gateway started against incomplete grants fails closed.
+      - NOO_APP_DB_PASSWORD_FILE=${NOO_APP_DB_PASSWORD:+/run/secrets/noo_app_db_password}
+      # Migration 034 creates the scoped `noo_evolve` role and reads this.
+      # It must be HERE, not only in the pro overlay: alembic runs in the
+      # gateway container, and this env block is an explicit ${VAR}
+      # allowlist. 033 shipped without its passthrough and the gateway
+      # crash-looped because the migration could never be satisfied.
+      - NOO_EVOLVE_DB_PASSWORD_FILE=${NOO_EVOLVE_DB_PASSWORD:+/run/secrets/noo_evolve_db_password}
+      # Migration 038 creates the scoped `noo_trellion` role and reads this.
+      # Same rule as 034 above: it must be HERE because alembic runs in the
+      # gateway container, regardless of where trellion itself runs.
+      - NOO_TRELLION_DB_PASSWORD_FILE=${NOO_TRELLION_DB_PASSWORD:+/run/secrets/noo_trellion_db_password}
+      # The BROKER runs in this container, and it
+      # creates each system's migration role as well as its runtime role. Both
+      # credentials must be here or `system_provision` cannot create the role
+      # — and that path is FATAL: mesh_migrate failing exits(1) rather than
+      # serving against a schema it could not migrate.
+      #
+      # This is the fourth time this line matters. 033 shipped without its
+      # NOO_APP_DB_PASSWORD passthrough and crash-looped the gateway; 034's
+      # comment says "it must be HERE, not only in the pro overlay"; #506 added
+      # trellion's. The env block is an explicit ${VAR} allowlist, so a value
+      # present in the shell reaches nothing.
+      #
+      # Empty is SAFE: the reconciler only demands a credential for a system
+      # the `systems:` manifest actually declares, and an install with no
+      # manifest never reads these at all.
+      - NOO_TRELLION_DDL_PASSWORD_FILE=${NOO_TRELLION_DDL_PASSWORD:+/run/secrets/noo_trellion_ddl_password}
+      - NOO_EVOLVE_DDL_PASSWORD_FILE=${NOO_EVOLVE_DDL_PASSWORD:+/run/secrets/noo_evolve_ddl_password}
+      # The flag the BROKER gates on. `systems:` entries name an
+      # `enabled_when` var, and `intent_declared()` reads it from THIS
+      # container's environment — not from `.env` on the host, which compose
+      # reads for interpolation and nothing forwards.
+      #
+      # (The NOO_PRO_ENABLED passthrough that lived here is GONE. It existed
+      # because the systems reconciler could not otherwise see that evolve was
+      # on — observed live 2026-08-05, `provisioned=1 skipped=1`, evolve's
+      # schema silently never created. The fix then was a sixth copy of the
+      # flag; the fix now is that there are no copies. Add-ons are declared in
+      # the `addons:` map of noomesh.yaml, which is MOUNTED into this
+      # container below, so the gateway and the launcher read the same file.)
+      - NOO_MODE=controller
+      # Launcher sentinel — exported by lib-config.sh (noo stack
+      # start/restart/rebuild) and by the onboard wizard's compose wrapper.
+      # Empty means this container was recreated by a BARE `docker compose
+      # up`, which bakes empty secrets (interpolation vars live in the
+      # launcher); the gateway warns loudly at startup. Deliberately NOT a
+      # `:?` guard — that fires file-wide and breaks worker recreates.
+      - NOO_LAUNCHED=${NOO_LAUNCHED:-}
+      # HOST path of the skills tree (mounted at /app/skills below). The
+      # executors rewrite skill_dir onto this prefix so the bind mount they
+      # request from a node-agent resolves on the host filesystem. Empty =
+      # no translation (bare-metal / host-run dev).
+      - NOO_SKILLS_HOST_DIR=${NOO_SKILLS_HOST_DIR:-${PWD:-}/skills}
+      # (NOO_MCP_TOKEN, the operator door's shared bearer, is retired: the
+      # door takes only a per-admin `mcp:operator` service key, and a token
+      # left in the store is warned about at boot and never delivered.)
+      # Native Rust external MCP door (gateway :8080 /mcp/user). Opt-in and
+      # separate from any credential: enabling the door and authenticating to it
+      # are now two different things. Every caller must present a service key
+      # bound to a noo_users account (`--user`); unbound keys are refused rather
+      # than silently running as the operator.
+      # Must be listed HERE — a flag only in .env never reaches the container,
+      # which is how the retired NOO_MULTI_USER gate was silently ignored
+      # before anyone noticed it did nothing.
+      - NOO_MCP_EXTERNAL_ENABLED=${NOO_MCP_EXTERNAL_ENABLED:-}
+      # Add-on presence drives the gateway's degradation
+      # contract — knowledge routes 503 with an explanation, the two ML
+      # autonomy locations skip, delegated heartbeat actions record
+      # requires-add-on errors, /health shows the add-on state. It is read from
+      # the `addons:` map in the mounted noomesh.yaml, not from env: one
+      # declaration, so the profile the launcher selected and the behaviour
+      # this container exhibits cannot disagree.
+      # Loopback base the door uses to call the gateway's own HTTP API.
+      # Empty by default: the door derives scheme from NOO_TLS_CERT, so a TLS
+      # deployment does not need this set. A hardcoded http:// here was what
+      # broke every external tool call on this stack.
+      - NOO_SELF_URL=${NOO_SELF_URL:-}
+      - REDIS_URL=${REDIS_URL:-rediss://redis:6379}
+      - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
+      - NATS_URL=${NATS_URL:-tls://nats:4222}
+      # This gateway's OWN bus principal. `gateway` is the only JetStream
+      # administrator and the only KV writer in users.conf; without this
+      # pair the gateway refuses to serve (nats_credentials.rs).
+      - NATS_GATEWAY_USER=${NATS_GATEWAY_USER:-}
+      - NATS_GATEWAY_PASSWORD_FILE=${NATS_GATEWAY_PASSWORD:+/run/secrets/nats_gateway_password}
+      # (The shared fleet pair NATS_USER/NATS_PASSWORD and its bridge
+      # NOO_NATS_LEGACY_SHARED_CREDS were retired by an earlier change — no
+      # service is handed either; tests/test_nats_legacy_principal_env.py.)
+      - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
+      # an earlier change. OPEN while unset — a shared-secret token still buys
+      # inference, and each acceptance warns naming the caller so "who has no
+      # key yet" is answerable before this closes. Delivered now, closed
+      # later: a posture key the running gateway does not know cannot be set
+      # (it 400s), so the env must reach the container a release ahead of the
+      # decision.
+      - NOO_SELF_CALL_SHARED_SECRET=${NOO_SELF_CALL_SHARED_SECRET:-}
+      # CUTOVER: gateway connects as noo_app, a NON-SUPERUSER holding only
+      # SELECT/INSERT/UPDATE/DELETE (migration 033). PGVECTOR_URL and
+      # PAGEINDEX_DSN below deliberately stay `pai`: the entrypoint resolves
+      # PAGEINDEX_DSN first for Alembic, and migrations need DDL. That split
+      # is load-bearing — moving all three breaks startup.
+      # Every DSN names its transport: sslmode=verify-full against the
+      # cluster CA, and the controller leaf (gateway/gateway.{crt,key}) as
+      # the client certificate pg_hba now requires from every TCP client.
+      # The paths are the ro mount's; a libpq client stages the 0644 key to
+      # a 0600 copy itself (docker/entrypoint.py, src/noomesh/db/engine.py),
+      # sqlx reads it as-is. tests/test_postgres_tls_only.py pins the shape.
+      #
+      # No password in any DSN (file-backed secrets, 2026-09-29). A DSN
+      # carrying `:${…PASSWORD}` put the password in Config.Env, where
+      # `docker inspect` printed it. The password now comes from a pgpass
+      # FILE: `/run/secrets/pgpass`, 0400 to this container's uid, one line
+      # per role this container logs in as (noo for the migration DSNs,
+      # noo_app for the pool). sqlx and libpq both read PGPASSFILE natively
+      # when the URL has no password, and both IGNORE a file with group or
+      # other bits — hence 0400. The launcher derives the body
+      # (lib-secrets.sh derive_file_secrets → NOO_PGPASS_GATEWAY) from the
+      # store; it never touches disk outside this container.
+      - PGPASSFILE=${NOO_PGPASS_GATEWAY:+/run/secrets/pgpass}
+      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
+      - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
+      - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
+      # Makes /app/src win over the empty `noomesh` stub in site-packages.
+      # The image sets this too (Dockerfile.gateway-rust); it is repeated here
+      # so an image built BEFORE that ENV landed still boots. Without it
+      # entrypoint.py cannot import noomesh.db, exits 1, and the gateway
+      # crash-loops with migrations never applying. Safe to drop once no such
+      # image can still be deployed.
+      - PYTHONPATH=/app/src
+      # Security
+      # No insecure default — the gateway fails closed at runtime on an empty
+      # JWT secret (auth.rs), and noomesh-start.sh refuses to start the
+      # controller profile without it. Compose-level :? guards fire file-wide
+      # on ANY compose op and break worker-node recreates.
+      - NOO_JWT_SECRET_FILE=${NOO_JWT_SECRET:+/run/secrets/noo_jwt_secret}
+      # The audit log's OWN key, to the services that write audit rows
+      # (gateway, worker, trellion, trellion-intel) and nowhere else. It is
+      # the ONLY signing key: unset, a row is refused at error, never signed
+      # with a key derived from NOO_JWT_SECRET (that derivation is the
+      # gateway's verify-only key for rows before the audit-key checkpoint —
+      # docs/security/secrets.md "The audit key").
+      - NOO_AUDIT_HMAC_KEY_FILE=${NOO_AUDIT_HMAC_KEY:+/run/secrets/noo_audit_hmac_key}
+      # Optional P-256 key (base64 PEM) that signs EXCHANGED agent tokens as
+      # ES256 and is published at /.well-known/jwks.json (an earlier change phase
+      # 3, jwks.rs). Absent = HS256 under NOO_JWT_SECRET, as before. Only
+      # the gateway reads it. This line is the whole reason the key reaches
+      # the container: a variable absent from this block reaches nothing,
+      # and the first live roll shipped without it — key in the store,
+      # JWKS empty, no error, because from in here it was simply unset.
+      - NOO_JWT_SIGNING_KEY_FILE=${NOO_JWT_SIGNING_KEY:+/run/secrets/noo_jwt_signing_key}
+      - NOO_CLUSTER_SECRET_FILE=${NOO_CLUSTER_SECRET:+/run/secrets/noo_cluster_secret}
+      # Controller-local secret. Since an earlier change it
+      # is held by the gateway ALONE: it signs nothing on the bus and the
+      # gateway refuses an HMAC signed with it from every caller. Its one
+      # remaining job is the boot guard that keeps fleet tokens node-scoped.
+      - NOO_CONTROLLER_SECRET_FILE=${NOO_CONTROLLER_SECRET:+/run/secrets/noo_controller_secret}
+      # The bus-principal keys, one per audience.
+      - NOO_BROWSER_KEY_FILE=${NOO_BROWSER_KEY:+/run/secrets/noo_browser_key}
+      - NOO_BUS_KEY_WORKER_FILE=${NOO_BUS_KEY_WORKER:+/run/secrets/noo_bus_key_worker}
+      - NOO_BUS_KEY_TRELLION_FILE=${NOO_BUS_KEY_TRELLION:+/run/secrets/noo_bus_key_trellion}
+      - NOO_BUS_KEY_TRELLION_INTEL_FILE=${NOO_BUS_KEY_TRELLION_INTEL:+/run/secrets/noo_bus_key_trellion_intel}
+      - NOO_NODE_AGENT_TOKEN_FILE=${NOO_NODE_AGENT_TOKEN:+/run/secrets/noo_node_agent_token}
+      # Intelligent-tier entitlement (signed token, secret store; an earlier change
+      # P1 entitlement). Verified offline by the gateway — absent/invalid
+      # means the trellion-intel surfaces refuse "unlicensed".
+      - NOO_ENTITLEMENT_FILE=${NOO_ENTITLEMENT:+/run/secrets/noo_entitlement}
+      # Agent-message review key: seals every
+      # agent-to-agent body on the bus/in the table; operators review
+      # through the gateway. Absent = plaintext (boot log says so).
+      - NOO_AGENT_REVIEW_KEY_FILE=${NOO_AGENT_REVIEW_KEY:+/run/secrets/noo_agent_review_key}
+      # Optional second agent-messaging secret: when set,
+      # signatures derive from THIS and NOO_AGENT_REVIEW_KEY becomes
+      # decrypt-only, so a reviewer who can read history cannot forge it.
+      - NOO_AGENT_SIGNING_KEY_FILE=${NOO_AGENT_SIGNING_KEY:+/run/secrets/noo_agent_signing_key}
+      - NOO_ADMIN_USER=${NOO_ADMIN_USER:-admin}
+      - NOO_ADMIN_PASSWORD_FILE=${NOO_ADMIN_PASSWORD:+/run/secrets/noo_admin_password}
+      # Agentic mesh ops: noo_mint_join_key tool (worker.api.cluster.mint-join-key)
+      - NOO_TAILSCALE_API_KEY_FILE=${NOO_TAILSCALE_API_KEY:+/run/secrets/noo_tailscale_api_key}
+      - NOO_TAILSCALE_TAILNET=${NOO_TAILSCALE_TAILNET:-}
+      # fu 50 item 4: OAuth client (scoped keys+acl, non-expiring secret) —
+      # the preferred credential; mint_join_key exchanges it for a
+      # short-lived token per call. Sourced from sops via the launcher.
+      - NOO_TAILSCALE_OAUTH_CLIENT_ID=${NOO_TAILSCALE_OAUTH_CLIENT_ID:-}
+      - NOO_TAILSCALE_OAUTH_CLIENT_SECRET_FILE=${NOO_TAILSCALE_OAUTH_CLIENT_SECRET:+/run/secrets/noo_tailscale_oauth_client_secret}
+      - NOO_BOOTSTRAP_SCRIPT_URL=${NOO_BOOTSTRAP_SCRIPT_URL:-}
+      - NGROK_DOMAIN=${NGROK_DOMAIN:-}
+      # Controller SSH PUBLIC key, served by POST /api/cluster/bootstrap
+      # (bootstrap-token enrollment) so a node can install the
+      # forced-command `noo-gate` entry. NOTHING in this repo dials that
+      # key any more — the controller->node SSH lane was removed and no
+      # container holds a private key. Kept only until the gate lane itself
+      # is retired. Empty =
+      # bootstrap enrollment reports itself unconfigured.
+      - NOO_CONTROLLER_SSH_PUBKEY=${NOO_CONTROLLER_SSH_PUBKEY:-}
+      # Observability: noo_metrics_query tool (PromQL)
+      - NOO_PROMETHEUS_URL=${NOO_PROMETHEUS_URL:-https://prometheus:9090}
+      # Alerts: noo_alerts_list adds Alertmanager's own view (active,
+      # silenced, inhibited) over the same cluster-CA mTLS as Prometheus.
+      - NOO_ALERTMANAGER_URL=${NOO_ALERTMANAGER_URL:-https://alertmanager:9093}
+      - CLOUD_PROVIDERS_ENABLED=${CLOUD_PROVIDERS_ENABLED:-}
+      # Provider keys arrive as FILES (the `secrets:` block above); the
+      # pointer is set only when the store holds a value.
+      - ANTHROPIC_API_KEY_FILE=${ANTHROPIC_API_KEY:+/run/secrets/anthropic_api_key}
+      # Web search. The provider name may also come from
+      # noomesh.yaml `search.provider`; the keys are secrets and only ever
+      # arrive this way. Absent = DuckDuckGo, which rate-limits scrapers.
+      - NOO_SEARCH_PROVIDER=${NOO_SEARCH_PROVIDER:-}
+      - NOO_SEARCH_SEARXNG_URL=${NOO_SEARCH_SEARXNG_URL:-}
+      - TAVILY_API_KEY_FILE=${TAVILY_API_KEY:+/run/secrets/tavily_api_key}
+      - BRAVE_SEARCH_API_KEY_FILE=${BRAVE_SEARCH_API_KEY:+/run/secrets/brave_search_api_key}
+      - NOO_AUDIT_LOG_FILE=${NOO_AUDIT_LOG_FILE:-}
+      # Timeouts
+      - NOO_WORKER_TIMEOUT_SECS=${NOO_WORKER_TIMEOUT_SECS:-120}
+      # NOO_WORKER_RSS_LIMIT_MB is NOT passed to the gateway any more. It
+      # configured the in-process supervisor's RSS ceiling, and there is no
+      # in-process worker pool here. The ceiling still exists —
+      # noo-trellion runs it as a self-watchdog with mem_limit as the cgroup
+      # backstop — so the 2026-07-10 OOM-without-respawn protection moved
+      # rather than disappeared. Passing a dead var here would imply the
+      # gateway still enforces something it does not.
+      # Scheduler timezone — cron expressions in noo_heartbeat_tasks are
+      # interpreted in this TZ by the Rust heartbeat_loop. Previously the
+      # .env value never reached the container and only the in-code
+      # default (America/New_York) applied.
+      - NOO_HEARTBEAT_TZ=${NOO_HEARTBEAT_TZ:-America/New_York}
+      # Where operator alerts go (operator_alert::dispatch_raw). Same class of
+      # bug as NOO_HEARTBEAT_TZ above: both were set in .env but never reached
+      # the container, so every alert fell back to recipient "broadcast", which
+      # Google Chat rejects with 404 — i.e. NO operator alert has been
+      # delivered, from any loop, while the send path reported success.
+      - NOO_AGENT_ALERT_CHANNEL=${NOO_AGENT_ALERT_CHANNEL:-google_chat}
+      - NOO_AGENT_ALERT_RECIPIENT=${NOO_AGENT_ALERT_RECIPIENT:-}
+      # Engine selector. The Python heartbeat firing loop it used to gate
+      # was retired — the Rust loop owns cron firing, and a
+      # worker handed `python` only logs a warning. Also used at build time
+      # to pick the Dockerfile.
+      - GATEWAY_ENGINE=${GATEWAY_ENGINE:-rust}
+      # TLS — host paths in .env are mapped to container-internal /app/pki/ paths.
+      # ${VAR:+...} means: if VAR is set and non-empty, use the container path.
+      - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/gateway/gateway.crt}
+      - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/gateway/gateway.key}
+      - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
+      - NOO_MTLS_GATEWAY=${NOO_MTLS_GATEWAY:-}
+      - NOO_PKI_DIR=${NOO_PKI_DIR:-}
+      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
+      - NOO_NATS_TLS=${NOO_NATS_TLS:-}
+      - NOO_PG_SSLMODE=${NOO_PG_SSLMODE:-}
+      # Grafana SSO. The console's "Open Grafana" asks
+      # POST /api/monitoring/grafana-session; the gateway signs a short ES256
+      # token with sso/grafana.key (under its whole-PKI mount above) and
+      # sends the browser to NOO_GRAFANA_URL — the URL the BROWSER uses,
+      # which is GRAFANA_ROOT_URL, never the compose-network name. Empty =
+      # the route answers 503 "not configured", never a half-working link.
+      - NOO_GRAFANA_URL=${GRAFANA_ROOT_URL:-}
+      - NOO_GRAFANA_SSO_KEY=/app/pki/sso/grafana.key
+      - NOO_GRAFANA_SESSION_TTL=${NOO_GRAFANA_SESSION_TTL:-15}
+      # an earlier change (fail closed): this compose file ships in the SAME CLI
+      # release as configs/grafana/ that points Grafana's data sources at the
+      # gateway, so this literal says "the configs beside me are the gateway
+      # kind". A read-only account is a Grafana Viewer ONLY when it is set
+      # (and Grafana's live data sources prove it). An older CLI rolling a
+      # newer gateway image renders its own older compose without it, so the
+      # gateway refuses read-only users instead of granting a Viewer over
+      # data sources that still dial Prometheus and Loki directly. A literal,
+      # never `${…}` from .env: it is the release's declaration, not a knob.
+      - NOO_GRAFANA_DS_VIA_GATEWAY=1
+      # Persistent data dir for retrieval_tracker.json + similar small
+      # state files. /data is the noo-data volume on D: (not the WSL
+      # .vhdx on C:). Both Rust gateway and Python worker honor this.
+      - NOO_DATA_DIR=/data
+      # Host-watcher command spool (bind-mounted from ./.noo-host-spool).
+      # The gateway has no Docker access; it writes lifecycle commands here
+      # for noo-hostd to execute on the host.
+      - NOO_HOST_SPOOL_DIR=/var/run/noo-spool
+      - RETRIEVAL_TRACKER_PATH=/data/retrieval_tracker.json
+      - RETRIEVAL_BANDIT_PATH=/data/retrieval_bandit.json
+      # harrier / 1024: the default embedder and trellion's vector(1024) DDL.
+      # The gateway REJECTS vectors whose width differs from EMBEDDING_DIM
+      # (embedding_client.rs), so a stale default here stops all embedding.
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-harrier}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
+      - OLLAMA_URL=${OLLAMA_URL:-https://stunnel-ollama:11434}
+      # Empty fallbacks on purpose: env_or_yaml treats empty as unset, so
+      # endpoint resolution defers to noomesh.yaml and then the code
+      # defaults in embedding_client.rs (ollama-first). The old fallbacks
+      # restated a stunnel-tei/tei endpoint that no longer deploys here.
+      - PAGEINDEX_EMBEDDING_URL=${PAGEINDEX_EMBEDDING_URL:-}
+      # Extra static embed endpoints (comma-separated), spread over beside
+      # the mesh nodes and the primary. Empty = none. See the optional
+      # ollama-embed-cpu service.
+      - PAGEINDEX_EMBEDDING_EXTRA_URLS=${PAGEINDEX_EMBEDDING_EXTRA_URLS:-}
+      # External-inference reranker (off unless set — see EXTERNAL_INFERENCE_CONTRACT.md)
+      - PAGEINDEX_EMBEDDING_BACKEND=${PAGEINDEX_EMBEDDING_BACKEND:-}
+      - PAGEINDEX_EMBEDDING_MODEL=${PAGEINDEX_EMBEDDING_MODEL:-}
+      - PAGEINDEX_LLM_URL=${PAGEINDEX_LLM_URL:-https://noo-vllm:8000}
+      - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}
+      # STT provider (generic layer — gateway-rust/src/stt_client.rs).
+      # Off-unless-set passthroughs: the compiled default already points at
+      # the opt-in `whisper` compose service (http://noo-whisper:8000,
+      # wire format "openai"), so these stay empty for the default path.
+      - NOO_STT_URL=${NOO_STT_URL:-}
+      - NOO_STT_BACKEND=${NOO_STT_BACKEND:-}
+      - NOO_STT_MODEL=${NOO_STT_MODEL:-}
+      - NOO_STT_API_KEY_ENV=${NOO_STT_API_KEY_ENV:-}
+      # TTS provider (generic layer — gateway-rust/src/tts_client.rs).
+      # Off-unless-set passthroughs: the compiled default already points at
+      # the opt-in `piper` compose service (http://noo-piper:8000, wire
+      # format "openai"), so these stay empty for the default path.
+      - NOO_TTS_URL=${NOO_TTS_URL:-}
+      - NOO_TTS_BACKEND=${NOO_TTS_BACKEND:-}
+      - NOO_TTS_VOICE=${NOO_TTS_VOICE:-}
+      - NOO_TTS_API_KEY_ENV=${NOO_TTS_API_KEY_ENV:-}
+      # Strangler-fig webhook migration: channels listed here (comma-
+      # separated, e.g. telegram,whatsapp,google_chat) take the generic
+      # NATS-forwarded webhook path (Python adapter verifies/parses)
+      # instead of the native Rust handler. Empty = all native (no change).
+      - NOO_GENERIC_WEBHOOK_CHANNELS=${NOO_GENERIC_WEBHOOK_CHANNELS:-}
+      - TELEGRAM_BOT_TOKEN_FILE=${TELEGRAM_BOT_TOKEN:+/run/secrets/telegram_bot_token}
+      - TELEGRAM_WEBHOOK_URL=${TELEGRAM_WEBHOOK_URL:-}
+      # TELEGRAM_SECRET_TOKEN is NOT delivered: inbound Telegram is
+      # long-polling (no webhook route exists), and no tree reads the name.
+      - GOOGLE_CHAT_CREDENTIALS=${GOOGLE_CHAT_CREDENTIALS:-}
+      # The service-account key itself (base64 of the JSON, store key
+      # NOO_FILECRED_GOOGLE_CHAT_B64), as a file like every other secret.
+      - GOOGLE_CHAT_CREDENTIALS_JSON_FILE=${NOO_FILECRED_GOOGLE_CHAT_B64:+/run/secrets/google_chat_credentials_json}
+      - GOOGLE_CHAT_PROJECT_ID=${GOOGLE_CHAT_PROJECT_ID:-}
+      - GOOGLE_CHAT_BEARER_TOKEN_FILE=${GOOGLE_CHAT_BEARER_TOKEN:+/run/secrets/google_chat_bearer_token}
+      # Set to a Cloud Pub/Sub subscription to pull Chat events privately
+      # (no public webhook). See GoogleChatAdapter Pub/Sub pull mode.
+      - GOOGLE_CHAT_PUBSUB_SUBSCRIPTION=${GOOGLE_CHAT_PUBSUB_SUBSCRIPTION:-}
+      # OBSOLETE: the Python pull loop is retired,
+      # so this selector selects nothing. Still plumbed through so a
+      # leftover "python" value reaches the gateway, which warns and
+      # ignores it (google_chat_pubsub.rs) instead of silently doing
+      # nothing — it never stands the Rust loop down.
+      - NOO_GCHAT_PUBSUB_ENGINE=${NOO_GCHAT_PUBSUB_ENGINE:-}
+      # DWD impersonation subject for Chat media:upload (Google rejects
+      # SA-only auth on that endpoint). The SA acts as this Workspace
+      # user when uploading attachments. Requires DWD authorized for
+      # https://www.googleapis.com/auth/chat.messages.create
+      # Shared-Drive folder for heartbeat report uploads (drive_id or
+      # subfolder id). When set, report dispatch uploads to Drive and
+      # posts a link instead of attempting a chat attachment.
+      - NOO_REPORTS_DRIVE_FOLDER_ID=${NOO_REPORTS_DRIVE_FOLDER_ID:-}
+      - WHATSAPP_TOKEN_FILE=${WHATSAPP_TOKEN:+/run/secrets/whatsapp_token}
+      - WHATSAPP_PHONE_ID=${WHATSAPP_PHONE_ID:-}
+      # WHATSAPP_VERIFY_TOKEN / WHATSAPP_APP_SECRET are NOT delivered: they
+      # authenticate an inbound webhook, and no such route exists (outbound
+      # send only — routes/communication.rs); nothing reads either name.
+      # Cluster discovery — pre-known hosts the agent can probe + (Tier 3)
+      # auto-enroll. Lives in the /data volume so it persists across
+      # container recreates and isn't bound to the host user's $HOME.
+      - NOO_CLUSTER_INVENTORY=/data/config/cluster-inventory.yaml
+      # Approval notification targets — where the gateway sends the
+      # "agent wants to add a node" card with Approve/Reject buttons.
+      # Leave empty to skip a channel; proposals still land in the
+      # dashboard regardless.
+      - NOO_APPROVAL_GCHAT_SPACE=${NOO_APPROVAL_GCHAT_SPACE:-}
+      - NOO_APPROVAL_TELEGRAM_CHAT=${NOO_APPROVAL_TELEGRAM_CHAT:-}
+      # Log aggregation — the gateway proxies Loki queries (/api/logs/query,
+      # /api/logs/status) and dials it with its own leaf over mTLS. The Rust
+      # gateway reads NOO_LOKI_URL (config.rs services.loki_url); this line
+      # said LOKI_URL until 2026-09-28, so the gateway answered "Loki not
+      # configured" on every install. tests/test_loki_wiring_parity.py pins
+      # the name to the reader.
+      - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}
+      # Python sandbox — isolated code execution (internal Docker network)
+      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-http://sandbox:9000}
+      # disk_watermark autonomy location. The gateway has no env_file, so
+      # these must be listed explicitly or the .env values never reach the
+      # container and the evaluator silently uses its built-in defaults
+      # (85% / "/"). Watching "/" is deliberate: the container's rootfs is
+      # an overlay backed by the host's image-layer store, which is the
+      # filesystem that actually fills up.
+      - NOO_DISK_WATERMARK_PERCENT=${NOO_DISK_WATERMARK_PERCENT:-}
+      # NOTE: the gateway has no env_file — a variable not named in this
+      # list never reaches the container, however carefully it is set in
+      # .env (the trap fixed for the disk watermark in #241).
+      - NOO_DISK_WATCH_PATHS=${NOO_DISK_WATCH_PATHS:-}
+      # The repo a new node installs the noo CLI from, named in the
+      # enrollment paste POST /api/security/bootstrap-tokens composes.
+      # Empty = the default release repo (same variable install-noo.sh and
+      # `noo upgrade` read).
+      - NOO_CLI_REPO=${NOO_CLI_REPO:-}
+      # (ANTHROPIC_API_KEY_FILE is delivered once, beside CLOUD_PROVIDERS_ENABLED
+      # above; the coding-task delegation reads the same secret.)
+      # ── Worker-pool supervision (WP-T23 trellion split) ────────────────
+      # inprocess (default/empty) = the Rust gateway spawns + supervises the
+      # Python worker pool in this container — today's behavior.
+      # external = a separate noo-trellion container runs the pool; the
+      # gateway spawns nothing. Set by noomesh-start.sh when
+      # Always `external` — the gateway no longer has an
+      # in-process worker pool. Retained as a variable only so the launcher
+      # sets it explicitly and preflight can report it; there is no longer a
+      # second mode to switch to.
+      - NOO_WORKER_SUPERVISOR=${NOO_WORKER_SUPERVISOR:-external}
+      # Which Alembic env(s) the gateway entrypoint applies. Empty/all =
+      # both (memory + mesh) — today's single-runner behavior. Set to
+      # `mesh` by noomesh-start.sh when the trellion add-on is on
+      # (`addons.trellion` in noomesh.yaml, default true): the memory env
+      # then runs in the noo-trellion container, and the gateway
+      # bounded-waits for the memory head before applying mesh
+      # (002_pro_tables FKs onto a memory table). Moves together with
+      # NOO_WORKER_SUPERVISOR above — same switch, same launcher.
+      - NOO_MIGRATIONS_ENVS=${NOO_MIGRATIONS_ENVS:-}
+      # OBSOLETE: the Python poll loop is retired, so
+      # this selector selects nothing. Plumbed through only so a leftover
+      # "python" value reaches the gateway's warn-and-ignore path
+      # (channels/telegram.rs) — the Rust poller runs regardless. The old
+      # split-updates hazard is gone by construction: exactly one poller
+      # can exist now.
+      - NOO_TELEGRAM_ENGINE=${NOO_TELEGRAM_ENGINE:-}
+      # ── Python worker-plane passthroughs (env audit, WP-T23 2026-08-01) ─
+      # Read by worker-pool-hosted code but previously absent from this
+      # allowlist, i.e. .env values silently never reached the container.
+      # Mirrored in the trellion service so the two blocks stay diffable.
+      - OPENAI_API_KEY_FILE=${OPENAI_API_KEY:+/run/secrets/openai_api_key}   # coordinator/cloud.rs
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}        # cloud_providers.py
+      - GOOGLE_API_KEY_FILE=${GOOGLE_API_KEY:+/run/secrets/google_api_key}   # coordinator/cloud.rs
+      - CLOUD_DEFAULT_PROVIDER=${CLOUD_DEFAULT_PROVIDER:-}
+      - NOO_EXEC_APPROVAL_MODE=${NOO_EXEC_APPROVAL_MODE:-}   # bootstrap only — DB security posture overrides at boot
+      # Proxies whose X-Forwarded-For is honoured (middleware.rs). Empty by
+      # default = loopback only. In tailnet mode the launcher adds this node's
+      # own tailnet address: Tailscale Serve (the ts.net front door) connects
+      # FROM it, so without the entry every caller through the door — host7,
+      # the kiosk, member devices — logged as the controller.
+      - NOO_TRUSTED_PROXIES=${NOO_TRUSTED_PROXIES:-}
+      # Approve-then-execute decision window (seconds, default 300) —
+      # how long a HIGH-risk tool call waits for a card/CLI/dashboard
+      # decision under approval mode before refusing.
+      - NOO_EXEC_APPROVAL_TIMEOUT_SECS=${NOO_EXEC_APPROVAL_TIMEOUT_SECS:-}
+      # Session lifetimes (auth_refresh.rs): access-token TTL in minutes
+      # (default 15) and refresh-token validity in days (default 30,
+      # sliding — refresh rotates on use, so only inactivity logs you out).
+      - NOO_TOKEN_EXPIRE_MINUTES=${NOO_TOKEN_EXPIRE_MINUTES:-}
+      - NOO_REFRESH_TOKEN_DAYS=${NOO_REFRESH_TOKEN_DAYS:-}
+      - NOO_PROACTIVE_ENABLED=${NOO_PROACTIVE_ENABLED:-}     # worker_pool.py proactive-agent autostart
+      # (SLACK_BOT_TOKEN is not delivered: there is no Slack adapter in any
+      # tree — docs/reference/env.md lists it as retired.)
+      - CHANNEL_HISTORY_LIMIT=${CHANNEL_HISTORY_LIMIT:-}     # worker_pool.py channel manager
+      - NOO_WORKER_GLOBAL_CONCURRENCY=${NOO_WORKER_GLOBAL_CONCURRENCY:-}
+      - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}   # workers/heartbeat.py security-audit task (same name as the gateway's)
+      - NOO_ARTIFACT_DIR=${NOO_ARTIFACT_DIR:-}      # workers/heartbeat.py report artifacts
+    volumes:
+      - ./noomesh.yaml:/app/noomesh.yaml
+      - ./docker-compose.override.yml:/app/docker-compose.override.yml
+      - ./prompts:/app/prompts
+      # Sandbox capabilities (manifest.yml + run.py) — pairs with
+      # NOO_SKILLS_HOST_DIR above for host-path translation.
+      - ./skills:/app/skills:ro
+      - noo-data:/data
+      # Artifact control plane: the same GGUF store nginx
+      # serves as /gguf/ (mTLS :8443), mounted read-only so the gateway's manifest
+      # route (/api/artifacts/manifest/gguf/{name}) hashes exactly the bytes a
+      # node will pull. Gateway ONLY — worker/trellion have no manifest route.
+      # Digest cache lives in noo-data:/data, so no new volume.
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/artifacts/models:ro
+      # Image tars exported by `noo cluster sync-images` (prop 22 step 2) —
+      # same one-directory/three-views contract as models above.
+      - ${IMAGES_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/images}:/artifacts/images:ro
+      - claude-config:/root/.claude
+      # PKI: a certificate-only view, never the PKI root.
+      # This container runs as 65532 — the uid loki, prometheus,
+      # alertmanager, node-exporter and llamacpp read their keys as — so a
+      # root mount let it read those keys whatever their modes. It holds
+      # ca.crt, its own gateway/ leaf, sso/ (the Grafana SSO key it signs
+      # with), and pki/public/{nodes,services}: a copy of every *.crt under
+      # nodes/ and services/ and nothing else, kept by the CLI (`noo
+      # security pki` issue/rotate/fix-modes, onboard, `upgrade --stack`,
+      # `stack start`). Mounted at /app/pki/nodes and /app/pki/services —
+      # the paths the root mount gave them — so cert expiry and `pki status`
+      # read what they always read. tests/test_pki_mounts_are_narrow.py.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/gateway:/app/pki/gateway:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/sso:/app/pki/sso:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/public/nodes:/app/pki/nodes:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/public/services:/app/pki/services:ro
+      # User directories: see docker-compose.override.yml, generated by
+      # `noo onboard` (and regenerated by `noo stack start` from noomesh.yaml).
+      # Each declared directory is bind-mounted INDIVIDUALLY as
+      # `<host>:/user-dirs/<base>`. That override is the ONLY way a host
+      # directory enters this container.
+      #
+      # REMOVED 2026-09-11 (tracker R22): `/mnt:/host-fs/mnt:ro`,
+      # `/home:/host-fs/home:ro`, `/media:/host-fs/media:ro` — the whole host,
+      # read-only, "for the directory picker". `USER nonroot` was the only
+      # thing between any gateway file-read bug and
+      # ~/.config/sops/age/keys.txt, ~/.ssh and every 0644 file in every home;
+      # on WSL /mnt/* is drvfs and world-readable, so it was not even that.
+      # The picker now browses declared roots only — see
+      # gateway-rust/src/routes/settings.rs::declared_browse_roots. Do not
+      # re-add these; tests/test_no_wide_host_mounts.py fails the build.
+      # Host-watcher command spool — replaces direct Docker socket access
+      # (see node-agent-go/internal/hostd). The gateway drops JSON command
+      # files here; the host daemon performs all docker/compose operations.
+      - ./.noo-host-spool:/var/run/noo-spool:rw
+      # REMOVED 2026-09-11: `.:/app/project:ro` put the WHOLE checkout —
+      # secrets/, pki/, .env — inside this container. Nothing read it:
+      # the image WORKDIR is /app, no source references /app/project, and
+      # everything actually consumed (scripts/, config/tools.json,
+      # docs/runbooks, static) is baked in or mounted at its own path.
+      # Dev: live-reload for the DASHBOARD only. There is no Python in this
+      # container any more and no uvicorn --reload — the
+      # comment that used to be here described a server that has not run here
+      # for two proposals. HTML/JS edits still apply on browser refresh.
+      # fu 47: var-driven like the trellion src overlay — dist mode
+      # neutralizes both so the dashboard assets come from the image.
+      - ${NOO_UI_STATIC_OVERLAY:-./src/noomesh/gateway/static}:${NOO_UI_STATIC_OVERLAY_DEST:-/app/static}:ro
+      #
+      # REMOVED with the Python source tree:
+      #   ./src:/app/src:ro
+      #     overlaid a directory the image no longer creates. Nothing in the
+      #     gateway imports noomesh; the only thing that had to survive is
+      #     index.html, which keeps its own mount above (routes/ui.rs reads it
+      #     from paths::GATEWAY_HTML_DIR).
+      #   ${TRELLION_PATH}/src/trellion:/opt/python/cpython-3.12.13-.../trellion
+      #     DEAD LONG BEFORE THIS CHANGE, and silently. The target is the
+      #     deps-base interpreter's site-packages; this image's interpreter has
+      #     sys.prefix=/usr and searches /usr/lib/python3.12/site-packages. So
+      #     the file was mounted where nothing would ever look — verified on
+      #     the live container: `import trellion` -> ModuleNotFoundError.
+      #     noo-trellion keeps its own copy of this mount, where it works.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - noo-cluster
+      - noo-db
+      # python_exec: gateway → http://sandbox:9000/exec (see M-3)
+      - noo-sandbox
+      # browser actions: gateway → http://browser:9222 (see R35)
+      - noo-browser
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_started
+        required: false
+      tei:
+        condition: service_started
+        required: false
+      sandbox:
+        condition: service_healthy
+        required: false
+    # No healthcheck override here ON PURPOSE. The image's own HEALTHCHECK
+    # (docker/Dockerfile.gateway-rust: `noo-gateway --health`) verifies the
+    # leaf against NOO_TLS_CA. The python override that used
+    # to sit here ran `ssl._create_unverified_context()` over the top of it,
+    # so the verified probe never ran on a compose-started gateway.
+    # `tests/test_healthchecks_verify_tls.py` keeps it that way.
+
+  # HISTORICAL: this
+  # file used to define a `noo-trellion` service directly, gated by a
+  # NOO_TRELLION_ENABLED flip. That flag is retired and the service moved
+  # entirely into the opt-out overlay docker-compose.trellion.yml (see its
+  # file header) — there is no `noo-trellion` service left in this file.
+  # NEVER run docker-compose.trellion.yml's service while the gateway is
+  # in inprocess supervisor mode — two worker pools would double-subscribe
+  # every worker.* subject (NOO_WORKER_SUPERVISOR is always `external` now).
+  # ── noo-worker: the slim always-on Python runtime ──
+  # FROM deps-core — NO ML tree. Serves the four non-ML worker subjects +
+  # in-process services (proactive, approvals, coding history, CRUD stores)
+  # with NOO_WORKER_SURFACES=core baked into the image. ALWAYS ON since the
+  # an earlier change flip (see the service's own comment below); the
+  # `worker-core` profile is kept only for solo rehearsal runs.
+  worker:
+    logging: *default-logging
+    # ALWAYS ON since the an earlier change flip: the four core worker
+    # subjects live here on every install. "worker-core" is kept for solo
+    # rehearsal runs.
+    profiles: ["controller", "worker-core", "standalone"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        DEPS_CORE: ${NOO_IMAGE_PREFIX:-noomesh}/deps-core:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_CORE:-}
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/worker:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_WORKER:-}
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-worker
+    # Tier-1 secrets as FILES (see the gateway service): 0400 to 65532, the
+    # image's `nonroot`; `noomesh.secret_env` reads each through its
+    # `<NAME>_FILE` pointer below. Anchored so worker-extra gets the same set.
+    secrets: &worker-secrets
+      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: nats_worker_password, target: nats_worker_password, uid: "65532", gid: "65532", mode: 0400 }
+      # NOT noo_cluster_secret: the fleet secret is a node's
+      # credential. The browser door, its one use here, has its own key.
+      - { source: noo_browser_key, target: noo_browser_key, uid: "65532", gid: "65532", mode: 0400 }
+      # NOT noo_controller_secret: the worker verifies bus
+      # principals with its OWN key, below, and signs nothing with it.
+      - { source: noo_bus_key_worker, target: noo_bus_key, uid: "65532", gid: "65532", mode: 0400 }
+      # NOT noo_jwt_secret: the worker acts as a user with
+      # the per-dispatch token the gateway mints (worker_delegation.rs) and
+      # holds no login signing secret. tests/test_jwt_secret_gateway_only.py.
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_svc_key_worker, target: noo_gateway_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: pgpass_worker, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
+      # Channel credentials. The worker reads them only to
+      # answer "is this channel configured?" (channels/gateway_client.py);
+      # sends go through the gateway.
+      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+    environment: &worker-env
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - NATS_URL=${NATS_URL:-tls://nats:4222}
+      - REDIS_URL=${REDIS_URL:-rediss://redis:6379}
+      - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
+      # NATS credentials — without them the pool reaches the broker over
+      # TLS and then loops on 'Authorization Violation', never subscribing
+      # to dispatch (launch defect #4, right after the DSN/CA fixes).
+      # This process's OWN bus principal — `worker`, shared by noo-worker,
+      # noo-trellion and noo-trellion-intel, denied `tasks.>`, `$KV.>` and
+      # stream administration. Without it the pool refuses to connect.
+      - NATS_WORKER_USER=${NATS_WORKER_USER:-}
+      - NATS_WORKER_PASSWORD_FILE=${NATS_WORKER_PASSWORD:+/run/secrets/nats_worker_password}
+      # noo-worker's OWN gateway key. Every Python -> gateway
+      # self-call in this container goes through
+      # cluster_auth.internal_gateway_headers, which presents this and
+      # nothing else (an earlier change: the shared-HMAC fallback is retired).
+      - NOO_GATEWAY_KEY_FILE=${NOO_SVC_KEY_WORKER:+/run/secrets/noo_gateway_key}
+      - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
+      # Postgres transport is carried BY THE DSNs below (sslmode=verify-full
+      # + the worker's own leaf as client cert); the passthrough is only the
+      # fallback engine.py applies to a DSN that names no sslmode. There is
+      # no NOO_PG_TLS switch any more: the server is TLS-only, unconditionally.
+      - NOO_PG_SSLMODE=${NOO_PG_SSLMODE:-}
+      # Constructed inline like trellion's — `${PAGEINDEX_DSN:-}` passed
+      # through a var no launcher exports, so the pool started with an
+      # empty DSN (critical_env_unset) and heartbeat run records had
+      # nowhere to go.
+      # No password in either DSN: noo_app's comes from the pgpass file
+      # (see the gateway service; NOO_PGPASS_WORKER, one line, noo_app).
+      - PGPASSFILE=${NOO_PGPASS_WORKER:+/run/secrets/pgpass}
+      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key
+      - PAGEINDEX_DSN=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key
+      # The browser container's door key (tools/browser_tool.py), not the
+      # fleet secret.
+      - NOO_BROWSER_KEY_FILE=${NOO_BROWSER_KEY:+/run/secrets/noo_browser_key}
+      # This container's OWN bus-principal key and the audience it is
+      # (noomesh/gateway/bus_principal.py). No
+      # NOO_CONTROLLER_SECRET: no Python process holds it any more.
+      - NOO_BUS_KEY_FILE=${NOO_BUS_KEY_WORKER:+/run/secrets/noo_bus_key}
+      - NOO_BUS_AUDIENCE=worker
+      # The audit log's OWN key, to the services that write audit rows
+      # (gateway, worker, trellion, trellion-intel) and nowhere else. It is
+      # the ONLY signing key: unset, a row is refused at error, never signed
+      # with a key derived from NOO_JWT_SECRET (that derivation is the
+      # gateway's verify-only key for rows before the audit-key checkpoint —
+      # docs/security/secrets.md "The audit key").
+      - NOO_AUDIT_HMAC_KEY_FILE=${NOO_AUDIT_HMAC_KEY:+/run/secrets/noo_audit_hmac_key}
+      - NOO_GATEWAY_URL=${NOO_TRELLION_GATEWAY_URL:-https://gateway:8080}
+      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-http://sandbox:9000}
+      # Restated from the image ENV on purpose: the Dockerfile shipped these
+      # under the retired PAI_ prefix for one stack release (v0.2.3) while
+      # every reader was NOO_, so the core worker booted with surfaces=all
+      # (ML handlers registered on a deps-core image, competing with
+      # trellion for worker.rag/memory subjects) and ran BOTH Alembic envs,
+      # racing trellion. Compose is the plane the launcher verifies.
+      - NOO_WORKER_SURFACES=core
+      - NOO_SKIP_MIGRATIONS=1
+      # `:+` on purpose (same as trellion/gateway): the host env holds HOST
+      # paths; `${NOO_TLS_CA:-}` passed the host path straight into the
+      # container, where it does not exist — NATS TLS failed with
+      # "unable to get local issuer certificate" and the pool never
+      # subscribed to dispatch.
+      - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
+      # The worker's OWN service leaf: presented to Postgres,
+      # Redis, NATS, the gateway and the backend doors. Never the
+      # controller's gateway leaf, which a node agent reads as "this caller
+      # may command me" — the worker commands no node; the node-agent calls
+      # its heartbeat once made (disk_cleanup's /cleanup/*) are the
+      # gateway's (heartbeat_actions.rs), which holds that leaf.
+      - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/leaf/service.crt}
+      - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/leaf/service.key}
+      - NOO_EXEC_APPROVAL_MODE=${NOO_EXEC_APPROVAL_MODE:-}
+      - NOO_APPROVAL_GCHAT_SPACE=${NOO_APPROVAL_GCHAT_SPACE:-}
+      - NOO_APPROVAL_TELEGRAM_CHAT=${NOO_APPROVAL_TELEGRAM_CHAT:-}
+      - NOO_PROACTIVE_ENABLED=${NOO_PROACTIVE_ENABLED:-}
+      - TELEGRAM_BOT_TOKEN_FILE=${TELEGRAM_BOT_TOKEN:+/run/secrets/telegram_bot_token}
+      - GOOGLE_CHAT_CREDENTIALS=${GOOGLE_CHAT_CREDENTIALS:-}
+      - GOOGLE_CHAT_CREDENTIALS_JSON_FILE=${NOO_FILECRED_GOOGLE_CHAT_B64:+/run/secrets/google_chat_credentials_json}
+      - GOOGLE_CHAT_BEARER_TOKEN_FILE=${GOOGLE_CHAT_BEARER_TOKEN:+/run/secrets/google_chat_bearer_token}
+      - WHATSAPP_TOKEN_FILE=${WHATSAPP_TOKEN:+/run/secrets/whatsapp_token}
+      - WHATSAPP_PHONE_ID=${WHATSAPP_PHONE_ID:-}
+    volumes: &worker-volumes
+      # Mirrors the non-ML slice of trellion's mounts: config, PKI, the
+      # gchat SA key for the approval ping, and noo-data for CRUD stores
+      # that write artifacts. No ingest/watched-folder mounts — those are
+      # the ML pack's.
+      - ./noomesh.yaml:/app/noomesh.yaml
+      - noo-data:/data
+      # ca.crt + the worker's OWN leaf (NOO_TLS_* above);
+      # never the whole PKI dir (ca.key, nodes/*/node.key) and never
+      # gateway/, the controller's identity. Issued by `noo onboard`
+      # (SVC_LIST) and, on an upgraded install, by `noo upgrade --stack`
+      # before the launcher runs. worker-extra shares it through the anchor.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/worker:/app/pki/leaf:ro
+    networks: &worker-networks
+      - noo-cluster
+      - noo-sandbox
+      - noo-browser
+    restart: unless-stopped
+    healthcheck: &worker-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Extra worker replicas. Same image, same env,
+  # same mounts as `worker` — through the anchors above, so the two can
+  # never drift — but NO container_name: these are anonymous siblings of
+  # the named noo-worker that every script, secret spec and `docker exec`
+  # knows. Scale with `NOO_WORKER_EXTRA=<n> noo stack restart`. Safe only
+  # because worker_pool subscribes in a queue group; see the comment
+  # there for what happened without one. Default 0: a one-CPU controller
+  # gains nothing from a second copy — run scripts/bench-sessions.py first.
+  worker-extra:
+    logging: *default-logging
+    profiles: ["controller", "worker-core", "standalone"]
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/worker:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_WORKER:-}
+    pull_policy: never
+    deploy:
+      replicas: ${NOO_WORKER_EXTRA:-0}
+    secrets: *worker-secrets
+    environment: *worker-env
+    volumes: *worker-volumes
+    networks: *worker-networks
+    restart: unless-stopped
+    healthcheck: *worker-health
+
+  # NOO_BASE_REGISTRY — where the third-party runtime images come from.
+  # The DEFAULT is `ghcr.io/noomesh`, the PUBLIC mirrors of the upstream
+  # images, so an un-seeded install never dials dhi.io. The hardened fleet
+  # sets `ghcr.io/noomesh/dhi` (the DHI mirrors) in noomesh.yaml compose_env. Both are maintained by
+  # .github/workflows/mirror-images.yml (the escape hatch when dhi.io is
+  # timing out: three TLS-handshake failures on 2026-08-17, or when
+  # DHI_TOKEN is unavailable). The mirror deliberately keeps the same
+  # `<name>:<tag>` suffix so only the prefix has to change.
+  #
+  # Redis (controller node only)
+  redis:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/redis:8.6-debian13-dev
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
+    profiles: ["controller", "standalone"]
+    # No external port — only accessible via Docker network (noo-db)
+    # The password as a FILE (0400, uid 0 — the DHI -dev image runs as
+    # root, `USER 0`); docker/redis-entrypoint.sh reads REDIS_PASSWORD_FILE
+    # and writes its 0600 config from it. Empty store value → no file and no
+    # pointer → the entrypoint refuses, exactly as an empty env did.
+    secrets:
+      - { source: redis_password, target: redis_password, uid: "0", gid: "0", mode: 0400 }
+    environment:
+      - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
+      - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
+    volumes:
+      - redis-data:/data
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/redis:/tls/services/redis:ro
+      - ./docker/redis-entrypoint.sh:/usr/local/bin/redis-entrypoint.sh:ro
+    networks:
+      - noo-cluster
+      - noo-db
+    restart: unless-stopped
+    # The password is NOT on this command line, and must never be put back
+    # there (tracker R27). Compose interpolates `command:` at up-time, so
+    # `--requirepass ${REDIS_PASSWORD}` wrote the real password into the
+    # container's Config.Cmd — visible to `docker inspect`, to
+    # `docker compose config`, and in /proc/<pid>/cmdline. The entrypoint
+    # reads the password from /run/secrets/redis_password (REDIS_PASSWORD_FILE
+    # above) and writes a 0600 config file inside the container instead; it refuses to start on an
+    # empty value, which is what the old `__MISSING_...__` placeholder was
+    # for. tests/test_no_secrets_on_compose_command_lines.py enforces this.
+    entrypoint: ["/usr/local/bin/redis-entrypoint.sh"]
+
+  # NATS (messaging broker with persistence)
+  nats:
+    logging: *default-logging
+    # Pinned by digest (H-N4) — controller-only, x86. Bump deliberately, not via :latest drift.
+    image: ${NATS_IMAGE:-nats:latest@sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-nats
+    profiles: ["controller", "standalone"]
+    ports:
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NATS:-4222}:4222"   # Client connections (workers need access; auth via NATS creds + mTLS)
+      # Monitoring — localhost only on the host, and on the TLS profile it
+      # is HTTPS with client-cert verification (an earlier change N9): every
+      # container on `noo-cluster` could previously read /connz (bus user +
+      # client IPs), /subsz and /jsz over plain HTTP. See
+      # monitoring/nats/nats-tls.conf for the operator curl.
+      - "127.0.0.1:${NOO_PORT_NATS_MON:-8222}:8222"
+    # NO environment. The rendered users.conf names no variable (followup
+    # 536 retired the legacy `$NATS_USER`/`$NATS_PASSWORD` principal, the
+    # only one that did); every principal is a bcrypt digest. Removing the
+    # pair while an on-disk users.conf still named it took host8's bus down
+    # on the stack-v0.2.78 roll, so `noo upgrade --stack` re-renders that
+    # file BEFORE launching, and the launcher's pre-`up` check refuses to
+    # start nats on a users.conf naming a variable it is not handed
+    # (bind_sources.rs). tests/test_nats_legacy_principal_env.py pins it.
+    # The ONE config. There is no plaintext profile: `nats.conf` and the
+    # `NOO_NATS_CONFIG` selector that could pick it are gone, so the bus is
+    # mTLS (`tls { verify: true }`) on every install, and a `.env` that still
+    # names NOO_NATS_CONFIG is refused by scripts/noomesh-start.sh before
+    # compose runs. tests/test_nats_tls_only.py pins all of this.
+    command: ["-c", "/etc/nats/nats-tls.conf"]
+    volumes:
+      - nats-data:/data
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/nats:/tls/services/nats:ro
+      - ./monitoring/nats/nats-tls.conf:/etc/nats/nats-tls.conf:ro
+      # Per-principal users, `include`d by the conf above.
+      # Rendered by `noo cluster nats-users render`; holds bcrypt digests,
+      # never a presentable password. A MISSING include is a fatal NATS
+      # startup error, which is why the baseline file is committed.
+      - ./monitoring/nats/users.conf:/etc/nats/users.conf:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # NATS uses a scratch image with no shell/wget/curl — disable healthcheck
+    # Server health is monitored via gateway's NATS client connection status
+    healthcheck:
+      disable: true
+
+  # vLLM backend
+  vllm:
+    logging: *default-logging
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
+    # Placement-managed since 2026-07-11: the node-agent's desired-state
+    # reconciler owns noo-vllm (noo cluster place <node> vllm <model>).
+    # This service is a manual/bootstrap fallback only — NOT in the
+    # controller profile, or every `noo stack rebuild` races the reconciler
+    # over the container name. Opt in explicitly with --profile vllm.
+    profiles: ["vllm"]
+    # No external port — gateway reaches vLLM via Docker network (noo-cluster)
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): vLLM posts usage
+      # stats to stats.vllm.ai at start and every 10 minutes unless told not to.
+      # Literal values — no .env may turn them back on.
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_DO_NOT_TRACK=1
+      - DO_NOT_TRACK=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - MODEL_NAME=${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEM_UTIL:-0.9}
+      - QUANTIZATION=${QUANTIZATION:-awq}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-16384}
+      - VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-}
+      - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+      - VLLM_TOOL_PARSER=${VLLM_TOOL_PARSER:-auto}
+      # WSL2 guards, mirroring node-agent's backendSpecs (the reconciler owns
+      # noo-vllm; this profile is the manual/bootstrap fallback and hits the
+      # same two bugs). Pinned memory: vLLM >=0.25 disables UVA on WSL2 and the
+      # engine dies at boot behind a misleading circular-import traceback. V2
+      # runner: wedges the engine under a thinking model — container stays
+      # "Up (healthy)" while GPU util sits at 0% and requests time out.
+      - VLLM_WSL2_ENABLE_PIN_MEMORY=${VLLM_WSL2_ENABLE_PIN_MEMORY:-1}
+      - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-0}
+    volumes:
+      - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # Self-check with the container's OWN leaf: the listener requires a client
+    # certificate and this image carries python3, not curl. Presenting the
+    # service's own cert to itself proves the mTLS listener is up, which is
+    # what a healthcheck is for; it grants nothing (the container already
+    # holds that key). CA-verified, hostname `localhost` is in every service
+    # leaf's SANs. start_period covers a cold model load.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 900s
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        # Auto-detect tool call parser from model name if not explicitly set
+        if [ -z "$$VLLM_TOOL_PARSER" ] || [ "$$VLLM_TOOL_PARSER" = "auto" ]; then
+          case "$$VLLM_MODEL" in
+            *gemma-4*|*gemma4*)  VLLM_TOOL_PARSER="gemma4" ;;     # vllm/vllm-openai:gemma4 ships this parser. If a future vllm drops it, the application-layer fallback in tools.rs::parse_tool_calls catches gemma's `call:tool{}` / pythonic `[tool(args)]` from content.
+            *gemma-3*|*gemma3*)  VLLM_TOOL_PARSER="pythonic" ;;
+            *Llama*|*llama*)     VLLM_TOOL_PARSER="llama3_json" ;;
+            *mistral*|*Mistral*) VLLM_TOOL_PARSER="mistral" ;;
+            *)                   VLLM_TOOL_PARSER="hermes" ;;  # Qwen, DeepSeek, most others
+          esac
+          echo "Auto-detected tool parser: $$VLLM_TOOL_PARSER for model $$VLLM_MODEL"
+        fi
+
+        # Auto-detect reasoning parser (only some models support it)
+        if [ -z "$$VLLM_REASONING_PARSER" ]; then
+          case "$$VLLM_MODEL" in
+            *gemma-4*|*gemma4*|*E4B*|*E2B*)
+              # extracts gemma's `thought\n...` prefix into the SSE `reasoning` field, which the
+              # dashboard's collapsible thinking panel reads. Asked of the image, not assumed: an
+              # unknown --reasoning-parser name stops the server booting, and the stream without
+              # the parser has no boundary between reasoning and answer.
+              if python3 -c "import sys; from vllm.reasoning import ReasoningParserManager as M; sys.exit(0 if 'gemma4' in M.list_registered() else 1)" >/dev/null 2>&1; then
+                VLLM_REASONING_PARSER="gemma4"
+              else
+                VLLM_REASONING_PARSER=""
+                echo "This vLLM image has no gemma4 reasoning parser; gemma reasoning will arrive inline"
+              fi ;;
+            *DeepSeek-R1*|*deepseek*) VLLM_REASONING_PARSER="deepseek_r1" ;;
+            *)                        VLLM_REASONING_PARSER="" ;;
+          esac
+        fi
+
+        # Quantization: explicit env var overrides auto-detection from model name
+        QUANT_ARG=""
+        if [ -n "$${VLLM_QUANTIZATION:-}" ]; then
+          QUANT_ARG="--quantization $$VLLM_QUANTIZATION"
+        else
+          case "$$VLLM_MODEL" in
+            *AWQ*|*awq*)   QUANT_ARG="--quantization awq" ;;
+            *GPTQ*|*gptq*) QUANT_ARG="--quantization gptq" ;;
+            *NVFP4*)        QUANT_ARG="--quantization fp8" ;;
+            *FP8*|*fp8*)   QUANT_ARG="--quantization fp8" ;;
+            *)              QUANT_ARG="" ;;
+          esac
+        fi
+
+        # Auto-detect max-num-seqs for models with known constraints.
+        # Mamba/hybrid models need fewer seqs (each decode needs a Mamba cache block).
+        MAX_SEQS_ARG=""
+        case "$$VLLM_MODEL" in
+          *Qwen3.5*|*qwen3.5*|*mamba*|*Mamba*|*jamba*|*Jamba*) MAX_SEQS_ARG="--max-num-seqs 64" ;;
+        esac
+
+        # Build base args
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --tensor-parallel-size $$TENSOR_PARALLEL_SIZE $$MAX_SEQS_ARG --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER --host 0.0.0.0 --port 8000"
+        if [ -n "$$VLLM_REASONING_PARSER" ]; then
+          ARGS="$$ARGS --reasoning-parser $$VLLM_REASONING_PARSER"
+        fi
+        # TLS is not a switch. The listener presents the `vllm` service leaf,
+        # verifies every caller against the cluster CA and REQUIRES a client
+        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
+        # presents its leaf, the controller's own agent its node leaf. Until
+        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
+        # asked for no client cert, so any process on the compose network
+        # could read every prompt. No leaf = no listener: refuse to start
+        # rather than serve plaintext (exit 78 = EX_CONFIG).
+        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
+          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
+          exit 78
+        fi
+        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+
+        # Resilient launch: if vLLM crashes with max_num_seqs or OOM errors,
+        # retry with progressively lower limits instead of crash-looping.
+        echo "Starting vLLM: $$ARGS"
+        python3 -m vllm.entrypoints.openai.api_server $$ARGS 2>&1
+        EXIT_CODE=$$?
+
+        if [ $$EXIT_CODE -ne 0 ] && [ -z "$$MAX_SEQS_ARG" ]; then
+          echo ""
+          echo "vLLM failed (exit $$EXIT_CODE) — retrying with --max-num-seqs 64 (may be a hybrid/Mamba model)..."
+          ARGS="$$ARGS --max-num-seqs 64"
+          echo "Retrying vLLM: $$ARGS"
+          exec python3 -m vllm.entrypoints.openai.api_server $$ARGS
+        else
+          exit $$EXIT_CODE
+        fi
+
+  # Secondary vLLM — any second model running side-by-side with the primary.
+  # Fully configurable via VLLM2_* env vars. GPU memory is auto-split by
+  # the rebuild/start scripts when this profile is active.
+  #
+  # Examples:
+  #   VLLM2_MODEL=google/gemma-4-E4B-it VLLM2_IMAGE=vllm/vllm-openai:gemma4
+  #   VLLM2_MODEL=meta-llama/Llama-3-8B-Instruct
+  #   VLLM2_MODEL=Qwen/Qwen3-4B
+  vllm-secondary:
+    logging: *default-logging
+    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
+    profiles: ["vllm-secondary"]
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): vLLM posts usage
+      # stats to stats.vllm.ai at start and every 10 minutes unless told not to.
+      # Literal values — no .env may turn them back on.
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_DO_NOT_TRACK=1
+      - DO_NOT_TRACK=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - MODEL_NAME=${VLLM2_MODEL:-}
+      - GPU_MEMORY_UTILIZATION=${VLLM2_GPU_MEM_UTIL:-0.35}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_MODEL=${VLLM2_MODEL:-}
+      - VLLM_MAX_MODEL_LEN=${VLLM2_MAX_MODEL_LEN:-8192}
+      - VLLM_TOOL_PARSER=${VLLM2_TOOL_PARSER:-auto}
+    volumes:
+      - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/root/.cache/huggingface
+      # shares the primary's leaf (same SANs, same entrypoint paths)
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/vllm:/app/pki/services/vllm:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # Self-check with the container's OWN leaf: the listener requires a client
+    # certificate and this image carries python3, not curl. Presenting the
+    # service's own cert to itself proves the mTLS listener is up, which is
+    # what a healthcheck is for; it grants nothing (the container already
+    # holds that key). CA-verified, hostname `localhost` is in every service
+    # leaf's SANs. start_period covers a cold model load.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import ssl,urllib.request; ctx=ssl.create_default_context(cafile='/app/pki/ca.crt'); ctx.load_cert_chain('/app/pki/services/vllm/service.crt','/app/pki/services/vllm/service.key'); urllib.request.urlopen('https://localhost:8000/health',context=ctx,timeout=5)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 900s
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        # Same auto-detection entrypoint as primary vLLM
+        if [ -z "$$VLLM_MODEL" ]; then
+          echo "ERROR: VLLM2_MODEL not set — configure in .env"
+          exit 1
+        fi
+
+        # Auto-detect tool parser
+        if [ -z "$$VLLM_TOOL_PARSER" ] || [ "$$VLLM_TOOL_PARSER" = "auto" ]; then
+          case "$$VLLM_MODEL" in
+            *gemma-4*|*gemma4*)  VLLM_TOOL_PARSER="gemma4" ;;     # vllm/vllm-openai:gemma4 ships this parser. If a future vllm drops it, the application-layer fallback in tools.rs::parse_tool_calls catches gemma's `call:tool{}` / pythonic `[tool(args)]` from content.
+            *gemma-3*|*gemma3*)  VLLM_TOOL_PARSER="pythonic" ;;
+            *Llama*|*llama*)     VLLM_TOOL_PARSER="llama3_json" ;;
+            *mistral*|*Mistral*) VLLM_TOOL_PARSER="mistral" ;;
+            *)                   VLLM_TOOL_PARSER="hermes" ;;
+          esac
+        fi
+
+        # Auto-detect quantization
+        QUANT_ARG=""
+        case "$$VLLM_MODEL" in
+          *AWQ*|*awq*)   QUANT_ARG="--quantization awq" ;;
+          *GPTQ*|*gptq*) QUANT_ARG="--quantization gptq" ;;
+          *)              QUANT_ARG="" ;;
+        esac
+
+        # Auto-detect reasoning parser
+        REASON_ARG=""
+        case "$$VLLM_MODEL" in
+          *gemma-4*|*gemma4*)
+            # vLLM 0.18 dropped "gemma4" and later releases restored it (0.29 has
+            # it). Ask the image: an unknown parser name stops the server booting.
+            if python3 -c "import sys; from vllm.reasoning import ReasoningParserManager as M; sys.exit(0 if 'gemma4' in M.list_registered() else 1)" >/dev/null 2>&1; then
+              REASON_ARG="--reasoning-parser gemma4"
+            fi ;;
+          *DeepSeek-R1*|*deepseek*) REASON_ARG="--reasoning-parser deepseek_r1" ;;
+        esac
+
+        ARGS="--model $$VLLM_MODEL $$QUANT_ARG --gpu-memory-utilization $$GPU_MEMORY_UTILIZATION --max-model-len $$VLLM_MAX_MODEL_LEN --enable-auto-tool-choice --tool-call-parser $$VLLM_TOOL_PARSER $$REASON_ARG --host 0.0.0.0 --port 8000"
+
+        # TLS is not a switch. The listener presents the `vllm` service leaf,
+        # verifies every caller against the cluster CA and REQUIRES a client
+        # certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED): the gateway
+        # presents its leaf, the controller's own agent its node leaf. Until
+        # 2026-09-28 this ran only when NOO_VLLM_TLS was set, and even then
+        # asked for no client cert, so any process on the compose network
+        # could read every prompt. No leaf = no listener: refuse to start
+        # rather than serve plaintext (exit 78 = EX_CONFIG).
+        if [ ! -f /app/pki/services/vllm/service.crt ] || [ ! -f /app/pki/services/vllm/service.key ]; then
+          echo "vllm: no services/vllm leaf under NOO_PKI_DIR — refusing to serve plaintext. Fix: noo security pki issue-service vllm" >&2
+          exit 78
+        fi
+        ARGS="$$ARGS --ssl-certfile /app/pki/services/vllm/service.crt --ssl-keyfile /app/pki/services/vllm/service.key --ssl-ca-certs /app/pki/ca.crt --ssl-cert-reqs 2"
+
+        echo "Starting secondary vLLM: $$VLLM_MODEL (GPU util: $$GPU_MEMORY_UTILIZATION, parser: $$VLLM_TOOL_PARSER)"
+        python3 -m vllm.entrypoints.openai.api_server $$ARGS
+
+  # llama.cpp backend
+  llamacpp:
+    logging: *default-logging
+    build:
+      context: .
+      # Hardened build (docker/README-llamacpp.md). This build: block stays
+      # inert on a dist install (pull_policy: missing below overrides it).
+      dockerfile: docker/Dockerfile.llamacpp
+    # Same release pin shape as the core services: the images-release matrix
+    # builds llamacpp and the signed lock carries its digest, but this line
+    # named the LOCAL build, so `--profile llamacpp` on a dist box tried to
+    # build from a Dockerfile the deploy slice does not carry (2026-09-07).
+    # LLAMACPP_IMAGE overrides straight to a different image (e.g. upstream
+    # ghcr.io/ggml-org/llama.cpp:server) — the same override the Go node
+    # agent honours — ahead of the release-pinned default below.
+    image: ${LLAMACPP_IMAGE:-${NOO_IMAGE_PREFIX:-noomesh}/llamacpp:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_LLAMACPP:-}}
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-llamacpp
+    # NOT in gpu-tier2: the launcher auto-adds that profile on any 4-10 GB
+    # box, and with no LLAMACPP_MODEL configured MODEL_PATH points at a GGUF
+    # that does not exist → llama-server restart-loops (host8 fresh
+    # install, 2026-08-31). Tier 2's banner promise is Ollama; llamacpp is
+    # opt-in via its own profile (or "cpu" on worker nodes, cluster-init.sh).
+    profiles: ["llamacpp", "cpu"]
+    # No host port, and no TLS of its own: llama-server has no TLS listener
+    # in either image, so every caller reaches it through stunnel-llamacpp
+    # below (mTLS, client cert required) at noo-stunnel-llamacpp:8085. Its
+    # own :8085 stays reachable on the shared noo-cluster network until the
+    # backends get a private network — the sidecar is the
+    # door every client is pointed at; the private network makes it the
+    # only one. Use `docker exec` for debugging.
+    #
+    # Mounts nothing from the PKI directory: it reads nothing there (#506
+    # said the same of the agent-started one), and the leaf it used to hold
+    # is the sidecar's to present.
+    environment:
+      - MODEL_PATH=${LLAMACPP_MODEL:-/models/llama-7b-Q5_K_M.gguf}
+      - N_GPU_LAYERS=${N_GPU_LAYERS:-0}
+      - N_CTX=${N_CTX:-4096}
+      - N_THREADS=${N_THREADS:-4}
+      # Pin the cluster contract port — overrides any stale ENV baked into
+      # an old image (a host8 build listened on 8080 and broke all routed
+      # inference to the node while its healthcheck stayed green).
+      - HOST=0.0.0.0
+      - PORT=${LLAMACPP_PORT:-8085}
+    volumes:
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          cpus: '4'
+          memory: 8G
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  # stunnel mTLS sidecar for llama.cpp (same shape as stunnel-ollama).
+  # Accepts on :8085 — the port every client already dials for llamacpp —
+  # presents the `llamacpp` service leaf, requires a cluster-CA client
+  # certificate (verify = 2) and forwards plain HTTP to llamacpp:8085 on the
+  # compose network. Clients: the gateway (its own leaf, coordinator/backend.rs
+  # local_backend_url), the controller's own agent (node leaf, BackendDialURL
+  # once it sees this container), Python callers (gateway leaf). Same
+  # profiles as the backend so the two start and stop together.
+  stunnel-llamacpp:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
+    profiles: ["llamacpp", "cpu"]
+    volumes:
+      - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/llamacpp:/tls/services/llamacpp:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - llamacpp
+
+  # AirLLM backend
+  airllm:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airllm
+    image: noomesh/airllm:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-airllm
+    profiles: ["airllm"]
+    # No external port — gateway reaches AirLLM via Docker network
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - MODEL_PATH=${AIRLLM_MODEL:-meta-llama/Llama-2-70b-hf}
+      - MAX_VRAM_GB=${MAX_VRAM_GB:-8.0}
+      - COMPRESSION=${COMPRESSION:-4bit}
+    volumes:
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models
+      - airllm-cache:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 16G
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  # Ollama inference backend — Tier 2 GPU nodes and controller (when gpu-tier2)
+  ollama:
+    logging: *default-logging
+    # H-N4: parameterized so it can be pinned to a verified version/digest.
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
+    profiles: ["ollama", "gpu-tier2"]
+    # No external port — gateway reaches Ollama via Docker network (noo-cluster)
+    environment:
+      # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
+      # (cloud models, web search). docs/security/telemetry.md
+      - OLLAMA_NO_CLOUD=1
+      - OLLAMA_HOST=0.0.0.0
+      # Default empty (was qwen3:8b — non-US). Ollama starts without auto-pulling
+      # a model; models are placed explicitly (noo cluster place / ship-model),
+      # so the fleet stays US-vendor (model governance).
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-}
+    volumes:
+      - ${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  # Ollama for the standalone profile: the single ollama that serves the
+  # embedder (harrier) AND chat on a one-box install (controller profiles
+  # run `ollama` behind stunnel-ollama instead).
+  ollama-embed:
+    logging: *default-logging
+    # H-N4: parameterized so it can be pinned to a verified version/digest.
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
+    profiles: ["standalone"]
+    # Publishes NOTHING. Every caller goes through stunnel-ollama-embed
+    # below — mTLS, client certificate required: the containers (gateway,
+    # worker, trellion's embedder) at https://noo-stunnel-ollama-embed:11434
+    # (onboard's topology env, the launchers' default), and the HOST
+    # node-agent at the sidecar's loopback publish. Its own
+    # :11434 stays reachable on the shared noo-cluster network beside the
+    # sidecar until the backends get a private network (an earlier change
+    # F-ii), same caveat as llamacpp above.
+    environment:
+      # Ollama sends no telemetry; this stops it handing a prompt to ollama.com
+      # (cloud models, web search). docs/security/telemetry.md
+      - OLLAMA_NO_CLOUD=1
+      - OLLAMA_HOST=0.0.0.0
+      # Concurrent requests per loaded model (declared, documented in
+      # docs/reference/env.md). Embed requests carry options.num_ctx=1024
+      # (gateway embedding_client.rs EMBED_NUM_CTX), so 4 slots cost ~4K
+      # tokens of KV, not 4 x 8192. NOTE: container-wide, so a chat model
+      # on this same ollama also gets this many slots (KV x N): set
+      # OLLAMA_EMBED_NUM_PARALLEL=1 on a box whose chat model is tight on VRAM.
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_NUM_PARALLEL:-4}
+    volumes:
+      - ollama-embed-data:/root/.ollama
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  # OPTIONAL CPU-only embedder beside ollama-embed (profile `embed-cpu`,
+  # off unless enabled). A second ollama with NO GPU device request and
+  # CUDA hidden, serving the same harrier model from the SAME model store
+  # (volume shared with ollama-embed, so nothing is pulled twice), for
+  # controllers whose GPU embedder is saturated and whose CPU is idle. The
+  # gateway treats it as a peer static endpoint (it spreads load across
+  # mesh nodes and every static endpoint): reached through its own mTLS
+  # sidecar below. Enabled by ONE declaration, `COMPOSE_PROFILES: embed-cpu`
+  # in noomesh.yaml compose_env; the launcher adds the profile and derives
+  # this door for PAGEINDEX_EMBEDDING_EXTRA_URLS (lib-config.sh).
+  # Enable: docs/operating/runbooks/embed-capacity.md.
+  ollama-embed-cpu:
+    logging: *default-logging
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
+    profiles: ["embed-cpu"]
+    # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (the
+    # same shared-network caveat as ollama-embed above).
+    environment:
+      - OLLAMA_NO_CLOUD=1
+      - OLLAMA_HOST=0.0.0.0
+      # Hide every GPU: this instance is CPU-only by declaration.
+      - CUDA_VISIBLE_DEVICES=-1
+      - NVIDIA_VISIBLE_DEVICES=none
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_EMBED_CPU_NUM_PARALLEL:-4}
+      # Keep harrier resident: reloading a model per idle gap would burn
+      # the CPU this exists to use.
+      - OLLAMA_KEEP_ALIVE=-1
+    volumes:
+      - ollama-embed-data:/root/.ollama
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - ollama-embed
+
+  # mTLS door for ollama-embed-cpu: the same shape as stunnel-ollama-embed
+  # below, with its own leaf (`ollama-embed-cpu`, issued by `noo upgrade
+  # --stack` when missing) and no host publish. Same profile as the
+  # backend, so the two start and stop together.
+  stunnel-ollama-embed-cpu:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
+    profiles: ["embed-cpu"]
+    volumes:
+      - ./docker/stunnel-ollama-embed-cpu.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed-cpu:/tls/services/ollama-embed-cpu:ro
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed-cpu/service.crt -key /tls/services/ollama-embed-cpu/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - ollama-embed-cpu
+
+  # stunnel mTLS sidecar for ollama-embed (same shape as stunnel-llamacpp).
+  # Accepts on :11434 — Ollama's own port — presents the `ollama-embed`
+  # service leaf, requires a cluster-CA client certificate (verify = 2) and
+  # forwards plain HTTP to ollama-embed:11434 on the compose network.
+  # Clients: the gateway (its own leaf, tls::cluster_client(): chat's
+  # static OLLAMA_URL, PageIndex embeddings, the ollama admin routes), the
+  # worker and trellion's embedder (each its own leaf, NOO_TLS_CERT). Same
+  # profile as the backend so the two start and stop together.
+  #
+  # The HOST node-agent (no compose DNS) reaches the door on loopback, for
+  # inference jobs dispatched to the controller's own node, its model pulls
+  # and its inventory: OLLAMA_URL=https://127.0.0.1:11434 in its env
+  # (provision.rs renders it once this file declares the publish below),
+  # dialled by the agent's "stack" lane with its node leaf
+  # (node-agent-go backendrt/native.go laneTransport). The `ollama-embed`
+  # leaf carries 127.0.0.1 and localhost. LOOPBACK ONLY, never a
+  # LAN/tailnet bind — and an mTLS door even there (it was a
+  # plaintext publish on ollama-embed itself until then).
+  #
+  # The healthcheck dials the door from inside with the sidecar's OWN leaf,
+  # CA-verified against `localhost` (in every service leaf's SANs): it
+  # proves the listener, the client-certificate requirement and the
+  # upstream in one round trip. `docker/Dockerfile.stunnel` carries the
+  # openssl CLI for exactly this.
+  stunnel-ollama-embed:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
+    profiles: ["standalone"]
+    volumes:
+      - ./docker/stunnel-ollama-embed.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama-embed:/tls/services/ollama-embed:ro
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'GET /api/version HTTP/1.0\r\nHost: localhost\r\n\r\n' | openssl s_client -quiet -verify_return_error -verify_hostname localhost -connect 127.0.0.1:11434 -CAfile /tls/ca.crt -cert /tls/services/ollama-embed/service.crt -key /tls/services/ollama-embed/service.key 2>/dev/null | grep -q 'HTTP/1.[01] 200' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "127.0.0.1:11434:11434"
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - ollama-embed
+
+  # Text Embeddings Inference — CPU (controller)
+  # Runs on controller so embeddings work out of the box without a GPU.
+  # Optional engine; nothing defaults to it anymore — point
+  # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
+  tei:
+    logging: *default-logging
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
+    profiles: ["tei-compose"]  # opt-in only (default: rerank=LLM fallback, embed=Ollama/node-agent)
+    # No external port — gateway reaches TEI via Docker network
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+    volumes:
+      - hf-cache:/data
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}"]
+
+  # Text Embeddings Inference — GPU (worker nodes)
+  # Use this on nodes with a GPU for faster embedding throughput.
+  tei-gpu:
+    logging: *default-logging
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
+    # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
+    # (`noo cluster up embedding <model> --node <node>`). Gated to an
+    # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
+    # the GPU embedder. Use `--profile tei-compose` to run the compose path.
+    profiles: ["tei-compose"]
+    # No external port — gateway reaches TEI via Docker network
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - MODEL_ID=${TEI_MODEL:-BAAI/bge-base-en-v1.5}
+    volumes:
+      - hf-cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    command: ["--model-id", "${TEI_MODEL:-BAAI/bge-base-en-v1.5}", "--dtype", "float16"]
+
+  stunnel-ollama:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
+    profiles: ["ollama", "gpu-tier2"]
+    volumes:
+      - ./docker/stunnel-ollama.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/ollama:/tls/services/ollama:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - ollama
+
+  # stunnel mTLS sidecar for TEI CPU (controller)
+  stunnel-tei:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
+    profiles: ["tei-compose"]  # opt-in only (paired with noo-tei)
+    volumes:
+      - ./docker/stunnel-tei.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tei:/tls/services/tei:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - tei
+
+  # stunnel mTLS sidecar for TEI GPU (worker nodes)
+  stunnel-tei-gpu:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
+    # Gated with tei-gpu — see above. Only needed for the compose path.
+    profiles: ["tei-compose"]
+    volumes:
+      - ./docker/stunnel-tei-gpu.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/tei:/tls/services/tei:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - tei-gpu
+
+  # Reranker — TEI serving a cross-encoder reranker model (GPU).
+  # Same image family as `tei`; a reranker MODEL_ID makes TEI expose POST
+  # /rerank. NOT REACHABLE FROM THE GATEWAY: no URL points at
+  # stunnel-reranker (a bypass would skip mesh routing and send no auth).
+  # Rerank is mesh-only — gateway -> node-agent /rerank.
+  # This service and its stunnel front are TEI-teardown leftovers behind the
+  # opt-in `tei-compose` profile; removing them is separate cleanup.
+  reranker:
+    logging: *default-logging
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
+    # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
+    # (`noo cluster up reranker <model> --node <node>`). Gated to opt-in
+    # so normal startup can't duplicate the GPU reranker. The mesh path
+    # (gateway -> node-agent /rerank) does not use this service.
+    profiles: ["tei-compose"]
+    # No external port — reached via stunnel-reranker on the Docker network
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - MODEL_ID=${RERANK_MODEL:-BAAI/bge-reranker-base}
+    volumes:
+      - hf-cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    command: ["--model-id", "${RERANK_MODEL:-BAAI/bge-reranker-base}", "--dtype", "float16"]
+
+  # stunnel mTLS sidecar for the reranker (mirrors stunnel-tei-gpu)
+  stunnel-reranker:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.stunnel
+    image: noomesh/stunnel:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
+    # Gated with reranker — see above. Only needed for the compose path.
+    profiles: ["tei-compose"]
+    volumes:
+      - ./docker/stunnel-reranker.conf:/etc/stunnel/stunnel.conf:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/reranker:/tls/services/reranker:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - reranker
+
+  # Node agent (runs on all nodes)
+  node-agent:
+    logging: *default-logging
+    build:
+      context: .
+      # Switch node engine: NODE_ENGINE=go (default) or NODE_ENGINE=python
+      dockerfile: docker/Dockerfile.node-agent-${NODE_ENGINE:-go}
+      args:
+        # Stamp the binary — unset, every image-built agent reports
+        # app_version "dev" and upgrade verification goes blind. The
+        # launcher exports NOO_IMAGE_TAG; source builds fall back to a
+        # local-build marker rather than lying with a release number.
+        NODE_AGENT_VERSION: ${NOO_IMAGE_TAG:-dev-local-build}
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/node-agent:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_NODE_AGENT:-}
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-agent
+    # OPT-IN ONLY since 2026-09-04. an earlier change removed the
+    # docker.sock mount from this service, and a containerised agent whose
+    # whole job is managing containers cannot do anything without the Docker
+    # API — it exits on startup and restarts forever. It was still in the
+    # default worker/controller/standalone profiles, so every controller ran
+    # a permanently crash-looping container (host8, 2026-09-04). The agent
+    # runs as a HOST PROCESS on every node in the fleet; the pull rail
+    # installs it that way (`noo enroll` + `noo cluster provision`).
+    # Kept, not deleted, for a deployment that re-adds the socket mount
+    # deliberately: select it with --profile node-agent-compose.
+    profiles: ["node-agent-compose"]
+    secrets: &node-agent-secrets
+      # The image runs as root (USER 0); 0400 root.
+      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "0", gid: "0", mode: 0400 }
+      - { source: noo_cluster_secret, target: noo_cluster_secret, uid: "0", gid: "0", mode: 0400 }
+      - { source: nats_node_password, target: nats_node_password, uid: "0", gid: "0", mode: 0400 }
+    ports:
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NODE_AGENT:-8081}:8081"  # Control API (H-N5 — confine to tailnet via NOO_BIND_ADDR)
+    environment:
+      - NODE_ID=${NODE_ID:-auto}
+      - NODE_IP=${NODE_IP:-}  # LAN IP for registration (set by provisioner)
+      - CONTROLLER_URL=${CONTROLLER_URL:-https://gateway:8080}  # Workers: set to https://<controller-ip>:8080
+      - NATS_URL=${NATS_URL:-tls://nats:4222}  # Workers: set to tls://<controller-ip>:4222
+      - NODE_TIER=${NODE_TIER:-3}
+      - GPU_MODEL=${GPU_MODEL:-}
+      - VRAM_GB=${VRAM_GB:-0.0}
+      - HF_TOKEN=${HF_TOKEN:-}
+      # "void", NOT "all". The agent never USES the GPU — it only needs to
+      # KNOW the host has one, so it can attach DeviceRequests to the backend
+      # containers it creates. Requesting "all" here makes Docker run the
+      # NVIDIA CDI modifier against the agent itself, and if the GPU is
+      # missing or the driver has fallen over, the AGENT CANNOT START:
+      #   failed to create the automatic CDI modifier: ...
+      #   error getting device handle for index '0': Unknown Error
+      # That turned a dead GPU on host8 (2026-07-26) into a fully
+      # unmanageable node — reconcile dead, capabilities empty, couldn't even
+      # undrain — while its ollama/llamacpp/reranker containers kept serving
+      # happily. A broken GPU must degrade the node to CPU-only, not evict it
+      # from the cluster.
+      #
+      # Detection still works without attaching the device: /proc/driver/nvidia
+      # comes from the host kernel and IS visible inside a plain container, so
+      # hasNvidiaGPU() keeps returning true on healthy NVIDIA hosts — and stops
+      # returning true the moment the driver dies, which is exactly the
+      # fallback we want. Override to "all" only if you have a reason.
+      - NVIDIA_VISIBLE_DEVICES=${NOO_AGENT_NVIDIA_VISIBLE:-void}
+      # GPU detection escape hatch, still REQUIRED on WSL2: there is no
+      # /proc/driver/nvidia there (the GPU is the paravirtual /dev/dxg), so a
+      # WSL2 controller must set NOO_FORCE_GPU=1 in .env or backend containers
+      # get created WITHOUT DeviceRequests (vllm dies: "Failed to infer device
+      # type"). On native Linux leave it unset so the probe can do its job —
+      # forcing it there would defeat the CPU-only fallback above.
+      - NOO_FORCE_GPU=${NOO_FORCE_GPU:-}
+      # How many GPUs this node's ollama may reserve. Unset keeps the spec
+      # default ("all"), so existing nodes are unchanged. Set to 0 on a node
+      # that runs ollama purely as an EMBEDDER beside a GPU-hungry chat
+      # backend: embedding is a single forward pass and a small embedder is
+      # fine on CPU, whereas "all" would have ollama fight vLLM for the
+      # whole device (GPUCount is not placement-overridable).
+      - NOO_OLLAMA_GPU_COUNT=${NOO_OLLAMA_GPU_COUNT:-}
+      # Secrets arrive as FILES (the `secrets:` block below; an earlier change
+      # §2): the agent reads NAME_FILE > NOO_SECRET_NAME > NAME
+      # (node-agent-go internal/config/secretenv.go).
+      - NOO_NODE_AGENT_TOKEN_FILE=${NOO_NODE_AGENT_TOKEN:+/run/secrets/noo_node_agent_token}
+      - NOO_CLUSTER_SECRET_FILE=${NOO_CLUSTER_SECRET:+/run/secrets/noo_cluster_secret}
+      # This node's OWN bus principal, delivered over the rail by
+      # `noo cluster nats-creds rotate <node>` / `noo cluster provision`.
+      - NATS_NODE_USER=${NATS_NODE_USER:-}
+      - NATS_NODE_PASSWORD_FILE=${NATS_NODE_PASSWORD:+/run/secrets/nats_node_password}
+      - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
+      - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
+      - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/nodes/$NODE_ID/node.crt}
+      - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/nodes/$NODE_ID/node.key}
+      # Passed through so a STALE `NOO_MTLS_NODES=false` in .env is loud:
+      # the agent refuses to start on it (the downgrade no longer exists —
+      # :8081 is mTLS-only, no plaintext fallback). Any other value is inert.
+      - NOO_MTLS_NODES=${NOO_MTLS_NODES:-}
+      - NOO_PKI_DIR=${NOO_PKI_DIR:-}
+      # No per-backend TLS switches: every backend door is mTLS
+      # unconditionally, and the agent refuses to start on a stale
+      # NOO_{VLLM,LLAMACPP,OLLAMA}_TLS=false, so none is passed in.
+      - NOO_DATA_ROOT=${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}
+      - HF_CACHE_DIR=${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}
+      - MODELS_DIR=${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}
+      - OLLAMA_DATA_DIR=${OLLAMA_DATA_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama}
+      # Model-weight cache: point a worker at the controller's model-cache
+      # (https://<controller>:8443, the mTLS data plane — an earlier change)
+      # so placed HF models are preseeded over the LAN instead of
+      # re-downloaded from HuggingFace. Unset = feature off. Since phase 2
+      # a plaintext http:// value is REFUSED by the agent (preseed.CacheURL),
+      # not rewritten: re-run `noo cluster provision <node>`.
+      - NOO_MODEL_CACHE_URL=${NOO_MODEL_CACHE_URL:-}
+    volumes:
+      # NO /var/run/docker.sock — fu 43 change 2, completed 2026-08-16 with
+      # the whole fleet (HOST3, host8, host9) running node-agent as a HOST
+      # process, delivered via the pull rail (`noo cluster provision` +
+      # `noo cluster upgrade-agents` — no SSH). The rw socket here was
+      # the last container-held root-equivalent hole we controlled. This
+      # containerised service remains ONLY as a bootstrap/reference shape; an
+      # agent launched from it can no longer manage backends (StartBackend
+      # fails loudly against the absent socket) — the sanctioned path is the
+      # host process. Do not re-add the mount: a socket-proxy is NOT a fix
+      # for this service (see the CRIT-4 note below — create/start admits
+      # arbitrary binds and privileged), host-process is.
+      - ./docker-compose.cluster.yml:/app/docker-compose.cluster.yml:ro  # Used by Python node-agent; Go agent uses Docker API directly
+      # its OWN node leaf only (NOO_TLS_CERT above), not every node's key
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/nodes/${NODE_ID:-auto}:/app/pki/nodes/${NODE_ID:-auto}:ro
+    extra_hosts:
+      - "noo-controller:${CONTROLLER_IP:-127.0.0.1}"  # Workers need this to reach the controller
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # CRIT-4: node-agent privilege. `privileged` historically supplied GPU
+    # device access (no nvidia runtime). It's now env-gated so you can drop it
+    # per node — default true = non-breaking; set NOO_NODE_AGENT_PRIVILEGED=false
+    # to run unprivileged (then a GPU node needs the nvidia device reservation /
+    # /dev/dxg on WSL). Roll out on one node first. no-new-privileges is always
+    # on (safe even with privileged).
+    #
+    # This comment used to add "and docker.sock should front a socket-proxy".
+    # Removed because it is not true for THIS service and reads as if it were a
+    # fix: node-agent's job is starting inference backends, so any allowlist
+    # that works admits POST /containers/create and /start — and the request
+    # body chooses the bind mounts and the privileged flag. A proxy that
+    # permits create changes the shape of the exploit, not its outcome.
+    #
+    # Dropping `privileged` is still worth doing (CRIT-4), but be
+    # clear about what it buys: it narrows direct device access, it does NOT
+    # contain a compromised node-agent, because the socket alone is
+    # host-root-equivalent. See an earlier change for the options that actually
+    # change that.
+    privileged: ${NOO_NODE_AGENT_PRIVILEGED:-true}
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Sensor companion agent (Tier 5) — OPT-IN ────────────────────────
+  #
+  # A SECOND node-agent on the same host, with its own node identity, so a
+  # box can be a worker AND a sensor companion without conflating the two
+  # roles. Same image, ~19 MB RAM, different env.
+  #
+  # Why a second process rather than one dual-role agent: `node_type` is
+  # derived from `tier` at registration (cluster/node.py), and a process
+  # has exactly one tier. The worker must stay tier 3/4 to keep scheduler
+  # slots; a companion is tier 5 with 0 slots and CompanionPolicy gating.
+  # One process cannot be both, and `device_sensors.py` only matches
+  # NodeType.COMPANION — so without this the sensor endpoints are live but
+  # the coordinator will never route to them.
+  #
+  # Deliberately smaller blast radius than the worker: NO docker.sock, so
+  # it cannot start, stop or inspect containers. The separation is enforced
+  # by what isn't mounted, not by convention.
+  #
+  #   noo stack start --profile sensors        # or COMPOSE_PROFILES=sensors
+  #
+  # Camera/mic note: sysfs telemetry (thermal, power, network) works
+  # unprivileged, but /dev/video* is NOT visible to an unprivileged
+  # container, so a webcam will not be detected until you either set
+  # NOO_SENSOR_AGENT_PRIVILEGED=true or add an explicit `devices:` entry.
+  # Default is false — least privilege until there is hardware to justify it.
+  node-agent-sensors:
+    logging: *default-logging
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/node-agent:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_NODE_AGENT:-}
+    pull_policy: never  # built by the `node-agent` service; never rebuild here
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-agent-sensors
+    profiles: ["sensors"]
+    secrets: *node-agent-secrets
+    ports:
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_SENSOR_AGENT_PORT:-8082}:${NOO_SENSOR_AGENT_PORT:-8082}"
+    environment:
+      # Distinct identity. Tier 5 => NodeType.COMPANION at registration.
+      - NODE_ID=${NODE_ID:-auto}-sensors
+      - NODE_IP=${NODE_IP:-}
+      - NODE_TIER=5
+      - NODE_AGENT_PORT=${NOO_SENSOR_AGENT_PORT:-8082}
+      - CONTROLLER_URL=${CONTROLLER_URL:-https://gateway:8080}
+      - NATS_URL=${NATS_URL:-tls://nats:4222}
+      # Secrets arrive as FILES (the `secrets:` block below; an earlier change
+      # §2): the agent reads NAME_FILE > NOO_SECRET_NAME > NAME
+      # (node-agent-go internal/config/secretenv.go).
+      - NOO_NODE_AGENT_TOKEN_FILE=${NOO_NODE_AGENT_TOKEN:+/run/secrets/noo_node_agent_token}
+      - NOO_CLUSTER_SECRET_FILE=${NOO_CLUSTER_SECRET:+/run/secrets/noo_cluster_secret}
+      # This node's OWN bus principal, delivered over the rail by
+      # `noo cluster nats-creds rotate <node>` / `noo cluster provision`.
+      - NATS_NODE_USER=${NATS_NODE_USER:-}
+      - NATS_NODE_PASSWORD_FILE=${NATS_NODE_PASSWORD:+/run/secrets/nats_node_password}
+      - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
+      # Reuses the HOST's node cert rather than minting one for the -sensors
+      # identity: it is the same machine and the same IP, and mTLS verifies
+      # against the cluster CA. Issuing a second per-identity cert would mean
+      # teaching the PKI tooling about sub-identities for no security gain.
+      - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
+      - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/nodes/$NODE_ID/node.crt}
+      - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/nodes/$NODE_ID/node.key}
+      # Same refusal as node-agent: a stale downgrade line stops the start.
+      - NOO_MTLS_NODES=${NOO_MTLS_NODES:-}
+      - NOO_PKI_DIR=${NOO_PKI_DIR:-}
+      # Sensor configuration (see internal/hardware/sensors.go)
+      - NOO_SENSOR_GPS_DEVICE=${NOO_SENSOR_GPS_DEVICE:-}
+      - NOO_SENSOR_CAMERA_DEVICE=${NOO_SENSOR_CAMERA_DEVICE:-}
+      - NOO_SENSOR_CAMERA_DISABLE=${NOO_SENSOR_CAMERA_DISABLE:-}
+      - NOO_DEVICE_LAT=${NOO_DEVICE_LAT:-}
+      - NOO_DEVICE_LON=${NOO_DEVICE_LON:-}
+      - NOO_DEVICE_ADDRESS=${NOO_DEVICE_ADDRESS:-}
+      - NODE_LOCATION=${NODE_LOCATION:-}
+      # On a bridge network the agent sees only its veth, so it reports
+      # network_type="" (unknown) rather than guessing. State it here if you
+      # know, or run this service with network_mode: host.
+      - NOO_NETWORK_TYPE=${NOO_NETWORK_TYPE:-}
+      # Thermal thresholds default to Pi values (fair 70 / serious 80 /
+      # critical 85). Override on Jetson (~99) or x86 (~100).
+      - NOO_THERMAL_FAIR_C=${NOO_THERMAL_FAIR_C:-}
+      - NOO_THERMAL_SERIOUS_C=${NOO_THERMAL_SERIOUS_C:-}
+      - NOO_THERMAL_CRITICAL_C=${NOO_THERMAL_CRITICAL_C:-}
+    volumes:
+      # NOTE: no /var/run/docker.sock. A sensor proxy has no business
+      # managing containers, and leaving it out makes that unbypassable.
+      # its OWN node leaf only (NOO_TLS_CERT above), not every node's key
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/nodes/${NODE_ID:-auto}:/app/pki/nodes/${NODE_ID:-auto}:ro
+      # fu 73 consolidation (opt-in, hosts that ALSO run the host agent):
+      # bind-mount the host binary over the image's copy so the artifact
+      # rail's agent-binary delivers this container's code too — noo-apply
+      # restarts it after installing a new agent binary (it qualifies by this
+      # container name's shape plus this mount; a root-owned
+      # NOO_HOSTD_COMPANION_CONTAINERS in the noo-hostd unit narrows the list).
+      # One binary per host, no skew; `noo cluster verify` shows `companions`.
+      # - /usr/local/bin/noo-node-agent:/usr/local/bin/noo-node-agent:ro
+    extra_hosts:
+      - "noo-controller:${CONTROLLER_IP:-127.0.0.1}"
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    privileged: ${NOO_SENSOR_AGENT_PRIVILEGED:-false}
+    security_opt:
+      - no-new-privileges:true
+
+  # Loki log aggregation — every controller runs it, standalone included.
+  #
+  # The monitoring set (loki, prometheus, alertmanager, grafana, the
+  # exporters) carries BOTH the `controller` and
+  # the `standalone` profile. It used to be `controller` only, with
+  # `noo onboard --with-monitoring` as a one-shot opt-in on standalone
+  # installs — and since the opt-in persisted nothing, the first
+  # `noo upgrade --stack` (which relaunches under NOO_DEFAULT_PROFILE=
+  # standalone) dropped the whole set again. The live controller ran from
+  # its onboarding (2026-09-07) to 2026-09-28 with a 4 KB Loki directory
+  # that way. Monitoring is part of
+  # the product: tests/test_monitoring_profile_parity.py pins every
+  # `controller` service onto `standalone` too.
+  loki:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/loki:3
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
+    profiles: ["monitoring", "controller", "standalone"]
+    # No external port — the gateway reaches Loki over the Docker network
+    # and is the only thing that pushes to it (the node-agent shipper goes
+    # through the gateway's ingest route, never to Loki directly).
+    environment:
+      # How long Loki keeps log lines, and how old a line may be and still
+      # be accepted (a node that buffered offline must be able to replay).
+      # One value for both, expanded by Loki itself (-config.expand-env).
+      # 720h = 30 days ≈ 0.9 GB on disk fleet-wide; see docs/operating/monitoring.md.
+      - NOO_LOKI_RETENTION=${NOO_LOKI_RETENTION:-720h}
+    volumes:
+      # ONE config, the mTLS one. The plaintext loki-config.yml used to be
+      # mounted beside it unused — a listener nobody selected on purpose but
+      # anybody could select by mistake. It is gone.
+      - ./monitoring/loki/loki-config-tls.yml:/etc/loki/tls-config.yaml:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/loki:/tls/services/loki:ro
+      - loki-data:/loki
+    command: ["-config.file=/etc/loki/tls-config.yaml", "-config.expand-env=true"]
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # Loki requires mTLS — wget inside container can't present client certs
+    # (and the image is distroless: no shell, no wget/curl, and `loki` has no
+    # probe subcommand). Health is `noo cluster verify --controller` (the
+    # `loki` row) and `noo logs status`, both through the gateway. Because
+    # nothing polls /ready, the config sets ingester.lifecycler
+    # .min_ready_duration: 0s — with the 15s default the FIRST /ready call
+    # after a recreate is a 503 whatever Loki's uptime (see the config).
+    healthcheck:
+      disable: true
+
+  # No log shipper here since fleet logging phase 4 (2026-09-28). promtail
+  # and its read-only docker-socket-proxy used to sit here and stream every
+  # container's stdout through the Docker API. The controller's container
+  # lines now arrive the same way every node's do: the node-agent that runs
+  # on the controller host itself (worker mode, a systemd unit — never a
+  # container) follows its containers and its journal and pushes to the
+  # gateway's `POST /api/cluster/nodes/<id>/logs` (`source="docker"` /
+  # `"journal"` in Loki); the gateway relays to Loki over mTLS. Nothing in
+  # this file mounts /var/run/docker.sock any more except the opt-in
+  # `node-agent-compose` shape; tests/test_docker_socket_allowlists.py pins
+  # that, and tests/test_monitoring_profile_parity.py the monitoring set.
+
+  # Prometheus (every controller, standalone included)
+  prometheus:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/prometheus:3
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-prometheus
+    profiles: ["monitoring", "controller", "standalone"]
+    ports:
+      - "127.0.0.1:${NOO_PORT_PROMETHEUS:-9090}:9090"  # localhost only — Grafana reaches via Docker network
+    volumes:
+      - prometheus-data:/prometheus
+      # an earlier change: NOT the whole PKI dir. Prometheus used to mount
+      # ${NOO_PKI_DIR} entire and scrape with gateway/gateway.crt AND
+      # gateway/gateway.key — the one credential a node agent reads as "this
+      # is the controller". A process whose entire behaviour is "GET the URLs
+      # in my own config file" held a key good for /start, /stop, /clean,
+      # /pull, /api/skills/run and /logs/{container} on every node.
+      #
+      # It now mounts exactly two things: the CA it verifies servers against,
+      # and its OWN leaf (CN=prometheus, O="Mesh Cluster Service"), which the
+      # node agent accepts on GET /metrics and nowhere else (see
+      # node-agent-go/internal/auth/principal.go MetricsReader). The narrow
+      # mount is the load-bearing half: leaving the directory mounted would
+      # leave the gateway key one `cat` away, whatever the scrape config says.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/prometheus:/app/pki/services/prometheus:ro
+      - ./monitoring/prometheus/web-config.yml:/etc/prometheus/web-config.yml:ro
+      - ./monitoring/alerts:/etc/prometheus/alerts:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.config.file=/etc/prometheus/web-config.yml'
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+
+  # Alertmanager — routes Prometheus alerts (H-L4). Default config uses a
+  # no-op receiver so the pipeline is live (alerts visible in the UIs) without
+  # an external channel; fill in monitoring/alertmanager/alertmanager.yml to
+  # notify Slack/email/webhook. NOTE: verify the image tag matches your
+  # registry (mirrors the dhi.io/prometheus:3 convention).
+  alertmanager:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/alertmanager:0
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-alertmanager
+    profiles: ["monitoring", "controller", "standalone"]
+    ports:
+      - "127.0.0.1:${NOO_PORT_ALERTMANAGER:-9093}:9093"  # localhost only — internal to the cluster network
+    volumes:
+      - alertmanager-data:/alertmanager
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./monitoring/alertmanager/web-config.yml:/etc/alertmanager/web-config.yml:ro
+      - ./monitoring/alertmanager/amtool-http.yml:/etc/alertmanager/amtool-http.yml:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/alertmanager:/app/pki/services/alertmanager:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    # `--web.config.file` is what makes the mounted web-config MEAN anything.
+    # an earlier change wrote the file and mounted it; the flag was never
+    # passed, so :9093 answered plain HTTP with no client auth while
+    # Prometheus dialled it as `scheme: https` (a silent alerting break
+    # AND an open door). `tests/test_monitoring_web_configs_are_loaded.py`
+    # pins every web-config mount to its flag.
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.config.file=/etc/alertmanager/web-config.yml'
+    # The image has no shell, wget or curl, so the probe is amtool (shipped
+    # in the image) presenting the container's OWN leaf over mTLS, the same
+    # self-check the vllm service does with python. CA-verified; `localhost`
+    # is in every service leaf's SANs.
+    healthcheck:
+      test: ["CMD", "/bin/amtool", "--alertmanager.url=https://localhost:9093", "--http.config.file=/etc/alertmanager/amtool-http.yml", "config", "show"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana (every controller, standalone included)
+  grafana:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/grafana:12-debian13-dev
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
+    profiles: ["monitoring", "controller", "standalone"]
+    # uid 0: the DHI -dev image runs as root (`USER 0`).
+    secrets:
+      - { source: grafana_admin_password, target: grafana_admin_password, uid: "0", gid: "0", mode: 0400 }
+    ports:
+      # §3f R28. NOT NOO_BIND_ADDR, whose default is 0.0.0.0: Grafana is the
+      # one service here with its own user database and its own login, and
+      # inheriting a fleet-wide "publish everywhere" default put an admin UI
+      # on every interface. Loopback, also on a tailnet controller once
+      # `tailscale serve` is confirmed fronting this port on the tailnet
+      # name with the tailnet's certificate (noo-cli/src/tailnet_serve.rs):
+      # a browser refuses the cluster-CA leaf on a direct tailnet publish,
+      # which stays only as the fallback when serve cannot be written.
+      - "${NOO_GRAFANA_BIND_ADDR:-127.0.0.1}:${NOO_PORT_GRAFANA:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${NOO_ADMIN_USER:-admin}
+      # No admin/admin default: noomesh-start.sh refuses to start the
+      # controller/monitoring profiles with an empty GRAFANA_PASSWORD. Not a
+      # compose `:?` guard — that fires file-wide on ANY compose op, breaking
+      # worker-node node-agent recreates where grafana never runs.
+      #
+      # The value is a POINTER, not the password: Grafana expands
+      # `$__file{…}` in any setting, env overrides included, and reads the
+      # file itself. NOT `GF_SECURITY_ADMIN_PASSWORD__FILE` — that suffix is
+      # implemented by the upstream image's run.sh, which the DHI image
+      # does not have; measured 2026-09-29, `__FILE` was ignored and the
+      # admin login stayed admin/admin. `$$` is compose's escape for `$`.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:+$$__file{/run/secrets/grafana_admin_password}}
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/cluster-overview.json
+      # TLS — enabled when PKI service certs exist
+      - GF_SERVER_PROTOCOL=${GF_SERVER_PROTOCOL:-https}
+      - GF_SERVER_CERT_FILE=/app/pki/services/grafana/service.crt
+      - GF_SERVER_CERT_KEY=/app/pki/services/grafana/service.key
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-https://localhost:3000}
+      # Where a bookmark of Grafana's port goes (grafana.ini [auth]
+      # signout_redirect_url): the console's Open Grafana. Empty on the
+      # loopback door. Derived by `noo upgrade --stack` (grafana_door.rs).
+      - NOO_GRAFANA_CONSOLE_URL=${NOO_GRAFANA_CONSOLE_URL:-}
+    volumes:
+      - ./configs/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+      # Same rule as prometheus above: its own leaf and the CA, not the
+      # fleet's whole key material. Grafana's datasources already dial
+      # prometheus and loki with services/grafana (configs/grafana/
+      # datasources/*.yml), so nothing here needed the wider mount.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/grafana:/app/pki/services/grafana:ro
+      # an earlier change: the PUBLIC half of the Grafana SSO key pair, one
+      # file, never the sso/ directory (grafana.key sits beside it and is the
+      # gateway's). `[auth.jwt] key_file` in configs/grafana/grafana.ini
+      # names this path; tests/test_pki_mounts_are_narrow.py allows exactly
+      # this file for exactly this service.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/sso/grafana.pub:/app/pki/sso/grafana.pub:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - loki
+
+  # Node exporter — controller only. It carried a `worker` profile, and so
+  # did promtail and its socket proxy, but no worker ever ran compose: nodes
+  # are native agents delivered by the bootstrap-token + provision rail, and
+  # the only launcher that passed `--profile worker` was the retired
+  # cluster-init.sh. Prometheus scrapes docker-DNS targets on the controller
+  # alone, so a worker node-exporter would not have been scraped either.
+  # The lane is gone (tests/test_no_worker_compose_lane.py); worker host
+  # metrics are a feature to design, not a profile to re-add.
+  node-exporter:
+    logging: *default-logging
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/node-exporter:1
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
+    profiles: ["monitoring", "controller", "standalone"]
+    ports:
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NODE_EXPORTER:-9100}:9100"  # H-N5 — exporter reachable by controller scrape over tailnet only
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/node-exporter:/tls/services/node-exporter:ro
+      - ./monitoring/node-exporter/web-config.yml:/etc/node-exporter/web-config.yml:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|run/user)($$|/)
+      - --collector.filesystem.fs-types-exclude=^(tmpfs|autofs|binfmt_misc|cgroup|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|overlay|proc|securityfs|sysfs|tracefs)$$
+      - --web.config.file=/etc/node-exporter/web-config.yml
+
+  # NVIDIA GPU exporter (GPU nodes only)
+  # Our own simple exporter - just parses nvidia-smi output
+  # Works in WSL2 (unlike DCGM) and we control the code
+  nvidia-exporter:
+    logging: *default-logging
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.nvidia-exporter
+    image: noomesh/nvidia-exporter:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-nvidia-exporter
+    profiles: ["controller", "standalone", "gpu-tier1", "gpu-tier2"]
+    ports:
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NVIDIA_EXPORTER:-9400}:9400"  # H-N5 — GPU exporter reachable by controller scrape over tailnet only
+    environment:
+      # Always set: the exporter refuses to start without all three rather
+      # than serving GPU metrics over plain HTTP to anyone on the network.
+      - NOO_TLS_CERT=/tls/services/nvidia-exporter/service.crt
+      - NOO_TLS_KEY=/tls/services/nvidia-exporter/service.key
+      - NOO_TLS_CA=/tls/ca.crt
+    volumes:
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/nvidia-exporter:/tls/services/nvidia-exporter:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    # Self-check with the container's OWN leaf, CA-verified, hostname
+    # checked (`localhost` is in every service leaf's SANs) — the vllm
+    # pattern. The old probe turned hostname checking off and then fell
+    # back to plain `http://localhost:9400`, which this exporter can never
+    # answer (it refuses to start without TLS), so the fallback only ever
+    # masked a broken TLS probe as "unhealthy" with no reason.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,ssl,urllib.request; ctx=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA']); ctx.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY']); urllib.request.urlopen('https://localhost:9400/health',context=ctx,timeout=5)"]
+      interval: 30s
+      timeout: 5s
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  # Browser automation (Playwright in a container)
+  browser:
+    logging: *default-logging
+    build:
+      context: ./src/noomesh/tools/browser
+      dockerfile: Dockerfile
+    image: noo-browser:latest
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-browser
+    profiles: ["browser"]
+    # uid 0: the Playwright base image has no USER line, so the server runs
+    # as root.
+    secrets:
+      - { source: noo_browser_key, target: noo_browser_key, uid: "0", gid: "0", mode: 0400 }
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      BROWSER_PORT: "9222"
+      BROWSER_IDLE_TIMEOUT: "${BROWSER_IDLE_TIMEOUT:-300}"
+      BROWSER_MAX_SESSION: "${BROWSER_MAX_SESSION:-600}"
+      BROWSER_URL_ALLOWLIST: "${BROWSER_URL_ALLOWLIST:-}"
+      BROWSER_URL_BLOCKLIST: "${BROWSER_URL_BLOCKLIST:-}"
+      # Every route refuses without this (an earlier change R35). Unset = the
+      # service answers 503 and says so; it never serves unauthenticated.
+      # Its OWN key, never the fleet secret: a leak of this
+      # opens the browser door and nothing else. A FILE: server.py's inlined
+      # reader takes NOO_BROWSER_KEY_FILE.
+      NOO_BROWSER_KEY_FILE: "${NOO_BROWSER_KEY:+/run/secrets/noo_browser_key}"
+      # ONE-RELEASE BRIDGE: the same BROWSER key under the old
+      # pointer name, so a locally built pre-702 noo-browser image (which reads
+      # NOO_CLUSTER_SECRET) keeps verifying the new bearer. It points at the
+      # browser key's file — the fleet secret is not delivered here. Remove in
+      # the release after v0.2.103, with the matching compat name in
+      # gateway-rust/src/routes/ui.rs `browser_start`.
+      NOO_CLUSTER_SECRET_FILE: "${NOO_BROWSER_KEY:+/run/secrets/noo_browser_key}"
+    # No external port — gateway/worker reach browser via Docker network
+    networks:
+      # R35: the browser renders and executes attacker-authored content,
+      # so it gets its own network — the same reasoning as `noo-sandbox`.
+      # On `noo-cluster` it sat beside postgres, redis, nats and every
+      # third-party image on the node, one `POST /execute` (unauthenticated
+      # until R35) away from `fetch('http://nats:8222/connz')`.
+      #
+      # NOT `internal: true`, unlike noo-sandbox: a browser with no egress
+      # is not a browser. Compose has no per-destination egress rule, so
+      # the network buys lateral isolation and nothing else —
+      # BROWSER_URL_ALLOWLIST is the ONLY wall on where it goes, and it is
+      # a substring match applied at `/navigate`, which in-page JavaScript
+      # (`/execute`) does not pass through. Treat anything this container
+      # can reach as reachable by the page it is showing.
+      - noo-browser
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    restart: "no"
+
+  # Python sandbox — isolated code execution for python_exec tool
+  # Hardened container: read-only rootfs, no capabilities, seccomp, resource limits.
+  # Gateway reaches sandbox via Docker network: http://sandbox:9000 on the
+  # dedicated `noo-sandbox` network (audit M-3 — this container must NOT sit
+  # on `noo-cluster`, where it could read NATS monitoring :8222).
+  sandbox:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sandbox
+      # No trellion sibling-context any more: the sandbox is FROM the
+      # non-ML deps-core tier, which does not bake
+      # noo-trellion in — and a declared build context must RESOLVE, so
+      # keeping it would make a sandbox rebuild require ../trellion
+      # on disk for a build that never reads it (same trap the gateway
+      # service documents above).
+      args:
+        DEPS_CORE: ${NOO_IMAGE_PREFIX:-noomesh}/deps-core:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_CORE:-}
+    image: noomesh/sandbox:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-sandbox
+    profiles: ["controller", "standalone"]
+    entrypoint: []
+    command: ["python", "-m", "uvicorn", "noomesh.sandbox.app:app", "--host", "0.0.0.0", "--port", "9000"]
+    # No external port — only accessible via Docker network (noo-cluster)
+    expose:
+      - "9000"
+    environment: &sandbox-env
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      # Per-call isolation INSIDE the container: `bwrap` (default) runs
+      # every snippet in its own user/PID/net namespace with a private
+      # root; `process` is container-only isolation and must be chosen by
+      # name — the executor refuses to run code rather than fall back.
+      # /health reports which is active. See src/noomesh/sandbox/app.py.
+      - NOO_SANDBOX_ISOLATION=${NOO_SANDBOX_ISOLATION:-bwrap}
+      - NOO_SANDBOX_EXEC_MEM_MB=${NOO_SANDBOX_EXEC_MEM_MB:-384}
+    security_opt: &sandbox-security
+      - no-new-privileges:true
+      # Docker's default profile with ONLY the user-namespace and mount
+      # syscalls Bubblewrap needs made unconditional — derived by
+      # scripts/derive-sandbox-seccomp.py, shape pinned by
+      # tests/test_sandbox_seccomp_profile.py. Every other rule (the ERRNO
+      # default, the ptrace/bpf/module gates) is as Docker ships it. The
+      # old hand-written seccomp-sandbox.json that blocked the server's own
+      # socket calls is long gone; this one is generated, not written.
+      - seccomp=./docker/seccomp-sandbox.json
+      # Ubuntu 24.04+ hosts restrict unprivileged user namespaces through
+      # AppArmor and the docker-default profile also denies mount, so
+      # Bubblewrap fails there with "No permissions to create new
+      # namespace" / "Can't mount proc". Set NOO_SANDBOX_APPARMOR=unconfined
+      # on such a host: the container is still under seccomp, cap_drop ALL,
+      # read-only rootfs and no-new-privileges. Ignored where AppArmor is
+      # absent (WSL2).
+      - apparmor=${NOO_SANDBOX_APPARMOR:-docker-default}
+    cap_drop: &sandbox-cap-drop
+      - ALL
+    cap_add: &sandbox-cap-add
+      - SETUID
+      - SETGID
+    read_only: true
+    # python_exec-only sizing again — the fu 49 claude runner (which needed
+    # the bigger tmpfs + memory) was reverted by the 2026-08-11 design flip.
+    tmpfs: &sandbox-tmpfs
+      - /tmp:size=100M,mode=1777
+      - /run:size=10M,mode=0755
+    deploy:
+      resources: &sandbox-resources
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    ulimits: &sandbox-ulimits
+      nproc: 256
+      nofile:
+        soft: 256
+        hard: 512
+    networks:
+      # M-3: the sandbox executes LLM-generated code, so it gets its OWN
+      # network and nothing else. On `noo-cluster` it could reach the
+      # NATS monitoring endpoint (nats:8222/connz →
+      # every node name, tailnet IP and TLS peer fingerprint; mTLS-only
+      # since an earlier change N9, but this container has no reason to be able
+      # to reach it at all), plus every
+      # other service hostname on the bus network. It has no reason to talk
+      # to anything: it is a pure inbound service — the gateway and trellion
+      # POST /exec to it and it never dials out to a cluster peer.
+      - noo-sandbox
+    restart: unless-stopped
+    healthcheck: &sandbox-health
+      # Use python urllib — sandbox image doesn't include curl. /health is
+      # unhealthy when the configured isolation cannot run, so a sandbox
+      # that would refuse every call shows up here, not in a tool error.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9000/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Extra executors. Same image, hardening and limits as `sandbox` through
+  # the anchors above, but NO container_name and an alias on the network
+  # so they answer to the name the gateway dials: Docker's embedded DNS
+  # rotates the A records across every container carrying the alias, so
+  # calls spread without a client change. Each container is a 1-CPU
+  # budget; raise this on a controller with cores to spare when
+  # concurrent sessions queue on python_exec. Default 0.
+  sandbox-extra:
+    logging: *default-logging
+    image: noomesh/sandbox:latest
+    pull_policy: never
+    profiles: ["controller", "standalone"]
+    entrypoint: []
+    command: ["python", "-m", "uvicorn", "noomesh.sandbox.app:app", "--host", "0.0.0.0", "--port", "9000"]
+    deploy:
+      replicas: ${NOO_SANDBOX_EXTRA:-0}
+      resources: *sandbox-resources
+    environment: *sandbox-env
+    security_opt: *sandbox-security
+    cap_drop: *sandbox-cap-drop
+    cap_add: *sandbox-cap-add
+    read_only: true
+    tmpfs: *sandbox-tmpfs
+    ulimits: *sandbox-ulimits
+    networks:
+      noo-sandbox:
+        aliases: [sandbox]
+    restart: unless-stopped
+    healthcheck: *sandbox-health
+
+  # PostgreSQL with pgvector for long-term semantic memory
+  # Hardened image: Chainguard postgres + pgvector built from source
+  postgres:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
+    image: noomesh/postgres-pgvector:latest
+    pull_policy: build
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-postgres
+    profiles: ["controller", "standalone"]
+    secrets:
+      - { source: postgres_password, target: postgres_password, uid: "70", gid: "70", mode: 0400 }
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-noomesh}
+      POSTGRES_USER: ${POSTGRES_USER:-noo}
+      # The superuser password as a FILE: the image's own entrypoint reads
+      # POSTGRES_PASSWORD_FILE natively (file_env), as the image user —
+      # uid 70, `postgres` in the alpine base — so the secret below is 0400
+      # to 70. It is only consulted at first init; an existing data dir
+      # keeps the password it was initialised with. The image refuses
+      # first-init with no password, and noomesh-start.sh guards
+      # controller starts.
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD:+/run/secrets/postgres_password}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/postgres:/tls/services/postgres:ro
+      # The shipped client-auth policy (TLS + cluster-CA client cert on
+      # every TCP connection, plaintext rejected). Selected by `-c hba_file`
+      # below so the copy initdb writes into the data volume is never what
+      # runs; tests/test_postgres_tls_only.py pins its content.
+      - ./docker/postgres/pg_hba.conf:/etc/noo/pg_hba.conf:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        # pg_stat_statements must be preloaded at startup — it cannot be
+        # enabled with CREATE EXTENSION alone. Without per-statement timings
+        # the only performance evidence available is per-TABLE scan counts,
+        # which cannot tell you WHICH query is expensive (2026-07-31: chasing
+        # a "never used" index took four wrong conclusions to resolve because
+        # of exactly this gap).
+        # Costs ~1-2% overhead and a fixed shared-memory allocation.
+        ARGS="-c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=top"
+        # TLS is not a switch. Until 2026-09-28 `ssl=on` hung on NOO_PG_TLS
+        # being set AND the leaf existing, and an unset variable started a
+        # plaintext server that the stock pg_hba then accepted every client
+        # on. Now: no leaf, no server — the message names the fix. The leaf
+        # is issued by `noo onboard` (SVC_LIST) or
+        # `noo security pki issue-service postgres`.
+        if [ ! -f /tls/services/postgres/service.crt ] || [ ! -f /tls/services/postgres/service.key ]; then
+          echo "postgres: refusing to start without its TLS leaf — /tls/services/postgres/service.{crt,key} not mounted (NOO_PKI_DIR unset, or the leaf was never issued: noo security pki issue-service postgres)" >&2
+          exit 1
+        fi
+        if [ ! -f /etc/noo/pg_hba.conf ]; then
+          echo "postgres: refusing to start without the shipped pg_hba.conf (docker/postgres/pg_hba.conf is not mounted at /etc/noo/pg_hba.conf — noo upgrade --stack re-materialises it)" >&2
+          exit 1
+        fi
+        # The mounted key is 0644 (readable by a non-root container, see
+        # noo-cli/src/pki.rs); postgres refuses a key that open, so it runs
+        # from a 0600 private copy.
+        cp /tls/services/postgres/service.key /tmp/pg-server.key
+        chmod 600 /tmp/pg-server.key
+        chown postgres:postgres /tmp/pg-server.key 2>/dev/null || true
+        ARGS="$$ARGS -c ssl=on -c ssl_cert_file=/tls/services/postgres/service.crt -c ssl_key_file=/tmp/pg-server.key -c ssl_ca_file=/tls/ca.crt -c ssl_min_protocol_version=TLSv1.2"
+        ARGS="$$ARGS -c hba_file=/etc/noo/pg_hba.conf"
+        # Route through the image entrypoint, not postgres directly: the
+        # entrypoint is what runs initdb on an empty data dir, and it execs
+        # `postgres "$@"` itself, so pass flags only. exec'ing postgres
+        # directly worked for years only because every start inherited an
+        # already-initialized volume (first fresh start: 2026-08-06). The
+        # flags reach its first-init temporary server too, which is why the
+        # shipped pg_hba keeps a `local … trust` line: `createdb` runs over
+        # the unix socket before any password could be used.
+        exec /usr/local/bin/docker-entrypoint.sh $$ARGS
+    ports:
+      # Default localhost-only (admin/debug). For a warm standby at another
+      # site, set POSTGRES_BIND to this controller's Tailscale 100.x IP so
+      # replication is reachable over the overlay only — never the LAN/WAN.
+      # See scripts/bootstrap-standby.sh.
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
+    networks:
+      - noo-cluster
+      - noo-db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noo -d noomesh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # REMOVED 2026-09-11 — the `cluster-executor` sidecar and the whole
+  # controller->node SSH lane are gone (an earlier change said "retired"; the
+  # container was still on the `controller` profile, still ran as root with
+  # ${HOME}/.ssh mounted, still `ssh`/`scp`/`sudo -n systemctl`'d hosts read
+  # out of noo_cluster_proposals). Nothing polls that table any more:
+  #   - revive_node  -> the gateway raises an operator alert carrying the
+  #                     exact command to run ON the node (there is no rail
+  #                     into a box whose agent is down, and pretending
+  #                     otherwise is what hid an 8-day outage).
+  #   - enrolment    -> the gateway resolves an approval to bootstrap-token
+  #                     instructions inline (routes/cluster.rs), which is
+  #                     all the executor ever did for that role.
+  # Do not reintroduce a service that mounts .ssh: tests/test_no_ssh_lane.py
+  # fails the build if one appears.
+
+  # Model-weight store (controller-hosted static file serving). Placement
+  # stays controller-driven; this is the DELIVERY layer — a placed node
+  # copies weights the controller ALREADY downloaded (LAN/Tailscale) instead
+  # of re-downloading from HuggingFace. No HF proxy, no CDN. See
+  # docs/models/weight-cache.md.
+  model-cache:
+    image: nginx:1.27-alpine
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
+    profiles: ["controller", "standalone"]
+    ports:
+      # an earlier change: the data plane is mTLS on 8443 — the node leaf
+      # (or the controller's) at the handshake, org-filtered in nginx. See
+      # docker/model-cache.nginx.conf for the listener contract. This is
+      # the ONLY published port: phase 2 (2026-09-29) removed the plaintext
+      # 8083 listener and its `NOO_MODEL_CACHE_PORT` mapping. A second
+      # `ports:` entry here fails tests/test_model_cache_mtls_only.py and the
+      # `noo cluster verify` "model cache" row. §3f R28: NOO_BIND_ADDR
+      # confines it, never 0.0.0.0 by omission.
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_MODEL_CACHE_TLS_PORT:-8443}:8443"
+    volumes:
+      - ./docker/model-cache.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # The served tree, shared by every listener (outside conf.d/ so the
+      # `*.conf` glob does not load it as a top-level config).
+      - ./docker/model-cache.locations.conf:/etc/nginx/model-cache.locations.conf:ro
+      # ca.crt plus its OWN leaf dir, never the PKI root
+      # (tests/test_pki_mounts_are_narrow.py). The leaf is
+      # issued by `noo onboard` (SVC_LIST) with the controller's reachable
+      # names as SANs, because nodes dial it by noo-controller / LAN IP /
+      # tailnet name exactly as they dial NATS.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/model-cache:/tls/services/model-cache:ro
+      # The controller's HF cache — served read-only (its vLLM/TEI fill this)
+      - ${HF_CACHE_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache}:/hf-store:ro
+      # GGUF weights served for llama.cpp nodes
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}:/models:ro
+      # Docker image tars for the agent /pull verb (prop 22 step 2)
+      - ${IMAGES_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/images}:/images-store:ro
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      # 127.0.0.1 (not localhost): busybox wget resolves localhost to ::1, but
+      # nginx here listens IPv4 only → the check falsely reported "unhealthy".
+      # 8084 is the loopback-only liveness listener: the data-plane port
+      # answers no probe (8443 needs a client cert).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  noo-cluster:
+    # external: true tells compose "this network is managed outside of
+    # me — just use it, don't create/recreate/label-check". Required
+    # because:
+    #   1. Workers have a long-lived `noo-cluster` network created by
+    #      legacy provisioning before compose's `name:` pin existed; that network
+    #      has no compose label, so compose with `external: false`
+    #      refuses to use it ("network exists but not created by compose").
+    #   2. Other containers (noo-llamacpp, noo-vllm, etc.) on the worker
+    #      were attached at provisioning time. Removing/recreating the
+    #      network would disconnect them, breaking the proxy.
+    # Provisioning (node provisioning + the executor's revive path) ensures the
+    # network exists with `docker network create noo-cluster` before
+    # `compose up` runs.
+    #
+    # fu 46: the KEY stays `noo-cluster` (service refs are static); the
+    # actual docker network is per-instance via the launcher's
+    # NOO_CLUSTER_NETWORK export. Workers never set it, so they keep the
+    # literal `noo-cluster` their provisioning created.
+    name: ${NOO_CLUSTER_NETWORK:-noo-cluster}
+    external: true
+  # Internal DB network — only gateway can reach postgres/redis
+  noo-db:
+    driver: bridge
+    internal: true
+  # Code-execution network (audit M-3) — carries exactly one link:
+  # gateway/trellion → sandbox:9000. The sandbox executes LLM-generated
+  # code, so it must not share a network with the bus (NATS monitoring
+  # :8222 discloses full cluster topology; mTLS-gated since 38 N9) or with
+  # any other service hostname.
+  #
+  # NOT `internal: true` on purpose: on `noo-cluster` the sandbox has
+  # NAT egress today, and python_exec code that fetches a URL or pip
+  # installs relies on it. Setting `internal: true` here is a further,
+  # AIRGAPPED since the 2026-08-11 design flip: the sandbox is Mesh's
+  # executor for untrusted code and has NO reason to dial out — Claude Code
+  # runs externally and reaches Mesh via the /mcp door, never from in
+  # here. `internal: true` means no egress at all; the known tradeoff is
+  # that python_exec code cannot `pip install` at runtime (bake needed
+  # libraries into the image instead).
+  noo-sandbox:
+    driver: bridge
+    internal: true
+  # Browser network (an earlier change R35) — carries gateway/worker → browser:9222
+  # and the browser's own egress to the web. Deliberately NOT
+  # `internal: true`: unlike the sandbox, this container's entire job is to
+  # fetch pages. What it buys is that a rendered page's JavaScript cannot
+  # address postgres, redis, nats or any other `noo-cluster` service by name.
+  noo-browser:
+    driver: bridge
+
+volumes:
+  # Heavy data volumes — bind-mounted to D: drive to avoid filling C:
+  # Override with NOO_DATA_ROOT env var if your D: mount path differs
+  noo-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/noo-data
+  redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/redis
+  nats-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/nats
+  ollama-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama
+  ollama-embed-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama
+  airllm-cache:
+  # Piper voice models for the opt-in `piper` service (profile "voice").
+  piper-voices:
+  hf-cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/hf-cache
+  prometheus-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/prometheus
+  alertmanager-data:
+    # Plain named volume (not a NOO_DATA_ROOT bind): alertmanager state
+    # (silences / notification log) is non-critical and this avoids requiring
+    # the host dir to pre-exist before `up`.
+    driver: local
+  grafana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/grafana
+  loki-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/loki
+  postgres-data:
+    # PostgreSQL needs POSIX ownership/permissions (chmod/chown).
+    # On Linux/macOS NOO_PG_DATA == NOO_DATA_ROOT/postgres (same drive).
+    # On WSL2 with NTFS data root, `noo onboard` redirects NOO_PG_DATA
+    # to $HOME/noo/postgres on the ext4 root filesystem
+    # (onboard/steps.rs `ensure_pg_data_path`).
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_PG_DATA:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/postgres}
+  claude-config:
+
+# ── Tier-1 secrets, delivered as FILES (2026-09-29) ─────────────────────
+# Every entry is sourced from an ENVIRONMENT VARIABLE of the process that
+# runs compose — never from a file on the host. The launcher
+# (scripts/lib-secrets.sh `load_secrets`) exports each value from
+# secrets/env.sops, compose copies it into the consuming container at
+# create time as /run/secrets/<target> with the uid/gid/mode each service
+# names, and nothing is written anywhere else: no host file, no tmpfs to
+# clean up, nothing in Config.Env. See docs/security/secrets.md.
+#
+# The launcher also guarantees every variable below is SET (empty when
+# the store has no value): compose refuses to create a service whose
+# secret's variable is unset ("required by secret … is not set"), which
+# is also what makes a bare `docker compose up` — no launcher, no store —
+# fail loudly instead of starting with empty credentials. An EMPTY value
+# creates the container with no file at all; the `${NAME:+…}` pointers
+# in each service then leave `<NAME>_FILE` unset, so an optional secret
+# reads as unset rather than as a broken mount.
+#
+# The two pgpass bodies are DERIVED by the launcher (derive_file_secrets)
+# from the role passwords — one line per role that container logs in as.
+#
+# Ownership: Docker writes each file owned by the CONTAINER's user when the
+# image declares one (measured 2026-09-29 — a DHI image with `USER 0` got
+# root-owned files whatever uid was asked for). So `uid`/`gid` on each
+# service RESTATE the image's user, and only decide ownership for an image
+# with no USER line; tests/test_compose_secret_files.py pins them to it.
+#
+# The add-on overlays (trellion, trellion-intel, evolve) reuse these entries
+# and declare the few only they take (their own gateway keys, their pgpass
+# bodies) in their own top-level `secrets:` — compose merges the blocks
+# across `-f` files.
+secrets:
+  noo_jwt_secret:
+    environment: NOO_JWT_SECRET
+  noo_cluster_secret:
+    environment: NOO_CLUSTER_SECRET
+  noo_controller_secret:
+    environment: NOO_CONTROLLER_SECRET
+  # The bus-principal keys. All three live here, not in
+  # the add-on overlays, because the gateway (this file) takes all three.
+  # The browser door's key: gateway, worker, browser.
+  noo_browser_key:
+    environment: NOO_BROWSER_KEY
+  noo_bus_key_worker:
+    environment: NOO_BUS_KEY_WORKER
+  noo_bus_key_trellion:
+    environment: NOO_BUS_KEY_TRELLION
+  noo_bus_key_trellion_intel:
+    environment: NOO_BUS_KEY_TRELLION_INTEL
+  noo_node_agent_token:
+    environment: NOO_NODE_AGENT_TOKEN
+  noo_admin_password:
+    environment: NOO_ADMIN_PASSWORD
+  noo_audit_hmac_key:
+    environment: NOO_AUDIT_HMAC_KEY
+  redis_password:
+    environment: REDIS_PASSWORD
+  noo_tailscale_oauth_client_secret:
+    environment: NOO_TAILSCALE_OAUTH_CLIENT_SECRET
+  noo_tailscale_api_key:
+    environment: NOO_TAILSCALE_API_KEY
+  noo_agent_review_key:
+    environment: NOO_AGENT_REVIEW_KEY
+  noo_agent_signing_key:
+    environment: NOO_AGENT_SIGNING_KEY
+  noo_jwt_signing_key:
+    environment: NOO_JWT_SIGNING_KEY
+  noo_entitlement:
+    environment: NOO_ENTITLEMENT
+  noo_app_db_password:
+    environment: NOO_APP_DB_PASSWORD
+  noo_evolve_db_password:
+    environment: NOO_EVOLVE_DB_PASSWORD
+  noo_evolve_ddl_password:
+    environment: NOO_EVOLVE_DDL_PASSWORD
+  noo_trellion_db_password:
+    environment: NOO_TRELLION_DB_PASSWORD
+  noo_trellion_ddl_password:
+    environment: NOO_TRELLION_DDL_PASSWORD
+  nats_gateway_password:
+    environment: NATS_GATEWAY_PASSWORD
+  nats_worker_password:
+    environment: NATS_WORKER_PASSWORD
+  # A node's own bus password — only the opt-in containerised node agent
+  # (profiles node-agent-compose / sensors) reads it; exported empty on a
+  # controller, so no file is created.
+  nats_node_password:
+    environment: NATS_NODE_PASSWORD
+  noo_svc_key_worker:
+    environment: NOO_SVC_KEY_WORKER
+  postgres_password:
+    environment: POSTGRES_PASSWORD
+  grafana_admin_password:
+    environment: GRAFANA_PASSWORD
+  pgpass_gateway:
+    environment: NOO_PGPASS_GATEWAY
+  pgpass_worker:
+    environment: NOO_PGPASS_WORKER
+  # Tier-2 provider and channel credentials. Optional on
+  # every install: the launcher exports each source EMPTY when the store
+  # lacks it, which creates no file and leaves the pointer unset.
+  anthropic_api_key:
+    environment: ANTHROPIC_API_KEY
+  openai_api_key:
+    environment: OPENAI_API_KEY
+  google_api_key:
+    environment: GOOGLE_API_KEY
+  tavily_api_key:
+    environment: TAVILY_API_KEY
+  brave_search_api_key:
+    environment: BRAVE_SEARCH_API_KEY
+  telegram_bot_token:
+    environment: TELEGRAM_BOT_TOKEN
+  whatsapp_token:
+    environment: WHATSAPP_TOKEN
+  google_chat_bearer_token:
+    environment: GOOGLE_CHAT_BEARER_TOKEN
+  google_chat_credentials_json:
+    environment: NOO_FILECRED_GOOGLE_CHAT_B64
+
+configs:
+  prometheus_config:
+    content: |
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+
+      alerting:
+        alertmanagers:
+          - scheme: https
+            tls_config:
+              ca_file: /app/pki/ca.crt
+              cert_file: /app/pki/services/prometheus/service.crt
+              key_file: /app/pki/services/prometheus/service.key
+              insecure_skip_verify: false
+            static_configs:
+              - targets: ['alertmanager:9093']
+
+      rule_files:
+        - /etc/prometheus/alerts/*.yml
+
+      # an earlier change: every job below scrapes with
+      # services/prometheus/service.{crt,key} — CN=prometheus,
+      # O="Mesh Cluster Service". Four of them used to present
+      # gateway/gateway.{crt,key}, which is the controller's identity; the
+      # node-agent job in particular meant the scraper could command any
+      # node it could reach. The service leaf opens GET /metrics and nothing
+      # else (node-agent-go/internal/auth/principal.go MetricsReader), and
+      # gateway.key is no longer mounted into this container at all.
+      #
+      # No job sends a bearer. The gateway and node-agent jobs used to send
+      # `${NOO_NODE_AGENT_TOKEN}`, which Prometheus does not expand: the
+      # literal string arrived, the node agent refused it, and the gateway
+      # ignored it because /metrics was public. Both now authenticate this
+      # leaf itself and nothing else: the gateway admits
+      # it on GET /metrics only, the node agent on /metrics only.
+      #
+      # Rotation: `noo security pki rotate-all` re-issues this leaf in place
+      # with every other; existing installs mint it once with
+      # `noo security pki issue-service prometheus`.
+      scrape_configs:
+        - job_name: 'prometheus'
+          scheme: https
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/prometheus/service.crt
+            key_file: /app/pki/services/prometheus/service.key
+            insecure_skip_verify: false
+          static_configs:
+            - targets: ['localhost:9090']
+
+        - job_name: 'gateway'
+          scheme: https
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/prometheus/service.crt
+            key_file: /app/pki/services/prometheus/service.key
+            insecure_skip_verify: false
+          static_configs:
+            - targets: ['gateway:8080']
+
+        - job_name: 'node'
+          scheme: https
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/prometheus/service.crt
+            key_file: /app/pki/services/prometheus/service.key
+            insecure_skip_verify: false
+          static_configs:
+            - targets: ['node-exporter:9100']
+
+        - job_name: 'nvidia_gpu'
+          scheme: https
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/prometheus/service.crt
+            key_file: /app/pki/services/prometheus/service.key
+            insecure_skip_verify: false
+          static_configs:
+            - targets: ['nvidia-exporter:9400']
+
+        - job_name: 'noo_node_agent'
+          scheme: https
+          tls_config:
+            ca_file: /app/pki/ca.crt
+            cert_file: /app/pki/services/prometheus/service.crt
+            key_file: /app/pki/services/prometheus/service.key
+            insecure_skip_verify: false
+          static_configs:
+            - targets: ['node-agent:8081']
+          metrics_path: '/metrics'

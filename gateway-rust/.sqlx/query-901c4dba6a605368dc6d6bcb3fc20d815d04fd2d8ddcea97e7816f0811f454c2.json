@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO noo_kb_teams (name, description, created_by, org_id) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "901c4dba6a605368dc6d6bcb3fc20d815d04fd2d8ddcea97e7816f0811f454c2"
+}

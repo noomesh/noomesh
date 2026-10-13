@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# .env keys that are RETIRED: nothing reads them any more, so the stack is
+# correct with or without the line, but the line does nothing.
+#
+# ONE source of truth, read by both:
+#   - scripts/lib-addons.sh  warn_retired_env_keys  (the launcher's WARN)
+#   - noo onboard --only env  (offers to remove them; noo-cli embeds this file)
+#
+# Format: KEY|what replaced it (one line; shown after "which is RETIRED and ignored —")
+# Keys the launcher REFUSES on (NOO_*_ENABLED add-on flags) are not listed
+# here: lib-addons.sh addons_guard_retired_flags owns those.
+TELEGRAM_ALLOWED_USERS|it admits nobody. Who may talk to the bot is noo_user_channel_links: noo security user link <username> telegram <id>
+NOO_VLLM_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
+NOO_LLAMACPP_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
+NOO_OLLAMA_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
+NOO_TEI_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
+NOO_RERANKER_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start

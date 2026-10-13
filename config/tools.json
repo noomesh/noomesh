@@ -1,0 +1,610 @@
+{
+  "_version": "1.0",
+  "_description": "Tool schemas shared between Python and Rust gateways. Single source of truth.",
+  "core_tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_tool_search",
+        "description": "Search for additional tools by capability. Returns tool names and descriptions. Use this first when you need a tool not in your current set.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "What capability you're looking for"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "discovery"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_rag_query",
+        "description": "Search your internal knowledge base for information. ALWAYS try this BEFORE web_search \u2014 it contains ingested documents, research papers, and notes. Returns relevant text with source citations.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "The question to search for"
+            },
+            "strategy": {
+              "type": "string",
+              "enum": [
+                "hybrid",
+                "vector",
+                "graph_first",
+                "lookup"
+              ],
+              "description": "Search strategy (default: hybrid)"
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "rag",
+        "knowledge"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_inference",
+        "description": "Run a prompt through the local LLM for reasoning, analysis, or generation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "The prompt to run"
+            },
+            "model": {
+              "type": "string",
+              "description": "Model name (optional, uses default)"
+            },
+            "max_tokens": {
+              "type": "integer",
+              "description": "Max tokens to generate"
+            }
+          },
+          "required": [
+            "prompt"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "inference"
+      ],
+      "speed": "slow"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_memory_search",
+        "description": "Search conversation memory for relevant past interactions. Check this alongside noo_rag_query for context before using external tools.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "memory"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "Search the public internet. Use ONLY when noo_rag_query returns no results or when you need real-time/current information not in the knowledge base.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "web"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_channel_send",
+        "description": "Send a message to an external channel (Google Chat, Telegram, etc.).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "channel": {
+              "type": "string",
+              "description": "Channel name (google_chat, telegram, etc.)"
+            },
+            "recipient": {
+              "type": "string",
+              "description": "Recipient ID or name"
+            },
+            "message": {
+              "type": "string",
+              "description": "Message text"
+            }
+          },
+          "required": [
+            "channel",
+            "message"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "channels"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_agent_message",
+        "description": "Send a message to another agent (a person's loop on any node, or a thread) as yourself. It is recorded, threaded and reviewable. Use kind=task to hand work over, kind=result to answer one.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "string",
+              "description": "Recipient agent id (a username, or 'thread' with thread_id)"
+            },
+            "text": {
+              "type": "string",
+              "description": "Message text"
+            },
+            "body": {
+              "type": "object",
+              "description": "Structured body instead of text"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "message",
+                "task",
+                "result",
+                "ack",
+                "note"
+              ],
+              "description": "Default message"
+            },
+            "thread_id": {
+              "type": "string",
+              "description": "Reply into an existing thread you are a party to"
+            },
+            "refs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Message ids this refers to"
+            }
+          },
+          "required": [
+            "to"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_agent_inbox",
+        "description": "Read your agent messages: unread ones by default, or a whole thread. Returns messages newest first.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "thread_id": {
+              "type": "string",
+              "description": "A thread to read in full"
+            },
+            "unread": {
+              "type": "boolean",
+              "description": "Only unread (default true unless thread_id is given)"
+            },
+            "since": {
+              "type": "string",
+              "description": "RFC 3339 timestamp; only newer messages"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max messages (default 20, max 100)"
+            }
+          }
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_agent_ack",
+        "description": "Mark one of your agent messages as read.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Message id"
+            }
+          },
+          "required": [
+            "id"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_task_done",
+        "description": "Finish the task this conversation is running: call it when the objective is fully achieved (with a short result), or with failed=true and the reason when it cannot be. Never claim completion without calling it.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string",
+              "description": "What was achieved, briefly"
+            },
+            "failed": {
+              "type": "boolean",
+              "description": "True when the objective cannot be achieved"
+            },
+            "reason": {
+              "type": "string",
+              "description": "Why it failed (with failed=true)"
+            }
+          }
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_task_delegate",
+        "description": "Hand part of your task to a sub-task that runs as you, on the node holding its model, under a role. It loops on its own; its notes and result arrive in this task's thread. Use noo_task_wait to wait for it.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "objective": {
+              "type": "string",
+              "description": "What the sub-task must achieve, self-contained"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "researcher",
+                "coder",
+                "analyst",
+                "planner",
+                "reviewer"
+              ],
+              "description": "The role it works under"
+            },
+            "model": {
+              "type": "string",
+              "description": "A model name to run it on (chooses the node)"
+            },
+            "loop_budget": {
+              "type": "integer",
+              "description": "Max loops (default 10)"
+            }
+          },
+          "required": [
+            "objective"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_task_status",
+        "description": "The state of your sub-tasks (or one of them): state, loops, last note, result.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "One sub-task; omit for all"
+            }
+          }
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "noo_task_wait",
+        "description": "Wait until one of your sub-tasks finishes (or the wait runs out), then return their states. Cheaper than looping to check.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "seconds": {
+              "type": "integer",
+              "description": "How long to wait at most (default 60, max 600)"
+            }
+          }
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "slow"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "python_tool",
+        "description": "Execute Python code for calculations, data processing, or analysis. Runs in a sandboxed environment.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "Python code to execute"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "compute"
+      ],
+      "speed": "fast",
+      "nats_subject": "worker.tool.python"
+    }
+  ],
+  "extended_tool_groups": {
+    "rag": {
+      "tools": [
+        "noo_rag_ingest",
+        "noo_rag_status",
+        "noo_docs_list",
+        "noo_memory_health"
+      ],
+      "keywords": [
+        "ingest",
+        "document",
+        "upload",
+        "rag",
+        "knowledge base",
+        "pageindex",
+        "embed",
+        "index"
+      ]
+    },
+    "graph": {
+      "tools": [
+        "noo_graph_search_entities",
+        "noo_graph_entity_detail",
+        "noo_graph_neighbors",
+        "noo_graph_stats",
+        "noo_graph_navigate",
+        "noo_graph_traverse_with_intent",
+        "noo_graph_explain_path",
+        "noo_graph_semantic_search",
+        "noo_graph_classify_intent",
+        "noo_graph_search_clusters",
+        "noo_graph_extract_relations",
+        "noo_graph_run_clustering"
+      ],
+      "keywords": [
+        "graph",
+        "entity",
+        "entities",
+        "relationship",
+        "knowledge graph",
+        "connected",
+        "neighbor",
+        "traverse",
+        "navigate",
+        "cluster",
+        "causal",
+        "hypothesis",
+        "path between",
+        "semantic search"
+      ]
+    },
+    "agents": {
+      "tools": [
+        "noo_agents_collaborate",
+        "noo_workflow_run",
+        "noo_workflow_list",
+        "noo_agentic_inference"
+      ],
+      "keywords": [
+        "agent",
+        "collaborate",
+        "workflow",
+        "pipeline",
+        "multi-agent",
+        "team",
+        "orchestrate"
+      ]
+    },
+    "cluster": {
+      "tools": [
+        "noo_cluster_status",
+        "noo_models_cached",
+        "noo_models_pull",
+        "noo_models_switch"
+      ],
+      "keywords": [
+        "cluster",
+        "node",
+        "gpu",
+        "vram",
+        "backend",
+        "model",
+        "pull",
+        "switch",
+        "swap",
+        "change model",
+        "status",
+        "health",
+        "infrastructure"
+      ]
+    },
+    "files": {
+      "tools": [
+        "local_files"
+      ],
+      "keywords": [
+        "file",
+        "read",
+        "write",
+        "directory",
+        "folder",
+        "path",
+        "filesystem",
+        "save",
+        "store",
+        "persist",
+        "workspace",
+        "markdown file",
+        "create file"
+      ]
+    },
+    "recall_memory": {
+      "tools": [
+        "noo_recall_search",
+        "noo_recall_status",
+        "noo_recall_archive",
+        "noo_recall_traversals",
+        "noo_walks_recall",
+        "noo_walks_stats"
+      ],
+      "keywords": [
+        "recall memory",
+        "video memory",
+        "recall",
+        "past conversation",
+        "remember",
+        "archive",
+        "system 1"
+      ]
+    },
+    "coding": {
+      "tools": [
+        "noo_coding_task"
+      ],
+      "keywords": [
+        "code",
+        "implement",
+        "fix bug",
+        "refactor",
+        "coding task",
+        "claude code"
+      ]
+    },
+    "heartbeat": {
+      "tools": [
+        "noo_heartbeat_list_tasks",
+        "noo_heartbeat_create_task",
+        "noo_heartbeat_run_task",
+        "noo_heartbeat_status"
+      ],
+      "keywords": [
+        "heartbeat",
+        "cron",
+        "scheduled",
+        "briefing",
+        "periodic"
+      ]
+    },
+    "channels": {
+      "tools": [
+        "noo_channel_list",
+        "noo_channel_list_recipients",
+        "noo_channel_read_messages"
+      ],
+      "keywords": [
+        "channel",
+        "telegram",
+        "whatsapp",
+        "google chat",
+        "messaging",
+        "recipient"
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM noo_heartbeat_tasks WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d6defb7e2f5ee40a25e57289b0b386124b6bed75123a098d2ddc465cae964a2e"
+}

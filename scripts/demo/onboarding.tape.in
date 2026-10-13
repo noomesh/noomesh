@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# The onboarding film: a stranger on a fresh Ubuntu box goes from nothing to a
+# first chat. This is a TEMPLATE: scripts/demo/record-onboarding.sh fills in
+# @INSTALL_URL@ (from the repo's one declared release repo) and runs it with vhs.
+# Every command is real, so the output on screen is whatever the machine prints.
+#
+# Run it ONLY on a clean sandbox with a generic hostname: the film shows output.
+# See scripts/demo/README.md.
+
+Output demo-out/onboarding.gif
+Output demo-out/onboarding.mp4
+
+# (curl is checked by the recorder: on this machine, or inside the box in box mode)
+
+Set Shell "bash"
+Set FontSize 20
+Set Width 1400
+Set Height 820
+Set Padding 28
+Set Theme "Catppuccin Mocha"
+Set WindowBar Colorful
+Set BorderRadius 10
+Set Framerate 30
+Set TypingSpeed 38ms
+Set PlaybackSpeed @PLAYBACK_SPEED@
+# Wait for the prompt to come back (a line ending in "$"); installs and image
+# pulls are slow on a first run, so the ceiling is generous.
+Set WaitPattern /\$$/
+Set WaitTimeout 30m
+
+# Off camera: a neutral prompt, so no host or user name is shown.
+Hide
+Type "@ENTER@" Enter
+# docker exec -it flushes keys typed before it has the terminal: give it a moment (this is off camera)
+Sleep 3s
+Type `PS1='\[\e[1;32m\]you@server\[\e[0m\]:\[\e[1;34m\]~\[\e[0m\]\$ '` Enter
+# Record the exit status of every command typed into the film (read by the recorder).
+Type `PROMPT_COMMAND='echo "${PIPESTATUS[*]}" >> "@EXIT_LOG@"'` Enter
+Type "export PATH=$HOME/.local/bin:$PATH" Enter
+# Everything noo and the installer print goes through the masker (node names,
+# IPs, tailnet names, e-mails, home paths, tokens become generic stand-ins) and
+# is logged raw and masked so the recorder can prove nothing leaked. Colour is
+# forced because a pipe would otherwise turn it off.
+Type `export NOO_DEMO_HOSTNAME="$(hostname)"` Enter
+Type `noo() { command noo --color always "$@" 2>&1 | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
+Type `sh() { command sh "$@" 2>&1 | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
+Type "clear" Enter
+Show
+
+Sleep 800ms
+Type "# A fresh Ubuntu box. No checkout, no registry login." Enter
+Sleep 1500ms
+
+Type "curl -fsSL @INSTALL_URL@ | sh" Enter
+Wait
+Sleep 1s
+Type "noo --version" Enter
+Wait
+Sleep 1500ms
+
+Type "# One command sets up the whole stack." Enter
+Sleep 1s
+Type "noo onboard --ci --skip-tailscale" Enter
+Wait
+Sleep 2500ms
+
+Type "noo health" Enter
+Wait
+Sleep 2s
+Type "noo cluster status" Enter
+Wait
+Sleep 3s
+
+Type "# Ask it something." Enter
+Sleep 1s
+Type `noo chat --message "in two lines, what can you do on this machine?"` Enter
+Wait
+Sleep 5s

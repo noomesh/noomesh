@@ -1,0 +1,7 @@
+NAME="Linux Mint"
+VERSION="22 (Wilma)"
+ID=linuxmint
+ID_LIKE="ubuntu debian"
+VERSION_ID="22"
+VERSION_CODENAME=wilma
+UBUNTU_CODENAME=noble

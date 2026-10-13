@@ -1,0 +1,6 @@
+{
+  "gpus": [
+    { "index": 0, "name": "RTX 4090", "node_id": "prime-01", "temperature": 54, "utilization": 38, "memory_used": 14520, "memory_total": 24564, "power": 210 },
+    { "index": 0, "name": "RTX 3090", "node_id": "atlas-02", "temperature": 72, "utilization": 91, "memory_used": 23340, "memory_total": 24564, "power": 340 }
+  ]
+}

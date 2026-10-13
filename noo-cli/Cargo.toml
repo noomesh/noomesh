@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+[package]
+name = "noo-cli"
+version = "0.5.92"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
+
+[[bin]]
+name = "noo"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+# Intelligent-tier entitlement tokens (entitlement.rs): sign + verify.
+ed25519-dalek = "2"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+# `security pki` — X.509 issuance with ca.py profile fidelity (see src/pki.rs).
+# sha1 is REQUIRED for RFC 5280 method-1 key identifiers (python-cryptography
+# parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+x509-parser = "0.16"
+sha1 = "0.10"
+# "formatting" also serves `config export-effective`'s generated_at stamp.
+time = { version = "0.3", features = ["formatting"] }
+# `onboard` — the setup wizard (zero-Python bootstrap). bcrypt hashes the
+# admin password into secrets/admin_password.txt exactly like Python's
+# step_security (bcrypt.hashpw). serde_yaml round-trips noomesh.yaml for the
+# coordinator backend/model + watched-folder/workspace edits (yaml.dump parity).
+bcrypt = "0.15"
+serde_yaml = "0.9"
+# `onboard --tui` — the native full-screen onboarding frontend (replaces the
+# Python Textual wizard for the TUI path). ratatui 0.30 is the current stable
+# line; crossterm 0.29 is the matching backend/event source (the same version
+# ratatui 0.30's crossterm feature links, so no duplicate-crate mismatch).
+ratatui = "0.30"
+crossterm = "0.29"
+rustyline = "15"
+
+# tests/recovery_rehearsal.rs serves a TLS mock gateway that asks for a
+# client certificate (the operator's). Same rustls + ring the
+# ureq dependency already links, so the lockfile gains no crate.
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+# build.rs reads each add-on overlay's `x-noo-addon` block
+# and generates the add-on key rows from it. Same version as the
+# runtime dependency above, so the lockfile gains no crate.
+[build-dependencies]
+serde_yaml = "0.9"
+
+[profile.release]
+strip = true
+lto = "thin"          # was fat lto + 1 codegen unit — 2x release-lane compile for ~1% CLI perf
+codegen-units = 16

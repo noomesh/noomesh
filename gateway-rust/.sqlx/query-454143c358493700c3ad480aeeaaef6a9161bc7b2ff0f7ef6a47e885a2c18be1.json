@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM noo_kb_role_grants WHERE username = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "454143c358493700c3ad480aeeaaef6a9161bc7b2ff0f7ef6a47e885a2c18be1"
+}

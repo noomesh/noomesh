@@ -1,0 +1,51 @@
+{
+  "_comment": "noomesh Grafana theme reference — use these hex values in dashboard panel thresholds, mappings, and overrides instead of stock Grafana named colors (green, yellow, red, etc.)",
+  "brand": {
+    "accent":    "#38bdf8",
+    "purple":    "#a855f7",
+    "indigo":    "#6366f1"
+  },
+  "status": {
+    "success":   "#10b981",
+    "warning":   "#f59e0b",
+    "error":     "#ef4444",
+    "info":      "#3b82f6"
+  },
+  "surface": {
+    "bg":        "#0a0f14",
+    "panel":     "#111827",
+    "panel_alt": "#0f172a",
+    "border":    "rgba(148, 163, 184, 0.2)"
+  },
+  "text": {
+    "primary":   "#e2e8f0",
+    "muted":     "#94a3b8",
+    "dim":       "#71717a"
+  },
+  "tiers": {
+    "tier1_gpu_high":   "#38bdf8",
+    "tier2_gpu_mid":    "#f59e0b",
+    "tier3_cpu":        "#94a3b8",
+    "tier4_edge":       "#10b981",
+    "tier5_companion":  "#a855f7",
+    "tier6_monitor":    "#6366f1"
+  },
+  "heatmap_gradient": {
+    "_comment": "Use these for heatmap threshold steps (low → high)",
+    "cool":     "#38bdf8",
+    "normal":   "#10b981",
+    "warm":     "#f59e0b",
+    "hot":      "#f97316",
+    "critical": "#ef4444"
+  },
+  "entity_types": {
+    "concept":      "#38bdf8",
+    "technology":   "#10b981",
+    "person":       "#f59e0b",
+    "organization": "#a855f7",
+    "process":      "#ec4899",
+    "product":      "#06b6d4",
+    "location":     "#84cc16",
+    "metric":       "#f97316"
+  }
+}

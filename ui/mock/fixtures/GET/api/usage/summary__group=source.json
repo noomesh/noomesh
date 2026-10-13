@@ -1,0 +1,35 @@
+{
+  "window": "2026-08",
+  "group": "source",
+  "totals": {
+    "prompt_tokens": 4812366,
+    "completion_tokens": 1233907,
+    "requests": 18442
+  },
+  "rows": [
+    {
+      "key": "chat",
+      "prompt_tokens": 3011900,
+      "completion_tokens": 910220,
+      "requests": 11204
+    },
+    {
+      "key": "mcp",
+      "prompt_tokens": 1204118,
+      "completion_tokens": 201558,
+      "requests": 4310
+    },
+    {
+      "key": "scheduler",
+      "prompt_tokens": 408904,
+      "completion_tokens": 88448,
+      "requests": 2204
+    },
+    {
+      "key": "api",
+      "prompt_tokens": 187444,
+      "completion_tokens": 33681,
+      "requests": 724
+    }
+  ]
+}

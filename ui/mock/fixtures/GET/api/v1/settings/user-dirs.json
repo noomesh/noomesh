@@ -1,0 +1,9 @@
+{
+  "directories": [
+    { "host": "/home/alice/research", "mount": "/data/research", "label": "research", "writable": false, "protected": false },
+    { "host": "/home/alice/pai-mesh-ui", "mount": "/workspace/code", "label": "code", "writable": true, "protected": true },
+    { "host": "/mnt/media/videos", "mount": "/data/media", "label": "media", "writable": false, "protected": false },
+    { "host": "/home/alice/notes", "mount": "/data/notes", "label": "notes", "writable": false, "protected": false }
+  ],
+  "workspace": null
+}

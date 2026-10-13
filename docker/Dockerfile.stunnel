@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Minimal stunnel TLS sidecar
+# Wraps mTLS around services that don't support native TLS (Ollama, TEI)
+#
+# openssl (the CLI) is here for the sidecars' healthchecks: a check that
+# presents the sidecar's own leaf through its own door proves the listener,
+# the client-cert requirement and the upstream at once. busybox wget cannot
+# present a certificate.
+
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/library/alpine:3.19
+
+RUN apk add --no-cache stunnel openssl
+RUN adduser -D -H stunnel 2>/dev/null || true
+
+ENTRYPOINT ["stunnel"]
+CMD ["/etc/stunnel/stunnel.conf"]

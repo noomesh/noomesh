@@ -1,0 +1,31 @@
+{
+  "name": "pai-mesh-ui",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Front end for the PAI Mesh system \u2014 talks to the gateway exclusively via the contracts/ API",
+  "//workspaces": "apps/mobile is intentionally OUT of the workspace. It is 14 files of scaffolding that nothing builds, nothing depends on, and no CI runs \u2014 but installing it pulls the whole React Native tree, which carried 8 HIGH CVEs (tar, @xmldom/xmldom, postcss) into a repo-wide Trivy gate and blocked every PR. Restore it by adding \"apps/mobile\" below, and do the SDK 52 -> 53 migration then, with something able to run it.",
+  "workspaces": [
+    "packages/*",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @metis/web",
+    "dev:mock": "npm run dev:mock -w @metis/web",
+    "mock": "node mock/server.mjs",
+    "audit:contract": "python3 contracts/audit/audit_ui_contract.py",
+    "package": "bash scripts/package.sh",
+    "gen:api": "npm run generate -w @metis/api",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^1.2.0",
+    "vite": "^5.4.0",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "esbuild": "^0.25.0",
+    "nanoid": "^3.3.18"
+  }
+}

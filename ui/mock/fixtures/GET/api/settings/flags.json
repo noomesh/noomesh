@@ -1,0 +1,8 @@
+{
+  "flags": [
+    { "key": "auto_enroll", "label": "Auto-enroll nodes", "help": "Automatically enroll discovered tailnet hosts.", "value": true, "category": "cluster", "source": "db" },
+    { "key": "idle_scaledown", "label": "Idle scale-down", "help": "Stop idle backends after 10 minutes.", "value": true, "category": "cluster", "source": "env" },
+    { "key": "require_approval", "label": "Require exec approval", "help": "Gate high-risk tool calls mid-flight.", "value": true, "category": "security", "source": "db" },
+    { "key": "recall_memory", "label": "Recall memory", "help": "Enable the recall memory archive.", "value": false, "category": "memory", "source": "default" }
+  ]
+}

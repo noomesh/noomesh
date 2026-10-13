@@ -1,0 +1,13 @@
+{
+  "violations": {
+    "total": 7,
+    "violations": 4,
+    "path_traversal": 1,
+    "xss": 0,
+    "sql_injection": 2,
+    "shell_meta": 0,
+    "blocked_file": 0
+  },
+  "risk_level": "MEDIUM",
+  "period_hours": 24
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Mesh Tool Definitions",
+  "description": "Schema for validating config/tools.json",
+  "type": "object",
+  "required": ["core_tools"],
+  "properties": {
+    "_version": {"type": "string"},
+    "_description": {"type": "string"},
+    "core_tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "function"],
+        "properties": {
+          "type": {"type": "string", "enum": ["function"]},
+          "function": {
+            "type": "object",
+            "required": ["name", "description", "parameters"],
+            "properties": {
+              "name": {"type": "string", "pattern": "^[a-z_][a-z0-9_]*$"},
+              "description": {"type": "string", "minLength": 10},
+              "parameters": {"type": "object"}
+            }
+          },
+          "tags": {"type": "array", "items": {"type": "string"}},
+          "speed": {"type": "string", "enum": ["fast", "slow"]},
+          "nats_subject": {"type": "string"}
+        }
+      }
+    },
+    "extended_tool_groups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["tools", "keywords"],
+        "properties": {
+          "tools": {"type": "array", "items": {"type": "string"}},
+          "keywords": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

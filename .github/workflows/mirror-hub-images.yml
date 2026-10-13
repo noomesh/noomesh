@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Mirror the Docker Hub images CI and the image builds use into GHCR.
+#
+# Hosted runners share IPs and Docker Hub rate-limits anonymous pulls per IP,
+# which fails builds on "toomanyrequests". The
+# consumers pull <prefix>/<hub path>:<tag> (scripts/hub-mirror.py
+# prefix/ref), falling back to Docker Hub with a warning whenever the mirror
+# lacks an image, so a stale or missing mirror costs a Hub pull, never a red
+# build.
+#
+# The inventory is .github/hub-mirror.txt. scripts/hub-mirror.py sync records
+# each source digest (job summary + artifact), copies registry to registry
+# with `docker buildx imagetools create` (every platform, no local pull), and
+# REFUSES a change that looks like a downgrade (source older than the mirror,
+# or a lower version annotation), failing the run with both sides printed.
+#
+# Prefix: repo variable HUB_MIRROR, else ghcr.io/<owner>/mirror. The prefix
+# follows the repository owner; set HUB_MIRROR to move it
+# anywhere else. Kept apart from mirror-images.yml (the DHI bases): these are
+# the official Docker Hub images, and can be made public so that sibling repos
+# pull them anonymously.
+name: mirror hub images
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'   # weekly, Monday 04:17 UTC
+  workflow_dispatch:
+  push:
+    # dev here, main in the public repo (its default branch): a trigger on
+    # the branch that does not exist in a repo never fires.
+    branches: [dev, main]
+    paths:
+      - '.github/hub-mirror.txt'
+      - '.github/workflows/mirror-hub-images.yml'
+      - 'scripts/hub-mirror.py'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-hub-images
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    # Pushes to ghcr.io/<repository_owner>/mirror with GITHUB_TOKEN: only the
+    # repo that lives in the image org may run it.
+    if: github.repository == 'noomesh/noomesh'
+    # Cloud runner on purpose: its IP is not the home IP whose Hub budget the
+    # mirror exists to spare, and the copy is pure registry-to-registry I/O.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Empty = scripts/hub-mirror.py's default, ghcr.io/<owner>/mirror.
+      HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Log in to GHCR (push)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Authenticated Hub reads have a far higher limit; the Docker account is
+      # the one already in secrets for dhi.io. Anonymous if it is absent.
+      - name: Log in to Docker Hub (higher read limit)
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -n "${DHI_TOKEN:-}" ]; then
+            echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+              || echo "::warning::docker.io login failed — anonymous Hub reads"
+          else
+            echo "::warning::no DHI_TOKEN — anonymous Hub reads"
+          fi
+      - name: Mirror (refuses a downgrade; records every source digest)
+        run: python3 scripts/hub-mirror.py sync --record "$RUNNER_TEMP/hub-mirror-digests.txt"
+      - name: Keep the digest record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hub-mirror-digests
+          path: ${{ runner.temp }}/hub-mirror-digests.txt
+          if-no-files-found: warn
+          retention-days: 90

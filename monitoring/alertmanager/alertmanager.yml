@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Alertmanager configuration (H-L4).
+#
+# Default routes to a no-op ('null') receiver so the alerting pipeline is LIVE
+# — alerts fire and are visible in the Prometheus and Alertmanager UIs — without
+# requiring an external notification channel. To get out-of-band notification,
+# fill in a receiver below (Slack / email / webhook to the gateway
+# operator_alert intake) and point the route at it.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'null'
+  group_by: ['alertname', 'category']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 3h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: 'null'        # replace with a paging receiver for criticals
+      repeat_interval: 1h
+
+receivers:
+  - name: 'null'
+  # Example — Slack (set the webhook, then route to 'slack' above):
+  # - name: 'slack'
+  #   slack_configs:
+  #     - api_url: '${ALERTMANAGER_SLACK_WEBHOOK}'
+  #       channel: '#noo-alerts'
+  #       title: '{{ .CommonAnnotations.summary }}'
+  #       text: '{{ .CommonAnnotations.description }}'
+  # Example — generic webhook (e.g. the gateway operator_alert intake):
+  # - name: 'webhook'
+  #   webhook_configs:
+  #     - url: 'https://gateway:8080/api/operator/alert-intake'

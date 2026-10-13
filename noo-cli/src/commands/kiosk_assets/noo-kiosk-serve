@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""noo-kiosk-serve — the display's local proxy. The browser's only hop.
+
+Stdlib only (a stock Ubuntu has python3, nothing else is promised).
+
+WHY THIS EXISTS. The kiosk bundle holds no credential — see
+`ui/apps/web/src/kiosk/main.tsx`, which says so and names this program.
+`createMetisClient({ baseUrl: '' })` is given no token store and no auth
+fetch, so the page sends no Authorization header, ever. Something has to
+attach one, and the page's authors put that something on the device
+rather than in the DOM: a bearer token in the DOM of a machine standing
+unattended in a corridor is extractable, because "locked in kiosk mode"
+means no window manager, not no USB port and no devtools.
+
+So: the browser talks ONLY to 127.0.0.1. It never learns the controller
+URL, and there is nothing in it worth taking.
+
+WHAT THIS PROXIES, AND NOTHING ELSE.
+
+  public, no credential   /kiosk.html, /assets/*, /favicon.ico
+                          (the gateway serves these unauthenticated too —
+                          the bundle is not the secret)
+  read, with the token    READ_PATHS + READ_PREFIXES below
+  everything else         404 here, never forwarded
+
+The read list MIRRORS `auth::KIOSK_READ_PATHS` in the gateway, and
+`the_proxy_allowlist_matches_the_gateway` fails if the two drift. Two
+allow-lists that disagree would mean either a tile that cannot load or a
+path the display can reach that the gateway never meant it to.
+
+THE CREDENTIAL IS NOT STORED. This mints by proving the display's tailnet
+identity, by shelling out to `noo-kiosk-cdp mint` — the same mint the
+launcher used, kept in one place so there is one dialback implementation
+to be correct about. The token lands in token.json (0600) and is re-minted
+before expiry.
+
+WHEN THE MINT FAILS this keeps serving the bundle and answers 401 on the
+API. That is deliberate: the page renders its own "credential rejected"
+band, which is a display saying what is wrong, where a dead port would be
+a browser error page saying nothing. The reason goes to last-error, which
+`noo kiosk status` reads — the journal has swallowed these before.
+
+WHEN THE GATEWAY IS DOWN the page itself cannot load, so the page's own
+band and self-reload never run — and neither does the watchdog's reload,
+which keys on a heartbeat only the page sets. A controller that went down
+and came back left the display on a 502 until someone ran `noo kiosk
+reload` (2026-09-24). So a PAGE path that cannot be fetched gets a holding
+page instead: it says what it is waiting for, and reloads itself into the
+real page once the gateway answers again.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = os.environ.get("NOO_KIOSK_STATE", "/var/lib/kiosk")
+TOKEN_FILE = os.path.join(STATE, "token.json")
+STATE_FILE = os.path.join(STATE, "state.json")
+MINT_CMD = os.environ.get("NOO_KIOSK_MINT_CMD", "noo-kiosk-cdp")
+RENEW_BEFORE = 120  # seconds; the watchdog uses the same margin
+PUBLISH_EVERY = 30  # seconds; keeps `updated_at` honest about being alive
+
+# Bundle paths, served WITHOUT a credential because the gateway serves
+# them without one (`auth::PUBLIC_PATHS_EXACT`). The bundle is not the
+# secret; the credential is, and it is not in there.
+PUBLIC_PATHS = ("/kiosk.html", "/kiosk", "/favicon.ico")
+PUBLIC_PREFIXES = ("/assets/",)
+
+# MIRRORS auth::KIOSK_READ_PATHS. Keep the order and the comments aligned
+# with the gateway's copy so a diff between them reads as a diff.
+READ_PATHS = (
+    "/api/cluster/status",
+    "/api/cluster/gpu-metrics",
+    "/api/jobs",
+    "/api/scheduler/status",
+    "/api/heartbeat/status",
+    "/api/memory/health",
+    "/api/v1/rag/status",
+    "/api/events/stream",
+)
+# NOT here, deliberately: "/api/v1/graph/clusters/overview". The graph view
+# reads /api/kiosk/graph (covered by READ_PREFIXES), which withholds names
+# unless asked; the general route returns them unconditionally.
+# `/api/kiosk/` covers the add-ons tile too: it reads /api/kiosk/addons,
+# not /health. /health needs no credential, so forwarding it here handed
+# the display the gateway version, engine, peer count and dependency
+# health to render four words.
+READ_PREFIXES = ("/api/kiosk/",)
+
+STREAM_PATH = "/api/events/stream"
+
+# The paths a browser NAVIGATES to. Only these get the holding page: an
+# asset or an API read that fails is the loaded page's business, and it
+# already shows that in its band.
+PAGE_PATHS = ("/kiosk.html", "/kiosk")
+# How often the holding page asks whether the gateway is back.
+HOLD_RETRY_S = 10
+
+
+def log(msg):
+    print(f"noo-kiosk-serve: {msg}", file=sys.stderr, flush=True)
+
+
+# ── published state ────────────────────────────────────────────────────
+#
+# `noo kiosk status` MUST work without sudo. A status command that asks
+# for a password gets run less often, and this is a display nobody is
+# watching — the one place where "I checked and it was fine" has to be
+# cheap. So the proxy publishes what it knows to a WORLD-READABLE file
+# and status reads that, rather than reaching into root-owned things.
+#
+# Nothing secret goes in here. The token's EXPIRY is a timestamp; the
+# token is not. token.json stays 0600 and status never opens it.
+#
+# The proxy is also the only thing that can answer these honestly: it
+# holds the credential, so it knows when the last mint was and whether it
+# worked. Reading the config instead would report what was CONFIGURED,
+# which is a different question and the one that produced
+# "key (pre-keyless)" on an install that has no key.
+
+_state = {
+    "mint": "tailnet",
+    "minted_at": None,
+    "expires_at": None,
+    "last_error": None,
+    "last_error_at": None,
+    "port": None,
+}
+_state_lock = threading.Lock()
+
+
+def publish(**updates):
+    """Write state.json (0644, atomic). Best effort: a proxy that cannot
+    write its state dir must still serve the display."""
+    with _state_lock:
+        _state.update(updates)
+        doc = dict(_state)
+    # From the unit's EnvironmentFile, so it is what the seat actually
+    # runs with. Absent stays absent — status prints "unknown" rather
+    # than inventing a default.
+    doc["mode"] = os.environ.get("NOO_KIOSK_MODE") or None
+    doc["vt"] = os.environ.get("NOO_KIOSK_VT") or None
+    doc["view"] = os.environ.get("NOO_KIOSK_VIEW") or None
+    doc["updated_at"] = int(time.time())
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f)
+        os.chmod(tmp, 0o644)  # umask can strip the mode above
+        os.replace(tmp, STATE_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_startup(cred, port):
+    """The first publish, before serving.
+
+    A restart finds the still-valid token.json the previous proxy left,
+    and `get()` reuses it WITHOUT minting until it nears expiry — so for
+    up to thirteen minutes nothing would publish `expires_at`, and status
+    read that silence as "the proxy has published no state" beside a
+    `state published: 6s ago` row. Publish what was carried over. The
+    expiry is a timestamp; the token stays in its 0600 file. `minted_at`
+    stays null because this proxy has not minted — status says so in
+    those words rather than borrowing the previous proxy's mint.
+    """
+    _, exp = cred._read()
+    publish(port=port, expires_at=exp or None)
+
+
+def record_error(msg):
+    """The reason the display has no credential, where status can read it.
+
+    Replaces rather than accumulates: the question is always "why is it
+    failing NOW".
+    """
+    log(msg)
+    publish(last_error=msg, last_error_at=int(time.time()))
+
+
+# When the gateway was first found unreachable, so the holding page can
+# say "since 14:02" rather than restart its count at every reload. Cleared
+# by the next answer the gateway gives.
+_down_since = None
+_down_lock = threading.Lock()
+
+
+def upstream_failed():
+    global _down_since
+    with _down_lock:
+        if _down_since is None:
+            _down_since = int(time.time())
+        return _down_since
+
+
+def upstream_answered():
+    global _down_since
+    with _down_lock:
+        _down_since = None
+
+
+HOLDING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Waiting for the controller</title>
+<style>
+html,body{margin:0;height:100%;background:#0b0e14;color:#c9d1d9;
+  font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{height:100%;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:.6rem;text-align:center;padding:0 1rem}
+h1{margin:0;font-weight:500;font-size:clamp(1.6rem,4vw,3rem);color:#e6edf3}
+p{margin:0;color:#8b949e;font-size:clamp(1rem,1.6vw,1.3rem)}
+.dot{width:14px;height:14px;border-radius:50%;background:#d29922;
+  animation:pulse 2s ease-in-out infinite;margin-bottom:.6rem}
+@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+code{color:#6e7681;font-size:.85rem}
+</style></head><body><main>
+<div class="dot"></div>
+<h1>Waiting for the controller</h1>
+<p id="since">The display will reconnect by itself.</p>
+<code id="why">__WHY__</code>
+</main><script>
+(function(){
+  var since = __SINCE__ * 1000, every = __RETRY__ * 1000;
+  var el = document.getElementById('since');
+  function tick(){
+    var m = Math.floor((Date.now() - since) / 60000);
+    var at = new Date(since).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    el.textContent = 'Unreachable since ' + at + (m > 0 ? ' (' + m + ' min)' : '') +
+      ' \u2014 the display will reconnect by itself.';
+  }
+  function probe(){
+    fetch(location.pathname, {method:'HEAD', cache:'no-store'})
+      .then(function(r){ if (r.ok) location.reload(); })
+      .catch(function(){});
+  }
+  tick(); setInterval(tick, 15000); setInterval(probe, every);
+})();
+</script></body></html>
+"""
+
+
+def holding_page(why, since):
+    """The page shown in place of the dashboard while the gateway is away.
+
+    Self-contained: no asset it could fail to fetch. Retries by HEAD on its
+    own path and reloads only on a 200, so it never flashes a browser error
+    page between attempts. `why` is escaped — it is an exception string.
+    """
+    import html
+
+    return (
+        HOLDING_PAGE.replace("__WHY__", html.escape(why))
+        .replace("__SINCE__", str(int(since)))
+        .replace("__RETRY__", str(HOLD_RETRY_S))
+        .encode()
+    )
+
+
+def allowed(path):
+    """(public, authed) — both False means: do not forward this at all."""
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
+        return True, False
+    if path in READ_PATHS or path.startswith(READ_PREFIXES):
+        return False, True
+    return False, False
+
+
+class Credential:
+    """The token, and the only thing that knows how to get one.
+
+    Minting is serialised: several tiles load at once, and a burst of
+    parallel mints would be several dialbacks racing for one port.
+    """
+
+    def __init__(self, mint_cmd=MINT_CMD):
+        self._lock = threading.Lock()
+        self._mint_cmd = mint_cmd
+
+    def _read(self):
+        try:
+            with open(TOKEN_FILE) as f:
+                rec = json.load(f)
+            return rec.get("token"), int(rec.get("expires_at") or 0)
+        except Exception:  # noqa: BLE001
+            return None, 0
+
+    def _mint(self):
+        try:
+            out = subprocess.run(
+                [self._mint_cmd, "mint"], capture_output=True, text=True, timeout=90
+            )
+        except Exception as e:  # noqa: BLE001
+            record_error(f"mint could not run ({self._mint_cmd}): {e}")
+            return False
+        if out.returncode != 0:
+            why = (out.stderr or out.stdout or "").strip().splitlines()
+            record_error(f"mint failed: {why[-1] if why else f'exit {out.returncode}'}")
+            return False
+        return True
+
+    def get(self):
+        """A usable token, or None. Never raises — a failed mint is a 401."""
+        with self._lock:
+            tok, exp = self._read()
+            if tok and exp - int(time.time()) > RENEW_BEFORE:
+                return tok
+            if self._mint():
+                tok, exp = self._read()
+                if tok:
+                    # A mint that worked answers the question status asks,
+                    # so the previous failure stops being the answer.
+                    publish(
+                        minted_at=int(time.time()),
+                        expires_at=exp,
+                        last_error=None,
+                        last_error_at=None,
+                    )
+                    return tok
+            # Fall back to a still-valid token rather than nothing: a mint
+            # that failed with 10 minutes left on the clock is a problem
+            # for the NEXT renewal, not a reason to blank the screen now.
+            if tok and exp > int(time.time()):
+                log("mint failed; serving with the token already held")
+                return tok
+            return None
+
+
+class Proxy(BaseHTTPRequestHandler):
+    upstream = ""
+    cred = None
+    protocol_version = "HTTP/1.1"
+    server_version = "noo-kiosk-serve"
+    sys_version = ""
+
+    def log_message(self, *_a):  # the journal has enough
+        return
+
+    def do_HEAD(self):  # noqa: N802
+        self._handle(body=False)
+
+    def do_GET(self):  # noqa: N802
+        self._handle(body=True)
+
+    def _refuse(self, code, msg):
+        body = json.dumps({"error": {"message": msg}}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hold(self, body, why):
+        """503 + the holding page. 503, not 200: nothing that checks the
+        status should mistake this for the dashboard."""
+        page = holding_page(why, upstream_failed())
+        self.send_response(503)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Retry-After", str(HOLD_RETRY_S))
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        if body:
+            try:
+                self.wfile.write(page)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle(self, body):
+        split = urllib.parse.urlsplit(self.path)
+        path = split.path
+        public, authed = allowed(path)
+        if not public and not authed:
+            # Never forwarded. The display asks for nine things; anything
+            # else is either a bug or someone at the keyboard.
+            self._refuse(404, "not a path this display serves")
+            return
+
+        token = None
+        if authed:
+            token = self.cred.get() if self.cred else None
+            if not token:
+                # The page renders "credential rejected" for this, which is
+                # a display saying what is wrong. A dead socket would be a
+                # browser error page saying nothing.
+                self._refuse(401, "the display has no usable credential (mint failed)")
+                return
+
+        url = self.upstream + path
+        if split.query:
+            url += "?" + split.query
+        req = urllib.request.Request(url, method="HEAD" if not body else "GET")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        if path == STREAM_PATH:
+            req.add_header("Accept", "text/event-stream")
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            # A 5xx on the PAGE is a gateway that is up but not serving yet
+            # (mid-restart, or a front proxy with nothing behind it) — the
+            # same wait, as far as the display is concerned.
+            if path in PAGE_PATHS and e.code >= 500:
+                self._hold(body, f"gateway answered {e.code} {e.reason}")
+                return
+            upstream_answered()
+            # Pass the gateway's own answer through: a 401 here means the
+            # token was refused, which the band must show as rejected
+            # rather than as a proxy fault.
+            self._refuse(e.code, f"gateway: {e.reason}")
+            return
+        except Exception as e:  # noqa: BLE001
+            record_error(f"upstream unreachable: {e}")
+            if path in PAGE_PATHS:
+                self._hold(body, f"cannot reach the gateway: {e}")
+                return
+            upstream_failed()
+            self._refuse(502, f"cannot reach the gateway: {e}")
+            return
+        upstream_answered()
+
+        if path == STREAM_PATH:
+            self._relay_stream(resp, body)
+        else:
+            self._relay_once(resp, body)
+
+    def _relay_once(self, resp, body):
+        with resp:
+            payload = resp.read() if body else b""
+            self.send_response(resp.status)
+            ctype = resp.headers.get("Content-Type")
+            if ctype:
+                self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if body and payload:
+                try:
+                    self.wfile.write(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _relay_stream(self, resp, body):
+        """Server-sent events, forwarded as they arrive.
+
+        BUFFERING HERE IS THE BUG THAT LOOKS LIKE NOTHING. The page's
+        liveness band reds out on silence, so a proxy that accumulates and
+        flushes at the end shows a display that is connected and dead. The
+        connection is close-delimited on purpose — no Content-Length,
+        nothing to accumulate toward.
+        """
+        self.close_connection = True
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "text/event-stream"))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not body:
+            resp.close()
+            return
+        try:
+            while True:
+                chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception:  # noqa: BLE001
+            # The browser went away, or the gateway did. Either is normal
+            # and the page reconnects; nothing to record.
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def build(upstream, port, cred, host="127.0.0.1"):
+    """The listener. `host` is 127.0.0.1 and the default is not a fallback.
+
+    A wildcard bind would put an AUTHENTICATING proxy on the local
+    network, where no tailnet ACL applies — anyone on the LAN would reach
+    the gateway with the display's credential attached, and nothing would
+    report the difference because the display would keep working.
+    """
+    handler = type("BoundProxy", (Proxy,), {"upstream": upstream.rstrip("/"), "cred": cred})
+    return ThreadingHTTPServer((host, port), handler)
+
+
+# A display set up before the keyless mint kept its service key in
+# /etc/default/kiosk. The KEY lane is retired: the controller no longer
+# serves POST /api/kiosk/token and refuses kiosk-scoped keys on every route,
+# so the value is never sent anywhere — this only names it, once, so an
+# operator reading the journal knows it is dead weight to remove and revoke.
+RETIRED_KEY_VARS = ("NOO_KIOSK_KEY",)
+
+
+def warn_retired_key(env=None):
+    """Log once if a retired key is configured. Returns whether it logged."""
+    env = os.environ if env is None else env
+    held = [k for k in RETIRED_KEY_VARS if env.get(k, "").strip()]
+    if not held:
+        return False
+    log(
+        f"{', '.join(held)} is set but IGNORED — the kiosk key lane is retired; this display "
+        "mints only by tailnet proof. Remove it from /etc/default/kiosk and revoke the key on "
+        "the controller: noo security service-key revoke <consumer> "
+        "(noo security service-key list marks it 'retired scope')"
+    )
+    return True
+
+
+def main(argv):
+    port = int(os.environ.get("NOO_KIOSK_SERVE_PORT", "8088"))
+    it = iter(argv)
+    for tok in it:
+        if tok == "--port":
+            port = int(next(it, ""))
+        elif tok == "--self-test":
+            return self_test()
+        else:
+            print(f"usage: noo-kiosk-serve [--port N]", file=sys.stderr)
+            return 2
+    upstream = os.environ.get("NOO_KIOSK_URL", "").rstrip("/")
+    if not upstream:
+        log("NOO_KIOSK_URL must be set (from /etc/default/kiosk)")
+        return 1
+    warn_retired_key()
+    cred = Credential()
+    srv = build(upstream, port, cred)
+
+    # Publish before serving, so `noo kiosk status` has something to read
+    # from the first second — and keep republishing, so `updated_at` is
+    # evidence the proxy is alive rather than a file left by a dead one.
+    publish_startup(cred, port)
+
+    def refresher():
+        while True:
+            time.sleep(PUBLISH_EVERY)
+            publish()
+
+    threading.Thread(target=refresher, daemon=True).start()
+
+    log(f"serving 127.0.0.1:{port} -> {upstream}")
+    srv.serve_forever(poll_interval=0.5)
+    return 0
+
+
+# ── self-test ──────────────────────────────────────────────────────────
+#
+# Exercised by a Rust test, because the three properties that matter here
+# cannot be read off the source: that an allow-listed path arrives at the
+# gateway WITH a bearer, that a path off the list never arrives at all,
+# and that the stream is relayed in pieces rather than accumulated. The
+# last one is the one that looks fine in review and shows a dead display.
+
+
+def self_test():  # noqa: C901
+    import http.client
+
+    seen = []
+
+    class Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_a):
+            return
+
+        def do_GET(self):  # noqa: N802
+            seen.append((self.path, self.headers.get("Authorization")))
+            if self.path == STREAM_PATH:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for i in range(3):
+                    self.wfile.write(f": keepalive {i}\n\n".encode())
+                    self.wfile.flush()
+                    time.sleep(0.25)
+                return
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    up_url = f"http://127.0.0.1:{up.server_address[1]}"
+
+    class FixedCred:
+        def get(self):
+            return "test-token"
+
+    px = build(up_url, 0, FixedCred())
+    threading.Thread(target=px.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    port = px.server_address[1]
+    failures = []
+
+    def check(name, cond, detail=""):
+        if not cond:
+            failures.append(f"{name}: {detail}")
+
+    # (a) an allow-listed read is forwarded WITH the bearer
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/cluster/status")
+    r = c.getresponse()
+    r.read()
+    check("allowlisted status", r.status == 200, f"got {r.status}")
+    check(
+        "allowlisted carries the bearer",
+        ("/api/cluster/status", "Bearer test-token") in seen,
+        f"upstream saw {seen}",
+    )
+    c.close()
+
+    # (b) a path off the list 404s AND never reaches upstream
+    before = len(seen)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/api/security/service-keys")
+    r = c.getresponse()
+    r.read()
+    check("off-list refused", r.status == 404, f"got {r.status}")
+    check(
+        "off-list never forwarded",
+        len(seen) == before,
+        f"upstream saw {seen[before:]} — the proxy forwarded a path it should have refused",
+    )
+    c.close()
+
+    # (c) the stream arrives in pieces. Read one event and assert it lands
+    # well before the upstream has finished sending them all: a buffering
+    # proxy cannot answer until the last one.
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", STREAM_PATH)
+    r = c.getresponse()
+    t0 = time.monotonic()
+    first = r.read1(64) if hasattr(r, "read1") else r.read(1)
+    dt = time.monotonic() - t0
+    check("stream first chunk", bool(first), "nothing arrived")
+    check(
+        "stream is not buffered",
+        dt < 0.4,
+        f"first chunk took {dt:.2f}s; upstream sends over ~0.75s, so this was accumulated",
+    )
+    c.close()
+
+    # (d) the gateway is DOWN: the page path gets the holding page, which
+    # must retry by itself, and an API read still gets the JSON 502 the
+    # page's band expects. A closed port stands in for the dead gateway.
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+    s.close()
+    dp = build(dead, 0, FixedCred())
+    threading.Thread(target=dp.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    dport = dp.server_address[1]
+    c = http.client.HTTPConnection("127.0.0.1", dport, timeout=5)
+    c.request("GET", "/kiosk.html?view=health")
+    r = c.getresponse()
+    page = r.read().decode()
+    check("holding page status", r.status == 503, f"got {r.status}")
+    check("holding page is html", "text/html" in (r.getheader("Content-Type") or ""), r.getheader("Content-Type"))
+    check("holding page says so", "Waiting for the controller" in page, page[:200])
+    check("holding page retries", "location.reload()" in page and "fetch(location.pathname" in page, "no retry loop")
+    left = [k for k in ("__WHY__", "__SINCE__", "__RETRY__") if k in page]
+    check("holding page has no placeholders left", not left, f"unfilled: {left}")
+    c.close()
+    c = http.client.HTTPConnection("127.0.0.1", dport, timeout=5)
+    c.request("GET", "/api/cluster/status")
+    r = c.getresponse()
+    r.read()
+    check("api read while down stays a 502", r.status == 502, f"got {r.status}")
+    c.close()
+    dp.shutdown()
+
+    # (e) a key left in /etc/default/kiosk by a pre-keyless setup is named
+    # and ignored: the only bearer that ever went upstream above is the
+    # minted one, and the retired variable is noticed, not used.
+    check("retired key noticed", warn_retired_key({"NOO_KIOSK_KEY": "sk-old"}) is True, "not logged")
+    check("blank key is not a finding", warn_retired_key({"NOO_KIOSK_KEY": " "}) is False, "logged a blank")
+    check(
+        "only the minted bearer went upstream",
+        all(a in (None, "Bearer test-token") for _, a in seen),
+        f"upstream saw {seen}",
+    )
+
+    px.shutdown()
+    up.shutdown()
+    if failures:
+        for f in failures:
+            print(f"FAIL {f}", file=sys.stderr)
+        return 1
+    print(
+        "ok: allow-list forwarded with bearer, off-list refused, stream relayed live, "
+        "holding page while the gateway is down, retired key ignored"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

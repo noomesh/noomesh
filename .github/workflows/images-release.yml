@@ -1,0 +1,930 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: stack images release
+
+# Pre-builds the custom Mesh container images (multi-arch amd64+arm64) and
+# pushes them to the org's public GHCR, so setting up a new controller/node is
+# a `docker pull` instead of a from-source `docker build`. Dev keeps building
+# locally (`docker compose build`); others pull the published tags.
+#
+# Trigger: push a namespaced tag, e.g.
+#     git tag stack-v0.3.0 && git push origin stack-v0.3.0
+# or run manually via workflow_dispatch with an explicit `tag` input.
+#
+# Required secrets:
+#   DHI_USERNAME    — Docker Hardened Images (dhi.io) registry user
+#   DHI_TOKEN       — dhi.io token/password (the hardened base images live there)
+# GITHUB_TOKEN (auto) authenticates the GHCR push.
+#
+# The stack release is CORE-ONLY. The licensed add-on images are built and
+# released from the add-ons' OWN private repositories with their own signed
+# lock (not yet available; docs/development/addons.md). Nothing here reads, builds, verifies
+# or locks an add-on image, and the app key reads only trellion and
+# trellion-protocols (the open library the core images are built from).
+
+on:
+  push:
+    tags:
+      - 'stack-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish — v0.3.0 or stack-v0.3.0, either works'
+        required: true
+      dry_run:
+        # Runs `release line` only: resolves the sibling SHAs and prints the
+        # re-tag/build plan for the tag (job summary), and publishes NOTHING —
+        # every other job is skipped. Safe on an already-released tag.
+        description: 'Plan only — print what would be re-tagged or built, publish nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write   # push to ghcr.io/noomesh/*
+
+concurrency:
+  group: stack-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: noomesh   # un-nested: ghcr.io/noomesh/<image>; packages CREATED by this repo (see publish-web.yml)
+  # DHI-derived images (dhi.io mirrors + deps-core / deps-base / static-ffmpeg
+  # layered on them) live under the prefix ghcr.io/noomesh/dhi/<name>, apart
+  # from the stack images at ghcr.io/noomesh/<name>. The hardened bases are
+  # public (DHI Community), so there is no visibility requirement on them.
+  # DHI_OWNER is the path under $REGISTRY, i.e. DHI_REGISTRY=ghcr.io/noomesh/dhi.
+  DHI_OWNER: noomesh/dhi
+  PLATFORMS: linux/amd64,linux/arm64
+  FFMPEG_VERSION: "7.1"           # pinned static-ffmpeg mirror tag
+
+jobs:
+  # Promotion model (dev → staging → main, every repo). A release candidate
+  # `stack-vX.Y.Z-rc.N` is cut on this repo's `staging` and builds the three
+  # sibling repos from THEIR `staging`; a final `stack-vX.Y.Z` is cut on
+  # `main` and builds them from `main`. Siblings therefore never need a dev
+  # freeze: what ships is what was promoted, in every repo. This job refuses
+  # a tag whose commit is not on the branch its kind belongs to, so a tag on
+  # dev (the pre-promotion habit) fails here, before any build lane runs.
+  release-line:
+    name: release line (rc → staging, final → main)
+    # The `release` environment: tag/main-only deployment rule, required reviewer.
+    environment: release
+    # Every job here is skipped outside the canonical repo: a fork that pushes
+    # a stack-v* tag has no app credentials, DHI token or signing seed, and a
+    # release it could not finish must not start. (tests/test_ci_public_safety.py)
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    outputs:
+      sibling_ref: ${{ steps.line.outputs.sibling_ref }}
+      # Each sibling branch resolved to a SHA ONCE, here. Job
+      # outputs are fixed for the life of a run, so `gh run rerun --failed`
+      # rebuilds from the SAME sibling commits as attempt 1 — before this, a
+      # re-run resolved the branch again and could mix two generations of
+      # sibling code into one lock (stack-v0.2.96).
+      trellion_sha: ${{ steps.siblings.outputs.trellion_sha }}
+      # The final re-tag plan (scripts/release-retag-plan.py). For an rc, or
+      # a final with no equal-tree rc, every image is `false` = build.
+      rc_tag: ${{ steps.plan.outputs.rc_tag }}
+      rc_image_tag: ${{ steps.plan.outputs.rc_image_tag }}
+      rc_commit: ${{ steps.plan.outputs.rc_commit }}
+      retag: ${{ steps.plan.outputs.retag }}
+      rc_digests: ${{ steps.plan.outputs.rc_digests }}
+    steps:
+      - name: Checkout (full history)   # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: The tag sits on its promotion branch
+        id: line
+        run: |
+          set -eu
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="stack-${raw#stack-}"
+          case "$tag" in
+            *-rc.*) line=staging ;;
+            *)      line=main ;;
+          esac
+          git fetch --quiet origin "+refs/heads/$line:refs/remotes/origin/$line" 2>fetch.err || {
+            cat fetch.err >&2
+            echo "::error::could not fetch origin/$line (git said: $(tr '\n' ' ' < fetch.err)) — if it does not exist, promote dev → $line before tagging $tag"; exit 1; }
+          commit="$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}")" || {
+            echo "::error::tag $tag not found"; exit 1; }
+          if ! git merge-base --is-ancestor "$commit" "origin/$line"; then
+            echo "::error::$tag (${commit:0:8}) is not on origin/$line. A release candidate (-rc.N) is cut on staging, a final release on main; promote by merge PR first (dev → staging → main), then tag there."
+            exit 1
+          fi
+          echo "sibling_ref=$line" >> "$GITHUB_OUTPUT"
+          echo "$tag (${commit:0:8}) is on origin/$line; siblings build from their $line"
+
+      # an earlier change: one resolution per run, passed to every sibling job by
+      # SHA. The siblings are public: the resolve reads them anonymously.
+      - name: Resolve each sibling branch to a SHA (once per run)
+        id: siblings
+        env:
+          LINE: ${{ steps.line.outputs.sibling_ref }}
+        run: |
+          set -eu
+          # scripts/sibling-refs.py runs git OUTSIDE the checkout with
+          # http.extraheader cleared. ci.yml resolves its siblings with the
+          # same script, so a promotion PR tests the commits this run will pin.
+          python3 scripts/sibling-refs.py resolve "$LINE" trellion
+
+      # FINAL = RE-TAG THE RC. A final is cut
+      # from a tree byte-identical to an rc; every image whose inputs are
+      # provably unchanged (this tree, and each sibling's tree vs the one the
+      # rc lock recorded) is re-tagged from the rc's digest instead of rebuilt.
+      # gateway and node-agent stamp the tag into their bits and always build.
+      # The rules, and why each fails open to BUILD, are in the script.
+      - name: Plan — re-tag from the rc, or build
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Kill switch: `gh variable set RELEASE_RETAG --body off` builds everything.
+          RELEASE_RETAG: ${{ vars.RELEASE_RETAG }}
+        run: |
+          set -eu
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="stack-${raw#stack-}"
+          python3 scripts/release-retag-plan.py --tag "$tag" \
+            --sibling-sha "trellion=${{ steps.siblings.outputs.trellion_sha }}"
+          rc="$(sed -n 's/^rc_tag=//p' "$GITHUB_OUTPUT" | tail -1)"
+          echo "rc_image_tag=${rc#stack-}" >> "$GITHUB_OUTPUT"
+
+  # Mirror the upstream static-ffmpeg image into our GHCR namespace so the
+  # gateway COPYs its binaries from our own registry (no build-time download,
+  # no anti-bot, no Docker Hub dependency at gateway-build time).
+  static-ffmpeg:
+    name: static-ffmpeg (mirror → GHCR)
+    needs: [release-line]
+    if: github.repository == 'noomesh/noomesh' && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: GHCR login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      - name: Docker Hub login (authenticated pull of the upstream image)
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -n "$DHI_TOKEN" ]; then
+            echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+              || echo "docker.io login failed — continuing anonymous" >&2
+          fi
+      - name: Mirror mwader/static-ffmpeg → GHCR (multi-arch manifest copy)
+        run: |
+          set -eux
+          docker buildx imagetools create \
+            --tag "$REGISTRY/$DHI_OWNER/static-ffmpeg:$FFMPEG_VERSION" \
+            "docker.io/mwader/static-ffmpeg:$FFMPEG_VERSION"
+
+  # deps-core is the NON-ML tier of the shared Python base:
+  # base deps + web/cache/feedback/pgvector/google-chat/mcp extras, no
+  # torch and no noo-trellion — so no trellion checkout and no sibling read token
+  # secret here. It must publish first: sandbox + worker FROM it
+  # directly (DEPS_CORE build-arg), and deps-base FROMs it to add the ML
+  # tier on top.
+  deps-core:
+    name: deps-core (amd64)
+    needs: [release-line]
+    if: github.repository == 'noomesh/noomesh' && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    env:
+      RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-core'] }}
+      RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
+      RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-core'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
+    steps:
+      - name: Checkout   # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Hosted runner: no persistent builder or disk. A docker-container
+      # builder (multi-platform, type=gha layer cache) and a roomier disk.
+      - name: Free disk (preinstalled toolchains the build does not use)
+        if: env.RETAG != 'true'
+        run: scripts/ci-free-disk.sh
+      - name: Set up buildx   # docker/setup-buildx-action@v3
+        if: env.RETAG != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
+      - name: Resolve tag
+        run: |
+          set -eu
+          # Strip `stack-` from EITHER source. The push path always had to
+          # (the git tag is stack-vX, the image tag is vX); the dispatch path
+          # took its input verbatim, so the two entry points disagreed about
+          # what a "tag" is. Dispatching `stack-v0.2.25` — the git tag, the
+          # obvious thing to type — published every image as
+          # `:stack-v0.2.25` and wrote `stack-stack-v0.2.25.lock`, and the
+          # launcher strips, so it looked for `:v0.2.25` and found nothing.
+          # An input that is wrong only for the value a human would naturally
+          # pass is worse than one that is always wrong.
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
+          # A release candidate never moves `:latest` (promotion model).
+          case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
+
+      - name: Registry logins (GHCR + dhi.io)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+
+      - name: Re-tag deps-core from the rc
+        if: env.RETAG == 'true'
+        run: bash scripts/release-retag-image.sh deps-core "$RC_TAG" "$TAG" "$RC_DIGEST"
+
+      - name: Build + push deps-core
+        if: env.RETAG != 'true'
+        run: |
+          set -eux
+          # Controller-side image: amd64 only, same policy as deps-base.
+          docker buildx build --push \
+            --platform linux/amd64 \
+            -f docker/Dockerfile.deps-core \
+            --cache-from type=gha,scope=deps-core \
+            --cache-to type=gha,mode=max,scope=deps-core \
+            --build-arg DHI_REGISTRY="$REGISTRY/$DHI_OWNER" \
+            -t "$REGISTRY/$DHI_OWNER/deps-core:$TAG" \
+            ${PUSH_LATEST:+-t "$REGISTRY/$DHI_OWNER/deps-core:latest"} \
+            .
+
+      # The base's digest goes into stack-$TAG.bases (signed, attached next to
+      # the lock — NOT into the lock, whose rows the launcher turns into
+      # NOO_IMAGE_DIGEST_* pins). A final that re-tags this base from the rc
+      # checks the rc tag still resolves to this digest.
+      - name: Record deps-core digest
+        run: |
+          set -eu
+          mkdir -p bases
+          d="$(docker buildx imagetools inspect "$REGISTRY/$DHI_OWNER/deps-core:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "deps-core@$d" | tee bases/deps-core
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bases-deps-core
+          path: bases/deps-core
+          retention-days: 7
+
+  # deps-base is the ML tier — FROM the deps-core published above, plus the
+  # ML extras and noo-trellion. It must publish before the images matrix:
+  # trellion pulls it per-arch from GHCR via the DEPS_BASE build-arg.
+  deps-base:
+    name: deps-base (multi-arch)
+    # The `release` environment: tag/main-only deployment rule, required reviewer.
+    environment: release
+    needs: [deps-core, release-line]
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    env:
+      RETAG: ${{ fromJSON(needs.release-line.outputs.retag)['deps-base'] }}
+      RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
+      RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-base'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
+    steps:
+      - name: Checkout   # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Hosted runner: no persistent builder or disk. A docker-container
+      # builder (multi-platform, type=gha layer cache) and a roomier disk.
+      - name: Free disk (preinstalled toolchains the build does not use)
+        if: env.RETAG != 'true'
+        run: scripts/ci-free-disk.sh
+      - name: Set up buildx   # docker/setup-buildx-action@v3
+        if: env.RETAG != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
+      # deps-base does `COPY --from=trellion` (compose supplies this as the
+      # `trellion` additional build-context = the ../trellion sibling). CI
+      # checks the trellion repo out and passes it as a named build context so
+      # buildx doesn't try to pull `trellion` as a docker image.
+      - name: Checkout noo-trellion (deps-base build context)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: personifAI/trellion
+          # The SHA release-line resolved from staging (-rc.N) / main (final),
+          # never the branch: a re-run must build what attempt 1 built (826).
+          ref: ${{ needs.release-line.outputs.trellion_sha || needs.release-line.outputs.sibling_ref }}
+          path: _trellion
+
+      # A stack tag pins THIS repo's commit and the image digests, but the
+      # trellion image is built from whatever trellion `dev` held at
+      # build time — so the lock could answer "which image ran" while
+      # saying nothing about whether it contained a given change. It shipped
+      # v0.2.20 without trellion #57 for exactly that reason (2026-09-04).
+      # Recording the resolved SHA makes the lock answer both questions.
+      - name: Record the trellion source SHA for the lock
+        run: |
+          set -eu
+          mkdir -p digests
+          sha="$(git -C _trellion rev-parse HEAD)"
+          echo "source:trellion@${sha}" > digests/source-trellion
+          echo "trellion source: ${sha}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: digest-source-trellion
+          path: digests/source-trellion
+          retention-days: 7
+
+      # deps-base also needs trellion-protocols, which trellion pins by full
+      # commit in its pyproject.toml (Dockerfile.deps-base resolves it from this
+      # build context and refuses any other commit). Resolved from the trellion
+      # checkout above, so a re-run builds the same thing. A trellion older
+      # than the pin does not use it; dev is checked out only to satisfy COPY.
+      # The grep reads a file; no git runs inside the workspace (#863).
+      - name: Resolve the trellion-protocols commit trellion pins
+        id: protocols
+        run: |
+          set -eu
+          # The repository comes from the pin too: trellion moved its pin to
+          # the public home once, and a hardcoded repo here then asked the
+          # old one for a commit it never had ("not our ref").
+          pin="$(grep -oE 'github\.com/[A-Za-z0-9._-]+/trellion-protocols\.git@[0-9a-f]{40}' _trellion/pyproject.toml | head -1 || true)"
+          sha="${pin##*@}"
+          repo="$(printf '%s' "${pin%%.git@*}" | sed 's#^github\.com/##')"
+          if [ -z "$pin" ] && grep -q 'trellion-protocols' _trellion/pyproject.toml; then
+            echo "::error::trellion names trellion-protocols but no github.com/<owner>/trellion-protocols.git@<sha> pin was found"; exit 1
+          fi
+          echo "trellion-protocols: ${pin:-unpinned (trellion predates it) -> personifAI/trellion-protocols@dev}"
+          echo "sha=${sha:-dev}" >> "$GITHUB_OUTPUT"
+          echo "repo=${repo:-personifAI/trellion-protocols}" >> "$GITHUB_OUTPUT"
+      - name: Checkout trellion-protocols (deps-base build context)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ steps.protocols.outputs.repo }}
+          ref: ${{ steps.protocols.outputs.sha }}
+          path: _trellion_protocols
+
+      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v3.2.0
+        if: env.RETAG != 'true'
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+        with:
+          platforms: arm64
+
+      - name: Resolve tag
+        run: |
+          set -eu
+          # Strip `stack-` from EITHER source. The push path always had to
+          # (the git tag is stack-vX, the image tag is vX); the dispatch path
+          # took its input verbatim, so the two entry points disagreed about
+          # what a "tag" is. Dispatching `stack-v0.2.25` — the git tag, the
+          # obvious thing to type — published every image as
+          # `:stack-v0.2.25` and wrote `stack-stack-v0.2.25.lock`, and the
+          # launcher strips, so it looked for `:v0.2.25` and found nothing.
+          # An input that is wrong only for the value a human would naturally
+          # pass is worse than one that is always wrong.
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
+          # A release candidate never moves `:latest` (promotion model).
+          case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
+
+      - name: Registry logins (GHCR + dhi.io)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+
+      - name: Re-tag deps-base from the rc
+        if: env.RETAG == 'true'
+        run: bash scripts/release-retag-image.sh deps-base "$RC_TAG" "$TAG" "$RC_DIGEST"
+
+      - name: Build + push deps-base
+        if: env.RETAG != 'true'
+        run: |
+          set -eux
+          # Controller-side image: amd64 only. The heavy Python/CUDA stack runs
+          # on x86 GPU nodes; arm64 edge nodes run node-agent + llama.cpp, not
+          # this base. (nvidia-cudnn-cu13 also has no clean arm64 wheel.)
+          docker buildx build --push \
+            --platform linux/amd64 \
+            -f docker/Dockerfile.deps-base \
+            --cache-from type=gha,scope=deps-base \
+            --cache-to type=gha,mode=max,scope=deps-base \
+            --build-arg DHI_REGISTRY="$REGISTRY/$DHI_OWNER" \
+            --build-arg DEPS_CORE="$REGISTRY/$DHI_OWNER/deps-core:$TAG" \
+            --build-context trellion=_trellion \
+            --build-context trellion_protocols=_trellion_protocols \
+            -t "$REGISTRY/$DHI_OWNER/deps-base:$TAG" \
+            ${PUSH_LATEST:+-t "$REGISTRY/$DHI_OWNER/deps-base:latest"} \
+            .
+      # The base's digest goes into stack-$TAG.bases (signed, attached next to
+      # the lock — NOT into the lock, whose rows the launcher turns into
+      # NOO_IMAGE_DIGEST_* pins). A final that re-tags this base from the rc
+      # checks the rc tag still resolves to this digest.
+      - name: Record deps-base digest
+        run: |
+          set -eu
+          mkdir -p bases
+          d="$(docker buildx imagetools inspect "$REGISTRY/$DHI_OWNER/deps-base:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "deps-base@$d" | tee bases/deps-base
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bases-deps-base
+          path: bases/deps-base
+          retention-days: 7
+
+  # Everything else. Images that FROM a shared base receive DEPS_CORE /
+  # DEPS_BASE pointing at the GHCR ref published above (so buildx pulls the
+  # correct arch per platform). needs deps-base, which needs deps-core — so
+  # both tiers are published before any consumer builds.
+  images:
+    name: ${{ matrix.name }} (multi-arch)
+    # The `release` environment: tag/main-only deployment rule, required reviewer.
+    environment: release
+    needs: [deps-base, static-ffmpeg, release-line]
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    env:
+      RETAG: ${{ fromJSON(needs.release-line.outputs.retag)[matrix.image] }}
+      RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
+      RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)[matrix.image] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gateway: amd64 only. It is the controller control plane and edge
+          # nodes do not run it; the constraint is its compiled Rust target,
+          # NOT deps-base.
+          #
+          # No DEPS_BASE, and no Python at all any more. The first sentence
+          # here used to read "gateway FROMs the amd64-only deps-base", which
+          # had already been false since an earlier change — and the very
+          # next line said so. an earlier change then removed the small
+          # Python dependency stage that replaced it: the runtime is now
+          # dhi.io/python NON-DEV (shell-less, no interpreter invoked, no
+          # alembic/sqlalchemy/psycopg), 640 MB -> 212 MB.
+          - name: gateway
+            image: gateway
+            dockerfile: docker/Dockerfile.gateway-rust
+            context: .
+            platforms: linux/amd64
+            # The gateway embeds the TAGGED console artifact — every build,
+            # not just releases: the vendored second console is gone.
+            #
+            # UI_IMAGE is passed as $TAG, exactly like DEPS_CORE and DEPS_BASE
+            # below, so a gateway tagged stack-vX embeds the console tagged
+            # stack-vX. That is the whole reason the console publishes on the
+            # stack tag now: one version line for the thing that ships.
+            #
+            # This step DID once override UI_IMAGE and the pins DRIFTED —
+            # releases shipped v0.1.5 while a local build got v0.1.6 — and the
+            # fix at the time was to delete the override and keep the
+            # Dockerfile default as the single pin. That fixed the symptom and
+            # kept the cause: TWO LITERALS, hand-maintained, nothing comparing
+            # them. It then sat at v0.1.7 through every release since.
+            #
+            # A literal and a variable cannot drift. $TAG is the same string
+            # the image being built is tagged with, so there is no second value
+            # to disagree. The Dockerfile default is now only a LOCAL-build
+            # fallback and is marked as such.
+            extra_args: --build-arg UI_IMAGE=$REGISTRY/$OWNER/mesh-ui-web:$TAG
+          # node-agent is Go (no CUDA) and runs on every node incl. arm64 edge.
+          # Version build-args: the Dockerfile has always accepted these and
+          # no invocation passed them, so every image-built agent reported
+          # app_version "dev" — which muddied every upgrade verification
+          # (HOST3 2026-08-17, host9-sensors 2026-08-28). github.ref_name is
+          # the stack-vX.Y.Z tag this workflow runs for.
+          - name: node-agent
+            image: node-agent
+            dockerfile: docker/Dockerfile.node-agent-go
+            context: .
+            platforms: linux/amd64,linux/arm64
+            extra_args: --build-arg NODE_AGENT_VERSION=${{ github.ref_name }} --build-arg NODE_AGENT_COMMIT=${{ github.sha }}
+          # ── Remaining controller-profile first-party images ──────────────
+          # Published so `pai stack start --dist` is a genuine pull-only
+          # install (no local build). All amd64: the controller is x86.
+          #
+          # sandbox + worker FROM deps-core, the non-ML tier
+          # — neither runs models, so neither pays for the ML
+          # tree. No trellion build-context: deps-core does not bake
+          # noo-trellion in (only deps-base, and therefore trellion, does).
+          - name: sandbox
+            image: sandbox
+            dockerfile: docker/Dockerfile.sandbox
+            context: .
+            platforms: linux/amd64
+            extra_args: --build-arg DEPS_CORE=$REGISTRY/$DHI_OWNER/deps-core:$TAG
+          # worker: the slim always-on Python runtime (an earlier change
+          # flip) — FROM deps-core like the sandbox, no ML tree.
+          - name: worker
+            image: worker
+            dockerfile: docker/Dockerfile.worker
+            context: .
+            platforms: linux/amd64
+            extra_args: --build-arg DEPS_CORE=$REGISTRY/$DHI_OWNER/deps-core:$TAG
+          # trellion is the Python worker pool. It became a CONTROLLER-profile
+          # service when the gateway's in-process pool was removed (proposal
+          # 19), so `--dist` must be able to pull it or a pull-only install
+          # falls back to building it from source. It is the ONE consumer of
+          # deps-base (the ML tier), which already bakes in noo-trellion — so
+          # no trellion build-context is needed here.
+          # FFMPEG_IMAGE matters HERE, not on the gateway: trellion runs the
+          # vidmem handlers and copies ffmpeg/ffprobe. Without this the build
+          # falls back to the Docker Hub default, which is exactly the
+          # anti-bot / external-dependency problem the GHCR mirror exists to
+          # avoid.
+          - name: trellion
+            image: trellion
+            dockerfile: docker/Dockerfile.trellion
+            context: .
+            platforms: linux/amd64
+            extra_args: --build-arg DEPS_BASE=$REGISTRY/$DHI_OWNER/deps-base:$TAG --build-arg FFMPEG_IMAGE=$REGISTRY/$DHI_OWNER/static-ffmpeg:$FFMPEG_VERSION
+          # Voice providers. Opt-in at RUNTIME (compose profile "voice"), but
+          # that is not a reason to leave them unpublished: `--dist` is meant
+          # to be pull-only for whatever profiles the operator enables, and an
+          # unpublished image silently turns voice into a source build.
+          #
+          # Neither derives from deps-base — both are python:3.12-slim pinned
+          # by digest with only their own runtime — so no DEPS_BASE arg.
+          - name: whisper
+            image: whisper
+            dockerfile: docker/Dockerfile.whisper
+            context: .
+            platforms: linux/amd64
+            extra_args: ""
+          - name: piper
+            image: piper
+            dockerfile: docker/Dockerfile.piper
+            context: .
+            platforms: linux/amd64
+            extra_args: ""
+          # postgres is self-contained (dhi.io base + pgvector compile).
+          # Image name intentionally differs from the compose service name.
+          - name: postgres
+            image: postgres-pgvector
+            dockerfile: docker/Dockerfile.postgres
+            context: .
+            platforms: linux/amd64
+            extra_args: ""
+          # llamacpp: the hardened llama-server, x86 only. ARM nodes resolve
+          # to the upstream multi-arch ghcr.io/ggml-org/llama.cpp:server
+          # (node-agent's llamacppDefaultImage), so building it here for
+          # arm64 would ship an image nothing asks for — and it is a
+          # from-source CMake build, so the QEMU cost is real.
+          #
+          # It was absent from this matrix entirely until 2026-09-04, which
+          # meant a --dist install could never start llamacpp on an x86
+          # node: the agent asked for pai-assistant/llamacpp:latest, a name
+          # that only exists on a machine that BUILT it, and the pull failed
+          # with "pull access denied". Found on host8 placing a gemma-4 12B.
+          #
+          # Its Dockerfile ships in the tree (docker/Dockerfile.llamacpp; see
+          # docker/README-llamacpp.md), so this is a normal core leg: a missing
+          # Dockerfile fails the build, and the lock always carries a llamacpp row.
+          - name: llamacpp
+            image: llamacpp
+            dockerfile: docker/Dockerfile.llamacpp
+            context: .
+            platforms: linux/amd64
+            extra_args: ""
+          # stunnel: the mTLS sidecar image (alpine + stunnel + openssl for
+          # the healthcheck). Built locally by every other stunnel-* service
+          # (inference-node profiles), but stunnel-ollama-embed fronts the
+          # standalone profile's embedder on EVERY standalone install, and a
+          # --dist install never builds — so it is published, from the
+          # ./docker context like nvidia-exporter.
+          #
+          # Multi-arch (like node-agent): the node agent runs stunnel sidecars
+          # beside the backends it starts, and some nodes are arm64 (host6
+          # under Docker Desktop, host9/host2). Without an arm64 image the
+          # agent falls back to plain alpine + `apk add stunnel` on every
+          # sidecar start (an earlier change §B). The build is two apk installs,
+          # so the QEMU leg costs seconds, not the CMake minutes llamacpp would.
+          - name: stunnel
+            image: stunnel
+            dockerfile: docker/Dockerfile.stunnel
+            context: ./docker
+            platforms: linux/amd64,linux/arm64
+            extra_args: ""
+          # nvidia-exporter builds from the ./docker context (not the repo root).
+          - name: nvidia-exporter
+            image: nvidia-exporter
+            dockerfile: docker/Dockerfile.nvidia-exporter
+            context: ./docker
+            platforms: linux/amd64
+            extra_args: ""
+    steps:
+      - name: Checkout   # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Hosted runner: no persistent builder or disk. A docker-container
+      # builder (multi-platform, type=gha layer cache) and a roomier disk.
+      - name: Free disk (preinstalled toolchains the build does not use)
+        if: env.RETAG != 'true'
+        run: scripts/ci-free-disk.sh
+      - name: Set up buildx   # docker/setup-buildx-action@v3
+        if: env.RETAG != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+
+      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v3.2.0
+        if: env.RETAG != 'true'
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+        with:
+          platforms: arm64
+
+      - name: Resolve tag
+        run: |
+          set -eu
+          # Strip `stack-` from EITHER source. The push path always had to
+          # (the git tag is stack-vX, the image tag is vX); the dispatch path
+          # took its input verbatim, so the two entry points disagreed about
+          # what a "tag" is. Dispatching `stack-v0.2.25` — the git tag, the
+          # obvious thing to type — published every image as
+          # `:stack-v0.2.25` and wrote `stack-stack-v0.2.25.lock`, and the
+          # launcher strips, so it looked for `:v0.2.25` and found nothing.
+          # An input that is wrong only for the value a human would naturally
+          # pass is worse than one that is always wrong.
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
+          # A release candidate never moves `:latest` (promotion model).
+          case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
+
+      - name: Registry logins (GHCR + dhi.io)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          set -eu
+          echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+
+      - name: Wait for the tagged console (publish-web.yml)
+        if: matrix.name == 'gateway'
+        run: |
+          set -eu
+          ref="$REGISTRY/$OWNER/mesh-ui-web:$TAG"
+          for i in $(seq 1 60); do
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              echo "console present: $ref"; exit 0
+            fi
+            echo "waiting for $ref ($i/60)"; sleep 20
+          done
+          echo "::error::$ref never appeared — did publish-web.yml run for this tag?"; exit 1
+
+      - name: Re-tag ${{ matrix.name }} from the rc
+        if: env.RETAG == 'true'
+        run: bash scripts/release-retag-image.sh "${{ matrix.image }}" "$RC_TAG" "$TAG" "$RC_DIGEST"
+
+      # Docker Hub bases (alpine, python, nvidia/cuda) come from the GHCR
+      # mirror (.github/hub-mirror.txt, mirror-hub-images.yml): Hub limits
+      # pulls per IP and every runner shares one. A mirror missing one of
+      # this Dockerfile's bases answers docker.io, with a warning.
+      - name: Docker Hub bases from the mirror (Hub on a miss)
+        if: env.RETAG != 'true'
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+          HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+          HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+        run: |
+          # A Hub fallback pulls authenticated (per-account limit, not the IP's).
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/${{ matrix.dockerfile }}")" >> "$GITHUB_ENV"
+
+      - name: Build + push ${{ matrix.name }}
+        if: env.RETAG != 'true'
+        run: |
+          set -eux
+          docker buildx build --push \
+            --platform "${{ matrix.platforms }}" \
+            -f "${{ matrix.dockerfile }}" \
+            --cache-from type=gha,scope=${{ matrix.name }} \
+            --cache-to type=gha,mode=max,scope=${{ matrix.name }} \
+            --build-arg DHI_REGISTRY="$REGISTRY/$DHI_OWNER" \
+            --build-arg HUB_MIRROR="$HUB_PREFIX" \
+            -t "$REGISTRY/$OWNER/${{ matrix.image }}:$TAG" \
+            ${PUSH_LATEST:+-t "$REGISTRY/$OWNER/${{ matrix.image }}:latest"} \
+            ${{ matrix.extra_args }} \
+            "${{ matrix.context }}"
+
+      # an earlier change slice C: the pushed manifest digest, one line per image,
+      # collected by the `lock` job into the signed stack-<tag>.lock.
+      - name: Record digest
+        run: |
+          set -eu
+          mkdir -p digests
+          d="$(docker buildx imagetools inspect "$REGISTRY/$OWNER/${{ matrix.image }}:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "${{ matrix.image }}@$d" | tee "digests/${{ matrix.image }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: digest-${{ matrix.image }}
+          path: digests/${{ matrix.image }}
+          retention-days: 7
+
+  # ── lock: the signed digest manifest for this stack tag (an earlier change C) ──
+  # One line per published image, `<image>@sha256:…`, signed with the
+  # release key and attached to a GitHub release on the stack tag. `noo
+  # upgrade --stack` verifies it and the launcher then pulls BY DIGEST — a
+  # quietly re-pushed tag changes nothing a controller runs.
+  lock:
+    name: signed digest lock
+    needs: [images, release-line]
+    if: ${{ github.repository == 'noomesh/noomesh' && !cancelled() && needs.images.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: release   # the signing seed is an environment secret of `release` (tag/main only, required reviewer)
+    # The workflow default is contents:read (image pushes need only
+    # packages:write); creating the release on the stack tag needs write.
+    # v0.2.11's lock was published by hand after this job got a 403.
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Resolve tag
+        run: |
+          set -eu
+          # Strip `stack-` from EITHER source. The push path always had to
+          # (the git tag is stack-vX, the image tag is vX); the dispatch path
+          # took its input verbatim, so the two entry points disagreed about
+          # what a "tag" is. Dispatching `stack-v0.2.25` — the git tag, the
+          # obvious thing to type — published every image as
+          # `:stack-v0.2.25` and wrote `stack-stack-v0.2.25.lock`, and the
+          # launcher strips, so it looked for `:v0.2.25` and found nothing.
+          # An input that is wrong only for the value a human would naturally
+          # pass is worse than one that is always wrong.
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=${raw#stack-}" >> "$GITHUB_ENV"
+          # A release candidate never moves `:latest` (promotion model).
+          case "${raw#stack-}" in *-rc.*) ;; *) echo "PUSH_LATEST=1" >> "$GITHUB_ENV" ;; esac
+      # Checkout FIRST: actions/checkout cleans the workspace, so it has to
+      # run before the digest artifacts land in digests/. What it is here for
+      # is `scripts/verify-release-signature.py` and the key list in
+      # `noo-cli/src/release_sig.rs` — both of them repository content at this
+      # tag, which is the only thing in this job that did not arrive over the
+      # network a moment ago.
+      - name: Checkout   # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: bases-*
+          path: bases
+          merge-multiple: true
+
+      # an earlier change's belt: every sibling source row must be the SHA
+      # release-line resolved for THIS run. A row from anywhere else means a
+      # job built a sibling from a commit the run did not choose.
+      - name: Sibling sources are the SHAs this run resolved
+        env:
+          WANT_TRELLION: ${{ needs.release-line.outputs.trellion_sha }}
+        run: |
+          set -eu
+          bad=0
+          check() { # digest file, wanted sha
+            [ -n "$2" ] || return 0   # nothing resolved (not the source repo): nothing to compare
+            if [ ! -f "$1" ]; then
+              echo "::error::release-line resolved $2 but no job recorded $1 — the lock would not say what this sibling was built from"; bad=1; return 0
+            fi
+            got="$(sed -n 's/^source:[^@]*@//p' "$1")"
+            if [ "$got" != "$2" ]; then
+              echo "::error::$1 records $got but release-line resolved $2"; bad=1
+            else
+              echo "ok  $(cat "$1")"
+            fi
+          }
+          check digests/source-trellion "$WANT_TRELLION"
+          exit $bad
+
+      # Provenance for a re-tagged final: which rc the reused digests came
+      # from. Not an image row (no sha256 digest), so `noo upgrade` and the
+      # launcher skip it, exactly as they skip the source: rows.
+      - name: Record the rc a re-tagged final reuses
+        if: contains(needs.release-line.outputs.retag, 'true')
+        env:
+          RC_TAG: ${{ needs.release-line.outputs.rc_tag }}
+          RC_COMMIT: ${{ needs.release-line.outputs.rc_commit }}
+        run: echo "retagged-from:${RC_TAG}@${RC_COMMIT}" | tee digests/retagged-from
+
+      # THE ONE JOB THAT MUST NOT BE COMPROMISED, and until 2026-09-04 it was
+      # the softest. Signing needs a CLI with the `security release-sign` verb
+      # (≥ 0.3.70), so this job asked GitHub for "the newest noo-cli release",
+      # downloaded a binary out of it, and ran it with the release signing seed
+      # in its environment — with nothing at all checked about that binary.
+      # Anyone able to attach an asset to a release, or to create one, could
+      # have had the key that every node in every fleet trusts by construction
+      # printed, posted or quietly used to sign something else. The blast
+      # radius is the whole rail: the CLI manifest and the stack lock are the
+      # two things a node has no way to second-guess.
+      #
+      # So the binary is now verified before it is trusted, using the very
+      # scheme it is about to apply: fetch the release's signed
+      # `sha256sums.txt`, verify that signature against the public keys pinned
+      # in the checked-out `noo-cli/src/release_sig.rs` (a stdlib-only Ed25519
+      # verifier in the repo does it, because asking the unverified binary to
+      # verify itself proves nothing), then check the downloaded binary's
+      # digest against the entry in that signed manifest. A release the
+      # pipeline did not produce cannot pass, whoever published it. This step
+      # deliberately carries NO signing seed: it runs on attacker-supplied
+      # bytes and must have nothing worth stealing.
+      - name: Fetch and verify the signing CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          cli_tag="$(gh release list --repo "${{ github.repository }}" --limit 60 --json tagName --jq '[.[].tagName | select(startswith("noo-cli-v"))] | first')"
+          [ -n "$cli_tag" ] || { echo "::error::no noo-cli-v* release to take the signing CLI from"; exit 1; }
+          echo "signing CLI from $cli_tag"
+          # Three network calls to a third party, in the middle of a release.
+          # On 2026-09-20 one TLS handshake to api.github.com failed and the
+          # whole stack build died reporting "$cli_tag does not publish
+          # noo-x86_64-unknown-linux-gnu" — an asset that was published and
+          # is still there. `||` collapses every cause into one sentence, so
+          # a dropped connection, an expired token, a rate limit and a
+          # genuinely missing file all read as the release being wrong. The
+          # re-run passed with no change, which is the tell.
+          #
+          # So: retry, because a transient must not fail a release; and when
+          # it really will not come, say WHICH of the two it was, because
+          # they send the reader to different places.
+          for asset in noo-x86_64-unknown-linux-gnu sha256sums.txt sha256sums.txt.sig; do
+            ok=0
+            for attempt in 1 2 3 4; do
+              if gh release download "$cli_tag" --repo "${{ github.repository }}" --pattern "$asset" --clobber; then
+                ok=1; break
+              fi
+              echo "attempt $attempt/4 for $asset failed; retrying in $((attempt * 5))s"
+              sleep $((attempt * 5))
+            done
+            [ "$ok" = 1 ] && continue
+            # Still failing. One question separates the two causes: does the
+            # release list the asset at all?
+            if gh release view "$cli_tag" --repo "${{ github.repository }}" --json assets \
+                 --jq '[.assets[].name] | join("\n")' 2>/dev/null | grep -qx "$asset"; then
+              echo "::error::could not download $asset from $cli_tag after 4 attempts — the release DOES publish it, so this is a transport or credential failure reaching GitHub, not a missing asset. Re-run this job."
+            else
+              echo "::error::$cli_tag does not publish $asset — refusing to run an unverifiable signing binary"
+            fi
+            exit 1
+          done
+          python3 scripts/verify-release-signature.py \
+            --keys-from noo-cli/src/release_sig.rs sha256sums.txt sha256sums.txt.sig \
+            || { echo "::error::$cli_tag's sha256sums.txt is not signed by a pinned release key — refusing to hand it the signing seed"; exit 1; }
+          want="$(awk '$2 ~ /noo-x86_64-unknown-linux-gnu$/ { print tolower($1); exit }' sha256sums.txt)"
+          [ -n "$want" ] || { echo "::error::the signed manifest of $cli_tag does not list noo-x86_64-unknown-linux-gnu"; exit 1; }
+          got="$(sha256sum noo-x86_64-unknown-linux-gnu | cut -d' ' -f1)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::signing CLI digest mismatch — signed manifest says $want, the downloaded asset is $got"
+            exit 1
+          fi
+          echo "signing CLI verified against the signed manifest of $cli_tag ($got)"
+          chmod +x noo-x86_64-unknown-linux-gnu
+
+      # The seed is scoped to this step alone — the step that does nothing but
+      # sign a file assembled from artifacts this workflow produced itself.
+      # Every fetch, every download and every piece of third-party input
+      # happened in steps above, none of which could read it.
+      - name: Assemble + sign stack-$TAG.lock
+        env:
+          NOO_RELEASE_SIGNING_SEED: ${{ secrets.NOO_RELEASE_SIGNING_SEED }}
+        run: |
+          set -eu
+          [ -n "${NOO_RELEASE_SIGNING_SEED:-}" ] || { echo "::error::NOO_RELEASE_SIGNING_SEED is not set — refusing an unsigned lock"; exit 1; }
+          cat digests/* | sort > "stack-$TAG.lock"
+          echo "== stack-$TAG.lock =="; cat "stack-$TAG.lock"
+          ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.lock"
+          ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.lock"
+          # The shared bases' digests, for a later final to verify a re-tag of
+          # them against. Signed like the lock; never read by the launcher.
+          cat bases/* | sort > "stack-$TAG.bases"
+          echo "== stack-$TAG.bases =="; cat "stack-$TAG.bases"
+          ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.bases"
+          ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.bases"
+      - name: Publish the lock on the stack tag
+        if: startsWith(github.ref, 'refs/tags/stack-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # --latest=false: a stack release carries only the lock, no install.sh.
+          # "Latest" must stay on a noo-cli release so releases/latest/download/install.sh
+          # (the README install line) never 404s.
+          # A release candidate is a prerelease: `noo upgrade` never picks one
+          # unless named with --tag, and it never takes Latest.
+          pre=""; case "$TAG" in *-rc.*) pre="--prerelease" ;; esac
+          gh release create "stack-$TAG" --repo "${{ github.repository }}" --latest=false $pre \
+            --title "stack $TAG" \
+            --notes "Image digest lock for stack $TAG. \`noo upgrade --stack\` verifies \`stack-$TAG.lock.sig\` against the release key baked into the CLI and pulls every image by digest." \
+            "stack-$TAG.lock" "stack-$TAG.lock.sig" "stack-$TAG.bases" "stack-$TAG.bases.sig" \
+          || gh release upload "stack-$TAG" --repo "${{ github.repository }}" --clobber "stack-$TAG.lock" "stack-$TAG.lock.sig" "stack-$TAG.bases" "stack-$TAG.bases.sig"

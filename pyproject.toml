@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+[project]
+name = "noomesh"
+version = "0.3.0"
+description = "Noomesh turns the machines you already own into one local-first AI cluster: GPU orchestration, RAG, agents and multi-channel coordination"
+readme = "README.md"
+# ONE Python version, and it is the one that ships. `.python-version` at the
+# repo root is the single source of truth (uv honours it, actions/setup-python
+# reads it via `python-version-file`); every other site in the tree — the two
+# Dockerfile ARGs, the CI jobs, the classifier below, ruff's target-version and
+# mypy's python_version — is pinned to the same value, and
+# tests/test_python_version_single_source.py fails the build if any of them
+# disagree.
+#
+# It is a CLOSED range, not `>=`. An open lower bound is what let CI test three
+# interpreters that nothing deploys: the images install exactly one
+# (docker/Dockerfile.deps-core), so a green run on 3.11 or 3.13 was evidence
+# about a Python no user has.
+requires-python = ">=3.12,<3.13"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+    {name = "PersonifAI", email = "contact@noomesh.ai"},
+]
+keywords = ["ai", "agent", "cluster", "gpu", "local-first", "rag", "llm", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    # One classifier, because one interpreter ships. See requires-python above.
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+  "httpx>=0.27",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "structlog>=24.0",
+  "tenacity>=8.0",
+  "python-jose[cryptography]>=3.3",
+  "bcrypt>=4.0",
+  "cryptography>=41.0",
+  "nats-py>=2.6.0",
+  "croniter>=1.3",
+  "orjson>=3.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/noomesh/noomesh"
+Repository = "https://github.com/noomesh/noomesh"
+Documentation = "https://github.com/noomesh/noomesh/tree/main/docs"
+Issues = "https://github.com/noomesh/noomesh/issues"
+
+[project.optional-dependencies]
+# trellion — the memory subsystem, published as its own repository
+# (github.com/personifAI/trellion). Not on PyPI, so it resolves over a git
+# URL. It is its own extra rather than a core dependency: as a core dep it
+# would put trellion's whole tree (torch, nvidia and triton wheels run to
+# several GB) into every install, including the gateway image, which runs no
+# models. Installs that need the memory subsystem (deps-base, and therefore
+# trellion/sandbox/worker) name this extra; the gateway does not.
+#
+# Local development: `pip install -e ../trellion[transport,video]` from the
+# repository root will SHADOW this git install with a sibling editable
+# checkout (the onboard wizard does this automatically when it detects one).
+#
+# Anything importing trellion must tolerate its absence via the project's
+# try/except ImportError + X_AVAILABLE convention. The ref is the literal
+# `@main` below: a PEP 508 direct URL cannot be templated.
+trellion = [
+  "trellion[transport,video] @ git+https://github.com/personifAI/trellion.git@main",
+]
+web = ["ddgs>=6.0"]
+# Pinned to 1.x: mcp 2.0 removed the decorator API on Server, so the
+# `@server.list_tools()` / `@server.call_tool()` wiring in mcp/hub.py fails
+# at init with "'Server' object has no attribute 'list_tools'". Unpinning
+# again requires porting hub.py to the 2.x server API first.
+mcp = ["mcp[cli]>=1.2,<2"]
+# sqlalchemy[asyncio], NOT bare sqlalchemy: SQLAlchemy 2.1 stopped pulling in
+# greenlet by default (it is now only the `asyncio` extra's dependency), and
+# noomesh.db.engine / gateway.audit_log use sqlalchemy.ext.asyncio. Without
+# it every async DB call dies "requires that the Python 'greenlet' library is
+# installed" -- live 2026-10-06 on noo-worker: audit rows lost, heartbeat
+# scheduler uninitialised. tests/test_worker_image_dependency_set.py pins it.
+db = ["psycopg[binary]>=3.1", "sqlalchemy[asyncio]>=2.0", "alembic>=1.13", "pgvector>=0.3"]
+pgvector = ["noomesh[db]"]
+rag = ["noomesh[db]", "pymupdf>=1.23", "markitdown[all]>=0.1"]
+voice = [
+  "faster-whisper>=1.0.0",
+  "piper-tts>=1.2.0",
+  "edge-tts>=6.1.0",
+]
+cloud = ["anthropic>=0.25", "openai>=1.12", "google-generativeai>=0.5"]
+cache = ["redis[hiredis]>=4.5.0,<5.0.0"]
+recall-memory = [
+    # Postgres+FAISS (an earlier change recall v2 — drops MP4/QR/cv2/pyzbar)
+    "numpy>=1.24",
+    "faiss-cpu>=1.7.4",
+]
+# Deprecated name of `recall-memory`; image builds and
+# installs that pin it keep working until the release after 0.6.0.
+video-memory = ["noomesh[recall-memory]"]
+graph = [
+    "networkx>=3.1",
+    "python-igraph>=0.11",
+    "scipy>=1.11",
+]
+feedback = ["noomesh[db]"]
+google-chat = ["google-auth>=2.0", "requests>=2.28"]
+monitoring = [
+  "prometheus-client>=0.19",
+  "opentelemetry-api>=1.20",
+  "opentelemetry-sdk>=1.20",
+  "opentelemetry-exporter-otlp>=1.20",
+]
+
+# LLM Backend options
+backends-llamacpp = ["llama-cpp-python[server]>=0.2.0"]
+backends-airllm = ["airllm>=2.8.0"]
+backends-all = [
+  "llama-cpp-python[server]>=0.2.0",
+  "airllm>=2.8.0",
+]
+
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=4.1",
+  "ruff>=0.6",
+  "mypy>=1.8",
+  "pre-commit>=3.6",
+  "bandit[toml]>=1.7",
+  "detect-secrets>=1.5",
+]
+
+all = [
+  "noomesh[web,mcp,db,rag,voice,cloud,cache,feedback,monitoring,google-chat,backends-all,recall-memory]",
+]
+
+[project.scripts]
+# NOTE: the console script is `noo-py`, not `pai` — the `pai` name belongs to
+# the Rust front-door binary (noo-cli/, installed at ~/.local/bin/pai), which
+# passes unported commands through to `noo-py` automatically.
+noo-py = "noomesh.cli:app"
+noo-mcp-server = "noomesh.mcp.server:main"
+noo-mcp-filesystem = "noomesh.mcp.filesystem_server:main"
+noo-mcp-github = "noomesh.mcp.github_server:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Import noomesh from THIS tree, not from wherever the venv's editable
+# install happens to point.
+#
+# The editable install resolves to the main clone (~/pai-assistant),
+# so running pytest from a worktree silently tested the main clone's source
+# instead of the branch under test. That fails in both directions: it reports
+# failures for code the branch does not contain, and it passes changes the
+# branch does. It cost a wrong "the suite is broken" read on 2026-08-11.
+#
+# pythonpath is resolved against rootdir, which in a worktree IS the worktree,
+# so this pins imports to the checkout pytest was invoked from. Prepending
+# src/ matches what the editable install does anyway — same code, right tree.
+pythonpath = ["src"]
+# Keep collection out of legacy/ (archived python-onboard wizard + its tests
+# moved there 2026-08-06 — kept for reference, not run).
+testpaths = ["tests"]
+markers = [
+    "integration: requires a running PAI gateway (deselect with '-m not integration')",
+]
+
+[tool.mypy]
+# Pinned to the interpreter in .python-version, for the same reason as ruff's
+# target-version: mypy otherwise type-checks against the oldest Python the
+# requires-python range permits, which is not the one the code runs on.
+python_version = "3.12"
+
+[tool.bandit]
+exclude_dirs = ["tests", "scripts"]
+skips = ["B101", "B603", "B607"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+# Pinned to the interpreter in .python-version. Without it ruff infers a target
+# from requires-python, so the lint target silently followed whatever the range
+# allowed — it was reading 3.11 while every container ran 3.12.
+target-version = "py312"
+
+[tool.ruff.lint]
+# Declare the rule set EXPLICITLY. Ruff 0.16 expanded its *default* selection,
+# and because the dev extra is unpinned (`ruff>=0.6`) CI silently upgraded and
+# went from green to 4047 findings — none caused by a code change. With `select`
+# pinned here, lint is deterministic across ruff versions, so CI only breaks
+# when someone's code actually breaks it.
+#
+# These four families are ruff's pre-0.16 defaults (pyflakes + the pycodestyle
+# error subset). Adopting broader families (UP type modernization, B, SIM, I,
+# S...) is worthwhile, but as a deliberate, separately-scoped cleanup — not
+# something inherited accidentally from a dependency bump.
+select = ["E4", "E7", "E9", "F"]
+# E402 (imports not at top) is a deliberate convention here: modules do
+# feature-detection with try/except ImportError guards before importing
+# dependents. E741 (ambiguous single-letter names) is noise for existing code.
+ignore = ["E402", "E741"]

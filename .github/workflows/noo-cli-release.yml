@@ -1,0 +1,782 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: noo-cli release
+
+# Builds the standalone, zero-Python `pai` control-plane binary for four
+# Linux targets and publishes a GitHub Release with checksums and the
+# install.sh one-liner:
+#   - x86_64-unknown-linux-musl   fully static, runs anywhere (installer default)
+#   - aarch64-unknown-linux-musl  fully static, arm64 (installer default)
+#   - x86_64-unknown-linux-gnu    glibc-linked (needs glibc >= the runner's)
+#   - aarch64-unknown-linux-gnu   glibc-linked, arm64 (edge nodes / RPi with a
+#                                 recent glibc; static musl remains the fallback)
+#
+# Trigger: push a namespaced tag, e.g.
+#     git tag noo-cli-v0.1.0 && git push origin noo-cli-v0.1.0
+# The `noo-cli-v*` prefix keeps these releases distinct from any other
+# component's future tags. `workflow_dispatch` allows a manual dry build
+# (no release is published unless a matching tag was pushed).
+
+on:
+  push:
+    tags:
+      - 'noo-cli-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for `gh release create`
+
+concurrency:
+  group: noo-cli-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Per-target builds, in PARALLEL (fu69 pt2) ─────────────────────────────
+  # One runner per target: wall-clock = the slowest single lane (~5 min)
+  # instead of the sum of four. Each lane builds, verifies ITS artifact
+  # (arch, linkage, embedded-assets sentinel, paired stack tag), and uploads
+  # it; the release job below joins them.
+  #
+  # All lanes run on GitHub-hosted runners (ubuntu-latest; macos-14 for the
+  # darwin lane). The gnu lanes apt-install cross toolchains and run host cargo,
+  # which a hosted runner provides (passwordless sudo, rustup on PATH).
+  # ── Tag window ────────────────────────────────────────────
+  # The stack tag is cut first, this CLI tag after. A commit between them
+  # that touches image-shipped code (gateway, UI, node-agent, ...) is in
+  # neither artifact. Refuse before spending the build lanes; the script
+  # names the commits. Run it locally before tagging too:
+  #   python3 scripts/check-tag-window.py --cli-ref HEAD
+  # To state that a commit rides the NEXT stack tag, set the repo variable
+  # TAG_WINDOW_ACK to its sha prefix(es), space-separated, and re-run.
+  tag-window:
+    name: stack tag covers this window
+    # EVERY job of this workflow is guarded: the release is created in
+    # github.repository with GITHUB_TOKEN, and noo's RELEASE_REPO is
+    # noomesh/noomesh, so a run anywhere else would publish where nothing looks.
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history and tags)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      # Promotion model: a final CLI release is cut on `main`, a candidate
+      # (`noo-cli-vA.B.C-rc.N`) on `staging` — the same lines as the stack
+      # tags (images-release.yml release-line). A tag anywhere else is refused
+      # here, before any build lane spends time on it.
+      - name: The tag sits on its promotion branch
+        id: line
+        run: |
+          set -eu
+          case "${GITHUB_REF_NAME}" in
+            *-rc.*) line=staging ;;
+            *)      line=main ;;
+          esac
+          git fetch --quiet origin "+refs/heads/$line:refs/remotes/origin/$line" || {
+            echo "::error::origin/$line does not exist — promote dev → $line before tagging ${GITHUB_REF_NAME}"; exit 1; }
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/$line"; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA:0:8}) is not on origin/$line. A candidate (-rc.N) is cut on staging, a final on main; promote by merge PR first (dev → staging → main), then tag the CLI and its stack there."
+            exit 1
+          fi
+      - name: Check <stack tag>..<cli ref>
+        env:
+          ACKS: ${{ vars.TAG_WINDOW_ACK }}
+        run: |
+          set -eu
+          git fetch --tags --quiet || true
+          args=""
+          for a in $ACKS; do args="$args --ack $a"; done
+          case "${GITHUB_REF_NAME}" in
+            *-rc.*)
+              # A candidate pairs with the candidate stack on the SAME commit.
+              rc_stack="$(git tag --points-at "${GITHUB_SHA}" 'stack-v*-rc.*' | sort -V | tail -1 || true)"
+              [ -n "$rc_stack" ] || { echo "::error::${GITHUB_REF_NAME} has no stack-v*-rc.* tag on ${GITHUB_SHA:0:8} — tag the stack candidate on this staging commit first"; exit 1; }
+              args="$args --stack-tag $rc_stack" ;;
+          esac
+          # shellcheck disable=SC2086
+          python3 scripts/check-tag-window.py --cli-ref "${GITHUB_SHA}" $args
+
+  # ── A final re-publishes the rc's gateway binaries (no rebuild) ──────────
+  # noo-gateway x86_64-musl is this workflow's long pole (18-24 min); the CLI
+  # lanes take 3-6. A final cut from the newest rc's exact tree takes the
+  # rc's noo-gateway-<target> bytes instead of rebuilding them. The CLI and
+  # the Go agents stamp the tag into their bits and always build. The plan
+  # (scripts/cli-release-reuse.py) answers BUILD on anything it cannot
+  # prove; its decision and reason are in this job's summary.
+  # Kill switch, no PR: `gh variable set CLI_RETAG --body off`, then re-run
+  # the WHOLE run (the plan is frozen into this job's outputs).
+  reuse-plan:
+    name: final reuses the rc (plan)
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # the rc's release run must have succeeded
+    outputs:
+      reuse: ${{ steps.plan.outputs.reuse }}
+      rc_tag: ${{ steps.plan.outputs.rc_tag }}
+    steps:
+      - name: Checkout (full history and tags)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLI_RETAG: ${{ vars.CLI_RETAG }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet || true
+          python3 scripts/cli-release-reuse.py plan --tag "${GITHUB_REF_NAME}"
+
+  build:
+    needs: [tag-window]
+    name: build (${{ matrix.target }})
+    # darwin builds need a real macOS runner (macos-14 is Apple Silicon and free
+    # for public repositories); every linux lane is ubuntu-latest.
+    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-14' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # glibc — cross-compiled on the runner (no QEMU, no third-party
+          # actions): x86_64 with the host toolchain, aarch64 via Ubuntu's
+          # cross gcc as linker (CC/AR overrides cover ring's C/asm build).
+          # These link the runner's glibc, so targets need one at least as
+          # new — the static musl assets are the universal fallback and the
+          # installer default.
+          - target: x86_64-unknown-linux-gnu
+            kind: gnu-host
+            want: dynamic
+          - target: aarch64-unknown-linux-gnu
+            kind: gnu-cross
+            want: dynamic
+          # musl x86_64 — native rust:1-alpine container, the same
+          # `cargo build --release` path proven by noo-cli/build.sh; alpine's
+          # toolchain yields a genuinely static (static-pie) binary.
+          - target: x86_64-unknown-linux-musl
+            kind: musl-container
+            want: static
+          # musl aarch64 — cargo-zigbuild cross-compile (zig as the C
+          # compiler/linker for the musl target). This lane used to run the
+          # same alpine container under --platform linux/arm64: QEMU
+          # user-mode emulation, ~60-80 min of a ~90 min release (fu69).
+          - target: aarch64-unknown-linux-musl
+            kind: musl-zig
+            want: static
+          # darwin arm64 — a NATIVE build on Apple Silicon (macos-14): `rustup
+          # target add` + `cargo build`, no cross toolchain and no docker.
+          # `release` needs this job, so one failed lane blocks the whole
+          # release, and a release without the darwin binaries would leave a
+          # Mac node without its CLI. Mach-O is always dynamically linked
+          # against system libs, hence want: macho.
+          # (The Mac node UX is install the CLI + `noo enroll`, so the CLI
+          # must exist for darwin. Intel Macs: not built; add
+          # x86_64-apple-darwin if one is needed.)
+          - target: aarch64-apple-darwin
+            kind: darwin-host
+            want: macho
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Tag ↔ Cargo.toml version guard. noo-cli-v0.2.2 shipped a binary
+      # self-reporting 0.2.1 because nothing tied the tag to the crate
+      # version. Cheap enough to run in every lane; fails BEFORE the build.
+      #
+      # A candidate is NOT a committed version: Cargo.toml carries the final
+      # A.B.C (it reaches staging through dev like every change, and main
+      # needs it unchanged), and a `noo-cli-vA.B.C-rc.N` tag stamps the
+      # pre-release suffix into this lane's checkout only. So the binary
+      # reports, and fetches its node assets from, `A.B.C-rc.N`, and no rc
+      # version is ever committed, merged back, or left on main.
+      - name: Verify tag matches Cargo.toml version (stamp a candidate)
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#noo-cli-v}"
+          crate_version="$(grep -m1 '^version' noo-cli/Cargo.toml | cut -d'"' -f2)"
+          case "$crate_version" in *-*)
+            echo "::error::noo-cli/Cargo.toml version $crate_version carries a pre-release suffix — commit the final A.B.C; a -rc.N candidate is stamped at build time from its tag"
+            exit 1 ;;
+          esac
+          case "$tag_version" in
+            *-rc.*)
+              base="${tag_version%%-rc.*}"; n="${tag_version##*-rc.}"
+              if [ "$base" != "$crate_version" ] || ! printf '%s' "$n" | grep -Eq '^[0-9]+$'; then
+                echo "::error::Candidate tag $GITHUB_REF_NAME must be noo-cli-v${crate_version}-rc.<N> (Cargo.toml is $crate_version)"
+                exit 1
+              fi
+              python3 - "$crate_version" "$tag_version" <<'PY'
+          import re, sys
+          final, rc = sys.argv[1], sys.argv[2]
+          p = "noo-cli/Cargo.toml"; s = open(p).read()
+          s2, n = re.subn(r'(?m)^version = "' + re.escape(final) + '"', 'version = "' + rc + '"', s, count=1)
+          assert n == 1, "Cargo.toml version line not found"
+          open(p, "w").write(s2)
+          p = "noo-cli/Cargo.lock"; s = open(p).read()
+          s2, n = re.subn(r'(name = "noo-cli"\nversion = )"' + re.escape(final) + '"', r'\1"' + rc + '"', s, count=1)
+          assert n == 1, "Cargo.lock noo-cli entry not found"
+          open(p, "w").write(s2)
+          print(f"stamped noo-cli {final} -> {rc} (this checkout only)")
+          PY
+              ;;
+            *)
+              if [ "$tag_version" != "$crate_version" ]; then
+                echo "::error::Tag $GITHUB_REF_NAME does not match noo-cli/Cargo.toml version $crate_version — bump the crate version (and merge it) before tagging, then retag."
+                exit 1
+              fi ;;
+          esac
+
+      # The stack tag this CLI release is PAIRED with: baked into the binary
+      # (build.rs → STANDALONE_STACK_TAG) so a no-repo standalone controller
+      # knows which images to run — it has no `git tag` to resolve one from.
+      - name: Resolve the paired stack tag
+        run: |
+          set -eux
+          git fetch --tags --quiet || true
+          # Promotion model: the stack tag and this CLI tag are cut on the
+          # SAME main commit, so pair with the final stack tag on this commit.
+          # Fall back to the newest final tag (a CLI-only release). A release
+          # candidate (`-rc.N`, cut on staging) is never a pairing.
+          case "${GITHUB_REF_NAME}" in
+            *-rc.*)
+              # A candidate CLI pairs ONLY with the candidate stack on this
+              # same staging commit — never a final, never a fallback.
+              TAG="$(git tag --points-at HEAD 'stack-v*-rc.*' | sort -V | tail -1 || true)"
+              [ -n "$TAG" ] || { echo "::error::no stack-v*-rc.* tag on this commit to pair ${GITHUB_REF_NAME} with"; exit 1; } ;;
+            *)
+              TAG="$(git tag --points-at HEAD 'stack-v*' | grep -v -- '-rc\.' | sort -V | tail -1 || true)"
+              [ -n "$TAG" ] || TAG="$(git tag -l 'stack-v*' | grep -v -- '-rc\.' | sort -V | tail -1 || true)" ;;
+          esac
+          echo "NOO_STACK_TAG=${TAG#stack-}" >> "$GITHUB_ENV"
+          echo "paired stack tag: ${TAG:-<none>}"
+
+      # Dep-tree cache per target — each lane used to compile from cold.
+      #
+      # RESTORE-ONLY. A cache SAVED by a tag run is scoped to that tag ref:
+      # no other run can ever restore it (a run sees its own ref and the
+      # default branch, dev). Saving from a tag run would fill the repo's
+      # cache budget with entries nothing can read again and evict the dev
+      # caches CI actually restores. Restoring still picks up anything dev
+      # has saved under a matching key.
+      - name: Cache cargo (restore only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            noo-cli/target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('noo-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.target }}-
+
+      - name: Build (${{ matrix.kind }})
+        run: |
+          set -eux
+          mkdir -p dist
+          # rustup's own bin dir, stated for EVERY lane rather than trusted to
+          # the runner image's PATH.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          case "${{ matrix.kind }}" in
+            gnu-host)
+              rustup target add x86_64-unknown-linux-gnu
+              (cd noo-cli && cargo build --release --locked --target x86_64-unknown-linux-gnu)
+              ;;
+            darwin-host)
+              rustup target add aarch64-apple-darwin
+              (cd noo-cli && cargo build --release --locked --target aarch64-apple-darwin)
+              cp "noo-cli/target/aarch64-apple-darwin/release/noo" "dist/noo-${{ matrix.target }}"
+              # The linux release-job smoke can't exec Mach-O — smoke HERE,
+              # on the only runner that can.
+              ./dist/noo-${{ matrix.target }} --version
+              ;;
+            gnu-cross)
+              # Install only when missing (a hosted runner has passwordless
+              # sudo and lacks the cross gcc).
+              command -v aarch64-linux-gnu-gcc >/dev/null \
+                || { sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu; }
+              rustup target add aarch64-unknown-linux-gnu
+              (cd noo-cli && \
+                CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+                CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+                AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+                cargo build --release --locked --target aarch64-unknown-linux-gnu)
+              cp "noo-cli/target/aarch64-unknown-linux-gnu/release/noo" "dist/noo-${{ matrix.target }}"
+              ;;
+            musl-container)
+              # Mount the WHOLE repo, build from the crate subdir: build.rs
+              # embeds the standalone deploy slice (fu67) from the parent
+              # tree — a crate-only mount builds an asset-less binary the
+              # sentinel check below rejects.
+              docker run --rm \
+                -e NOO_STACK_TAG="${NOO_STACK_TAG:-}" \
+                -v "${PWD}":/build \
+                -w /build/noo-cli \
+                rust:1-alpine \
+                sh -c 'apk add -q musl-dev && cargo build --release --locked'
+              cp "noo-cli/target/release/noo" "dist/noo-${{ matrix.target }}"
+              # target/ is root-owned (container writes as root) — reclaim so
+              # the cache step can save it.
+              docker run --rm -v "${PWD}/noo-cli":/w alpine chown -R "$(id -u):$(id -g)" /w/target
+              ;;
+            musl-zig)
+              # NOT pipx: its isolated venv hides the ziglang wheel from the
+              # `python3 -m ziglang` lookup cargo-zigbuild uses to find zig
+              # ("Failed to find zig" on the first fast-lane run). Plain pip,
+              # ziglang EXPLICIT; --break-system-packages fallback for
+              # PEP-668-managed pythons.
+              # Skip when present; a hosted runner lacks it and has pip.
+              export PATH="$HOME/.local/bin:$PATH"
+              command -v cargo-zigbuild >/dev/null || {
+                PIP="$(command -v pip || command -v pip3 || echo 'python3 -m pip')"
+                $PIP install --user cargo-zigbuild ziglang \
+                  || $PIP install --user --break-system-packages cargo-zigbuild ziglang
+              }
+              export PATH="$HOME/.local/bin:$PATH"
+              cargo-zigbuild --version
+              rustup target add aarch64-unknown-linux-musl
+              (cd noo-cli && NOO_STACK_TAG="${NOO_STACK_TAG:-}" \
+                cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
+              cp "noo-cli/target/aarch64-unknown-linux-musl/release/noo" "dist/noo-${{ matrix.target }}"
+              ;;
+          esac
+          # gnu-host copies here so every arm lands the same way
+          if [ "${{ matrix.kind }}" = "gnu-host" ]; then
+            cp "noo-cli/target/x86_64-unknown-linux-gnu/release/noo" "dist/noo-${{ matrix.target }}"
+          fi
+
+      # Verify THIS lane's artifact: arch + linkage + the embedded-assets
+      # sentinel (a crate-only build ships a binary whose `onboard
+      # --standalone` refuses — the 2026-08-19 musl mount bug) + the paired
+      # stack tag (a no-repo controller resolves its images from it).
+      - name: Verify artifact
+        run: |
+          set -eux
+          f="dist/noo-${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) file "$f" | grep -E 'Mach-O 64-bit.*arm64' ;;
+            x86_64-*)  file "$f" | grep -E 'ELF 64-bit.*x86-64' ;;
+            aarch64-*) file "$f" | grep -E 'ELF 64-bit.*(aarch64|ARM aarch64)' ;;
+          esac
+          case "${{ matrix.want }}" in
+            static)  file "$f" | grep -E 'static(-pie)? linked|statically linked' ;;
+            dynamic) file "$f" | grep -E 'dynamically linked' ;;
+            macho)   : ;; # Mach-O linkage already asserted by the target case
+          esac
+          grep -aq NOO_EMBEDDED_ASSETS_PRESENT "$f" \
+            || { echo "::error::$f carries no embedded standalone assets"; exit 1; }
+          if [ -n "${NOO_STACK_TAG:-}" ]; then
+            grep -aq "${NOO_STACK_TAG}" "$f" \
+              || { echo "::error::$f lacks the paired stack tag ${NOO_STACK_TAG}"; exit 1; }
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noo-${{ matrix.target }}
+          path: dist/noo-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 3
+
+  # ── Darwin node agents: no container image carries them (Macs run the
+  # agent as a LaunchAgent, not in Docker), so a standalone controller
+  # could only "build from source" — which it has no checkout for.
+  # Cross-build them here with the project's own docker script
+  # and publish them as release assets; `noo cluster provision` fetches
+  # them by tag. Named noo-* so the assemble job's download and checksum
+  # globs pick them up unchanged.
+  darwin-agents:
+    name: darwin agents (cross-build)
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Registry login (dhi.io)
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          set -eu
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin
+      - name: Build noo-node-agent + noo-hostd for darwin/arm64
+        run: |
+          set -eux
+          mkdir -p dist
+          (cd node-agent-go && BINARY=noo-node-agent bash build-cross.sh darwin/arm64 && BINARY=noo-hostd bash build-cross.sh darwin/arm64)
+          cp node-agent-go/noo-node-agent-darwin-arm64 dist/noo-node-agent-aarch64-apple-darwin
+          cp node-agent-go/noo-hostd-darwin-arm64 dist/noo-hostd-aarch64-apple-darwin
+          file dist/noo-node-agent-aarch64-apple-darwin | grep -q "Mach-O 64-bit.*arm64"
+      # noo-hostd for LINUX too, in this job because it already has the DHI
+      # toolchain and the login. The harness lifecycle is a hostd op
+      #, so a Linux node that has no hostd cannot start its
+      # harness at all, and `cluster upgrade-hostd` cross-builds from a
+      # checkout a standalone controller does not have. Same reasoning as
+      # the gateway binary one job below: a node needs it, so the RELEASE
+      # ships it.
+      - name: Build noo-hostd for linux/amd64 + linux/arm64
+        run: |
+          set -eux
+          (cd node-agent-go && BINARY=noo-hostd bash build-cross.sh linux/amd64 && BINARY=noo-hostd bash build-cross.sh linux/arm64)
+          cp node-agent-go/noo-hostd-amd64 dist/noo-hostd-x86_64-unknown-linux-gnu
+          cp node-agent-go/noo-hostd-arm64 dist/noo-hostd-aarch64-unknown-linux-gnu
+          file dist/noo-hostd-x86_64-unknown-linux-gnu | grep -E 'ELF 64-bit.*x86-64'
+          file dist/noo-hostd-aarch64-unknown-linux-gnu | grep -E 'ELF 64-bit.*(aarch64|ARM aarch64)'
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noo-agents-aarch64-apple-darwin
+          path: |
+            dist/noo-*-aarch64-apple-darwin
+            dist/noo-hostd-x86_64-unknown-linux-gnu
+            dist/noo-hostd-aarch64-unknown-linux-gnu
+
+  # ── Join: smoke, bundle, checksums, publish ───────────────────────────────
+  # ── gateway binary per target ──────────────────
+  # The harness is `noo-gateway harness`, a subcommand of the gateway
+  # binary, and an earlier change ships it to nodes over the rail like the
+  # agent — as a release ASSET, not an image. So the gateway crate builds
+  # here, beside the CLI, for the targets nodes run: Linux x86_64 and
+  # aarch64 (glibc — the crate's aws-lc-sys wants a real C toolchain and
+  # cmake, which the musl/zig lanes do not give it; musl is a followup),
+  # and macOS arm64 on the darwin runner. `provision` fetches
+  # `noo-gateway-<target>` the way it fetches the CLI asset and stages it
+  # as `harness-binary`.
+  #
+  # Tag-neutral: no step here passes the tag, ref, commit or stack tag into
+  # the build, so a final may re-publish the rc's bytes (reuse-plan above).
+  # Keep it that way, or drop the asset from scripts/cli-release-reuse.py
+  # REUSABLE (tests/test_cli_release_reuse.py guards both).
+  gateway:
+    name: gateway (${{ matrix.target }})
+    needs: [reuse-plan]
+    runs-on: ${{ matrix.kind == 'darwin-host' && 'macos-14' || 'ubuntu-latest' }}
+    env:
+      REUSE: ${{ needs.reuse-plan.outputs.reuse }}
+      RC_TAG: ${{ needs.reuse-plan.outputs.rc_tag }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # STATIC musl, not glibc. The gnu build imposes the RUNNER's
+          # glibc as a floor on every node, and a binary needing a newer
+          # glibc than the node has cannot exec at all. The CLI ships static
+          # musl to nodes for exactly this reason; the harness is a node
+          # binary and belongs on the same footing.
+          # aws-lc-sys builds under musl with cmake + a C toolchain
+          # (verified before this change: 21m44s in rust:1-alpine).
+          - target: x86_64-unknown-linux-musl
+            kind: musl-container
+          - target: aarch64-unknown-linux-musl
+            kind: musl-zig
+          - target: aarch64-apple-darwin
+            kind: darwin-host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # The rc's bytes, proven against BOTH its .sha256 and its sha256sums.txt
+      # row. Any failure (download, digest) is a warning and this lane builds
+      # instead: the two steps below run unless this one set reused=true. The
+      # release job then checks the rc manifest's signature.
+      - name: Reuse the rc's binary (final, same tree)
+        id: reuse
+        if: env.REUSE == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/cli-release-reuse.py fetch --rc-tag "$RC_TAG" --asset "noo-gateway-${{ matrix.target }}" --out dist
+      # Restore-only, for the reason given on the CLI lanes' cache above.
+      - name: Cache cargo (restore only)
+        if: steps.reuse.outputs.reused != 'true'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            gateway-rust/target
+          key: ${{ runner.os }}-cargo-gateway-${{ matrix.target }}-${{ hashFiles('gateway-rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-gateway-${{ matrix.target }}-
+      # SQLX_OFFLINE: the crate's queries are checked against the committed
+      # .sqlx cache, never a database — the same way the image builds it.
+      - name: Build (${{ matrix.kind }})
+        if: steps.reuse.outputs.reused != 'true'
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -eux
+          mkdir -p dist
+          # rustup's own bin dir, stated for EVERY lane rather than trusted to
+          # the runner image's PATH.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          case "${{ matrix.kind }}" in
+            musl-container)
+              # Native alpine container, the lane the CLI already uses.
+              # cmake/perl/make/g++ are what aws-lc-sys needs to build its
+              # C sources against musl.
+              docker run --rm \
+                -e SQLX_OFFLINE=true \
+                -v "${PWD}":/build \
+                -w /build/gateway-rust \
+                rust:1-alpine \
+                sh -c 'apk add -q musl-dev cmake perl make g++ && cargo build --release --locked'
+              cp "gateway-rust/target/release/noo-gateway" "dist/noo-gateway-${{ matrix.target }}"
+              docker run --rm -v "${PWD}/gateway-rust":/w alpine chown -R "$(id -u):$(id -g)" /w/target
+              ;;
+            musl-zig)
+              # Skip when present; a hosted runner lacks it and has pip.
+              export PATH="$HOME/.local/bin:$PATH"
+              command -v cargo-zigbuild >/dev/null || {
+                PIP="$(command -v pip || command -v pip3 || echo 'python3 -m pip')"
+                $PIP install --user cargo-zigbuild ziglang \
+                  || $PIP install --user --break-system-packages cargo-zigbuild ziglang
+              }
+              export PATH="$HOME/.local/bin:$PATH"
+              # Same rule as the gnu-cross lane: install only when missing.
+              command -v cmake >/dev/null \
+                || { sudo apt-get update -q && sudo apt-get install -y -q cmake; }
+              rustup target add aarch64-unknown-linux-musl
+              (cd gateway-rust && SQLX_OFFLINE=true \
+                cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
+              cp "gateway-rust/target/aarch64-unknown-linux-musl/release/noo-gateway" "dist/noo-gateway-${{ matrix.target }}"
+              ;;
+            darwin-host)
+              rustup target add aarch64-apple-darwin
+              (cd gateway-rust && cargo build --release --locked --target aarch64-apple-darwin)
+              cp "gateway-rust/target/aarch64-apple-darwin/release/noo-gateway" "dist/noo-gateway-${{ matrix.target }}"
+              ;;
+          esac
+      # The binary must be the right shape AND actually run: `--health`
+      # against no gateway exits 1 (a real probe failure), where a loader
+      # or arch error is 126/127/139. Cross-built targets cannot run here,
+      # so they get the shape check only; the applier repeats the ELF check
+      # on the node before install.
+      - name: Verify artifact
+        run: |
+          set -eux
+          f="dist/noo-gateway-${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) file "$f" | grep -E 'Mach-O 64-bit.*arm64' ;;
+            x86_64-*)  file "$f" | grep -E 'ELF 64-bit.*x86-64' ;;
+            aarch64-*) file "$f" | grep -E 'ELF 64-bit.*(aarch64|ARM aarch64)' ;;
+          esac
+          # STATIC, asserted: a dynamically linked asset here would make
+          # the runner's glibc a silent floor for every node, and the only
+          # symptom would be a harness that cannot exec on an older box.
+          case "${{ matrix.target }}" in
+            *-linux-musl)
+              file "$f" | grep -E 'static(-pie)? linked|statically linked' \
+                || { echo "::error::$f is not statically linked — it would impose this runner's glibc on every node"; exit 1; }
+              ;;
+          esac
+          if [ "${{ matrix.kind }}" != "musl-zig" ]; then
+            chmod +x "$f"
+            set +e; "$f" --health >/dev/null 2>&1; rc=$?; set -e
+            [ "$rc" = 1 ] || { echo "::error::$f did not run as a gateway binary (exit $rc)"; exit 1; }
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: noo-gateway-${{ matrix.target }}
+          path: dist/noo-gateway-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: assemble + release
+    needs: [reuse-plan, build, darwin-agents, gateway]
+    runs-on: ubuntu-latest
+    environment: release   # the signing seed is an environment secret of `release` (tag/main only, required reviewer)
+    env:
+      REUSE: ${{ needs.reuse-plan.outputs.reuse }}
+      RC_TAG: ${{ needs.reuse-plan.outputs.rc_tag }}
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Smoke + bundle export
+        run: |
+          set -eux
+          cd dist
+          ls -l
+          chmod +x noo-*
+          # x86_64 binaries run on this runner — smoke-test both flavours.
+          ./noo-x86_64-unknown-linux-musl --version
+          ./noo-x86_64-unknown-linux-gnu --version
+          # On a tag, the CLI must report exactly the tag's version (a final
+          # never "-rc.N", a candidate its own "-rc.N"): the build lanes are
+          # never reused, and this is what proves it.
+          case "${GITHUB_REF_NAME}" in noo-cli-v*)
+            want="${GITHUB_REF_NAME#noo-cli-v}"
+            for b in ./noo-x86_64-unknown-linux-musl ./noo-x86_64-unknown-linux-gnu; do
+              got="$("$b" --version)"
+              [ "${got##* }" = "$want" ] || { echo "::error::$b --version says '$got', the tag wants $want"; exit 1; }
+            done ;;
+          esac
+          # Standalone deploy-slice bundle (fu67 Mode B): exported BY the
+          # built binary from its own embedded table — one source of truth,
+          # so the bundle always matches this release's assets; writes the
+          # .sha256 sidecar `onboard --standalone --bundle <url>` verifies.
+          ./noo-x86_64-unknown-linux-gnu bundle export noo-stack-bundle.tar.gz
+          tar -tzf noo-stack-bundle.tar.gz >/dev/null
+
+      - name: Generate SHA-256 checksums
+        run: |
+          set -eux
+          cd dist
+          # Per-asset .sha256 files (what install.sh verifies against) ...
+          for f in noo-*-unknown-linux-* noo-*-apple-darwin; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          # ... plus one combined manifest: `sha256sum -c sha256sums.txt`.
+          # noo-*-unknown-linux-gnu and noo-*-apple-darwin also match the
+          # noo-gateway-<target> assets: they are in the
+          # signed manifest by the same globs, on purpose.
+          sha256sum noo-*-unknown-linux-musl noo-*-unknown-linux-gnu noo-*-apple-darwin > sha256sums.txt
+          ls -l
+          cat sha256sums.txt
+
+      # A final that re-published the rc's gateway binaries proves them here,
+      # with the CLI this run built from the same tree (its baked release
+      # keys): the rc's sha256sums.txt signature must verify, and each
+      # noo-gateway-* in dist/ either equals the rc manifest's row (re-used)
+      # or was rebuilt by a lane that fell back. A bad signature FAILS the
+      # release: set CLI_RETAG=off and re-run the whole run to build instead.
+      - name: Re-published rc binaries verify (final, same tree)
+        id: reuse
+        if: env.REUSE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/noo-x86_64-unknown-linux-gnu
+          python3 scripts/cli-release-reuse.py verify --rc-tag "$RC_TAG" --dist dist --noo dist/noo-x86_64-unknown-linux-gnu
+
+      - name: Sign the checksum manifest (an earlier change slice B)
+        # The seed lives only in this secret (+ the operator's off-repo copy).
+        # No secret → no release: an unsigned tag would be refused by every
+        # noo upgrade from 0.3.70 on, so failing here is the honest outcome.
+        env:
+          NOO_RELEASE_SIGNING_SEED: ${{ secrets.NOO_RELEASE_SIGNING_SEED }}
+        run: |
+          set -eu
+          cd dist
+          if [ -z "${NOO_RELEASE_SIGNING_SEED:-}" ]; then
+            echo "::error::NOO_RELEASE_SIGNING_SEED is not set — refusing to publish an unsigned release"
+            exit 1
+          fi
+          chmod +x noo-x86_64-unknown-linux-gnu
+          ./noo-x86_64-unknown-linux-gnu security release-sign sha256sums.txt
+          ./noo-x86_64-unknown-linux-gnu security release-verify sha256sums.txt
+          cat sha256sums.txt.sig
+
+      - name: Create GitHub Release
+        # Only publish on a real tag push (skip for manual workflow_dispatch
+        # dry runs, which have no tag to attach to).
+        if: startsWith(github.ref, 'refs/tags/noo-cli-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REUSE_NOTE: ${{ steps.reuse.outputs.note || 'all built by this run' }}
+        run: |
+          set -eux
+          version="${TAG#noo-cli-v}"
+          cp noo-cli/install.sh dist/install.sh
+
+          notes="$(cat <<EOF
+          # pai CLI ${TAG}
+
+          Standalone, **zero-Python** Rust control plane for Mesh — ~119 native
+          commands served in ~10ms, with everything else passing through. The
+          **static musl** binaries (no libc, no runtime deps) run even when the
+          Python venv is broken, which is the point; the glibc (\`-gnu\`) builds
+          are for hosts that prefer a dynamically linked binary and require a
+          glibc at least as new as the CI runner's.
+
+          ## Install (one-liner)
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sh
+          \`\`\`
+
+          Then:
+
+          \`\`\`sh
+          pai --version
+          pai onboard
+          \`\`\`
+
+          ## Assets
+          | file | platform |
+          | --- | --- |
+          | \`noo-x86_64-unknown-linux-musl\` | Linux x86_64 (static musl — default) |
+          | \`noo-aarch64-unknown-linux-musl\` | Linux aarch64 / arm64 (static musl — default) |
+          | \`noo-x86_64-unknown-linux-gnu\` | Linux x86_64 (glibc) |
+          | \`noo-aarch64-unknown-linux-gnu\` | Linux aarch64 / arm64 (glibc) |
+          | \`noo-hostd-<target>\` | the confined-root helper a node needs before it can start a harness; staged by \`noo upgrade --nodes\` as \`hostd-binary\` |
+          | \`noo-gateway-<target>\` | the gateway binary — what a node runs as its harness (\`noo-gateway harness\`), delivered over the rail by \`noo upgrade --nodes\`; x86_64 / aarch64 glibc, macOS arm64 |
+          | \`sha256sums.txt\` | combined manifest (\`sha256sum -c sha256sums.txt\`) |
+          | \`noo-stack-bundle.tar.gz\` | standalone deploy slice — \`pai onboard --standalone --bundle <url>\` |
+
+          Each binary also ships a per-file \`.sha256\`; the installer verifies
+          it before install.
+
+          Version: \`${version}\`
+
+          Gateway binaries: ${REUSE_NOTE}
+          EOF
+          )"
+
+          # --latest: the README install line is releases/latest/download/install.sh,
+          # which must always resolve to a CLI release (only these carry install.sh).
+          # The stack release is created with --latest=false for the same reason.
+          # A candidate is a prerelease and never Latest: `noo upgrade` skips
+          # prereleases, and only a final may own the install.sh link.
+          flags="--latest"
+          case "$TAG" in *-rc.*) flags="--prerelease --latest=false" ;; esac
+          # shellcheck disable=SC2086
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            $flags \
+            --title "pai CLI ${TAG}" \
+            --notes "${notes}" \
+            dist/noo-x86_64-unknown-linux-musl \
+            dist/noo-x86_64-unknown-linux-musl.sha256 \
+            dist/noo-aarch64-unknown-linux-musl \
+            dist/noo-aarch64-unknown-linux-musl.sha256 \
+            dist/noo-x86_64-unknown-linux-gnu \
+            dist/noo-x86_64-unknown-linux-gnu.sha256 \
+            dist/noo-aarch64-apple-darwin \
+            dist/noo-aarch64-apple-darwin.sha256 \
+            dist/noo-node-agent-aarch64-apple-darwin \
+            dist/noo-node-agent-aarch64-apple-darwin.sha256 \
+            dist/noo-hostd-aarch64-apple-darwin \
+            dist/noo-hostd-aarch64-apple-darwin.sha256 \
+            dist/noo-hostd-x86_64-unknown-linux-gnu \
+            dist/noo-hostd-x86_64-unknown-linux-gnu.sha256 \
+            dist/noo-hostd-aarch64-unknown-linux-gnu \
+            dist/noo-hostd-aarch64-unknown-linux-gnu.sha256 \
+            dist/noo-aarch64-unknown-linux-gnu \
+            dist/noo-aarch64-unknown-linux-gnu.sha256 \
+            dist/noo-gateway-x86_64-unknown-linux-musl \
+            dist/noo-gateway-x86_64-unknown-linux-musl.sha256 \
+            dist/noo-gateway-aarch64-unknown-linux-musl \
+            dist/noo-gateway-aarch64-unknown-linux-musl.sha256 \
+            dist/noo-gateway-aarch64-apple-darwin \
+            dist/noo-gateway-aarch64-apple-darwin.sha256 \
+            dist/sha256sums.txt \
+            dist/sha256sums.txt.sig \
+            dist/noo-stack-bundle.tar.gz \
+            dist/noo-stack-bundle.tar.gz.sha256 \
+            dist/install.sh

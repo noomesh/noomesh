@@ -1,0 +1,73 @@
+# Cluster desired-state seed — copy to config/cluster-seed.yaml (gitignored)
+# and apply with:  pai cluster seed
+#
+# This file is the ONLY place your machine-specific cluster truth lives
+# (IPs — including Tailscale IPs — ssh users, data roots). It is never
+# committed; migrations create empty tables. Snapshot a running cluster
+# back into this file with:  pai cluster seed --export
+
+nodes:
+  node-1:                    # controller
+    ip: 100.64.0.1           # LAN or Tailscale IP
+    ssh_user: youruser
+    tier: 1
+    data_root: /var/lib/pai
+    models_dir: /var/lib/pai/models
+  node-2:                    # GPU worker
+    ip: 100.64.0.2
+    ssh_user: youruser
+    tier: 2
+    data_root: /var/lib/pai
+    # gpu_model / vram_gb: only set BOTH to override broken auto-detection
+    # gpu_model: "NVIDIA GeForce RTX 4090"
+    # vram_gb: 24
+    # The agent loop on this node: auto = a harness follows
+    # whatever chat backend runs here; manual = only an explicit
+    # `noo cluster place <node> harness`; off = never. Omit for the cluster
+    # default (NOO_HARNESS_DEFAULT_POLICY, else manual).
+    # harness_policy: auto
+  phone:                     # companion (tier 5) — policy is per node, in the DB
+    tier: 5
+    # Companion gating. Omit for the gateway default
+    # (battery ≥ 25%, wifi/ethernet only, not serious/critical thermal).
+    # companion_policy:
+    #   min_battery_pct: 40
+    #   require_wifi: true
+    #   blocked_thermal_states: [serious, critical]
+
+placements:
+  - node: node-1
+    backend: vllm
+    model: org/model-name        # HF id for vllm
+    port: 8000
+    tls: true
+  - node: node-2
+    backend: llamacpp
+    model: model.Q4_K_M.gguf     # gguf filename for llamacpp
+    port: 8085
+    state: running               # or "stopped"
+
+# Model classes: the names an external consumer may send as
+# `model`, each an ORDERED list of candidates the gateway fails over across.
+# Optional — with nothing declared the gateway derives one class per served
+# model and `chat-default` from the configured default model.
+#   * omit `model` to mean "the placement's model on that node" (never
+#     restate a placement here)
+#   * `degraded: true` candidates are the only ones allowed to answer with a
+#     DIFFERENT model, and only once every other candidate has failed
+#   * `aliases` are extra names for the class (`default` and `auto` are built
+#     in and always mean chat-default)
+# Applied with `noo cluster seed`; the same as `noo cluster class set`.
+# `--export` writes `model` only where the declaration carried one.
+# model_classes:
+#   chat-default:
+#     aliases: [gemma4:12b-any]
+#     candidates:
+#       - node: node-1
+#         backend: vllm                  # model: the placement's
+#       - node: node-2
+#         backend: ollama
+#         model: gemma4:12b              # pulled on node-2, not its placement
+#       - node: node-3
+#         backend: ollama
+#         degraded: true                 # a smaller model, last resort

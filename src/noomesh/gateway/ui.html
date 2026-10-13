@@ -1,0 +1,464 @@
+﻿<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright 2026 PersonifAI LLC -->
+
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>noomesh</title>
+    <style>
+      :root {
+        --bg: #0a0f14;
+        --panel: #111827;
+        --panel-2: #0f172a;
+        --accent: #38bdf8;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --border: rgba(148, 163, 184, 0.2);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #1c2a3a, #0a0f14 55%);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      .shell {
+        width: min(1100px, 100%);
+        background: rgba(17, 24, 39, 0.95);
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        border-radius: 18px;
+        padding: 20px;
+        box-shadow: 0 35px 60px rgba(0, 0, 0, 0.45);
+        display: grid;
+        gap: 16px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      h1 {
+        font-size: 18px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
+        margin: 0;
+      }
+      .status {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+      }
+      button {
+        background: var(--accent);
+        color: #0a0f14;
+        border: none;
+        padding: 10px 14px;
+        border-radius: 10px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .main {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 16px;
+      }
+      .panel {
+        background: rgba(11, 18, 28, 0.8);
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        padding: 16px;
+        display: grid;
+        gap: 12px;
+      }
+      .feed {
+        min-height: 320px;
+        max-height: 440px;
+        overflow-y: auto;
+        display: grid;
+        gap: 10px;
+      }
+      .msg {
+        padding: 12px 14px;
+        border-radius: 12px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+      .msg.user {
+        background: rgba(56, 189, 248, 0.15);
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        justify-self: end;
+      }
+      .msg.assistant {
+        background: rgba(148, 163, 184, 0.15);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        justify-self: start;
+      }
+      .msg.pending {
+        opacity: 0.7;
+        font-style: italic;
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+      }
+      input {
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        color: var(--text);
+        font-size: 14px;
+      }
+      .tool-list {
+        display: grid;
+        gap: 8px;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+      .tool-item {
+        padding: 10px 12px;
+        background: rgba(15, 23, 42, 0.8);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        font-size: 13px;
+      }
+      .tool-item strong {
+        display: block;
+        font-size: 12px;
+        color: var(--accent);
+      }
+      .tool-check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 0;
+        font-size: 13px;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      @media (max-width: 900px) {
+        .main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <div>
+          <h1>noomesh</h1>
+          <div class="status" id="status">connecting...</div>
+        </div>
+        <div class="actions">
+          <button class="secondary" id="new-session">New Session</button>
+          <button class="secondary" id="voice">Voice</button>
+          <button id="send" form="chat-form" type="submit">Send</button>
+        </div>
+      </header>
+
+      <div class="main">
+        <section class="panel">
+          <div class="feed" id="feed"></div>
+          <form id="chat-form">
+            <input
+              id="prompt"
+              type="text"
+              placeholder="Ask your local agent..."
+              autocomplete="off"
+            />
+            <button class="secondary" type="button" id="clear">Clear</button>
+          </form>
+        </section>
+
+        <aside class="panel">
+          <div>
+            <strong>Selected Tools</strong>
+            <div class="muted">Live preview based on your prompt.</div>
+          </div>
+          <div class="tool-list" id="tools"></div>
+          <div class="muted" id="tool-status">Type a prompt to preview tools.</div>
+
+          <div>
+            <strong>Pinned Tools</strong>
+            <div class="muted">Pinned tools are always included.</div>
+          </div>
+          <div class="tool-list" id="pinned"></div>
+        </aside>
+      </div>
+    </div>
+
+    <script>
+      const feed = document.getElementById('feed');
+      const form = document.getElementById('chat-form');
+      const promptInput = document.getElementById('prompt');
+      const statusEl = document.getElementById('status');
+      const sendBtn = document.getElementById('send');
+      const clearBtn = document.getElementById('clear');
+      const newSessionBtn = document.getElementById('new-session');
+      const voiceBtn = document.getElementById('voice');
+      const toolsEl = document.getElementById('tools');
+      const toolStatus = document.getElementById('tool-status');
+      const pinnedEl = document.getElementById('pinned');
+
+      let socket;
+      let pendingEl = null;
+      let toolTimer = null;
+      let recognition = null;
+      let listening = false;
+      let pinnedTools = new Set();
+      let allTools = [];
+
+      function appendMessage(text, cls) {
+        const msg = document.createElement('div');
+        msg.className = `msg ${cls}`;
+        msg.textContent = text;
+        feed.appendChild(msg);
+        feed.scrollTop = feed.scrollHeight;
+        return msg;
+      }
+
+      function setPending() {
+        pendingEl = appendMessage('noomesh is thinking...', 'assistant pending');
+      }
+
+      function updatePending(delta) {
+        if (!pendingEl) {
+          pendingEl = appendMessage('', 'assistant pending');
+        }
+        pendingEl.textContent = pendingEl.textContent === 'noomesh is thinking...'
+          ? delta
+          : pendingEl.textContent + delta;
+        feed.scrollTop = feed.scrollHeight;
+      }
+
+      function resolvePending(finalText) {
+        if (pendingEl) {
+          pendingEl.textContent = finalText;
+          pendingEl.classList.remove('pending');
+          pendingEl = null;
+        } else {
+          appendMessage(finalText, 'assistant');
+        }
+        sendBtn.disabled = false;
+      }
+
+      function resetSession() {
+        if (socket) {
+          socket.close();
+        }
+        feed.innerHTML = '';
+        connect();
+      }
+
+      function connect() {
+        const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+
+        socket.addEventListener('open', () => {
+          statusEl.textContent = 'connected';
+        });
+
+        socket.addEventListener('close', () => {
+          statusEl.textContent = 'disconnected';
+        });
+
+        socket.addEventListener('message', (event) => {
+          let payload;
+          try {
+            payload = JSON.parse(event.data);
+          } catch (e) {
+            resolvePending(event.data);
+            return;
+          }
+
+          if (payload.type === 'token') {
+            updatePending(payload.content || '');
+            return;
+          }
+          if (payload.type === 'done') {
+            resolvePending(payload.reply || (pendingEl ? pendingEl.textContent : ''));
+            return;
+          }
+          if (payload.type === 'error') {
+            resolvePending(payload.message || 'Error');
+          }
+        });
+      }
+
+      async function fetchTools(prompt) {
+        if (!prompt) {
+          toolsEl.innerHTML = '';
+          toolStatus.textContent = 'Type a prompt to preview tools.';
+          return;
+        }
+        toolStatus.textContent = 'Selecting tools...';
+        try {
+          const response = await fetch('/tools/select', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, pinned_tools: Array.from(pinnedTools) })
+          });
+          const data = await response.json();
+          const tools = data.tools || [];
+          toolsEl.innerHTML = '';
+          if (!tools.length) {
+            toolStatus.textContent = 'No tools selected.';
+            return;
+          }
+          toolStatus.textContent = '';
+          tools.forEach((tool) => {
+            const item = document.createElement('div');
+            item.className = 'tool-item';
+            item.innerHTML = `<strong>${tool.name}</strong>${tool.description || ''}`;
+            toolsEl.appendChild(item);
+          });
+        } catch (err) {
+          toolStatus.textContent = 'Tool preview unavailable.';
+        }
+      }
+
+      async function loadToolList() {
+        try {
+          const response = await fetch('/tools/list');
+          const data = await response.json();
+          allTools = data.tools || [];
+          renderPinnedTools();
+        } catch (err) {
+          pinnedEl.innerHTML = '<div class="muted">Unable to load tools.</div>';
+        }
+      }
+
+      function renderPinnedTools() {
+        pinnedEl.innerHTML = '';
+        if (!allTools.length) {
+          pinnedEl.innerHTML = '<div class="muted">No tools available.</div>';
+          return;
+        }
+        allTools.forEach((tool) => {
+          const row = document.createElement('label');
+          row.className = 'tool-check';
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.checked = pinnedTools.has(tool.name);
+          checkbox.addEventListener('change', () => {
+            if (checkbox.checked) {
+              pinnedTools.add(tool.name);
+            } else {
+              pinnedTools.delete(tool.name);
+            }
+            fetchTools(promptInput.value.trim());
+          });
+          const label = document.createElement('span');
+          label.textContent = tool.name;
+          row.appendChild(checkbox);
+          row.appendChild(label);
+          pinnedEl.appendChild(row);
+        });
+      }
+
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const value = promptInput.value.trim();
+        if (!value || !socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        appendMessage(value, 'user');
+        socket.send(JSON.stringify({
+          prompt: value,
+          pinned_tools: Array.from(pinnedTools)
+        }));
+        promptInput.value = '';
+        sendBtn.disabled = true;
+        setPending();
+        fetchTools('');
+      });
+
+      clearBtn.addEventListener('click', () => {
+        promptInput.value = '';
+        fetchTools('');
+      });
+
+      newSessionBtn.addEventListener('click', () => {
+        resetSession();
+      });
+
+      promptInput.addEventListener('input', () => {
+        const prompt = promptInput.value.trim();
+        if (toolTimer) {
+          clearTimeout(toolTimer);
+        }
+        toolTimer = setTimeout(() => fetchTools(prompt), 300);
+      });
+
+      function setupVoice() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+          voiceBtn.disabled = true;
+          voiceBtn.textContent = 'Voice N/A';
+          return;
+        }
+        recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+
+        recognition.onstart = () => {
+          listening = true;
+          voiceBtn.textContent = 'Listening...';
+        };
+        recognition.onend = () => {
+          listening = false;
+          voiceBtn.textContent = 'Voice';
+        };
+        recognition.onresult = (event) => {
+          let transcript = '';
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            transcript += event.results[i][0].transcript;
+          }
+          promptInput.value = transcript.trim();
+          fetchTools(promptInput.value.trim());
+        };
+      }
+
+      voiceBtn.addEventListener('click', () => {
+        if (!recognition) return;
+        if (listening) {
+          recognition.stop();
+          return;
+        }
+        recognition.start();
+      });
+
+      connect();
+      setupVoice();
+      loadToolList();
+    </script>
+  </body>
+</html>

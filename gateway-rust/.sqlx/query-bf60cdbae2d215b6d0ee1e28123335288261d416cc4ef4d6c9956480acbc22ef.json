@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO noo_prompt_skill_stats (skill_name, conversation_id, context) VALUES ($1, $2, '{}'::jsonb)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bf60cdbae2d215b6d0ee1e28123335288261d416cc4ef4d6c9956480acbc22ef"
+}

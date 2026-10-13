@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# GPU access for the standalone single-ollama (ollama-embed hosts BOTH the
+# embedder and chat models on a standalone box). Included by the launcher
+# ONLY when nvidia-smi reports a working GPU: compose cannot reserve
+# devices conditionally, and an unconditional reservation breaks CPU-only
+# controllers. Without this overlay a GPU box ran gemma on CPU while the
+# 3060 idled (2026-09-01).
+services:
+  ollama-embed:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

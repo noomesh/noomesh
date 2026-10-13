@@ -1,0 +1,142 @@
+{
+  "_comment": [
+    "The node-tier ladder's contract, shared by every implementation of it.",
+    "",
+    "The rules live in three places that cannot see each other at build time:",
+    "gateway-rust/src/node_tier.rs (the canonical statement, and the only one",
+    "that runs continuously), and noo-cli's two birth-time parsers in",
+    "commands/provision.rs — derive_tier_facts over the enrolment JSON and",
+    "derive_tier over `noo-gate facts` text. There is no shared crate: the two",
+    "Cargo projects have no workspace, no path dependency and separate Docker",
+    "build contexts, so a compiler cannot hold them together.",
+    "",
+    "This file can. Both crates' unit tests read it and assert every case,",
+    "and tests/test_node_tier_ladder_parity.py fails if either stops reading",
+    "it. Add a case here first; a rule that only one side implements shows up",
+    "as a red test rather than as a mis-tiered node.",
+    "",
+    "`tier: null` means the ladder must DECLINE — the facts do not decide.",
+    "Only the gateway distinguishes this: the CLI ladders run at birth where",
+    "the enrolling script always sends every field, so they resolve their",
+    "absences to the worker default. Cases marked birth_time_default say what",
+    "the CLI is allowed to answer instead."
+  ],
+  "cases": [
+    {
+      "name": "workstation with a discrete GPU",
+      "facts": {
+        "is_arm": false,
+        "gpu_present": true,
+        "gpu_memory_gb": 24.0
+      },
+      "tier": 2,
+      "why": "tier 1 is controller-class and never auto-assigned from a GPU-present signal"
+    },
+    {
+      "name": "jetson reports VRAM but is edge",
+      "facts": {
+        "device_tree_model": "NVIDIA Jetson Orin Nano",
+        "is_arm": true,
+        "gpu_present": true,
+        "gpu_memory_gb": 16.0
+      },
+      "tier": 4,
+      "why": "the board branch runs before the GPU rules; a VRAM-first ladder gives a Jetson vLLM work"
+    },
+    {
+      "name": "raspberry pi 5",
+      "facts": {
+        "device_tree_model": "Raspberry Pi 5 Model B Rev 1.0",
+        "is_arm": true,
+        "gpu_present": false
+      },
+      "tier": 4,
+      "why": "no GPU, but edge rather than CPU worker"
+    },
+    {
+      "name": "rockchip board",
+      "facts": {
+        "device_tree_model": "Rockchip RK3588 EVB",
+        "is_arm": true
+      },
+      "tier": 4
+    },
+    {
+      "name": "plain x86 cpu box",
+      "facts": {
+        "is_arm": false,
+        "gpu_present": false
+      },
+      "tier": 3
+    },
+    {
+      "name": "arm server with no board model",
+      "facts": {
+        "is_arm": true,
+        "gpu_present": false
+      },
+      "tier": 4,
+      "why": "aarch64 with nothing else to go on is edge by architecture"
+    },
+    {
+      "name": "8GB mac mini",
+      "facts": {
+        "unified_memory": true,
+        "gpu_memory_gb": 5.3,
+        "gpu_api": "metal",
+        "is_arm": true
+      },
+      "tier": 2,
+      "why": "unified memory is a real GPU; 8 GB of it landed in tier 4 before this branch existed"
+    },
+    {
+      "name": "large mac studio stays tier 2",
+      "facts": {
+        "unified_memory": true,
+        "gpu_memory_gb": 48.0,
+        "gpu_api": "metal",
+        "is_arm": true
+      },
+      "tier": 2,
+      "why": "no vLLM on Metal, so no amount of unified memory earns the second slot"
+    },
+    {
+      "name": "cuda unified memory box reaches tier 1",
+      "facts": {
+        "unified_memory": true,
+        "gpu_memory_gb": 96.0,
+        "gpu_api": "cuda",
+        "is_arm": true
+      },
+      "tier": 1,
+      "why": "DGX Spark / GB10 class — CUDA, so vLLM runs"
+    },
+    {
+      "name": "tiny unified memory box is edge",
+      "facts": {
+        "unified_memory": true,
+        "gpu_memory_gb": 2.0,
+        "gpu_api": "metal",
+        "is_arm": true
+      },
+      "tier": 4
+    },
+    {
+      "name": "nothing reported",
+      "facts": {},
+      "tier": null,
+      "birth_time_default": 3,
+      "why": "on the heartbeat path silence is not evidence; deriving 3 here and comparing it against a declared 1 manufactures a disagreement out of an older agent build"
+    },
+    {
+      "name": "unified memory with no usable figure",
+      "facts": {
+        "unified_memory": true,
+        "is_arm": true
+      },
+      "tier": null,
+      "birth_time_default": 4,
+      "why": "the branch exists to weigh the usable share; without it there is nothing to weigh"
+    }
+  ]
+}

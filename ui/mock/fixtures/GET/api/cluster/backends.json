@@ -1,0 +1,35 @@
+{
+  "backends": [
+    {
+      "node_id": "prime-01",
+      "backend": "vllm",
+      "backend_type": "vllm",
+      "model": "llama-3.1-70b-instruct",
+      "status": "running",
+      "hostname": "prime-01",
+      "load": 0.36,
+      "url": "http://192.0.2.84:8001"
+    },
+    {
+      "node_id": "atlas-02",
+      "backend": "vllm",
+      "backend_type": "vllm",
+      "model": "qwen-2.5-32b-instruct",
+      "status": "running",
+      "hostname": "atlas-02",
+      "load": 0.82,
+      "url": "http://192.0.2.22:8001"
+    },
+    {
+      "node_id": "prime-01",
+      "backend": "ollama",
+      "backend_type": "ollama",
+      "model": "nomic-embed-text",
+      "status": "running",
+      "hostname": "prime-01",
+      "load": 0.05,
+      "url": "http://192.0.2.84:11434"
+    }
+  ],
+  "grouped": {}
+}

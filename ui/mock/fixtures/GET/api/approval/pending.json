@@ -1,0 +1,6 @@
+{
+  "pending": [
+    { "id": "apr-7f3a2b", "tool": "pai_coding_task", "risk_level": "high", "created_at": "2026-08-01T14:18:00Z" },
+    { "id": "apr-2b9104", "tool": "shell_exec", "risk_level": "medium", "created_at": "2026-08-01T14:10:00Z" }
+  ]
+}

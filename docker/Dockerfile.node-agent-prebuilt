@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Prebuilt node-agent runtime — wraps an ALREADY cross-compiled static binary
+# (noo-node-agent-arm64) that `noo cluster sync-images` / `upgrade-agents` ships
+# to arm64 edge nodes, then builds NATIVELY on the node so the image arch and
+# the binary arch match.
+#
+# Why this exists: the controller is x86, so `docker save node-agent:latest |
+# ssh <arm-node> docker load` puts an amd64 image on an arm64 board →
+# `exec /bin/sh: exec format error`. The cross-arch path instead cross-compiles
+# the binary (CGO_ENABLED=0, build-cross.sh) and wraps it here on the node.
+#
+# No builder stage (the binary is prebuilt) and a plain public base — edge nodes
+# may lack DHI registry access, and a static binary needs no glibc/musl shim.
+# GPU bits (gcompat/nvidia) are intentionally omitted: arm edge nodes are CPU
+# llama.cpp workers.
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/library/alpine:3.22
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+# Cross-compiled static binary, scp'd into the build context by the caller
+# (see sync_node_agent_arm in noo-cli). Static → runs on any arch-matched base.
+COPY noo-node-agent-arm64 /usr/local/bin/noo-node-agent
+RUN chmod +x /usr/local/bin/noo-node-agent
+
+# Cluster CA injection — parity with docker/Dockerfile.node-agent-go.
+COPY docker/inject-ca.sh /opt/inject-ca.sh
+RUN chmod +x /opt/inject-ca.sh 2>/dev/null || true
+
+ENV NODE_ID=auto CONTROLLER_URL=https://gateway:8080 NODE_TIER=4 GPU_MODEL="" HEARTBEAT_INTERVAL=30
+EXPOSE 8081
+HEALTHCHECK --interval=30s --timeout=10s \
+    CMD ["/usr/local/bin/noo-node-agent", "-healthcheck"]
+USER 0
+ENTRYPOINT []
+CMD ["sh", "-c", "[ -x /opt/inject-ca.sh ] && . /opt/inject-ca.sh; exec noo-node-agent"]

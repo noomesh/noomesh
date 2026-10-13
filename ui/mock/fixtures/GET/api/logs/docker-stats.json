@@ -1,0 +1,7 @@
+{
+  "containers": [
+    { "name": "pai-gateway", "node_id": "prime-01", "node_hostname": "prime-01", "status": "running", "cpu_percent": 12.4, "mem_usage_mb": 512, "mem_limit_mb": 4096, "mem_percent": 12.5, "net_rx_mb": 120, "net_tx_mb": 88, "block_read_mb": 0, "block_write_mb": 4 },
+    { "name": "vllm-llama", "node_id": "prime-01", "node_hostname": "prime-01", "status": "running", "cpu_percent": 68.1, "mem_usage_mb": 18400, "mem_limit_mb": 32768, "mem_percent": 56.2, "net_rx_mb": 40, "net_tx_mb": 900, "block_read_mb": 2, "block_write_mb": 1 },
+    { "name": "vllm-qwen", "node_id": "atlas-02", "node_hostname": "atlas-02", "status": "running", "cpu_percent": 90.5, "mem_usage_mb": 21200, "mem_limit_mb": 32768, "mem_percent": 64.7, "net_rx_mb": 30, "net_tx_mb": 1200, "block_read_mb": 1, "block_write_mb": 1 }
+  ]
+}

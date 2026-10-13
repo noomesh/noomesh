@@ -1,0 +1,8 @@
+{
+  "users": [
+    { "username": "dev", "disabled": false, "scopes": ["admin", "write", "read"], "last_login_at": "2026-08-01T14:00:00Z", "locked_until": null },
+    { "username": "alice", "disabled": false, "scopes": ["write", "read"], "last_login_at": "2026-07-31T20:00:00Z", "locked_until": null },
+    { "username": "ops", "disabled": false, "scopes": ["read"], "last_login_at": "2026-07-30T09:15:00Z", "locked_until": null },
+    { "username": "agent-bot", "disabled": true, "scopes": ["read"], "last_login_at": null, "locked_until": null }
+  ]
+}

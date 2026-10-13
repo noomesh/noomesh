@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# docker-compose.voice.yml — the voice add-on OVERLAY: noo-whisper (STT) and
+# noo-piper (TTS). an earlier change.
+#
+# Composed by the launcher when `addons.voice: true` is declared in
+# noomesh.yaml (scripts/lib-compose.sh, the one file list) and by nothing
+# else. No `profiles:` in here, on purpose: composing this file IS the
+# switch. Opting out on a live stack stops the containers in
+# the same run — `up` never touches a service it was not shown.
+#
+# Dist installs: each service below interpolates `pull_policy:
+# ${NOO_PULL_POLICY:-build}`, and both dist implementations export `missing`.
+# The launcher does NOT pass --no-build on its `up`, which is what the
+# earlier note here claimed; trellion relied on the same claim and a
+# standalone controller tried to build it from a checkout it does not have
+# (2026-09-23). A dist row for these services is deliberately absent: a row
+# for a service the overlay did not compose is a bare service with no image,
+# and compose refuses the whole project.
+#
+# The volumes (hf-cache, piper-voices) are declared in the base file's
+# top-level `volumes:`; an overlay may reference them.
+#
+# Whisper STT — faster-whisper behind the OpenAI-compatible audio API
+# (docker/whisper_server.py). The gateway's generic STT provider layer
+# (gateway-rust/src/stt_client.rs) points at it by default
+# (http://noo-whisper:8000, wire format "openai"), so enabling the add-on is
+# the whole setup. CPU (int8) by default; WHISPER_MODEL picks the preloaded
+# model (tiny/base/small/medium/large-v3 or an HF CTranslate2 repo id). The
+# long-term GPU home is a node-agent backend spec (backends.go), like
+# embedding/reranker — not a GPU variant of this service.
+#
+# Piper TTS — piper-tts behind the OpenAI-compatible speech API
+# (docker/piper_server.py). The gateway's generic TTS provider layer
+# (gateway-rust/src/tts_client.rs) points at it by default
+# (http://noo-piper:8000, wire format "openai"); its native /synthesize shape
+# is wire format "piper".
+#
+# To use a DIFFERENT provider instead (OpenAI cloud, vLLM audio model,
+# speaches, LocalAI, kokoro-fastapi, openedai-speech):
+#   NOO_STT_URL / NOO_TTS_URL              (e.g. https://api.openai.com)
+#   NOO_STT_BACKEND / NOO_TTS_BACKEND      (openai; "whisper"/"piper" for the native shapes)
+#   NOO_STT_MODEL                          (e.g. whisper-1; empty = client hint)
+#   NOO_STT_API_KEY_ENV / NOO_TTS_API_KEY_ENV (e.g. OPENAI_API_KEY)
+# Provider selection is the gateway's; this overlay only deploys the
+# containers.
+#
+# YAML anchors do not cross files: the logging block is restated here, the
+# same way docker-compose.evolve.yml carries it.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  whisper:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.whisper
+    # Same reason as trellion's: an add-on overlay
+    # cannot have a dist row, so the pull policy is interpolated and the
+    # launcher exports `missing` in dist mode. Without it the fallback is
+    # `build`, and a standalone controller that has already PULLED this
+    # image rebuilds it from a deploy slice that carries no docker/ tree.
+    pull_policy: ${NOO_PULL_POLICY:-build}
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/whisper:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_WHISPER:-}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-whisper
+    # No external port — gateway reaches it via the Docker network.
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-auto}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # Same HF cache volume as tei — model downloads land on the data disk.
+      - hf-cache:/models
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+
+  piper:
+    logging: *default-logging
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.piper
+    # Same reason as trellion's: an add-on overlay
+    # cannot have a dist row, so the pull policy is interpolated and the
+    # launcher exports `missing` in dist mode. Without it the fallback is
+    # `build`, and a standalone controller that has already PULLED this
+    # image rebuilds it from a deploy slice that carries no docker/ tree.
+    pull_policy: ${NOO_PULL_POLICY:-build}
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/piper:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_PIPER:-}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-piper
+    # No external port — gateway reaches it via the Docker network.
+    environment:
+      # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
+      # the libraries built on it honour these.
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - DO_NOT_TRACK=1
+      - PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
+      - PIPER_USE_CUDA=${PIPER_USE_CUDA:-0}
+    volumes:
+      # Voice models (~60MB each) survive container recreation.
+      - piper-voices:/voices
+    networks:
+      - noo-cluster
+    restart: unless-stopped
+

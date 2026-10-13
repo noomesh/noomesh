@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
+// noomesh tailnet ACL policy — pushed by `noo security tailnet policy --push`
+// (validates, then backs up the existing policy, then replaces it). HuJSON: comments + trailing commas OK.
+//
+// Model: the tailnet is deny-by-default once this policy is applied.
+// Roles are expressed as tags; enrollment keys carry the tag, so a node is
+// locked down from its first packet. Adding a node or a site with the same
+// roles requires NO changes here — only new *relationships* do.
+{
+	"tagOwners": {
+		// Only tailnet admins (you) may apply these tags to devices.
+		"tag:controller": ["autogroup:admin"],
+		// tag:controller co-owns tag:worker so the OAUTH CLIENT (which
+		// acts AS its tags) may mint worker join keys — autogroup:admin
+		// authorizes only humans in the console.
+		"tag:worker":     ["autogroup:admin", "tag:controller"],
+		// tag:kiosk is co-owned for the same reason tag:worker is: the
+		// controller's OAuth client mints the display's tagged auth key
+		// (`noo kiosk invite`), and a client may only mint for a tag one
+		// of its own tags owns.
+		"tag:kiosk":      ["autogroup:admin", "tag:controller"],
+	},
+
+	"acls": [
+		// Worker nodes → controller: gateway API (heartbeat/registration),
+		// NATS, and the model-weight cache (so a placed node preseeds model
+		// weights over the LAN instead of from HF). The cache is :8443 only —
+		// mTLS with the node's own leaf; there is no plaintext listener.
+		// Nothing else on the controller is reachable from a worker.
+		{
+			"action": "accept",
+			"src":    ["tag:worker"],
+			"dst":    ["tag:controller:8080", "tag:controller:4222", "tag:controller:8443"],
+		},
+
+		// Controller → workers: the node-agent control/inference proxy.
+		// NO :22. The controller reaches a node over the pull rail, never over
+		// SSH, and `sshd` on a node is the operator's own decision, nothing
+		// the mesh needs. A grant is a standing permission, so :22 is not
+		// listed. An admin reaching a node by SSH is covered by the
+		// `autogroup:admin` grant below; from the controller such a
+		// connection would HANG rather than error, because a denied tailnet
+		// port drops packets and `tailscale ping` keeps answering.
+		// 8082 is the OPTIONAL Tier 5 sensor companion agent — a second
+		// node-agent on the same host with its own node identity (compose
+		// profile "sensors"). The gateway proxies device_* tool calls to the
+		// URL the node reports, so without this grant those calls TIME OUT
+		// rather than fail fast: the node registers fine, shows online, and
+		// advertises its sensors, but every sensor request hangs.
+		// Same shape as the model-cache grant below — a new controller
+		// port is invisible to nodes until it is listed here.
+		{
+			"action": "accept",
+			"src":    ["tag:controller"],
+			"dst":    ["tag:worker:8081", "tag:worker:8082"],
+		},
+
+		// Tailnet admins: unrestricted. Full dashboard,
+		// SSH anywhere (an admin reaching a node by SSH is a person's
+		// decision, not the mesh's), debugging.
+		{
+			"action": "accept",
+			"src":    ["autogroup:admin"],
+			"dst":    ["*:*"],
+		},
+
+		// Other tailnet members: gateway only — dashboard + API. What they
+		// can DO there is governed by their noomesh account's scopes (read = view + chat/query).
+		//
+		// Both ports are the SAME gateway, and both are 401-gated; they differ
+		// only in which cert the client must trust:
+		//   :443  — Tailscale Serve, public Let's Encrypt cert. Browsers get
+		//           https://<controller>.<tailnet>.ts.net with no warning
+		//           and no port in the URL. Use this for the dashboard.
+		//   :8080 — the gateway's own cluster-CA cert. REQUIRED by the `noo`
+		//           CLI and node-agents: cli_http_verify() pins verification
+		//           to pki/ca.crt (cafile only, no system roots), so those
+		//           clients reject the Let's Encrypt cert on :443. Removing
+		//           this would break CLI access for members.
+		{
+			"action": "accept",
+			"src":    ["autogroup:member"],
+			"dst":    ["tag:controller:443", "tag:controller:8080"],
+		},
+
+		// Kiosk displays → controller, :443 ONLY.
+		//
+		// A display is a VIEWER, not a node: no node-agent, no node identity,
+		// nothing reconciles it. It reads the dashboard's kiosk entry point
+		// over Tailscale Serve and draws. :8080 is deliberately absent — that
+		// port carries the gateway's cluster-CA cert, Chromium on Linux
+		// ignores the OS trust store, and a certificate wall on a screen with
+		// no keyboard cannot be dismissed. `noo kiosk setup` refuses a :8080
+		// URL for that reason, so granting it here would only add a way to
+		// get it wrong.
+		//
+		// This grant is what a tagged display has INSTEAD of the member grant
+		// above, never in addition: `--advertise-tags` REPLACES the user
+		// identity the laptop joined with. Tag a display before this rule is
+		// live and it silently loses the 443 it had as a member — `tailscale
+		// ping` keeps succeeding, because the host is reachable and only the
+		// port is not.
+		{
+			"action": "accept",
+			"src":    ["tag:kiosk"],
+			"dst":    ["tag:controller:443"],
+		},
+
+		// Controller → kiosk displays, :8099 ONLY — the DIALBACK port.
+		//
+		// This is the one inbound grant a display has, and it exists so the
+		// display can hold NO durable secret. To mint its 15-minute token it
+		// publishes a nonce on its own tailnet address and asks the gateway
+		// to come and read it; WireGuard routing means only the true owner
+		// of that address can answer, which is what proves the caller IS
+		// the display. Same admission as node enrollment, applied to a
+		// viewer.
+		//
+		// The listener is EPHEMERAL: the display opens it, serves one nonce,
+		// and closes it whether the mint succeeded or not. It is not a
+		// service. `noo kiosk setup` binds it to the tailnet address
+		// specifically and REFUSES to mint if that address cannot be
+		// resolved — a wildcard bind would be reachable from the local
+		// network, where no tailnet ACL applies, and this rule would then
+		// bound nothing while everything still appeared to work.
+		{
+			"action": "accept",
+			"src":    ["tag:controller"],
+			"dst":    ["tag:kiosk:8099"],
+		},
+
+		// OPTIONAL — warm-standby Postgres replication between controllers
+		// (scripts/bootstrap-standby.sh). Uncomment when a second controller
+		// site exists. 5433 is the primary's host-published Postgres port.
+		// {
+		// 	"action": "accept",
+		// 	"src":    ["tag:controller"],
+		// 	"dst":    ["tag:controller:5433"],
+		// },
+
+		// There is no rule for an MCP port here, and there should not be one.
+		// There is no separate plain-HTTP MCP listener: both doors are paths
+		// on the gateway's own HTTPS port — `/mcp/user` and `/mcp/operator` — so a member who can reach
+		// `tag:controller:443` or `:8080` above can reach them already, with a
+		// service key on every request. Nothing to open.
+	],
+}

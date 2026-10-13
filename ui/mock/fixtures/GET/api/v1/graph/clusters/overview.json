@@ -1,0 +1,1403 @@
+{
+  "nodes": [
+    {
+      "id": "c01",
+      "name": "mesh operations",
+      "type": "cluster",
+      "level": 1,
+      "degree": 11,
+      "member_count": 52
+    },
+    {
+      "id": "c02",
+      "name": "people",
+      "type": "cluster",
+      "level": 1,
+      "degree": 9,
+      "member_count": 94
+    },
+    {
+      "id": "c03",
+      "name": "pai-assistant",
+      "type": "cluster",
+      "level": 1,
+      "degree": 13,
+      "member_count": 50
+    },
+    {
+      "id": "c04",
+      "name": "pai-mesh-ui",
+      "type": "cluster",
+      "level": 1,
+      "degree": 9,
+      "member_count": 36
+    },
+    {
+      "id": "c05",
+      "name": "trellion",
+      "type": "cluster",
+      "level": 1,
+      "degree": 12,
+      "member_count": 69
+    },
+    {
+      "id": "c06",
+      "name": "hardware",
+      "type": "cluster",
+      "level": 1,
+      "degree": 12,
+      "member_count": 64
+    },
+    {
+      "id": "c07",
+      "name": "security & pki",
+      "type": "cluster",
+      "level": 1,
+      "degree": 12,
+      "member_count": 88
+    },
+    {
+      "id": "c08",
+      "name": "launch",
+      "type": "cluster",
+      "level": 1,
+      "degree": 11,
+      "member_count": 77
+    },
+    {
+      "id": "c09",
+      "name": "design",
+      "type": "cluster",
+      "level": 1,
+      "degree": 7,
+      "member_count": 34
+    },
+    {
+      "id": "c10",
+      "name": "models",
+      "type": "cluster",
+      "level": 1,
+      "degree": 13,
+      "member_count": 52
+    },
+    {
+      "id": "c11",
+      "name": "conversations",
+      "type": "cluster",
+      "level": 1,
+      "degree": 9,
+      "member_count": 107
+    },
+    {
+      "id": "c12",
+      "name": "misc",
+      "type": "cluster",
+      "level": 1,
+      "degree": 13,
+      "member_count": 111
+    },
+    {
+      "id": "c13",
+      "name": "gateway",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 5
+    },
+    {
+      "id": "c14",
+      "name": "node agents",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 14
+    },
+    {
+      "id": "c15",
+      "name": "scheduler",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 7
+    },
+    {
+      "id": "c16",
+      "name": "embeddings",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 43
+    },
+    {
+      "id": "c17",
+      "name": "vllm",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 27
+    },
+    {
+      "id": "c18",
+      "name": "ollama",
+      "type": "cluster",
+      "level": 1,
+      "degree": 8,
+      "member_count": 36
+    },
+    {
+      "id": "c19",
+      "name": "docker",
+      "type": "cluster",
+      "level": 1,
+      "degree": 2,
+      "member_count": 33
+    },
+    {
+      "id": "c20",
+      "name": "kubernetes",
+      "type": "cluster",
+      "level": 1,
+      "degree": 2,
+      "member_count": 15
+    },
+    {
+      "id": "c21",
+      "name": "tailscale",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 26
+    },
+    {
+      "id": "c22",
+      "name": "certificates",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 11
+    },
+    {
+      "id": "c23",
+      "name": "backups",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 16
+    },
+    {
+      "id": "c24",
+      "name": "monitoring",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 29
+    },
+    {
+      "id": "c25",
+      "name": "prometheus",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 12
+    },
+    {
+      "id": "c26",
+      "name": "grafana",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 11
+    },
+    {
+      "id": "c27",
+      "name": "postgres",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 38
+    },
+    {
+      "id": "c28",
+      "name": "nats",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 21
+    },
+    {
+      "id": "c29",
+      "name": "redis",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 40
+    },
+    {
+      "id": "c30",
+      "name": "migrations",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 12
+    },
+    {
+      "id": "c31",
+      "name": "cli",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 23
+    },
+    {
+      "id": "c32",
+      "name": "onboarding",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 41
+    },
+    {
+      "id": "c33",
+      "name": "docs",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 18
+    },
+    {
+      "id": "c34",
+      "name": "runbooks",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 5
+    },
+    {
+      "id": "c35",
+      "name": "proposals",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 7
+    },
+    {
+      "id": "c36",
+      "name": "followups",
+      "type": "cluster",
+      "level": 1,
+      "degree": 6,
+      "member_count": 28
+    },
+    {
+      "id": "c37",
+      "name": "releases",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 6
+    },
+    {
+      "id": "c38",
+      "name": "ghcr",
+      "type": "cluster",
+      "level": 1,
+      "degree": 3,
+      "member_count": 12
+    },
+    {
+      "id": "c39",
+      "name": "licensing",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 36
+    },
+    {
+      "id": "c40",
+      "name": "entitlements",
+      "type": "cluster",
+      "level": 1,
+      "degree": 4,
+      "member_count": 11
+    },
+    {
+      "id": "c41",
+      "name": "evolve",
+      "type": "cluster",
+      "level": 1,
+      "degree": 6,
+      "member_count": 7
+    },
+    {
+      "id": "c42",
+      "name": "heartbeat",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 20
+    },
+    {
+      "id": "c43",
+      "name": "autonomy",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 11
+    },
+    {
+      "id": "c44",
+      "name": "approvals",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 9
+    },
+    {
+      "id": "c45",
+      "name": "recall",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 17
+    },
+    {
+      "id": "c46",
+      "name": "recall memory",
+      "type": "cluster",
+      "level": 1,
+      "degree": 6,
+      "member_count": 27
+    },
+    {
+      "id": "c47",
+      "name": "rag ingest",
+      "type": "cluster",
+      "level": 1,
+      "degree": 6,
+      "member_count": 38
+    },
+    {
+      "id": "c48",
+      "name": "graph build",
+      "type": "cluster",
+      "level": 1,
+      "degree": 5,
+      "member_count": 42
+    }
+  ],
+  "edges": [
+    {
+      "src": "c01",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.89,
+      "weight": 5
+    },
+    {
+      "src": "c01",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.76,
+      "weight": 6
+    },
+    {
+      "src": "c02",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.92,
+      "weight": 2
+    },
+    {
+      "src": "c02",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.86,
+      "weight": 22
+    },
+    {
+      "src": "c03",
+      "dst": "c18",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.69,
+      "weight": 3
+    },
+    {
+      "src": "c03",
+      "dst": "c36",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 1
+    },
+    {
+      "src": "c03",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 9
+    },
+    {
+      "src": "c04",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.67,
+      "weight": 3
+    },
+    {
+      "src": "c04",
+      "dst": "c18",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.58,
+      "weight": 10
+    },
+    {
+      "src": "c05",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.91,
+      "weight": 8
+    },
+    {
+      "src": "c05",
+      "dst": "c09",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.87,
+      "weight": 9
+    },
+    {
+      "src": "c06",
+      "dst": "c18",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.64,
+      "weight": 1
+    },
+    {
+      "src": "c06",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.57,
+      "weight": 8
+    },
+    {
+      "src": "c06",
+      "dst": "c41",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.56,
+      "weight": 2
+    },
+    {
+      "src": "c07",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 2
+    },
+    {
+      "src": "c07",
+      "dst": "c24",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.57,
+      "weight": 3
+    },
+    {
+      "src": "c08",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.9,
+      "weight": 15
+    },
+    {
+      "src": "c08",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.77,
+      "weight": 17
+    },
+    {
+      "src": "c08",
+      "dst": "c17",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.98,
+      "weight": 8
+    },
+    {
+      "src": "c08",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.88,
+      "weight": 6
+    },
+    {
+      "src": "c09",
+      "dst": "c15",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.74,
+      "weight": 2
+    },
+    {
+      "src": "c09",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.88,
+      "weight": 4
+    },
+    {
+      "src": "c10",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.67,
+      "weight": 9
+    },
+    {
+      "src": "c10",
+      "dst": "c32",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.79,
+      "weight": 2
+    },
+    {
+      "src": "c10",
+      "dst": "c11",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.98,
+      "weight": 14
+    },
+    {
+      "src": "c10",
+      "dst": "c18",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.81,
+      "weight": 1
+    },
+    {
+      "src": "c11",
+      "dst": "c09",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.75,
+      "weight": 7
+    },
+    {
+      "src": "c11",
+      "dst": "c18",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.57,
+      "weight": 9
+    },
+    {
+      "src": "c11",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.77,
+      "weight": 4
+    },
+    {
+      "src": "c11",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.51,
+      "weight": 18
+    },
+    {
+      "src": "c12",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.87,
+      "weight": 11
+    },
+    {
+      "src": "c12",
+      "dst": "c27",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.59,
+      "weight": 4
+    },
+    {
+      "src": "c12",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.61,
+      "weight": 7
+    },
+    {
+      "src": "c13",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.9,
+      "weight": 2
+    },
+    {
+      "src": "c13",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.8,
+      "weight": 2
+    },
+    {
+      "src": "c14",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.63,
+      "weight": 4
+    },
+    {
+      "src": "c14",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.91,
+      "weight": 4
+    },
+    {
+      "src": "c14",
+      "dst": "c35",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.61,
+      "weight": 1
+    },
+    {
+      "src": "c15",
+      "dst": "c13",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.56,
+      "weight": 2
+    },
+    {
+      "src": "c15",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.92,
+      "weight": 2
+    },
+    {
+      "src": "c16",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.89,
+      "weight": 5
+    },
+    {
+      "src": "c16",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.6,
+      "weight": 1
+    },
+    {
+      "src": "c16",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.63,
+      "weight": 6
+    },
+    {
+      "src": "c16",
+      "dst": "c11",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.56,
+      "weight": 11
+    },
+    {
+      "src": "c17",
+      "dst": "c43",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.82,
+      "weight": 2
+    },
+    {
+      "src": "c17",
+      "dst": "c45",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.65,
+      "weight": 1
+    },
+    {
+      "src": "c18",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.74,
+      "weight": 8
+    },
+    {
+      "src": "c18",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.79,
+      "weight": 7
+    },
+    {
+      "src": "c18",
+      "dst": "c17",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.51,
+      "weight": 8
+    },
+    {
+      "src": "c19",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.59,
+      "weight": 10
+    },
+    {
+      "src": "c19",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.5,
+      "weight": 3
+    },
+    {
+      "src": "c20",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.61,
+      "weight": 2
+    },
+    {
+      "src": "c20",
+      "dst": "c11",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.74,
+      "weight": 1
+    },
+    {
+      "src": "c21",
+      "dst": "c14",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.9,
+      "weight": 3
+    },
+    {
+      "src": "c21",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.91,
+      "weight": 3
+    },
+    {
+      "src": "c21",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.77,
+      "weight": 4
+    },
+    {
+      "src": "c22",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.62,
+      "weight": 2
+    },
+    {
+      "src": "c22",
+      "dst": "c32",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.89,
+      "weight": 2
+    },
+    {
+      "src": "c23",
+      "dst": "c33",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.62,
+      "weight": 1
+    },
+    {
+      "src": "c23",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.93,
+      "weight": 2
+    },
+    {
+      "src": "c23",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.68,
+      "weight": 5
+    },
+    {
+      "src": "c23",
+      "dst": "c11",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.69,
+      "weight": 5
+    },
+    {
+      "src": "c24",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.95,
+      "weight": 8
+    },
+    {
+      "src": "c24",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.72,
+      "weight": 8
+    },
+    {
+      "src": "c24",
+      "dst": "c35",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.86,
+      "weight": 2
+    },
+    {
+      "src": "c24",
+      "dst": "c32",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.77,
+      "weight": 8
+    },
+    {
+      "src": "c25",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.54,
+      "weight": 2
+    },
+    {
+      "src": "c25",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.87,
+      "weight": 1
+    },
+    {
+      "src": "c25",
+      "dst": "c46",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.67,
+      "weight": 3
+    },
+    {
+      "src": "c26",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.94,
+      "weight": 4
+    },
+    {
+      "src": "c26",
+      "dst": "c09",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.56,
+      "weight": 1
+    },
+    {
+      "src": "c26",
+      "dst": "c48",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.61,
+      "weight": 2
+    },
+    {
+      "src": "c27",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.75,
+      "weight": 10
+    },
+    {
+      "src": "c27",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.67,
+      "weight": 4
+    },
+    {
+      "src": "c27",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.53,
+      "weight": 8
+    },
+    {
+      "src": "c27",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.64,
+      "weight": 5
+    },
+    {
+      "src": "c28",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.88,
+      "weight": 2
+    },
+    {
+      "src": "c28",
+      "dst": "c36",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.84,
+      "weight": 6
+    },
+    {
+      "src": "c29",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 6
+    },
+    {
+      "src": "c29",
+      "dst": "c47",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.85,
+      "weight": 12
+    },
+    {
+      "src": "c29",
+      "dst": "c42",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.94,
+      "weight": 5
+    },
+    {
+      "src": "c29",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 2
+    },
+    {
+      "src": "c30",
+      "dst": "c36",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.92,
+      "weight": 2
+    },
+    {
+      "src": "c30",
+      "dst": "c09",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.81,
+      "weight": 2
+    },
+    {
+      "src": "c30",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.94,
+      "weight": 4
+    },
+    {
+      "src": "c31",
+      "dst": "c41",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.88,
+      "weight": 2
+    },
+    {
+      "src": "c31",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.76,
+      "weight": 1
+    },
+    {
+      "src": "c31",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.86,
+      "weight": 3
+    },
+    {
+      "src": "c32",
+      "dst": "c47",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 3
+    },
+    {
+      "src": "c32",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.51,
+      "weight": 2
+    },
+    {
+      "src": "c33",
+      "dst": "c25",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.72,
+      "weight": 1
+    },
+    {
+      "src": "c33",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.76,
+      "weight": 2
+    },
+    {
+      "src": "c33",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 3
+    },
+    {
+      "src": "c34",
+      "dst": "c26",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.98,
+      "weight": 2
+    },
+    {
+      "src": "c34",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 1
+    },
+    {
+      "src": "c34",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.96,
+      "weight": 2
+    },
+    {
+      "src": "c34",
+      "dst": "c28",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.56,
+      "weight": 1
+    },
+    {
+      "src": "c35",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.53,
+      "weight": 1
+    },
+    {
+      "src": "c35",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.58,
+      "weight": 1
+    },
+    {
+      "src": "c36",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.79,
+      "weight": 1
+    },
+    {
+      "src": "c36",
+      "dst": "c41",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 1,
+      "weight": 1
+    },
+    {
+      "src": "c36",
+      "dst": "c14",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.5,
+      "weight": 5
+    },
+    {
+      "src": "c37",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.73,
+      "weight": 1
+    },
+    {
+      "src": "c37",
+      "dst": "c45",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.8,
+      "weight": 1
+    },
+    {
+      "src": "c37",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.68,
+      "weight": 2
+    },
+    {
+      "src": "c37",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.84,
+      "weight": 2
+    },
+    {
+      "src": "c38",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.64,
+      "weight": 3
+    },
+    {
+      "src": "c38",
+      "dst": "c08",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.96,
+      "weight": 3
+    },
+    {
+      "src": "c38",
+      "dst": "c43",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.88,
+      "weight": 1
+    },
+    {
+      "src": "c39",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.84,
+      "weight": 2
+    },
+    {
+      "src": "c39",
+      "dst": "c33",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.78,
+      "weight": 1
+    },
+    {
+      "src": "c39",
+      "dst": "c22",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.99,
+      "weight": 2
+    },
+    {
+      "src": "c39",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.77,
+      "weight": 8
+    },
+    {
+      "src": "c40",
+      "dst": "c11",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.99,
+      "weight": 2
+    },
+    {
+      "src": "c40",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.7,
+      "weight": 3
+    },
+    {
+      "src": "c40",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.8,
+      "weight": 1
+    },
+    {
+      "src": "c40",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 3
+    },
+    {
+      "src": "c41",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.95,
+      "weight": 1
+    },
+    {
+      "src": "c41",
+      "dst": "c29",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.66,
+      "weight": 2
+    },
+    {
+      "src": "c41",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.78,
+      "weight": 2
+    },
+    {
+      "src": "c42",
+      "dst": "c44",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 2
+    },
+    {
+      "src": "c42",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.78,
+      "weight": 3
+    },
+    {
+      "src": "c42",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.52,
+      "weight": 2
+    },
+    {
+      "src": "c42",
+      "dst": "c30",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.58,
+      "weight": 1
+    },
+    {
+      "src": "c43",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.62,
+      "weight": 1
+    },
+    {
+      "src": "c43",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.87,
+      "weight": 3
+    },
+    {
+      "src": "c43",
+      "dst": "c45",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.83,
+      "weight": 1
+    },
+    {
+      "src": "c44",
+      "dst": "c09",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.68,
+      "weight": 1
+    },
+    {
+      "src": "c44",
+      "dst": "c07",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.57,
+      "weight": 3
+    },
+    {
+      "src": "c44",
+      "dst": "c04",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 2
+    },
+    {
+      "src": "c44",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.69,
+      "weight": 1
+    },
+    {
+      "src": "c45",
+      "dst": "c12",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.65,
+      "weight": 4
+    },
+    {
+      "src": "c45",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.71,
+      "weight": 3
+    },
+    {
+      "src": "c46",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.59,
+      "weight": 8
+    },
+    {
+      "src": "c46",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.62,
+      "weight": 2
+    },
+    {
+      "src": "c46",
+      "dst": "c02",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.67,
+      "weight": 3
+    },
+    {
+      "src": "c46",
+      "dst": "c06",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.55,
+      "weight": 2
+    },
+    {
+      "src": "c47",
+      "dst": "c05",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.9,
+      "weight": 11
+    },
+    {
+      "src": "c47",
+      "dst": "c46",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.97,
+      "weight": 6
+    },
+    {
+      "src": "c47",
+      "dst": "c03",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.9,
+      "weight": 9
+    },
+    {
+      "src": "c48",
+      "dst": "c47",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.93,
+      "weight": 6
+    },
+    {
+      "src": "c48",
+      "dst": "c35",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.7,
+      "weight": 2
+    },
+    {
+      "src": "c48",
+      "dst": "c10",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.92,
+      "weight": 9
+    },
+    {
+      "src": "c48",
+      "dst": "c01",
+      "rel_type": "INTER_CLUSTER",
+      "confidence": 0.65,
+      "weight": 1
+    }
+  ],
+  "stats": {
+    "node_count": 48,
+    "edge_count": 144,
+    "level": 1
+  }
+}

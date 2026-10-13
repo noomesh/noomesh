@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Availability / liveness alerting rules (H-L4).
+groups:
+  - name: availability
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Prometheus target down: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Scrape target has been unreachable for >2m."
+
+      - alert: GatewayDown
+        expr: absent(noo_gateway_up) or noo_gateway_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "PAI gateway is not reporting up"
+          description: "noo_gateway_up is absent or 0 for >1m — the gateway may be down."
+
+      - alert: NatsDLQBacklog
+        expr: nats_dlq_pending > 100
+        for: 10m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "NATS dead-letter backlog growing ({{ $value }})"
+          description: "nats_dlq_pending={{ $value }} for >10m — a consumer may be failing."

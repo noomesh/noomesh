@@ -1,0 +1,219 @@
+{
+  "_comment": "One set of cases for the data-root SHAPE rule, read by the node agent (node-agent-go/internal/dataroots/policy_test.go) and the noo CLI (noo-cli/src/commands/data_root.rs tests), so the two implementations cannot drift. ok=false cases name the problem code the first failing rule reports.",
+  "cases": [
+    {
+      "os": "linux",
+      "path": "/var/lib/noo",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/data/noo",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/srv/noo",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/mnt/bigdisk/noo",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/media/alice/extradrive1/noo",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/var/lib/noo/",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/var/lib/noo/instances/obtest",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/mnt/bigdisk/noo/instances/x",
+      "ok": true
+    },
+    {
+      "os": "linux",
+      "path": "/var/lib/noo/instances/a/b",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "linux",
+      "path": "/data/stuff/instances/x",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "linux",
+      "path": "noo",
+      "ok": false,
+      "code": "not_absolute"
+    },
+    {
+      "os": "linux",
+      "path": "/data/../etc/noo",
+      "ok": false,
+      "code": "relative_component"
+    },
+    {
+      "os": "linux",
+      "path": "/data/.hidden/noo",
+      "ok": false,
+      "code": "hidden"
+    },
+    {
+      "os": "linux",
+      "path": "/data/noomesh",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "linux",
+      "path": "/data",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "linux",
+      "path": "/",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "linux",
+      "path": "/etc/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/root/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/usr/local/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/tmp/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/opt/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/var/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/var/lib/docker/noo",
+      "ok": false,
+      "code": "system_path"
+    },
+    {
+      "os": "linux",
+      "path": "/home/alice/noo",
+      "ok": false,
+      "code": "home_dir"
+    },
+    {
+      "os": "linux",
+      "path": "/mnt/d/noo",
+      "ok": false,
+      "code": "windows_drive"
+    },
+    {
+      "os": "linux",
+      "path": "/mnt/c/Users/x/noo",
+      "ok": false,
+      "code": "windows_drive"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/alice/Library/Application Support/noo",
+      "ok": true
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/alice/noomesh",
+      "ok": true
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/bob/noomesh",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Volumes/T7/noo",
+      "ok": true
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Volumes/T7/ai/noo",
+      "ok": true
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/alice/noomesh/data",
+      "ok": false,
+      "code": "not_dedicated"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/alice/noo",
+      "ok": false,
+      "code": "mac_location"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/bob/Library/Application Support/noo",
+      "ok": false,
+      "code": "mac_location"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Library/noo",
+      "ok": false,
+      "code": "mac_location"
+    },
+    {
+      "os": "macos",
+      "home": "/Users/alice",
+      "path": "/Users/alice/.noo",
+      "ok": false,
+      "code": "hidden"
+    }
+  ]
+}

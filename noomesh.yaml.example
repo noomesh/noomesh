@@ -1,0 +1,456 @@
+# noomesh.yaml — Runtime configuration for noomesh
+# Copy this file to noomesh.yaml (repo root, or ~/.config/noo/noomesh.yaml on
+# a standalone controller) and edit to match your environment. This is the
+# only file the readers look for (gateway-rust/src/paths.rs
+# CONFIG_YAML_CANDIDATES; scripts/lib-config.sh's search order); there is no
+# other starting-point config file. (An old, unread `ollama:`/`agent:`/
+# `context:` schema previously lived at configs/config.example.yaml and
+# siblings; removed 2026-09 as dead weight — nothing loaded it.)
+#
+# ── Config precedence (config-graduation phase 1) ────────────────────
+# For any setting that exists both as an env var and a YAML key:
+#   1. env var (set in .env / compose / DB security posture) — the OVERRIDE
+#   2. this YAML file — the documented DEFAULT
+#   3. compiled-in default
+# Secrets (passwords, API keys, tokens) live in secrets/env.sops, decrypted
+# at launch — never in .env or here. See docs/security/secrets.md. .env
+# holds only genuinely site-specific, non-secret values (node identity,
+# paths, bind addresses). App behavior belongs here.
+# Security invariants (gateway auth, strict cluster-token verification) are
+# not configurable at all — always on, fail-closed.
+
+# addons: — which add-ons this install runs. THE declaration.
+#
+# One place. There is no NOO_TRELLION_ENABLED / NOO_PRO_ENABLED /
+# NOO_TRELLION_INTEL_ENABLED / NOO_VOICE_ENABLED any more: the same fact used
+# to live in .env, the launcher, the onboard wizard, the gateway's add-on
+# table, the compose passthrough AND `systems.*.enabled_when` — six homes for
+# one boolean, which is how evolve's schema was silently never provisioned on
+# 2026-08-05 while the add-on was on everywhere else.
+#
+# The launcher reads this map for compose profiles and overlays; the gateway
+# reads the same file for routing and refusals. What got deployed and what the
+# gateway will route to cannot disagree.
+#
+# A name you leave OUT is not "off" — it is "not stated", which resolves to
+# that add-on's own polarity: trellion is opt-out (on unless you say false),
+# the licensed ones are opt-in. `noo onboard --only addons` writes this for
+# you; a licensed add-on still needs its entitlement as well as a `true`.
+addons:
+  trellion: true          # RAG, memory search, the knowledge graph (~4-5 GB)
+  # evolve: true          # licensed — self-tuning sidecar
+  # trellion_intel: true  # licensed — graph-guided retrieval, temporal extraction
+  # identity: false       # free, ON by default — short-lived per-agent/per-session tokens.
+                          # Set false only to remove the exchange surface entirely.
+  # voice: true           # whisper STT + piper TTS containers
+
+ollama:
+  # The HOST's native ollama on loopback (Python factory.py client), not a
+  # stack service door: it has no TLS listener and never leaves the box.
+  base_url: http://localhost:11434
+  model: qwen3:8b
+  options:
+    temperature: 0.7
+
+agent:
+  system_prompt: You are noomesh, a helpful local-first assistant. Be concise and action-oriented.
+  max_tool_loops: 5
+  tool_mode: auto
+
+context:
+  files: []
+
+tools:
+  enabled:
+    - web_search
+    - python_exec
+    - local_files
+  selection_mode: smart
+  max_selected: 5
+  min_score: 0.1
+  selection_scoring: bm25
+  always_include: []
+
+web_search:
+  provider: duckduckgo
+  max_results: 5
+
+sandbox:
+  url: null   # env override: NOO_SANDBOX_URL
+
+# Tool-execution approval gate.
+#
+# The MODE is NOT here. `exec_approval_mode` is a posture gate — it lives in
+# the noo_security_posture table, set with:
+#
+#   noo security posture set NOO_EXEC_APPROVAL_MODE approval   # or auto | strict
+#   noo stack restart gateway                                  # read once, at start
+#
+# This file is writable over `PUT /api/config/security`, which the agent's own
+# `noo_config_set` tool can reach — a gate stored here could be flipped by the
+# thing it constrains. Leaving the key here is now a STARTUP REFUSAL, not a
+# silently ignored value: the gateway (and the Python worker) will not load a
+# config that sets it. Unset anywhere = `strict` (deny HIGH-risk calls);
+# `noo onboard` applies the `hardened` profile, which sets `approval`.
+security:
+  exec_approval_timeout: 300    # decision-window seconds (Python worker; the
+                                # Rust gate uses NOO_EXEC_APPROVAL_TIMEOUT_SECS)
+
+memory:
+  enabled: true
+  min_score: 0.2
+
+mcp:
+  enabled: true
+  # MCP hub (config-graduation phase 2). Env overrides win.
+  # `port` is retired (stack-v0.2.40): the operator door is /mcp/operator on the gateway port.
+  timeout: 120        # tool-call timeout seconds (env NOO_MCP_TIMEOUT)
+  tools_filter: all   # comma list of tool names, or "all" (env NOO_MCP_TOOLS)
+  # External MCP servers are a REGISTRY, not config: `noo mcp server add …`
+  # or `noo mcp import <yaml>`.
+
+cache:
+  enabled: true
+  ttl: 600
+
+# ── Service endpoints (config-graduation phase 2) ────────────────────
+# Env override → this YAML → compiled default, at every reader (Rust
+# gateway + Python workers). Secrets (passwords in DSNs, tokens) stay in
+# .env/sops — put topology here, credentials there. Note: the Python
+# side resolves DATABASE_URL through the secret store first (a secret
+# file always wins); the Rust gateway honors this YAML key.
+services:
+  redis_url: rediss://redis:6379         # env REDIS_URL (password injected from secrets; redis serves TLS only)
+  nats_url: tls://nats:4222              # env NATS_URL (nats serves mTLS only)
+  database_url: postgresql://noo:noo@postgres:5432/noomesh   # env DATABASE_URL
+  ollama_url: https://stunnel-ollama:11434  # env OLLAMA_URL (gateway-side calls: the stunnel mTLS door; ollama itself has no TLS listener)
+  gateway_url: https://localhost:8080    # env NOO_GATEWAY_URL (self/public URL used in agent cards, MCP proxies)
+  prometheus_url: https://prometheus:9090  # env NOO_PROMETHEUS_URL
+  alertmanager_url: https://alertmanager:9093  # env NOO_ALERTMANAGER_URL
+  loki_url: ""                           # env NOO_LOKI_URL wins (compose sets https://loki:3100); empty in both = logs UI disabled
+  nvidia_exporter_url: https://nvidia-exporter:9400/metrics  # env NVIDIA_EXPORTER_URL (the exporter serves mTLS only)
+
+  # ── Embedding topology (the REAL call path, audited 2026-07-18) ────
+  # ALL embedding traffic — Rust /api/external/embeddings, Rust memory/
+  # coordinator query-embed, and the Python trellion ingest/embedding
+  # worker — goes through ONE backend-agnostic client and speaks the
+  # wire format selected by embedding_backend:
+  #   tei    → POST {url}/embed          {"inputs": [...], "truncate": true}  (legacy default)
+  #   openai → POST {url}/v1/embeddings  {"model": m, "input": [...]}
+  #            (TEI, llama.cpp, vLLM and Ollama ALL serve this — the
+  #             portable choice for any non-TEI embedder)
+  #   ollama → POST {url}/api/embed      {"model": m, "input": [...]}
+  # There is NO mesh routing for embeddings (unlike rerank). With the
+  # tei backend the model is pinned server-side in the TEI container
+  # (env TEI_MODEL, deploy-time); openai/ollama backends send
+  # embedding_model in the request body.
+  # Production TLS deploys point this at the stunnel sidecar:
+  #   embedding_url: https://stunnel-tei:443
+  # To move embeddings to llama.cpp / vLLM / Ollama: point embedding_url
+  # at the server, set embedding_backend: openai (+ embedding_model),
+  # and keep embedding_dim matching the model — preflight probes the
+  # backend and refuses embed WRITES if the returned dims don't match
+  # the store's vector(N) columns (reads keep working).
+  # Empty = the code's ollama-first resolution (onboard writes the values
+  # matching the deployed profile: standalone → http://ollama-embed:11434 /
+  # ollama / harrier). TEI is OPT-IN (tei-compose profile) — point
+  # embedding_url at it explicitly (TLS deploys: https://stunnel-tei:443,
+  # backend tei) only when that profile actually runs.
+  embedding_url: ""                      # env PAGEINDEX_EMBEDDING_URL
+  embedding_backend: ""                  # env PAGEINDEX_EMBEDDING_BACKEND (ollama | openai | tei)
+  embedding_model: ""                    # env PAGEINDEX_EMBEDDING_MODEL (openai/ollama backends; ignored by tei — TEI pins TEI_MODEL server-side)
+  embedding_extra_urls: ""              # env PAGEINDEX_EMBEDDING_EXTRA_URLS (comma-separated extra static embed endpoints, e.g. the optional CPU embedder https://noo-stunnel-ollama-embed-cpu:11434)
+  embedding_dim: 1024                    # env EMBEDDING_DIM (must match the served model AND the store's vector(N) columns — trellion's DDL is vector(1024); the default embedder harrier is 1024-dim)
+
+# Python worker-pool limits (config-graduation phase 2)
+worker:
+  global_concurrency: 32   # env NOO_WORKER_GLOBAL_CONCURRENCY — total in-flight cap
+  timeout_secs: 120        # env NOO_WORKER_TIMEOUT_SECS — NATS request timeout (Rust + Python)
+  rss_limit_mb: 0          # env NOO_WORKER_RSS_LIMIT_MB — restart ceiling; 0 = disabled
+
+# Rust agent-loop token budget (config-graduation phase 2)
+inference:
+  vllm_max_model_len: 16384   # env VLLM_MAX_MODEL_LEN
+  vllm_max_tokens: 4096       # env VLLM_MAX_TOKENS — output reserve; keep ≥256 for thinking models
+
+# Heartbeat scheduler (config-graduation phase 2 additions).
+# tz resolution: noo_settings DB row (hot: POST /api/heartbeat/reload)
+# → env NOO_HEARTBEAT_TZ → this key → America/New_York.
+heartbeat:
+  tz: America/New_York
+
+cluster:
+  default_backend: vllm
+  backends:
+    ollama:
+      enabled: false
+      model: qwen3:8b
+    vllm:
+      enabled: true
+      model: Qwen/Qwen3-8B-AWQ
+      quantization: awq
+      gpu_memory_utilization: 0.9
+      extra_args:
+        tool_call_parser: hermes
+        tensor_parallel_size: 1
+    llamacpp:
+      enabled: false
+      model: ""
+  auto_scale: true
+  idle_timeout_sec: 1800
+  pinned_backends: []
+  # Example: pin a backend to a specific node
+  # pinned_backends:
+  #   - node: my-gpu-node
+  #     backend: vllm
+  # Model CLASSES and ALIASES — the names an external consumer may send as
+  # `model` on /v1/chat/completions and /api/external/chat/completions, each
+  # an ordered failover list — are NOT configured here. They are a
+  # declaration, like placements: `noo cluster class set <class>
+  # <node>/<backend>[=<model>]...` writes them to the database, and the
+  # `model_classes:` block of config/cluster-seed.yaml seeds them
+  # (`noo cluster seed`). With none declared the gateway derives one class
+  # per served model, and `chat-default` (aliases `default`, `auto`) from
+  # `backends.<default_backend>.model` above. `noo cluster class list`.
+
+ocr:
+  enabled: false
+  model: deepseek-ai/DeepSeek-OCR
+  min_text_length: 50
+  dpi: 150
+  prompt: "<image>\n\n  Free OCR."
+
+# Edge devices (Tier 4): Jetson, RPi5, RK3588 — always-on, 3-8B models
+watched_folders:
+  enabled: false
+  folders: []
+  # Example:
+  # folders:
+  #   - /path/to/your/documents
+  patterns:
+    - "*.pdf"
+    - "*.md"
+    - "*.txt"
+    - "*.html"
+    - "*.docx"
+    - "*.pptx"
+    - "*.xlsx"
+    - "*.csv"
+  poll_interval_seconds: 60
+  recursive: true
+  notify_channels: []
+  notify_recipients: []
+
+# Recall memory (System 1 episodic recall). The section's new name is
+# `recall_memory:` and the gateway accepts it, but keep `video_memory:` until
+# the evolve add-on's update ships: evolve still reads the old key. The old
+# key is deprecated (one warning at boot) and is removed in the release after
+# 0.6.0; if both are present, `recall_memory` wins.
+video_memory:  # deprecated name, kept on purpose until evolve reads recall_memory
+  enabled: true
+
+# Per-system database plane. The gateway's broker reads this
+# manifest on every boot and provisions each declared system: its schema,
+# its DDL role (owns the schema's objects) and its runtime role, with
+# passwords taken from the named env vars (generated by `noo onboard`).
+# WITHOUT this section no system is ever provisioned — trellion's memory
+# migrations cannot run and the gateway fail-closes preflight on a fresh
+# install (found by the first sandbox rehearsal, 2026-08-06). trellion is
+# mandatory (a single-container mesh is not a supported shape); evolve is
+# gated by `addons.evolve` in this file (there is no env flag any more).
+systems:
+  trellion:
+    role: noo_trellion
+    ddl_role: noo_trellion_ddl
+    schema: trellion
+    password_env: NOO_TRELLION_DB_PASSWORD
+    ddl_password_env: NOO_TRELLION_DDL_PASSWORD
+  evolve:
+    role: noo_evolve
+    ddl_role: noo_evolve_ddl
+    schema: evolve
+    password_env: NOO_EVOLVE_DB_PASSWORD
+    ddl_password_env: NOO_EVOLVE_DDL_PASSWORD
+    # No `enabled_when`: a system whose name matches an add-on follows the
+    # `addons:` map above. Naming a flag here as well was the third home of
+    # the same fact.
+
+terminal:
+  default_backend: vllm
+  default_model: Qwen/Qwen3-8B-AWQ
+  context_length: 16384
+  auto_create_variants: true
+
+self_identity:
+  focus: ""
+
+# ── KB role segmentation ─────────────────────────────────────────────
+# Documents inherit audience roles from their provenance; explicit roles
+# on the ingest call always win. First glob match wins (fnmatch against
+# source_uri and source path). Every document is stored WITH an audience:
+# an upload by a signed-in account defaults to that account (user:<name>),
+# never to default_roles; see default_roles below.
+kb:
+  source_roles:
+    - match: "runbook://*"        # repo runbooks → ops knowledge
+      roles: [system]
+    # - match: "gdrive://*"       # shared Drive → org-wide
+    #   roles: [company]
+    # - match: "/data/ingest/users/alice/*"
+    #   roles: ["user:alice"]
+    # - match: "channel:google_chat*"
+    #   roles: [team]
+  # source_roles and default_roles apply ONLY to ingests with no uploader
+  # identity (watched folders, Drive, internal loops); a signed-in person's
+  # upload is always theirs (user:<account>) until they share it.
+  # default_roles is the fallback when no rule above matches. Empty →
+  # admin-only, stored as an explicit `admin` tag (never an absent one).
+  default_roles: []
+
+# ═════════════════════════════════════════════════════════════════════
+# ENV-ONLY FOR NOW (config-graduation phase 2 appendix)
+# ═════════════════════════════════════════════════════════════════════
+# The vars below are APP-plane knobs that stay in .env for this phase —
+# either they are deploy-time compose interpolation (a YAML read can
+# never reach them), they are read by the Go node-agent (which does not
+# load this file), or wiring a YAML fallback into every reader was too
+# invasive for one PR. None of them are half-wired: setting them here
+# does NOTHING today. The third group is the phase-3 graduation list.
+#
+# 1) Deploy-time compose interpolation (stay env-only by design):
+#    AIRLLM_MODEL COMPRESSION GPU_MEM_UTIL GRAFANA_ADMIN_USER
+#    GRAFANA_ROOT_URL LLAMACPP_MODEL LLAMACPP_PORT LOKI_PUSH_URL
+#    LOKI_URL NATS_IMAGE N_CTX N_GPU_LAYERS
+#    N_THREADS OLLAMA_IMAGE OLLAMA_MODEL NOO_EVOLVE_GATEWAY_URL
+#    NOO_EVOLVE_GA_ENABLED NOO_EVOLVE_RL_ENABLED
+#    NOO_IMAGE_PREFIX NOO_IMAGE_TAG
+#    QUANTIZATION RERANK_MODEL TENSOR_PARALLEL_SIZE VERSION
+#    VLLM2_GPU_MEM_UTIL VLLM2_IMAGE VLLM2_MAX_MODEL_LEN VLLM2_MODEL
+#    VLLM2_TOOL_PARSER VLLM_QUANTIZATION VLLM_TOOL_PARSER
+#
+# 2) Go node-agent readers (node-agent does not read noo-mesh.yaml):
+#    NOO_LOCAL_RERANK_URL NOO_MODEL_CACHE_URL NOO_MTLS_NODES
+#
+# 3) Phase-3 graduation list (code readers exist, YAML read not wired
+#    yet — env-only until then):
+#    BROWSER_IDLE_TIMEOUT BROWSER_MAX_SESSION BROWSER_URL_ALLOWLIST
+#    BROWSER_URL_BLOCKLIST BROWSER_VIEWPORT_HEIGHT BROWSER_VIEWPORT_WIDTH
+#    CHANNEL_HISTORY_LIMIT CHANNEL_STATS_FLUSH_SECONDS CLAUDE_MODEL
+#    CLOUD_DEFAULT_PROVIDER EMBEDDING_MODEL GATEWAY_ENGINE
+#    OPENAI_BASE_URL OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_INSECURE
+#    PAGEINDEX_DSN PAGEINDEX_LLM_MODEL PAGEINDEX_LLM_URL
+#    NOO_ALLOW_LOCAL_PYTHON_EXEC NOO_ARTIFACT_DIR NOO_BACKEND_MIN_VRAM_GB
+#    NOO_BOOTSTRAP_SCRIPT_URL
+#    NOO_CONTROLLER_SSH_PUBKEY NOO_DEFAULT_AGENT_URL
+#    NOO_EGRESS_ALLOWLIST NOO_EMBEDDING_BACKPRESSURE_THRESHOLD
+#    NOO_LOCAL_AGENT_URL NOO_MODEL_FILTER_MODE NOO_MODEL_PUBLISHERS
+#    NOO_MODEL_PUBLISHER_MODE NOO_MODEL_TASKS
+#    NOO_MODEL_VENDORS NOO_PLUGIN_DIR NOO_REFRESH_GRACE_SECS
+#    NOO_REFRESH_TOKEN_DAYS
+#    NOO_SELF_MODIFY_AUDIT_PATH NOO_SESSION_CACHE_MAX_COUNT
+#    NOO_TOKEN_EXPIRE_MINUTES NOO_TOOL_TIMEOUT_SECS NOO_TRUSTED_PROXIES
+#    PGVECTOR_URL PIPELINE_GATEWAY_URL RESEARCH_MAP_MODEL
+#    RESEARCH_REDUCE_MODEL RETRIEVAL_TRACKER_PATH TEI_MODEL TEI_URL
+#    VLLM_IMAGE WHATSAPP_PHONE_ID
+#
+#    Deliberately env-only FOREVER (not phase 3): the
+#    TLS/mTLS family (NOO_NATS_TLS NOO_REDIS_TLS NOO_PG_SSLMODE
+#    NOO_PG_SSLROOTCERT NOO_PG_TLS_REQUIRED NOO_MTLS_GATEWAY) — these
+#    are security-posture switches written to .env at boot by the DB
+#    posture and must not be weakenable from a YAML edit.
+#    (NOO_PRO_ENABLED, the old deploy-time add-on switch, is retired —
+#    add-ons are the `addons:` map above, read by both the launcher and
+#    the gateway from this one file.)
+
+# ─────────────────────────────────────────────────────────────────────
+# compose_env — deployment values that docker compose interpolates
+#
+# Compose substitutes ${VAR} from the process environment or `.env`, and
+# from nothing else: it cannot read this file. `scripts/lib-config.sh`
+# (load_config) bridges the gap by exporting this section before compose
+# runs, exactly as lib-secrets.sh does for credentials. That is what lets
+# deployment config live here instead of in `.env`.
+#
+# The three planes, once fully migrated:
+#   secrets           -> secrets/env.sops   (lib-secrets.sh)
+#   deployment config -> this section       (lib-config.sh)
+#   `.env`            -> only the bootstrap flags read before either loads
+#                        (NOO_SECRETS_BACKEND, NOO_INSTALL_MODE,
+#                         NOO_IMAGE_TAG, NOO_DATA_ROOT/NOO_INSTANCE/
+#                         NOO_PORT_OFFSET, NOO_DEFAULT_PROFILE — NOT
+#                         add-on flags, which are retired; add-ons live in
+#                         the `addons:` map above)
+#
+# Flat and ENV-shaped ON PURPOSE. The nested sections above are read by the
+# APPLICATION via config::env_or_yaml, resolved at runtime inside the
+# container. These are different: they must exist as environment variables
+# on the HOST before a container is created, so modelling them as nested
+# config would imply an application read that never happens.
+#
+# Precedence: an already-set environment variable always wins, so
+# `NODE_ID=other noo stack start` still overrides, and migrating keys out
+# of `.env` can be done a few at a time rather than as a flag day. A key
+# present in BOTH `.env` and here is reported loudly at every launch —
+# two sources with a silent winner is the failure mode this split exists
+# to remove.
+#
+# compose_env:
+#   NODE_ID: noo-controller
+#   NODE_IP: 100.64.0.1
+#   NODE_TIER: 1
+#   CLUSTER_MODE: controller
+#   VLLM_MODEL: google/gemma-4-12B-it-qat-w4a16-ct
+# ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+# systems: — which systems extend this database, and who owns what.
+#
+# an earlier change's broker manifest. Mesh is the only component that holds
+# privilege on the cluster; it creates each system's role and schema, and
+# then each system runs its OWN migrations as its OWN role. No service
+# provisions itself, because provisioning requires privilege and handing
+# every service a privileged credential is the problem, not the fix.
+#
+# THIS BLOCK DECLARES. IT DOES NOT ACTIVATE. Every system the stack knows
+# about is listed on every install. A system whose name matches an add-on
+# (trellion, evolve, …) follows the `addons:` map above — the ONE switch —
+# and carries no `enabled_when`; naming a flag here as well was a second
+# home for the same fact, and the one that failed live on 2026-08-05.
+# `enabled_when` exists only for a system that is NOT an add-on and is
+# gated by a plain env flag.
+#
+# Neither is "is the password set". `noo-cli` generates role passwords
+# from a SecretSpec whose requirement follows the same map, so a
+# credential's presence says nothing about whether an operator wants the
+# system. Gating on it creates a `noo_evolve` login role on OSS installs
+# that will never run evolve.
+#
+# Omit the block entirely and nothing is provisioned — the reconciler is a
+# no-op, which is what every install sees until it opts in.
+#
+# TWO ROLES PER SYSTEM. `ddl_role` owns the schema and is the only identity
+# that can create in it; `role` reads and writes and holds no CREATE anywhere.
+# They are different privileges used at different moments — migrations, and
+# every other second — and collapsing them means the runtime holds DDL rights
+# permanently so that a migration can hold them briefly.
+#
+# systems:
+#   trellion:
+#     role: noo_trellion
+#     ddl_role: noo_trellion_ddl
+#     schema: trellion
+#     password_env: NOO_TRELLION_DB_PASSWORD
+#     ddl_password_env: NOO_TRELLION_DDL_PASSWORD
+#     # no enabled_when: noo-trellion is mandatory since the container split
+#     # Installed by the broker: both are UNTRUSTED extensions, so CREATE
+#     # EXTENSION needs superuser regardless of schema ownership. Declaring
+#     # them here is what lets trellion's chain run as its DDL role.
+#     extensions: [vector, pg_trgm]
+#   evolve:
+#     role: noo_evolve
+#     ddl_role: noo_evolve_ddl
+#     schema: evolve
+#     password_env: NOO_EVOLVE_DB_PASSWORD
+#     ddl_password_env: NOO_EVOLVE_DDL_PASSWORD
+#     # no enabled_when either: evolve is an add-on, `addons.evolve` decides
+# ─────────────────────────────────────────────────────────────────────

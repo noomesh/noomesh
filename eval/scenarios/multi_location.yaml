@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Multi-location latency & nearest-node routing
+description: >
+  Drive traffic tagged from several tailnet locations to measure per-location
+  latency and whether requests land on the nearest node. Run this driver from
+  ≥2 physical tailnet endpoints (or tag origins) for a true geo view.
+axes: [node, location]
+duration_s: 90
+concurrency: 10
+personas:
+  - {id: us-client, location: us-east, weight: 0.4}
+  - {id: eu-client, location: eu-west, weight: 0.3}
+  - {id: home-client, location: home-lab, weight: 0.3}
+workloads:
+  - {endpoint: /v1/chat/completions, model: gemma-4-12b, weight: 0.8,
+     prompt: "Give a one-line status summary."}
+  - {endpoint: /api/external/embeddings, model: bge, weight: 0.2, prompt: "geo latency probe"}
+isolation_probes: false

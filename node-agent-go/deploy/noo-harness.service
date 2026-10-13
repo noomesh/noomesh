@@ -1,0 +1,48 @@
+# The harness: the agent loop that runs on THIS node, beside its model
+# It is the gateway binary running its `harness` subcommand.
+#
+# Delivered over the rail as `harness-unit`, `harness-binary` and
+# `harness-env`, installed by noo-apply, and started/stopped by the NODE
+# AGENT per placement through the one-line sudoers grant in
+# /etc/sudoers.d/noo-harness-lifecycle. It is deliberately NOT enabled:
+# placed = running, and the agent's reconcile is what makes that true after
+# a reboot too. A harness that runs when nothing placed it would take turns
+# the gateway never meant to send here — the gateway gates dispatch above
+# this, but the node should not run what it was not asked to run.
+[Unit]
+Description=noomesh harness — the agent loop beside this node's model
+Documentation=https://github.com/noomesh/noomesh
+After=network-online.target noo-node-agent.service
+Wants=network-online.target
+StartLimitBurst=0
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noo-gateway harness
+Restart=always
+RestartSec=30
+# Root-owned, 600, read by pid 1 — the harness process never sees the file,
+# only the environment. The node's NATS pair and the paths to its PKI live
+# here, rendered by the controller like /etc/noo-node-agent.env.
+EnvironmentFile=-/etc/noo-harness.env
+# A dedicated user (an earlier change's reasoning, applied to a process that
+# executes a model's decisions): in group noo-agent so it can read the
+# node's certificate and key (0640 root:noo-agent under /etc/noo/pki), and
+# in NO other group — above all not `docker`, which is root on the host.
+User=noo-harness
+Group=noo-agent
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/noo/pki
+# The caps the container used to carry.
+MemoryMax=1G
+CPUQuota=100%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noo-harness
+
+[Install]
+WantedBy=multi-user.target

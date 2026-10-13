@@ -1,0 +1,35 @@
+{
+  "window": "2026-08",
+  "group": "node",
+  "totals": {
+    "prompt_tokens": 4812366,
+    "completion_tokens": 1233907,
+    "requests": 18442
+  },
+  "rows": [
+    {
+      "key": "prime-01",
+      "prompt_tokens": 2904118,
+      "completion_tokens": 743201,
+      "requests": 10233
+    },
+    {
+      "key": "atlas-02",
+      "prompt_tokens": 1402884,
+      "completion_tokens": 361558,
+      "requests": 5619
+    },
+    {
+      "key": "cloud",
+      "prompt_tokens": 421904,
+      "completion_tokens": 112448,
+      "requests": 2104
+    },
+    {
+      "key": "companion-07",
+      "prompt_tokens": 83460,
+      "completion_tokens": 16700,
+      "requests": 486
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO noo_heartbeat_runs SELECT (jsonb_populate_record(NULL::noo_heartbeat_runs, s.payload)).* FROM noo_heartbeat_run_prune_staging s WHERE s.prune_run_id = $1 AND s.restored_at IS NULL AND EXISTS (SELECT 1 FROM noo_heartbeat_tasks t WHERE t.id = s.task_id) ON CONFLICT (run_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0129c0eaf88a413e43445e7e2620271bece51adea1aacc035d60b7181bce2aa"
+}

@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 PersonifAI LLC
+
+[project]
+name = "noo-gateway-client"
+version = "0.1.0"
+description = "The one way an add-on authenticates to the noomesh gateway: key exchange, refresh, refusal circuit, and the add-on metrics door."
+readme = "README.md"
+# The interpreter the stack ships (`.python-version` at the monorepo root);
+# tests/test_python_version_single_source.py holds every pin to it.
+requires-python = ">=3.12,<3.13"
+# An SPDX string, not the {text=…} table: with `license-files` present,
+# setuptools >= 77 (what an isolated build fetches) rejects the table form,
+# and it rejects a License :: classifier beside the expression.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "PersonifAI", email = "contact@noomesh.ai"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+# httpx and NOTHING else. The package is imported by the proprietary
+# trellion-intel and by evolve, whose image carries no `noomesh`; a
+# dependency on core would invert the add-on seam and, once core relicenses,
+# make every import a licensing question. tests/test_noo_gateway_client_package.py
+# in the monorepo holds this line.
+dependencies = [
+  "httpx>=0.27,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/noomesh/noomesh"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+noo_gateway = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# The monorepo's rule set (E4, E7, E9, F); CI lints this package with it.
+select = ["E4", "E7", "E9", "F"]

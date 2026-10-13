@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: text_summarizer
+version: 1.0.0
+description: Summarize text (extractive, frequency-based, stdlib-only). Accepts raw text and returns a concise summary.
+author: noo-builtin
+
+inputs:
+  text:
+    type: string
+    required: true
+    description: The text to summarize
+  max_length:
+    type: number
+    required: false
+    description: Maximum summary length in words (default 150)
+    default: 150
+  style:
+    type: string
+    required: false
+    description: "Summary style: brief, detailed, or bullet_points"
+    default: brief
+
+outputs:
+  summary:
+    type: string
+    description: The generated summary
+  word_count:
+    type: number
+    description: Word count of the summary
+
+container:
+  image: noo-sandbox-base:latest
+  command: ["python", "/skill/run.py"]
+  timeout: 120
+  memory_limit: 512m
+  network: none
+  gpu: false
+
+permissions:
+  filesystem: none
+  network: none
+  shell: false

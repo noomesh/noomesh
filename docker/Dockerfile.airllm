@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# AirLLM backend Dockerfile
+# Docker Hardened Image: near-zero CVEs, includes Python + PyTorch + CUDA
+
+# NOTE(build-from-mirrors, 2026-08-20): pytorch bases deliberately stay on
+# dhi.io — multi-GB x3 tags, a real GHCR storage cost for images we rarely
+# rebuild. If dhi flakes here, retry; everything else builds from mirrors.
+FROM dhi.io/pytorch:2.10-cuda13.0-debian13-dev
+
+WORKDIR /app
+
+# Vendor telemetry off (docs/security/telemetry.md), baked into the image so
+# a container started outside compose carries it too; compose sets the same.
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1
+
+# Install AirLLM and dependencies (Python + pip already in DHI base)
+RUN pip install --no-cache-dir \
+    airllm>=2.8.0 \
+    fastapi>=0.111 \
+    uvicorn>=0.30 \
+    httpx>=0.27
+
+# Copy server script
+COPY docker/airllm_server.py /app/server.py
+
+# Environment variables
+ENV MODEL_PATH=meta-llama/Llama-2-70b-hf
+ENV MAX_VRAM_GB=8.0
+ENV COMPRESSION=4bit
+ENV HOST=0.0.0.0
+ENV PORT=8001
+
+# Expose port
+EXPOSE 8001
+
+# Health check
+HEALTHCHECK --interval=60s --timeout=20s --start-period=180s \
+    CMD python -c "import httpx; httpx.get('http://localhost:8001/health', timeout=10)"
+
+RUN chown nonroot:nonroot /app
+
+USER nonroot
+
+# Start server
+CMD ["python", "server.py"]

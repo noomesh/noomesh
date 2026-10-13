@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH pruned AS ( DELETE FROM noo_heartbeat_runs hr WHERE hr.started_at < NOW() - make_interval(days => $1) RETURNING hr.run_id, hr.task_id, to_jsonb(hr) AS payload ) INSERT INTO noo_heartbeat_run_prune_staging (run_id, task_id, payload, reason, prune_run_id) SELECT p.run_id, p.task_id, p.payload, $2, $3 FROM pruned p",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e9e0b3233d26b8d9ea923829da9bc22919a115c776fec3b133dab47c1935c9b"
+}

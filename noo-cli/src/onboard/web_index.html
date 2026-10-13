@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright 2026 PersonifAI LLC -->
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noomesh Setup Wizard</title>
+<style>
+  :root {
+    --bg: #0a0f14; --surface: #0f172a; --border: #334155;
+    --text: #e2e8f0; --dim: #94a3b8; --accent: #38bdf8;
+    --green: #22c55e; --yellow: #eab308; --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    background: var(--bg); color: var(--text);
+    max-width: 800px; margin: 0 auto; padding: 1rem;
+  }
+  h1 { color: var(--accent); font-size: 1.3rem; margin-bottom: 0.5rem; }
+  #step-header {
+    background: var(--surface); padding: 0.6rem 1rem;
+    border: 1px solid var(--border); border-radius: 4px;
+    margin-bottom: 0.5rem; color: var(--accent); font-weight: bold;
+  }
+  #progress-bar {
+    width: 100%; height: 6px; background: var(--surface);
+    border-radius: 3px; margin-bottom: 0.5rem; overflow: hidden;
+  }
+  #progress-fill {
+    height: 100%; background: var(--accent); width: 0%;
+    transition: width 0.3s ease;
+  }
+  #log {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0.8rem; height: 50vh;
+    overflow-y: auto; font-size: 0.85rem; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .ev-success { color: var(--green); }
+  .ev-warning { color: var(--yellow); }
+  .ev-error { color: var(--red); }
+  .ev-info { color: var(--dim); }
+  .ev-progress { color: var(--dim); font-style: italic; }
+  #prompt-area {
+    display: none; background: var(--surface);
+    border: 1px solid var(--accent); border-radius: 4px;
+    padding: 0.8rem; margin-top: 0.5rem;
+  }
+  #prompt-label { color: var(--accent); margin-bottom: 0.4rem; white-space: pre-wrap; }
+  #prompt-input {
+    width: 100%; padding: 0.4rem; font-family: inherit;
+    font-size: 0.9rem; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 3px;
+  }
+  #prompt-input:focus { outline: none; border-color: var(--accent); }
+  .btn {
+    display: inline-block; padding: 0.4rem 1rem; margin-top: 0.4rem;
+    margin-right: 0.3rem; font-family: inherit; font-size: 0.85rem;
+    border: 1px solid var(--accent); border-radius: 3px;
+    background: transparent; color: var(--accent); cursor: pointer;
+  }
+  .btn:hover { background: var(--accent); color: var(--bg); }
+  .btn-primary { background: var(--accent); color: var(--bg); }
+  .btn-danger { border-color: var(--red); color: var(--red); }
+  .btn-danger:hover { background: var(--red); color: var(--bg); }
+  #status { color: var(--dim); font-size: 0.8rem; margin-top: 0.3rem; }
+</style>
+</head>
+<body>
+<h1>Noomesh Setup Wizard</h1>
+<div id="step-header">Connecting...</div>
+<div id="progress-bar"><div id="progress-fill"></div></div>
+<div id="log"></div>
+<div id="prompt-area">
+  <div id="prompt-label"></div>
+  <input id="prompt-input" autocomplete="off" />
+  <button class="btn btn-primary" onclick="submitAnswer()">Submit</button>
+</div>
+<div id="dir-select-area" style="display:none; background:var(--surface);
+    border:1px solid var(--accent); border-radius:4px; padding:0.8rem; margin-top:0.5rem;">
+  <div style="color:var(--accent); margin-bottom:0.4rem;" id="dir-select-label"></div>
+  <div id="dir-browse" style="max-height:200px; overflow-y:auto; border:1px solid var(--border);
+      border-radius:3px; padding:0.4rem; margin-bottom:0.5rem; font-size:0.85rem;"></div>
+  <div style="display:flex; gap:0.3rem; margin-bottom:0.5rem;">
+    <input id="dir-path-input" placeholder="Or type a path..." style="flex:1; padding:0.4rem;
+        font-family:inherit; font-size:0.85rem; background:var(--bg); color:var(--text);
+        border:1px solid var(--border); border-radius:3px;" />
+    <button class="btn" onclick="addDirFromInput()">+ Add</button>
+  </div>
+  <div id="dir-selected-list" style="margin-bottom:0.5rem;"></div>
+  <button class="btn btn-primary" onclick="submitDirSelect()">Done</button>
+</div>
+<div id="nav-area" style="display:none; margin-top:0.5rem;">
+  <button class="btn" id="btn-back" onclick="goBack()" disabled>← Back</button>
+  <button class="btn btn-primary" id="btn-next" onclick="goNext()">Next →</button>
+</div>
+<div>
+  <button class="btn btn-danger" onclick="abortWizard()">Abort</button>
+</div>
+<div id="status">Connecting...</div>
+
+<script>
+const log = document.getElementById('log');
+const promptArea = document.getElementById('prompt-area');
+const promptLabel = document.getElementById('prompt-label');
+const promptInput = document.getElementById('prompt-input');
+const stepHeader = document.getElementById('step-header');
+const progressFill = document.getElementById('progress-fill');
+const status = document.getElementById('status');
+
+let totalSteps = 8;
+let currentStep = 0;
+
+function appendLog(cls, text) {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = text + '\n';
+  log.appendChild(span);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showPrompt(label, isSecret) {
+  promptLabel.textContent = label;
+  promptInput.type = isSecret ? 'password' : 'text';
+  promptInput.value = '';
+  promptArea.style.display = 'block';
+  // Ensure the prompt is visible — may be below the 50vh log
+  setTimeout(function() {
+    promptArea.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+    promptInput.focus();
+  }, 50);
+}
+
+function hidePrompt() { promptArea.style.display = 'none'; }
+
+async function submitAnswer() {
+  const value = promptInput.value;
+  hidePrompt();
+  if (promptInput.type !== 'password' && value) {
+    appendLog('ev-info', '  \u2192 ' + value);
+  } else if (value) {
+    appendLog('ev-info', '  \u2192 ********');
+  }
+  // Send answer as query param (avoids JSON body parsing issues)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await fetch('/answer?v=' + encodeURIComponent(value), {
+        method: 'POST'
+      });
+      if (resp.ok) return;
+      console.warn('answer POST returned ' + resp.status + ', retry ' + (attempt + 1));
+    } catch (err) {
+      console.warn('answer POST failed:', err, 'retry ' + (attempt + 1));
+    }
+    await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+  }
+  appendLog('ev-error', 'Failed to submit answer — try again or click Abort');
+  showPrompt(promptLabel.textContent, promptInput.type === 'password');
+}
+
+promptInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitAnswer();
+});
+
+function abortWizard() {
+  fetch('/abort', {method: 'POST'});
+  status.textContent = 'Aborted';
+  es.close();
+  appendLog('ev-warning', '\nSetup aborted by user.');
+  appendLog('ev-info', 'Run "pai onboard" to try again.');
+  document.querySelector('.btn-danger').disabled = true;
+  document.querySelector('.btn-danger').textContent = 'Aborted';
+  hidePrompt();
+  hideNav();
+}
+
+const navArea = document.getElementById('nav-area');
+const btnBack = document.getElementById('btn-back');
+
+function showNav(canBack) {
+  btnBack.disabled = !canBack;
+  navArea.style.display = 'block';
+  navArea.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+function hideNav() { navArea.style.display = 'none'; }
+function goBack() { hideNav(); fetch('/go-back', {method: 'POST'}); }
+function goNext() { hideNav(); fetch('/go-next', {method: 'POST'}); }
+
+// --- Directory selector ---
+let selectedDirs = [];
+let currentBrowsePath = '/';
+
+function showDirSelect(label, existing) {
+  document.getElementById('dir-select-label').textContent = label;
+  selectedDirs = existing.slice();
+  renderSelectedDirs();
+  document.getElementById('dir-select-area').style.display = 'block';
+  browsePath('/');
+  setTimeout(function() {
+    document.getElementById('dir-select-area').scrollIntoView({behavior:'smooth',block:'nearest'});
+  }, 50);
+}
+
+function hideDirSelect() {
+  document.getElementById('dir-select-area').style.display = 'none';
+}
+
+async function browsePath(path) {
+  currentBrowsePath = path;
+  const browse = document.getElementById('dir-browse');
+  browse.innerHTML = '<span style="color:var(--dim)">Loading...</span>';
+  try {
+    const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
+    const data = await resp.json();
+    let html = '<div style="color:var(--dim);margin-bottom:0.3rem">' + escHtml(path) + '</div>';
+    if (path !== '/') {
+      const parent = path.replace(/\/[^\/]+\/?$/, '') || '/';
+      html += '<div style="cursor:pointer;color:var(--accent)" onclick="browsePath(\''+escJs(parent)+'\')">.. (up)</div>';
+    }
+    (data.entries || []).forEach(function(e) {
+      if (e.type === 'dir') {
+        const full = path.replace(/\/$/, '') + '/' + e.name;
+        html += '<div style="display:flex;align-items:center;gap:0.5rem">';
+        html += '<span style="cursor:pointer;color:var(--text)" onclick="browsePath(\''+escJs(full)+'\')">\ud83d\udcc1 '+escHtml(e.name)+'/</span>';
+        html += '<span class="btn" style="padding:0.1rem 0.4rem;font-size:0.75rem;margin:0" onclick="addDir(\''+escJs(full)+'\')">Add</span>';
+        html += '</div>';
+      }
+    });
+    browse.innerHTML = html;
+  } catch(err) {
+    browse.innerHTML = '<span style="color:var(--red)">Error browsing: '+escHtml(err.message)+'</span>';
+  }
+}
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escJs(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+function addDir(path) {
+  if (selectedDirs.indexOf(path) === -1) {
+    selectedDirs.push(path);
+    renderSelectedDirs();
+  }
+}
+
+function addDirFromInput() {
+  const inp = document.getElementById('dir-path-input');
+  const val = inp.value.trim();
+  if (val && selectedDirs.indexOf(val) === -1) {
+    selectedDirs.push(val);
+    renderSelectedDirs();
+    inp.value = '';
+  }
+}
+
+document.getElementById('dir-path-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') addDirFromInput();
+});
+
+function removeDir(idx) {
+  selectedDirs.splice(idx, 1);
+  renderSelectedDirs();
+}
+
+function renderSelectedDirs() {
+  const list = document.getElementById('dir-selected-list');
+  if (!selectedDirs.length) { list.innerHTML = '<span style="color:var(--dim)">No directories added yet</span>'; return; }
+  let html = '<div style="color:var(--accent);margin-bottom:0.2rem">Selected directories:</div>';
+  selectedDirs.forEach(function(d, i) {
+    html += '<div style="display:flex;align-items:center;gap:0.5rem;padding:0.1rem 0">';
+    html += '<span style="color:var(--text)">'+escHtml(d)+'</span>';
+    html += '<span style="cursor:pointer;color:var(--red);font-size:0.8rem" onclick="removeDir('+i+')">\u2716</span>';
+    html += '</div>';
+  });
+  list.innerHTML = html;
+}
+
+async function submitDirSelect() {
+  hideDirSelect();
+  const value = selectedDirs.join(':');
+  if (selectedDirs.length) {
+    appendLog('ev-info', '  \u2192 ' + selectedDirs.length + ' directories selected');
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const resp = await fetch('/answer?v=' + encodeURIComponent(value), {method: 'POST'});
+      if (resp.ok) return;
+    } catch(err) {}
+    await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+  }
+  appendLog('ev-error', 'Failed to submit directories');
+}
+
+// SSE connection
+const es = new EventSource('/events');
+es.onopen = function() {
+  status.textContent = 'Connected';
+};
+es.onmessage = function(e) {
+  try {
+    const ev = JSON.parse(e.data);
+    const kind = ev.kind;
+    const text = ev.text || '';
+    const data = ev.data || {};
+
+    if (kind === 'step_start') {
+      hideNav();
+      currentStep = data.step || 0;
+      totalSteps = data.total || 8;
+      stepHeader.textContent = 'Step ' + currentStep + '/' + totalSteps + ': ' + text;
+      progressFill.style.width = ((currentStep - 1) / totalSteps * 100) + '%';
+      status.textContent = 'Step ' + currentStep + '/' + totalSteps;
+    } else if (kind === 'navigate') {
+      showNav(data.can_back || false);
+      status.textContent = 'Click Next to continue';
+    } else if (kind === 'step_done') {
+      progressFill.style.width = ((data.step || currentStep) / totalSteps * 100) + '%';
+    } else if (kind === 'success') {
+      appendLog('ev-success', '  \u2713 ' + text);
+    } else if (kind === 'warning') {
+      appendLog('ev-warning', '  \u26a0 ' + text);
+    } else if (kind === 'error') {
+      appendLog('ev-error', '  \u2717 ' + text);
+    } else if (kind === 'info') {
+      appendLog('ev-info', '  ' + text);
+    } else if (kind === 'progress') {
+      status.textContent = text;
+    } else if (kind === 'prompt') {
+      let label = text;
+      if (data.default) label += ' (default: ' + data.default + ')';
+      showPrompt(label, data.secret || false);
+      status.textContent = 'Waiting for input...';
+    } else if (kind === 'confirm') {
+      const def = data.default ? 'y' : 'n';
+      showPrompt(text + ' (y/n, default: ' + def + ')', false);
+      status.textContent = 'Waiting for input...';
+    } else if (kind === 'dir_select') {
+      showDirSelect(text, data.existing || []);
+      status.textContent = 'Select directories...';
+    } else if (kind === 'done') {
+      status.textContent = text;
+      appendLog('ev-success', '\n' + text);
+      es.close();
+      // Show dashboard link and auto-redirect
+      const dashUrl = (data.gateway_url || 'https://127.0.0.1:8080');
+      appendLog('ev-info', '\nOpening dashboard at ' + dashUrl + ' ...');
+      setTimeout(function() { window.location.href = dashUrl; }, 3000);
+    }
+  } catch (err) {
+    console.error('SSE parse error:', err, 'raw:', e.data);
+  }
+};
+es.onerror = function() {
+  status.textContent = 'Reconnecting...';
+};
+</script>
+</body>
+</html>

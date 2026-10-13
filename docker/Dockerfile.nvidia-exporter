@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# NVIDIA GPU metrics exporter using nvidia-ml-py (NVML)
+# Uses the same library as PyTorch/TensorFlow for GPU detection
+
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/nvidia/cuda:12.2.0-base-ubuntu22.04
+
+# Install Python and pip
+RUN apt-get update && apt-get install -y --no-install-recommends --fix-missing \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install nvidia-ml-py - official NVIDIA Python bindings (replaces deprecated pynvml)
+RUN pip3 install --no-cache-dir nvidia-ml-py
+
+WORKDIR /app
+
+# Copy our exporter
+COPY nvidia-smi-exporter.py /app/exporter.py
+
+EXPOSE 9400
+
+# Self-check with the container's OWN leaf (NOO_TLS_*, which the exporter
+# refuses to start without), CA-verified, hostname checked (`localhost` is
+# in every service leaf's SANs). The previous probe set CERT_NONE and then
+# fell back to plain http://localhost:9400, which this exporter can never
+# answer — so a broken TLS probe read as "unhealthy" with no reason, and a
+# working one verified nothing. tests/test_healthchecks_verify_tls.py.
+HEALTHCHECK --interval=30s --timeout=5s \
+    CMD ["python3", "-c", "import os,ssl,urllib.request; ctx=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA']); ctx.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY']); urllib.request.urlopen('https://localhost:9400/health',context=ctx,timeout=5)"]
+
+CMD ["python3", "/app/exporter.py"]

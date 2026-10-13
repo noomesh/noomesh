@@ -1,0 +1,28 @@
+{
+  "_comment": "ONE fixture for followup 1305. Python (tests/test_kb_audience_isolation.py) pins _resolve_kb_roles to `callers`; Rust (gateway-rust/src/memory/scope.rs, DB-backed) feeds those same role sets to the scoped SQL and checks `expect_docs`. If the resolver and the SQL ever disagree about who is who, one of the two fails.",
+  "callers": {
+    "a":      {"sub": "a",               "scopes": ["read"],  "grants": [],           "roles": ["company", "system", "user:a"]},
+    "a_conn": {"sub": "a/codex-desktop", "scopes": ["read"],  "grants": [],           "roles": ["company", "system", "user:a"]},
+    "a_team": {"sub": "a",               "scopes": ["read"],  "grants": ["team:x"],   "roles": ["company", "system", "team:x", "user:a"]},
+    "b":      {"sub": "b",               "scopes": ["read"],  "grants": [],           "roles": ["company", "system", "user:b"]},
+    "b_op":   {"sub": "b",               "scopes": ["read", "write"], "grants": ["admin", "system", "user"], "roles": ["company", "system", "user:b"]},
+    "admin":  {"sub": "root",            "scopes": ["admin"], "grants": [],           "roles": null}
+  },
+  "docs": [
+    {"key": "a_priv",  "roles": ["user:a"]},
+    {"key": "b_priv",  "roles": ["user:b"]},
+    {"key": "co",      "roles": ["company"]},
+    {"key": "sys",     "roles": ["system"]},
+    {"key": "adm",     "roles": ["admin"]},
+    {"key": "legacy",  "roles": null},
+    {"key": "team_x",  "roles": ["team:x"]},
+    {"key": "gen",     "roles": ["generated"]}
+  ],
+  "expect_docs": {
+    "a":      ["a_priv", "co", "sys"],
+    "a_conn": ["a_priv", "co", "sys"],
+    "a_team": ["a_priv", "co", "sys", "team_x"],
+    "b":      ["b_priv", "co", "sys"],
+    "b_op":   ["b_priv", "co", "sys"]
+  }
+}

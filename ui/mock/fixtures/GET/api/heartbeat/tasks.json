@@ -1,0 +1,7 @@
+{
+  "tasks": [
+    { "id": "t-security-audit", "name": "Security audit", "schedule": "0 */4 * * *", "action": "security_audit", "enabled": true, "last_run": "2026-08-01T12:00:00Z", "next_run": "2026-08-01T16:00:00Z" },
+    { "id": "t-disk-cleanup", "name": "Disk cleanup", "schedule": "0 3 * * *", "action": "disk_cleanup", "enabled": true, "last_run": "2026-08-01T03:00:00Z", "next_run": "2026-08-02T03:00:00Z" },
+    { "id": "t-daily-digest", "name": "Daily digest", "schedule": "0 8 * * *", "action": "custom_prompt", "enabled": false, "last_run": "2026-07-31T08:00:00Z", "next_run": null }
+  ]
+}

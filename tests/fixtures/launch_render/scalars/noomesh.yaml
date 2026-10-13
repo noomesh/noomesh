@@ -1,0 +1,4 @@
+compose_env:
+  NODE_ID: noo-controller
+  PORT: 8080
+  RATIO: 1.5

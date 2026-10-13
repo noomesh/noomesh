@@ -1,0 +1,16 @@
+{
+  "conversation_memory": {
+    "total_entries": 4210,
+    "embedded_entries": 4102,
+    "unembedded_entries": 108,
+    "embedding_coverage_pct": 97.4,
+    "conversations_30d": 188,
+    "messages_30d": 2940,
+    "avg_messages_per_conversation": 15.6,
+    "oldest_record": "2026-03-02T09:12:44Z",
+    "newest_record": "2026-08-01T14:19:58Z",
+    "coverage_score": 97.4,
+    "warnings": []
+  },
+  "overall": { "score": 97.4, "grade": "A", "systems_checked": 1, "total_warnings": 0 }
+}

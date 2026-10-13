@@ -1,0 +1,61 @@
+# Ignore large/unnecessary files to speed up Docker build context transfer
+# (WSL2 NTFS bridge is slow — reduces 180s context transfer to ~5s)
+
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Rust build artifacts (compiled in Docker, not needed in context)
+gateway-rust/target/
+
+# Go build artifacts (compiled in Docker, not needed in context)
+node-agent-go/bin/
+
+# Node/JS
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Data (mounted as volumes, not baked into image)
+.pki-placeholder/
+data/
+logs/
+
+# Documentation (not needed in image)
+docs/
+# runbooks ship in the gateway image (task #14 — /api/docs/runbooks)
+!docs/operating/runbooks
+*.md
+!README.md
+
+# Tests — except the shared redaction corpus, which the gateway crate
+# include_str!s (tests/test_rust_build_context_complete.py checks that a
+# COPYed source is not shadowed here).
+tests/
+!tests/fixtures/redaction_corpus.json
+!tests/fixtures/audit_hash_v2_vectors.json
+!tests/fixtures/kb_audience_isolation.json
+!tests/fixtures/own_image_cases.json
+
+# Archived reference code (legacy/README.md). Never built, never copied by a
+# Dockerfile — and the vendored console alone is ~1.6 MB of context on a
+# bridge this file exists to keep fast.
+legacy/

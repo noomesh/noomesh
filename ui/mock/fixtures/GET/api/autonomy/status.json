@@ -1,0 +1,55 @@
+{
+  "enabled": true,
+  "running": true,
+  "running_detail": null,
+  "locations_total": 4,
+  "locations_enabled": 3,
+  "audit_entries": null,
+  "audit_detail": "not tracked — no autonomy audit store is readable; fired actions are visible in the gateway logs only",
+  "locations": [
+    {
+      "name": "backend_availability",
+      "type": "builtin",
+      "enabled": true,
+      "interval": 60,
+      "cooldown": 300,
+      "last_check": "2026-08-27T17:40:11Z",
+      "conditions": 1,
+      "actions": 1,
+      "source": "config"
+    },
+    {
+      "name": "node_health",
+      "type": "builtin",
+      "enabled": true,
+      "interval": 120,
+      "cooldown": 300,
+      "last_check": "2026-08-27T17:39:02Z",
+      "conditions": 2,
+      "actions": 2,
+      "source": "config"
+    },
+    {
+      "name": "backend_idle_scaledown",
+      "type": "builtin",
+      "enabled": true,
+      "interval": 300,
+      "cooldown": 900,
+      "last_check": null,
+      "conditions": 1,
+      "actions": 1,
+      "source": "config"
+    },
+    {
+      "name": "backend_scaling",
+      "type": "custom",
+      "enabled": false,
+      "interval": 300,
+      "cooldown": 600,
+      "last_check": null,
+      "conditions": 1,
+      "actions": 1,
+      "source": "db"
+    }
+  ]
+}

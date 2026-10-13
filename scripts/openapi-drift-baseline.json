@@ -1,0 +1,5 @@
+{
+  "_comment": "Drift accepted when the check was introduced. Shrink this as routes are documented; never grow it to pass a build.",
+  "undocumented": [],
+  "phantom": []
+}

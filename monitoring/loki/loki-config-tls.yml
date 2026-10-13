@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  http_tls_config:
+    cert_file: /tls/services/loki/service.crt
+    key_file: /tls/services/loki/service.key
+    client_ca_file: /tls/ca.crt
+    client_auth_type: RequireAndVerifyClientCert
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+ingester:
+  lifecycler:
+    # 0s, not the 15s default. dskit's Lifecycler.CheckReady (Loki 3.7)
+    # starts its "ready since" clock the first time /ready is CALLED and
+    # finds the ring healthy, then answers 503 "Ingester not ready: waiting
+    # for 15s after being ready" for the next 15s. Nothing polls Loki's
+    # /ready (its healthcheck is disabled: distroless, mTLS-only), so the
+    # first `noo cluster verify` after a stack recreate always landed in
+    # that window, however long Loki had been up (host8, 2026-10-03: up
+    # 20 min, ingesting, one /ready miss -- the verify call). The delay
+    # paces rolling updates of a multi-ingester ring; a single binary on
+    # an in-memory ring has no peer to wait for.
+    # tests/test_loki_wiring_parity.py pins it.
+    min_ready_duration: 0s
+
+schema_config:
+  configs:
+    - from: "2020-10-24"
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # NOO_LOKI_RETENTION (.env; compose passes it, Loki expands it with
+  # -config.expand-env=true). 720h = 30 days. Must be a multiple of the
+  # 24h index period. reject_old_samples_max_age tracks it on purpose: a
+  # node that buffered logs offline must be able to replay them, and the
+  # oldest line worth keeping is exactly one retention window old.
+  # tests/test_loki_wiring_parity.py pins the two to one expression.
+  retention_period: ${NOO_LOKI_RETENTION:-720h}
+  reject_old_samples: true
+  reject_old_samples_max_age: ${NOO_LOKI_RETENTION:-720h}
+  # Required for Loki 3.x with schema v11 + boltdb-shipper.
+  # To re-enable: migrate schema to v13 + tsdb index type.
+  allow_structured_metadata: false
+
+compactor:
+  working_directory: /loki/compactor
+  # shared_store was removed in Loki 3.x — delete_store_name is set via storage_config.
+  delete_request_store: filesystem
+  retention_enabled: true
+  retention_delete_delay: 2h
+  compaction_interval: 10m
+
+analytics:
+  reporting_enabled: false

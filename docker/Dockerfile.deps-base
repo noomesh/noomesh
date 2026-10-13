@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noomesh/deps-base — the ML tier of the shared Python base
+# (an earlier change: deps-core holds the non-ML tier; this image adds the ML
+# extras and trellion on top).
+#
+# FROM deps-core (base deps + web/cache/feedback/pgvector/google-chat/mcp)
+# plus the ML extras (trellion, rag, voice, graph, recall-memory) and the
+# vendored trellion package. Rebuilt only when pyproject.toml or
+# trellion changes; the downstream trellion image FROMs this and adds
+# only its service-specific bits.
+#
+# Why this exists: the ML dep tree is the heavy half of site-packages.
+# Installing it ONCE here keeps trellion rebuilds fast — and keeping it
+# OUT of deps-core keeps sandbox and the worker (which run no
+# models) from shipping it at all. A dependency belongs here only if it
+# is genuinely ML-only; everything else goes in Dockerfile.deps-core.
+#
+# Build deps-core first if not yet built:
+#   docker compose build deps-core
+# Then: docker compose build deps-base
+# (or directly: docker build -f docker/Dockerfile.deps-base \
+#   --build-context trellion=../trellion \
+#   --build-context trellion_protocols=../trellion-protocols \
+#   -t noomesh/deps-base:latest .)
+
+ARG DEPS_CORE=pai-assistant/deps-core:latest
+FROM ${DEPS_CORE}
+
+# deps-core already carries `pai.image.keep=true` and LABELs are
+# inherited; restated here because this image is ALSO a build-only base
+# (the trellion image is what runs), and an inherited-only label is one
+# refactor away from being lost.
+LABEL pai.image.role=base
+LABEL pai.image.keep=true
+
+WORKDIR /app
+
+# trellion comes from the additional_contexts mount; see compose.
+# uv --overrides rewrites the git+ssh URL in pyproject.toml to a local
+# file:// path so the build container never needs SSH/credentials.
+COPY --from=trellion . /tmp/noo-trellion
+# The add-on gateway client comes from THIS build
+# context — it lives in the monorepo so a stack tag pins it even though it
+# does not pin trellion. The override line resolves trellion's dependency on
+# it (once trellion declares one) to the same tree; the explicit install
+# below puts it in the image before trellion depends on it.
+COPY packages/noo-gateway-client /tmp/noo-gateway-client
+# trellion-protocols (the interface trellion offers add-ons; Apache-2.0, its
+# own private repo) is a dependency of trellion pinned by full commit. Same
+# arrangement as trellion: a named build context (compose:
+# ../trellion-protocols; images-release: a checkout at the SHA trellion pins),
+# resolved by the override line, so the build needs no credentials. The
+# check refuses a context that is not the pinned commit.
+COPY --from=trellion_protocols . /tmp/trellion-protocols
+COPY scripts/check-protocols-pin.py /tmp/check-protocols-pin.py
+RUN python /tmp/check-protocols-pin.py /tmp/noo-trellion /tmp/trellion-protocols
+RUN echo "trellion[transport,video] @ file:///tmp/noo-trellion" > /tmp/uv-overrides.txt \
+    && echo "noo-gateway-client @ file:///tmp/noo-gateway-client" >> /tmp/uv-overrides.txt \
+    && echo "trellion-protocols @ file:///tmp/trellion-protocols" >> /tmp/uv-overrides.txt
+
+# CPU-only torch. NOTHING built on this base has a GPU — trellion
+# runs with DeviceRequests=null, and `torch.cuda.is_available()` returns
+# False there. GPU inference lives in the vllm / llamacpp / ollama
+# containers, which use upstream images and never touch this base.
+#
+# Without this, the default index resolves the CUDA build (torch 2.13+cu130)
+# and drags the whole GPU stack into site-packages:
+#     nvidia/*  2.7GB
+#     torch     1.1GB
+#     triton    689MB
+# ~4.5GB of CUDA that can never execute.
+#
+# torch itself is not a direct dependency; it arrives via sentence-transformers,
+# transformers, piper-tts, thinc (spacy) and POT. Pinning the index here
+# catches all of them at once.
+#
+# GPU is a BUILD-TIME CHOICE, not a permanent exclusion. Whisper genuinely
+# benefits: `voice/transcription.py::_detect_device()` already probes
+# `torch.cuda.is_available()` and switches to float16 on CUDA. To build a
+# GPU-capable base:
+#
+#   docker build -f docker/Dockerfile.deps-base \
+#     --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130 ...
+#
+# CPU is the default because a CUDA base costs ~6.5GB and trellion (its
+# one consumer) currently gets no GPU (DeviceRequests=null) — the CUDA
+# wheels could not execute even if present.
+#
+# Note the flag alone is NOT sufficient for GPU work. The container also
+# needs an actual device request, and free VRAM: HOST3's GPU sits at
+# ~15.5/16GB with vLLM resident, so adding a consumer there risks the OOM
+# and engine-wedge failures already documented. For sustained GPU work the
+# architecture's own answer is a dedicated placed backend (as vllm, TEI and
+# the reranker already are), which the scheduler puts where VRAM exists —
+# rather than fattening a shared base image.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+ENV UV_EXTRA_INDEX_URL=${TORCH_INDEX} \
+    UV_INDEX_STRATEGY=unsafe-best-match
+
+# The ML extras on top of the deps-core layer — done ONCE per
+# pyproject.toml / noo-trellion change. Re-lists the deps-core extras so
+# uv resolves ONE consistent environment (the already-installed wheels
+# are cache hits, not re-downloads).
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install --system --overrides /tmp/uv-overrides.txt \
+    -e ".[trellion,web,cache,feedback,pgvector,google-chat,mcp,recall-memory,rag,voice,graph]" \
+    /tmp/noo-gateway-client
+
+# Marker so downstream images can verify they're built on top of a
+# compatible base (handy for debugging mismatched layers).
+RUN echo "pai-assistant/deps-base built $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/deps-base-version

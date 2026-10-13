@@ -1,0 +1,11 @@
+{
+  "doc_count": 24,
+  "page_count": 1840,
+  "chunk_count": 9620,
+  "embedded_pages": 1720,
+  "embedded_chunks": 9100,
+  "unembedded_pages": 120,
+  "unembedded_chunks": 520,
+  "started": true,
+  "embedder_state": { "state": "idle" }
+}

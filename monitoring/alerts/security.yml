@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Security alerting rules (H-L4). Evaluated by Prometheus against the
+# gateway's DB-backed security gauges (see gateway-rust: collect_db_gauges).
+# Thresholds are conservative defaults — tune per environment.
+groups:
+  - name: security
+    rules:
+      - alert: AuthFailureSpike
+        expr: noo_auth_failures_5m > 20
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Authentication-failure spike ({{ $value }} in 5m)"
+          description: >-
+            noo_auth_failures_5m={{ $value }}. Possible brute-force /
+            credential-stuffing. Check noo_security_audit for the origins
+            (details->>'source_ip', event_type='auth_failure').
+
+      - alert: ExecDenialSpike
+        expr: noo_exec_denials_5m > 10
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Tool-exec denial spike ({{ $value }} in 5m)"
+          description: >-
+            noo_exec_denials_5m={{ $value }}. Possible probing of
+            approval-gated tools (event_type='exec_denied').
+
+      - alert: SecurityAuditSinkStalled
+        # The worker_pool emits an 'audit_logger_started' marker at boot and
+        # security events continuously; if NO auth events land in 30m while the
+        # gateway is up, the audit sink may be unwired (CRIT-5 regression).
+        expr: (noo_auth_failures_5m == 0) and (noo_exec_denials_5m == 0) and (time() - process_start_time_seconds{job="gateway"} > 1800)
+        for: 30m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "No security-audit events observed in 30m"
+          description: >-
+            Confirm the audit sink is live (worker_pool.audit_logger_initialized
+            db_sink=true) and that noo_security_audit is receiving rows.

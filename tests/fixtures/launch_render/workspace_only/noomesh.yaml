@@ -1,0 +1,4 @@
+workspace:
+  enabled: true
+  host: /home/op/ws
+  mount: /workspace

@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+"""CLI entrypoint: ``python -m noo_eval <cmd>``.
+
+Commands:
+  topology [--out PATH]                     REAL topology report from `noo cluster status`
+  demo     [--out PATH]                     render the SYNTHETIC seeded demo report
+  run      SCENARIO --gateway URL [opts]    drive a live run and render a report
+
+Reports are written under eval/reports/ by default (kept local, git-ignored).
+
+Live run options:
+  --gateway URL     gateway base URL (e.g. https://host3.ts.net:8080)
+  --prom URL        Prometheus base URL for the security panel (optional)
+  --token TOKEN     service bearer (or set NOO_EVAL_TOKEN)
+  NOO_EVAL_IDENTITY_KEY   identity-scoped service key for the window / isolation probes (env only)
+  --out PATH        report output path (default: eval/out/<scenario>.html)
+  --body-only       emit Artifact-ready body (no <html>/<head>) instead of a full doc
+  --json PATH       also dump the raw RunResult JSON
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+
+import httpx
+import sys
+import time
+from pathlib import Path
+
+from . import collector, driver, identity, report
+from .demo import build_demo
+from .faults import NodeKillInjector, schedule_faults
+from .scenario import Scenario
+from .schema import RunResult, SecurityPosture
+
+
+def _slug(s: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in s.lower()).strip("-")[:60]
+
+
+def _resolve_verify(ca: str):
+    """TLS verification for httpx: a CA-bundle path (chain-verified) when we can
+    find the cluster CA, else True (system trust). We never disable verification
+    — the gateway cert chains to the cluster CA and its SAN covers localhost, so
+    a CA path gives full chain+hostname verification (the CRIT-3-safe pattern).
+    """
+    candidates = [
+        ca,
+        os.getenv("NOO_EVAL_CA", ""),
+        os.getenv("NOO_TLS_CA", ""),
+        "/etc/noo/pki/ca.crt",                       # where `noo` installs the cluster CA
+        os.path.expanduser("~/pai-assistant/pki/ca.crt"),
+        os.path.join(os.getenv("NOO_PKI_DIR", ""), "ca.crt") if os.getenv("NOO_PKI_DIR") else "",
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return True
+
+
+async def _live_run(args) -> RunResult:
+    scn = Scenario.load(args.scenario)
+    token = args.token or os.getenv("NOO_EVAL_TOKEN", "")
+    print(f"[noo-eval] {scn.name}: {scn.duration_s:.0f}s @ concurrency {scn.concurrency} → {args.gateway}")
+
+    topology = await collector.collect_topology(args.gateway, token)
+    if not topology:
+        # Gateway node list needs a bearer; fall back to the CLI (its own auth).
+        topology = await collector.collect_topology_cli()
+    print(f"[noo-eval] topology: {len(topology)} node(s), {sum(n.online for n in topology)} online")
+
+    verify = _resolve_verify(getattr(args, "ca", ""))
+    t0 = time.monotonic()
+    injector = NodeKillInjector(args.gateway, token)  # dry-run unless stop/start wired
+    if scn.workloads:
+        load_task = asyncio.create_task(driver.run_load(scn, args.gateway, token, verify=verify))
+        fault_task = asyncio.create_task(schedule_faults(injector, scn.faults, t0))
+        records, faults = await asyncio.gather(load_task, fault_task)
+    else:
+        records, faults = [], []   # a probe-only scenario drives no load
+
+    security = await collector.collect_security(args.prom) if args.prom else SecurityPosture()
+
+    result = RunResult(
+        scenario=scn.name, axes=scn.axes, started_at=args.started_at or "",
+        duration_s=scn.duration_s, gateway=args.gateway,
+        topology=topology, requests=records, faults=faults, security=security,
+        notes=[f"{len(records)} requests over {scn.duration_s:.0f}s"],
+    )
+    # Identity-plane probes (windows, foreign account) and the cross-account
+    # probes both mint through the identity exchange with ONE key from the
+    # environment. Absent key → the probes are reported as not run, never as
+    # isolated.
+    key_env = scn.identity.key_env if scn.identity else "NOO_EVAL_IDENTITY_KEY"
+    ikey = os.getenv(key_env, "")
+    if scn.identity or scn.isolation_probes:
+        if not ikey:
+            result.notes.append(f"probes NOT RUN: set {key_env} to an identity-scoped service key")
+        else:
+            async with httpx.AsyncClient(base_url=args.gateway, timeout=30.0, verify=verify) as client:
+                if scn.identity:
+                    rep = await identity.run_identity(client, ikey, scn.identity.owner,
+                                                      scn.identity.windows, scn.identity.foreign)
+                    result.isolation_tests.extend(rep.tests)
+                    result.notes.extend(rep.notes)
+                if scn.isolation_probes:
+                    rep = await identity.run_cross_account(client, ikey, [p.id for p in scn.personas])
+                    result.isolation_tests.extend(rep.tests)
+                    result.notes.extend(rep.notes)
+    return result
+
+
+async def _topology_run(args) -> RunResult:
+    """Render a REAL report from live cluster topology — no synthetic data, no
+    load driven. Node list comes from `noo cluster status`; security counters
+    from Prometheus if --prom is given.
+    """
+    topology = await collector.collect_topology_cli()
+    print(f"[noo-eval] real topology: {len(topology)} node(s), "
+          f"{sum(n.online for n in topology)} online")
+    security = await collector.collect_security(args.prom) if args.prom else SecurityPosture()
+    online = [n.node_id for n in topology if n.online]
+    return RunResult(
+        scenario="Live cluster topology",
+        axes=["node"],
+        gateway="noo cluster status",
+        topology=topology,
+        security=security,
+        notes=[
+            "REAL data — node list from `noo cluster status --json`.",
+            f"{len(online)} node(s) online: {', '.join(online) or 'none'}.",
+            "No load driven and no faults injected in this snapshot; run "
+            "`noo_eval run <scenario>` to add latency/throughput/failover metrics.",
+            "Locations aren't tracked by the cluster yet — all nodes tagged 'tailnet'.",
+        ],
+    )
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="noo_eval")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pt = sub.add_parser("topology", help="real topology report from `noo cluster status`")
+    pt.add_argument("--out", default="eval/reports/topology.html")
+    pt.add_argument("--prom", default="")
+    pt.add_argument("--json", default="")
+
+    pd = sub.add_parser("demo", help="render the SYNTHETIC seeded demo report")
+    pd.add_argument("--out", default="eval/reports/demo-SYNTHETIC.html")
+    pd.add_argument("--body-only", action="store_true")
+    pd.add_argument("--json", default="")
+
+    pr = sub.add_parser("run", help="drive a live evaluation run")
+    pr.add_argument("scenario")
+    pr.add_argument("--gateway", required=True)
+    pr.add_argument("--prom", default="")
+    pr.add_argument("--token", default="")
+    pr.add_argument("--started-at", default="")
+    pr.add_argument("--ca", default="",
+                    help="cluster CA bundle for TLS verification (default: auto-detect "
+                         "NOO_TLS_CA / pki/ca.crt). Verification is never disabled.")
+    pr.add_argument("--out", default="")
+    pr.add_argument("--body-only", action="store_true")
+    pr.add_argument("--json", default="")
+
+    args = p.parse_args(argv)
+
+    if args.cmd == "demo":
+        result = build_demo()
+    elif args.cmd == "topology":
+        result = asyncio.run(_topology_run(args))
+    else:
+        result = asyncio.run(_live_run(args))
+        if not args.out:
+            args.out = f"eval/reports/{_slug(result.scenario)}.html"
+
+    out = report.write_report(result, args.out, standalone=not getattr(args, "body_only", False))
+    print(f"[noo-eval] report → {out}")
+    if getattr(args, "json", ""):
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(result.model_dump_json(indent=2))
+        print(f"[noo-eval] raw json → {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

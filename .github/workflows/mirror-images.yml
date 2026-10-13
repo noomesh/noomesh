@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Mirror third-party images into our GHCR.
+#
+# Why: ci.yml's sqlx-drift job needs a Postgres SERVICE container. Service
+# images are pulled during job SETUP — before any step runs — so a Docker
+# Hub outage doesn't fail the job, it hangs it: 2026-08-06 produced three
+# consecutive 15m01s runs with ZERO steps executed. Pulling from our own
+# GHCR removes the Hub dependency; this workflow refreshes the mirror.
+#
+# Pushing from a workflow (GITHUB_TOKEN) also auto-links the package to
+# THIS repo, which is what lets ci.yml's `credentials:` block read it with
+# the ordinary GITHUB_TOKEN — no PAT involved.
+#
+# Run it by hand: `gh workflow run mirror-images.yml -R noomesh/noomesh`.
+# workflow_dispatch runs the file as it is on the DEFAULT branch (main), so a
+# matrix change reaches the mirror once it is promoted there. There is no
+# push or schedule trigger: this workflow holds registry credentials and
+# pushes packages, so it starts only on a deliberate dispatch. Mirrored tags
+# are stable majors; refreshes are rare and deliberate.
+name: mirror images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    # Skipped outside the canonical repo: a fork has neither the DHI token nor
+    # the right to push to ghcr.io/noomesh.
+    if: github.repository == 'noomesh/noomesh'
+    # Cloud runner on purpose: mirroring is pull-from-Hub + push-to-GHCR,
+    # pure network I/O with no cache to reuse.
+    runs-on: ubuntu-latest
+    strategy:
+      # One dead upstream source must not cancel the other fifteen. A mirror
+      # that stops at the first 404 leaves every base image it had already
+      # reached un-mirrored, which is how `dhi.io/promtail:3: not found` —
+      # an image DHI no longer publishes, unrelated to anything here —
+      # cancelled the uv/python/rust/alpine-base lane the stack release
+      # depends on. Partial is the right answer for a mirror: copy what
+      # exists, and let the run name what did not.
+      fail-fast: false
+      matrix:
+        include:
+          # ci.yml sqlx-drift service container. Keep the tag in lockstep
+          # with docker/Dockerfile.postgres's major (pg_dump output differs
+          # across majors and the drift check would fail on version, not
+          # drift).
+          - source: pgvector/pgvector:pg18
+            dest: pgvector:pg18
+
+          # ── Docker Hub base images (build path) ──────────────────────
+          # python:3.12-slim is the root Dockerfile's base and ci.yml's
+          # `build` job died on it 2026-08-17: "timeout awaiting response
+          # headers" from registry-1.docker.io. ci.yml already logs in to
+          # Hub for the higher RATE LIMIT, which does nothing for a network
+          # timeout — the pull has to leave Hub entirely.
+          #
+          # There was a python:3.11-slim row here too, mirrored because the
+          # root Dockerfile was still on 3.11 while every shipped image ran
+          # 3.12. That Dockerfile now reads `.python-version` like everything
+          # else, so 3.11 has no consumer — see
+          # tests/test_python_version_single_source.py.
+          - source: python:3.12-slim
+            dest: python:3.12-slim
+            auth: hub
+
+          # ── dhi.io (runtime services) ────────────────────────────────
+          # Three TLS-handshake timeouts against dhi.io on 2026-08-17
+          # alone. Mirroring also removes an AUTH failure mode: pulling
+          # these needs DHI_TOKEN at build time, so a credential problem
+          # is currently indistinguishable from an outage.
+
+          - source: dhi.io/redis:8.6-debian13-dev
+            dest: redis:8.6-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/grafana:12-debian13-dev
+            dest: grafana:12-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/loki:3
+            dest: loki:3
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/prometheus:3
+            dest: prometheus:3
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/alertmanager:0
+            dest: alertmanager:0
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/node-exporter:1
+            dest: node-exporter:1
+            auth: dhi
+            dest_org: noomesh/dhi
+
+          # ── dhi.io BUILD BASES (build-from-mirrors, 2026-08-20) ──────
+          # The release workflow now builds first-party images FROM these
+          # mirrors (--build-arg DHI_REGISTRY): dhi.io TLS timeouts have
+          # broken four builds. The gateway runtime FROM is digest-pinned —
+          # mirroring BY that digest preserves it (manifest copy). The
+          # pytorch bases (vllm/airllm) are deliberately NOT mirrored:
+          # multi-GB x3 tags of storage for rarely-rebuilt images.
+          - source: dhi.io/rust:1-debian13-dev
+            dest: rust:1-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/python:3.12-debian13@sha256:4da000f376259ab2e5832ae781db58b04f2f67b9acc9f5b17ecc9568742e70b4
+            dest: python:3.12-debian13
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/uv:0-debian13-dev
+            dest: uv:0-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/golang:1.25-debian13-dev
+            dest: golang:1.25-debian13-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/alpine-base:3.22
+            dest: alpine-base:3.22
+            auth: dhi
+            dest_org: noomesh/dhi
+          - source: dhi.io/postgres:18-alpine3.22-dev
+            dest: postgres:18-alpine3.22-dev
+            auth: dhi
+            dest_org: noomesh/dhi
+
+          # DHI lanes set dest_org `noomesh/dhi`: ghcr.io/noomesh/dhi/<name>,
+          # a NESTED prefix in the org (list: scripts/dhi-images.txt). The
+          # hardened bases are DHI Community images, so there is no
+          # visibility requirement on these packages.
+          # The nested prefix is what lets the SAME names (redis, loki, ...)
+          # exist as PUBLIC upstream mirrors at ghcr.io/noomesh/<name> (the
+          # `dest_org: noomesh` lanes below): the compose template
+          # ${NOO_BASE_REGISTRY}/redis:... resolves under both. The hardened
+          # fleet sets NOO_BASE_REGISTRY=ghcr.io/noomesh/dhi, the public
+          # channel ghcr.io/noomesh.
+          # History: packages pushed under another owner were linked to a
+          # different repository, which this repo's GITHUB_TOKEN cannot read,
+          # and deps-core FROMs them - the first stack release died at
+          # `uv: not found`. Pushing from THIS repo makes the package its own.
+          #
+          # Re-mirroring rather than granting keeps the property the namespace
+          # move exists for: packages this repository creates and owns, with no
+          # cross-repo permission to maintain. They stay PRIVATE and in-org,
+          # which is what the DHI terms require.
+          #
+          # ── OFFICIAL images → the PUBLIC noomesh org (2026-08-19) ────
+          # The public distribution cannot use the DHI mirrors above (DHI
+          # terms: own-org use only, packages stay PRIVATE). These are the
+          # open-source official equivalents — freely redistributable —
+          # mirrored to ghcr.io/noomesh and RETAGGED to the exact tag
+          # strings the compose expects, so `NOO_BASE_REGISTRY=
+          # ghcr.io/noomesh` is the only switch a public install needs.
+          # Sources verified upstream 2026-08-19. Pushed with this repo's own
+          # GITHUB_TOKEN (the repo lives in the noomesh org); flip these
+          # packages PUBLIC after the first push.
+          - source: redis:8
+            dest: redis:8.6-debian13-dev
+            dest_org: noomesh
+          - source: grafana/grafana:12.2
+            dest: grafana:12-debian13-dev
+            dest_org: noomesh
+          - source: grafana/loki:3
+            dest: loki:3
+            dest_org: noomesh
+          - source: prom/prometheus:v3
+            dest: prometheus:3
+            dest_org: noomesh
+          - source: prom/alertmanager:v0
+            dest: alertmanager:0
+            dest_org: noomesh
+          - source: prom/node-exporter:v1
+            dest: node-exporter:1
+            dest_org: noomesh
+    steps:
+      - name: Checkout (the DHI privacy guard lives in scripts/)   # actions/checkout@v4.2.2
+        if: matrix.auth == 'dhi' && github.repository == 'noomesh/noomesh'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # dhi.io is private and Hub pulls benefit from an authenticated rate
+      # limit. Both reuse the same Docker account already in secrets.
+      - name: Log in to source registry
+        if: matrix.auth != ''
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -z "${DHI_TOKEN:-}" ]; then
+            echo "::error::${{ matrix.auth }} source needs DHI_TOKEN; refusing to mirror a partial set"
+            exit 1
+          fi
+          registry=docker.io
+          [ "${{ matrix.auth }}" = "dhi" ] && registry=dhi.io
+          echo "$DHI_TOKEN" | docker login "$registry" -u "$DHI_USERNAME" --password-stdin
+
+      # imagetools COPIES THE MANIFEST LIST — every architecture the source
+      # publishes survives. The previous `pull && tag && push` resolved to
+      # the RUNNER's architecture and pushed a single-arch image, which
+      # would strand arm64 nodes (host9, Jetson) on a mirror that has no
+      # image for them. Copying by digest-list also avoids re-uploading
+      # layers GHCR already has.
+      - name: Mirror ${{ matrix.source }} → GHCR (multi-arch manifest copy)
+        run: |
+          dest_org="${{ matrix.dest_org || github.repository_owner }}"
+          docker buildx imagetools create \
+            --tag "ghcr.io/${dest_org}/${{ matrix.dest }}" \
+            "${{ matrix.source }}"
+
+      - name: Verify the mirrored manifest
+        run: |
+          dest_org="${{ matrix.dest_org || github.repository_owner }}"
+          echo "--- source ---"
+          docker buildx imagetools inspect "${{ matrix.source }}" \
+            | grep -E "^\s+Platform:" | sort > "$RUNNER_TEMP/src.txt" || true
+          echo "--- mirror ---"
+          docker buildx imagetools inspect \
+            "ghcr.io/${dest_org}/${{ matrix.dest }}" \
+            | grep -E "^\s+Platform:" | sort > "$RUNNER_TEMP/dst.txt"
+          cat "$RUNNER_TEMP/dst.txt"
+          # A mirror missing an architecture the source has is the exact
+          # failure this rewrite exists to prevent — fail loudly, now.
+          if ! diff -q "$RUNNER_TEMP/src.txt" "$RUNNER_TEMP/dst.txt" >/dev/null; then
+            echo "::error::platform mismatch between source and mirror"
+            diff "$RUNNER_TEMP/src.txt" "$RUNNER_TEMP/dst.txt" || true
+            exit 1
+          fi

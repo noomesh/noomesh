@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE noo_kb_role_grants SET roles = $2, updated_at = now(), updated_by = $3 WHERE username = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f33b94fae54f84d6218d0a9cf8dcd749a19135de47e12bda961791ce871995cf"
+}

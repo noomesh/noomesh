@@ -1,0 +1,4 @@
+compose_env:
+  FLAG_ON: true
+  FLAG_OFF: false
+  EMPTY: null

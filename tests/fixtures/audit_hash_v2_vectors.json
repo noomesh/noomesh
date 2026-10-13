@@ -1,0 +1,68 @@
+{
+  "_comment": "Shared hash-v2 vectors (followup 1287). The Rust verifier/writer (gateway-rust/src/audit_integrity.rs) and the Python writer (src/noomesh/gateway/audit_log.py) must both reproduce `canonical` and `entry_hash` for each `row` under `key`. `details` is Postgres's jsonb text; `timestamp_us` the stored microseconds. Never regenerate these to make a test pass: a change here invalidates every v2 row already written.",
+  "key": "test-audit-key-123",
+  "vectors": [
+    {
+      "name": "python_worker_row",
+      "row": {
+        "id": "2f1c9a64-0b7e-4d3a-9c55-6e2b8f0d1a37",
+        "timestamp_us": 1790000000123456,
+        "event_type": "bus_principal_refused",
+        "severity": "warning",
+        "actor": "bus",
+        "resource": "noo.jobs.submit",
+        "outcome": "refused",
+        "request_id": "9f2c41d07ab3",
+        "details": "{\"path\": \"/api/x\", \"source_ip\": \"10.0.0.7\"}",
+        "prev_hash": null
+      },
+      "canonical": "noo-audit-row-v2\nid=36:2f1c9a64-0b7e-4d3a-9c55-6e2b8f0d1a37\ntimestamp_us=16:1790000000123456\nevent_type=21:bus_principal_refused\nseverity=7:warning\nactor=3:bus\nresource=15:noo.jobs.submit\noutcome=7:refused\nrequest_id=12:9f2c41d07ab3\ndetails=43:{\"path\": \"/api/x\", \"source_ip\": \"10.0.0.7\"}\nprev_hash=-",
+      "entry_hash": "v2:f538ebeccb6e235fdf92655c8e47f646f82d8348456787df9bd7447934b83704"
+    },
+    {
+      "name": "gateway_checkpoint_row",
+      "row": {
+        "id": "c0ffee00-1234-4abc-8def-0123456789ab",
+        "timestamp_us": 1790000123000001,
+        "event_type": "audit_key_checkpoint",
+        "severity": "info",
+        "actor": "noo-gateway",
+        "resource": "audit-key:00112233445566778899aabbccddeeff;after:d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7;at:1790000123",
+        "outcome": "from:ffeeddccbbaa99887766554433221100",
+        "request_id": null,
+        "details": "{\"what\": \"the audit log's signing key changed\", \"after_row_id\": null}",
+        "prev_hash": "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7"
+      },
+      "canonical": "noo-audit-row-v2\nid=36:c0ffee00-1234-4abc-8def-0123456789ab\ntimestamp_us=16:1790000123000001\nevent_type=20:audit_key_checkpoint\nseverity=4:info\nactor=11:noo-gateway\nresource=127:audit-key:00112233445566778899aabbccddeeff;after:d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7;at:1790000123\noutcome=37:from:ffeeddccbbaa99887766554433221100\nrequest_id=-\ndetails=69:{\"what\": \"the audit log's signing key changed\", \"after_row_id\": null}\nprev_hash=64:d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7",
+      "entry_hash": "v2:abebe5724c3b876a8cbc688f4ef14301d3fe74f04cdec34e55ccceeb0f6c8b06"
+    },
+    {
+      "name": "separator_unicode_null_vs_empty",
+      "row": {
+        "id": "00000000-0000-4000-8000-000000000000",
+        "timestamp_us": 0,
+        "event_type": "auth_failure",
+        "severity": "warning",
+        "actor": "al\u001fice \u00fcn\u00ef \u2603",
+        "resource": "",
+        "outcome": "bad_password",
+        "request_id": "",
+        "details": null,
+        "prev_hash": null
+      },
+      "canonical": "noo-audit-row-v2\nid=36:00000000-0000-4000-8000-000000000000\ntimestamp_us=1:0\nevent_type=12:auth_failure\nseverity=7:warning\nactor=16:al\u001fice \u00fcn\u00ef \u2603\nresource=0:\noutcome=12:bad_password\nrequest_id=0:\ndetails=-\nprev_hash=-",
+      "entry_hash": "v2:98f7e6288a7f2d50e7d10ce5c676db36ac46523bc5948f2c9de979902b4cc334"
+    }
+  ],
+  "jsonb_renderings": [
+    {
+      "input": "{\"zeta\":1,\"source_ip\":\"10.0.0.7\",\"a\":[1.50,{\"y\":null,\"x\":\"\u00e9\"}],\"big\":1e-07}",
+      "text": "{\"a\": [1.50, {\"x\": \"\u00e9\", \"y\": null}], \"big\": 0.0000001, \"zeta\": 1, \"source_ip\": \"10.0.0.7\"}"
+    },
+    {
+      "input": "{\"source_ip\": \"10.0.0.7\", \"path\": \"/api/x\"}",
+      "text": "{\"path\": \"/api/x\", \"source_ip\": \"10.0.0.7\"}"
+    }
+  ],
+  "_comment_jsonb_renderings": "What `$1::jsonb::text` returns for a writer's JSON. The v2 hash covers details as this text, so a Postgres whose rendering differs would fail every v2 row with details. Checked against a live server by audit_integrity.rs::the_v2_details_render_the_same_on_this_postgres (docs/reference/postgres.md, before a major upgrade)."
+}

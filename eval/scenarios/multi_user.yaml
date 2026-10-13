@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Multi-user concurrency & isolation
+description: >
+  Drive several personas concurrently across channels, then run cross-user
+  isolation probes (the H-D1 tenant-isolation control test). Each persona
+  plants a secret; probes verify no persona can read another's.
+axes: [node, user]
+duration_s: 90
+concurrency: 16
+personas:
+  - {id: alice, location: home-lab, weight: 0.35, secret: "project-atlas-launch-code-7731"}
+  - {id: bob,   location: us-east,  weight: 0.25, secret: "bob-medical-record-A"}
+  - {id: carol, location: eu-west,  weight: 0.20, secret: "carol-salary-figure"}
+  - {id: dave,  location: us-east,  weight: 0.12}
+  - {id: erin,  location: home-lab, weight: 0.08}
+workloads:
+  - {endpoint: /v1/chat/completions, model: gemma-4-12b, weight: 0.7,
+     prompt: "Remember my secret and summarize our last conversation."}
+  - {endpoint: /api/external/embeddings, model: bge, weight: 0.3, prompt: "recall context"}
+isolation_probes: true

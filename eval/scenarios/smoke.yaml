@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Live smoke load (gentle)
+description: >
+  A deliberately light real load — short duration, low concurrency, mostly cheap
+  embeddings — to produce a REAL metrics report without stressing a busy fleet.
+axes: [node, user]
+duration_s: 20
+concurrency: 3
+personas:
+  - {id: eval-a, location: tailnet, weight: 0.6}
+  - {id: eval-b, location: tailnet, weight: 0.4}
+workloads:
+  - {endpoint: /api/external/embeddings, model: bge, weight: 0.8,
+     prompt: "evaluation smoke embedding probe"}
+  - {endpoint: /v1/chat/completions, model: gemma-4-12b, weight: 0.2,
+     prompt: "Reply with a single word: ok."}
+isolation_probes: false

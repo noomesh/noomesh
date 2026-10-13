@@ -1,0 +1,7 @@
+{
+  "tools": [
+    { "name": "rag_query", "total_calls": 1180, "successful": 1170, "success_rate": 0.991, "avg_execution_ms": 210 },
+    { "name": "shell_exec", "total_calls": 510, "successful": 472, "success_rate": 0.925, "avg_execution_ms": 640 },
+    { "name": "pai_coding_task", "total_calls": 420, "successful": 398, "success_rate": 0.948, "avg_execution_ms": 3200 }
+  ]
+}

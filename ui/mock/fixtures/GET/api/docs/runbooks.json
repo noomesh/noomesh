@@ -1,0 +1,7 @@
+{
+  "runbooks": [
+    { "name": "docker-stack", "title": "Docker Stack" },
+    { "name": "cluster-health", "title": "Cluster Health" },
+    { "name": "node-provisioning", "title": "Node Provisioning" }
+  ]
+}

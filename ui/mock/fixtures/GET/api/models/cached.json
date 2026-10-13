@@ -1,0 +1,7 @@
+{
+  "models": [
+    { "name": "llama-3.1-70b-instruct", "backend": "vllm", "size": "40 GB", "nodes": ["prime-01"] },
+    { "name": "qwen-2.5-32b-instruct", "backend": "vllm", "size": "19 GB", "nodes": ["atlas-02"] },
+    { "name": "nomic-embed-text", "backend": "ollama", "size": "274 MB", "nodes": ["prime-01", "atlas-02"] }
+  ]
+}

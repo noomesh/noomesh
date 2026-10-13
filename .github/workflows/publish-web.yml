@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Publish the web console as an immutable, versioned artifact the gateway pins.
+#
+# Workflows run only from the repository root, so this lives here rather than
+# under ui/.github/workflows/.
+#
+# TRIGGER: the STACK tag, not a UI version. The console ships inside the
+# gateway image, so it has no release of its own to have a version for, and
+# `images-release.yml` already described the intended design — "rollback =
+# repin the previous stack tag" — while the pin was actually a UI version
+# (v0.1.7). One version line for the thing that gets deployed; a pin that
+# cannot drift because it is the same string as everything else in the release.
+#
+# It must publish BEFORE the images matrix: docker/Dockerfile.gateway-rust does
+# `FROM ${UI_IMAGE}`, so the gateway build pulls this artifact.
+name: Publish web console
+
+on:
+  push:
+    tags: ['stack-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Stack tag to publish as (e.g. stack-v0.2.25)'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Un-nested: ghcr.io/noomesh/mesh-ui-web, a package CREATED by this
+  # repository's first push and linked to it. Must equal OWNER in
+  # images-release.yml: pinned by tests/test_image_namespace_declarations.py.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/mesh-ui-web
+
+jobs:
+  publish:
+    # Pushes to ghcr.io/<repository_owner>/mesh-ui-web: only the repo whose
+    # owner IS the image org may run it (a run from any other repo would push
+    # the console to the wrong org with that org's GITHUB_TOKEN).
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+        with:
+          fetch-depth: 0
+
+      # Promotion model (#697): a release candidate `stack-vX.Y.Z-rc.N` is cut
+      # on staging, a final `stack-vX.Y.Z` on main. Same refusal as
+      # images-release.yml's release-line job, so the console is never
+      # published from a tag the image release would refuse.
+      - name: The tag sits on its promotion branch
+        working-directory: .
+        run: |
+          set -eu
+          raw="${{ inputs.tag || github.ref_name }}"
+          tag="stack-${raw#stack-}"
+          case "$tag" in *-rc.*) line=staging ;; *) line=main ;; esac
+          git fetch --quiet origin "+refs/heads/$line:refs/remotes/origin/$line" 2>fetch.err || {
+            cat fetch.err >&2
+            echo "::error::could not fetch origin/$line (git said: $(tr '\n' ' ' < fetch.err)) — if it does not exist, promote dev → $line before tagging $tag"; exit 1; }
+          commit="$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}")" || { echo "::error::tag $tag not found"; exit 1; }
+          git merge-base --is-ancestor "$commit" "origin/$line" || {
+            echo "::error::$tag (${commit:0:8}) is not on origin/$line — promote by merge PR first, then tag there"; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # STRIP `stack-`, exactly as images-release.yml does
+      # (TAG=${GITHUB_REF_NAME#stack-}). The two must agree to the character:
+      # the gateway build pulls $REGISTRY/$OWNER/mesh-ui-web:$TAG, so a console
+      # published as `stack-v0.2.25` while the gateway looks for `v0.2.25` is a
+      # release that dies at `FROM ${UI_IMAGE}` — the same drift this whole
+      # change exists to remove, one layer down.
+      - name: Resolve tag
+        id: tag
+        working-directory: .
+        run: |
+          set -eu
+          raw="${{ inputs.tag || github.ref_name }}"
+          echo "value=${raw#stack-}" >> "$GITHUB_OUTPUT"
+
+      - name: Install
+        run: npm ci
+
+      # Re-run the gates so a tag can never publish an unbuilt or broken
+      # artifact. Same four as the `ui` job in ci.yml, on purpose: this is the
+      # last chance before something ships inside the gateway image.
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Contract audit
+        run: npm run audit:contract
+      # The console carries this tag as a plain string, so "which build is
+      # the display running?" is answerable from the public bundle with
+      # curl and grep. Without it every console reports `dev`.
+      - name: Build web console
+        run: npm run build -w @metis/web
+        env:
+          NOO_CONSOLE_BUILD: stack-${{ steps.tag.outputs.value }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9   # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # FROM scratch — just /dist, nothing to run. No Node or JS build
+      # toolchain ever enters the gateway image.
+      - name: Build & push artifact image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6
+        with:
+          context: ui/apps/web/dist
+          file: ui/deploy/web-artifact.Dockerfile
+          push: true
+          # A release candidate never moves :latest (promotion model, #697);
+          # build-push-action drops the empty line an rc leaves here.
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
+            ${{ !contains(steps.tag.outputs.value, '-rc.') && format('{0}:latest', env.IMAGE) || '' }}
+
+      - name: Summary
+        working-directory: .
+        run: |
+          echo "### Published \`${{ env.IMAGE }}:${{ steps.tag.outputs.value }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "The gateway pins it via docker/Dockerfile.gateway-rust's UI_IMAGE." >> "$GITHUB_STEP_SUMMARY"

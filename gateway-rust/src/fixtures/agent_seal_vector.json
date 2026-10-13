@@ -1,0 +1,29 @@
+{
+ "controller_secret": "controller-review-secret-with-enough-entropy-0123",
+ "agent_secret": "agent-secret-with-enough-entropy-abcdefghijklmn",
+ "plaintext": {
+  "text": "cross-language vector",
+  "n": 7
+ },
+ "envelope": {
+  "id": "msg_vector",
+  "thread_id": "thr_vector",
+  "from": "node-c/coordinator",
+  "to": "node-a/claude-code-1",
+  "kind": "message",
+  "ts": "2026-09-03T00:00:00Z",
+  "body": {
+   "ct": "hzNYwwpjS7iL9H/Zn3Aum2O7ZXq4x+SNwNSho4gxFmau6JB0N/X0110zWK78wlKI2W/dOAmV"
+  }
+ },
+ "enc_meta": {
+  "alg": "x25519-chacha20poly1305-v1",
+  "epk": "lrJL9KMAcqudRSYTcQXnJ+Kvvw1Oq+Lkt1u+0X9VAzI=",
+  "nonce": "WrCyklmJy6i2nNLd",
+  "wraps": {
+   "review": "djWk0Cc4dugs1XYDlR5BsJL17kG8mYYjQArMYxVPmLn28NGj21mOYfwOiPBxUxkz",
+   "node-a/claude-code-1": "8HOGqyiwyVT4ApTLfBdYQQPFF3/2huduTaT5t4tJWLIpmH5QKg2deTAE4kcOxWmc"
+  }
+ },
+ "sig": "6W5nDV+dcPhf4rF9Q3IJPZrFaxynWJf5Yj1WEy1LYNBewxdC5Olx8Xe2cKCD+EzVrgwgTCb2e0lJtHL044ZcDw=="
+}

@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noo-worker — the slim ALWAYS-ON Python runtime.
+#
+# FROM deps-core: the NON-ML site-packages tier (fastapi/pydantic,
+# SQLAlchemy/psycopg, httpx, nats-py, structlog). No torch, no nvidia
+# tree, no noo-trellion package — the ML pack lives ONLY in the opt-in
+# noo-trellion image (Dockerfile.trellion, FROM deps-base).
+#
+# What runs here: the worker-pool NATS runtime with
+# NOO_WORKER_SURFACES=core — exactly the three non-ML subjects
+# (worker.tool.generic,
+# worker.api.coding.task history, the worker.api.heartbeat.run dispatch
+# shell) plus the non-ML in-process services (proactive loop, exec
+# approval, coding manager, settings/heartbeat/job CRUD stores, the
+# gateway channel client).
+#
+# NO MIGRATIONS: noo-worker applies neither Alembic env — the gateway
+# owns mesh (sqlx) and noo-trellion owns memory. NOO_SKIP_MIGRATIONS is
+# baked so a compose block cannot accidentally hand this container a
+# migration role.
+#
+# Until an earlier change flips the default shape, this image is built
+# but not started by the controller profile — noo-trellion still runs
+# surfaces=all.
+
+ARG DEPS_CORE=pai-assistant/deps-core:latest
+FROM ${DEPS_CORE}
+# deps-core carries pai.image.keep=true (build-only base protection);
+# LABELs are inherited, so without this override the rebuild prune would
+# skip this application image too.
+LABEL pai.image.keep=false
+
+WORKDIR /app
+
+COPY src ./src
+COPY config/tools.json /app/config/tools.json
+
+ENV NOO_WORKER_SURFACES=core \
+    NOO_SKIP_MIGRATIONS=1
+
+RUN chown -R nonroot:nonroot /app
+USER nonroot
+
+# Worker health listener (worker_pool standalone mode): 127.0.0.1:8090,
+# loopback only — its one consumer is the HEALTHCHECK below, so nothing is
+# EXPOSEd for it.
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)" || exit 1
+
+# deps-core descends from the uv base image, whose ENTRYPOINT is `uv` —
+# left in place it turns the CMD below into `uv python -m …`, which is
+# uv's toolchain-management subcommand, not an interpreter: the container
+# crash-loops without ever starting the pool (live 2026-08-12, every
+# heartbeat delegate abandoned at 1860s). Dockerfile.trellion overrides
+# its entrypoint for the same reason.
+ENTRYPOINT []
+CMD ["python", "-m", "noomesh.gateway.worker_pool"]

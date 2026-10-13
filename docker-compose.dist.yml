@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# docker-compose.dist.yml — DISTRIBUTION overlay (run the published images).
+#
+# The base docker-compose.cluster.yml is a DEV file: every first-party service
+# carries `pull_policy: build`, so `docker compose up` always compiles from the
+# local source tree. That is the right default for development — but it means the
+# published GHCR images are never actually exercised.
+#
+# This overlay flips the stack to pull-only. Layered on top of the base file it:
+#   1. replaces `pull_policy: build` with `missing` (pull the image; never build)
+#   2. repoints the images that hardcode `noomesh/...` at
+#      ${NOO_IMAGE_PREFIX}/...:${NOO_IMAGE_TAG} so they resolve to GHCR
+#
+# It deliberately does NOT strip the `build:` blocks. Compose needs them to stay
+# schema-valid, and with pull_policy=missing they are inert — nothing builds.
+#
+# ALWAYS use it as an OVERLAY, never alone:
+#
+#   NOO_IMAGE_PREFIX=ghcr.io/noomesh NOO_IMAGE_TAG=v0.1.8 \
+#     docker compose -f docker-compose.cluster.yml -f docker-compose.dist.yml \
+#     --profile controller up -d
+#
+# In practice you never type that — use the CLI, which sets the vars, verifies
+# the GHCR login and pulls first:
+#
+#   noo stack start --dist              # newest pinned release
+#   noo stack start --dist --tag v0.1.7 # a specific one
+#   noo stack reset --dist              # wipe + onboard + stand up from images
+#
+# The core images are public: no registry login is needed. Add-on images are in
+# a private registry and need `docker login ghcr.io` once registry access is
+# granted with the entitlement.
+#
+# `NOO_INSTALL_MODE` (recorded by `noo onboard`) decides which way a bare
+# `noo stack start` goes: on a dist install it behaves like `--dist`. To
+# force a one-off source run on any install, use `noo stack start --dev`
+# (mutually exclusive with `--dist`/`--build`).
+
+services:
+  # ── Published to GHCR by .github/workflows/images-release.yml ────────────
+  # These already interpolate ${NOO_IMAGE_PREFIX}/${NOO_IMAGE_TAG} in the base
+  # file, so only the pull policy needs flipping.
+  deps-core:
+    pull_policy: missing
+
+  deps-base:
+    pull_policy: missing
+
+  gateway:
+    pull_policy: missing
+
+  node-agent:
+    pull_policy: missing
+
+  # trellion is NOT here either: its overlay interpolates
+  # `pull_policy: ${NOO_PULL_POLICY:-build}` and lib-dist exports
+  # NOO_PULL_POLICY=missing in dist mode.
+
+  # trellion-intel is NOT here: it is an add-on overlay
+  # that carries its own `pull_policy: missing`, and a dist row for a service
+  # the overlay did not compose would define a bare service with no image.
+
+  # whisper / piper are NOT here: the voice add-on is an
+  # overlay, the launcher's --no-build makes a dist install pull them, and a
+  # dist row for a service the overlay did not compose is a bare service
+  # compose refuses. Their images must still be published: pinned by
+  # tests/test_dist_mode.py::test_every_addon_overlay_image_is_published.
+
+  # ── Images whose base-file ref is hardcoded to the local dev name ────────
+  # Repointed at the registry as well as flipped to pull-only.
+  sandbox:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/sandbox:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_SANDBOX:-}
+    pull_policy: missing
+  sandbox-extra:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/sandbox:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_SANDBOX:-}
+    pull_policy: missing
+
+  worker:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/worker:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_WORKER:-}
+    pull_policy: missing
+
+  # Image name differs from the service name (see the release matrix).
+  postgres:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/postgres-pgvector:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_POSTGRES_PGVECTOR:-}
+    pull_policy: missing
+
+  nvidia-exporter:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/nvidia-exporter:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_NVIDIA_EXPORTER:-}
+    pull_policy: missing
+
+  # llamacpp is in the release matrix and the lock; pull it like the core
+  # (the base service still carries a build: block for dev checkouts).
+  llamacpp:
+    pull_policy: missing
+
+  # The standalone profile's embedder sidecar (stunnel-ollama-embed, the
+  # mTLS door in front of ollama-embed) runs on EVERY standalone install,
+  # so its image is in the release matrix (`stunnel`, docker/Dockerfile.stunnel)
+  # and pulled here. The other stunnel-* services are not overridden (see
+  # below): they are on inference-node profiles a controller never starts.
+  stunnel-ollama-embed:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+  # The optional CPU embedder's door (profile `embed-cpu`): the same
+  # published stunnel image as above.
+  stunnel-ollama-embed-cpu:
+    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/stunnel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_STUNNEL:-}
+    pull_policy: missing
+
+# NOT overridden here — and why:
+#   sandbox-base, airllm, stunnel-* (except stunnel-ollama-embed above), browser
+#     Not in the `controller` profile, so a controller dist run never starts
+#     them. llamacpp/airllm/stunnel are inference-node images built on the node
+#     that runs them; adding them to the release matrix is the next step if you
+#     want pull-only WORKER installs too (the `stunnel` image IS published now —
+#     the standalone sidecar needs it — so those rows are one line each).
+#   redis, nats, vllm, ollama, tei*, reranker, loki, prometheus,
+#   alertmanager, grafana, node-exporter, model-cache
+#     Third-party upstream images — already pulled, never built. Untouched.

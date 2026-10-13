@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT node_id, backend FROM noo_backend_placements WHERE desired_state = 'running'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "node_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "backend",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "9ac3d1920662a860db52809c462476f5011353f8dfbf6d387f93248734320f45"
+}

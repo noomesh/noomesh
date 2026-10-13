@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# The DHI-derived images in the org's registry, under the NESTED prefix:
+# package `dhi/<name>` = ghcr.io/noomesh/dhi/<name>. Names below are written
+# without the prefix.
+#
+# The dhi.io hardened bases are DHI Community images and stay public, so there
+# is no visibility requirement on these packages; the list is the declaration
+# the mirror lanes, the Dockerfiles and the tests agree on.
+#
+#   mirror   a dhi.io mirror made by mirror-images.yml.
+#   derived  built by the release on top of DHI bases (deps-core, deps-base) or
+#            copied for the same build path (static-ffmpeg).
+#
+# The `dhi/` prefix is what lets the same names (redis, loki, ...) ALSO exist as
+# upstream mirrors at ghcr.io/noomesh/<name>: the two sets must never share a
+# package name.
+# tests/test_image_namespace_declarations.py pins this list against the
+# mirror-images.yml `auth: dhi` lanes, the Dockerfile `${DHI_REGISTRY}/` FROMs
+# and the public lanes.
+mirror redis
+mirror grafana
+mirror loki
+mirror prometheus
+mirror alertmanager
+mirror node-exporter
+mirror rust
+mirror python
+mirror uv
+mirror golang
+mirror alpine-base
+mirror postgres
+derived static-ffmpeg
+derived deps-core
+derived deps-base

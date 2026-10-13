@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Mesh sandbox image — isolated Python code execution for the
+# python_exec tool (compose runs `uvicorn noomesh.sandbox.app:app`).
+# Formerly Dockerfile.gateway-python; the Python FastAPI gateway was
+# deleted (the Rust gateway is the only engine), this image remains as
+# the sandbox base.
+#
+# FROM the shared deps-core image — the NON-ML tier of the
+# noomesh site-packages. This service runs `uvicorn
+# noomesh.sandbox.app:app` (fastapi + pydantic) and its entrypoint
+# imports stdlib + sqlalchemy + noomesh.db.migration_runner; none of
+# that touches torch/transformers/noo-trellion, so it no longer inherits
+# the ML tree that Dockerfile.deps-base adds for trellion. This image
+# adds only the actual src/ and sandbox-specific config. When
+# pyproject.toml is unchanged, none of the heavy install work runs here.
+#
+# Build deps-core first if not yet built:
+#   docker compose build deps-core
+
+ARG DEPS_CORE=pai-assistant/deps-core:latest
+FROM ${DEPS_CORE}
+# deps-core carries `pai.image.keep=true` so the rebuild's
+# `image prune -a --filter label!=pai.image.keep=true` never deletes that
+# build-only base. LABELs are INHERITED, so without this override every
+# image built FROM it silently inherited the protection too — meaning the
+# prune skipped the ~11GB application images it exists to clean up.
+LABEL pai.image.keep=false
+
+WORKDIR /app
+
+# System dependencies (gateway/sandbox-specific, not part of deps-core).
+# No ffmpeg here — the sandbox doesn't process audio/video. No node/claude
+# either: the fu 49 in-sandbox Claude Code runner was REVERTED by the
+# 2026-08-11 design flip — Claude Code runs EXTERNALLY and calls Mesh
+# through the /mcp door; the sandbox is Mesh's AIRGAPPED executor for
+# untrusted code and never talks to Anthropic. ffmpeg lives in
+# Dockerfile.gateway-rust where voice mode actually needs it.
+# Keeping the sandbox lean avoids the libavfilter → libsphinxbase →
+# LAPACK → gcc-14-base dep conflict that Debian Trixie introduced.
+#
+# bubblewrap: every /exec call runs inside `bwrap --unshare-all` — its
+# own root, PID space and no network — see src/noomesh/sandbox/app.py.
+# Needs docker/seccomp-sandbox.json on the container (compose does it).
+#
+# Docker CLI intentionally NOT installed — the gateway has no Docker access;
+# container lifecycle is owned by the host-side noo-hostd
+# via the command spool (./.noo-host-spool → /var/run/noo-spool).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    init-system-helpers \
+    curl \
+    git \
+    libzbar0 \
+    bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
+# Real source overlays the stub from deps-core. The editable .pth file
+# in deps-core points at /app/src so the overlay is transparent.
+COPY src ./src
+
+# Init git repo for Claude Code project detection
+RUN git init /app
+
+# MCP config + shared tool schemas
+COPY docker/mcp-servers.json /app/.mcp.json
+COPY config/tools.json /app/config/tools.json
+
+# /opt/claude-defaults is GONE (design flip 2026-08-11): the sandbox never
+# hosts a claude subprocess, so there is nothing to seed. External Claude
+# Code brings its own config and reaches Mesh via ~/.claude/settings.json
+# → http://127.0.0.1:3100/mcp.
+
+# CA bundle installer
+COPY docker/entrypoint.py /opt/entrypoint.py
+RUN chmod +x /opt/entrypoint.py
+
+# Transfer ownership
+RUN chown -R nonroot:nonroot /app
+
+# Terminal welcome
+RUN echo '[ -n "$NOO_TERMINAL" ] && echo -e "\033[36m  Mesh Gateway Shell\033[0m\n  noo cluster status — cluster health\n  noo rag query \"...\" — knowledge base search\n"' >> /home/nonroot/.bashrc
+
+# Python entrypoint (works with or without shell)
+ENTRYPOINT ["python", "/opt/entrypoint.py"]
+
+USER nonroot
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import urllib.request,ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8080/health',context=ctx,timeout=5)" || exit 1
+
+CMD []

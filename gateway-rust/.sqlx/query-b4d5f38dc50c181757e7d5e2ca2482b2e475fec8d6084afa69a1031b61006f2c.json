@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH degrees AS (\n                     SELECT entity_id, COUNT(*) AS deg FROM (\n                       SELECT src_entity_id AS entity_id FROM edges\n                       UNION ALL\n                       SELECT dst_entity_id AS entity_id FROM edges\n                     ) e GROUP BY entity_id\n                   )\n                   SELECT e.entity_id::text AS \"entity_id!\",\n                          e.canonical_name, e.type, d.deg AS \"deg!\"\n                   FROM entities e\n                   JOIN degrees d ON e.entity_id = d.entity_id\n                   WHERE d.deg >= $1\n                   ORDER BY d.deg DESC\n                   LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entity_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "canonical_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "deg!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "b4d5f38dc50c181757e7d5e2ca2482b2e475fec8d6084afa69a1031b61006f2c"
+}

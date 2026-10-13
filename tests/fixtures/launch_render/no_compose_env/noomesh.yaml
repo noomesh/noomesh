@@ -1,0 +1,7 @@
+addons:
+  trellion: true
+watched_folders:
+  enabled: true
+  folders:
+    - host: /home/op/docs
+      mount: /data/docs

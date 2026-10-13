@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+apiVersion: 1
+
+# Prometheus, THROUGH THE GATEWAY, never https://prometheus directly.
+# In open-source Grafana every user, a Viewer included, can POST
+# /api/ds/query with a query of its own; the gateway is where that is
+# decided. It admits only Grafana's service leaf (the tlsClientCert below),
+# reads X-Grafana-User ([dataproxy] send_user_header in grafana.ini), looks
+# up that person's LIVE noomesh tier, and runs a read-only account's query
+# only when it is one of the provisioned dashboards' own (no Loki at all).
+# Operators and admins get the read API. `noo cluster verify --controller`
+# FAILs its "grafana door" row if this URL dials Prometheus directly, and
+# tests/test_grafana_sso_parity.py fails the build.
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: https://gateway:8080/api/grafana-ds/prometheus
+    isDefault: true
+    editable: false
+    jsonData:
+      tlsAuth: true
+      tlsAuthWithCACert: true
+      # Data-source-managed alert rules live in Prometheus/Alertmanager
+      # config, not here; the gateway serves the read API only.
+      manageAlerts: false
+    secureJsonData:
+      tlsCACert: $__file{/app/pki/ca.crt}
+      tlsClientCert: $__file{/app/pki/services/grafana/service.crt}
+      tlsClientKey: $__file{/app/pki/services/grafana/service.key}

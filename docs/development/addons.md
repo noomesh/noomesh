@@ -1,0 +1,607 @@
+# Building an add-on
+
+An add-on is a separate service the gateway reaches, deployed alongside it
+and gated by the `addons:` map in `noomesh.yaml` plus (for licensed ones) a
+signed entitlement — there is no per-add-on environment variable. Four are
+declared in the gateway's `ADDONS` table (`gateway-rust/src/addons.rs`)
+today: **trellion** (the ML knowledge pack, on by default), **identity**
+(free, on by default), **evolve** (opt-in) and **trellion-intel** (trellion's licensed tier, opt-in).
+A fifth, **voice** (whisper STT + piper TTS), is launcher-only: it composes
+an overlay the same way but is never in `ADDONS` and never reported by
+`/health`.
+
+This page is the contract. Follow it and your add-on plugs into the gateway
+without a single new line of gateway routing code.
+
+## The two layers
+
+Every add-on shares the **declaration** layer and picks **one** transport.
+They are deliberately separate: presence and messaging are the same problem
+for every add-on, but NATS and HTTP are genuinely different surfaces and
+pretending otherwise would make both worse.
+
+| Layer | Where | What it decides |
+|---|---|---|
+| Declaration | `gateway-rust/src/addons.rs` — one `Addon` row | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
+| Transport (HTTP) | your repo's route manifest, delivered to `/opt/noo/addon-routes/<name>/routes.json` | Which paths the gateway proxies to it (validated and mounted at startup) |
+| Transport (NATS) | a subject prefix, matched in `worker_client.rs` | Which subjects it answers |
+
+Pick HTTP if your add-on serves an API. Pick NATS if it answers worker
+subjects on the existing bus. Trellion does the second; evolve does the
+first.
+
+## What your repo must provide
+
+The gateway side is one table row. Everything else lives in your repo,
+because everything else is something only you can keep true.
+
+| # | Artifact | Where | Why it is yours |
+|---|---|---|---|
+| 1 | The service | your `src/`, serving the declared paths + `/health` | — |
+| 2 | Route manifest | in your package and image (the example below: `src/example_addon/example-addon.routes.json`) | the gateway mounts your HTTP surface from it at runtime; the core names none of your routes |
+| 3 | Contract test | `tests/test_gateway_route_contract.py` | the gateway cannot tell whether you serve what your manifest declares; only you can |
+| 4 | Manifest delivery | a one-shot service in your overlay that writes the manifest into a volume the gateway mounts read-only (dev: bind-mount the file) | the manifest the gateway reads must be the one in the image beside it |
+| 5 | CI that runs 3 | a workflow | an unrun check is documentation |
+| 6 | MCP tool fragment | `mcp-tools-<addon>.json`, named by `NOO_MCP_EXTRA_MANIFEST` | optional — only if your add-on should appear as MCP tools |
+| 7 | Compose overlay | `docker-compose.<addon>.yml` with an explicit env allowlist | the launcher composes it when `addons.<name>` is declared on in `noomesh.yaml` |
+| 8 | Gateway client | e.g. `gateway_client.py` | everything in the gateway's domain routes back over HTTP, and only you know which calls you make |
+
+## A minimal worked example: `example-addon`
+
+`example-addon` is fictional. It is the smallest add-on that has all eight
+artifacts, so each one is shown once, in the form the rest of this page
+defines.
+
+```text
+example-addon/
+  src/example_addon/
+    app.py                          # 1  the service: /health + the declared paths
+    example-addon.routes.json       # 2  the route manifest
+    gateway_client.py               # 8  calls back into the gateway over HTTP
+  tests/test_gateway_route_contract.py   # 3  manifest == what app.py serves
+  .github/workflows/ci.yml          # 5  runs 3
+  mcp-tools-example-addon.json      # 6  optional MCP tool fragment
+  docker-compose.example-addon.yml  # 7  overlay, 4  manifest delivery
+```
+
+1. **The service** serves `GET /health` and the one path it declares.
+2. **The manifest** declares that one path (shape in step 2a):
+
+   ```json
+   {
+     "version": 1,
+     "addon": "example-addon",
+     "base_url_env": "NOO_EXAMPLE_ADDON_URL",
+     "base_url_default": "https://noo-example-addon:8090",
+     "routes": [
+       { "name": "status", "method": "GET", "path": "/api/example-addon/status" }
+     ]
+   }
+   ```
+
+3. **The contract test** is the one in step 4, pointed at that file.
+4. **Manifest delivery**: the overlay runs a one-shot service from the
+   add-on's own image that copies the manifest into a named volume; the
+   gateway mounts that volume read-only at
+   `/opt/noo/addon-routes/example-addon` and waits for the one-shot to finish.
+5. **CI** runs the contract test on every push.
+6. **MCP fragment** (optional): `mcp-tools-example-addon.json`, named by
+   `NOO_MCP_EXTRA_MANIFEST`, exposes `status` as a tool.
+7. **Overlay**: `docker-compose.example-addon.yml`, an explicit `environment:`
+   allowlist, no `profiles:`.
+8. **Gateway client**: `gateway_client.py` sends the cluster-HMAC bearer the
+   gateway expects on each call and is the only place the add-on talks to the
+   gateway.
+
+
+**Why 3 and not "the gateway checks it".** The gateway proxies a path; it
+cannot know whether the far end answers. A path is a string in your manifest
+and in your handlers, and renaming one leaves everything compiling and the
+route 404ing in production with nobody watching. An MCP tool can sit in exactly that state indefinitely
+(served by the add-on, never mounted by the gateway, advertised to every MCP
+client) when neither side compares the two lists.
+
+This is the same convention the console already uses: `ui/` vendors
+`contracts/openapi.json` and runs an audit against the gateway's router,
+with a changelog as the coordination channel. Follow it.
+
+## Step 1 — declare it
+
+One row in `ADDONS` (`gateway-rust/src/addons.rs`):
+
+```rust
+Addon {
+    name: "yourthing",                       // the /health `addons.<name>` key
+    default_on: false,                       // opt-in; `true` = opt-out
+    disabled_msg: YOURTHING_DISABLED_MSG,    // what an operator sees
+    requires_feature: Some("yourthing"),     // None for an open add-on
+    unlicensed_msg: YOURTHING_UNLICENSED_MSG,
+}
+```
+
+There is deliberately no `env` field: the switch is the `addons.<name>` key
+in `noomesh.yaml`, read by both the launcher (compose overlays) and the
+gateway (routing/refusals) from the same file. No per-add-on environment
+variable exists or is accepted. Set `routes_manifest: true` on the row if you
+serve HTTP routes through a manifest (step 2a).
+
+`default_on` is the whole polarity decision. An open pack people expect to
+have (trellion) is opt-out; anything licensed is opt-in.
+
+The two messages matter more than they look. A disabled add-on, an
+unlicensed one and a broken one must stay **three distinguishable answers** —
+that is the reason this table exists rather than a scattering of env reads.
+
+## Step 2a — declare your routes (HTTP add-ons)
+
+Write your manifest in your own repo and ship it in your image. The gateway
+reads it at startup from `/opt/noo/addon-routes/<name>/routes.json` when your
+switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
+
+```json
+{
+  "version": 1,
+  "addon": "yourthing",
+  "base_url_env": "NOO_YOURTHING_URL",
+  "base_url_default": "https://noo-yourthing:8090",
+  "timeout_secs": 60,
+  "routes": [
+    { "name": "status", "method": "GET", "path": "/api/yourthing/status" },
+    { "name": "list", "method": "GET", "path": "/api/yourthing/items", "query": true },
+    { "name": "detail", "method": "GET", "path": "/api/yourthing/items/{item_id}",
+      "params": { "item_id": "uuid" } },
+    { "name": "run", "method": "POST", "path": "/api/yourthing/run" },
+    { "name": "internal_tick", "method": "POST", "path": "/api/yourthing/tick",
+      "internal": true }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Stable key. Gateway code calls a route by this, never by its path. |
+| `method` | `GET` or `POST`. |
+| `aliases` | Extra gateway paths reaching the same route — for a path that shipped under more than one spelling. |
+| `params` | `{"id": "uuid"}` (`uuid` or `string`). A malformed uuid is a 400 from the gateway; garbage never reaches your URL. |
+| `query` | Pass the caller's query string through. |
+| `internal` | Callable from gateway code, **not mounted** on the public API. |
+| `timeout_secs` | Per route (1–600); falls back to the manifest's. |
+| `note` | Free text for whoever reads the file. |
+
+Any other field is refused.
+
+### Delivering it
+
+Your overlay hands the file to the gateway read-only: a one-shot service from
+the add-on's own image writes the manifest into a named volume, the gateway
+mounts that volume at `/opt/noo/addon-routes/<name>` (`:ro`) and waits for the
+one-shot to complete.
+A file, not a fetch: nothing at boot depends on the network or on the add-on
+being up first, and an image upgrade rewrites the file.
+
+### What the gateway checks
+
+The gateway still decides what it exposes. A manifest declares paths and an
+upstream, never who may call them, and the gateway refuses the whole add-on
+when any of these fails:
+
+- `version` is 1 and `addon` is the add-on it was delivered for;
+- the upstream is your own service: `base_url_env` is `NOO_<NAME>_URL` and
+  `base_url_default` is `https://noo-<name>[:port]`, no other host, no
+  credentials, path or query;
+- paths are plain segments (no `..`, no wildcard), every `{param}` is
+  declared, public paths live under `/api/` and outside the gateway's own
+  namespaces (`/api/addons/`, `/api/security/`, `/api/config`, … —
+  `RESERVED_PREFIXES`);
+- routes the gateway calls by name (`CALLED_BY_NAME`: the console and CLI
+  pieces and the gateway's own scheduled calls) are `internal`;
+- a public `POST` is one the front door already refuses a User-tier caller,
+  so a manifest cannot place a write where a User is admitted;
+- no public route collides with a core route.
+
+Scopes are the gateway's: the global auth middleware runs in front of every
+mounted route exactly as it does for core routes.
+
+### When it is missing or wrong
+
+Switched on, with no manifest or an invalid one: **none** of your routes are
+mounted, never a partial surface. The gateway logs the reason at startup,
+`/health` reports `addons.<name>: "unhealthy"`, and every internal call to
+you answers with the reason (an image from before manifests shipped with the
+add-on is named as the likely cause, with the fix). Switched off: nothing is
+read or mounted and the gateway starts normally.
+
+Your routes are not in the public OpenAPI spec or the console's contract;
+your own surface types them from your manifest.
+
+### `internal` is a security boundary, not a convenience
+
+A route marked `internal` is reachable from gateway code and from nowhere
+else. Use it for anything that should not be triggerable by a caller with API
+access: a route only the gateway's own scheduled work calls (`internal_tick`
+in the manifest above) is the typical case.
+
+## Step 2b — claim a subject prefix (NATS add-ons)
+
+Add your prefix to the matcher in `addons.rs` (`is_trellion_subject` is the
+model) and the guard in `worker_client.rs` refuses your subjects with the
+add-on's message instead of letting them time out. A timeout reads like an
+outage; that is the failure this replaces.
+
+## Step 3 — serve it
+
+Nothing exotic. Serve the declared paths, and a `/health`. Where you need
+something the gateway owns — its config, its knowledge graph, a heartbeat
+task, an activity, a channel message — **go back over HTTP** rather than
+reaching into its tables. The `gateway_client.py` of the example above mints
+the cluster-HMAC token per request.
+
+Own your own tables outright, on your own connection, as a single writer.
+Everything else routes back. That split is what keeps an add-on from becoming
+a second authority on a fact the gateway already owns — the single most
+repeated failure in this codebase's history.
+
+## Step 3b — know who called you
+
+Every proxied request now arrives with the gateway's own credential and, when
+a person was behind it, that person's identity. Both are set by the gateway on
+a request it builds from nothing, so a client cannot forge either by sending
+the headers itself — they are dropped at the proxy and re-set.
+
+| Header | Meaning |
+|---|---|
+| `Authorization: Bearer <token>` | the gateway itself. Verify it (below) before trusting anything else. |
+| `X-Noo-Requester-Sub` | the mesh **account** the call acts for. |
+| `X-Noo-Requester-Connection` | the live session, when the account was reached through one. |
+| `X-Noo-Requester-Role` | `user`, `operator` or `admin`, resolved when the credential was validated. |
+| `X-Noo-Requester-Scopes` | comma-separated, in credential order. |
+
+**An absent `X-Noo-Requester-Sub` means the gateway itself** — a heartbeat
+digest, the meta-loop, a scheduled evaluator. It does not mean "anyone", and
+it must never be read as unrestricted. Treat it the way the gateway treats an
+internal caller on the way in: a machine with no human behind it, authorized
+by what it is, not by what it claims.
+
+This is the reverse of the key your add-on presents when it calls the gateway
+(`NOO_GATEWAY_KEY`). Both are rows in the same table with the
+same properties; they are not interchangeable, and neither is accepted where
+the other belongs.
+
+### Verifying the bearer
+
+The token is a row in `noo_service_keys` under the consumer
+`addon-caller:gateway`, minted fresh on every gateway start
+(`gateway-rust/src/addon_auth.rs`). The raw value exists only in the gateway
+process; what is stored is its sha256. Each start revokes the previous row,
+and deletes revoked `addon-caller:*` rows older than 7 days; no other
+consumer's revoked row is ever deleted. `noo security service-key list
+--all` leaves the retired caller rows out, and `--callers` shows them.
+
+The value is `noo-ak-` followed by 64 hex characters, and the stored hash is
+of that whole string, prefix included. Hash exactly what you were presented;
+do not strip the prefix, and do not check the length or alphabet — a gateway
+released before the prefix presents the same 64 hex without it, and its row
+verifies the same way. If you want to know when those are gone, count a
+verified bearer that does not start with `noo-ak-` (log it, once per consumer per hour).
+
+Your DB role cannot read that table, and should not — it holds every other
+consumer's key. Read the view instead:
+
+```sql
+SELECT consumer FROM noo_addon_caller_keys WHERE key_hash = $1
+```
+
+`noo_addon_caller_keys` exposes the consumer, the hash and the creation time
+for add-on-caller rows alone, and mesh migration `077_addon_caller_verify_view` grants
+SELECT on it to each add-on role. Hash what you were presented, look it up,
+and refuse the request when there is no row.
+
+Cache the lookup briefly if you like; the gateway caches its own key
+resolution for 60 seconds. Do not cache the ABSENCE of a row for long —
+that is the revocation path (`noo security service-key revoke
+addon-caller:gateway`), and a gateway restart is the rotation path.
+
+If your add-on predates this, nothing breaks: the headers are additive and an
+add-on that ignores them behaves exactly as it did. But an add-on reachable on
+the mesh network that does not check is one that answers anything which can
+reach its port.
+
+## Step 2c — declare your worker handlers (NATS add-ons)
+
+Claiming a subject prefix says which subjects are yours. It does not put a
+handler behind them. Until recently the handler MODULE used to have to live in the
+mesh repo and be named in `noomesh/workers/__init__.py`'s import list —
+which meant an add-on could not move its own code without breaking a caller
+in a repository it does not own.
+
+Declare them instead. In your `pyproject.toml`:
+
+```toml
+[project.entry-points."noomesh.worker_surfaces"]
+"ml-intel:graph" = "your_package.worker_surface"
+```
+
+The entry point resolves to a module whose import registers
+`@worker_handler` subjects, or to a callable that registers them. Install
+the package and the subjects are served; nothing in the mesh names you.
+
+**The name carries the surface gate**, as `<surface>:<label>` — one of
+`core`, `ml`, `ml-intel`, or `all`. This matters because several add-on
+packages ship in the same image: a licensed surface must not register on the
+core worker merely because its package is installed alongside. A name with
+no prefix runs on every surface.
+
+A declaration that fails to load **warns and is skipped**, and its subjects
+go unserved rather than half-served. It does not take the worker down, and
+it does not look like an absent add-on.
+
+## Step 4 — prove you serve what your manifest declares
+
+Add a test in **your** repo that reads your manifest and asserts your app
+serves every route in it. This is the drift check, and it belongs in your CI
+because that is where the fix belongs.
+
+```python
+# tests/test_gateway_route_contract.py
+import json, pathlib
+
+MANIFEST = pathlib.Path("src/yourthing/yourthing.routes.json")  # the file you ship
+
+def test_we_serve_every_route_we_declare():
+    declared = json.loads(MANIFEST.read_text())["routes"]
+    served = {(r.methods, r.path) for r in create_app().routes if hasattr(r, "methods")}
+    missing = [
+        r for r in declared
+        if not any(r["path"] == path and r["method"] in methods for methods, path in served)
+    ]
+    assert not missing, f"the manifest declares routes we do not serve: {missing}"
+```
+
+## Step 5 — document the routes
+
+Your routes are documented in your repo, next to the manifest. The gateway's
+public spec (`src/noomesh/gateway/static/openapi.json`) and the console's
+contract carry core routes only; CI's `openapi-drift` job reads the gateway's
+`.route(` calls and never sees an add-on's. Document the **503** shape your
+callers get: for an add-on route, "the operator did not enable this" is a
+normal answer, not an outage a UI should render as one.
+
+`internal` routes are not part of any API.
+
+
+## Console pieces — filling your slots in the console diagrams
+
+The console's diagrams (the brain map and the workflow view) ship complete in
+core, with a placeholder wherever an add-on owns a node. An installed add-on
+serves its own description of those nodes — its *piece* — and the console fills
+the slots at runtime. With no piece (add-on off, unreachable, or invalid) a slot
+simply keeps its placeholder.
+
+**Slot ids** are `<addon>:<name>`, where `<addon>` is the add-on's key in
+`/health`'s `addons` map (`evolve`, `trellion_intel`). Every slot key in your
+piece must start with your own `<addon>:`; the gateway refuses a piece that
+names anyone else's.
+
+**The piece** is JSON, version 1:
+
+```json
+{
+  "version": 1,
+  "addon": "<addon>",
+  "slots": {
+    "<addon>:<name>": { "title": "...", "description": "...", "steps": ["..."] }
+  }
+}
+```
+
+`title` and `description` are strings. `steps` is optional; when present it is
+an array of strings (possibly empty). `slots` may be empty. The whole piece must
+stay under 64 KB.
+
+**Transport** follows the add-on's own:
+
+- *HTTP add-ons* serve `GET /console-piece` and declare it in the manifest as an
+  `internal` route named `console_piece` (`timeout_secs: 5`). It is never
+  mounted on the public API; the gateway reaches it through
+  `addon_proxy::call("<addon>", "console_piece", ...)`.
+- *NATS add-ons* answer the request subject `worker.graph.console_piece`
+  (empty or `{}` payload) with the piece as the reply. The subject sits inside
+  the existing `worker.graph.*` family, so no new grant is needed.
+
+**The gateway route** is `GET /api/addons/{addon_id}/console-piece`, readable by
+any signed-in account. It validates the piece (version, `addon` match, key
+prefix, types, size) and returns the validated copy:
+
+| Status | Meaning |
+|---|---|
+| 200 | the validated piece |
+| 404 `{"error":"unknown_addon"}` | `addon_id` is not an add-on that owns slots |
+| 503 | the add-on is disabled or unlicensed; the body carries `addons::refusal_msg` |
+| 502 | enabled, but no answer, a timeout, a non-200 upstream, or an invalid piece |
+
+The route never answers 500.
+
+## CLI pieces — bringing your own `noo` commands
+
+The released `noo` is generic: it carries no add-on code. An enabled add-on
+describes its own command groups in a *CLI piece*, and `noo` turns each command
+into a request to the gateway's add-on proxy. This is how an add-on's commands
+(a `widget` group, say) exist: the add-on provides them, not core.
+
+**What the CLI does.** For `noo <group> <command> ...`, where `<group>` is not a
+built-in command, it reads the enabled add-ons from `/health`'s `addons` map,
+fetches each one's piece, and caches it per controller in the CLI's state
+directory (ten minutes; a stale cache is used when the controller is
+unreachable). It finds the group, builds the request from the command's `args`,
+asks for confirmation when the command has a `confirm` (`-y`/`--yes` skips the
+prompt; `--json` never prompts and so needs `-y`), sends it, and renders the
+`output`. `--json` prints the raw response. A response that is HTTP 2xx but says
+`{"status":"error"}` (or has an `error` string) is shown as an error and exits
+non-zero. `noo --help` lists the add-on groups, marked as coming from the
+add-on; `noo <group> --help` lists the commands. A group whose add-on is off
+says so (exit 5). A group that collides with a built-in command is ignored with
+a warning, so an add-on can never shadow a core command.
+
+**The piece** is JSON, version 1:
+
+```json
+{
+  "version": 1,
+  "addon": "<addon>",
+  "groups": [{"name": "widget", "summary": "Manage widgets"}],
+  "commands": [{
+    "group": "widget", "name": "rollback",
+    "summary": "Restore a previous widget state",
+    "method": "POST", "path": "/api/widget/rollback",
+    "args": [{"name": "to", "flag": "--to", "kind": "int", "required": false,
+              "into": "body:version", "help": "version to restore"}],
+    "confirm": "Restore the previous widget state?",
+    "output": {"title": "widget rollback",
+               "fields": [{"key": "/restored", "label": "restored"}],
+               "hint": "noo widget resume"}
+  }]
+}
+```
+
+The gateway validates the whole piece and refuses it (502) if any rule fails:
+
+- `version` is 1 and `addon` is yours. Group and command names match
+  `^[a-z][a-z0-9-]{0,23}$`, and every command's group is declared.
+- **Every command's `method` and `path` must match a mounted, non-internal
+  route in your add-on's manifest.** Path parameters are written the manifest's
+  way, `{cycle_id}`. This is the security property: an add-on can only make the
+  CLI call routes the gateway already exposes for it. Declare the routes your
+  commands need in the manifest first (`internal` routes cannot be named).
+- `args[].kind` is `string`, `int`, `uuid` or `bool`. `args[].into` is
+  `path:<param>`, `query:<name>` or `body:<name>`. Every `{param}` in the path
+  needs exactly one required `path:` arg. Positional args have no `flag`;
+  flagged args have a `flag` starting with `--`. `query:` needs a manifest
+  route marked `query: true`; `body:` is for `POST` only.
+- `confirm` is an optional string, shown verbatim. `output.fields[].key` are JSON
+  pointers; `output.list` is an optional pointer to an array, rendered as a table
+  with `output.columns: [{key, label}]`; `output.hint` is an optional command to
+  suggest next. Arrays render comma-joined, booleans as yes/no, null as a dash.
+- The whole piece stays under 64 KB.
+
+**Transport.** An HTTP add-on serves `GET /cli-piece` and declares it in its
+manifest as an `internal` route named `cli_piece` (`timeout_secs: 5`); the
+gateway reaches it through `addon_proxy::call`, as it does for `console_piece`.
+There is no per-command timeout in the piece: the manifest route's
+`timeout_secs` governs, and the CLI waits at least that long (310 s).
+
+**The gateway route** is `GET /api/addons/{addon_id}/cli-piece`, readable by any
+signed-in account:
+
+| Status | Meaning |
+|---|---|
+| 200 | the validated piece |
+| 404 `{"error":"unknown_addon"}` | `addon_id` is not an add-on |
+| 404 `{"error":"no_cli_piece"}` | the add-on declares no `cli_piece` route (NATS add-ons such as `trellion_intel` have none) |
+| 503 | the add-on is disabled or unlicensed; the body carries `addons::refusal_msg` |
+| 502 | enabled, but no answer, a timeout, a non-2xx upstream, or an invalid piece |
+
+The route never answers 500.
+
+## Roles — how the Python host asks an add-on for a capability
+
+The host never imports an add-on by name. It asks for a role
+(`src/noomesh/addon_roles.py`) and the add-on declares what fills it:
+
+* **Provider roles** (graph ranking, graph metrics, the temporal graph store, the
+  conversation extractor, the retrieval tracker, audience scope, saved walks, query
+  classification): the add-on trellion discovers declares `TRELLION_PROVIDERS` at its
+  package root, role name to `"module:attribute"`; the host calls
+  `addon_provider(role)`. No add-on, no declaration, or a declaration that does not
+  resolve all read as "this tier is not available" to the caller; the last two are
+  logged at WARNING.
+* **Extensions** (`cli_groups`, `mcp_tool_defs`): a package declares
+  `NOOMESH_EXTENSIONS = {kind: {name: "module:attr"}}` and registers with the
+  `noomesh.addons` entry point (value: the package name), or is named in
+  `NOOMESH_ADDON_PACKAGES` where it is mounted rather than installed. A CLI group is
+  a Typer app added under `name`; an `mcp_tool_defs` entry is a module whose import
+  registers its tools. A package that is not installed is skipped silently; one that
+  is installed but whose declaration does not resolve is skipped with a WARNING.
+
+## Can an add-on extend the dashboard?
+
+Partly today, and the part that works is worth knowing before you ask for
+more.
+
+**What works now, with no dashboard change:**
+
+- **Presence.** `/health` carries `addons.<name>`, and the console renders it
+  as a tri-state badge — `enabled` (solid green), `disabled` (dashed, muted,
+  *not* a fault), `unhealthy` (red, is a fault), anything else `unknown`.
+  Declaring your add-on in `addons.rs` is all it takes to appear there. That
+  distinction is a rendering contract the console tests pin, so do not
+  collapse it into a boolean anywhere.
+- **Your data, through your routes.** Anything you serve and the gateway
+  proxies is reachable by the console like any other endpoint, and appears in
+  the OpenAPI spec the console builds against.
+
+**What does not exist: a way for an add-on to contribute UI.** The console is
+a built SPA (`ui/`, shipped as the `mesh-ui-web` artifact and unpacked at
+`/var/www`). Panels are written there, hardcoded in the console, which is why a
+panel exists for a built-in add-on and would not exist for yours.
+
+**If you need panels today**, the honest answer is a PR touching `ui/`,
+coordinated with the console's contract changelog.
+
+**The extension point, if it gets built,** should be declarative — panels
+described as DATA (which endpoint, which fields, which shape), rendered by a
+generic component in the console. Not a JavaScript bundle the console loads
+from the add-on at runtime. The reasoning is the same one that put the route
+manifest in the gateway rather than in the add-on, only sharper: a mounted
+file that adds *routes* lets a sidecar publish a path; a loaded bundle that
+adds *code* runs it on the operator's authenticated dashboard origin, with
+their session. The console must decide what it renders, the same way the
+gateway decides what it exposes.
+
+## What you get for free
+
+- **Presence** — `/health` reports `addons.<name>` as `enabled` /
+  `disabled` / `unlicensed`.
+- **Honest refusals** — every mounted route answers a 503 that says which of
+  those three it is, with the add-on's own message. Never a silent 404.
+- **Entitlement checks** — offline ed25519 against a key baked into the
+  binary (`entitlement.rs`). No licence server, nothing leaves the box.
+- **Auth** — the global middleware gates mutating routes on write/admin scope
+  before your handler is reached.
+- **Param validation, query passthrough, timeouts** — from the manifest.
+
+## Deployment
+
+Ship a compose overlay — `docker-compose.<addon>.yml` — with an **explicit env allowlist**. A variable absent from that
+block reaches nothing, which is deliberate: it makes the container's
+configuration a list someone can read rather than whatever happened to be
+exported. Put no `profiles:` inside it: composing the file is the switch, and
+a profile inside an overlay is a second switch a launcher can forget.
+
+The launcher composes your overlay when `addons.<name>` is declared on — the
+file list has one home, `scripts/lib-compose.sh`.
+
+Add your overlay to `ADDON_OVERLAYS` in `tests/_compose_projection.py` — the
+env-allowlist and secret guards read the fully composed projection
+(`docker compose config --no-interpolate` with every profile selected), not
+the raw YAML, so an overlay missing from that list is never checked. Running
+that guard locally needs Docker Compose ≥ 2.40. `pull_policy` in your overlay
+should follow `${NOO_PULL_POLICY:-build}`, which `--dist` installs set to
+`missing`.
+
+### Where an add-on's release image is built
+
+The stack release is **core-only**. The signed stack lock
+(`stack-<tag>.lock`) lists core images and nothing else: the stack release
+workflow has no add-on job, reads no add-on repository, and records no
+add-on image or `source:` row.
+
+A licensed add-on's image is built, pushed and released by the add-on's
+**own** repository, with its **own signed lock**. That per-add-on lock is
+**not yet available**: until it exists, an add-on image is not pinned by
+digest from the stack lock, and an add-on switched on in a `--dist` install
+runs by tag and says it is unpinned.
+
+The overlay (`docker-compose.<addon>.yml`) stays here and names the published
+image; the add-on repo's release is the only thing that must agree with it.
+Add-on images are held in a **private registry**; pulling them needs
+`docker login` with the credentials issued with the add-on's licence.

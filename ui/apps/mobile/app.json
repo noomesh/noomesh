@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Noomesh",
+    "slug": "noomesh-companion",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "noomesh",
+    "newArchEnabled": true,
+    "backgroundColor": "#0e1116",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ai.noomesh.companion"
+    },
+    "android": {
+      "package": "ai.noomesh.companion"
+    },
+    "plugins": ["expo-secure-store"]
+  }
+}

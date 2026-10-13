@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noo-trellion — the Python worker pool as its own service (WP-T23 phase 2).
+#
+# The existing Python runtime minus the Rust binary: FROM the shared
+# deps-base (entire noomesh site-packages incl. the noo-trellion memory
+# library), COPY src, entrypoint `python -m noomesh.gateway.worker_pool`.
+# Mirrors docker/Dockerfile.sandbox.
+#
+# Differences from the sandbox image:
+#   - ffmpeg/ffprobe: voice (pydub/whisper) + recall handlers need them —
+#     copied from the pinned static-ffmpeg stage, same as
+#     Dockerfile.gateway-rust (apt ffmpeg on Trixie drags a LAPACK/gfortran
+#     chain that conflicts with deps-base pins).
+#   - No Claude Code settings seeding: the noo_coding_task subprocess runs
+#     in noo-sandbox; this image only hosts the manager-side handlers.
+#
+# Build deps-base first if not yet built:
+#   docker compose build deps-base
+
+ARG DEPS_BASE=pai-assistant/deps-base:latest
+# Global (pre-first-FROM) so it can name the ffmpeg stage — BuildKit forbids
+# variable expansion in `COPY --from=${VAR}`. Release pipeline overrides with
+# the org's GHCR mirror (see Dockerfile.gateway-rust for rationale).
+ARG FFMPEG_IMAGE=mwader/static-ffmpeg:7.1
+
+FROM ${FFMPEG_IMAGE} AS ffmpeg
+
+FROM ${DEPS_BASE}
+# deps-base carries `pai.image.keep=true`; LABELs are inherited, so override
+# or the rebuild prune skips this application image (see Dockerfile.sandbox).
+LABEL pai.image.keep=false
+
+USER root
+
+# Pinned static ffmpeg + ffprobe for voice/recall handlers.
+COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
+RUN /usr/local/bin/ffmpeg -version | head -1
+
+# libzbar0: QR/barcode decode used by vision-adjacent tools (same as the
+# sandbox image). Docker CLI intentionally NOT installed — container
+# lifecycle stays with the host-side watcher via the command spool.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        hostname \
+    libzbar0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Real source overlays the stub from deps-base. The editable .pth file
+# in deps-base points at /app/src so the overlay is transparent.
+COPY src ./src
+
+# Shared entrypoint: PKI copy/permissions, cluster-CA bundle install, then
+# exec CMD. Phase 3 (plan §4): this container applies the MEMORY Alembic
+# env only (NOO_MIGRATIONS_ENVS=memory in compose, over the privileged
+# NOO_MIGRATIONS_DSN); the gateway runs the mesh env. No runner overlap —
+# each env has its own version table and file set.
+COPY docker/entrypoint.py /opt/entrypoint.py
+
+RUN chown -R nonroot:nonroot /app
+
+USER nonroot
+
+# 3100 = MCP hub (published 127.0.0.1:3100 by compose when this service is
+# enabled). The /health listener is 127.0.0.1:8090, loopback only — its one
+# consumer is the HEALTHCHECK below — so it is not EXPOSEd.
+EXPOSE 3100
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=5).status==200 else 1)" || exit 1
+
+ENTRYPOINT ["python", "/opt/entrypoint.py"]
+CMD ["python", "-m", "noomesh.gateway.worker_pool"]

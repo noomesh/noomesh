@@ -1,0 +1,4 @@
+{
+  "entity_types": { "concept": 63, "person": 42, "project": 18, "node": 12 },
+  "total_edges": 210
+}

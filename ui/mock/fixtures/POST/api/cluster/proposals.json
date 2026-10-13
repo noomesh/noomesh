@@ -1,0 +1,46 @@
+{
+  "proposals": [
+    {
+      "id": "prop-a1c3",
+      "host": "192.0.2.51",
+      "user_name": "alice",
+      "user": "alice",
+      "role": "worker",
+      "reason": "Idle RTX 4090 box discovered on the tailnet; proposing enrollment as a tier-2 inference worker.",
+      "proposed_by": "scout-agent",
+      "created_at": "2026-08-01T14:19:00Z",
+      "status": "pending",
+      "executed_at": null,
+      "execution_log": null,
+      "decided_by": null
+    },
+    {
+      "id": "prop-b2d4",
+      "host": "studio-mini.local",
+      "user_name": "alice",
+      "user": "alice",
+      "role": "companion",
+      "reason": "macOS companion node; SSH reachable but the node-agent isn't bootstrapped yet.",
+      "proposed_by": "alice",
+      "created_at": "2026-08-01T13:05:00Z",
+      "status": "needs_bootstrap",
+      "executed_at": null,
+      "execution_log": "SSH ok, but the `pai` binary is missing on PATH.\n--- raw output ---\nbash: pai: command not found",
+      "decided_by": "alice"
+    },
+    {
+      "id": "prop-c3e5",
+      "host": "192.0.2.10",
+      "user_name": "ops",
+      "user": "ops",
+      "role": "worker",
+      "reason": "Auto-discovered spare A6000 host during the nightly tailnet sweep.",
+      "proposed_by": "scout-agent",
+      "created_at": "2026-07-31T22:30:00Z",
+      "status": "enrolled",
+      "executed_at": "2026-07-31T22:34:00Z",
+      "execution_log": "enrolled OK",
+      "decided_by": "alice"
+    }
+  ]
+}

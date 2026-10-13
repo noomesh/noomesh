@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# PostgreSQL with pgvector extension
+# Docker Hardened Image: near-zero CVEs
+#
+# The builder upgrades musl first to stay in sync with Alpine repos,
+# then builds pgvector without LLVM/JIT (not needed for pgvector).
+
+# Base-image registry: dhi.io by default (local/dev/OSS builds), our ghcr
+# MIRRORS in the release workflow (--build-arg DHI_REGISTRY=ghcr.io/…) —
+# dhi.io TLS timeouts have now broken four builds (build-from-mirrors,
+# 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
+# preserve digests.
+ARG DHI_REGISTRY=dhi.io
+FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev AS builder
+
+USER root
+RUN apk add --no-cache --force-overwrite musl musl-utils && \
+    apk add --no-cache build-base git
+
+WORKDIR /build
+# OPTFLAGS override is LOAD-BEARING: pgvector's Makefile defaults to
+# `-march=native`, which bakes the BUILD machine's ISA (AVX-512 on our CI
+# runners) into a DISTRIBUTED image. First fresh-user install on an older
+# CPU crashed the postgres backend with SIGILL (signal 4) on the first
+# vector DDL — 26 identical backend kills, migrations never completed
+# (host1, 2026-08-23, first-contact finding #29). `-O3` keeps the
+# optimization level; the ISA stays the image's portable x86-64 baseline.
+RUN git clone --branch v0.8.2 --depth 1 https://github.com/pgvector/pgvector.git . && \
+    make -j$(nproc) with_llvm=no OPTFLAGS="-O3" && \
+    make with_llvm=no OPTFLAGS="-O3" install
+
+# Runtime
+FROM ${DHI_REGISTRY}/postgres:18-alpine3.22-dev
+
+USER root
+COPY --from=builder /build/vector.so /tmp/vector.so
+COPY --from=builder /build/vector.control /tmp/vector.control
+COPY --from=builder /build/sql/ /tmp/vector-sql/
+
+RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
+    PG_SHAREDIR=$(pg_config --sharedir) && \
+    cp /tmp/vector.so "$PG_LIBDIR/" && \
+    mkdir -p "$PG_SHAREDIR/extension" && \
+    cp /tmp/vector.control "$PG_SHAREDIR/extension/" && \
+    cp /tmp/vector-sql/*.sql "$PG_SHAREDIR/extension/" && \
+    rm -rf /tmp/vector*
+
+USER postgres

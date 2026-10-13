@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Node agent (Go) — manages backends on each cluster node
+# Docker Hardened Image: DHI golang builder + DHI alpine-base runtime
+#
+# DHI Alpine Base: zero known CVEs, signed provenance, SBOM + VEX metadata.
+# Same hardened supply chain as all other PAI images.
+#
+# No Docker CLI needed — backend lifecycle uses Docker Engine API directly.
+# nvidia-smi is provided by the NVIDIA container runtime (--gpus flag).
+# Go binary is statically linked (CGO_ENABLED=0) — no musl/glibc concerns.
+# gcompat is added so NVIDIA runtime's glibc nvidia-smi can execute on musl Alpine.
+#
+# Image size: ~16MB (3MB hardened Alpine base + 4MB gcompat + 9MB Go binary)
+
+# ── Builder (DHI hardened Golang) ──
+# Runs on the NATIVE build platform and cross-compiles to $TARGETARCH via
+# GOARCH — CGO is off, so this is a pure Go cross-compile (no emulation of
+# the compile step). Enables fast, correct linux/amd64 AND linux/arm64
+# builds (arm64 = Jetson GPU nodes, and Docker Desktop on Apple Silicon).
+# Base-image registry: dhi.io by default (local/dev/OSS builds), our ghcr
+# MIRRORS in the release workflow (--build-arg DHI_REGISTRY=ghcr.io/…) —
+# dhi.io TLS timeouts have now broken four builds (build-from-mirrors,
+# 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
+# preserve digests.
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+ARG DHI_REGISTRY=dhi.io
+FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/golang:1.25-debian13-dev AS builder
+
+ENV GOTOOLCHAIN=local
+ARG TARGETARCH
+# Build stamp so `noo cluster status` / heartbeats show each node's binary
+# (parity with node-agent-go/Dockerfile; passed by build-cross / image build).
+ARG NODE_AGENT_VERSION=dev
+ARG NODE_AGENT_COMMIT=unknown
+
+WORKDIR /build
+
+# Cache Go dependencies (layer invalidates only when go.mod/go.sum change)
+COPY node-agent-go/go.mod node-agent-go/go.sum ./
+RUN go mod download
+
+# Build static binary — no CGO, so no libc dependency at runtime
+COPY node-agent-go/ ./
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
+    -ldflags="-s -w -X github.com/noomesh/noomesh/node-agent-go/internal/version.Version=${NODE_AGENT_VERSION} -X github.com/noomesh/noomesh/node-agent-go/internal/version.Commit=${NODE_AGENT_COMMIT}" \
+    -o /noo-node-agent \
+    ./cmd/node-agent/
+
+# ── glibc compat layer (standard Alpine has apk, DHI base doesn't) ──
+FROM ${HUB_MIRROR}/library/alpine:3.22 AS gcompat
+RUN apk add --no-cache gcompat
+
+# ── Runtime (DHI hardened Alpine — zero CVEs, 3MB base) ──
+FROM ${DHI_REGISTRY}/alpine-base:3.22
+
+# Copy gcompat libs from standard Alpine (provides glibc shim for nvidia-smi).
+# The gcompat stage is built for $TARGETARCH, so the ld-linux glob resolves to
+# the arch-appropriate loader: ld-linux-x86-64.so.2 (amd64) or
+# ld-linux-aarch64.so.1 (arm64). Never hardcode one — that broke arm64 builds.
+COPY --from=gcompat /lib/ld-linux-*.so* /lib/
+COPY --from=gcompat /lib/libgcompat.so.0 /lib/libgcompat.so.0
+COPY --from=gcompat /usr/lib/libobstack.so* /usr/lib/
+COPY --from=gcompat /usr/lib/libucontext.so* /usr/lib/
+
+WORKDIR /app
+
+COPY --from=builder /noo-node-agent /usr/local/bin/noo-node-agent
+
+# CA bundle injection: if NOO_TLS_CA is set, add cluster CA to system trust
+COPY docker/inject-ca.sh /opt/inject-ca.sh
+RUN chmod +x /opt/inject-ca.sh 2>/dev/null || true
+
+ENV NODE_ID=auto CONTROLLER_URL=https://gateway:8080 NODE_TIER=3 GPU_MODEL="" HEARTBEAT_INTERVAL=30
+
+EXPOSE 8081
+
+HEALTHCHECK --interval=30s --timeout=10s \
+    CMD ["/usr/local/bin/noo-node-agent", "-healthcheck"]
+
+# Must run as root for system-level setup
+USER 0
+
+# Create /lib64 symlink — x86-64 glibc binaries (nvidia-smi) expect the linker
+# at /lib64/. Arch-agnostic: symlink whatever loader gcompat provided (no-op
+# but harmless on arm64, whose loader lives at /lib/ld-linux-aarch64.so.1).
+RUN mkdir -p /lib64 && \
+    for l in /lib/ld-linux-*.so*; do ln -sf "$l" "/lib64/$(basename "$l")"; done
+
+# Docker socket access + nvidia-smi user setup
+RUN echo "root:x:0:0:root:/root:/bin/sh" >> /etc/passwd && \
+    echo "docker:x:999:nonroot" >> /etc/group && \
+    (addgroup nonroot docker 2>/dev/null || true)
+
+ENTRYPOINT []
+CMD ["sh", "-c", "[ -x /opt/inject-ca.sh ] && . /opt/inject-ca.sh; exec noo-node-agent"]

@@ -1,0 +1,18 @@
+{
+  "status": "ok",
+  "id": "00000000-0000-0000-0000-000000000000",
+  "token": "EXAMPLE-NOT-A-REAL-TOKEN",
+  "expires_at": "2030-01-01T00:00:00+00:00",
+  "node_name": "example-node",
+  "role_hint": null,
+  "allowed_cidr": null,
+  "bootstrap_sha256": null,
+  "install_command": "command -v noo >/dev/null || curl -fsSL https://raw.githubusercontent.com/noomesh/noomesh/main/noo-cli/install.sh | sh",
+  "enroll_command": "noo enroll noo1.EXAMPLE-NOT-A-REAL-BLOB",
+  "provision_command": "noo cluster provision example-node --wait",
+  "joins_tailnet": true,
+  "tailnet_skipped": null,
+  "ca_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "controller_url": "https://noo-controller.example.ts.net:8080",
+  "note": "single-use; the raw token is shown exactly once"
+}

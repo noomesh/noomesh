@@ -1,0 +1,35 @@
+{
+  "window": "2026-08",
+  "group": "backend",
+  "totals": {
+    "prompt_tokens": 4812366,
+    "completion_tokens": 1233907,
+    "requests": 19442
+  },
+  "rows": [
+    {
+      "key": "vllm",
+      "prompt_tokens": 3402118,
+      "completion_tokens": 861440,
+      "requests": 12980
+    },
+    {
+      "key": "ollama",
+      "prompt_tokens": 905884,
+      "completion_tokens": 221558,
+      "requests": 3872
+    },
+    {
+      "key": "cloud-anthropic",
+      "prompt_tokens": 421904,
+      "completion_tokens": 112448,
+      "requests": 2104
+    },
+    {
+      "key": "llamacpp",
+      "prompt_tokens": 82460,
+      "completion_tokens": 38461,
+      "requests": 486
+    }
+  ]
+}

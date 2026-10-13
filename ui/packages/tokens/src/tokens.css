@@ -1,0 +1,76 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright 2026 PersonifAI LLC */
+
+/* @metis/tokens — Slate palette as CSS variables.
+   Light is the default; `.dark` on a root ancestor (set by the theme toggle)
+   swaps the palette.
+
+   Two layers, one source of truth:
+   1. Descriptive Slate tokens (--bg, --surface, --ink, --primary…) — the shell
+      reads these directly.
+   2. shadcn semantic tokens (--background, --card, --primary, --muted, --border…)
+      mapped onto layer 1, so shadcn components (and `npx shadcn add`) work
+      unchanged. The brand colour is shadcn's --primary (not --accent, which
+      shadcn reserves for subtle hover surfaces).
+
+   Rules: --primary = system/interaction; --warn = "needs attention" (never the
+   brand); neutrals are cool, biased toward the brand. */
+
+:root {
+  /* descriptive */
+  --bg: #eaeef3;
+  --sidebar: #e7ebf2;
+  --surface: #f8fafc;
+  --surface-2: #eef1f6;
+  --surface-3: #e4e9f0;
+  --line: rgba(30, 52, 84, 0.14);
+  --line-2: rgba(30, 52, 84, 0.22);
+  --ink: #182230;
+  --ink-2: #46566b;
+  --dim: #6b7789;
+  --good: #2f8f66;
+  --warn: #b5771f;
+  --bad: #c04a44;
+  --primary: #3f6fb0;
+  --primary-foreground: #ffffff;
+  --primary-soft: rgba(63, 111, 176, 0.12);
+
+  /* shadcn semantic (mapped) */
+  --background: var(--bg);
+  --foreground: var(--ink);
+  --card: var(--surface);
+  --card-foreground: var(--ink);
+  --popover: var(--surface);
+  --popover-foreground: var(--ink);
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--ink);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--dim);
+  --accent: var(--surface-3);
+  --accent-foreground: var(--ink);
+  --destructive: var(--bad);
+  --destructive-foreground: #ffffff;
+  --border: var(--line-2);
+  --input: var(--line-2);
+  --ring: var(--primary);
+  --radius: 0.5rem;
+}
+
+.dark {
+  --bg: #0c0e12;
+  --sidebar: #090b0e;
+  --surface: #14171d;
+  --surface-2: #1b1f28;
+  --surface-3: #232937;
+  --line: rgba(150, 172, 205, 0.11);
+  --line-2: rgba(150, 172, 205, 0.2);
+  --ink: #e6eaf1;
+  --ink-2: #aab4c4;
+  --dim: #8993a6;
+  --good: #46c08a;
+  --warn: #e0a24a;
+  --bad: #e5675a;
+  --primary: #5f8fd0;
+  --primary-foreground: #08111c;
+  --primary-soft: rgba(95, 143, 208, 0.14);
+}

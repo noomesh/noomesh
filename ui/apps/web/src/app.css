@@ -1,0 +1,3713 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright 2026 PersonifAI LLC */
+
+@import 'tailwindcss';
+
+/* Expose the Slate semantic tokens (defined in @metis/tokens/tokens.css) as
+   Tailwind v4 theme colors, so shadcn utilities — bg-primary, text-muted-
+   foreground, border-border, bg-card, rounded-lg — resolve to our palette. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* The Slate tokens come from @metis/tokens/tokens.css (imported first in
+   main.tsx): :root = light, .dark = dark. The shell styles below read those
+   vars — no raw hex — the same model shadcn uses, so they get replaced by
+   shadcn primitives token-for-token over time. */
+
+:root {
+  /* Reading measure for the chat column. Steps up with the viewport rather
+     than being one fixed value, so a 13" laptop is not needlessly narrow and a
+     4K monitor is not a single 2000px line. */
+  --measure: 46rem;
+
+  --sans: system-ui, 'Segoe UI', -apple-system, Roboto, sans-serif;
+  --mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, themed scrollbars to match the hairline aesthetic (both themes).
+   The transparent border + padding-box clip makes a slim, inset thumb. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+*::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--dim);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@media (min-width: 1600px) {
+  :root {
+    --measure: 52rem;
+  }
+}
+@media (max-width: 1100px) {
+  :root {
+    --measure: 100%;
+  }
+}
+
+/* ---- app shell ---- */
+.app {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  /* `vh` here, `dvh` in the @supports below — NOT two declarations in one
+     block. `dvh` is the right unit, because it tracks a phone's retracting
+     URL bar and `vh` does not; but a browser that does not know the unit
+     drops the declaration, and a shell with no height is a shell whose rows
+     size to their content. On desktop that degrades into a page scrollbar
+     and nobody notices. On `.app.mobile`, which clips its own overflow, it
+     degrades into a transcript that cannot be scrolled at all.
+     The obvious fallback — `height: 100vh; height: 100dvh;` — does not
+     survive the build: esbuild's CSS minifier treats the first as dead and
+     emits only `100dvh` (verified against dist/). A separate @supports rule
+     cannot be collapsed that way, which is the whole reason it is written
+     like this. */
+  height: 100vh;
+}
+@supports (height: 100dvh) {
+  .app {
+    height: 100dvh;
+  }
+}
+/* Below 860px the shell swaps to `.app.mobile`, which sets its own grid —
+   this is the fallback for the instant before React reads the media query. */
+@media (max-width: 860px) {
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+}
+
+/* sidebar */
+.side {
+  background: var(--sidebar);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+  min-height: 0;
+}
+.side-brand {
+  padding: 6px 8px 14px;
+}
+.side-brand .name {
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 15px;
+}
+.side-brand .stat {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--good);
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.side-brand .stat::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--good);
+}
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+}
+.nav button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--ink-2);
+  font-size: 13px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  width: 100%;
+}
+.nav button svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+}
+.nav button:hover {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.nav button.active {
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-weight: 600;
+}
+.nav .grp {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 12px 10px 5px;
+}
+.side-foot {
+  margin-top: auto;
+  padding: 8px 6px;
+  border-top: 1px solid var(--line);
+}
+/* Account trigger — opens the user menu (theme + sign out). */
+.user-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--ink-2);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+.user-trigger:hover,
+.user-trigger[data-state='open'] {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.user-trigger .uname {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-trigger .chev-up {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+  color: var(--dim);
+}
+.user-trigger .ava {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* main split */
+.main {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.9fr) minmax(0, 1.1fr);
+  min-width: 0;
+  min-height: 0;
+}
+/* Was 980px, which stacked chat above panel in a single column and gave each
+   half the height — worst of both. Below 860px the mobile shell shows the
+   chat alone and puts the panel in a sheet, so the split holds until then. */
+@media (max-width: 860px) {
+  .main {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* chat */
+.chat {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  min-width: 0;
+  /* A grid item's `min-height` is `auto`, which means "at least as tall as my
+     content". Without this the chat grows to fit the whole transcript and
+     overflows its track, instead of the transcript scrolling inside it. */
+  min-height: 0;
+  background: var(--surface);
+}
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.bar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+/* what answered the last turn (metadata frame) */
+.bar .serving {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bar .serving-via {
+  color: var(--dim);
+}
+.panel-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 0;
+}
+.panel-toggle svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.panel-toggle:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+.panel-toggle:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+.panel-toggle[aria-pressed='true'] {
+  color: var(--primary);
+  border-color: var(--primary);
+}
+.bar .t {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+.bar .live {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bar .live::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .bar .live::before {
+    animation: pulse 2s ease-in-out infinite;
+  }
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.transcript {
+  flex: 1;
+  padding: 22px 24px;
+  overflow-y: auto;
+  /* A touch drag that reaches the end of this box must stop there. Chained to
+     an ancestor that clips its own overflow, the gesture goes nowhere and
+     reads as "the chat does not scroll". */
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-height: 0;
+}
+/* Measure, not width. Long lines are hard to read and the chat spans the whole
+   window once the side panel is collapsed. The scroll container stays
+   full-bleed so the scrollbar sits at the edge; only the content is centred —
+   which is what ChatGPT and Claude do, and why their transcripts read well on
+   a wide monitor. */
+.transcript > * {
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+}
+.composer-row,
+.composer-status {
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+}
+.turn .who {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+.turn.you .u {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
+  padding-left: 11px;
+  border-left: 2px solid var(--line-2);
+}
+/* ---- reasoning disclosure ---- */
+.reason {
+  margin-bottom: 10px;
+}
+.reason-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+.reason-head:hover {
+  color: var(--ink-2);
+}
+.reason-head:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.reason-head .chev {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  transition: transform 0.15s ease;
+}
+.reason.open .reason-head .chev {
+  transform: rotate(90deg);
+}
+/* the live phase is the one worth drawing the eye to */
+.reason.live .reason-label {
+  color: var(--primary);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .reason.live .reason-label {
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+}
+@keyframes shimmer {
+  50% {
+    opacity: 0.45;
+  }
+}
+.reason-body {
+  margin-top: 6px;
+  padding: 8px 11px;
+  max-height: 210px;
+  overflow-y: auto;
+  border-left: 2px solid var(--line-2);
+  background: var(--surface-2);
+  border-radius: 0 3px 3px 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--dim);
+  white-space: pre-wrap;
+}
+
+/* ---- tool runs ---- */
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.tool-chip:disabled {
+  cursor: default;
+}
+.tool-chip:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+.tool-chip .tool-mark {
+  font-size: 11px;
+  line-height: 1;
+}
+.tool-chip.running .tool-mark {
+  color: var(--primary);
+}
+.tool-chip.ok .tool-mark {
+  color: var(--good);
+}
+.tool-chip.fail {
+  border-color: var(--bad);
+}
+.tool-chip.fail .tool-mark {
+  color: var(--bad);
+}
+.tool-chip .tool-ms {
+  color: var(--dim);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .tool-chip.running .tool-mark {
+    animation: spin 1.1s linear infinite;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.tool-detail {
+  margin: 4px 0 2px;
+  padding: 8px 11px;
+  max-height: 190px;
+  overflow: auto;
+  background: var(--surface-2);
+  border-left: 2px solid var(--line-2);
+  border-radius: 0 3px 3px 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.turn.metis .m {
+  font-size: 14px;
+  line-height: 1.62;
+  color: var(--ink);
+}
+.turn.metis .m .n {
+  font-family: var(--mono);
+  color: var(--primary);
+  font-weight: 600;
+}
+/* per-turn accounting from the done frame */
+.turn-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 10px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.act {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  border: none;
+  border-radius: 5px;
+  padding: 8px 13px;
+  cursor: pointer;
+  margin-top: 11px;
+  font-family: inherit;
+}
+.act:hover {
+  filter: brightness(1.08);
+}
+.act:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+.composer {
+  border-top: 1px solid var(--line);
+  /* The extra bottom room is the phone's home indicator / gesture bar, which
+     otherwise sits on top of the send button. Zero everywhere else. */
+  padding: 14px 22px calc(16px + env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  /* Neither end of the chat compresses to make room: the transcript is the
+     flexible one, and it is the one that can scroll. */
+  flex-shrink: 0;
+}
+.composer-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+/* backend readiness + model override (in the chat bar) */
+.model-pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.model-pick select {
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 3px 6px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  max-width: 200px;
+}
+.model-pick select:disabled {
+  color: var(--dim);
+  cursor: not-allowed;
+}
+.model-pick select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+.serve-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--dim);
+}
+.serve-dot.ready {
+  background: var(--good);
+}
+.serve-dot.loading {
+  background: var(--warn);
+}
+.serve-dot.down {
+  background: var(--bad);
+}
+.composer-status {
+  font-size: 11px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-status.err {
+  color: var(--bad);
+}
+.composer input {
+  flex: 1;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  padding: 10px 12px;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 13.5px;
+}
+.composer input::placeholder {
+  color: var(--dim);
+}
+.composer input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.composer .send {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border: none;
+  border-radius: 7px;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.composer .send svg {
+  width: 17px;
+  height: 17px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+}
+
+/* cluster panel */
+.panel {
+  padding: 18px;
+  background: var(--bg);
+  min-width: 0;
+  overflow-y: auto;
+}
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.panel-head h2 {
+  font-size: 16px;
+  margin: 0;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+.panel-head .meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.tile {
+  background: var(--surface);
+  padding: 11px 13px;
+}
+.tile .v {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.tile .k {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-top: 6px;
+}
+.tile.hot .v {
+  color: var(--warn);
+}
+.node {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 13px 14px;
+  margin-bottom: 9px;
+}
+.node.off {
+  opacity: 0.62;
+}
+.node-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.node .host {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+.node .ip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+.tags {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.tier {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 2px 6px;
+}
+.st {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.st::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent);
+}
+.st.on {
+  color: var(--good);
+}
+.st.busy {
+  color: var(--warn);
+}
+.st.off {
+  color: var(--dim);
+}
+.specs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+  margin: 11px 0 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.specs b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.track {
+  flex: 1;
+  height: 6px;
+  background: var(--surface-3);
+  border-radius: 2px;
+  position: relative;
+  overflow: hidden;
+}
+.track::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(90deg, transparent 0, transparent 11px, var(--bg) 11px, var(--bg) 12px);
+}
+.fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 2px;
+}
+.fill.hot {
+  background: var(--warn);
+}
+/* Three-level meter fills (src/lib/meter.ts). Direction is decided by the
+   caller — a high backend load is bad, a high tool success rate is good — so
+   the colour always means the same thing: fine / worth a look / wrong. */
+.fill.ok {
+  background: var(--good);
+}
+.fill.warn {
+  background: var(--warn);
+}
+.fill.bad {
+  background: var(--bad);
+}
+
+/* ---- nav groups + status ---- */
+.nav-primary {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 10px 5px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.nav-group-header .chev {
+  margin-left: auto;
+  font-size: 8px;
+  transition: transform 0.15s ease;
+}
+.nav-group.collapsed .chev {
+  transform: rotate(-90deg);
+}
+.nav-group.collapsed .nav-group-items {
+  display: none;
+}
+.nav-group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav button .label {
+  flex: 1;
+}
+.nav button.soon-item {
+  color: var(--dim);
+}
+.nav button.soon-item:hover {
+  color: var(--ink-2);
+}
+.nav .soon {
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  opacity: 0.7;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+/* ---- chat-only (solo) main ---- */
+.main.solo {
+  grid-template-columns: 1fr;
+}
+/* Nothing to divide from once the chat is the only column. */
+.main.solo .chat {
+  border-right: none;
+}
+
+/* ---- chat minimised to a rail ---- */
+.main.railed {
+  grid-template-columns: 46px minmax(0, 1fr);
+}
+.chat-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  min-width: 0;
+}
+.chat-rail button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 0;
+}
+.chat-rail button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.chat-rail button:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+.chat-rail button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+/* Same signal as the chat bar's status, kept visible while collapsed. */
+.rail-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  flex-shrink: 0;
+}
+.rail-dot.off {
+  background: var(--dim);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .rail-dot:not(.off) {
+    animation: pulse 2s ease-in-out infinite;
+  }
+}
+.rail-label {
+  writing-mode: vertical-rl;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--dim);
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- node footer (backends + heartbeat) ---- */
+.node-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.node-foot .backends {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.node-foot .chip {
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 1px 5px;
+  color: var(--ink-2);
+}
+.node-foot .heart {
+  flex-shrink: 0;
+}
+.node .meter {
+  margin-top: 10px;
+}
+
+/* ---- status badge (shared) ---- */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.status-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.status-badge.good {
+  color: var(--good);
+  background: color-mix(in srgb, var(--good) 12%, transparent);
+  border-color: color-mix(in srgb, var(--good) 30%, transparent);
+}
+.status-badge.warn {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+}
+.status-badge.bad {
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border-color: color-mix(in srgb, var(--bad) 30%, transparent);
+}
+.status-badge.neutral {
+  color: var(--dim);
+  background: color-mix(in srgb, var(--dim) 12%, transparent);
+  border-color: var(--line-2);
+}
+
+/* ---- proposals ---- */
+.panel-head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.filter-select {
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: var(--sans);
+  cursor: pointer;
+}
+.filter-select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.proposal {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 13px 14px;
+  margin-bottom: 9px;
+}
+.proposal-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.proposal-top .host {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+.proposal-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 7px;
+}
+.proposal-reason {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  margin-bottom: 11px;
+}
+.proposal-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ---- backends ---- */
+.backend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 12px 14px;
+  margin-bottom: 9px;
+}
+.backend-main {
+  min-width: 0;
+}
+.backend-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+.backend-node {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-left: 6px;
+}
+.backend-model {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.backend-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.backend-right .meter {
+  width: 120px;
+}
+.subhead {
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-family: var(--mono);
+  margin: 20px 0 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.cache-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  padding: 9px 13px;
+}
+.cache-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+.cache-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  text-align: right;
+}
+
+/* ---- jobs ---- */
+.jobs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 20px 0 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.queue-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.job-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.job-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+}
+.job-main {
+  min-width: 0;
+}
+.job-line1 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.job-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.job-type {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.job-line2 {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+
+/* ---- security: approvals + certs ---- */
+.approval-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 9px;
+}
+.approval-main {
+  min-width: 0;
+}
+.approval-line1 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.approval-tool {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.approval-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+.approval-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.cert-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  padding: 9px 13px;
+}
+.cert-id {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.cert-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.cert-role {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+.cert-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.cert-days {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.cert-days.warn {
+  color: var(--warn);
+}
+.cert-days.bad {
+  color: var(--bad);
+}
+
+/* ---- observability ---- */
+.health-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.health-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line-2);
+  background: var(--surface);
+}
+.health-pill::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.health-pill.ok {
+  color: var(--good);
+}
+.health-pill.ok::before {
+  background: var(--good);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent);
+}
+.health-pill.down {
+  color: var(--bad);
+}
+.health-pill.down::before {
+  background: var(--bad);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--bad) 20%, transparent);
+}
+.health-pill.unknown {
+  color: var(--muted-foreground);
+}
+.health-pill.unknown::before {
+  background: var(--muted-foreground);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted-foreground) 18%, transparent);
+}
+/* ---- add-ons (opt-in subsystems) ---- */
+
+/* Visually quieter than the dependency pills, and never red. An operator who
+   turned an add-on off must not see a fault colour for a choice they made —
+   the gateway is explicit about this, and "broken" is the watchdog's job. */
+.addon-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 6px;
+}
+.addon-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--line-2);
+  background: transparent;
+  color: var(--dim);
+}
+.addon-pill.enabled {
+  border-style: solid;
+  color: var(--ink-2);
+}
+/* Enabled but not responding — the one add-on state that IS a fault, and the
+   only one that earns red. Solid border like `enabled`, because the operator
+   asked for it to be on; the colour is what says it isn't. */
+.addon-pill.unhealthy {
+  border-style: solid;
+  border-color: var(--bad);
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 7%, transparent);
+}
+.addon-pill.unknown {
+  border-style: dotted;
+}
+.addon-state {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--dim);
+}
+.addon-pill.enabled .addon-state {
+  background: color-mix(in srgb, var(--good) 15%, var(--surface-2));
+  color: var(--good);
+}
+.addon-pill.unhealthy .addon-state {
+  background: color-mix(in srgb, var(--bad) 18%, var(--surface-2));
+  color: var(--bad);
+}
+
+.gpu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 11px 14px;
+  margin-bottom: 9px;
+}
+.gpu-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  min-width: 110px;
+}
+.gpu-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.gpu-node {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.gpu-metrics {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex: 1;
+  justify-content: flex-end;
+}
+.gpu-stat {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.gpu-util {
+  min-width: 150px;
+}
+.obs-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  padding: 9px 13px;
+}
+.obs-c-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.c-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.c-dot.ok {
+  background: var(--good);
+}
+.c-dot.down {
+  background: var(--dim);
+}
+.c-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.c-node {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.door-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.door-badge.running {
+  color: var(--good);
+  border-color: var(--good);
+}
+.door-badge.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  font-weight: 600;
+}
+.obs-c-metrics {
+  display: flex;
+  gap: 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- memory: tool usage ---- */
+.tool-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 8px;
+}
+.tool-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.tool-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.tool-calls {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.tool-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+}
+.tool-meter {
+  min-width: 150px;
+}
+.tool-avg {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+  text-align: right;
+}
+
+/* ---- channels ---- */
+.adapter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.adapter {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 13px 14px;
+}
+.adapter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.adapter-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.adapter-stats {
+  display: flex;
+  gap: 16px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.adapter-stats b {
+  color: var(--ink);
+}
+.adapter-stats .err b {
+  color: var(--bad);
+}
+.recipient-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 8px;
+}
+.recipient-main {
+  min-width: 0;
+}
+.recipient-line1 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.recipient-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.recipient-ch {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+.recipient-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* ---- files: directory list ---- */
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 11px 14px;
+  margin-bottom: 8px;
+}
+.dir-row.writable {
+  border-left: 3px solid var(--warn);
+}
+.dir-icon {
+  font-size: 17px;
+  flex-shrink: 0;
+}
+.dir-main {
+  flex: 1;
+  min-width: 0;
+}
+.dir-host {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  word-break: break-all;
+}
+.dir-shield {
+  margin-left: 6px;
+  font-size: 12px;
+}
+.dir-mount {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 3px;
+}
+.dir-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 2px 6px;
+  flex-shrink: 0;
+}
+.dir-rw {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.dir-rw.rw {
+  color: var(--primary-foreground);
+  background: var(--warn);
+}
+.dir-rw.ro {
+  color: var(--dim);
+  background: var(--surface-3);
+}
+
+/* ---- docs ---- */
+.runbook-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+.runbook-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 13px 15px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  text-decoration: none;
+  color: var(--ink);
+  transition: border-color 0.15s, background 0.15s;
+}
+.runbook-card:hover {
+  border-color: var(--primary);
+  background: var(--surface-2);
+}
+/* Cards are buttons now, not links — the runbook API is authenticated and a
+   plain href cannot carry the bearer. Reset the button defaults so they still
+   look like cards. */
+.runbook-card {
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.runbook-card.active {
+  border-color: var(--primary);
+  background: var(--surface-2);
+}
+
+/* ---- rendered runbook ---- */
+.runbook-view {
+  margin-top: 14px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--surface);
+  padding: 4px 18px 18px;
+}
+.runbook-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  padding: 12px 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+.runbook-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.runbook-close {
+  font: inherit;
+  font-size: 12px;
+  color: var(--dim);
+  background: none;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.runbook-close:hover {
+  color: var(--ink);
+  border-color: var(--primary);
+}
+.runbook-body {
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.runbook-body h1,
+.runbook-body h2,
+.runbook-body h3,
+.runbook-body h4 {
+  color: var(--ink);
+  margin: 18px 0 8px;
+  line-height: 1.3;
+}
+.runbook-body h1 { font-size: 18px; }
+.runbook-body h2 { font-size: 16px; }
+.runbook-body h3 { font-size: 14.5px; }
+.runbook-body p { margin: 8px 0; }
+/* Tailwind's preflight strips list markers globally. Prose needs them back —
+   an unnumbered ordered list of steps is actively misleading in a runbook. */
+.runbook-body ul,
+.runbook-body ol { margin: 8px 0 8px 22px; padding-left: 0; }
+.runbook-body ul { list-style: disc outside; }
+.runbook-body ol { list-style: decimal outside; }
+.runbook-body li { margin: 3px 0; }
+.runbook-body a { color: var(--primary); }
+.runbook-body code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.runbook-body pre {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 11px 13px;
+  overflow-x: auto;
+  margin: 10px 0;
+}
+/* The <code> inside a block must not repeat the inline chip styling. */
+.runbook-body pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.runbook-body blockquote {
+  margin: 10px 0;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--line-2);
+  color: var(--dim);
+}
+.runbook-body hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 14px 0;
+}
+.runbook-card strong {
+  font-size: 13.5px;
+}
+.runbook-card span {
+  font-size: 12px;
+  color: var(--dim);
+  line-height: 1.45;
+}
+.docs-links {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.docs-link {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--primary);
+  text-decoration: none;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 8px 13px;
+}
+.docs-link:hover {
+  background: var(--primary-soft);
+}
+/* ---- tasks (heartbeat) ---- */
+.task-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 8px;
+}
+.task-main {
+  min-width: 0;
+}
+.task-line1 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.task-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.task-action {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+.task-line2 {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+.task-cron {
+  color: var(--ink-2);
+}
+.task-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ---- knowledge graph ---- */
+.type-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+.type-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.type-name {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  min-width: 90px;
+}
+.type-bar {
+  flex: 1;
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.type-fill {
+  display: block;
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+}
+.type-count {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  min-width: 32px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* ---- admin: users + flags ---- */
+.user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 7px;
+}
+.user-l {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.user-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.user-you {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+  margin-left: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  padding: 1px 5px;
+}
+.user-scopes {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.scope-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.user-r {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.user-login {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.flag-group {
+  margin-bottom: 10px;
+}
+.flag-cat {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 4px 0 6px;
+}
+.flag-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 2px;
+}
+.flag-row > button {
+  min-width: 46px;
+  flex-shrink: 0;
+}
+.flag-main {
+  flex: 1;
+  min-width: 0;
+}
+.flag-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+.flag-help {
+  font-size: 11.5px;
+  color: var(--dim);
+  margin-left: 8px;
+}
+.flag-source {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--dim);
+  flex-shrink: 0;
+}
+
+/* ---- documents (rag) ---- */
+.doc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 7px;
+}
+.doc-main {
+  min-width: 0;
+}
+.doc-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.doc-source {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-time {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  flex-shrink: 0;
+}
+
+/* ---- autonomy ---- */
+
+/* The two facts the gateway is careful to keep separate: permitted-to-act vs
+   loop-actually-alive. Rendered side by side so the pair reads as one answer. */
+.auto-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.auto-stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-left-width: 2px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface);
+}
+.auto-stat.on {
+  border-left-color: var(--good);
+}
+.auto-stat.off {
+  border-left-color: var(--line-2);
+}
+/* Permitted but not ticking — the rules look armed and nothing runs them. */
+.auto-stat.bad {
+  border-left-color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 7%, var(--surface));
+}
+.auto-stat-k {
+  font-size: 12px;
+  color: var(--dim);
+}
+.auto-stat-v {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.auto-warn {
+  padding: 10px 13px;
+  margin-bottom: 14px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bad) 8%, var(--surface));
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.auto-note {
+  font-size: 12px;
+  color: var(--dim);
+  line-height: 1.55;
+  margin-top: 12px;
+}
+.auto-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 11px 14px;
+  margin-bottom: 7px;
+}
+.auto-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex-shrink: 0;
+}
+.auto-dot.on {
+  background: var(--good);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent);
+}
+.auto-dot.off {
+  background: var(--dim);
+}
+.auto-main {
+  min-width: 0;
+  flex: 1;
+}
+/* Timestamps read as UNKNOWN when absent (a dash), never as "never":
+   last_check lives in the loop's memory and is empty after a restart. */
+.auto-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 3px;
+}
+.auto-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.auto-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.auto-interval,
+.auto-state {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.auto-hint {
+  font-size: 12px;
+  color: var(--dim);
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
+/* ---- explorer: recall memory ---- */
+.vseg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 10px 13px;
+  margin-bottom: 7px;
+}
+.vseg-id {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.vseg-file {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vseg-kind {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-radius: 2px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+.vseg-kind.conv {
+  color: var(--primary);
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, transparent);
+}
+.vseg-kind.trav {
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.vseg-records {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+/* ---- query states ---- */
+.state {
+  padding: 26px;
+  text-align: center;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.state.err {
+  color: var(--bad);
+}
+.state.warn {
+  color: var(--warn);
+}
+
+/* ---- placeholder empty state ---- */
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.placeholder .box {
+  text-align: center;
+  max-width: 340px;
+}
+.placeholder .pico {
+  width: 40px;
+  height: 40px;
+  color: var(--dim);
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.3;
+  margin: 0 auto 14px;
+  display: block;
+}
+.placeholder h2 {
+  font-size: 17px;
+  margin: 0 0 8px;
+  font-weight: 620;
+}
+.placeholder p {
+  font-size: 13px;
+  color: var(--dim);
+  line-height: 1.55;
+  margin: 0 0 16px;
+}
+.placeholder a {
+  color: var(--primary);
+  font-size: 12.5px;
+  text-decoration: none;
+  font-family: var(--mono);
+}
+.placeholder a:hover {
+  text-decoration: underline;
+}
+
+/* ---- login overlay ---- */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(4px);
+}
+.login-card {
+  width: 100%;
+  max-width: 340px;
+  padding: 28px;
+}
+.login-brand {
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 18px;
+  color: var(--ink);
+}
+.login-sub {
+  font-size: 13px;
+  color: var(--dim);
+  margin: 6px 0 18px;
+}
+.login-error {
+  background: color-mix(in srgb, var(--bad) 15%, transparent);
+  color: var(--bad);
+  border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent);
+  border-radius: 6px;
+  padding: 8px 11px;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+}
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---- confirm dialog ---- */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  backdrop-filter: blur(3px);
+}
+.confirm-content {
+  position: fixed;
+  z-index: 121;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: calc(100% - 40px);
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  padding: 22px;
+  box-shadow: var(--shadow, 0 24px 60px -30px rgba(0, 0, 0, 0.6));
+}
+.confirm-title {
+  font-size: 16px;
+  font-weight: 640;
+  margin: 0 0 6px;
+}
+.confirm-desc {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+  margin: 0 0 18px;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---- live chat ---- */
+.bar .live.off {
+  color: var(--dim);
+}
+.bar .live.off::before {
+  background: var(--dim);
+  animation: none;
+}
+.turn.metis .m {
+  white-space: pre-wrap;
+}
+.turn.metis .m.err {
+  color: var(--bad);
+}
+.cursor {
+  color: var(--primary);
+  font-weight: 700;
+  margin-left: 1px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .cursor {
+    animation: blink 1s steps(1) infinite;
+  }
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+
+/* Operator action forms (start backend, cache model, etc.) */
+.op-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 2px 0 14px;
+}
+.op-form > input {
+  flex: 1 1 150px;
+  min-width: 110px;
+}
+.op-form > button {
+  flex: 0 0 auto;
+}
+.op-select {
+  flex: 0 0 auto;
+  height: 2.25rem;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 13px;
+  cursor: pointer;
+}
+.op-select:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* Drained-node chips (Jobs tab) */
+.drained-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+.drained-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--warn);
+}
+.drained-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  cursor: pointer;
+}
+.drained-chip:hover {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+}
+.drained-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Inline checkbox label in operator forms */
+.op-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.op-check input {
+  cursor: pointer;
+}
+
+/* Document ingest form (RAG tab) */
+.ingest-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+.ingest-form .op-form {
+  margin: 0;
+}
+.op-textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
+}
+.op-textarea::placeholder {
+  color: var(--muted-foreground);
+}
+.op-textarea:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* ============================================================
+   Architecture diagrams — shared by Architecture (core) and Brain Map (full).
+   Both render through features/_diagram/, so nothing here is edition-specific.
+   ============================================================ */
+.diagram-panel {
+  overflow: hidden;
+}
+.diagram-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+}
+.diagram {
+  min-width: 880px;
+}
+.diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.brain-node,
+.brain-loop,
+.wf-node {
+  cursor: pointer;
+}
+.brain-node rect,
+.brain-node circle,
+.wf-node rect {
+  transition: stroke-width 0.12s ease;
+}
+.brain-node:hover rect,
+.brain-node:hover circle,
+.wf-node:hover rect {
+  stroke-width: 2.5;
+}
+.diagram svg .wf-lane-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+.diagram svg .wf-timing {
+  font-size: 8px;
+  fill: var(--dim);
+}
+.diagram svg .wf-arrow-label {
+  font-size: 8px;
+  font-weight: 600;
+}
+.diagram-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  justify-content: center;
+  margin-top: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.diagram-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.diagram-legend .ldot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* Node inspect modal */
+.diag-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--background) 55%, transparent);
+  backdrop-filter: blur(3px);
+}
+.diag-modal {
+  position: relative;
+  width: 100%;
+  max-width: 540px;
+  max-height: 82vh;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px 24px;
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.5);
+}
+.diag-modal-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.diag-modal-close:hover {
+  color: var(--foreground);
+}
+.diag-modal-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+.diag-modal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.diag-modal-badge {
+  display: inline-block;
+  margin: 4px 0 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid currentColor;
+  opacity: 0.8;
+}
+.diag-modal-layer {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  margin-bottom: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.diag-modal-desc {
+  font-size: 13px;
+  line-height: 1.65;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.diag-modal-flow {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+  white-space: pre-wrap;
+  margin-bottom: 14px;
+}
+.diag-modal-sec {
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.diag-modal-sec strong {
+  display: block;
+  color: var(--muted-foreground);
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+.diag-modal-files {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.diag-modal-files code {
+  background: var(--muted);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 12px;
+}
+.diag-modal-note {
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+/* ---- MCP key dialog ---- */
+.mcp-key-dialog {
+  max-width: 560px;
+}
+.mcp-key-status {
+  font-size: 12.5px;
+  line-height: 1.6;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 9px 11px;
+  margin-bottom: 12px;
+}
+.mcp-key-status .dim {
+  color: var(--dim);
+}
+.mcp-key-hint {
+  font-size: 12.5px;
+  color: var(--dim);
+  margin: 0 0 10px;
+}
+/* The one-time secret. `user-select: all` makes a single click select the
+   whole key, so the clipboard fallback is a real fallback rather than an
+   invitation to mis-drag and copy half of it. */
+.mcp-key-value {
+  user-select: all;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 10px;
+  margin: 0 0 14px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.mcp-key-snippet {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+  background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 10px;
+  margin: 0 0 16px;
+  max-height: 190px;
+  overflow: auto;
+  white-space: pre;
+}
+.mcp-key-warn {
+  font-size: 11.5px;
+  color: var(--warn, var(--dim));
+  margin: 10px 0 0;
+}
+
+/* ---- usage: token accounting ---- */
+.usage-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.usage-controls label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.usage-controls .ctl-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.usage-controls select {
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.usage-controls select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+/* segmented control */
+.seg {
+  display: flex;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg button {
+  padding: 4px 11px;
+  background: var(--surface-2);
+  border: none;
+  border-right: 1px solid var(--line-2);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.seg button:last-child {
+  border-right: none;
+}
+.seg button:hover {
+  color: var(--ink);
+}
+.seg button.on {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.seg button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.usage-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+.usage-row:last-of-type {
+  border-bottom: none;
+}
+.usage-id {
+  width: 150px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.usage-key {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-note {
+  font-size: 10px;
+  color: var(--dim);
+}
+/* split bar: prompt then completion, both scaled against the largest row */
+.usage-bar {
+  flex: 1;
+  display: flex;
+  height: 9px;
+  min-width: 0;
+  background: var(--surface-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.usage-fill {
+  display: block;
+  height: 100%;
+}
+.usage-fill.prompt {
+  background: var(--primary);
+}
+.usage-fill.completion {
+  background: var(--good);
+}
+.usage-nums {
+  width: 108px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-family: var(--mono);
+}
+.usage-total {
+  font-size: 12px;
+  color: var(--ink);
+}
+.usage-reqs {
+  font-size: 10px;
+  color: var(--dim);
+}
+.usage-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 14px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.usage-legend span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.usage-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.usage-legend i.prompt {
+  background: var(--primary);
+}
+.usage-legend i.completion {
+  background: var(--good);
+}
+
+/* ---- knowledge graph map ---- */
+.graph-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 16px 0 12px;
+}
+.graph-controls label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.graph-controls .ctl-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.graph-controls select {
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  max-width: 180px;
+}
+.graph-controls select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+.ctl-clear {
+  background: none;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 4px 10px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.ctl-clear:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.graph-map {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.graph-map svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.graph-edges line {
+  stroke: var(--line-2);
+  stroke-width: 1;
+}
+.graph-edges line.dim {
+  stroke-opacity: 0.18;
+}
+.graph-edges line.lit {
+  stroke: var(--primary);
+  stroke-width: 1.6;
+  stroke-opacity: 0.9;
+}
+.gnode {
+  cursor: pointer;
+}
+.gnode circle {
+  stroke: var(--surface);
+  stroke-width: 1.5;
+}
+.gnode text {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--ink-2);
+  pointer-events: none;
+}
+.gnode:hover circle {
+  stroke: var(--ink);
+}
+.gnode.dim {
+  opacity: 0.22;
+}
+.gnode.sel circle {
+  stroke: var(--ink);
+  stroke-width: 2.5;
+}
+.gnode.sel text {
+  fill: var(--ink);
+  font-weight: 600;
+}
+
+.graph-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+}
+.graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.graph-legend span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.graph-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.graph-note {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--warn);
+}
+
+.graph-sel {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line-2);
+  border-left: 2px solid var(--primary);
+  border-radius: 0 5px 5px 0;
+  background: var(--surface-2);
+}
+.gs-name {
+  font-size: 13px;
+  color: var(--ink);
+}
+.gs-type,
+.gs-deg,
+.gs-hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+/* ---- mobile shell (<=860px) ------------------------------------------
+   Below this width the console stops being a three-column desktop and
+   becomes a chat: nav moves into a drawer, panels arrive as sheets over
+   the transcript. Driven by React (useIsMobile) as well as CSS, because
+   the structure differs, not just the styling. */
+.app.mobile {
+  grid-template-columns: 1fr;
+  grid-template-rows: auto minmax(0, 1fr);
+  /* See `.app` for why this is split. It matters MORE here: the clip below
+     is what turns a missing height into "the chat will not scroll". */
+  height: 100vh;
+  position: relative;
+  overflow: hidden;
+}
+@supports (height: 100dvh) {
+  .app.mobile {
+    height: 100dvh;
+  }
+}
+
+/* top bar */
+.mbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--sidebar);
+  border-bottom: 1px solid var(--line);
+}
+.mbar-menu {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  margin-left: -6px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  padding: 0;
+}
+.mbar-menu svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+.mbar-menu:active {
+  background: var(--surface-3);
+}
+.mbar-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.mbar-brand {
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mbar-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--good);
+}
+
+/* The chat owns the screen; no border to divide it from. */
+.app.mobile .chat {
+  border-right: none;
+}
+
+/* nav drawer */
+.scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.5);
+}
+.drawer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 21;
+  width: min(78vw, 290px);
+  display: flex;
+  box-shadow: 0 0 32px rgba(0, 0, 0, 0.4);
+}
+.drawer .side {
+  width: 100%;
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .drawer {
+    animation: drawer-in 0.18s ease-out;
+  }
+  .scrim {
+    animation: fade-in 0.18s ease-out;
+  }
+}
+@keyframes drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* panel sheet */
+.sheet {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sheet {
+    animation: sheet-in 0.2s ease-out;
+  }
+}
+@keyframes sheet-in {
+  from {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+}
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  background: var(--sidebar);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.sheet-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+.sheet-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  margin-right: -6px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  padding: 0;
+}
+.sheet-close svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+.sheet-close:active {
+  background: var(--surface-3);
+}
+.sheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.sheet-body .panel {
+  flex: 1;
+  overflow: visible;
+}
+
+/* ---- narrow-screen density ---------------------------------------------
+   Independent of the shell swap above: these keep content usable once the
+   viewport is phone-width, whichever container it lands in. */
+@media (max-width: 860px) {
+  .chat .bar {
+    padding: 10px 14px;
+    gap: 8px;
+  }
+  /* The serving label is the first thing to go â€” the status dot, model
+     picker and composer all say more in less room. */
+  .bar .serving {
+    display: none;
+  }
+  .model-pick select {
+    max-width: 130px;
+  }
+  .transcript {
+    padding: 16px 14px;
+    gap: 18px;
+  }
+  .composer {
+    padding: 10px 14px 12px;
+  }
+  .panel {
+    padding: 14px;
+  }
+
+  /* KPI tiles: four across is unreadable on a phone. */
+  .tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* Usage + graph rows reflow to two lines rather than crushing the bar. */
+  .usage-row {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+  }
+  .usage-id {
+    width: auto;
+    flex: 1 1 55%;
+  }
+  .usage-nums {
+    width: auto;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .usage-bar {
+    flex: 1 1 100%;
+    order: 3;
+  }
+  .usage-controls,
+  .graph-controls {
+    gap: 10px;
+  }
+  .graph-controls select,
+  .usage-controls select {
+    max-width: 140px;
+  }
+  .graph-foot {
+    padding: 8px 10px;
+  }
+}
+
+/* Tap targets: a 28px desktop icon button is below the ~44px guidance. */
+@media (max-width: 860px) and (pointer: coarse) {
+  .panel-toggle,
+  .ctl-clear,
+  .seg button {
+    min-height: 34px;
+  }
+  .nav button {
+    padding: 11px 10px;
+  }
+}
+
+/* ---- first-run guidance ----------------------------------------------
+   Shown where a list is empty on a fresh install. Deliberately wordier than
+   the terse `.state` message it replaces: on the first screen the user has
+   ever seen, "No nodes registered" is a dead end rather than an answer. */
+.onboard {
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--primary);
+  border-radius: 0 7px 7px 0;
+  background: var(--surface);
+  padding: 18px 20px;
+  max-width: 620px;
+}
+.onboard p {
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  margin-bottom: 10px;
+}
+.onboard p:last-child {
+  margin-bottom: 0;
+}
+.onboard-lead {
+  font-size: 14.5px !important;
+  color: var(--ink) !important;
+  font-weight: 600;
+}
+.onboard-cmd {
+  margin: 12px 0;
+  padding: 11px 13px;
+  background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: pre;
+}
+.onboard-note {
+  font-size: 12px !important;
+  color: var(--dim) !important;
+}
+
+/* Brand status reads the real cluster; dim it when there is nothing online. */
+.side-brand .stat.idle {
+  color: var(--dim);
+}
+.side-brand .stat.idle::before {
+  background: var(--dim);
+}
+
+/* ---- security: violation breakdown ---- */
+/* A category with no hits is context, not news. */
+.cache-row.quiet .cache-name,
+.cache-row.quiet .cache-meta {
+  color: var(--dim);
+}
+.cache-meta.vio-hit {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ---- inline exec-approval card ----------------------------------------
+   A tool call is blocked on a human. Deliberately louder than a tool chip:
+   the turn cannot proceed until this is answered, and before it existed the
+   request expired unseen. */
+.approval-card {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--warn);
+  border-left-width: 2px;
+  border-radius: 0 7px 7px 0;
+  background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+}
+.approval-card.settled,
+.approval-card.expired {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+.ac-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.ac-lock svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--warn);
+  stroke-width: 1.5;
+  display: block;
+}
+.approval-card.settled .ac-lock svg,
+.approval-card.expired .ac-lock svg {
+  stroke: var(--dim);
+}
+.ac-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.ac-tool {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.ac-left {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--warn);
+}
+.ac-left.expired {
+  color: var(--dim);
+}
+.ac-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 11px;
+}
+/* The call being gated. Wraps rather than truncates: a command the operator
+   can only half-read is the failure this card exists to prevent. */
+.ac-args {
+  margin-top: 9px;
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.ac-verdict {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--dim);
+  white-space: pre-wrap;
+}
+/* A blocked call is the outcome the operator most needs to notice. */
+.ac-verdict.blocked {
+  color: var(--bad);
+}
+
+/* ---- add node ---- */
+.addnode {
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  max-width: 640px;
+}
+.addnode-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.addnode-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.addnode-close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+}
+.addnode-close:hover {
+  color: var(--ink);
+}
+.addnode-lead {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  margin-bottom: 10px;
+}
+.addnode-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.addnode-row > :first-child {
+  flex: 1;
+  min-width: 160px;
+}
+.addnode-hint {
+  margin-top: 9px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--dim);
+}
+.addnode-hint code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.addnode-select {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.addnode-check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.addnode-check input {
+  margin-top: 3px;
+}
+.addnode-step {
+  margin-top: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.addnode-step code {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 400;
+}
+.addnode-err {
+  border-left: 2px solid var(--bad);
+  padding-left: 10px;
+  margin: 10px 0;
+}
+.addnode-err p:first-child {
+  font-size: 13px;
+  color: var(--bad);
+}
+
+/* ---- graph: staged prunes ---- */
+.prune-help {
+  font-size: 12px;
+  color: var(--dim);
+  margin: 4px 0 12px;
+}
+.prune-note {
+  margin-top: 8px;
+}
+.prune-left.hot {
+  color: var(--warn);
+}

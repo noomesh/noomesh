@@ -1,0 +1,11 @@
+{
+  "state": "idle",
+  "stats": {
+    "total_processed": 14230,
+    "total_embedded": 13980,
+    "total_failed": 12,
+    "relationships_created": 2140,
+    "total_batches": 0,
+    "current_batch": 0
+  }
+}

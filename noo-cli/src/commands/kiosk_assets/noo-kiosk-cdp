@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""noo-kiosk-cdp — the display's tiny hands: mint, inject, navigate, probe.
+
+Stdlib only (a stock Ubuntu has python3, nothing else is promised). The
+Chrome DevTools Protocol is spoken over a hand-rolled websocket client
+because `websocket-client` is not installed on a fresh laptop and this
+file must work the first time it runs.
+
+There is NO durable secret to protect here any more: the display mints
+by proving its tailnet identity (publish a nonce on its own tailnet
+address, let the controller come and read it), so nothing is stored
+between mints except the short-lived token in /var/lib/kiosk/token.json.
+Nothing travels on argv either way.
+
+Subcommands (all exit non-zero on failure, JSON on stdout where useful):
+  mint         prove tailnet identity, write token.json (0600)
+  start URL    navigate, WAIT for the origin to commit, inject, reload
+  inject       localStorage['noo_kiosk_token'] = <token from token.json>
+  navigate URL Page.navigate
+  reload       Page.reload
+  heartbeat    print window.__nooKioskHeartbeat (ms epoch) or "null"
+  frame        print the graph page's {ms, quality} frame measure as JSON, or "null"
+  build        print the stack tag this console was built from, or "null"
+  probe        exit 0 iff CDP answers on 127.0.0.1:9222
+  expires      print token expiry as epoch seconds (from token.json)
+
+`start` exists because the ORDER matters and the wrong order is silent.
+localStorage belongs to an ORIGIN. Injecting while the browser still sits
+on about:blank writes to an opaque origin nothing can read back; navigating
+afterwards lands on a document whose storage is empty. The page then sends
+no Authorization header and every call 401s — while the dashboard itself
+renders perfectly, because the bundle is public. That shipped, and the
+first real display never loaded a single tile until it was found.
+"""
+import base64, http.server, json, os, secrets, socket, string, struct, subprocess, sys, threading, time, urllib.request, urllib.error, urllib.parse
+
+STATE = os.environ.get("NOO_KIOSK_STATE", "/var/lib/kiosk")
+TOKEN_FILE = os.path.join(STATE, "token.json")
+CDP = ("127.0.0.1", int(os.environ.get("NOO_KIOSK_CDP_PORT", "9222")))
+
+
+def die(msg, code=1):
+    print(f"noo-kiosk-cdp: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ── token ──────────────────────────────────────────────────────────────
+
+
+def tailnet_ip():
+    """This display's OWN tailnet address, or None.
+
+    The bind address for the dialback listener is resolved here and
+    NOWHERE else. If this returns None the mint REFUSES — see bind_proof.
+    """
+    for argv in (["tailscale", "ip", "-4"], ["/usr/bin/tailscale", "ip", "-4"]):
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        except Exception:  # noqa: BLE001
+            continue
+        if out.returncode == 0:
+            for line in out.stdout.split():
+                line = line.strip()
+                if line.startswith("100."):
+                    return line
+    # Fall back to the JSON shape, which some builds prefer.
+    for argv in (["tailscale", "status", "--json"], ["/usr/bin/tailscale", "status", "--json"]):
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        except Exception:  # noqa: BLE001
+            continue
+        if out.returncode != 0:
+            continue
+        try:
+            ips = json.loads(out.stdout).get("Self", {}).get("TailscaleIPs") or []
+        except Exception:  # noqa: BLE001
+            continue
+        for ip in ips:
+            if isinstance(ip, str) and ip.startswith("100."):
+                return ip
+    return None
+
+
+class _Nonce(http.server.BaseHTTPRequestHandler):
+    nonce = ""
+
+    def do_GET(self):  # noqa: N802
+        body = self.nonce.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_a):  # silence; the journal has enough
+        return
+
+
+def bind_proof(ip, port, nonce):
+    """Serve `nonce` on (ip, port) ONLY.
+
+    The bind address is the resolved tailnet address, never a wildcard.
+    A wildcard bind would also answer on the LOCAL NETWORK, where no
+    tailnet ACL applies — the tag:controller -> tag:kiosk grant would
+    bound nothing and the mint would still succeed, so nothing would ever
+    report the difference. That is why there is no fallback here: if the
+    address cannot be resolved we refuse to mint at all.
+    """
+    _Nonce.nonce = nonce
+    srv = http.server.HTTPServer((ip, port), _Nonce)
+    t = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
+    t.start()
+    return srv
+
+
+def mint():
+    url = os.environ.get("NOO_KIOSK_URL", "").rstrip("/")
+    if not url:
+        die("NOO_KIOSK_URL must be set (from /etc/default/kiosk)")
+    port = int(os.environ.get("NOO_KIOSK_DIALBACK_PORT", "8099"))
+
+    ip = tailnet_ip()
+    if not ip:
+        die(
+            "cannot resolve this display's tailnet address — refusing to mint. "
+            "Binding the dialback listener to a wildcard would expose it on the local "
+            "network, where the tailnet ACL does not apply. Is tailscaled running and "
+            "is this device logged in?",
+            6,
+        )
+
+    nonce = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+    srv = None
+    try:
+        try:
+            srv = bind_proof(ip, port, nonce)
+        except OSError as e:
+            die(f"cannot bind the dialback listener on {ip}:{port}: {e}", 6)
+        req = urllib.request.Request(
+            url + "/api/kiosk/token/tailnet",
+            data=json.dumps({"tailnet_ip": ip, "proof_nonce": nonce, "proof_port": port}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode() or "{}").get("error", {}).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            die(f"mint refused: HTTP {e.code} {detail}", 4)
+        except Exception as e:  # noqa: BLE001
+            die(f"mint failed: {e}", 3)
+    finally:
+        # EVERY exit path closes the listener, including the failures
+        # above — a mint that errors must not leave the port held. `die`
+        # raises SystemExit, which this finally still runs for.
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+
+    token = body.get("token")
+    ttl = int(body.get("expires_in") or 900)
+    if not token:
+        die("mint answered without a token")
+    now = int(time.time())
+    rec = {"token": token, "expires_at": now + ttl, "minted_at": now,
+           "consumer": body.get("consumer"), "via": "tailnet"}
+    os.makedirs(STATE, exist_ok=True)
+    tmp = TOKEN_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, TOKEN_FILE)
+    print(json.dumps({"expires_at": rec["expires_at"], "consumer": rec["consumer"], "via": "tailnet"}))
+
+
+def read_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        die("no token yet — run `noo-kiosk-cdp mint` first", 2)
+    except Exception as e:  # noqa: BLE001
+        die(f"token.json unreadable: {e}", 2)
+
+
+# ── a websocket client small enough to trust ───────────────────────────
+
+
+class WS:
+    def __init__(self, url):
+        # ws://127.0.0.1:9222/devtools/page/<id>
+        rest = url.split("://", 1)[1]
+        hostport, path = rest.split("/", 1)
+        host, port = hostport.split(":")
+        self.sock = socket.create_connection((host, int(port)), timeout=10)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            (
+                f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).encode()
+        )
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket handshake: connection closed")
+            resp += chunk
+        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+            raise RuntimeError("websocket handshake refused: " + resp.split(b"\r\n", 1)[0].decode(errors="replace"))
+        self.buf = resp.split(b"\r\n\r\n", 1)[1]
+        self.next_id = 0
+
+    def _recv_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, text):
+        data = text.encode()
+        mask = os.urandom(4)
+        head = bytes([0x81])
+        n = len(data)
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack("!H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack("!Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(head + mask + masked)
+
+    def recv(self):
+        while True:
+            b0, b1 = self._recv_exact(2)
+            op = b0 & 0x0F
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack("!H", self._recv_exact(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self._recv_exact(8))[0]
+            if b1 & 0x80:
+                self._recv_exact(4)
+            payload = self._recv_exact(n)
+            if op == 0x1:
+                return payload.decode()
+            if op == 0x8:
+                raise RuntimeError("websocket closed by peer")
+            # ping/pong/binary/continuation: ignore
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        mid = self.next_id
+        self.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            msg = json.loads(self.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg.get("result", {})
+        raise RuntimeError(f"{method}: no reply")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def origin_of(u):
+    """scheme://host for a URL, or "" for about:blank and friends.
+
+    This is the unit localStorage is keyed by, so it is the unit every
+    decision about WHERE a token lands has to be made in.
+    """
+    p = urllib.parse.urlsplit(u or "")
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+
+
+def list_targets():
+    with urllib.request.urlopen(f"http://{CDP[0]}:{CDP[1]}/json/list", timeout=3) as r:
+        return [t for t in json.loads(r.read().decode())
+                if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+
+
+def target_by_id(tid):
+    try:
+        for t in list_targets():
+            if t.get("id") == tid:
+                return t
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def page_target(wait_s=0, want_origin=None):
+    """A `page` target CDP lists; waits up to wait_s for one.
+
+    Prefers a real http(s) document. Chrome lists internal surfaces as
+    page targets too — the omnibox popup is one, seen on the live display
+    — and "the first target" is not reliably the page we mean. Injecting
+    into `chrome://…` writes localStorage for THAT origin, which is the
+    same bug as injecting into about:blank wearing a different hat.
+
+    `want_origin` makes it exact: return only a target already on that
+    origin, which is what `start` needs after a navigate.
+    """
+    deadline = time.time() + wait_s
+    last = None
+    while True:
+        try:
+            targets = list_targets()
+            if want_origin:
+                for t in targets:
+                    if origin_of(t.get("url", "")) == want_origin:
+                        return t
+                last = f"no page target on {want_origin} yet"
+            else:
+                for t in targets:
+                    if (t.get("url") or "").startswith(("http://", "https://")):
+                        return t
+                if targets:
+                    # Only about:blank so far — correct at startup, and
+                    # what `start` navigates away from.
+                    return targets[0]
+                last = "no page target yet"
+        except Exception as e:  # noqa: BLE001
+            last = str(e)
+        if time.time() >= deadline:
+            die(f"CDP not answering on {CDP[0]}:{CDP[1]}: {last}", 5)
+        time.sleep(0.5)
+
+
+def evaluate_on(t, expr):
+    ws = WS(t["webSocketDebuggerUrl"])
+    try:
+        res = ws.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+    finally:
+        ws.close()
+    return res.get("result", {}).get("value")
+
+
+def evaluate(expr, wait_s=0):
+    return evaluate_on(page_target(wait_s), expr)
+
+
+def inject_on(t):
+    tok = read_token()["token"]
+    # JSON-encode so the token is a string literal, whatever it contains.
+    evaluate_on(t, f"localStorage.setItem('noo_kiosk_token', {json.dumps(tok)}); 'ok'")
+
+
+def inject(wait_s):
+    inject_on(page_target(wait_s))
+    print("injected")
+
+
+def navigate(url, wait_s):
+    t = page_target(wait_s)
+    ws = WS(t["webSocketDebuggerUrl"])
+    try:
+        ws.call("Page.navigate", {"url": url})
+    finally:
+        ws.close()
+    print("navigated")
+
+
+def start(url, wait_s):
+    """navigate → WAIT for the origin to commit → inject → reload.
+
+    One subcommand rather than three shell calls, because the steps are
+    only correct in this order and only if each one has actually landed.
+    `Page.navigate` returns before the new document exists, so injecting
+    straight afterwards races the commit and can still write to
+    about:blank — the very bug this replaces, with a smaller window.
+
+    Refuses rather than guessing: if the page has not reached the target
+    origin in time, the token would go somewhere it cannot be read back
+    from, and a display that fails loudly beats one showing a dashboard
+    with nothing in it.
+    """
+    want = origin_of(url)
+    if not want:
+        die(f"start needs an absolute http(s) URL, got {url!r}", 2)
+
+    t = page_target(wait_s)
+    ws = WS(t["webSocketDebuggerUrl"])
+    try:
+        ws.call("Page.navigate", {"url": url})
+    finally:
+        ws.close()
+
+    tid = t.get("id")
+    deadline = time.time() + max(wait_s, 30)
+    while True:
+        cur = target_by_id(tid) if tid else None
+        if cur and origin_of(cur.get("url", "")) == want:
+            t = cur
+            break
+        # The target can be replaced rather than navigated in some
+        # flows; accept any target that reached the origin.
+        try:
+            for other in list_targets():
+                if origin_of(other.get("url", "")) == want:
+                    t = other
+                    cur = other
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if cur and origin_of(cur.get("url", "")) == want:
+            break
+        if time.time() >= deadline:
+            at = (cur or {}).get("url", "?")
+            die(
+                f"page did not reach {want} in time (still at {at!r}) — refusing to inject, "
+                "because the token would land on the wrong origin and the display would show "
+                "a dashboard that never loads",
+                7,
+            )
+        time.sleep(0.3)
+
+    inject_on(t)
+    ws = WS(t["webSocketDebuggerUrl"])
+    try:
+        ws.call("Page.reload", {"ignoreCache": True})
+    finally:
+        ws.close()
+    print("started")
+
+
+def reload():
+    t = page_target()
+    ws = WS(t["webSocketDebuggerUrl"])
+    try:
+        ws.call("Page.reload", {"ignoreCache": True})
+    finally:
+        ws.close()
+    print("reloaded")
+
+
+def main(argv):
+    if not argv:
+        die(__doc__.strip(), 2)
+    cmd, rest = argv[0], argv[1:]
+    wait_s = int(os.environ.get("NOO_KIOSK_CDP_WAIT", "0"))
+    if cmd == "mint":
+        mint()
+    elif cmd == "start":
+        if not rest:
+            die("start needs a URL", 2)
+        start(rest[0], wait_s)
+    elif cmd == "inject":
+        inject(wait_s)
+    elif cmd == "navigate":
+        if not rest:
+            die("navigate needs a URL", 2)
+        navigate(rest[0], wait_s)
+    elif cmd == "reload":
+        reload()
+    elif cmd == "heartbeat":
+        v = evaluate("window.__nooKioskHeartbeat ?? null")
+        print("null" if v is None else int(v))
+    elif cmd == "build":
+        # Which build of the console is on this screen. A string literal in
+        # the bundle, so it survives minification — the whole point of it.
+        # "null" on a console cut before the stamp existed.
+        v = evaluate("window.__nooKioskBuild ?? null")
+        print("null" if v is None else str(v))
+    elif cmd == "frame":
+        # The graph page's smoothed frame work (ms) and drawing tier, as
+        # JSON, or "null" on a view that does not measure one.
+        v = evaluate("window.__nooKioskFrame ? JSON.stringify(window.__nooKioskFrame) : null")
+        print("null" if v is None else v)
+    elif cmd == "probe":
+        page_target()
+        print("ok")
+    elif cmd == "expires":
+        print(int(read_token().get("expires_at", 0)))
+    else:
+        die(f"unknown subcommand {cmd!r}", 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

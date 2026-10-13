@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Federated multi-controller push
+description: >
+  Two controllers (primary + peer) with replication push over the A2A peer
+  protocol. Drives load at both, samples replication lag, and (optionally)
+  kills the primary to measure controller-failover time. Requires a second
+  controller enrolled as a peer (see /.well-known/agent.json).
+axes: [node, controller]
+duration_s: 120
+concurrency: 12
+personas:
+  - {id: primary-client, location: home-lab, weight: 0.6}
+  - {id: peer-client,    location: eu-west,  weight: 0.4}
+workloads:
+  - {endpoint: /v1/chat/completions, model: gemma-4-12b, weight: 1.0,
+     prompt: "Replicate this note across controllers."}
+faults:
+  - {at_s: 70, kind: controller_kill, target: controller-primary}
+isolation_probes: false

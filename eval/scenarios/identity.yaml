@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Identity plane — windows and accounts
+description: >
+  No load. Mints windows under one account through the identity exchange and
+  asks the questions an earlier change answers: can a window address a
+  sibling; does the recipient see it and nobody else; does mail to the account
+  reach every window; does one window's ack stay its own; and can a foreign
+  account read or address any of it. Every probe is a row in the isolation
+  matrix; LEAK anywhere fails the control.
+axes: [user]
+duration_s: 0
+concurrency: 1
+personas:
+  - {id: eval, location: tailnet}
+workloads: []
+isolation_probes: false
+identity:
+  owner: identity-smoke            # the account NOO_EVAL_IDENTITY_KEY is bound to
+  windows: [eval-a, eval-b, eval-c]
+  foreign: identity-smoke-other    # an account the key may mint but does not own; null to skip
+  key_env: NOO_EVAL_IDENTITY_KEY

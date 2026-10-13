@@ -1,0 +1,9 @@
+{
+  "total": 842,
+  "conversations": [
+    { "id": "c-1a2b", "preview": "which node is hottest right now?", "started_at": "2026-08-01T14:22:00Z", "model": "llama-3.1-70b", "total_messages": 6 },
+    { "id": "c-2c3d", "preview": "summarize today's cluster alerts", "started_at": "2026-08-01T13:40:00Z", "model": "qwen-2.5-32b", "total_messages": 4 },
+    { "id": "c-3e4f", "preview": "draft a runbook for reconnecting a node", "started_at": "2026-08-01T11:15:00Z", "model": "llama-3.1-70b", "total_messages": 12 },
+    { "id": "c-4g5h", "preview": "what changed in the last deploy?", "started_at": "2026-07-31T22:05:00Z", "model": "gpt-4o", "total_messages": 8 }
+  ]
+}

@@ -1,0 +1,493 @@
+{
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "prime-01",
+      "type": "node",
+      "degree": 6
+    },
+    {
+      "id": "n2",
+      "name": "Alice",
+      "type": "person",
+      "degree": 8
+    },
+    {
+      "id": "n3",
+      "name": "pai-mesh-ui",
+      "type": "project",
+      "degree": 7
+    },
+    {
+      "id": "n4",
+      "name": "Slate design",
+      "type": "concept",
+      "degree": 1
+    },
+    {
+      "id": "n5",
+      "name": "cluster enrollment",
+      "type": "concept",
+      "degree": 3
+    },
+    {
+      "id": "n6",
+      "name": "atlas-02",
+      "type": "node",
+      "degree": 5
+    },
+    {
+      "id": "n7",
+      "name": "companion-07",
+      "type": "node",
+      "degree": 2
+    },
+    {
+      "id": "n8",
+      "name": "pai-assistant",
+      "type": "project",
+      "degree": 11
+    },
+    {
+      "id": "n9",
+      "name": "pai-evolve",
+      "type": "project",
+      "degree": 4
+    },
+    {
+      "id": "n10",
+      "name": "trellion",
+      "type": "project",
+      "degree": 6
+    },
+    {
+      "id": "n11",
+      "name": "Noomesh",
+      "type": "org",
+      "degree": 2
+    },
+    {
+      "id": "n12",
+      "name": "contract discipline",
+      "type": "concept",
+      "degree": 2
+    },
+    {
+      "id": "n13",
+      "name": "vLLM",
+      "type": "tool",
+      "degree": 4
+    },
+    {
+      "id": "n14",
+      "name": "Ollama",
+      "type": "tool",
+      "degree": 2
+    },
+    {
+      "id": "n15",
+      "name": "PostgreSQL",
+      "type": "tool",
+      "degree": 4
+    },
+    {
+      "id": "n16",
+      "name": "pgvector",
+      "type": "tool",
+      "degree": 3
+    },
+    {
+      "id": "n17",
+      "name": "knowledge graph",
+      "type": "concept",
+      "degree": 3
+    },
+    {
+      "id": "n18",
+      "name": "PageIndex",
+      "type": "concept",
+      "degree": 3
+    },
+    {
+      "id": "n19",
+      "name": "Tailscale",
+      "type": "tool",
+      "degree": 3
+    },
+    {
+      "id": "n20",
+      "name": "worktree workflow",
+      "type": "concept",
+      "degree": 4
+    },
+    {
+      "id": "n21",
+      "name": "Joe",
+      "type": "person",
+      "degree": 2
+    },
+    {
+      "id": "n22",
+      "name": "token usage",
+      "type": "concept",
+      "degree": 4
+    },
+    {
+      "id": "n23",
+      "name": "MCP",
+      "type": "concept",
+      "degree": 2
+    },
+    {
+      "id": "n24",
+      "name": "gemma-4-E4B",
+      "type": "model",
+      "degree": 2
+    },
+    {
+      "id": "n25",
+      "name": "qwen-2.5-32b",
+      "type": "model",
+      "degree": 1
+    }
+  ],
+  "edges": [
+    {
+      "src": "n2",
+      "dst": "n3",
+      "rel_type": "MAINTAINS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n8",
+      "rel_type": "MAINTAINS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n9",
+      "rel_type": "MAINTAINS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n10",
+      "rel_type": "MAINTAINS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n11",
+      "rel_type": "FOUNDED",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n21",
+      "dst": "n11",
+      "rel_type": "ADVISES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n21",
+      "rel_type": "KNOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n4",
+      "rel_type": "USES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n12",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n20",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n12",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n20",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n9",
+      "dst": "n20",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n10",
+      "dst": "n20",
+      "rel_type": "FOLLOWS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n8",
+      "rel_type": "TALKS_TO",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n9",
+      "rel_type": "TALKS_TO",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n10",
+      "rel_type": "TALKS_TO",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n1",
+      "dst": "n13",
+      "rel_type": "RUNS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n1",
+      "dst": "n14",
+      "rel_type": "RUNS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n6",
+      "dst": "n13",
+      "rel_type": "RUNS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n1",
+      "dst": "n5",
+      "rel_type": "PARTICIPATES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n6",
+      "dst": "n5",
+      "rel_type": "PARTICIPATES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n7",
+      "dst": "n5",
+      "rel_type": "PARTICIPATES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n1",
+      "dst": "n19",
+      "rel_type": "REACHABLE_VIA",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n6",
+      "dst": "n19",
+      "rel_type": "REACHABLE_VIA",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n7",
+      "dst": "n19",
+      "rel_type": "REACHABLE_VIA",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n15",
+      "rel_type": "STORES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n15",
+      "dst": "n16",
+      "rel_type": "EXTENDS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n17",
+      "dst": "n16",
+      "rel_type": "INDEXED_BY",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n18",
+      "dst": "n16",
+      "rel_type": "INDEXED_BY",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n10",
+      "dst": "n17",
+      "rel_type": "BUILDS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n10",
+      "dst": "n18",
+      "rel_type": "BUILDS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n17",
+      "rel_type": "QUERIES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n18",
+      "rel_type": "QUERIES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n13",
+      "dst": "n24",
+      "rel_type": "SERVES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n13",
+      "dst": "n25",
+      "rel_type": "SERVES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n14",
+      "dst": "n24",
+      "rel_type": "SERVES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n8",
+      "dst": "n23",
+      "rel_type": "EXPOSES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n23",
+      "rel_type": "CONSUMES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n22",
+      "dst": "n8",
+      "rel_type": "MEASURED_BY",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n3",
+      "dst": "n22",
+      "rel_type": "DISPLAYS",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n1",
+      "dst": "n22",
+      "rel_type": "ATTRIBUTED_TO",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n6",
+      "dst": "n22",
+      "rel_type": "ATTRIBUTED_TO",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n1",
+      "rel_type": "OPERATES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n2",
+      "dst": "n6",
+      "rel_type": "OPERATES",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n9",
+      "dst": "n15",
+      "rel_type": "STORES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    },
+    {
+      "src": "n10",
+      "dst": "n15",
+      "rel_type": "STORES_IN",
+      "confidence": 0.9,
+      "created_at": "2026-08-01T00:00:00Z"
+    }
+  ],
+  "stats": {
+    "node_count": 135,
+    "edge_count": 210,
+    "max_degree": 11,
+    "min_degree": 1,
+    "created_min": "2026-05-02T00:00:00Z",
+    "created_max": "2026-08-16T00:00:00Z"
+  }
+}

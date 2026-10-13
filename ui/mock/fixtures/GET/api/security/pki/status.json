@@ -1,0 +1,11 @@
+{
+  "configured": true,
+  "ca_exists": true,
+  "summary": { "total": 4, "ok": 3, "expiring": 1, "expired": 0 },
+  "certs": [
+    { "name": "pai-ca", "role": "ca", "subject": "CN=PAI Root CA", "issued": "2025-06-01", "expires": "2030-06-01", "days_left": 1400, "status": "ok" },
+    { "name": "gateway", "role": "gateway", "subject": "CN=pai-controller.example.ts.net", "issued": "2026-05-01", "expires": "2026-08-20", "days_left": 19, "status": "expiring" },
+    { "name": "prime-01", "role": "node", "subject": "CN=prime-01", "issued": "2026-05-01", "expires": "2027-05-01", "days_left": 273, "status": "ok" },
+    { "name": "atlas-02", "role": "node", "subject": "CN=atlas-02", "issued": "2026-05-01", "expires": "2027-05-01", "days_left": 273, "status": "ok" }
+  ]
+}

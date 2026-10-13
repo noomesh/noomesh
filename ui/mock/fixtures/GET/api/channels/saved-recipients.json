@@ -1,0 +1,7 @@
+{
+  "recipients": [
+    { "id": "r-1a2b", "channel": "google_chat", "display_name": "Engineering", "recipient_id": "spaces/AAAAxxxxBBBB", "notes": "Daily standups space", "is_default": true },
+    { "id": "r-3c4d", "channel": "telegram", "display_name": "Alice (DM)", "recipient_id": "5512345678", "notes": null, "is_default": false },
+    { "id": "r-5e6f", "channel": "google_chat", "display_name": "Ops Alerts", "recipient_id": "spaces/CCCCyyyyDDDD", "notes": "On-call escalations", "is_default": false }
+  ]
+}

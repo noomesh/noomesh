@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Publish the harrier embedder artifact as an OCI image:
+#   ghcr.io/noomesh/harrier:v1  (+ :latest)
+# Three files from the `models-harrier-v1` release (GGUF, Modelfile,
+# sha256), FROM scratch, no runtime. `noo onboard` / `noo migrate import`
+# `docker create` + `docker cp` them out — the registry the stack already
+# logs into, so a fresh host needs no `gh` and no second credential.
+name: publish harrier artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "release tag holding the three files"
+        default: models-harrier-v1
+        required: true
+      image_tag:
+        description: "image tag to publish"
+        default: v1
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: noomesh
+
+jobs:
+  publish:
+    if: github.repository == 'noomesh/noomesh'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rm -rf harrier && mkdir harrier && cd harrier
+          gh release download "${{ github.event.inputs.release }}" -R "${{ github.repository }}" \
+            -p harrier-Q4_K_M.gguf -p harrier.Modelfile -p harrier.sha256
+          sha256sum -c harrier.sha256
+          cat > Dockerfile <<'DF'
+          FROM scratch
+          COPY harrier-Q4_K_M.gguf harrier.Modelfile harrier.sha256 /harrier/
+          CMD ["/harrier/harrier.Modelfile"]
+          DF
+      - name: Registry login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      - name: Build + push
+        run: |
+          set -eux
+          cd harrier
+          docker build -t "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}" -t "$REGISTRY/$OWNER/harrier:latest" .
+          docker push "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}"
+          docker push "$REGISTRY/$OWNER/harrier:latest"
+          docker manifest inspect "$REGISTRY/$OWNER/harrier:${{ github.event.inputs.image_tag }}" >/dev/null
+      - name: Clean up
+        if: always()
+        run: rm -rf harrier

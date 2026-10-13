@@ -1,0 +1,9 @@
+{
+  "running": true,
+  "paused": false,
+  "queue_depth": 1,
+  "active_jobs": 1,
+  "drained_nodes": [],
+  "background_queue_depth": 0,
+  "history_size": 40
+}

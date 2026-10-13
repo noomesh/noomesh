@@ -1,0 +1,6 @@
+[
+  { "doc_id": "d-1a2b", "title": "Cluster health runbook", "source_uri": "/docs/runbooks/cluster-health.md", "created_at": "2026-08-01T10:00:00Z" },
+  { "doc_id": "d-2c3d", "title": "PAI architecture overview", "source_uri": "https://internal/arch.pdf", "created_at": "2026-07-30T14:20:00Z" },
+  { "doc_id": "d-3e4f", "title": "Slate design tokens", "source_uri": "packages/tokens/tokens.css", "created_at": "2026-07-29T09:00:00Z" },
+  { "doc_id": "d-4g5h", "title": "NATS delegation protocol", "source_uri": "/docs/nats-messaging.md", "created_at": "2026-07-28T16:45:00Z" }
+]

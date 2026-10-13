@@ -1,0 +1,14 @@
+{
+  "name": "@metis/tokens",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Slate design tokens for the noomesh UI — the Instrument palette as CSS variables (web) and JS objects (mobile).",
+  "exports": {
+    ".": "./src/slate.ts",
+    "./tokens.css": "./src/tokens.css"
+  },
+  "main": "./src/slate.ts",
+  "types": "./src/slate.ts"
+}

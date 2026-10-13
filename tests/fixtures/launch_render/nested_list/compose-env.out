@@ -1,0 +1,1 @@
+!ERR FOO is a list, not a scalar — compose_env is a flat map of ENV_VAR: value

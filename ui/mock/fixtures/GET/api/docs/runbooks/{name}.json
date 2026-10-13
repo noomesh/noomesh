@@ -1,0 +1,4 @@
+{
+  "name": "generic",
+  "markdown": "# Runbook\n\nThe templated fallback: any runbook without its own fixture lands here, so\nclicking a second card proves the panel *refetches* rather than showing the\nfirst one again.\n\n- `docker-stack` has a fixture of its own with richer markup.\n- Everything else gets this.\n\nSee `mock/fixtures/GET/api/docs/runbooks/` to add more.\n"
+}

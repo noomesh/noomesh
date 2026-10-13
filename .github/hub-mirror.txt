@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Docker Hub images our CI and image builds pull, mirrored into GHCR by
+# .github/workflows/mirror-hub-images.yml (scripts/hub-mirror.py sync).
+#
+# Why: every self-hosted runner sits behind one home IP, and Docker Hub's
+# anonymous pull limit is per IP. On 2026-10-09 rust-gateway, noo-cli and
+# standalone-smoke failed four attempts in a row on "toomanyrequests" pulling
+# rust:1-bookworm.
+#
+# One row per image: the FULL Docker Hub path (official images under
+# `library/`), `:tag`, and optionally `@sha256:` when the consumer pins a
+# digest. It is mirrored to <prefix>/<same path>:<tag>, so a consumer switches
+# between the mirror and Hub by swapping ONE prefix: `<prefix>` (default
+# ghcr.io/<owner>/mirror, repo variable HUB_MIRROR) or `docker.io`.
+#
+# tests/test_hub_mirror.py fails when a Dockerfile FROMs, or a workflow runs,
+# a Docker Hub image that is not listed here.
+#
+# source                                                       consumers
+library/rust:1-bookworm                                        scripts/cargo-docker.sh (ci.yml rust-gateway, noo-cli, standalone-smoke)
+library/python:3.12-slim                                       Dockerfile (ci.yml build)
+library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b  docker/Dockerfile.whisper, docker/Dockerfile.piper
+library/alpine:3.19                                            docker/Dockerfile.stunnel
+library/alpine:3.22                                            docker/Dockerfile.node-agent-prebuilt, docker/Dockerfile.node-agent-go (gcompat stage)
+library/alpine:latest                                          workspace-reclaim steps (`docker run alpine`, before checkout; local image first)
+nvidia/cuda:12.2.0-base-ubuntu22.04                            docker/Dockerfile.nvidia-exporter
+pgvector/pgvector:pg16                                         CI `services:` postgres
+pgvector/pgvector:pg18                                         noomesh ci.yml `services:` (today via mirror-images.yml's ghcr.io/<owner>/pgvector:pg18)

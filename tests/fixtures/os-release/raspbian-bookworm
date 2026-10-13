@@ -1,0 +1,6 @@
+PRETTY_NAME="Raspbian GNU/Linux 12 (bookworm)"
+NAME="Raspbian GNU/Linux"
+VERSION_ID="12"
+VERSION_CODENAME=bookworm
+ID=raspbian
+ID_LIKE=debian

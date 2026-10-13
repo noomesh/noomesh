@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO noo_kb_role_grants (username, roles, updated_by) VALUES ($1, $2, $3) ON CONFLICT (username) DO UPDATE SET roles = $2, updated_at = now(), updated_by = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3ff844443fc77412095cdae55b9a3306c301be43f1b1ca4ffdc94feb38639a5b"
+}

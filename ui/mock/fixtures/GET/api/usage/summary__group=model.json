@@ -1,0 +1,35 @@
+{
+  "window": "2026-08",
+  "group": "model",
+  "totals": {
+    "prompt_tokens": 4812366,
+    "completion_tokens": 1233907,
+    "requests": 18442
+  },
+  "rows": [
+    {
+      "key": "qwen-2.5-32b-instruct",
+      "prompt_tokens": 2510330,
+      "completion_tokens": 640118,
+      "requests": 8842
+    },
+    {
+      "key": "llama-3.1-70b-instruct",
+      "prompt_tokens": 1402884,
+      "completion_tokens": 401220,
+      "requests": 5310
+    },
+    {
+      "key": "claude-sonnet-4",
+      "prompt_tokens": 614900,
+      "completion_tokens": 150119,
+      "requests": 2604
+    },
+    {
+      "key": "nomic-embed-text",
+      "prompt_tokens": 284252,
+      "completion_tokens": 42450,
+      "requests": 1686
+    }
+  ]
+}

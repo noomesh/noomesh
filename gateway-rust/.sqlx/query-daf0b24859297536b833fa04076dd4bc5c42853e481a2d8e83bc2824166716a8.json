@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM noo_heartbeat_run_prune_staging WHERE staged_at < NOW() - make_interval(days => $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "daf0b24859297536b833fa04076dd4bc5c42853e481a2d8e83bc2824166716a8"
+}

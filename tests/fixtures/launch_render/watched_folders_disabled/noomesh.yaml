@@ -1,0 +1,5 @@
+watched_folders:
+  enabled: false
+  folders:
+    - host: /home/op/docs
+      mount: /data/docs

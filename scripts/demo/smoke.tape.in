@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# Toolchain check for the onboarding film: the same settings, the same
+# Hide/Show/Wait mechanics and the same masking pipeline as onboarding.tape.in,
+# over harmless commands (a fake `noo` that prints made-up sensitive values).
+# If this renders a GIF and an MP4 and the recorder's leak check passes, vhs,
+# ttyd, ffmpeg, perl and the masker all work. record-onboarding.sh --smoke runs it.
+
+Output demo-out/smoke.gif
+Output demo-out/smoke.mp4
+
+Set Shell "bash"
+Set FontSize 20
+Set Width 1000
+Set Height 500
+Set Padding 24
+Set Theme "Catppuccin Mocha"
+Set WindowBar Colorful
+Set BorderRadius 10
+Set Framerate 30
+Set TypingSpeed 38ms
+Set WaitPattern /\$$/
+Set WaitTimeout 60s
+
+Hide
+Type "@ENTER@" Enter
+# docker exec -it flushes keys typed before it has the terminal: give it a moment (this is off camera)
+Sleep 3s
+Type `PS1='\[\e[1;32m\]you@server\[\e[0m\]:\[\e[1;34m\]~\[\e[0m\]\$ '` Enter
+# Record the exit status of every command typed into the film (read by the recorder).
+Type `PROMPT_COMMAND='echo "${PIPESTATUS[*]}" >> "@EXIT_LOG@"'` Enter
+Type `export NOO_DEMO_HOSTNAME="$(hostname)" NOO_DEMO_MASK_NAMES="peerbox"` Enter
+Type `noo() { printf 'this box: node %s at 10.1.2.3, controller https://ctl.fake-tailnet.ts.net, peer peerbox at 10.1.2.4 (mail %s)\n' "$NOO_DEMO_HOSTNAME" person@mail.test | tee -a "@RAW_LOG@" | "@MASK@" | tee -a "@MASKED_LOG@"; return ${PIPESTATUS[0]}; }` Enter
+Type "clear" Enter
+Show
+
+Sleep 500ms
+Type "# smoke test: the output below is masked" Enter
+Type "noo cluster status" Enter
+Wait
+Type "sleep 2 && echo done" Enter
+Wait
+Sleep 1500ms

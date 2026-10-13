@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Public-repo leak scan: generic patterns only (secret shapes, private keys,
+# tailnet / LAN addresses, tailnet hostnames, real home paths, key/env files).
+# No secrets, no private repository access. Copy this file and
+# scripts/public-leak-scan.sh unchanged into another public repository, or call
+# it from there:
+#
+#   jobs:
+#     leak-scan:
+#       uses: noomesh/noomesh/.github/workflows/public-leak-scan.yml@<full SHA>
+name: public-leak-scan
+
+# It is a TEMPLATE: noomesh itself is a networking product whose tests name LAN
+# addresses and home paths on purpose, so here it runs only on demand
+# (workflow_dispatch) and when called. A repo that wants it on every PR adds
+# `pull_request:` to its own copy.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Scan the tree
+        run: bash scripts/public-leak-scan.sh .

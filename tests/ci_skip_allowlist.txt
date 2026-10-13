@@ -1,0 +1,97 @@
+# ci_skip_allowlist.txt — every skip the CI pytest job (`pytest tests/ -v
+# --cov=noomesh --cov-report=xml`, .github/workflows/ci.yml) is allowed to
+# have, and why. Enforced by tests/_ci_skip_guard.py (see
+# docs/development/developer-guide.md, "A skip in CI must be explained").
+#
+# Format, one entry per line:
+#   <glob on nodeid> | <regex on skip reason> | <justification>
+# `#` comments and blank lines are ignored. All three fields are required.
+#
+# An entry that matches nothing in a FULL `pytest tests -q` run (no -k, no
+# -m, no narrowed path args) is treated as STALE and fails the session —
+# this list is meant to track real, currently-skipping tests, not to become
+# a blanket exemption nobody revisits.
+#
+# Seeded from PR #551's CI test job (84 skipped) — categories cross-checked
+# against each test file's own skip condition below.
+#
+# NOTE: tests/test_launch_render_parity.py is deliberately NOT listed here.
+# A parallel change is making it run for real in CI (build the noo-cli
+# debug binary the test needs); once that lands it must not skip, and if it
+# does, that is exactly the kind of silent-guard regression this file
+# exists to catch — do not add an entry to paper over it.
+
+# ── integration/*: every integration test needs a live gateway/node-agent,
+# which the CI pytest job never starts (it's a unit-test job; integration
+# coverage lives elsewhere). All of these gate on an env var
+# (NOO_GATEWAY_URL / NOO_NODE_AGENT_URL) or a host tool (npx) that CI does
+# not provide, and fail closed (skip) rather than silently no-op.
+tests/integration/test_mcp_external_door.py::* | .* | needs a live PAI gateway (NOO_GATEWAY_URL); CI's pytest job is unit-only and starts no gateway.
+tests/integration/test_mcp_filesystem.py::* | .* | needs a live PAI gateway (NOO_GATEWAY_URL) and/or npx on PATH for the filesystem MCP server; CI's pytest job provides neither.
+tests/integration/test_node_agent.py::* | .* | needs a live node-agent (NOO_NODE_AGENT_URL) and/or gateway (NOO_GATEWAY_URL); CI's pytest job starts neither.
+tests/integration/test_persona_e2e.py::* | .* | needs a live gateway with seeded personas (NOO_GATEWAY_URL); CI's pytest job starts no gateway.
+tests/integration/test_smoke_autonomy.py::* | .* | needs a live gateway with autonomy running; CI's pytest job starts no gateway.
+
+# ── test_pki_rotation.py: written ahead of the implementation. ClusterCA
+# does not yet have get_cert_info / rotate_gateway_cert / CRL support /
+# passphrase support (see the feature-detect skipif marks at the top of the
+# file). This entry must come OUT once those land — at that point the
+# feature-detect condition flips and the tests run for real; if they still
+# skip after that, this allow-list entry going stale (matching nothing) is
+# what will catch it.
+tests/test_pki_rotation.py::* | not implemented yet | ClusterCA features (get_cert_info/rotate_gateway_cert/CRL/passphrase) are not implemented yet; remove this entry when they land.
+
+
+# ── test_rotate_passphrase_preserves_the_store.py: needs the host `sops`
+# and `age` binaries, which are not installed in the CI pytest job's image.
+tests/test_rotate_passphrase_preserves_the_store.py::* | not installed on this host | needs the host sops/age binaries, not installed in the CI test image.
+
+# ── test_addon_declares_its_grant.py: compares this repo's add-on
+# declaration against a sibling evolve add-on checkout, which CI's single-repo
+# workspace does not have.
+tests/test_addon_declares_its_grant.py::* | no evolve add-on checkout beside this one | compares against a sibling evolve add-on checkout that CI's single-repo workspace does not have.
+
+# ── test_file_reader_parity.py: the add-on readers' manifests
+# (each add-on's own secret_env reader)
+# are pinned in the test and re-read from a sibling checkout when one sits
+# beside this repo; CI's single-repo workspace has none.
+tests/test_file_reader_parity.py::test_the_pinned_add_on_manifests_match_the_sibling_checkouts* | no pai-[a-z-]+ checkout beside this one carries | re-reads the add-on reader manifests from sibling add-on checkouts that CI's single-repo workspace does not have; the pins themselves are checked by every run.
+
+# ── test_addon_doors_are_mtls.py: the evolve SERVER half of the add-on mTLS
+# door lives in the evolve add-on; the noomesh half
+# (manifest https, overlay material, cluster_client) runs everywhere.
+tests/test_addon_doors_are_mtls.py::test_the_evolve_server_requires_a_client_certificate | NOO_EVOLVE_PATH names no evolve add-on checkout | reads the add-on's TLS listener source from a checkout CI's single-repo workspace does not have; the add-on's own tests cover it there.
+
+# ── test_cloud_providers.py: exercises optional cloud SDKs (anthropic,
+# openai, google-generativeai) that only install under the `[cloud]` extra,
+# which the CI job's `pip install -e ".[trellion,dev,web,cache]"` does not
+# request.
+tests/test_cloud_providers.py::* | SDK not installed | optional cloud SDKs (anthropic/openai/google-generativeai) install under the [cloud] extra, which CI's pytest job does not install.
+
+# ── test_launcher_bind_sources.py end-to-end cases: run the real `noo`
+# debug binary against a scratch compose project, and CI's pytest job does
+# not build noo-cli. The same four cases run as Rust unit tests in the
+# noo-cli job (commands::bind_sources::tests), and the shell glue and the
+# every-`up`-is-guarded check in this file run in CI without skipping.
+tests/test_launcher_bind_sources.py::test_e2e_* | needs the debug noo | the checker logic is proven by commands::bind_sources unit tests in the noo-cli CI job; only this real-binary replay needs a local cargo build.
+
+# ── test_launcher_system_credentials.py end-to-end cases:
+# replay `check_system_credentials` through the real `noo` debug binary,
+# which CI's pytest job does not build. The decision is unit-tested in the
+# noo-cli job (commands::systems::launch_check_tests); the guard and glue
+# cases in the same file run in CI without skipping.
+tests/test_launcher_system_credentials.py::test_e2e_* | needs the debug noo | the launch-check decision is proven by commands::systems::launch_check_tests in the noo-cli CI job; only this real-binary replay needs a local cargo build.
+# ── test_launcher_secrets_at_rest.py end-to-end cases: run
+# the real `noo` debug binary's `config launch-check secrets-at-rest` against
+# a scratch install; CI's pytest job does not build noo-cli. The same cases
+# (planted secret, non-sops backend, host8's key set) run as Rust unit tests
+# in the noo-cli job (commands::plaintext_env::tests); the guard and the
+# shell glue in this file run in CI without skipping.
+tests/test_launcher_secrets_at_rest.py::test_e2e_* | needs the debug noo | the criterion is proven by commands::plaintext_env unit tests in the noo-cli CI job; only this real-binary replay needs a local cargo build.
+
+
+
+# ── worker_pool retrieval tracker, real trellion-intel add-on: needs the private
+# trellion_intel package importable. The seam-level behaviour (skip / init /
+# warn) is covered by the faked-seam tests in the same file, which always run.
+tests/test_worker_pool_startup_warnings.py::test_real_intel_tier_tracker_initialises | no provider-capable trellion with an Intelligent-tier add-on installed | initialises the real tracker through the real add-on role seam; CI's public pytest job has no Intelligent-tier add-on. The faked-seam tests beside it run everywhere.

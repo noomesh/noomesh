@@ -1,0 +1,53 @@
+{
+  "nodes": [
+    {
+      "id": "prime-01",
+      "hostname": "prime-01",
+      "ip": "192.0.2.84",
+      "ip_address": "192.0.2.84",
+      "tier": 1,
+      "gpu_model": "RTX 4090",
+      "vram_gb": 24,
+      "cpu_cores": 32,
+      "ram_gb": 128,
+      "is_arm": false,
+      "backends": ["vllm", "ollama"],
+      "running_backends": { "vllm": "llama-3.1-70b" },
+      "status": "online",
+      "last_heartbeat": "2026-08-01T14:22:05Z"
+    },
+    {
+      "id": "atlas-02",
+      "hostname": "atlas-02",
+      "ip": "192.0.2.22",
+      "ip_address": "192.0.2.22",
+      "tier": 2,
+      "gpu_model": "RTX 3090",
+      "vram_gb": 24,
+      "cpu_cores": 24,
+      "ram_gb": 64,
+      "is_arm": false,
+      "backends": ["vllm"],
+      "running_backends": { "vllm": "qwen-2.5-32b" },
+      "status": "busy",
+      "last_heartbeat": "2026-08-01T14:22:07Z"
+    },
+    {
+      "id": "companion-07",
+      "hostname": "companion-07",
+      "ip": "192.0.2.51",
+      "ip_address": "192.0.2.51",
+      "tier": 5,
+      "gpu_model": "",
+      "vram_gb": 0,
+      "cpu_cores": 6,
+      "ram_gb": 8,
+      "is_arm": true,
+      "backends": [],
+      "running_backends": {},
+      "status": "offline",
+      "last_heartbeat": "2026-08-01T14:18:00Z"
+    }
+  ],
+  "stats": { "total_nodes": 3, "online": 1, "busy": 1, "offline": 1 }
+}

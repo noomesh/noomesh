@@ -1,0 +1,76 @@
+[Unit]
+Description=PAI Node Agent — cluster node management
+Documentation=https://github.com/noomesh/noomesh
+After=network-online.target docker.service
+Wants=network-online.target
+
+# Rate-limit by SPACING restarts, not by giving up on them.
+#
+# StartLimit* live in [Unit], NOT [Service]: systemd ignores them in [Service] and says so on every load:
+#
+#   /etc/systemd/system/noo-node-agent.service:13: Unknown key name
+#   'StartLimitIntervalSec' in section 'Service', ignoring.
+#
+# The warning scrolls past in the journal and the unit still starts, so the
+# only visible effect was the intended rate limit not applying — the default
+# (5 starts / 10s) governed instead of 5 / 60s. That matters exactly when it
+# is least convenient: an agent crash-looping on a bad config during a
+# cutover, restarting faster than anyone can read the logs.
+#
+# Once fixed, though, the limit did something worse than nothing. Five
+# failures inside a minute put the unit in `failed` and systemd STOPS
+# TRYING — permanently. That terminal state is precisely what the
+# controller's `revive_node` path existed to clear, by SSHing in and
+# running `systemctl restart`. A node's recovery depended on an inbound
+# privileged path, which is exactly the reach the mesh is removing
+# (by design, the controller has no sudo mode on the nodes).
+#
+# So: no burst limit, and a restart delay long enough to keep the original
+# intent. RestartSec=30 caps the agent at two starts a minute — the same
+# ceiling 5/60s was reaching for — but it never lands in a state only a
+# human or an inbound SSH session can leave. A crash-looping agent is
+# readable in the journal AND still trying when whatever broke is fixed.
+StartLimitBurst=0
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noo-node-agent
+# `always`, not `on-failure`: a clean exit(0) the agent did not intend --
+# an unhandled shutdown path, a config reader that returns instead of
+# erroring -- left the node silent with nothing to restart it. There is no
+# exit code this unit should treat as "meant to stay down"; stopping the
+# agent deliberately is `systemctl stop`, which Restart= does not override.
+Restart=always
+RestartSec=30
+
+# Environment (override via /etc/noo-node-agent.env)
+EnvironmentFile=-/etc/noo-node-agent.env
+
+# Identity: the agent is NOT root.
+#
+# This said `User=root` with a comment claiming GPU nodes need root for
+# nvidia-smi. Probed false on a real GPU node: /dev/nvidia*
+# are 0666 and `nvidia-smi` returns the GPU fine for an unprivileged system
+# account. The docker group covers backend management; everything else the
+# agent touches is provisioned to noo-agent by the installer:
+#   /etc/noo/pki            read  (root:noo-agent, dirs 750 / files 640)
+#   /var/lib/noo-node-agent write (spool + staging; worker-hostd, which IS
+#                                  root, reads the spool and does the swap)
+#   NOO_DATA_ROOT           write (model/cache downloads)
+# Port 8081 is unprivileged. Root remains only inside noo-hostd — no
+# listener, file spool, fixed op list — which is the §6 division of labor.
+NoNewPrivileges=true
+User=noo-agent
+SupplementaryGroups=docker
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noo-node-agent
+
+# Docker socket access
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

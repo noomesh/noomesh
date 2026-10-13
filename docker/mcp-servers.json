@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "noo-tools": {
+      "command": "python",
+      "args": ["-m", "noomesh.mcp.server"]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+addons:
+  a: true
+  b: false
+  c: 1
+  d: 0
+  e: ""
+  f: yes
+  g: null

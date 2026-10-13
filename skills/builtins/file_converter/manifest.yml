@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: file_converter
+version: 1.0.0
+description: Convert between file formats (Markdown to HTML, CSV to JSON, JSON to YAML, etc.).
+author: noo-builtin
+
+inputs:
+  content:
+    type: string
+    required: true
+    description: The file content to convert
+  from_format:
+    type: string
+    required: true
+    description: "Source format: markdown, csv, json, yaml, html, text"
+  to_format:
+    type: string
+    required: true
+    description: "Target format: markdown, csv, json, yaml, html, text"
+
+outputs:
+  converted:
+    type: string
+    description: The converted content
+  format:
+    type: string
+    description: The output format used
+
+container:
+  image: noo-sandbox-base:latest
+  command: ["python", "/skill/run.py"]
+  timeout: 30
+  memory_limit: 128m
+  network: none
+  gpu: false
+
+permissions:
+  filesystem: none
+  network: none
+  shell: false

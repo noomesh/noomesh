@@ -1,0 +1,601 @@
+{
+ "ui_paths": {
+  "/api/addons/<id>/console-piece": [
+   "apps/web/src/features/addons/useConsolePieces.ts"
+  ],
+  "/api/addons/{addon_id}/console-piece": [
+   "apps/web/src/features/addons/useConsolePieces.ts"
+  ],
+  "/api/alerts/clients": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/approval/pending": [
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/approval/stats": [
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/approval/{request_id}/approve": [
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/approval/{request_id}/deny": [
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/auth/logout": [
+   "packages/api/src/authApi.ts"
+  ],
+  "/api/auth/refresh": [
+   "packages/api/src/auth.ts"
+  ],
+  "/api/autonomy/decisions": [
+   "apps/web/src/features/autonomy/AutonomyPanel.tsx"
+  ],
+  "/api/autonomy/locations/{name}/toggle": [
+   "apps/web/src/features/autonomy/AutonomyPanel.tsx"
+  ],
+  "/api/autonomy/status": [
+   "apps/web/src/features/autonomy/AutonomyPanel.tsx"
+  ],
+  "/api/channels/saved-recipients": [
+   "apps/web/src/features/channels/useChannels.ts"
+  ],
+  "/api/channels/saved-recipients/{recipient_db_id}": [
+   "apps/web/src/features/channels/useChannels.ts"
+  ],
+  "/api/channels/status": [
+   "apps/web/src/features/channels/useChannels.ts"
+  ],
+  "/api/channels/test": [
+   "apps/web/src/features/channels/useChannels.ts"
+  ],
+  "/api/cluster/backends": [
+   "apps/web/src/features/backends/useBackends.ts"
+  ],
+  "/api/cluster/backends/start": [
+   "apps/web/src/features/backends/useBackends.ts"
+  ],
+  "/api/cluster/gpu-metrics": [
+   "apps/web/src/features/observability/useObservability.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/cluster/nodes": [
+   "apps/web/src/features/cluster/useClusterNodes.ts",
+   "packages/api/src/client.ts"
+  ],
+  "/api/cluster/proposals": [
+   "apps/web/src/features/proposals/useProposals.ts"
+  ],
+  "/api/cluster/proposals/decide": [
+   "apps/web/src/features/proposals/useProposals.ts"
+  ],
+  "/api/cluster/status": [
+   "apps/web/src/features/brain-map/useBrainStatus.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/conversations/stats/overview": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/conversations/stats/tools": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/docs/openapi": [
+   "apps/web/src/features/docs/useRunbooks.ts"
+  ],
+  "/api/docs/runbooks": [
+   "apps/web/src/features/docs/useRunbooks.ts"
+  ],
+  "/api/docs/runbooks/{name}": [
+   "apps/web/src/features/docs/useRunbooks.ts"
+  ],
+  "/api/events/stream": [
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/heartbeat/status": [
+   "apps/web/src/features/tasks/useTasks.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/heartbeat/tasks": [
+   "apps/web/src/features/tasks/useTasks.ts"
+  ],
+  "/api/heartbeat/tasks/{task_id}": [
+   "apps/web/src/features/tasks/useTasks.ts"
+  ],
+  "/api/heartbeat/tasks/{task_id}/run": [
+   "apps/web/src/features/tasks/useTasks.ts"
+  ],
+  "/api/heartbeat/tasks/{task_id}/toggle": [
+   "apps/web/src/features/tasks/useTasks.ts"
+  ],
+  "/api/jobs": [
+   "apps/web/src/features/jobs/useJobs.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/jobs/submit": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/jobs/{job_id}": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/kiosk/addons": [
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/kiosk/graph": [
+   "apps/web/src/kiosk/GraphKiosk.tsx",
+   "apps/web/src/kiosk/store.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/logs/docker-stats": [
+   "apps/web/src/features/observability/useObservability.ts"
+  ],
+  "/api/memory/embed/start": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/memory/embed/status": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/memory/embed/stop": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/memory/health": [
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/memory/storage-stats": [
+   "apps/web/src/features/memory/useMemory.ts"
+  ],
+  "/api/models/cache": [
+   "apps/web/src/features/backends/useBackends.ts"
+  ],
+  "/api/models/cached": [
+   "apps/web/src/features/backends/useBackends.ts"
+  ],
+  "/api/monitoring/grafana-session": [
+   "apps/web/src/features/observability/useGrafanaSession.ts"
+  ],
+  "/api/scheduler/drain/{node_id}": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/scheduler/pause": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/scheduler/resume": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/scheduler/status": [
+   "apps/web/src/features/jobs/useJobs.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/scheduler/undrain/{node_id}": [
+   "apps/web/src/features/jobs/useJobs.ts"
+  ],
+  "/api/security/bootstrap-tokens": [
+   "apps/web/src/features/cluster/useMintBootstrapToken.ts"
+  ],
+  "/api/security/pki/status": [
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/security/service-keys/self": [
+   "apps/web/src/features/account/useMcpKey.ts"
+  ],
+  "/api/security/service-keys/self/revoke": [
+   "apps/web/src/features/account/useMcpKey.ts"
+  ],
+  "/api/security/violations": [
+   "apps/web/src/features/brain-map/useBrainStatus.ts",
+   "apps/web/src/features/security/useSecurity.ts"
+  ],
+  "/api/settings/flags": [
+   "apps/web/src/features/admin/useAdmin.ts"
+  ],
+  "/api/settings/flags/set": [
+   "apps/web/src/features/admin/useAdmin.ts"
+  ],
+  "/api/terminal/backends/stop": [
+   "apps/web/src/features/backends/useBackends.ts"
+  ],
+  "/api/usage/summary": [
+   "apps/web/src/features/usage/useUsage.ts"
+  ],
+  "/api/users": [
+   "apps/web/src/features/admin/useAdmin.ts"
+  ],
+  "/api/v1/docs": [
+   "apps/web/src/features/rag/RagPanel.tsx"
+  ],
+  "/api/v1/docs/ingest": [
+   "apps/web/src/features/rag/RagPanel.tsx"
+  ],
+  "/api/v1/graph/clusters/overview": [
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/v1/graph/overview": [
+   "apps/web/src/features/graph/useGraph.ts"
+  ],
+  "/api/v1/graph/prune/restore": [
+   "apps/web/src/features/graph/usePrunes.ts"
+  ],
+  "/api/v1/graph/prune/staged": [
+   "apps/web/src/features/graph/usePrunes.ts"
+  ],
+  "/api/v1/graph/stats": [
+   "apps/web/src/features/graph/useGraph.ts"
+  ],
+  "/api/v1/ops/{id}": [
+   "packages/api/src/ops.ts"
+  ],
+  "/api/v1/rag/status": [
+   "apps/web/src/features/rag/RagPanel.tsx",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/v1/recall/status": [
+   "apps/web/src/features/explorer/ExplorerPanel.tsx"
+  ],
+  "/api/v1/settings/user-dirs": [
+   "apps/web/src/features/files/FilesPanel.tsx"
+  ],
+  "/auth/me": [
+   "packages/api/src/authApi.ts"
+  ],
+  "/auth/token": [
+   "packages/api/src/authApi.ts"
+  ],
+  "/health": [
+   "apps/web/src/features/addons/slots.ts",
+   "apps/web/src/features/addons/useConsolePieces.ts",
+   "apps/web/src/features/brain-map/useBrainStatus.ts",
+   "apps/web/src/features/observability/useObservability.ts",
+   "apps/web/src/kiosk/store.ts",
+   "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/v1/models": [
+   "apps/web/src/features/chat/useBackendHealth.ts"
+  ],
+  "/ws/coordinator": [
+   "apps/web/src/features/chat/useCoordinator.ts"
+  ]
+ },
+ "missing_from_openapi": [],
+ "missing_from_router": [],
+ "spec_paths_without_route": [],
+ "spec_unused_by_ui": [
+  "/",
+  "/.well-known/agent.json",
+  "/.well-known/jwks.json",
+  "/.well-known/oauth-authorization-server",
+  "/api/activities",
+  "/api/activities/{id}/complete",
+  "/api/activities/{id}/link-task",
+  "/api/activities/{id}/progress",
+  "/api/activities/{id}/status",
+  "/api/addon/token",
+  "/api/addons/{addon_id}/cli-piece",
+  "/api/agent/loops",
+  "/api/agent/run",
+  "/api/agents/collaborate",
+  "/api/agents/keys/review",
+  "/api/agents/keys/{agent}",
+  "/api/agents/messages",
+  "/api/agents/messages/{id}",
+  "/api/agents/messages/{id}/ack",
+  "/api/agents/peer/",
+  "/api/agents/peer/for-capability/{capability}",
+  "/api/agents/peer/register",
+  "/api/agents/peer/{agent_id}",
+  "/api/agents/peer/{agent_id}/task",
+  "/api/agents/presence",
+  "/api/agents/roles",
+  "/api/agents/threads",
+  "/api/agents/trust",
+  "/api/agents/trust/remove",
+  "/api/alerts/list",
+  "/api/approval/{request_id}/decide",
+  "/api/artifacts/manifest/{kind}/{name}",
+  "/api/autonomy/audit",
+  "/api/autonomy/disable",
+  "/api/autonomy/enable",
+  "/api/autonomy/locations",
+  "/api/cache/stats",
+  "/api/capability-router/status",
+  "/api/channels/send",
+  "/api/channels/{channel}/messages",
+  "/api/channels/{channel}/recipients",
+  "/api/cleanup/heartbeat-runs/restore",
+  "/api/cloud-providers/status",
+  "/api/cluster/backends/clear-cooldowns",
+  "/api/cluster/backends/stop",
+  "/api/cluster/bootstrap",
+  "/api/cluster/cli-asset/{name}",
+  "/api/cluster/delete-tailscale-device",
+  "/api/cluster/discover",
+  "/api/cluster/enroll-tailnet",
+  "/api/cluster/maintenance",
+  "/api/cluster/mint-join-key",
+  "/api/cluster/model-classes",
+  "/api/cluster/model-classes/{class}",
+  "/api/cluster/nodes/register",
+  "/api/cluster/nodes/{id}/forget",
+  "/api/cluster/nodes/{id}/heartbeat",
+  "/api/cluster/nodes/{id}/register",
+  "/api/cluster/nodes/{node_id}/clean",
+  "/api/cluster/nodes/{node_id}/config",
+  "/api/cluster/nodes/{node_id}/desired-config",
+  "/api/cluster/nodes/{node_id}/fit",
+  "/api/cluster/nodes/{node_id}/logs",
+  "/api/cluster/nodes/{node_id}/maintenance",
+  "/api/cluster/nodes/{node_id}/placements/{backend}",
+  "/api/cluster/nodes/{node_id}/pull",
+  "/api/cluster/nodes/{node_id}/restart-agent",
+  "/api/cluster/nodes/{node}/mcp/{id}/tools",
+  "/api/cluster/propose",
+  "/api/cluster/provision-bundle/{node}",
+  "/api/cluster/provision-bundle/{node}/status",
+  "/api/cluster/replication-status",
+  "/api/cluster/suggest-placement",
+  "/api/coding/task",
+  "/api/coding/tasks",
+  "/api/coding/tasks/{task_id}",
+  "/api/config",
+  "/api/config/{section}",
+  "/api/conversations",
+  "/api/conversations/feedback/export/dpo",
+  "/api/conversations/feedback/stats",
+  "/api/conversations/with-preview",
+  "/api/conversations/{conversation_id}",
+  "/api/conversations/{conversation_id}/feedback",
+  "/api/coordinator/context",
+  "/api/db/migrations",
+  "/api/db/migrations/apply",
+  "/api/exec-approval/status",
+  "/api/external/capabilities",
+  "/api/external/chat/completions",
+  "/api/external/classify",
+  "/api/external/embeddings",
+  "/api/external/inference",
+  "/api/external/models",
+  "/api/external/rerank",
+  "/api/external/usage",
+  "/api/grafana-ds/loki/{*path}",
+  "/api/grafana-ds/prometheus/{*path}",
+  "/api/harness/call",
+  "/api/heartbeat/actions",
+  "/api/heartbeat/artifacts",
+  "/api/heartbeat/history",
+  "/api/heartbeat/reload",
+  "/api/heartbeat/review-existing",
+  "/api/heartbeat/review-existing/approve",
+  "/api/heartbeat/schedule",
+  "/api/heartbeat/tasks/{task_id}/artifacts",
+  "/api/heartbeat/tasks/{task_id}/schedule",
+  "/api/identity/token",
+  "/api/inference",
+  "/api/inference/stream",
+  "/api/jobs/history",
+  "/api/jobs/{job_id}/reprioritize",
+  "/api/kb/grants",
+  "/api/kb/rules",
+  "/api/kb/teams",
+  "/api/kb/teams/create",
+  "/api/kb/teams/delete",
+  "/api/kiosk/gpus",
+  "/api/kiosk/heartbeat",
+  "/api/kiosk/jobs",
+  "/api/kiosk/memory",
+  "/api/kiosk/nodes",
+  "/api/kiosk/rag",
+  "/api/kiosk/scheduler",
+  "/api/kiosk/token/tailnet",
+  "/api/logs/containers",
+  "/api/logs/errors",
+  "/api/logs/node/{node_id}/{container}",
+  "/api/logs/query",
+  "/api/logs/search",
+  "/api/logs/status",
+  "/api/logs/tail",
+  "/api/mcp/servers",
+  "/api/mcp/servers/{id}",
+  "/api/mcp/servers/{id}/placements/{node}",
+  "/api/mcp/status",
+  "/api/memory/batch-index",
+  "/api/memory/cleanup",
+  "/api/memory/relationships/{record_id}",
+  "/api/memory/search",
+  "/api/memory/stats/{user_id}",
+  "/api/memory/status",
+  "/api/mesh/operations",
+  "/api/mesh/rebuild",
+  "/api/mesh/restart",
+  "/api/mesh/stack-rebuild",
+  "/api/mesh/status",
+  "/api/metrics/discover",
+  "/api/metrics/gauge",
+  "/api/metrics/increment",
+  "/api/metrics/query",
+  "/api/metrics/range",
+  "/api/models/pull",
+  "/api/ollama/models",
+  "/api/persona/",
+  "/api/persona/{persona_id}",
+  "/api/proactive/history",
+  "/api/proactive/rules",
+  "/api/proactive/rules/{rule_id}",
+  "/api/proactive/status",
+  "/api/prompt-skills",
+  "/api/prompt-skills/evolve",
+  "/api/prompt-skills/{name}",
+  "/api/prompt-skills/{name}/fitness",
+  "/api/prompt-skills/{name}/retire",
+  "/api/security/audit-history",
+  "/api/security/audit/stats",
+  "/api/security/audit/verify",
+  "/api/security/bootstrap-tokens/{id}/revoke",
+  "/api/security/channel-links/unlink",
+  "/api/security/channel-team-links/unlink",
+  "/api/security/erasure-archive",
+  "/api/security/kb-rules",
+  "/api/security/operator-certs/register",
+  "/api/security/operator-certs/revoke",
+  "/api/security/operator-token",
+  "/api/security/orgs",
+  "/api/security/pki/rotate-expiring",
+  "/api/security/posture",
+  "/api/security/posture/profile",
+  "/api/security/role-grants",
+  "/api/security/service-keys",
+  "/api/security/service-keys/scopes",
+  "/api/security/service-keys/{consumer}/quota",
+  "/api/security/service-keys/{consumer}/retire",
+  "/api/security/service-keys/{consumer}/revoke-and-disable",
+  "/api/security/service-keys/{consumer}/rotate",
+  "/api/security/teams",
+  "/api/security/teams/{team}",
+  "/api/security/teams/{team}/spaces",
+  "/api/security/user-proposals",
+  "/api/security/user-proposals/{id}",
+  "/api/security/user-proposals/{id}/decide",
+  "/api/security/users",
+  "/api/security/users/propose",
+  "/api/security/users/{username}/disable",
+  "/api/security/users/{username}/erase",
+  "/api/security/users/{username}/links",
+  "/api/security/users/{username}/org",
+  "/api/security/users/{username}/password",
+  "/api/security/users/{username}/role",
+  "/api/security/users/{username}/roles",
+  "/api/security/users/{username}/roles/revoke",
+  "/api/security/users/{username}/scopes",
+  "/api/settings",
+  "/api/settings/export",
+  "/api/skills/list",
+  "/api/skills/rescan",
+  "/api/skills/{skill_name}/info",
+  "/api/skills/{skill_name}/run",
+  "/api/snapshots",
+  "/api/snapshots/consolidate",
+  "/api/snapshots/diff",
+  "/api/snapshots/{snapshot_id}",
+  "/api/snapshots/{snapshot_id}/curriculum",
+  "/api/tags",
+  "/api/tasks",
+  "/api/tasks/inference",
+  "/api/tasks/submit",
+  "/api/tasks/{id}",
+  "/api/tasks/{id}/stop",
+  "/api/temporal/adaptations",
+  "/api/temporal/agent-self",
+  "/api/temporal/evolution",
+  "/api/temporal/facts",
+  "/api/temporal/projects",
+  "/api/temporal/user-profile/{user_id}",
+  "/api/terminal/backends",
+  "/api/terminal/ollama/create-claude-variant",
+  "/api/terminal/ollama/pull",
+  "/api/terminal/ollama/{model_name}",
+  "/api/tests/run",
+  "/api/tests/status",
+  "/api/tools/browser/action",
+  "/api/tools/browser/sessions",
+  "/api/tools/browser/sessions/start",
+  "/api/tools/browser/sessions/{session_id}/stop",
+  "/api/tools/browser/status",
+  "/api/tools/nodes/{node_id}",
+  "/api/tools/registry/raw",
+  "/api/users/disable",
+  "/api/users/proposals",
+  "/api/users/propose",
+  "/api/v1/admin/walks",
+  "/api/v1/device/{action}",
+  "/api/v1/docs/held",
+  "/api/v1/docs/hold",
+  "/api/v1/docs/purge",
+  "/api/v1/docs/unhold",
+  "/api/v1/graph/classify-intent",
+  "/api/v1/graph/clusters/audit",
+  "/api/v1/graph/entities",
+  "/api/v1/graph/entities/resolve",
+  "/api/v1/graph/entities/{entity_id}",
+  "/api/v1/graph/entities/{entity_id}/neighbors",
+  "/api/v1/graph/entity-cleanup",
+  "/api/v1/graph/explain-path",
+  "/api/v1/graph/extract-relations",
+  "/api/v1/graph/navigate",
+  "/api/v1/graph/recall-traversals",
+  "/api/v1/graph/recluster",
+  "/api/v1/graph/search-clusters",
+  "/api/v1/graph/semantic-search",
+  "/api/v1/graph/traverse",
+  "/api/v1/ingest/scan",
+  "/api/v1/ops",
+  "/api/v1/ops/types",
+  "/api/v1/rag/deduplicate",
+  "/api/v1/rag/ingest",
+  "/api/v1/rag/query",
+  "/api/v1/rag/retag",
+  "/api/v1/recall/archive",
+  "/api/v1/recall/archive-status",
+  "/api/v1/recall/lifecycle",
+  "/api/v1/recall/lifecycle-preview",
+  "/api/v1/recall/lifecycle-stats",
+  "/api/v1/recall/prominent",
+  "/api/v1/recall/refresh",
+  "/api/v1/recall/search",
+  "/api/v1/recall/videos",
+  "/api/v1/settings",
+  "/api/v1/settings/browse",
+  "/api/v1/settings/export",
+  "/api/v1/settings/preference",
+  "/api/v1/settings/restart-status",
+  "/api/v1/video-memory/archive",
+  "/api/v1/video-memory/archive-status",
+  "/api/v1/video-memory/lifecycle",
+  "/api/v1/video-memory/lifecycle-preview",
+  "/api/v1/video-memory/lifecycle-stats",
+  "/api/v1/video-memory/prominent",
+  "/api/v1/video-memory/refresh",
+  "/api/v1/video-memory/search",
+  "/api/v1/video-memory/status",
+  "/api/v1/video-memory/videos",
+  "/api/v1/walks",
+  "/api/v1/walks/settings",
+  "/api/v1/walks/stats",
+  "/api/v1/walks/{id}",
+  "/api/version",
+  "/api/voice/status",
+  "/api/voice/synthesize",
+  "/api/voice/transcribe",
+  "/api/voice/transcribe/detailed",
+  "/api/voice/voices",
+  "/api/workflows",
+  "/api/workflows/run",
+  "/auth/logout",
+  "/auth/refresh",
+  "/bootstrap",
+  "/bootstrap/apply",
+  "/bootstrap/bundle/{node}",
+  "/bootstrap/bundle/{node}/applied",
+  "/bootstrap/bundle/{node}/fetched",
+  "/bootstrap/ca.crt",
+  "/bootstrap/cli/{name}",
+  "/bootstrap/deenroll",
+  "/bootstrap/fetch",
+  "/bootstrap/prep",
+  "/dashboard",
+  "/favicon.ico",
+  "/kiosk",
+  "/kiosk.html",
+  "/mcp/operator",
+  "/mcp/user",
+  "/metrics",
+  "/tools/list",
+  "/tools/select",
+  "/ui/basic",
+  "/upload",
+  "/upload/{file_id}",
+  "/v1/chat/completions",
+  "/v1/models/{model_id}",
+  "/v1/responses",
+  "/ws/agent",
+  "/ws/collab"
+ ],
+ "proposed_calls": [],
+ "proposed_promote": [],
+ "proposed_stale": []
+}

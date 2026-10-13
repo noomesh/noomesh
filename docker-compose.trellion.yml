@@ -1,0 +1,508 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# docker-compose.trellion.yml — the trellion add-on OVERLAY: the knowledge
+# pack (RAG, memory, graph, recall). an earlier change.
+#
+# Composed by the launcher unless `addons.trellion: false` is declared in
+# noomesh.yaml — trellion is the one opt-OUT add-on — and by nothing else
+# (scripts/lib-compose.sh is the one file list). No `profiles:` in here, on
+# purpose: composing this file IS the switch. Opting out on a
+# live stack stops the container in the same run; the gateway's degradation
+# contract then answers every knowledge surface with an explained 503, and
+# `noo health` reports `addons.trellion=disabled`.
+#
+# This phase moves WHERE trellion is declared, not whether it runs: a
+# base-only install still degrades on the 503 contract rather than carrying
+# another memory system. Bringing your own memory system is an earlier change
+# phase 4 (the `Http` memory provider behind gateway-rust/src/memory/
+# provider.rs), which is designed and unbuilt.
+#
+# The Intelligent tier (docker-compose.trellion-intel.yml) `extends` the
+# service below, so this file must be composed whenever that one is.
+#
+# pull_policy: the base file's first-party services say `build` and the dist
+# overlay flips them to `missing`; an add-on overlay cannot have a dist row
+# (a row for a service the overlay did not compose is a bare service compose
+# refuses — measured), so lib-dist exports NOO_PULL_POLICY=missing in dist
+# mode and this file interpolates it.
+#
+# YAML anchors do not cross files: the logging block is restated here, and
+# the shared trellion environment lives HERE now (it used to be a top-level
+# anchor in the base file).
+# ── What this add-on's gateway key asks for ──────────
+# `x-noo-addon` is the ONE place this add-on's per-consumer key is declared.
+# noo-cli's build script reads it from this file and derives the secret
+# registry row (`noo security secrets` rotate/audit/doctor), the default
+# grant `noo security service-key provision trellion` shows and asks the
+# operator to confirm, and the `cluster verify` grants check. The overlay
+# only ASKS: the operator grants at provision, or by enabling the add-on
+# (`noo addons enable`, which shows the same request first), and the gateway
+# decides what each word opens (`GET /api/security/service-keys/scopes`).
+#
+# Compose never reads an `x-` key, so this block has no runtime effect. It is
+# read PER FILE and never from `docker compose config`: compose merges
+# top-level `x-` keys across `-f` files, so the merged projection shows only
+# the last overlay's block. tests/test_addon_declares_its_grant.py pins the
+# block against this file's own NOO_GATEWAY_KEY interpolation, both ways.
+#
+# History: the key exists because the shared secret made rotation
+# all-or-nothing; noo-trellion and noo-trellion-intel present different rows
+# of noo_service_keys from the same image. `metrics` is asked for ahead of
+# an earlier change, which moves trellion's counters and gauges onto the
+# gateway (`POST /api/metrics/increment`) instead of a NATS subject nothing
+# subscribes to.
+x-noo-addon:
+  addon: trellion
+  consumer: svc:trellion
+  key: NOO_SVC_KEY_TRELLION
+  containers: [noo-trellion]
+  scopes: [chat, embeddings, metrics]
+  why: >-
+    the knowledge pack's extraction and retrieval call the gateway's chat and
+    embeddings, and its counters post to the gateway's metrics door.
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+# The environment noo-trellion and noo-trellion-intel SHARE.
+# Hoisted out of the trellion service so the anchor means what its name
+# says. It used to BE trellion's environment block, which made it
+# impossible to give trellion anything of its own without handing the
+# same value to every merging service — and a per-consumer gateway key
+# is exactly what must never travel that way.
+x-trellion-env: &trellion-env
+  # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub
+  # (faster-whisper, tokenizers, model fetches) honours these.
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  DO_NOT_TRACK: '1'
+  # Surfaces: trellion serves ONLY the ML pack —
+  # the core subjects moved to the always-on noo-worker. Overridable
+  # (=all) as a one-release escape hatch if the split misbehaves.
+  NOO_WORKER_SURFACES: '${NOO_WORKER_SURFACES:-ml}'
+  # ═══ ENV ALLOWLIST — plan §6's #1 risk ═══════════════════════════
+  # Compose env is an explicit ${VAR} allowlist; a var missing here
+  # falls back to code defaults SILENTLY. This block was built by
+  # auditing every os.getenv/get_secret/env_or_yaml read reachable
+  # from worker_pool._init_python_services + the registered workers
+  # (noomesh/workers/*, channels/, memory/, mcp/, voice/, cluster/,
+  # tools/), then diffing against the gateway service's block above.
+  # worker_pool logs `worker_pool.critical_env_unset` at startup for
+  # the known-critical subset. Keep this block diffable against the
+  # gateway's — same order, same defaults.
+  #
+  # Audited and DELIBERATELY OMITTED (not read by the worker plane, or
+  # declared elsewhere):
+  #   RUST_LOG, NOO_APP_DB_PASSWORD, NOO_EVOLVE_DB_PASSWORD (alembic
+  #     runs in the gateway entrypoint — migrations stay there in
+  #     phases 1-2), NOO_WORKER_TIMEOUT_SECS (Rust-side NATS deadline),
+  #     WHATSAPP_* (fully Rust-native),
+  #     NOO_DISK_WATERMARK_PERCENT / NOO_DISK_WATCH_PATHS (Rust
+  #     autonomy loops),
+  #     NOO_GENERIC_WEBHOOK_CHANNELS (Rust webhook router; Python side
+  #     is reached via NATS payloads), NOO_SELF_MODIFY_RATE_*
+  #     (read directly by the Rust restart/rebuild rate limiter),
+  #     NOO_ENCRYPTION_KEY / NOO_EGRESS_ALLOWLIST / NOO_CONTROLLER_ID /
+  #     NOO_BACKEND_MIN_VRAM_GB (not in the gateway allowlist today
+  #     either — flagged in the WP-T23 audit as pre-existing gaps,
+  #     add to BOTH blocks if ever needed).
+  # ──────────────────────────────────────────────────────────────────
+  DEV_MODE: '${DEV_MODE:-}'
+  NOO_MODE: 'controller'
+  # Phase 3 (plan §4): this container owns the MEMORY Alembic env
+  # (alembic_version_memory); the gateway runs mesh-only when the
+  # launcher exports NOO_MIGRATIONS_ENVS=mesh. No runner overlap:
+  # each env has its own version table and file set.
+  NOO_MIGRATIONS_ENVS: 'memory'
+  # The MIGRATION identity — noo_trellion_ddl, NOT superuser (proposal
+  # 19 B′, noo-trellion #35). The two things that used to force the
+  # memory env onto the privileged `pai` connection are both broker work
+  # now: untrusted-extension installs and role creation. This role holds
+  # CREATE on schema `trellion` and nothing else, so a compromised or
+  # buggy migration is confined to trellion's own segment.
+  #
+  # An older trellion image ignores this variable and falls through to
+  # PAGEINDEX_DSN below (still `pai`), so the transition is order-free.
+  NOO_TRELLION_DDL_DATABASE_URL: 'postgresql://noo_trellion_ddl@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  # Trellion's OWN engine (snapshot/consolidation handlers,
+  # workers/common._trellion_engine, autonomy trellion bootstrap)
+  # connects as the scoped noo_trellion role: owner of the 27 memory
+  # tables + the two prune staging tables it adopts, no privilege on
+  # anything else. Mirrors NOO_EVOLVE_DATABASE_URL in the pro
+  # overlay. The three DSNs below are deliberately NOT flipped: the
+  # worker pool still hosts mixed-plane handlers (channels, settings,
+  # exec approval, heartbeat delegations) whose stores resolve
+  # PAGEINDEX_DSN/DATABASE_URL and touch mesh tables — flipping them
+  # to noo_trellion would fail those inits silently (they are all
+  # try/except warnings). noo_app remains the mixed-plane identity.
+  NOO_TRELLION_DATABASE_URL: 'postgresql://noo_trellion@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  # NOO_TRELLION_DB_PASSWORD is NOT delivered. It used to be, "because
+  # trellion CREATES the role" (noo-trellion #34) —
+  # but role creation became the broker's job in phase A′ (trellion
+  # src/trellion/db/migrations/env.py: "creating the noo_trellion role —
+  # the broker's job"), and nothing in this image reads the variable any
+  # more. The three roles this container logs in as get their passwords
+  # from the pgpass file below, not from the DSNs and not from env.
+  #
+  # ── Postgres passwords: a pgpass FILE ────────────
+  # No DSN in this block carries a password. libpq (psycopg, every engine
+  # this container builds — noomesh's and trellion's) reads PGPASSFILE
+  # natively: one `postgres:5432:noomesh:<role>:<password>` line for each
+  # of noo_app, noo_trellion and noo_trellion_ddl, derived by the launcher
+  # (lib-secrets.sh NOO_PGPASS_ROLES_TRELLION, libpq escaping) and
+  # delivered 0400 to the image's user. Unset when the store holds none of
+  # the three passwords, so libpq falls back to no password and Postgres
+  # refuses — loudly, naming the role.
+  PGPASSFILE: '${NOO_PGPASS_TRELLION:+/run/secrets/pgpass}'
+  # Gateway self-calls (heartbeat actions, recall, proactive, MCP tool
+  # proxy) — 127.0.0.1 does not reach the gateway from this container.
+  # Honored by gateway/helpers._local_gateway_url + mcp/tool_models.
+  NOO_GATEWAY_URL: '${NOO_TRELLION_GATEWAY_URL:-https://gateway:8080}'
+  # /health listener for the healthcheck below (container-internal).
+  NOO_WORKER_HEALTH_PORT: '8090'
+  # RSS self-watchdog (graceful exit; restart: unless-stopped
+  # respawns). mem_limit below is the hard cgroup backstop.
+  NOO_WORKER_RSS_LIMIT_MB: '${NOO_WORKER_RSS_LIMIT_MB:-7000}'
+  NOO_WORKER_GLOBAL_CONCURRENCY: '${NOO_WORKER_GLOBAL_CONCURRENCY:-}'
+  # (The Python MCP hub that lived here is retired; the gateway serves
+  # both doors on its own port, each authenticated by service keys.)
+  # ── Stores (same three-DSN split as the gateway: PAGEINDEX_DSN is
+  # resolved first by the worker plane and stays `pai`) ──────────────
+  # search_path rides the DSN: the worker plane's stores query mesh
+  # tables UNQUALIFIED, and on installs built after the mesh-schema move
+  # those live in schema `mesh`. Pinning here covers every engine built
+  # from these DSNs without touching each construction site — the same
+  # each-consumer-declares rule the gateway (state.rs) and trellion's
+  # engine already follow. Absent schemas in the path are silently
+  # skipped, so legacy installs resolve identically.
+  DATABASE_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  # noo_app, NOT superuser — an earlier change closed (2026-08-05). The two
+  # things that made these superuser by accident are both fixed at the
+  # source: partition DDL goes through SECURITY DEFINER functions (036's
+  # ensure + 047's drop twin), and init_db's extension step is
+  # check-then-act, so it no longer trips privilege-check-before-guard.
+  # Everything else the worker plane does on these DSNs is DML, which
+  # noo_app holds on every table plus by default privilege. A compromised
+  # worker container can no longer drop a database.
+  PGVECTOR_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  PAGEINDEX_DSN: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  REDIS_URL: '${REDIS_URL:-rediss://redis:6379}'
+  REDIS_PASSWORD_FILE: '${REDIS_PASSWORD:+/run/secrets/redis_password}'
+  NATS_URL: '${NATS_URL:-tls://nats:4222}'
+  # This process's OWN bus principal (see the worker service above).
+  NATS_WORKER_USER: '${NATS_WORKER_USER:-}'
+  NATS_WORKER_PASSWORD_FILE: '${NATS_WORKER_PASSWORD:+/run/secrets/nats_worker_password}'
+  NOO_NATS_ALLOW_ANONYMOUS: '${NOO_NATS_ALLOW_ANONYMOUS:-}'
+  # ── Security ───────────────────────────────────────────────────────
+  # FILES since an earlier change, like noo-gateway/noo-worker's since
+  # 2026-09-29: every secret below arrives as /run/secrets/<name> (the
+  # service's `secrets:` list) and the environment holds only the
+  # `<NAME>_FILE` pointer — `${NAME:+…}`, so a value the store does not
+  # hold leaves the pointer unset and reads as unset. Readers: noomesh's
+  # `secret_env` (worker_pool, every module that reads these) and
+  # trellion's `trellion/live/secret_env.py` (gateway_auth: the key —
+  # its HMAC fallback is retired), both in the images since
+  # stack-v0.2.80
+  # (x-noo-secrets-floor). Never add a plain NAME back beside its
+  # NAME_FILE: both readers refuse to boot on both-set.
+  # No NOO_JWT_SECRET: nothing in this image reads it —
+  # only the gateway holds the login signing secret.
+  # NEITHER shared secret. Not the fleet secret: it is a
+  # node's credential, and this image drives no browser (the browser door has
+  # its own key, held by noo-worker). Not the controller secret: worker_pool verifies bus
+  # principals with this container's OWN key (NOO_BUS_KEY_FILE, set per
+  # service below), and its self-calls present NOO_GATEWAY_KEY only.
+  # This image's worker_pool writes security audit rows, and signs them with
+  # this key and nothing else (no key → the row is refused, loudly).
+  NOO_AUDIT_HMAC_KEY_FILE: '${NOO_AUDIT_HMAC_KEY:+/run/secrets/noo_audit_hmac_key}'
+  NOO_NODE_AGENT_TOKEN_FILE: '${NOO_NODE_AGENT_TOKEN:+/run/secrets/noo_node_agent_token}'
+  # NOO_ADMIN_USER names the operator for heartbeat tasks (gateway/heartbeat.py).
+  # NOO_ADMIN_PASSWORD is the gateway's bootstrap login (routes/core.rs) and
+  # nothing in this image reads it, so it is not delivered.
+  NOO_ADMIN_USER: '${NOO_ADMIN_USER:-admin}'
+  NOO_AUDIT_LOG_FILE: '${NOO_AUDIT_LOG_FILE:-}'
+  NOO_EXEC_APPROVAL_MODE: '${NOO_EXEC_APPROVAL_MODE:-}'
+  # ── TLS/PKI (entrypoint.py remaps onto /tmp/pki copies) ────────────
+  # /app/pki/leaf is the container's OWN service leaf, the
+  # client certificate every DSN above and every Redis/NATS/gateway dial
+  # presents: services/trellion here, services/trellion-intel in the intel
+  # overlay, mounted at the same path. Never the controller's gateway leaf,
+  # which a node agent reads as "this caller may command me".
+  NOO_TLS_CERT: '${NOO_TLS_CERT:+/app/pki/leaf/service.crt}'
+  NOO_TLS_KEY: '${NOO_TLS_KEY:+/app/pki/leaf/service.key}'
+  NOO_TLS_CA: '${NOO_TLS_CA:+/app/pki/ca.crt}'
+  NOO_PKI_DIR: '${NOO_PKI_DIR:-}'
+  NOO_REDIS_TLS: '${NOO_REDIS_TLS:-}'
+  NOO_NATS_TLS: '${NOO_NATS_TLS:-}'
+  NOO_PG_SSLMODE: '${NOO_PG_SSLMODE:-}'
+  # ── RAG / embeddings / LLM endpoints ───────────────────────────────
+  # NOT ${PAGEINDEX_EMBEDDING_URL} — this is the one var that CANNOT be
+  # shared with the gateway. With BACKEND=gateway the embedder POSTs to
+  # `{url}/api/external/embeddings`, and the deployed value is
+  # `https://localhost:8080`: correct while the worker pool lived INSIDE
+  # noo-gateway (loopback to itself), and wrong the moment it moved here,
+  # where localhost:8080 is trellion — which has no embeddings endpoint.
+  #
+  # Found by the first live cutover (2026-08-02): `pai rag query` reached
+  # trellion (seed selection ran, 35 candidates) and then died with
+  # httpx.ConnectError "All connection attempts failed" in
+  # trellion/live/pageindex_embedder.py::_embed_gateway. Verified from
+  # inside the container: localhost:8080 → ConnectError,
+  # gateway:8080 → HTTP 401 (reachable; the real client carries auth).
+  #
+  # This is exactly the plan §6 risk #1 shape — a var that is silently
+  # container-relative. Override with NOO_TRELLION_EMBEDDING_URL if the
+  # embedder should target something other than the gateway.
+  PAGEINDEX_EMBEDDING_URL: '${NOO_TRELLION_EMBEDDING_URL:-https://gateway:8080}'
+  # trellion warns-and-ignores non-gateway backends; no tei default.
+  PAGEINDEX_EMBEDDING_BACKEND: '${PAGEINDEX_EMBEDDING_BACKEND:-}'
+  PAGEINDEX_EMBEDDING_MODEL: '${PAGEINDEX_EMBEDDING_MODEL:-}'
+  # Same shape for the LLM (2026-09-09): NOT ${PAGEINDEX_LLM_URL}. That
+  # value names a backend the WORKER dials directly; trellion's graph
+  # extraction, answer synthesis and image descriptions go through the
+  # gateway's /v1/chat/completions instead, which resolves the backend
+  # over the mesh exactly as the chat channels do (a placement on any
+  # node, role=chat, PAGEINDEX_LLM_MODEL as the exact-match hint) and
+  # carries the node credential for the last hop that trellion never
+  # had. Pointed straight at a backend, extraction was pinned to the
+  # controller's own ollama and shared the GPU with every chat
+  #. Override with NOO_TRELLION_LLM_URL to target
+  # something other than the gateway.
+  PAGEINDEX_LLM_URL: '${NOO_TRELLION_LLM_URL:-https://gateway:8080}'
+  PAGEINDEX_LLM_MODEL: '${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}'
+  # harrier / 1024: the default embedder and trellion's vector(1024) DDL.
+  EMBEDDING_MODEL: '${EMBEDDING_MODEL:-harrier}'
+  EMBEDDING_DIM: '${EMBEDDING_DIM:-1024}'
+  # The embed throttle (trellion/live/embed_throttle.py), one per process:
+  # requests in flight and the largest batch. Empty = trellion's defaults
+  # (1 in flight, 32 per batch). With several embed targets one request in
+  # flight leaves most of them idle: a batch takes 10-60 s, so the backlog
+  # drained at ~30 chunks a minute with three embedders up (2026-10-09).
+  # Set it in noomesh.yaml compose_env, e.g. TRELLION_EMBED_MAX_INFLIGHT: 3
+  # (about one per embed target; the gateway sheds what it cannot take with
+  # a 503 + Retry-After, which this throttle honours). trellion-intel
+  # extends this service, so both processes get it.
+  TRELLION_EMBED_MAX_INFLIGHT: '${TRELLION_EMBED_MAX_INFLIGHT:-}'
+  TRELLION_EMBED_BATCH_MAX: '${TRELLION_EMBED_BATCH_MAX:-}'
+  OLLAMA_URL: '${OLLAMA_URL:-https://stunnel-ollama:11434}'
+  # ── Channels: engine selectors are OBSOLETE (an earlier change —
+  # the Python inbound loops are retired). Plumbed through only so
+  # ChannelManager.start_channel_loops can warn about a leftover
+  # "python" value; it never starts a loop either way. ──
+  NOO_TELEGRAM_ENGINE: '${NOO_TELEGRAM_ENGINE:-}'
+  NOO_GCHAT_PUBSUB_ENGINE: '${NOO_GCHAT_PUBSUB_ENGINE:-}'
+  TELEGRAM_BOT_TOKEN_FILE: '${TELEGRAM_BOT_TOKEN:+/run/secrets/telegram_bot_token}'
+  TELEGRAM_WEBHOOK_URL: '${TELEGRAM_WEBHOOK_URL:-}'
+  GOOGLE_CHAT_CREDENTIALS: '${GOOGLE_CHAT_CREDENTIALS:-}'
+  # The key ITSELF (base64'd JSON from the SOPS store), as a file.
+  GOOGLE_CHAT_CREDENTIALS_JSON_FILE: '${NOO_FILECRED_GOOGLE_CHAT_B64:+/run/secrets/google_chat_credentials_json}'
+  GOOGLE_CHAT_PROJECT_ID: '${GOOGLE_CHAT_PROJECT_ID:-}'
+  GOOGLE_CHAT_BEARER_TOKEN_FILE: '${GOOGLE_CHAT_BEARER_TOKEN:+/run/secrets/google_chat_bearer_token}'
+  GOOGLE_CHAT_PUBSUB_SUBSCRIPTION: '${GOOGLE_CHAT_PUBSUB_SUBSCRIPTION:-}'
+  # TELEGRAM_SECRET_TOKEN and SLACK_BOT_TOKEN are not delivered: no tree
+  # reads either name (tests/test_secret_env_has_a_reader.py).
+  CHANNEL_HISTORY_LIMIT: '${CHANNEL_HISTORY_LIMIT:-}'
+  NOO_REPORTS_DRIVE_FOLDER_ID: '${NOO_REPORTS_DRIVE_FOLDER_ID:-}'
+  NOO_APPROVAL_GCHAT_SPACE: '${NOO_APPROVAL_GCHAT_SPACE:-}'
+  NOO_APPROVAL_TELEGRAM_CHAT: '${NOO_APPROVAL_TELEGRAM_CHAT:-}'
+  NOO_PROACTIVE_ENABLED: '${NOO_PROACTIVE_ENABLED:-}'
+  # ── Cloud providers (coordinator-in-worker) ────────────────────────
+  CLOUD_PROVIDERS_ENABLED: '${CLOUD_PROVIDERS_ENABLED:-}'
+  ANTHROPIC_API_KEY_FILE: '${ANTHROPIC_API_KEY:+/run/secrets/anthropic_api_key}'
+  OPENAI_API_KEY_FILE: '${OPENAI_API_KEY:+/run/secrets/openai_api_key}'
+  OPENAI_BASE_URL: '${OPENAI_BASE_URL:-}'
+  GOOGLE_API_KEY_FILE: '${GOOGLE_API_KEY:+/run/secrets/google_api_key}'
+  CLOUD_DEFAULT_PROVIDER: '${CLOUD_DEFAULT_PROVIDER:-}'
+  # ── Cluster / observability / misc ─────────────────────────────────
+  # NOO_TAILSCALE_API_KEY is not delivered: its only Python reader is
+  # cluster/tailscale.py, reached only from the `noomesh cluster
+  # mint-join-key` CLI (cluster/cli.py), which this container never runs.
+  # The gateway mints join keys (routes/cluster.rs) from its own file.
+  NOO_TAILSCALE_TAILNET: '${NOO_TAILSCALE_TAILNET:-}'
+  # The Tailscale OAuth client (NOO_TAILSCALE_OAUTH_CLIENT_ID/_SECRET, fu 50
+  # item 4) is read by the gateway's routes/cluster.rs only — mint_join_key
+  # runs there — so it is not delivered to this image.
+  NOO_BOOTSTRAP_SCRIPT_URL: '${NOO_BOOTSTRAP_SCRIPT_URL:-}'
+  NGROK_DOMAIN: '${NGROK_DOMAIN:-}'
+  NOO_CLUSTER_INVENTORY: '/data/config/cluster-inventory.yaml'
+  NOO_PROMETHEUS_URL: '${NOO_PROMETHEUS_URL:-https://prometheus:9090}'
+  NOO_LOKI_URL: '${NOO_LOKI_URL:-}'
+  NOO_HEARTBEAT_TZ: '${NOO_HEARTBEAT_TZ:-America/New_York}'
+  NOO_DATA_DIR: '/data'
+  # Recall-memory (config section `recall_memory`) FAISS shards. Declared here so the path is a compose
+  # decision, not trellion's in-code fallback (which is the same value). The directory keeps its
+  # historical name. NOO_RECALL_MEMORY_PATH is the name noomesh reads; NOO_VIDEO_MEMORY_PATH is the
+  # deprecated one trellion still reads — keep both, equal, until trellion reads the new name
+  #. Equal values do not warn.
+  NOO_RECALL_MEMORY_PATH: '/data/video_memory'
+  NOO_VIDEO_MEMORY_PATH: '/data/video_memory'
+  NOO_HOST_SPOOL_DIR: '/var/run/noo-spool'
+  RETRIEVAL_TRACKER_PATH: '/data/retrieval_tracker.json'
+  RETRIEVAL_BANDIT_PATH: '/data/retrieval_bandit.json'
+  NOO_SANDBOX_URL: '${NOO_SANDBOX_URL:-http://sandbox:9000}'
+  NOO_SKILLS_HOST_DIR: '${NOO_SKILLS_HOST_DIR:-${PWD:-}/skills}'
+  NOO_ARTIFACT_DIR: '${NOO_ARTIFACT_DIR:-}'
+
+# The secrets only an add-on takes. Compose merges top-level `secrets:`
+# across `-f` files, so the shared ones (redis_password, noo_audit_hmac_key, …)
+# are the base file's entries, reused; these two are trellion's own. Sourced
+# from a variable of the LAUNCHER's environment, never a host file
+# (lib-secrets.sh derive_file_secrets exports every source, empty when the
+# store does not hold it, and derives NOO_PGPASS_TRELLION).
+secrets:
+  noo_svc_key_trellion:
+    environment: NOO_SVC_KEY_TRELLION
+  pgpass_trellion:
+    environment: NOO_PGPASS_TRELLION
+
+services:
+  trellion:
+    logging: *default-logging
+    # OPT-OUT (see the file header above): composed by the launcher unless
+    # `addons.trellion: false` is declared in noomesh.yaml. No profile —
+    # composing this file IS the switch. Riding the controller profile
+    # too — the proposal-19 arrangement — made the opt-out flag disable
+    # the BEHAVIOR (gateway 503s) while the container still started:
+    # live rehearsal 2026-08-13. The slim noo-worker carries the
+    # always-on contract now.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.trellion
+      args:
+        DEPS_BASE: ${NOO_IMAGE_PREFIX:-noomesh}/deps-base:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_DEPS_BASE:-}
+      additional_contexts:
+        trellion: ${TRELLION_PATH:-../trellion}   # consumed via deps-base FROM
+    image: ${NOO_IMAGE_PREFIX:-noomesh}/trellion:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_TRELLION:-}
+    pull_policy: ${NOO_PULL_POLICY:-build}
+    container_name: ${NOO_CONTAINER_PREFIX:-noo}-trellion
+    # Same host-gid trick as the gateway: the command spool + PKI dir are
+    # owned by the host operator (uid/gid 1000) and this container runs as
+    # nonroot (65532).
+    group_add:
+      - "${NOO_HOST_GID:-1000}"
+    ports:
+      # MCP hub RETIRED here: the Rust gateway
+      # serves /mcp now and owns host 3100. This mapping is PARKED at 3199
+      # (compose cannot conditionally remove it; nothing listens on
+      # container :3100 here any more). The /health listener (:8090) is
+      # deliberately NOT published.
+      - "127.0.0.1:${NOO_PORT_MCP:-3199}:3100"
+    environment:
+      <<: *trellion-env
+      # trellion's OWN gateway key — its own row in noo_service_keys,
+      # never the shared anchor and never the shared HMAC. It is
+      # trellion's only gateway credential: unset,
+      # gateway_auth.py refuses every call in-process, naming
+      # `noo security service-key provision trellion`. `noo onboard` and
+      # `noo addons enable` mint it.
+      NOO_GATEWAY_KEY_FILE: '${NOO_SVC_KEY_TRELLION:+/run/secrets/noo_gateway_key}'
+      # trellion's OWN bus-principal key and audience:
+      # worker_pool verifies each worker.* message's `trellion` MAC with it.
+      NOO_BUS_KEY_FILE: '${NOO_BUS_KEY_TRELLION:+/run/secrets/noo_bus_key}'
+      NOO_BUS_AUDIENCE: trellion
+    # Every secret the anchor points at, as a FILE owned by the image's user
+    # (DHI `nonroot`, 65532 — measured on the stack-v0.2.80 image) and 0400:
+    # libpq refuses a pgpass with group/other bits. trellion-intel `extends`
+    # this service and compose merges this list BY TARGET (measured, compose
+    # v5.0.2), so intel inherits every entry and replaces `noo_gateway_key`
+    # with its own key's source — see docker-compose.trellion-intel.yml.
+    secrets:
+      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: nats_worker_password, target: nats_worker_password, uid: "65532", gid: "65532", mode: 0400 }
+      # This container's own bus-principal key; intel
+      # re-sources the target from its own key, like noo_gateway_key.
+      - { source: noo_bus_key_trellion, target: noo_bus_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_svc_key_trellion, target: noo_gateway_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: pgpass_trellion, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: anthropic_api_key, target: anthropic_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: openai_api_key, target: openai_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: google_api_key, target: google_api_key, uid: "65532", gid: "65532", mode: 0400 }
+    volumes:
+      - ./noomesh.yaml:/app/noomesh.yaml
+      - ./docker-compose.override.yml:/app/docker-compose.override.yml
+      - ./prompts:/app/prompts
+      - ./skills:/app/skills:ro
+      - noo-data:/data
+      # ca.crt + trellion's OWN leaf (NOO_TLS_* above); never
+      # the whole PKI dir, which holds ca.key and every node's key, and never
+      # gateway/, the controller's identity. trellion-intel replaces this
+      # entry BY TARGET with its own leaf (docker-compose.trellion-intel.yml).
+      # Issued by `noo onboard` (SVC_LIST) and, on an upgraded install, by
+      # `noo upgrade --stack` before the launcher runs.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/app/pki/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/trellion:/app/pki/leaf:ro
+      # Ingest sources (RAG ingest and watched-folder handlers run HERE
+      # after the split) arrive through docker-compose.override.yml, which
+      # emits the same per-directory `<host>:/user-dirs/<base>` mounts for
+      # this service as for the gateway. The generator learned about this
+      # service some time ago; the note claiming otherwise outlived it.
+      #
+      # REMOVED 2026-09-11 (tracker R22) — see the gateway service above for
+      # why the /host-fs binds are gone and are not coming back.
+      # Host-watcher command spool — worker.settings restart/rebuild
+      # actions write commands here (a sibling container cannot be
+      # restarted in-process — plan §6 restart-signal note).
+      - ./.noo-host-spool:/var/run/noo-spool:rw
+      # REMOVED 2026-09-11: `.:/app/project:ro` put the WHOLE checkout —
+      # secrets/, pki/, .env — inside this container. Nothing read it:
+      # the image WORKDIR is /app, no source references /app/project, and
+      # everything actually consumed (scripts/, config/tools.json,
+      # docs/runbooks, static) is baked in or mounted at its own path.
+      # Dev overlays — MUST mirror the gateway service or "edit, restart,
+      # test" silently tests stale code in one of the two containers.
+      # fu 47: SOURCE and DEST are var-driven (same defect-20 pattern as
+      # TRELLION_SRC below) so DIST mode can neutralize the overlay — the
+      # launcher repoints DEST at a scratch path and the image's baked
+      # /app/src is the code that runs. Behavior depends on the RELEASE,
+      # never on the host checkout's git state.
+      - ${NOO_SRC_OVERLAY:-./src}:${NOO_SRC_OVERLAY_DEST:-/app/src}:ro
+      # Dev-only trellion source overlay. SOURCE and DEST both var-driven:
+      # when no sibling noo-trellion checkout exists (customer install,
+      # sandbox), docker would otherwise CREATE AN EMPTY DIR at the source
+      # and mount it OVER the image's site-packages/trellion — "No module
+      # named 'trellion.db'" crash-loop on every fresh machine (sandbox
+      # rehearsal, defect #20). The launchers detect the missing checkout
+      # and repoint DEST at a scratch path so the baked package survives.
+      - ${TRELLION_SRC:-../trellion/src/trellion}:${TRELLION_SRC_DEST:-/opt/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/site-packages/trellion}:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - noo-cluster
+      - noo-db
+      # python_exec runs in the worker pool, which lives here (see M-3)
+      - noo-sandbox
+      # BrowserTool runs here too (see R35)
+      - noo-browser
+    # Replaces main.rs supervision (plan §3): Docker restart backoff
+    # replaces the 2s→60s respawn loop.
+    restart: unless-stopped
+    # Hard cgroup backstop for the RSS self-watchdog above: an OOM-kill now
+    # takes down only this container (the original 2026-07-10 motivation),
+    # and the restart policy respawns it. 0 = unlimited.
+    mem_limit: ${NOO_WORKER_MEM_LIMIT:-0}
+    # Fail-open posture: the GATEWAY takes no depends_on on this service —
+    # trellion down must degrade the gateway per-capability, never block it.
+    depends_on:
+      nats:
+        condition: service_started
+        required: false
+      postgres:
+        condition: service_started
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Cold Python start with ML imports is slow, and the /health listener
+      # runs on the main event loop (deliberately — a wedged loop should
+      # read as unhealthy). Don't count the init window against retries.
+      start_period: 180s

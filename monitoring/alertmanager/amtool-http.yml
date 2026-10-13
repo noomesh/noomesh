@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# amtool's client-side HTTP config for the compose healthcheck.
+# See: https://prometheus.io/docs/alerting/latest/configuration/#http_config
+#
+# The listener (web-config.yml) requires a cluster-CA client certificate,
+# and the image has no shell, wget or curl — so the probe is amtool
+# presenting the container's OWN leaf to itself over mTLS. CA-verified,
+# hostname checked (`localhost` is in every service leaf's SANs). It proves
+# the mTLS listener is up, which is what a healthcheck is for; it grants
+# nothing (the container already holds that key).
+tls_config:
+  ca_file: /app/pki/ca.crt
+  cert_file: /app/pki/services/alertmanager/service.crt
+  key_file: /app/pki/services/alertmanager/service.key
+  insecure_skip_verify: false

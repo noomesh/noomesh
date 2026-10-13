@@ -1,0 +1,44 @@
+{
+  "total_nodes": 3,
+  "online": 1,
+  "busy": 1,
+  "unknown": 0,
+  "offline": 1,
+  "nodes": [
+    {
+      "id": "prime-01",
+      "hostname": "prime-01",
+      "status": "online",
+      "load": 0.38,
+      "tier": 1,
+      "vram_gb": 24,
+      "backends": ["vllm", "ollama"],
+      "cert_not_after": 1790000000,
+      "running_backends": { "vllm": "llama-3.1-70b" }
+    },
+    {
+      "id": "atlas-02",
+      "hostname": "atlas-02",
+      "status": "busy",
+      "load": 0.91,
+      "tier": 2,
+      "vram_gb": 24,
+      "backends": ["vllm"],
+      "cert_not_after": 1790000000,
+      "running_backends": { "vllm": "qwen-2.5-32b" }
+    },
+    {
+      "id": "companion-07",
+      "hostname": "companion-07",
+      "status": "offline",
+      "load": null,
+      "tier": 5,
+      "vram_gb": 0,
+      "backends": [],
+      "cert_not_after": null,
+      "running_backends": {}
+    }
+  ],
+  "error": null,
+  "engine": "rust"
+}

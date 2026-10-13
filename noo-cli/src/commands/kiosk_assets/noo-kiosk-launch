@@ -1,0 +1,153 @@
+#!/bin/bash
+# noo-kiosk-launch — the display's session: one compositor, one browser,
+# one page. Written by `noo kiosk setup`; edits here are overwritten by
+# the next setup. Runs as the kiosk user under kiosk.service with
+# /etc/default/kiosk as its environment.
+#
+# THE BROWSER HOLDS NO CREDENTIAL AND NEVER LEARNS THE CONTROLLER URL.
+# It is pointed at 127.0.0.1, where `noo kiosk serve` (kiosk-serve.service)
+# listens. That process holds the token — minted by proving this display's
+# tailnet identity — and attaches it to the reads the dashboard is allowed
+# to make.
+#
+# Which is why there is no CDP injection here any more. There used to be,
+# and it never worked: the page stopped reading localStorage on
+# 2026-09-06 (ui/apps/web/src/kiosk/main.tsx says so), so the launcher was
+# writing a token into storage nothing read, and the display showed
+# "credential rejected" while every endpoint answered 200 to anyone who
+# asked with a header. CDP stays, for the watchdog's reload and heartbeat.
+set -euo pipefail
+
+: "${NOO_KIOSK_URL:?NOO_KIOSK_URL missing (see /etc/default/kiosk)}"
+VIEW="${NOO_KIOSK_VIEW:-health}"
+ROTATE="${NOO_KIOSK_ROTATE:-}"
+POLL="${NOO_KIOSK_POLL:-}"
+QUALITY="${NOO_KIOSK_QUALITY:-}"
+STATE="${NOO_KIOSK_STATE:-/var/lib/kiosk}"
+PROFILE="$STATE/profile"
+CDP_PORT="${NOO_KIOSK_CDP_PORT:-9222}"
+SERVE_PORT="${NOO_KIOSK_SERVE_PORT:-8088}"
+BROWSER="${NOO_KIOSK_BROWSER:-chromium}"
+
+# The local proxy, never the controller. The same bundle fetched straight
+# from the gateway would have no credential behind it.
+PAGE="http://127.0.0.1:${SERVE_PORT}/kiosk.html?view=${VIEW}"
+if [ -n "$ROTATE" ]; then PAGE="${PAGE}&rotate=${ROTATE}"; fi
+# The graph view has no push event yet, so an ingest is invisible until
+# a reconnect. `--poll` is how a graph screen notices new data.
+if [ -n "$POLL" ]; then PAGE="${PAGE}&poll=${POLL}"; fi
+# Pins the graph's drawing quality; unset, the page decides for itself.
+if [ -n "$QUALITY" ]; then PAGE="${PAGE}&quality=${QUALITY}"; fi
+
+mkdir -p "$PROFILE"
+# 0755 on the state dir, NOT 0700. `noo kiosk status` must work without
+# sudo, and it reads $STATE/state.json — which the proxy writes 0644 and
+# which holds nothing secret. A 0700 dir makes that 0644 meaningless: no
+# other user can even traverse in to reach it. The secrets are guarded by
+# their own modes, not by the directory: token.json is 0600, and the
+# browser PROFILE (cookies, session) stays 0700 below.
+chmod 0755 "$STATE" 2>/dev/null || true
+chmod 0700 "$PROFILE" 2>/dev/null || true
+
+# Every failure records its reason HERE as well as on stderr, and
+# `noo kiosk status` shows it.
+#
+# Not belt-and-braces. On the first real display the journal carried only
+# systemd's own lines across dozens of restart cycles — no launcher
+# output at all, though this script does echo its reasons. Whatever
+# swallowed them, a service that fails silently once a minute teaches the
+# operator nothing, and finding the real cause took six rounds of
+# guessing. A file we write ourselves cannot be routed away from us.
+ERR_FILE="$STATE/last-error"
+fail() {
+    echo "noo-kiosk-launch: $1" >&2
+    ( umask 077; printf '%s %s\n' "$(date -Is)" "$1" > "$ERR_FILE" ) 2>/dev/null || true
+}
+
+# Wait for the proxy rather than racing it. kiosk.service Requires= it, so
+# systemd has started it — but "started" is not "listening", and a browser
+# that arrives first gets a connection-refused error page. That is a worse
+# thing to see across a room than the page's own liveness band, which is
+# what appears if the proxy is up and its mint is failing.
+proxy_up=0
+for _ in $(seq 1 30); do
+    if (exec 3<>/dev/tcp/127.0.0.1/"$SERVE_PORT") 2>/dev/null; then
+        exec 3>&- 3<&- 2>/dev/null || true
+        proxy_up=1
+        break
+    fi
+    sleep 1
+done
+
+# Falling through this loop silently is how the first bring-up wasted an
+# evening: the browser opened anyway, showed a connection error, and
+# nothing recorded why. If the proxy never listens there is no page worth
+# drawing, so say so and let systemd restart us.
+if [ "$proxy_up" -ne 1 ]; then
+    fail "kiosk-serve is not listening on 127.0.0.1:$SERVE_PORT after 30s — exiting; systemd restarts this unit shortly. Check: systemctl status kiosk-serve.service, and $ERR_FILE for the proxy's own reason"
+    exit 1
+fi
+
+# cage: a single-window Wayland compositor. Chromium runs inside it with
+# its debugging port on loopback only — that is how the token gets in and
+# how the watchdog reads the page's heartbeat.
+#
+# KNOWN EXPOSURE, written down rather than implied. This port is a FULL
+# control surface: whoever reaches it can read the token out of
+# localStorage, drive the browser anywhere, and never touch the tailnet
+# doing it. Loopback bounds that to someone with a local shell here — and
+# TCP has no file permissions, so that means ANY local user, not only the
+# kiosk one.
+#
+# What actually closes it is `--remote-debugging-pipe`: no port at all,
+# CDP over fds inherited by a parent that then exposes a mode-0600 unix
+# socket for the watchdog, so file permissions gate what nothing gates
+# today. It is not here because it could not be VERIFIED — the machine
+# this was written on has no browser installed, and an unverified rewrite
+# of the one path that injects the credential is worse than a documented
+# limitation.
+#
+# The --disable-background-networking group keeps Chromium's own traffic to
+# Google (component and variations updates, Safe Browsing fetches, crash and
+# domain-reliability reports, UMA) off the kiosk: it shows one local page.
+# docs/security/telemetry.md.
+#
+# The address is stated explicitly rather than left to Chrome's default,
+# so a changed default cannot widen this silently. A guard asserts it.
+cage -- "$BROWSER" \
+    --kiosk \
+    --noerrdialogs \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    --disable-features=TranslateUI \
+    --no-first-run \
+    --disable-background-networking \
+    --disable-component-update \
+    --disable-domain-reliability \
+    --disable-breakpad \
+    --disable-sync \
+    --metrics-recording-only \
+    --no-pings \
+    --ozone-platform=wayland \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port="$CDP_PORT" \
+    --remote-allow-origins=http://127.0.0.1:"$CDP_PORT" \
+    --user-data-dir="$PROFILE" \
+    "$PAGE" &
+CAGE_PID=$!
+
+# The browser opens the page ITSELF. It used to start on about:blank and
+# be driven to the page over CDP, because the token had to go in first —
+# and that made CDP a startup dependency: when the wait for the debugging
+# port timed out, the launcher killed a browser that was working and
+# systemd restarted it, once a minute, forever.
+#
+# With no token to inject there is nothing to wait for. CDP is now only
+# the watchdog's business: if it never answers, the watchdog says so and
+# the page still renders.
+echo "noo-kiosk-launch: showing $PAGE"
+rm -f "$ERR_FILE" 2>/dev/null || true
+
+# From here the watchdog timer owns re-minting and reloads. We just keep
+# the session alive; if cage exits, systemd restarts us.
+wait "$CAGE_PID"

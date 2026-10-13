@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE noo_users SET disabled = $2 WHERE username = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4755c3b920b5f720b08ae5702eb77b2c1ae6dbbcdf6d05d9031f24b05d90d8c1"
+}

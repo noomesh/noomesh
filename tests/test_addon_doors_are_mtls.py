@@ -1,0 +1,216 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+"""Every HTTP add-on door is HTTPS with a required cluster-CA client cert.
+
+an earlier change. The gateway's add-on proxy (`gateway-rust/src/addon_proxy.rs`)
+sends the gateway's own bearer (`Authorization: Bearer …`, the
+`addon-caller:gateway` key) and the requester identity headers on every call.
+Until 1256 evolve's route manifest said
+`"base_url_default": "http://noo-evolve:8090"` and evolve's uvicorn bound
+`0.0.0.0:8090` in plain HTTP — the bearer crossed `noo-cluster`/`noo-db` in
+the clear, and anything on those networks could call a route. Every other
+in-cluster door (vLLM, the stunnel sidecars, Postgres, Redis, NATS, Loki,
+Alertmanager, model-cache) already required a client certificate.
+
+What this pins, from the shipped files:
+
+  1. the gateway refuses a route manifest that does not dial
+     `https://noo-<addon>` (manifests ship with the add-on now and are
+     validated at startup, `addon_proxy::validate`; the Rust unit test
+     `every_addon_door_is_https` plants `http://`);
+  2. every such add-on has a row in LISTENER_TLS below (a new HTTP add-on
+     without one fails, naming it), and its service in the composed
+     projection declares that row's cert / key / client-CA env, each naming
+     a file under one of the service's own mounts — the add-on's OWN
+     `services/<addon>` leaf (never the gateway's) and the cluster CA;
+  3. the leaf's SANs (onboard `svc_extra_hostnames`) cover the host the
+     manifest dials, so the gateway's verification can succeed at all;
+  4. no compose healthcheck on the service dials plain `http://`;
+  5. the proxy dials through `crate::tls::cluster_client()` (presents the
+     gateway leaf, verifies against the cluster CA) and refuses a
+     non-`https://` base URL before sending;
+  6. when an evolve add-on checkout is named (`NOO_EVOLVE_PATH`), its server
+     hands uvicorn `ssl.CERT_REQUIRED` and its dev overlay declares the same
+     three variables. the add-on's own `tests/test_serve_tls.py` pins the
+     server from that side with a real listener; this is the cross-check.
+
+The listener-side check is necessarily per add-on (the env names are the
+add-on's), which is why it is a table and why a manifest without a row fails
+rather than being skipped. The HTTP add-ons are the `routes_manifest: true`
+rows of `addons::ADDONS`, and the host each is dialled at is `noo-<addon>`,
+the only upstream `addon_proxy::validate` accepts.
+
+Planted 2026-09-29: `https://` → `http://` in evolve's manifest →
+the gateway's manifest check failed naming evolve; the NOO_EVOLVE_TLS_CERT
+line removed from docker-compose.evolve.yml →
+`test_each_addon_listener_declares_its_mtls_material` fails. Both restored
+from `.bak`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pytest
+
+from tests._compose_projection import env_of, full_projection
+
+ROOT = Path(__file__).resolve().parents[1]
+ADDONS_RS = ROOT / "gateway-rust" / "src" / "addons.rs"
+PROXY = ROOT / "gateway-rust" / "src" / "addon_proxy.rs"
+STEPS = ROOT / "noo-cli" / "src" / "onboard" / "steps.rs"
+
+# add-on → (cert env, key env, client-CA env) its listener reads. The
+# server refuses to start with any unset (the evolve add-on's TLS listener).
+LISTENER_TLS: dict[str, tuple[str, str, str]] = {
+    "evolve": ("NOO_EVOLVE_TLS_CERT", "NOO_EVOLVE_TLS_KEY", "NOO_EVOLVE_TLS_CLIENT_CA"),
+}
+
+
+def _manifests() -> list[dict]:
+    """Every HTTP add-on, as {addon, base_url_default}: the rows of
+    `addons::ADDONS` that ship a route manifest, dialled at the one upstream
+    the gateway accepts for them."""
+    text = ADDONS_RS.read_text()
+    rows = re.findall(r'Addon \{\s*name: "([a-z_]+)",(.*?)\n    \}', text, re.S)
+    out = [
+        {"addon": name, "base_url_default": f"https://noo-{name}"}
+        for name, body in rows
+        if re.search(r"routes_manifest:\s*true", body)
+    ]
+    assert rows and out, "no HTTP add-ons parsed from addons.rs — every assertion below would be vacuous"
+    return out
+
+
+def _service_for(host: str, services: dict) -> tuple[str, dict]:
+    for name, svc in services.items():
+        if name == host or svc.get("container_name") == host:
+            return name, svc
+    raise AssertionError(
+        f"no composed service answers to {host!r} (by service or container name) — "
+        "the manifest dials a host no overlay provides"
+    )
+
+
+def test_every_manifest_dials_https() -> None:
+    """The gateway refuses any manifest whose upstream is not https://."""
+    src = PROXY.read_text()
+    up = src[src.index("fn check_upstream("):]
+    up = up[: up.index("\n}\n")]
+    assert 'url.scheme() != "https"' in up, (
+        "addon_proxy::check_upstream must refuse a non-https base_url_default: the gateway "
+        "sends its bearer on every add-on call, so the door must be mTLS"
+    )
+    assert "container_of(addon)" in up, "the upstream host must be the add-on's own service"
+
+
+def test_every_http_addon_has_a_listener_tls_row() -> None:
+    missing = [m["addon"] for m in _manifests() if m["addon"] not in LISTENER_TLS]
+    assert not missing, (
+        f"add-on(s) {missing} have a route manifest but no LISTENER_TLS row here: say which "
+        "env vars make their listener serve TLS with a required client certificate"
+    )
+
+
+def _mount_targets(svc: dict) -> dict[str, str]:
+    out = {}
+    for v in svc.get("volumes") or []:
+        if isinstance(v, dict):
+            out[v["target"]] = str(v.get("source", ""))
+        else:
+            src, _, rest = str(v).partition(":")
+            out[rest.split(":")[0]] = src
+    return out
+
+
+def _under(path: str, targets: dict[str, str]) -> str | None:
+    for t in targets:
+        if path == t or path.startswith(t.rstrip("/") + "/"):
+            return t
+    return None
+
+
+def test_each_addon_listener_declares_its_mtls_material() -> None:
+    services = full_projection()["services"]
+    for m in _manifests():
+        addon = m["addon"]
+        host = urlparse(m["base_url_default"]).hostname
+        name, svc = _service_for(host, services)
+        env = env_of(svc)
+        targets = _mount_targets(svc)
+        cert_env, key_env, ca_env = LISTENER_TLS[addon]
+        for var in (cert_env, key_env, ca_env):
+            assert env.get(var, "").strip(), (
+                f"{name} does not declare {var}: its listener would refuse to start "
+                "(or, on an older image, serve plaintext)"
+            )
+            t = _under(env[var], targets)
+            assert t, f"{name} {var}={env[var]} is not under any of its mounts {sorted(targets)}"
+        for var in (cert_env, key_env):
+            t = _under(env[var], targets)
+            assert targets[t].rstrip("/").endswith(f"services/{addon}"), (
+                f"{name} {var} comes from {targets[t]!r}: an add-on serves with its OWN "
+                f"services/{addon} leaf, never the gateway's"
+            )
+        ca_src = targets[_under(env[ca_env], targets)]
+        assert ca_src.endswith("/ca.crt") and env[ca_env].endswith("ca.crt"), (
+            f"{name} {ca_env} does not come from the cluster CA mount ({ca_src!r})"
+        )
+
+
+def test_the_leaf_covers_the_host_the_gateway_dials() -> None:
+    text = STEPS.read_text()
+    svc_list = re.search(r"pub\(crate\) const SVC_LIST: &\[&str\] = &\[(.*?)\];", text, re.S)
+    assert svc_list, "SVC_LIST not found in steps.rs"
+    for m in _manifests():
+        addon = m["addon"]
+        host = urlparse(m["base_url_default"]).hostname
+        assert f'"{addon}"' in svc_list.group(1), f"onboard never issues a services/{addon} leaf"
+        row = re.search(rf'"{re.escape(addon)}"\s*=>\s*&\[([^\]]*)\]', text)
+        sans = {addon, "localhost"} | set(re.findall(r'"([^"]+)"', row.group(1) if row else ""))
+        assert host in sans, (
+            f"the {addon} leaf's SANs {sorted(sans)} do not include {host!r}, the host the "
+            "gateway dials — verification would fail on every call"
+        )
+
+
+def test_no_addon_healthcheck_dials_plaintext() -> None:
+    services = full_projection()["services"]
+    for m in _manifests():
+        name, svc = _service_for(urlparse(m["base_url_default"]).hostname, services)
+        hc = json.dumps(svc.get("healthcheck") or {})
+        assert "http://" not in hc, f"{name} healthcheck dials plain http: {hc}"
+
+
+def test_the_proxy_dials_through_the_cluster_client_and_refuses_plaintext() -> None:
+    src = PROXY.read_text()
+    fwd = src[src.index("async fn forward("):]
+    fwd = fwd[: fwd.index("\n}\n")]
+    assert "crate::tls::cluster_client()" in fwd, (
+        "addon_proxy::forward must dial through tls::cluster_client() — the one client "
+        "that presents the gateway leaf and verifies against the cluster CA"
+    )
+    assert "reqwest::Client::new" not in fwd and "Client::builder" not in fwd
+    refuse = fwd.find("plaintext_refusal(")
+    send = fwd.find("cluster_client()")
+    assert 0 <= refuse < send, "the https check must run before the request is built"
+
+
+EVOLVE_PATH = os.environ.get("NOO_EVOLVE_PATH", "").strip()
+
+
+@pytest.mark.skipif(not EVOLVE_PATH, reason="NOO_EVOLVE_PATH names no evolve add-on checkout")
+def test_the_evolve_server_requires_a_client_certificate() -> None:
+    base = Path(EVOLVE_PATH)
+    serve = (base / "src/noo_evolve/serve_tls.py").read_text()
+    main = (base / "src/noo_evolve/__main__.py").read_text()
+    assert '"ssl_cert_reqs": ssl.CERT_REQUIRED' in serve
+    assert "**tls.uvicorn_kwargs()" in main and main.count("uvicorn.run(") == 1
+    dev = (base / "docker-compose.evolve.yml").read_text()
+    for var in LISTENER_TLS["evolve"]:
+        assert f"- {var}=" in dev, f"pai-evolve's dev overlay does not declare {var}"

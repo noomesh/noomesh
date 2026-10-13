@@ -1,0 +1,70 @@
+#!/bin/bash
+# noo-kiosk-watchdog — one tick per minute from kiosk-watchdog.timer.
+# Written by `noo kiosk setup`. Runs as root (it may restart the kiosk
+# service); the state directory belongs to the kiosk user.
+#
+# Two duties now, in order of cost:
+#   1. reload the page when its heartbeat is older than 5 minutes — the
+#      page also self-reloads at that age, so this is the second opinion;
+#   2. restart kiosk.service after 3 consecutive ticks with no CDP answer,
+#      which is the one failure neither the page nor cage can recover from.
+#
+# RE-MINTING IS NOT HERE ANY MORE. kiosk-serve.service holds the token and
+# renews it in process, because it is the thing that USES it: a token
+# renewed by one process and needed by another is two places to be wrong
+# about expiry. The injection half of that never worked at all — the page
+# stopped reading localStorage on 2026-09-06. When a mint fails the proxy
+# writes the reason to last-error and `noo kiosk status` shows it.
+set -uo pipefail
+
+STATE="${NOO_KIOSK_STATE:-/var/lib/kiosk}"
+USER_NAME="${NOO_KIOSK_USER:-kiosk}"
+STRIKES="$STATE/watchdog.strikes"
+STALE_AFTER=300000     # ms
+
+as_kiosk() { runuser -u "$USER_NAME" -- "$@"; }
+
+# Record failures where `noo kiosk status` can read them, for the same
+# reason the launcher does: the journal proved unreliable for this seat's
+# own output, and a renewal that quietly stops is how a working display
+# goes dark 15 minutes later.
+#
+# Written AS the kiosk user on purpose. This script runs as root, and a
+# root-owned last-error would afterwards be unwritable by the launcher.
+ERR_FILE="$STATE/last-error"
+fail() {
+    echo "noo-kiosk-watchdog: $1" >&2
+    as_kiosk bash -c 'umask 077; printf "%s %s\n" "$(date -Is)" "$1" > "$2"' _ "$1" "$ERR_FILE" 2>/dev/null || true
+}
+
+if ! as_kiosk noo-kiosk-cdp probe >/dev/null 2>&1; then
+    n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$STRIKES"
+    echo "noo-kiosk-watchdog: CDP not answering (strike $n/3)" >&2
+    if [ "$n" -ge 3 ]; then
+        echo "noo-kiosk-watchdog: restarting kiosk.service" >&2
+        rm -f "$STRIKES"
+        systemctl restart kiosk.service
+    fi
+    exit 0
+fi
+rm -f "$STRIKES"
+
+now=$(date +%s)
+
+# The proxy owns renewal. Repeat its complaint, and ONLY its complaint: a
+# display that goes dark in fifteen minutes should announce itself now,
+# not then — and a tick that prints the whole state every minute is a log
+# nobody reads, which is the same as silence.
+err=$(sed -n 's/.*"last_error": *"\([^"]*\)".*/\1/p' "$STATE/state.json" 2>/dev/null)
+if [ -n "$err" ]; then
+    echo "noo-kiosk-watchdog: the proxy cannot mint: $err (noo kiosk status)" >&2
+fi
+
+hb=$(as_kiosk noo-kiosk-cdp heartbeat 2>/dev/null || echo null)
+now_ms=$(( now * 1000 ))
+if [ "$hb" != "null" ] && [ $(( now_ms - hb )) -gt "$STALE_AFTER" ]; then
+    echo "noo-kiosk-watchdog: heartbeat $(( (now_ms - hb) / 1000 ))s old; reloading"
+    as_kiosk noo-kiosk-cdp reload >/dev/null 2>&1 || true
+fi
+exit 0

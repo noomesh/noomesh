@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: data_extractor
+version: 1.0.0
+description: Extract structured data (entities, dates, amounts, key-value pairs) from unstructured text using a local LLM.
+author: noo-builtin
+
+inputs:
+  text:
+    type: string
+    required: true
+    description: The text to extract data from
+  schema:
+    type: object
+    required: false
+    description: "Optional JSON schema describing the expected output structure"
+  extract_types:
+    type: array
+    required: false
+    description: "Types to extract: entities, dates, amounts, emails, urls, key_value"
+    default: ["entities", "dates", "amounts"]
+
+outputs:
+  extracted:
+    type: object
+    description: Extracted structured data
+  entities:
+    type: array
+    description: Named entities found in the text
+  confidence:
+    type: number
+    description: Overall extraction confidence (0-1)
+
+container:
+  image: noo-sandbox-base:latest
+  command: ["python", "/skill/run.py"]
+  timeout: 90
+  memory_limit: 512m
+  network: restricted
+  gpu: false
+
+permissions:
+  filesystem: none
+  network: restricted
+  shell: false

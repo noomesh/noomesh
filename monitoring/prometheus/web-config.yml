@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Prometheus TLS + mTLS configuration
+# See: https://prometheus.io/docs/prometheus/latest/configuration/https/
+tls_server_config:
+  cert_file: /app/pki/services/prometheus/service.crt
+  key_file: /app/pki/services/prometheus/service.key
+  client_ca_file: /app/pki/ca.crt
+  # Every caller presents a cluster-CA leaf: Grafana (services/grafana), the
+  # gateway's PromQL route (its own leaf), and Prometheus scraping itself.
+  # VerifyClientCertIfGiven used to let a browser read every metric with no
+  # credential at all; metrics are for operators, and an operator reads them
+  # through Grafana or `noo`'s /api/metrics/query, both authenticated.
+  client_auth_type: RequireAndVerifyClientCert
+  # Only the principals that dial this listener (exporter-toolkit exact match
+  # on a DNS/IP/e-mail/URI SAN; the CN is never consulted; no wildcards):
+  #   noo-gateway  every gateway leaf (/api/metrics/query, the grafana-ds proxy)
+  #   prometheus   services/prometheus (the `prometheus` self-scrape job)
+  # Grafana is NOT listed: its datasource goes through the gateway
+  # (configs/grafana/datasources/prometheus.yml), and a direct dial from its
+  # own leaf is exactly what this refuses. Node leaves are not listed.
+  # tests/test_monitoring_web_configs_are_loaded.py pins this list.
+  client_allowed_sans:
+    - noo-gateway
+    - prometheus
+  min_version: TLS12

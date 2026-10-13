@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noo-piper — piper-tts behind the OpenAI-compatible speech API.
+#
+# The opt-in compose `piper` service (profile "voice", the same switch as
+# `whisper`): the first concrete provider behind the gateway's generic TTS
+# layer (gateway-rust/src/tts_client.rs speaks to it with the default
+# "openai" wire format; its native /synthesize shape is wire format "piper").
+#
+# Why build our own instead of pulling a piper image:
+#   - rhasspy/wyoming-piper and lscr.io/linuxserver/piper are pullable but
+#     serve the Wyoming protocol (length-prefixed JSON over a raw TCP
+#     socket), not HTTP — nothing a generic HTTP TTS client can POST to.
+#   - piper1-gpl ships `python -m piper.http_server`, but its contract is a
+#     bare `GET /?text=` returning WAV: no voice inventory, no health probe,
+#     no OpenAI shape, so /api/voice/voices and /api/voice/status would have
+#     nothing honest to report.
+#   - ghcr.io/matatonic/openedai-speech does serve /v1/audio/speech, but it
+#     bundles piper AND xtts/coqui (a multi-GB GPU stack) and its last
+#     release predates the piper1-gpl rewrite.
+#   - this shim is ~200 lines of auditable Python over the same piper-tts
+#     engine the retired in-process voice module used, with identical speed
+#     handling (see docker/piper_server.py).
+#   - anyone who prefers openedai-speech/LocalAI/kokoro-fastapi/OpenAI cloud
+#     points NOO_TTS_URL at it — same wire format, no gateway change.
+#
+# CPU by default (onnxruntime CPU, ~50MB of wheels, real-time on a laptop
+# core). PIPER_USE_CUDA=1 needs a CUDA-libs base image — the long-term GPU
+# home is a node-agent backend spec (node-agent-go internal/docker/
+# backends.go), not this compose service.
+#
+# Tag+digest pinned like Dockerfile.whisper and the nats upstream.
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+
+# piper-tts 1.6 (piper1-gpl) ships an abi3 manylinux wheel that bundles
+# espeak-ng and its phoneme data — no system packages needed.
+RUN pip install --no-cache-dir \
+        piper-tts==1.6.0 \
+        "fastapi>=0.115,<0.116" \
+        "uvicorn>=0.34,<0.35"
+
+# Vendor telemetry off (docs/security/telemetry.md), baked into the image so
+# a container started outside compose carries it too; compose sets the same.
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1
+
+WORKDIR /app
+COPY docker/piper_server.py /app/piper_server.py
+
+# Voice cache on a volume so downloads survive container recreation.
+ENV PIPER_VOICE=en_US-lessac-medium \
+    PIPER_VOICE_DIR=/voices \
+    PIPER_USE_CUDA=0
+VOLUME /voices
+
+EXPOSE 8000
+
+# curl-less healthcheck (slim image): python stdlib probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+CMD ["uvicorn", "piper_server:app", "--host", "0.0.0.0", "--port", "8000"]

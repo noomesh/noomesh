@@ -1,0 +1,9 @@
+{
+  "channels_registered": 2,
+  "active_conversations": 3,
+  "queue_mode": "redis",
+  "channels": {
+    "google_chat": { "stats": { "received": 142, "sent": 138, "errors": 0 } },
+    "telegram": { "stats": { "received": 56, "sent": 56, "errors": 1 } }
+  }
+}

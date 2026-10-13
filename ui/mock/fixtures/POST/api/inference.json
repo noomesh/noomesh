@@ -1,0 +1,6 @@
+{
+  "response": "atlas-02 is running hottest — 91% CPU against 22.8 / 24 GB of VRAM at load 0.88. It's effectively saturated, while prime-01 has plenty of headroom (38% CPU, 14.2 / 24 GB). I'd route the next inference job to prime-01. Want me to do that?",
+  "backend": "vllm",
+  "node_id": "prime-01",
+  "usage": { "total_tokens": 142 }
+}

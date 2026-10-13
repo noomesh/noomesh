@@ -1,0 +1,23 @@
+{
+  "$comment": "THE 'is this one of our images' rule, as cases. Read by node-agent-go (internal/docker image_ref_test.go), noo-cli (image_stage.rs) and gateway-rust (routes/artifacts.rs): all three must agree on every row. A ref is ours when, after Docker's normalisation, its name sits under one of `roots` or under a local-build namespace (docker.io/noomesh/, docker.io/pai-assistant/, docker.io/library/noo-). Unparsable refs count as ours (rail-only, fail closed).",
+  "roots": ["registry.example/acme/noomesh/", "ghcr.example/noomesh", "localhost:5000/team"],
+  "cases": [
+    {"ref": "registry.example/acme/noomesh/llamacpp:v0.2.103", "own": true},
+    {"ref": "registry.example/acme/noomeshx/llamacpp:v1", "own": false},
+    {"ref": "ghcr.example/noomesh/node-agent:v1", "own": true},
+    {"ref": "ghcr.example/noomesh/node-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "own": true},
+    {"ref": "localhost:5000/team/x:1", "own": true},
+    {"ref": "noomesh/stunnel:latest", "own": true},
+    {"ref": "docker.io/noomesh/stunnel:latest", "own": true},
+    {"ref": "pai-assistant/llamacpp:amd64", "own": true},
+    {"ref": "noo-sandbox-base:latest", "own": true},
+    {"ref": "docker.io/library/noo-browser:latest", "own": true},
+    {"ref": "ollama/ollama:latest", "own": false},
+    {"ref": "alpine:3.20", "own": false},
+    {"ref": "ghcr.io/ggml-org/llama.cpp:server", "own": false},
+    {"ref": "quay.io/someone/noomesh/x:1", "own": false},
+    {"ref": "vllm/vllm-openai:latest", "own": false},
+    {"ref": "someone/noo-thing:1", "own": false},
+    {"ref": "Bad/Upper:1", "own": true}
+  ]
+}

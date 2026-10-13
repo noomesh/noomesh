@@ -1,0 +1,8 @@
+watched_folders:
+  enabled: true
+  folders:
+    - host: /home/op/docs
+      mount: /data/docs
+    - host: /home/op/scratch
+      mount: /data/scratch
+      writable: true

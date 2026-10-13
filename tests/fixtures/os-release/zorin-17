@@ -1,0 +1,7 @@
+NAME="Zorin OS"
+VERSION="17.2"
+ID=zorin
+ID_LIKE="ubuntu debian"
+VERSION_ID="17"
+VERSION_CODENAME=jammy
+UBUNTU_CODENAME=jammy

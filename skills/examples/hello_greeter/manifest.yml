@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: hello_greeter
+version: 1.0.0
+description: Worked example skill — greets someone by name. Copy this directory into ~/.pai/skills (or $NOO_SKILLS_DIR) to activate, or start fresh with `pai skills scaffold <name>`.
+author: noo-example
+
+inputs:
+  name:
+    type: string
+    required: false
+    description: Name to greet
+    default: world
+
+outputs:
+  greeting:
+    type: string
+    description: The greeting message
+
+container:
+  image: noo-sandbox-base:latest
+  command: ["python", "/skill/run.py"]
+  timeout: 30
+  memory_limit: 256m
+  network: none
+  gpu: false
+
+permissions:
+  filesystem: none
+  network: none
+  shell: false

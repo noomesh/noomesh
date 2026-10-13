@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noo-whisper — faster-whisper behind the OpenAI-compatible audio API.
+#
+# The opt-in compose `whisper` service (profile "voice"): the first concrete
+# provider behind the gateway's generic STT layer (gateway-rust/src/stt_client.rs
+# speaks to it with the default "openai" wire format).
+#
+# Why build our own instead of pulling speaches/faster-whisper-server:
+#   - those images are pullable but ship a full model-management stack and
+#     only accept HuggingFace repo ids as model names; `pai voice transcribe`
+#     sends faster-whisper size names ("base") by default.
+#   - this shim is ~150 lines of auditable Python over the same
+#     faster-whisper engine the retired in-process voice module used, with
+#     identical decode parameters (see docker/whisper_server.py).
+#   - anyone who prefers speaches/LocalAI/vLLM-audio/OpenAI cloud points
+#     NOO_STT_URL at it — same wire format, no gateway change.
+#
+# CPU by default (int8). CUDA needs a CUDA-libs base image — the long-term
+# GPU home is a node-agent backend spec (node-agent-go internal/docker/
+# backends.go, like embedding/reranker), not this compose service.
+#
+# Tag+digest pinned like the nats upstream in docker-compose.cluster.yml.
+# Docker Hub base via the GHCR mirror (.github/hub-mirror.txt): Hub rate-limits
+# pulls per IP. Needs a ghcr.io login; without one, build with
+# --build-arg HUB_MIRROR=docker.io.
+ARG HUB_MIRROR=ghcr.io/noomesh/mirror
+FROM ${HUB_MIRROR}/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+
+# faster-whisper bundles decode via PyAV (static ffmpeg libs in the wheel)
+# and VAD via onnxruntime — no system packages needed.
+# `requests` is imported by faster_whisper.utils but missing from its
+# declared deps at this pin — install it explicitly.
+RUN pip install --no-cache-dir \
+        faster-whisper==1.1.1 \
+        "requests>=2.32,<3" \
+        "fastapi>=0.115,<0.116" \
+        "uvicorn>=0.34,<0.35" \
+        "python-multipart>=0.0.18,<0.1"
+
+# Vendor telemetry off (docs/security/telemetry.md), baked into the image so
+# a container started outside compose carries it too; compose sets the same.
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1
+
+WORKDIR /app
+COPY docker/whisper_server.py /app/whisper_server.py
+
+# Model cache on a volume so pulls survive container recreation.
+ENV HF_HOME=/models \
+    WHISPER_MODEL=base \
+    WHISPER_DEVICE=auto
+VOLUME /models
+
+EXPOSE 8000
+
+# curl-less healthcheck (slim image): python stdlib probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+CMD ["uvicorn", "whisper_server:app", "--host", "0.0.0.0", "--port", "8000"]

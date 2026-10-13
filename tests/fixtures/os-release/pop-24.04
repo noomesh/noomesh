@@ -1,0 +1,7 @@
+NAME="Pop!_OS"
+VERSION="24.04 LTS"
+ID=pop
+ID_LIKE="ubuntu debian"
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+UBUNTU_CODENAME=noble

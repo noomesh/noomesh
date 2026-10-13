@@ -1,0 +1,1523 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# RUNNERS: every job runs on a GitHub-hosted runner (ubuntu-latest). This
+# repository is public, so a pull request from a fork must never reach
+# maintainer hardware: there is no persistent runner, no shared workspace and no
+# break-glass variable. Fork runs need a maintainer's approval first (repo
+# setting "Approval for running fork pull request workflows": all external
+# contributors). Caches are
+# GitHub's: `type=gha` for docker layers, a toolchain+Cargo.lock-keyed
+# actions/cache for cargo.
+#
+# Every job here runs with the public repository's own access: GITHUB_TOKEN
+# and, for the image builds, the DHI org credentials (never on a fork pull
+# request: secrets are withheld there and each login step also carries a
+# same-repo clause). Nothing reads a private repository, mints an app token or
+# needs a repository variable to switch it on. The checks that need the
+# licensed add-ons' code (overlay parity, the graph context against the real
+# add-on) live in the add-on repositories and run there.
+# tests/test_ci_public_safety.py and tests/test_ci_cloud_only.py hold every
+# shipped workflow to this.
+#
+# Nothing here may use `pull_request_target`, and no job grants write
+# permissions or secrets to code from a fork.
+name: CI
+
+on:
+  push:
+    branches: [ main, staging, develop, dev ]
+  pull_request:
+    # staging and main receive promotion merge PRs: they must be checked like
+    # any other PR.
+    branches: [ main, staging, develop, dev ]
+
+# THE ONE SWITCH for trellion being public. 'false' until trellion and
+# trellion-protocols are public: test-core then deselects the tests that import
+# trellion and sqlx-drift skips its checks, both with a notice and with NO
+# network probe, so a verdict never depends on GitHub's reachability. The
+# cutover flips this one line to 'true': from then on both jobs install
+# trellion and an unreachable trellion FAILS them (it never skips).
+env:
+  TRELLION_PUBLIC: 'true'
+
+jobs:
+  # The cheap repo-hygiene gates. Everything else `needs:` this, so a hygiene
+  # failure produces ONE clear failure and a set of skips.
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - name: No maintainer literals or real-shaped secrets in the tree
+      run: |
+        if [ -x scripts/leak-check.sh ]; then bash scripts/leak-check.sh; else echo "the leak gate is not present in this tree (migration tool, not shipped): SKIPPED, not failed"; fi
+    # Licence headers cannot rot: every source file carries the SPDX line (the
+    # Apache-2.0 SDK subtree has its own LICENSE and is skipped). The checker
+    # is not part of the public tree, so it runs where it is present.
+    - name: Every source file carries its SPDX licence header
+      run: |
+        if [ -f internal/noomesh/licensing/spdx.py ]; then python3 internal/noomesh/licensing/spdx.py . AGPL-3.0-only --check; else echo "the SPDX checker is not present in this tree (migration tool, not shipped): SKIPPED, not failed"; fi
+    # Docs guardrails: every docs/ file indexed once, every relative link
+    # resolves, the generated CLI reference blocks match noo-cli/src/usage.rs,
+    # and no retired names creep back into public prose.
+    - name: Docs index, links, and generated CLI reference are consistent
+      run: python3 scripts/docs-check.py
+
+    - name: Legacy sudoers list is in sync between prep-host and doctor
+      run: python3 scripts/check-legacy-sudoers-sync.py
+    - name: Every multi-site declaration has an indexed guard
+      run: |
+        if [ -f scripts/check-declaration-guards.py ]; then python3 scripts/check-declaration-guards.py; else echo "the declaration-guard checker is not present in this tree (migration tool, not shipped): SKIPPED, not failed"; fi
+
+    # A PR that NAMES a prerequisite must not be mergeable before it. The
+    # body is passed through the environment rather than interpolated into
+    # the shell — it is attacker-controlled text on a fork PR.
+    - name: Named prerequisites are merged
+      # The job grants pull-requests: read so the check can read the named PRs;
+      # `contents` is listed because naming any permission drops the defaults.
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: python3 scripts/check-blocked-by.py
+
+    - name: CLI state words agree between the guide and ui::state
+      run: python3 scripts/check-state-words.py
+
+  # ── Is there any CODE in this change? ─────────────────────────────────
+  #
+  # The jobs below always RUN and always report; what is conditional is the
+  # expensive work inside them, so a docs-only PR still gets green checks in
+  # seconds. A `paths:` filter on the workflow would not do: a workflow
+  # skipped by path filtering never reports its checks, and a required check
+  # that never reported stays Pending forever. This also behaves under a
+  # merge queue.
+  #
+  # The predicate is deliberately coarse: "did ANY file outside docs change?"
+  # A per-area filter is tempting and wrong here, because the cross-language
+  # parity guards read each other's sources. One file of code anywhere and
+  # everything runs.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+      gateway: ${{ steps.diff.outputs.gateway }}
+      cli: ${{ steps.diff.outputs.cli }}
+      sqlx: ${{ steps.diff.outputs.sqlx }}
+      ui: ${{ steps.diff.outputs.ui }}
+      llamacpp: ${{ steps.diff.outputs.llamacpp }}
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+      with:
+        fetch-depth: 0
+    - id: diff
+      name: Does this change touch anything but documentation?
+      env:
+        BASE: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -eu
+        # ── llamacpp: its OWN inputs, on every event ─────────────────────
+        # The llama-server image has one input in this tree:
+        # docker/Dockerfile.llamacpp (tests/test_ci_scope_declarations.py holds it
+        # to that). On a pull request the PR's diff decides (that path or this
+        # workflow); on a push the tree diff against the last final release
+        # decides, so a break keeps compiling until it ships. A CHANGED-FILES
+        # test, never a file-presence test: a moved Dockerfile shows up as a
+        # change under the old path and fails loudly. Fail open: nothing to diff
+        # against compiles it.
+        if [ -n "${BASE:-}" ]; then
+          lc_range="$BASE...HEAD"
+          lc_pattern='^(docker/Dockerfile\.llamacpp$|\.github/workflows/ci\.yml$)'
+        else
+          lc_release="$(git tag --list 'stack-v*' | grep -vE -- '-rc\.' | sort -V | tail -1 || true)"
+          if [ -z "$lc_release" ] && git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
+            lc_release=refs/remotes/origin/main
+          fi
+          lc_range="${lc_release:+$lc_release..HEAD}"
+          lc_pattern='^docker/Dockerfile\.llamacpp$'
+        fi
+        if [ -n "$lc_range" ]; then
+          lc_changed="$(git diff --name-only "$lc_range" 2>/dev/null)" || lc_range=""
+        fi
+        if [ -z "$lc_range" ]; then
+          llamacpp=true; echo "llamacpp: no base to diff against — compiling (fail open)"
+        elif printf '%s\n' "$lc_changed" | grep -qE "$lc_pattern"; then
+          llamacpp=true; echo "llamacpp: its inputs changed in $lc_range"
+        else
+          llamacpp=false; echo "llamacpp: its inputs are unchanged in $lc_range"
+        fi
+        echo "llamacpp=$llamacpp" >> "$GITHUB_OUTPUT"
+
+        # A push (to dev/main) is the integration point — never narrow it.
+        all_true() {
+          for k in code gateway cli sqlx ui; do echo "$k=true" >> "$GITHUB_OUTPUT"; done
+        }
+        if [ -z "${BASE:-}" ]; then
+          all_true
+          echo "push event — running everything"
+          exit 0
+        fi
+        changed="$(git diff --name-only "$BASE...HEAD")"
+        [ -n "$changed" ] || { all_true; exit 0; }
+        echo "changed files:"; printf '%s\n' "$changed" | sed 's/^/  /'
+        # COUNT the documentation lines and compare with the total, rather than
+        # asking `grep -v` whether a non-doc line exists: `grep -c` means the
+        # same thing in every grep, `-qv` does not.
+        # on a real code change, from a test that passed locally.
+        total="$(printf '%s\n' "$changed" | wc -l)"
+        docs="$(printf '%s\n' "$changed" | grep -cE '^(internal/|docs/)|\.md$' || true)"
+        echo "changed=$total docs=$docs"
+        if [ "$total" -eq "$docs" ]; then
+          echo "code=false" >> "$GITHUB_OUTPUT"
+          echo "documentation only — the build steps will be skipped"
+        else
+          echo "code=true" >> "$GITHUB_OUTPUT"
+          echo "code changed — running the full suite"
+        fi
+
+        # ── Per-crate narrowing ──────────────────────────────────────────
+        # Three jobs own a tree nothing else compiles, and they are the three
+        # expensive ones. Everything else stays unconditional, because that is
+        # where the cross-language parity guards live.
+        #
+        # FAIL OPEN. A path this case statement does not recognise turns every
+        # gate back on: a new top-level directory must cost minutes, never
+        # coverage. tests/test_ci_scope_declarations.py holds this shape.
+        gateway=false; cli=false; sqlx=false; ui=false; unknown=""
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          case "$f" in
+            docs/*|internal/*|*.md)   ;;
+            # The gateway also owns the sqlx offline data and the mesh
+            # migrations that sqlx-drift diffs against Alembic.
+            gateway-rust/*)           gateway=true; sqlx=true; ui=true ;;
+            noo-cli/*)                cli=true ;;
+            # The console. Its own job; it does not compile any Rust.
+            ui/*)                     ui=true ;;
+            # go-node-agent is unconditional; nothing else compiles this tree.
+            node-agent-go/*)          ;;
+            # The Alembic chain lives under src/noomesh/db.
+            src/*|tests/*|pyproject.toml|alembic.ini) sqlx=true ;;
+            *)                        unknown="$unknown $f" ;;
+          esac
+        done <<EOF
+        $changed
+        EOF
+        if [ -n "$unknown" ]; then
+          gateway=true; cli=true; sqlx=true; ui=true
+          echo "unrecognised path(s) — every gate stays on:$unknown"
+        fi
+        # docker/Dockerfile.llamacpp is routed to "unknown" above (docker/ is
+        # not a recognised tree), so it re-arms every gate like any other
+        # unrecognised path. Its OWN build
+        # switch is computed at the top of this step, independently, so no
+        # future narrowing here can turn the llama-server build back into a
+        # tag-time surprise.
+        echo "gateway=$gateway" >> "$GITHUB_OUTPUT"
+        echo "cli=$cli" >> "$GITHUB_OUTPUT"
+        echo "sqlx=$sqlx" >> "$GITHUB_OUTPUT"
+        echo "ui=$ui" >> "$GITHUB_OUTPUT"
+        echo "gateway=$gateway cli=$cli sqlx=$sqlx ui=$ui llamacpp=$llamacpp"
+
+  # ── The Python suite ───────────────────────────────────────────────────
+  #
+  # The only Python job: it needs no token. The trellion library
+  # (and trellion-protocols, which it pins) is installed from its PUBLIC
+  # location once the TRELLION_PUBLIC switch (top of this file) is 'true'; until then the
+  # tests that import trellion are ignored/deselected (the `needs_trellion`
+  # lists below) and the rest runs. The first run after both repositories go
+  # public therefore starts running those tests with no workflow change. The
+  # tests that need the licensed add-ons' code live in the add-on repositories.
+  test-core:
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    permissions:
+      contents: read
+    # The KB-audience and entity-cleanup DB tests build their tables in a
+    # throwaway schema and need Postgres + pgvector; the entity-cleanup
+    # worker's production-layout tests CREATE DATABASE and ROLE, so the DSN
+    # must be a superuser. Same mirrored image as sqlx-drift. NO fixed host
+    # port: Docker picks one and the DSN reads it from job.services.
+    services:
+      postgres:
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
+        # One expression for the whole mapping: an empty string is falsy in
+        # GitHub expressions (so `cond && '' || x` always yields x) and the
+        # runner rejects '' or null inside `credentials`. So it is the GHCR
+        # login object when the mirror is on, and {} (no login, the token is
+        # never offered to Docker Hub) when HUB_MIRROR_OFF is set.
+        credentials: ${{ fromJSON(!(vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false') && format('{{"username":"{0}","password":"{1}"}}', github.actor, secrets.GITHUB_TOKEN) || '{}') }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: noo
+          POSTGRES_DB: noomesh
+        ports: ['5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+      with:
+        persist-credentials: false
+
+    # Compose v5 for the compose-projection guards (the hosted runners ship
+    # 2.38.2; `config --no-interpolate` needs 2.40+). Per-job DOCKER_CONFIG
+    # first: the action copies the plugin into $DOCKER_CONFIG/cli-plugins.
+    - name: Per-job DOCKER_CONFIG
+      run: |
+        mkdir -p "$RUNNER_TEMP/.docker"
+        echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
+    - uses: docker/setup-compose-action@2fe291b7677a45ee1269ec56a42604c143505e7e   # v1
+      with:
+        version: v5.0.2
+
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+      with:
+        python-version-file: .python-version
+    - name: Cache pip packages
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-py${{ hashFiles('.python-version') }}-pipcore-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-py${{ hashFiles('.python-version') }}-pipcore-
+    # Is the trellion library public yet? Decided by the TRELLION_PUBLIC switch
+    # at the top of this file, never by the network.
+    - name: Is trellion declared public? (TRELLION_PUBLIC)
+      id: trellion
+      run: |
+        set -u
+        if [ "$TRELLION_PUBLIC" != "true" ]; then
+          echo "public=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::trellion is not public yet: the tests that import it are skipped from this run"
+          exit 0
+        fi
+        # Declared public: unreachable is a failure, never a skip.
+        for r in trellion trellion-protocols; do
+          GIT_TERMINAL_PROMPT=0 git ls-remote "https://github.com/personifAI/$r" HEAD >/dev/null \
+            || { echo "::error::TRELLION_PUBLIC is true but $r is not reachable anonymously"; exit 1; }
+          echo "$r: reachable"
+        done
+        echo "public=true" >> "$GITHUB_OUTPUT"
+    - name: Install dependencies
+      env:
+        TRELLION_PUBLIC: ${{ steps.trellion.outputs.public }}
+      run: |
+        python -m pip install --upgrade pip
+        if [ "$TRELLION_PUBLIC" = "true" ]; then
+          pip install -e ".[trellion,dev,web,cache,db]"
+        else
+          pip install -e ".[dev,web,cache,db]"
+        fi
+    - name: Lint with ruff
+      run: ruff check src/
+
+    # The Rust external MCP door serves gateway-rust/mcp-tools.json, generated
+    # from the Python ToolDef registry. If they drift, the door advertises a
+    # schema the tools no longer have, and the failure is silent: clients get
+    # a valid-looking tool list and their calls 400 on fields that moved.
+    - name: MCP manifest is current
+      run: python3 scripts/build-mcp-manifest.py --check
+
+    # The live sandbox test (tests/test_sandbox_exec_isolation.py::
+    # test_bwrap_live_*) should RUN in CI, not skip. GitHub-hosted runners ship
+    # no bubblewrap, and Ubuntu 24.04's AppArmor blocks the unprivileged user
+    # namespaces it needs. Install it and lift that restriction (the hosted VM
+    # has passwordless sudo). Bounded on purpose: wait at most 60 s for the
+    # dpkg lock, cap each apt call, retry once after a fresh index, and cap the
+    # step so a hang fails fast.
+    - name: Sandbox prerequisites (bubblewrap)
+      timeout-minutes: 6
+      run: |
+        if ! command -v bwrap >/dev/null; then
+          if sudo -n true 2>/dev/null; then
+            APT="sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -y -qq"
+            $APT install --no-install-recommends bubblewrap \
+              || { $APT update && $APT install --no-install-recommends bubblewrap; }
+          else
+            echo "::warning::bubblewrap is missing and this runner has no passwordless sudo; the live bwrap test will skip"
+          fi
+        fi
+        [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" != "1" ] || { sudo -n true 2>/dev/null && sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; }
+        command -v bwrap >/dev/null && bwrap --ro-bind / / --unshare-net true && echo "bwrap runs here" || echo "::warning::bwrap cannot run on this runner"
+
+    - name: Run tests
+      env:
+        TRELLION_PUBLIC: ${{ steps.trellion.outputs.public }}
+        NOO_KB_AUDIENCE_TEST_DSN: postgresql://noo:noo@localhost:${{ job.services.postgres.ports['5432'] }}/noomesh
+        # A path that does not exist, so nothing mistakes a stray directory for
+        # a sibling checkout.
+        PAI_TRELLION_CHECKOUT: ${{ github.workspace }}/_no_sibling_checkout
+      run: |
+        # Skips are expected here (no sibling checkouts, no bubblewrap).
+        export NOO_STRICT_SKIPS=0
+        # Only while trellion is not public: tests that import it.
+        needs_trellion=(
+          # Import the trellion package at collection time.
+          --ignore=tests/test_agent_messaging_client.py
+          --ignore=tests/test_backend_profiles.py
+          --ignore=tests/test_evidence.py
+          --ignore=tests/test_memory_shim_providers.py
+          --ignore=tests/test_parallel_collab.py
+          --ignore=tests/test_rag_orchestrator.py
+          --ignore=tests/test_rag_verifier.py
+          --ignore=tests/test_workflow.py
+          # Need the trellion package (installed by the [trellion] extra).
+          --deselect=tests/test_persona_scoping.py
+          --deselect=tests/test_walks_worker.py
+          --deselect=tests/test_snapshot_audience.py
+        )
+        args=(
+          # Reads the SPDX checker, which is not part of this tree.
+          --ignore=tests/test_spdx_header_declarations.py
+          # Read release/image workflows, private docs or sibling checkouts that
+          # are not part of this tree.
+          --deselect=tests/test_dist_mode.py
+          --deselect=tests/test_cla_workflow_declarations.py
+          --deselect=tests/test_cla_text_one_source.py::test_public_cla_equals_kit_master
+          --deselect=tests/test_release_lock_retries_the_network.py
+          --deselect=tests/test_image_namespace_declarations.py
+          --deselect=tests/test_hygiene_defaults.py
+          --deselect=tests/test_ci_scope_declarations.py::test_the_console_artifact_tag_matches_what_the_gateway_pulls
+          --deselect=tests/test_ci_scope_declarations.py::test_the_llamacpp_image_reads_nothing_else_from_the_tree
+          --deselect=tests/test_hub_mirror.py::test_every_mirrored_from_is_in_the_inventory_and_one_prefix_is_declared
+          --deselect=tests/test_hub_mirror.py::test_rust_jobs_and_image_builds_use_the_mirror
+          --deselect=tests/test_noo_gateway_client_package.py::test_the_images_install_it
+          --deselect=tests/test_precommit_hooks_can_run.py::test_the_leak_gate_is_the_same_script_locally_and_in_ci
+          --deselect=tests/test_precommit_hooks_can_run.py::test_the_leak_gate_takes_no_filenames_and_always_runs
+          --deselect=tests/test_pro_build_cfg_excluded_from_oss.py::test_cfg_gated_pro_files_are_excluded_from_the_oss_sync
+          --deselect=tests/test_release_images_are_pinned_in_compose.py::test_every_released_compose_service_uses_the_release_pin
+          --deselect=tests/test_workflow_release_line_fetch.py::test_the_guards_exist_where_expected
+        )
+        if [ "$TRELLION_PUBLIC" != "true" ]; then args+=("${needs_trellion[@]}"); fi
+        pytest tests/ -v --cov=noomesh --cov-report=xml "${args[@]}"
+
+    # Coverage goes to a BUILD ARTIFACT, not to a third-party uploader: visible
+    # per run, no token, and no network call that can take a green run down.
+    - name: Upload coverage artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      with:
+        name: coverage-py
+        path: coverage.xml
+        retention-days: 14
+        if-no-files-found: warn
+
+  # Compiled agents are gated: a commit using a removed Go API must not merge
+  # green. These jobs close that gap.
+  go-node-agent:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    defaults:
+      run:
+        working-directory: node-agent-go
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
+      with:
+        go-version-file: node-agent-go/go.mod
+        cache-dependency-path: node-agent-go/go.sum
+
+    - name: Build, vet, test
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        go build ./...
+        go vet ./...
+        go test ./...
+
+  rust-gateway:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
+    # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
+    # cache, builds on top of it and tars it back up, which can run out of disk
+    # inside the cache save. Remove the preinstalled toolchains this job never
+    # uses. continue-on-error so a slow or failed delete is never a red job.
+    - name: Free hosted-runner disk
+      if: needs.scope.outputs.gateway == 'true' && runner.environment == 'github-hosted'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: |
+        df -h /
+        # -n: never prompt. A runner without passwordless sudo leaves the disk as is.
+        big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"
+        sudo -n rm -rf $big || { echo "::notice::could not free hosted-runner disk (no passwordless sudo?) — continuing"; }
+        df -h /
+
+    # No host toolchain: every cargo invocation below runs in a rust container
+    # via scripts/cargo-docker.sh. Docker is the only host dependency.
+
+    # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
+    # The rustc version is in the key so a toolchain bump rebuilds, and a source
+    # hash ends it so a dev push that changed the crate saves a fresh target while
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
+    # PR-scoped save is visible to that PR alone and evicts useful entries from
+    # the repo's cache budget.
+    # `.sqlx` is in the source hash, but a restored target is still never trusted
+    # for the macros: that is the `cargo clean -p` step below.
+    # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
+    # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
+    # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
+    # login in a shared credential store can be revoked under an overlapping job
+    # (tests/test_workflow_docker_login_isolation.py).
+    - name: Per-job Docker credential store and GHCR login
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+        mkdir -p "$DOCKER_CONFIG"
+        echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+    # The Hub fallback pulls AUTHENTICATED (a per-account limit, not the shared
+    # IP's anonymous one) with the Docker account in secrets. Private-only: the
+    # public repository has no such secret and pulls anonymously.
+    - name: Docker Hub login (private repository only)
+      if: github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "${DHI_TOKEN:-}" ]; then
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+        fi
+    - name: Rust image from the mirror (Hub on a miss)
+      env:
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        # $GITHUB_WORKSPACE: noo-cli's steps run in noo-cli/ (defaults), where a
+        # relative scripts/ path is missing and the image would come back EMPTY.
+        ref="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/rust:1-bookworm)" || ref=""
+        if [ -z "$ref" ]; then
+          echo "::warning::hub-mirror.py gave no image — rust:1-bookworm from Docker Hub"
+          ref=docker.io/library/rust:1-bookworm
+        fi
+        echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+    - name: Rust toolchain id (cache key)
+      id: rustc
+      if: needs.scope.outputs.gateway == 'true'
+      run: echo "id=$(docker run --rm "${CARGO_DOCKER_IMAGE:-rust:1-bookworm}" rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore cargo cache
+      id: cargo-cache
+      if: needs.scope.outputs.gateway == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          gateway-rust/target
+        key: ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-
+
+    # `sqlx::query!` is a macro, and cargo's freshness check only tracks SOURCE
+    # files — editing `.sqlx/` does not dirty the crate. With a restored
+    # `target/`, `cargo check` is then a no-op and cache drift sails through.
+    # Measured locally: deleting a cached query "passed" in 0.9s against a warm
+    # target, and failed with exit 101 the moment the crate was forced to
+    # rebuild. Cleaning just this package (not its dependencies, which dominate
+    # build time) forces the macros to re-expand while keeping the cache useful.
+    - name: Force sqlx macro re-expansion
+      if: needs.scope.outputs.gateway == 'true'
+      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh clean -p noo-gateway
+
+    # SQLX_OFFLINE makes `sqlx::query!` type-check against the committed
+    # `.sqlx/` cache instead of a live database. This is also the SOURCE↔CACHE
+    # drift check: sqlx fails the build when a `query!` in the source has no
+    # cached entry, so a developer who edits SQL without re-running
+    # `scripts/sqlx-prepare.sh` cannot merge.
+    #
+    # It does NOT catch CACHE↔SCHEMA drift — a migration that drops a column
+    # still passes here, because the stale cache is self-consistent. That is the
+    # `sqlx-drift` job below.
+    - name: cargo check
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh check --locked --tests
+
+    # Lint gate. The crate's pre-existing debt is declared as documented
+    # crate-root allows in `gateway-rust/src/main.rs` rather than suppressed
+    # here, so the list is visible to a reader of the code and can be burned
+    # down. SQLX_OFFLINE for the same reason as the step above: the macros must
+    # validate against the committed cache, not a job-level DATABASE_URL.
+    - name: Clippy (deny warnings)
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      # CARGO_DOCKER_SHARED_TARGET: lint against the target `cargo check` just
+      # warmed (and the cache restored) instead of an always-empty volume on a
+      # hosted runner — see scripts/cargo-docker.sh.
+      run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
+
+    # `cargo check` does not build `#[cfg(test)]` code and never runs it, so the
+    # crate's unit tests need their own step (and `--tests` above, so a test
+    # that fails to COMPILE cannot merge). They are pure unit tests — no
+    # database, no network — and run in seconds against the warm target.
+    # SQLX_OFFLINE for the same reason as the check above.
+    - name: cargo test
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh test --locked
+
+
+    # Prune before saving: incremental dirs, the crate's own (test) binaries
+    # and top-level outputs go; dependency artifacts stay. A target still over
+    # the cap is dropped whole (scripts/ci-prune-cargo-target.sh).
+    - name: Prune cargo target before the cache save
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: scripts/ci-prune-cargo-target.sh gateway-rust 4
+
+    # continue-on-error: a cache save is an optimisation, never a check; a full
+    # runner disk inside the tar must not turn a green run red.
+    - name: Save cargo cache (dev pushes only)
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          gateway-rust/target
+        key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The console: typecheck, tests, build and the contract audit. The audit
+  # diffs `.route(...)` in gateway-rust against ui/contracts/openapi.json.
+  ui:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: ui/package-lock.json
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+      with:
+        python-version-file: .python-version
+
+    - name: Install
+      if: needs.scope.outputs.ui == 'true'
+      run: npm ci
+
+    # The console's four gates.
+    - name: Typecheck
+      if: needs.scope.outputs.ui == 'true'
+      run: npm run typecheck
+    - name: Test
+      if: needs.scope.outputs.ui == 'true'
+      run: npm test
+    - name: Build web console
+      if: needs.scope.outputs.ui == 'true'
+      run: npm run build -w @metis/web
+    - name: Contract audit (UI + router vs openapi.json)
+      if: needs.scope.outputs.ui == 'true'
+      run: npm run audit:contract
+
+    # Only what ships to a browser. The dev/build toolchain is excluded by
+    # design: it never enters the bundle. apps/mobile is out of the workspace.
+    - name: Security audit (web runtime deps)
+      if: needs.scope.outputs.ui == 'true'
+      run: npm audit -w apps/web --omit=dev --audit-level=high
+
+  # CACHE↔SCHEMA drift: does `.sqlx/` still describe the database the
+  # migrations actually produce? `cargo check` cannot answer this — a cache
+  # that is stale but self-consistent compiles perfectly — so this job builds
+  # the schema from the migrations and asks the database directly. The memory
+  # migration chain comes from the trellion library, read from its public
+  # location with no token: until the TRELLION_PUBLIC switch (top of this file)
+  # is flipped the job reports a notice and skips its work (it passes); after
+  # the flip it checks, and an unreachable trellion fails it.
+  sqlx-drift:
+    # Pinned to a GitHub-hosted runner, unlike its siblings: it needs a live
+    # Postgres SERVICE container and `cargo sqlx prepare --check` against it.
+    runs-on: ubuntu-latest
+    # `needs: scope` only reads the diff: it gates the work, not the job, so a
+    # required check never hangs Pending.
+    needs: [scope]
+    if: ${{ !cancelled() && needs.scope.result == 'success' }}
+    services:
+      postgres:
+        # pgvector, not plain postgres: the migrations create `vector` columns.
+        # pg18 to match the controller image. Not cosmetic: the baseline check
+        # compares pg_dump output, which differs between major versions, so an
+        # older service would fail the check on the version rather than on
+        # drift. Bump with docker/Dockerfile.postgres. Pulled from the GHCR
+        # mirror, not Docker Hub, so a Hub outage cannot hang the job.
+        image: ${{ vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false' && 'pgvector/pgvector:pg18' || format('ghcr.io/{0}/pgvector:pg18', github.repository_owner) }}
+        # One expression for the whole mapping: an empty string is falsy in
+        # GitHub expressions (so `cond && '' || x` always yields x) and the
+        # runner rejects '' or null inside `credentials`. So it is the GHCR
+        # login object when the mirror is on, and {} (no login, the token is
+        # never offered to Docker Hub) when HUB_MIRROR_OFF is set.
+        credentials: ${{ fromJSON(!(vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false') && format('{{"username":"{0}","password":"{1}"}}', github.actor, secrets.GITHUB_TOKEN) || '{}') }}
+        env:
+          POSTGRES_USER: noo
+          POSTGRES_PASSWORD: noo
+          POSTGRES_DB: noomesh
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://noo:noo@localhost:5432/noomesh
+      # The role-creating migrations refuse to invent a password ("a predictable
+      # password on a login role is worse than a failed migration"), so each
+      # needs one here. A literal, not a secret: this Postgres is a throwaway
+      # service container on an ephemeral runner, and a secret would imply a
+      # confidentiality it does not have. List them with:
+      NOO_APP_DB_PASSWORD: ci-ephemeral-not-a-secret
+      #   grep -rl _DB_PASSWORD src/noomesh/db/migrations/versions/
+      NOO_EVOLVE_DB_PASSWORD: ci-ephemeral-not-a-secret
+      NOO_TRELLION_DB_PASSWORD: ci-ephemeral-not-a-secret
+    steps:
+    # persist-credentials: false: no token header shadows anything git runs
+    # from the workspace.
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5
+      if: needs.scope.outputs.sqlx == 'true'
+      with:
+        # Read from the same `.python-version` as every other job.
+        python-version-file: .python-version
+
+    # The memory Alembic env lives in trellion, and BOTH heads must run: many
+    # statements read memory-owned tables, so a mesh-only schema would report
+    # false drift. So the job only works when trellion (and trellion-protocols,
+    # which it pins) can be read anonymously; until TRELLION_PUBLIC is flipped it
+    # skips cleanly, afterwards an unreachable trellion fails it.
+    - name: Is trellion declared public? (TRELLION_PUBLIC)
+      id: trellion
+      if: needs.scope.outputs.sqlx == 'true'
+      run: |
+        set -u
+        if [ "$TRELLION_PUBLIC" != "true" ]; then
+          echo "public=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::trellion is not public yet: the migration-drift checks are SKIPPED (not failed) until it is"
+          exit 0
+        fi
+        # Declared public: unreachable is a failure, never a skip.
+        for r in trellion trellion-protocols; do
+          GIT_TERMINAL_PROMPT=0 git ls-remote "https://github.com/personifAI/$r" HEAD >/dev/null \
+            || { echo "::error::TRELLION_PUBLIC is true but $r is not reachable anonymously"; exit 1; }
+          echo "$r: reachable"
+        done
+        echo "public=true" >> "$GITHUB_OUTPUT"
+
+    - name: Install noomesh
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      run: |
+        python -m pip install --upgrade pip
+        # [trellion] explicitly: this job replays BOTH chains and the memory
+        # chain lives in the trellion package, which is not a core dependency.
+        pip install -e ".[trellion]"
+
+    # Replays both chains from the empty service container, verifies both
+    # version tables land on their env's real head, and re-runs the upgrade to
+    # prove the existing-install path is a no-op. Guards the replayability
+    # property: baselines are pinned DDL, not create_all().
+    - name: Replay migrations from empty (both chains)
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      run: bash scripts/migration-replay-check.sh 'postgresql+psycopg://noo:noo@localhost:5432/noomesh'
+
+    - name: Mesh sqlx baselines match the Alembic chain
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      env:
+        BASELINE_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        POSTGRES_PASSWORD: pai
+        PGSUPERUSER: noo
+      run: |
+        set -euo pipefail
+        # The postgres service is a real container on the runner; pg_dump must
+        # run INSIDE it so the client version tracks the server (see the
+        # script header). Resolve its name rather than assuming the pattern.
+        # Match EXACTLY one. `| head -1` would silently pick an arbitrary
+        # container; a drift check against a database that is not ours would
+        # fail confusingly. Ambiguity is a hard error.
+        mapfile -t PGC < <(docker ps --filter id=${{ job.services.postgres.id }} --format '{{.Names}}')
+        if [ "${#PGC[@]}" -ne 1 ]; then
+          echo "::error::expected exactly 1 pg18 container, found ${#PGC[@]}: ${PGC[*]}" >&2
+          docker ps >&2
+          exit 1
+        fi
+        PGCONTAINER="${PGC[0]}"
+        export PGCONTAINER
+        bash scripts/generate-mesh-baseline.sh --check
+
+    - name: Full-install equivalence (sqlx path vs Alembic, both envs)
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      env:
+        BASELINE_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        POSTGRES_PASSWORD: pai
+        PGSUPERUSER: noo
+      run: |
+        set -euo pipefail
+        # Deliberately SEPARATE from the check above, which is mesh-only on both
+        # sides and so cannot see an object spanning two migration domains. This
+        # one migrates the memory env first, like every real install, so a
+        # cross-domain object from ANY writer shows up as a schema diff.
+        mapfile -t PGC < <(docker ps --filter id=${{ job.services.postgres.id }} --format '{{.Names}}')
+        if [ "${#PGC[@]}" -ne 1 ]; then
+          echo "::error::expected exactly 1 pg18 container, found ${#PGC[@]}: ${PGC[*]}" >&2
+          exit 1
+        fi
+        PGCONTAINER="${PGC[0]}" bash scripts/verify-full-install-equivalence.sh
+
+    # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
+    # The rustc version is in the key so a toolchain bump rebuilds, and a source
+    # hash ends it so a dev push that changed the crate saves a fresh target while
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
+    # PR-scoped save is visible to that PR alone and evicts useful entries from
+    # the repo's cache budget.
+    # Host toolchain here (this job runs cargo on the hosted runner, not in
+    # cargo-docker), so the id is the runner image's rustc.
+    # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
+    # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
+    # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
+    # login in a shared credential store can be revoked under an overlapping job
+    # (tests/test_workflow_docker_login_isolation.py).
+    - name: Rust image from the mirror (Hub on a miss)
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+        mkdir -p "$DOCKER_CONFIG"
+        echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+        # No Docker Hub credential here: a miss in the mirror pulls anonymously.
+        # $GITHUB_WORKSPACE: noo-cli's steps run in noo-cli/ (defaults), where a
+        # relative scripts/ path is missing and the image came back EMPTY.
+        ref="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/rust:1-bookworm)" || ref=""
+        if [ -z "$ref" ]; then
+          echo "::warning::hub-mirror.py gave no image — rust:1-bookworm from Docker Hub"
+          ref=docker.io/library/rust:1-bookworm
+        fi
+        echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+    - name: Rust toolchain id (cache key)
+      id: rustc
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      run: echo "id=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore cargo cache
+      id: cargo-cache
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin
+          gateway-rust/target
+        key: ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-${{ hashFiles('gateway-rust/src/**', 'gateway-rust/.sqlx/**', 'gateway-rust/Cargo.toml', 'gateway-rust/build.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-sqlxdrift-rustc${{ steps.rustc.outputs.id }}-
+
+    - name: Install sqlx-cli
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      run: |
+        # Guarded: an unguarded `sudo apt-get` fails on a runner without
+        # passwordless sudo EVEN IF the packages are present — the sudo call
+        # itself is what fails. Kept rather than deleted because hosted images
+        # are not guaranteed to carry libssl-dev.
+        if ! dpkg -s pkg-config libssl-dev >/dev/null 2>&1; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libssl-dev
+        fi
+        command -v sqlx || cargo install sqlx-cli --version '^0.8' \
+          --no-default-features --features postgres,rustls --locked
+
+    # `--check` writes nothing and fails on any disagreement. The clean is
+    # required: cargo tracks only source files, so against a restored target/
+    # the macros would not re-expand and this would exit 0 without ever
+    # consulting the database — agreement it never verified. Cleaning one
+    # package keeps the dependency artifacts that make the cache worth having.
+    - name: Check .sqlx against the migrated schema
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      working-directory: gateway-rust
+      env:
+        # The SAME search_path the runtime pool pins (state.rs): since the
+        # trellion squash the memory tables live in schema `trellion` on a
+        # fresh database, and prepare must validate queries under the path
+        # they actually execute with — a default-path prepare fails on
+        # `relation "edges" does not exist`, which is a wrong address, not
+        # a wrong query.
+        DATABASE_URL: postgresql://noo:noo@localhost:5432/noomesh?options=-c%20search_path%3Dpublic,trellion,evolve
+      run: |
+        cargo clean -p noo-gateway
+        cargo sqlx prepare --check -- --all-targets
+
+    # The broker's roles, schemas and grants are invisible to every schema
+    # gate above: the baseline and equivalence scripts both dump
+    # `--no-privileges` on both sides. These checks query the live catalogue
+    # instead. The dump script makes the plane visible; this step makes a
+    # violation red. It runs against the chain-built service DB, where the
+    # roles from the role-creating migrations exist.
+    - name: Privilege-plane invariants
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      run: |
+        set -euo pipefail
+        mapfile -t PGC < <(docker ps --filter id=${{ job.services.postgres.id }} --format '{{.Names}}')
+        if [ "${#PGC[@]}" -ne 1 ]; then
+          echo "::error::expected exactly 1 pg18 container, found ${#PGC[@]}: ${PGC[*]}" >&2
+          exit 1
+        fi
+        PGCONTAINER="${PGC[0]}" bash scripts/verify-privilege-plane.sh noomesh
+
+    # The DSN-gated Rust suites SKIP silently without their DSN variables, so
+    # they are set here rather than left to a default: a test that never runs
+    # looks exactly like a test that passes. --test-threads=1 because they set
+    # process-wide env vars. Last step in the job on purpose: it reuses the
+    # compile that `sqlx prepare` just paid for.
+    - name: DSN-gated suites against a real catalogue (broker + layout)
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true'
+      working-directory: gateway-rust
+      env:
+        NOO_BROKER_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        # The model-class storage round trip (coordinator/classes.rs db_tests)
+        # is gated the same way and asserts the head revision against this
+        # same catalogue.
+        NOO_TEST_DSN: postgresql://noo:noo@localhost:5432/noomesh
+        # OFFLINE for the compile, online only for the tests themselves.
+        # `cargo clean` above forces a recompile here, and without this the
+        # sqlx MACROS (repo/graph.rs) validate against the job-level
+        # DATABASE_URL — unpinned search_path, so `relation "edges" does not
+        # exist` at COMPILE time. The prepare step just certified .sqlx
+        # against the pinned URL; this step consumes that certificate.
+        SQLX_OFFLINE: "true"
+      # The FULL binary suite, not a name filter: the DSN-gated tests span
+      # several modules, and a filter that names modules silently under-runs
+      # when the next one arrives. The ungated tests re-run in seconds on the
+      # warm target, so this also proves they hold with a live database.
+      run: cargo test --bin noo-gateway -- --test-threads=1
+
+
+    # Prune before saving: incremental dirs, the crate's own (test) binaries
+    # and top-level outputs go; dependency artifacts stay. A target still over
+    # the cap is dropped whole (scripts/ci-prune-cargo-target.sh).
+    - name: Prune cargo target before the cache save
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: scripts/ci-prune-cargo-target.sh gateway-rust 4
+
+    # continue-on-error: a cache save is an optimisation, never a check; a full
+    # runner disk inside the tar must not turn a green run red.
+    - name: Save cargo cache (dev pushes only)
+      if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin
+          gateway-rust/target
+        key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # noo-cli is the Rust front door: native commands dispatched by a
+  # first-match registry, everything else passed through to the Python CLI.
+  # This job gates the dispatch/contract so a handler edit can't silently
+  # break routing:
+  #   - clippy (-D warnings) with the crate's documented pre-existing allows
+  #   - cargo test: registry-integrity + resolve() dispatch + passthrough
+  #     taxonomy + the onboard unit tests
+  #   - tests/smoke.sh: gateway-free standalone contract on the built binary
+  # `cargo fmt --check` is intentionally omitted: the ported handler modules
+  # are not rustfmt-clean under default settings (the rust-gateway job also
+  # only builds/checks). The native (glibc) target is sufficient; musl is a
+  # release-packaging concern.
+  noo-cli:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    defaults:
+      run:
+        working-directory: noo-cli
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
+    # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
+    # cache, builds on top of it and tars it back up, which can run out of disk
+    # inside the cache save. Remove the preinstalled toolchains this job never
+    # uses. continue-on-error so a slow or failed delete is never a red job.
+    - name: Free hosted-runner disk
+      if: needs.scope.outputs.cli == 'true' && runner.environment == 'github-hosted'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: |
+        df -h /
+        # -n: never prompt. A runner without passwordless sudo leaves the disk as is.
+        big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"
+        sudo -n rm -rf $big || { echo "::notice::could not free hosted-runner disk (no passwordless sudo?) — continuing"; }
+        df -h /
+
+    # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
+    # The rustc version is in the key so a toolchain bump rebuilds, and a source
+    # hash ends it so a dev push that changed the crate saves a fresh target while
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
+    # PR-scoped save is visible to that PR alone and evicts useful entries from
+    # the repo's cache budget.
+    # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
+    # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
+    # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
+    # login in a shared credential store can be revoked under an overlapping job
+    # (tests/test_workflow_docker_login_isolation.py).
+    - name: Per-job Docker credential store and GHCR login
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+        mkdir -p "$DOCKER_CONFIG"
+        echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+    # The Hub fallback pulls AUTHENTICATED (a per-account limit, not the shared
+    # IP's anonymous one) with the Docker account in secrets. Private-only: the
+    # public repository has no such secret and pulls anonymously.
+    - name: Docker Hub login (private repository only)
+      if: github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "${DHI_TOKEN:-}" ]; then
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+        fi
+    - name: Rust image from the mirror (Hub on a miss)
+      env:
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        # $GITHUB_WORKSPACE: noo-cli's steps run in noo-cli/ (defaults), where a
+        # relative scripts/ path is missing and the image would come back EMPTY.
+        ref="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/rust:1-bookworm)" || ref=""
+        if [ -z "$ref" ]; then
+          echo "::warning::hub-mirror.py gave no image — rust:1-bookworm from Docker Hub"
+          ref=docker.io/library/rust:1-bookworm
+        fi
+        echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+    - name: Rust toolchain id (cache key)
+      id: rustc
+      if: needs.scope.outputs.cli == 'true'
+      run: echo "id=$(docker run --rm "${CARGO_DOCKER_IMAGE:-rust:1-bookworm}" rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore cargo cache
+      id: cargo-cache
+      if: needs.scope.outputs.cli == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          noo-cli/target
+        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-
+
+    - name: Clippy (deny warnings)
+      if: needs.scope.outputs.cli == 'true'
+      run: cd .. && CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/noo-cli" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets -- -D warnings
+
+    - name: Unit + gateway-integration tests
+      if: needs.scope.outputs.cli == 'true'
+      run: cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh test --locked
+
+    # The macOS applier's privilege tests (node_fetch.rs `root_only_*`: the
+    # lowered poll cannot write a root file, a lowered child cannot setuid(0),
+    # a file or hardlink at the agent spool is refused rather than chowned,
+    # root_install writes only into root's own directories) need a real root.
+    # The step above runs as the invoking user, where they skip. Run exactly
+    # that filter again, from the test binary the step above built, in the
+    # same Rust image as uid 0. The checkout is mounted READ-ONLY, so nothing
+    # in the workspace is ever written as root. NOO_REQUIRE_ROOT_TESTS=1 turns
+    # a skip into a failure, and the count check fails a filter that matched
+    # nothing.
+    - name: Root-only privilege tests (macOS applier)
+      if: needs.scope.outputs.cli == 'true'
+      timeout-minutes: 5
+      run: |
+        set -uo pipefail
+        t="$(cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh test --locked --no-run --color never --bin noo 2>&1 \
+              | sed -n 's|.*Executable unittests src/main.rs (\(.*\))|\1|p' | head -1)"
+        [ -n "$t" ] && [ -x "$t" ] || { echo "::error::could not locate the noo unit-test binary ($t)"; exit 1; }
+        log="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/root-tests.XXXXXX")"
+        docker run --rm --user 0 -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo/noo-cli \
+          -e NOO_REQUIRE_ROOT_TESTS=1 -e NOO_CARGO_DOCKER=1 "${CARGO_DOCKER_IMAGE:-rust:1-bookworm}" \
+          "/repo/noo-cli/$t" root_only_ --test-threads=1 >"$log" 2>&1
+        rc=$?
+        cat "$log"
+        [ "$rc" -eq 0 ] || exit "$rc"
+        n="$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" | head -1)"
+        [ "${n:-0}" -ge 5 ] || { echo "::error::expected at least 5 root-only tests, ran ${n:-0}"; exit 1; }
+
+    # tests/secrets_store.rs drives the built `noo` against a throwaway sops
+    # store, and SKIPS without sops/age, which the build container never has.
+    # Run that test binary again on the RUNNER with sops and age installed from
+    # the versions and digests pinned in scripts/noo-secrets-sops-init.sh (a
+    # digest mismatch fails the step). NOO_REQUIRE_SOPS=1 turns a skip into a
+    # failure. Bounded: no sudo, no apt, capped downloads, a step timeout.
+    # The binaries are built in rust:1-bookworm (glibc 2.36); the hosted runner's
+    # glibc loads them.
+    - name: sops-backed store tests on the runner
+      if: needs.scope.outputs.cli == 'true' && runner.environment == 'github-hosted'
+      timeout-minutes: 5
+      run: |
+        set -euo pipefail
+        eval "$(grep -E '^(AGE|SOPS)_(VERSION|SHA256_(amd64|arm64))=' ../scripts/noo-secrets-sops-init.sh)"
+        case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "::error::no pinned sops/age for $(uname -m)"; exit 1 ;; esac
+        # RUNNER_TEMP can be unset when a local runner replays this step.
+        tools="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sops-tools.XXXXXX")"
+        get() { curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 -o "$2" "$1"; }
+        get "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-${arch}.tar.gz" "$tools/age.tgz"
+        eval "want=\$AGE_SHA256_${arch}"; echo "$want  $tools/age.tgz" | sha256sum -c -
+        tar -xzf "$tools/age.tgz" -C "$tools" --strip-components=1 age/age age/age-keygen
+        get "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.${arch}" "$tools/sops"
+        eval "want=\$SOPS_SHA256_${arch}"; echo "$want  $tools/sops" | sha256sum -c -
+        chmod 755 "$tools/sops"
+        export PATH="$tools:$PATH"
+        # The exact test binary the step above built (cargo names it with a
+        # hash; a restored cache can hold older ones beside it). --color
+        # never: cargo-docker.sh forces colour, which wraps "Executable" in
+        # escapes the sed below would not match.
+        t="$(cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh test --locked --no-run --color never --test secrets_store 2>&1 \
+              | sed -n 's|.*Executable tests/secrets_store.rs (\(.*\))|\1|p')"
+        [ -n "$t" ] && [ -x "$t" ] || { echo "::error::could not locate the secrets_store test binary ($t)"; exit 1; }
+        NOO_REQUIRE_SOPS=1 NOO_TEST_BIN="$PWD/target/debug/noo" "$t" --test-threads=4
+
+    - name: Build release binary
+      if: needs.scope.outputs.cli == 'true'
+      run: cd .. && CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh build --release --locked
+
+    - name: Standalone smoke test (gateway-free contract)
+      if: needs.scope.outputs.cli == 'true'
+      run: bash tests/smoke.sh target/release/noo
+
+
+    # Prune before saving: incremental dirs, the crate's own (test) binaries
+    # and top-level outputs go; dependency artifacts stay. A target still over
+    # the cap is dropped whole (scripts/ci-prune-cargo-target.sh).
+    - name: Prune cargo target before the cache save
+      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: scripts/ci-prune-cargo-target.sh noo-cli 5
+
+    # continue-on-error: a cache save is an optimisation, never a check; a full
+    # runner disk inside the tar must not turn a green run red.
+    - name: Save cargo cache (dev pushes only)
+      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          noo-cli/target
+        key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # Proves the release contract of the built binary in an environment that has
+  # NO Python at all: the linux-gnu binary is built on the runner, then
+  # executed inside a bare ubuntu:24.04 container (same glibc as
+  # ubuntu-latest, no python3/python preinstalled) so nothing can silently
+  # fall back to the Python CLI.
+  standalone-smoke:
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
+    # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
+    # cache, builds on top of it and tars it back up, which can run out of disk
+    # inside the cache save. Remove the preinstalled toolchains this job never
+    # uses. continue-on-error so a slow or failed delete is never a red job.
+    - name: Free hosted-runner disk
+      if: needs.scope.outputs.code == 'true' && runner.environment == 'github-hosted'
+      continue-on-error: true
+      working-directory: ${{ github.workspace }}
+      run: |
+        df -h /
+        # -n: never prompt. A runner without passwordless sudo leaves the disk as is.
+        big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"
+        sudo -n rm -rf $big || { echo "::notice::could not free hosted-runner disk (no passwordless sudo?) — continuing"; }
+        df -h /
+
+    # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
+    # The rustc version is in the key so a toolchain bump rebuilds, and a source
+    # hash ends it so a dev push that changed the crate saves a fresh target while
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
+    # PR-scoped save is visible to that PR alone and evicts useful entries from
+    # the repo's cache budget.
+    # RESTORE-ONLY here: noo-cli (same key, superset of this build) saves it.
+    # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
+    # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
+    # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
+    # login in a shared credential store can be revoked under an overlapping job
+    # (tests/test_workflow_docker_login_isolation.py).
+    - name: Per-job Docker credential store and GHCR login
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+        mkdir -p "$DOCKER_CONFIG"
+        echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+    # The Hub fallback pulls AUTHENTICATED (a per-account limit, not the shared
+    # IP's anonymous one) with the Docker account in secrets. Private-only: the
+    # public repository has no such secret and pulls anonymously.
+    - name: Docker Hub login (private repository only)
+      if: github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "${DHI_TOKEN:-}" ]; then
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+        fi
+    - name: Rust image from the mirror (Hub on a miss)
+      env:
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        # $GITHUB_WORKSPACE: noo-cli's steps run in noo-cli/ (defaults), where a
+        # relative scripts/ path is missing and the image would come back EMPTY.
+        ref="$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" ref library/rust:1-bookworm)" || ref=""
+        if [ -z "$ref" ]; then
+          echo "::warning::hub-mirror.py gave no image — rust:1-bookworm from Docker Hub"
+          ref=docker.io/library/rust:1-bookworm
+        fi
+        echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
+    - name: Rust toolchain id (cache key)
+      id: rustc
+      if: needs.scope.outputs.code == 'true'
+      run: echo "id=$(docker run --rm "${CARGO_DOCKER_IMAGE:-rust:1-bookworm}" rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+    - name: Restore cargo cache
+      id: cargo-cache
+      if: needs.scope.outputs.code == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          noo-cli/target
+        key: ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-${{ hashFiles('noo-cli/src/**', 'noo-cli/Cargo.toml', 'noo-cli/build.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('noo-cli/Cargo.lock') }}-
+          ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-
+
+    - name: Build linux-gnu release binary
+      if: needs.scope.outputs.code == 'true'
+      run: CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh build --release --locked
+
+    - name: Native surface in a no-Python container
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        set -eux
+        docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
+          ubuntu:24.04 bash -euxc '
+            # The whole point: prove there is no Python to fall back to.
+            ! command -v python3
+            ! command -v python
+
+            # 1. Native help path — no Python, exit 0, native banner.
+            out="$(noo --help)"
+            grep -q "local-first AI agent mesh" <<<"$out"
+
+            # 2. Native gateway command with no gateway: a clean, structured
+            #    exit 3 (gateway_unreachable) — never a crash or a passthrough.
+            set +e
+            out="$(noo health --json 2>&1)"
+            rc=$?
+            set -e
+            [ "$rc" -eq 3 ]
+            grep -q "gateway_unreachable" <<<"$out"
+          '
+
+    # PY_ONLY message contract: never-port commands must print the
+    # actionable "requires the Python install" message, exit 2.
+    # (Pick from the PY_ONLY list in noo-cli/src/passthrough.rs.) The retired
+    # `tui` gets its own assertion: native pointer, exit 1, no Python involved.
+    - name: PY_ONLY message contract
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        set -eux
+        docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
+          ubuntu:24.04 bash -euxc '
+            # 3. A PY_ONLY command with no Python: friendly actionable message,
+            #    exit 2 — not a stack trace, not a silent failure.
+            set +e
+            out="$(noo plugins 2>&1)"
+            rc=$?
+            set -e
+            [ "$rc" -eq 2 ]
+            grep -q "requires the Python install" <<<"$out"
+            # 3b. The RETIRED tui: native pointer message, exit 1.
+            set +e
+            out="$(noo tui 2>&1)"
+            rc=$?
+            set -e
+            [ "$rc" -eq 1 ]
+            grep -q "retired" <<<"$out"
+          '
+
+    # The add-on profile-skip behaviour (addon_profile_args, recreate_args, the
+    # Created-stamp verdict) rehearsed against a real `docker compose`: the
+    # defect was compose's own profile behaviour, which no unit test can
+    # observe. Runs on a throwaway `alpine` project in ~15s; it needs Docker
+    # and nothing else, no stack and no controller.
+    - name: Rotation rehearsal (add-on profile skip)
+      if: needs.scope.outputs.code == 'true'
+      run: scripts/test-rotation-rehearsal.sh
+
+  build:
+    # The root Dockerfile is the install gate for pyproject.toml: it must build
+    # from a clean tree. GitHub-hosted runner; layers cached in the Actions
+    # cache (type=gha, scope ci-build) since there is no persistent builder.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope, test-core]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.test-core.result == 'success' }}
+
+    # A superseded PR build has no value, so cancel it. Pushes and tags are the
+    # integration point and always run to completion.
+    concurrency:
+      group: ci-image-build-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    # The DHI org credentials: never on a fork pull request (GitHub withholds
+    # secrets there, and the clause says so).
+    - name: Docker Hub login (higher pull rate limit)
+      if: needs.scope.outputs.code == 'true' && github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "$DHI_TOKEN" ]; then
+          echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "docker.io login failed — continuing with anonymous pulls" >&2
+        else
+          echo "no Docker creds in secrets — anonymous pulls" >&2
+        fi
+
+    # python:3.12-slim from the GHCR mirror (.github/hub-mirror.txt): Hub
+    # rate-limits per IP and every runner shares one. A miss answers
+    # docker.io with a warning, never a failure.
+    - name: Docker Hub base from the mirror (Hub on a miss)
+      if: needs.scope.outputs.code == 'true'
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        HUB_MIRROR: ${{ vars.HUB_MIRROR }}
+        HUB_MIRROR_OFF: ${{ vars.HUB_MIRROR_OFF }}
+      run: |
+        echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+          || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
+        echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/Dockerfile")" >> "$GITHUB_ENV"
+
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3
+      if: needs.scope.outputs.code == 'true'
+    # Exposes ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL to the shell so
+    # `docker buildx build --cache-to type=gha` can reach the Actions cache.
+    - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124   # v3
+      if: needs.scope.outputs.code == 'true'
+
+    - name: Build Docker image
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        set -o pipefail
+        # --load: the next step runs the image. The root Dockerfile installs
+        # `.[web,mcp,pgvector]`, which does not name the trellion extra, so it
+        # builds with no token.
+        docker buildx build --load \
+          --cache-from type=gha,scope=ci-build \
+          --cache-to type=gha,mode=max,scope=ci-build \
+          --build-arg HUB_MIRROR="${HUB_PREFIX:-docker.io}" \
+          -t pai-assistant:${{ github.sha }} .
+
+    - name: Test Docker image
+      if: needs.scope.outputs.code == 'true'
+      run: |
+        docker run --rm pai-assistant:${{ github.sha }} python -c "import noomesh; print('Import successful')"
+
+  llamacpp-image:
+    # The hardened llama-server (docker/Dockerfile.llamacpp) is
+    # otherwise built by the release workflow alone, on a TAG, so a break would
+    # surface after the tag exists. This job compiles the builder stage on every
+    # PR that changes the Dockerfile so the break lands on the PR; layer cache
+    # makes the unchanged case a hit in seconds. The compile steps are gated on
+    # the repository, NOT on hashFiles(): a moved or renamed Dockerfile must
+    # fail this job, not quietly skip it.
+    #
+    # Same concurrency reasoning as `build`. The job
+    # always runs and always reports; only the compile is conditional, for the
+    # reason `scope` gives: a path-filtered job never reports, and a
+    # never-reporting required check is a permanently blocked branch.
+    runs-on: ubuntu-latest
+    needs: [preflight, scope]
+    # Job-level, not just step-level: a job whose steps all skip still takes a
+    # runner. Not a required check, so a skip blocks nothing. It runs whenever ITS
+    # inputs changed (the diff against the target branch for a promotion PR;
+    # against the last final release for a push), so a break in llama-server
+    # keeps compiling until it ships.
+    if: ${{ github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' && needs.scope.outputs.llamacpp == 'true' }}
+    concurrency:
+      group: ci-llamacpp-image-${{ github.ref }}
+      # A superseded PR build has no value, so cancel it; pushes and tags run on.
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    - name: Nothing to compile
+      if: needs.scope.outputs.llamacpp != 'true' || github.repository != 'noomesh/noomesh' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+      run: echo "docker/Dockerfile.llamacpp unchanged, or this is a fork PR / another repository — the llama-server build is not exercised by this PR"
+
+    - name: dhi.io login
+      if: needs.scope.outputs.llamacpp == 'true' && github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      env:
+        DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+        DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+      run: |
+        if [ -n "$DHI_TOKEN" ]; then
+          echo "$DHI_TOKEN" | docker login dhi.io -u "$DHI_USERNAME" --password-stdin \
+            || echo "dhi.io login failed — continuing anonymously" >&2
+        else
+          echo "no DHI creds in secrets — anonymous pull" >&2
+        fi
+
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3
+      if: needs.scope.outputs.llamacpp == 'true'
+    - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124   # v3
+      if: needs.scope.outputs.llamacpp == 'true'
+
+    - name: Compile llama-server (builder stage, linux/amd64)
+      if: needs.scope.outputs.llamacpp == 'true' && github.repository == 'noomesh/noomesh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      run: |
+        set -o pipefail
+        docker buildx build --load --target builder -f docker/Dockerfile.llamacpp \
+          --cache-from type=gha,scope=ci-llamacpp \
+          --cache-to type=gha,mode=max,scope=ci-llamacpp \
+          -t noomesh-llamacpp-builder:${{ github.sha }} . 2>&1 | tail -n 200
+        # The image must say which llama.cpp it holds — the whole point of the
+        # pin — and the binary must at least start. --entrypoint: the builder's
+        # base image is the uv image, whose entrypoint is `uv`.
+        docker run --rm --entrypoint sh noomesh-llamacpp-builder:${{ github.sha }} \
+          -c 'cat /src/LLAMACPP_COMMIT && /src/build/bin/llama-server --version'
+        docker rmi noomesh-llamacpp-builder:${{ github.sha }} >/dev/null 2>&1 || true
+
+  openapi-drift:
+    # The OpenAPI spec is what the console builds its typed client against, so a
+    # route missing from it surfaces there as an apparent gateway bug. The two
+    # checks answer different questions and both are worth running:
+    #
+    #   check-openapi-drift  did drift APPEAR since the baseline? (also
+    #                        catches phantoms: spec paths no route serves)
+    #   gen-openapi --check  is EVERY registered route documented, baseline
+    #                        or not? This is the one that stays at zero.
+    #
+    # Neither is a required status check. A red mark here is visibility, not a
+    # gate, and the failure says which one it is.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+      - name: Check routes against the OpenAPI spec
+        run: python3 scripts/check-openapi-drift.py
+
+      # Fails naming the exact routes, so the fix is: write the `///` doc
+      # comment on the handler, run scripts/gen-openapi.py, commit.
+      - name: Every registered route has a spec entry
+        run: python3 scripts/gen-openapi.py --check
+
+      # The console's contract (`ui/contracts/openapi.json`) is a MERGE of the
+      # gateway spec, made by hand with export-openapi.py. Every check above
+      # compares the router with the GATEWAY spec only, so a stale console
+      # contract would pass them all.
+      - name: The console's contract matches the gateway spec
+        run: python3 scripts/export-openapi.py --check
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: preflight
+    steps:
+
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+
+    # trivy-action's installer resolves the version by fetching the github.com
+    # release PAGE anonymously; shared hosted-runner IPs get rate-limited there
+    # and the step dies "unable to find 'v...'". The release ASSET URL is served
+    # from the asset CDN, so install from it directly, verify the published
+    # sha256, and tell the action to skip its own installer. Bump version and
+    # hash together (trivy_<v>_checksums.txt).
+    - name: Install Trivy (pinned, checksum-verified)
+      env:
+        TRIVY_VERSION: "0.70.0"
+        TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
+      run: |
+        dir="$RUNNER_TEMP/trivy-bin"
+        mkdir -p "$dir"
+        curl -fsSL --retry 3 -o "$dir/trivy.tgz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $dir/trivy.tgz" | sha256sum -c -
+        tar -xzf "$dir/trivy.tgz" -C "$dir" trivy
+        rm -f "$dir/trivy.tgz"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/trivy" --version
+
+    - name: Trivy filesystem scan (deps — fail on HIGH/CRITICAL)
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        skip-setup-trivy: true
+        scan-type: fs
+        scan-ref: .
+        severity: HIGH,CRITICAL
+        ignore-unfixed: true
+        exit-code: '1'
+        format: table
+
+    - name: Trivy config scan (Dockerfiles + compose misconfig — report only)
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        skip-setup-trivy: true
+        scan-type: config
+        scan-ref: .
+        severity: HIGH,CRITICAL
+        exit-code: '0'
+        format: table

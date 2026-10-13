@@ -1,0 +1,80 @@
+# Add-ons
+
+noomesh is a free, self-hosted core plus **add-ons**: extras that run as
+their own containers beside the core stack. They are switched by the
+`addons:` map in `noomesh.yaml`; there is no per-add-on environment
+variable. Some are free, some need a licence.
+
+| Add-on | What it adds | Kind | `addons:` key (default) |
+|---|---|---|---|
+| Trellion knowledge pack | RAG over ingested documents, conversation-memory search, the knowledge graph, episodic recall (`noo rag`, `noo memory`, `noo graph`, `noo recall`) | free | `addons.trellion` (on) |
+| Identity | short-lived per-agent connection tokens | free | `addons.identity` (on) |
+| Voice | local speech-to-text and text-to-speech; the voice channel and `noo voice` | free | `addons.voice` (off) |
+| Intelligent tier | graph-guided retrieval on top of the knowledge pack | licensed | `addons.trellion_intel` (off) |
+| Evolve | self-tuning of the agent from its own runs; provides `noo loop` and `noo ga` | licensed | `addons.evolve` (off) |
+
+## Turn one on or off
+
+Edit the map in `noomesh.yaml`, then restart the stack:
+
+```yaml
+addons:
+  trellion: true
+  voice: true
+```
+
+```bash
+noo stack restart --force
+noo health --json          # the "addons" object reads enabled, disabled or unlicensed
+```
+
+Or use the wizard step on its own:
+
+```bash
+noo onboard --only addons
+```
+
+A name left out of the map takes its default from the table. For a licensed
+add-on the flag is not enough: it also needs an entitlement (below).
+
+From the command line, `noo addons enable <name>` mints what the add-on needs
+and declares it on; `noo addons list` shows the state of each.
+
+## What a disabled add-on does
+
+Nothing else breaks. The gateway keeps serving; only the add-on's own surface
+answers **HTTP 503** with `{"error": "<why>", "addon": "<name>"}`, and the
+`noo` commands that hit it exit 5 and print the reason. `/health` stays 200
+and reports each add-on as `enabled`, `disabled` or `unlicensed` (flag on,
+no valid entitlement).
+
+## Licensed add-ons
+
+A licensed add-on needs an entitlement token from PersonifAI. Register at
+<https://noomesh.ai/add-ons>; the terms are at
+<https://noomesh.ai/add-ons/terms>.
+
+```bash
+noo security entitlement install <token>   # prints the terms, asks you to type accept
+noo security entitlement show              # subject, expiry, what it unlocks
+noo addons enable trellion-intel
+noo stack restart --force
+```
+
+In a non-interactive run, pass `--accept-terms <version>` naming the terms
+version the install prints. If `install` refuses a token,
+`noo security entitlement verify <token>` says why.
+
+## Build your own
+
+An add-on is anything that speaks one of the core's extension seams (an MCP
+server, a plugin shim, a model backend, a worker container). The author guide
+is [development/addons.md](../development/addons.md); the Apache-2.0 client
+for calling the gateway is `packages/noo-gateway-client`.
+
+## Licensing
+
+The core is AGPL-3.0-only (see `LICENSE`). Trellion is AGPL-3.0-only with a
+commercial licence available from PersonifAI LLC. The licensed add-ons are
+proprietary, live in separate repositories and talk to the core over the same
+network seams you can use.

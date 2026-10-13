@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Hardened llama.cpp backend — builds llama-server from UPSTREAM SOURCE on a
+# Docker Hardened Image base (near-zero CVEs), runs as nonroot.
+#
+# Why from source: the old `llama-cpp-python==0.3.2` pin lagged upstream by
+# years (no gemma-4 / new-arch support). Building llama.cpp itself, pinned by
+# a git ref, decouples us from the Python binding's cadence and always tracks
+# the real project.
+#
+# Durable update path:  bump LLAMACPP_REF to a NEW IMMUTABLE TAG (e.g.
+#                       `b10917`), then `noo stack rebuild` (or docker
+#                       build). Hardening and the env interface below are
+#                       unchanged.
+#
+# The ref must be immutable (§3f R30). It defaulted to `master`, and the
+# release workflow passes no --build-arg for it, so every published
+# `ghcr.io/noomesh/llamacpp:<stack-tag>` was built from whatever
+# upstream `master` happened to be at build time: two images with the same
+# tag could contain different code, and nothing recorded which. A moving ref
+# is now refused by the build.
+
+# ── Builder ──────────────────────────────────────────────────────────
+# Base-image registry: dhi.io by default (local/dev/OSS builds), our ghcr
+# MIRRORS in the release workflow (--build-arg DHI_REGISTRY=ghcr.io/…) —
+# dhi.io TLS timeouts have now broken four builds (build-from-mirrors,
+# 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
+# preserve digests.
+ARG DHI_REGISTRY=dhi.io
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates libopenblas-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# An IMMUTABLE upstream tag. Bump it deliberately; do not point it at a
+# branch. `b9628` is upstream tag c2ba3e47a2038a2c4f51138c1843e374b174e83d.
+ARG LLAMACPP_REF=b9628
+# Break glass for a bisect or an upstream fix that has no tag yet. Setting it
+# is a decision someone made on purpose and can be seen in the build command;
+# `master` slipping in as a default is not.
+ARG LLAMACPP_ALLOW_MOVING_REF=0
+WORKDIR /src
+RUN set -eu; \
+    case "${LLAMACPP_REF}" in \
+        master|main|HEAD|"") \
+            if [ "${LLAMACPP_ALLOW_MOVING_REF}" != "1" ]; then \
+                echo "Dockerfile.llamacpp: LLAMACPP_REF='${LLAMACPP_REF}' is a moving ref." >&2; \
+                echo "  Two builds of the same image tag would contain different code, and" >&2; \
+                echo "  nothing would record which. Pass an immutable tag (e.g. b10917), or" >&2; \
+                echo "  --build-arg LLAMACPP_ALLOW_MOVING_REF=1 if you really mean it." >&2; \
+                exit 64; \
+            fi ;; \
+    esac; \
+    git clone --depth 1 --branch "${LLAMACPP_REF}" \
+        https://github.com/ggml-org/llama.cpp.git .; \
+    git rev-parse HEAD > /src/LLAMACPP_COMMIT; \
+    echo "llama.cpp ${LLAMACPP_REF} = $(cat /src/LLAMACPP_COMMIT)"
+# The single-clone form replaced a `|| (git clone … && git checkout …)`
+# fallback whose `2>/dev/null` swallowed the first clone's error: a typo'd
+# tag became a full clone of master followed by a checkout that may or may
+# not have resolved, silently. A ref that does not exist must fail here.
+
+# CPU build with OpenBLAS. GGML_NATIVE=OFF for a portable binary (no -march=native)
+# so the image runs across mixed x86 worker CPUs. Build only the server target.
+#
+# No embedded web UI, and no download of one. Since upstream tag b9628 the
+# server links a `llama-ui` library whose assets come from, in order, an
+# npm build, or a prebuilt bundle fetched from Hugging Face for the version
+# `git rev-list --count HEAD` names. A `--depth 1` clone counts ONE commit,
+# so the fetch asked for "b1", got nothing, fell back to the MOVING `latest`
+# bundle, and that newer UI lacks the `loading.html` this tag's embedder
+# requires: the stack-v0.2.38 release build died right there, the first time
+# the pinned ref was ever built (v0.2.37 was a cache hit on `master`).
+# Nothing in noomesh dials the llama.cpp web UI — the node-agent proxies the
+# API — so the honest build is LLAMA_BUILD_UI=OFF plus
+# LLAMA_USE_PREBUILT_UI=OFF: no npm, no network, the same bytes every time,
+# which is what pinning the ref was for.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+      -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+ && cmake --build build --config Release -j"$(nproc)" --target llama-server
+
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas0 libgomp1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Recent llama.cpp emits the server binary + its shared libs together in
+# build/bin; ship the whole dir and point the loader at it.
+COPY --from=builder /src/build/bin/ /opt/llama/
+# What this image actually contains. `docker run --rm <image> cat
+# /opt/llama/LLAMACPP_COMMIT` answers "which llama.cpp is on that node"
+# without trusting a tag.
+COPY --from=builder /src/LLAMACPP_COMMIT /opt/llama/LLAMACPP_COMMIT
+ENV PATH="/opt/llama:${PATH}" LD_LIBRARY_PATH="/opt/llama"
+
+WORKDIR /app
+RUN chown nonroot:nonroot /app
+
+# Env interface kept stable so the node-agent's existing llamacpp config works
+# unchanged (MODEL_PATH / N_GPU_LAYERS / N_CTX / N_THREADS).
+ENV MODEL_PATH=/models/model.gguf N_GPU_LAYERS=0 N_CTX=4096 N_THREADS=4 HOST=0.0.0.0 PORT=8085
+EXPOSE 8085
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s \
+    CMD curl -fs "http://localhost:${PORT}/health" || exit 1
+
+USER nonroot
+
+# Reset the base image's `uv` entrypoint so our CMD runs directly.
+ENTRYPOINT []
+
+# Translate the stable env interface into upstream llama-server flags.
+CMD ["sh","-c","exec llama-server \
+  --model \"${MODEL_PATH}\" --n-gpu-layers \"${N_GPU_LAYERS}\" \
+  --ctx-size \"${N_CTX}\" --threads \"${N_THREADS}\" \
+  --host \"${HOST}\" --port \"${PORT}\" --jinja"]

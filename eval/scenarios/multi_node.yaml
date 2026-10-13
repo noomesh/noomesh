@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+name: Multi-node routing & failover
+description: >
+  Fan mixed inference (GPU chat, CPU chat, embeddings) across all nodes, then
+  kill a worker mid-run to measure reroute behaviour and MTTR.
+axes: [node]
+duration_s: 120
+concurrency: 12
+rps: 0            # 0 = as fast as concurrency allows
+personas:
+  - {id: driver, location: home-lab, weight: 1.0}
+workloads:
+  - {endpoint: /v1/chat/completions, model: gemma-4-12b, weight: 0.6,
+     prompt: "Explain gradient descent in two sentences."}
+  - {endpoint: /api/external/embeddings, model: bge, weight: 0.3,
+     prompt: "vector search relevance"}
+  - {endpoint: /api/external/rerank, model: bge-reranker, weight: 0.1,
+     prompt: "best matching document"}
+faults:
+  - {at_s: 60, kind: node_kill, target: edge-node}
+isolation_probes: false

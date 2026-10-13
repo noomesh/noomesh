@@ -1,0 +1,1189 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "PAI Mesh Gateway API (public surface)",
+    "version": "2.0",
+    "description": "The endpoints reachable WITHOUT a credential \u2014 enrollment, discovery, auth and health. Derived from the full spec by scripts/gen-public-openapi.py, filtered by the same lists gateway-rust/src/auth.rs checks. The full spec is authenticated: GET /api/docs/openapi."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local gateway"
+    }
+  ],
+  "tags": [
+    {
+      "name": "core",
+      "description": "Health, metrics, authentication"
+    },
+    {
+      "name": "cluster",
+      "description": "Node management, backends, GPU metrics, models"
+    },
+    {
+      "name": "inference",
+      "description": "LLM inference, streaming, OpenAI-compat endpoints"
+    },
+    {
+      "name": "memory",
+      "description": "Conversation memory, embeddings, search, diagnostics"
+    },
+    {
+      "name": "knowledge",
+      "description": "RAG, document ingestion, knowledge graph"
+    },
+    {
+      "name": "intelligence",
+      "description": "Heartbeat scheduler, autonomy engine"
+    },
+    {
+      "name": "admin",
+      "description": "Logs, security, jobs, scheduler, debug, testing"
+    },
+    {
+      "name": "agents",
+      "description": "Multi-agent collaboration, workflows, personas, coding, skills"
+    },
+    {
+      "name": "communication",
+      "description": "Voice, channels, alerts, webhooks, recipients"
+    },
+    {
+      "name": "settings",
+      "description": "Config, prompt skills, user directories, personas"
+    },
+    {
+      "name": "recall",
+      "description": "Recall memory: status, search, archive and lifecycle (`/api/v1/video-memory/*` are deprecated aliases)"
+    },
+    {
+      "name": "ui",
+      "description": "Dashboard HTML pages, uploads, tools, proactive, browser"
+    },
+    {
+      "name": "other",
+      "description": "MCP, cloud providers, capability router, device, terminal"
+    },
+    {
+      "name": "websocket",
+      "description": "WebSocket endpoints for real-time communication"
+    },
+    {
+      "name": "mesh",
+      "description": "Host/stack operations"
+    },
+    {
+      "name": "pro",
+      "description": "Features served by the licensed evolve add-on"
+    },
+    {
+      "name": "heartbeat",
+      "description": "Heartbeat tasks"
+    },
+    {
+      "name": "approval",
+      "description": "Approval queue"
+    },
+    {
+      "name": "conversations",
+      "description": "Conversation history"
+    },
+    {
+      "name": "graph",
+      "description": "Knowledge graph"
+    },
+    {
+      "name": "auth",
+      "description": "Authentication"
+    },
+    {
+      "name": "operations",
+      "description": "Asynchronous operations: start a long run, poll for its result"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "core"
+        ],
+        "summary": "Health check",
+        "description": "[native] Liveness, for any caller: `status` (healthy|degraded), and HTTP 503 when PostgreSQL or NATS is down. `engine`, `version`, `peers`, `dependencies` and `addons` are returned ONLY to a caller that presents a credential \u2014 they describe the deployment, and an anonymous probe needs the status code, not the inventory.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "healthy",
+                        "degraded"
+                      ]
+                    },
+                    "engine": {
+                      "type": "string",
+                      "example": "rust"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "peers": {
+                      "type": "integer"
+                    },
+                    "dependencies": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "healthy": {
+                            "type": "boolean"
+                          },
+                          "optional": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "addons": {
+                      "type": "object",
+                      "description": "Opt-in subsystem states, keyed by add-on name (`trellion`, `evolve`, `trellion_intel`, \u2026). Built from the gateway's `addons::ADDONS` table, so a new add-on appears here with no schema change \u2014 clients must render the keys they receive rather than a fixed list. Three of the four states are emitted today by `addons::health_word`: `enabled`; `disabled`, meaning the operator turned it off, which is NOT a fault; and `unlicensed`, meaning the flag is on but no entitlement grants it, which is also not a fault but needs an action the operator can take (`noo security entitlement install <token>`). The per-add-on reason is deliberately NOT carried here \u2014 /health is polled by the compose healthcheck and the host watcher on a short interval, and operator prose on every poll costs bandwidth continuously for something only a human reading a console needs. `unhealthy` (flag on, container missing or down) IS a fault and is specced but NOT YET EMITTED \u2014 no arm of `health_word` produces it. Treat any unrecognised value as unknown rather than guessing.",
+                      "additionalProperties": {
+                        "type": "string",
+                        "enum": [
+                          "enabled",
+                          "disabled",
+                          "unlicensed",
+                          "unhealthy"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/token": {
+      "post": {
+        "tags": [
+          "core"
+        ],
+        "summary": "Obtain auth token",
+        "description": "[native] Authenticate and receive a JWT token.",
+        "operationId": "auth_token",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "password"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "grant_type": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "password"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "grant_type": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": [
+          "core"
+        ],
+        "summary": "Current user info",
+        "description": "[native] Returns the authenticated user's identity.",
+        "operationId": "auth_me",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": [
+          "ui"
+        ],
+        "summary": "Dashboard index",
+        "description": "[native] Serves the main dashboard HTML page.",
+        "operationId": "serve_index",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/dashboard": {
+      "get": {
+        "tags": [
+          "ui"
+        ],
+        "summary": "Dashboard (alias)",
+        "description": "[native] Redirects to the main dashboard.",
+        "operationId": "serve_dashboard",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/favicon.ico": {
+      "get": {
+        "tags": [
+          "ui"
+        ],
+        "summary": "Favicon",
+        "description": "[native] Serves the inline SVG favicon.",
+        "operationId": "serve_favicon",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/ui/basic": {
+      "get": {
+        "tags": [
+          "ui"
+        ],
+        "summary": "Basic UI",
+        "description": "[native] Serves the basic (legacy) HTML UI.",
+        "operationId": "serve_basic_ui",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/auth/refresh": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Rotate refresh token, mint access token",
+        "description": "[native] Reads the HttpOnly refresh cookie (noo_refresh; HttpOnly; Secure; SameSite=Strict; Path=/api/auth), validates and rotates it (single-use; revoked-token replay triggers a defensive revoke of all the user's chains), sets a fresh rotated refresh cookie, and returns a new short-lived access token. Also registered at /auth/refresh.",
+        "operationId": "auth_refresh",
+        "responses": {
+          "200": {
+            "description": "New access token issued; a rotated refresh cookie is set via Set-Cookie.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "access_token": {
+                      "type": "string",
+                      "description": "Freshly minted JWT access token."
+                    },
+                    "token_type": {
+                      "type": "string",
+                      "example": "bearer"
+                    },
+                    "expires_in": {
+                      "type": "integer",
+                      "description": "Access token lifetime in seconds."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or replayed refresh cookie.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke refresh token and clear cookie",
+        "description": "[native] Revokes the presented refresh token (if any) and clears the HttpOnly refresh cookie (noo_refresh; HttpOnly; Secure; SameSite=Strict; Path=/api/auth) via an expiring Set-Cookie. Idempotent. Also registered at /auth/logout.",
+        "operationId": "auth_logout",
+        "responses": {
+          "200": {
+            "description": "Refresh token revoked and cookie cleared.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "example": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/agent.json": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get agent.json",
+        "description": "[native] GET /.well-known/agent.json \u2014 PAI's AgentCard for A2A discovery.",
+        "operationId": "agent_card",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/bootstrap": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create bootstrap",
+        "description": "[native] POST /api/cluster/bootstrap \u2014 redeem a bootstrap token.",
+        "operationId": "cluster_bootstrap",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create logout",
+        "description": "[native] POST /auth/logout \u2014 Revoke the presented refresh cookie + clear it from the browser. Idempotent.",
+        "operationId": "auth_logout_handler",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create refresh",
+        "description": "[native] POST /auth/refresh \u2014 Exchange the refresh cookie for a new access token + a rotated refresh cookie.",
+        "operationId": "auth_refresh_handler",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get bootstrap",
+        "description": "[native] GET /bootstrap \u2014 the enrollment script (public, because it runs before the host has any credential). The script itself does nothing without a valid TOKEN.",
+        "operationId": "serve_enroll_script",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/prep": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get prep",
+        "description": "[native] GET /bootstrap/prep \u2014 the ROOT host-prep phase, fetched by bootstrap-enroll.sh and run under the operator's one attended sudo. Public for the same reason as `/bootstrap`: it is an inert script from the repo; run by nobody but the operator, on a host that has no credential of any kind yet.",
+        "operationId": "serve_prep_script",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/apply": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get apply",
+        "description": "[native] GET /bootstrap/apply \u2014 the noo-apply root applier (\u00a77b). It refuses any bundle not signed by the cluster CA, which is why serving the SCRIPT publicly is harmless: the script is the lock, not the key.",
+        "operationId": "serve_apply_script",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/ca.crt": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get ca.crt",
+        "description": "[native] GET /bootstrap/ca.crt \u2014 the cluster CA CERTIFICATE (public half only). This is the trust anchor a brand-new node needs BEFORE the first signed bundle can verify: noo-apply refuses everything without it, so birth is the one moment it must arrive out-of-band. Serving it publicly discloses nothing (a certificate is public by construction); the node fetches it during token-authenticated enrollment, which is the sanctioned trust-on-first-use ceremony. The PRIVATE key never leaves noo-cli.",
+        "operationId": "serve_cluster_ca",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/deenroll": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get deenroll",
+        "description": "[native] GET /bootstrap/prep \u2014 the ROOT host-prep phase, fetched by bootstrap-enroll.sh and run under the operator's one attended sudo. Public for the same reason as `/bootstrap`: it is an inert script from the repo; run by nobody but the operator, on a host that has no credential of any kind yet.",
+        "operationId": "serve_deenroll_script",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/fetch": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get fetch",
+        "description": "[native] GET /bootstrap/fetch \u2014 the pull-provisioning fetcher, installed by prep-host.sh as /usr/local/bin/noo-fetch. Public like its siblings: an inert script; the bundle it fetches is ciphertext to anyone without the node's birth key, and noo-apply still verifies the CA signature on the plaintext.",
+        "operationId": "serve_fetch_script",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/enroll-tailnet": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create enroll tailnet",
+        "description": "[native] POST /api/cluster/enroll-tailnet \u2014 tailnet-native enrollment. No token, no pins: the tailnet IS the authenticated channel.",
+        "operationId": "enroll_tailnet",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/cli/{name}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Serve a CLI release asset (or its .sha256)",
+        "description": "[native] Node-side mirror of the GitHub release asset: `GET /bootstrap/cli/<asset>` returns the binary, `<asset>.sha256` returns `<sha>  <name>`. Read by `noo upgrade` on node role and by noo-apply's cli-binary kind."
+      }
+    },
+    "/mcp/operator": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Operator MCP door",
+        "description": "[native] POST /mcp/operator \u2014 the OPERATOR MCP door (JSON-RPC over HTTPS). Credential mandatory: an mcp:operator service key bound to an account that holds the admin role (re-checked on every call; mint one with `noo security service-key issue <you>-mcp --scopes mcp:operator --user <admin>`). The shared NOO_MCP_TOKEN bearer, retired,  is refused. Its separate plain-HTTP loopback listener (:3100, path /mcp) was removed in stack-v0.2.40.",
+        "operationId": "handle",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get operator",
+        "description": "[native] GET / DELETE on an MCP endpoint: the legacy standalone SSE stream and session teardown. This revision has neither; the spec says 405.",
+        "operationId": "method_not_allowed",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete operator",
+        "description": "[native] GET / DELETE on an MCP endpoint: the legacy standalone SSE stream and session teardown. This revision has neither; the spec says 405.",
+        "operationId": "method_not_allowed",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mcp/user": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create user",
+        "description": "[native] POST /mcp/user \u2014 the USER MCP door (JSON-RPC over HTTP).",
+        "operationId": "handle",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get user",
+        "description": "[native] GET / DELETE on an MCP endpoint: the legacy standalone SSE stream and session teardown. This revision has neither; the spec says 405.",
+        "operationId": "method_not_allowed",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete user",
+        "description": "[native] GET / DELETE on an MCP endpoint: the legacy standalone SSE stream and session teardown. This revision has neither; the spec says 405.",
+        "operationId": "method_not_allowed",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kiosk": {
+      "get": {
+        "tags": [
+          "kiosk"
+        ],
+        "summary": "The unattended display page",
+        "operationId": "serve_kiosk",
+        "description": "Serves `dist/kiosk.html` from the same UI artifact as the console. PUBLIC, like `/`: a top-level navigation cannot carry an Authorization header and the bundle is not the secret \u2014 the page holds nothing until the host launcher injects a kiosk token, and every `/api/*` call it then makes is authenticated. Exact paths only. 404 (with an explanation) when the UI artifact predates the kiosk entry.",
+        "responses": {
+          "200": {
+            "description": "The page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The UI artifact in this image has no kiosk.html."
+          }
+        }
+      }
+    },
+    "/kiosk.html": {
+      "get": {
+        "tags": [
+          "kiosk"
+        ],
+        "summary": "The unattended display page",
+        "operationId": "serve_kiosk",
+        "description": "Serves `dist/kiosk.html` from the same UI artifact as the console. PUBLIC, like `/`: a top-level navigation cannot carry an Authorization header and the bundle is not the secret \u2014 the page holds nothing until the host launcher injects a kiosk token, and every `/api/*` call it then makes is authenticated. Exact paths only. 404 (with an explanation) when the UI artifact predates the kiosk entry.",
+        "responses": {
+          "200": {
+            "description": "The page.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The UI artifact in this image has no kiosk.html."
+          }
+        }
+      }
+    },
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "OAuth 2.0 authorization-server metadata (RFC 8414)",
+        "operationId": "identity_metadata",
+        "description": "Public discovery for the agent identity exchange. **404 when the `identity` add-on has been switched off** \u2014 discovery answers \"does this exist\", so an install without the add-on advertises nothing. `issuer` is derived from the request `Host` (and `X-Forwarded-Proto`), because a self-hosted controller does not know its own external name. `token_endpoint_auth_methods_supported` is `noomesh_service_key`, a deliberately non-registered value: the credential is a noomesh service key in the `Authorization` header, which is neither `client_secret_basic` nor `client_secret_post`. `response_types_supported` is empty because there is no authorization endpoint \u2014 there is no human to redirect and nothing to consent to.",
+        "responses": {
+          "200": {
+            "description": "Metadata.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "issuer": {
+                      "type": "string"
+                    },
+                    "token_endpoint": {
+                      "type": "string"
+                    },
+                    "grant_types_supported": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "response_types_supported": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "token_endpoint_auth_methods_supported": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "subject_token_types_supported": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "scopes_supported": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "service_documentation": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `identity` add-on has been switched off on this install."
+          }
+        }
+      }
+    },
+    "/.well-known/jwks.json": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "JSON Web Key Set for exchanged agent tokens",
+        "operationId": "identity_jwks",
+        "description": "Proposal 49 phase 3. The public half of the exchange's ES256 signing key, so a third party can verify an agent token without holding anything that could mint one. Public by definition. **404 when the `identity` add-on is off.** With the add-on on but no `NOO_JWT_SIGNING_KEY` configured, returns `{\"keys\": []}` \u2014 a valid JWKS meaning \"this issuer publishes none\", distinguishable from a misrouted request. Only EXCHANGED tokens are signed asymmetrically; dashboard and CLI logins stay HS256, so there is no dual-accept window on the login path. The gateway selects its verification key from the token's own `alg` and pins validation to that one algorithm, which closes algorithm confusion (an HS256 token signed with the published key as the HMAC secret does not verify).",
+        "responses": {
+          "200": {
+            "description": "The key set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "keys"
+                  ],
+                  "properties": {
+                    "keys": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "kty": {
+                            "type": "string",
+                            "example": "EC"
+                          },
+                          "crv": {
+                            "type": "string",
+                            "example": "P-256"
+                          },
+                          "x": {
+                            "type": "string"
+                          },
+                          "y": {
+                            "type": "string"
+                          },
+                          "use": {
+                            "type": "string",
+                            "example": "sig"
+                          },
+                          "alg": {
+                            "type": "string",
+                            "example": "ES256"
+                          },
+                          "kid": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `identity` add-on has been switched off on this install."
+          }
+        }
+      }
+    },
+    "/api/kiosk/token/tailnet": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create tailnet",
+        "description": "[native] POST /api/kiosk/token/tailnet \u2014 a kiosk token for a display that holds NO durable secret. The tailnet is the credential. The only kiosk mint: the key lane (POST /api/kiosk/token) was retired on 2026-09-30.",
+        "operationId": "token_tailnet",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OperationHandle": {
+        "type": "object",
+        "description": "What an operation-backed route answers 202 with when the run outlasted its wait, and what POST /api/v1/ops answers. Poll `poll` (GET, optionally `?wait=<s>`, at most 25).",
+        "required": [
+          "op_id",
+          "type",
+          "status",
+          "poll",
+          "poll_interval_ms"
+        ],
+        "properties": {
+          "op_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "type": {
+            "type": "string",
+            "example": "graph.recluster"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running"
+            ]
+          },
+          "poll": {
+            "type": "string",
+            "example": "/api/v1/ops/0f9c1d2e-0000-4000-8000-000000000001"
+          },
+          "poll_interval_ms": {
+            "type": "integer"
+          },
+          "hint": {
+            "type": "string"
+          },
+          "joined": {
+            "type": "boolean",
+            "description": "Present and true when this request joined the same account's run already in flight (exclusive types) and started nothing new."
+          }
+        }
+      },
+      "Operation": {
+        "type": "object",
+        "description": "One asynchronous operation as GET /api/v1/ops/{id} shows it. `result` and `result_status` appear once it has finished; a listing omits them.",
+        "required": [
+          "op_id",
+          "type",
+          "status"
+        ],
+        "properties": {
+          "op_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "type": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "poll": {
+            "type": "string"
+          },
+          "poll_interval_ms": {
+            "type": "integer"
+          },
+          "progress": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "As stored: ingest text is omitted, over-large params replaced by a marker."
+          },
+          "result": {
+            "description": "The route's own body, in its own shape.",
+            "nullable": true
+          },
+          "result_status": {
+            "type": "integer",
+            "nullable": true,
+            "description": "The HTTP status the synchronous route would have answered."
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancel": {
+            "type": "object",
+            "description": "Present on a cancelled op: {gateway_aborted, worker_stopped, note}. `worker_stopped` is false: a worker run already underway is not stopped.",
+            "additionalProperties": true
+          },
+          "retry_safe": {
+            "type": "boolean",
+            "description": "On a failed op: whether resubmitting is harmless."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}

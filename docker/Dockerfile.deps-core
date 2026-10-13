@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# noomesh/deps-core — the NON-ML tier of the shared Python base
+#.
+#
+# Contains the noomesh site-packages for the web/db/cache/mcp surface
+# ONLY: base dependencies plus the web, cache, feedback, pgvector,
+# google-chat and mcp extras. No torch, no transformers, no whisper, no
+# faiss, no noo-trellion — the ML tier lives in Dockerfile.deps-base,
+# which is FROM this image.
+#
+# Why two tiers: one fat shared base means every consumer pays for the
+# union of all dependencies. Only trellion actually runs models; sandbox
+# (uvicorn noomesh.sandbox.app + docker/entrypoint.py = stdlib +
+# sqlalchemy + noomesh.db.migration_runner) and the worker
+# were each carrying the ~1.4GB ML tree for nothing — paid again on
+# every pull, push-to-node and cross-arch ship.
+#
+# Consumers: sandbox, worker (directly), deps-base (as its
+# FROM). Everything installed here is inherited by the ML tier, so a
+# dependency belongs here unless it is genuinely ML-only.
+#
+# Build: docker compose build deps-core
+# (or directly: docker build -f docker/Dockerfile.deps-core \
+#   -t noomesh/deps-core:latest .)
+
+# Base-image registry: dhi.io by default (local/dev/OSS builds), our ghcr
+# MIRRORS in the release workflow (--build-arg DHI_REGISTRY=ghcr.io/…) —
+# dhi.io TLS timeouts have now broken four builds (build-from-mirrors,
+# 2026-08-20). Digest-pinned FROMs survive the swap: manifest copies
+# preserve digests.
+ARG DHI_REGISTRY=dhi.io
+FROM ${DHI_REGISTRY}/uv:0-debian13-dev
+
+# Mark this image as "keep" so the rebuild script's `docker image prune -a`
+# pass doesn't nuke it. deps-core is a build-only base — no container runs
+# from it directly, so without this label `image prune -a` (which removes
+# all "unused" tagged images) wipes it on every rebuild and forces a
+# multi-minute bootstrap on the next build.
+LABEL pai.image.role=base
+LABEL pai.image.keep=true
+
+ENV UV_BREAK_SYSTEM_PACKAGES=1 \
+    UV_PYTHON_INSTALL_DIR=/opt/python
+
+# Vendor telemetry off (docs/security/telemetry.md), baked into the image so
+# a container started outside compose carries it too; compose sets the same.
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    DO_NOT_TRACK=1
+
+# THE interpreter. Every Python service image FROMs this tier, so this ARG is
+# the version the fleet runs. It is pinned to `.python-version` at the repo root
+# and tests/test_python_version_single_source.py fails if the two drift — change
+# the version there and here in the same commit, never one alone.
+ARG PYTHON_VERSION=3.12
+
+RUN uv python install "${PYTHON_VERSION}" \
+    && ln -sf $(uv python find "${PYTHON_VERSION}") /usr/local/bin/python \
+    && ln -sf $(uv python find "${PYTHON_VERSION}") /usr/local/bin/python3 \
+    && [ -e /bin/sh ] || ln -sf /usr/bin/sh /bin/sh
+
+WORKDIR /app
+
+# pyproject.toml + README.md are the inputs that determine deps.
+# README.md is required by setuptools metadata.
+COPY pyproject.toml README.md ./
+
+# Stub src/ so editable install can write its .pth file pointing at
+# /app/src. Downstream images COPY their real src OVER this stub at the
+# same path; the .pth resolves through to whatever's there at runtime.
+RUN mkdir -p src/noomesh && touch src/noomesh/__init__.py
+
+# The non-ML extras only. Everything trellion-, torch- or model-adjacent
+# (trellion, rag, voice, graph, recall-memory) is installed by
+# Dockerfile.deps-base on top of this image — adding one here silently
+# re-fattens sandbox and the worker, which is exactly what this
+# split exists to prevent. No torch index pin needed: nothing in this
+# set resolves torch.
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install --system \
+    -e ".[web,cache,feedback,pgvector,google-chat,mcp]"
+
+# Marker so downstream images can verify they're built on top of a
+# compatible base (handy for debugging mismatched layers).
+RUN echo "pai-assistant/deps-core built $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/deps-core-version

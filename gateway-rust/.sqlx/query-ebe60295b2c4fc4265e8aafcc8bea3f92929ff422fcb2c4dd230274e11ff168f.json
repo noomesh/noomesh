@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE neighbors AS (\n                     SELECT e.edge_id, e.src_entity_id, e.rel_type,\n                            e.dst_entity_id, e.evidence_json,\n                            1 AS depth,\n                            ARRAY[e.src_entity_id, e.dst_entity_id] AS visited\n                     FROM edges e\n                     WHERE (e.src_entity_id = $1::uuid OR e.dst_entity_id = $1::uuid)\n                     UNION ALL\n                     SELECT e.edge_id, e.src_entity_id, e.rel_type,\n                            e.dst_entity_id, e.evidence_json,\n                            n.depth + 1,\n                            n.visited || CASE\n                                WHEN e.src_entity_id = ANY(n.visited)\n                                THEN ARRAY[e.dst_entity_id]\n                                ELSE ARRAY[e.src_entity_id]\n                            END\n                     FROM edges e\n                     JOIN neighbors n ON (\n                         (e.src_entity_id = n.dst_entity_id AND NOT e.dst_entity_id = ANY(n.visited))\n                         OR\n                         (e.dst_entity_id = n.src_entity_id AND NOT e.src_entity_id = ANY(n.visited))\n                     )\n                     WHERE n.depth < $2\n                   )\n                   SELECT DISTINCT edge_id::text AS \"edge_id!\",\n                          src_entity_id::text AS \"src_entity_id!\",\n                          rel_type AS \"rel_type!\",\n                          dst_entity_id::text AS \"dst_entity_id!\",\n                          evidence_json, depth\n                   FROM neighbors\n                   ORDER BY depth, edge_id::text",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "edge_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "src_entity_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "rel_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "dst_entity_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "evidence_json",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "depth",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ebe60295b2c4fc4265e8aafcc8bea3f92929ff422fcb2c4dd230274e11ff168f"
+}

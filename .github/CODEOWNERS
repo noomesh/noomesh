@@ -1,0 +1,4 @@
+# Every change is reviewed by a founder. Required-review itself is enforced by
+# the `main` ruleset: it applies to outside
+# contributors; the `maintainers` team may merge their own PRs after CI.
+* @personifai-llc @richard-raithel

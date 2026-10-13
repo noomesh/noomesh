@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# BuildKit GC policy for the self-hosted CI builder.
+#
+# Applied when the builder is created:
+#   docker buildx create --driver docker-container --config docker/buildkitd.toml
+#
+# WHY THIS FILE EXISTS
+#
+# NOTE (2026-08-13): the ci.yml cache-cap step already bounds every builder the
+# runner user owns, including this one, and that is what brought host8 back
+# from 96.9 GB to ~18 GB. This config is DEFENCE IN DEPTH, not the remedy: it
+# makes buildkitd enforce the ceiling continuously, including for builds that
+# never go through CI (a local `docker buildx build`, `build-cross.sh`), rather
+# than only after a CI build finishes.
+#
+# On 2026-08-11 host8 sat at 82% disk while `docker system df` reported 1.2 GB
+# of build cache. The real figure was 96.9 GB, held inside the `noo-builder`
+# container-driver builder — `system df` only ever sees the docker-driver
+# builder, so the growth was invisible to the usual check.
+#
+# It then caused a second, less obvious failure: a nearly-full disk makes
+# containerd's content GC run hard, and an aggressive GC collects leases out
+# from under CONCURRENT builds. Four runner agents share this one daemon, so
+# builds started dying at metadata resolution with
+#
+#   unable to lease content: lease does not exist: not found
+#
+# — three times in two days, each after a 13–16 minute stall, on PRs that could
+# not possibly have caused it. See an earlier change.
+#
+# An age-based prune cannot fix this. `--filter until=168h` evicts cache by LAST
+# USED, and cache that every build reuses is never idle, so it is never evicted
+# no matter how large it grows. Only a SIZE bound works, and a bound the daemon
+# enforces continuously beats one a cron job applies after the fact.
+#
+# THE NUMBERS
+#
+#   reservedSpace  cache below this is never pruned — keeps builds warm, which
+#                  is the entire reason the build job is pinned to this box.
+#   maxUsedSpace   hard ceiling. 40 GB against the 96.9 GB actually observed.
+#   minFreeSpace   the one that protects the machine: always leave this much
+#                  free on the disk, regardless of the other two. host8 also
+#                  runs inference backends, and a CI cache must not be what
+#                  takes them down.
+#
+# Verified against buildkit v0.31 (`buildx inspect --bootstrap` echoes the
+# policy back and buildkitd starts clean) — these keys replaced the older
+# `gckeepstorage` in buildkit 0.16 and are silently ignored by anything older,
+# so check the echo if you change buildkit versions.
+
+[worker.oci]
+  gc = true
+  reservedSpace = "10GB"
+  maxUsedSpace  = "40GB"
+  minFreeSpace  = "20GB"

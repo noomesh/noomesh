@@ -1,0 +1,10 @@
+{
+  "started": true,
+  "enabled": true,
+  "total_records": 42800,
+  "total_size_mb": 0,
+  "promotion_threshold": 0.6,
+  "lifecycle": { "live_records": 41200, "tombstoned_records": 1600 },
+  "episodes_by_type": { "conversation": 27800, "traversal": 13400 },
+  "traversals": { "buffer_size": 320, "min_outcome_score": 0.7 }
+}
