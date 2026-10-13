@@ -732,6 +732,15 @@ case "${PREP_CONTROLLER_IP:-}" in
 esac
 
 # ── 9. Marker: the record of the decisions made here ───────────────────────
+# PREP_SHA256 is this script's own digest: the controller's local lane skips
+# host prep (and its sudo) while the marker names the prep it is about to run
+# and nothing it passes has changed (PREP_RELEASE is the caller's release
+# identity: a new CLI or stack tag re-runs prep once, which refreshes the gate
+# tools the gateway serves). Empty when the script came from a pipe.
+PREP_SHA256=""
+if [ -f "$0" ]; then
+    PREP_SHA256="$( { sha256sum "$0" 2>/dev/null || shasum -a 256 "$0" 2>/dev/null || true; } | awk '{print $1}')"
+fi
 cat > "$MARKER" <<EOF
 # Written by scripts/prep-host.sh — read this file for the values, do not
 # re-derive them (a second derivation on different disk state diverges).
@@ -741,6 +750,10 @@ NOO_DATA_ROOT=$NOO_DATA_ROOT
 ENROLL_USER=$ENROLL_USER
 GPU_PRESENT=$GPU_PRESENT
 INSTALLED_TAILSCALE=${PREP_TS_INSTALLED_BY_US:-0}
+PREP_SHA256=$PREP_SHA256
+PREP_NODE_NAME=${PREP_NODE_NAME:-}
+PREP_NOO_URL=${PREP_NOO_URL:-}
+PREP_RELEASE=${PREP_RELEASE:-}
 EOF
 chmod 644 "$MARKER"
 say "done — marker at $MARKER"

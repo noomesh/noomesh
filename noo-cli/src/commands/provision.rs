@@ -1562,6 +1562,202 @@ fn local_agent_secret_files_script(applier: &str) -> String {
     )
 }
 
+/// The marker prep-host.sh writes (the record of what it decided and, since
+/// it records them, the prep digest, inputs and release it ran with).
+const LOCAL_PREP_MARKER: &str = "/etc/noo/host-prepped";
+/// The installed agent binary (world-readable, so compared directly).
+const LOCAL_AGENT_BIN: &str = "/usr/local/bin/noo-node-agent";
+/// Per-node record of what the local lane last installed successfully:
+/// `<kind> <sha256>` lines, 0600, in the operator's PKI dir beside node.key.
+const LOCAL_LANE_STATE: &str = "local-lane.state";
+/// The install script's exit when the agent env holds no NATS pair after the
+/// install. The agent is NOT restarted on it, so a running agent keeps the
+/// pair it already has in its process environment.
+const NATS_PAIR_MISSING_EXIT: i32 = 86;
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(b))
+}
+
+/// POSIX single-quoting.
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A Command rendered as one shell line (program and arguments quoted).
+fn command_line(c: &Command) -> String {
+    std::iter::once(c.get_program()).chain(c.get_args())
+        .map(|a| shq(&a.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Is the prep marker a record of THIS prep, run with these inputs? Every
+/// wanted key must match exactly and the digest must be present: a marker
+/// from an older prep (no digest) is not current, which re-runs prep once.
+fn prep_marker_current(marker: &str, want: &[(&str, &str)]) -> bool {
+    let kv: BTreeMap<&str, &str> = marker.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .collect();
+    kv.get("PREPPED_VERSION") == Some(&"1")
+        && kv.get("PREP_SHA256").is_some_and(|v| !v.is_empty())
+        && want.iter().all(|(k, v)| kv.get(k) == Some(v))
+}
+
+/// The inputs of the controller's local "bundle": the same kinds a rail
+/// bundle carries for an agent, delivered by one sudo script.
+struct LocalInputs {
+    agent_env: Vec<u8>,
+    nats_creds: Vec<u8>,
+    agent_binary: Vec<u8>,
+    agent_unit: Vec<u8>,
+    ca_crt: Vec<u8>,
+    node_crt: Vec<u8>,
+    node_key: Vec<u8>,
+    leaves: Vec<(String, Vec<u8>)>,
+    secret_files_script: Vec<u8>,
+}
+
+/// The staged kinds, in install order. Refuses a `nats-creds` that is not
+/// this node's or carries no pair: the lane must never install an agent env
+/// that cannot present one.
+fn local_bundle(node: &str, i: LocalInputs) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let creds = String::from_utf8_lossy(&i.nats_creds);
+    let val = |k: &str| creds.lines().filter_map(|l| l.strip_prefix(k)).next_back().unwrap_or("").trim().to_string();
+    if val("NODE=") != node {
+        return Err(format!("the NATS credential names '{}', not {node}", val("NODE=")));
+    }
+    if val("NATS_NODE_USER=") != format!("node-{node}") || val("NATS_NODE_PASSWORD=").is_empty() {
+        return Err(format!("the NATS credential for {node} carries no complete pair"));
+    }
+    let mut v: Vec<(String, Vec<u8>)> = vec![
+        ("ca.crt".into(), i.ca_crt),
+        ("node.crt".into(), i.node_crt),
+        ("node.key".into(), i.node_key),
+    ];
+    v.extend(i.leaves);
+    v.push(("agent-env".into(), i.agent_env));
+    v.push(("nats-creds".into(), i.nats_creds));
+    v.push(("agent-binary".into(), i.agent_binary));
+    v.push(("agent-unit".into(), i.agent_unit));
+    v.push(("secret-files".into(), i.secret_files_script));
+    Ok(v)
+}
+
+fn parse_lane_state(s: &str) -> BTreeMap<String, String> {
+    s.lines().filter_map(|l| l.split_once(' '))
+        .map(|(k, d)| (k.trim().to_string(), d.trim().to_string()))
+        .filter(|(k, d)| !k.is_empty() && !d.is_empty())
+        .collect()
+}
+
+fn render_lane_state(staged: &[(String, Vec<u8>)]) -> String {
+    staged.iter().map(|(k, b)| format!("{k} {}\n", sha256_hex(b))).collect()
+}
+
+/// Kinds whose staged digest differs from the recorded (or installed) one.
+fn changed_kinds(staged: &[(String, Vec<u8>)], recorded: &BTreeMap<String, String>) -> std::collections::BTreeSet<String> {
+    staged.iter()
+        .filter(|(k, b)| recorded.get(k) != Some(&sha256_hex(b)))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// `nats_pair_ok ENV USER` — the env names USER and a non-empty password,
+/// plain or behind a readable `_FILE` pointer (the secret-files layout).
+const NATS_PAIR_CHECK: &str = r#"nats_pair_ok() {
+    _np_v() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1 | tr -d '\015' | sed -e 's/^"\(.*\)"$/\1/'; }
+    [ "$(_np_v "$1" NATS_NODE_USER)" = "$2" ] || return 1
+    [ -n "$(_np_v "$1" NATS_NODE_PASSWORD)" ] && return 0
+    _np_f="$(_np_v "$1" NATS_NODE_PASSWORD_FILE)"
+    [ -n "$_np_f" ] && [ -s "$_np_f" ]
+}
+"#;
+
+struct LocalScript<'a> {
+    node: &'a str,
+    work: &'a Path,
+    changed: &'a std::collections::BTreeSet<String>,
+    prep: Option<&'a str>,
+    secret_files: &'a str,
+    leaves: &'a [String],
+    restart: bool,
+}
+
+/// The one root script: host prep when it is not current, then only the
+/// pieces that changed, the secret-files conversion, the NATS pair check
+/// (fail loud, before any restart), and a restart only when needed.
+fn local_install_script(s: &LocalScript) -> String {
+    let (node, w) = (s.node, s.work.display());
+    let ch = |k: &str| s.changed.contains(k);
+    let mut out = String::from("set -e\n");
+    if let Some(p) = s.prep {
+        out.push_str(p);
+    }
+    if ch("ca.crt") || ch("node.crt") || ch("node.key") {
+        out.push_str(&format!(
+            "install -d -m 750 -o root -g noo-agent /etc/noo/pki /etc/noo/pki/nodes \"/etc/noo/pki/nodes/{node}\" 2>/dev/null   || install -d -m 755 /etc/noo/pki \"/etc/noo/pki/nodes/{node}\"\n\
+             grp=noo-agent; getent group noo-agent >/dev/null || grp=root\n"));
+        if ch("ca.crt") {
+            out.push_str(&format!("install -m 640 -o root -g \"$grp\" \"{w}/ca.crt\"   /etc/noo/pki/ca.crt.new && mv /etc/noo/pki/ca.crt.new /etc/noo/pki/ca.crt\n"));
+        }
+        if ch("node.crt") {
+            out.push_str(&format!("install -m 640 -o root -g \"$grp\" \"{w}/node.crt\" \"/etc/noo/pki/nodes/{node}/node.crt\"\n"));
+        }
+        if ch("node.key") {
+            out.push_str(&format!("install -m 640 -o root -g \"$grp\" \"{w}/node.key\" \"/etc/noo/pki/nodes/{node}/node.key\"\n"));
+        }
+    }
+    // Staged under their bundle kind names; each pair installed the way
+    // noo-apply does (root, key 0600, cert 0644, temp + rename).
+    for l in super::node_leaves::NODE_DOOR_LEAVES {
+        if !s.leaves.iter().any(|k| k == l.crt_kind) || !(ch(l.crt_kind) || ch(l.key_kind)) {
+            continue;
+        }
+        out.push_str(&format!(
+            "install -d -m 755 -o root -g root /etc/noo/pki/services /etc/noo/pki/services/{s}\n\
+             install -m 600 -o root -g root \"{w}/{k}\" /etc/noo/pki/services/{s}/.service.key.next\n\
+             install -m 644 -o root -g root \"{w}/{c}\" /etc/noo/pki/services/{s}/.service.crt.next\n\
+             mv -f /etc/noo/pki/services/{s}/.service.key.next /etc/noo/pki/services/{s}/service.key\n\
+             mv -f /etc/noo/pki/services/{s}/.service.crt.next /etc/noo/pki/services/{s}/service.crt\n",
+            s = l.service, k = l.key_kind, c = l.crt_kind));
+    }
+    if ch("agent-env") || ch("nats-creds") || ch("secret-files") {
+        // agent-env replaces the env whole, then nats-creds is merged in
+        // exactly as noo-apply merges it on the rail.
+        out.push_str(&format!(
+            "install -m 600 -o root -g root \"{w}/agent-env\" /etc/noo-node-agent.env\n\
+             nc_tmp=\"$(mktemp)\"; chmod 600 \"$nc_tmp\"\n\
+             grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD|NATS_NODE_PASSWORD_FILE)=' /etc/noo-node-agent.env > \"$nc_tmp\" || true\n\
+             grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' \"{w}/nats-creds\" >> \"$nc_tmp\"\n\
+             install -m 600 -o root -g root \"$nc_tmp\" /etc/noo-node-agent.env; rm -f \"$nc_tmp\"\n"));
+    }
+    if ch("agent-binary") {
+        out.push_str(&format!("install -m 755 \"{w}/agent-binary\" /usr/local/bin/noo-node-agent\n"));
+    }
+    if ch("agent-unit") {
+        out.push_str(&format!(
+            "install -m 644 \"{w}/agent-unit\" /etc/systemd/system/noo-node-agent.service\n\
+             getent passwd noo-agent >/dev/null || sed -i 's/^User=noo-agent/User=root/' /etc/systemd/system/noo-node-agent.service\n\
+             systemctl daemon-reload\n\
+             systemctl enable noo-node-agent\n"));
+    }
+    out.push_str(s.secret_files);
+    out.push_str(NATS_PAIR_CHECK);
+    out.push_str(&format!(
+        "nats_pair_ok /etc/noo-node-agent.env 'node-{node}' || {{ echo \"provision --local: /etc/noo-node-agent.env holds no NATS pair for node-{node} — the agent was not restarted\" >&2; exit {NATS_PAIR_MISSING_EXIT}; }}\n"));
+    if s.restart {
+        // restart, not `enable --now`: `--now` is a NO-OP on an already-running
+        // unit, so a surviving agent from a previous install kept its STALE
+        // process env (old controller URLs) forever while the rewritten env
+        // file sat unread.
+        out.push_str("systemctl restart noo-node-agent\n");
+    }
+    out
+}
+
 pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i32, Unhandled> {
     let root = crate::envfile::repo_root();
     let pki = crate::pki::pki_dir();
@@ -1597,9 +1793,25 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         Err(e) => fail(g.json, ExitCode::Generic, "prep_unavailable", &e,
             Some("install a released noo binary (it embeds prep-host.sh) or run from a checkout")),
     };
-    {
-        nstep("running host prep locally (idempotent; one sudo)");
-        let user = std::env::var("USER").unwrap_or_default();
+    // Host prep runs inside the ONE sudo script below, and only when the
+    // marker it last wrote does not name this prep, these inputs and this
+    // release: re-running it on every `noo upgrade --nodes` cost a sudo for
+    // nothing.
+    let user = std::env::var("USER").unwrap_or_default();
+    let prep_release = format!("{}/{}", env!("CARGO_PKG_VERSION"), image_tag());
+    let prep_sha = std::fs::read(&prep).map(|b| sha256_hex(&b)).unwrap_or_default();
+    let prep_url = format!("https://{ctrl_host}:8080");
+    let prep_current = std::fs::read_to_string(LOCAL_PREP_MARKER).map(|m| prep_marker_current(&m, &[
+        ("PREP_SHA256", prep_sha.as_str()),
+        ("NOO_DATA_ROOT", data_root.as_str()),
+        ("ENROLL_USER", user.as_str()),
+        ("PREP_NODE_NAME", node),
+        ("PREP_NOO_URL", prep_url.as_str()),
+        ("PREP_RELEASE", prep_release.as_str()),
+    ])).unwrap_or(false);
+    let prep_cmd = if prep_current {
+        None
+    } else {
         // The gateway's leaf is not in the system trust store, so prep's
         // one first-contact fetch (GET /bootstrap/ca.crt, only when
         // /etc/noo/pki/ca.crt is absent) cannot verify the transport —
@@ -1614,17 +1826,21 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
             .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "ca_pin",
                 &format!("cannot fingerprint {}: {e}", pki.join("ca.crt").display()),
                 Some("host prep would fetch the cluster CA unpinned; run `noo onboard --only security` first")));
-        let _ = Command::new("sudo")
-            .arg("env")
-            .arg(format!("PREP_ENROLL_USER={user}"))
-            .arg(format!("PREP_NOO_URL=https://{ctrl_host}:8080"))
+        // Built as a Command so the pin rides the same argument list as the
+        // insecure switch, then rendered into the install script (already
+        // root there). Prep's exit status was never fatal: it tolerates
+        // fetch failures with warnings, and inside the script it stays so.
+        let mut c = Command::new("env");
+        c.arg(format!("PREP_ENROLL_USER={user}"))
+            .arg(format!("PREP_NOO_URL={prep_url}"))
             .arg("PREP_INSECURE=1")
             .arg(format!("PREP_CA_SHA256={ca_pin}"))
             .arg(format!("PREP_NODE_NAME={node}"))
             .arg(format!("NOO_DATA_ROOT={data_root}"))
-            .arg("bash").arg(&prep)
-            .status();
-    }
+            .arg(format!("PREP_RELEASE={prep_release}"))
+            .arg("bash").arg(&prep);
+        Some(format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c)))
+    };
 
     // Certs must exist in the local PKI (the wizard's security step issues
     // the node cert for this hostname; issue-node covers a differing name).
@@ -1724,81 +1940,124 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         fail(g.json, ExitCode::Generic, "render", &e, None)
     });
 
-    // Stage in a private dir, install everything with ONE sudo script,
-    // scrub the staged env either way.
-    let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
-    let _ = std::fs::set_permissions(&work, {
-        use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
+    // ── the controller's own NATS credential ──────────────
+    // The same source of truth and the same bundle kind as the rail lane
+    // (node_credential_payload): this lane used to install agent-env whole
+    // and carry no `nats-creds`, so every `noo upgrade --nodes` dropped the
+    // controller agent's bus pair while it still registered over HTTP.
+    // REQUIRED, as on the rail: nothing is installed without it.
+    let nats_creds = super::nats_users::node_credential_payload(&root, node).unwrap_or_else(|e| {
+        fail(g.json, ExitCode::Generic, "nats_credential",
+            &format!("could not mint {node}'s own NATS credential ({e}) — the agent has no other \
+                      bus credential, so nothing was installed"),
+            Some("check the secret store (`noo security secrets audit`), then re-run \
+                  `noo cluster provision <node> --local`"))
     });
-    let wr = |name: &str, bytes: &[u8]| {
-        std::fs::write(work.join(name), bytes)
-            .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
-    };
-    wr("agent-env", env_body.as_bytes());
-    wr("agent-binary", &binary);
-    wr("agent-unit", &std::fs::read(root.join("node-agent-go/deploy/noo-node-agent.service"))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "unit", &e.to_string(), None)));
-    wr("ca.crt", &std::fs::read(pki.join("ca.crt"))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "pki", &e.to_string(), None)));
-    wr("node.crt", &std::fs::read(pki.join(format!("nodes/{node}/node.crt")))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "pki", &e.to_string(), None)));
-    wr("node.key", &std::fs::read(pki.join(format!("nodes/{node}/node.key")))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "pki", &e.to_string(), None)));
-    // Staged under their bundle kind names; the script installs each pair
-    // the way noo-apply does (root, key 0600, cert 0644, temp + rename).
+
     let (leaves, _) = super::node_leaves::leaf_payloads(&leaf_ca, node)
         .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "leaf_read", &e, None));
-    let mut leaf_script = String::new();
-    for (kind, bytes) in &leaves {
-        wr(kind, bytes);
-    }
-    for l in super::node_leaves::NODE_DOOR_LEAVES {
-        if !leaves.iter().any(|(k, _)| *k == l.crt_kind) {
-            continue;
-        }
-        leaf_script.push_str(&format!(
-            "install -d -m 755 -o root -g root /etc/noo/pki/services /etc/noo/pki/services/{s}\n\
-             install -m 600 -o root -g root \"{w}/{k}\" /etc/noo/pki/services/{s}/.service.key.next\n\
-             install -m 644 -o root -g root \"{w}/{c}\" /etc/noo/pki/services/{s}/.service.crt.next\n\
-             mv -f /etc/noo/pki/services/{s}/.service.key.next /etc/noo/pki/services/{s}/service.key\n\
-             mv -f /etc/noo/pki/services/{s}/.service.crt.next /etc/noo/pki/services/{s}/service.crt\n",
-            s = l.service, k = l.key_kind, c = l.crt_kind, w = work.display()));
-    }
+    let read_or_fail = |p: std::path::PathBuf, kind: &str| std::fs::read(&p)
+        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, kind, &format!("{}: {e}", p.display()), None));
+    let asf = local_agent_secret_files_script(super::enroll::asset_apply());
+    let staged = local_bundle(node, LocalInputs {
+        agent_env: env_body.into_bytes(),
+        nats_creds,
+        agent_binary: binary,
+        agent_unit: read_or_fail(root.join("node-agent-go/deploy/noo-node-agent.service"), "unit"),
+        ca_crt: read_or_fail(pki.join("ca.crt"), "pki"),
+        node_crt: read_or_fail(pki.join(format!("nodes/{node}/node.crt")), "pki"),
+        node_key: read_or_fail(pki.join(format!("nodes/{node}/node.key")), "pki"),
+        leaves: leaves.iter().map(|(k, b)| (k.to_string(), b.clone())).collect(),
+        secret_files_script: asf.clone().into_bytes(),
+    }).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "nats_credential", &e, None));
 
-    nstep("installing the host agent (one sudo)");
-    let script = format!(r#"set -e
-install -d -m 750 -o root -g noo-agent /etc/noo/pki /etc/noo/pki/nodes "/etc/noo/pki/nodes/{node}" 2>/dev/null   || install -d -m 755 /etc/noo/pki "/etc/noo/pki/nodes/{node}"
-grp=noo-agent; getent group noo-agent >/dev/null || grp=root
-install -m 640 -o root -g "$grp" "{w}/ca.crt"   /etc/noo/pki/ca.crt.new && mv /etc/noo/pki/ca.crt.new /etc/noo/pki/ca.crt
-install -m 640 -o root -g "$grp" "{w}/node.crt" "/etc/noo/pki/nodes/{node}/node.crt"
-install -m 640 -o root -g "$grp" "{w}/node.key" "/etc/noo/pki/nodes/{node}/node.key"
-{leaf_script}install -m 600 -o root -g root  "{w}/agent-env" /etc/noo-node-agent.env
-install -m 755 "{w}/agent-binary" /usr/local/bin/noo-node-agent
-install -m 644 "{w}/agent-unit" /etc/systemd/system/noo-node-agent.service
-getent passwd noo-agent >/dev/null || sed -i 's/^User=noo-agent/User=root/' /etc/systemd/system/noo-node-agent.service
-{asf}systemctl daemon-reload
-systemctl enable noo-node-agent
-# restart, not `enable --now`: `--now` is a NO-OP on an already-running
-# unit, so a surviving agent from a previous install kept its STALE
-# process env (old controller URLs) forever while the rewritten env file
-# sat unread — 21h of "nats still disconnected" to a ghost tailnet name
-# (finding #71b, live on host1 2026-08-27).
-systemctl restart noo-node-agent
-"#, node = node, w = work.display(), leaf_script = leaf_script,
-        asf = local_agent_secret_files_script(super::enroll::asset_apply()));
-    let ok = Command::new("sudo").args(["sh", "-c", &script])
-        .status().map(|s| s.success()).unwrap_or(false);
-    // Scrub the staged env regardless of outcome.
-    for staged in std::iter::once("agent-env").chain(leaves.iter().map(|(k, _)| *k).filter(|k| k.ends_with(".key"))) {
-        let p = work.join(staged);
-        if let Ok(m) = std::fs::metadata(&p) { let _ = std::fs::write(&p, vec![0u8; m.len() as usize]); }
+    // What changed since this lane last installed successfully: the state
+    // file (kind → sha256, in the operator's own PKI dir beside node.key)
+    // for what root keeps unreadable, the installed binary itself for the
+    // binary. Nothing changed, prep current and the agent running → no sudo.
+    let state_path = pki.join("nodes").join(node).join(LOCAL_LANE_STATE);
+    let mut recorded = parse_lane_state(&std::fs::read_to_string(&state_path).unwrap_or_default());
+    match std::fs::read(LOCAL_AGENT_BIN) {
+        Ok(b) => { recorded.insert("agent-binary".into(), sha256_hex(&b)); }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { recorded.remove("agent-binary"); }
+        Err(_) => {}
     }
-    let _ = std::fs::remove_dir_all(&work);
-    if !ok {
-        fail(g.json, ExitCode::Generic, "install_failed",
-            "local agent install failed (see output above)", None);
+    let changed = changed_kinds(&staged, &recorded);
+    let active = Command::new("systemctl").args(["is-active", "--quiet", "noo-node-agent"])
+        .status().map(|s| s.success()).unwrap_or(false);
+    let needs_nats_render = changed.contains("nats-creds");
+
+    if prep_cmd.is_none() && changed.is_empty() && active {
+        nstep("host agent, certs and credential are current; host prep is current — nothing to install (no sudo)");
+    } else {
+        if needs_nats_render {
+            match super::nats_users::render_all(g, &[node.to_string()]) {
+                Ok(out) => {
+                    let reloaded = super::nats_users::hup_nats();
+                    nnote(&format!("bundle carries this node's own NATS credential; {} users rendered{}",
+                        out.users, if reloaded { " and noo-nats reloaded" } else { " (reload noo-nats: docker kill -s HUP noo-nats)" }));
+                }
+                Err(e) => nnote(&format!(
+                    "node credential minted but users.conf did not re-render ({e}) — the agent \
+                     retries auth until `noo cluster nats-users render` (then \
+                     `docker kill -s HUP noo-nats`) accepts node-{node}")),
+            }
+        }
+        // Stage in a private dir, install what changed with ONE sudo script,
+        // scrub the staged secrets either way.
+        let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
+        let _ = std::fs::set_permissions(&work, {
+            use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
+        });
+        for (kind, bytes) in &staged {
+            if kind == "secret-files" { continue; }
+            std::fs::write(work.join(kind), bytes)
+                .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
+        }
+        let what: Vec<&str> = changed.iter().map(String::as_str).collect();
+        nstep(&format!("installing the host agent (one sudo){}{}",
+            if prep_cmd.is_some() { "; host prep" } else { "" },
+            if what.is_empty() { String::new() } else { format!("; changed: {}", what.join(", ")) }));
+        let script = local_install_script(&LocalScript {
+            node, work: &work, changed: &changed, prep: prep_cmd.as_deref(), secret_files: &asf,
+            leaves: &leaves.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
+            restart: !changed.is_empty() || !active,
+        });
+        let code = Command::new("sudo").args(["sh", "-c", &script])
+            .status().ok().and_then(|s| s.code());
+        // Scrub the staged secrets regardless of outcome.
+        for staged_kind in ["agent-env", "nats-creds", "node.key"].into_iter()
+            .chain(leaves.iter().map(|(k, _)| *k).filter(|k| k.ends_with(".key")))
+        {
+            let p = work.join(staged_kind);
+            if let Ok(m) = std::fs::metadata(&p) { let _ = std::fs::write(&p, vec![0u8; m.len() as usize]); }
+        }
+        let _ = std::fs::remove_dir_all(&work);
+        match code {
+            Some(0) => {}
+            Some(NATS_PAIR_MISSING_EXIT) => fail(g.json, ExitCode::Generic, "nats_pair_missing",
+                &format!("{node}'s agent env holds no NATS pair after the install — the agent would \
+                          register over HTTP with no bus connection; it was NOT restarted"),
+                Some(format!("noo cluster nats-creds rotate {node}").as_str())),
+            _ => fail(g.json, ExitCode::Generic, "install_failed",
+                "local agent install failed (see output above)", None),
+        }
+        // Recorded only after a successful install whose env presented a pair.
+        let body = render_lane_state(&staged);
+        let wrote = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp = state_path.with_extension("next");
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+                .and_then(|_| std::fs::rename(&tmp, &state_path))
+        };
+        if let Err(e) = wrote {
+            nnote(&format!("could not record {} ({e}) — the next run reinstalls everything", state_path.display()));
+        }
     }
 
     nstep(&format!("waiting for {node} to register on the mesh"));
@@ -3338,5 +3597,154 @@ mod controller_hostd_tests {
         let hostd = code.find(r#"files.push(("hostd-binary""#).expect("hostd is staged");
         let self_branch = code.find("the bundle carries no CLI").expect("the self-node CLI branch");
         assert!(hostd < self_branch, "hostd staging must precede, not sit inside, the self-node CLI branch");
+    }
+}
+
+#[cfg(test)]
+mod local_lane_tests {
+    use super::*;
+
+    fn creds(node: &str, pw: &str) -> Vec<u8> {
+        crate::commands::nats_users::creds_payload(node, pw).into_bytes()
+    }
+
+    fn inputs(nats_creds: Vec<u8>) -> LocalInputs {
+        LocalInputs {
+            agent_env: b"NODE_ID=ctrl\nCONTROLLER_URL=https://ctrl:8080\n".to_vec(),
+            nats_creds,
+            agent_binary: b"\x7fELF-agent".to_vec(),
+            agent_unit: b"[Service]\nUser=noo-agent\n".to_vec(),
+            ca_crt: b"ca".to_vec(),
+            node_crt: b"crt".to_vec(),
+            node_key: b"key".to_vec(),
+            leaves: vec![("svc-vllm.crt".into(), b"lc".to_vec()), ("svc-vllm.key".into(), b"lk".to_vec())],
+            secret_files_script: b"agent_secret_files ...\n".to_vec(),
+        }
+    }
+
+    /// The local lane's bundle carries the controller's own NATS pair as
+    /// `nats-creds`, the kind the rail lane uses, from the same payload.
+    #[test]
+    fn the_local_bundle_carries_this_nodes_nats_creds() {
+        let b = local_bundle("ctrl", inputs(creds("ctrl", "pw-1"))).expect("bundle");
+        let kinds: Vec<&str> = b.iter().map(|(k, _)| k.as_str()).collect();
+        let nc = b.iter().find(|(k, _)| k == "nats-creds").expect("nats-creds is staged");
+        let text = String::from_utf8_lossy(&nc.1);
+        assert!(text.contains("NATS_NODE_USER=node-ctrl\n") && text.contains("NATS_NODE_PASSWORD=pw-1\n"), "{text}");
+        // Merged after agent-env, which replaces the env whole.
+        let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+        assert!(pos("agent-env") < pos("nats-creds"));
+        for k in ["ca.crt", "node.crt", "node.key", "svc-vllm.crt", "svc-vllm.key", "agent-binary", "agent-unit", "secret-files"] {
+            assert!(kinds.contains(&k), "{k} missing from {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn a_credential_for_another_node_or_without_a_pair_is_refused() {
+        assert!(local_bundle("ctrl", inputs(creds("other", "pw"))).unwrap_err().contains("names 'other'"));
+        assert!(local_bundle("ctrl", inputs(creds("ctrl", ""))).unwrap_err().contains("no complete pair"));
+        assert!(local_bundle("ctrl", inputs(b"NODE=ctrl\n".to_vec())).is_err());
+    }
+
+    #[test]
+    fn only_what_differs_from_the_last_install_is_changed() {
+        let b = local_bundle("ctrl", inputs(creds("ctrl", "pw-1"))).unwrap();
+        assert_eq!(changed_kinds(&b, &BTreeMap::new()).len(), b.len(), "no record: everything installs");
+        let mut rec = parse_lane_state(&render_lane_state(&b));
+        assert!(changed_kinds(&b, &rec).is_empty(), "a faithful record: nothing to install");
+        rec.insert("agent-binary".into(), sha256_hex(b"an older agent"));
+        let only: Vec<String> = changed_kinds(&b, &rec).into_iter().collect();
+        assert_eq!(only, vec!["agent-binary".to_string()]);
+    }
+
+    fn script(changed: &[&str], restart: bool) -> String {
+        let changed: std::collections::BTreeSet<String> = changed.iter().map(|s| s.to_string()).collect();
+        let leaves = vec!["svc-vllm.crt".to_string(), "svc-vllm.key".to_string()];
+        local_install_script(&LocalScript {
+            node: "ctrl", work: Path::new("/w"), changed: &changed, prep: None,
+            secret_files: "", leaves: &leaves, restart,
+        })
+    }
+
+    #[test]
+    fn nothing_changed_installs_nothing_and_does_not_restart() {
+        let s = script(&[], false);
+        assert!(!s.contains("install -m"), "{s}");
+        assert!(!s.contains("systemctl restart"), "{s}");
+        assert!(s.contains("nats_pair_ok /etc/noo-node-agent.env 'node-ctrl'"), "the pair is checked every time");
+    }
+
+    #[test]
+    fn a_new_binary_reinstalls_only_the_binary() {
+        let s = script(&["agent-binary"], true);
+        assert!(s.contains("/w/agent-binary\" /usr/local/bin/noo-node-agent"));
+        for not in ["/w/node.key", "/w/agent-env", "/w/agent-unit", "/w/svc-vllm.key"] {
+            assert!(!s.contains(not), "{not} reinstalled for a binary change:\n{s}");
+        }
+    }
+
+    #[test]
+    fn the_env_install_merges_nats_creds_after_agent_env() {
+        let s = script(&["agent-env"], true);
+        let env = s.find("\"/w/agent-env\" /etc/noo-node-agent.env").expect("env installed");
+        let merge = s.find("\"/w/nats-creds\" >>").expect("nats-creds merged");
+        let check = s.find("nats_pair_ok /etc/noo-node-agent.env").unwrap();
+        let restart = s.find("systemctl restart").unwrap();
+        assert!(env < merge && merge < check && check < restart, "{s}");
+    }
+
+    /// Fail loud: an env with no pair stops the script with the dedicated
+    /// exit BEFORE the restart, so "installed and registered" never prints
+    /// and a running agent keeps the pair in its process env.
+    #[test]
+    fn an_env_without_a_pair_fails_loud_before_the_restart() {
+        let dir = std::env::temp_dir().join(format!("noo-local-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join("agent.env");
+        let pwfile = dir.join("NATS_NODE_PASSWORD");
+        let run = |body: &str| {
+            std::fs::write(&env, body).unwrap();
+            let s = script(&[], true).replace("/etc/noo-node-agent.env", &env.display().to_string());
+            let out = Command::new("sh").arg("-c")
+                .arg(format!("systemctl() {{ echo RESTARTED; }}\n{s}")).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string())
+        };
+        let (code, out) = run("NODE_ID=ctrl\n");
+        assert_eq!(code, Some(NATS_PAIR_MISSING_EXIT));
+        assert!(!out.contains("RESTARTED"));
+        assert_eq!(run("NODE_ID=ctrl\nNATS_NODE_USER=node-other\nNATS_NODE_PASSWORD=x\n").0, Some(NATS_PAIR_MISSING_EXIT));
+        let (code, out) = run("NODE_ID=ctrl\nNATS_NODE_USER=node-ctrl\nNATS_NODE_PASSWORD=pw\n");
+        assert_eq!(code, Some(0));
+        assert!(out.contains("RESTARTED"));
+        // The secret-files layout: a pointer to a non-empty file is a pair,
+        // a pointer to an empty one is not.
+        std::fs::write(&pwfile, "").unwrap();
+        let ptr = format!("NODE_ID=ctrl\nNATS_NODE_USER=node-ctrl\nNATS_NODE_PASSWORD_FILE={}\n", pwfile.display());
+        assert_eq!(run(&ptr).0, Some(NATS_PAIR_MISSING_EXIT));
+        std::fs::write(&pwfile, "pw").unwrap();
+        assert_eq!(run(&ptr).0, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_prep_marker_is_current_only_for_this_prep_and_these_inputs() {
+        let m = "# Written by scripts/prep-host.sh\nPREPPED_VERSION=1\nNOO_DATA_ROOT=/d\nENROLL_USER=op\n\
+                 PREP_SHA256=abc\nPREP_NODE_NAME=ctrl\nPREP_NOO_URL=https://c:8080\nPREP_RELEASE=0.6.0/v0.6.0\n";
+        let want = [("PREP_SHA256", "abc"), ("NOO_DATA_ROOT", "/d"), ("ENROLL_USER", "op"),
+                    ("PREP_NODE_NAME", "ctrl"), ("PREP_NOO_URL", "https://c:8080"), ("PREP_RELEASE", "0.6.0/v0.6.0")];
+        assert!(prep_marker_current(m, &want));
+        assert!(!prep_marker_current(&m.replace("abc", "def"), &want), "a changed prep re-runs");
+        assert!(!prep_marker_current(&m.replace("0.6.0/v0.6.0", "0.6.1/v0.6.1"), &want), "a new release re-runs");
+        assert!(!prep_marker_current(&m.replace("PREP_SHA256=abc\n", ""), &[("NOO_DATA_ROOT", "/d")]),
+            "a marker from an older prep (no digest) is not current");
+    }
+
+    #[test]
+    fn the_prep_line_carries_the_pin_beside_the_insecure_switch() {
+        let mut c = Command::new("env");
+        c.arg("PREP_INSECURE=1").arg("PREP_CA_SHA256=ab").arg("NOO_DATA_ROOT=/a b").arg("bash").arg("/tmp/p'q.sh");
+        assert_eq!(command_line(&c),
+            "'env' 'PREP_INSECURE=1' 'PREP_CA_SHA256=ab' 'NOO_DATA_ROOT=/a b' 'bash' '/tmp/p'\\''q.sh'");
     }
 }
