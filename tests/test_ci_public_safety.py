@@ -730,3 +730,20 @@ def test_once_the_switch_is_set_no_step_can_skip_on_probe_failure(job, tmp_path)
 def test_nothing_else_decides_the_trellion_skip_from_the_network(job):
     text = json.dumps(_load("ci.yml")["jobs"][job], default=str)
     assert text.count("git ls-remote") == 1, "only the probe loop touches the network"
+
+
+def test_hub_mirror_off_fails_loud_on_a_public_repository():
+    """The bridge flag cannot become steady state: every job that pulls a Hub
+    image through the mirror refuses to run with it set on the public repository."""
+    jobs = _load("ci.yml")["jobs"]
+    guarded = []
+    for name, job in jobs.items():
+        steps = job.get("steps", [])
+        for i, s in enumerate(steps):
+            if "HUB_MIRROR_OFF" in str(s.get("env", {})):
+                prev = steps[i - 1]
+                cond = str(prev.get("if", ""))
+                assert "github.repository == 'noomesh/noomesh'" in cond and "HUB_MIRROR_OFF" in cond, name
+                assert "exit 1" in prev["run"], name
+                guarded.append(name)
+    assert {"rust-gateway", "sqlx-drift", "noo-cli", "standalone-smoke", "build"} <= set(guarded), guarded

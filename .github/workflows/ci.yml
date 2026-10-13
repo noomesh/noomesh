@@ -494,6 +494,14 @@ jobs:
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
           "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -801,6 +809,14 @@ jobs:
     # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
     # login in a shared credential store can be revoked under an overlapping job
     # (tests/test_workflow_docker_login_isolation.py).
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1015,6 +1031,14 @@ jobs:
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
           "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -1211,6 +1235,14 @@ jobs:
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
           "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -1343,6 +1375,14 @@ jobs:
     # python:3.12-slim from the GHCR mirror (.github/hub-mirror.txt): Hub
     # rate-limits per IP and every runner shares one. A miss answers
     # docker.io with a warning, never a failure.
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Docker Hub base from the mirror (Hub on a miss)
       if: needs.scope.outputs.code == 'true'
       env:
