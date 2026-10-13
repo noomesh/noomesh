@@ -747,3 +747,33 @@ def test_hub_mirror_off_fails_loud_on_a_public_repository():
                 assert "exit 1" in prev["run"], name
                 guarded.append(name)
     assert {"rust-gateway", "sqlx-drift", "noo-cli", "standalone-smoke", "build"} <= set(guarded), guarded
+
+
+DEPENDABOT = REPO / ".github" / "dependabot.yml"
+
+
+def test_every_dependabot_update_targets_dev():
+    """Update PRs go where every PR goes: `dev`. Without a target-branch,
+    Dependabot opens them against the default branch (main), which changes by
+    promotion only."""
+    doc = yaml.safe_load(DEPENDABOT.read_text())
+    assert doc.get("version") == 2
+    updates = doc.get("updates") or []
+    assert updates, "dependabot.yml declares no update entries — the parse found nothing to check"
+    off = [f"{u.get('package-ecosystem')} {u.get('directory')}: {u.get('target-branch')!r}"
+           for u in updates if u.get("target-branch") != "dev"]
+    assert not off, "update entries not targeting dev:\n" + "\n".join(off)
+    ecosystems = {u.get("package-ecosystem") for u in updates}
+    assert {"npm", "pip", "gomod", "cargo", "github-actions"} <= ecosystems, ecosystems
+
+
+def test_every_dependabot_directory_holds_a_manifest():
+    """A directory that names nothing is an entry that silently checks nothing."""
+    manifests = {"npm": ["package.json"], "pip": ["pyproject.toml", "requirements.txt", "setup.py"],
+                 "gomod": ["go.mod"], "cargo": ["Cargo.toml"]}
+    for u in yaml.safe_load(DEPENDABOT.read_text())["updates"]:
+        eco, d = u["package-ecosystem"], REPO / u["directory"].lstrip("/")
+        if eco == "github-actions":
+            assert (REPO / ".github" / "workflows").is_dir()
+            continue
+        assert any((d / m).is_file() for m in manifests[eco]), f"{eco} {u['directory']}: no manifest"

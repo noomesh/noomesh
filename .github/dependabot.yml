@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Dependency update PRs. Every entry targets `dev`: `dev` is the integration
+# branch and the only one that takes pull requests; staging and main change
+# by promotion only (tests/test_ci_public_safety.py holds every entry to it).
+# Minor and patch bumps are grouped per manifest so one PR carries them;
+# majors arrive one per PR. The two Rust crates are separate manifests (no
+# Cargo workspace), so each has its own entry. Security updates follow the
+# same target branch.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/ui"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      npm-ui-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: pip
+    directory: "/"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      pip-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: pip
+    directory: "/packages/noo-gateway-client"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      pip-packages-noo-gateway-client-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: gomod
+    directory: "/node-agent-go"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      gomod-node-agent-go-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: cargo
+    directory: "/gateway-rust"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      cargo-gateway-rust-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: cargo
+    directory: "/noo-cli"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      cargo-noo-cli-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      github-actions-minor-patch:
+        update-types:
+          - minor
+          - patch
