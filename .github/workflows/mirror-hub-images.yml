@@ -76,6 +76,7 @@ jobs:
               echo "::error::docker.io login failed with the configured DHI credentials"
               exit 1
             fi
+            scripts/hub-ratelimit-probe.sh
           else
             echo "::notice::no DHI_USERNAME/DHI_TOKEN secrets - anonymous Hub reads"
           fi
