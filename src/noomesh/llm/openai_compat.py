@@ -10,7 +10,7 @@ protocol as :class:`OllamaClient`.
 This is the PRIMARY extension point for new inference backends: register a
 :class:`~noomesh.backends.BackendProfile` with ``api_format="openai"`` and
 ``factory.build_llm_client`` will hand back this client — no new client
-class needed (see docs/models/adding-a-backend.md).
+class needed.
 """
 from __future__ import annotations
 

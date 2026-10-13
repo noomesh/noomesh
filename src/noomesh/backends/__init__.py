@@ -26,7 +26,7 @@ lives here, once, as open ``BackendProfile`` records:
 - ``factory.build_llm_client`` picks the client class from ``api_format``
   ("openai" → ``OpenAICompatClient``, anything else → ``OllamaClient``).
 
-Adding a backend = one :func:`backend` call (see docs/models/adding-a-backend.md).
+Adding a backend = one :func:`backend` call.
 The registry is open: third-party/plugin code may register at import time.
 OpenAI-compatible HTTP is the primary extension point — a new backend that
 speaks ``/v1/chat/completions`` needs nothing but a profile with

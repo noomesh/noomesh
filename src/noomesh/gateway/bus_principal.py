@@ -47,8 +47,7 @@ downgrade:
 There is no unsigned mode. The one-release rollout bridge that served an
 unsigned message (``NOO_BUS_PRINCIPAL=optional``) is retired; the gateway
 refuses to start while a posture row or env value still holds it open
-(``gateway-rust/src/posture.rs`` → ``RETIRED_BRIDGES``). See
-``docs/operating/runbooks/nats-isolation.md``.
+(``gateway-rust/src/posture.rs`` → ``RETIRED_BRIDGES``).
 """
 from __future__ import annotations
 
