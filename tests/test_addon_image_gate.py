@@ -131,6 +131,25 @@ def test_reachable_without_a_lock_digest_proceeds_but_says_unpinned(tmp_path):
     assert "unpinned" in r.stderr and "reg/x/evolve:v0.6.0" in r.stderr
 
 
+def test_no_lock_rows_with_both_addons_on_names_each_as_unverified(tmp_path):
+    # The core stack lock carries no add-on rows: both add-ons start by tag,
+    # and each is named in its own notice that says it was not verified.
+    r = _run(tmp_path, "require_addon_images", NOO_EVOLVE_IMAGE_PREFIX="reg/x",
+             NOO_INTEL_IMAGE_PREFIX="reg/x")
+    assert r.returncode == 0, r.stderr
+    for name in ("trellion-intel", "evolve"):
+        assert f"{name} add-on: not in this stack release's signed lock" in r.stderr
+        assert f"reg/x/{name}:v0.6.0 by tag — unpinned and UNVERIFIED" in r.stderr
+
+
+def test_evolve_routes_runs_the_same_image_as_evolve():
+    # The routes one-shot must follow the add-on prefix/override exactly like
+    # noo-evolve: the core registry carries no evolve image.
+    import yaml
+    svcs = yaml.safe_load((REPO / "docker-compose.evolve.yml").read_text())["services"]
+    assert svcs["noo-evolve-routes"]["image"] == svcs["noo-evolve"]["image"]
+
+
 def test_a_digest_in_the_lock_is_probed_and_not_called_unpinned(tmp_path):
     r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n", NOO_EVOLVE_IMAGE_PREFIX="reg/x",
              NOO_IMAGE_DIGEST_EVOLVE="@sha256:abc")

@@ -131,9 +131,12 @@ services:
 
   # One-shot: copy the image's route manifest into evolve-routes, then exit.
   # No network, no secrets, no PKI: it reads a file from its own image.
+  # The SAME image reference as noo-evolve below (override, add-on prefix,
+  # core-prefix fallback): the core registry carries no add-on image, so a
+  # bare core-prefix ref here failed the pull on every evolve-enabled start.
   noo-evolve-routes:
     logging: *default-logging
-    image: ${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/evolve:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_EVOLVE:-}
+    image: ${NOO_EVOLVE_IMAGE:-${NOO_EVOLVE_IMAGE_PREFIX:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}}/evolve:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_EVOLVE:-}}
     container_name: noo-evolve-routes
     network_mode: none
     restart: "no"

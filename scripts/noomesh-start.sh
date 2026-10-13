@@ -783,8 +783,11 @@ require_compose_v2 || exit 1
             # here: a half-pulled dist stack would silently fall back to
             # whatever stale local image happened to match the tag.
             #
-            # noo-evolve is pulled only when THIS tag's lock carries a digest
-            # for it (NOO_IMAGE_DIGEST_EVOLVE, set by lib-dist from the lock).
+            # noo-evolve (and noo-evolve-routes, the same image) is pulled only
+            # when THIS tag's lock carries a digest for it
+            # (NOO_IMAGE_DIGEST_EVOLVE, set by lib-dist from the lock). Without
+            # one, require_addon_images has already probed the image and said
+            # it runs unpinned; `up` fetches it by tag (pull_policy missing).
             # Tags before the evolve image was published have no digest, and
             # on those a blanket pull died on "pull access denied" for the
             # local build name before anything was recreated. With a digest
@@ -792,7 +795,7 @@ require_compose_v2 || exit 1
             if [ -n "${NOO_IMAGE_DIGEST_EVOLVE:-}" ]; then
                 _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null || true)"
             else
-                _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null | grep -v '^noo-evolve$' || true)"
+                _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null | grep -vE '^noo-evolve(-routes)?$' || true)"
             fi
             # Up to three attempts: GHCR blob downloads over IPv6 timed out
             # twice on host8 (2026-09-03), each time on the largest layer,

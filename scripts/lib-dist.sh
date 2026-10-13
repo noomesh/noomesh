@@ -273,7 +273,8 @@ require_addon_images() {
         _addon_probe "$_ADDON_REF"
         if [ "$_ADDON_PROBE" = present ]; then
             if [ -z "${!dg:-}" ] && [ -z "${!ov:-}" ]; then
-                echo "◦ ${name}: no digest for it in this release lock — running ${_ADDON_REF} by tag, unpinned" >&2
+                echo "◦ ${name} add-on: not in this stack release's signed lock (the core release carries no add-on rows)" >&2
+                echo "  running ${_ADDON_REF} by tag — unpinned and UNVERIFIED: no digest was checked for this image" >&2
             fi
             continue
         fi
