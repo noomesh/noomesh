@@ -492,6 +492,7 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
     - name: Rust image from the mirror (Hub on a miss)
       env:
@@ -1012,6 +1013,7 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
     - name: Rust image from the mirror (Hub on a miss)
       env:
@@ -1207,6 +1209,7 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
     - name: Rust image from the mirror (Hub on a miss)
       env:
@@ -1332,6 +1335,7 @@ jobs:
         if [ -n "$DHI_TOKEN" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "docker.io login failed — continuing with anonymous pulls" >&2
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         else
           echo "no Docker creds in secrets — anonymous pulls" >&2
         fi
