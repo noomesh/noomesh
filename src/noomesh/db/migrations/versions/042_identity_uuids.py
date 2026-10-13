@@ -10,7 +10,7 @@ three domains at once — mesh, trellion (memory), and noo-evolve (pro).
 
 That is the blocker for splitting schema ownership three ways. A UUID is the
 stable key those domains can carry without any of them owning the others'
-tables. See ``internal/proposals/17-uuid-identity-and-domain-split.md``.
+tables.
 
 **This migration only mints the values.** The primary keys stay on
 ``username`` / ``id``, no other table changes, nothing reads the new columns

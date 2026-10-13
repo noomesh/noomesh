@@ -777,3 +777,60 @@ def test_every_dependabot_directory_holds_a_manifest():
             assert (REPO / ".github" / "workflows").is_dir()
             continue
         assert any((d / m).is_file() for m in manifests[eco]), f"{eco} {u['directory']}: no manifest"
+
+
+# ---- user-visible strings name only paths that exist (followup i16) ----------
+
+_STRING_SCAN_SUFFIXES = {".rs", ".go", ".sh", ".py"}
+_STRING_SCAN_SKIP = {"target", "node_modules", ".git", ".worktrees", "tests"}
+_DOC_PATH = re.compile(r"(?<![\w/.-])(docs/[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.md)\b")
+# scripts/docs-check.py validates an optional internal/proposals/ directory and
+# names it in its own errors; that check only runs where the directory exists.
+_RECORDS_ALLOWED = {"scripts/docs-check.py"}
+_REMOVED_RECORDS = re.compile(
+    r"(?<![\w/.-])internal/(?:followups|compliance|proposals|plans)/[\w.-]+"
+    r"|(?<![\w/.-])internal/[A-Z][A-Z0-9_]+\.md"
+)
+
+
+def _scan_files():
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in _STRING_SCAN_SKIP]
+        for f in files:
+            p = Path(root) / f
+            if p.suffix in _STRING_SCAN_SUFFIXES:
+                yield p
+
+
+def test_user_visible_strings_name_only_existing_paths():
+    """A string an operator can read must not point at a file that is absent.
+
+    Comment-only lines are skipped (harmless); everything else, multi-line
+    strings and shell heredocs included, is checked line by line: a `docs/*.md`
+    reference must exist in the tree and a removed-records path (`internal/
+    followups/...`, `internal/CLI_AUTH_PLAN.md`, ...) is never allowed.
+    """
+    bad = []
+    for p in _scan_files():
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for n, line in enumerate(lines, 1):
+            if line.lstrip().startswith(("//", "#", "*", "///")):
+                continue
+            rel = p.relative_to(REPO)
+            for m in _REMOVED_RECORDS.finditer(line):
+                if str(rel) in _RECORDS_ALLOWED:
+                    continue
+                bad.append(f"{rel}:{n}: removed records path {m.group(0)}")
+            for m in _DOC_PATH.finditer(line):
+                if not (REPO / m.group(1)).exists():
+                    bad.append(f"{rel}:{n}: {m.group(1)} does not exist")
+    assert not bad, "user-visible strings point at missing paths:\n" + "\n".join(bad)
+
+
+def test_path_guard_catches_a_removed_records_path():
+    assert _REMOVED_RECORDS.search('println!("see internal/followups/78-x.md");')
+    assert _REMOVED_RECORDS.search("see internal/CLI_AUTH_PLAN.md")
+    assert not _REMOVED_RECORDS.search("node-agent-go/internal/docker/x.go")
