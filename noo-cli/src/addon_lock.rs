@@ -453,7 +453,9 @@ mod tests {
 
     #[test]
     fn unreadable_fields_are_refused() {
-        let cases: Vec<(fn(&mut AddonLock), fn(&AddonLockError) -> bool)> = vec![
+        type Mutate = fn(&mut AddonLock);
+        type Expect = fn(&AddonLockError) -> bool;
+        let cases: Vec<(Mutate, Expect)> = vec![
             (|l| l.format = "noo-addon-lock/9".into(), |e| matches!(e, AddonLockError::UnknownFormat(_))),
             (|l| l.version = "one".into(), |e| matches!(e, AddonLockError::BadVersion(_))),
             (|l| l.source_commit = "main".into(), |e| matches!(e, AddonLockError::BadSourceCommit(_))),
