@@ -43,6 +43,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,34 @@ HUB = "docker.io"
 
 class MirrorError(Exception):
     pass
+
+
+ATTEMPTS = 5
+RATE_LIMITED = re.compile(r"429|toomanyrequests|too many requests", re.I)
+
+
+def _seconds(env: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(env, default)))
+    except ValueError:
+        return default
+
+
+def _run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run a registry command, retrying a rate-limit answer (HTTP 429) up to
+    ATTEMPTS times. The wait grows with the attempt (HUB_MIRROR_BACKOFF
+    seconds per attempt, default 20) and honours a `Retry-After: <seconds>` the
+    registry printed. Any other failure is returned at once."""
+    for attempt in range(1, ATTEMPTS + 1):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0 or attempt == ATTEMPTS or not RATE_LIMITED.search(r.stderr):
+            return r
+        m = re.search(r"retry-after\D{0,3}(\d+)", r.stderr, re.I)
+        wait = max(_seconds("HUB_MIRROR_BACKOFF", 20) * attempt, float(m.group(1)) if m else 0.0)
+        print(f"::warning::hub-mirror: rate limited (attempt {attempt}/{ATTEMPTS}); retrying in {wait:.0f}s",
+              file=sys.stderr)
+        time.sleep(wait)
+    return r  # unreachable
 
 
 def rows(path: Path = INVENTORY) -> list[str]:
@@ -98,8 +127,7 @@ def default_prefix() -> str:
 
 
 def _inspect(ref: str, fmt: str) -> object | None:
-    r = subprocess.run(["docker", "buildx", "imagetools", "inspect", ref, "--format", fmt],
-                       capture_output=True, text=True, timeout=180)
+    r = _run(["docker", "buildx", "imagetools", "inspect", ref, "--format", fmt], 180)
     if r.returncode != 0:
         err = r.stderr.strip()
         if re.search(r"not found|manifest unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN", err, re.I):
@@ -148,7 +176,11 @@ def looks_like_downgrade(old: dict, new: dict) -> str:
 
 def sync(prefix: str, inventory: list[str], record: Path | None) -> int:
     failures, lines = [], []
-    for row in inventory:
+    for n, row in enumerate(inventory):
+        if n:
+            # Space the images out: the registry's per-account allowance is
+            # spent by bursts, not by the total.
+            time.sleep(_seconds("HUB_MIRROR_SPACING", 5))
         src, dst = source_ref(row), mirror_ref(prefix, row)
         _, _, pinned = split(row)
         try:
@@ -175,8 +207,7 @@ def sync(prefix: str, inventory: list[str], record: Path | None) -> int:
                           f"version {old['version'] or '?'} -> {new['version'] or '?'})")
                 else:
                     print(f"new        {row}  {new['digest']}")
-                r = subprocess.run(["docker", "buildx", "imagetools", "create", "--tag", dst, src],
-                                   capture_output=True, text=True, timeout=900)
+                r = _run(["docker", "buildx", "imagetools", "create", "--tag", dst, src], 900)
                 if r.returncode != 0:
                     raise MirrorError(f"copy {src} -> {dst}: {r.stderr.strip()[-300:]}")
                 got = describe(dst)

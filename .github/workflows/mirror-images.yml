@@ -37,7 +37,7 @@ jobs:
     # pure network I/O with no cache to reuse.
     runs-on: ubuntu-latest
     strategy:
-      # One dead upstream source must not cancel the other fifteen. A mirror
+      # One dead upstream source must not cancel the others. A mirror
       # that stops at the first 404 leaves every base image it had already
       # reached un-mirrored, which is how `dhi.io/promtail:3: not found` —
       # an image DHI no longer publishes, unrelated to anything here —
@@ -45,6 +45,10 @@ jobs:
       # depends on. Partial is the right answer for a mirror: copy what
       # exists, and let the run name what did not.
       fail-fast: false
+      # ghcr.io rate-limits pushes per minute (HTTP 429, "allowed: 2000/minute");
+      # sixteen jobs pushing at once tripped it on the first dispatch. Three at
+      # a time stays under it, and the copy step below retries a stray 429.
+      max-parallel: 3
       matrix:
         include:
           # ci.yml sqlx-drift service container. Keep the tag in lockstep
@@ -213,9 +217,22 @@ jobs:
       - name: Mirror ${{ matrix.source }} → GHCR (multi-arch manifest copy)
         run: |
           dest_org="${{ matrix.dest_org || github.repository_owner }}"
-          docker buildx imagetools create \
-            --tag "ghcr.io/${dest_org}/${{ matrix.dest }}" \
-            "${{ matrix.source }}"
+          # Bounded retry with growing backoff: a transient 429 from either
+          # registry must not fail the job; a real error still does after the
+          # last attempt.
+          for attempt in 1 2 3 4 5; do
+            if docker buildx imagetools create \
+                 --tag "ghcr.io/${dest_org}/${{ matrix.dest }}" \
+                 "${{ matrix.source }}"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              echo "::warning::copy attempt ${attempt}/5 failed; retrying in $((20 * attempt))s"
+              sleep $((20 * attempt))
+            fi
+          done
+          echo "::error::copy failed after 5 attempts"
+          exit 1
 
       - name: Verify the mirrored manifest
         run: |
