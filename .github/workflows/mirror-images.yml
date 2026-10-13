@@ -192,6 +192,25 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # Hub-sourced entries without `auth` (pgvector, redis, grafana, ...) read
+      # docker.io too: log in with the same account when its secrets exist, so
+      # they draw the account's allowance rather than the runner IP's anonymous
+      # one. Present-but-rejected credentials fail the job.
+      - name: Log in to Docker Hub (higher read limit)
+        if: matrix.auth == '' && github.repository == 'noomesh/noomesh'
+        env:
+          DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
+          DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+        run: |
+          if [ -n "${DHI_TOKEN:-}" ] && [ -n "${DHI_USERNAME:-}" ]; then
+            if ! echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin; then
+              echo "::error::docker.io login failed with the configured DHI credentials"
+              exit 1
+            fi
+          else
+            echo "::notice::no DHI_USERNAME/DHI_TOKEN secrets - anonymous Hub reads"
+          fi
+
       # dhi.io is private and Hub pulls benefit from an authenticated rate
       # limit. Both reuse the same Docker account already in secrets.
       - name: Log in to source registry
