@@ -154,14 +154,15 @@ jobs:
           #
           # Re-mirroring rather than granting keeps the property the namespace
           # move exists for: packages this repository creates and owns, with no
-          # cross-repo permission to maintain. They stay PRIVATE and in-org,
-          # which is what the DHI terms require.
+          # cross-repo permission to maintain. DHI Community images are Apache-2.0,
+          # so these packages are public like the rest (attribution:
+          # THIRD_PARTY_NOTICES.md).
           #
           # ── OFFICIAL images → the PUBLIC noomesh org (2026-08-19) ────
-          # The public distribution cannot use the DHI mirrors above (DHI
-          # terms: own-org use only, packages stay PRIVATE). These are the
-          # open-source official equivalents — freely redistributable —
-          # mirrored to ghcr.io/noomesh and RETAGGED to the exact tag
+          # The public channel uses the upstream official images
+          # rather than the hardened DHI mirrors above (a different image
+          # family, not a licence limit: DHI Community is Apache-2.0). These
+          # are the open-source official equivalents, mirrored to ghcr.io/noomesh and RETAGGED to the exact tag
           # strings the compose expects, so `NOO_BASE_REGISTRY=
           # ghcr.io/noomesh` is the only switch a public install needs.
           # Sources verified upstream 2026-08-19. Pushed with this repo's own
@@ -211,7 +212,7 @@ jobs:
             echo "::notice::no DHI_USERNAME/DHI_TOKEN secrets - anonymous Hub reads"
           fi
 
-      # dhi.io is private and Hub pulls benefit from an authenticated rate
+      # dhi.io needs a login for the pull and Hub pulls benefit from an authenticated rate
       # limit. Both reuse the same Docker account already in secrets.
       - name: Log in to source registry
         if: matrix.auth != ''

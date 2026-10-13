@@ -98,7 +98,10 @@ def test_dhi_owner_is_the_namespace():
     wf = (ROOT / ".github/workflows/images-release.yml").read_text()
     m = re.search(r"^\s*DHI_OWNER:\s*(\S+)", wf, re.M)
     assert m and m.group(1) == EXPECTED + "/dhi", "images-release.yml DHI_OWNER moved or gone"
-    # Hardened bases stay public (By design:): no privacy guard.
+    # Hardened bases stay public (DHI Community is Apache-2.0): no privacy
+    # guard, but the attribution must be carried.
+    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    assert "Docker Hardened Images" in notices and "Apache License, Version 2.0" in notices
     assert not (ROOT / "scripts/check-dhi-private.sh").exists()
     assert "check-dhi-private" not in wf
     assert "check-dhi-private" not in (ROOT / ".github/workflows/mirror-images.yml").read_text()
