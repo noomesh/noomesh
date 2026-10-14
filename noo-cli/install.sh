@@ -322,8 +322,8 @@ sha256_of() {
 # over the exact manifest bytes, the same format noo-cli/src/release_sig.rs
 # writes and reads. A POSIX shell has no Ed25519 of its own, so we borrow one:
 # python3 first, because RFC 8032 verification is forty lines of stdlib integer
-# arithmetic that behaves identically on every box, and OpenSSL 3 second, for
-# the rare host with no python3 at all. LibreSSL — which is what `openssl` is
+# arithmetic that behaves identically on every box, then OpenSSL 3, then an
+# installed noo. Returns 0 verified, 1 bad signature, 2 no verifier. LibreSSL — which is what `openssl` is
 # on stock macOS — has no `pkeyutl -rawin`, hence the explicit major-version
 # check rather than letting it fail and look like a forged signature.
 verify_release_sig() {
@@ -427,11 +427,43 @@ PYVERIFY
         return $?
     fi
 
-    # No python3 at all: an ALREADY-INSTALLED noo carries the same key list
-    # compiled in (`noo security release-verify`, an earlier change slice B), and it
-    # got onto this box through this same verified path, so it is a legitimate
-    # anchor for a re-install or an upgrade. It is not available on a genuinely
-    # fresh box, which is why it is the second choice and not the first.
+    # No python3: OpenSSL 3 verifies Ed25519 natively. The pinned 32-byte key
+    # is wrapped in its fixed SubjectPublicKeyInfo header (RFC 8410) and the
+    # signature is the raw 64 bytes; `-rawin` (OpenSSL 3+) checks the manifest
+    # bytes as-is. LibreSSL has no -rawin, hence the version check: a refusal
+    # from an unsupported openssl must not look like a forged signature.
+    case "$(openssl version 2>/dev/null)" in
+        OpenSSL\ [3-9]*|OpenSSL\ [1-9][0-9]*)
+            _t="$(mktemp -d 2>/dev/null)" || return 2
+            _b64="$(printf '%s' "$_body" | tr '_-' '/+')"
+            _b64="${_b64}$(printf '%*s' $(( (4 - ${#_b64} % 4) % 4 )) '' | tr ' ' '=')"
+            if printf '%s' "$_b64" | openssl base64 -d -A > "${_t}/sig.bin" 2>/dev/null \
+                && [ "$(wc -c < "${_t}/sig.bin" | tr -d '[:space:]')" = 64 ]; then
+                for _k in $RELEASE_PUBKEYS; do
+                    # 30 2a 30 05 06 03 2b 65 70 03 21 00 = ASN.1 Ed25519 SPKI header
+                    { printf '\060\052\060\005\006\003\053\145\160\003\041\000'
+                      _h="$_k"
+                      while [ -n "$_h" ]; do
+                          _byte="${_h%"${_h#??}"}"; _h="${_h#??}"
+                          printf "\\$(printf '%03o' "$((0x${_byte}))")"
+                      done
+                    } > "${_t}/pub.der"
+                    if openssl pkeyutl -verify -pubin -inkey "${_t}/pub.der" -keyform DER \
+                        -rawin -in "$_mf" -sigfile "${_t}/sig.bin" >/dev/null 2>&1; then
+                        rm -rf "$_t"; return 0
+                    fi
+                done
+            fi
+            rm -rf "$_t"
+            info "signature does not verify against any release key pinned in this installer"
+            return 1
+            ;;
+    esac
+
+    # Neither python3 nor OpenSSL 3: an ALREADY-INSTALLED noo carries the same
+    # key list compiled in (`noo security release-verify`), and it got onto this
+    # box through this same verified path, so it is a legitimate anchor for a
+    # re-install or an upgrade. It is not available on a genuinely fresh box.
     if have noo; then
         if noo security release-verify "$_mf" "$_sig" >/dev/null 2>&1; then
             return 0
@@ -440,8 +472,8 @@ PYVERIFY
         return 1
     fi
 
-    info "no Ed25519 verifier available on this host: install 'python3' (or an existing 'noo')"
-    return 1
+    # 2 = no verifier at all, which the caller must not report as a bad signature.
+    return 2
 }
 
 # ---- detect platform -------------------------------------------------------
@@ -575,7 +607,11 @@ whoever answered this request. Refusing to install.
     expected="$(cut -d' ' -f1 "${tmpdir}/${asset}.sha256" | tr -d '[:space:]')"
     [ -n "$expected" ] || err "checksum file was empty or malformed: ${sum_url}"
 else
-    if ! verify_release_sig "${tmpdir}/${MANIFEST}" "${tmpdir}/${MANIFEST}.sig"; then
+    verify_release_sig "${tmpdir}/${MANIFEST}" "${tmpdir}/${MANIFEST}.sig" && _vrc=0 || _vrc=$?
+    if [ "$_vrc" = 2 ]; then
+        err "no verifier available: install python3" 1
+    fi
+    if [ "$_vrc" != 0 ]; then
         err "release signature INVALID for ${MANIFEST} (${man_url})
 The checksum manifest is not signed by any release key pinned in this
 installer. Either this build of the installer predates a key rotation, or the

@@ -7,6 +7,14 @@
 # sha256), FROM scratch, no runtime. `noo onboard` / `noo migrate import`
 # `docker create` + `docker cp` them out — the registry the stack already
 # logs into, so a fresh host needs no `gh` and no second credential.
+#
+# One-time, not per release: harrier is versioned by its own tag (:v1), not
+# the stack tag, so it is in no images-release matrix and no lock row. The
+# release lane only CHECKS that :v1 is publicly pullable. Bootstrap:
+#   1. create the `models-harrier-v1` release in THIS repo with the three
+#      assets (harrier-Q4_K_M.gguf, harrier.Modelfile, harrier.sha256);
+#   2. dispatch this workflow;
+#   3. make the new ghcr package public (org packages start private).
 name: publish harrier artifact
 
 on:
