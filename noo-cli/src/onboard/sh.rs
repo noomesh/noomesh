@@ -75,6 +75,43 @@ fn compose_files_in(
     v
 }
 
+/// The add-on image environment for this install's composed overlays, with
+/// the launcher's semantics (`commands::addon_pins::addon_image_env`, the
+/// Rust side of `scripts/lib-dist.sh` `require_addon_pins`): on a dist
+/// install only verified, local pins; on a dev one the dev build's names.
+/// `Err` lists each refusal as `(add-on, why, remedy)`.
+pub(crate) fn addon_pin_env(ctx: &Ctx) -> Result<Vec<(String, String)>, Vec<crate::commands::addon_pins::PinRefusal>> {
+    let files = compose_files(ctx);
+    let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
+    let composed: Vec<String> = ADDON_COMPOSE
+        .iter()
+        .filter(|a| crate::onboard::yamlcfg::read_yaml_addon(ctx, a.key).unwrap_or(a.default_on))
+        .map(|a| a.key.to_string())
+        .collect();
+    let tag = ctx.read_env("NOO_IMAGE_TAG");
+    let prefix = std::env::var("NOO_IMAGE_PREFIX").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "noomesh".into());
+    let input = crate::commands::addon_pins::PinEnvInput {
+        root: &ctx.repo_root,
+        dist: ctx.read_env("NOO_INSTALL_MODE") == "dist",
+        tag: tag.trim(),
+        image_prefix: &prefix,
+        compose_texts: texts,
+        composed_addons: composed,
+    };
+    crate::commands::addon_pins::addon_image_env(
+        &input,
+        &|a| crate::addons::resolve::installed_anchor(a),
+        &|r| {
+            Command::new("docker")
+                .args(["image", "inspect", "--format", "{{.Id}}", r])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        },
+    )
+}
+
 /// The wizard is a sanctioned launcher, so its compose calls carry the same
 /// env noomesh-start.sh exports before compose:
 /// - NOO_LAUNCHED=1 — the bare-`docker compose up` sentinel (secrets are in
@@ -85,6 +122,13 @@ fn compose_files_in(
 ///   loopback MCP listener is gone.) Pre-set values in the environment win.
 fn launcher_env(ctx: &Ctx, cmd: &mut Command) {
     cmd.env("NOO_LAUNCHED", "1");
+    // Add-on images: exactly what the launcher would export. A refusal
+    // leaves the variables unset, so the overlay renders its unpinned
+    // sentinel and nothing unverified runs; the caller that recreates
+    // add-ons asks `addon_pin_env` first and says why (steps.rs).
+    for (k, v) in addon_pin_env(ctx).unwrap_or_default() {
+        cmd.env(k, v);
+    }
     // File-backed secrets (2026-09-29): the same two things
     // lib-secrets.sh `derive_file_secrets` does for every other launcher —
     // derive the pgpass bodies, and make every `secrets:` source variable
