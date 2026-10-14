@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "noo-cli"
-version = "0.5.92"
+version = "0.6.0"
 dependencies = [
  "base64",
  "bcrypt",
