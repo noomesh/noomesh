@@ -182,9 +182,12 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }));
     }
     let count = containers.len();
+    // A container docker keeps restarting is broken, not "up": the exit
+    // code says so (i58), whatever the table prints.
+    let exit = stack_exit_code(&containers);
     if g.json {
         print_json(&serde_json::json!({"containers": containers, "count": count, "tailnet_serve": serve_word(&serve)}));
-        return Ok(0);
+        return Ok(exit);
     }
 
     // Human view: the same container set rendered natively. (Until
@@ -235,6 +238,13 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if running < count {
         println!();
         println!("{}", ui::status_line(Glyph::Warn, &format!("{} of {count} containers not running", count - running)));
+        let looping: Vec<&str> = containers.iter()
+            .filter(|c| c["state"].as_str() == Some("restarting"))
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        if !looping.is_empty() {
+            println!("{}", ui::status_line(Glyph::Err, &format!("crash-looping (Restarting): {}", looping.join(", "))));
+        }
         println!("{}", ui::hint("noo stack logs <service>"));
     }
     // A controller with no serve mapping is reachable by IP and by nothing
@@ -258,7 +268,13 @@ fn mesh_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
         _ => {}
     }
-    Ok(0)
+    Ok(exit)
+}
+
+/// Exit code for `noo stack status`: 1 when any container is `restarting`
+/// (crash-looping), else 0. `restarting` is never counted as running.
+fn stack_exit_code(containers: &[serde_json::Value]) -> i32 {
+    i32::from(containers.iter().any(|c| c["state"].as_str() == Some("restarting")))
 }
 
 /// `tailscale serve status` on a CONTROLLER (a worker fronts nothing);
@@ -1130,6 +1146,14 @@ pub fn mesh_sandbox(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod stop_clean_tests {
+    #[test]
+    fn stack_exit_is_nonzero_only_when_a_container_is_restarting() {
+        let c = |state: &str| serde_json::json!({"name": "noo-x", "state": state});
+        assert_eq!(stack_exit_code(&[c("running"), c("running")]), 0);
+        assert_eq!(stack_exit_code(&[c("running"), c("restarting")]), 1);
+        assert_eq!(stack_exit_code(&[]), 0);
+    }
+
     use super::*;
 
     #[test]

@@ -92,17 +92,28 @@ pub(crate) struct ContainerState {
     /// `.State.Health.Status`; `None` when the container declares no
     /// healthcheck (or disables it).
     pub health: Option<String>,
+    /// `.RestartCount`: restarts docker's policy has made. 0 for a node
+    /// report, which does not carry it.
+    pub restart_count: i64,
+    /// `.State.Restarting`: docker is between restarts right now.
+    pub restarting: bool,
+    /// `.State.ExitCode` of the last run.
+    pub exit_code: i64,
 }
 
-const INSPECT_TEMPLATE: &str = "{{.State.Running}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}";
+const INSPECT_TEMPLATE: &str = "{{.State.Running}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.RestartCount}}|{{.State.Restarting}}|{{.State.ExitCode}}";
 
 /// Parse one line of [`INSPECT_TEMPLATE`] output.
 pub(crate) fn parse_inspect(line: &str) -> Option<ContainerState> {
-    let mut parts = line.trim().splitn(3, '|');
+    let mut parts = line.trim().splitn(6, '|');
     let running = parts.next()? == "true";
     let started_unix = super::parse_rfc3339_unix(parts.next()?)?;
     let health = parts.next().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string);
-    Some(ContainerState { running, started_unix, health })
+    // The trailing fields are absent in a short (older-shape) line: 0/false.
+    let restart_count = parts.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    let restarting = parts.next().map(|v| v.trim() == "true").unwrap_or(false);
+    let exit_code = parts.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    Some(ContainerState { running, started_unix, health, restart_count, restarting, exit_code })
 }
 
 /// What `docker inspect` gave back: a state, or why there is none. A
@@ -249,8 +260,21 @@ pub(crate) fn judge(check: Check, readiness_miss: bool, container: &str, state: 
     };
     let up = (now_unix - st.started_unix).max(0);
     let health = st.health.as_deref();
-    let warming = st.running && matches!(health, None | Some("starting"));
     let window = window_for(check.name);
+    // A container docker keeps restarting never leaves warm-up by the clock
+    // (every restart resets `started_unix`), so the clock cannot judge it:
+    // Restarting now, or restarted at all inside the window, is a failure
+    // that names the container (i58). Warm-up is for a first start only.
+    if st.restarting || (st.restart_count > 0 && up < window) {
+        return Check {
+            verdict: Verdict::Fail,
+            detail: format!("{} — {container} crash-looping ({} restarts; last exit {}) — noo stack logs {}",
+                check.detail, st.restart_count, st.exit_code, check.name),
+            remedy: None,
+            ..check
+        };
+    }
+    let warming = st.running && matches!(health, None | Some("starting"));
     if warming && up < window {
         let hs = health.map(|h| format!(", health={h}")).unwrap_or_default();
         let phase = if check.name == "loki" { "ring joining, " } else { "" };
@@ -281,6 +305,9 @@ pub(crate) fn node_container_state(n: &Value, backend: &str) -> Option<Container
         running: e["running"].as_bool()?,
         started_unix: e["started_at"].as_i64()?,
         health: e["health"].as_str().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string),
+        restart_count: 0,
+        restarting: false,
+        exit_code: 0,
     })
 }
 
@@ -420,6 +447,33 @@ pub(crate) fn wait_for_warmup(g: &Globals) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_crash_looping_container_fails_where_a_first_start_only_warms_up() {
+        // Real shape of `docker inspect -f INSPECT_TEMPLATE` for each case.
+        let at = "2026-10-14T12:00:00Z";
+        let t = super::super::parse_rfc3339_unix(at).unwrap();
+        let judged = |line: &str, up: i64| {
+            let st = parse_inspect(line).unwrap();
+            judge(loki_fail(), true, "noo-loki", Some(&st), t + up)
+        };
+        // Restarting, RestartCount=10, 39s since the latest start: red.
+        let c = judged(&format!("false|{at}||10|true|1"), 39);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("noo-loki crash-looping (10 restarts; last exit 1) — noo stack logs loki"), "{}", c.detail);
+        // Between restarts it can read running=true with RestartCount>0: still red.
+        let c = judged(&format!("true|{at}||3|false|137"), 39);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("(3 restarts; last exit 137)"), "{}", c.detail);
+        // First start, never restarted: warm-up grace kept.
+        let c = judged(&format!("true|{at}||0|false|0"), 39);
+        assert_eq!(c.verdict, Verdict::Starting, "{}", c.detail);
+        assert!(!c.detail.contains("crash-looping"), "{}", c.detail);
+        // Healthy and ready: not touched at all.
+        let ok = Check { verdict: Verdict::Ok, ..loki_fail() };
+        let c = judge(ok, false, "noo-loki", Some(&parse_inspect(&format!("true|{at}|healthy|2|false|0")).unwrap()), t + 39);
+        assert_eq!(c.verdict, Verdict::Ok);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -429,7 +483,7 @@ mod tests {
         super::super::loki_check(Some(&json!({ "loki_configured": true, "loki_url": "https://noo-loki:3100", "loki_ready": false })), true)
     }
     fn state(up: i64, health: Option<&str>) -> ContainerState {
-        ContainerState { running: true, started_unix: NOW - up, health: health.map(str::to_string) }
+        ContainerState { running: true, started_unix: NOW - up, health: health.map(str::to_string), restart_count: 0, restarting: false, exit_code: 0 }
     }
 
     #[test]
@@ -478,7 +532,7 @@ mod tests {
         for st in [
             state(5, Some("unhealthy")),
             state(5, Some("healthy")),
-            ContainerState { running: false, started_unix: NOW - 5, health: None },
+            ContainerState { running: false, started_unix: NOW - 5, health: None, restart_count: 0, restarting: false, exit_code: 0 },
         ] {
             let c = judge(loki_fail(), true, "noo-loki", Some(&st), NOW);
             assert_eq!(c.verdict, Verdict::Fail, "{st:?}: {}", c.detail);
@@ -580,7 +634,7 @@ mod tests {
 
     #[test]
     fn a_503_from_a_loki_not_running_or_not_inspectable_still_fails() {
-        let stopped = ContainerState { running: false, started_unix: NOW - 240, health: None };
+        let stopped = ContainerState { running: false, started_unix: NOW - 240, health: None, restart_count: 0, restarting: false, exit_code: 0 };
         let c = loki_judged(Some(INGESTER_503), Some(&stopped));
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("noo-loki is not running") && c.detail.contains("answered 503"), "{}", c.detail);

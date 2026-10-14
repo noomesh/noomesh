@@ -520,6 +520,12 @@ dist_ref_is_stack_versioned() {
 # box (observed live 2026-10-07, host8, v0.2.93 -> v0.2.94: "the pull would
 # fetch .../grafana:12-debian13-dev, but this start runs v0.2.94"). See
 # dist_ref_is_stack_versioned for how the set is derived.
+#
+# The runtime images' own registry (NOO_BASE_REGISTRY, default
+# `<prefix>/dhi`, the DHI mirrors) nests UNDER the image prefix. Nothing
+# there is a stack image, whatever its name or tag looks like, so a ref
+# under `${NOO_BASE_REGISTRY}/` is skipped by rule rather than by the
+# accident of `dhi/<name>` matching no lock pin.
 dist_assert_pull_refs() {
     local _imgs _ref _rest _name _tag _dig _ok _p
     local _rc=0
@@ -531,8 +537,13 @@ dist_assert_pull_refs() {
         compose_report_error "$_rc"
         return 0
     fi
+    local _base="${NOO_BASE_REGISTRY:-${NOO_IMAGE_PREFIX:-}/dhi}"
+    _base="${_base%/}"
     while IFS= read -r _ref; do
         case "$_ref" in "${NOO_IMAGE_PREFIX:-}"/*) : ;; *) continue ;; esac
+        if [ -n "$_base" ] && [ "$_base" != "${NOO_IMAGE_PREFIX:-}" ]; then
+            case "$_ref" in "$_base"/*) continue ;; esac
+        fi
         _rest="${_ref#"${NOO_IMAGE_PREFIX:-}"/}"
         _rest="${_rest%%@*}"
         _name="${_rest%%:*}"

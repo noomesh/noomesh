@@ -119,13 +119,15 @@ def test_every_dhi_image_is_in_the_declared_list():
     used |= set(re.findall(r"\$\{DHI_REGISTRY\}/([a-z0-9-]+):", (ROOT / "Dockerfile").read_text()))
     assert used and used <= lst["mirror"], f"DHI bases not in scripts/dhi-images.txt: {sorted(used - lst['mirror'])}"
     # compose refs through NOO_BASE_REGISTRY resolve to an existing lane under
-    # BOTH registries: ghcr.io/noomesh and ghcr.io/noomesh/dhi
+    # BOTH registries: ghcr.io/noomesh/dhi (the default, the DHI family) and
+    # ghcr.io/noomesh (the upstream family, kept mirrored for operators who
+    # choose it by hand).
     compose = (ROOT / "docker-compose.cluster.yml").read_text()
-    comp = {r.split(":")[0] for r in re.findall(r"\$\{NOO_BASE_REGISTRY:-ghcr\.io/noomesh\}/(\S+)", compose)}
+    comp = {r.split(":")[0] for r in re.findall(r"\$\{NOO_BASE_REGISTRY:-ghcr\.io/noomesh/dhi\}/(\S+)", compose)}
     assert comp, "compose no longer reads NOO_BASE_REGISTRY - update this test"
     defaults = set(re.findall(r"\$\{NOO_BASE_REGISTRY:-([^}]+)\}", compose))
-    assert defaults == {"ghcr.io/" + EXPECTED}, defaults
-    # An un-seeded PUBLIC install must never dial dhi.io: the compose default is the public mirror.
+    assert defaults == {"ghcr.io/" + EXPECTED + "/dhi"}, defaults
+    # An un-seeded PUBLIC install must never dial dhi.io: the compose default is our mirror.
     assert "NOO_BASE_REGISTRY:-dhi.io" not in compose
     assert comp <= public, f"no upstream lane (ghcr.io/noomesh/x) for: {sorted(comp - public)}"
     assert comp <= dhi_lanes, f"no dhi/ lane (ghcr.io/noomesh/dhi/x) for: {sorted(comp - dhi_lanes)}"
@@ -144,26 +146,79 @@ def test_every_dhi_image_is_in_the_declared_list():
         assert f"$REGISTRY/$OWNER/{n}" not in wf, f"derived {n} pushed outside dhi/"
 
 
-def test_no_public_channel_default_resolves_to_the_dhi_mirror():
-    """The seeded NOO_BASE_REGISTRY default is the public mirror of the
-    UPSTREAM images, and every compose ref it feeds exists as a public lane."""
+COMPOSE_FILES = sorted(ROOT.glob("docker-compose*.yml"))
+BASE_REF = re.compile(r"\$\{NOO_BASE_REGISTRY(?::?-([^}]*))?\}/(\S+)")
+
+
+def _base_refs() -> list[tuple[str, str | None, str]]:
+    """(file, default, name:tag) of every `${NOO_BASE_REGISTRY...}/x` image ref
+    in every compose file the launcher may load."""
+    out = []
+    for f in COMPOSE_FILES:
+        for ln in f.read_text().splitlines():
+            if ln.lstrip().startswith("#"):
+                continue
+            for default, ref in BASE_REF.findall(ln):
+                out.append((f.name, default or None, ref.strip("\"'")))
+    return out
+
+
+def _lanes_by_org() -> dict[str, set[str]]:
+    """dest_org -> {dest name:tag} from mirror-images.yml."""
+    mir = (ROOT / ".github/workflows/mirror-images.yml").read_text()
+    out: dict[str, set[str]] = {}
+    for blk in re.split(r"(?m)^\s*- source:", mir)[1:]:
+        d = re.search(r"^\s*dest:\s*(\S+)", blk, re.M)
+        o = re.search(r"^\s*dest_org:\s*(\S+)", blk, re.M)
+        if d and o:
+            out.setdefault(o.group(1), set()).add(d.group(1))
+    return out
+
+
+def test_public_channel_default_is_the_dhi_mirror():
+    """The seeded NOO_BASE_REGISTRY default is the DHI runtime family under
+    `dhi/`, the uids every service key and data volume is handed to. The bare
+    namespace serves the UPSTREAM images under the same names and tags (other
+    uids): 0.6.0/0.6.1 seeded it and the public fleet's monitoring set
+    restart-looped on `permission denied` (2026-10-14)."""
     for rel in ("noo-cli/src/onboard/standalone.rs", "noo-cli/src/onboard/steps.rs"):
+        seen = 0
         for ln in (ROOT / rel).read_text().splitlines():
             if '"NOO_BASE_REGISTRY"' in ln and ("update_env" in ln or "seeds.push" in ln):
+                seen += 1
                 assert "PUBLIC_BASE_REGISTRY" in ln, f"{rel}: {ln.strip()}"
+        assert seen, f"{rel}: no NOO_BASE_REGISTRY seed found - update this test"
     rs = (ROOT / "noo-cli/src/registry.rs").read_text()
-    assert re.search(r"PUBLIC_BASE_REGISTRY: &str = IMAGE_NAMESPACE;", rs)
-    compose = (ROOT / "docker-compose.cluster.yml").read_text()
-    refs = set(re.findall(r"\$\{NOO_BASE_REGISTRY:-ghcr\.io/noomesh\}/(\S+)", compose))
-    assert refs, "compose no longer reads NOO_BASE_REGISTRY — update this test"
-    mir = (ROOT / ".github/workflows/mirror-images.yml").read_text()
-    public = set()
-    for blk in re.split(r"(?m)^\s*- source:", mir)[1:]:
-        d = re.search(r"dest:\s*(\S+)", blk)
-        if d and re.search(r"dest_org:\s*noomesh\b", blk):
-            public.add(d.group(1))
-    missing = refs - public
-    assert not missing, f"public default registry has no public mirror lane for: {sorted(missing)}"
+    m = re.search(r'PUBLIC_BASE_REGISTRY: &str = "([^"]+)";', rs)
+    assert m, "registry.rs PUBLIC_BASE_REGISTRY is not a literal any more - update this test"
+    assert m.group(1) == "ghcr.io/" + EXPECTED + "/dhi", m.group(1)
+    # The channel switch writes the same constant, not the image namespace.
+    ch = (ROOT / "noo-cli/src/commands/channel.rs").read_text()
+    assert "base_registry: crate::registry::PUBLIC_BASE_REGISTRY.into()" in ch
+
+
+def test_every_base_registry_compose_ref_has_a_dhi_mirror_lane():
+    """Every `${NOO_BASE_REGISTRY}` image ref in any compose file defaults to
+    the DHI path and has a `dest_org: noomesh/dhi` mirror lane with the SAME
+    name:tag; the upstream lane of the same name:tag is kept too (both
+    families stay published)."""
+    refs = _base_refs()
+    assert len(refs) >= 6, f"found only {refs} - the compose moved; update this test"
+    lanes = _lanes_by_org()
+    dhi, upstream = lanes.get(EXPECTED + "/dhi", set()), lanes.get(EXPECTED, set())
+    assert dhi and upstream, f"mirror-images.yml parse found no lanes: {sorted(lanes)}"
+    bad_default = [(f, d, r) for f, d, r in refs if d != "ghcr.io/" + EXPECTED + "/dhi"]
+    assert not bad_default, f"NOO_BASE_REGISTRY refs not defaulting to the DHI path: {bad_default}"
+    no_dhi = sorted({r for _, _, r in refs} - dhi)
+    assert not no_dhi, f"no `dest_org: {EXPECTED}/dhi` mirror lane for: {no_dhi}"
+    no_upstream = sorted({r for _, _, r in refs} - upstream)
+    assert not no_upstream, f"the upstream family lost a lane for: {no_upstream}"
+
+
+def test_the_base_ref_parse_sees_a_wrong_default():
+    """Guard the guard: the parse reports a ref defaulting to the bare namespace."""
+    line = "    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/loki:3"
+    assert BASE_REF.findall(line) == [("ghcr.io/noomesh", "loki:3")]
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +244,7 @@ HOMES = {
     "node-agent-go/internal/hostd/install.go": "systemd unit Documentation= URL, metadata only",
     "node-agent-go/deploy/noo-node-agent.service": "systemd unit Documentation= URL (sha256-pinned in noo-apply.sh)",
     "node-agent-go/deploy/noo-harness.service": "systemd unit Documentation= URL (sha256-pinned in noo-apply.sh)",
-    "scripts/snapshot.sh": "move tooling: the repo the snapshot publishes to",
+    ".github/ISSUE_TEMPLATE/config.yml": "issue-chooser contact links (Discussions, SECURITY.md) point at the public repo",
     "docker/Dockerfile.gateway-rust": "ARG default, pinned by SITES",
     # The Docker Hub mirror prefix (ghcr.io/<owner>/mirror), a different
     # namespace from the release one: one ARG default per Dockerfile, all
@@ -209,8 +264,6 @@ HOMES = {
     "scripts/install-noo.sh": "same, pinned equal to RELEASE_REPO",
     "gateway-rust/src/routes/bootstrap.rs": "separate crate, cannot import noo-cli; pinned equal",
     "gateway-rust/src/routes/identity.rs": "a documentation URL in metadata, not a pull/release source",
-    "scripts/sync-to-oss.sh": "the rewrite rule that flips the org name for the public mirror",
-    "scripts/lib-oss-org.sh": "the declared rewrite table the sync applies to the staged tree",
     "pyproject.toml": "package metadata URLs (licensing PR owns them)",
     "packages/noo-gateway-client/pyproject.toml": "package metadata URLs",
     "tests/fixtures/redaction_corpus.json": "redaction fixture: the strings are INPUT to a redactor",

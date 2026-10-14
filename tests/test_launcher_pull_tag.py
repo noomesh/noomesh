@@ -264,3 +264,42 @@ def test_an_operator_profile_in_env_reaches_the_pull_and_the_up(tmp_path):
     for verb in (" pull ", " up "):
         line = _line(log, verb)
         assert "--profile embed-cpu" in line, (verb, line)
+
+
+# The DHI runtime family, as the public channel renders it since 0.6.2:
+# NOO_BASE_REGISTRY=<prefix>/dhi nests under the stack's own prefix.
+DHI_UNDER_PREFIX = (
+    'echo "${NOO_IMAGE_PREFIX}/dhi/grafana:12-debian13-dev"\n'
+    'echo "${NOO_IMAGE_PREFIX}/dhi/loki:3"\n'
+    'echo "${NOO_IMAGE_PREFIX}/dhi/prometheus:3"\n'
+    # A tag with a stack tag's SHAPE: held to the stack tag were it a stack
+    # image. Under the base registry it is not, by rule.
+    'echo "${NOO_IMAGE_PREFIX}/dhi/redis:v8.6.0"\n'
+)
+
+
+def test_runtime_images_under_the_base_registry_path_are_pulled_as_declared(tmp_path):
+    """The `dhi/` base-registry path sits under the image prefix; nothing
+    there is a stack image, so none of it is held to the stack tag, while a
+    stack image at the wrong tag beside it is still refused."""
+    work, env = _tree(tmp_path, stale_store=False)
+    env["NOO_IMAGE_PREFIX"] = "ghcr.io/noomesh"
+    env["NOO_BASE_REGISTRY"] = "ghcr.io/noomesh/dhi"
+    d = tmp_path / "bin" / "docker"
+    d.write_text(FAKE_DOCKER.replace('     echo "postgres:16" ;;',
+                                     "     " + DHI_UNDER_PREFIX + '     echo "postgres:16" ;;'))
+    r = _run(tmp_path, env, work)
+    assert "refusing to pull" not in r.stderr, r.stderr
+    pulls = _pull_lines(tmp_path)
+    assert pulls and f"TAG={NEW}" in pulls[0], (pulls, r.stderr)
+
+    tmp2 = tmp_path / "wrong"
+    tmp2.mkdir()
+    work, env = _tree(tmp2, stale_store=False)
+    env["NOO_IMAGE_PREFIX"] = "ghcr.io/noomesh"
+    env["NOO_BASE_REGISTRY"] = "ghcr.io/noomesh/dhi"
+    (tmp2 / "bin" / "docker").write_text(FAKE_DOCKER.replace(
+        'echo "${NOO_IMAGE_PREFIX}/worker:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_WORKER:-}"',
+        DHI_UNDER_PREFIX + f'     echo "${{NOO_IMAGE_PREFIX}}/worker:{OLD}"'))
+    r = _run(tmp2, env, work)
+    assert r.returncode == 1 and "refusing to pull the wrong images" in r.stderr, r.stderr
