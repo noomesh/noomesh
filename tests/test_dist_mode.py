@@ -32,8 +32,8 @@ def _load(path: Path) -> dict:
 
 
 # The licensed add-on images are NOT built or locked by the stack release
-# (core-only, By design:): the add-ons' own repos release
-# them with their own signed lock (planned). The overlays still name them.
+# (core-only, by design): the add-ons' own repos release them with their own
+# signed lock, and the overlays take them from the pin (NOO_ADDON_IMAGE_<NAME>).
 ADDON_IMAGES = {"trellion-intel", "evolve"}
 
 
@@ -121,27 +121,43 @@ def test_every_dist_service_image_is_published() -> None:
 
 
 def test_every_addon_overlay_image_is_published() -> None:
-    """An add-on overlay's services are pull-only on a dist install (the
-    launcher's --no-build), so their images must be in the release matrix.
-    This used to be covered by the dist overlay's rows for whisper/piper and
-    trellion-intel; since an earlier change those rows are gone (a dist row for a
-    service the overlay did not compose is a bare service compose refuses),
-    so the guarantee lives here."""
+    """An add-on overlay's services are pull-only on a dist install. The
+    unlicensed ones (voice, trellion) pull stack release images, so those must
+    be in the release matrix. The licensed ones run the digest ref their own
+    signed lock pins: every image line reads ${NOO_ADDON_IMAGE_<NAME>:-…}, set
+    only by scripts/lib-dist.sh require_addon_pins, and names no stack-release
+    image. (Since an earlier change the dist overlay has no rows for these
+    services, so the guarantee lives here.)"""
+    import re
+
     from tests._compose_projection import ADDON_OVERLAYS, load_raw, untag
-    published = _published_images()
-    checked = 0
+    published = _core_published_images()
+    checked = pinned = 0
     for name in ADDON_OVERLAYS:
         for svc_name, svc in (untag(load_raw(REPO_ROOT / name)).get("services") or {}).items():
             ref = svc.get("image")
-            if not ref or not any(v in ref for v in ("NOO_IMAGE_PREFIX", "NOO_INTEL_IMAGE", "NOO_EVOLVE_IMAGE")):
+            if not ref:
+                continue
+            if "NOO_ADDON_IMAGE_" in ref:
+                m = re.fullmatch(r"\$\{(NOO_ADDON_IMAGE_[A-Z0-9_]+):-noo-addon-unpinned\.invalid/([a-z0-9-]+):run-noo-addons-upgrade\}", ref)
+                assert m, f"{name}: {svc_name!r} must read its pin with only the .invalid sentinel as fallback: {ref}"
+                assert m.group(2) in ADDON_IMAGES, f"{name}: {svc_name!r} is pin-sourced but names {m.group(2)!r}"
+                assert m.group(1) == "NOO_ADDON_IMAGE_" + m.group(2).upper().replace("-", "_"), ref
+                pinned += 1
+                continue
+            if "NOO_IMAGE_PREFIX" not in ref:
                 continue
             image = _image_basename(ref)
+            assert image not in ADDON_IMAGES, (
+                f"{name}: service {svc_name!r} runs licensed add-on image {image!r} without its pin "
+                f"(NOO_ADDON_IMAGE_*): {ref}")
             assert image in published, (
                 f"{name}: service {svc_name!r} pulls image {image!r}, which the release "
                 f"workflow does not publish. Published: {sorted(published)}"
             )
             checked += 1
-    assert checked >= 4, f"checked only {checked} add-on images — the overlay scan broke"
+    assert checked >= 2, f"checked only {checked} published add-on images — the overlay scan broke"
+    assert pinned == 3, f"expected trellion-intel, noo-evolve and noo-evolve-routes pin-sourced, found {pinned}"
 
 
 # Profiles the CONTROLLER host starts. `noo stack start` selects controller
@@ -391,29 +407,26 @@ def test_both_dist_implementations_export_the_same_vars() -> None:
 EVOLVE_OVERLAY = REPO_ROOT / "docker-compose.evolve.yml"
 
 
-def test_the_evolve_overlay_runs_the_published_image_and_builds_nothing() -> None:
+def test_the_evolve_overlay_runs_the_pinned_image_and_builds_nothing() -> None:
     svc = _load(EVOLVE_OVERLAY)["services"]["noo-evolve"]
     assert "build" not in svc, "the dist overlay must not need a checkout to build from"
-    assert _image_basename(svc["image"]) == "evolve"
-    assert "NOO_IMAGE_DIGEST_EVOLVE" in svc["image"], "pulled by digest like every first-party image"
+    assert svc["image"] == "${NOO_ADDON_IMAGE_EVOLVE:-noo-addon-unpinned.invalid/evolve:run-noo-addons-upgrade}"
 
 
 def test_evolve_and_intel_overlays_resolve_their_image_the_same_way() -> None:
-    """Both licensed add-ons: whole-reference override, then own prefix, then the
-    core prefix, then tag, then digest. One shape so lib-dist.sh's
-    require_addon_images can describe both with one rule."""
-    import re
-
+    """Both licensed add-ons: the pin (NOO_ADDON_IMAGE_<NAME>) and nothing
+    else. No tag fallback, no override variable, no add-on prefix, no
+    stack-lock digest: unset, the ref is a sentinel under the reserved
+    `.invalid` domain, which can never be pulled or exist locally."""
     from tests._compose_projection import load_raw, untag
 
     intel = untag(load_raw(REPO_ROOT / "docker-compose.trellion-intel.yml"))["services"]["trellion-intel"]["image"]
     evolve = _load(EVOLVE_OVERLAY)["services"]["noo-evolve"]["image"]
-    for ref, key, name, digest in (
-        (intel, "NOO_INTEL_IMAGE", "trellion-intel", "NOO_IMAGE_DIGEST_TRELLION_INTEL"),
-        (evolve, "NOO_EVOLVE_IMAGE", "evolve", "NOO_IMAGE_DIGEST_EVOLVE"),
+    for ref, var, name in (
+        (intel, "NOO_ADDON_IMAGE_TRELLION_INTEL", "trellion-intel"),
+        (evolve, "NOO_ADDON_IMAGE_EVOLVE", "evolve"),
     ):
-        assert ref.startswith("${" + key + ":-${" + key + "_PREFIX:-${NOO_IMAGE_PREFIX"), ref
-        assert re.search(r"\}/" + re.escape(name) + r":\$\{NOO_IMAGE_TAG:-latest\}\$\{" + digest + r":-\}\}$", ref), ref
+        assert ref == "${" + var + ":-noo-addon-unpinned.invalid/" + name + ":run-noo-addons-upgrade}", ref
 
 
 def test_the_stack_lock_does_not_wait_for_an_addon_image() -> None:
@@ -422,8 +435,12 @@ def test_the_stack_lock_does_not_wait_for_an_addon_image() -> None:
     assert not ({"evolve", "trellion-intel"} & set(lock["needs"])), lock["needs"]
 
 
-def test_the_dist_pull_no_longer_excludes_evolve_unconditionally() -> None:
+def test_the_dist_pull_never_pulls_an_addon() -> None:
+    """The launcher never pulls a licensed add-on: the CLI pulled it by digest
+    with the registry token, and require_addon_pins refused a start whose image
+    is not local. The exclusion is derived from the overlays (addon_services),
+    not a list of add-on names."""
     src = (REPO_ROOT / "scripts/noomesh-start.sh").read_text()
-    assert "NOO_IMAGE_DIGEST_EVOLVE" in src, (
-        "the dist pull must include noo-evolve whenever the tag's lock carries its digest"
-    )
+    assert "NOO_IMAGE_DIGEST_EVOLVE" not in src
+    assert "grep -vxF -f <(addon_services $COMPOSE_FILES" in src
+    assert "noo-evolve" not in src.split('ui_step "Pulling images"')[1].split("compose_pull")[0]

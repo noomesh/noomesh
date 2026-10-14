@@ -911,9 +911,24 @@ pub(crate) fn drive(ctx: &mut Ctx, reconfigure: bool) -> i32 {
             ctx.raw(&format!("  {line}"));
         }
         if ctx.non_interactive {
-            ctx.raw("\nNon-interactive re-run on a configured host — nothing to do.");
-            ctx.raw("Re-run with --reconfigure to re-apply, or --dry-run to preview.");
-            return 0;
+            // "Configured" reads .env + secrets only; the stack can still be
+            // down. Exiting 0 with "nothing to do" beside "core services: not
+            // all running" was a silent success (rc.3 rehearsal): the same
+            // health check the summary above prints decides the exit code.
+            let verdict = configured_rerun_verdict(is_worker_host(ctx), core_services_running());
+            match verdict {
+                RerunVerdict::Healthy => {
+                    ctx.raw("\nNon-interactive re-run on a configured, running host — nothing to do.");
+                    ctx.raw("Re-run with --reconfigure to re-apply, or --dry-run to preview.");
+                }
+                RerunVerdict::StackDown => {
+                    ctx.raw("");
+                    ctx.error("Core services not all running on this configured host — not \"nothing to do\"");
+                    ctx.raw("  Start the stack: `noo stack start` — or re-apply the setup: `noo onboard --reconfigure`");
+                    ctx.raw("  `noo health` is the proof.");
+                }
+            }
+            return verdict.exit_code();
         }
         let proceed = ctx
             .asker
@@ -1063,12 +1078,49 @@ fn detected_summary(ctx: &Ctx) -> Vec<String> {
     out.push("auth: always on (invariant)".to_string());
     let ca = ctx.pki_dir.join("ca.crt").exists();
     out.push(format!("PKI: {}", if ca { "CA present" } else { "none" }));
-    let running = sh::are_services_running(&["noo-postgres", "noo-redis", "noo-nats", "noo-gateway"]);
+    let running = core_services_running();
     out.push(format!(
         "core services: {}",
         if running { "running" } else { "not all running" }
     ));
     out
+}
+
+/// The core containers a controller install runs; the re-run guard's
+/// health check and the "core services" summary line read the same set.
+const CORE_SERVICES: &[&str] = &["noo-postgres", "noo-redis", "noo-nats", "noo-gateway"];
+
+fn core_services_running() -> bool {
+    sh::are_services_running(CORE_SERVICES)
+}
+
+/// A worker's core services run on its controller (`CONTROLLER_URL` is
+/// written only in worker mode), so their absence here is not a fault.
+fn is_worker_host(ctx: &Ctx) -> bool {
+    !ctx.read_env("CONTROLLER_URL").trim().is_empty()
+}
+
+/// What a non-interactive re-run on an already-configured host concludes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerunVerdict {
+    /// Configured and running (or a worker): nothing to do, exit 0.
+    Healthy,
+    /// Configured, but the core services are not all running: exit 1 and
+    /// name the remedy — never "nothing to do".
+    StackDown,
+}
+
+impl RerunVerdict {
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            RerunVerdict::Healthy => 0,
+            RerunVerdict::StackDown => 1,
+        }
+    }
+}
+
+pub(crate) fn configured_rerun_verdict(worker: bool, core_running: bool) -> RerunVerdict {
+    if worker || core_running { RerunVerdict::Healthy } else { RerunVerdict::StackDown }
 }
 
 /// Drive the steps in order, honoring skip flags. Prerequisites failure in
@@ -1591,5 +1643,32 @@ mod posture_tests {
         assert!(body.contains(&ret), "posture_list no longer returns the gates under `{POSTURE_LIST_KEY}`");
         assert!(body.contains("\"key\": key,"), "posture_list gate rows lost `key`");
         assert!(body.contains("\"pending_restart\": pending,"), "posture_list gate rows lost `pending_restart`");
+    }
+}
+
+#[cfg(test)]
+mod rerun_tests {
+    use super::{configured_rerun_verdict, RerunVerdict};
+
+    #[test]
+    fn a_configured_host_with_its_stack_down_is_not_nothing_to_do() {
+        let v = configured_rerun_verdict(false, false);
+        assert_eq!(v, RerunVerdict::StackDown);
+        assert_ne!(v.exit_code(), 0, "a non-interactive re-run over a down stack must not exit 0");
+    }
+
+    #[test]
+    fn a_running_controller_or_a_worker_is_nothing_to_do() {
+        assert_eq!(configured_rerun_verdict(false, true).exit_code(), 0);
+        assert_eq!(configured_rerun_verdict(true, false).exit_code(), 0, "a worker's core services run on its controller");
+    }
+
+    #[test]
+    fn the_non_interactive_guard_exits_on_the_verdict() {
+        let src = include_str!("mod.rs");
+        let body = &src[src.find("pub(crate) fn drive(").expect("drive")..];
+        let guard = &body[..body.find("let proceed = ctx").expect("interactive branch")];
+        assert!(guard.contains("return verdict.exit_code();"), "the non-interactive re-run exits on the health verdict");
+        assert!(!guard.contains("return 0;"), "no unconditional success in the non-interactive re-run");
     }
 }

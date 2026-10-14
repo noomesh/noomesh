@@ -236,6 +236,9 @@ jobs:
     if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     permissions:
       contents: read
+      # The postgres service image is pulled from the GHCR mirror, which is
+      # private until published: reading it needs packages: read.
+      packages: read
     # The KB-audience and entity-cleanup DB tests build their tables in a
     # throwaway schema and need Postgres + pgvector; the entity-cleanup
     # worker's production-layout tests CREATE DATABASE and ROLE, so the DSN
@@ -492,7 +495,16 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -535,6 +547,24 @@ jobs:
       if: needs.scope.outputs.gateway == 'true'
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh clean -p noo-gateway
 
+    # Fail fast (i5): lint before check/test.
+    # Lint gate. The crate's pre-existing debt is declared as documented
+    # crate-root allows in `gateway-rust/src/main.rs` rather than suppressed
+    # here, so the list is visible to a reader of the code and can be burned
+    # down. SQLX_OFFLINE for the same reason as the step above: the macros must
+    # validate against the committed cache, not a job-level DATABASE_URL.
+    - name: Clippy (deny warnings)
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      # CARGO_DOCKER_SHARED_TARGET: lint against the restored cache target
+      # instead of an always-empty volume on a hosted runner — see
+      # scripts/cargo-docker.sh. Lint runs FIRST (i5): it is the cheapest
+      # step that can fail, so a lint failure stops the job before check and
+      # the long test run. clippy --all-targets also expands the sqlx macros,
+      # so the drift guard below still fires on a stale cache.
+      run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
+
     # SQLX_OFFLINE makes `sqlx::query!` type-check against the committed
     # `.sqlx/` cache instead of a live database. This is also the SOURCE↔CACHE
     # drift check: sqlx fails the build when a `query!` in the source has no
@@ -549,20 +579,6 @@ jobs:
       env:
         SQLX_OFFLINE: "true"
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh check --locked --tests
-
-    # Lint gate. The crate's pre-existing debt is declared as documented
-    # crate-root allows in `gateway-rust/src/main.rs` rather than suppressed
-    # here, so the list is visible to a reader of the code and can be burned
-    # down. SQLX_OFFLINE for the same reason as the step above: the macros must
-    # validate against the committed cache, not a job-level DATABASE_URL.
-    - name: Clippy (deny warnings)
-      if: needs.scope.outputs.gateway == 'true'
-      env:
-        SQLX_OFFLINE: "true"
-      # CARGO_DOCKER_SHARED_TARGET: lint against the target `cargo check` just
-      # warmed (and the cache restored) instead of an always-empty volume on a
-      # hosted runner — see scripts/cargo-docker.sh.
-      run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
 
     # `cargo check` does not build `#[cfg(test)]` code and never runs it, so the
     # crate's unit tests need their own step (and `--tests` above, so a test
@@ -800,6 +816,14 @@ jobs:
     # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
     # login in a shared credential store can be revoked under an overlapping job
     # (tests/test_workflow_docker_login_isolation.py).
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1012,7 +1036,16 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -1207,7 +1240,16 @@ jobs:
         if [ -n "${DHI_TOKEN:-}" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "::warning::docker.io login failed — a Hub fallback pulls anonymously"
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         fi
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Rust image from the mirror (Hub on a miss)
       env:
         HUB_MIRROR: ${{ vars.HUB_MIRROR }}
@@ -1332,6 +1374,7 @@ jobs:
         if [ -n "$DHI_TOKEN" ]; then
           echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
             || echo "docker.io login failed — continuing with anonymous pulls" >&2
+          "$GITHUB_WORKSPACE/scripts/hub-ratelimit-probe.sh"
         else
           echo "no Docker creds in secrets — anonymous pulls" >&2
         fi
@@ -1339,6 +1382,14 @@ jobs:
     # python:3.12-slim from the GHCR mirror (.github/hub-mirror.txt): Hub
     # rate-limits per IP and every runner shares one. A miss answers
     # docker.io with a warning, never a failure.
+    # The bridge flag HUB_MIRROR_OFF sends pulls to Docker Hub while the GHCR
+    # mirrors are missing. On a public repository (noomesh/noomesh)
+    # it must not become the steady state: fail loud instead.
+    - name: Refuse HUB_MIRROR_OFF on a public repository
+      if: github.repository == 'noomesh/noomesh' && vars.HUB_MIRROR_OFF != '' && vars.HUB_MIRROR_OFF != '0' && vars.HUB_MIRROR_OFF != 'false'
+      run: |
+        echo "::error::HUB_MIRROR_OFF is set on a public repository: Docker Hub pulls are rate limited. Populate the GHCR mirrors and delete the variable."
+        exit 1
     - name: Docker Hub base from the mirror (Hub on a miss)
       if: needs.scope.outputs.code == 'true'
       env:

@@ -266,6 +266,12 @@ impl Requirement {
     }
 }
 
+/// Registry rows only this CLI reads (no container holds them, so a rotation
+/// recreates nothing): `consumers` is empty on purpose, and
+/// `registry_is_well_formed` allows exactly these.
+#[cfg(test)]
+pub(crate) const CLI_ONLY_SECRETS: &[&str] = &["NOO_ADDON_REGISTRY_TOKEN"];
+
 pub struct SecretSpec {
     pub key: &'static str,
     pub class: Class,
@@ -758,6 +764,21 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
             "noo-trellion",
             "noo-trellion-intel",
         ],
+        required_when: Requirement::Optional,
+    },
+    // The controller's read credential for the licensed add-ons' registry
+    // packages (i33): `noo addons enable|upgrade` and `noo upgrade --stack`
+    // fetch each add-on's signed lock and pull its images by digest with it,
+    // through a throwaway docker config. No container holds it, so it is a
+    // CLI_ONLY_SECRETS row and names no consumer.
+    SecretSpec {
+        key: "NOO_ADDON_REGISTRY_TOKEN",
+        class: Class::ProviderIssued,
+        gen_bytes: 0,
+        consequence: "issued with the licence: a registry token that can read the licensed add-on \
+                      packages (read:packages on GHCR). Install the new token, then run \
+                      `noo addons verify`, then revoke the old one",
+        consumers: &[],
         required_when: Requirement::Optional,
     },
     // ── Web search: the provider is `search.provider` /
@@ -6150,6 +6171,9 @@ mod tests {
                 // keys were delivered and read long before).
                 "OPENAI_API_KEY",
                 "GOOGLE_API_KEY",
+                // The controller's read token for the licensed add-on
+                // packages (i33); only an install running one needs it.
+                "NOO_ADDON_REGISTRY_TOKEN",
                 // Search provider keys, asked for by the wizard.
                 "TAVILY_API_KEY",
                 "BRAVE_SEARCH_API_KEY",
@@ -7015,7 +7039,7 @@ mod tests {
         for s in registry() {
             assert!(seen.insert(s.key), "duplicate registry key {}", s.key);
             assert!(!s.consequence.is_empty(), "{} has no consequence", s.key);
-            assert!(!s.consumers.is_empty(), "{} lists no consumers", s.key);
+            assert!(!s.consumers.is_empty() || CLI_ONLY_SECRETS.contains(&s.key), "{} lists no consumers", s.key);
             if s.class.self_generatable() {
                 assert!(s.gen_bytes >= 32, "{} generates too little entropy", s.key);
             } else {

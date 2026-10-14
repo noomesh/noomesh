@@ -852,15 +852,15 @@ fn audit_leftovers(g: &Globals, print: bool) -> Vec<String> {
 
     // Warn-only: a stale repo clone shadows repo_root() ranking (bit us live
     // 2026-08-23). Not counted as a leftover — a dev box legitimately has one.
-    // Both names: the checkout is `noomesh-pv` after the monorepo move and
-    // `pai-assistant` before it, and a box mid-migration has BOTH — which is
-    // exactly the case that shadows repo_root() ranking.
+    // Both names: a clone of noomesh/noomesh is `noomesh` and the checkout was
+    // `pai-assistant` before the monorepo move, and a box mid-migration has
+    // BOTH — which is exactly the case that shadows repo_root() ranking.
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let clone = ["noomesh-pv", "pai-assistant"]
+    let clone = ["noomesh", "pai-assistant"]
         .iter()
         .map(|n| home.join(n))
         .find(|p| p.is_dir())
-        .unwrap_or_else(|| home.join("noomesh-pv"));
+        .unwrap_or_else(|| home.join("noomesh"));
     if clone.is_dir() && print {
         println!("  {} {}", ui::glyph_cell(Glyph::Bullet), ui::muted(&format!("repo clone at {} — fine on a dev box, but on a test \
                   box it shadows the standalone home (remove it there)", clone.display())));
