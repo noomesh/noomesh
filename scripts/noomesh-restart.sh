@@ -155,6 +155,7 @@ fi
 # The file list has ONE home. Evaluated here, after
 # dist mode and the add-on map are both known.
 . "$_LIBDIR/lib-compose.sh"
+. "$_LIBDIR/lib-restart.sh"
 COMPOSE_FILES="$(compose_file_args .)"
 
 # Standalone: the single ollama-embed serves chat too (gateway static
@@ -252,20 +253,55 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         NOO_CREATED_GUARD_SERVICES="$(printf '%s\n' "$ACTIVE_SVCS" | tr '\n' ' ')" \
             noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
     else
-        docker compose $COMPOSE_FILES $PROFILE_ARGS restart
+        docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
+            _rc=$?
+            ui_close_failed "compose failed (exit $_rc) restarting the stack"
+            exit "$_rc"
+        }
     fi
 else
     ui_phase "Stack"
+    # Names resolve against the services compose renders for THIS profile and
+    # overlay set; the status table's spelling (evolve) and add-on keys work,
+    # an unknown name is a refusal that lists the valid ones.
+    # shellcheck disable=SC2086
+    if ! VALID_SVCS="$(restart_valid_services $COMPOSE_FILES $PROFILE_ARGS)"; then
+        _rc=$?
+        ui_close_failed "could not list the compose services"
+        compose_report_error "$_rc"
+        exit 1
+    fi
+    # shellcheck disable=SC2086
+    restart_resolve_all "$VALID_SVCS" $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" || exit 1
+    SERVICES=("${RESOLVED_SERVICES[@]}")
     ui_step "Restarting ${SERVICES[*]}"
+    if [ "$FORCE_RECREATE" != true ]; then
+        # A plain restart keeps the old image: after `noo addons upgrade` the
+        # pin moved but the container did not. Recreate those (--no-deps).
+        # shellcheck disable=SC2086
+        DRIFTED="$(restart_image_drift $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" | tr '\n' ' ')"
+        if [ -n "${DRIFTED// /}" ]; then
+            ui_note "pin moved: ${DRIFTED% }still on an older image - recreating instead of restarting"
+            FORCE_RECREATE=true
+        fi
+    fi
+    RESTART_RC=0
     if [ "$FORCE_RECREATE" = true ]; then
         # --no-deps: "restart THESE" must not recreate half the stack via
         # depends_on; --no-build: a restart never compiles anything.
         check_bind_sources --no-deps "${SERVICES[@]}" || exit 1
-        docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps --force-recreate ${SERVICES[@]}
-        NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" \
-            noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
+        docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps --force-recreate "${SERVICES[@]}" || RESTART_RC=$?
+        if [ "$RESTART_RC" -eq 0 ]; then
+            NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" \
+                noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
+        fi
     else
-        docker compose $COMPOSE_FILES $PROFILE_ARGS restart ${SERVICES[@]}
+        docker compose $COMPOSE_FILES $PROFILE_ARGS restart "${SERVICES[@]}" || RESTART_RC=$?
+    fi
+    if [ "$RESTART_RC" -ne 0 ]; then
+        ui_close_failed "compose failed (exit $RESTART_RC) restarting ${SERVICES[*]}"
+        echo "       valid services: $(printf '%s\n' "$VALID_SVCS" | tr '\n' ' ')" >&2
+        exit "$RESTART_RC"
     fi
 fi
 
