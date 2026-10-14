@@ -3382,6 +3382,16 @@ class HeartbeatActionExecutor:
 # Default starter tasks
 # ========================================================================
 
+# Names that older releases seeded for a default task whose cadence has since
+# changed. Installs keep the row they were seeded with (insert-only seeding), so
+# a default that moved from 6-hourly to daily kept the old NAME while the
+# schedule was moved separately (`noo heartbeat set-schedule`): the task read
+# "6-hourly" and ran daily. Only an EXACT match on the old default name is
+# renamed; an operator's own rename is never touched.
+LEGACY_DEFAULT_NAMES = {
+    ("database_backup", "Database Backup (6-hourly)"): "Database Backup (daily, 03:30)",
+}
+
 DEFAULT_TASKS = [
     {
         # Enabled by default — the agent-message record has no other pruner
@@ -3797,6 +3807,14 @@ class HeartbeatScheduler:
                 task = HeartbeatTask.from_dict(task_data)
                 if task.next_run is None:
                     task.next_run = compute_next_run(task.schedule)
+                renamed = LEGACY_DEFAULT_NAMES.get((task.id, task.name))
+                if renamed:
+                    task.name = renamed
+                    try:
+                        self.store.save_task(task.to_dict())
+                    except Exception as e:
+                        logger.warning("heartbeat_legacy_rename_failed",
+                                       task_id=task.id, error=str(e))
                 was_override = task.id in self._tasks
                 self._tasks[task.id] = task
                 logger.info("heartbeat_task_loaded_from_store",

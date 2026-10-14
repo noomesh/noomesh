@@ -40,8 +40,9 @@ _SINCE_HELP = (
 )
 _NODE_HELP = "Node id as the gateway verified it (e.g. 'host3', 'host8'). Omit for every node."
 _NAME_HELP = (
-    "Exact `name` label: the container without its 'noo-' prefix ('gateway', "
-    "'vllm') or a host unit ('noo-hostd', 'noo-harness')."
+    "Exact `name` label: a container ('noo-worker' as Loki carries it; the bare "
+    "'worker' is accepted and matches the same streams) or a host unit "
+    "('noo-hostd', 'noo-harness')."
 )
 _SOURCE_HELP = "Where the line came from: docker | journal | self | file. Omit for all."
 
