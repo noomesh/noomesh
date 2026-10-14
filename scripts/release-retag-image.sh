@@ -8,7 +8,11 @@
 #   e.g.  release-retag-image.sh whisper v0.2.99-rc.1 v0.2.99 sha256:2ec4…
 #
 # Env: REGISTRY, OWNER (as images-release.yml sets them), PUSH_LATEST=1 to
-# also move :latest (a final always does).
+# also move :latest (a final always does). IMAGE_OWNER is the registry path the
+# image is published under, if not $OWNER: the DHI-derived bases (deps-core,
+# deps-base) live under $DHI_OWNER (ghcr.io/noomesh/dhi/<img>). The workflow
+# passes it from the same variable its build step pushes to; re-tagging under
+# the wrong one is "not found" (stack-v0.6.0).
 #
 # images-release.yml calls this for every image scripts/release-retag-plan.py
 # cleared (the rc's tree and sibling trees equal the final's). Three checks,
@@ -25,7 +29,7 @@ set -euo pipefail
 
 img="${1:?image}" rc="${2:?rc image tag}" tag="${3:?final image tag}" want="${4:-}"
 : "${REGISTRY:?}" "${OWNER:?}"
-ref="$REGISTRY/$OWNER/$img"
+ref="$REGISTRY/${IMAGE_OWNER:-$OWNER}/$img"
 
 digest_of() {
     docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}' | tr -d '"'

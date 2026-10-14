@@ -283,3 +283,61 @@ def test_the_source_row_check_executes(tmp_path):
     (d / "source-trellion").unlink()
     assert run(WANT_TRELLION="aaa") != 0, "a resolved SHA with no recorded row passed"
     assert run() == 0
+
+
+def _push_owner(job, image):
+    """The owner var the job's build step pushes <image> under."""
+    text = "\n".join(str(s.get("run", "")) for s in WF["jobs"][job]["steps"])
+    m = re.search(r'-t "\$REGISTRY/\$\{?(\w+)\}?/(?:%s|\$\{\{ matrix\.image \}\}):\$TAG"' % re.escape(image), text)
+    assert m, f"{job} has no build step pushing {image}"
+    return m.group(1)
+
+
+def test_every_retag_passes_the_owner_the_build_step_pushes_to():
+    """stack-v0.6.0: deps-core is pushed under $DHI_OWNER but the re-tag looked
+    under $OWNER ('ghcr.io/noomesh/deps-core:...-rc.4: not found')."""
+    seen = 0
+    for job, spec in WF["jobs"].items():
+        for s in spec.get("steps", []):
+            run = str(s.get("run", ""))
+            m = re.search(r"release-retag-image\.sh\s+(\S+)", run)
+            if not m:
+                continue
+            seen += 1
+            img = m.group(1).strip('"')
+            owner = _push_owner(job, img)
+            got = (s.get("env") or {}).get("IMAGE_OWNER")
+            assert got == "${{ env.%s }}" % owner, f"{job}: re-tag of {img} passes IMAGE_OWNER={got!r}, build pushes under ${owner}"
+    assert seen == 3
+
+
+def test_retag_script_builds_its_ref_from_image_owner(tmp_path):
+    import os
+    import subprocess
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "log"
+    (bindir / "docker").write_text(
+        '#!/usr/bin/env bash\necho "$*" >> "$STUB_LOG"\n'
+        'case "$*" in *inspect*) echo "\\"${STUB_DIGEST}\\"";; esac\n'
+    )
+    (bindir / "docker").chmod(0o755)
+
+    def run(env_extra, want="sha256:aa"):
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_LOG": str(log),
+               "STUB_DIGEST": "sha256:aa", "REGISTRY": "ghcr.io", "OWNER": "noomesh", **env_extra}
+        env.pop("IMAGE_OWNER", None) if "IMAGE_OWNER" not in env_extra else None
+        log.write_text("")
+        r = subprocess.run(["bash", str(ROOT / "scripts/release-retag-image.sh"), "deps-core", "v1-rc.1", "v1", want],
+                           env=env, capture_output=True, text=True)
+        return r, log.read_text()
+
+    r, calls = run({"IMAGE_OWNER": "noomesh/dhi"})
+    assert r.returncode == 0, r.stderr
+    assert "ghcr.io/noomesh/dhi/deps-core:v1-rc.1" in calls and "--tag ghcr.io/noomesh/dhi/deps-core:v1" in calls
+    r, calls = run({})
+    assert r.returncode == 0 and "ghcr.io/noomesh/deps-core:v1-rc.1" in calls
+    # a registry digest that differs from the rc lock's is a hard failure, before any create
+    r, calls = run({"IMAGE_OWNER": "noomesh/dhi"}, want="sha256:bb")
+    assert r.returncode != 0 and "imagetools create" not in calls
