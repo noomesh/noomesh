@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.5.92"
+version = "0.6.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
