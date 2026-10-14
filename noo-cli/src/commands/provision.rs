@@ -270,10 +270,10 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // 2026-09-05) — the bundle is encrypted to the node's birth cert and
     // STAGED at the gateway; the node's noo-fetch timer collects it. No
     // controller→node connection at all.
-    // --local: provision THIS machine's own agent (the standalone
-    // controller's self-node, finding #15) — no gate, no pull, no
-    // enrollment record: certs come from the local PKI the wizard already
-    // issued, facts from the machine itself, and the files land via sudo.
+    // --local is retired as a lane (i67): the controller's own node rides
+    // the rail like any node, and the sudo install runs only inside
+    // `noo onboard` (provision_local). The flag is still accepted so an old
+    // script says what changed instead of dying on an unknown flag.
     let mut local = false;
     // The harness policy this node is born with: `auto` means
     // the loop follows whatever chat backend is later placed here, so the
@@ -292,7 +292,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                 let v = it.next().cloned().unwrap_or_default();
                 if !matches!(v.as_str(), "auto" | "manual" | "off") {
                     fail(g.json, ExitCode::Usage, "usage", "--harness must be auto, manual or off",
-                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data] [--local]"));
+                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
                 }
                 harness = Some(v);
             }
@@ -308,17 +308,17 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             // through to the Python CLI (which has no `provision`).
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data] [--local]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
             t if node.is_none() => node = Some(t.to_string()),
             t if tier.is_none() => tier = Some(t.to_string()),
             t => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unexpected argument: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data] [--local]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
         }
     }
     let Some(node) = node else {
         fail(g.json, ExitCode::Usage, "usage", "node name required",
-            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data] [--local]"));
+            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
     };
 
     if !g.json && !ui::quiet() {
@@ -326,22 +326,32 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     }
     let root = crate::envfile::repo_root();
 
-    if local {
-        return provision_local(g, &node, tier.as_deref());
+    // i67: the controller's own node rides the rail, exactly like a remote
+    // node, whenever its pull units exist; without them it is refused (never
+    // a sudo fallback) and `noo onboard` does the one first install.
+    //
+    // i11a still holds, by construction: the self node is never resolved
+    // from an enrollment record (one under its name may belong to another
+    // machine that announced the same name). Its address, account, facts
+    // and birth cert come from THIS machine (self_node_redemption), and the
+    // birth cert is recorded at the gateway by the self-node route.
+    let is_self = crate::role::is_self_node(&node) && crate::role::detect().controller.is_some();
+    if local && !is_self {
+        fail(g.json, ExitCode::Usage, "usage",
+            &format!("--local is retired: '{node}' is not this controller's own node"),
+            Some("a remote node enrolls (`noo enroll` on it) and is provisioned over the rail: noo cluster provision <node>"));
     }
-    // i11a: the controller's own node never takes the rail. It does not
-    // enroll with itself, so an enrollment record under its name belongs
-    // to ANOTHER machine that announced the same name (Pop!_OS calls every
-    // install `host8`). Provisioning from that record re-issued the
-    // controller's cert with the other machine's address and without the
-    // controller names, and staged a bundle for the other machine's key.
-    if let Some(why) = self_node_rail_refusal(&node, crate::role::is_self_node(&node), crate::role::detect().controller.is_some()) {
-        fail(g.json, ExitCode::Generic, "self_node", &why,
-            Some(&format!("noo cluster provision {node} --local")));
+    if local {
+        nnote("--local is retired: the controller's own node rides the rail like any node (the sudo install runs only inside `noo onboard`)");
+    }
+    if is_self {
+        if let SelfLane::Refuse(why) = self_node_lane(&node, false, &pull_units_missing(&node)) {
+            fail(g.json, ExitCode::Generic, "self_node_units", &why, Some(SELF_RAIL_REMEDY));
+        }
     }
 
     // ── 1. --wait for the enrollment to land ────────────────────────────────
-    if let Some(secs) = wait {
+    if let Some(secs) = wait.filter(|_| !is_self) {
         // One live line (guide §5 "Waiting is one line"); off a TTY a
         // heartbeat per minute (finding #73: a silent multi-minute wait
         // reads as a hang AND lets idle SSH/NAT paths drop the session).
@@ -370,7 +380,27 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
 
     // ── 2. The enrollment record (pull lane needs it even for inventoried
     //       nodes: birth cert + facts live there) ────────────────────────────
-    let record = redemption_record(g, &node);
+    let record = if is_self {
+        match self_node_redemption(&node) {
+            Ok(r) => Some(r),
+            Err(e) => fail(g.json, ExitCode::Generic, "self_node_units", &e, Some(SELF_RAIL_REMEDY)),
+        }
+    } else {
+        redemption_record(g, &node)
+    };
+    // The gateway verifies the fetch receipt and the apply report against
+    // the birth cert it holds for this name; for the self node that record
+    // is written here (idempotent: an equal cert writes nothing).
+    if is_self {
+        if let Some(rec) = record.as_ref() {
+            match register_self_birth_cert(g, &node, rec) {
+                Ok(status) => nstep(&format!("self node: birth cert {status} at the gateway; riding the rail like any node")),
+                Err(e) => fail(g.json, ExitCode::Generic, "self_birth_cert",
+                    &format!("the gateway did not record {node}'s birth cert ({e}) — the rail cannot verify this node's receipts"),
+                    Some("noo upgrade --stack")),
+            }
+        }
+    }
     // What the node says it is running: the controller must not stage kinds
     // this version's applier cannot parse (applier_knows_harness_kinds).
     // The node's live record, fetched once: its running version here, and
@@ -429,11 +459,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         if let Some(h) = &harness {
             body["harness_policy"] = serde_json::json!(h);
         }
-        match crate::http::put_json_try(g, &format!("/api/cluster/nodes/{}/config", super::urlencode(&node)), &body, true, 15) {
+        // Not for the self node: its registry row is the one its agent
+        // registered, and this box's LAN address is not necessarily the one
+        // the gateway dials it on.
+        if !is_self { match crate::http::put_json_try(g, &format!("/api/cluster/nodes/{}/config", super::urlencode(&node)), &body, true, 15) {
             Ok(_) => nstep(&format!("registry row updated: tier {t}, {ip}, user {user}{}",
                 harness.as_deref().map(|h| format!(", harness {h}")).unwrap_or_default())),
             Err(e) => nnote(&format!("registry row not updated ({e}) — `noo cluster set-config {node} --tier {t}` records it by hand")),
-        }
+        } }
         (ip, user, t)
     };
 
@@ -534,7 +567,16 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // The SAN set `pki issue-node` would produce for this node right now.
     let want_dns: Vec<String> = vec![node.clone(), "localhost".into(), "node-agent".into()];
     let mut want_ips: Vec<String> = vec![ip.clone(), "127.0.0.1".into()];
-    want_ips.extend(crate::pki::ClusterCa::tailscale_ip4(&node));
+    // The self node: the controller names are what its cert must carry
+    // (i11a), and its tailnet address is this device's own, never a lookup
+    // of its node name — the same test the onboard install applies.
+    let role = crate::pki::NodeRole::of(&node);
+    let (want_dns, want_ips) = if is_self {
+        (role.required_dns().to_vec(), Vec::new())
+    } else {
+        want_ips.extend(crate::pki::ClusterCa::tailscale_ip4(&node));
+        (want_dns, want_ips)
+    };
     let reason = if !node_key.exists() || !node_crt.exists() {
         Some(format!("no certs for {node}"))
     } else if !crate::pki::ClusterCa::cert_covers_sans(&node_crt, &want_dns, &want_ips) {
@@ -985,6 +1027,12 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         }
     }
 
+    // i44 on the rail: no bundle leaves without this node's own pair —
+    // the controller's own node included.
+    if let Err(e) = require_nats_creds(&node, &files) {
+        scrub(&work);
+        fail(g.json, ExitCode::Generic, "nats_credential", &e, None);
+    }
     let bundle = match super::security_local::build_signed_bundle(&ca, &node, &files, &work) {
         Ok(b) => b,
         Err(e) => { scrub(&work);
@@ -1123,6 +1171,9 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                     nnote(&lane);
                 }
                 record_signing_adoption(&node, msg);
+                if is_self {
+                    write_self_lane(&node, SelfLaneRecord::Rail);
+                }
                 // The controller runs hostd twice from ONE binary: worker mode
                 // (a root system unit, which the applier just restarted and
                 // verified) and controller mode (this operator's user unit,
@@ -1278,15 +1329,200 @@ pub(crate) fn enrolled_os(record: Option<&Redemption>) -> String {
         .to_string()
 }
 
-/// Why the rail must not provision `node`, or `None` when it may. The
-/// controller's own node is reached by the local lane only (i11a): see the
-/// call site. Pure, so the decision is testable without a controller.
-pub(crate) fn self_node_rail_refusal(node: &str, is_self: bool, on_controller: bool) -> Option<String> {
-    (is_self && on_controller).then(|| format!(
-        "'{node}' is this controller's own node: it is provisioned by the local lane, never the rail. \
-         An enrollment record under this name belongs to another machine that announced the same \
-         name; provisioning from it would re-issue the controller's cert with that machine's address"
-    ))
+// ── i67: the controller's own node rides the rail ─────────────────────────
+//
+// A controller box holds two roles that update separately: the controller
+// (`noo upgrade --stack`) and a node (the rail, like every other node). The
+// node role must not depend on the controller role's update path, so the
+// self node is staged, poked, fetched, applied and reported exactly like a
+// remote node. The one sudo left is the first install inside `noo onboard`,
+// which is what puts the pull units below on the box.
+
+/// What host prep installs for the pull lane, as `(path, name)`: without any
+/// one of them a staged bundle is never collected or applied.
+pub(crate) const PULL_UNITS: &[(&str, &str)] = &[
+    ("/usr/local/bin/noo-fetch", "noo-fetch"),
+    ("/usr/local/bin/noo-apply", "noo-apply"),
+    ("/etc/systemd/system/noo-fetch.timer", "noo-fetch.timer"),
+    (SELF_BIRTH_CRT, "the birth cert"),
+];
+/// The self node's birth cert (0644; the key beside it is root 0600).
+const SELF_BIRTH_CRT: &str = "/etc/noo/birth.crt";
+/// The node name noo-fetch asks the controller for.
+const SELF_NODE_NAME_FILE: &str = "/etc/noo/node-name";
+/// The command that installs the pull units on a controller (its services
+/// step runs the first install, the one sudo).
+pub(crate) const SELF_RAIL_REMEDY: &str = "noo onboard --only services";
+
+/// The pull units missing for `node`, by name; empty = the rail can reach
+/// it. `exists` and the recorded node name are passed in so the rule is
+/// testable without a prepped host.
+pub(crate) fn missing_pull_units(node: &str, exists: &dyn Fn(&str) -> bool, node_name: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = PULL_UNITS.iter()
+        .filter(|(p, _)| !exists(p))
+        .map(|(_, n)| (*n).to_string())
+        .collect();
+    match node_name.map(str::trim).filter(|n| !n.is_empty()) {
+        None => out.push(format!("{SELF_NODE_NAME_FILE} (no node name)")),
+        // noo-fetch would collect another name's bundle.
+        Some(n) if !n.eq_ignore_ascii_case(node) => out.push(format!("{SELF_NODE_NAME_FILE} names '{n}', not '{node}'")),
+        Some(_) => {}
+    }
+    out
+}
+
+/// [`missing_pull_units`] on this machine.
+pub(crate) fn pull_units_missing(node: &str) -> Vec<String> {
+    let name = std::fs::read_to_string(SELF_NODE_NAME_FILE).ok();
+    missing_pull_units(node, &|p| Path::new(p).is_file(), name.as_deref())
+}
+
+/// How the controller's own node is provisioned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelfLane {
+    /// Staged on the rail, like any node. No sudo.
+    Rail,
+    /// The first install, inside `noo onboard`: the one sudo, which also
+    /// installs the pull units so every later install is [`SelfLane::Rail`].
+    FirstInstall,
+    /// No pull units, outside onboard: refused, never a sudo fallback.
+    Refuse(String),
+}
+
+/// The provisioning plan for the controller's own node. Pure.
+pub(crate) fn self_node_lane(node: &str, onboard: bool, missing: &[String]) -> SelfLane {
+    if missing.is_empty() {
+        SelfLane::Rail
+    } else if onboard {
+        SelfLane::FirstInstall
+    } else {
+        SelfLane::Refuse(format!(
+            "'{node}' is this controller's own node and its pull units are missing ({}): the rail \
+             cannot reach it, and an upgrade never falls back to sudo",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Which lane last installed the self node, recorded beside its PKI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfLaneRecord {
+    /// `noo onboard`'s first install (the one sudo).
+    Onboard,
+    /// A rail apply the node reported with exit 0.
+    Rail,
+}
+
+impl SelfLaneRecord {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            SelfLaneRecord::Onboard => "onboard",
+            SelfLaneRecord::Rail => "rail",
+        }
+    }
+}
+
+/// `<pki>/nodes/<node>/self-agent.lane`: one word, `onboard` or `rail`.
+/// Absent while an older CLI's local lane was the last to install.
+pub(crate) const SELF_LANE_RECORD: &str = "self-agent.lane";
+
+fn write_self_lane(node: &str, lane: SelfLaneRecord) {
+    let path = crate::pki::pki_dir().join("nodes").join(node).join(SELF_LANE_RECORD);
+    if let Err(e) = std::fs::write(&path, format!("{}\n", lane.word())) {
+        nnote(&format!("could not record the self-agent lane at {} ({e}) — `noo cluster verify` will read it as unknown", path.display()));
+    }
+}
+
+/// The recorded lane for `node`, and whether the pre-i67 local lane's
+/// install record is present (`local-lane.state`).
+pub(crate) fn read_self_lane(node: &str) -> (Option<String>, bool) {
+    let dir = crate::pki::pki_dir().join("nodes").join(node);
+    let rec = std::fs::read_to_string(dir.join(SELF_LANE_RECORD)).ok()
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    (rec, dir.join(LOCAL_LANE_STATE).is_file())
+}
+
+/// This controller's own node name: the enrolled name on this box, else the
+/// NODE_ID the controller install recorded, else the hostname.
+pub(crate) fn self_node_name() -> Option<String> {
+    let trimmed = |s: String| { let t = s.trim().to_string(); (!t.is_empty()).then_some(t) };
+    std::fs::read_to_string(SELF_NODE_NAME_FILE).ok().and_then(trimmed)
+        .or_else(|| trimmed(crate::onboard::env::read_env_key(&crate::envfile::repo_root().join(".env"), "NODE_ID")))
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().and_then(trimmed))
+}
+
+/// The self node's data root when nothing else names one: the process env,
+/// then the install's `.env`, then the built-in default.
+fn local_data_root(root: &Path) -> String {
+    std::env::var("NOO_DATA_ROOT").ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let v = crate::onboard::env::read_env_key(&root.join(".env"), "NOO_DATA_ROOT");
+            (!v.is_empty()).then_some(v)
+        })
+        .unwrap_or_else(|| "/data/noo".into())
+}
+
+/// The self node's "enrollment record", from THIS machine: its address,
+/// operator account, facts and birth cert. Never the gateway's record under
+/// its name, which may belong to another machine (i11a).
+fn self_node_redemption(node: &str) -> Result<Redemption, String> {
+    let cert = std::fs::read_to_string(SELF_BIRTH_CRT)
+        .map_err(|e| format!("cannot read {SELF_BIRTH_CRT} ({e}) — '{node}' has no birth identity for the rail"))?;
+    if !cert.trim_start().starts_with("-----BEGIN CERTIFICATE-----") {
+        return Err(format!("{SELF_BIRTH_CRT} is not a PEM certificate"));
+    }
+    let root = crate::envfile::repo_root();
+    let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+    Ok(Redemption {
+        ip: crate::onboard::util::detect_ip(),
+        user: std::env::var("USER").unwrap_or_default(),
+        birth_cert: Some(cert),
+        facts: Some(self_node_facts(std::env::consts::ARCH, &local_data_root(&root), gpu)),
+    })
+}
+
+/// The facts the self node reports for itself, in the shape `noo enroll`
+/// sends. Pure.
+pub(crate) fn self_node_facts(arch: &str, data_root: &str, gpu: bool) -> serde_json::Value {
+    serde_json::json!({"os": "linux", "arch": arch, "data_root": data_root, "gpu_present": gpu})
+}
+
+/// Record the self node's birth cert at the gateway (i67 route). Returns the
+/// gateway's word: `current` (already on record) or `recorded`.
+fn register_self_birth_cert(g: &Globals, node: &str, rec: &Redemption) -> Result<String, String> {
+    let body = serde_json::json!({
+        "birth_cert": rec.birth_cert.as_deref().unwrap_or(""),
+        "enroll_user": rec.user,
+        "ip": rec.ip,
+        "facts": rec.facts,
+    });
+    let v = crate::http::post_json_try(g, &format!("/api/cluster/self-node/{}/birth-cert", super::urlencode(node)), &body, true, 15)?;
+    Ok(v.get("status").and_then(|s| s.as_str()).unwrap_or("recorded").to_string())
+}
+
+/// The `nats-creds` member every bundle must carry: present, naming `node`,
+/// with a complete `node-<node>` pair. The i44 class (the pair dropped from
+/// a bundle) is refused here on the rail, the controller's own node
+/// included, before anything is signed.
+pub(crate) fn require_nats_creds(node: &str, files: &[(&str, Vec<u8>)]) -> Result<(), String> {
+    let Some((_, nc)) = files.iter().find(|(k, _)| *k == "nats-creds") else {
+        return Err(format!("the bundle for {node} carries no nats-creds — its agent would have no bus credential"));
+    };
+    check_nats_creds(node, nc)
+}
+
+/// The credential names `node` and carries its own pair.
+fn check_nats_creds(node: &str, bytes: &[u8]) -> Result<(), String> {
+    let creds = String::from_utf8_lossy(bytes);
+    let val = |k: &str| creds.lines().filter_map(|l| l.strip_prefix(k)).next_back().unwrap_or("").trim().to_string();
+    if val("NODE=") != node {
+        return Err(format!("the NATS credential names '{}', not {node}", val("NODE=")));
+    }
+    if val("NATS_NODE_USER=") != format!("node-{node}") || val("NATS_NODE_PASSWORD=").is_empty() {
+        return Err(format!("the NATS credential for {node} carries no complete pair"));
+    }
+    Ok(())
 }
 
 /// A node's redeemed name-bound token, everything provisioning needs.
@@ -1530,12 +1766,13 @@ impl Drop for PrepGuard {
     }
 }
 
-/// `--local` (finding #15): install THIS machine's own agent as a host
-/// process — the standalone controller's self-node. The same artifacts as
-/// the remote lanes (image-extracted binary, canonical env template,
-/// embedded unit, local PKI certs), delivered by sudo instead of gate/pull.
-/// Runs the embedded prep first (idempotent) so the noo-agent account,
-/// /etc/noo layout, and gate/fetch tooling match a normal node.
+/// The FIRST install of THIS machine's own agent (finding #15; i67: called
+/// only by `noo onboard`) — the standalone controller's self-node. The same
+/// artifacts as the rail (image-extracted binary, canonical env template,
+/// embedded unit, local PKI certs), delivered by the one sudo onboard asks
+/// for. Host prep runs inside it with a birth keypair, so it leaves the pull
+/// units (noo-fetch, noo-apply, the timer, the birth cert) behind, and every
+/// later install of this node rides the rail (`SelfLane::Rail`).
 /// The applier's `agent_secret_files` block, lifted from
 /// between its markers. `noo-apply` runs it at the end of every bundle; the
 /// controller's own node is installed by the sudo script below instead, so
@@ -1549,7 +1786,7 @@ pub(crate) fn agent_secret_files_block(applier: &str) -> Option<&str> {
     Some(&applier[start..end])
 }
 
-/// The block plus its call, for provision --local's install script (empty
+/// The block plus its call, for onboard's first-install script (empty
 /// when the block is unavailable). Same owner rule as the applier: the
 /// unit's `User=`, root when that user does not exist.
 fn local_agent_secret_files_script(applier: &str) -> String {
@@ -1624,14 +1861,7 @@ struct LocalInputs {
 /// this node's or carries no pair: the lane must never install an agent env
 /// that cannot present one.
 fn local_bundle(node: &str, i: LocalInputs) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let creds = String::from_utf8_lossy(&i.nats_creds);
-    let val = |k: &str| creds.lines().filter_map(|l| l.strip_prefix(k)).next_back().unwrap_or("").trim().to_string();
-    if val("NODE=") != node {
-        return Err(format!("the NATS credential names '{}', not {node}", val("NODE=")));
-    }
-    if val("NATS_NODE_USER=") != format!("node-{node}") || val("NATS_NODE_PASSWORD=").is_empty() {
-        return Err(format!("the NATS credential for {node} carries no complete pair"));
-    }
+    check_nats_creds(node, &i.nats_creds)?;
     let mut v: Vec<(String, Vec<u8>)> = vec![
         ("ca.crt".into(), i.ca_crt),
         ("node.crt".into(), i.node_crt),
@@ -1694,7 +1924,18 @@ fn local_install_script(s: &LocalScript) -> String {
     let ch = |k: &str| s.changed.contains(k);
     let mut out = String::from("set -e\n");
     if let Some(p) = s.prep {
+        // A birth keypair when the box has none (the same shape
+        // bootstrap-enroll.sh generates); prep installs it to /etc/noo and
+        // arms the pull timer with it. Never fatal: without it the pull units
+        // stay unarmed and `noo cluster verify` says so.
+        out.push_str(&format!(
+            "if [ ! -s /etc/noo/birth.key ] || [ ! -s /etc/noo/birth.crt ]; then\n\
+             \x20 openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 3650 \
+             -keyout \"{w}/birth.key\" -out \"{w}/birth.crt\" -subj \"/CN=noo-birth-{node}\" >/dev/null 2>&1 \
+             || echo \"birth keypair generation failed — the pull units stay unarmed\" >&2\n\
+             fi\n"));
         out.push_str(p);
+        out.push_str(&format!("rm -f \"{w}/birth.key\" \"{w}/birth.crt\"\n"));
     }
     if ch("ca.crt") || ch("node.crt") || ch("node.key") {
         out.push_str(&format!(
@@ -1747,7 +1988,7 @@ fn local_install_script(s: &LocalScript) -> String {
     out.push_str(s.secret_files);
     out.push_str(NATS_PAIR_CHECK);
     out.push_str(&format!(
-        "nats_pair_ok /etc/noo-node-agent.env 'node-{node}' || {{ echo \"provision --local: /etc/noo-node-agent.env holds no NATS pair for node-{node} — the agent was not restarted\" >&2; exit {NATS_PAIR_MISSING_EXIT}; }}\n"));
+        "nats_pair_ok /etc/noo-node-agent.env 'node-{node}' || {{ echo \"first install: /etc/noo-node-agent.env holds no NATS pair for node-{node} — the agent was not restarted\" >&2; exit {NATS_PAIR_MISSING_EXIT}; }}\n"));
     if s.restart {
         // restart, not `enable --now`: `--now` is a NO-OP on an already-running
         // unit, so a surviving agent from a previous install kept its STALE
@@ -1768,13 +2009,7 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
     // .env (the wizard's storage step wrote it there), and only then the
     // bare default — which on 2026-09-07 sent the controller's self-agent
     // to /data/noo while every volume lived on the chosen drive.
-    let data_root = std::env::var("NOO_DATA_ROOT").ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let v = crate::onboard::env::read_env_key(&root.join(".env"), "NOO_DATA_ROOT");
-            (!v.is_empty()).then_some(v)
-        })
-        .unwrap_or_else(|| "/data/noo".into());
+    let data_root = local_data_root(&root);
     let tier = tier.map(str::to_string).unwrap_or_else(|| {
         let gpu = Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
         if gpu { "2".into() } else { "3".into() }
@@ -1809,7 +2044,13 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         ("PREP_NOO_URL", prep_url.as_str()),
         ("PREP_RELEASE", prep_release.as_str()),
     ])).unwrap_or(false);
-    let prep_cmd = if prep_current {
+    // The pull units are what make every later install sudo-free; prep is
+    // what installs them, so it runs whenever any is missing, current or not.
+    let units_missing = pull_units_missing(node);
+    // The private staging dir, named up front: prep reads the birth keypair
+    // the install script generates into it.
+    let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
+    let prep_cmd = if prep_current && units_missing.is_empty() {
         None
     } else {
         // The gateway's leaf is not in the system trust store, so prep's
@@ -1838,6 +2079,10 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
             .arg(format!("PREP_NODE_NAME={node}"))
             .arg(format!("NOO_DATA_ROOT={data_root}"))
             .arg(format!("PREP_RELEASE={prep_release}"))
+            // The birth keypair (generated by the install script when the box
+            // has none): prep installs it and arms noo-fetch.timer with it.
+            .arg(format!("PREP_BIRTH_KEY={}/birth.key", work.display()))
+            .arg(format!("PREP_BIRTH_CRT={}/birth.crt", work.display()))
             .arg("bash").arg(&prep);
         Some(format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c)))
     };
@@ -1951,7 +2196,7 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
             &format!("could not mint {node}'s own NATS credential ({e}) — the agent has no other \
                       bus credential, so nothing was installed"),
             Some("check the secret store (`noo security secrets audit`), then re-run \
-                  `noo cluster provision <node> --local`"))
+                  `noo onboard --only services`"))
     });
 
     let (leaves, _) = super::node_leaves::leaf_payloads(&leaf_ca, node)
@@ -2005,7 +2250,6 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         }
         // Stage in a private dir, install what changed with ONE sudo script,
         // scrub the staged secrets either way.
-        let work = std::env::temp_dir().join(format!("noo-selfprov-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
         let _ = std::fs::set_permissions(&work, {
@@ -2017,8 +2261,8 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
                 .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
         }
         let what: Vec<&str> = changed.iter().map(String::as_str).collect();
-        nstep(&format!("installing the host agent (one sudo){}{}",
-            if prep_cmd.is_some() { "; host prep" } else { "" },
+        nstep(&format!("installing the host agent (one sudo, the first install){}{}",
+            if prep_cmd.is_some() { "; host prep and the pull units" } else { "" },
             if what.is_empty() { String::new() } else { format!("; changed: {}", what.join(", ")) }));
         let script = local_install_script(&LocalScript {
             node, work: &work, changed: &changed, prep: prep_cmd.as_deref(), secret_files: &asf,
@@ -2058,6 +2302,19 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         if let Err(e) = wrote {
             nnote(&format!("could not record {} ({e}) — the next run reinstalls everything", state_path.display()));
         }
+    }
+    write_self_lane(node, SelfLaneRecord::Onboard);
+    // The rail from here on: the gateway must hold this node's birth cert to
+    // verify its fetch receipts and apply reports. Best effort here; every
+    // rail provision of this node records it again (idempotent).
+    match pull_units_missing(node) {
+        missing if !missing.is_empty() => nnote(&format!(
+            "the pull units are still missing ({}) — upgrades cannot reach this node until `{SELF_RAIL_REMEDY}` installs them",
+            missing.join(", "))),
+        _ => match self_node_redemption(node).and_then(|rec| register_self_birth_cert(g, node, &rec)) {
+            Ok(_) => nnote("pull units armed and the birth cert recorded — upgrades of this node ride the rail (no sudo)"),
+            Err(e) => nnote(&format!("pull units armed; the birth cert is not recorded yet ({e}) — the next `noo upgrade --nodes` records it")),
+        },
     }
 
     nstep(&format!("waiting for {node} to register on the mesh"));
@@ -2350,8 +2607,13 @@ pub(crate) fn stage_bundle_pull(
     bundle: &std::path::Path,
     work: &std::path::Path,
 ) -> Option<Result<(), String>> {
-    let rec = redemption_record(g, node)?;
-    let cert = rec.birth_cert?;
+    // The controller's own node: its birth cert is on THIS disk (i67), never
+    // taken from an enrollment record under its name (i11a).
+    let cert = if crate::role::is_self_node(node) && crate::role::detect().controller.is_some() {
+        std::fs::read_to_string(SELF_BIRTH_CRT).ok()?
+    } else {
+        redemption_record(g, node)?.birth_cert?
+    };
     Some(
         encrypt_bundle_cms(bundle, &cert, work)
             .and_then(|blob| post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob)),
@@ -3191,19 +3453,6 @@ mod tests {
         assert!(binary_carries_version(&bin, "v0.2.23"));
     }
 
-    /// i11a: `noo cluster provision <controller's own node>` on the
-    /// controller is refused on the rail and pointed at the local lane. A
-    /// node of the same name provisioned from a worker box, or any other
-    /// node, is not affected.
-    #[test]
-    fn the_controllers_own_node_is_refused_on_the_rail() {
-        let why = self_node_rail_refusal("host8", true, true).expect("refused");
-        assert!(why.contains("'host8' is this controller's own node"), "{why}");
-        assert!(why.contains("local lane"), "{why}");
-        assert_eq!(self_node_rail_refusal("host8", true, false), None);
-        assert_eq!(self_node_rail_refusal("host8-ma", false, true), None);
-    }
-
     /// i11a: the local lane re-issues on missing CONTROLLER NAMES, not only
     /// on a missing cert, and passes this box's own address so the issuer
     /// never looks the controller's node name up on the tailnet.
@@ -3601,6 +3850,153 @@ mod controller_hostd_tests {
 }
 
 #[cfg(test)]
+mod self_node_rail_tests {
+    //! i67: the controller's own node rides the rail like any node; the
+    //! sudo install is onboard's first install and nothing else.
+    use super::*;
+
+    fn units<'a>(present: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |p: &str| present.contains(&p)
+    }
+    const ALL: [&str; 4] = ["/usr/local/bin/noo-fetch", "/usr/local/bin/noo-apply",
+        "/etc/systemd/system/noo-fetch.timer", "/etc/noo/birth.crt"];
+
+    #[test]
+    fn a_prepped_controller_has_no_missing_units() {
+        assert!(missing_pull_units("pop-os", &units(&ALL), Some("pop-os\n")).is_empty());
+        // Case-insensitive, as node names are.
+        assert!(missing_pull_units("pop-os", &units(&ALL), Some("Pop-OS")).is_empty());
+    }
+
+    #[test]
+    fn each_missing_unit_is_named() {
+        let m = missing_pull_units("pop-os", &units(&ALL[..2]), Some("pop-os"));
+        assert_eq!(m, vec!["noo-fetch.timer".to_string(), "the birth cert".to_string()]);
+        let m = missing_pull_units("pop-os", &units(&ALL), None);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("no node name"), "{m:?}");
+        // noo-fetch would ask for another name's bundle.
+        let m = missing_pull_units("pop-os", &units(&ALL), Some("host8"));
+        assert!(m[0].contains("names 'host8', not 'pop-os'"), "{m:?}");
+    }
+
+    /// The plan: units → rail (upgrades and onboard alike); no units →
+    /// refused outside onboard, the first install inside it.
+    #[test]
+    fn the_self_node_rides_the_rail_whenever_its_units_exist() {
+        assert_eq!(self_node_lane("pop-os", false, &[]), SelfLane::Rail);
+        assert_eq!(self_node_lane("pop-os", true, &[]), SelfLane::Rail, "onboard re-runs ride the rail too");
+    }
+
+    #[test]
+    fn without_units_an_upgrade_refuses_and_never_falls_back_to_sudo() {
+        let missing = vec!["noo-fetch.timer".to_string()];
+        let SelfLane::Refuse(why) = self_node_lane("pop-os", false, &missing) else {
+            panic!("an upgrade without pull units must refuse");
+        };
+        assert!(why.contains("'pop-os' is this controller's own node"), "{why}");
+        assert!(why.contains("noo-fetch.timer"), "{why}");
+        assert!(why.contains("never falls back to sudo"), "{why}");
+        assert_eq!(SELF_RAIL_REMEDY, "noo onboard --only services");
+    }
+
+    #[test]
+    fn onboard_without_units_is_the_first_install() {
+        let missing = vec!["the birth cert".to_string()];
+        assert_eq!(self_node_lane("pop-os", true, &missing), SelfLane::FirstInstall);
+    }
+
+    /// Source: `cluster provision` (the rail, which `noo upgrade --nodes`
+    /// runs per node) never reaches the sudo lane, and resolves the self
+    /// node from this machine, never from an enrollment record (i11a).
+    #[test]
+    fn the_rail_verb_has_no_sudo_lane_and_builds_the_self_node_locally() {
+        let whole = include_str!("provision.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let start = src.find("pub fn cluster_provision(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(!body.contains("provision_local("), "the rail verb must not call the first-install lane");
+        assert!(!body.contains(r#"Command::new("sudo")"#), "the rail verb must not run sudo");
+        let refuse = body.find("SelfLane::Refuse(").expect("the refusal");
+        assert!(body[refuse..].contains("SELF_RAIL_REMEDY"), "the refusal names the remedy");
+        let local = body.find("self_node_redemption(&node)").expect("self node built locally");
+        let reg = body.find("register_self_birth_cert(").expect("birth cert recorded at the gateway");
+        let stage = body.find("/api/cluster/provision-bundle/{node}\"), &blob)").expect("the stage");
+        assert!(local < reg && reg < stage, "local facts, then the birth cert, then the stage");
+        let lane = body.find("write_self_lane(&node, SelfLaneRecord::Rail)").expect("the lane record");
+        let applied = body.find("reported: applied (exit 0)").expect("the applied arm");
+        assert!(applied < lane, "the lane is recorded only after the node reported exit 0");
+        // `noo upgrade` restages the self node through the same verb.
+        let up = include_str!("upgrade.rs");
+        let up = up.split("#[cfg(test)]").next().unwrap();
+        let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(f.contains("provision_one(g, me, &[])"), "{f}");
+        assert!(!f.contains("--local") && !f.contains("sudo -n"), "{f}");
+    }
+
+    /// i44 on the rail: no bundle is signed without the node's own pair,
+    /// for a remote node and for the controller's own node alike.
+    #[test]
+    fn every_bundle_must_carry_this_nodes_nats_creds() {
+        let nc = |n: &str| crate::commands::nats_users::creds_payload(n, "pw").into_bytes();
+        for node in ["aserve", "pop-os"] {
+            let files: Vec<(&str, Vec<u8>)> = vec![("agent-env", b"x".to_vec()), ("nats-creds", nc(node))];
+            assert_eq!(require_nats_creds(node, &files), Ok(()), "{node}");
+            let without: Vec<(&str, Vec<u8>)> = vec![("agent-env", b"x".to_vec())];
+            assert!(require_nats_creds(node, &without).unwrap_err().contains("carries no nats-creds"), "{node}");
+            let other: Vec<(&str, Vec<u8>)> = vec![("nats-creds", nc("someone-else"))];
+            assert!(require_nats_creds(node, &other).is_err(), "{node}");
+        }
+        // And the check sits in front of the signature in the rail verb.
+        let whole = include_str!("provision.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap();
+        let start = src.find("pub fn cluster_provision(").unwrap();
+        let body = &src[start..];
+        let guard = body.find("require_nats_creds(&node, &files)").expect("the guard");
+        let sign = body.find("build_signed_bundle(&ca, &node, &files, &work)").expect("the signature");
+        assert!(guard < sign, "the pair is required before the bundle is signed");
+    }
+
+    /// Blast radius: restarting the controller's own agent must not touch
+    /// the gateway's bus session. They are separate principals: the self
+    /// node's bundle carries `node-<self>`, never a controller principal,
+    /// and its password lives under its own store key.
+    #[test]
+    fn the_self_nodes_bus_principal_is_not_the_gateways() {
+        let payload = crate::commands::nats_users::creds_payload("pop-os", "pw");
+        assert_eq!(check_nats_creds("pop-os", payload.as_bytes()), Ok(()));
+        let user = payload.lines().find_map(|l| l.strip_prefix("NATS_NODE_USER=")).unwrap();
+        assert_eq!(user, "node-pop-os");
+        for principal in crate::commands::nats_users::CONTROLLER_PRINCIPALS {
+            assert_ne!(user, *principal, "the self node must not present a controller principal");
+        }
+        let key = crate::commands::nats_users::node_secret_key("pop-os");
+        assert_eq!(key, "NATS_NODE_PASSWORD_POP_OS");
+        assert_ne!(key, "NATS_GATEWAY_PASSWORD");
+        assert_ne!(key, "NATS_WORKER_PASSWORD");
+    }
+
+    #[test]
+    fn the_self_node_reports_facts_in_the_enroll_shape() {
+        let f = self_node_facts("aarch64", "/var/lib/noo", true);
+        assert_eq!(f["os"], "linux");
+        assert_eq!(f["arch"], "aarch64");
+        assert_eq!(f["data_root"], "/var/lib/noo");
+        // The facts drive the same tier ladder as an enrollment's.
+        assert_eq!(derive_tier_facts(&f), "2", "a GPU box");
+        assert_eq!(derive_tier_facts(&self_node_facts("x86_64", "/d", false)), "3");
+    }
+
+    #[test]
+    fn the_lane_record_words_are_what_verify_reads() {
+        assert_eq!(SelfLaneRecord::Onboard.word(), "onboard");
+        assert_eq!(SelfLaneRecord::Rail.word(), "rail");
+        assert_eq!(SELF_LANE_RECORD, "self-agent.lane");
+    }
+}
+
+#[cfg(test)]
 mod local_lane_tests {
     use super::*;
 
@@ -3725,6 +4121,32 @@ mod local_lane_tests {
         std::fs::write(&pwfile, "pw").unwrap();
         assert_eq!(run(&ptr).0, Some(0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// i67: the first install generates the birth keypair (when the box has
+    /// none) BEFORE host prep, which installs it and arms the pull timer,
+    /// and removes the staged copy right after.
+    #[test]
+    fn the_first_install_leaves_the_pull_units_behind() {
+        let changed = std::collections::BTreeSet::new();
+        let s = local_install_script(&LocalScript {
+            node: "ctrl", work: Path::new("/w"), changed: &changed, prep: Some("PREP_LINE\n"),
+            secret_files: "", leaves: &[], restart: false,
+        });
+        let gen = s.find("openssl req -x509 -newkey rsa:4096").expect("keypair generated");
+        assert!(s.contains("[ ! -s /etc/noo/birth.key ]"), "only when the box has none: {s}");
+        assert!(s.contains("-keyout \"/w/birth.key\" -out \"/w/birth.crt\" -subj \"/CN=noo-birth-ctrl\""), "{s}");
+        let prep = s.find("PREP_LINE").expect("prep runs");
+        let rm = s.find("rm -f \"/w/birth.key\" \"/w/birth.crt\"").expect("staged key removed");
+        assert!(gen < prep && prep < rm, "{s}");
+        // No prep (nothing to do): no keypair, no prep.
+        assert!(!script(&[], false).contains("openssl req"));
+        // The prep line itself hands prep the keypair.
+        let whole = include_str!("provision.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap();
+        assert!(src.contains(r#".arg(format!("PREP_BIRTH_KEY={}/birth.key", work.display()))"#));
+        assert!(src.contains("let prep_cmd = if prep_current && units_missing.is_empty()"),
+            "prep re-runs while a pull unit is missing");
     }
 
     #[test]
