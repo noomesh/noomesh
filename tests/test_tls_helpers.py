@@ -127,13 +127,15 @@ class TestCliHttpVerify:
 
         assert cli_http_verify() == str(ca)
 
-    def test_returns_false_for_https_without_ca(self, monkeypatch):
+    def test_never_false_for_https_without_ca(self, monkeypatch, tmp_path):
         monkeypatch.delenv("NOO_TLS_CA", raising=False)
+        monkeypatch.setenv("NOO_PKI_DIR", str(tmp_path / "empty"))
         monkeypatch.setenv("CONTROLLER_URL", "https://localhost:8080")
+        monkeypatch.setattr("noomesh.tls_ca.CONTAINER_CA_PATHS", ())
 
         from noomesh.cli_utils import cli_http_verify
 
-        assert cli_http_verify() is False
+        assert cli_http_verify() is True  # system store; verification stays ON
 
     def test_returns_true_for_http(self, monkeypatch):
         monkeypatch.delenv("NOO_TLS_CA", raising=False)

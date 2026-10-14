@@ -282,7 +282,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack and nodes; --channel moves release channel |
+| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack and nodes; --channel moves release channel |
 
 ### `noo doctor` — Host-plane health checks with guided recovery
 | Command | Arguments | What it does |
@@ -327,8 +327,11 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
-| `noo addons enable` | `<name> [--force]` | Mint an add-on's absent credentials and key, then declare it ON; restart applies it |
+| `noo addons enable` | `<name> [--force]` | Pin a licensed add-on's signed lock, mint its credentials and key, then declare it ON |
 | `noo addons disable` | `<name>` | Declare an add-on OFF in noomesh.yaml; restart applies it |
+| `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade]` | Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin |
+| `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
+| `noo addons launch-pins` | `<tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 | Command | Arguments | What it does |

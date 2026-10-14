@@ -63,18 +63,27 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       # Authenticated Hub reads have a far higher limit; the Docker account is
-      # the one already in secrets for dhi.io. Anonymous if it is absent.
+      # the one already in secrets for dhi.io. Anonymous only when the secrets
+      # are absent; present-but-rejected credentials fail the run, so a bad
+      # token is never mistaken for a rate limit.
       - name: Log in to Docker Hub (higher read limit)
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
           DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
         run: |
-          if [ -n "${DHI_TOKEN:-}" ]; then
-            echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin \
-              || echo "::warning::docker.io login failed — anonymous Hub reads"
+          if [ -n "${DHI_TOKEN:-}" ] && [ -n "${DHI_USERNAME:-}" ]; then
+            if ! echo "$DHI_TOKEN" | docker login docker.io -u "$DHI_USERNAME" --password-stdin; then
+              echo "::error::docker.io login failed with the configured DHI credentials"
+              exit 1
+            fi
+            scripts/hub-ratelimit-probe.sh
           else
-            echo "::warning::no DHI_TOKEN — anonymous Hub reads"
+            echo "::notice::no DHI_USERNAME/DHI_TOKEN secrets - anonymous Hub reads"
           fi
+      # Images are copied one at a time, a few seconds apart, and a 429 is
+      # retried (5 attempts, growing backoff, Retry-After honoured) inside
+      # scripts/hub-mirror.py: a logged-in account still has a finite
+      # allowance, and a burst of manifest reads spends it.
       - name: Mirror (refuses a downgrade; records every source digest)
         run: python3 scripts/hub-mirror.py sync --record "$RUNNER_TEMP/hub-mirror-digests.txt"
       - name: Keep the digest record

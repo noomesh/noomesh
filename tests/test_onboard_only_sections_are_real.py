@@ -31,11 +31,11 @@ def test_every_documented_only_section_exists() -> None:
     bad: list[str] = []
     seen = 0
     assert (ROOT / "docs").is_dir(), "docs/ is missing — the scan has nothing to check"
-    # The records moved to noomesh/noomesh-internal; skip their
+    # The records are kept outside this repository; skip their
     # roots when absent, loudly. docs/ is never optional.
     for root in ("internal/followups", "internal/proposals"):
         if not (ROOT / root).is_dir():
-            print(f"{root} not present, SKIPPED (records live in noomesh/noomesh-internal)")
+            print(f"{root} not present, SKIPPED (records are kept outside this repository)")
     for root in ("docs", "internal/followups", "internal/proposals"):
         if not (ROOT / root).is_dir():
             continue

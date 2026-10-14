@@ -258,6 +258,37 @@ is one HIGH finding that says so, not a CRITICAL "unset" per secret. A gateway U
 reported as `CRITICAL / Gateway Transport`; `http://` to loopback is
 reported as `LOW`, because that is the local-development default.
 
+### Sign and verify an add-on lock
+
+An add-on releases from its own repository with its own signed lock: the
+add-on's version, the commit it was built from, the stack versions it runs
+on, and each image pinned by digest. The add-on's release workflow signs it
+with the add-on's own Ed25519 seed, never the stack release key:
+
+```sh
+printf '%s' "$ADDON_SIGNING_SEED" | noo security addon-lock sign \
+  --addon example_addon --version 1.2.0 --source-commit "$GITHUB_SHA" \
+  --supports v0.6.0 \
+  --image example-addon=ghcr.io/example/example-addon@sha256:<64 hex> \
+  --registry ghcr.io/example/example-addon \
+  --seed-file - --out addon-lock.json
+noo security addon-lock verify addon-lock.json --key <pubkey hex> \
+  --addon example_addon --registry ghcr.io/example/example-addon --stack v0.6.0
+```
+
+`sign` writes the lock in its one canonical JSON form and the signature
+(`noo-sig1`, the stack lock's envelope) next to it as `addon-lock.json.sig`.
+It reads the seed from a file, or from standard input with `--seed-file -`,
+never from an environment variable, and never prints it. It refuses a lock
+no verifier would accept. `--base trellion=sha256:…` records the stack image
+an add-on is built on.
+
+`verify` refuses a lock whose signature does not match a `--key` (repeat the
+flag for a rotation: current key first), a lock for another add-on, an image
+outside `--registry` or not pinned by digest, a lock with no stack version,
+and a lock that is not in canonical form. `--stack` also requires the lock to
+list that stack version exactly; an rc and its final are separate entries.
+
 ## Related guides
 
 - [../security/secrets.md](../security/secrets.md) — the secret store and `noo security secrets`
@@ -323,12 +354,14 @@ reported as `LOW`, because that is the local-development default.
 | `noo security service-key self-revoke` | — | Revoke the caller's own MCP key |
 | `noo security generate-secret` | `[<type>] [--length <bytes>]` | Print a random secret: general (jwt, cluster alike) or fernet; --length not for fernet |
 | `noo security entitlement keygen` | `[--out <file>]` | Hidden: create the entitlement signing key, mode 600 (vendor builds only) |
-| `noo security entitlement issue` | `--sub <customer> (--terms <version>\|--no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--key <file>]` | Hidden: sign an entitlement token for a customer (vendor builds only) |
+| `noo security entitlement issue` | `--sub <customer> (--terms <version>\|--no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--addon <name>=<registry>:<key>[,<key>]]... [--key <file>]` | Hidden: sign an entitlement token for a customer (vendor builds only) |
 | `noo security entitlement install` | `<token> [--enable] [--ci] [--accept-terms <version>]` | Verify and store a token as NOO_ENTITLEMENT; --enable mints and switches on what it grants |
 | `noo security entitlement show` | — | Show the installed entitlement, its validity, and which add-ons it unlocks |
 | `noo security entitlement verify` | `<token>` | Verify a token offline against this build's entitlement key |
 | `noo security release-sign` | `<file> [--seed-file <path>] [--out <file.sig>]` | Hidden: sign sha256sums.txt with the release key (CI only) |
 | `noo security release-verify` | `<file> [<file.sig>]` | Verify a release manifest signature against the keys baked into this build |
+| `noo security addon-lock sign` | `--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--registry <root>] --seed-file <path\|-> --out <path>` | Hidden: sign an add-on lock with the add-on's own key (add-on CI only) |
+| `noo security addon-lock verify` | `<path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>]` | Verify a signed add-on lock against the add-on's keys and registry root |
 | `noo security secrets tidy` | `[-y\|--yes]` | Thin the store to secrets only: move config to .env, drop retired keys, blank .env copies |
 | `noo security secrets audit` | `[--sops-file <path>] [--env-file <path>]` | Compare env.sops against .env by digest and report findings (no values shown) |
 | `noo security secrets resync` | `<key>... \| --all [--dry-run] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]` | Make Postgres role passwords match the values already in the SOPS store |

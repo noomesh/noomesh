@@ -258,6 +258,11 @@ derive_file_secrets() {
     done
 }
 
+# Store keys load_secrets never exports (see _load_secrets_sops). The CLI-only
+# names include every noo-cli/src/commands/secrets.rs CLI_ONLY_SECRETS row
+# (tests/test_secrets_not_exported.py holds the two equal).
+_SECRETS_NOT_EXPORTED="NOO_IMAGE_TAG NOO_ADDON_REGISTRY_TOKEN NOO_ADDON_REGISTRY_USER"
+
 _load_secrets_sops() {
     local enc="${NOO_SOPS_FILE:-secrets/env.sops}"
     # noo-secrets-sops-init.sh installs sops/age to ~/.local/bin (deliberately,
@@ -297,10 +302,14 @@ _load_secrets_sops() {
         [ -z "$line" ] && continue
         case "$line" in \#*) continue ;; esac
         [ "${line#*=}" = "$line" ] && continue  # skip lines without '='
-        # The stack pin is CONFIG, not a secret: a stale
-        # NOO_IMAGE_TAG frozen in env.sops must never override the launcher's
-        # resolved tag or the .env pin. Never export it from the store.
-        case "$line" in NOO_IMAGE_TAG=*) continue ;; esac
+        # Never exported from the store (_SECRETS_NOT_EXPORTED):
+        #  - NOO_IMAGE_TAG: the stack pin is CONFIG, not a secret; a stale one
+        #    frozen in env.sops must never override the launcher's resolved
+        #    tag or the .env pin.
+        #  - CLI-only secrets (noo-cli secrets.rs CLI_ONLY_SECRETS): read by
+        #    the noo CLI from the store itself, held by no container, so they
+        #    must not sit in the launcher's, compose's or any child's env.
+        case " $_SECRETS_NOT_EXPORTED " in *" ${line%%=*} "*) continue ;; esac
         export "$line"
         count=$((count + 1))
     done <<EOF

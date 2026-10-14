@@ -94,7 +94,15 @@ services:
     # Dockerfile (docker/Dockerfile.trellion-intel) from now on; dist installs
     # pull only.
     build: !reset null
-    image: ${NOO_INTEL_IMAGE:-${NOO_INTEL_IMAGE_PREFIX:-${NOO_IMAGE_PREFIX:-noomesh}}/trellion-intel:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_TRELLION_INTEL:-}}
+    # Dist: NOO_ADDON_IMAGE_TRELLION_INTEL, the digest ref the add-on's own
+    # signed lock pins for this stack tag. Only scripts/lib-dist.sh
+    # require_addon_pins sets it, after re-verifying the pin; the launcher
+    # refuses an enabled intel without it and never pulls it (the CLI pulled it
+    # by digest: noo addons upgrade). There is no tag fallback: unset, the ref
+    # is a sentinel under the reserved .invalid domain that can never be
+    # pulled or exist locally, so nothing unverified can run. A dev start sets
+    # the variable to the dev build's name (require_addon_pins).
+    image: ${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}
     pull_policy: missing
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-trellion-intel
     # Inherits trellion's file-delivered secrets through `extends`: compose

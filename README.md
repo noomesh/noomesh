@@ -165,5 +165,7 @@ under the Intelligent-tier entitlement. See
 [Add-ons](./docs/getting-started/add-ons.md#licensing-in-one-paragraph) for what
 is free and what is licensed. The client SDK (`packages/noo-gateway-client`) is
 Apache-2.0 so add-ons of any licence can use it.
+Third-party attributions, including the Apache-2.0 Docker Hardened Images
+Community bases, are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
 This is a summary, not legal advice; the licence texts govern.

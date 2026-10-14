@@ -947,10 +947,53 @@ agent_secret_files() {
 }
 # END agent_secret_files
 
+# agent-env replaces /etc/noo-node-agent.env WHOLE, and the node's NATS pair
+# is not an agent-env key: it arrives only as `nats-creds`. A bundle that
+# carries agent-env WITHOUT nats-creds therefore used to drop the pair the
+# node already held, and the agent came back with no bus credential while
+# still registering over HTTP (the controller's local lane did exactly that).
+# So the pair the installed env holds is carried into the new one, but only
+# when it is THIS node's (NATS_NODE_USER = node-<NODE_ID>): a renamed node
+# never inherits another principal's credential. A bundle that carries
+# nats-creds replaces the pair below, as before.
+# tests/test_apply_nats_pair_carry.py drives this block.
+# BEGIN agent_env_nats_carry
+# agent_env_carry_nats_pair NEW_ENV OLD_ENV NODE_ID — append OLD_ENV's pair
+# lines (user, password or its _FILE pointer) to NEW_ENV, a staged copy.
+agent_env_carry_nats_pair() {
+    _cn_new="$1"; _cn_old="$2"; _cn_id="$3"
+    [ -f "$_cn_old" ] || return 0
+    _cn_user="$(sed -n 's/^NATS_NODE_USER=//p' "$_cn_old" | tail -1 | tr -d '\015"'"'")"
+    if [ -z "$_cn_user" ]; then
+        echo "noo-apply: NOTICE: this bundle carries no nats-creds and $_cn_old holds no NATS pair — the agent starts without a bus credential; \`noo cluster nats-creds rotate $_cn_id\` delivers one" >&2
+        return 0
+    fi
+    if [ "$_cn_user" != "node-$_cn_id" ]; then
+        echo "noo-apply: NOTICE: the NATS pair in $_cn_old belongs to '$_cn_user', not node-$_cn_id — not carried; \`noo cluster nats-creds rotate $_cn_id\` delivers this node's own" >&2
+        return 0
+    fi
+    grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD|NATS_NODE_PASSWORD_FILE)=' "$_cn_new" > "$_cn_new.x" || true
+    for _cn_k in NATS_NODE_USER NATS_NODE_PASSWORD NATS_NODE_PASSWORD_FILE; do
+        grep -E "^${_cn_k}=" "$_cn_old" | tail -1 >> "$_cn_new.x" || true
+    done
+    mv -f "$_cn_new.x" "$_cn_new"
+    echo "noo-apply: NOTICE: this bundle carries no nats-creds — kept this node's existing NATS pair ($_cn_user) from $_cn_old"
+    return 0
+}
+# END agent_env_nats_carry
+
 if [ -f "$WORK/files/agent-env" ]; then
     grep -qE '^NODE_ID=.+' "$WORK/files/agent-env" \
         || { echo "noo-apply: agent-env lacks NODE_ID — refusing a config that boots an anonymous agent" >&2; exit 65; }
-    install -m 600 -o root -g root "$WORK/files/agent-env" /etc/noo-node-agent.env
+    STAGED_ENV="$(mktemp)"
+    chmod 600 "$STAGED_ENV"
+    cp "$WORK/files/agent-env" "$STAGED_ENV"
+    if [ ! -f "$WORK/files/nats-creds" ]; then
+        agent_env_carry_nats_pair "$STAGED_ENV" /etc/noo-node-agent.env \
+            "$(grep -E '^NODE_ID=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+    fi
+    install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
+    rm -f "$STAGED_ENV"
     # The roots the controller declared for this node: reachable by the
     # agent's user, or the agent reports the drive as missing.
     for _k in NOO_DATA_ROOT MODELS_DIR HF_CACHE_DIR; do

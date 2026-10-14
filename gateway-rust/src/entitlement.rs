@@ -62,6 +62,50 @@ pub struct Entitlement {
     /// what the token unlocks. Parsed so signed payloads round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terms: Option<String>,
+    /// Per add-on lock trust anchor (`{"keys": [...], "registry": "<root>"}`),
+    /// read by the CLI to verify an add-on's signed lock. The gateway does not
+    /// use it, but it holds a token to the same shape rules the CLI does, so
+    /// the two never disagree about whether a token is valid.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub addons: std::collections::BTreeMap<String, AddonAnchor>,
+}
+
+/// One add-on's trust anchor, as the CLI's `addon_lock::TrustAnchor`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AddonAnchor {
+    pub keys: Vec<String>,
+    pub registry: String,
+}
+
+/// The CLI's `entitlement::validate_addons`: every anchor names at least one
+/// key, every key is an ed25519 public key, and the registry is a `host/path`
+/// root with no scheme, tag or digest.
+fn validate_addons(addons: &std::collections::BTreeMap<String, AddonAnchor>) -> Result<(), String> {
+    for (name, a) in addons {
+        if name.trim().is_empty() {
+            return Err("add-on trust block has an empty add-on name".into());
+        }
+        if a.keys.is_empty() {
+            return Err(format!("add-on trust block for {name} names no signing key"));
+        }
+        for (i, k) in a.keys.iter().enumerate() {
+            pubkey_from_hex(k).map_err(|e| format!("add-on trust block for {name}: key #{i} {e}"))?;
+        }
+        let r = a.registry.trim();
+        let root_ok = !r.is_empty()
+            && r.contains('/')
+            && !r.contains("://")
+            && !r.contains('@')
+            && !r.contains(':')
+            && !r.starts_with('/')
+            && !r.ends_with('/')
+            && !r.split('/').any(str::is_empty)
+            && !r.chars().any(char::is_whitespace);
+        if !root_ok {
+            return Err(format!("add-on trust block for {name}: registry {:?} is not a registry root (host/path)", a.registry));
+        }
+    }
+    Ok(())
 }
 
 impl Entitlement {
@@ -111,6 +155,7 @@ pub fn verify_with(token: &str, key: &VerifyingKey) -> Result<Entitlement, Strin
     if ent.v != 1 {
         return Err(format!("unsupported entitlement version {}", ent.v));
     }
+    validate_addons(&ent.addons)?;
     Ok(ent)
 }
 
@@ -197,6 +242,7 @@ pub mod testing {
             bound: None,
             max_nodes: None,
             terms: None,
+            addons: Default::default(),
         }
     }
 }
@@ -258,6 +304,53 @@ mod tests {
         let e = verify_with(&tok, &vk).unwrap();
         assert_eq!(e.terms, None);
         assert!(e.grants("trellion_intel"));
+    }
+
+    /// The CLI's entitlement gained an `addons` trust block (i33). The
+    /// gateway does not read it; a token carrying it must still verify here
+    /// and unlock exactly what its features say, so this struct must keep
+    /// tolerating unknown fields.
+    #[test]
+    fn token_with_addon_trust_block_still_verifies() {
+        let vk = testing::key().verifying_key();
+        let k: String = testing::key().verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let payload = format!(
+            r#"{{"v":1,"sub":"acme","tier":"intelligent","features":["evolve"],"iat":1,"exp":0,"id":"t","addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/example/evolve"}}}}}}"#
+        );
+        let sig = ed25519_dalek::Signer::sign(&testing::key(), payload.as_bytes());
+        let tok = format!(
+            "{TOKEN_PREFIX}{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        let e = verify_with(&tok, &vk).unwrap();
+        assert!(e.grants("evolve") && !e.grants("trellion_intel"));
+        assert_eq!(e.addons["evolve"].registry, "ghcr.io/example/evolve");
+    }
+
+    /// A malformed block refuses the token here exactly as in the CLI.
+    #[test]
+    fn a_malformed_addon_trust_block_refuses_the_token() {
+        let vk = testing::key().verifying_key();
+        let k: String = testing::key().verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let sign = |block: &str| {
+            let payload = format!(r#"{{"v":1,"sub":"a","tier":"t","features":["evolve"],"iat":1,"exp":0,"id":"t",{block}}}"#);
+            let sig = ed25519_dalek::Signer::sign(&testing::key(), payload.as_bytes());
+            format!(
+                "{TOKEN_PREFIX}{}.{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            )
+        };
+        for (block, want) in [
+            (r#""addons":{"evolve":{"keys":"x","registry":"ghcr.io/x/y"}}"#.to_string(), "payload is not an entitlement"),
+            (r#""addons":{"evolve":{"keys":[],"registry":"ghcr.io/x/y"}}"#.to_string(), "names no signing key"),
+            (r#""addons":{"evolve":{"keys":["zz"],"registry":"ghcr.io/x/y"}}"#.to_string(), "key #0"),
+            (format!(r#""addons":{{"evolve":{{"keys":["{k}"],"registry":"https://ghcr.io/x"}}}}"#), "not a registry root"),
+        ] {
+            let err = verify_with(&sign(&block), &vk).unwrap_err();
+            assert!(err.contains(want), "{block}: {err}");
+        }
     }
 
     #[test]

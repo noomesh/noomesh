@@ -53,7 +53,7 @@ def build_llm_client(
     unregistered backend_type, preserving the historical default) →
     :class:`OllamaClient`. OpenAI-compatible HTTP is the primary extension
     point: registering a new profile with ``api_format="openai"`` makes this
-    factory work for it with no code change (see docs/models/adding-a-backend.md).
+    factory work for it with no code change.
 
     Args:
         base_url: HTTP base URL of the inference server.

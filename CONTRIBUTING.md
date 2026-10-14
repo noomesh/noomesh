@@ -118,12 +118,20 @@ literals that test names, in one commit.
   a doc that names a file that no longer exists gets fixed or removed.
   `python3 scripts/docs-check.py` enforces the index and the links.
 
-## Issues and security
+## Where to go
 
-Use the [bug report](.github/ISSUE_TEMPLATE/bug_report.md) and
-[feature request](.github/ISSUE_TEMPLATE/feature_request.md) templates.
-For a vulnerability, do not open a public issue — follow
-[SECURITY.md](SECURITY.md).
+- **Questions and ideas:** [GitHub Discussions](https://github.com/noomesh/noomesh/discussions).
+  Start there for "how do I", design ideas and anything you are not sure
+  is a bug.
+- **Bugs:** open an [issue](https://github.com/noomesh/noomesh/issues/new/choose)
+  with the [bug report](.github/ISSUE_TEMPLATE/bug_report.md) template;
+  feature requests have their own
+  [template](.github/ISSUE_TEMPLATE/feature_request.md).
+- **Security disclosures:** never a public issue or discussion. Follow
+  [SECURITY.md](SECURITY.md) and email **contact@noomesh.ai**.
+- **Pull requests:** target `dev`; they are rebase-merged (linear history),
+  and CI must be green before review. On your first pull request the CLA
+  bot comments and asks you to sign (see below).
 
 ## Licensing and the CLA
 

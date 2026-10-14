@@ -58,9 +58,12 @@ services:
   # `pull_policy: ${NOO_PULL_POLICY:-build}` and lib-dist exports
   # NOO_PULL_POLICY=missing in dist mode.
 
-  # trellion-intel is NOT here: it is an add-on overlay
-  # that carries its own `pull_policy: missing`, and a dist row for a service
-  # the overlay did not compose would define a bare service with no image.
+  # trellion-intel / noo-evolve are NOT here: they are licensed add-on
+  # overlays with their own `pull_policy: missing`, and a dist row for a
+  # service the overlay did not compose would define a bare service with no
+  # image. Their image is NOO_ADDON_IMAGE_<NAME>, the digest ref the add-on's
+  # own signed lock pins (scripts/lib-dist.sh require_addon_pins); the stack
+  # release publishes no add-on image and the launcher never pulls one.
 
   # whisper / piper are NOT here: the voice add-on is an
   # overlay, the launcher's --no-build makes a dist install pull them, and a

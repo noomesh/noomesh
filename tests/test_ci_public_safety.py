@@ -730,3 +730,107 @@ def test_once_the_switch_is_set_no_step_can_skip_on_probe_failure(job, tmp_path)
 def test_nothing_else_decides_the_trellion_skip_from_the_network(job):
     text = json.dumps(_load("ci.yml")["jobs"][job], default=str)
     assert text.count("git ls-remote") == 1, "only the probe loop touches the network"
+
+
+def test_hub_mirror_off_fails_loud_on_a_public_repository():
+    """The bridge flag cannot become steady state: every job that pulls a Hub
+    image through the mirror refuses to run with it set on the public repository."""
+    jobs = _load("ci.yml")["jobs"]
+    guarded = []
+    for name, job in jobs.items():
+        steps = job.get("steps", [])
+        for i, s in enumerate(steps):
+            if "HUB_MIRROR_OFF" in str(s.get("env", {})):
+                prev = steps[i - 1]
+                cond = str(prev.get("if", ""))
+                assert "github.repository == 'noomesh/noomesh'" in cond and "HUB_MIRROR_OFF" in cond, name
+                assert "exit 1" in prev["run"], name
+                guarded.append(name)
+    assert {"rust-gateway", "sqlx-drift", "noo-cli", "standalone-smoke", "build"} <= set(guarded), guarded
+
+
+DEPENDABOT = REPO / ".github" / "dependabot.yml"
+
+
+def test_every_dependabot_update_targets_dev():
+    """Update PRs go where every PR goes: `dev`. Without a target-branch,
+    Dependabot opens them against the default branch (main), which changes by
+    promotion only."""
+    doc = yaml.safe_load(DEPENDABOT.read_text())
+    assert doc.get("version") == 2
+    updates = doc.get("updates") or []
+    assert updates, "dependabot.yml declares no update entries — the parse found nothing to check"
+    off = [f"{u.get('package-ecosystem')} {u.get('directory')}: {u.get('target-branch')!r}"
+           for u in updates if u.get("target-branch") != "dev"]
+    assert not off, "update entries not targeting dev:\n" + "\n".join(off)
+    ecosystems = {u.get("package-ecosystem") for u in updates}
+    assert {"npm", "pip", "gomod", "cargo", "github-actions"} <= ecosystems, ecosystems
+
+
+def test_every_dependabot_directory_holds_a_manifest():
+    """A directory that names nothing is an entry that silently checks nothing."""
+    manifests = {"npm": ["package.json"], "pip": ["pyproject.toml", "requirements.txt", "setup.py"],
+                 "gomod": ["go.mod"], "cargo": ["Cargo.toml"]}
+    for u in yaml.safe_load(DEPENDABOT.read_text())["updates"]:
+        eco, d = u["package-ecosystem"], REPO / u["directory"].lstrip("/")
+        if eco == "github-actions":
+            assert (REPO / ".github" / "workflows").is_dir()
+            continue
+        assert any((d / m).is_file() for m in manifests[eco]), f"{eco} {u['directory']}: no manifest"
+
+
+# ---- user-visible strings name only paths that exist (followup i16) ----------
+
+_STRING_SCAN_SUFFIXES = {".rs", ".go", ".sh", ".py"}
+_STRING_SCAN_SKIP = {"target", "node_modules", ".git", ".worktrees", "tests"}
+_DOC_PATH = re.compile(r"(?<![\w/.-])(docs/[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.md)\b")
+# scripts/docs-check.py validates an optional internal/proposals/ directory and
+# names it in its own errors; that check only runs where the directory exists.
+_RECORDS_ALLOWED = {"scripts/docs-check.py"}
+_REMOVED_RECORDS = re.compile(
+    r"(?<![\w/.-])internal/(?:followups|compliance|proposals|plans)/[\w.-]+"
+    r"|(?<![\w/.-])internal/[A-Z][A-Z0-9_]+\.md"
+)
+
+
+def _scan_files():
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in _STRING_SCAN_SKIP]
+        for f in files:
+            p = Path(root) / f
+            if p.suffix in _STRING_SCAN_SUFFIXES:
+                yield p
+
+
+def test_user_visible_strings_name_only_existing_paths():
+    """A string an operator can read must not point at a file that is absent.
+
+    Comment-only lines are skipped (harmless); everything else, multi-line
+    strings and shell heredocs included, is checked line by line: a `docs/*.md`
+    reference must exist in the tree and a removed-records path (`internal/
+    followups/...`, `internal/CLI_AUTH_PLAN.md`, ...) is never allowed.
+    """
+    bad = []
+    for p in _scan_files():
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for n, line in enumerate(lines, 1):
+            if line.lstrip().startswith(("//", "#", "*", "///")):
+                continue
+            rel = p.relative_to(REPO)
+            for m in _REMOVED_RECORDS.finditer(line):
+                if str(rel) in _RECORDS_ALLOWED:
+                    continue
+                bad.append(f"{rel}:{n}: removed records path {m.group(0)}")
+            for m in _DOC_PATH.finditer(line):
+                if not (REPO / m.group(1)).exists():
+                    bad.append(f"{rel}:{n}: {m.group(1)} does not exist")
+    assert not bad, "user-visible strings point at missing paths:\n" + "\n".join(bad)
+
+
+def test_path_guard_catches_a_removed_records_path():
+    assert _REMOVED_RECORDS.search('println!("see internal/followups/78-x.md");')
+    assert _REMOVED_RECORDS.search("see internal/CLI_AUTH_PLAN.md")
+    assert not _REMOVED_RECORDS.search("node-agent-go/internal/docker/x.go")

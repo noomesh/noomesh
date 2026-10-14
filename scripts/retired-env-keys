@@ -17,3 +17,7 @@ NOO_LLAMACPP_TLS|every backend door is mTLS unconditionally, and a false value m
 NOO_OLLAMA_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
 NOO_TEI_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
 NOO_RERANKER_TLS|every backend door is mTLS unconditionally, and a false value makes the node agent refuse to start
+NOO_INTEL_IMAGE|a licensed add-on runs only the image its own signed lock pins (addons.lock, written by noo addons upgrade); there is no override
+NOO_EVOLVE_IMAGE|a licensed add-on runs only the image its own signed lock pins (addons.lock, written by noo addons upgrade); there is no override
+NOO_INTEL_IMAGE_PREFIX|the add-on registry comes from the entitlement's add-on trust block, and its images are pinned by digest (noo addons upgrade)
+NOO_EVOLVE_IMAGE_PREFIX|the add-on registry comes from the entitlement's add-on trust block, and its images are pinned by digest (noo addons upgrade)

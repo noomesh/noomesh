@@ -145,6 +145,21 @@ def test_the_mirror_workflow_is_weekly_and_dispatchable() -> None:
     assert "scripts/hub-mirror.py sync --record" in runs
 
 
+def test_hub_login_fails_loud_when_secrets_are_present() -> None:
+    steps = _wf("mirror-hub-images.yml")["jobs"]["mirror"]["steps"]
+    run = next(s["run"] for s in steps if "Docker Hub" in str(s.get("name")))
+    assert "::warning::docker.io login failed" not in run
+    assert "::error::docker.io login failed" in run and "exit 1" in run
+    assert "::notice::" in run
+
+
+def test_images_mirror_is_throttled_and_retries() -> None:
+    wf = _wf("mirror-images.yml")["jobs"]["mirror"]
+    assert wf["strategy"]["max-parallel"] == 3 and wf["strategy"]["fail-fast"] is False
+    copy = next(s["run"] for s in wf["steps"] if "multi-arch manifest copy" in str(s.get("name")))
+    assert "for attempt in 1 2 3 4 5" in copy and "sleep $((20 * attempt))" in copy
+
+
 def test_the_push_trigger_names_the_default_branch_of_both_repos() -> None:
     # The public repo's default branch is main, not dev: a push trigger on
     # dev alone never fires there (only the cron does).
@@ -194,6 +209,13 @@ if a[:3] == ["buildx", "imagetools", "inspect"]:
         print(json.dumps({"linux/amd64": {"created": img["created"], "config": {}}}))
     sys.exit(0)
 if a[:3] == ["buildx", "imagetools", "create"]:
+    flaky = os.environ.get("FAKE_429_TIMES")
+    if flaky:
+        cnt = state_path + ".429"
+        n = int(open(cnt).read()) if os.path.exists(cnt) else 0
+        if n < int(flaky):
+            open(cnt, "w").write(str(n + 1))
+            sys.stderr.write("ERROR: 429 Too Many Requests\nRetry-After: 1\n"); sys.exit(1)
     dst, src = a[a.index("--tag") + 1], a[-1]
     state[dst] = state[src.split("@")[0]] if "@" in src and src.split("@")[0] in state else state[src]
     json.dump(state, open(state_path, "w"))
@@ -245,6 +267,22 @@ def test_sync_copies_a_new_image_and_records_its_digest(registry) -> None:
     assert rc == 0, out
     assert state[DST]["digest"] == D1 and "imagetools create --tag " + DST in log
     assert rec.read_text() == f"library/rust:1-bookworm {D1} 2026-10-01T00:00:00Z\n"
+
+
+def test_sync_retries_a_rate_limited_copy(registry) -> None:
+    rc, out, state, log = registry({SRC: _img(D1, "2026-10-01T00:00:00Z")}, "sync",
+                                   inventory=["library/rust:1-bookworm"],
+                                   FAKE_429_TIMES="2", HUB_MIRROR_BACKOFF="0")
+    assert rc == 0, out
+    assert "rate limited (attempt 2/5)" in out and state[DST]["digest"] == D1
+    assert log.count("imagetools create") == 3
+
+
+def test_sync_gives_up_after_bounded_rate_limit_retries(registry) -> None:
+    rc, out, _, log = registry({SRC: _img(D1, "2026-10-01T00:00:00Z")}, "sync",
+                               inventory=["library/rust:1-bookworm"],
+                               FAKE_429_TIMES="99", HUB_MIRROR_BACKOFF="0")
+    assert rc == 1 and log.count("imagetools create") == 5
 
 
 def test_sync_leaves_an_unchanged_image_alone(registry) -> None:

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# The Rust toolchain every build of this crate uses: a developer's cargo, the
+# containers scripts/cargo-docker.sh starts, and CI. Pinned to the exact
+# version the CI image (rust:1-bookworm) shipped when this file was written,
+# so "clippy clean locally" means "clippy clean in CI". A new Rust release
+# adds lints; take it deliberately: bump this version in all crates together
+# (tests/test_rust_toolchain_pin.py checks they agree), fix what it flags,
+# and merge that as one PR.
+#
+# Inside the rust container rustup honours this file: if the image's moving
+# tag has gone past this version, rustup installs the pinned one.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Issues are for bugs and feature requests; questions go to Discussions and
+# vulnerabilities to SECURITY.md, never a public issue.
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/noomesh/noomesh/discussions
+    about: Ask how to do something, or float an idea, in GitHub Discussions.
+  - name: Security disclosure
+    url: https://github.com/noomesh/noomesh/blob/dev/SECURITY.md
+    about: Report a vulnerability privately (contact@noomesh.ai), not in a public issue.
