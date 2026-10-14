@@ -32,10 +32,11 @@
 #                own build args and package context; a merged
 #                build would keep the parent's args and contexts
 # Overrides:
-#   image / pull_policy missing — its OWN image name. NOO_INTEL_IMAGE_PREFIX points
-#     --dist installs at the image namespace; NOO_INTEL_IMAGE is the
-#     launcher's escape hatch (lib-dist.sh::resolve_intel_image) for a
-#     pinned stack tag that predates the dedicated image. Dist installs never build (pull only).
+#   image / pull_policy missing — its OWN image name, by digest only:
+#     NOO_ADDON_IMAGE_TRELLION_INTEL is exported by the launcher from the
+#     add-on's verified pin (lib-dist.sh::require_addon_pins); unset, the
+#     ref renders as an .invalid sentinel that can never pull. No tag
+#     fallback, no escape hatch. Dist installs never build (pull only).
 #   NOO_WORKER_SURFACES=ml-intel — the surface
 #   NOO_SKIP_MIGRATIONS=1 — the memory Alembic env runs ONLY in the trellion
 #     container; a second runner would race it
@@ -90,9 +91,9 @@ services:
     profiles: !reset []
     ports: !reset []
     # No build recipe here: `extends` would otherwise inherit trellion's build
-    # block, so it is reset. Dev builds of intel use this repo's own
-    # Dockerfile (docker/Dockerfile.trellion-intel) from now on; dist installs
-    # pull only.
+    # block, so it is reset. The intel image is built in its own repo (the
+    # add-on is a puzzle piece: core carries no add-on Dockerfile); installs
+    # pull it by the digest its signed lock names.
     build: !reset null
     # Dist: NOO_ADDON_IMAGE_TRELLION_INTEL, the digest ref the add-on's own
     # signed lock pins for this stack tag. Only scripts/lib-dist.sh
