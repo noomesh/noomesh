@@ -3528,6 +3528,29 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
 /// provisioned before the switch flipped — but the next restart is a
 /// crash-loop, and the launcher now refuses it. This row catches the state an
 /// enable left before a restart makes it an outage.
+/// The `add-on pins` row from `noo addons verify --json`: "N verified (key
+/// #i)" or the first failing add-on and why.
+pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
+    let Some(rows) = v["addons"].as_array() else {
+        return warn("add-on pins", "not read (`noo addons verify` gave no verdict)", Some("noo addons verify".into()));
+    };
+    let bad: Vec<String> = rows
+        .iter()
+        .filter(|r| r["ok"] != true)
+        .map(|r| format!("{}: {}", r["addon"].as_str().unwrap_or("?"), r["problem"].as_str().unwrap_or("not verified")))
+        .collect();
+    if ec != 0 || !bad.is_empty() {
+        let why = if bad.is_empty() { "not verified".to_string() } else { bad.join("; ") };
+        return fail("add-on pins", why, "noo addons upgrade");
+    }
+    let mut keys: Vec<u64> = rows.iter().filter_map(|r| r["key_index"].as_u64()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let keys: Vec<String> = keys.iter().map(|k| format!("#{k}")).collect();
+    let stack = v["stack"].as_str().unwrap_or("?");
+    ok("add-on pins", format!("{} verified for {stack} (key {})", rows.len(), keys.join(", ")))
+}
+
 pub(crate) fn system_credentials_check(missing: Result<Vec<(String, Vec<String>)>, String>) -> Check {
     match missing {
         Ok(m) if m.is_empty() => ok("system credentials", "every enabled system holds its credentials"),
@@ -3704,6 +3727,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         };
         let mut checks = controller_checks(&posture, &keys, &required, (sc, &secrets), &exposure, &strangers, audit_errors, tailnet_missing, entitlement);
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
+        // Licensed add-ons run images pinned by their own signed lock
+        // (`noo addons verify`: offline re-verify, local image, what runs).
+        if licensed_on {
+            let (ec, pins, _) = self_json(g, &["addons", "verify"]);
+            checks.push(addon_pins_check(ec, &pins));
+        }
         let missing: Vec<&str> = MONITORING_LEAVES
             .iter()
             .copied()
@@ -5339,6 +5368,22 @@ mod tests {
             assert!(!r.contains("--push"), "the row suggests a wholesale push: {r}");
         }
         assert!(f.remedy.as_deref().unwrap().starts_with("noo security tailnet policy --merge"));
+    }
+
+    #[test]
+    fn the_addon_pins_row() {
+        let good = serde_json::json!({"stack": "v0.6.0", "verified": 2, "failed": 0, "addons": [
+            {"addon": "trellion_intel", "ok": true, "key_index": 0}, {"addon": "evolve", "ok": true, "key_index": 0}]});
+        let c = addon_pins_check(0, &good);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert_eq!(c.detail, "2 verified for v0.6.0 (key #0)");
+        let bad = serde_json::json!({"stack": "v0.6.0", "addons": [
+            {"addon": "evolve", "ok": false, "problem": "evolve has no pin in addons.lock"}]});
+        let c = addon_pins_check(1, &bad);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("evolve has no pin"), "{c:?}");
+        assert_eq!(c.remedy.as_deref(), Some("noo addons upgrade"));
+        assert_eq!(addon_pins_check(1, &Value::Null).verdict, Verdict::Warn);
     }
 
     /// host8, 2026-10-02: the licence sat in plaintext `.env` (tidy had

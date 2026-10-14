@@ -70,7 +70,6 @@ impl Entitlement {
         self.exp > 0 && now >= self.exp
     }
     /// The trust anchor this licence names for `addon`, if any.
-    #[cfg_attr(not(test), allow(dead_code))] // the controller's lock fetch (i33 N2) is the caller
     pub fn addon_anchor(&self, addon: &str) -> Option<&TrustAnchor> {
         self.addons.get(addon)
     }

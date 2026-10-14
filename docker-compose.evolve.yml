@@ -131,12 +131,11 @@ services:
 
   # One-shot: copy the image's route manifest into evolve-routes, then exit.
   # No network, no secrets, no PKI: it reads a file from its own image.
-  # The SAME image reference as noo-evolve below (override, add-on prefix,
-  # core-prefix fallback): the core registry carries no add-on image, so a
-  # bare core-prefix ref here failed the pull on every evolve-enabled start.
+  # The SAME image reference as noo-evolve below: the pinned add-on image. The
+  # core registry carries no add-on image.
   noo-evolve-routes:
     logging: *default-logging
-    image: ${NOO_EVOLVE_IMAGE:-${NOO_EVOLVE_IMAGE_PREFIX:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}}/evolve:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_EVOLVE:-}}
+    image: ${NOO_ADDON_IMAGE_EVOLVE:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/evolve:${NOO_IMAGE_TAG:-latest}}
     container_name: noo-evolve-routes
     network_mode: none
     restart: "no"
@@ -150,14 +149,13 @@ services:
 
   noo-evolve:
     logging: *default-logging
-    # Same override shape as the trellion-intel overlay: NOO_EVOLVE_IMAGE is the
-    # whole reference (escape hatch), NOO_EVOLVE_IMAGE_PREFIX the namespace (the
-    # add-ons are licensed and live in a private registry that is NOT the core
-    # prefix), and NOO_IMAGE_PREFIX the fallback, which stays REQUIRED here so a
-    # bare `docker compose` still fails loudly. NOO_IMAGE_DIGEST_EVOLVE pins by
-    # digest when the lock (or the operator) supplies one; unset, the tag is used.
-    # scripts/lib-dist.sh::require_addon_images says why when this cannot be pulled.
-    image: ${NOO_EVOLVE_IMAGE:-${NOO_EVOLVE_IMAGE_PREFIX:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}}/evolve:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_EVOLVE:-}}
+    # Same shape as the trellion-intel overlay. Dist: NOO_ADDON_IMAGE_EVOLVE,
+    # the digest ref evolve's own signed lock pins for this stack tag, set only
+    # by scripts/lib-dist.sh require_addon_pins after re-verifying the pin; the
+    # launcher refuses an enabled evolve without it and never pulls it (the CLI
+    # pulled it by digest: noo addons upgrade). The fallback keeps
+    # NOO_IMAGE_PREFIX REQUIRED so a bare `docker compose` still fails loudly.
+    image: ${NOO_ADDON_IMAGE_EVOLVE:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/evolve:${NOO_IMAGE_TAG:-latest}}
     container_name: noo-evolve
     # Every secret arrives as a FILE /run/secrets/<name>
     # from the `secrets:` list below, the environment holding only the

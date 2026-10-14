@@ -19,7 +19,7 @@ name: stack images release
 #
 # The stack release is CORE-ONLY. The licensed add-on images are built and
 # released from the add-ons' OWN private repositories with their own signed
-# lock (not yet available; docs/development/addons.md). Nothing here reads, builds, verifies
+# lock (an OCI artifact in the add-on's package; docs/development/addons.md). Nothing here reads, builds, verifies
 # or locks an add-on image, and the app key reads only trellion and
 # trellion-protocols (the open library the core images are built from).
 

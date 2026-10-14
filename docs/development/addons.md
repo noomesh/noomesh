@@ -596,12 +596,86 @@ workflow has no add-on job, reads no add-on repository, and records no
 add-on image or `source:` row.
 
 A licensed add-on's image is built, pushed and released by the add-on's
-**own** repository, with its **own signed lock**. That per-add-on lock is
-**not yet available**: until it exists, an add-on image is not pinned by
-digest from the stack lock, and an add-on switched on in a `--dist` install
-runs by tag and says it is unpinned.
+**own** repository, with its **own signed lock**. The controller pins each
+licensed add-on by that lock, never by tag.
 
-The overlay (`docker-compose.<addon>.yml`) stays here and names the published
-image; the add-on repo's release is the only thing that must agree with it.
-Add-on images are held in a **private registry**; pulling them needs
-`docker login` with the credentials issued with the add-on's licence.
+### The signed add-on lock
+
+The lock is `addon-lock.json`: compact canonical JSON in the format
+`noo-addon-lock/1`, written and signed by
+`noo security addon-lock sign --out addon-lock.json`, which also writes
+`addon-lock.json.sig` (a `noo-sig1` signature over the exact bytes). Its fields
+are `format`, `addon` (the `addons:` key), `version` (semver), `source_commit`,
+`supports_stack` (exact stack tags), `images` (`name` → `ref@sha256:…`) and,
+for an add-on built `FROM` a stack image, `base` (`{image, digest}`, checked
+against that image's row in the stack's own signed lock). Never re-serialise
+the file: non-canonical bytes are refused.
+
+**Trust anchor.** The licence names whom to trust. The entitlement token
+carries, per add-on,
+`"addons": {"<name>": {"keys": ["<hex ed25519 pubkey>", …], "registry": "<root>"}}`,
+with the current key first, and is issued with
+`--addon <name>=<root>:<key>[,<key>]`. The public tree names no add-on key and
+no add-on registry.
+
+**Where the lock is published.** It is an OCI artifact in the add-on's
+**own registry package**: the `registry` root from the licence (for example
+`ghcr.io/<owner>/<image>`), which is the same package as the image. One
+`read:packages` credential therefore reads both, and it cannot read source.
+
+| | |
+|---|---|
+| Reference | `<root>:stack-<stack tag>`, for example `…:stack-v0.6.0` or `…:stack-v0.6.0-rc.1`; push one tag per entry in `supports_stack` |
+| Manifest | OCI image manifest (`application/vnd.oci.image.manifest.v1+json`) with `artifactType: application/vnd.noomesh.addon-lock.v1` and the empty config (`application/vnd.oci.empty.v1+json`) |
+| Layer 1 | `mediaType: application/vnd.noomesh.addon-lock.v1+json`, annotation `org.opencontainers.image.title: addon-lock.json` |
+| Layer 2 | `mediaType: application/vnd.noomesh.addon-lock.sig.v1`, annotation `org.opencontainers.image.title: addon-lock.json.sig` |
+| Limits | each layer at most 1 MiB; each blob's sha256 is checked against the manifest |
+
+A release publishes it with oras (1.2 or later), run from the directory
+that holds the two files:
+
+```sh
+oras push <root>:stack-v0.6.0 \
+  --artifact-type application/vnd.noomesh.addon-lock.v1 \
+  addon-lock.json:application/vnd.noomesh.addon-lock.v1+json \
+  addon-lock.json.sig:application/vnd.noomesh.addon-lock.sig.v1
+```
+
+The signed content is the authority. The tag is only a lookup, and a newer
+build for the same stack moves it.
+
+**On the controller.** `noo addons enable <name>`, `noo addons upgrade` and
+`noo upgrade --stack` (for the target tag, before anything else moves) run
+the same steps:
+
+1. fetch the artifact over TLS;
+2. verify the signature against the licence's keys;
+3. check that the add-on name matches, that every image is under the root,
+   that the stack tag is listed, that `base` matches the stack lock, and that
+   the version is not a downgrade (allowed only with `--allow-downgrade`);
+4. pull every image by digest through a throwaway docker config holding the
+   store's `NOO_ADDON_REGISTRY_TOKEN`;
+5. cache the lock under `addon-locks/` and write the pin to `addons.lock`,
+   beside `stack.lock`.
+
+A refusal at any step changes nothing. An add-on with no lock for the target
+stack holds the stack roll, and `noo upgrade --check --stack` says which
+add-on holds it.
+
+**At start.** The launcher never pulls an add-on and holds no registry
+credential. `scripts/lib-dist.sh` `require_addon_pins` asks
+`noo addons launch-pins` to re-verify each cached lock offline. It then
+requires each image to be present locally by its digest, and exports
+`NOO_ADDON_IMAGE_<NAME>`: the lock's image name upper-cased, with `-` as `_`.
+Your overlay's `image:` line must read that variable first:
+
+```yaml
+image: ${NOO_ADDON_IMAGE_<NAME>:-${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE_TAG:-latest}}
+```
+
+The fallback is the development build's name and is never used by a dist start.
+`noo addons verify` and `noo cluster verify` (row `add-on pins`) re-check
+three things: the pins, the local images, and what runs.
+
+The overlay (`docker-compose.<addon>.yml`) stays here; the add-on repo's
+release is the only thing that must agree with it.

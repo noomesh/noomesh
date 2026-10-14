@@ -321,6 +321,9 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Err(e) => fail(g.json, ExitCode::Generic, "config", &e, None),
     };
     let features = granted_features();
+    // Signed-lock pins (licensed add-ons only); an unreadable pins file shows
+    // as no pins here — `noo addons verify` is the place that fails on it.
+    let pins = crate::addons::pins::read(&crate::envfile::repo_root()).unwrap_or_default();
 
     if g.json {
         let rows: Vec<_> = ADDON_ROWS
@@ -333,6 +336,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     "effective": resolve(d, r.default_on),
                     "licensed": r.licensed,
                     "granted": r.licensed.is_none_or(|f| grants(&features, f)),
+                    "pin": pins.get(r.key),
                 })
             })
             .collect();
@@ -367,7 +371,11 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             } else {
                 ui::muted("off")
             };
-            vec![r.key.to_string(), declared_cell, effective, licence_cell]
+            let mut row = vec![r.key.to_string(), declared_cell, effective, licence_cell];
+            if r.licensed.is_some() {
+                row.extend(crate::commands::addon_pins::pin_cells(pins.get(r.key)));
+            }
+            row
         })
         .collect();
     print!(
@@ -378,13 +386,18 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 ui::Col::left("declared"),
                 ui::Col::left("effective"),
                 ui::Col::left("licence"),
+                ui::Col::left("version"),
+                ui::Col::left("stack"),
+                ui::Col::left("digest"),
+                ui::Col::left("key"),
             ],
             &rows
         )
     );
     println!();
     ui::guide(&[
-        ("noo addons enable <name>", "declare it on in noomesh.yaml"),
+        ("noo addons enable <name>", "pins a licensed add-on's signed lock, then declares it on"),
+        ("noo addons verify", "re-checks every pin against its signed lock and what runs"),
         ("noo stack restart", "applies it — the switch decides which containers run"),
     ]);
     Ok(0)
@@ -461,7 +474,7 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // data operation, and nothing it needs can be missing.
     let mut enabled_report = None;
     let path = if on {
-        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g }) {
+        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force }) {
             Ok(e) => {
                 let p = e.config.clone();
                 enabled_report = Some(e);

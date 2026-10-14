@@ -139,178 +139,144 @@ require_secrets_floor() {
     return 1
 }
 
-# resolve_intel_image — never let the Intelligent tier strand a pinned stack.
+# ── Licensed add-ons: pinned by their own signed lock, never pulled here ──
 #
-# The trellion-intel service has its own image name since noo-cli 0.3.48
-#, but stack tags before v0.2.6 never built
-# it: a dist install pinned to such a tag with NOO_TRELLION_INTEL_ENABLED=1
-# died at pull ("trellion-intel:v0.2.5: not found") on every start/restart
-# (host8, 2026-09-02). The image is the SAME build as trellion for those
-# tags, so when the dedicated one is absent we point the service at the
-# tag's trellion image via NOO_INTEL_IMAGE and say so, naming the tag.
-# Cheap: an image already present locally short-circuits; otherwise ONE
-# manifest lookup against the registry the pull would hit anyway.
-resolve_intel_image() {
+# The licensed add-ons (trellion-intel, evolve) release from their own
+# repositories with their own signed lock; the stack release carries no add-on
+# row. `noo addons enable|upgrade` and `noo upgrade --stack` fetch that lock
+# from the add-on's registry package, verify it against the entitlement's trust
+# anchor, pull every image BY DIGEST (with the controller's registry token, in a
+# throwaway docker config) and write the pin to `addons.lock` beside
+# `stack.lock`. The launcher only checks: it never pulls an add-on and holds no
+# registry credential.
+#
+# The overlays take their image from NOO_ADDON_IMAGE_<NAME> (the lock's image
+# name upper-cased, `-` as `_`: NOO_ADDON_IMAGE_TRELLION_INTEL,
+# NOO_ADDON_IMAGE_EVOLVE), which only require_addon_pins sets. There is no
+# tag-only path, no prefix fallback and no override variable any more
+# (NOO_INTEL_IMAGE, NOO_EVOLVE_IMAGE and their *_PREFIX twins are retired:
+# scripts/retired-env-keys).
+
+# _addon_noo — the noo binary, through lib-config.sh's noo_bin when it is
+# loaded (it resolves the binary that invoked the launcher), else PATH.
+_addon_noo() {
+    if declare -F noo_bin >/dev/null 2>&1; then noo_bin; else command -v noo; fi
+}
+
+# require_addon_pins — a dist start runs each licensed add-on that is on from
+# the image its signed lock pins for THIS tag, present locally by digest, or it
+# does not start.
+#
+# `noo addons launch-pins <tag> <add-on>...` re-verifies, offline, each cached
+# lock against the installed entitlement, checks it lists the tag and that
+# addons.lock matches it, and answers one line per add-on:
+#   pin <addon> <VAR> <ref@sha256:…>     export VAR=ref once the image is local
+#   refuse <addon> <why>                 REFUSE, naming the add-on and why
+# Unlicensed add-ons (voice, trellion, identity) are not its business and get no
+# line. Every NOO_ADDON_IMAGE_* already in the environment is dropped first, so
+# an .env line or a shell export can never name an add-on image: only a pin
+# that verified here does. The exports are recorded in _ADDON_PINS for
+# dist_assert_addon_refs. REFUSE = return 1; both launchers `|| exit 1` before
+# anything is pulled or recreated.
+_ADDON_PINS=()
+require_addon_pins() {
     [ "${DIST_MODE:-0}" = 1 ] || return 0
-    [ -n "${NOO_INTEL_IMAGE:-}" ] && return 0
-    local prefix="${NOO_INTEL_IMAGE_PREFIX:-${NOO_IMAGE_PREFIX}}"
-    local want="${prefix}/trellion-intel:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_TRELLION_INTEL:-}"
-    # Only an ABSENT image means "this tag predates the dedicated image". A
-    # refused credential or an unreachable registry says nothing about the
-    # tag, and substituting the public trellion image there would run the
-    # licensed tier on an unlicensed build with a note about tag age. Those
-    # fall through untouched; require_addon_images reports them.
-    _addon_probe "$want"
-    case "$_ADDON_PROBE" in
-        present|denied|unreachable) return 0 ;;
-    esac
-    # Absent AND the tag predates v0.2.6 (version-shaped and below it): the
-    # fallback is correct. Absent on a newer or non-version tag means the
-    # add-on is simply not in this registry (a public install), and running the
-    # licensed tier on the public trellion image would hide that, so leave it
-    # for require_addon_images to refuse with the licence message.
-    local _t="${NOO_IMAGE_TAG#stack-}"
-    printf '%s' "$_t" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' || return 0
-    _t="v${_t#v}"; _t="${_t%%-rc.*}"
-    [ "$_t" != v0.2.6 ] && [ "$(printf '%s\nv0.2.6\n' "$_t" | sort -V | head -1)" = "$_t" ] || return 0
-    export NOO_INTEL_IMAGE="${NOO_IMAGE_PREFIX}/trellion:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_TRELLION:-}"
-    echo "◦ trellion-intel: stack tag ${NOO_IMAGE_TAG} has no ${want} — running the Intelligent tier on" >&2
-    echo "  ${NOO_INTEL_IMAGE} for this start (identical build for that tag). Tags ≥ v0.2.6 ship the" >&2
-    echo "  dedicated image: noo upgrade --stack" >&2
-    return 0
-}
-
-# _addon_probe <image-ref> — classify what the registry says about one image.
-# Sets _ADDON_PROBE (one word) and _ADDON_PROBE_LINE (the registry's last line,
-# for the message). Never exits non-zero and never prints.
-#   present     in the local image store, or `docker manifest inspect` succeeded
-#   denied      the registry answered but refused us (unauthorized / forbidden /
-#               denied / no credential): the LICENCE gate on a private package
-#   notfound    the registry answered and has no such image/tag
-#   unreachable no answer (DNS, timeout, refused connection, TLS)
-#   unknown     failed in a way none of the above matches (treated as a failure
-#               by require_addon_images, as "absent" by resolve_intel_image,
-#               which is what it did before this classification existed)
-_addon_probe() {
-    local ref="$1" out
-    _ADDON_PROBE="present"; _ADDON_PROBE_LINE=""
-    if docker image inspect "$ref" >/dev/null 2>&1; then
-        return 0
+    local _v _k _val _on="" _nb _out _kind _addon _rest _var _ref fail=0
+    for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
+    _ADDON_PINS=()
+    while IFS='=' read -r _k _val; do
+        [ "${_val:-}" = 1 ] && _on="${_on} ${_k}"
+    done <<ADDONS
+${NOO_ADDON_MAP:-}
+ADDONS
+    [ -n "$_on" ] || return 0
+    local _tag="${DIST_TAG:-${NOO_IMAGE_TAG:-}}"
+    if ! _nb="$(_addon_noo)" || [ -z "$_nb" ]; then
+        echo "REFUSING: add-ons are on (${_on# }) and no noo CLI was found to verify their signed pins." >&2
+        return 1
     fi
-    if out="$(docker manifest inspect "$ref" 2>&1 >/dev/null)"; then
-        return 0
-    fi
-    _ADDON_PROBE_LINE="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)"
-    case "$(printf '%s' "$out" | tr 'A-Z' 'a-z')" in
-        *unauthorized*|*denied*|*forbidden*|*"authentication required"*|*"401"*|*"403"*|*"requested access"*)
-            _ADDON_PROBE="denied" ;;
-        *"no such manifest"*|*"manifest unknown"*|*"not found"*|*"404"*|*"name unknown"*)
-            _ADDON_PROBE="notfound" ;;
-        *"no such host"*|*timeout*|*"timed out"*|*"connection refused"*|*"network is unreachable"*|*"dial tcp"*|*"tls:"*|*"temporary failure"*|*"i/o timeout"*|*"eof"*)
-            _ADDON_PROBE="unreachable" ;;
-        *)  _ADDON_PROBE="unknown" ;;
-    esac
-    return 0
-}
-
-# _addon_ref <overridevar> <prefixvar> <name> <digestvar> — the reference the
-# overlay will run, computed the way its `image:` line does:
-#   $<overridevar>  else  ${<prefixvar>:-$NOO_IMAGE_PREFIX}/<name>:$NOO_IMAGE_TAG$<digestvar>
-# Echoes it; sets _ADDON_PREFIX to the prefix tried (empty when an override
-# supplied the whole reference). Call it WITHOUT a command substitution if
-# _ADDON_PREFIX is wanted (a subshell loses it); see require_addon_images.
-_addon_ref() {
-    local ov="${!1:-}" pf="${!2:-}" dg="${!4:-}"
-    if [ -n "$ov" ]; then _ADDON_PREFIX=""; _ADDON_REF="$ov"; return 0; fi
-    _ADDON_PREFIX="${pf:-${NOO_IMAGE_PREFIX:-}}"
-    _ADDON_REF="${_ADDON_PREFIX}/${3}:${NOO_IMAGE_TAG:-latest}${dg}"
-}
-
-# require_addon_images — a dist install that turns an add-on on must either be
-# able to pull its image or stop with a message that says what is missing.
-#
-# The add-ons (trellion-intel, evolve) are LICENSED. Their images are private
-# packages; the right to pull one IS the licence gate, and the entitlement
-# itself is checked offline elsewhere. A public install has neither the
-# entitlement nor a login to that registry, and without this check it reaches
-# `compose pull`, retries three times and dies on a bare "pull access denied" /
-# "manifest unknown" that names no add-on and no remedy.
-#
-# Behaviour per input (dist mode only; other modes build from a checkout):
-#   add-on switched off ........ not looked at (absent is not failed).
-#   image already local ........ passes, no registry call. This is also how a
-#                                controller-staged / `docker load`ed image works
-#                                on a box with no registry route.
-#   add-on image NOT in the lock  (NOO_IMAGE_DIGEST_<NAME> empty): the public
-#                                lock carries no add-on rows, so this is the
-#                                normal case, not a failure. The tag is probed
-#                                instead and the start proceeds UNPINNED, with
-#                                one note saying so. It is never silently
-#                                treated as pinned.
-#   prefix unset ............... the prefix tried is the core one, which holds
-#                                no add-on: reported as `notfound`, with the
-#                                NOO_<NAME>_IMAGE_PREFIX remedy. (NOO_IMAGE_PREFIX
-#                                itself is always set by apply_dist_mode.)
-#   registry denied ............ REFUSE. Names the add-on, the image, the prefix,
-#                                that add-ons are licensed and pulled from a private
-#                                registry, and what to do (entitlement + login).
-#   registry unreachable ....... REFUSE with the transport error. Not a licence
-#                                problem and the message must not say it is.
-#   image not found ............ REFUSE: wrong prefix or tag not yet published.
-#   unknown failure ............ REFUSE, quoting the registry's last line.
-# REFUSE = return 1; both launchers `|| exit 1`, before anything is recreated.
-# A probe is one manifest request, the same one the pull would make.
-require_addon_images() {
-    [ "${DIST_MODE:-0}" = 1 ] || return 0
-    local entry name ov pf dg flag fail=0
-    # name|override var|prefix var|digest var|addon_on key
-    for entry in \
-        "trellion-intel|NOO_INTEL_IMAGE|NOO_INTEL_IMAGE_PREFIX|NOO_IMAGE_DIGEST_TRELLION_INTEL|trellion_intel" \
-        "evolve|NOO_EVOLVE_IMAGE|NOO_EVOLVE_IMAGE_PREFIX|NOO_IMAGE_DIGEST_EVOLVE|evolve"; do
-        IFS='|' read -r name ov pf dg flag <<<"$entry"
-        addon_on "$flag" 0 || continue
-        _addon_ref "$ov" "$pf" "$name" "$dg"
-        _addon_probe "$_ADDON_REF"
-        if [ "$_ADDON_PROBE" = present ]; then
-            if [ -z "${!dg:-}" ] && [ -z "${!ov:-}" ]; then
-                echo "◦ ${name} add-on: not in this stack release's signed lock (the core release carries no add-on rows)" >&2
-                echo "  running ${_ADDON_REF} by tag — unpinned and UNVERIFIED: no digest was checked for this image" >&2
-            fi
-            continue
-        fi
-        fail=1
+    # shellcheck disable=SC2086
+    if ! _out="$("$_nb" addons launch-pins "$_tag" $_on 2>&1)"; then
         {
-            echo "REFUSING: the ${name} add-on is switched on but its image cannot be pulled."
-            echo "  image:  ${_ADDON_REF}"
-            if [ -n "$_ADDON_PREFIX" ]; then
-                echo "  prefix: ${_ADDON_PREFIX}   (override: ${pf}; the core prefix NOO_IMAGE_PREFIX is the fallback)"
-            else
-                echo "  source: ${ov} (a full reference you set)"
-            fi
-            case "$_ADDON_PROBE" in
-                denied)
-                    echo "  The registry refused us. Add-ons are licensed and pulled from a PRIVATE registry;"
-                    echo "  the public stack registry does not carry them and the right to pull is the licence."
-                    echo "  Fix:  noo security entitlement install <token>   (no licence: set addons.${flag}: false in noomesh.yaml)"
-                    echo "        docker login <registry of ${pf}>   with the credential your licence came with" ;;
-                notfound)
-                    echo "  The registry has no such image. Add-ons are licensed and are NOT in the public stack"
-                    echo "  registry; either ${pf} is unset or wrong, or this tag has no ${name} build yet."
-                    echo "  Fix:  set ${pf} to your add-on registry, or addons.${flag}: false in noomesh.yaml" ;;
-                unreachable)
-                    echo "  The registry could not be reached (a network or TLS problem, not a licence one)."
-                    echo "  Fix:  check the route to that registry, or load the image locally, then re-run" ;;
-                *)
-                    echo "  The registry check failed in a way this launcher cannot classify."
-                    echo "  Add-ons are licensed and pulled from a private registry; check ${pf} and your login." ;;
-            esac
-            if [ -z "${NOO_ENTITLEMENT:-}" ]; then
-                echo "  No NOO_ENTITLEMENT is visible to the launcher."
-            fi
-            if [ -n "$_ADDON_PROBE_LINE" ]; then echo "  registry said: ${_ADDON_PROBE_LINE}"; fi
+            echo "REFUSING: the add-on pins could not be read (noo addons launch-pins failed):"
+            printf '  %s\n' "$_out"
+            echo "  Fix:  noo addons verify"
         } >&2
-    done
+        return 1
+    fi
+    while read -r _kind _addon _rest; do
+        case "$_kind" in
+            pin)
+                _var="${_rest%% *}"; _ref="${_rest#* }"
+                case "$_var" in NOO_ADDON_IMAGE_*) : ;; *)
+                    echo "REFUSING: noo addons launch-pins named '${_var}' for ${_addon}, not an add-on image variable" >&2
+                    fail=1; continue ;;
+                esac
+                if ! docker image inspect "$_ref" >/dev/null 2>&1; then
+                    {
+                        echo "REFUSING: the ${_addon} add-on is on, and its pinned image is not on this host:"
+                        echo "  image:  ${_ref}"
+                        echo "  The launcher never pulls an add-on; the CLI pulls it by digest with the registry token."
+                        echo "  Fix:  noo addons upgrade ${_addon}"
+                    } >&2
+                    fail=1; continue
+                fi
+                export "${_var}=${_ref}"
+                _ADDON_PINS+=("${_var}=${_ref}") ;;
+            refuse)
+                {
+                    echo "REFUSING: the ${_addon} add-on is on and has no verified pin for ${_tag}:"
+                    echo "  ${_rest}"
+                    echo "  Fix:  noo addons upgrade ${_addon}   (or turn it off: noo addons disable ${_addon})"
+                } >&2
+                fail=1 ;;
+        esac
+    done <<PINS
+$_out
+PINS
     [ "$fail" = 0 ]
+}
+
+# addon_services <compose args> — the services whose image an add-on pin
+# supplies: every service whose `image:` line reads ${NOO_ADDON_IMAGE_…}, in
+# the compose files named by `-f`. Derived from the overlays, so core names no
+# add-on service. The dist pull leaves these out (the launcher never pulls an
+# add-on) and dist_assert_addon_refs holds them to their pins.
+addon_services() {
+    local _prev="" _f
+    for _f in "$@"; do
+        if [ "$_prev" = "-f" ] && [ -f "$_f" ]; then
+            awk '
+                /^services:[[:space:]]*$/ { in_s = 1; next }
+                /^[^[:space:]#]/ { in_s = 0 }
+                in_s && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { svc = $1; sub(/:$/, "", svc) }
+                in_s && /^    image:.*\$\{NOO_ADDON_IMAGE_/ { print svc }
+            ' "$_f"
+        fi
+        _prev="$_f"
+    done | sort -u
+}
+
+# dist_assert_addon_refs <compose args> — every add-on service compose renders
+# must run exactly a pinned reference (one of _ADDON_PINS). Refuses with the
+# service and the ref otherwise: an add-on overlay that resolved to anything
+# but its verified pin must never start.
+dist_assert_addon_refs() {
+    local _svc _ref _p _ok
+    for _svc in $(addon_services "$@"); do
+        _ref="$(docker compose "$@" config --images "$_svc" 2>/dev/null | head -1)" || _ref=""
+        [ -n "$_ref" ] || continue
+        _ok=""
+        for _p in "${_ADDON_PINS[@]+"${_ADDON_PINS[@]}"}"; do
+            [ "${_p#*=}" = "$_ref" ] && _ok=1
+        done
+        if [ -z "$_ok" ]; then
+            echo "ERROR: add-on service ${_svc} would run ${_ref}, which is not its signed pin for ${DIST_TAG:-this tag} - refusing" >&2
+            echo "       Fix:  noo addons upgrade" >&2
+            return 1
+        fi
+    done
+    return 0
 }
 
 # release_image_namespace — the registry namespace release images are PULLED
@@ -466,5 +432,8 @@ dist_assert_pull_refs() {
     done <<REFS
 $_imgs
 REFS
+    # Add-on refs sit outside NOO_IMAGE_PREFIX, so the loop above never sees
+    # them: they are held to their signed pins instead.
+    dist_assert_addon_refs "$@" || return 1
     return 0
 }
