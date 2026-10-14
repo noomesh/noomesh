@@ -3523,11 +3523,6 @@ pub(crate) fn tailnet_merge_missing(j: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// An enabled system (evolve, trellion) whose credentials
-/// are not in the store. Nothing is broken YET — the running gateway
-/// provisioned before the switch flipped — but the next restart is a
-/// crash-loop, and the launcher now refuses it. This row catches the state an
-/// enable left before a restart makes it an outage.
 /// The `add-on pins` row from `noo addons verify --json`: "N verified (key
 /// #i)" or the first failing add-on and why.
 pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
@@ -3551,6 +3546,11 @@ pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
     ok("add-on pins", format!("{} verified for {stack} (key {})", rows.len(), keys.join(", ")))
 }
 
+/// An enabled system (evolve, trellion) whose credentials
+/// are not in the store. Nothing is broken YET — the running gateway
+/// provisioned before the switch flipped — but the next restart is a
+/// crash-loop, and the launcher now refuses it. This row catches the state an
+/// enable left before a restart makes it an outage.
 pub(crate) fn system_credentials_check(missing: Result<Vec<(String, Vec<String>)>, String>) -> Check {
     match missing {
         Ok(m) if m.is_empty() => ok("system credentials", "every enabled system holds its credentials"),
@@ -3729,9 +3729,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(system_credentials_check(crate::commands::systems::store_missing_credentials()));
         // Licensed add-ons run images pinned by their own signed lock
         // (`noo addons verify`: offline re-verify, local image, what runs).
-        if licensed_on {
-            let (ec, pins, _) = self_json(g, &["addons", "verify"]);
-            checks.push(addon_pins_check(ec, &pins));
+        // An unreadable noomesh.yaml is a failed row, never "no add-on on".
+        match crate::addons::licensed_on(&crate::envfile::repo_root()) {
+            Ok(on) if on.is_empty() => {}
+            Ok(_) => {
+                let (ec, pins, _) = self_json(g, &["addons", "verify"]);
+                checks.push(addon_pins_check(ec, &pins));
+            }
+            Err(e) => checks.push(fail("add-on pins", format!("which add-ons are on is unknown: {e}"), "noo addons list")),
         }
         let missing: Vec<&str> = MONITORING_LEAVES
             .iter()

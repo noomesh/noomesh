@@ -26,12 +26,16 @@ use crate::ui;
 use crate::{Globals, Unhandled};
 
 const UPGRADE_USAGE: &str = "usage: noo addons upgrade [<name>...] [--check] [--allow-downgrade]";
+const VERIFY_USAGE: &str = "usage: noo addons verify";
 
 /// The add-ons a verb acts on: the named ones (licensed only), else every
 /// licensed add-on declared on.
 fn targets(g: &Globals, root: &Path, named: &[String]) -> Vec<&'static str> {
     if named.is_empty() {
-        return addons::licensed_addons().filter(|a| addons::declared_on(root, a)).collect();
+        return match addons::licensed_on(root) {
+            Ok(l) => l,
+            Err(e) => fail(g.json, ExitCode::Generic, "config", &format!("{e} — refusing to guess which add-ons are on"), Some("noo addons list")),
+        };
     }
     named
         .iter()
@@ -80,9 +84,15 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(0);
     }
     let stack_lock = resolve::installed_stack_lock(&root, &tag);
-    let cred = addons::lock_fetch::installed_credential();
+    let cred = match addons::lock_fetch::installed_credential() {
+        Ok(c) => c,
+        Err(e) => fail(g.json, ExitCode::Generic, "store_unreadable", &e, Some("noo security secrets audit")),
+    };
     let client = addons::lock_fetch::Client::new(cred.clone());
-    let current = pins::read(&root).unwrap_or_default();
+    let current = match pins::read(&root) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
+    };
     let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client: &client, cred: cred.as_ref() };
     let mut rows = Vec::new();
     let mut failed = 0;
@@ -100,9 +110,9 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     };
                     resolve::fetch_and_check(&client, &anchor, &want)
                 })
-                .map(|(v, _)| (pins::Pin::from_verified(&v, &tag), 0usize))
+                .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock), 0usize))
         } else {
-            addons::prepare(&ctx, addon, &mut resolve::LiveDocker)
+            addons::prepare(&ctx, addon, &mut resolve::LiveDocker::new(&root))
                 .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled)))
         };
         match outcome {
@@ -199,14 +209,27 @@ pub(crate) fn verify_one(
 
 /// `noo addons verify`
 pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    if !args.is_empty() {
-        return Err(Unhandled);
+    match args {
+        [] => {}
+        [h] if h == "--help" || h == "-h" => {
+            println!("{VERIFY_USAGE}");
+            return Ok(0);
+        }
+        _ => fail(g.json, ExitCode::Usage, "usage", &format!("unexpected argument {}", args[0]), Some(VERIFY_USAGE)),
     }
     let root = crate::envfile::repo_root();
     let tag = require_tag(g, &root);
     let list = targets(g, &root, &[]);
-    let mut docker = resolve::LiveDocker;
-    let ps = resolve::Docker::running(&mut docker).unwrap_or_default();
+    let mut docker = resolve::LiveDocker::new(&root);
+    // An unreadable `docker ps` is not "nothing running": fail, do not guess.
+    let ps = if list.is_empty() {
+        Vec::new()
+    } else {
+        match resolve::Docker::running(&mut docker) {
+            Ok(ps) => ps,
+            Err(e) => fail(g.json, ExitCode::Generic, "docker_unreadable", &format!("could not list running containers: {e}"), Some("noo stack status")),
+        }
+    };
     let verdicts: Vec<Verdict> =
         list.iter().map(|a| verify_one(&root, a, &tag, resolve::installed_anchor(a), &mut docker, &ps)).collect();
     let bad = verdicts.iter().filter(|v| v.problem.is_some()).count();

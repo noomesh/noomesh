@@ -25,19 +25,17 @@ pub fn current_tag(root: &Path) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// The licensed add-ons (`ADDON_ROWS` with a licence feature): the only
-/// ones that release from their own repositories with a signed lock.
-pub fn licensed_addons() -> impl Iterator<Item = &'static str> {
-    crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()).map(|r| r.key)
-}
-
-/// Is `addon` declared on in `root`'s noomesh.yaml (its own default when
-/// silent)?
-pub fn declared_on(root: &Path, addon: &str) -> bool {
-    let text = std::fs::read_to_string(root.join("noomesh.yaml")).unwrap_or_default();
-    let declared = crate::commands::addons::declared_in(&text).get(addon).copied();
-    let default_on = crate::commands::addons::row(addon).is_some_and(|r| r.default_on);
-    crate::commands::addons::resolve(declared, default_on)
+/// The licensed add-ons declared on in `root`'s noomesh.yaml (each one's own
+/// default when silent). An unreadable or unparseable file is an error, never
+/// "no add-ons": that would skip every hold and every check.
+pub fn licensed_on(root: &Path) -> Result<Vec<&'static str>, String> {
+    let declared = crate::commands::addons::declared_map_at(&root.join("noomesh.yaml"))?;
+    Ok(crate::commands::addons::ADDON_ROWS
+        .iter()
+        .filter(|r| r.licensed.is_some())
+        .filter(|r| crate::commands::addons::resolve(declared.get(r.key).copied(), r.default_on))
+        .map(|r| r.key)
+        .collect())
 }
 
 /// A lock that passed every check and whose images are local, ready to be

@@ -92,7 +92,7 @@ def test_verified_local_pins_are_exported_for_the_overlays(tmp_path):
     assert _exports(r) == {"NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "NOO_ADDON_IMAGE_EVOLVE": EVOLVE_REF}
     asked = (tmp_path / "noo.log").read_text().split()
     assert asked[:3] == ["addons", "launch-pins", "v0.6.0"], asked
-    assert set(asked[3:]) == {"trellion_intel", "evolve"}, "only add-ons that are on are asked about"
+    assert set(asked[3:]) == {"trellion", "trellion_intel", "evolve"}, "only composed add-ons are asked about"
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull or log in"
 
 
@@ -163,20 +163,67 @@ def test_rendered_addon_refs_must_be_their_pins(tmp_path):
     # A fake compose that renders the add-on service's image from the env.
     fake = """#!/bin/sh
 if [ "$1" = "compose" ] ; then
-  case "$*" in *"config --images trellion-intel"*) echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-ghcr.io/noomesh/trellion-intel:v0.6.0}" ;; esac
+  case "$*" in *"config --images trellion-intel"*) [ -n "$FAKE_RENDER_FAIL" ] && exit 1; echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}" ;; esac
   exit 0
 fi
 exit 0
 """
     _bin(tmp_path, "docker", fake)
     body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}\"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml"
-    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0"}
+    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1"}
     ok = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF},
                         capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr
     bad = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
     assert bad.returncode == 1
-    assert "trellion-intel would run ghcr.io/noomesh/trellion-intel:v0.6.0" in bad.stderr
+    assert "trellion-intel would run noo-addon-unpinned.invalid/trellion-intel" in bad.stderr
+    # compose cannot render the ref: a refusal, never a skip.
+    broken = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "FAKE_RENDER_FAIL": "1"},
+                            capture_output=True, text=True)
+    assert broken.returncode == 1 and "could not render" in broken.stderr, broken.stderr
+
+
+def test_a_lock_image_name_the_overlay_does_not_read_is_refused(tmp_path):
+    # The lock calls the image `noo-evolve`, so the pin is exported as
+    # NOO_ADDON_IMAGE_NOO_EVOLVE; the overlay reads NOO_ADDON_IMAGE_EVOLVE and
+    # would render its unpinned sentinel. Refused, naming the variable.
+    r = _run(tmp_path, SHOW, MAP="trellion=0\nevolve=1\n",
+             FAKE_PINS=f"pin evolve NOO_ADDON_IMAGE_NOO_EVOLVE {EVOLVE_REF}\\n")
+    assert r.returncode == 1, r.stderr
+    assert "runs ${NOO_ADDON_IMAGE_EVOLVE}, and no verified pin supplies it" in r.stderr
+
+
+def test_core_only_gates_exactly_what_is_composed(tmp_path):
+    # --core-only defers evolve and trellion_intel: their overlays are not
+    # composed, so a declared-but-unpinned add-on does not refuse the start.
+    r = _run(tmp_path, SHOW, CORE_ONLY="true", FAKE_PINS="refuse evolve nope\\n")
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "noo.log").exists()
+
+
+def test_a_dev_start_runs_the_dev_build_names(tmp_path):
+    r = _run(tmp_path, SHOW, DIST_MODE="0", NOO_IMAGE_PREFIX="noomesh", NOO_IMAGE_TAG="latest",
+             NOO_ADDON_IMAGE_EVOLVE="mine/evolve:x")
+    assert r.returncode == 0, r.stderr
+    assert _exports(r) == {"NOO_ADDON_IMAGE_EVOLVE": "noomesh/evolve:latest",
+                           "NOO_ADDON_IMAGE_TRELLION_INTEL": "noomesh/trellion-intel:latest"}
+    assert not (tmp_path / "noo.log").exists(), "a dev start verifies nothing and asks the CLI nothing"
+
+
+def test_restart_gates_and_asserts_before_it_recreates():
+    """noomesh-restart.sh runs require_addon_pins after its env loaders and
+    dist_assert_addon_refs once COMPOSE_FILES is known, both before any `up`;
+    noomesh-start.sh asserts after COMPOSE_FILES whether or not it pulls."""
+    restart = (REPO / "scripts/noomesh-restart.sh").read_text()
+    pins = restart.index("require_addon_pins || exit 1")
+    files = restart.index('COMPOSE_FILES="$(compose_file_args .)"')
+    asserted = restart.index("dist_assert_addon_refs $COMPOSE_FILES || exit 1")
+    first_up = restart.index(" up -d")
+    assert restart.index("load_secrets ||") < pins < files < asserted < first_up
+    start = (REPO / "scripts/noomesh-start.sh").read_text()
+    files = start.index('COMPOSE_FILES="$(compose_file_args .)"')
+    asserted = start.index("dist_assert_addon_refs $COMPOSE_FILES || exit 1")
+    assert files < asserted < start.index('if [ "$PULL" = true ]; then')
 
 
 def test_evolve_routes_runs_the_same_image_as_evolve():

@@ -245,13 +245,21 @@ pub fn installed_grants(feature: &str, now: i64) -> Result<Entitlement, String> 
 /// The token installed on this controller, if any: the sops store when
 /// that backend is active, else `.env`. Values never leave the process.
 pub fn installed_token() -> Option<String> {
+    installed_token_checked().ok().flatten()
+}
+
+/// [`installed_token`], but a store that cannot be decrypted is an error,
+/// never "no entitlement installed": the remedy is the age key, not a token.
+pub fn installed_token_checked() -> Result<Option<String>, String> {
     let root = crate::envfile::repo_root();
     if crate::envfile::sops_backend_active() {
-        let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops")).ok()?;
-        return store.get(STORE_KEY).map(str::to_string).filter(|s| !s.trim().is_empty());
+        let path = root.join("secrets/env.sops");
+        let store = crate::commands::secrets::SecretStore::load_sops(&path)
+            .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+        return Ok(store.get(STORE_KEY).map(str::to_string).filter(|s| !s.trim().is_empty()));
     }
     let v = crate::onboard::env::read_env_key(&root.join(".env"), STORE_KEY);
-    if v.trim().is_empty() { None } else { Some(v) }
+    Ok(if v.trim().is_empty() { None } else { Some(v) })
 }
 
 #[cfg(test)]

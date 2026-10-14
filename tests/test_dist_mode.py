@@ -128,6 +128,8 @@ def test_every_addon_overlay_image_is_published() -> None:
     only by scripts/lib-dist.sh require_addon_pins, and names no stack-release
     image. (Since an earlier change the dist overlay has no rows for these
     services, so the guarantee lives here.)"""
+    import re
+
     from tests._compose_projection import ADDON_OVERLAYS, load_raw, untag
     published = _core_published_images()
     checked = pinned = 0
@@ -137,11 +139,10 @@ def test_every_addon_overlay_image_is_published() -> None:
             if not ref:
                 continue
             if "NOO_ADDON_IMAGE_" in ref:
-                image = _image_basename(ref.split(":-", 1)[1])
-                assert image in ADDON_IMAGES, f"{name}: {svc_name!r} is pin-sourced but names {image!r}"
-                assert ref.startswith("${NOO_ADDON_IMAGE_" + image.upper().replace("-", "_") + ":-"), (
-                    f"{name}: {svc_name!r} must take NOO_ADDON_IMAGE_<NAME> first: {ref}")
-                assert "NOO_IMAGE_DIGEST_" not in ref, f"{name}: an add-on is never pinned by the stack lock: {ref}"
+                m = re.fullmatch(r"\$\{(NOO_ADDON_IMAGE_[A-Z0-9_]+):-noo-addon-unpinned\.invalid/([a-z0-9-]+):run-noo-addons-upgrade\}", ref)
+                assert m, f"{name}: {svc_name!r} must read its pin with only the .invalid sentinel as fallback: {ref}"
+                assert m.group(2) in ADDON_IMAGES, f"{name}: {svc_name!r} is pin-sourced but names {m.group(2)!r}"
+                assert m.group(1) == "NOO_ADDON_IMAGE_" + m.group(2).upper().replace("-", "_"), ref
                 pinned += 1
                 continue
             if "NOO_IMAGE_PREFIX" not in ref:
@@ -409,15 +410,14 @@ EVOLVE_OVERLAY = REPO_ROOT / "docker-compose.evolve.yml"
 def test_the_evolve_overlay_runs_the_pinned_image_and_builds_nothing() -> None:
     svc = _load(EVOLVE_OVERLAY)["services"]["noo-evolve"]
     assert "build" not in svc, "the dist overlay must not need a checkout to build from"
-    assert svc["image"].startswith("${NOO_ADDON_IMAGE_EVOLVE:-"), "run the add-on's signed pin"
-    assert _image_basename(svc["image"].split(":-", 1)[1]) == "evolve"
+    assert svc["image"] == "${NOO_ADDON_IMAGE_EVOLVE:-noo-addon-unpinned.invalid/evolve:run-noo-addons-upgrade}"
 
 
 def test_evolve_and_intel_overlays_resolve_their_image_the_same_way() -> None:
-    """Both licensed add-ons: the pin (NOO_ADDON_IMAGE_<NAME>) first, then the
-    dev name. No override variable, no add-on prefix, no stack-lock digest."""
-    import re
-
+    """Both licensed add-ons: the pin (NOO_ADDON_IMAGE_<NAME>) and nothing
+    else. No tag fallback, no override variable, no add-on prefix, no
+    stack-lock digest: unset, the ref is a sentinel under the reserved
+    `.invalid` domain, which can never be pulled or exist locally."""
     from tests._compose_projection import load_raw, untag
 
     intel = untag(load_raw(REPO_ROOT / "docker-compose.trellion-intel.yml"))["services"]["trellion-intel"]["image"]
@@ -426,10 +426,7 @@ def test_evolve_and_intel_overlays_resolve_their_image_the_same_way() -> None:
         (intel, "NOO_ADDON_IMAGE_TRELLION_INTEL", "trellion-intel"),
         (evolve, "NOO_ADDON_IMAGE_EVOLVE", "evolve"),
     ):
-        assert ref.startswith("${" + var + ":-${NOO_IMAGE_PREFIX"), ref
-        assert re.search(r"\}/" + re.escape(name) + r":\$\{NOO_IMAGE_TAG:-latest\}\}$", ref), ref
-        for retired in ("NOO_INTEL_IMAGE", "NOO_EVOLVE_IMAGE", "NOO_IMAGE_DIGEST_"):
-            assert retired not in ref, ref
+        assert ref == "${" + var + ":-noo-addon-unpinned.invalid/" + name + ":run-noo-addons-upgrade}", ref
 
 
 def test_the_stack_lock_does_not_wait_for_an_addon_image() -> None:

@@ -555,6 +555,9 @@ if [ -n "${DIST_TAG:-}" ]; then
     # recreated. The launcher never pulls an add-on. Off add-ons are not
     # looked at.
     DIST_MODE=1 require_addon_pins || exit 1
+else
+    # A dev start: composed add-on overlays run the dev build's names.
+    DIST_MODE=0 require_addon_pins || exit 1
 fi
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$SCRIPT_DIR/lib-created-guard.sh"
@@ -765,6 +768,12 @@ docker run --rm -v \"\$PWD/noomesh.yaml\":/f alpine sh -c 'chgrp 65532 /f && chm
 # override, add-on overlays, then dist last so pinned image refs win.
 . "$(dirname "$0")/lib-compose.sh"
 COMPOSE_FILES="$(compose_file_args .)"
+# Every add-on service compose renders must run exactly its verified pin,
+# whether or not this start pulls (empty render = refusal). Dist only.
+if [ -n "${DIST_TAG:-}" ]; then
+    # shellcheck disable=SC2086
+    DIST_MODE=1 dist_assert_addon_refs $COMPOSE_FILES || exit 1
+fi
 # Before the pull loop (and every later `docker compose`): no v2 plugin is a
 # prerequisite failure, not a pull failure — exit, never retry.
 require_compose_v2 || exit 1

@@ -163,36 +163,74 @@ _addon_noo() {
     if declare -F noo_bin >/dev/null 2>&1; then noo_bin; else command -v noo; fi
 }
 
-# require_addon_pins — a dist start runs each licensed add-on that is on from
-# the image its signed lock pins for THIS tag, present locally by digest, or it
-# does not start.
+# addon_image_vars <compose args> — the NOO_ADDON_IMAGE_* variables the
+# composed overlays (the files named by `-f`) read in an `image:` line. Derived
+# from the overlays, so core names no add-on image.
+addon_image_vars() {
+    local _prev="" _f
+    for _f in "$@"; do
+        if [ "$_prev" = "-f" ] && [ -f "$_f" ]; then
+            grep -oE '^    image:[[:space:]]*\$\{NOO_ADDON_IMAGE_[A-Z0-9_]+' "$_f" | sed 's/.*\${//'
+        fi
+        _prev="$_f"
+    done | sort -u
+}
+
+# _addon_composed_names — the add-on keys whose overlay is composed (the same
+# addon_on decisions addon_compose_overlay_args makes, --core-only included).
+_addon_composed_names() {
+    local _n _d
+    for _n in trellion:1 voice:0 trellion_intel:0 evolve:0; do
+        _d="${_n#*:}"; _n="${_n%%:*}"
+        addon_on "$_n" "$_d" && printf '%s\n' "$_n"
+    done
+    return 0
+}
+
+# require_addon_pins — a start or restart runs each composed licensed add-on
+# overlay from the image its signed lock pins for THIS tag, present locally by
+# digest, or it does not start.
 #
-# `noo addons launch-pins <tag> <add-on>...` re-verifies, offline, each cached
-# lock against the installed entitlement, checks it lists the tag and that
-# addons.lock matches it, and answers one line per add-on:
+# The set looked at is exactly what is composed (addon_compose_overlay_args:
+# addon_on, so `--core-only` defers the same add-ons it leaves out of the file
+# list). Every NOO_ADDON_IMAGE_* already in the environment is dropped first,
+# so an .env line or a shell export can never name an add-on image.
+#
+# Dist: `noo addons launch-pins <tag> <add-on>...` re-verifies, offline, each
+# cached lock against the installed entitlement and answers one line per
+# licensed add-on:
 #   pin <addon> <VAR> <ref@sha256:…>     export VAR=ref once the image is local
 #   refuse <addon> <why>                 REFUSE, naming the add-on and why
-# Unlicensed add-ons (voice, trellion, identity) are not its business and get no
-# line. Every NOO_ADDON_IMAGE_* already in the environment is dropped first, so
-# an .env line or a shell export can never name an add-on image: only a pin
-# that verified here does. The exports are recorded in _ADDON_PINS for
-# dist_assert_addon_refs. REFUSE = return 1; both launchers `|| exit 1` before
-# anything is pulled or recreated.
+# Then every variable the composed overlays read must have been exported from
+# a pin: a lock whose image name maps to another variable (the overlay would
+# render its unpinned sentinel) is refused here, by name. The exports are
+# recorded in _ADDON_PINS for dist_assert_addon_refs.
+#
+# Dev (not dist): each variable the composed overlays read is set to the dev
+# build's name, `${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE_TAG:-latest}`.
+#
+# REFUSE = return 1; both launchers `|| exit 1` before anything is pulled or
+# recreated.
 _ADDON_PINS=()
 require_addon_pins() {
-    [ "${DIST_MODE:-0}" = 1 ] || return 0
-    local _v _k _val _on="" _nb _out _kind _addon _rest _var _ref fail=0
+    local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
     _ADDON_PINS=()
-    while IFS='=' read -r _k _val; do
-        [ "${_val:-}" = 1 ] && _on="${_on} ${_k}"
-    done <<ADDONS
-${NOO_ADDON_MAP:-}
-ADDONS
-    [ -n "$_on" ] || return 0
+    _args="$(addon_compose_overlay_args)"
+    # shellcheck disable=SC2086
+    _vars="$(addon_image_vars $_args)"
+    [ -n "$_vars" ] || return 0
+    if [ "${DIST_MODE:-0}" != 1 ]; then
+        for _v in $_vars; do
+            _name="$(printf '%s' "${_v#NOO_ADDON_IMAGE_}" | tr 'A-Z_' 'a-z-')"
+            export "${_v}=${NOO_IMAGE_PREFIX:-$(local_image_namespace)}/${_name}:${NOO_IMAGE_TAG:-latest}"
+        done
+        return 0
+    fi
+    _on="$(_addon_composed_names | tr '\n' ' ')"
     local _tag="${DIST_TAG:-${NOO_IMAGE_TAG:-}}"
     if ! _nb="$(_addon_noo)" || [ -z "$_nb" ]; then
-        echo "REFUSING: add-ons are on (${_on# }) and no noo CLI was found to verify their signed pins." >&2
+        echo "REFUSING: add-on overlays are composed (${_on% }) and no noo CLI was found to verify their signed pins." >&2
         return 1
     fi
     # shellcheck disable=SC2086
@@ -234,6 +272,18 @@ ADDONS
     done <<PINS
 $_out
 PINS
+    [ "$fail" = 0 ] || return 1
+    for _v in $_vars; do
+        if [ -z "${!_v:-}" ]; then
+            {
+                echo "REFUSING: a composed add-on overlay runs \${${_v}}, and no verified pin supplies it."
+                echo "  The add-on's signed lock names its image differently from the overlay, or the add-on"
+                echo "  is not licensed on this install. The overlay would render its unpinned sentinel."
+                echo "  Fix:  noo addons verify"
+            } >&2
+            fail=1
+        fi
+    done
     [ "$fail" = 0 ]
 }
 
@@ -257,15 +307,22 @@ addon_services() {
     done | sort -u
 }
 
-# dist_assert_addon_refs <compose args> — every add-on service compose renders
-# must run exactly a pinned reference (one of _ADDON_PINS). Refuses with the
-# service and the ref otherwise: an add-on overlay that resolved to anything
-# but its verified pin must never start.
+# dist_assert_addon_refs <compose args> — in dist mode, every add-on service
+# compose renders must run exactly a pinned reference (one of _ADDON_PINS).
+# Refuses with the service and the ref otherwise, and when compose cannot
+# render the ref at all: an add-on overlay that resolved to anything but its
+# verified pin must never start. Both launchers call it once COMPOSE_FILES is
+# known, whether or not they pull.
 dist_assert_addon_refs() {
+    [ "${DIST_MODE:-0}" = 1 ] || return 0
     local _svc _ref _p _ok
     for _svc in $(addon_services "$@"); do
         _ref="$(docker compose "$@" config --images "$_svc" 2>/dev/null | head -1)" || _ref=""
-        [ -n "$_ref" ] || continue
+        if [ -z "$_ref" ]; then
+            echo "ERROR: compose could not render the image of add-on service ${_svc} - refusing to start it unverified" >&2
+            echo "       Fix:  noo addons verify" >&2
+            return 1
+        fi
         _ok=""
         for _p in "${_ADDON_PINS[@]+"${_ADDON_PINS[@]}"}"; do
             [ "${_p#*=}" = "$_ref" ] && _ok=1
