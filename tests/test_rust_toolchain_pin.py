@@ -70,3 +70,25 @@ def test_clippy_precedes_every_other_cargo_step(job):
     assert "-D warnings" in steps[clippy[0]]["run"]
     earlier = [s.get("name") for i, s in cargo if i < clippy[0]]
     assert not earlier, f"{job}: cargo steps run before clippy: {earlier}"
+
+
+def _release_matrix_targets(job: str) -> set[str]:
+    doc = yaml.safe_load((REPO / ".github/workflows/noo-cli-release.yml").read_text())
+    return {e["target"] for e in doc["jobs"][job]["strategy"]["matrix"]["include"]}
+
+
+@pytest.mark.parametrize(
+    "crate,job", [("noo-cli", "build"), ("gateway-rust", "gateway")]
+)
+def test_every_release_target_is_in_the_pinned_toolchain(crate, job):
+    # The pin switches cargo to its own toolchain; targets rustup-added to the
+    # runner's default toolchain are invisible to it (E0463 on rc.2).
+    want = _release_matrix_targets(job)
+    have = set(_pin(crate).get("targets", []))
+    assert want <= have, f"{crate}: rust-toolchain.toml targets lack {sorted(want - have)}"
+
+
+def test_rustup_target_add_runs_inside_the_crate_dir():
+    text = (REPO / ".github/workflows/noo-cli-release.yml").read_text()
+    for m in re.finditer(r"^\s*(.*rustup target add .*)$", text, re.M):
+        assert re.match(r"\(cd (noo-cli|gateway-rust) && rustup target add ", m[1]), m[1]

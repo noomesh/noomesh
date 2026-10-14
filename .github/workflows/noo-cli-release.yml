@@ -282,11 +282,11 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           case "${{ matrix.kind }}" in
             gnu-host)
-              rustup target add x86_64-unknown-linux-gnu
+              (cd noo-cli && rustup target add x86_64-unknown-linux-gnu)
               (cd noo-cli && cargo build --release --locked --target x86_64-unknown-linux-gnu)
               ;;
             darwin-host)
-              rustup target add aarch64-apple-darwin
+              (cd noo-cli && rustup target add aarch64-apple-darwin)
               (cd noo-cli && cargo build --release --locked --target aarch64-apple-darwin)
               cp "noo-cli/target/aarch64-apple-darwin/release/noo" "dist/noo-${{ matrix.target }}"
               # The linux release-job smoke can't exec Mach-O — smoke HERE,
@@ -298,7 +298,7 @@ jobs:
               # sudo and lacks the cross gcc).
               command -v aarch64-linux-gnu-gcc >/dev/null \
                 || { sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu; }
-              rustup target add aarch64-unknown-linux-gnu
+              (cd noo-cli && rustup target add aarch64-unknown-linux-gnu)
               (cd noo-cli && \
                 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
                 CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
@@ -337,7 +337,7 @@ jobs:
               }
               export PATH="$HOME/.local/bin:$PATH"
               cargo-zigbuild --version
-              rustup target add aarch64-unknown-linux-musl
+              (cd noo-cli && rustup target add aarch64-unknown-linux-musl)
               (cd noo-cli && NOO_STACK_TAG="${NOO_STACK_TAG:-}" \
                 cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
               cp "noo-cli/target/aarch64-unknown-linux-musl/release/noo" "dist/noo-${{ matrix.target }}"
@@ -538,13 +538,13 @@ jobs:
               # Same rule as the gnu-cross lane: install only when missing.
               command -v cmake >/dev/null \
                 || { sudo apt-get update -q && sudo apt-get install -y -q cmake; }
-              rustup target add aarch64-unknown-linux-musl
+              (cd gateway-rust && rustup target add aarch64-unknown-linux-musl)
               (cd gateway-rust && SQLX_OFFLINE=true \
                 cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
               cp "gateway-rust/target/aarch64-unknown-linux-musl/release/noo-gateway" "dist/noo-gateway-${{ matrix.target }}"
               ;;
             darwin-host)
-              rustup target add aarch64-apple-darwin
+              (cd gateway-rust && rustup target add aarch64-apple-darwin)
               (cd gateway-rust && cargo build --release --locked --target aarch64-apple-darwin)
               cp "gateway-rust/target/aarch64-apple-darwin/release/noo-gateway" "dist/noo-gateway-${{ matrix.target }}"
               ;;
