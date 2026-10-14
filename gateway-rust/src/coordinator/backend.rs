@@ -747,7 +747,7 @@ pub async fn resolve_backend_for_model(state: &AppState, requested_model: Option
 /// Cached briefly — this sits on the inference hot path and roles change at
 /// operator speed, not request speed. A stale entry costs at most one
 /// CACHE_TTL window of the old routing behaviour.
-async fn non_chat_backends(state: &AppState) -> Result<HashSet<(String, String)>> {
+pub(crate) async fn non_chat_backends(state: &AppState) -> Result<HashSet<(String, String)>> {
     const CACHE_TTL: Duration = Duration::from_secs(30);
     static CACHE: OnceLock<Mutex<Option<(Instant, HashSet<(String, String)>)>>> = OnceLock::new();
 

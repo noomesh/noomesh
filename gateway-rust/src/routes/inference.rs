@@ -310,7 +310,7 @@ async fn native_inference(
     let mut node_from_model = false;
     if node_pin.is_none() {
         if let Some(m) = req.model.as_deref() {
-            if node_inference_backend(&state, m).await.is_some() {
+            if node_chat_backend(&state, m).await.is_node() {
                 tracing::info!(node = %m, "model_field_matched_node_id_treating_as_pin");
                 node_pin = Some(m.to_string());
                 node_from_model = true;
@@ -321,10 +321,17 @@ async fn native_inference(
         // Resolve the node's inference backend INCLUDING the controller (self).
         // gossip.alive_peers() excludes self, so `--node HOST3` (the controller)
         // used to 404 even though it runs vllm/embedding locally.
-        // node_inference_backend() falls back to the mesh_nodes KV (every node).
-        let (backend_type, model_name, base_url) = match node_inference_backend(&state, node_id).await {
-            Some(t) => t,
-            None => return (StatusCode::NOT_FOUND, Json(json!({
+        // node_chat_backend() reads the mesh_nodes KV (every node).
+        let (backend_type, model_name, base_url) = match node_chat_backend(&state, node_id).await {
+            NodeChat::Serves(bt, m, url) => (bt, m, url),
+            // Refused BEFORE dispatch: the node is there, it just serves no chat.
+            NodeChat::NoChat(msg) => return (NO_CHAT_STATUS, Json(json!({
+                "success": false,
+                "error": msg,
+                "code": "node_serves_no_chat",
+                "node": node_id,
+            }))).into_response(),
+            NodeChat::Unknown => return (StatusCode::NOT_FOUND, Json(json!({
                 "success": false,
                 "error": format!("node '{}' not found or has no inference backend", node_id),
             }))).into_response(),
@@ -347,6 +354,14 @@ async fn native_inference(
                     "engine": "rust",
                     "pinned": true,
                 },
+            }))).into_response(),
+            Err(e) if backend_cannot_chat(&e) => (NO_CHAT_STATUS, Json(json!({
+                "success": false,
+                "error": no_chat_refusal(node_id, &[(backend_type.clone(), model.clone())], &[]),
+                "code": "node_serves_no_chat",
+                "node": node_id,
+                "backend": backend_type,
+                "detail": e,
             }))).into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({
                 "success": false,
@@ -584,10 +599,6 @@ async fn proxy_ollama_version(State(state): State<Arc<AppState>>) -> impl IntoRe
     proxy_backend_health(&state, "ollama", "/api/version").await
 }
 
-/// Resolve a named node's first inference backend (vllm > ollama > llamacpp),
-/// INCLUDING the controller (self) which gossip.alive_peers() excludes. Returns
-/// (backend_type, model, node_agent_base_url). Gossip first (live), then the
-/// authoritative mesh_nodes KV (matches on node id or hostname).
 /// Single-turn chat completion against a specific node's backend.
 ///
 /// Extracted from the node-pinned branch of `native_inference` so the native
@@ -636,42 +647,132 @@ pub(crate) async fn chat_completion_on_node(
     }
 }
 
-pub(crate) async fn node_inference_backend(state: &AppState, node_id: &str) -> Option<(String, String, String)> {
+/// What a pinned chat can get from a named node.
+#[derive(Debug, PartialEq)]
+pub(crate) enum NodeChat {
+    /// `(backend_type, model, node_agent_base_url)` — a backend that may serve chat.
+    Serves(String, String, String),
+    /// The node is in the mesh with running backends, but every one is
+    /// placed for a non-chat role (an embedder, a reranker). Dispatching
+    /// anyway was the raw 502 `"harrier" does not support chat` (i69a).
+    /// Carries the refusal, already worded.
+    NoChat(String),
+    /// No such node, or it runs no inference backend at all.
+    Unknown,
+}
+
+impl NodeChat {
+    /// Whether `node_id` named a node at all — for the `model: "<node-id>"`
+    /// leniency, where an embed-only node is still a pin (and is refused).
+    pub(crate) fn is_node(&self) -> bool {
+        !matches!(self, NodeChat::Unknown)
+    }
+}
+
+/// HTTP status for a pin to a node that serves no chat. The request is
+/// wrong, not the backend: 4xx, never the 502 it used to be.
+pub(crate) const NO_CHAT_STATUS: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
+
+/// The node's first chat-capable backend (vllm > ollama > llamacpp), or the
+/// `(backend, model)` pairs it runs when none may serve chat. Pure: the
+/// caller supplies the node's `running_backends` and the declared non-chat
+/// `(node, backend)` set (`coordinator::non_chat_backends`, the one the
+/// resolver already skips with `backend_skipped_non_chat_role`).
+pub(crate) fn pick_chat_backend(
+    node_id: &str,
+    running: &serde_json::Map<String, Value>,
+    non_chat: &std::collections::HashSet<(String, String)>,
+) -> Result<(String, String), Vec<(String, String)>> {
+    let mut skipped = Vec::new();
+    for bt in ["vllm", "ollama", "llamacpp"] {
+        let Some(m) = running.get(bt).and_then(|m| m.as_str()).filter(|m| !m.is_empty()) else { continue };
+        if non_chat.contains(&(node_id.to_string(), bt.to_string())) {
+            skipped.push((bt.to_string(), m.to_string()));
+            continue;
+        }
+        return Ok((bt.to_string(), m.to_string()));
+    }
+    Err(skipped)
+}
+
+/// The refusal for a chat pinned to a node that serves no chat, naming what
+/// it does serve and where to go instead.
+pub(crate) fn no_chat_refusal(node_id: &str, served: &[(String, String)], roles: &[(String, String)]) -> String {
+    let what: Vec<String> = served
+        .iter()
+        .map(|(bt, model)| {
+            let r: Vec<&str> = roles
+                .iter()
+                .filter(|(b, role)| b == bt && role != "chat")
+                .map(|(_, role)| role.as_str())
+                .collect();
+            let r = if r.is_empty() { "a non-chat role".to_string() } else { r.join("+") };
+            format!("{bt} ({model}) for {r}")
+        })
+        .collect();
+    format!(
+        "node '{node_id}' serves no chat: it runs {} — a chat pinned there cannot be answered. \
+         Pin a node that serves chat (`noo cluster status` lists what each node runs), \
+         or drop the node pin and let the cluster choose",
+        what.join(", ")
+    )
+}
+
+/// Resolve a named node's chat backend, INCLUDING the controller (self)
+/// which gossip.alive_peers() excludes. Matches the mesh_nodes KV on node id
+/// or hostname.
+pub(crate) async fn node_chat_backend(state: &AppState, node_id: &str) -> NodeChat {
     // Read the mesh_nodes KV for ALL nodes. We deliberately do NOT use
     // gossip.alive_peers() here: it excludes the controller (self), AND a peer's
     // BackendInfo.url is the backend's advertised address (e.g. the internal
     // `noo-llamacpp:8085`) which is unreachable from the gateway for a remote
     // node. The KV gives ip_address → the node-agent URL (`<ip>:8081`), the same
     // reachable path coordinator::resolve_backend uses, for every node.
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        use tokio_stream::StreamExt;
-        if let Ok(keys) = kv.keys().await {
-            let keys: Vec<String> = keys.filter_map(|k| k.ok()).collect().await;
-            for key in keys {
-                if key == "gateway" { continue; }
-                if let Ok(Some(entry)) = kv.get(&key).await {
-                    if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
-                        let id = data.get("id").and_then(|v| v.as_str()).unwrap_or(key.as_str());
-                        let host = data.get("hostname").and_then(|v| v.as_str()).unwrap_or(key.as_str());
-                        if id != node_id && host != node_id { continue; }
-                        let ip = data.get("ip_address").and_then(|v| v.as_str())
-                            .or_else(|| data.get("ip").and_then(|v| v.as_str())).unwrap_or("");
-                        if ip.is_empty() { continue; }
-                        if let Some(rb) = data.get("running_backends").and_then(|b| b.as_object()) {
-                            for bt in ["vllm", "ollama", "llamacpp"] {
-                                if let Some(m) = rb.get(bt).and_then(|m| m.as_str()) {
-                                    if !m.is_empty() {
-                                        return Some((bt.to_string(), m.to_string(), format!("https://{ip}:8081")));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+    let Ok(kv) = state.js.get_key_value("mesh_nodes").await else { return NodeChat::Unknown };
+    use tokio_stream::StreamExt;
+    let Ok(keys) = kv.keys().await else { return NodeChat::Unknown };
+    let keys: Vec<String> = keys.filter_map(|k| k.ok()).collect().await;
+    for key in keys {
+        if key == "gateway" { continue; }
+        let Ok(Some(entry)) = kv.get(&key).await else { continue };
+        let Ok(data) = serde_json::from_slice::<Value>(&entry) else { continue };
+        let id = data.get("id").and_then(|v| v.as_str()).unwrap_or(key.as_str());
+        let host = data.get("hostname").and_then(|v| v.as_str()).unwrap_or(key.as_str());
+        if id != node_id && host != node_id { continue; }
+        let ip = data.get("ip_address").and_then(|v| v.as_str())
+            .or_else(|| data.get("ip").and_then(|v| v.as_str())).unwrap_or("");
+        if ip.is_empty() { continue; }
+        let Some(rb) = data.get("running_backends").and_then(|b| b.as_object()) else { continue };
+        // The same declared-role set the resolver routes by. Unavailable
+        // (DB down, no cache) is not a reason to refuse a pin: dispatch as
+        // before and let the backend answer.
+        let non_chat = match crate::coordinator::non_chat_backends(state).await {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::warn!(node = %id, error = %e, "pinned_chat_role_check_unavailable");
+                Default::default()
             }
+        };
+        match pick_chat_backend(id, rb, &non_chat) {
+            Ok((bt, m)) => return NodeChat::Serves(bt, m, format!("https://{ip}:8081")),
+            Err(served) if !served.is_empty() => {
+                let roles = crate::repo::cluster::node_running_roles(&state.db, id).await.unwrap_or_default();
+                let msg = no_chat_refusal(id, &served, &roles);
+                tracing::warn!(node = %id, served = ?served, "pinned_chat_refused_node_serves_no_chat");
+                return NodeChat::NoChat(msg);
+            }
+            Err(_) => continue,
         }
     }
-    None
+    NodeChat::Unknown
+}
+
+/// A backend's own "this model cannot chat" answer (ollama:
+/// `"harrier" does not support chat`). The placement table is the first
+/// line; this catches an embedder nobody declared, so the caller still gets
+/// a 4xx naming the node rather than a raw 502.
+pub(crate) fn backend_cannot_chat(err: &str) -> bool {
+    err.contains("does not support chat")
 }
 
 /// Find the node-agent URL for any node running `backend_type`, INCLUDING the
@@ -687,7 +788,7 @@ pub(crate) async fn node_inference_backend(state: &AppState, node_id: &str) -> O
 /// gateway-initiated request, and `proxy_backend_health` attaches a live
 /// cluster-HMAC credential via `with_backend_hint_url`. The address therefore
 /// always comes from the authenticated `mesh_nodes` KV, exactly as the sibling
-/// `node_inference_backend` already does.
+/// `node_chat_backend` already does.
 async fn backend_node_agent_url(state: &AppState, backend_type: &str) -> Option<String> {
     // Gossip supplies a *preference* (lowest load) — an id, not a URL.
     let preferred: Option<String> = state
@@ -1501,5 +1602,90 @@ mod catalogue_tests {
         assert_eq!(m["noo"]["candidates"], 1);
         let text = serde_json::to_string(&m).unwrap();
         assert!(!text.contains("host3") && !text.contains("100.64"), "{text}");
+    }
+}
+
+/// i69a: a chat pinned to an embeddings-only node is refused before
+/// dispatch, naming what the node serves, with a 4xx — not the backend's
+/// raw 502 `"harrier" does not support chat`.
+#[cfg(test)]
+mod pinned_no_chat_tests {
+    use super::{backend_cannot_chat, no_chat_refusal, pick_chat_backend, NodeChat, NO_CHAT_STATUS};
+    use std::collections::HashSet;
+
+    fn running(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    fn non_chat(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs.iter().map(|(n, b)| (n.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn an_embed_only_node_has_no_chat_backend() {
+        // robopi / aserve on 2026-10-14: ollama serving harrier, placed for embed.
+        let rb = running(serde_json::json!({"ollama": "harrier"}));
+        let got = pick_chat_backend("robopi", &rb, &non_chat(&[("robopi", "ollama")]));
+        assert_eq!(got, Err(vec![("ollama".to_string(), "harrier".to_string())]));
+    }
+
+    #[test]
+    fn a_chat_backend_behind_an_embedder_is_still_found() {
+        // vllm > ollama > llamacpp: the embedder used to win by order alone.
+        let rb = running(serde_json::json!({"ollama": "harrier", "llamacpp": "gemma-4-E2B"}));
+        let got = pick_chat_backend("robopi", &rb, &non_chat(&[("robopi", "ollama")]));
+        assert_eq!(got, Ok(("llamacpp".to_string(), "gemma-4-E2B".to_string())));
+    }
+
+    #[test]
+    fn the_role_set_is_per_node() {
+        // Another node's embed placement does not make this node's ollama non-chat.
+        let rb = running(serde_json::json!({"ollama": "llama3.2:3b"}));
+        let got = pick_chat_backend("host9", &rb, &non_chat(&[("robopi", "ollama")]));
+        assert_eq!(got, Ok(("ollama".to_string(), "llama3.2:3b".to_string())));
+    }
+
+    #[test]
+    fn no_backends_is_not_a_no_chat_refusal() {
+        let got = pick_chat_backend("x", &running(serde_json::json!({"ollama": ""})), &HashSet::new());
+        assert_eq!(got, Err(vec![]));
+    }
+
+    #[test]
+    fn the_refusal_names_the_node_its_roles_and_the_way_out() {
+        let msg = no_chat_refusal(
+            "robopi",
+            &[("ollama".into(), "harrier".into())],
+            &[("ollama".into(), "embed".into())],
+        );
+        assert!(msg.contains("node 'robopi' serves no chat"), "{msg}");
+        assert!(msg.contains("ollama (harrier) for embed"), "{msg}");
+        assert!(msg.contains("noo cluster status"), "{msg}");
+        // Unknown role still reads as a sentence.
+        let msg = no_chat_refusal("aserve", &[("ollama".into(), "harrier".into())], &[]);
+        assert!(msg.contains("for a non-chat role"), "{msg}");
+    }
+
+    #[test]
+    fn the_refusal_is_a_client_error() {
+        assert!(NO_CHAT_STATUS.is_client_error(), "{NO_CHAT_STATUS}");
+        assert_ne!(NO_CHAT_STATUS, axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn an_undeclared_embedder_is_recognised_from_the_backend_answer() {
+        // The exact error chat_completion_on_node returned on the live fleet.
+        let live = r#"backend returned 400 Bad Request: {"error":"\"harrier\" does not support chat"}"#;
+        assert!(backend_cannot_chat(live));
+        assert!(!backend_cannot_chat("backend unreachable: timed out"));
+    }
+
+    #[test]
+    fn an_embed_only_node_is_still_a_pin() {
+        // `model: "robopi"` must route to the refusal, not fall through to the
+        // coordinator as if "robopi" were a model name.
+        assert!(NodeChat::NoChat("x".into()).is_node());
+        assert!(NodeChat::Serves("a".into(), "b".into(), "c".into()).is_node());
+        assert!(!NodeChat::Unknown.is_node());
     }
 }
