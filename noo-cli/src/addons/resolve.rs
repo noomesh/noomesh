@@ -184,8 +184,41 @@ pub trait Docker {
     /// Pull `refs` (all digest-form) from `host`, logging in with `cred` in
     /// a throwaway config that is removed afterwards.
     fn pull(&mut self, host: &str, refs: &[String], cred: Option<&Credential>) -> Result<(), String>;
-    /// Running containers as `(name, image reference they were created from)`.
-    fn running(&mut self) -> Result<Vec<(String, String)>, String>;
+    /// The local image id (`sha256:…`) of this exact reference, or why it
+    /// could not be read.
+    fn image_id(&mut self, reference: &str) -> Result<String, String>;
+    /// Running containers, read with `docker inspect` (not `docker ps`,
+    /// whose IMAGE column drops the digest of a digest-only reference).
+    fn running(&mut self) -> Result<Vec<Container>, String>;
+}
+
+/// One running container as `docker inspect` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Container {
+    pub name: String,
+    /// `.Config.Image`: the reference it was created from, digest included.
+    pub config_image: String,
+    /// `.Image`: the id of the image it actually runs.
+    pub image_id: String,
+}
+
+/// Parse `docker inspect --format '{{.Name}}\t{{.Config.Image}}\t{{.Image}}'`
+/// output. A line that is not three fields is an error, never skipped.
+pub fn parse_inspect(out: &str) -> Result<Vec<Container>, String> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            match f.as_slice() {
+                [n, c, i] if !n.is_empty() && !c.is_empty() && !i.is_empty() => Ok(Container {
+                    name: n.trim_start_matches('/').to_string(),
+                    config_image: c.to_string(),
+                    image_id: i.to_string(),
+                }),
+                _ => Err(format!("unexpected docker inspect line {l:?}")),
+            }
+        })
+        .collect()
 }
 
 /// Step 7: every image by digest, skipping what is already local.
@@ -293,18 +326,49 @@ impl Docker for LiveDocker {
         Ok(())
     }
 
-    fn running(&mut self) -> Result<Vec<(String, String)>, String> {
+    fn image_id(&mut self, reference: &str) -> Result<String, String> {
         let out = std::process::Command::new("docker")
-            .args(["ps", "--format", "{{.Names}}\t{{.Image}}"])
+            .args(["image", "inspect", "--format", "{{.Id}}", reference])
             .output()
-            .map_err(|e| format!("docker ps: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("docker ps: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            .map_err(|e| format!("docker image inspect: {e}"))?;
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || id.is_empty() {
+            return Err(format!("docker image inspect {reference}: {}", last_line(&out.stderr)));
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_once('\t').map(|(n, i)| (n.to_string(), i.to_string())))
-            .collect())
+        Ok(id)
+    }
+
+    fn running(&mut self) -> Result<Vec<Container>, String> {
+        // A container that exits between `ps` and `inspect` fails the
+        // inspect; read once more before calling it an error.
+        let mut last = String::new();
+        for _ in 0..2 {
+            let ps = std::process::Command::new("docker")
+                .args(["ps", "-q", "--no-trunc"])
+                .output()
+                .map_err(|e| format!("docker ps: {e}"))?;
+            if !ps.status.success() {
+                return Err(format!("docker ps: {}", String::from_utf8_lossy(&ps.stderr).trim()));
+            }
+            let ids: Vec<String> = String::from_utf8_lossy(&ps.stdout).split_whitespace().map(String::from).collect();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let out = std::process::Command::new("docker")
+                .args(["inspect", "--type", "container", "--format", "{{.Name}}\t{{.Config.Image}}\t{{.Image}}"])
+                .args(&ids)
+                .output()
+                .map_err(|e| format!("docker inspect: {e}"))?;
+            if out.status.success() {
+                let found = parse_inspect(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("docker inspect: {e}"))?;
+                if found.len() != ids.len() {
+                    return Err(format!("docker inspect: {} of {} running containers read", found.len(), ids.len()));
+                }
+                return Ok(found);
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        }
+        Err(format!("docker inspect: {last}"))
     }
 }
 
@@ -450,27 +514,52 @@ impl Drop for DeferSignals {
 /// How a pinned image's running containers compare with the pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Running {
-    /// Containers created from exactly the pinned reference.
+    /// Containers created from exactly the pinned digest AND running the
+    /// image id that digest has locally.
     Pinned(Vec<String>),
-    /// Containers of the same repository created from another reference.
+    /// Containers of the same repository that are not that: `(name, why)`.
     Drift(Vec<(String, String)>),
     Absent,
 }
 
-/// Compare one pinned reference with `docker ps`.
-pub fn running_state(pinned_ref: &str, ps: &[(String, String)]) -> Running {
-    let repo = |r: &str| -> String {
-        let base = r.split('@').next().unwrap_or(r);
-        let last_slash = base.rfind('/').map(|i| i + 1).unwrap_or(0);
-        match base[last_slash..].find(':') {
-            Some(c) => base[..last_slash + c].to_string(),
-            None => base.to_string(),
+/// `repo` of a reference: tag and digest stripped (a registry port kept).
+fn repo_of(r: &str) -> &str {
+    let base = r.split('@').next().unwrap_or(r);
+    let last_slash = base.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match base[last_slash..].find(':') {
+        Some(c) => &base[..last_slash + c],
+        None => base,
+    }
+}
+
+fn short_id(id: &str) -> &str {
+    let h = id.strip_prefix("sha256:").unwrap_or(id);
+    &h[..h.len().min(12)]
+}
+
+/// Compare one pinned reference (`repo@sha256:…`) with the running
+/// containers. `pinned_id` is the local image id of that reference (`None`
+/// when it could not be read: nothing can then be confirmed as pinned).
+pub fn running_state(pinned_ref: &str, pinned_id: Option<&str>, running: &[Container]) -> Running {
+    let want = repo_of(pinned_ref);
+    let digest = pinned_ref.split_once('@').map(|(_, d)| d);
+    let mut exact = Vec::new();
+    let mut drift = Vec::new();
+    for c in running.iter().filter(|c| repo_of(&c.config_image) == want) {
+        let created_from = c.config_image.split_once('@').map(|(_, d)| d);
+        if digest.is_none() || created_from != digest {
+            drift.push((c.name.clone(), format!("runs {}", c.config_image)));
+            continue;
         }
-    };
-    let want = repo(pinned_ref);
-    let exact: Vec<String> = ps.iter().filter(|(_, i)| i == pinned_ref).map(|(n, _)| n.clone()).collect();
-    let drift: Vec<(String, String)> =
-        ps.iter().filter(|(_, i)| i != pinned_ref && repo(i) == want).map(|(n, i)| (n.clone(), i.clone())).collect();
+        match pinned_id {
+            Some(id) if id == c.image_id => exact.push(c.name.clone()),
+            Some(id) => drift.push((
+                c.name.clone(),
+                format!("was created from the pinned digest but runs image {}, not {}", short_id(&c.image_id), short_id(id)),
+            )),
+            None => drift.push((c.name.clone(), format!("runs image {}, and the pinned image's id is unknown", short_id(&c.image_id)))),
+        }
+    }
     if !drift.is_empty() {
         Running::Drift(drift)
     } else if !exact.is_empty() {
@@ -580,7 +669,9 @@ pub(crate) mod tests {
         pub local: Vec<String>,
         pub pulls: Vec<(String, Vec<String>, bool)>,
         pub fail_pull: bool,
-        pub ps: Vec<(String, String)>,
+        /// `(reference, image id)` for `image_id`.
+        pub ids: Vec<(String, String)>,
+        pub running: Vec<Container>,
     }
 
     impl Docker for FakeDocker {
@@ -595,8 +686,11 @@ pub(crate) mod tests {
             self.local.extend(refs.iter().cloned());
             Ok(())
         }
-        fn running(&mut self) -> Result<Vec<(String, String)>, String> {
-            Ok(self.ps.clone())
+        fn image_id(&mut self, r: &str) -> Result<String, String> {
+            self.ids.iter().find(|(l, _)| l == r).map(|(_, i)| i.clone()).ok_or_else(|| format!("No such image: {r}"))
+        }
+        fn running(&mut self) -> Result<Vec<Container>, String> {
+            Ok(self.running.clone())
         }
     }
 
@@ -659,12 +753,47 @@ pub(crate) mod tests {
 
     #[test]
     fn running_state_tells_pinned_from_drift() {
+        // The real shapes. For a container created from a digest-only
+        // reference `docker ps --format '{{.Image}}'` prints just
+        // `ghcr.io/example/intel` (Docker 27.5.1, 29.9.0), which can never
+        // equal the pin; `docker inspect` keeps the digest in .Config.Image.
         let pinned = format!("{ROOT}@{}", digest('1'));
-        let ps = vec![("noo-trellion-intel".to_string(), pinned.clone())];
-        assert_eq!(running_state(&pinned, &ps), Running::Pinned(vec!["noo-trellion-intel".into()]));
-        let ps = vec![("noo-trellion-intel".to_string(), format!("{ROOT}:v0.6.0"))];
-        assert!(matches!(running_state(&pinned, &ps), Running::Drift(_)));
-        assert_eq!(running_state(&pinned, &[]), Running::Absent);
+        let id = digest('a');
+        let inspect = format!("/noo-trellion-intel\t{pinned}\t{id}\n/noo-gateway\tnoomesh/gateway:v0.6.0\t{}\n", digest('b'));
+        let running = parse_inspect(&inspect).unwrap();
+        assert_eq!(running[0], Container { name: "noo-trellion-intel".into(), config_image: pinned.clone(), image_id: id.clone() });
+        assert_eq!(running_state(&pinned, Some(&id), &running), Running::Pinned(vec!["noo-trellion-intel".into()]));
+
+        // Right reference, other bytes: recreated from a retagged image.
+        match running_state(&pinned, Some(&digest('c')), &running) {
+            Running::Drift(d) => assert!(d[0].1.contains("runs image aaaaaaaaaaaa, not cccccccccccc"), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
+        // The pinned id unreadable: nothing is confirmed.
+        assert!(matches!(running_state(&pinned, None, &running), Running::Drift(_)));
+
+        // Another digest, or a tag, of the same repository.
+        let other = parse_inspect(&format!("/noo-trellion-intel\t{ROOT}@{}\t{id}\n", digest('2'))).unwrap();
+        assert!(matches!(running_state(&pinned, Some(&id), &other), Running::Drift(_)));
+        let tagged = parse_inspect(&format!("/noo-trellion-intel\t{ROOT}:v0.6.0\t{id}\n")).unwrap();
+        match running_state(&pinned, Some(&id), &tagged) {
+            Running::Drift(d) => assert_eq!(d[0].1, format!("runs {ROOT}:v0.6.0")),
+            other => panic!("{other:?}"),
+        }
+
+        // The tag-less string `docker ps` prints is not the pinned digest.
+        let ps_shape = vec![Container { name: "noo-trellion-intel".into(), config_image: ROOT.into(), image_id: id.clone() }];
+        assert!(matches!(running_state(&pinned, Some(&id), &ps_shape), Running::Drift(_)));
+
+        assert_eq!(running_state(&pinned, Some(&id), &running[1..]), Running::Absent);
+        assert_eq!(running_state(&pinned, Some(&id), &[]), Running::Absent);
+    }
+
+    #[test]
+    fn inspect_lines_that_do_not_parse_are_errors() {
+        assert!(parse_inspect("").unwrap().is_empty());
+        assert!(parse_inspect("/noo-x\tghcr.io/x/evolve\n").is_err());
+        assert!(parse_inspect("/noo-x\t\tsha256:aa\n").is_err());
     }
 
     #[test]

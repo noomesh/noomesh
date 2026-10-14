@@ -173,7 +173,7 @@ pub(crate) fn verify_one(
     tag: &str,
     anchor: Result<crate::addon_lock::TrustAnchor, resolve::Refusal>,
     docker: &mut dyn resolve::Docker,
-    ps: &[(String, String)],
+    running: &[resolve::Container],
 ) -> Verdict {
     let mut v = Verdict { addon: addon.to_string(), pin: None, problem: None, notes: Vec::new() };
     let anchor = match anchor {
@@ -191,13 +191,22 @@ pub(crate) fn verify_one(
         }
     };
     for (name, r) in &pin.images {
-        if !docker.image_present(r) {
+        let pinned_id = if docker.image_present(r) {
+            match docker.image_id(r) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    v.problem = Some(format!("could not read the image id of {r}: {e}"));
+                    None
+                }
+            }
+        } else {
             v.problem = Some(format!("{r} is not in the local image store"));
-        }
-        match resolve::running_state(r, ps) {
+            None
+        };
+        match resolve::running_state(r, pinned_id.as_deref(), running) {
             resolve::Running::Pinned(_) => {}
             resolve::Running::Drift(d) => {
-                let who: Vec<String> = d.iter().map(|(n, i)| format!("{n} runs {i}")).collect();
+                let who: Vec<String> = d.iter().map(|(n, why)| format!("{n} {why}")).collect();
                 v.problem = Some(format!("not the pinned image: {}", who.join(", ")));
             }
             resolve::Running::Absent => v.notes.push(format!("{name} is not running")),
@@ -221,17 +230,17 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let tag = require_tag(g, &root);
     let list = targets(g, &root, &[]);
     let mut docker = resolve::LiveDocker::new(&root);
-    // An unreadable `docker ps` is not "nothing running": fail, do not guess.
-    let ps = if list.is_empty() {
+    // Unreadable containers are not "nothing running": fail, do not guess.
+    let running = if list.is_empty() {
         Vec::new()
     } else {
         match resolve::Docker::running(&mut docker) {
-            Ok(ps) => ps,
+            Ok(r) => r,
             Err(e) => fail(g.json, ExitCode::Generic, "docker_unreadable", &format!("could not list running containers: {e}"), Some("noo stack status")),
         }
     };
     let verdicts: Vec<Verdict> =
-        list.iter().map(|a| verify_one(&root, a, &tag, resolve::installed_anchor(a), &mut docker, &ps)).collect();
+        list.iter().map(|a| verify_one(&root, a, &tag, resolve::installed_anchor(a), &mut docker, &running)).collect();
     let bad = verdicts.iter().filter(|v| v.problem.is_some()).count();
     if g.json {
         let rows: Vec<_> = verdicts
@@ -442,16 +451,32 @@ mod tests {
     #[test]
     fn verify_reports_missing_images_and_drift_and_notes_not_running() {
         let (d, reference) = pinned_root("verify");
-        let mut docker = FakeDocker { local: vec![reference.clone()], ..Default::default() };
-        let ok = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[("noo-trellion-intel".into(), reference.clone())]);
+        let id = format!("sha256:{}", "a".repeat(64));
+        let mut docker = FakeDocker { local: vec![reference.clone()], ids: vec![(reference.clone(), id.clone())], ..Default::default() };
+        // What `docker inspect` reports for a container the launcher created
+        // from the digest-only pin (`docker ps` would print just the repo).
+        let running = |config_image: &str, image_id: &str| {
+            vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: config_image.into(), image_id: image_id.into() }]
+        };
+        let ok = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &running(&reference, &id));
         assert!(ok.problem.is_none() && ok.notes.is_empty(), "{ok:?}");
 
         let idle = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]);
         assert!(idle.problem.is_none(), "{idle:?}");
         assert_eq!(idle.notes, ["trellion-intel is not running"]);
 
-        let drift = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[("noo-trellion-intel".into(), format!("{ROOT}:v0.6.0"))]);
+        let drift = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &running(&format!("{ROOT}:v0.6.0"), &id));
         assert!(drift.problem.unwrap().contains("not the pinned image"));
+
+        // The pinned reference, but a container recreated from other bytes.
+        let other = format!("sha256:{}", "b".repeat(64));
+        let retagged = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &running(&reference, &other));
+        let why = retagged.problem.unwrap();
+        assert!(why.contains("not the pinned image") && why.contains("runs image bbbbbbbbbbbb, not aaaaaaaaaaaa"), "{why}");
+
+        let mut no_id = FakeDocker { local: vec![reference.clone()], ..Default::default() };
+        let unread = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut no_id, &running(&reference, &id));
+        assert!(unread.problem.unwrap().contains("not the pinned image"));
 
         let mut empty = FakeDocker::default();
         let gone = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut empty, &[]);
