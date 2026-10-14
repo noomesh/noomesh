@@ -9615,7 +9615,7 @@
                   },
                   "name": {
                     "type": "string",
-                    "description": "exact `name` label (container, with or without its noo- prefix, or host unit)"
+                    "description": "exact `name` label (container without its noo- prefix, or host unit)"
                   },
                   "source": {
                     "type": "string",
@@ -9764,7 +9764,7 @@
                   },
                   "name": {
                     "type": "string",
-                    "description": "exact `name` label (container, with or without its noo- prefix, or host unit)"
+                    "description": "exact `name` label (container without its noo- prefix, or host unit)"
                   },
                   "source": {
                     "type": "string",
@@ -9834,7 +9834,7 @@
                           },
                           "name": {
                             "type": "string",
-                            "description": "container, with or without its noo- prefix, or host unit"
+                            "description": "container without its noo- prefix, or host unit"
                           },
                           "source": {
                             "type": "string",
@@ -16305,7 +16305,7 @@
                   },
                   "name": {
                     "type": "string",
-                    "description": "exact `name` label (container, with or without its noo- prefix, or host unit)"
+                    "description": "exact `name` label (container without its noo- prefix, or host unit)"
                   },
                   "source": {
                     "type": "string",
@@ -16411,7 +16411,7 @@
                           },
                           "name": {
                             "type": "string",
-                            "description": "container, with or without its noo- prefix, or host unit"
+                            "description": "container without its noo- prefix, or host unit"
                           },
                           "source": {
                             "type": "string",
