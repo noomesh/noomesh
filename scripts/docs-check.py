@@ -322,11 +322,11 @@ def check_proposal_numbers(errors: list[str]) -> None:
 
     root = REPO / "internal" / "proposals"
     if not root.is_dir():
-        # an earlier change: the records live in noomesh/noomesh-internal now. Absent
+        # an earlier change: the records are kept outside this repository now. Absent
         # is not failed, but it is said out loud, never a quiet pass.
         print(
             "docs-check: internal/proposals/ not present, SKIPPED "
-            "(records moved to noomesh/noomesh-internal)"
+            "(records are kept outside this repository)"
         )
         return
     index = root / "README.md"

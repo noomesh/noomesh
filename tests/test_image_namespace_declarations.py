@@ -258,7 +258,7 @@ def _stray_literals() -> list[str]:
             continue
         for i, ln in _code_lines(rel, text):
             # A literal followed by `-`/word chars is a longer, different name
-            # (`noomesh/noomesh-internal` is the records repo, not the release repo).
+            # (`noomesh/noomesh-extra` is a different repo from `noomesh/noomesh`).
             if _LITERAL_RE.search(ln):
                 # Workflow identity checks (`github.repository == '<repo>'`) say
                 # "the private canonical repo", not where releases live.
