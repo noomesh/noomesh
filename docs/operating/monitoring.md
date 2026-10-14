@@ -298,7 +298,10 @@ with `services/prometheus`; the container's healthcheck is `amtool`
 presenting `services/alertmanager` to itself (`amtool-http.yml`). To reach
 it by hand: `curl --cacert ca.crt --cert services/prometheus/service.crt
 --key services/prometheus/service.key https://localhost:9093/-/healthy`.
-`noo cluster verify --controller` reports the `monitoring web config` row
+`noo cluster verify --controller` reports the `image family` row (each
+running redis/monitoring container's image comes from `NOO_BASE_REGISTRY`,
+default `ghcr.io/noomesh/dhi`, and runs as the uid its key is handed to),
+the `monitoring web config` row
 (every mounted web-config is named by its command) and one `<name> at rest`
 row per data directory — loki, postgres, redis, nats, prometheus, grafana,
 noo-data, pki, age key — OK on a dm-crypt device, WARN otherwise: nothing

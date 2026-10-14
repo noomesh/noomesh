@@ -269,6 +269,19 @@ impl Requirement {
 /// Registry rows only this CLI reads (no container holds them, so a rotation
 /// recreates nothing): `consumers` is empty on purpose, and
 /// `registry_is_well_formed` allows exactly these.
+/// The "must be recreated" block of a rotation report: `None` when no
+/// container holds the key (a CLI-only key, `recreate: (none)`), so the
+/// heading is never printed over an empty list (i57b).
+fn recreate_notice(consumers: &[String]) -> Option<String> {
+    if consumers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "these containers hold the old value and must be recreated (an env change does not survive a plain docker restart): {}",
+        consumers.join(", ")
+    ))
+}
+
 #[cfg(test)]
 pub(crate) const CLI_ONLY_SECRETS: &[&str] = &["NOO_ADDON_REGISTRY_TOKEN"];
 
@@ -4991,15 +5004,18 @@ pub fn secrets_rotate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ui::close_warned(&format!("not independently verified: {}", unverified.join(", ")));
             println!("{}", ui::note("the ALTER ROLE ran, but this Postgres accepts any password over loopback (a `trust` line in pg_hba.conf precedes the scram one), so the login test proves nothing; confirm from a real client path before trusting it"));
         }
-        ui::close_warned(&format!(
-            "these containers hold the old value and must be recreated (an env change does not survive a plain docker restart): {}",
-            consumers.join(", ")
-        ));
+        if let Some(notice) = recreate_notice(&consumers) {
+            ui::close_warned(&notice);
+        }
         if !restart {
-            ui::guide(&[
-                ("noo stack restart --force", "RECREATES the consumers above with the new values (sources scripts/lib-secrets.sh so the new store is decrypted first). Without --force this is `docker compose restart`, which keeps the old environment — the line above says so, and this used to name it anyway"),
-                ("noo security secrets audit", "confirms store, gateway env and Postgres roles agree"),
-            ]);
+            if consumers.is_empty() {
+                ui::guide(&[("noo security secrets audit", "confirms store, gateway env and Postgres roles agree")]);
+            } else {
+                ui::guide(&[
+                    ("noo stack restart --force", "RECREATES the consumers above with the new values (sources scripts/lib-secrets.sh so the new store is decrypted first). Without --force this is `docker compose restart`, which keeps the old environment — the line above says so, and this used to name it anyway"),
+                    ("noo security secrets audit", "confirms store, gateway env and Postgres roles agree"),
+                ]);
+            }
         }
     }
 
@@ -5642,6 +5658,14 @@ pub fn secrets_resync(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recreate_notice_only_when_a_container_holds_the_key() {
+        assert_eq!(recreate_notice(&[]), None, "no consumer, no heading");
+        let n = recreate_notice(&["gateway".to_string(), "worker".to_string()]).unwrap();
+        assert!(n.starts_with("these containers hold the old value and must be recreated"), "{n}");
+        assert!(n.ends_with("gateway, worker"), "{n}");
+    }
+
     // ── scoped recreate (a key change is not a stack restart) ──
 
     struct FakeStack {

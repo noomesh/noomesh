@@ -962,18 +962,23 @@ services:
     healthcheck: *worker-health
 
   # NOO_BASE_REGISTRY — where the third-party runtime images come from.
-  # The DEFAULT is `ghcr.io/noomesh`, the PUBLIC mirrors of the upstream
-  # images, so an un-seeded install never dials dhi.io. The hardened fleet
-  # sets `ghcr.io/noomesh/dhi` (the DHI mirrors) in noomesh.yaml compose_env. Both are maintained by
-  # .github/workflows/mirror-images.yml (the escape hatch when dhi.io is
-  # timing out: three TLS-handshake failures on 2026-08-17, or when
-  # DHI_TOKEN is unavailable). The mirror deliberately keeps the same
-  # `<name>:<tag>` suffix so only the prefix has to change.
+  # The DEFAULT is `ghcr.io/noomesh/dhi`: the PUBLIC mirrors of the DHI
+  # runtime images (mirror-images.yml `dest_org: noomesh/dhi`), so an
+  # un-seeded install never dials dhi.io. These are the images the stack is
+  # built around: every service key and data volume is handed to their uids
+  # (pki.rs SERVICE_KEY_READERS: 65532, root for the -dev variants).
+  # `ghcr.io/noomesh/<name>` (no dhi/) is a DIFFERENT image family under the
+  # same names and tags - the upstream official images, which run as
+  # nobody/10001/472 and restart-loop on `permission denied` against those
+  # keys (0.6.1 public fleet, 2026-10-14). Never point the default there.
+  # tests/test_image_namespace_declarations.py pins every ref below to a
+  # `dest_org: noomesh/dhi` mirror lane of the same name:tag; `noo cluster
+  # verify` (the "image family" row) checks the running containers.
   #
   # Redis (controller node only)
   redis:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/redis:8.6-debian13-dev
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
     profiles: ["controller", "standalone"]
     # No external port — only accessible via Docker network (noo-db)
@@ -2070,7 +2075,7 @@ services:
   # `controller` service onto `standalone` too.
   loki:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/loki:3
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
     profiles: ["monitoring", "controller", "standalone"]
     # No external port — the gateway reaches Loki over the Docker network
@@ -2119,7 +2124,7 @@ services:
   # Prometheus (every controller, standalone included)
   prometheus:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/prometheus:3
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-prometheus
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2161,7 +2166,7 @@ services:
   # registry (mirrors the dhi.io/prometheus:3 convention).
   alertmanager:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/alertmanager:0
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-alertmanager
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2199,7 +2204,7 @@ services:
   # Grafana (every controller, standalone included)
   grafana:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/grafana:12-debian13-dev
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
     profiles: ["monitoring", "controller", "standalone"]
     # uid 0: the DHI -dev image runs as root (`USER 0`).
@@ -2273,7 +2278,7 @@ services:
   # metrics are a feature to design, not a profile to re-add.
   node-exporter:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}/node-exporter:1
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
     profiles: ["monitoring", "controller", "standalone"]
     ports:
