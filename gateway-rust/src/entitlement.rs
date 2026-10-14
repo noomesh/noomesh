@@ -260,6 +260,27 @@ mod tests {
         assert!(e.grants("trellion_intel"));
     }
 
+    /// The CLI's entitlement gained an `addons` trust block (i33). The
+    /// gateway does not read it; a token carrying it must still verify here
+    /// and unlock exactly what its features say, so this struct must keep
+    /// tolerating unknown fields.
+    #[test]
+    fn token_with_addon_trust_block_still_verifies() {
+        let vk = testing::key().verifying_key();
+        let k = "ab".repeat(32);
+        let payload = format!(
+            r#"{{"v":1,"sub":"acme","tier":"intelligent","features":["evolve"],"iat":1,"exp":0,"id":"t","addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/example/evolve"}}}}}}"#
+        );
+        let sig = ed25519_dalek::Signer::sign(&testing::key(), payload.as_bytes());
+        let tok = format!(
+            "{TOKEN_PREFIX}{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+        let e = verify_with(&tok, &vk).unwrap();
+        assert!(e.grants("evolve") && !e.grants("trellion_intel"));
+    }
+
     #[test]
     fn baked_key_is_a_valid_ed25519_point() {
         pubkey_from_hex(PUBKEY_HEX).expect("PUBKEY_HEX must decode");
