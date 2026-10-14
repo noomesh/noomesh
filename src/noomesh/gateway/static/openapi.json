@@ -18091,6 +18091,40 @@
           }
         }
       }
+    },
+    "/api/cluster/self-node/{node}/birth-cert": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create birth cert",
+        "description": "[native] POST /api/cluster/self-node/{node}/birth-cert \u2014 record the controller's own node's birth cert (i67).",
+        "operationId": "self_node_birth_cert",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

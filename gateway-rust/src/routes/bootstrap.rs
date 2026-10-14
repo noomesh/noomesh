@@ -94,6 +94,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/provision-bundle/{node}",
             post(provision_bundle_put).layer(DefaultBodyLimit::max(MAX_RAIL_BODY)))
         .route("/api/cluster/provision-bundle/{node}/status", get(provision_bundle_status))
+        // i67: the controller's OWN node records its birth cert here, so the
+        // rail can restage it like any node. Operator-only, and only for
+        // this controller's own node name (every other node enrolls).
+        .route("/api/cluster/self-node/{node}/birth-cert", post(self_node_birth_cert))
         .route("/bootstrap/bundle/{node}/applied", post(bundle_apply_report))
         // The node's FETCH receipt. The GET cannot carry a
         // proof over the bundle's sha — at that moment the node has not seen
@@ -1446,6 +1450,107 @@ async fn provision_bundle_status(
     }
 }
 
+/// The body of `POST /api/cluster/self-node/{node}/birth-cert`.
+#[derive(Deserialize)]
+struct SelfBirthCertBody {
+    /// PEM of `/etc/noo/birth.crt` on the controller (written by host prep).
+    birth_cert: String,
+    /// The operator account on the controller (recorded like an enrollee's).
+    enroll_user: Option<String>,
+    /// The controller's own address, as the CLI detects it.
+    ip: Option<String>,
+    /// Machine facts, the same shape `noo enroll` reports.
+    facts: Option<serde_json::Value>,
+}
+
+/// May `node` record a birth cert through the self-node route? Only when it
+/// IS this controller's own node: every other node proves its birth key by
+/// enrolling, and this route must not become a way around that. Pure, so the
+/// rule is testable without an environment.
+pub fn self_birth_target_allowed(node: &str, self_id: Option<&str>) -> bool {
+    self_id.is_some_and(|s| !s.trim().is_empty() && s.trim().eq_ignore_ascii_case(node.trim()))
+}
+
+/// POST /api/cluster/self-node/{node}/birth-cert — record the controller's
+/// own node's birth cert (i67).
+///
+/// The controller's node does not enroll with itself, so the gateway held no
+/// birth cert for it, and the two pull-lane writes that verify one (the
+/// fetch receipt and the apply report, `check_birth_proof`) refused it. The
+/// node therefore could not ride the rail, and `noo upgrade --nodes` reached
+/// it by a sudo lane instead. This records the cert the way the tailnet lane
+/// does (a pre-used token row carrying the enrollment payload), so the self
+/// node is then staged, fetched, applied and reported exactly like a remote
+/// one.
+///
+/// Idempotent: a cert equal to the one already on record writes nothing. A
+/// different one is a new birth key, so a bundle still staged for the old
+/// key is dropped, as a re-enrollment drops it.
+async fn self_node_birth_cert(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
+    Path(node): Path<String>,
+    Json(body): Json<SelfBirthCertBody>,
+) -> AppResult {
+    let by = bootstrap_admin_guard(&ctx)?;
+    if !valid_node_name(&node) {
+        return Err(AppError::BadRequest("invalid node name".into()));
+    }
+    let self_id = crate::self_node::self_node_id();
+    if !self_birth_target_allowed(&node, self_id.as_deref()) {
+        return Err(AppError::Forbidden(format!(
+            "'{node}' is not this controller's own node ({}): a remote node records its birth cert \
+             by enrolling (`noo enroll` on the node)",
+            self_id.as_deref().unwrap_or("unset")
+        )));
+    }
+    let cert = body.birth_cert.trim();
+    if !(cert.starts_with("-----BEGIN CERTIFICATE-----") && cert.len() < 16_384) {
+        return Err(AppError::BadRequest("birth_cert must be one PEM certificate".into()));
+    }
+    if birth_cert_for(&state.db, &node).await.as_deref().map(str::trim) == Some(cert) {
+        return Ok(Json(json!({ "status": "current", "node": node })));
+    }
+    let ip = body.ip.as_deref().map(str::trim)
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let enroll_user = body.enroll_user.as_deref().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 64);
+    let token_hash = hash_token(&generate_bootstrap_token());
+    let row: (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO noo_bootstrap_tokens \
+             (token_hash, created_by, expires_at, role_hint, node_name, \
+              used_at, used_by_ip, enroll_user, birth_cert, facts) \
+         VALUES ($1, $2, now(), 'controller-self', $3, now(), $4, $5, $6, $7) \
+         RETURNING id",
+    )
+    .bind(&token_hash)
+    .bind(&by)
+    .bind(&node)
+    .bind(&ip)
+    .bind(enroll_user)
+    .bind(cert)
+    .bind(&body.facts)
+    .fetch_one(&state.db)
+    .await?;
+    // A new birth key: a bundle staged for the old one cannot be decrypted.
+    sqlx::query("DELETE FROM noo_provision_bundles WHERE node_name = $1")
+        .bind(&node)
+        .execute(&state.db)
+        .await?;
+    crate::routes::core::audit_event(
+        &state.db,
+        "self_node_birth_cert_recorded",
+        "warning",
+        &by,
+        &format!("bootstrap-token:{}", row.0),
+        "ok",
+        json!({ "node": node, "ip": ip }),
+    )
+    .await;
+    Ok(Json(json!({ "status": "recorded", "node": node, "id": row.0.to_string() })))
+}
+
 /// POST /bootstrap/bundle/{node}/applied — the node's fetcher reports the
 /// applier's outcome for the bundle it just processed: `{sha, rc, msg}`.
 ///
@@ -2216,6 +2321,27 @@ mod tests {
             apply_report_decision(false, &ProofStatus::Unsigned(ProofError::NoBirthCert)),
             Err(())
         );
+    }
+
+    /// i67: the self-node birth-cert route records a cert for THIS
+    /// controller's own node only, case-insensitively, and never when the
+    /// controller does not know its own name.
+    #[test]
+    fn only_the_controllers_own_node_may_record_a_birth_cert_here() {
+        assert!(self_birth_target_allowed("pop-os", Some("pop-os")));
+        assert!(self_birth_target_allowed("Pop-OS", Some("pop-os")));
+        assert!(!self_birth_target_allowed("aserve", Some("pop-os")), "a remote node enrolls");
+        assert!(!self_birth_target_allowed("pop-os", None), "no self id: refuse");
+        assert!(!self_birth_target_allowed("pop-os", Some(" ")), "blank self id: refuse");
+        // The handler applies the rule and the operator guard before it writes.
+        let src = include_str!("bootstrap.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let start = src.find("async fn self_node_birth_cert(").expect("handler");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let guard = body.find("bootstrap_admin_guard(").expect("operator guard");
+        let rule = body.find("self_birth_target_allowed(").expect("self-node rule");
+        let write = body.find("INSERT INTO noo_bootstrap_tokens").expect("the write");
+        assert!(guard < write && rule < write, "the guard and the rule precede the write");
     }
 
     /// The retired unsigned-write window (`NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH`)
