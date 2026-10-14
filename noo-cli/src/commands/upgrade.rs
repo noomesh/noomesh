@@ -2225,10 +2225,13 @@ fn local_agent_name(agent_present: bool, hostname: &str, rail: &[String]) -> Opt
 
 const LOCAL_AGENT_BIN: &str = "/usr/local/bin/noo-node-agent";
 
-/// Restage the controller's own node over the rail (i67), like any node:
-/// no sudo, never a prompt. A controller whose pull units are missing is
-/// refused by the child with the remedy (`noo onboard --only services`);
-/// there is no sudo fallback here.
+/// Restage the controller's own node over the rail (i67), like any node.
+/// No sudo — except ONCE on a controller installed before 0.6.3, whose node
+/// identity (birth key, pull units, the gateway's copy of the cert) does not
+/// exist yet: the child creates it ("sudo once, never again") through the
+/// same prep path onboard uses, then rides the rail. When that sudo would
+/// prompt with nobody at a terminal the child refuses with the remedy
+/// (`noo onboard --only services`). There is no sudo agent install here.
 fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>) {
     // Same child-process isolation as the rail nodes: `cluster provision`
     // reports its failures through `fail`, and an exit here would drop the

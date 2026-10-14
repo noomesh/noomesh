@@ -75,16 +75,27 @@ fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>
 ///
 /// - pull units missing: FAIL, the rail cannot reach it (`noo onboard
 ///   --only services` installs them, the one sudo);
+/// - the gateway does not verify against THIS birth cert (no mount, a
+///   stale copy, another self id): FAIL with the cause's remedy;
 /// - last install `rail` (or onboard's first install): OK;
 /// - anything else while the units exist: FAIL — an older CLI's local lane
 ///   installed it after onboard (`local-lane.state` without a lane record),
 ///   which left hostd behind on pop-os after the 0.6.2 roll.
-pub(crate) fn self_agent_lane_check(node: &str, missing_units: &[String], record: Option<&str>, legacy_local: bool) -> Check {
+pub(crate) fn self_agent_lane_check(
+    node: &str,
+    missing_units: &[String],
+    gateway: Option<&crate::commands::provision::SelfViewProblem>,
+    record: Option<&str>,
+    legacy_local: bool,
+) -> Check {
     const NAME: &str = "self-agent lane";
     if !missing_units.is_empty() {
         return fail(NAME,
-            format!("{node}: pull units missing ({}) — the rail cannot reach the controller's own node", missing_units.join(", ")),
+            format!("{node}: node identity incomplete ({}) — the rail cannot reach the controller's own node", missing_units.join(", ")),
             crate::commands::provision::SELF_RAIL_REMEDY);
+    }
+    if let Some(p) = gateway {
+        return fail(NAME, format!("{node}: {}", p.msg), p.remedy.clone());
     }
     match record {
         Some("rail") => ok(NAME, format!("rail — {node} is restaged over the rail like any node (no sudo)")),
@@ -3764,7 +3775,18 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .filter(|_| std::path::Path::new("/usr/local/bin/noo-node-agent").is_file())
         {
             let (rec, legacy) = crate::commands::provision::read_self_lane(&me);
-            checks.push(self_agent_lane_check(&me, &crate::commands::provision::pull_units_missing(&me), rec.as_deref(), legacy));
+            let missing = crate::commands::provision::pull_units_missing(&me);
+            // The gateway must verify against the cert on this disk.
+            let view = if !missing.is_empty() { None } else {
+                std::fs::read("/etc/noo/birth.crt").ok()
+                    .and_then(|pem| crate::commands::node_fetch::cert_der_sha256(&pem).ok())
+                    .and_then(|fp| {
+                        let answer = crate::http::get_raw_opt(g, "/api/cluster/self-node", true, 15);
+                        crate::commands::provision::judge_gateway_self_view(&me, &fp,
+                            answer.as_ref().map(|(st, b)| (*st, b.as_str()))).err()
+                    })
+            };
+            checks.push(self_agent_lane_check(&me, &missing, view.as_ref(), rec.as_deref(), legacy));
         }
         // Licensed add-ons run images pinned by their own signed lock
         // (`noo addons verify`: offline re-verify, local image, what runs).
@@ -7167,7 +7189,7 @@ mod self_agent_lane_tests {
 
     #[test]
     fn a_rail_installed_self_node_passes() {
-        let c = self_agent_lane_check("pop-os", &[], Some("rail"), true);
+        let c = self_agent_lane_check("pop-os", &[], None, Some("rail"), true);
         assert_eq!(c.verdict, Verdict::Ok);
         assert_eq!(c.name, "self-agent lane");
         assert!(c.detail.starts_with("rail"), "{}", c.detail);
@@ -7175,7 +7197,7 @@ mod self_agent_lane_tests {
 
     #[test]
     fn onboards_first_install_reads_as_the_rail() {
-        let c = self_agent_lane_check("pop-os", &[], Some("onboard"), true);
+        let c = self_agent_lane_check("pop-os", &[], None, Some("onboard"), true);
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(c.detail.starts_with("rail"), "{}", c.detail);
     }
@@ -7184,19 +7206,32 @@ mod self_agent_lane_tests {
     /// the old local lane (its state file, no lane record).
     #[test]
     fn the_local_lane_after_onboard_fails_with_the_rail_as_the_remedy() {
-        let c = self_agent_lane_check("pop-os", &[], None, true);
+        let c = self_agent_lane_check("pop-os", &[], None, None, true);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.starts_with("local"), "{}", c.detail);
         assert!(c.detail.contains("local-lane.state"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("noo cluster provision pop-os"));
-        assert_eq!(self_agent_lane_check("pop-os", &[], Some("local"), false).verdict, Verdict::Fail);
+        assert_eq!(self_agent_lane_check("pop-os", &[], None, Some("local"), false).verdict, Verdict::Fail);
     }
 
     #[test]
     fn missing_pull_units_fail_with_onboard_as_the_remedy() {
-        let c = self_agent_lane_check("pop-os", &["noo-fetch.timer".to_string()], Some("rail"), false);
+        let c = self_agent_lane_check("pop-os", &["noo-fetch.timer".to_string()], None, Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("noo-fetch.timer"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("noo onboard --only services"));
+    }
+
+    /// The gateway verifying against another cert (or none) fails the row
+    /// even when the last install was the rail.
+    #[test]
+    fn the_gateways_view_must_match_the_local_cert() {
+        let p = crate::commands::provision::SelfViewProblem {
+            code: "gateway_no_self_cert", msg: "the gateway cannot read this node's birth cert".into(),
+            remedy: "noo upgrade --stack".into(),
+        };
+        let c = self_agent_lane_check("pop-os", &[], Some(&p), Some("rail"), false);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
     }
 }
