@@ -772,7 +772,7 @@ COMPOSE_FILES="$(compose_file_args .)"
 # whether or not this start pulls (empty render = refusal). Dist only.
 if [ -n "${DIST_TAG:-}" ]; then
     # shellcheck disable=SC2086
-    DIST_MODE=1 dist_assert_addon_refs $COMPOSE_FILES || exit 1
+    DIST_MODE=1 dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
 fi
 # Before the pull loop (and every later `docker compose`): no v2 plugin is a
 # prerequisite failure, not a pull failure — exit, never retry.
@@ -796,7 +796,8 @@ require_compose_v2 || exit 1
             # The set is derived from the overlays (addon_services), so core
             # names no add-on service.
             # shellcheck disable=SC2086
-            _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null \
+            compose_active_services $COMPOSE_FILES $PROFILE_ARGS
+            _dist_services="$(printf '%s\n' "$COMPOSE_OUT" \
                 | grep -vxF -f <(addon_services $COMPOSE_FILES; echo '#none#') || true)"
             # Up to three attempts: GHCR blob downloads over IPv6 timed out
             # twice on host8 (2026-09-03), each time on the largest layer,
@@ -905,7 +906,9 @@ require_compose_v2 || exit 1
     # `up` starts anything (first-contact finding #12: the standalone
     # profile has no nvidia-exporter, and a GPU box without the container
     # toolkit walked straight into it). Scale only what the profile runs.
-    ACTIVE_SVCS="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    compose_active_services $COMPOSE_FILES $PROFILE_ARGS
+    ACTIVE_SVCS="$COMPOSE_OUT"
     GPU_SCALE=""
     if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
         if printf '%s\n' "$ACTIVE_SVCS" | grep -qx nvidia-exporter; then

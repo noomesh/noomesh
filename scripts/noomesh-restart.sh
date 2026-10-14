@@ -156,10 +156,6 @@ fi
 # dist mode and the add-on map are both known.
 . "$_LIBDIR/lib-compose.sh"
 COMPOSE_FILES="$(compose_file_args .)"
-# Every add-on service compose renders must run exactly its verified pin
-# (require_addon_pins above exported them); empty render = refusal. Dist only.
-# shellcheck disable=SC2086
-dist_assert_addon_refs $COMPOSE_FILES || exit 1
 
 # Standalone: the single ollama-embed serves chat too (gateway static
 # fallback, stack-v0.2.5). An install whose .env predates that (0.3.31
@@ -213,6 +209,13 @@ done
 # variable beside our own --profile flags; lib-config.sh).
 PROFILE_ARGS="$PROFILE_ARGS $(operator_profile_args)"
 derive_profile_env
+# Every add-on service compose renders must run exactly its verified pin
+# (require_addon_pins above exported them); empty render = refusal. Dist only.
+# Rendered with the SAME --profile flags `up` gets: without them compose can
+# reject the whole project (a COMPOSE_PROFILES profile whose service depends
+# on one only the launcher's own profile defines).
+# shellcheck disable=SC2086
+dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
 
 if [ ${#SERVICES[@]} -eq 0 ]; then
     ui_phase "Stack"
@@ -224,7 +227,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # phase 0; on a CPU box `up` left it Created with "could not select
         # device driver nvidia" and the guard below called it DOWN —
         # 2026-09-29 upgrade rehearsal), minus the containerised agent.
-        ACTIVE_SVCS="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null || true)"
+        # shellcheck disable=SC2086
+        compose_active_services $COMPOSE_FILES $PROFILE_ARGS
+        ACTIVE_SVCS="$COMPOSE_OUT"
         GPU_SCALE=""
         if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
             if printf '%s\n' "$ACTIVE_SVCS" | grep -qx nvidia-exporter; then

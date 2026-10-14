@@ -255,6 +255,8 @@ jobs:
 
       - name: Re-tag deps-core from the rc
         if: env.RETAG == 'true'
+        env:
+          IMAGE_OWNER: ${{ env.DHI_OWNER }}   # where the build step below pushes it
         run: bash scripts/release-retag-image.sh deps-core "$RC_TAG" "$TAG" "$RC_DIGEST"
 
       - name: Build + push deps-core
@@ -415,6 +417,8 @@ jobs:
 
       - name: Re-tag deps-base from the rc
         if: env.RETAG == 'true'
+        env:
+          IMAGE_OWNER: ${{ env.DHI_OWNER }}   # where the build step below pushes it
         run: bash scripts/release-retag-image.sh deps-base "$RC_TAG" "$TAG" "$RC_DIGEST"
 
       - name: Build + push deps-base
@@ -696,6 +700,8 @@ jobs:
 
       - name: Re-tag ${{ matrix.name }} from the rc
         if: env.RETAG == 'true'
+        env:
+          IMAGE_OWNER: ${{ env.OWNER }}   # where the build step below pushes it
         run: bash scripts/release-retag-image.sh "${{ matrix.image }}" "$RC_TAG" "$TAG" "$RC_DIGEST"
 
       # Docker Hub bases (alpine, python, nvidia/cuda) come from the GHCR

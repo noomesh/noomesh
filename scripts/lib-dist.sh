@@ -196,7 +196,7 @@ _addon_composed_names() {
 # list). Every NOO_ADDON_IMAGE_* already in the environment is dropped first,
 # so an .env line or a shell export can never name an add-on image.
 #
-# Dist: `noo addons launch-pins <tag> <add-on>...` re-verifies, offline, each
+# Dist: `noo addons launch-pins --root <install root> <tag> <add-on>...` re-verifies, offline, each
 # cached lock against the installed entitlement and answers one line per
 # licensed add-on:
 #   pin <addon> <VAR> <ref@sha256:…>     export VAR=ref once the image is local
@@ -212,6 +212,9 @@ _addon_composed_names() {
 # REFUSE = return 1; both launchers `|| exit 1` before anything is pulled or
 # recreated.
 _ADDON_PINS=()
+# The install root this launcher belongs to (scripts/..), fixed when the
+# library is sourced. launch-pins reads the pins under it, never the cwd.
+_DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
@@ -234,7 +237,7 @@ require_addon_pins() {
         return 1
     fi
     # shellcheck disable=SC2086
-    if ! _out="$("$_nb" addons launch-pins "$_tag" $_on 2>&1)"; then
+    if ! _out="$("$_nb" addons launch-pins --root "${PROJECT_ROOT:-$_DIST_LIB_ROOT}" "$_tag" $_on 2>&1)"; then
         {
             echo "REFUSING: the add-on pins could not be read (noo addons launch-pins failed):"
             printf '  %s\n' "$_out"
@@ -307,6 +310,33 @@ addon_services() {
     done | sort -u
 }
 
+# compose_capture <compose args...> - run `docker compose "$@"`, keeping its
+# stdout in COMPOSE_OUT and its stderr in COMPOSE_ERR; returns compose's own
+# exit status. Callers used to write `2>/dev/null`, which turned a compose
+# config error (a missing required variable, a bad overlay) into an empty
+# string that every gate then reported as something else (live 2026-10-13,
+# pop-os: "could not render the image of add-on service noo-evolve").
+COMPOSE_OUT=""; COMPOSE_ERR=""
+compose_capture() {
+    local _ef _rc
+    _ef="$(mktemp)" || { COMPOSE_OUT=""; COMPOSE_ERR="mktemp failed"; return 1; }
+    COMPOSE_OUT="$(docker compose "$@" 2>"$_ef")"; _rc=$?
+    COMPOSE_ERR="$(cat "$_ef" 2>/dev/null)"
+    rm -f "$_ef"
+    return "$_rc"
+}
+
+# compose_report_error <exit status> - print the last 10 lines of the stderr
+# compose_capture kept, indented, plus the exit status. Prints to stderr.
+compose_report_error() {
+    echo "       docker compose exited with status ${1:-?}; its last output:" >&2
+    if [ -n "$COMPOSE_ERR" ]; then
+        printf '%s\n' "$COMPOSE_ERR" | tail -n 10 | sed 's/^/         /' >&2
+    else
+        echo "         (no output on stderr)" >&2
+    fi
+}
+
 # dist_assert_addon_refs <compose args> — in dist mode, every add-on service
 # compose renders must run exactly a pinned reference (one of _ADDON_PINS).
 # Refuses with the service and the ref otherwise, and when compose cannot
@@ -315,12 +345,42 @@ addon_services() {
 # known, whether or not they pull.
 dist_assert_addon_refs() {
     [ "${DIST_MODE:-0}" = 1 ] || return 0
-    local _svc _ref _p _ok
+    local _svc _ref _p _ok _rc _l
     for _svc in $(addon_services "$@"); do
-        _ref="$(docker compose "$@" config --images "$_svc" 2>/dev/null | head -1)" || _ref=""
-        if [ -z "$_ref" ]; then
+        _rc=0
+        _ref=""
+        if command -v python3 >/dev/null 2>&1; then
+            # The service's OWN image. `config --images <svc>` prints <svc> AND
+            # its depends_on chain (5 lines for noo-evolve, the gateway first
+            # on compose 5.0.2 and 5.5.1), so its first line is a dependency's
+            # image and the pin check would refuse a correct start.
+            compose_capture "$@" config --format json || _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                _ref="$(printf '%s' "$COMPOSE_OUT" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["services"][sys.argv[1]].get("image", ""))
+except Exception:
+    pass' "$_svc" 2>/dev/null)"
+            fi
+        else
+            # No python3: fall back to `--images`, whose output includes the
+            # dependency chain. Accept the line that IS one of the pins; if
+            # none is, the first line is reported as the offending ref.
+            compose_capture "$@" config --images "$_svc" || _rc=$?
+            _ref="$(printf '%s\n' "$COMPOSE_OUT" | head -1)"
+            while IFS= read -r _l; do
+                for _p in "${_ADDON_PINS[@]+"${_ADDON_PINS[@]}"}"; do
+                    [ "${_p#*=}" = "$_l" ] && _ref="$_l"
+                done
+            done <<IMGS
+$COMPOSE_OUT
+IMGS
+        fi
+        if [ "$_rc" -ne 0 ] || [ -z "$_ref" ]; then
             echo "ERROR: compose could not render the image of add-on service ${_svc} - refusing to start it unverified" >&2
-            echo "       Fix:  noo addons verify" >&2
+            compose_report_error "$_rc"
+            echo "       Fix:  the compose files could not be rendered: see the lines above" >&2
             return 1
         fi
         _ok=""
@@ -450,8 +510,8 @@ dist_ref_is_stack_versioned() {
 # a digest that is not one of the lock's pins is another release's. Fails
 # with the offending ref instead of fetching the wrong images (observed live
 # 2026-10-06: a v0.2.91 -> v0.2.93 roll pulled `<svc>:v0.2.91@sha256:...`
-# while `up` ran v0.2.93). Silent when compose cannot list images; the pull
-# then says why.
+# while `up` ran v0.2.93). When compose cannot list images it warns with
+# compose's own error and lets the pull proceed.
 #
 # Only the images the stack versions are held to the stack tag. A
 # controller whose NOO_BASE_REGISTRY mirrors the monitoring images under the
@@ -462,7 +522,15 @@ dist_ref_is_stack_versioned() {
 # dist_ref_is_stack_versioned for how the set is derived.
 dist_assert_pull_refs() {
     local _imgs _ref _rest _name _tag _dig _ok _p
-    _imgs="$(docker compose "$@" config --images 2>/dev/null)" || return 0
+    local _rc=0
+    compose_capture "$@" config --images || _rc=$?
+    _imgs="$COMPOSE_OUT"
+    if [ "$_rc" -ne 0 ]; then
+        # Not a refusal (the pull itself will fail loudly), but never silent.
+        echo "WARNING: compose could not list the images this pull would fetch, so they are not checked" >&2
+        compose_report_error "$_rc"
+        return 0
+    fi
     while IFS= read -r _ref; do
         case "$_ref" in "${NOO_IMAGE_PREFIX:-}"/*) : ;; *) continue ;; esac
         _rest="${_ref#"${NOO_IMAGE_PREFIX:-}"/}"
@@ -492,5 +560,20 @@ REFS
     # Add-on refs sit outside NOO_IMAGE_PREFIX, so the loop above never sees
     # them: they are held to their signed pins instead.
     dist_assert_addon_refs "$@" || return 1
+    return 0
+}
+
+# compose_active_services <compose args> - COMPOSE_OUT = the services the
+# files+profiles render. A render failure is reported (compose's own error)
+# instead of becoming an empty list that silently skips the GPU/guard
+# arithmetic; the launcher goes on with an empty set, as before.
+compose_active_services() {
+    local _rc=0
+    compose_capture "$@" config --services || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        echo "WARNING: compose could not list the stack's services (continuing with none)" >&2
+        compose_report_error "$_rc"
+        COMPOSE_OUT=""
+    fi
     return 0
 }
