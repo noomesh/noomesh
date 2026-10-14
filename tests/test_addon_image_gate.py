@@ -92,8 +92,10 @@ def test_verified_local_pins_are_exported_for_the_overlays(tmp_path):
     assert r.returncode == 0, r.stderr
     assert _exports(r) == {"NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "NOO_ADDON_IMAGE_EVOLVE": EVOLVE_REF}
     asked = (tmp_path / "noo.log").read_text().split()
-    assert asked[:3] == ["addons", "launch-pins", "v0.6.0"], asked
-    assert set(asked[3:]) == {"trellion", "trellion_intel", "evolve"}, "only composed add-ons are asked about"
+    # The pins are read from the launcher's install root, whatever the cwd is.
+    assert asked[:4] == ["addons", "launch-pins", "--root", str(REPO)], asked
+    assert asked[4] == "v0.6.0", asked
+    assert set(asked[5:]) == {"trellion", "trellion_intel", "evolve"}, "only composed add-ons are asked about"
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull or log in"
 
 
