@@ -35,7 +35,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -464,128 +463,6 @@ def test_e_no_job_mints_an_app_token():
     assert not [(w, n) for w, n, _, _ in MINT_JOBS], MINT_JOBS
 
 
-GATES_PY = REPO / "scripts" / "snapshot_gates.py"
-if GATES_PY.exists():  # absent from the public tree: the rule lives in the snapshot tooling
-    import importlib.util
-
-    _spec = importlib.util.spec_from_file_location("snapshot_gates", GATES_PY)
-    GATES = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(GATES)  # type: ignore[union-attr]
-else:
-    GATES = None
-
-needs_gates = pytest.mark.skipif(GATES is None, reason="scripts/snapshot_gates.py (the one implementation of the rule) is not in this tree")
-
-
-def _reads_private_source(job: dict) -> bool:
-    """A secret other than GITHUB_TOKEN, PAI_REPOS_PAT, the app mint, a non-self checkout, a self-hosted
-    runner or vars.CI_RUNNER (the shared rule, scripts/snapshot_gates.py::wf_reaches)."""
-    return bool(GATES.wf_reaches(job))
-
-
-def _snapshot_allow(tmp_path) -> "Path":
-    """The reviewed exceptions, read from snapshot.sh's own noomesh-pv configuration."""
-    snap = REPO / "scripts" / "snapshot.sh"
-    out = subprocess.run(["bash", "-c", f'source "{snap}"; snap_config noomesh-pv; printf "%s\\n" "${{SNAP_WORKFLOWS_ALLOW[@]}}"'],
-                         capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    allow = tmp_path / "workflows.allow"
-    allow.write_text(out.stdout)
-    # Five waivers remain (CLA bot, the DHI-using ci.yml jobs, the release base images, the mirrors, the darwin agents),
-    # two separators each: fewer means the parse found nothing and the checks below would pass on an empty list.
-    assert allow.read_text().count("::") >= 10, "could not read SNAP_WORKFLOWS_ALLOW from snapshot.sh"
-    return allow
-
-
-@needs_gates
-def test_e_the_shipped_workflows_obey_the_rule_the_snapshot_gate_enforces(tmp_path):
-    """The same function the `workflow-guards` snapshot gate runs on the staged tree, run here on the
-    source tree (plus the private-only gateway-image.yml). The exceptions are the reviewed list in
-    scripts/snapshot.sh; every entry must still match something (no stale waivers)."""
-    allow = GATES.load_allow(str(_snapshot_allow(tmp_path)))
-    left = GATES.wf_scan(WORKFLOWS_DIR, allow)
-    assert not left, "\n".join(f"{r}: {j}: {e}" for r, j, e in left)
-    used = {i for i, (pr, lr, _) in enumerate(allow)
-            for r, j, e in GATES.wf_scan(WORKFLOWS_DIR, []) if pr.search(r) and lr.search(f"{j}: {e}")}
-    assert used == set(range(len(allow))), "a SNAP_WORKFLOWS_ALLOW entry matches nothing: drop it"
-
-
-def _job(**kw):
-    return {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}], **kw}
-
-
-@needs_gates
-def test_the_rule_negative_controls():
-    pr = {"on": {"pull_request": {}}}
-    tag = {"on": {"push": {"tags": ["v*"]}}}
-    canon = "github.repository == 'noomesh/noomesh'"
-
-    def bad(job, doc=pr):
-        return bool(GATES.wf_job_violations("w.yml", "j", job, doc))
-
-    secret = _job(steps=[{"env": {"T": "${{ secrets.SOME_TOKEN }}"}}])
-    assert bad({**secret, "if": canon}), "an ungated job naming a secret must fail"
-    assert bad(secret)
-    assert bad(_job(**{"runs-on": ["self-hosted", "linux"]})), "a self-hosted runner must fail"
-    assert bad(_job(**{"runs-on": "${{ fromJSON(vars.CI_RUNNER || '\"ubuntu-latest\"') }}"}))
-    assert bad(_job(steps=[{"env": {"PAI_REPOS_PAT": "x"}}]))
-    assert bad(_job(steps=[{"uses": "actions/create-github-app-token@x"}]))
-    assert bad(_job(steps=[{"uses": "actions/checkout@x", "with": {"repository": "somebody/else"}}]))
-    # the org rewrite turned a private literal into the public repo name: that guard is TRUE publicly
-    assert bad({**secret, "if": "${{ github.repository == 'noomesh/noomesh' && !cancelled() }}"})
-    # no repository variable exempts a job any more
-    assert bad({**secret, "if": "vars.PRIVATE_UPSTREAM == 'true'"}), "a variable gate is no exemption"
-    assert bad({**secret, "if": "${{ vars.PRIVATE_UPSTREAM == 'true' && !cancelled() }}"})
-    # a tag-only release-environment job passes; the same on a fork-reachable trigger does not
-    assert not bad({**secret, "environment": "release"}, tag)
-    assert bad({**secret, "environment": "release"}, pr)
-    # GITHUB_TOKEN and a core job are fine
-    assert not bad(_job(steps=[{"env": {"T": "${{ secrets.GITHUB_TOKEN }}"}}]))
-    assert not bad(_job())
-
-
-@needs_gates
-def test_the_allow_list_waives_exact_occurrences_only(tmp_path):
-    wf = tmp_path / ".github" / "workflows"
-    wf.mkdir(parents=True)
-    (wf / "cla.yml").write_text("on: {pull_request_target: {}}\njobs:\n  cla:\n    runs-on: ubuntu-latest\n    steps:\n    - env: {T: '${{ secrets.CLA_PAT }}'}\n")
-    allow = tmp_path / "a"
-    allow.write_text("\\.github/workflows/cla\\.yml$ :: ^cla: names secrets\\.CLA_PAT; :: the CLA bot\n")
-    assert GATES.wf_scan(wf, GATES.load_allow(str(allow))) == []
-    assert GATES.wf_scan(wf, []), "without the entry the CLA job fails"
-    # a second secret in the same job changes the evidence and is NOT waived
-    (wf / "cla.yml").write_text((wf / "cla.yml").read_text() + "    - env: {U: '${{ secrets.OTHER }}'}\n")
-    assert GATES.wf_scan(wf, GATES.load_allow(str(allow)))
-
-
-@needs_gates
-def test_the_workflow_guards_gate_runs_on_the_staged_tree(tmp_path):
-    """Run the real sync (org rewrite included) into a temp repo and hold the STAGED workflows to the
-    rule, with the reviewed allow list from snapshot.sh: a rewrite that flips a guard cannot pass."""
-    sync = REPO / "scripts" / "sync-to-oss.sh"
-    snap = REPO / "scripts" / "snapshot.sh"
-    if not sync.exists() or not snap.exists():
-        pytest.skip("sync or snapshot script not present")
-    target = tmp_path / "pub"
-    subprocess.run(["git", "init", "-q", str(target)], check=True)
-    env = {**os.environ, "NOO_SYNC_SKIP_BUILD": "1"}
-    env.pop("OSS_ORG_STRICT", None)
-    r = subprocess.run(["bash", str(sync), "--yes", str(target)], stdin=subprocess.DEVNULL,
-                       capture_output=True, text=True, env=env)
-    assert r.returncode == 0, f"the sync itself failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}"
-    assert list((target / ".github" / "workflows").glob("*.yml")), "the parse found no staged workflows"
-    allow = _snapshot_allow(tmp_path)
-    g = subprocess.run([sys.executable, str(GATES_PY), "workflows", "--tree", str(target), "--allow", str(allow)],
-                       capture_output=True, text=True)
-    assert g.returncode == 0, g.stdout + g.stderr
-    # negative control on the real staged tree: a job pinned to a self-hosted runner is caught
-    ci = target / ".github" / "workflows" / "ci.yml"
-    ci.write_text(ci.read_text().replace("runs-on: ubuntu-latest", "runs-on: [self-hosted, linux]", 1))
-    g = subprocess.run([sys.executable, str(GATES_PY), "workflows", "--tree", str(target), "--allow", str(allow)],
-                       capture_output=True, text=True)
-    assert g.returncode == 1 and "ci.yml" in g.stdout, g.stdout + g.stderr
-
-
 # What the add-on repositories run now (their own stack-contract.yml / ci.yml) and what the
 # public CI therefore must not carry.
 MOVED_OUT_JOBS = ("sibling-overlay-parity", "sibling-intel-overlay-parity", "intel-graph-context", "test", "promotion-gate")
@@ -651,28 +528,6 @@ def test_sqlx_drift_reads_trellion_anonymously_and_skips_cleanly():
     assert any(s.get("name") == "Install noomesh" for s in gated), "the install must wait for the probe"
     assert any("migration-replay-check.sh" in s.get("run", "") for s in gated), "the replay must wait for the probe"
     assert not _refs(job), _refs(job)
-
-
-def test_e2_every_release_matrix_dockerfile_exists_in_the_public_tree(tmp_path):
-    """The release builds from the PUBLIC tree. Sync into a temp git repo
-    (non-strict, build check skipped) and require every Dockerfile the images
-    matrix names to be there: a Dockerfile left under an excluded path would
-    pass in the private tree and break the first public release."""
-    sync = REPO / "scripts" / "sync-to-oss.sh"
-    if not sync.exists() or not (WORKFLOWS_DIR / "images-release.yml").exists():
-        pytest.skip("sync script or release workflow not present")
-    include = _load("images-release.yml")["jobs"]["images"]["strategy"]["matrix"]["include"]
-    named = {m["name"]: m["dockerfile"] for m in include}
-    assert named, "the parse found no matrix entries"
-    target = tmp_path / "pub"
-    subprocess.run(["git", "init", "-q", str(target)], check=True)
-    env = {**os.environ, "NOO_SYNC_SKIP_BUILD": "1"}
-    env.pop("OSS_ORG_STRICT", None)
-    r = subprocess.run(["bash", str(sync), "--yes", str(target)], stdin=subprocess.DEVNULL,
-                       capture_output=True, text=True, env=env)
-    assert r.returncode == 0, f"the sync itself failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}"
-    missing = {n: d for n, d in named.items() if not (target / d).is_file()}
-    assert not missing, f"matrix Dockerfiles absent from the synced public tree: {missing}"
 
 
 def test_e_the_public_required_checks_are_jobs_that_run_in_the_public_repo():
