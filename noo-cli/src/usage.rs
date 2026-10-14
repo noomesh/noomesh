@@ -353,7 +353,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["auth", "status"], "", "Show which credential this CLI would use and whether the gateway accepts it"),
     (&["auth", "logout"], "", "Revoke the stored refresh token server-side and delete the local credential"),
     (&["usage"], "[-m <YYYY-MM> | --all-time] [-g node|model|backend|source|user|consumer|day]", "Show token-usage totals for a month or all time, grouped by a dimension"),
-    (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack and nodes; --channel moves release channel"),
+    (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack and nodes; --channel moves release channel"),
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
     (&["addons", "enable"], "<name> [--force]", "Pin a licensed add-on's signed lock, mint its credentials and key, then declare it ON"),
     (&["addons", "disable"], "<name>", "Declare an add-on OFF in noomesh.yaml; restart applies it"),

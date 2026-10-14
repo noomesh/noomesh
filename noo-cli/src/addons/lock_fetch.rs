@@ -53,7 +53,8 @@ const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const MAX_BLOB: u64 = 1 << 20;
 
 /// The store key holding the controller's registry credential: a token that
-/// can read the add-on packages (`read:packages` on GHCR). Never in `.env`.
+/// can read the add-on packages (`read:packages` on GHCR). Read from the
+/// encrypted store only, never from `.env`.
 pub const TOKEN_KEY: &str = "NOO_ADDON_REGISTRY_TOKEN";
 /// The user name sent with it. Optional; GHCR checks only the token.
 pub const USER_KEY: &str = "NOO_ADDON_REGISTRY_USER";
@@ -95,29 +96,26 @@ impl Credential {
     }
 }
 
-/// The credential installed on this controller: the encrypted store when
-/// that backend is active (the only supported home), else `.env` for a
-/// development checkout. `None` = no token; fetches then go anonymous and a
-/// private package answers "access refused".
-pub fn installed_credential() -> Option<Credential> {
+/// The credential installed on this controller. Its only home is the
+/// encrypted store: never `.env`. `Ok(None)` = no token stored (fetches then
+/// go anonymous and a private package answers "access refused"); `Err` = the
+/// store could not be read, which is never "no token".
+pub fn installed_credential() -> Result<Option<Credential>, String> {
     let root = crate::envfile::repo_root();
-    let read = |k: &str| -> Option<String> {
-        let v = if crate::envfile::sops_backend_active() {
-            let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops")).ok()?;
-            store.get(k).map(str::to_string)
-        } else {
-            Some(crate::onboard::env::read_env_key(&root.join(".env"), k))
-        };
-        v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    };
-    let token = read(TOKEN_KEY)?;
-    // The user name is not a secret, so it may sit in `.env` beside a
-    // store-held token.
+    if !crate::envfile::sops_backend_active() {
+        return Ok(None);
+    }
+    let path = root.join("secrets/env.sops");
+    let store = crate::commands::secrets::SecretStore::load_sops(&path)
+        .map_err(|e| format!("{} could not be read for {TOKEN_KEY}: {e}", path.display()))?;
+    let get = |k: &str| store.get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(token) = get(TOKEN_KEY) else { return Ok(None) };
+    // The user name is not a secret, so it may sit in `.env` beside it.
     let env_user = crate::onboard::env::read_env_key(&root.join(".env"), USER_KEY).trim().to_string();
-    let user = read(USER_KEY)
+    let user = get(USER_KEY)
         .or((!env_user.is_empty()).then_some(env_user))
         .unwrap_or_else(|| DEFAULT_USER.to_string());
-    Some(Credential { user, token })
+    Ok(Some(Credential { user, token }))
 }
 
 /// The lock and signature as fetched, before any verification.
@@ -129,26 +127,33 @@ pub struct Fetched {
 
 /// An OCI registry client for add-on locks.
 pub struct Client {
+    /// Manifest and token requests: no redirects at all.
     agent: ureq::Agent,
+    /// Blob requests: redirects allowed (GHCR answers with one), never with
+    /// the Authorization header.
+    blob_agent: ureq::Agent,
     scheme: &'static str,
     cred: Option<Credential>,
+    /// The registry host of the current fetch: the token realm must be on it.
+    host: std::cell::RefCell<String>,
 }
 
 impl Client {
     /// The production client: https only, verified by the platform trust
     /// store, Authorization never forwarded on a redirect.
     pub fn new(cred: Option<Credential>) -> Self {
-        Client { agent: agent(true), scheme: "https", cred }
+        Client { agent: agent(true, 0), blob_agent: agent(true, 5), scheme: "https", cred, host: Default::default() }
     }
 
     /// Plain http on loopback, for the fake registry in tests only.
     #[cfg(test)]
     pub(crate) fn plain_http_for_tests(cred: Option<Credential>) -> Self {
-        Client { agent: agent(false), scheme: "http", cred }
+        Client { agent: agent(false, 0), blob_agent: agent(false, 5), scheme: "http", cred, host: Default::default() }
     }
 
     fn get(&self, url: &str, accept: Option<&str>, auth: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
-        let mut req = self.agent.get(url).header("User-Agent", "noo-cli");
+        let agent = if url.contains("/blobs/") { &self.blob_agent } else { &self.agent };
+        let mut req = agent.get(url).header("User-Agent", "noo-cli");
         if let Some(a) = accept {
             req = req.header("Accept", a);
         }
@@ -194,6 +199,14 @@ impl Client {
                 format!("the registry's token realm {realm:?} is not {}; refusing to send a credential there", self.scheme),
             ));
         }
+        let realm_host = realm[self.scheme.len() + 3..].split(['/', '?']).next().unwrap_or("");
+        if realm_host != self.host.borrow().as_str() {
+            return Err(FetchError::new(
+                FetchClass::Auth,
+                format!("the registry's token realm {realm:?} is not on the registry host {}; refusing to send a credential there",
+                    self.host.borrow()),
+            ));
+        }
         let query: Vec<String> = params
             .iter()
             .filter(|(k, _)| k == "service" || k == "scope")
@@ -222,6 +235,7 @@ impl Client {
         let Some((host, path)) = split_root(root) else {
             return Err(FetchError::new(FetchClass::Other, format!("registry root {root:?} is not host/path")));
         };
+        *self.host.borrow_mut() = host.to_string();
         let base = format!("{}://{host}/v2/{path}", self.scheme);
         let mut bearer: Option<String> = None;
         let url = format!("{base}/manifests/{}", lock_tag(stack_tag));
@@ -259,11 +273,12 @@ impl Client {
     }
 }
 
-fn agent(https_only: bool) -> ureq::Agent {
+fn agent(https_only: bool, max_redirects: u32) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60)))
         .http_status_as_error(false)
         .https_only(https_only)
+        .max_redirects(max_redirects)
         .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
         .build()
         .into()
@@ -592,12 +607,33 @@ mod tests {
     }
 
     #[test]
-    fn production_client_is_https_only_and_refuses_a_plain_realm() {
+    fn production_client_is_https_only_and_refuses_a_plain_or_foreign_realm() {
         let c = Client::new(Some(Credential { user: "u".into(), token: "t".into() }));
         assert_eq!(c.scheme, "https");
+        *c.host.borrow_mut() = "ghcr.io".into();
         let e = c.token("Bearer realm=\"http://evil.example/token\",service=\"x\"").unwrap_err();
         assert_eq!(e.class, FetchClass::Tls, "{e}");
         assert!(e.detail.contains("refusing to send a credential"), "{e}");
+        let e = c.token("Bearer realm=\"https://evil.example/token\",service=\"x\"").unwrap_err();
+        assert!(e.detail.contains("not on the registry host ghcr.io"), "{e}");
+        // An http URL — what a downgrade redirect would hand it — is refused
+        // by the agent itself, before any byte is sent.
+        let st = serve(|_| Routes::new());
+        let e = c.get(&format!("{}/blobs/x", st.base), None, None).unwrap_err();
+        assert_eq!(e.class, FetchClass::Tls, "{e}");
+        assert!(st.seen.lock().unwrap().is_empty(), "a plain-http request reached the server");
+    }
+
+    #[test]
+    fn manifest_requests_do_not_follow_redirects() {
+        let reg = serve(|base| {
+            let mut r = Routes::new();
+            r.insert(format!("/v2/{ROOT_PATH}/manifests/stack-v0.6.0"), (307, vec![("Location".into(), format!("{base}/elsewhere"))], vec![]));
+            r
+        });
+        let e = Client::plain_http_for_tests(None).fetch(&root(&reg.base), "v0.6.0").unwrap_err();
+        assert!(reg.seen.lock().unwrap().iter().all(|s| s.path != "/elsewhere"), "the redirect was followed");
+        let _ = e;
     }
 
     #[test]

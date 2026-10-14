@@ -40,7 +40,7 @@ const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
 const INSTALLER: &str = include_str!("../../install.sh");
 const UPGRADE_USAGE: &str =
-    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
+    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
 
 /// THE release repo, for every caller. `NOO_CLI_REPO` overrides the default.
 ///
@@ -104,6 +104,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // service-key listing in the pre-roll check — the store check stays.
     // Separate from --force, which overrides unrelated refusals.
     let mut skip_gw_key_check = false;
+    // `--stack` only: an explicit rollback may take a licensed add-on back to
+    // an older signed version with it. Refused by default (add-ons may carry
+    // database migrations).
+    let mut allow_downgrade = false;
     // Move this install between release channels.
     let mut chan = super::channel::Flags::default();
     let mut yes = false;
@@ -119,6 +123,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--allow-unsigned" => allow_unsigned = true,
             "--force" => force = true,
             "--skip-gateway-key-check" => skip_gw_key_check = true,
+            "--allow-downgrade" => allow_downgrade = true,
             "--yes" | "-y" => yes = true,
             "--channel" | "--release-repo" | "--image-prefix" | "--base-registry" => match it.next() {
                 Some(v) => {
@@ -165,10 +170,15 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    if allow_downgrade && !stack {
+        fail(g.json, ExitCode::Usage, "usage", "--allow-downgrade applies to the stack roll only (--stack or --all)",
+            Some(UPGRADE_USAGE));
+    }
+
     // Stage 2: we ARE the freshly-installed binary; run the stack/node
     // stages with THIS build's paired tag + embedded assets.
     if stage2 {
-        return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check);
+        return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -310,7 +320,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if stack || nodes {
             // No swap happened — this process IS the current build, so its
             // paired tag and assets are already the right ones.
-            return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check);
+            return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
         }
         return Ok(0);
     }
@@ -470,6 +480,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if nodes { cmd.arg("--nodes"); }
             if let Some(t) = &tag_override { cmd.arg("--tag").arg(t); }
             if skip_gw_key_check { cmd.arg("--skip-gateway-key-check"); }
+            if allow_downgrade { cmd.arg("--allow-downgrade"); }
             let err = cmd.exec(); // only returns on failure
             fail(g.json, ExitCode::Generic, "reexec_failed",
                 &format!("could not re-exec the new binary: {err}"),
@@ -725,7 +736,7 @@ fn version_less_than(a: &str, b: &str) -> bool {
 
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
-fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool)
+fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
     -> Result<i32, Unhandled>
 {
     let mut rc = 0;
@@ -735,7 +746,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
     let phased = nodes;
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
-        rc = upgrade_stack(g, tag_override, force, skip_gw_key_check)?;
+        rc = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
         if rc != 0 { failed_stage = "stack"; }
         else if !nodes {
             // The roll returns the moment compose is up; the gateway reports
@@ -848,7 +859,7 @@ fn rerender_nats_users_for_roll(g: &Globals, root: &std::path::Path) {
     }
 }
 
-fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool) -> Result<i32, Unhandled> {
+fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool) -> Result<i32, Unhandled> {
     // repo_root() ranks a python-venv-derived root above the standalone
     // home, so a STALE clone (e.g. ~/pai-assistant left from an early
     // manual attempt) shadowed a healthy ~/.noo and --stack refused a
@@ -1032,7 +1043,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    cannot is a hold: the roll is refused naming it, with nothing
     //    changed. The pins are written beside stack.lock in step 2.
     let target_stack_lock = fetch_stack_lock(g, &tag);
-    let addon_prep = addon_preflight(g, &root, &tag, target_stack_lock.as_deref());
+    let addon_prep = addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade);
 
     // -1. The audit log's signing key. A release whose
     //    gateway signs audit rows ONLY with NOO_AUDIT_HMAC_KEY refuses every
@@ -3332,9 +3343,26 @@ fn write_stack_lock(g: &Globals, tag: &str, root: &std::path::Path, lock: Option
     if !g.json { ui::done(&format!("digest lock verified: {n} image(s) pinned from stack-{tag} (release-signed)")); }
 }
 
-/// The licensed add-ons declared on in `root`'s noomesh.yaml.
-fn addons_on(root: &std::path::Path) -> Vec<&'static str> {
-    crate::addons::licensed_addons().filter(|a| crate::addons::declared_on(root, a)).collect()
+/// The licensed add-ons declared on in `root`'s noomesh.yaml. An unreadable
+/// or unparseable file refuses (it would otherwise read as "no add-on on" and
+/// skip every hold).
+fn addons_on(g: &Globals, root: &std::path::Path) -> Vec<&'static str> {
+    match crate::addons::licensed_on(root) {
+        Ok(l) => l,
+        Err(e) => fail(g.json, ExitCode::Generic, "config",
+            &format!("{e} — refusing to roll without knowing which add-ons are on. Nothing was changed"),
+            Some("noo addons list")),
+    }
+}
+
+/// The registry credential, or a refusal: an unreadable store is never "no
+/// token".
+fn addon_credential(g: &Globals) -> Option<crate::addons::lock_fetch::Credential> {
+    match crate::addons::lock_fetch::installed_credential() {
+        Ok(c) => c,
+        Err(e) => fail(g.json, ExitCode::Generic, "store_unreadable", &format!("{e}. Nothing was changed"),
+            Some("noo security secrets audit")),
+    }
 }
 
 /// Remedy for an add-on that holds a stack roll.
@@ -3342,7 +3370,10 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if r.is_auth() {
         return crate::addons::resolve::TOKEN_FIX.to_string();
     }
-    format!("noo addons disable {addon}   # or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z>")
+    if matches!(r, crate::addons::resolve::Refusal::Downgrade { .. }) {
+        return "noo upgrade --stack --allow-downgrade   # an explicit rollback of the add-on with the stack".to_string();
+    }
+    format!("noo addons disable {addon}   # or wait for its release for this stack, or roll to an older one: noo upgrade --stack --tag <vX.Y.Z> (add --allow-downgrade to take the add-on back with it)")
 }
 
 /// Step -1z of `upgrade_stack`: resolve, verify and pull every add-on that
@@ -3352,18 +3383,19 @@ fn addon_preflight(
     root: &std::path::Path,
     tag: &str,
     stack_lock: Option<&str>,
+    allow_downgrade: bool,
 ) -> Vec<crate::addons::Prepared> {
-    let on = addons_on(root);
+    let on = addons_on(g, root);
     if on.is_empty() {
         return Vec::new();
     }
-    let cred = crate::addons::lock_fetch::installed_credential();
+    let cred = addon_credential(g);
     let client = crate::addons::lock_fetch::Client::new(cred.clone());
-    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade: false, client: &client, cred: cred.as_ref() };
+    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade, client: &client, cred: cred.as_ref() };
     let mut out = Vec::new();
     for addon in on {
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
-        match crate::addons::prepare(&ctx, addon, &mut crate::addons::resolve::LiveDocker) {
+        match crate::addons::prepare(&ctx, addon, &mut crate::addons::resolve::LiveDocker::new(root)) {
             Ok(p) => out.push(p),
             Err(r) => fail(g.json, ExitCode::Generic, "addon_hold",
                 &format!("refusing to roll to {tag}: the {addon} add-on is on and {}. Nothing was changed",
@@ -3401,7 +3433,7 @@ fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &
 /// The add-ons that hold a roll to `target`: `(addon, why)` for each one on
 /// that has no lock for it that verifies. Read-only (no pull, no pin).
 fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String, String)> {
-    let on = addons_on(root);
+    let on = addons_on(g, root);
     if on.is_empty() {
         return Vec::new();
     }
@@ -3409,9 +3441,11 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
         Ok(t) => t,
         Err((_, msg, _)) => return on.iter().map(|a| (a.to_string(), format!("the stack lock for {target} did not verify ({msg})"))).collect(),
     };
-    let cred = crate::addons::lock_fetch::installed_credential();
-    let client = crate::addons::lock_fetch::Client::new(cred);
-    let pins = crate::addons::pins::read(root).unwrap_or_default();
+    let client = crate::addons::lock_fetch::Client::new(addon_credential(g));
+    let pins = match crate::addons::pins::read(root) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
+    };
     on.into_iter()
         .filter_map(|addon| {
             let pinned = pins.get(addon).map(|p| p.version.clone());
@@ -4729,6 +4763,8 @@ mod keyless_tests {
         let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
         let pre = at("addon_preflight(g, &root, &tag");
+        assert!(body.contains("addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade)"),
+            "--allow-downgrade is the only way past the add-on downgrade rule on a roll");
         for later in ["reconcile_audit_key(&root)", "systems::reconcile_credentials(&root)", "standalone::materialize(&root)",
                       "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
             assert!(pre < at(later), "the add-on preflight must run before `{later}`");
@@ -4745,6 +4781,8 @@ mod keyless_tests {
         assert!(super::hold_line("v0.6.0", "v0.6.1", &[]).contains("every add-on that is on has a lock for it"));
         let r = crate::addons::resolve::Refusal::NoAnchor;
         assert!(super::addon_hold_fix("evolve", &r).starts_with("noo addons disable evolve"));
+        let d = crate::addons::resolve::Refusal::Downgrade { pinned: "2.0.0".into(), offered: "1.0.0".into() };
+        assert!(super::addon_hold_fix("evolve", &d).starts_with("noo upgrade --stack --allow-downgrade"));
     }
 
     #[test]

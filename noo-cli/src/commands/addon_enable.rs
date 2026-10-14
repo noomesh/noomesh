@@ -192,6 +192,7 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
     }
     match r {
         R::NoEntitlement(_) => "noo security entitlement install <token>".into(),
+        R::Store(_) => "noo security secrets audit".into(),
         R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),
         R::Downgrade { .. } => format!("noo addons upgrade {addon} --allow-downgrade"),
         R::Fetch { .. } | R::NotForStack { .. } | R::NoStackLock { .. } | R::BaseRowMissing { .. } => {
@@ -214,7 +215,10 @@ impl EnableOps for Live<'_> {
             ));
         };
         let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
-        let cred = addons::lock_fetch::installed_credential();
+        let cred = addons::lock_fetch::installed_credential().map_err(|e| Refusal {
+            why: format!("{e}. Nothing was changed"),
+            fix: "noo security secrets audit".into(),
+        })?;
         let client = addons::lock_fetch::Client::new(cred.clone());
         let ctx = addons::Ctx {
             root: &root,
@@ -227,7 +231,7 @@ impl EnableOps for Live<'_> {
         if !self.g.json {
             crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));
         }
-        let prepared = match addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker) {
+        let prepared = match addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker::new(&root)) {
             Ok(p) => p,
             Err(r @ (R::NoEntitlement(_) | R::NoAnchor)) if self.force => {
                 return Ok(PinStep::Skipped(format!(

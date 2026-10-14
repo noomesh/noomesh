@@ -135,7 +135,7 @@ services:
   # core registry carries no add-on image.
   noo-evolve-routes:
     logging: *default-logging
-    image: ${NOO_ADDON_IMAGE_EVOLVE:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/evolve:${NOO_IMAGE_TAG:-latest}}
+    image: ${NOO_ADDON_IMAGE_EVOLVE:-noo-addon-unpinned.invalid/evolve:run-noo-addons-upgrade}
     container_name: noo-evolve-routes
     network_mode: none
     restart: "no"
@@ -153,9 +153,11 @@ services:
     # the digest ref evolve's own signed lock pins for this stack tag, set only
     # by scripts/lib-dist.sh require_addon_pins after re-verifying the pin; the
     # launcher refuses an enabled evolve without it and never pulls it (the CLI
-    # pulled it by digest: noo addons upgrade). The fallback keeps
-    # NOO_IMAGE_PREFIX REQUIRED so a bare `docker compose` still fails loudly.
-    image: ${NOO_ADDON_IMAGE_EVOLVE:-${NOO_IMAGE_PREFIX:?set by scripts/lib-dist.sh — run `noo stack start --dist`, not docker compose}/evolve:${NOO_IMAGE_TAG:-latest}}
+    # pulled it by digest: noo addons upgrade). There is no tag fallback:
+    # unset, the ref is a sentinel under the reserved .invalid domain that can
+    # never be pulled or exist locally, so a bare `docker compose up` fails
+    # loudly. A dev start sets the variable to the dev build's name.
+    image: ${NOO_ADDON_IMAGE_EVOLVE:-noo-addon-unpinned.invalid/evolve:run-noo-addons-upgrade}
     container_name: noo-evolve
     # Every secret arrives as a FILE /run/secrets/<name>
     # from the `secrets:` list below, the environment holding only the

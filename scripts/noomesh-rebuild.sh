@@ -318,6 +318,10 @@ NO_CACHE=""
 # The file list has ONE home.
 . "$(dirname "$0")/lib-compose.sh"
 COMPOSE_FILES="$(compose_file_args .)"
+# Composed add-on overlays read NOO_ADDON_IMAGE_<NAME> (no tag fallback):
+# a rebuild is a dev start, so they get the dev build's names here
+# (lib-dist.sh require_addon_pins; DIST_MODE is never 1 in a rebuild).
+DIST_MODE=0 require_addon_pins || exit 1
 
 while [[ $# -gt 0 ]]; do
     case $1 in

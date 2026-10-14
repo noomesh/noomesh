@@ -128,8 +128,16 @@ pub(crate) fn config_path() -> std::path::PathBuf {
 /// parsed. Reading is a safe serde round-trip — nothing is written back, so
 /// the comment-destroying problem does not apply to this direction.
 fn declared_map() -> Result<std::collections::BTreeMap<String, bool>, String> {
-    let path = config_path();
-    let text = std::fs::read_to_string(&path)
+    declared_map_at(&config_path())
+}
+
+/// [`declared_map`] for a given noomesh.yaml. A missing file declares
+/// nothing; an unreadable or unparseable one is an error.
+pub(crate) fn declared_map_at(path: &std::path::Path) -> Result<std::collections::BTreeMap<String, bool>, String> {
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(Default::default());

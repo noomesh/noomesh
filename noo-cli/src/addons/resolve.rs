@@ -57,6 +57,9 @@ pub enum Refusal {
     Downgrade { pinned: String, offered: String },
     Pull(String),
     Write(String),
+    /// The encrypted store could not be read (a decrypt failure is never
+    /// "nothing installed").
+    Store(String),
 }
 
 impl Refusal {
@@ -91,6 +94,7 @@ impl Refusal {
             ),
             Refusal::Pull(e) => format!("{addon}'s images could not be pulled: {e}"),
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
+            Refusal::Store(e) => format!("the encrypted store could not be read to resolve {addon}: {e}"),
         }
     }
 
@@ -161,7 +165,9 @@ pub fn fetch_and_check(
 
 /// The anchor for `addon` from the installed, unexpired entitlement.
 pub fn installed_anchor(addon: &str) -> Result<TrustAnchor, Refusal> {
-    let token = crate::entitlement::installed_token().ok_or_else(|| Refusal::NoEntitlement("none installed".into()))?;
+    let token = crate::entitlement::installed_token_checked()
+        .map_err(Refusal::Store)?
+        .ok_or_else(|| Refusal::NoEntitlement("none installed".into()))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -196,13 +202,11 @@ pub fn pull_images(docker: &mut dyn Docker, v: &VerifiedLock, cred: Option<&Cred
     Ok(missing.len())
 }
 
-/// Step 8: cache the lock and set this add-on's pin (other pins kept).
+/// Step 8: cache the lock and set this add-on's pin (other pins kept), as
+/// one atomic pair under the pins lock (`pins::set_pin`).
 pub fn record(root: &Path, addon: &str, v: &VerifiedLock, fetched: &Fetched, stack_tag: &str) -> Result<Pin, Refusal> {
-    let mut all = pins::read(root).map_err(Refusal::Write)?;
-    let pin = Pin::from_verified(v, stack_tag);
-    pins::cache(root, addon, &fetched.lock, &fetched.sig).map_err(Refusal::Write)?;
-    all.insert(addon.to_string(), pin.clone());
-    pins::write(root, &all).map_err(Refusal::Write)?;
+    let pin = Pin::from_verified(v, stack_tag, &fetched.lock);
+    pins::set_pin(root, addon, &pin, &fetched.lock, &fetched.sig).map_err(Refusal::Write)?;
     Ok(pin)
 }
 
@@ -214,8 +218,7 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
     if pin.stack != tag {
         return Err(format!("{addon} is pinned for stack {}, and this stack runs {tag}", pin.stack));
     }
-    let (lock, sig) = pins::cached_lock(root, addon)
-        .ok_or_else(|| format!("{addon}'s verified lock is missing from {}/", pins::CACHE_DIR))?;
+    let (lock, sig) = pins::cached_lock(root, addon, &pin)?;
     let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| format!("{addon}'s cached lock no longer verifies: {e}"))?;
     if !v.lock.supports(tag) {
         return Err(format!("{addon} {}'s lock does not list stack {tag}", v.lock.version));
@@ -226,8 +229,21 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
     Ok(pin)
 }
 
-/// The production [`Docker`].
-pub struct LiveDocker;
+/// The production [`Docker`]. Its throwaway docker configs live under the
+/// install's runtime secrets directory (`<root>/secrets/.runtime`, 0700).
+pub struct LiveDocker {
+    runtime: std::path::PathBuf,
+}
+
+impl LiveDocker {
+    pub fn new(root: &Path) -> Self {
+        LiveDocker { runtime: root.join("secrets").join(".runtime") }
+    }
+}
+
+fn last_line(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).lines().last().unwrap_or("").to_string()
+}
 
 impl Docker for LiveDocker {
     fn image_present(&mut self, reference: &str) -> bool {
@@ -240,7 +256,11 @@ impl Docker for LiveDocker {
     }
 
     fn pull(&mut self, host: &str, refs: &[String], cred: Option<&Credential>) -> Result<(), String> {
-        let dir = ThrowawayConfig::new()?;
+        // Declared first so it drops LAST: the directory is gone before a
+        // deferred Ctrl-C or SIGTERM is re-raised.
+        let _signals = DeferSignals::install();
+        sweep_stale(&self.runtime);
+        let dir = ThrowawayConfig::new(&self.runtime)?;
         if let Some(c) = cred {
             let mut child = std::process::Command::new("docker")
                 .arg("--config")
@@ -256,8 +276,7 @@ impl Docker for LiveDocker {
             }
             let out = child.wait_with_output().map_err(|e| format!("docker login: {e}"))?;
             if !out.status.success() {
-                let why = String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").to_string();
-                return Err(format!("docker login {host} refused the add-on registry token: {why}"));
+                return Err(format!("docker login {host} refused the add-on registry token: {}", last_line(&out.stderr)));
             }
         }
         for r in refs {
@@ -268,8 +287,7 @@ impl Docker for LiveDocker {
                 .output()
                 .map_err(|e| format!("docker pull: {e}"))?;
             if !out.status.success() {
-                let why = String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").to_string();
-                return Err(format!("docker pull {r}: {why}"));
+                return Err(format!("docker pull {r}: {}", last_line(&out.stderr)));
             }
         }
         Ok(())
@@ -290,27 +308,53 @@ impl Docker for LiveDocker {
     }
 }
 
-/// A docker config directory (mode 0700) that exists for one operation and
-/// is removed on drop, so the registry token is never left in
-/// `~/.docker/config.json`.
+const THROWAWAY_PREFIX: &str = "noo-addon-docker-";
+
+/// Remove throwaway configs a killed run left behind (SIGKILL, power loss):
+/// a registry token must not outlive the operation that needed it.
+pub fn sweep_stale(runtime: &Path) {
+    if let Ok(entries) = std::fs::read_dir(runtime) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(THROWAWAY_PREFIX) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
+/// A docker config directory (mode 0700, under a 0700 parent) that exists
+/// for one operation and is removed on drop, so the registry token is never
+/// left in `~/.docker/config.json`.
 pub struct ThrowawayConfig(pub std::path::PathBuf);
 
 impl ThrowawayConfig {
-    pub fn new() -> Result<Self, String> {
-        let base = std::env::temp_dir();
-        for n in 0..100u32 {
-            let p = base.join(format!(
-                "noo-addon-docker-{}-{}-{n}",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
-            ));
+    pub fn new(runtime: &Path) -> Result<Self, String> {
+        let mk = |p: &Path| -> std::io::Result<()> {
             let mut b = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt as _;
                 b.mode(0o700);
             }
-            match b.create(&p) {
+            b.create(p)
+        };
+        if !runtime.is_dir() {
+            if let Some(parent) = runtime.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            match mk(runtime) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("{}: {e}", runtime.display())),
+            }
+        }
+        for n in 0..100u32 {
+            let p = runtime.join(format!(
+                "{THROWAWAY_PREFIX}{}-{}-{n}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+            ));
+            match mk(&p) {
                 Ok(()) => return Ok(ThrowawayConfig(p)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(format!("{}: {e}", p.display())),
@@ -323,6 +367,58 @@ impl ThrowawayConfig {
 impl Drop for ThrowawayConfig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// While alive, SIGINT/SIGTERM/SIGHUP are recorded instead of killing the
+/// process (a signal would skip every destructor, the throwaway config's
+/// included). A Ctrl-C still reaches the docker child in the foreground
+/// process group, so the pull stops; on drop the previous dispositions come
+/// back and a recorded signal is re-raised, so the exit status is still the
+/// signal's.
+pub struct DeferSignals {
+    #[cfg(unix)]
+    prev: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+#[cfg(unix)]
+static DEFERRED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+impl DeferSignals {
+    pub fn install() -> Self {
+        #[cfg(unix)]
+        {
+            extern "C" fn record(sig: libc::c_int) {
+                DEFERRED.store(sig, std::sync::atomic::Ordering::SeqCst);
+            }
+            DEFERRED.store(0, std::sync::atomic::Ordering::SeqCst);
+            let handler = record as *const () as libc::sighandler_t;
+            let prev = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+                .iter()
+                // SAFETY: installing a handler that only stores an atomic.
+                .map(|&s| (s, unsafe { libc::signal(s, handler) }))
+                .collect();
+            DeferSignals { prev }
+        }
+        #[cfg(not(unix))]
+        DeferSignals {}
+    }
+}
+
+impl Drop for DeferSignals {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            for (s, h) in &self.prev {
+                // SAFETY: restoring the disposition we replaced.
+                unsafe { libc::signal(*s, *h) };
+            }
+            let sig = DEFERRED.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if sig != 0 {
+                // SAFETY: re-raising the signal we deferred.
+                unsafe { libc::raise(sig) };
+            }
+        }
     }
 }
 
@@ -486,6 +582,7 @@ pub(crate) mod tests {
         let cred = Credential { user: "u".into(), token: "t".into() };
         assert_eq!(pull_images(&mut d, &v, Some(&cred)).unwrap(), 1);
         assert_eq!(d.pulls[0].0, "ghcr.io");
+        assert!(d.pulls[0].2, "the registry credential must reach the pull");
         assert!(d.pulls[0].1.iter().all(|r| r.contains("@sha256:")));
         assert_eq!(pull_images(&mut d, &v, Some(&cred)).unwrap(), 0, "a local image is not pulled again");
         let mut bad = FakeDocker { fail_pull: true, ..Default::default() };
@@ -511,16 +608,20 @@ pub(crate) mod tests {
         assert!(offline_check(&d, "evolve", "v0.6.0", &anchor()).unwrap_err().contains("no pin"));
 
         // One byte of the cached lock changed: the launcher must refuse.
-        let cached = d.join(pins::CACHE_DIR).join("trellion_intel.json");
+        let cache = d.join(pins::CACHE_DIR);
+        let cached = std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "json")).unwrap();
         let text = std::fs::read_to_string(&cached).unwrap().replace("1.2.0", "1.3.0");
         std::fs::write(&cached, text).unwrap();
-        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("no longer verifies"));
+        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("was altered"));
+        std::fs::remove_file(&cached).unwrap();
+        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("is missing"));
 
         // A pin edited to point elsewhere, with the lock intact.
         record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
         let mut all = pins::read(&d).unwrap();
         all.get_mut("trellion_intel").unwrap().images.insert("trellion-intel".into(), format!("{ROOT}@{}", digest('7')));
-        pins::write(&d, &all).unwrap();
+        std::fs::write(d.join(pins::PINS_FILE), serde_json::to_vec(&all).unwrap()).unwrap();
         assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("was edited"));
     }
 
@@ -542,16 +643,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn throwaway_config_is_private_and_removed() {
+    fn throwaway_config_is_private_under_the_runtime_dir_and_removed() {
+        let root = scratch("throwaway");
+        let runtime = root.join("secrets").join(".runtime");
         let p = {
-            let t = ThrowawayConfig::new().unwrap();
+            let t = ThrowawayConfig::new(&runtime).unwrap();
+            assert!(t.0.starts_with(&runtime));
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 assert_eq!(std::fs::metadata(&t.0).unwrap().permissions().mode() & 0o777, 0o700);
+                assert_eq!(std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777, 0o700);
             }
             t.0.clone()
         };
         assert!(!p.exists(), "the throwaway docker config outlived its operation");
+        // A config a killed run left behind is swept before the next pull.
+        let stale = runtime.join(format!("{THROWAWAY_PREFIX}1-2-3"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("config.json"), "{}").unwrap();
+        let other = runtime.join("keep-me");
+        std::fs::write(&other, "x").unwrap();
+        sweep_stale(&runtime);
+        assert!(!stale.exists() && other.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_the_operation_is_deferred_until_cleanup() {
+        // SIGHUP's previous disposition is restored and a deferred one is
+        // re-raised: test with an ignored signal so the re-raise is harmless.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        {
+            let _g = DeferSignals::install();
+            unsafe { libc::raise(libc::SIGHUP) };
+            assert_eq!(DEFERRED.load(std::sync::atomic::Ordering::SeqCst), libc::SIGHUP);
+        }
+        assert_eq!(DEFERRED.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let now = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_eq!(now, libc::SIG_IGN, "the previous disposition was not restored");
     }
 }

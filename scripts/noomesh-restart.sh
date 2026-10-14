@@ -156,6 +156,10 @@ fi
 # dist mode and the add-on map are both known.
 . "$_LIBDIR/lib-compose.sh"
 COMPOSE_FILES="$(compose_file_args .)"
+# Every add-on service compose renders must run exactly its verified pin
+# (require_addon_pins above exported them); empty render = refusal. Dist only.
+# shellcheck disable=SC2086
+dist_assert_addon_refs $COMPOSE_FILES || exit 1
 
 # Standalone: the single ollama-embed serves chat too (gateway static
 # fallback, stack-v0.2.5). An install whose .env predates that (0.3.31
