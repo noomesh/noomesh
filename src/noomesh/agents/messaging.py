@@ -304,9 +304,13 @@ class AgentMessenger:
 
     def _client(self):
         from ..gateway.helpers import _local_gateway_url  # noqa: PLC0415
+        from ..tls_ca import require_ca  # noqa: PLC0415
         import httpx  # noqa: PLC0415
 
-        return httpx.Client(base_url=_local_gateway_url(), headers=self._headers(), verify=os.getenv("NOO_TLS_CA") or True, timeout=15)
+        # A CA is REQUIRED (NOO_TLS_CA, else the install's standard path):
+        # no CA raises TlsCaMissing naming the setting; verification is never switched off
+        # and no silent system-store fallback.
+        return httpx.Client(base_url=_local_gateway_url(), headers=self._headers(), verify=require_ca(), timeout=15)
 
     def register(self, prev: Optional[AgentKeys] = None) -> dict:
         """Register this agent's public keys (self-signed). Pass ``prev`` —

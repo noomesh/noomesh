@@ -36,12 +36,8 @@ from pathlib import Path
 DEFAULT_PROMPT = "In one sentence: what is the current status of this cluster? Use a tool if one helps."
 
 
-def _ctx(cacert: str | None, insecure: bool) -> ssl.SSLContext:
-    if insecure:
-        c = ssl.create_default_context()
-        c.check_hostname = False
-        c.verify_mode = ssl.CERT_NONE
-        return c
+def _ctx(cacert: str | None) -> ssl.SSLContext:
+    # Always verified: --cacert or the system store. There is no skip flag.
     return ssl.create_default_context(cafile=cacert) if cacert else ssl.create_default_context()
 
 
@@ -84,7 +80,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gateway", default=os.environ.get("NOO_GATEWAY_URL", "https://localhost:8080"))
     ap.add_argument("--cacert", default=os.environ.get("NOO_TLS_CA"))
-    ap.add_argument("--insecure", action="store_true", help="skip TLS verification (diagnostics only)")
     ap.add_argument("--sessions", type=int, default=4, help="concurrent sessions per round")
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -95,7 +90,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    ctx = _ctx(args.cacert, args.insecure)
+    ctx = _ctx(args.cacert)
     tok = _token(args, ctx)
     if not tok:
         print("no credential: pass --token, set NOO_TOKEN, --user/--password, or `noo auth login` first", file=sys.stderr)
