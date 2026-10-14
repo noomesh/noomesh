@@ -196,7 +196,7 @@ _addon_composed_names() {
 # list). Every NOO_ADDON_IMAGE_* already in the environment is dropped first,
 # so an .env line or a shell export can never name an add-on image.
 #
-# Dist: `noo addons launch-pins <tag> <add-on>...` re-verifies, offline, each
+# Dist: `noo addons launch-pins --root <install root> <tag> <add-on>...` re-verifies, offline, each
 # cached lock against the installed entitlement and answers one line per
 # licensed add-on:
 #   pin <addon> <VAR> <ref@sha256:…>     export VAR=ref once the image is local
@@ -212,6 +212,9 @@ _addon_composed_names() {
 # REFUSE = return 1; both launchers `|| exit 1` before anything is pulled or
 # recreated.
 _ADDON_PINS=()
+# The install root this launcher belongs to (scripts/..), fixed when the
+# library is sourced. launch-pins reads the pins under it, never the cwd.
+_DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
@@ -234,7 +237,7 @@ require_addon_pins() {
         return 1
     fi
     # shellcheck disable=SC2086
-    if ! _out="$("$_nb" addons launch-pins "$_tag" $_on 2>&1)"; then
+    if ! _out="$("$_nb" addons launch-pins --root "${PROJECT_ROOT:-$_DIST_LIB_ROOT}" "$_tag" $_on 2>&1)"; then
         {
             echo "REFUSING: the add-on pins could not be read (noo addons launch-pins failed):"
             printf '  %s\n' "$_out"

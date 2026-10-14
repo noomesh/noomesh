@@ -392,13 +392,31 @@ pub(crate) fn addon_image_env(
     if refused.is_empty() { Ok(env) } else { Err(refused) }
 }
 
-/// `noo addons launch-pins <tag> [<name>…]` (hidden; the launcher's reader).
+/// Split an optional `--root <dir>` (or `--root=<dir>`) off the front of the
+/// launch-pins arguments.
+fn launch_root_arg(args: &[String]) -> Result<(Option<std::path::PathBuf>, &[String]), String> {
+    match args.first().map(String::as_str) {
+        Some("--root") => match args.get(1) {
+            Some(d) if !d.is_empty() => Ok((Some(d.into()), &args[2..])),
+            _ => Err("--root needs a directory".to_string()),
+        },
+        Some(a) if a.starts_with("--root=") && a.len() > 7 => Ok((Some(a[7..].into()), &args[1..])),
+        _ => Ok((None, args)),
+    }
+}
+
+/// `noo addons launch-pins [--root <dir>] <tag> [<name>…]` (hidden; the launcher's reader).
 pub fn addons_launch_pins(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let Some((tag, names)) = args.split_first() else {
-        fail(g.json, ExitCode::Usage, "usage", "launch-pins needs the stack tag", Some("noo addons launch-pins <tag> [<name>...]"));
+    let (explicit, rest) = match launch_root_arg(args) {
+        Ok(v) => v,
+        Err(e) => fail(g.json, ExitCode::Usage, "usage", &e, Some("noo addons launch-pins [--root <dir>] <tag> [<name>...]")),
     };
-    // The launcher runs from the install root; read the pins there.
-    let root = std::env::current_dir().unwrap_or_else(|_| crate::envfile::repo_root());
+    let Some((tag, names)) = rest.split_first() else {
+        fail(g.json, ExitCode::Usage, "usage", "launch-pins needs the stack tag", Some("noo addons launch-pins [--root <dir>] <tag> [<name>...]"));
+    };
+    // The install root, never the cwd: the launcher inherits the operator's
+    // directory (`~`), and the pins live under the state home.
+    let root = explicit.unwrap_or_else(crate::envfile::repo_root);
     for l in launch_lines(&root, tag, names, &|a| resolve::installed_anchor(a)) {
         println!("{l}");
     }
@@ -446,6 +464,27 @@ mod tests {
 
         let other_tag = launch_lines(&d, "v0.6.1", &names[..1], &|_| Ok(anchor()));
         assert!(other_tag[0].starts_with("refuse trellion_intel trellion_intel is pinned for stack v0.6.0"), "{other_tag:?}");
+    }
+
+    #[test]
+    fn launch_pins_read_the_given_root_not_the_cwd() {
+        let (d, reference) = pinned_root("launch-root");
+        let cwd = std::env::current_dir().unwrap();
+        assert_ne!(cwd, d, "the fake root must not be the cwd");
+        let args: Vec<String> = ["--root", d.to_str().unwrap(), "v0.6.0", "trellion_intel"].map(String::from).into();
+        let (root, rest) = launch_root_arg(&args).unwrap();
+        assert_eq!(root.as_deref(), Some(d.as_path()));
+        assert_eq!(rest, ["v0.6.0", "trellion_intel"]);
+        let lines = launch_lines(root.as_deref().unwrap(), &rest[0], &rest[1..], &|_| Ok(anchor()));
+        assert_eq!(lines[0], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
+        // The cwd has no pins: reading it (the old behaviour) finds nothing.
+        let from_cwd = launch_lines(&cwd, "v0.6.0", &rest[1..], &|_| Ok(anchor()));
+        assert!(from_cwd[0].starts_with("refuse"), "{from_cwd:?}");
+
+        let eq: Vec<String> = ["--root=/x", "v0.6.0"].map(String::from).into();
+        assert_eq!(launch_root_arg(&eq).unwrap().0.as_deref(), Some(std::path::Path::new("/x")));
+        assert!(launch_root_arg(&["--root".to_string()]).is_err());
+        assert!(launch_root_arg(&["v0.6.0".to_string()]).unwrap().0.is_none());
     }
 
     #[test]
