@@ -144,9 +144,14 @@ jobs:
           # The nested prefix is what lets the SAME names (redis, loki, ...)
           # exist as PUBLIC upstream mirrors at ghcr.io/noomesh/<name> (the
           # `dest_org: noomesh` lanes below): the compose template
-          # ${NOO_BASE_REGISTRY}/redis:... resolves under both. The hardened
-          # fleet sets NOO_BASE_REGISTRY=ghcr.io/noomesh/dhi, the public
-          # channel ghcr.io/noomesh.
+          # ${NOO_BASE_REGISTRY}/redis:... resolves under both. The DEFAULT
+          # (compose and registry.rs PUBLIC_BASE_REGISTRY) is
+          # ghcr.io/noomesh/dhi: every service key and data volume is handed
+          # to these images' uids. 0.6.0/0.6.1 pointed the public channel at
+          # ghcr.io/noomesh (the upstream lanes below, other uids) and the
+          # monitoring set restart-looped on `permission denied`.
+          # tests/test_image_namespace_declarations.py pins every compose
+          # ${NOO_BASE_REGISTRY} ref to a lane here of the same name:tag.
           # History: packages pushed under another owner were linked to a
           # different repository, which this repo's GITHUB_TOKEN cannot read,
           # and deps-core FROMs them - the first stack release died at
@@ -159,12 +164,13 @@ jobs:
           # THIRD_PARTY_NOTICES.md).
           #
           # ── OFFICIAL images → the PUBLIC noomesh org (2026-08-19) ────
-          # The public channel uses the upstream official images
-          # rather than the hardened DHI mirrors above (a different image
-          # family, not a licence limit: DHI Community is Apache-2.0). These
-          # are the open-source official equivalents, mirrored to ghcr.io/noomesh and RETAGGED to the exact tag
-          # strings the compose expects, so `NOO_BASE_REGISTRY=
-          # ghcr.io/noomesh` is the only switch a public install needs.
+          # The upstream official equivalents of the DHI runtime images,
+          # mirrored to ghcr.io/noomesh and RETAGGED to the exact tag strings
+          # the compose expects. NOT the default and not what the public
+          # channel seeds (since 0.6.2): they are a different image family
+          # that runs as other uids (nobody/10001/472), so the stack's key
+          # ACLs and data dirs do not fit them. Kept published for an
+          # operator who chooses them deliberately and re-hands the keys.
           # Sources verified upstream 2026-08-19. Pushed with this repo's own
           # GITHUB_TOKEN (the repo lives in the noomesh org); flip these
           # packages PUBLIC after the first push.

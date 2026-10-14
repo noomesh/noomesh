@@ -35,6 +35,7 @@ use crate::{Globals, Unhandled};
 use serde_json::Value;
 use std::process::Command;
 
+mod image_family;
 mod warmup;
 
 /// One invariant, judged.
@@ -3865,6 +3866,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             checks.push(at_rest_check(row.name, row.what, &row.path, exists, mount.as_ref().map(|(d, m)| (d.as_str(), m.as_str())), encrypted));
         }
         checks.push(monitoring_web_config_check(compose.as_deref()));
+        // The runtime images (redis + monitoring) are the family their keys
+        // and data are handed to (0.6.1: the upstream family, restart loops).
+        checks.push(image_family::image_family_row());
         // Every container that bind-mounts noomesh.yaml still
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());

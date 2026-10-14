@@ -4450,14 +4450,15 @@ ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
     };
     ctx.update_env("NOO_INSTALL_MODE", &install_mode);
     // Third-party base images (loki/redis/prometheus/...) resolve through
-    // ${NOO_BASE_REGISTRY:-ghcr.io/noomesh}, and dhi.io retires tags — the ghcr
+    // ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}, and dhi.io retires tags — the ghcr
     // mirror exists precisely because those refs "actually fail"
     // (mirror-images.yml). The standalone flow already seeds this; the
     // dist rehearsal showed a plain `onboard --ci` install dies on the
     // first retired tag without it.
     if ctx.read_env("NOO_BASE_REGISTRY").trim().is_empty() {
-        // The PUBLIC mirror of the upstream official images (registry.rs
-        // PUBLIC_BASE_REGISTRY), never the DHI mirror.
+        // The public DHI mirrors (registry.rs PUBLIC_BASE_REGISTRY), never
+        // the upstream-image mirrors at the bare namespace: those run as
+        // other uids and cannot read the keys handed to the DHI ones.
         ctx.update_env("NOO_BASE_REGISTRY", crate::registry::PUBLIC_BASE_REGISTRY);
     }
     ctx.state.install_mode = install_mode.clone();

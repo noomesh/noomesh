@@ -22,13 +22,28 @@ pub(crate) const IMAGE_NAMESPACE: &str = "ghcr.io/noomesh";
 
 /// The registry namespace a fresh install seeds into `NOO_BASE_REGISTRY` (where
 /// redis / loki / prometheus / alertmanager / grafana / node-exporter come
-/// from). It is the PUBLIC mirror of the UPSTREAM official images that
-/// mirror-images.yml publishes (the `dest_org: noomesh` lanes, retagged to the
-/// compose's tag strings). It must NEVER serve a dhi.io-derived image: those
-/// live under the `dhi/` prefix in the same org (scripts/dhi-images.txt), and
-/// no package name may be in both sets (pinned by
-/// tests/test_image_namespace_declarations.py).
-pub(crate) const PUBLIC_BASE_REGISTRY: &str = IMAGE_NAMESPACE;
+/// from): the DHI runtime mirrors that mirror-images.yml publishes under the
+/// NESTED `dhi/` prefix (`dest_org: noomesh/dhi`, list in
+/// scripts/dhi-images.txt). Those are the images the stack is built around:
+/// every service-key reader in `pki::SERVICE_KEY_READERS` and every
+/// data-volume owner is the DHI image's uid (65532, or root for the `-dev`
+/// variants).
+///
+/// It is NOT `IMAGE_NAMESPACE`. `ghcr.io/noomesh/<name>` (no `dhi/`) holds
+/// the UPSTREAM official images under the same names and tags (prom/*,
+/// grafana/*, redis), which run as nobody / 10001 / 472 and cannot read a
+/// key handed to 65532: 0.6.0 and 0.6.1 seeded that path, and the public
+/// fleet's monitoring set restart-looped on `permission denied` after
+/// `noo upgrade --channel public` (2026-10-14). The old private org served
+/// both families from one path, which is why it never showed there.
+pub(crate) const PUBLIC_BASE_REGISTRY: &str = "ghcr.io/noomesh/dhi";
+
+/// The `NOO_BASE_REGISTRY` value 0.6.0 and 0.6.1 wrote on the public channel
+/// (the upstream-mirror family, see above). `noo upgrade` corrects exactly
+/// this value to `PUBLIC_BASE_REGISTRY` on a public-channel install
+/// (`commands::channel::legacy_base_registry_fix`); any other operator value
+/// is left alone.
+pub(crate) const LEGACY_PUBLIC_BASE_REGISTRY: &str = IMAGE_NAMESPACE;
 
 /// The GitHub repo `noo` self-upgrades and installs from
 /// (`NOO_CLI_REPO` overrides it, see `commands::upgrade::repo`).
@@ -105,6 +120,22 @@ mod tests {
         assert!(is_registry_image("ghcr.io/noomesh/gateway"));
         assert!(!is_registry_image("noomesh/gateway"));
         assert!(!is_registry_image("pai-assistant/gateway"));
+    }
+
+    #[test]
+    fn the_base_registry_is_the_dhi_path_under_the_namespace() {
+        // The runtime images come from the DHI family, nested under the
+        // release namespace; the bare namespace is the upstream family.
+        assert_eq!(PUBLIC_BASE_REGISTRY, format!("{IMAGE_NAMESPACE}/dhi"));
+        assert_eq!(PUBLIC_BASE_REGISTRY, format!("{PUBLIC_IMAGE_NAMESPACE}/dhi"));
+        assert_ne!(PUBLIC_BASE_REGISTRY, IMAGE_NAMESPACE);
+        assert_ne!(PUBLIC_BASE_REGISTRY, PUBLIC_IMAGE_NAMESPACE);
+        assert!(!PUBLIC_BASE_REGISTRY.ends_with('/'));
+        // The value the migration corrects is exactly what 0.6.0/0.6.1 wrote.
+        assert_eq!(LEGACY_PUBLIC_BASE_REGISTRY, PUBLIC_IMAGE_NAMESPACE);
+        assert_ne!(LEGACY_PUBLIC_BASE_REGISTRY, PUBLIC_BASE_REGISTRY);
+        // Still one of ours for cleanup: the dhi path sits under the owned root.
+        assert!(is_registry_image(&format!("{PUBLIC_BASE_REGISTRY}/prometheus:3")));
     }
 
     #[test]
