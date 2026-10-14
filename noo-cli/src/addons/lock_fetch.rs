@@ -152,7 +152,18 @@ impl Client {
     }
 
     fn get(&self, url: &str, accept: Option<&str>, auth: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
-        let agent = if url.contains("/blobs/") { &self.blob_agent } else { &self.agent };
+        self.get_via(&self.agent, url, accept, auth)
+    }
+
+    /// GET through `agent`: the caller picks it by what it fetches (manifest
+    /// and token: no redirects; blob: redirects without Authorization).
+    fn get_via(
+        &self,
+        agent: &ureq::Agent,
+        url: &str,
+        accept: Option<&str>,
+        auth: Option<&str>,
+    ) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
         let mut req = agent.get(url).header("User-Agent", "noo-cli");
         if let Some(a) = accept {
             req = req.header("Accept", a);
@@ -167,12 +178,13 @@ impl Client {
     /// then one retry with a Bearer token from the challenge's realm.
     fn get_authed(
         &self,
+        agent: &ureq::Agent,
         url: &str,
         accept: Option<&str>,
         bearer: &mut Option<String>,
     ) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
         let auth = bearer.as_ref().map(|t| format!("Bearer {t}"));
-        let resp = self.get(url, accept, auth.as_deref())?;
+        let resp = self.get_via(agent, url, accept, auth.as_deref())?;
         if resp.status().as_u16() != 401 || bearer.is_some() {
             return Ok(resp);
         }
@@ -185,7 +197,7 @@ impl Client {
         let token = self.token(&challenge)?;
         *bearer = Some(token);
         let auth = bearer.as_ref().map(|t| format!("Bearer {t}"));
-        self.get(url, accept, auth.as_deref())
+        self.get_via(agent, url, accept, auth.as_deref())
     }
 
     /// Exchange the credential for a Bearer token at the challenge's realm.
@@ -239,7 +251,7 @@ impl Client {
         let base = format!("{}://{host}/v2/{path}", self.scheme);
         let mut bearer: Option<String> = None;
         let url = format!("{base}/manifests/{}", lock_tag(stack_tag));
-        let resp = self.get_authed(&url, Some(MANIFEST_ACCEPT), &mut bearer)?;
+        let resp = self.get_authed(&self.agent, &url, Some(MANIFEST_ACCEPT), &mut bearer)?;
         let status = resp.status().as_u16();
         if let Some((class, _)) = release_fetch::classify_status(status, &|_| None, 0) {
             return Err(FetchError::new(class, format!("{} → HTTP {status}", artifact_ref(root, stack_tag))));
@@ -250,7 +262,7 @@ impl Client {
         })?;
         let mut blob = |l: &Layer| -> Result<Vec<u8>, FetchError> {
             let url = format!("{base}/blobs/{}", l.digest);
-            let resp = self.get_authed(&url, None, &mut bearer)?;
+            let resp = self.get_authed(&self.blob_agent, &url, None, &mut bearer)?;
             let status = resp.status().as_u16();
             if let Some((class, _)) = release_fetch::classify_status(status, &|_| None, 0) {
                 return Err(FetchError::new(class, format!("blob {} ({}) → HTTP {status}", l.digest, l.title)));
@@ -619,7 +631,7 @@ mod tests {
         // An http URL — what a downgrade redirect would hand it — is refused
         // by the agent itself, before any byte is sent.
         let st = serve(|_| Routes::new());
-        let e = c.get(&format!("{}/blobs/x", st.base), None, None).unwrap_err();
+        let e = c.get_via(&c.blob_agent, &format!("{}/blobs/x", st.base), None, None).unwrap_err();
         assert_eq!(e.class, FetchClass::Tls, "{e}");
         assert!(st.seen.lock().unwrap().is_empty(), "a plain-http request reached the server");
     }
@@ -633,7 +645,9 @@ mod tests {
         });
         let e = Client::plain_http_for_tests(None).fetch(&root(&reg.base), "v0.6.0").unwrap_err();
         assert!(reg.seen.lock().unwrap().iter().all(|s| s.path != "/elsewhere"), "the redirect was followed");
-        let _ = e;
+        // Not followed, and not taken for a manifest: a refusal of its own.
+        assert_eq!(e.class, FetchClass::Other, "{e}");
+        assert!(e.detail.contains("HTTP 307") || e.detail.contains("redirect"), "{e}");
     }
 
     #[test]

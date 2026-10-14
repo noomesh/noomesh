@@ -293,6 +293,96 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
     out
 }
 
+/// The `NOO_ADDON_IMAGE_*` variables composed overlay texts read in an
+/// `image:` line — `scripts/lib-dist.sh` `addon_image_vars`, in Rust.
+pub(crate) fn overlay_image_vars(texts: &[String]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for t in texts {
+        for line in t.lines() {
+            let Some(rest) = line.strip_prefix("    image:") else { continue };
+            let Some(v) = rest.trim_start().strip_prefix("${NOO_ADDON_IMAGE_") else { continue };
+            let name: String = v.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+            if !name.is_empty() {
+                out.insert(format!("NOO_ADDON_IMAGE_{name}"));
+            }
+        }
+    }
+    out
+}
+
+/// What a non-launcher that composes the add-on overlays (the onboard
+/// wizard) needs to know to run them.
+pub(crate) struct PinEnvInput<'a> {
+    pub root: &'a Path,
+    pub dist: bool,
+    pub tag: &'a str,
+    /// The dev build's namespace (`NOO_IMAGE_PREFIX`, else `noomesh`).
+    pub image_prefix: &'a str,
+    /// The texts of every compose file that will be composed.
+    pub compose_texts: Vec<String>,
+    /// The add-ons whose overlay is composed.
+    pub composed_addons: Vec<String>,
+}
+
+/// One refusal: `(add-on or variable, why, remedy)`.
+pub(crate) type PinRefusal = (String, String, String);
+
+/// The add-on image environment, with the launcher's semantics
+/// (`require_addon_pins`): dev = the dev build's names; dist = only images a
+/// verified pin for `tag` names, present locally by digest, covering every
+/// variable a composed overlay reads. Refusals name the add-on and
+/// `noo addons upgrade <name>`.
+pub(crate) fn addon_image_env(
+    input: &PinEnvInput,
+    anchor: &dyn Fn(&str) -> Result<crate::addon_lock::TrustAnchor, resolve::Refusal>,
+    present: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, Vec<PinRefusal>> {
+    let vars = overlay_image_vars(&input.compose_texts);
+    if vars.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !input.dist {
+        return Ok(vars
+            .iter()
+            .map(|v| {
+                let name = v.trim_start_matches("NOO_ADDON_IMAGE_").to_ascii_lowercase().replace('_', "-");
+                let tag = if input.tag.is_empty() { "latest" } else { input.tag };
+                (v.clone(), format!("{}/{name}:{tag}", input.image_prefix))
+            })
+            .collect());
+    }
+    let mut env = Vec::new();
+    let mut refused: Vec<PinRefusal> = Vec::new();
+    for line in launch_lines(input.root, input.tag, &input.composed_addons, anchor) {
+        let mut parts = line.splitn(3, ' ');
+        let (kind, addon, rest) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let fix = format!("noo addons upgrade {addon}");
+        match kind {
+            "pin" => {
+                let (var, reference) = rest.split_once(' ').unwrap_or((rest, ""));
+                if present(reference) {
+                    env.push((var.to_string(), reference.to_string()));
+                } else {
+                    refused.push((addon.to_string(), format!("its pinned image {reference} is not on this host"), fix));
+                }
+            }
+            _ => refused.push((addon.to_string(), format!("no verified pin for {}: {rest}", input.tag), fix)),
+        }
+    }
+    if refused.is_empty() {
+        for v in &vars {
+            if !env.iter().any(|(k, _)| k == v) {
+                refused.push((
+                    v.clone(),
+                    format!("a composed add-on overlay runs ${{{v}}} and no verified pin supplies it"),
+                    "noo addons verify".to_string(),
+                ));
+            }
+        }
+    }
+    if refused.is_empty() { Ok(env) } else { Err(refused) }
+}
+
 /// `noo addons launch-pins <tag> [<name>…]` (hidden; the launcher's reader).
 pub fn addons_launch_pins(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let Some((tag, names)) = args.split_first() else {
@@ -369,6 +459,54 @@ mod tests {
 
         let no_anchor = verify_one(&d, "trellion_intel", "v0.6.0", Err(resolve::Refusal::NoAnchor), &mut docker, &[]);
         assert!(no_anchor.problem.unwrap().contains("names no signing key"));
+    }
+
+    fn input<'a>(root: &'a std::path::Path, dist: bool, addons: &[&str]) -> PinEnvInput<'a> {
+        let overlay = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.trellion-intel.yml"),
+        )
+        .unwrap();
+        PinEnvInput {
+            root,
+            dist,
+            tag: "v0.6.0",
+            image_prefix: "noomesh",
+            compose_texts: vec![overlay],
+            composed_addons: addons.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn wizard_env_pins_a_pinned_addon_and_refuses_an_unpinned_one() {
+        let (d, reference) = pinned_root("wizard-env");
+        let r2 = reference.clone();
+        let env = addon_image_env(&input(&d, true, &["trellion", "trellion_intel"]), &|_| Ok(anchor()), &|r| r == r2).unwrap();
+        assert_eq!(env, vec![("NOO_ADDON_IMAGE_TRELLION_INTEL".to_string(), reference.clone())]);
+
+        // Pinned but not local: refused, naming the add-on and the remedy.
+        let e = addon_image_env(&input(&d, true, &["trellion_intel"]), &|_| Ok(anchor()), &|_| false).unwrap_err();
+        assert_eq!(e[0].0, "trellion_intel");
+        assert!(e[0].1.contains("is not on this host"), "{e:?}");
+        assert_eq!(e[0].2, "noo addons upgrade trellion_intel");
+
+        // On but unpinned (a fresh root): refused the same way.
+        let empty = scratch("wizard-env-unpinned");
+        let e = addon_image_env(&input(&empty, true, &["trellion_intel"]), &|_| Ok(anchor()), &|_| true).unwrap_err();
+        assert!(e[0].1.contains("no verified pin for v0.6.0") && e[0].1.contains("has no pin"), "{e:?}");
+        assert_eq!(e[0].2, "noo addons upgrade trellion_intel");
+
+        // The overlay reads a variable no pin supplies (the add-on is not in
+        // the composed set): refused by variable.
+        let e = addon_image_env(&input(&d, true, &["trellion"]), &|_| Ok(anchor()), &|_| true).unwrap_err();
+        assert_eq!(e[0].0, "NOO_ADDON_IMAGE_TRELLION_INTEL");
+
+        // A dev install runs the dev build's name and verifies nothing.
+        let dev = addon_image_env(&input(&empty, false, &["trellion_intel"]), &|_| Err(resolve::Refusal::NoAnchor), &|_| false).unwrap();
+        assert_eq!(dev, vec![("NOO_ADDON_IMAGE_TRELLION_INTEL".to_string(), "noomesh/trellion-intel:v0.6.0".to_string())]);
+
+        // No add-on overlay composed: nothing to do.
+        let none = PinEnvInput { compose_texts: vec!["services:\n  gateway:\n    image: x\n".into()], ..input(&empty, true, &[]) };
+        assert!(addon_image_env(&none, &|_| Err(resolve::Refusal::NoAnchor), &|_| false).unwrap().is_empty());
     }
 
     #[test]

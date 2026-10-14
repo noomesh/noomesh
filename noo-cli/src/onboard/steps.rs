@@ -4561,6 +4561,21 @@ ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
         // profile PROJECTS, read from compose (2026-09-28).
         let Some(core) = controller_services(ctx) else { return };
         let core_refs: Vec<&str> = core.iter().map(String::as_str).collect();
+        // Enabled licensed add-ons run only their verified pins (the
+        // launcher's rule). One that is on but unpinned is named here with
+        // its remedy, before compose would fail on the unpinned sentinel.
+        if !ctx.dry_run {
+            if let Err(refused) = sh::addon_pin_env(ctx) {
+                for (who, why, fix) in &refused {
+                    ctx.error(&format!("{who}: {why} — run: {fix}"));
+                }
+                let (who, _, fix) = &refused[0];
+                ctx.state.hard_failures.push(format!(
+                    "services: the {who} add-on is on and has no verified pin to run (run `{fix}`, then `noo onboard --only services`)"
+                ));
+                return;
+            }
+        }
         let args = sh::recreate_args(ctx, &core_refs);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let code = sh::run_compose_streamed(ctx, &argv);

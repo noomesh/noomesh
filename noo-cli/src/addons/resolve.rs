@@ -312,13 +312,36 @@ const THROWAWAY_PREFIX: &str = "noo-addon-docker-";
 
 /// Remove throwaway configs a killed run left behind (SIGKILL, power loss):
 /// a registry token must not outlive the operation that needed it.
+/// A directory whose owning process (`noo-addon-docker-<pid>-…`) is still
+/// alive belongs to a concurrent operation and is left alone.
 pub fn sweep_stale(runtime: &Path) {
-    if let Ok(entries) = std::fs::read_dir(runtime) {
-        for e in entries.flatten() {
-            if e.file_name().to_string_lossy().starts_with(THROWAWAY_PREFIX) {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
+    let Ok(entries) = std::fs::read_dir(runtime) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(THROWAWAY_PREFIX) else { continue };
+        let pid: Option<i32> = rest.split('-').next().and_then(|p| p.parse().ok());
+        if pid.is_some_and(pid_alive) {
+            continue;
         }
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+/// Is `pid` a live process (ours, or one we may not signal)?
+fn pid_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 only checks that the process exists.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -397,6 +420,8 @@ impl DeferSignals {
                 .iter()
                 // SAFETY: installing a handler that only stores an atomic.
                 .map(|&s| (s, unsafe { libc::signal(s, handler) }))
+                // SIG_ERR = the handler was not installed; nothing to restore.
+                .filter(|(_, h)| *h != libc::SIG_ERR)
                 .collect();
             DeferSignals { prev }
         }
@@ -658,14 +683,19 @@ pub(crate) mod tests {
             t.0.clone()
         };
         assert!(!p.exists(), "the throwaway docker config outlived its operation");
+        // A config a concurrent (live) run holds is left alone.
+        let live = runtime.join(format!("{THROWAWAY_PREFIX}{}-9-9", std::process::id()));
+        std::fs::create_dir_all(&live).unwrap();
         // A config a killed run left behind is swept before the next pull.
-        let stale = runtime.join(format!("{THROWAWAY_PREFIX}1-2-3"));
+        // (pid 2^22+1 is above Linux's pid_max ceiling: never alive.)
+        let stale = runtime.join(format!("{THROWAWAY_PREFIX}4194305-2-3"));
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("config.json"), "{}").unwrap();
         let other = runtime.join("keep-me");
         std::fs::write(&other, "x").unwrap();
         sweep_stale(&runtime);
         assert!(!stale.exists() && other.exists());
+        assert!(live.exists(), "a live process's config was swept");
     }
 
     #[cfg(unix)]
