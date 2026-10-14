@@ -11,7 +11,15 @@
 #
 # Inside the rust container rustup honours this file: if the image's moving
 # tag has gone past this version, rustup installs the pinned one.
+# Cross targets the release workflow (.github/workflows/noo-cli-release.yml)
+# builds for this crate. They belong HERE: this file switches cargo to the
+# pinned toolchain, which ships only its host target, so a target added to the
+# runner's default toolchain is invisible (E0463 "can't find crate for core").
+# rustup installs these with the toolchain on any host. The rust:1-alpine
+# musl-container lanes honour this file too (rustup installs the pin there; the
+# musl target is that image's host).
 [toolchain]
 channel = "1.99.0"
 profile = "minimal"
 components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"]
