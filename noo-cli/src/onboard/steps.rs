@@ -4184,6 +4184,93 @@ fn generate_compose_override(ctx: &Ctx, read_entries: &[(String, String)], works
     }
 }
 
+// ── Dist digest lock ─────────────────────────────────────────────────────
+
+/// The stack tag the dist launcher will start, resolved in the launcher's
+/// own order (`noomesh-start.sh --dist`): the process `NOO_IMAGE_TAG`, then
+/// `.env`, then the newest `stack-v*` git tag of the checkout.
+fn dist_launch_tag(ctx: &Ctx) -> String {
+    if let Ok(t) = std::env::var("NOO_IMAGE_TAG") {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    let t = ctx.read_env("NOO_IMAGE_TAG");
+    if !t.trim().is_empty() {
+        return t.trim().to_string();
+    }
+    Command::new("bash")
+        .arg("-c")
+        .arg("git tag -l 'stack-v*' 2>/dev/null | sort -V | tail -1")
+        .current_dir(&ctx.repo_root)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().trim_start_matches("stack-").to_string())
+        .unwrap_or_default()
+}
+
+/// Fetch + verify `stack-<tag>.lock` with the same code `noo upgrade
+/// --stack` runs ([`crate::commands::upgrade::stack_lock_with`]) and write it
+/// atomically as `<root>/stack.lock`. A release with no lock, or one that
+/// does not verify, is an error: a dist install never runs unpinned.
+/// Returns the number of image rows pinned.
+pub(crate) fn install_dist_stack_lock(
+    root: &Path,
+    tag: &str,
+    fetch: &mut crate::commands::upgrade::ReleaseFileFetch<'_>,
+    verify: &crate::commands::upgrade::SigVerify<'_>,
+) -> Result<usize, String> {
+    use crate::commands::upgrade::{stack_lock_with, write_stack_lock_file};
+    let text = match stack_lock_with(tag, fetch, verify) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err(format!(
+            "stack-{tag} publishes no signed digest lock (stack-{tag}.lock) — a released-image install never runs unpinned"
+        )),
+        Err((_, msg, _)) => return Err(msg),
+    };
+    write_stack_lock_file(root, tag, &text)
+        .map_err(|e| format!("could not write {}: {e}", root.join("stack.lock").display()))
+}
+
+/// The services step's dist gate: true when the verified lock for the
+/// launch tag is in place (or this is a dry run), false after recording a
+/// hard failure — the caller then starts nothing.
+fn pin_dist_stack_lock(ctx: &mut Ctx) -> bool {
+    let tag = dist_launch_tag(ctx);
+    if tag.is_empty() {
+        ctx.error("No release tag to start — NOO_IMAGE_TAG is unset and the checkout has no stack-v* tag");
+        ctx.state.hard_failures.push(
+            "services: no release tag to pin (set NOO_IMAGE_TAG in .env, then `noo onboard --only services`)".into(),
+        );
+        return false;
+    }
+    if ctx.dry_run {
+        ctx.dry(&format!("fetch + verify stack-{tag}.lock, write stack.lock"));
+        return true;
+    }
+    ctx.progress(&format!("Verifying the signed digest lock for stack-{tag}..."));
+    let g = ctx.g;
+    let fetched = install_dist_stack_lock(
+        &ctx.repo_root,
+        &tag,
+        &mut |rel, name| crate::commands::upgrade::fetch_tag_file(g, rel, name),
+        &crate::release_sig::verify,
+    );
+    match fetched {
+        Ok(n) => {
+            ctx.success(&format!("Digest lock verified: {n} image(s) pinned from stack-{tag} (release-signed)"));
+            true
+        }
+        Err(why) => {
+            ctx.error(&format!("Digest lock for stack-{tag} not verified: {why}"));
+            ctx.state.hard_failures.push(format!(
+                "services: refused to start {tag} without its verified stack lock ({why}); fix the cause, then `noo onboard --only services`"
+            ));
+            false
+        }
+    }
+}
+
 // ── Step 5: Services ─────────────────────────────────────────────────────
 
 pub fn services(ctx: &mut Ctx) {
@@ -4452,6 +4539,15 @@ ensure noo_evolve_ddl "${{NOO_EVOLVE_DDL_PASSWORD:-}}"
                 ctx.info("Skipped. Run 'noo stack start' later.");
                 return;
             }
+        }
+        // A dist install never runs unpinned: the signed digest lock for the
+        // tag the launcher will start is fetched, verified and written
+        // BEFORE anything starts — the way `noo upgrade --stack` does it.
+        // Without it the stack came up by tag, and every later check
+        // against the lock (add-on entitlement, image staging) refused with
+        // "no verified stack.lock" until an upgrade to the SAME tag (rc.3).
+        if !pin_dist_stack_lock(ctx) {
+            return;
         }
         ctx.progress("Starting stack from released images (scripts/noomesh-start.sh --dist)...");
         // Standalone runs the `standalone` profile instead of the full
@@ -7643,5 +7739,113 @@ mod compose_prereq_tests {
     #[test]
     fn a_missing_binary_is_a_failure_not_a_panic() {
         assert!(probe_compose("/nonexistent/docker").unwrap_err().contains("could not run"));
+    }
+}
+
+#[cfg(test)]
+mod dist_stack_lock_tests {
+    use super::install_dist_stack_lock;
+    use crate::release_fetch::{FetchClass, FetchError};
+    use std::collections::HashMap;
+
+    const TAG: &str = "v0.6.0-rc.3";
+    const LOCK: &str = "gateway@sha256:aaaa\ntrellion@sha256:bbbb\nsource:trellion@0123abcd\n";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-onboard-lock-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A fake release: the files `stack-<tag>` publishes, signed by a test
+    /// key, and the verifier that trusts only that key — the same shape as
+    /// the baked release key, without it.
+    struct FakeRelease {
+        files: HashMap<(String, String), Vec<u8>>,
+        pubkey: String,
+    }
+
+    impl FakeRelease {
+        fn signed(lock: &str) -> Self {
+            let key = crate::release_sig::signing_key_from_seed_hex(&"cd".repeat(32)).unwrap();
+            let rel = format!("stack-{TAG}");
+            let name = format!("{rel}.lock");
+            let mut files = HashMap::new();
+            files.insert((rel.clone(), name.clone()), lock.as_bytes().to_vec());
+            files.insert((rel, format!("{name}.sig")), crate::release_sig::sign(&key, lock.as_bytes()).into_bytes());
+            FakeRelease { files, pubkey: crate::release_sig::pubkey_hex(&key) }
+        }
+
+        fn install(&self, root: &std::path::Path) -> Result<usize, String> {
+            let files = self.files.clone();
+            let pk = self.pubkey.clone();
+            install_dist_stack_lock(
+                root,
+                TAG,
+                &mut |rel, name| {
+                    files.get(&(rel.to_string(), name.to_string())).cloned()
+                        .ok_or_else(|| FetchError::new(FetchClass::NotFound, format!("{rel}/{name}")))
+                },
+                &|data, sig| crate::release_sig::verify_with_keys(data, sig, &[pk.as_str()]),
+            )
+        }
+    }
+
+    #[test]
+    fn a_verified_lock_is_written_for_the_tag_the_launcher_starts() {
+        let root = scratch("ok");
+        let n = FakeRelease::signed(LOCK).install(&root).expect("a signed lock installs");
+        assert_eq!(n, 2, "two image rows pinned (the provenance row is not an image)");
+        let written = std::fs::read_to_string(root.join("stack.lock")).unwrap();
+        // The header the launcher matches (`^# tag ${DIST_TAG}$`) and the
+        // reader the entitlement check uses both accept it.
+        assert_eq!(written, format!("# tag {TAG}\n{LOCK}"));
+        assert_eq!(crate::addons::resolve::installed_stack_lock(&root, TAG).as_deref().map(|t| t.contains("gateway@sha256:aaaa")), Some(true));
+        assert!(!root.join(".stack.lock.tmp").exists(), "the temp file is renamed into place, not left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_release_without_a_lock_refuses_and_writes_nothing() {
+        let root = scratch("missing");
+        let mut rel = FakeRelease::signed(LOCK);
+        rel.files.clear();
+        let err = rel.install(&root).expect_err("no lock is a refusal, never an unpinned start");
+        assert!(err.contains("publishes no signed digest lock"), "{err}");
+        assert!(!root.join("stack.lock").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lock_that_does_not_verify_refuses_and_writes_nothing() {
+        let root = scratch("tampered");
+        let mut rel = FakeRelease::signed(LOCK);
+        let key = (format!("stack-{TAG}"), format!("stack-{TAG}.lock"));
+        rel.files.insert(key, b"gateway@sha256:evil\n".to_vec());
+        let err = rel.install(&root).expect_err("a tampered lock refuses");
+        assert!(err.contains("refusing to deploy"), "{err}");
+        assert!(!root.join("stack.lock").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unsigned_lock_refuses() {
+        let root = scratch("unsigned");
+        let mut rel = FakeRelease::signed(LOCK);
+        rel.files.retain(|(_, n), _| !n.ends_with(".sig"));
+        let err = rel.install(&root).expect_err("an unsigned lock refuses");
+        assert!(err.contains("without a signature"), "{err}");
+        assert!(!root.join("stack.lock").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_dist_start_pins_the_lock_before_the_launcher_runs() {
+        let src = include_str!("steps.rs");
+        let body = &src[src.find("pub fn services(ctx: &mut Ctx)").expect("services step")..];
+        let pin = body.find("if !pin_dist_stack_lock(ctx)").expect("the dist branch pins the lock");
+        let launch = body.find("run_script_streamed(ctx, \"noomesh-start.sh\"").expect("the dist launch");
+        assert!(pin < launch, "stack.lock must be verified and written before the launcher starts anything");
     }
 }
