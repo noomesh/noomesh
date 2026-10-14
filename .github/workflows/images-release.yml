@@ -119,6 +119,21 @@ jobs:
           echo "sibling_ref=$line" >> "$GITHUB_OUTPUT"
           echo "$tag (${commit:0:8}) is on origin/$line; siblings build from their $line"
 
+      # harrier is the default embedder and ships as an OCI model artifact
+      # (<namespace>/harrier:v1), versioned independently of the stack
+      # tag, so it is in no matrix and no lock row: `noo onboard` and `noo
+      # migrate import` pull it by the fixed :v1 tag. It is published by
+      # publish-harrier.yml, once. A release that cannot be installed
+      # (rc.3: `denied`, no embedder, RAG down) must not start, so ask for
+      # it the way a fresh host does: anonymously, before any login.
+      - name: The harrier embedder artifact is published and public
+        run: |
+          set -eu
+          if ! docker manifest inspect "${REGISTRY}/${OWNER}/harrier:v1" >/dev/null 2>&1; then
+            echo "::error::${REGISTRY}/${OWNER}/harrier:v1 is not pullable anonymously (absent, or the package is private). Run the 'publish harrier artifact' workflow once (after uploading the models-harrier-v1 release assets), then set the package public, then re-run this release."
+            exit 1
+          fi
+
       # an earlier change: one resolution per run, passed to every sibling job by
       # SHA. The siblings are public: the resolve reads them anonymously.
       - name: Resolve each sibling branch to a SHA (once per run)
