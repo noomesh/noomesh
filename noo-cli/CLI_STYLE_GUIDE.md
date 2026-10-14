@@ -366,6 +366,11 @@ between units the reader needs air.
   which mirrors the glyphs, colours and mode rules (`NO_COLOR`, TTY). No
   emoji, no `compose ps` dump (that is `noo stack status`), tips as a
   guidance block.
+- **A launcher's closing line is earned.** `✓ Services restarted` prints
+  only after every compose call exited 0; a failure closes with `✗` and
+  exits non-zero. A name an operator can read off `noo stack status` is a
+  valid argument (`evolve` for `noo-evolve`), and an unknown name is a
+  refusal that lists the valid ones.
 
 ### Guidance
 
