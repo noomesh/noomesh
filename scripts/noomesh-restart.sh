@@ -224,7 +224,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         # phase 0; on a CPU box `up` left it Created with "could not select
         # device driver nvidia" and the guard below called it DOWN —
         # 2026-09-29 upgrade rehearsal), minus the containerised agent.
-        ACTIVE_SVCS="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null || true)"
+        # shellcheck disable=SC2086
+        compose_active_services $COMPOSE_FILES $PROFILE_ARGS
+        ACTIVE_SVCS="$COMPOSE_OUT"
         GPU_SCALE=""
         if ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
             if printf '%s\n' "$ACTIVE_SVCS" | grep -qx nvidia-exporter; then
