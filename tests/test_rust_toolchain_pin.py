@@ -3,7 +3,7 @@
 
 """The Rust toolchain is pinned, and lint runs before the long Rust steps (i5).
 
-noomesh-pv #1000 passed clippy locally (1.97) and failed it in CI (1.99):
+One change passed clippy locally (1.97) and failed it in CI (1.99):
 the lint set moves with the toolchain. So:
 
   * every crate CI builds carries a rust-toolchain.toml, all naming the SAME
