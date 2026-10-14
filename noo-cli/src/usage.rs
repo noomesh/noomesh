@@ -174,7 +174,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "fetch"], "<hf_repo> <file.gguf> [--revision <rev>] [--force]", "Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified)"),
     (&["stack", "status"], "", "Show stack container status (from docker ps)"),
     (&["stack", "logs"], "[<service>...] [--follow] [--tail <n>]", "Show container logs for one service or compose logs for many"),
-    (&["stack", "restart"], "[--profile <p>] [--force] [<service>...]", "Restart stack services (names as in stack status, or an add-on key); --force recreates to reload env and secrets"),
+    (&["stack", "restart"], "[--profile <p>] [--force] [<service>...]", "Restart services by status name or add-on key; --force recreates (reloads env, secrets)"),
     (&["stack", "start"], "[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]", "Start the stack via scripts/noomesh-start.sh"),
     (&["stack", "stop"], "[--volumes [-y|--yes]]", "Stop the stack; --volumes deletes the database and every volume, after a typed confirm"),
     (&["stack", "rebuild"], "[<service>...] [-q|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b|--background]", "Rebuild stack images in the foreground, or queue it for noo-hostd with --background"),
