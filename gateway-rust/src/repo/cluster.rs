@@ -87,6 +87,24 @@ where
     Ok(rows)
 }
 
+/// `(backend, role)` for every RUNNING placement on one node.
+///
+/// For naming what a node serves when a pinned chat cannot go there (i69a:
+/// "node robopi serves embed (ollama)"), not for routing. Runtime query for
+/// the same offline-cache reason as `placements_non_chat`.
+pub async fn node_running_roles<'e, E>(db: E, node_id: &str) -> Result<Vec<(String, String)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT DISTINCT backend, role FROM noo_backend_placements \
+         WHERE node_id = $1 AND desired_state = 'running' ORDER BY backend, role",
+    )
+    .bind(node_id)
+    .fetch_all(db)
+    .await
+}
+
 /// Does `node_id` have a RUNNING placement declared for `role`?
 ///
 /// The gateway's own answer to "is this node an embedder", independent of what

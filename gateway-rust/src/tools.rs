@@ -1269,7 +1269,7 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
     let mut node_from_model = false;
     if node_pin.is_none() {
         if let Some(m) = model.as_deref() {
-            if crate::routes::inference::node_inference_backend(state, m).await.is_some() {
+            if crate::routes::inference::node_chat_backend(state, m).await.is_node() {
                 node_pin = Some(m.to_string());
                 node_from_model = true;
             }
@@ -1277,19 +1277,23 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
     }
 
     if let Some(node_id) = node_pin {
-        let (backend_type, model_name, base_url) =
-            match crate::routes::inference::node_inference_backend(state, &node_id).await {
-                Some(t) => t,
-                None => return err_result(
-                    call,
-                    format!("node '{node_id}' not found or has no inference backend"),
-                ),
-            };
+        use crate::routes::inference::{self as inf, NodeChat};
+        let (backend_type, model_name, base_url) = match inf::node_chat_backend(state, &node_id).await {
+            NodeChat::Serves(bt, m, url) => (bt, m, url),
+            // Same refusal as the HTTP route, before dispatch (i69a).
+            NodeChat::NoChat(msg) => return err_result(call, msg),
+            NodeChat::Unknown => return err_result(
+                call,
+                format!("node '{node_id}' not found or has no inference backend"),
+            ),
+        };
         let model_used = if node_from_model { model_name } else { model.unwrap_or(model_name) };
-        return match crate::routes::inference::chat_completion_on_node(
-            &backend_type, &model_used, &base_url, &prompt,
-        ).await {
+        return match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt).await {
             Ok(text) => ok_result(call, text),
+            Err(e) if inf::backend_cannot_chat(&e) => err_result(
+                call,
+                inf::no_chat_refusal(&node_id, &[(backend_type.clone(), model_used.clone())], &[]),
+            ),
             Err(e) => err_result(call, e),
         };
     }

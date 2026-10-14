@@ -289,6 +289,23 @@ class ClusterMessaging:
         self._reconnect_hooks.append(callback)
 
     async def _on_error(self, e):
+        # A refused REPLY is the caller losing its answer, not bus noise: say
+        # which request it was and how long it was held (i69). nats-py gives
+        # only the lowercased subject; the ledger maps it back.
+        from . import reply_ledger
+
+        lost = reply_ledger.refused_reply(str(e))
+        if lost is not None:
+            logger.error(
+                "worker.reply_undeliverable",
+                **lost,
+                message="NATS refused this reply, so the requester will never receive the "
+                        "answer (it times out). The principal's grant must allow a publish "
+                        "on the requester's reply inbox that survives a NATS config reload "
+                        "— allow_responses entries are wiped by every reload "
+                        "(noo-cli nats_users.rs GATEWAY_REPLY_INBOX)",
+            )
+            return
         logger.error("nats_async_error", url=scrub_url_userinfo(self.nats_url), error=str(e))
 
     async def _on_disconnected(self):

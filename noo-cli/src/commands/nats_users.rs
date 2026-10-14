@@ -306,6 +306,29 @@ fn subject_token(id: &str) -> String {
 /// timeout outgrows it.
 pub(crate) const RESPONSE_EXPIRES: &str = "20m";
 
+/// The gateway's reply inboxes, granted to the WORKER as a static publish.
+///
+/// `allow_responses` is not durable. nats-server keeps the "you may answer
+/// this one reply subject" entries in a per-connection map, and every
+/// config reload re-authorizes each client (`reloadAuthorization` ->
+/// `isClientAuthorized` -> `RegisterUser` -> `setPermissions`), which
+/// replaces that map with an empty one. So any request in flight across a
+/// SIGHUP has its reply refused as a `Publish Violation` on `_INBOX_gw.…`,
+/// however short the request — the window above never comes into it. On
+/// pop-os 2026-10-14 a 12 s `worker.rag.query` (MCP `noo_rag_query`) was
+/// delivered at 20:54:32, NATS reloaded at 20:54:37 (a provision's
+/// re-render + HUP), and the reply at 20:54:44 was refused (i69). A slow
+/// answer is simply more likely to straddle a reload.
+///
+/// The gateway is the only principal allowed to publish `worker.>`, so every
+/// request the worker answers carries a gateway reply subject: this is the
+/// worker's own reply path, nothing wider. It must equal the gateway's
+/// `nats_credentials::INBOX_PREFIX` + `.>` —
+/// tests/test_nats_worker_reply_grant_parity.py compares the two crates.
+/// `allow_responses` stays for the other requesters the worker answers
+/// (`agent.msg.direct.*`, `agent.peer.*.task.*`).
+pub(crate) const GATEWAY_REPLY_INBOX: &str = "_INBOX_gw.>";
+
 fn perms_for(role: Role, id: &str) -> String {
     let ind = "          ";
     let tok = subject_token(id);
@@ -316,7 +339,7 @@ fn perms_for(role: Role, id: &str) -> String {
         ),
         Role::Worker => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\"]\n\
+             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{GATEWAY_REPLY_INBOX}\"]\n\
              {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
@@ -1197,6 +1220,15 @@ mod tests {
         assert!(w.contains("\"$KV.>\""));
         assert!(w.contains("$JS.API.STREAM.PURGE.>"));
         assert!(w.contains("allow_responses: { max: 1, expires: \"20m\" }"), "{w}");
+        // i69: the worker's reply to the gateway must survive a NATS reload,
+        // which wipes allow_responses entries — a static publish on the
+        // gateway's inbox, and ONLY the worker holds it.
+        let w_block = w.split("user: \"node-").next().unwrap();
+        assert!(w_block.contains("\"_INBOX_gw.>\""), "{w_block}");
+        for node in text.split("user: \"node-").skip(1) {
+            let publish = node.split("subscribe:").next().unwrap();
+            assert!(!publish.contains("_INBOX_gw"), "a node may not answer into the gateway inbox statically:\n{node}");
+        }
         assert!(!text.contains("allow_responses: true"), "a bare `true` is a 2-minute reply window");
     }
 
