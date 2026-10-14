@@ -14,7 +14,7 @@ use crate::ui::{self, Glyph};
 use crate::{Globals, Unhandled};
 
 pub(super) const USAGE: &str = "Usage: noo security entitlement keygen [--out <file>]\n\
-       noo security entitlement issue --sub <customer> (--terms <version> | --no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--key <file>]\n\
+       noo security entitlement issue --sub <customer> (--terms <version> | --no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--addon <name>=<registry>:<key>[,<key>]]... [--key <file>]\n\
        noo security entitlement install <token> [--enable] [--ci] [--accept-terms <version>]\n\
        noo security entitlement show\n\
        noo security entitlement verify <token>";
@@ -64,6 +64,26 @@ fn print_ent(g: &Globals, ent: &Entitlement, verdict: &str, acceptance: Option<O
         let (glyph, label) = if ent.grants(feature) { (Glyph::Ok, "unlocks".to_string()) } else { (Glyph::Bullet, ui::muted("not granted")) };
         println!("  {}  {what}  {label}", ui::glyph_cell(glyph));
     }
+    if !ent.addons.is_empty() {
+        println!("{}", ui::section("add-on signers"));
+        print!("{}", ui::kv(&addon_signer_rows(ent)));
+    }
+}
+
+/// One row per add-on trust block: the registry root and the current key
+/// (#0) by short id, plus how many older keys still verify.
+pub(super) fn addon_signer_rows(ent: &Entitlement) -> Vec<(&str, String)> {
+    ent.addons
+        .iter()
+        .map(|(name, a)| {
+            let older = match a.keys.len() {
+                0 | 1 => String::new(),
+                n => ui::muted(&format!("  (+{} older)", n - 1)),
+            };
+            let key0 = a.keys.first().map(|k| entitlement::short_key_id(k)).unwrap_or_else(|| ui::dash().to_string());
+            (name.as_str(), format!("{}  key #0 {key0}{older}", a.registry))
+        })
+        .collect()
 }
 
 pub(super) fn terms_at_issue(ent: &Entitlement) -> String {
@@ -347,10 +367,22 @@ mod tests {
 
     #[test]
     fn show_prints_terms_both_ways() {
-        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "intelligent".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None };
+        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "intelligent".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default() };
         assert_eq!(terms_at_issue(&e), "none recorded (issued before terms)");
         e.terms = Some("addon-1.0".into());
         assert_eq!(terms_at_issue(&e), "addon-1.0");
+    }
+
+    #[test]
+    fn show_lists_addon_signers_by_registry_and_key_zero() {
+        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "t".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default() };
+        assert!(super::addon_signer_rows(&e).is_empty());
+        e.addons.insert("evolve".into(), crate::addon_lock::TrustAnchor { keys: vec!["cd".repeat(32), "ef".repeat(32)], registry: "ghcr.io/example/evolve".into() });
+        let rows = super::addon_signer_rows(&e);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "evolve");
+        assert!(rows[0].1.starts_with("ghcr.io/example/evolve  key #0 cdcdcdcdcdcdcdcd…"), "{}", rows[0].1);
+        assert!(rows[0].1.contains("+1 older"), "{}", rows[0].1);
     }
 
     #[test]

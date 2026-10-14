@@ -119,7 +119,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "service-key", "self-revoke"], "", "Revoke the caller's own MCP key"),
     (&["security", "generate-secret"], "[<type>] [--length <bytes>]", "Print a random secret: general (jwt, cluster alike) or fernet; --length not for fernet"),
     (&["security", "entitlement", "keygen"], "[--out <file>]", "Hidden: create the entitlement signing key, mode 600 (vendor builds only)"),
-    (&["security", "entitlement", "issue"], "--sub <customer> (--terms <version>|--no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--key <file>]", "Hidden: sign an entitlement token for a customer (vendor builds only)"),
+    (&["security", "entitlement", "issue"], "--sub <customer> (--terms <version>|--no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--addon <name>=<registry>:<key>[,<key>]]... [--key <file>]", "Hidden: sign an entitlement token for a customer (vendor builds only)"),
     (&["security", "entitlement", "install"], "<token> [--enable] [--ci] [--accept-terms <version>]", "Verify and store a token as NOO_ENTITLEMENT; --enable mints and switches on what it grants"),
     (&["security", "entitlement", "show"], "", "Show the installed entitlement, its validity, and which add-ons it unlocks"),
     (&["security", "entitlement", "verify"], "<token>", "Verify a token offline against this build's entitlement key"),
