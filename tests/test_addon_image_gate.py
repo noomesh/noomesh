@@ -163,7 +163,7 @@ def test_rendered_addon_refs_must_be_their_pins(tmp_path):
     # A fake compose that renders the add-on service's image from the env.
     fake = """#!/bin/sh
 if [ "$1" = "compose" ] ; then
-  case "$*" in *"config --images trellion-intel"*) [ -n "$FAKE_RENDER_FAIL" ] && exit 1; echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}" ;; esac
+  case "$*" in *"config --images trellion-intel"*) [ -n "$FAKE_RENDER_FAIL" ] && { echo "boom: required variable X is missing" >&2; exit 1; }; echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}" ;; esac
   exit 0
 fi
 exit 0
@@ -181,6 +181,37 @@ exit 0
     broken = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "FAKE_RENDER_FAIL": "1"},
                             capture_output=True, text=True)
     assert broken.returncode == 1 and "could not render" in broken.stderr, broken.stderr
+    # ...and the refusal carries compose's own error, indented, with the exit
+    # status, and points at the render error rather than `noo addons verify`.
+    assert "         boom: required variable X is missing" in broken.stderr, broken.stderr
+    assert "exited with status 1" in broken.stderr, broken.stderr
+    assert "see the lines above" in broken.stderr and "noo addons verify" not in broken.stderr, broken.stderr
+
+
+def test_a_pull_that_cannot_list_images_shows_compose_error(tmp_path):
+    fake = """#!/bin/sh
+echo "boom: required variable X is missing" >&2
+exit 1
+"""
+    _bin(tmp_path, "docker", fake)
+    body = f"cd {REPO}; . scripts/lib-dist.sh; dist_assert_pull_refs -f docker-compose.yml; echo rc=$?"
+    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1"}
+    r = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
+    assert "rc=0" in r.stdout
+    assert "boom: required variable X is missing" in r.stderr, r.stderr
+
+
+def test_a_failed_service_listing_is_reported_not_swallowed(tmp_path):
+    fake = """#!/bin/sh
+echo "boom: required variable X is missing" >&2
+exit 1
+"""
+    _bin(tmp_path, "docker", fake)
+    body = f"cd {REPO}; . scripts/lib-dist.sh; compose_active_services -f x.yml; echo out=[$COMPOSE_OUT]"
+    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    r = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
+    assert "out=[]" in r.stdout
+    assert "boom: required variable X is missing" in r.stderr, r.stderr
 
 
 def test_a_lock_image_name_the_overlay_does_not_read_is_refused(tmp_path):
