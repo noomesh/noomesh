@@ -282,7 +282,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo upgrade` — Self-update the CLI; --stack/--nodes/--controller roll the rest
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack and nodes; --channel moves release channel |
+| `noo upgrade` | `[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public\|rollback\|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]` | Self-update noo, optionally stack and nodes; --channel moves release channel |
 
 ### `noo doctor` — Host-plane health checks with guided recovery
 | Command | Arguments | What it does |
