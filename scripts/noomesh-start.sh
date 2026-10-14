@@ -772,7 +772,7 @@ COMPOSE_FILES="$(compose_file_args .)"
 # whether or not this start pulls (empty render = refusal). Dist only.
 if [ -n "${DIST_TAG:-}" ]; then
     # shellcheck disable=SC2086
-    DIST_MODE=1 dist_assert_addon_refs $COMPOSE_FILES || exit 1
+    DIST_MODE=1 dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
 fi
 # Before the pull loop (and every later `docker compose`): no v2 plugin is a
 # prerequisite failure, not a pull failure — exit, never retry.
