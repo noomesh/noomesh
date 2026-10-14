@@ -219,7 +219,7 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
         enable_unlocked(
             &crate::commands::addons::config_path(),
             &unlock_names,
-            &mut crate::commands::addon_enable::Live { g },
+            &mut crate::commands::addon_enable::Live { g, force: false },
         )
     } else {
         (Vec::new(), Vec::new())
@@ -346,7 +346,7 @@ mod enable_tests {
             ops.calls
         );
         assert!(matches!(e.key, KeyStep::Issued { .. }), "no service key was provisioned: {:?}", ops.calls);
-        assert_eq!(ops.calls, ["plan:evolve", "mint:evolve", "issue:evolve"]);
+        assert_eq!(ops.calls, ["pin:evolve", "plan:evolve", "mint:evolve", "issue:evolve"]);
     }
 
     #[test]

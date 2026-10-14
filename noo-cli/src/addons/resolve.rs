@@ -1,0 +1,557 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
+//! From an add-on name to verified, pulled, pinned images.
+//!
+//! Every path that moves an add-on (`noo addons enable`, `noo addons
+//! upgrade`, `noo upgrade --stack`) runs the same steps in the same order:
+//!   1. the trust anchor from the installed entitlement
+//!      (`addons.<name>` = keys + registry root);
+//!   2. fetch `<root>:stack-<tag>` ([`super::lock_fetch`]);
+//!   3. [`crate::addon_lock::verify`]: signature, add-on name, registry root;
+//!   4. the lock lists `<tag>` (`supports`);
+//!   5. a lock built on a stack image matches that image's row in the
+//!      verified `stack.lock` for `<tag>` (`base_matches`);
+//!   6. not older than the pinned version unless `--allow-downgrade`
+//!      (`is_downgrade`);
+//!   7. pull every image by digest through a throwaway docker config;
+//!   8. cache the lock and write the pin.
+//!
+//! Steps 1-6 decide; nothing is written until all of them pass. The offline
+//! twin ([`offline_check`]) re-runs 1, 3, 4 and the pin comparison from the
+//! cache, for `noo addons verify` and the launcher.
+
+use std::path::Path;
+
+use crate::addon_lock::{self, AddonLockError, TrustAnchor, VerifiedLock};
+use crate::release_fetch::{FetchClass, FetchError};
+
+use super::lock_fetch::{self, Credential, Fetched};
+use super::pins::{self, Pin};
+
+/// What one resolve is for.
+#[derive(Debug, Clone, Copy)]
+pub struct Want<'a> {
+    pub addon: &'a str,
+    pub stack_tag: &'a str,
+    /// The verified stack lock text for `stack_tag` (rows `name@sha256:…`),
+    /// when one is published. A lock with a `base` is refused without it.
+    pub stack_lock: Option<&'a str>,
+    /// The version pinned now, for the downgrade rule.
+    pub pinned: Option<&'a str>,
+    pub allow_downgrade: bool,
+}
+
+/// Why an add-on lock was not accepted. `why` is the operator's sentence;
+/// the remedy depends on the verb, so the caller supplies it.
+#[derive(Debug, Clone)]
+pub enum Refusal {
+    NoEntitlement(String),
+    NoAnchor,
+    Fetch { reference: String, err: FetchError },
+    Lock(AddonLockError),
+    NotForStack { tag: String, version: String, supports: Vec<String> },
+    NoStackLock { image: String, tag: String },
+    BaseRowMissing { image: String, tag: String },
+    Base(AddonLockError),
+    Downgrade { pinned: String, offered: String },
+    Pull(String),
+    Write(String),
+}
+
+impl Refusal {
+    pub fn why(&self, addon: &str) -> String {
+        match self {
+            Refusal::NoEntitlement(e) => format!("{addon} is licensed and no usable entitlement is installed ({e})"),
+            Refusal::NoAnchor => format!(
+                "the installed entitlement names no signing key or registry for {addon}, so its lock cannot be verified \
+                 (the token predates signed add-on locks)"
+            ),
+            Refusal::Fetch { reference, err } => match err.class {
+                FetchClass::NotFound => format!("{reference} is not published: {addon} has no release for this stack yet"),
+                FetchClass::Auth => format!(
+                    "the registry refused {reference} (access refused): the controller's {} cannot read {addon}'s package",
+                    lock_fetch::TOKEN_KEY
+                ),
+                _ => format!("{reference}: {}", err.summary()),
+            },
+            Refusal::Lock(e) => format!("{addon}'s lock refused: {e}"),
+            Refusal::NotForStack { tag, version, supports } => format!(
+                "{addon} {version} does not support stack {tag} (it lists {})",
+                supports.join(", ")
+            ),
+            Refusal::NoStackLock { image, tag } => format!(
+                "{addon} is built on the stack's {image} image, and stack {tag} has no verified stack.lock to check it against"
+            ),
+            Refusal::BaseRowMissing { image, tag } => format!("stack {tag}'s lock has no {image} row to check {addon}'s base against"),
+            Refusal::Base(e) => format!("{addon}: {e}"),
+            Refusal::Downgrade { pinned, offered } => format!(
+                "{addon} {offered} is older than the pinned {pinned}; an add-on may carry database migrations, so this is \
+                 refused without --allow-downgrade"
+            ),
+            Refusal::Pull(e) => format!("{addon}'s images could not be pulled: {e}"),
+            Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
+        }
+    }
+
+    /// True when the registry refused the credential: the remedy is the
+    /// token, not the add-on.
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Refusal::Fetch { err, .. } if err.class == FetchClass::Auth)
+    }
+}
+
+/// The remedy for a credential refusal, shared by every verb.
+pub const TOKEN_FIX: &str = "noo security secrets rotate NOO_ADDON_REGISTRY_TOKEN --set-from-stdin --yes";
+
+/// The digest a stack lock pins for `image` (rows `name@sha256:…`).
+pub fn stack_lock_row(text: &str, image: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let (name, digest) = l.trim().split_once('@')?;
+        (name == image && addon_lock::is_sha256_digest(digest)).then(|| digest.to_string())
+    })
+}
+
+/// The installed `stack.lock` text when it is for `tag` (header `# tag
+/// <tag>`, written by `noo upgrade --stack` after verifying it).
+pub fn installed_stack_lock(root: &Path, tag: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("stack.lock")).ok()?;
+    text.lines().any(|l| l.trim() == format!("# tag {tag}")).then_some(text)
+}
+
+/// Steps 3-6 over fetched bytes. Pure.
+pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<VerifiedLock, Refusal> {
+    let v = addon_lock::verify(&fetched.lock, &fetched.sig, anchor, want.addon).map_err(Refusal::Lock)?;
+    if !v.lock.supports(want.stack_tag) {
+        return Err(Refusal::NotForStack {
+            tag: want.stack_tag.to_string(),
+            version: v.lock.version.clone(),
+            supports: v.lock.supports_stack.clone(),
+        });
+    }
+    if let Some(base) = &v.lock.base {
+        let text = want
+            .stack_lock
+            .ok_or_else(|| Refusal::NoStackLock { image: base.image.clone(), tag: want.stack_tag.to_string() })?;
+        let row = stack_lock_row(text, &base.image)
+            .ok_or_else(|| Refusal::BaseRowMissing { image: base.image.clone(), tag: want.stack_tag.to_string() })?;
+        v.lock.base_matches(&row).map_err(Refusal::Base)?;
+    }
+    if let Some(p) = want.pinned {
+        if !want.allow_downgrade && addon_lock::is_downgrade(p, &v.lock.version).map_err(Refusal::Lock)? {
+            return Err(Refusal::Downgrade { pinned: p.to_string(), offered: v.lock.version.clone() });
+        }
+    }
+    Ok(v)
+}
+
+/// Steps 2-6: fetch and check.
+pub fn fetch_and_check(
+    client: &lock_fetch::Client,
+    anchor: &TrustAnchor,
+    want: &Want,
+) -> Result<(VerifiedLock, Fetched), Refusal> {
+    let fetched = client.fetch(&anchor.registry, want.stack_tag).map_err(|err| Refusal::Fetch {
+        reference: lock_fetch::artifact_ref(&anchor.registry, want.stack_tag),
+        err,
+    })?;
+    let v = check(&fetched, anchor, want)?;
+    Ok((v, fetched))
+}
+
+/// The anchor for `addon` from the installed, unexpired entitlement.
+pub fn installed_anchor(addon: &str) -> Result<TrustAnchor, Refusal> {
+    let token = crate::entitlement::installed_token().ok_or_else(|| Refusal::NoEntitlement("none installed".into()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ent = crate::entitlement::check(&token, now).map_err(Refusal::NoEntitlement)?;
+    ent.addon_anchor(addon).cloned().ok_or(Refusal::NoAnchor)
+}
+
+/// The docker side, behind a seam so pulls and the throwaway login are
+/// testable without a daemon.
+pub trait Docker {
+    /// Is this exact reference (by digest) in the local image store?
+    fn image_present(&mut self, reference: &str) -> bool;
+    /// Pull `refs` (all digest-form) from `host`, logging in with `cred` in
+    /// a throwaway config that is removed afterwards.
+    fn pull(&mut self, host: &str, refs: &[String], cred: Option<&Credential>) -> Result<(), String>;
+    /// Running containers as `(name, image reference they were created from)`.
+    fn running(&mut self) -> Result<Vec<(String, String)>, String>;
+}
+
+/// Step 7: every image by digest, skipping what is already local.
+pub fn pull_images(docker: &mut dyn Docker, v: &VerifiedLock, cred: Option<&Credential>) -> Result<usize, Refusal> {
+    let missing: Vec<String> = v.lock.images.values().filter(|r| !docker.image_present(r)).cloned().collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let host = missing[0].split('/').next().unwrap_or_default().to_string();
+    docker.pull(&host, &missing, cred).map_err(Refusal::Pull)?;
+    if let Some(r) = missing.iter().find(|r| !docker.image_present(r)) {
+        return Err(Refusal::Pull(format!("{r} is still not in the local image store after the pull")));
+    }
+    Ok(missing.len())
+}
+
+/// Step 8: cache the lock and set this add-on's pin (other pins kept).
+pub fn record(root: &Path, addon: &str, v: &VerifiedLock, fetched: &Fetched, stack_tag: &str) -> Result<Pin, Refusal> {
+    let mut all = pins::read(root).map_err(Refusal::Write)?;
+    let pin = Pin::from_verified(v, stack_tag);
+    pins::cache(root, addon, &fetched.lock, &fetched.sig).map_err(Refusal::Write)?;
+    all.insert(addon.to_string(), pin.clone());
+    pins::write(root, &all).map_err(Refusal::Write)?;
+    Ok(pin)
+}
+
+/// The offline check: the cached lock still verifies against `anchor`,
+/// lists `tag`, and is exactly what the pin says. Returns the pin.
+pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
+    let all = pins::read(root)?;
+    let pin = all.get(addon).cloned().ok_or_else(|| format!("{addon} has no pin in {}", pins::PINS_FILE))?;
+    if pin.stack != tag {
+        return Err(format!("{addon} is pinned for stack {}, and this stack runs {tag}", pin.stack));
+    }
+    let (lock, sig) = pins::cached_lock(root, addon)
+        .ok_or_else(|| format!("{addon}'s verified lock is missing from {}/", pins::CACHE_DIR))?;
+    let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| format!("{addon}'s cached lock no longer verifies: {e}"))?;
+    if !v.lock.supports(tag) {
+        return Err(format!("{addon} {}'s lock does not list stack {tag}", v.lock.version));
+    }
+    if v.lock.images != pin.images || v.lock.version != pin.version || v.key_index != pin.key_index {
+        return Err(format!("{addon}'s pin does not match its signed lock ({} was edited)", pins::PINS_FILE));
+    }
+    Ok(pin)
+}
+
+/// The production [`Docker`].
+pub struct LiveDocker;
+
+impl Docker for LiveDocker {
+    fn image_present(&mut self, reference: &str) -> bool {
+        std::process::Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", reference])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn pull(&mut self, host: &str, refs: &[String], cred: Option<&Credential>) -> Result<(), String> {
+        let dir = ThrowawayConfig::new()?;
+        if let Some(c) = cred {
+            let mut child = std::process::Command::new("docker")
+                .arg("--config")
+                .arg(&dir.0)
+                .args(["login", host, "--username", &c.user, "--password-stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("docker login: {e}"))?;
+            if let Some(mut si) = child.stdin.take() {
+                crate::child_stdin::write_child_stdin(&mut si, c.token.as_bytes()).map_err(|e| format!("docker login: {e}"))?;
+            }
+            let out = child.wait_with_output().map_err(|e| format!("docker login: {e}"))?;
+            if !out.status.success() {
+                let why = String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").to_string();
+                return Err(format!("docker login {host} refused the add-on registry token: {why}"));
+            }
+        }
+        for r in refs {
+            let out = std::process::Command::new("docker")
+                .arg("--config")
+                .arg(&dir.0)
+                .args(["pull", "--quiet", r])
+                .output()
+                .map_err(|e| format!("docker pull: {e}"))?;
+            if !out.status.success() {
+                let why = String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").to_string();
+                return Err(format!("docker pull {r}: {why}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn running(&mut self) -> Result<Vec<(String, String)>, String> {
+        let out = std::process::Command::new("docker")
+            .args(["ps", "--format", "{{.Names}}\t{{.Image}}"])
+            .output()
+            .map_err(|e| format!("docker ps: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("docker ps: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('\t').map(|(n, i)| (n.to_string(), i.to_string())))
+            .collect())
+    }
+}
+
+/// A docker config directory (mode 0700) that exists for one operation and
+/// is removed on drop, so the registry token is never left in
+/// `~/.docker/config.json`.
+pub struct ThrowawayConfig(pub std::path::PathBuf);
+
+impl ThrowawayConfig {
+    pub fn new() -> Result<Self, String> {
+        let base = std::env::temp_dir();
+        for n in 0..100u32 {
+            let p = base.join(format!(
+                "noo-addon-docker-{}-{}-{n}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+            ));
+            let mut b = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                b.mode(0o700);
+            }
+            match b.create(&p) {
+                Ok(()) => return Ok(ThrowawayConfig(p)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}", p.display())),
+            }
+        }
+        Err("could not create a throwaway docker config directory".into())
+    }
+}
+
+impl Drop for ThrowawayConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// How a pinned image's running containers compare with the pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Running {
+    /// Containers created from exactly the pinned reference.
+    Pinned(Vec<String>),
+    /// Containers of the same repository created from another reference.
+    Drift(Vec<(String, String)>),
+    Absent,
+}
+
+/// Compare one pinned reference with `docker ps`.
+pub fn running_state(pinned_ref: &str, ps: &[(String, String)]) -> Running {
+    let repo = |r: &str| -> String {
+        let base = r.split('@').next().unwrap_or(r);
+        let last_slash = base.rfind('/').map(|i| i + 1).unwrap_or(0);
+        match base[last_slash..].find(':') {
+            Some(c) => base[..last_slash + c].to_string(),
+            None => base.to_string(),
+        }
+    };
+    let want = repo(pinned_ref);
+    let exact: Vec<String> = ps.iter().filter(|(_, i)| i == pinned_ref).map(|(n, _)| n.clone()).collect();
+    let drift: Vec<(String, String)> =
+        ps.iter().filter(|(_, i)| i != pinned_ref && repo(i) == want).map(|(n, i)| (n.clone(), i.clone())).collect();
+    if !drift.is_empty() {
+        Running::Drift(drift)
+    } else if !exact.is_empty() {
+        Running::Pinned(exact)
+    } else {
+        Running::Absent
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::addon_lock::{AddonLock, BaseImage};
+    use crate::release_sig;
+    use std::collections::BTreeMap;
+
+    pub(crate) const ROOT: &str = "ghcr.io/example/intel";
+
+    pub(crate) fn seed() -> String {
+        "cd".repeat(32)
+    }
+
+    pub(crate) fn anchor() -> TrustAnchor {
+        let pk = release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(&seed()).unwrap());
+        TrustAnchor { keys: vec![pk], registry: ROOT.into() }
+    }
+
+    pub(crate) fn digest(c: char) -> String {
+        format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    pub(crate) fn lock(version: &str, supports: &[&str], base: Option<&str>) -> AddonLock {
+        AddonLock {
+            format: addon_lock::FORMAT.into(),
+            addon: "trellion_intel".into(),
+            version: version.into(),
+            source_commit: "a".repeat(40),
+            supports_stack: supports.iter().map(|s| s.to_string()).collect(),
+            images: BTreeMap::from([("trellion-intel".into(), format!("{ROOT}@{}", digest('1')))]),
+            base: base.map(|d| BaseImage { image: "trellion".into(), digest: d.into() }),
+        }
+    }
+
+    pub(crate) fn signed(l: &AddonLock) -> Fetched {
+        let (bytes, sig) = addon_lock::sign(l, &seed()).unwrap();
+        Fetched { lock: bytes, sig }
+    }
+
+    fn want<'a>(stack_lock: Option<&'a str>, pinned: Option<&'a str>) -> Want<'a> {
+        Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock, pinned, allow_downgrade: false }
+    }
+
+    #[test]
+    fn a_good_lock_passes_every_step() {
+        let stack = format!("# tag v0.6.0\ngateway@{}\ntrellion@{}\n", digest('9'), digest('2'));
+        let f = signed(&lock("1.2.0", &["v0.6.0"], Some(&digest('2'))));
+        let v = check(&f, &anchor(), &want(Some(&stack), Some("1.1.0"))).expect("passes");
+        assert_eq!(v.key_index, 0);
+    }
+
+    #[test]
+    fn a_tampered_lock_is_refused() {
+        let mut f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        f.lock = String::from_utf8(f.lock).unwrap().replace("1.2.0", "1.2.1").into_bytes();
+        assert!(matches!(check(&f, &anchor(), &want(None, None)), Err(Refusal::Lock(AddonLockError::BadSignature(_)))));
+    }
+
+    #[test]
+    fn a_lock_for_another_stack_is_refused() {
+        let f = signed(&lock("1.2.0", &["v0.5.9"], None));
+        let e = check(&f, &anchor(), &want(None, None)).unwrap_err();
+        assert!(matches!(e, Refusal::NotForStack { .. }));
+        assert!(e.why("trellion_intel").contains("does not support stack v0.6.0 (it lists v0.5.9)"), "{}", e.why("x"));
+    }
+
+    #[test]
+    fn a_based_lock_needs_the_stack_lock_row_and_must_match_it() {
+        let f = signed(&lock("1.2.0", &["v0.6.0"], Some(&digest('2'))));
+        assert!(matches!(check(&f, &anchor(), &want(None, None)), Err(Refusal::NoStackLock { .. })));
+        let no_row = format!("gateway@{}\n", digest('9'));
+        assert!(matches!(check(&f, &anchor(), &want(Some(&no_row), None)), Err(Refusal::BaseRowMissing { .. })));
+        let other = format!("trellion@{}\n", digest('3'));
+        assert!(matches!(check(&f, &anchor(), &want(Some(&other), None)), Err(Refusal::Base(_))));
+    }
+
+    #[test]
+    fn downgrades_need_the_flag() {
+        let f = signed(&lock("1.1.0", &["v0.6.0"], None));
+        let e = check(&f, &anchor(), &want(None, Some("1.2.0"))).unwrap_err();
+        assert!(matches!(e, Refusal::Downgrade { .. }));
+        assert!(e.why("x").contains("--allow-downgrade"));
+        let w = Want { allow_downgrade: true, ..want(None, Some("1.2.0")) };
+        assert!(check(&f, &anchor(), &w).is_ok());
+        assert!(check(&f, &anchor(), &want(None, Some("1.1.0"))).is_ok(), "the same version is not a downgrade");
+    }
+
+    #[test]
+    fn a_lock_signed_by_another_key_is_refused() {
+        let mut a = anchor();
+        a.keys = vec![release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(&"ef".repeat(32)).unwrap())];
+        let f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        assert!(matches!(check(&f, &a, &want(None, None)), Err(Refusal::Lock(AddonLockError::BadSignature(_)))));
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakeDocker {
+        pub local: Vec<String>,
+        pub pulls: Vec<(String, Vec<String>, bool)>,
+        pub fail_pull: bool,
+        pub ps: Vec<(String, String)>,
+    }
+
+    impl Docker for FakeDocker {
+        fn image_present(&mut self, r: &str) -> bool {
+            self.local.iter().any(|l| l == r)
+        }
+        fn pull(&mut self, host: &str, refs: &[String], cred: Option<&Credential>) -> Result<(), String> {
+            self.pulls.push((host.into(), refs.to_vec(), cred.is_some()));
+            if self.fail_pull {
+                return Err("denied".into());
+            }
+            self.local.extend(refs.iter().cloned());
+            Ok(())
+        }
+        fn running(&mut self) -> Result<Vec<(String, String)>, String> {
+            Ok(self.ps.clone())
+        }
+    }
+
+    #[test]
+    fn pulls_only_what_is_missing_by_digest() {
+        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0 };
+        let mut d = FakeDocker::default();
+        let cred = Credential { user: "u".into(), token: "t".into() };
+        assert_eq!(pull_images(&mut d, &v, Some(&cred)).unwrap(), 1);
+        assert_eq!(d.pulls[0].0, "ghcr.io");
+        assert!(d.pulls[0].1.iter().all(|r| r.contains("@sha256:")));
+        assert_eq!(pull_images(&mut d, &v, Some(&cred)).unwrap(), 0, "a local image is not pulled again");
+        let mut bad = FakeDocker { fail_pull: true, ..Default::default() };
+        assert!(matches!(pull_images(&mut bad, &v, None), Err(Refusal::Pull(_))));
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-addon-resolve-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn record_then_offline_check_and_tamper_detection() {
+        let d = scratch("offline");
+        let f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let v = check(&f, &anchor(), &want(None, None)).unwrap();
+        record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        let pin = offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).expect("verifies");
+        assert_eq!(pin.version, "1.2.0");
+        assert!(offline_check(&d, "trellion_intel", "v0.6.1", &anchor()).unwrap_err().contains("pinned for stack v0.6.0"));
+        assert!(offline_check(&d, "evolve", "v0.6.0", &anchor()).unwrap_err().contains("no pin"));
+
+        // One byte of the cached lock changed: the launcher must refuse.
+        let cached = d.join(pins::CACHE_DIR).join("trellion_intel.json");
+        let text = std::fs::read_to_string(&cached).unwrap().replace("1.2.0", "1.3.0");
+        std::fs::write(&cached, text).unwrap();
+        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("no longer verifies"));
+
+        // A pin edited to point elsewhere, with the lock intact.
+        record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        let mut all = pins::read(&d).unwrap();
+        all.get_mut("trellion_intel").unwrap().images.insert("trellion-intel".into(), format!("{ROOT}@{}", digest('7')));
+        pins::write(&d, &all).unwrap();
+        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("was edited"));
+    }
+
+    #[test]
+    fn stack_lock_rows() {
+        let t = format!("# tag v0.6.0\nsource:trellion@abc\ntrellion@{}\n", digest('2'));
+        assert_eq!(stack_lock_row(&t, "trellion"), Some(digest('2')));
+        assert_eq!(stack_lock_row(&t, "gateway"), None);
+    }
+
+    #[test]
+    fn running_state_tells_pinned_from_drift() {
+        let pinned = format!("{ROOT}@{}", digest('1'));
+        let ps = vec![("noo-trellion-intel".to_string(), pinned.clone())];
+        assert_eq!(running_state(&pinned, &ps), Running::Pinned(vec!["noo-trellion-intel".into()]));
+        let ps = vec![("noo-trellion-intel".to_string(), format!("{ROOT}:v0.6.0"))];
+        assert!(matches!(running_state(&pinned, &ps), Running::Drift(_)));
+        assert_eq!(running_state(&pinned, &[]), Running::Absent);
+    }
+
+    #[test]
+    fn throwaway_config_is_private_and_removed() {
+        let p = {
+            let t = ThrowawayConfig::new().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(std::fs::metadata(&t.0).unwrap().permissions().mode() & 0o777, 0o700);
+            }
+            t.0.clone()
+        };
+        assert!(!p.exists(), "the throwaway docker config outlived its operation");
+    }
+}

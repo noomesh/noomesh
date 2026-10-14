@@ -114,7 +114,6 @@ pub enum AddonLockError {
     /// The ref is not `<repo>@sha256:<hex>`.
     NotDigestRef { image: String, reference: String },
     OutsideRegistry { image: String, reference: String, root: String },
-    #[cfg_attr(not(test), allow(dead_code))] // built by `base_matches`, below
     BaseMismatch { image: String, locked: String, stack: String },
 }
 
@@ -196,7 +195,6 @@ impl AddonLock {
     /// digest the stack's verified lock pins for that image. `stack_digest`
     /// may be the bare digest or a full `<repo>@sha256:…` ref. An add-on
     /// with no base (it does not build on the stack) always matches.
-    #[cfg_attr(not(test), allow(dead_code))] // the controller path calls it; see `is_downgrade`
     pub fn base_matches(&self, stack_digest: &str) -> Result<(), AddonLockError> {
         let Some(base) = &self.base else { return Ok(()) };
         let stack = stack_digest.trim();
@@ -314,9 +312,6 @@ pub fn verify(
 /// precedence (`cmp_cli_semver`: a release outranks its own pre-releases).
 /// An unreadable version is an error, never "not a downgrade": a caller
 /// that cannot order two versions must not move between them silently.
-// The controller path (`noo addons enable|upgrade`) is the caller; until it
-// lands only the tests reach this.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_downgrade(current: &str, candidate: &str) -> Result<bool, AddonLockError> {
     if cmp_cli_semver(current, current).is_none() {
         return Err(AddonLockError::BadVersion(current.to_string()));

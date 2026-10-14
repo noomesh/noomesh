@@ -48,7 +48,11 @@ use crate::ui;
 pub(crate) const STAGED_INDEX: &str = "staged-images.json";
 
 /// Lock images that only ever run on the controller. Everything else in the
-/// lock is node-bound and staged (`--all-images` stages these too).
+/// lock is node-bound and staged (`--all-images` stages these too). The
+/// licensed add-ons (trellion-intel, evolve) are not in the stack lock at all:
+/// they carry their own signed lock and the controller pulls them by digest
+/// itself (`crate::addons`). Their names stay here so a lock row an older
+/// release carried is never staged to a node.
 pub(crate) const CONTROLLER_ONLY: &[&str] = &[
     "gateway", "worker", "trellion", "trellion-intel", "trellion-evolve", "evolve", "postgres-pgvector",
 ];

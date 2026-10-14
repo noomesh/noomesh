@@ -17,6 +17,12 @@
 //!
 //! ## The order, and why the flag is last
 //!
+//!   0. **pin the signed lock** (licensed add-ons only): resolve the add-on's
+//!      signed lock for the running stack tag from its own registry package,
+//!      verify it against the entitlement's trust anchor, pull its images by
+//!      digest and write the pin (`addons.lock`). FIRST, before any credential
+//!      is minted: an add-on with no verifiable release for this stack must
+//!      refuse with nothing changed. See `crate::addons`.
 //!   1. **plan the key** (read-only): does the add-on's overlay declare a key
 //!      (`x-noo-addon`), and does the gateway already hold an active one for
 //!      that consumer? Refuses before anything changes when the gateway
@@ -91,9 +97,21 @@ pub(crate) enum KeyStep {
 /// what was enabled, and what was refused with its fix.
 pub(crate) type EnableOutcomes<'a> = (Vec<(&'a str, Enabled)>, Vec<(String, Refusal)>);
 
+/// What step 0 did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PinStep {
+    /// Not a licensed add-on: it ships with the stack, nothing to pin.
+    NotLicensed,
+    /// Not pinned, and why (a development checkout pins no stack tag;
+    /// `--force` without a licence). The launcher refuses it until pinned.
+    Skipped(String),
+    Pinned { version: String, stack: String, key_index: usize, pulled: usize },
+}
+
 /// The outcome of a completed enable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Enabled {
+    pub pin: PinStep,
     /// Credential NAMES minted in step 2 (empty when all were present).
     pub minted: Vec<String>,
     pub key: KeyStep,
@@ -106,6 +124,7 @@ pub(crate) struct Enabled {
 /// a refusal leaves noomesh.yaml untouched — is testable without a gateway or
 /// a sops key. [`Live`] is the only production implementation.
 pub(crate) trait EnableOps {
+    fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal>;
     fn plan_key(&mut self, addon: &str) -> Result<KeyPlan, Refusal>;
     fn mint_credentials(&mut self, addon: &str) -> Result<Vec<String>, Refusal>;
     fn issue_key(&mut self, addon: &str, plan: &KeyPlan) -> Result<(), Refusal>;
@@ -123,6 +142,7 @@ fn declared_on(config: &Path, name: &str) -> bool {
 /// untouched. Idempotent: a second run mints nothing, issues nothing and
 /// writes nothing.
 pub(crate) fn enable(config: &Path, addon: &str, ops: &mut dyn EnableOps) -> Result<Enabled, Refusal> {
+    let pin = ops.pin_lock(addon)?;
     let plan = ops.plan_key(addon)?;
     let minted = ops.mint_credentials(addon)?;
     let key = match &plan {
@@ -142,7 +162,7 @@ pub(crate) fn enable(config: &Path, addon: &str, ops: &mut dyn EnableOps) -> Res
         })?;
         true
     };
-    Ok(Enabled { minted, key, flipped, config: config.to_path_buf() })
+    Ok(Enabled { pin, minted, key, flipped, config: config.to_path_buf() })
 }
 
 // ── the live side ──────────────────────────────────────────────────────
@@ -154,13 +174,76 @@ const TIMEOUT: u64 = 15;
 /// `noo security service-key provision` uses.
 pub(crate) struct Live<'a> {
     pub g: &'a Globals,
+    /// `--force`: enabling a licensed add-on with no usable licence. Its lock
+    /// cannot be verified without the licence's trust anchor, so step 0 is
+    /// skipped (said so); the launcher refuses the add-on until it is pinned.
+    pub force: bool,
 }
 
 fn sops_path() -> PathBuf {
     crate::envfile::repo_root().join("secrets/env.sops")
 }
 
+/// The remedy for a step-0 refusal, by cause.
+pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
+    use crate::addons::resolve::Refusal as R;
+    if r.is_auth() {
+        return crate::addons::resolve::TOKEN_FIX.to_string();
+    }
+    match r {
+        R::NoEntitlement(_) => "noo security entitlement install <token>".into(),
+        R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),
+        R::Downgrade { .. } => format!("noo addons upgrade {addon} --allow-downgrade"),
+        R::Fetch { .. } | R::NotForStack { .. } | R::NoStackLock { .. } | R::BaseRowMissing { .. } => {
+            format!("noo addons upgrade {addon} --check   # shows what the add-on publishes for this stack")
+        }
+        _ => format!("noo addons upgrade {addon}"),
+    }
+}
+
 impl EnableOps for Live<'_> {
+    fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
+        use crate::addons::{self, resolve::Refusal as R};
+        if crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
+            return Ok(PinStep::NotLicensed);
+        }
+        let root = crate::envfile::repo_root();
+        let Some(tag) = addons::current_tag(&root) else {
+            return Ok(PinStep::Skipped(
+                "this install pins no stack tag (a development checkout builds its own images)".into(),
+            ));
+        };
+        let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
+        let cred = addons::lock_fetch::installed_credential();
+        let client = addons::lock_fetch::Client::new(cred.clone());
+        let ctx = addons::Ctx {
+            root: &root,
+            tag: &tag,
+            stack_lock: stack_lock.as_deref(),
+            allow_downgrade: false,
+            client: &client,
+            cred: cred.as_ref(),
+        };
+        if !self.g.json {
+            crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));
+        }
+        let prepared = match addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker) {
+            Ok(p) => p,
+            Err(r @ (R::NoEntitlement(_) | R::NoAnchor)) if self.force => {
+                return Ok(PinStep::Skipped(format!(
+                    "{} (--force); the launcher refuses {addon} until `noo addons upgrade {addon}` pins it",
+                    r.why(addon)
+                )));
+            }
+            Err(r) => return Err(Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) }),
+        };
+        let pin = addons::commit(&root, &prepared, &tag).map_err(|r| Refusal {
+            why: format!("{}. The images are pulled; noomesh.yaml is unchanged", r.why(addon)),
+            fix: pin_fix(addon, &r),
+        })?;
+        Ok(PinStep::Pinned { version: pin.version, stack: pin.stack, key_index: pin.key_index, pulled: prepared.pulled })
+    }
+
     fn plan_key(&mut self, addon: &str) -> Result<KeyPlan, Refusal> {
         let Some(targets) = secrets::addon_decl(addon).and_then(|_| secrets::provision_targets(addon)) else {
             return Ok(KeyPlan::NotDeclared);
@@ -283,6 +366,13 @@ impl EnableOps for Live<'_> {
 /// The lines an enable prints on success (non-JSON), shared by both callers.
 pub(crate) fn report(addon: &str, e: &Enabled) {
     use crate::ui;
+    match &e.pin {
+        PinStep::NotLicensed => {}
+        PinStep::Skipped(why) => ui::warned(&format!("{addon}: not pinned: {why}")),
+        PinStep::Pinned { version, stack, key_index, pulled } => ui::done(&format!(
+            "{addon} {version} pinned for stack {stack} (lock signed by add-on key #{key_index}; {pulled} image(s) pulled by digest)"
+        )),
+    }
     if e.minted.is_empty() {
         ui::done(&format!("{addon}: credentials present — nothing minted"));
     } else {
@@ -311,8 +401,16 @@ pub(crate) fn report_json(addon: &str, e: &Enabled) -> serde_json::Value {
             serde_json::json!({ "consumer": consumer, "state": "issued", "stored_as": secret_key })
         }
     };
+    let pin = match &e.pin {
+        PinStep::NotLicensed => serde_json::json!({ "state": "not_licensed" }),
+        PinStep::Skipped(why) => serde_json::json!({ "state": "skipped", "why": why }),
+        PinStep::Pinned { version, stack, key_index, pulled } => serde_json::json!({
+            "state": "pinned", "version": version, "stack": stack, "key_index": key_index, "pulled": pulled,
+        }),
+    };
     serde_json::json!({
         "addon": addon,
+        "pin": pin,
         "credentials_minted": e.minted,
         "service_key": key,
         "flipped": e.flipped,
@@ -336,12 +434,20 @@ pub(crate) mod tests {
         pub fail_plan: bool,
         pub fail_mint: bool,
         pub fail_issue: bool,
+        pub fail_pin: bool,
         pub calls: Vec<String>,
     }
 
     pub(crate) const CREDS: [&str; 2] = ["NOO_EVOLVE_DB_PASSWORD", "NOO_EVOLVE_DDL_PASSWORD"];
 
     impl EnableOps for Fake {
+        fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
+            self.calls.push(format!("pin:{addon}"));
+            if self.fail_pin {
+                return Err(Refusal { why: "no lock for this stack".into(), fix: format!("noo addons upgrade {addon} --check") });
+            }
+            Ok(PinStep::Pinned { version: "1.0.0".into(), stack: "v0.6.0".into(), key_index: 0, pulled: 1 })
+        }
         fn plan_key(&mut self, addon: &str) -> Result<KeyPlan, Refusal> {
             self.calls.push(format!("plan:{addon}"));
             if self.fail_plan {
@@ -418,7 +524,7 @@ addons:
             KeyStep::Issued { consumer: "svc:evolve".into(), secret_key: "NOO_SVC_KEY_EVOLVE".into() }
         );
         assert!(e.flipped && evolve_on(&p));
-        assert_eq!(ops.calls, ["plan:evolve", "mint:evolve", "issue:evolve"], "the flag is last, after both mints");
+        assert_eq!(ops.calls, ["pin:evolve", "plan:evolve", "mint:evolve", "issue:evolve"], "the lock is pinned first and the flag is last");
         assert!(std::fs::read_to_string(&p).unwrap().contains("# licensed"), "comments survive the flip");
     }
 
@@ -461,8 +567,34 @@ addons:
         let mut ops = Fake { declares_key: true, fail_plan: true, ..Default::default() };
         enable(&p, "evolve", &mut ops).expect_err("must refuse");
         assert!(ops.store.is_empty(), "credentials were minted for an enable that could not finish");
-        assert_eq!(ops.calls, ["plan:evolve"]);
+        assert_eq!(ops.calls, ["pin:evolve", "plan:evolve"]);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG);
+    }
+
+    /// No verifiable release for this stack: refused before a credential is
+    /// minted or a key planned, and noomesh.yaml is untouched.
+    #[test]
+    fn a_lock_refusal_changes_nothing_at_all() {
+        let p = scratch("pinfail");
+        let mut ops = Fake { declares_key: true, fail_pin: true, ..Default::default() };
+        let r = enable(&p, "evolve", &mut ops).expect_err("must refuse");
+        assert!(r.fix.contains("noo addons upgrade evolve --check"), "{r:?}");
+        assert_eq!(ops.calls, ["pin:evolve"], "nothing may run after a lock refusal");
+        assert!(ops.store.is_empty());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG);
+    }
+
+    #[test]
+    fn pin_remedies_name_real_causes() {
+        use crate::addons::resolve::Refusal as R;
+        use crate::release_fetch::{FetchClass, FetchError};
+        let auth = R::Fetch { reference: "r".into(), err: FetchError::new(FetchClass::Auth, "x") };
+        assert_eq!(pin_fix("evolve", &auth), crate::addons::resolve::TOKEN_FIX);
+        let nf = R::Fetch { reference: "r".into(), err: FetchError::new(FetchClass::NotFound, "x") };
+        assert!(pin_fix("evolve", &nf).starts_with("noo addons upgrade evolve --check"));
+        assert!(pin_fix("evolve", &R::NoEntitlement("none".into())).starts_with("noo security entitlement install"));
+        let d = R::Downgrade { pinned: "2".into(), offered: "1".into() };
+        assert_eq!(pin_fix("evolve", &d), "noo addons upgrade evolve --allow-downgrade");
     }
 
     #[test]

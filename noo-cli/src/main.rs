@@ -48,6 +48,7 @@
 #![allow(clippy::ptr_arg)]
 
 mod addon_lock;
+mod addons;
 mod auth;
 mod catalog;
 mod child_stdin;
@@ -637,6 +638,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "list"], commands::addons_list),
     (&["addons", "enable"], commands::addons_enable),
     (&["addons", "disable"], commands::addons_disable),
+    (&["addons", "upgrade"], commands::addons_upgrade),
+    (&["addons", "verify"], commands::addons_verify),
+    (&["addons", "launch-pins"], commands::addons_launch_pins),
     (&["kiosk", "invite"], commands::kiosk_invite),
     (&["kiosk", "labels"], commands::kiosk_labels),
     (&["kiosk", "reload"], commands::kiosk_reload),
@@ -671,6 +675,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
 const HIDDEN_NATIVE: &[&[&str]] = &[
     &["config", "launch-render"],
     &["config", "launch-check"],
+    // The launcher's reader of the add-on pins (scripts/lib-dist.sh
+    // require_addon_pins) — see `commands::addon_pins`.
+    &["addons", "launch-pins"],
     // Pure aliases and internal/retired verbs: still dispatched, not in help.
     &["approval", "pending"],
     &["autonomy", "locations"],

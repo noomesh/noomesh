@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""A public (dist) install that turns a licensed add-on on must stop with a
-message that names the add-on, the prefix tried and the licence, instead of
-reaching `compose pull` and dying on a bare "pull access denied".
+"""A dist start runs each licensed add-on that is on from the image its own
+signed lock pins for THIS stack tag, present locally by digest, or it does not
+start. The launcher never pulls an add-on and holds no registry credential.
 
-scripts/lib-dist.sh::require_addon_images is exercised for real against a fake
-`docker` on PATH (no registry, no daemon). Each case pins one row of the
-failure-semantics table in that function's comment: switched off, local image,
-denied, not found, unreachable, unknown, digest absent from the lock, and the
-two overlays' image overrides resolving the same way."""
+scripts/lib-dist.sh::require_addon_pins is exercised for real against a fake
+`docker` and a fake `noo` on PATH (no registry, no daemon). The fake `noo`
+answers `addons launch-pins` with the protocol the real one prints (one `pin`
+or `refuse` line per licensed add-on); the Rust side of that verb is unit-tested
+in noo-cli/src/commands/addon_pins.rs."""
 
 from __future__ import annotations
 
@@ -18,31 +18,41 @@ import stat
 import subprocess
 from pathlib import Path
 
-import pytest
-
 REPO = Path(__file__).resolve().parents[1]
 
+INTEL_REF = "ghcr.io/example/trellion-intel@sha256:" + "1" * 64
+EVOLVE_REF = "ghcr.io/example/evolve@sha256:" + "2" * 64
+
 FAKE_DOCKER = """#!/bin/sh
-# FAKE_LOCAL: space-separated refs present locally. FAKE_MANIFEST_ERR: stderr of
-# a failing `manifest inspect` (empty = success).
+# FAKE_LOCAL: space-separated refs present locally.
 case "$1 $2" in
   "image inspect") for r in $FAKE_LOCAL; do [ "$r" = "$3" ] && exit 0; done; exit 1 ;;
-  "manifest inspect")
-    echo "$3" >> "$FAKE_LOG"
-    if [ -n "$FAKE_MANIFEST_ERR" ]; then echo "$FAKE_MANIFEST_ERR" >&2; exit 1; fi
-    exit 0 ;;
+  pull*) echo "$*" >> "$FAKE_LOG"; exit 0 ;;
 esac
+case "$1" in pull|login) echo "$*" >> "$FAKE_LOG" ;; esac
 exit 0
 """
 
+FAKE_NOO = """#!/bin/sh
+# FAKE_PINS: the launch-pins answer (lines). FAKE_NOO_RC: its exit code.
+echo "$*" >> "$FAKE_NOO_LOG"
+[ "$1 $2" = "addons launch-pins" ] || exit 2
+printf '%b' "$FAKE_PINS"
+exit "${FAKE_NOO_RC:-0}"
+"""
+
+
+def _bin(tmp_path: Path, name: str, text: str) -> None:
+    d = tmp_path / "bin"
+    d.mkdir(exist_ok=True)
+    f = d / name
+    f.write_text(text)
+    f.chmod(f.stat().st_mode | stat.S_IEXEC)
+
 
 def _run(tmp_path: Path, body: str, **env: str) -> subprocess.CompletedProcess:
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    d = bindir / "docker"
-    d.write_text(FAKE_DOCKER)
-    d.chmod(d.stat().st_mode | stat.S_IEXEC)
-    log = tmp_path / "manifest.log"
+    _bin(tmp_path, "docker", FAKE_DOCKER)
+    _bin(tmp_path, "noo", FAKE_NOO)
     script = f"""
 set -u
 cd {tmp_path}
@@ -51,149 +61,145 @@ cd {tmp_path}
 {body}
 """
     full_env = {
-        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "NOO_ADDON_MAP_OVERRIDE": "1",
-        "NOO_ADDON_MAP": env.pop("MAP", "trellion_intel=1\nevolve=1\n"),
+        "NOO_ADDON_MAP": env.pop("MAP", "trellion_intel=1\nevolve=1\nvoice=0\n"),
         "DIST_MODE": "1",
+        "DIST_TAG": "v0.6.0",
         "NOO_IMAGE_PREFIX": "ghcr.io/noomesh",
         "NOO_IMAGE_TAG": "v0.6.0",
-        "FAKE_LOCAL": "",
-        "FAKE_MANIFEST_ERR": "",
-        "FAKE_LOG": str(log),
+        "FAKE_LOCAL": f"{INTEL_REF} {EVOLVE_REF}",
+        "FAKE_PINS": (f"pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {INTEL_REF}\\n"
+                      f"pin evolve NOO_ADDON_IMAGE_EVOLVE {EVOLVE_REF}\\n"),
+        "FAKE_LOG": str(tmp_path / "docker.log"),
+        "FAKE_NOO_LOG": str(tmp_path / "noo.log"),
     }
     full_env.update(env)
     return subprocess.run(["bash", "-c", script], env=full_env, capture_output=True, text=True)
 
 
-def test_both_addons_off_is_not_looked_at(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="trellion_intel=0\nevolve=0\n",
-             FAKE_MANIFEST_ERR="denied: boom")
+def _exports(r: subprocess.CompletedProcess) -> dict[str, str]:
+    return dict(l.split("=", 1) for l in r.stdout.splitlines() if l.startswith("NOO_ADDON_IMAGE_"))
+
+
+SHOW = 'require_addon_pins; rc=$?; env | grep "^NOO_ADDON_IMAGE_" | sort; exit $rc'
+
+
+def test_verified_local_pins_are_exported_for_the_overlays(tmp_path):
+    r = _run(tmp_path, SHOW)
     assert r.returncode == 0, r.stderr
-    assert not (tmp_path / "manifest.log").exists(), "an off add-on must make no registry call"
+    assert _exports(r) == {"NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "NOO_ADDON_IMAGE_EVOLVE": EVOLVE_REF}
+    asked = (tmp_path / "noo.log").read_text().split()
+    assert asked[:3] == ["addons", "launch-pins", "v0.6.0"], asked
+    assert set(asked[3:]) == {"trellion_intel", "evolve"}, "only add-ons that are on are asked about"
+    assert not (tmp_path / "docker.log").exists(), "the launcher must never pull or log in"
+
+
+def test_addons_off_make_no_call_at_all(tmp_path):
+    r = _run(tmp_path, SHOW, MAP="trellion_intel=0\nevolve=0\n")
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "noo.log").exists()
+    # An unlicensed add-on that is on is the CLI's to ignore: no line, no pin.
+    r = _run(tmp_path, SHOW, MAP="trellion_intel=0\nvoice=1\n", FAKE_PINS="")
+    assert r.returncode == 0, r.stderr
+    assert _exports(r) == {}
 
 
 def test_not_dist_mode_is_a_noop(tmp_path):
-    r = _run(tmp_path, "require_addon_images", DIST_MODE="0", FAKE_MANIFEST_ERR="denied: boom")
+    r = _run(tmp_path, SHOW, DIST_MODE="0", FAKE_PINS="refuse evolve nope\\n")
     assert r.returncode == 0, r.stderr
 
 
-def test_registry_denied_names_the_addon_prefix_and_licence(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n",
-             NOO_EVOLVE_IMAGE_PREFIX="ghcr.io/personifai-addons",
-             FAKE_MANIFEST_ERR="denied: requested access to the resource is denied")
+def test_a_refused_pin_names_the_addon_the_reason_and_the_remedy(tmp_path):
+    r = _run(tmp_path, SHOW, MAP="evolve=1\n",
+             FAKE_PINS="refuse evolve evolve's cached lock no longer verifies: Add-on lock signature invalid\\n")
     assert r.returncode == 1
-    err = r.stderr
-    assert "evolve" in err and "ghcr.io/personifai-addons" in err
-    assert "licensed" in err and "PRIVATE registry" in err
-    assert "NOO_EVOLVE_IMAGE_PREFIX" in err and "addons.evolve: false" in err
-    assert "requested access" in err  # the registry's own line is quoted
-    assert "No NOO_ENTITLEMENT" in err
+    assert "REFUSING: the evolve add-on is on and has no verified pin for v0.6.0" in r.stderr
+    assert "cached lock no longer verifies" in r.stderr
+    assert "noo addons upgrade evolve" in r.stderr
+    assert _exports(r) == {}
 
 
-def test_entitlement_present_drops_the_entitlement_hint(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n", NOO_ENTITLEMENT="noo-ent-x",
-             FAKE_MANIFEST_ERR="unauthorized: authentication required")
-    assert r.returncode == 1 and "No NOO_ENTITLEMENT" not in r.stderr
-
-
-def test_core_prefix_without_the_image_is_notfound_with_the_remedy(tmp_path):
-    # Prefix var unset: falls back to the core prefix, which carries no add-on.
-    r = _run(tmp_path, "require_addon_images", MAP="trellion_intel=1\n",
-             FAKE_MANIFEST_ERR="manifest unknown")
+def test_a_pinned_image_missing_locally_refuses_and_is_never_pulled(tmp_path):
+    r = _run(tmp_path, SHOW, FAKE_LOCAL=INTEL_REF)
     assert r.returncode == 1
-    assert "ghcr.io/noomesh/trellion-intel:v0.6.0" in r.stderr
-    assert "NOT in the public stack" in r.stderr and "NOO_INTEL_IMAGE_PREFIX" in r.stderr
+    assert "REFUSING: the evolve add-on is on, and its pinned image is not on this host" in r.stderr
+    assert EVOLVE_REF in r.stderr and "noo addons upgrade evolve" in r.stderr
+    assert not (tmp_path / "docker.log").exists(), "the launcher must never pull an add-on"
 
 
-def test_unreachable_registry_is_not_called_a_licence_problem(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n",
-             FAKE_MANIFEST_ERR="dial tcp: lookup registry.example: no such host")
+def test_an_env_file_value_cannot_name_an_addon_image(tmp_path):
+    # An operator export (or an .env line a loader exported) is dropped: only
+    # a pin that verified may set the variable.
+    r = _run(tmp_path, SHOW, MAP="evolve=0\n", NOO_ADDON_IMAGE_EVOLVE="mine/evolve:latest")
+    assert r.returncode == 0, r.stderr
+    assert _exports(r) == {}
+    r = _run(tmp_path, SHOW, MAP="evolve=1\n", NOO_ADDON_IMAGE_EVOLVE="mine/evolve:latest",
+             FAKE_PINS="refuse evolve evolve has no pin in addons.lock\\n")
+    assert r.returncode == 1 and _exports(r) == {}
+
+
+def test_a_failing_reader_refuses(tmp_path):
+    r = _run(tmp_path, SHOW, FAKE_NOO_RC="1", FAKE_PINS="boom\\n")
     assert r.returncode == 1
-    assert "could not be reached" in r.stderr and "refused us" not in r.stderr
+    assert "the add-on pins could not be read" in r.stderr and "noo addons verify" in r.stderr
 
 
-def test_unclassified_failure_still_refuses_and_quotes(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n", FAKE_MANIFEST_ERR="weird thing")
-    assert r.returncode == 1 and "weird thing" in r.stderr
+def test_a_reader_line_that_is_not_an_addon_variable_is_refused(tmp_path):
+    r = _run(tmp_path, SHOW, MAP="evolve=1\n", FAKE_PINS=f"pin evolve PATH {EVOLVE_REF}\\n")
+    assert r.returncode == 1 and "not an add-on image variable" in r.stderr
 
 
-def test_local_image_passes_without_a_registry_call(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n",
-             FAKE_LOCAL="ghcr.io/noomesh/evolve:v0.6.0", FAKE_MANIFEST_ERR="denied: x")
+def test_addon_services_are_derived_from_the_overlays():
+    files = "-f docker-compose.cluster.yml -f docker-compose.trellion-intel.yml -f docker-compose.evolve.yml -f docker-compose.voice.yml"
+    r = subprocess.run(["bash", "-c", f"cd {REPO}; . scripts/lib-dist.sh; addon_services {files}"],
+                       capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert not (tmp_path / "manifest.log").exists()
+    assert r.stdout.split() == ["noo-evolve", "noo-evolve-routes", "trellion-intel"]
 
 
-def test_reachable_without_a_lock_digest_proceeds_but_says_unpinned(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n", NOO_EVOLVE_IMAGE_PREFIX="reg/x")
-    assert r.returncode == 0, r.stderr
-    assert "unpinned" in r.stderr and "reg/x/evolve:v0.6.0" in r.stderr
-
-
-def test_no_lock_rows_with_both_addons_on_names_each_as_unverified(tmp_path):
-    # The core stack lock carries no add-on rows: both add-ons start by tag,
-    # and each is named in its own notice that says it was not verified.
-    r = _run(tmp_path, "require_addon_images", NOO_EVOLVE_IMAGE_PREFIX="reg/x",
-             NOO_INTEL_IMAGE_PREFIX="reg/x")
-    assert r.returncode == 0, r.stderr
-    for name in ("trellion-intel", "evolve"):
-        assert f"{name} add-on: not in this stack release's signed lock" in r.stderr
-        assert f"reg/x/{name}:v0.6.0 by tag — unpinned and UNVERIFIED" in r.stderr
+def test_rendered_addon_refs_must_be_their_pins(tmp_path):
+    # A fake compose that renders the add-on service's image from the env.
+    fake = """#!/bin/sh
+if [ "$1" = "compose" ] ; then
+  case "$*" in *"config --images trellion-intel"*) echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-ghcr.io/noomesh/trellion-intel:v0.6.0}" ;; esac
+  exit 0
+fi
+exit 0
+"""
+    _bin(tmp_path, "docker", fake)
+    body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}\"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml"
+    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0"}
+    ok = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF},
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    bad = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
+    assert bad.returncode == 1
+    assert "trellion-intel would run ghcr.io/noomesh/trellion-intel:v0.6.0" in bad.stderr
 
 
 def test_evolve_routes_runs_the_same_image_as_evolve():
-    # The routes one-shot must follow the add-on prefix/override exactly like
-    # noo-evolve: the core registry carries no evolve image.
     import yaml
     svcs = yaml.safe_load((REPO / "docker-compose.evolve.yml").read_text())["services"]
     assert svcs["noo-evolve-routes"]["image"] == svcs["noo-evolve"]["image"]
 
 
-def test_a_digest_in_the_lock_is_probed_and_not_called_unpinned(tmp_path):
-    r = _run(tmp_path, "require_addon_images", MAP="evolve=1\n", NOO_EVOLVE_IMAGE_PREFIX="reg/x",
-             NOO_IMAGE_DIGEST_EVOLVE="@sha256:abc")
-    assert r.returncode == 0 and "unpinned" not in r.stderr
-    assert "reg/x/evolve:v0.6.0@sha256:abc" in (tmp_path / "manifest.log").read_text()
-
-
-def test_full_reference_override_wins_for_both(tmp_path):
-    r = _run(tmp_path, "require_addon_images", NOO_EVOLVE_IMAGE="mine/e:1", NOO_INTEL_IMAGE="mine/i:1")
-    assert r.returncode == 0, r.stderr
-    log = (tmp_path / "manifest.log").read_text().split()
-    assert sorted(log) == ["mine/e:1", "mine/i:1"]
-    assert "unpinned" not in r.stderr  # an operator-set reference is the operator's pin
-
-
-def test_one_bad_addon_fails_even_if_the_other_is_fine(tmp_path):
-    r = _run(tmp_path, "require_addon_images", FAKE_LOCAL="ghcr.io/noomesh/evolve:v0.6.0",
-             FAKE_MANIFEST_ERR="denied: x")
-    assert r.returncode == 1
-    assert "trellion-intel" in r.stderr and "REFUSING: the evolve" not in r.stderr
-
-
-# resolve_intel_image must not turn "refused" or "public install" into "old tag".
-def test_intel_fallback_still_applies_to_a_tag_before_the_dedicated_image(tmp_path):
-    r = _run(tmp_path, 'resolve_intel_image; echo "INTEL=${NOO_INTEL_IMAGE:-}"',
-             NOO_IMAGE_TAG="v0.2.5", FAKE_MANIFEST_ERR="manifest unknown")
-    assert "INTEL=ghcr.io/noomesh/trellion:v0.2.5" in r.stdout
-
-
-@pytest.mark.parametrize("err,tag", [
-    ("denied: x", "v0.2.5"),            # refused says nothing about the tag
-    ("no such host", "v0.2.5"),          # nor does an unreachable registry
-    ("manifest unknown", "v0.6.0"),      # absent on a NEW tag = not in this registry
-    ("manifest unknown", "latest"),      # unknown tag cannot be shown old
-])
-def test_intel_fallback_does_not_mask_a_licence_or_registry_problem(tmp_path, err, tag):
-    r = _run(tmp_path, 'resolve_intel_image; echo "INTEL=${NOO_INTEL_IMAGE:-}"',
-             NOO_IMAGE_TAG=tag, FAKE_MANIFEST_ERR=err)
-    assert "INTEL=\n" in r.stdout + "\n", r.stdout
-
-
-def test_both_launchers_call_the_gate_before_any_pull():
+def test_both_launchers_call_the_gate_before_any_pull_and_the_old_paths_are_gone():
     start = (REPO / "scripts/noomesh-start.sh").read_text()
     restart = (REPO / "scripts/noomesh-restart.sh").read_text()
-    assert "require_addon_images || exit 1" in restart
-    assert "require_addon_images || exit 1" in start
-    assert start.index("require_addon_images || exit 1") < start.index("ui_step \"Pulling images\"")
+    lib = (REPO / "scripts/lib-dist.sh").read_text()
+    assert "require_addon_pins || exit 1" in restart
+    assert "require_addon_pins || exit 1" in start
+    assert start.index("require_addon_pins || exit 1") < start.index("ui_step \"Pulling images\"")
+    for gone in ("resolve_intel_image", "require_addon_images", "_addon_ref ", "_addon_ref(", "_addon_probe"):
+        for name, text in (("noomesh-start.sh", start), ("noomesh-restart.sh", restart), ("lib-dist.sh", lib)):
+            code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+            assert gone not in code, f"{gone} is retired but {name} still calls it"
+    assert "dist_assert_addon_refs \"$@\" || return 1" in lib, "the pull guard covers add-on refs"
+
+
+def test_the_retired_addon_image_keys_are_warned_about():
+    keys = (REPO / "scripts/retired-env-keys").read_text()
+    for k in ("NOO_INTEL_IMAGE", "NOO_EVOLVE_IMAGE", "NOO_INTEL_IMAGE_PREFIX", "NOO_EVOLVE_IMAGE_PREFIX"):
+        assert f"\n{k}|" in keys, k

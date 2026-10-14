@@ -9,7 +9,7 @@ set -e
 # Single-flight across every compose-mutating entry point (an earlier change —
 # the 2026-07-31 outage was two recreate paths interleaving).
 source "$(dirname "${BASH_SOURCE[0]}")/lib-compose-lock.sh"
-# resolve_intel_image (the pinned-tag fallback for the Intelligent tier).
+# require_addon_pins (licensed add-ons run only their signed, local pins).
 source "$(dirname "${BASH_SOURCE[0]}")/lib-dist.sh"
 # Presentation helpers (ui_step/ui_kv/…) follow
 # noo-cli/CLI_STYLE_GUIDE.md. Sourced HERE, before ANY caller: the
@@ -548,17 +548,13 @@ unset _data_root
 # launcher).
 if [ -n "${DIST_TAG:-}" ]; then
     dist_reassert_pins
-    # The Intelligent tier's dedicated image exists only for tags ≥ v0.2.6;
-    # on an older pin, run it on the tag's trellion image and say so rather
-    # than strand the whole start on a pull that cannot succeed.
-    if addon_on trellion_intel 0; then
-        DIST_MODE=1 resolve_intel_image
-    fi
-    # A licensed add-on whose image cannot be pulled (public install, no
-    # entitlement or registry login, wrong or unreachable add-on prefix) stops
-    # HERE with a message that names it, before the pull loop turns it into a
-    # bare "pull access denied". Switched-off add-ons are not looked at.
-    DIST_MODE=1 require_addon_images || exit 1
+    # A licensed add-on that is on runs only the image its signed lock pins
+    # for THIS tag, already local by digest (the CLI pulled it). No pin, a
+    # pin that no longer verifies, or the image missing: refused HERE, naming
+    # the add-on and `noo addons upgrade`, before anything is pulled or
+    # recreated. The launcher never pulls an add-on. Off add-ons are not
+    # looked at.
+    DIST_MODE=1 require_addon_pins || exit 1
 fi
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$SCRIPT_DIR/lib-created-guard.sh"
@@ -783,20 +779,16 @@ require_compose_v2 || exit 1
             # here: a half-pulled dist stack would silently fall back to
             # whatever stale local image happened to match the tag.
             #
-            # noo-evolve (and noo-evolve-routes, the same image) is pulled only
-            # when THIS tag's lock carries a digest for it
-            # (NOO_IMAGE_DIGEST_EVOLVE, set by lib-dist from the lock). Without
-            # one, require_addon_images has already probed the image and said
-            # it runs unpinned; `up` fetches it by tag (pull_policy missing).
-            # Tags before the evolve image was published have no digest, and
-            # on those a blanket pull died on "pull access denied" for the
-            # local build name before anything was recreated. With a digest
-            # it is a first-party image like any other and must be pulled.
-            if [ -n "${NOO_IMAGE_DIGEST_EVOLVE:-}" ]; then
-                _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null || true)"
-            else
-                _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null | grep -vE '^noo-evolve(-routes)?$' || true)"
-            fi
+            # Add-on services are never pulled here: their images are pinned
+            # by the add-on's own signed lock and were pulled by digest by the
+            # CLI (`noo addons enable|upgrade`, `noo upgrade --stack`) with the
+            # registry token the launcher does not hold. require_addon_pins
+            # has already refused a start whose add-on image is not local.
+            # The set is derived from the overlays (addon_services), so core
+            # names no add-on service.
+            # shellcheck disable=SC2086
+            _dist_services="$(docker compose $COMPOSE_FILES $PROFILE_ARGS config --services 2>/dev/null \
+                | grep -vxF -f <(addon_services $COMPOSE_FILES; echo '#none#') || true)"
             # Up to three attempts: GHCR blob downloads over IPv6 timed out
             # twice on host8 (2026-09-03), each time on the largest layer,
             # and each re-run resumed from the layers already on disk. A

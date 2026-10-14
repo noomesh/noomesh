@@ -66,8 +66,9 @@ apply_dist_mode "."
 if [ "${DIST_MODE:-0}" = 1 ]; then
     require_secrets_floor "." "$NOO_IMAGE_TAG" || exit 1
 fi
-resolve_intel_image
-require_addon_images || exit 1
+# Licensed add-ons run only their signed, local pins for this tag (see
+# lib-dist.sh require_addon_pins); restart never pulls one either.
+require_addon_pins || exit 1
 
 DEFAULT_PROFILE="controller"
 
