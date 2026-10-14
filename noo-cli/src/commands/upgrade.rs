@@ -3298,11 +3298,29 @@ fn fetch_stack_lock(g: &Globals, tag: &str) -> Option<String> {
 }
 
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
-type StackLockErr = (&'static str, String, Option<&'static str>);
+pub(crate) type StackLockErr = (&'static str, String, Option<&'static str>);
 fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr> {
+    stack_lock_with(tag, &mut |rel, name| fetch_tag_file(g, rel, name), &crate::release_sig::verify)
+}
+
+/// A release-file fetcher: `(release tag, file name)` -> bytes.
+pub(crate) type ReleaseFileFetch<'a> = dyn FnMut(&str, &str) -> Result<Vec<u8>, FetchError> + 'a;
+/// A detached-signature check: `(data, sig text)` -> index of the matching key.
+pub(crate) type SigVerify<'a> = dyn Fn(&[u8], &str) -> Result<usize, String> + 'a;
+
+/// The fetch-and-verify behind [`try_stack_lock`], over an injected
+/// fetcher (`fetch(release tag, file name)`) and signature check, so the
+/// onboard dist start runs the SAME rules as `noo upgrade --stack` and a
+/// test can drive both with a fake release. `Ok(None)` = the release
+/// publishes no lock (a genuine not-found only).
+pub(crate) fn stack_lock_with(
+    tag: &str,
+    fetch: &mut ReleaseFileFetch<'_>,
+    verify: &SigVerify<'_>,
+) -> Result<Option<String>, StackLockErr> {
     let rel = format!("stack-{tag}");
     let name = format!("{rel}.lock");
-    let lock = match fetch_tag_file(g, &rel, &name) {
+    let lock = match fetch(&rel, &name) {
         Ok(b) => b,
         // Only a genuine not-found means "no lock published"
         // i11b): a network or auth failure must not quietly downgrade the
@@ -3311,12 +3329,12 @@ fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr
         Err(e) => return Err(("stack_lock_fetch_failed", format!("{name}: {e}"),
             Some("retry; or NOO_ALLOW_UNSIGNED=1 to deploy by tag only"))),
     };
-    let sig = match fetch_tag_file(g, &rel, &format!("{name}.sig")) {
+    let sig = match fetch(&rel, &format!("{name}.sig")) {
         Ok(b) => String::from_utf8_lossy(&b).to_string(),
         Err(e) => return Err(("stack_lock_unsigned",
             format!("{name} is published without a signature ({e}) — refusing"), None)),
     };
-    if let Err(e) = crate::release_sig::verify(&lock, &sig) {
+    if let Err(e) = verify(&lock, &sig) {
         return Err(("stack_lock_invalid", format!("{name}: {e} — refusing to deploy"),
             Some("the release was altered after signing; do not work around this")));
     }
@@ -3325,6 +3343,20 @@ fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr
         return Err(("stack_lock_empty", format!("{name} names no images"), None));
     }
     Ok(Some(text))
+}
+
+/// Write verified lock text as `<root>/stack.lock` (header `# tag <tag>`)
+/// atomically: a temp file beside it, then a rename, so the launcher never
+/// reads a half-written lock. Returns the number of image rows pinned.
+pub(crate) fn write_stack_lock_file(root: &std::path::Path, tag: &str, text: &str) -> std::io::Result<usize> {
+    let dst = root.join("stack.lock");
+    let tmp = root.join(".stack.lock.tmp");
+    std::fs::write(&tmp, format!("# tag {tag}\n{text}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(text.lines().filter(|l| l.contains("@sha256:")).count())
 }
 
 /// Write the verified lock as `<root>/stack.lock` (header `# tag <tag>`),
@@ -3336,10 +3368,10 @@ fn write_stack_lock(g: &Globals, tag: &str, root: &std::path::Path, lock: Option
         let _ = std::fs::remove_file(&dst);
         return;
     };
-    let n = text.lines().filter(|l| l.contains("@sha256:")).count();
-    if let Err(e) = std::fs::write(&dst, format!("# tag {tag}\n{text}")) {
-        fail(g.json, ExitCode::Generic, "stack_lock_write_failed", &format!("{}: {e}", dst.display()), None);
-    }
+    let n = match write_stack_lock_file(root, tag, text) {
+        Ok(n) => n,
+        Err(e) => fail(g.json, ExitCode::Generic, "stack_lock_write_failed", &format!("{}: {e}", dst.display()), None),
+    };
     if !g.json { ui::done(&format!("digest lock verified: {n} image(s) pinned from stack-{tag} (release-signed)")); }
 }
 
