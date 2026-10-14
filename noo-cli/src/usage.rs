@@ -359,7 +359,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["addons", "disable"], "<name>", "Declare an add-on OFF in noomesh.yaml; restart applies it"),
     (&["addons", "upgrade"], "[<name>...] [--check] [--allow-downgrade]", "Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin"),
     (&["addons", "verify"], "", "Re-verify add-on locks offline and compare local and running images with the pins"),
-    (&["addons", "launch-pins"], "<tag> [<name>...]", "Hidden: print verified add-on image pins for the launcher (internal)"),
+    (&["addons", "launch-pins"], "[--root <dir>] <tag> [<name>...]", "Hidden: print verified add-on image pins for the launcher (internal)"),
     (&["kiosk", "invite"], "<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]", "Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands"),
     (&["kiosk", "labels"], "on|off|status", "Controller: entity names on the kiosk graph (kiosk.graph_labels; audited, no restart)"),
     (&["kiosk", "reload"], "", "Reload the page on the display and report the console build either side"),
