@@ -185,15 +185,18 @@ def run_async(coro):
 def cli_http_verify() -> bool | str:
     """Return TLS verification setting for CLI→gateway requests.
 
-    If the cluster CA file exists, returns its path (httpx uses it for
-    verification).  Otherwise returns ``False`` for HTTPS (self-signed)
-    or ``True`` for HTTP (system default).
+    The cluster CA path when one resolves (``NOO_TLS_CA``, else the install's
+    standard location -- see ``noomesh.tls_ca``), else ``True`` (the system
+    trust store). NEVER ``False``: this used to return ``False`` for an HTTPS
+    gateway with no CA. A gateway whose leaf the CA issued now fails the
+    handshake loudly instead of being accepted unverified. (Unlike
+    ``AgentMessenger`` it does not raise on a missing CA: a CLI pointed at a
+    publicly-trusted gateway needs none, and the no-login refusal in
+    ``cli_httpx_kwargs`` must stay reachable without one.)
     """
-    import os
-    ca = os.environ.get("NOO_TLS_CA", "")
-    if ca and os.path.isfile(ca):
-        return ca  # httpx accepts str path for verify=
-    return not get_gateway_url().startswith("https://")
+    from .tls_ca import resolve_ca
+
+    return resolve_ca() or True
 
 
 def cli_client_cert() -> tuple[str, str] | None:
