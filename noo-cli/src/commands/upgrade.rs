@@ -178,6 +178,9 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // Stage 2: we ARE the freshly-installed binary; run the stack/node
     // stages with THIS build's paired tag + embedded assets.
     if stage2 {
+        // The fresh binary corrects what an older one could not know about
+        // (the parent of a self-update is the previous release).
+        super::channel::migrate_legacy_base_registry(g, false);
         return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
     }
 
@@ -190,8 +193,13 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             if let Some(code) = super::channel::run(g, req, yes, check_only, &current) {
                 return Ok(code);
             }
+            // The operator chose these values just now (a rollback restores
+            // them as recorded): the stage-2 re-exec must not "correct" them.
+            std::env::set_var(super::channel::CHANNEL_SET_THIS_RUN, "1");
         }
-        Ok(None) => {}
+        // No channel asked: an install still carrying the base registry
+        // 0.6.0/0.6.1 wrote on the public channel is corrected, once.
+        Ok(None) => super::channel::migrate_legacy_base_registry(g, check_only),
     }
     let target = match target_triple() {
         Some(t) => t,

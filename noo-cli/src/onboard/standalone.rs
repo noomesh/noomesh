@@ -179,14 +179,15 @@ fn seed_install_mode_dist(home: &Path) -> io::Result<()> {
         seeds.push(("NOO_IMAGE_TAG", STANDALONE_STACK_TAG));
         seeds.push(("NOO_IMAGE_PREFIX", crate::registry::IMAGE_NAMESPACE));
     }
-    // Base images from OUR public ghcr mirrors of the upstream official
-    // images (mirror-images.yml, multi-arch), not from dhi.io — the
-    // ghcr login the wizard already requires then covers EVERY pull, and a
-    // fresh box needs no Docker account (first contact hit that wall live).
-    // NB the DHI mirrors (scripts/dhi-images.txt) live under the `dhi/`
-    // prefix, apart from the upstream mirrors. The default seeded here is the PUBLIC mirror of the
-    // UPSTREAM official images (registry.rs PUBLIC_BASE_REGISTRY), never the
-    // DHI one; pinned by a test in registry.rs and tests/test_image_namespace_*.
+    // Base images from OUR public ghcr mirrors (mirror-images.yml,
+    // multi-arch), not from dhi.io — the ghcr login the wizard already
+    // requires then covers EVERY pull, and a fresh box needs no Docker
+    // account (first contact hit that wall live). The default seeded here is
+    // the DHI runtime family under the `dhi/` prefix (registry.rs
+    // PUBLIC_BASE_REGISTRY), the uids every service key and data volume is
+    // handed to; NEVER the upstream mirrors at the bare namespace, whose
+    // images run as other uids (0.6.1 restart loops). Pinned by a test in
+    // registry.rs and tests/test_image_namespace_*.
     seeds.push(("NOO_BASE_REGISTRY", crate::registry::PUBLIC_BASE_REGISTRY));
     let (body, reseeded) = apply_seeds(&existing, &seeds, PAIRING_KEYS, stack_present());
     for key in &reseeded {

@@ -40,7 +40,7 @@ impl Channel {
         Channel {
             repo: crate::registry::PUBLIC_RELEASE_REPO.into(),
             image_prefix: crate::registry::PUBLIC_IMAGE_NAMESPACE.into(),
-            base_registry: crate::registry::PUBLIC_IMAGE_NAMESPACE.into(),
+            base_registry: crate::registry::PUBLIC_BASE_REGISTRY.into(),
         }
     }
 
@@ -150,7 +150,8 @@ pub(crate) fn current() -> Channel {
     Channel {
         repo: get("NOO_CLI_REPO", crate::registry::RELEASE_REPO),
         image_prefix: get("NOO_IMAGE_PREFIX", crate::registry::IMAGE_NAMESPACE),
-        base_registry: get("NOO_BASE_REGISTRY", crate::registry::IMAGE_NAMESPACE),
+        // The compose default is the same constant, so an unset key means it.
+        base_registry: get("NOO_BASE_REGISTRY", crate::registry::PUBLIC_BASE_REGISTRY),
     }
 }
 
@@ -179,6 +180,92 @@ pub(crate) fn apply(env: &Path, changes: &[Change]) -> std::io::Result<()> {
         crate::onboard::env::update_env_key(env, c.key, &c.new)?;
     }
     Ok(())
+}
+
+/// Set in the environment by an upgrade run that applied an explicit
+/// `--channel` request, so the `--stage2` re-exec of the same run does not
+/// "correct" the values the operator just chose (a rollback to a recorded
+/// channel is honoured as recorded).
+pub(crate) const CHANNEL_SET_THIS_RUN: &str = "NOO_UPGRADE_CHANNEL_SET";
+
+/// The one-time correction of the base registry 0.6.0/0.6.1 wrote on the
+/// public channel (`registry::LEGACY_PUBLIC_BASE_REGISTRY`, the upstream
+/// image family) to the DHI path (`registry::PUBLIC_BASE_REGISTRY`).
+///
+/// `now` is the effective channel; `file_value` is the key as `~/.noo/.env`
+/// holds it (`None` when absent); `process_value` is the process
+/// environment's (`None` when unset or empty). Returns the change only when
+/// all of these hold, else `None`:
+/// - the install is on the public channel (repo and image prefix);
+/// - the file holds exactly the legacy value (a trailing `/` tolerated);
+/// - the process environment does not set some OTHER value (an operator's
+///   export wins over the file, so correcting the file would change nothing
+///   and touch a value that is not what runs).
+///
+/// Any other value, including an operator's own custom registry, is never
+/// touched.
+pub(crate) fn legacy_base_registry_fix(now: &Channel, file_value: Option<&str>, process_value: Option<&str>) -> Option<Change> {
+    use crate::registry::{LEGACY_PUBLIC_BASE_REGISTRY as LEGACY, PUBLIC_BASE_REGISTRY as DHI};
+    let norm = |v: &str| v.trim().trim_matches('"').trim_end_matches('/').to_string();
+    let on_public = now.repo == crate::registry::PUBLIC_RELEASE_REPO
+        && norm(&now.image_prefix) == crate::registry::PUBLIC_IMAGE_NAMESPACE;
+    let file = norm(file_value?);
+    if !on_public || file != LEGACY {
+        return None;
+    }
+    if let Some(p) = process_value.map(norm).filter(|p| !p.is_empty()) {
+        if p != LEGACY {
+            return None;
+        }
+    }
+    Some(Change { key: "NOO_BASE_REGISTRY", old: file, new: DHI.to_string() })
+}
+
+/// `KEY` as `env` holds it (last assignment wins, as `release_var` reads it).
+fn file_value(env: &Path, key: &str) -> Option<String> {
+    let body = std::fs::read_to_string(env).ok()?;
+    body.lines().filter_map(|l| l.strip_prefix(&format!("{key}="))).next_back().map(|v| v.trim().to_string())
+}
+
+/// Apply `legacy_base_registry_fix` to this install: one line saying so, and
+/// the process env follows so the rest of this run (the launcher it starts)
+/// pulls from the corrected path. `channel.prev` is not written: this is
+/// not a channel switch, and a rollback still restores what it recorded.
+/// `check_only` reports without writing.
+pub(crate) fn migrate_legacy_base_registry(g: &Globals, check_only: bool) {
+    if std::env::var(CHANNEL_SET_THIS_RUN).is_ok_and(|v| v == "1") {
+        return;
+    }
+    let env = env_path();
+    let process = std::env::var("NOO_BASE_REGISTRY").ok();
+    let Some(change) = legacy_base_registry_fix(&current(), file_value(&env, "NOO_BASE_REGISTRY").as_deref(), process.as_deref()) else {
+        return;
+    };
+    let line = format!(
+        "NOO_BASE_REGISTRY {} -> {}: the public channel's runtime images (redis, loki, prometheus, alertmanager, grafana, node-exporter) are the DHI mirrors; 0.6.0/0.6.1 wrote the upstream-mirror path",
+        change.old, change.new);
+    if check_only {
+        if !g.json {
+            println!("{}", ui::status_line(Glyph::Warn, &format!("would correct {line}")));
+        }
+        return;
+    }
+    if let Err(e) = apply(&env, std::slice::from_ref(&change)) {
+        if !g.json {
+            println!("{}", ui::status_line(Glyph::Warn, &format!(
+                "could not correct NOO_BASE_REGISTRY in {}: {e}; set it to {} by hand", env.display(), change.new)));
+        }
+        return;
+    }
+    std::env::set_var("NOO_BASE_REGISTRY", &change.new);
+    if !g.json {
+        println!("{}", ui::status_line(Glyph::Ok, &format!("corrected {line}")));
+        if let Some(p) = super::secrets::store_pins_of(&["NOO_BASE_REGISTRY"]).filter(|p| !p.is_empty()) {
+            println!("{}", ui::status_line(Glyph::Warn, &format!(
+                "{} is also set in the secrets store, which beats .env at every launch: run `noo security secrets tidy` or the old value comes back",
+                p.join(", "))));
+        }
+    }
 }
 
 /// Run the channel step. Returns `Some(code)` when the run should end here
@@ -314,7 +401,65 @@ mod tests {
         let p = Channel::public();
         assert_eq!(p.repo, crate::registry::PUBLIC_RELEASE_REPO);
         assert_eq!(p.image_prefix, crate::registry::PUBLIC_IMAGE_NAMESPACE);
-        assert_eq!(p.base_registry, p.image_prefix);
+        // The runtime images are the DHI family, nested under the prefix.
+        assert_eq!(p.base_registry, crate::registry::PUBLIC_BASE_REGISTRY);
+        assert_eq!(p.base_registry, format!("{}/dhi", p.image_prefix));
+    }
+
+    #[test]
+    fn the_legacy_public_base_registry_is_corrected_and_nothing_else() {
+        use crate::registry::{LEGACY_PUBLIC_BASE_REGISTRY as LEGACY, PUBLIC_BASE_REGISTRY as DHI};
+        let public = |b: &str| ch(crate::registry::PUBLIC_RELEASE_REPO, crate::registry::PUBLIC_IMAGE_NAMESPACE, b);
+        // What 0.6.0/0.6.1 wrote: corrected, old -> new.
+        let c = legacy_base_registry_fix(&public(LEGACY), Some(LEGACY), None).expect("legacy value is corrected");
+        assert_eq!((c.key, c.old.as_str(), c.new.as_str()), ("NOO_BASE_REGISTRY", LEGACY, DHI));
+        // Quoted or with a trailing slash is the same value.
+        assert!(legacy_base_registry_fix(&public(LEGACY), Some(&format!("{LEGACY}/")), None).is_some());
+        assert!(legacy_base_registry_fix(&public(LEGACY), Some(&format!("\"{LEGACY}\"")), None).is_some());
+        // A process env carrying the same legacy value does not block it.
+        assert!(legacy_base_registry_fix(&public(LEGACY), Some(LEGACY), Some(LEGACY)).is_some());
+        // Already corrected: nothing to do (so it runs once).
+        assert!(legacy_base_registry_fix(&public(DHI), Some(DHI), None).is_none());
+        // Absent from the file: the compose default (DHI) applies; nothing to write.
+        assert!(legacy_base_registry_fix(&public(DHI), None, None).is_none());
+        // An operator's own value is never touched.
+        for other in ["registry.example.com/mirror", "dhi.io", "ghcr.io/noomesh/other", "ghcr.io/noomesh-evil"] {
+            assert!(legacy_base_registry_fix(&public(other), Some(other), None).is_none(), "{other}");
+        }
+        // An operator export of a different value wins over the file: leave the file alone.
+        assert!(legacy_base_registry_fix(&public(LEGACY), Some(LEGACY), Some("registry.example.com/x")).is_none());
+        // Off the public channel (a custom/private channel): never touched,
+        // even when the value happens to be the legacy string.
+        let private = ch("acme/noomesh", "registry.example.com/acme", LEGACY);
+        assert!(legacy_base_registry_fix(&private, Some(LEGACY), None).is_none());
+        let other_prefix = ch(crate::registry::PUBLIC_RELEASE_REPO, "registry.example.com/acme", LEGACY);
+        assert!(legacy_base_registry_fix(&other_prefix, Some(LEGACY), None).is_none());
+    }
+
+    #[test]
+    fn the_correction_rewrites_only_that_key_and_leaves_the_snapshot_alone() {
+        use crate::registry::{LEGACY_PUBLIC_BASE_REGISTRY as LEGACY, PUBLIC_BASE_REGISTRY as DHI};
+        let dir = std::env::temp_dir().join(format!("noo-channel-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join(".env");
+        let snap = dir.join("channel.prev");
+        let recorded = ch("o/old", "ghcr.io/x/old", "ghcr.io/x/old");
+        write_snapshot(&snap, &recorded).unwrap();
+        std::fs::write(&env, format!("NOO_IMAGE_TAG=v1\nNOO_BASE_REGISTRY={LEGACY}\nNOO_CLI_REPO={}\n",
+            crate::registry::PUBLIC_RELEASE_REPO)).unwrap();
+        let now = ch(crate::registry::PUBLIC_RELEASE_REPO, crate::registry::PUBLIC_IMAGE_NAMESPACE, LEGACY);
+        let fix = legacy_base_registry_fix(&now, file_value(&env, "NOO_BASE_REGISTRY").as_deref(), None).unwrap();
+        apply(&env, std::slice::from_ref(&fix)).unwrap();
+        let body = std::fs::read_to_string(&env).unwrap();
+        assert!(body.contains(&format!("NOO_BASE_REGISTRY={DHI}\n")), "{body}");
+        assert!(!body.lines().any(|l| l == format!("NOO_BASE_REGISTRY={LEGACY}")), "{body}");
+        assert!(body.contains("NOO_IMAGE_TAG=v1"), "{body}");
+        // Second pass: nothing left to correct.
+        assert!(legacy_base_registry_fix(&now, file_value(&env, "NOO_BASE_REGISTRY").as_deref(), None).is_none());
+        // channel.prev is untouched: rollback still restores what was recorded.
+        assert_eq!(read_snapshot(&snap), Some(recorded));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
