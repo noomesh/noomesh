@@ -547,6 +547,24 @@ jobs:
       if: needs.scope.outputs.gateway == 'true'
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh clean -p noo-gateway
 
+    # Fail fast (i5): lint before check/test.
+    # Lint gate. The crate's pre-existing debt is declared as documented
+    # crate-root allows in `gateway-rust/src/main.rs` rather than suppressed
+    # here, so the list is visible to a reader of the code and can be burned
+    # down. SQLX_OFFLINE for the same reason as the step above: the macros must
+    # validate against the committed cache, not a job-level DATABASE_URL.
+    - name: Clippy (deny warnings)
+      if: needs.scope.outputs.gateway == 'true'
+      env:
+        SQLX_OFFLINE: "true"
+      # CARGO_DOCKER_SHARED_TARGET: lint against the restored cache target
+      # instead of an always-empty volume on a hosted runner — see
+      # scripts/cargo-docker.sh. Lint runs FIRST (i5): it is the cheapest
+      # step that can fail, so a lint failure stops the job before check and
+      # the long test run. clippy --all-targets also expands the sqlx macros,
+      # so the drift guard below still fires on a stale cache.
+      run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
+
     # SQLX_OFFLINE makes `sqlx::query!` type-check against the committed
     # `.sqlx/` cache instead of a live database. This is also the SOURCE↔CACHE
     # drift check: sqlx fails the build when a `query!` in the source has no
@@ -561,20 +579,6 @@ jobs:
       env:
         SQLX_OFFLINE: "true"
       run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh check --locked --tests
-
-    # Lint gate. The crate's pre-existing debt is declared as documented
-    # crate-root allows in `gateway-rust/src/main.rs` rather than suppressed
-    # here, so the list is visible to a reader of the code and can be burned
-    # down. SQLX_OFFLINE for the same reason as the step above: the macros must
-    # validate against the committed cache, not a job-level DATABASE_URL.
-    - name: Clippy (deny warnings)
-      if: needs.scope.outputs.gateway == 'true'
-      env:
-        SQLX_OFFLINE: "true"
-      # CARGO_DOCKER_SHARED_TARGET: lint against the target `cargo check` just
-      # warmed (and the cache restored) instead of an always-empty volume on a
-      # hosted runner — see scripts/cargo-docker.sh.
-      run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
 
     # `cargo check` does not build `#[cfg(test)]` code and never runs it, so the
     # crate's unit tests need their own step (and `--tests` above, so a test
