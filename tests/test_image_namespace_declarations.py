@@ -189,7 +189,7 @@ HOMES = {
     "node-agent-go/internal/hostd/install.go": "systemd unit Documentation= URL, metadata only",
     "node-agent-go/deploy/noo-node-agent.service": "systemd unit Documentation= URL (sha256-pinned in noo-apply.sh)",
     "node-agent-go/deploy/noo-harness.service": "systemd unit Documentation= URL (sha256-pinned in noo-apply.sh)",
-    "scripts/snapshot.sh": "move tooling: the repo the snapshot publishes to",
+    ".github/ISSUE_TEMPLATE/config.yml": "issue-chooser contact links (Discussions, SECURITY.md) point at the public repo",
     "docker/Dockerfile.gateway-rust": "ARG default, pinned by SITES",
     # The Docker Hub mirror prefix (ghcr.io/<owner>/mirror), a different
     # namespace from the release one: one ARG default per Dockerfile, all
@@ -209,8 +209,6 @@ HOMES = {
     "scripts/install-noo.sh": "same, pinned equal to RELEASE_REPO",
     "gateway-rust/src/routes/bootstrap.rs": "separate crate, cannot import noo-cli; pinned equal",
     "gateway-rust/src/routes/identity.rs": "a documentation URL in metadata, not a pull/release source",
-    "scripts/sync-to-oss.sh": "the rewrite rule that flips the org name for the public mirror",
-    "scripts/lib-oss-org.sh": "the declared rewrite table the sync applies to the staged tree",
     "pyproject.toml": "package metadata URLs (licensing PR owns them)",
     "packages/noo-gateway-client/pyproject.toml": "package metadata URLs",
     "tests/fixtures/redaction_corpus.json": "redaction fixture: the strings are INPUT to a redactor",

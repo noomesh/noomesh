@@ -19,9 +19,15 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "internal" / "noomesh" / "licensing" / "spdx.py"
 ID = "AGPL-3.0-only"
+
+if not TOOL.is_file():
+    # The checker lives under internal/, which the public sync excludes.
+    pytest.skip(f"SPDX checker not in this tree ({TOOL.relative_to(ROOT)})", allow_module_level=True)
 
 _spec = importlib.util.spec_from_file_location("spdx_tool", TOOL)
 spdx = importlib.util.module_from_spec(_spec)
