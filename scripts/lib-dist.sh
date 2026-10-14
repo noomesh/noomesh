@@ -342,11 +342,38 @@ compose_report_error() {
 # known, whether or not they pull.
 dist_assert_addon_refs() {
     [ "${DIST_MODE:-0}" = 1 ] || return 0
-    local _svc _ref _p _ok _rc
+    local _svc _ref _p _ok _rc _l
     for _svc in $(addon_services "$@"); do
         _rc=0
-        compose_capture "$@" config --images "$_svc" || _rc=$?
-        _ref="$(printf '%s\n' "$COMPOSE_OUT" | head -1)"
+        _ref=""
+        if command -v python3 >/dev/null 2>&1; then
+            # The service's OWN image. `config --images <svc>` prints <svc> AND
+            # its depends_on chain (5 lines for noo-evolve, the gateway first
+            # on compose 5.0.2 and 5.5.1), so its first line is a dependency's
+            # image and the pin check would refuse a correct start.
+            compose_capture "$@" config --format json || _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+                _ref="$(printf '%s' "$COMPOSE_OUT" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["services"][sys.argv[1]].get("image", ""))
+except Exception:
+    pass' "$_svc" 2>/dev/null)"
+            fi
+        else
+            # No python3: fall back to `--images`, whose output includes the
+            # dependency chain. Accept the line that IS one of the pins; if
+            # none is, the first line is reported as the offending ref.
+            compose_capture "$@" config --images "$_svc" || _rc=$?
+            _ref="$(printf '%s\n' "$COMPOSE_OUT" | head -1)"
+            while IFS= read -r _l; do
+                for _p in "${_ADDON_PINS[@]+"${_ADDON_PINS[@]}"}"; do
+                    [ "${_p#*=}" = "$_l" ] && _ref="$_l"
+                done
+            done <<IMGS
+$COMPOSE_OUT
+IMGS
+        fi
         if [ "$_rc" -ne 0 ] || [ -z "$_ref" ]; then
             echo "ERROR: compose could not render the image of add-on service ${_svc} - refusing to start it unverified" >&2
             compose_report_error "$_rc"

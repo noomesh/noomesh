@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import stat
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -159,17 +160,30 @@ def test_addon_services_are_derived_from_the_overlays():
     assert r.stdout.split() == ["noo-evolve", "noo-evolve-routes", "trellion-intel"]
 
 
-def test_rendered_addon_refs_must_be_their_pins(tmp_path):
-    # A fake compose that renders the add-on service's image from the env.
-    fake = """#!/bin/sh
-if [ "$1" = "compose" ] ; then
-  case "$*" in *"config --images trellion-intel"*) [ -n "$FAKE_RENDER_FAIL" ] && { echo "boom: required variable X is missing" >&2; exit 1; }; echo "${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}" ;; esac
-  exit 0
-fi
+# A compose whose `config` needs `--profile standalone` (else it rejects the
+# whole project), whose `--images <svc>` prints a dependency's image FIRST
+# (as real compose does), and whose `--format json` carries each service's own.
+FAKE_COMPOSE_RENDER = """#!/bin/sh
+[ "$1" = "compose" ] || exit 0
+case "$*" in *" config "*) ;; *) exit 0 ;; esac
+case "$*" in *"--profile standalone"*) ;; *)
+  echo 'service "ollama-embed-cpu" depends on undefined service "ollama-embed": invalid compose project' >&2; exit 15 ;;
+esac
+[ -n "$FAKE_RENDER_FAIL" ] && { echo "boom: required variable X is missing" >&2; exit 1; }
+IMG="${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}"
+case "$*" in
+  *"--format json"*) printf '{"services":{"gateway":{"image":"ghcr.io/noomesh/gateway:v0.6.0"},"trellion-intel":{"image":"%s"}}}' "$IMG" ;;
+  *"--images"*) echo ghcr.io/noomesh/gateway:v0.6.0; echo "$IMG" ;;
+esac
 exit 0
 """
+
+
+def test_rendered_addon_refs_must_be_their_pins(tmp_path):
+    # A fake compose that renders the add-on service's image from the env.
+    fake = FAKE_COMPOSE_RENDER
     _bin(tmp_path, "docker", fake)
-    body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}\"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml"
+    body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}\"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml --profile standalone"
     env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1"}
     ok = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF},
                         capture_output=True, text=True)
@@ -248,12 +262,12 @@ def test_restart_gates_and_asserts_before_it_recreates():
     restart = (REPO / "scripts/noomesh-restart.sh").read_text()
     pins = restart.index("require_addon_pins || exit 1")
     files = restart.index('COMPOSE_FILES="$(compose_file_args .)"')
-    asserted = restart.index("dist_assert_addon_refs $COMPOSE_FILES || exit 1")
+    asserted = restart.index("dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1")
     first_up = restart.index(" up -d")
     assert restart.index("load_secrets ||") < pins < files < asserted < first_up
     start = (REPO / "scripts/noomesh-start.sh").read_text()
     files = start.index('COMPOSE_FILES="$(compose_file_args .)"')
-    asserted = start.index("dist_assert_addon_refs $COMPOSE_FILES || exit 1")
+    asserted = start.index("dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1")
     assert files < asserted < start.index('if [ "$PULL" = true ]; then')
 
 
@@ -281,3 +295,34 @@ def test_the_retired_addon_image_keys_are_warned_about():
     keys = (REPO / "scripts/retired-env-keys").read_text()
     for k in ("NOO_INTEL_IMAGE", "NOO_EVOLVE_IMAGE", "NOO_INTEL_IMAGE_PREFIX", "NOO_EVOLVE_IMAGE_PREFIX"):
         assert f"\n{k}|" in keys, k
+
+
+def test_the_gate_needs_the_profile_flags_and_reads_the_services_own_image(tmp_path):
+    _bin(tmp_path, "docker", FAKE_COMPOSE_RENDER)
+    base = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}"); '
+    env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1",
+           "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF}
+    f = "-f docker-compose.trellion-intel.yml"
+    # Without the launcher's profile flags compose rejects the project: refusal
+    # carrying compose's own message.
+    r = subprocess.run(["bash", "-c", base + f"dist_assert_addon_refs {f}"], env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "invalid compose project" in r.stderr, r.stderr
+    # With them it passes, although `--images` would have printed the gateway first.
+    r = subprocess.run(["bash", "-c", base + f"dist_assert_addon_refs {f} --profile standalone"], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_without_python3_the_pin_is_found_among_the_images_lines(tmp_path):
+    _bin(tmp_path, "docker", FAKE_COMPOSE_RENDER)
+    # PATH with docker and the basics but no python3.
+    nopy = tmp_path / "nopy"
+    nopy.mkdir()
+    for t in ("bash", "sh", "head", "tail", "sed", "cat", "mktemp", "rm", "sort", "awk", "printf", "env"):
+        src = shutil.which(t)
+        if src:
+            (nopy / t).symlink_to(src)
+    body = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml --profile standalone'
+    env = {"PATH": f"{tmp_path / 'bin'}:{nopy}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1",
+           "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF}
+    r = subprocess.run([str(nopy / "bash"), "-c", body], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
