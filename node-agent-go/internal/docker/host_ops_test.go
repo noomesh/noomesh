@@ -3,7 +3,14 @@
 
 package docker
 
-import "testing"
+import (
+	"bytes"
+	"log/slog"
+	"os"
+	"strings"
+	"syscall"
+	"testing"
+)
 
 func TestHostDirAllowed(t *testing.T) {
 	ok := []string{
@@ -46,5 +53,41 @@ func TestHelperImageFollowsTheReleasePair(t *testing.T) {
 	t.Setenv("NOO_HELPER_IMAGE", "example.test/pinned:1")
 	if got := helperImage(); got != "example.test/pinned:1" {
 		t.Fatalf("pin: got %q", got)
+	}
+}
+
+// An unprivileged agent that cannot chown a foreign-owned dir must warn once,
+// not on every reconcile tick.
+func TestChownHostDirWarnsOncePerDirAndSkipsWhenAlreadyOwned(t *testing.T) {
+	dir := t.TempDir()
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys := st.Sys().(*syscall.Stat_t)
+	chownWarned.Delete(dir + "\x00x")
+
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+
+	// Already owned: no chown, no warning.
+	chownHostDir(dir, "x", int(sys.Uid), int(sys.Gid))
+	if buf.Len() != 0 {
+		t.Fatalf("an already-correct owner must not warn: %s", buf.String())
+	}
+	if os.Getuid() == 0 {
+		t.Skip("root can chown anything; the refusal path cannot be exercised")
+	}
+	// uid 0 is not ours to give: refused. Five ticks, one warning.
+	for i := 0; i < 5; i++ {
+		chownHostDir(dir, "x", 0, 0)
+	}
+	if n := strings.Count(buf.String(), "host dir not chowned"); n != 1 {
+		t.Fatalf("want exactly one warning over 5 ticks, got %d: %s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "noo cluster provision") {
+		t.Errorf("the warning must carry the fix: %s", buf.String())
 	}
 }

@@ -47,7 +47,8 @@ pub struct SearchSpec {
     /// Free text — becomes a `|=` line filter.
     pub text: Option<String>,
     pub node: Option<String>,
-    /// Exact `name` label (container without its `noo-` prefix, or unit).
+    /// Exact `name` label. Either form of a container name (`worker` or
+    /// `noo-worker`) is accepted — see `name_matcher`.
     pub name: Option<String>,
     /// Substring of `name` — the pre-Loki `container` contract.
     pub name_contains: Option<String>,
@@ -102,6 +103,28 @@ fn quote_regex_literal(s: &str) -> String {
         lit.push(ch);
     }
     quote(&lit)
+}
+
+/// The container prefix on the `name` label.
+const NAME_PREFIX: &str = "noo-";
+
+/// Matcher for an exact `name`.
+///
+/// Docker container streams carry the label WITH the `noo-` prefix
+/// (`noo-worker`), host units without a container prefix (`noo-hostd`), and the
+/// tool docs once promised the bare form (`worker`), which matched nothing. A
+/// caller naming either form of a container now gets both: `worker` and
+/// `noo-worker` select `name=~"worker|noo-worker"`. A name that is neither
+/// (`docker`, `mesh-x`) stays an exact matcher, and `noo-hostd` also matches
+/// a bare `hostd` stream, which is harmless.
+fn name_matcher(v: &str) -> String {
+    let bare = v.strip_prefix(NAME_PREFIX).unwrap_or(v);
+    if bare.is_empty() || bare.starts_with("mesh-") || bare == "docker" {
+        return format!("name={}", quote(v));
+    }
+    let lit = quote_regex_literal(bare);
+    let inner = &lit[1..lit.len() - 1];
+    format!("name=~\"{inner}|{NAME_PREFIX}{inner}\"")
 }
 
 /// `30m`, `2h`, `1d`, `45s`, `-15m` (the sign is ignored — a duration is
@@ -203,7 +226,7 @@ pub fn build(spec: &SearchSpec, now: DateTime<Utc>) -> Result<BuiltQuery, String
                 matchers.push(format!("node={}", quote(v)));
             }
             if let Some(v) = spec.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                matchers.push(format!("name={}", quote(v)));
+                matchers.push(name_matcher(v));
             } else if let Some(v) = spec.name_contains.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 let lit = quote_regex_literal(v);
                 // `=~` is anchored in Loki; `.*x.*` is "contains".
@@ -449,7 +472,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(q.logql, r#"{node="host3", name="gateway", source="docker", level="error"}"#);
+        assert_eq!(q.logql, r#"{node="host3", name=~"gateway|noo-gateway", source="docker", level="error"}"#);
     }
 
     #[test]
@@ -503,7 +526,21 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(q.logql, r#"{name="gateway"}"#);
+        assert_eq!(q.logql, r#"{name=~"gateway|noo-gateway"}"#);
+    }
+
+    #[test]
+    fn a_bare_and_a_prefixed_container_name_select_the_same_streams() {
+        for given in ["worker", "noo-worker"] {
+            let q = build(&SearchSpec { name: Some(given.into()), ..spec() }, now()).unwrap();
+            assert_eq!(q.logql, r#"{name=~"worker|noo-worker"}"#, "given {given}");
+        }
+        // Not a container: stays exact.
+        let q = build(&SearchSpec { name: Some("docker".into()), ..spec() }, now()).unwrap();
+        assert_eq!(q.logql, r#"{name="docker"}"#);
+        // Metacharacters in the bare part are escaped, never interpreted.
+        let q = build(&SearchSpec { name: Some("a.b|c".into()), ..spec() }, now()).unwrap();
+        assert!(q.logql.contains(r"a\\.b\\|c"), "{}", q.logql);
     }
 
     // ── time ──

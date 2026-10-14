@@ -94,9 +94,14 @@ type Watchdog struct {
 	interval time.Duration
 	now      func() time.Time
 
-	mu           sync.Mutex
-	state        State
-	failStreak   map[string]int // container name -> consecutive failed probes
+	mu         sync.Mutex
+	state      State
+	failStreak map[string]int // container name -> consecutive failed probes
+	// servingNoted marks containers whose "probe failed but the backend is
+	// serving" verdict has already been logged once. Under WSL2 nvidia-smi can
+	// fail inside a container for as long as it runs, so that verdict repeats
+	// every cycle; logging it every time buried real faults (awolf, 2026-10).
+	servingNoted map[string]bool
 	lastRestart  map[string]time.Time
 	restartTotal int
 }
@@ -106,12 +111,13 @@ type Watchdog struct {
 // and restarts are skipped — restarting containers cannot heal a wedged bus.
 func New(d DockerAPI, hostProbe func() bool) *Watchdog {
 	return &Watchdog{
-		docker:      d,
-		hostProbe:   hostProbe,
-		interval:    defaultInterval,
-		now:         time.Now,
-		failStreak:  map[string]int{},
-		lastRestart: map[string]time.Time{},
+		docker:       d,
+		hostProbe:    hostProbe,
+		interval:     defaultInterval,
+		now:          time.Now,
+		failStreak:   map[string]int{},
+		servingNoted: map[string]bool{},
+		lastRestart:  map[string]time.Time{},
 	}
 }
 
@@ -191,6 +197,7 @@ func (w *Watchdog) Check(ctx context.Context) {
 	for name := range w.failStreak {
 		if !seen[name] {
 			delete(w.failStreak, name)
+			delete(w.servingNoted, name)
 			delete(w.lastRestart, name)
 		}
 	}
@@ -215,10 +222,12 @@ func (w *Watchdog) checkContainer(ctx context.Context, ctr docker.GPUContainer, 
 		cs.Status = statusUnverifiable
 		cs.Detail = err.Error()
 		w.failStreak[ctr.Name] = 0
+		delete(w.servingNoted, ctr.Name)
 		return cs
 	}
 	if code == 0 {
 		w.failStreak[ctr.Name] = 0
+		delete(w.servingNoted, ctr.Name)
 		return cs
 	}
 
@@ -250,10 +259,24 @@ func (w *Watchdog) checkContainer(ctx context.Context, ctr docker.GPUContainer, 
 			cs.Status = statusServing
 			cs.Detail = "nvidia-smi failed inside the container, but the backend is " +
 				"answering — not restarting a working backend on a probe alone"
-			slog.Warn("gpuwatch: GPU probe failed but the backend is serving; not restarting",
-				"container", ctr.Name, "streak", streak)
+			// The backend's own answer is the authority on whether it works.
+			// Hold the streak at the confirmation threshold instead of letting
+			// it climb for as long as the probe keeps failing, and say so ONCE:
+			// it is a standing condition, not a new event each cycle.
+			w.failStreak[ctr.Name] = 2
+			if !w.servingNoted[ctr.Name] {
+				w.servingNoted[ctr.Name] = true
+				slog.Warn("gpuwatch: GPU probe failed but the backend is serving; not restarting "+
+					"(logged once; further cycles log at debug until the probe passes)",
+					"container", ctr.Name)
+			} else {
+				slog.Debug("gpuwatch: GPU probe still failing, backend still serving",
+					"container", ctr.Name)
+			}
 			return cs
 		}
+		// Not answering: whatever the serving verdict was, it is over.
+		delete(w.servingNoted, ctr.Name)
 	}
 
 	last, restarted := w.lastRestart[ctr.Name]
