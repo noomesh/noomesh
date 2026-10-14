@@ -101,14 +101,7 @@ pub(crate) fn addon_pin_env(ctx: &Ctx) -> Result<Vec<(String, String)>, Vec<crat
     crate::commands::addon_pins::addon_image_env(
         &input,
         &|a| crate::addons::resolve::installed_anchor(a),
-        &|r| {
-            Command::new("docker")
-                .args(["image", "inspect", "--format", "{{.Id}}", r])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        },
+        &|r| crate::addons::resolve::Docker::image_present(&mut crate::addons::resolve::LiveDocker::new(&ctx.repo_root), r),
     )
 }
 
