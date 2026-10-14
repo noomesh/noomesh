@@ -1043,6 +1043,20 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    cannot is a hold: the roll is refused naming it, with nothing
     //    changed. The pins are written beside stack.lock in step 2.
     let target_stack_lock = fetch_stack_lock(g, &tag);
+    // i57c: a dist install is pull-only and digest-pinned. A release with no
+    // signed lock has nothing to check its images against, so the roll is
+    // refused HERE, on its own, ahead of the add-on preflight (which used to
+    // be the only thing that happened to stop it).
+    if target_stack_lock.is_none() {
+        let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
+        let mode = std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
+            .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
+            .unwrap_or_default();
+        if let Some(why) = no_lock_refusal(&mode, &tag) {
+            fail(g.json, ExitCode::Generic, "stack_lock_missing", &why,
+                Some("pick a published release: noo upgrade --check --stack"));
+        }
+    }
     let addon_prep = addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade);
 
     // -1. The audit log's signing key. A release whose
@@ -3297,6 +3311,18 @@ fn fetch_stack_lock(g: &Globals, tag: &str) -> Option<String> {
     }
 }
 
+/// i57c: the refusal for a roll whose target publishes no signed stack lock.
+/// Only a dist install (pull-only, digest-pinned) refuses; a dev install may
+/// still pull a pre-v0.2.11 tag by tag, with the warning.
+pub(crate) fn no_lock_refusal(install_mode: &str, tag: &str) -> Option<String> {
+    if install_mode.trim() != "dist" {
+        return None;
+    }
+    Some(format!(
+        "stack-{tag} publishes no signed digest lock, and this install pulls only digest-pinned images — \
+         refusing to roll to a release that cannot be verified. Nothing was changed"))
+}
+
 /// [`fetch_stack_lock`] without the exit: `Err((code, message, remedy))`.
 pub(crate) type StackLockErr = (&'static str, String, Option<&'static str>);
 fn try_stack_lock(g: &Globals, tag: &str) -> Result<Option<String>, StackLockErr> {
@@ -4804,6 +4830,29 @@ mod keyless_tests {
         let lock = at("write_stack_lock(g, &tag, &root");
         let pins = at("commit_addon_pins(g, &root, &tag");
         assert!(lock < pins && pins < at("NOO_IMAGE_TAG\", &tag"), "add-on pins are written with stack.lock, before the tag moves");
+    }
+
+    /// i57c: a release with no lock refuses on a dist install (before anything
+    /// is written), proceeds on a dev one; a release with a lock is not refused.
+    #[test]
+    fn a_dist_roll_to_a_tag_with_no_lock_is_refused() {
+        let mut missing = |_: &str, _: &str| Err(crate::release_fetch::FetchError::new(crate::release_fetch::FetchClass::NotFound, "404"));
+        let none = super::stack_lock_with("v9.9.9", &mut missing, &|_, _| Ok(0)).unwrap();
+        assert!(none.is_none());
+        let why = super::no_lock_refusal("dist", "v9.9.9").expect("dist refuses");
+        assert!(why.contains("Nothing was changed") && why.contains("stack-v9.9.9"));
+        assert!(super::no_lock_refusal("", "v9.9.9").is_none(), "dev keeps the warning-only path");
+        let mut has = |_: &str, name: &str| Ok(if name.ends_with(".sig") { b"sig".to_vec() } else { b"gateway@sha256:aa\n".to_vec() });
+        assert!(super::stack_lock_with("v9.9.9", &mut has, &|_, _| Ok(0)).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_missing_lock_refusal_precedes_the_addon_preflight() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n}"));
+        assert!(at("no_lock_refusal(&mode") < at("addon_preflight(g, &root, &tag"));
+        assert!(body.contains("noo upgrade --check --stack"));
     }
 
     #[test]
