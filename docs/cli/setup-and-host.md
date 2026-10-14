@@ -331,7 +331,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo addons disable` | `<name>` | Declare an add-on OFF in noomesh.yaml; restart applies it |
 | `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade]` | Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin |
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
-| `noo addons launch-pins` | `<tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
+| `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 | Command | Arguments | What it does |
