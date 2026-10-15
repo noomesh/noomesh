@@ -212,7 +212,7 @@ override. Everything else below is env-only.
 | `NOO_LAUNCHED` | — | set by the launcher; the gateway warns when started any other way |
 | `NOO_CONFIG_PATH` | resolved | write path for `noo config set` |
 | `VLLM_MAX_MODEL_LEN`, `VLLM_MAX_TOKENS` | `16384`, `4096` | token budget (`inference.*`). `4096` is the one default (`DEFAULT_VLLM_MAX_TOKENS` in `agent_loop.rs`), used both to size the request and as the output reserve the context budget subtracts from `VLLM_MAX_MODEL_LEN` |
-| `CLOUD_PROVIDERS_ENABLED` | off | behavioural flag — prefer the dashboard / `noo_settings` ([config.md](config.md#behavioural-flags)) |
+| `CLOUD_PROVIDERS_ENABLED` | off | behavioural flag — prefer the dashboard / `noo_settings` ([config.md](config.md#behavioural-flags)). Gates `claude-*` / `gpt-*` / `gemini-*` models, which run the full agent loop (tools, memory, context) on the controller against the provider |
 | `NOO_EVOLVE_HOFSTADTER_ENABLED` | on (with the evolve add-on) | behavioural flags — prefer the dashboard / `noo_settings` ([config.md](config.md#behavioural-flags)) |
 | `NOO_AGENT_AUTORETRY`, `NOO_AGENT_ESCALATE_NOTIFY`, `NOO_AGENT_AUTODISABLE`, `NOO_AGENT_ACTIVITY_*` | off | add-on gates — read by the **evolve** container, not the gateway; set them in its compose environment |
 | `RUST_LOG` | — | tracing filter |

@@ -100,6 +100,11 @@ async fn harness_call(
         HarnessOp::ModelPreference => json!({"model": rt.user_model_preference(user).await}),
         HarnessOp::DetectModel { prompt } => json!({"model": rt.detect_model_from_prompt(&prompt).await}),
         HarnessOp::ResolveBackend { model, exclude_urls } => {
+            // A node harness has no provider keys: cloud models run on the
+            // controller (dispatch keeps those turns in process).
+            if let Some(m) = model.as_deref().filter(|m| crate::coordinator::is_cloud_model(m)) {
+                return Err(AppError::BadRequest(format!("'{m}' is a cloud model; cloud models run on the controller, not on a node harness")).into());
+            }
             let backend = rt.resolve_backend_excluding(model.as_deref(), &exclude_urls).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
             json!({"backend": backend})
         }

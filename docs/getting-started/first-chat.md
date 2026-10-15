@@ -25,6 +25,14 @@ noo chat --message "in two lines, what can you do on this machine?"
 that answered is shown on stderr. The full flag list is in
 [agents-and-channels.md](../cli/agents-and-channels.md).
 
+A controller with no node can run on a cloud model alone: turn on
+`CLOUD_PROVIDERS_ENABLED` (console: Settings -> Features -> Cloud model
+routing), put the provider's key in the secret store
+(`noo security secrets rotate ANTHROPIC_API_KEY --set-from-stdin --yes`, or
+`OPENAI_API_KEY` / `GOOGLE_API_KEY`), and pick the model, for example
+`noo chat --model claude-sonnet-4-5`. Tools, memory and the rest work the
+same as on a local model.
+
 ## A first good question: your own cluster
 
 Ask about what you just built. These need no setup:

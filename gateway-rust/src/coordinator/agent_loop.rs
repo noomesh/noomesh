@@ -489,6 +489,13 @@ fn select_tool_schemas(all_schemas: &[Value], user_message: &str) -> Vec<Value> 
 /// - "openai" (vLLM) — POST /v1/chat/completions {model, messages, tools, stream}
 /// - "ollama" — POST /api/chat {model, messages, tools, stream}
 /// - "llamacpp" — POST /completion {prompt, stream} (messages flattened to prompt)
+/// - "anthropic" (cloud) — POST /v1/messages (see `anthropic_wire`)
+///
+/// A cloud OpenAI/Gemini backend takes the OpenAI branch with the
+/// vLLM-only extras left off (`chat_template_kwargs`, the `max_tokens`
+/// guessed from `VLLM_MAX_MODEL_LEN`): a provider rejects parameters it
+/// does not know, and each model's own output limit is the right default.
+/// `enable_thinking` maps to nothing on a cloud backend in this phase.
 ///
 /// The match is on the WIRE format (`backend::wire_format`), not on
 /// `api_format`: a llama.cpp backend takes the OpenAI branch — native
@@ -500,7 +507,15 @@ fn build_llm_request(
     stream: bool,
     enable_thinking: bool,
 ) -> (String, Value) {
+    let cloud = super::backend::is_cloud_backend(backend);
     match super::backend::wire_format(backend) {
+        "anthropic" => {
+            let url = format!("{}/v1/messages", backend.url);
+            let body = super::anthropic_wire::request_body(
+                &backend.model, messages, tools, stream, super::cloud::DEFAULT_MAX_TOKENS,
+            );
+            (url, body)
+        }
         "ollama" => {
             // Ollama uses /api/chat with a slightly different schema.
             // Messages format is the same (OpenAI-compatible since Ollama 0.1.24).
@@ -535,8 +550,29 @@ fn build_llm_request(
             (url, body)
         }
         _ => {
-            // OpenAI-compatible (vLLM, etc.) — /v1/chat/completions
-            let url = format!("{}/v1/chat/completions", backend.url);
+            // OpenAI-compatible (vLLM, etc.) — /v1/chat/completions.
+            // Gemini's OpenAI surface has no `/v1` under its base.
+            let url = if backend.backend_type == "cloud-gemini" {
+                format!("{}/chat/completions", backend.url)
+            } else {
+                format!("{}/v1/chat/completions", backend.url)
+            };
+            if cloud {
+                let mut body = json!({
+                    "model": backend.model,
+                    "messages": cloud_openai_messages(messages),
+                    "stream": stream,
+                });
+                if stream {
+                    body["stream_options"] = json!({"include_usage": true});
+                }
+                if let Some(tools) = tools {
+                    if !tools.is_empty() {
+                        body["tools"] = Value::Array(tools.to_vec());
+                    }
+                }
+                return (url, body);
+            }
 
             // Dynamic max_tokens: use env default but cap to fit within max_model_len.
             let configured_max = vllm_max_tokens();
@@ -569,6 +605,27 @@ fn build_llm_request(
             (url, body)
         }
     }
+}
+
+/// The loop's messages as a cloud OpenAI-compatible API accepts them: a
+/// `role:"tool"` message carries only `role`, `content` and `tool_call_id`
+/// (the session also records the tool's `name`, which vLLM ignores and a
+/// strict provider schema need not).
+fn cloud_openai_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                let mut t = json!({"role": "tool", "content": m.get("content").cloned().unwrap_or(json!(""))});
+                if let Some(id) = m.get("tool_call_id") {
+                    t["tool_call_id"] = id.clone();
+                }
+                t
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 /// The `max_tokens` to send, or `None` to let the server fill the window.
@@ -838,6 +895,7 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
 /// OpenAI-style message with `role`, `content`, and optional `tool_calls`.
 fn parse_llm_response(api_format: &str, body: &Value) -> Value {
     match api_format {
+        "anthropic" => super::anthropic_wire::parse_response(body),
         "ollama" => {
             // Ollama response: {"message": {"role": ..., "content": ..., "tool_calls": [...]}}
             if let Some(msg) = body.get("message") {
@@ -1345,6 +1403,14 @@ pub fn backend_failover_alert(target: &str, detail: impl Into<String>) -> crate:
 /// existing per-format behaviour) — recompute `api_format`-dependent
 /// handling from `backend` AFTER this returns, since fallback may have
 /// switched formats.
+///
+/// A cloud backend (`is_cloud_backend`) never fails over, in either
+/// direction: a pinned cloud model that errors is reported as that
+/// provider's error, never silently answered by a node's model, and a
+/// failed node is never replaced by a paid provider. It goes out on the
+/// public-internet client with the provider's auth instead of the node
+/// hint, and retries 429/5xx/transport failures on the same provider
+/// within the same bounded attempts (`send_cloud_attempt`).
 async fn send_llm_with_fallback<R: HarnessRuntime>(
     rt: &R,
     backend: &mut ResolvedBackend,
@@ -1359,6 +1425,12 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
     for attempt in 1..=MAX_LLM_BACKEND_ATTEMPTS {
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
         let (url, body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
+        if super::backend::is_cloud_backend(backend) {
+            match send_cloud_attempt(backend, &url, &body, attempt).await? {
+                Some(resp) => return Ok(resp),
+                None => continue,
+            }
+        }
         let failure = match with_backend_hint(client.post(&url).json(&body), backend).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -1422,6 +1494,9 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         let failed_type = backend.backend_type.clone();
         failed_urls.push(backend.url.clone());
         match rt.resolve_backend_excluding(effective_model, failed_urls).await {
+            Ok(fallback) if super::backend::is_cloud_backend(&fallback) => {
+                anyhow::bail!("All node backends failed ({failure}); a cloud provider is never a fallback");
+            }
             Ok(fallback) if !failed_urls.contains(&fallback.url) => {
                 tracing::info!(
                     failed_url = %backend.url,
@@ -1462,6 +1537,57 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
         }
     }
     anyhow::bail!("All backends failed after {MAX_LLM_BACKEND_ATTEMPTS} attempts")
+}
+
+/// One request to a cloud provider. `Ok(Some)` = success; `Ok(None)` =
+/// a retryable failure (429, 5xx, 529 overloaded, transport) with attempts
+/// left — the caller retries the SAME provider after the backoff slept
+/// here; `Err` = the provider's error as the user sees it (status and
+/// reason), on a non-retryable status or the last attempt.
+async fn send_cloud_attempt(
+    backend: &ResolvedBackend,
+    url: &str,
+    body: &Value,
+    attempt: usize,
+) -> Result<Option<reqwest::Response>> {
+    let label = super::cloud::provider_label(&backend.backend_type);
+    let req = super::cloud::with_provider_auth(
+        crate::tls::external_client().post(url).json(body),
+        &backend.backend_type,
+    )?;
+    let last = attempt >= MAX_LLM_BACKEND_ATTEMPTS;
+    let retry_after = match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(Some(resp));
+            }
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let err_body = resp.text().await.unwrap_or_default();
+            let message = super::cloud::provider_error_message(&backend.backend_type, status, &err_body);
+            tracing::error!(status = %status, provider = label, model = %backend.model, attempt, "cloud_llm_http_error: {message}");
+            let code = status.as_u16();
+            let retryable = code == 429 || code == 529 || (500..=599).contains(&code);
+            if !retryable || last {
+                anyhow::bail!("{message}");
+            }
+            retry_after
+        }
+        Err(e) => {
+            tracing::error!(error = %e, provider = label, model = %backend.model, attempt, "cloud LLM request failed");
+            if last {
+                anyhow::bail!("{label} API request failed: {e}");
+            }
+            None
+        }
+    };
+    let wait = retry_after.unwrap_or(2 * attempt as u64).min(10);
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    Ok(None)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1571,20 +1697,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         .or(prompt_model);
     let effective_model = effective_model.as_deref();
 
-    // Cloud model — call the provider API natively (single-turn, no tools)
-    if let Some(m) = effective_model {
-        if is_cloud_model(m) {
-            let result = rt.run_cloud_completion(prompt, conversation_id, "dashboard", m).await?;
-            let _ = writer.send_event("content", json!(result.response)).await;
-            let _ = writer.send_event("done", json!({
-                "iterations": result.iterations,
-                "tool_calls": result.tool_calls.len(),
-                "elapsed_seconds": (result.elapsed_secs * 10.0).round() / 10.0,
-                "engine": "rust_cloud",
-            })).await;
-            return Ok(result);
-        }
-    }
+    // A cloud model (claude-/gpt-/gemini-) resolves to a cloud backend below
+    // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
     let mut usage = UsageStats::default();
@@ -1781,7 +1895,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         response: String::new(),
         model: backend.model.clone(),
         backend: backend.backend_type.clone(),
-        node: super::backend::node_from_backend_url(&backend.url),
+        // No node did a cloud backend's work — the summary layer renders
+        // NULL as "cloud".
+        node: if super::backend::is_cloud_backend(&backend) { None } else { super::backend::node_from_backend_url(&backend.url) },
         iterations: 0,
         tool_calls: Vec::new(),
         elapsed_secs: 0.0,
@@ -1849,6 +1965,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // Buffer for reading SSE lines
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
+        // Anthropic streams its own events (`content_block_delta`, ...):
+        // each is translated to the OpenAI chunk this reader accumulates,
+        // so everything below is shared by every wire.
+        let mut anthropic_sse = (super::backend::wire_format(&backend) == "anthropic")
+            .then(super::anthropic_wire::SseTranslator::new);
+        let mut stream_failed = false;
 
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
@@ -1871,7 +1993,20 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 let data = &line[6..];
                 if data == "[DONE]" { continue; }
 
-                if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                let parsed = serde_json::from_str::<Value>(data).ok();
+                let parsed = match (parsed, anthropic_sse.as_mut()) {
+                    (Some(event), Some(t)) => match t.translate(&event) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "SSE stream error");
+                            let _ = writer.send_event("error", json!(e)).await;
+                            stream_failed = true;
+                            break;
+                        }
+                    },
+                    (p, _) => p,
+                };
+                if let Some(chunk_json) = parsed {
                     // Extract delta from SSE chunk
                     let delta = chunk_json.get("choices")
                         .and_then(|c| c.get(0))
@@ -2025,6 +2160,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     }
                 }
             }
+            if stream_failed { break; }
+        }
+        if stream_failed {
+            // The provider ended the stream with an error event (already
+            // sent to the client): end the turn, as a failed send does.
+            break;
         }
 
         // Flush remaining tag buffer after stream ends
@@ -2623,12 +2764,8 @@ async fn run_inner_bound<R: HarnessRuntime>(
         .or(prompt_model);
     let effective_model = effective_model.as_deref();
 
-    // Cloud model — call the provider API natively (single-turn, no tools)
-    if let Some(m) = effective_model {
-        if is_cloud_model(m) {
-            return rt.run_cloud_completion(prompt, conversation_id, channel, m).await;
-        }
-    }
+    // A cloud model (claude-/gpt-/gemini-) resolves to a cloud backend below
+    // and runs this same loop — tools, context, session, usage, hooks.
 
     let start = Instant::now();
     let mut usage = UsageStats::default();
@@ -2794,7 +2931,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
         response: String::new(),
         model: backend.model.clone(),
         backend: backend.backend_type.clone(),
-        node: super::backend::node_from_backend_url(&backend.url),
+        // No node did a cloud backend's work — the summary layer renders
+        // NULL as "cloud".
+        node: if super::backend::is_cloud_backend(&backend) { None } else { super::backend::node_from_backend_url(&backend.url) },
         iterations: 0,
         tool_calls: Vec::new(),
         elapsed_secs: 0.0,
@@ -2886,7 +3025,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
             };
             (msg, content, calls)
         } else {
-            // ollama / llamacpp non-streaming — original behavior.
+            // ollama / llamacpp / anthropic non-streaming — one JSON body.
             let llm_response = match resp.json::<Value>().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -2895,9 +3034,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 }
             };
             if let Some(u) = llm_response.get("usage") {
-                usage.prompt_tokens += u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                usage.completion_tokens += u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                usage.total_tokens += u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                // OpenAI-shaped, or Anthropic's input/output_tokens.
+                let (p, c, t) = super::anthropic_wire::usage_tokens(u);
+                usage.prompt_tokens += p as u32;
+                usage.completion_tokens += c as u32;
+                usage.total_tokens += t as u32;
             }
             let message = parse_llm_response(super::backend::wire_format(&backend), &llm_response);
             let content = message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
@@ -3374,5 +3515,98 @@ mod max_tokens_default_tests {
         );
         assert!(prod.matches("= vllm_max_tokens()").count() >= 3, "all three call sites use the helper");
         assert_eq!(super::DEFAULT_VLLM_MAX_TOKENS, 4096, "the value docs/reference/env.md documents");
+    }
+}
+
+#[cfg(test)]
+mod cloud_loop_tests {
+    use super::*;
+
+    /// PINNED (i83 phase C): a cloud model runs the full loop. Neither
+    /// entry point may short-circuit to the single-turn, no-tool
+    /// `run_cloud_completion` again — that is what made a one-box install
+    /// with only an API key a chatbot instead of an agent.
+    #[test]
+    fn neither_loop_entry_point_short_circuits_to_the_single_turn_path() {
+        let src = include_str!("agent_loop.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let sealed = [
+            "run_streaming_on", "run_streaming_on_bound", "run_inner", "run_inner_bound",
+            "send_llm_with_fallback", "send_cloud_attempt",
+        ];
+        let mut current: Option<&str> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut offenders = Vec::new();
+        for (i, line) in prod.lines().enumerate() {
+            if let Some(rest) = line.trim_start().strip_prefix("pub(crate) async fn ").or_else(|| line.trim_start().strip_prefix("pub async fn ")).or_else(|| line.trim_start().strip_prefix("async fn ")).or_else(|| line.trim_start().strip_prefix("fn ")) {
+                let name = rest.split(['<', '(']).next().unwrap_or("");
+                current = sealed.iter().copied().find(|s| *s == name);
+                if let Some(f) = current {
+                    seen.insert(f);
+                }
+                continue;
+            }
+            if let Some(f) = current {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("run_cloud_completion") || code.contains("run_cloud(") {
+                    offenders.push(format!("{f} line {}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "the loop short-circuits cloud models:\n{}", offenders.join("\n"));
+        assert_eq!(seen.len(), sealed.len(), "the scan covered every entry point: saw {seen:?}");
+    }
+
+    fn cloud(backend_type: &str, api_format: &str, url: &str) -> ResolvedBackend {
+        ResolvedBackend {
+            url: url.to_string(),
+            model: "m".to_string(),
+            backend_type: backend_type.to_string(),
+            api_format: api_format.to_string(),
+        }
+    }
+
+    fn tools() -> Vec<Value> {
+        vec![json!({"type": "function", "function": {"name": "web_search", "description": "search", "parameters": {"type": "object"}}})]
+    }
+
+    #[test]
+    fn an_anthropic_backend_gets_a_messages_request_with_tools() {
+        let b = cloud("cloud-anthropic", "anthropic", super::super::cloud::ANTHROPIC_BASE_URL);
+        let messages = vec![json!({"role": "system", "content": "sys"}), json!({"role": "user", "content": "hi"})];
+        let (url, body) = build_llm_request(&b, &messages, Some(&tools()), true, true);
+        assert_eq!(url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["tools"][0]["name"], "web_search");
+        assert_eq!(body["max_tokens"], super::super::cloud::DEFAULT_MAX_TOKENS);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("thinking").is_none(), "enable_thinking maps to nothing on Anthropic in this phase");
+        assert!(body.get("chat_template_kwargs").is_none());
+        // And its non-streaming response parses through the shared entry.
+        let msg = parse_llm_response("anthropic", &json!({"content": [{"type": "tool_use", "id": "t1", "name": "web_search", "input": {}}], "stop_reason": "tool_use"}));
+        assert_eq!(msg["tool_calls"][0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn cloud_openai_and_gemini_get_plain_chat_completions() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "tool", "name": "web_search", "content": "r", "tool_call_id": "c1"}),
+        ];
+        let o = cloud("cloud-openai", "openai", super::super::cloud::OPENAI_BASE_URL);
+        let (url, body) = build_llm_request(&o, &messages, Some(&tools()), true, true);
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+        assert!(body.get("chat_template_kwargs").is_none(), "vLLM-only extras stay off a provider");
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][1], json!({"role": "tool", "content": "r", "tool_call_id": "c1"}));
+        let g = cloud("cloud-gemini", "openai", super::super::cloud::GEMINI_BASE_URL);
+        let (url, _) = build_llm_request(&g, &messages, None, false, false);
+        assert_eq!(url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+        // A node backend is untouched by any of this.
+        let v = cloud("vllm", "openai", "https://noo-vllm:8000");
+        let (url, body) = build_llm_request(&v, &messages, None, false, false);
+        assert_eq!(url, "https://noo-vllm:8000/v1/chat/completions");
+        assert!(body.get("chat_template_kwargs").is_some());
     }
 }

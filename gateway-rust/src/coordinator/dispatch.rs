@@ -197,6 +197,10 @@ pub async fn harness_node_for(state: &AppState, model: Option<&str>) -> Option<S
 /// their credentials were wrong.
 pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Result<String, String> {
     let named = model.map(|m| format!("'{m}'")).unwrap_or_else(|| "the default model".into());
+    // A cloud model's turn runs where the provider keys are: here.
+    if let Some(m) = super::backend::model_hint(model).filter(|m| super::backend::is_cloud_model(m)) {
+        return Err(format!("'{m}' is a cloud model, served by its provider from the controller — nothing to dispatch"));
+    }
     let (backend, known_node) = super::backend::resolve_backend_and_node(state, model, &[]).await.map_err(|e| {
         format!("no backend resolved for {named}: {e}")
     })?;
@@ -367,6 +371,16 @@ pub async fn try_dispatch<S: TurnSink>(
         return Ok(None);
     }
     let Some(user) = user_id.filter(|u| !u.is_empty()) else { return Ok(None) };
+    // With no model named, the turn runs on the user's saved preference; a
+    // cloud preference runs in process (the keys are here), not on the node
+    // that serves the default model.
+    if super::backend::model_hint(model).is_none() {
+        if let Some(pref) = super::backend::fetch_user_model_preference(state, user).await {
+            if super::backend::is_cloud_model(&pref) {
+                return Ok(None);
+            }
+        }
+    }
     let Some(node) = harness_node_for(state, model).await else { return Ok(None) };
     let Some(role) = role_of(state, user).await else {
         tracing::warn!(user, node = %node, "harness dispatch: unknown or disabled user; running in process");

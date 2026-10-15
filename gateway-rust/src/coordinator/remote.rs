@@ -195,6 +195,12 @@ impl HarnessRuntime for RemoteRuntime {
     }
 
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend> {
+        // Cloud models run on the controller, which holds the provider keys
+        // (dispatch keeps such turns in process). Should one reach a node
+        // harness anyway, refuse it rather than answer with the node's model.
+        if let Some(m) = model.filter(|m| super::backend::is_cloud_model(m)) {
+            anyhow::bail!("harness: '{m}' is a cloud model; cloud models run on the controller, not on a node harness");
+        }
         if let Some(pinned) = &self.pinned {
             if exclude_urls.contains(&pinned.url) {
                 anyhow::bail!("harness: the placed model endpoint {} failed and a harness has no other", pinned.url);
@@ -471,5 +477,8 @@ mod tests {
         .pin_backend(pinned.clone());
         assert_eq!(rt.resolve_backend_for_model(Some("anything")).await.unwrap(), pinned);
         assert!(rt.resolve_backend_excluding(None, std::slice::from_ref(&pinned.url)).await.is_err());
+        // A cloud model is never silently answered by the pinned node model.
+        let e = rt.resolve_backend_for_model(Some("claude-sonnet-4-5")).await.unwrap_err();
+        assert!(e.to_string().contains("run on the controller"), "{e}");
     }
 }
