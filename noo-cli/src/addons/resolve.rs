@@ -74,7 +74,7 @@ impl Refusal {
                 "the installed entitlement names no signing key or registry for {addon}, so its lock cannot be verified \
                  (the token predates signed add-on locks)"
             ),
-            Refusal::Fetch { stack_tag, err, .. } if err.class == FetchClass::NotFound => not_published(addon, stack_tag),
+            Refusal::Fetch { stack_tag, err, .. } if err.class == FetchClass::NotFound => not_published(stack_tag),
             Refusal::Fetch { reference, err, .. } => match err.class {
                 FetchClass::Auth => format!(
                     "the registry refused {reference} (access refused): the controller's {} cannot read {addon}'s package",
@@ -113,10 +113,13 @@ impl Refusal {
 /// `manifest unknown`): the stack release is out, and the vendor's own
 /// release workflow signs the add-on lock for it minutes later. Distinct
 /// from an auth or signature failure, whose text and remedy are different.
-pub fn not_published(addon: &str, stack_tag: &str) -> String {
+/// No `<addon>: ` prefix: every caller that prints it beside others already
+/// leads with the add-on's name (`x evolve: evolve: …` was the 0.6.4-rc.1
+/// rehearsal's output), and the one that does not adds it.
+pub fn not_published(stack_tag: &str) -> String {
     let tag = format!("v{}", stack_tag.trim().trim_start_matches("stack-").trim_start_matches('v'));
     format!(
-        "{addon}: no signed lock published yet for {tag} — the vendor publishes it minutes after a stack release; \
+        "no signed lock published yet for {tag} — the vendor publishes it minutes after a stack release; \
          retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
     )
 }
@@ -707,7 +710,7 @@ pub(crate) mod tests {
         let why = e.why("trellion_intel");
         assert_eq!(
             why,
-            "trellion_intel: no signed lock published yet for v0.6.0 — the vendor publishes it minutes after a stack release; \
+            "no signed lock published yet for v0.6.0 — the vendor publishes it minutes after a stack release; \
              retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
         );
         assert!(!why.contains("access refused") && !why.contains("signature"), "{why}");
@@ -716,7 +719,7 @@ pub(crate) mod tests {
     #[test]
     fn the_not_published_tag_is_v_prefixed_whatever_form_it_arrives_in() {
         for t in ["v0.6.4", "0.6.4", "stack-v0.6.4"] {
-            assert!(not_published("evolve", t).contains("for v0.6.4 —"), "{t}");
+            assert!(not_published(t).starts_with("no signed lock published yet for v0.6.4 —"), "{t}");
         }
     }
 
