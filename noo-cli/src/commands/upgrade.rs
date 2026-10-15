@@ -1848,6 +1848,8 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     if !g.json { println!("{}", ui::phase("Nodes")); }
     println!("{}", ui::note(&format!("restaging provision bundles for {} node(s): {}", names.len(), names.join(", "))));
     let mut failed: Vec<String> = Vec::new();
+    // Nodes staged with --stage-only, waiting for their apply report.
+    let mut pending: Vec<super::provision::PendingApply> = Vec::new();
     // Nodes already offline BEFORE the roll cannot fetch anything: staging
     // for them only burns the wait window and fails the whole stage
     // (host8-ma, v0.2.93 roll). Skip them loudly, with the one command that
@@ -1895,16 +1897,44 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         // Each node is an item; cluster provision prints the `ui::item`
         // label and its indented steps. A blank line separates nodes.
         println!();
-        match provision_one(g, n, &[]) {
-            Ok(0) => {}
-            _ => failed.push(n.clone()),
+        // Whether this node ever reported an apply is read BEFORE the
+        // staging replaces its row; the combined wait needs it for the
+        // legacy fallback (the child judged the same fact for its own steps).
+        let legacy = super::provision::node_never_reported_apply(g, n);
+        // `--stage-only`: stage and poke, return at once. The apply is
+        // waited for below, for every node together, so one slow node no
+        // longer holds up staging the rest.
+        if !matches!(provision_one(g, n, &["--stage-only"]), Ok(0)) {
+            failed.push(n.clone());
+            continue;
+        }
+        // The staged sha is read back from the status route rather than
+        // parsed from the child's `--json` output: the child's stdout is
+        // inherited (its step lines stream to the operator live), and the
+        // route is the same record the wait judges against. If the route
+        // has no sha the node cannot be waited on and is reported failed
+        // here instead of silently counted as staged.
+        match super::provision::staged_sha_of(g, n) {
+            Some(sha) => pending.push(super::provision::PendingApply { node: n.clone(), sha, legacy }),
+            None => {
+                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                    &format!("{n}: staged, but the gateway reports no staged bundle to wait on"))));
+                failed.push(n.clone());
+            }
         }
     }
-    // The controller's OWN node, last, over the same rail (i67).
+    // The controller's OWN node, last, over the same rail (i67): staged after
+    // the remote nodes have been STAGED (not applied). It keeps its own full
+    // `cluster provision` run (its own apply wait and the self-node steps
+    // after the apply: lane record, controller hostd restart), so it is not
+    // part of the combined wait below.
     if let Some(me) = local_agent_node(&names) {
         // The child prints its own `ui::item` label, as the rail nodes do.
         println!();
         upgrade_self_node(g, &me, &mut failed);
+    }
+    if !pending.is_empty() {
+        wait_and_settle_nodes(g, &pending, &mut failed);
     }
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
@@ -1955,6 +1985,78 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         ui::guide(&cmds.iter().map(|c| (c.as_str(), why)).collect::<Vec<_>>());
     }
     Ok(rc)
+}
+
+/// The longest the combined wait gives a staged fleet to pull, apply and
+/// report, measured from when the last node was staged (the single-node
+/// `cluster provision` wait is the same 600 s).
+const NODES_APPLY_BUDGET_SECS: u64 = 600;
+const NODES_APPLY_POLL_SECS: u64 = 10;
+
+/// Wait for every staged node together, then settle each: a node that
+/// applied runs the post-apply steps `cluster provision` runs; one that
+/// refused or never reported goes into `failed` with its remedy. A skipped
+/// or unreported step is printed as such, never counted as applied.
+fn wait_and_settle_nodes(g: &Globals, pending: &[super::provision::PendingApply], failed: &mut Vec<String>) {
+    use super::provision::ApplyEnd;
+    println!();
+    let ends = super::provision::wait_nodes_applied(g, pending, NODES_APPLY_BUDGET_SECS, NODES_APPLY_POLL_SECS);
+    let mut applied = 0usize;
+    let mut unconfirmed = 0usize;
+    let mut json_rows: Vec<serde_json::Value> = Vec::new();
+    for (n, end) in ends {
+        match end {
+            ApplyEnd::Applied { rc: 0, msg } => {
+                applied += 1;
+                json_rows.push(serde_json::json!({"node": n, "outcome": "applied", "rc": 0}));
+                println!();
+                println!("{}", ui::item(&n));
+                super::provision::after_remote_applied(g, &n, &msg);
+            }
+            ApplyEnd::Applied { rc, msg } => {
+                json_rows.push(serde_json::json!({"node": n, "outcome": "refused", "rc": rc}));
+                let tail: String = msg.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+                println!();
+                println!("{}", ui::item(&n));
+                ui::capture("applier output", tail.trim());
+                println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                    &format!("{n}: the applier refused the bundle (exit {rc}); the node kept its previous state"))));
+                if !g.json {
+                    ui::guide(&[(&format!("noo cluster provision {n} --wait"), "fix the cause above, then re-stage")]);
+                }
+                failed.push(n);
+            }
+            ApplyEnd::LegacyUnconfirmed => {
+                unconfirmed += 1;
+                json_rows.push(serde_json::json!({"node": n, "outcome": "unconfirmed"}));
+            }
+            ApplyEnd::NotReported { fetched } => {
+                json_rows.push(serde_json::json!({"node": n, "outcome": if fetched { "not_reported_after_fetch" } else { "not_fetched" }}));
+                println!();
+                println!("{}", ui::item(&n));
+                println!("{}", ui::sub(&ui::status_line(Glyph::Err, &if fetched {
+                    format!("{n}: fetched the bundle but reported no apply outcome within {}m", NODES_APPLY_BUDGET_SECS / 60)
+                } else {
+                    format!("{n}: bundle staged but the node never fetched it within {}m", NODES_APPLY_BUDGET_SECS / 60)
+                })));
+                if !g.json {
+                    ui::guide(&[(&format!("noo cluster provision {n} --wait"),
+                        if fetched { "re-stage once the apply error is fixed (on the node: journalctl -u noo-fetch -n 20)" }
+                        else { "re-stage once the node's poll reaches the controller (on the node: systemctl status noo-fetch.timer)" })]);
+                }
+                failed.push(n);
+            }
+        }
+    }
+    if g.json {
+        println!("{}", serde_json::json!({"nodes_apply": json_rows}));
+    } else {
+        println!();
+        println!("{}", ui::note(&format!(
+            "{} of {} staged node(s) applied{}",
+            applied, pending.len(),
+            if unconfirmed > 0 { format!(", {unconfirmed} unconfirmed (legacy fetcher)") } else { String::new() })));
+    }
 }
 
 /// A gateway younger than this has not had time to hear every node's
