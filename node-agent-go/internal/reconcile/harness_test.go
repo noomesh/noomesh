@@ -5,6 +5,10 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -373,5 +377,102 @@ func TestForeignHarnessKindsCarryTheirVendorSwitches(t *testing.T) {
 	again, _ := HarnessTelemetryEnv("claude-code")
 	if again["DISABLE_TELEMETRY"] != "1" {
 		t.Error("HarnessTelemetryEnv handed out the table itself")
+	}
+}
+
+// The node agent's embedded table is a COPY of config/harness-kinds.json
+// (go:embed cannot reach outside the module). Equal after JSON
+// normalisation, or a kind added to the shipped file is one the gateway
+// accepts and this agent calls unknown.
+func TestHarnessKindsTableMatchesTheShippedFile(t *testing.T) {
+	shipped, err := os.ReadFile(filepath.Join("..", "..", "..", "config", "harness-kinds.json"))
+	if err != nil {
+		t.Fatalf("config/harness-kinds.json: %v", err)
+	}
+	var a, b any
+	if err := json.Unmarshal(shipped, &a); err != nil {
+		t.Fatalf("config/harness-kinds.json: %v", err)
+	}
+	if err := json.Unmarshal(harnessKindsJSON, &b); err != nil {
+		t.Fatalf("embedded harness_kinds.json: %v", err)
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatal("node-agent-go/internal/reconcile/harness_kinds.json differs from config/harness-kinds.json: copy the shipped file over the embedded one")
+	}
+	if len(harnessKindTable) == 0 || harnessKindTable[0].Kind != "noo" || harnessKindTable[0].Runner == nil {
+		t.Fatalf("`noo` must be the first kind and have a runner: %+v", harnessKindTable)
+	}
+	if got := knownHarnessKinds(); got != "noo, claude-code, copilot, codex" {
+		t.Fatalf("known kinds = %q", got)
+	}
+}
+
+// Refusal by absence: a kind is refused because its runner does not ship
+// (runner null in the table) or is not installed on this node, never
+// because its name is not `noo`.
+func TestHarnessKindIsRefusedForAnAbsentRunner(t *testing.T) {
+	chat := []placement{{Backend: "ollama", Model: "gemma", DesiredState: "running"}}
+	h := func(kind string) placement {
+		return placement{Backend: "harness", Model: "auto", Role: "harness", DesiredState: "running", Env: map[string]string{"NOO_HARNESS_KIND": kind}}
+	}
+	present := func(string) bool { return true }
+	var asked []string
+	absent := func(r string) bool { asked = append(asked, r); return false }
+
+	if got := harnessKindRefusal(h("noo"), chat, present); got != "" {
+		t.Fatalf("noo with its runner installed must not be refused: %q", got)
+	}
+	got := harnessKindRefusal(h("noo"), chat, absent)
+	if got != `harness kind "noo": its runner "noo-gateway" is not installed on this node` {
+		t.Fatalf("noo without its runner: %q", got)
+	}
+	if len(asked) != 1 || asked[0] != "noo-gateway" {
+		t.Fatalf("the check must ask for the table's runner, asked %v", asked)
+	}
+	// A kind whose runner does not ship is refused before anything looks
+	// at the disk.
+	asked = nil
+	if got := harnessKindRefusal(h("copilot"), chat, absent); got != `harness kind "copilot": its runner is not shipped yet` {
+		t.Fatalf("copilot: %q", got)
+	}
+	if len(asked) != 0 {
+		t.Fatalf("a kind with no runner must not be looked for on disk: %v", asked)
+	}
+	// codex's wire is served by no node backend: the refusal says so from
+	// the table rather than listing nothing.
+	got = harnessKindRefusal(h("codex"), chat, present)
+	if !strings.Contains(got, `no chat backend on this node can serve harness kind "codex" (it needs OpenAI's Responses API)`) ||
+		!strings.Contains(got, "its wire is not served by any backend yet") {
+		t.Fatalf("codex: %q", got)
+	}
+	// With no chat backend to check against, codex is still refused, for
+	// its runner.
+	if got := harnessKindRefusal(h("codex"), nil, present); got != `harness kind "codex": its runner is not shipped yet` {
+		t.Fatalf("codex without a chat backend: %q", got)
+	}
+	// An unknown kind lists the table's kinds.
+	if got := harnessKindRefusal(h("hermes"), nil, present); got != `unknown harness kind "hermes" (known: noo, claude-code, copilot, codex)` {
+		t.Fatalf("unknown kind: %q", got)
+	}
+	// Telemetry: codex has an entry, empty until its switches are declared.
+	if env, ok := HarnessTelemetryEnv("codex"); !ok || len(env) != 0 {
+		t.Fatalf("codex telemetry entry: %v %v", env, ok)
+	}
+}
+
+// Through the reconciler: a missing runner is a refusal and nothing starts.
+func TestAMissingRunnerIsARefusalNotAStart(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &hostsvc.Fake{Cur: hostsvc.Stopped}
+	r := &Reconciler{harness: f, runnerInstalled: func(string) bool { return false }}
+	r.convergeHarness(context.Background(), placement{Backend: "harness", DesiredState: "running"}, nil)
+	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), `its runner "noo-gateway" is not installed on this node`) {
+		t.Fatalf("calls=%v refusal=%q", f.Calls, harnessRefusal())
+	}
+	r.runnerInstalled = func(string) bool { return true }
+	r.convergeHarness(context.Background(), placement{Backend: "harness", DesiredState: "running"}, nil)
+	if f.Cur != hostsvc.Running || harnessRefusal() != "" {
+		t.Fatalf("installed runner must start and clear the refusal: state=%s refusal=%q", f.Cur, harnessRefusal())
 	}
 }

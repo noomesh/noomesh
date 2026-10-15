@@ -115,6 +115,10 @@ type Reconciler struct {
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
 	harness hostsvc.Service
+	// runnerInstalled says whether a harness kind's runner executable is
+	// on this node (runnerOnDisk in production, set by New). nil skips the
+	// check: tests that build a bare Reconciler around a fake service.
+	runnerInstalled func(runner string) bool
 
 	// driftRecreated records, per backend, the desired spec hash we last
 	// recreated the container for on a spec-drift detection. It bounds the
@@ -177,16 +181,17 @@ func shouldStartOllamaPull(st *ollamaPullState, now time.Time) bool {
 
 func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harness hostsvc.Service) *Reconciler {
 	return &Reconciler{
-		cfg:            cfg,
-		docker:         docker,
-		ollamaPulls:    map[string]*ollamaPullState{},
-		storeHas:       dockerpkg.ModelInStore,
-		importModel:    docker.ImportOllamaModel,
-		client:         client,
-		mcp:            mcpsrv.New(cfg, client, docker),
-		native:         backendrt.NewAdopted(),
-		harness:        harness,
-		driftRecreated: map[string]string{},
+		cfg:             cfg,
+		docker:          docker,
+		ollamaPulls:     map[string]*ollamaPullState{},
+		storeHas:        dockerpkg.ModelInStore,
+		importModel:     docker.ImportOllamaModel,
+		client:          client,
+		mcp:             mcpsrv.New(cfg, client, docker),
+		native:          backendrt.NewAdopted(),
+		harness:         harness,
+		runnerInstalled: runnerOnDisk,
+		driftRecreated:  map[string]string{},
 	}
 }
 
@@ -777,95 +782,6 @@ func plainLastLine(s string) string {
 		}
 	}
 	return ""
-}
-
-// harnessKinds is what a harness placement may run (gateway HARNESS_KINDS),
-// and the wire family each needs from the node's chat backend. `noo` is
-// this gateway's own loop and speaks every backend's wire; Claude Code
-// speaks Anthropic's Messages API, which ollama serves and vllm/llamacpp
-// do not; Copilot CLI speaks OpenAI's, which all three serve. The runners
-// for the foreign kinds are the design: until they ship, a placement
-// naming one is checked for compatibility and then refused, loudly, so
-// the operator learns both facts at placement time rather than later.
-var harnessKinds = map[string][]string{
-	"noo":         {"vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"},
-	"claude-code": {"ollama"},
-	"copilot":     {"vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"},
-}
-
-// harnessTelemetryOff is the ONE declared place for the vendor telemetry
-// switches of each harness kind (docs/security/telemetry.md, "Agent
-// harnesses"). Every kind in harnessKinds must have an entry here, even an
-// empty one: tests/test_no_vendor_telemetry.py and
-// TestEveryHarnessKindDeclaresItsTelemetrySwitches fail on a kind with none,
-// so a new HARNESS_KINDS entry cannot ship without deciding.
-//
-// The runner for the foreign kinds is not shipped yet, so
-// nothing launches these today; HarnessTelemetryEnv is what that launcher
-// must merge into the CLI's environment, AFTER any operator or placement
-// value, so a placement cannot switch a vendor's reporting back on.
-//
-//   - noo: our own gateway binary in harness mode; no phone-home code.
-//   - claude-code: Claude Code's documented opt-outs
-//     (https://code.claude.com/docs/en/env-vars and /data-usage).
-//     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC covers auto-updates,
-//     telemetry, error reporting, /feedback, release notes and survey
-//     traffic in one; the individual switches are set too so the claim does
-//     not rest on one variable's coverage list.
-//     CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL is NOT covered by
-//     that one: Anthropic says so in the same row, and it has its own switch
-//     (a first launch would otherwise register the official plugin marketplace).
-//   - copilot: COPILOT_OFFLINE=true, which GitHub documents as "prevent
-//     Copilot CLI from contacting GitHub's servers"; "In offline mode, all
-//     telemetry is disabled and the CLI only communicates with your
-//     configured provider" (GitHub changelog 2026-04-07, "Copilot CLI now
-//     supports BYOK and local models"). GitHub documents no separate
-//     telemetry opt-out for Copilot CLI.
-var harnessTelemetryOff = map[string]map[string]string{
-	"noo": {},
-	"claude-code": {
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":             "1",
-		"DISABLE_TELEMETRY":                                    "1",
-		"DISABLE_ERROR_REPORTING":                              "1",
-		"DISABLE_FEEDBACK_COMMAND":                             "1",
-		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY":                  "1",
-		"DISABLE_UPDATES":                                      "1",
-		"DO_NOT_TRACK":                                         "1",
-		"CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
-	},
-	"copilot": {
-		"COPILOT_OFFLINE": "true",
-	},
-}
-
-// HarnessTelemetryEnv returns a copy of the switches a harness kind must be
-// launched with (nil for a kind with none). An UNKNOWN kind returns ok=false:
-// absent is not "nothing to switch off".
-func HarnessTelemetryEnv(kind string) (env map[string]string, ok bool) {
-	m, known := harnessTelemetryOff[kind]
-	if !known {
-		return nil, false
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out, true
-}
-
-// harnessKindCompatible says whether `kind` can talk to `backend`; the
-// error names the backends that would do.
-func harnessKindCompatible(kind, backend string) error {
-	ok, known := harnessKinds[kind]
-	if !known {
-		return fmt.Errorf("unknown harness kind %q (known: noo, claude-code, copilot)", kind)
-	}
-	for _, b := range ok {
-		if b == backend {
-			return nil
-		}
-	}
-	return fmt.Errorf("harness kind %q cannot use a %s backend; it needs one of %s", kind, backend, strings.Join(ok, ", "))
 }
 
 func firstNonEmpty(vals ...string) string {

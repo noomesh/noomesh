@@ -3203,10 +3203,6 @@ where
     Ok(Some(Option::<Value>::deserialize(d)?))
 }
 
-/// The harnesses a placement may name (the design ships the foreign
-/// runners; until then the node agent refuses to start any but `noo`).
-pub const HARNESS_KINDS: &[&str] = &["noo", "claude-code", "copilot"];
-
 /// The node-config upsert. A const so the
 /// column/value arity is pinned by a test — the 2026-09-11 cut listed
 /// twelve columns and supplied eleven values, which no compiler sees.
@@ -3612,12 +3608,17 @@ async fn placement_put(
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
     // A harness placement may name its KIND in env (followup
-    // 1233): `noo` (this gateway's loop, the default), `claude-code`,
-    // `copilot`. The node agent enforces what each kind can talk to.
+    // 1233): `noo` (this gateway's loop, the default) or a foreign kind
+    // from config/harness-kinds.json. The node agent enforces what each
+    // kind can talk to.
     if backend == "harness" {
         if let Some(kind) = body.env.as_ref().and_then(|e| e.get("NOO_HARNESS_KIND")).and_then(|k| k.as_str()) {
-            if !HARNESS_KINDS.contains(&kind) {
-                return Err(AppError::BadRequest(format!("NOO_HARNESS_KIND must be one of {}", HARNESS_KINDS.join(", "))));
+            // The kinds are declared once, in config/harness-kinds.json
+            // (crate::harness_kinds); the node agent refuses one whose
+            // runner is absent.
+            let kinds = crate::harness_kinds::names();
+            if !kinds.contains(&kind) {
+                return Err(AppError::BadRequest(format!("NOO_HARNESS_KIND must be one of {}", kinds.join(", "))));
             }
         }
     }

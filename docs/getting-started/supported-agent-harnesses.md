@@ -18,9 +18,14 @@ door, and nothing is placed on a node. See
 | `noo` (default) | noomesh's own loop (`noo-gateway harness`) | **Runs today** | vLLM, llama.cpp, Ollama, AirLLM | None: no phone-home code |
 | `claude-code` | Anthropic's Claude Code CLI | Accepted, then **refused**: its runner is not shipped yet | Ollama only (it speaks Anthropic's Messages API, which Ollama serves and vLLM and llama.cpp do not) | Switched off by a fixed set of variables, see [Telemetry](#telemetry) |
 | `copilot` | GitHub's Copilot CLI | Accepted, then **refused**: its runner is not shipped yet | vLLM, llama.cpp, Ollama, AirLLM (OpenAI's wire) | Offline mode only, see [Telemetry](#telemetry) |
+| `codex` | OpenAI's Codex CLI | Accepted, then **refused**: its wire is not served by any node backend yet | None yet (it speaks OpenAI's Responses API, which no node backend serves) | No switches declared yet, see [Telemetry](#telemetry) |
 
-No noomesh image or installer ships the Claude Code or Copilot CLI, so a
-placement of either kind cannot start anything today.
+The kinds, the chat backends each can use, the runner each needs and its
+vendor telemetry switches are declared once, in `config/harness-kinds.json`;
+the gateway and the node agent both read that table.
+
+No noomesh image or installer ships the Claude Code, Copilot or Codex CLI,
+so a placement of any of those kinds cannot start anything today.
 
 ## Place a harness
 
@@ -41,11 +46,15 @@ this order, and reports the first problem as the placement's refusal:
 
 1. **Wire compatibility.** The kind must speak the wire of the node's
    running chat backend. For example, `claude-code` on a node whose chat
-   backend is vLLM is refused with the backends that would do.
-2. **Known kind.** Anything other than `noo`, `claude-code` or `copilot` is
-   refused.
-3. **Runner shipped.** `claude-code` and `copilot` are refused with "its
-   runner is not shipped yet".
+   backend is vLLM is refused with the backends that would do; `codex`,
+   whose wire no node backend serves yet, is refused saying so.
+2. **Known kind.** Anything not in `config/harness-kinds.json` (`noo`,
+   `claude-code`, `copilot`, `codex`) is refused.
+3. **Runner shipped.** A kind with no runner in the table (`claude-code`,
+   `copilot`, `codex`) is refused with "its runner is not shipped yet".
+4. **Runner installed.** A kind whose runner ships (`noo`, whose runner is
+   `noo-gateway`) is refused with "its runner ... is not installed on this
+   node" when the binary is not where the node's installer puts it.
 
 So a placement tells you at once whether the kind would fit the node, even
 before its runner exists. The node reports the refusal on its next
@@ -73,9 +82,10 @@ Not recorded yet.
 
 ## Getting a harness added
 
-A new kind is a code change, not a configuration value. The gateway accepts
-only the kinds it lists, and the node agent will not accept one until the
-same change declares which chat backends it can use and its vendor
+A new kind is a change to `config/harness-kinds.json`, not a configuration
+value: the gateway and the node agent are built with that table, so a node
+or controller learns a new kind by upgrading. The row declares which chat
+backends the kind can use, its runner (none until one ships) and its vendor
 telemetry switches (or that it has none); a test fails otherwise. To ask for
 one, open an issue naming the harness and the wire it speaks.
 
