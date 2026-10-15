@@ -966,6 +966,16 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             None => nnote(&format!("no harness in this bundle: no gateway asset for {os}/{arch}")),
         }
     }
+    // A binary the node's own last report proves it already runs is not
+    // carried again (bandwidth only: the applier skips identical bytes anyway).
+    // The proof is the node's `binary-sha:` statement; see `node_runs_asset`.
+    // The status read is one GET; unreachable or unparseable = carry everything.
+    {
+        let last = crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10);
+        for note in drop_proven_binaries(&mut files, last.as_ref(), darwin, self_node) {
+            nnote(&note);
+        }
+    }
     // ── the backend door leaves issued in 3b ──────────────────────────────
     // Same rail, same signature. A Mac whose applier predates the kinds
     // would refuse the WHOLE bundle on them (it has no self-updating shell
@@ -1816,6 +1826,64 @@ pub(crate) fn applier_applied(msg: &str, kind: &str) -> bool {
         return false;
     }
     msg[at + "applied:".len()..].split_whitespace().any(|k| k == kind)
+}
+
+/// The `<kind>=<sha256>` pairs after the LAST `binary-sha:` in an apply
+/// report message (Linux `noo-apply` prints it as its final line; a Mac's
+/// fetch appends it). Empty for an applier that predates the line.
+fn reported_binary_shas(msg: &str) -> Vec<(String, String)> {
+    let Some(at) = msg.rfind("binary-sha:") else { return Vec::new() };
+    msg[at + "binary-sha:".len()..].split_whitespace()
+        .filter_map(|t| t.split_once('='))
+        .filter(|(_, h)| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|(k, h)| (k.to_string(), h.to_ascii_lowercase()))
+        .collect()
+}
+
+/// Does the node's last apply report PROVE it runs exactly `asset_sha` as
+/// `kind`? `status` is `/api/cluster/provision-bundle/<node>/status`. All of:
+/// the report is about the bundle currently staged (`applied_sha` equals the
+/// staged `sha256`), it was an apply that succeeded (`apply_rc` 0), and the
+/// node itself stated `kind=<asset_sha>` in its `binary-sha:` line. Anything
+/// else — no status, no report yet, a refused apply, an applier that prints no
+/// such line, a different sha — is "not proven", and the caller carries the
+/// binary. Never decided from a version string.
+fn node_runs_asset(status: Option<&serde_json::Value>, kind: &str, asset_sha: &str) -> bool {
+    let Some(st) = status else { return false };
+    let staged = st["sha256"].as_str().unwrap_or("");
+    let applied = st["applied_sha"].as_str().unwrap_or("");
+    if staged.is_empty() || staged != applied || st["apply_rc"].as_i64() != Some(0) {
+        return false;
+    }
+    let msg = st["apply_msg"].as_str().unwrap_or("");
+    reported_binary_shas(msg).iter().any(|(k, h)| k == kind && h == &asset_sha.to_ascii_lowercase())
+}
+
+/// Remove from the bundle the binary kinds the node has proven it already
+/// runs; returns one printed note per omission. Never touches the applier,
+/// fetcher, env, unit, certificate or harness-env kinds. Held back on purpose:
+/// a Mac's `agent-binary` (its applier requires that payload for a full
+/// install) and, on the controller's own node, `hostd-binary` (the controller
+/// restarts its user-mode hostd only when this apply installs one).
+fn drop_proven_binaries(
+    files: &mut Vec<(&str, Vec<u8>)>,
+    status: Option<&serde_json::Value>,
+    darwin: bool,
+    self_node: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for kind in ["agent-binary", "hostd-binary", "cli-binary", "harness-binary"] {
+        if (darwin && kind == "agent-binary") || (self_node && kind == "hostd-binary") {
+            continue;
+        }
+        let Some(sha) = files.iter().find(|(k, _)| *k == kind).map(|(_, b)| sha256_hex(b)) else { continue };
+        if !node_runs_asset(status, kind, &sha) {
+            continue;
+        }
+        files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
+        notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
+    }
+    notes
 }
 
 /// Restart the controller-mode hostd (a user unit on the same binary the
@@ -4498,5 +4566,87 @@ mod local_lane_tests {
         c.arg("PREP_INSECURE=1").arg("PREP_CA_SHA256=ab").arg("NOO_DATA_ROOT=/a b").arg("bash").arg("/tmp/p'q.sh");
         assert_eq!(command_line(&c),
             "'env' 'PREP_INSECURE=1' 'PREP_CA_SHA256=ab' 'NOO_DATA_ROOT=/a b' 'bash' '/tmp/p'\\''q.sh'");
+    }
+
+    // ── a binary the node proved it runs is not carried again ──────────
+
+    fn st(rc: i64, staged: &str, applied: &str, msg: &str) -> serde_json::Value {
+        serde_json::json!({ "sha256": staged, "applied_sha": applied, "apply_rc": rc, "apply_msg": msg })
+    }
+    fn report_with(kind: &str, sha: &str) -> String {
+        format!("noo-apply: x applied: agent-env {kind}=unchanged verified-by: signing-key ca-lane: retired binary-sha: {kind}={sha}")
+    }
+
+    #[test]
+    fn omission_needs_the_nodes_own_proof() {
+        let bytes = b"\x7fELFgateway".to_vec();
+        let sha = sha256_hex(&bytes);
+        let ok = st(0, "b1", "b1", &report_with("harness-binary", &sha));
+        // No status at all (never staged): carry.
+        assert!(!node_runs_asset(None, "harness-binary", &sha));
+        // An applier that prints no binary-sha line: carry.
+        assert!(!node_runs_asset(Some(&st(0, "b1", "b1", "applied: harness-binary")), "harness-binary", &sha));
+        // Proven: the report is about the staged bundle, rc 0, and states this sha.
+        assert!(node_runs_asset(Some(&ok), "harness-binary", &sha));
+        // The last apply was refused: carry.
+        assert!(!node_runs_asset(Some(&st(65, "b1", "b1", &report_with("harness-binary", &sha))), "harness-binary", &sha));
+        // The report belongs to an older bundle than the staged one: carry.
+        assert!(!node_runs_asset(Some(&st(0, "b2", "b1", &report_with("harness-binary", &sha))), "harness-binary", &sha));
+        // Nothing applied yet (null applied_sha): carry.
+        assert!(!node_runs_asset(Some(&serde_json::json!({"sha256": "b1", "applied_sha": null, "apply_rc": null, "apply_msg": null})), "harness-binary", &sha));
+        // The asset changed since the node's statement: carry.
+        assert!(!node_runs_asset(Some(&ok), "harness-binary", &sha256_hex(b"newer")));
+        // A statement about another kind proves nothing about this one.
+        assert!(!node_runs_asset(Some(&ok), "agent-binary", &sha));
+    }
+
+    #[test]
+    fn dropping_removes_only_proven_binary_kinds() {
+        let hb = b"harness-bytes".to_vec();
+        let cb = b"cli-bytes".to_vec();
+        let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
+            ("agent-env", b"E".to_vec()), ("agent-binary", b"agent".to_vec()), ("hostd-binary", b"hostd".to_vec()),
+            ("cli-binary", cb.clone()), ("cli-user", b"u".to_vec()), ("harness-binary", hb.clone()),
+            ("harness-env", b"H".to_vec()), ("applier", b"A".to_vec()), ("fetcher", b"F".to_vec()),
+            ("ca.crt", b"C".to_vec()), ("node.crt", b"N".to_vec()), ("node.key", b"K".to_vec()),
+        ] };
+        let msg = format!("applied: x binary-sha: harness-binary={} cli-binary={} agent-binary={} hostd-binary={}",
+            sha256_hex(&hb), sha256_hex(&cb), sha256_hex(b"agent"), sha256_hex(b"hostd"));
+        let status = st(0, "s", "s", &msg);
+        let names = |f: &Vec<(&str, Vec<u8>)>| f.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+
+        let mut f = mk();
+        let notes = drop_proven_binaries(&mut f, Some(&status), false, false);
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(notes.iter().all(|n| n.contains("unchanged since last apply, not carried")));
+        assert_eq!(names(&f), ["agent-env", "harness-env", "applier", "fetcher", "ca.crt", "node.crt", "node.key"],
+            "env, unit, cert, applier and fetcher kinds are never omitted (cli-user leaves with its binary)");
+
+        // No state: everything rides.
+        let mut f = mk();
+        assert!(drop_proven_binaries(&mut f, None, false, false).is_empty());
+        assert_eq!(f.len(), 12);
+
+        // A Mac keeps agent-binary (its applier demands it); the controller's own node keeps hostd.
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&status), true, false);
+        assert!(names(&f).contains(&"agent-binary") && !names(&f).contains(&"hostd-binary"));
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&status), false, true);
+        assert!(names(&f).contains(&"hostd-binary") && !names(&f).contains(&"agent-binary"));
+
+        // One asset changed: only that one rides.
+        let mut f = mk();
+        f.iter_mut().find(|(k, _)| *k == "harness-binary").unwrap().1 = b"harness-v2".to_vec();
+        drop_proven_binaries(&mut f, Some(&status), false, false);
+        assert!(names(&f).contains(&"harness-binary") && !names(&f).contains(&"cli-binary"));
+    }
+
+    #[test]
+    fn binary_sha_parsing_takes_only_well_formed_pairs_after_the_last_marker() {
+        let h = "a".repeat(64);
+        let got = reported_binary_shas(&format!("binary-sha: old={} later text binary-sha: agent-binary={h} bad=zz short={}", "b".repeat(64), "c".repeat(63)));
+        assert_eq!(got, vec![("agent-binary".to_string(), h)]);
+        assert!(reported_binary_shas("applied: agent-binary").is_empty());
     }
 }

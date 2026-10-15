@@ -526,12 +526,12 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         match payloads.get(kind) {
             Some(b) if installed_matches(&dst, b, mode) => {
                 crate::ui::done(&format!("noo node fetch: {kind} unchanged — already the bytes this node runs, not rewritten"));
-                note_binary(kind, true);
+                note_binary(kind, true, payloads.get(kind).map_or(&[][..], |b| b.as_slice()));
                 true
             }
             _ => {
                 let ok = inst(kind, dst, mode);
-                if ok { note_binary(kind, false); }
+                if ok { note_binary(kind, false, payloads.get(kind).map_or(&[][..], |b| b.as_slice())); }
                 ok
             }
         }
@@ -625,9 +625,9 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
             // restarts its daemon), no heartbeat wait. Absent or unreadable
             // is not a match, so a first install takes the path below.
             crate::ui::done("noo node fetch: hostd-binary unchanged — noo-hostd already runs these bytes, not touched");
-            note_binary("hostd-binary", true);
+            note_binary("hostd-binary", true, hostd_bytes);
         } else if install_hostd(hostd_bytes) {
-            note_binary("hostd-binary", false);
+            note_binary("hostd-binary", false, hostd_bytes);
         }
     }
     // The agent's state directory is root's again, and its working
@@ -676,7 +676,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     });
     if cli_unchanged {
         crate::ui::done("noo node fetch: cli-binary unchanged — the CLI already is these bytes, not rewritten");
-        note_binary("cli-binary", true);
+        if let Some(c) = payloads.get("cli-binary") { note_binary("cli-binary", true, c); }
     } else if let Some(cli) = payloads.get("cli-binary").filter(|b| !b.is_empty()) {
         // The user's copy as the user (no root chmod/chown into the user's
         // tree, H2); root's copy from the verified bytes.
@@ -694,7 +694,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
             }
         };
         if root_ok || !as_root {
-            note_binary("cli-binary", false);
+            note_binary("cli-binary", false, cli);
         }
         if root_ok {
             crate::ui::done("noo node fetch: CLI updated from the bundle");
@@ -1253,7 +1253,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     refused.join(", ")
                 ));
             }
-            report(0, &with_binary_summary(apply_report_msg(&last_verified(), &refused), &binary_outcomes()));
+            report(0, &with_binary_summary(apply_report_msg(&last_verified(), &refused), &binary_outcomes(), &binary_shas()));
             Ok(0)
         }
         Err(e) => {
@@ -2071,25 +2071,44 @@ pub(crate) const ROOT_REFUSED_TAG: &str = "root-refused:";
 /// whole-token lookup (`applier_applied`) for `<kind>` means "installed".
 static BINARY_OUTCOMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-fn note_binary(kind: &str, unchanged: bool) {
+/// `<kind>=<sha256>` for each binary this apply left running, installed or
+/// unchanged: the node's own statement of what it runs (the Linux applier's
+/// `binary-sha:` line), which lets the controller leave an identical binary
+/// out of the next bundle. Absent from an older CLI, which means "carry all".
+static BINARY_SHAS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note_binary(kind: &str, unchanged: bool, bytes: &[u8]) {
+    use sha2::{Digest, Sha256};
     if let Ok(mut g) = BINARY_OUTCOMES.lock() {
         g.retain(|t| t.split('=').next() != Some(kind));
         g.push(if unchanged { format!("{kind}=unchanged") } else { kind.to_string() });
     }
+    if let Ok(mut g) = BINARY_SHAS.lock() {
+        g.retain(|t| t.split('=').next() != Some(kind));
+        g.push(format!("{kind}={}", hex::encode(Sha256::digest(bytes))));
+    }
+}
+
+fn binary_shas() -> Vec<String> {
+    BINARY_SHAS.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 fn binary_outcomes() -> Vec<String> {
     BINARY_OUTCOMES.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-/// Append the binary summary to an apply report message as ` applied: <tokens>`
-/// (nothing when this bundle carried no binary, so such a message is unchanged).
-fn with_binary_summary(msg: String, tokens: &[String]) -> String {
+/// Append the binary summary to an apply report message as
+/// ` applied: <tokens> binary-sha: <kind>=<sha256> …` (nothing when this
+/// bundle carried no binary, so such a message is unchanged).
+fn with_binary_summary(msg: String, tokens: &[String], shas: &[String]) -> String {
     if tokens.is_empty() {
-        msg
-    } else {
-        format!("{msg} applied: {}", tokens.join(" "))
+        return msg;
     }
+    let mut m = format!("{msg} applied: {}", tokens.join(" "));
+    if !shas.is_empty() {
+        m.push_str(&format!(" binary-sha: {}", shas.join(" ")));
+    }
+    m
 }
 
 /// Is `path` already exactly these bytes with exactly this mode? True only on
@@ -4593,15 +4612,15 @@ mod user_writes_tests {
 
     #[test]
     fn unchanged_binaries_ride_the_report_as_a_distinct_token() {
-        let m = with_binary_summary("applied v".into(), &["agent-binary=unchanged".into(), "hostd-binary".into()]);
-        assert_eq!(m, "applied v applied: agent-binary=unchanged hostd-binary");
-        assert_eq!(with_binary_summary("applied v".into(), &[]), "applied v", "no binary, message unchanged");
+        let m = with_binary_summary("applied v".into(), &["agent-binary=unchanged".into(), "hostd-binary".into()], &["agent-binary=ab".into()]);
+        assert_eq!(m, "applied v applied: agent-binary=unchanged hostd-binary binary-sha: agent-binary=ab");
+        assert_eq!(with_binary_summary("applied v".into(), &[], &[]), "applied v", "no binary, message unchanged");
         // The controller's whole-token lookup: `=unchanged` is NOT "installed".
         assert!(!crate::commands::provision::applier_applied(&m, "agent-binary"));
         assert!(crate::commands::provision::applier_applied(&m, "agent-binary=unchanged"));
         assert!(crate::commands::provision::applier_applied(&m, "hostd-binary"));
         // The root-refusal tag still parses when both are present.
-        let both = with_binary_summary(apply_report_msg("v", &["noo-cli".into()]), &["cli-binary".into()]);
+        let both = with_binary_summary(apply_report_msg("v", &["noo-cli".into()]), &["cli-binary".into()], &[]);
         assert!(both.contains(&format!("{ROOT_REFUSED_TAG} noo-cli")));
     }
 
@@ -4643,6 +4662,6 @@ mod user_writes_tests {
         assert!(f[gate..].contains(r#"launchctl(&["print", &target]).0 == 0"#), "skip needs the daemon loaded");
         assert!(gate < f.find(r#"launchctl(&["bootout", &target])"#).unwrap());
         assert!(f.contains(r#"inst_bin("agent-binary""#) && f.contains(r#"inst_bin("harness-binary""#));
-        assert!(f.contains(r#"note_binary("hostd-binary", true)"#) && f.contains(r#"note_binary("cli-binary", true)"#));
+        assert!(f.contains(r#"note_binary("hostd-binary", true"#) && f.contains(r#"note_binary("cli-binary", true"#));
     }
 }
