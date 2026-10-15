@@ -3,7 +3,7 @@
 The contract between the gateway and a harness: what a harness is handed,
 what it may call back, and what it must publish. `noo-gateway harness`
 (`gateway-rust/src/harness_main.rs`) is the reference implementation. A
-foreign loop (`claude-code`, `copilot`, a future `codex`) is a wrapper that
+foreign loop (`claude-code`, `copilot`, `codex`) is a wrapper that
 speaks this protocol; nothing else about the gateway is visible to it.
 
 The names below are the code's names. A test in
@@ -16,9 +16,9 @@ A harness is an agent loop placed on a node, next to that node's chat
 backend, so a turn runs beside its model instead of on the controller. Two
 independent axes describe a placement:
 
-- **Which loop** is the *kind*: `noo`, `claude-code`, `copilot`
-  (`HARNESS_KINDS` in `gateway-rust/src/routes/cluster.rs`;
-  `NOO_HARNESS_KIND` on the placement).
+- **Which loop** is the *kind*: `noo`, `claude-code`, `copilot`, `codex`
+  (declared once in `config/harness-kinds.json`; `NOO_HARNESS_KIND` on the
+  placement).
 - **Which model** is the *endpoint*: the one chat backend the harness was
   placed beside (`NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`,
   `NOO_HARNESS_BACKEND`). A harness is pinned to it and never asks the
@@ -80,7 +80,7 @@ The node agent sets all of this from the placement.
 | `NATS_NODE_USER`, `NATS_NODE_PASSWORD` | the node's bus principal; the password may arrive as `NATS_NODE_PASSWORD_FILE`, never both |
 | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type (default `openai`) |
 | `NOO_HARNESS_MAX_TURNS` | concurrent turns and tasks (default 8) |
-| `NOO_HARNESS_KIND` | the loop kind of the placement (`noo`, `claude-code`, `copilot`); the node agent reads it to choose the runner, the reference harness does not |
+| `NOO_HARNESS_KIND` | the loop kind of the placement (a kind from `config/harness-kinds.json`); the node agent reads it to choose the runner, the reference harness does not |
 
 `NODE_ID`, `NOO_GATEWAY_URL`, `NATS_URL`, `NOO_HARNESS_MODEL_URL` and
 `NOO_HARNESS_MODEL` are required; the reference harness refuses to start
