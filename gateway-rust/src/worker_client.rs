@@ -80,15 +80,17 @@ pub async fn request_with_timeout(
     // if a publish appears anywhere else.
     let headers = crate::bus_principal::headers_for(subject);
 
-    let response = tokio::time::timeout(timeout, async {
-        match headers {
-            Some(h) => {
-                nats.request_with_headers(subject.to_string(), h, data.into())
-                    .await
-            }
-            None => nats.request(subject.to_string(), data.into()).await,
-        }
-    })
+    // The reply comes back on the WORKER principal's own inbox prefix, the
+    // one its static publish grant names (i69/i70): a NATS config reload
+    // wipes `allow_responses`, so a reply on the gateway's shared default
+    // inbox would be refused whenever the request straddles a SIGHUP.
+    let mut request = async_nats::Request::new()
+        .payload(data.into())
+        .inbox(crate::nats_credentials::scoped_inbox(nats, crate::nats_credentials::WORKER_REPLY_PREFIX));
+    if let Some(h) = headers {
+        request = request.headers(h);
+    }
+    let response = tokio::time::timeout(timeout, nats.send_request(subject.to_string(), request))
     .await
     .map_err(|_| anyhow::anyhow!("Worker timeout on {subject}"))?
     .map_err(|e| anyhow::anyhow!("NATS request failed: {e}"))?;
@@ -321,7 +323,8 @@ pub async fn request_stream(
     subject: &str,
     payload: &Value,
 ) -> Result<async_nats::Subscriber> {
-    let inbox = nats.new_inbox();
+    // The worker principal's own reply prefix, as `request_with_timeout`.
+    let inbox = crate::nats_credentials::scoped_inbox(nats, crate::nats_credentials::WORKER_REPLY_PREFIX);
     let sub = nats.subscribe(inbox.clone()).await?;
 
     let data = serde_json::to_vec(payload)?;
