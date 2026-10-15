@@ -18091,6 +18091,29 @@
           }
         }
       }
+    },
+    "/api/cluster/self-node": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "The controller's own node id and the birth cert fingerprint the rail verifies it against",
+        "description": "[native] GET /api/cluster/self-node \u2014 the controller's own node id and the DER-sha256 fingerprint of the birth cert the gateway verifies its fetch receipts and apply reports against (i67). Read-only: the cert is a host file, and nothing here can change it. `noo cluster provision <self>` compares the fingerprint with `/etc/noo/birth.crt` before staging.",
+        "operationId": "self_node_identity",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

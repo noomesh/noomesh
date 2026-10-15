@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
@@ -15,19 +15,19 @@ path = "src/main.rs"
 [dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls", "json", "platform-verifier"] }
 serde_json = "1"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 # Intelligent-tier entitlement tokens (entitlement.rs): sign + verify.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 # `security pki` — X.509 issuance with ca.py profile fidelity (see src/pki.rs).
 # sha1 is REQUIRED for RFC 5280 method-1 key identifiers (python-cryptography
 # parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 sha1 = "0.10"
 # "formatting" also serves `config export-effective`'s generated_at stamp.
 time = { version = "0.3", features = ["formatting"] }

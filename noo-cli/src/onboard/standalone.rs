@@ -80,8 +80,8 @@ pub fn prepare_from_bundle(home: &Path, bundle: &str) -> Result<(), String> {
 
 /// Fetch the bundle (+ sha sidecar). A local path takes a sibling `.sha256`
 /// when present (warns when absent); a URL REQUIRES one — a remote artifact
-/// with no checksum is not verifiable. Token env (GH_TOKEN/GITHUB_TOKEN/
-/// PAI_REPOS_PAT) rides along for private release assets.
+/// with no checksum is not verifiable. Token env (GH_TOKEN/GITHUB_TOKEN)
+/// rides along when set, for a private release mirror.
 fn acquire_bundle(bundle: &str) -> Result<(Vec<u8>, Option<String>), String> {
     if bundle.starts_with("http://") {
         return Err("refusing a plaintext http:// bundle URL — use https:// or a local path".into());

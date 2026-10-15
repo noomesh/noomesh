@@ -2893,8 +2893,8 @@ pub fn pki_push_nodes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 g.json,
                 crate::output::ExitCode::Generic,
                 "self_node",
-                &format!("'{o}' is this controller's own node: its cert is a local file, not a rail delivery"),
-                Some(&format!("noo cluster provision {o} --local   (re-issues it with the controller names and installs it)")),
+                &format!("'{o}' is this controller's own node: its cert rides its provision bundle, not this push"),
+                Some(&format!("noo cluster provision {o}   (re-issues it with the controller names and stages it over the rail)")),
             );
         }
         let msg = match &only {

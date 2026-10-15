@@ -47,6 +47,85 @@ def _get_recall_memory():
     return None
 
 
+def _trellion_engine():
+    """The trellion async DB engine, or None when it is not importable/wired."""
+    try:
+        from trellion.db.engine import get_async_engine
+        return get_async_engine()
+    except Exception:
+        return None
+
+
+def _body_arg(request: dict, key: str, default: Any = None) -> Any:
+    """Read ``key`` from the flat body the Rust route forwards verbatim,
+    falling back to the legacy ``params`` envelope."""
+    if key in request:
+        return request[key]
+    params = request.get("params")
+    if isinstance(params, dict) and key in params:
+        return params[key]
+    return default
+
+
+def _clamp_top_k(value: Any, default: int, maximum: int = 100) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, maximum))
+
+
+def _record_kind(record_type: Any) -> str:
+    return "traversal" if str(record_type or "") == "traversal" else str(record_type or "conversation")
+
+
+# One projection for both doors. An episode row only carries a summary; for a
+# traversal the readable body is the proven query + intent in
+# trellion_traversal_records (joined on video_frame_id).
+_EPISODE_SELECT = (
+    "SELECT e.id::text, e.record_type, e.index_name, e.content_summary, "
+    "       e.prominence_score, e.access_count, e.metadata, "
+    "       t.query_text, t.intent, t.outcome_score "
+    "FROM trellion_episodes e "
+    "LEFT JOIN trellion_traversal_records t ON t.video_frame_id = e.id "
+)
+
+
+def _episode_view(row: Any) -> dict:
+    """Door projection of one episode row: always says what KIND of record it
+    is and where its text came from, so an empty body is explained, not silent."""
+    (rid, rtype, iname, summary, prom, access, meta, qtext, intent, outcome) = tuple(row)
+    kind = _record_kind(rtype)
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    if kind == "traversal":
+        if intent is not None:
+            meta.setdefault("intent", intent)
+        if outcome is not None:
+            meta.setdefault("outcome", float(outcome))
+    text = (qtext if kind == "traversal" and qtext else summary) or ""
+    return {
+        "record_id": str(rid),
+        "kind": kind,
+        "record_type": str(rtype or ""),
+        "source_index": str(iname or ""),
+        "text": str(text),
+        "prominence": float(prom) if prom is not None else None,
+        "access_count": int(access) if access is not None else None,
+        "metadata": meta,
+    }
+
+
+async def _episode_views(engine: Any, ids: list[str]) -> dict[str, dict]:
+    from sqlalchemy import bindparam, text as _text
+    if not ids:
+        return {}
+    stmt = _text(_EPISODE_SELECT + "WHERE e.id::text IN :ids").bindparams(
+        bindparam("ids", expanding=True))
+    async with engine.connect() as conn:
+        rows = (await conn.execute(stmt, {"ids": ids})).all()
+    return {v["record_id"]: v for v in (_episode_view(r) for r in rows)}
+
+
 @worker_handler("worker.recall.search")
 async def _recall_search(request: dict) -> Any:
     """Handle recall memory search delegation."""
@@ -58,9 +137,40 @@ async def _recall_search(request: dict) -> Any:
     # Was: `except Exception: pass` → [], so a search that BLEW UP was
     # reported as "no matches". Let it propagate — the worker pool wraps
     # handler exceptions as {"success": false, "error": ...}.
-    query = request.get("params", {}).get("query", "")
-    results = await vm.search(query, top_k=5)
-    return [r.__dict__ for r in (results or [])]
+    #
+    # The Rust route forwards the POST body flat ({query, top_k}); this used
+    # to read request["params"]["query"] (always "") and hardcode top_k=5, so
+    # neither argument ever took effect.
+    query = _body_arg(request, "query", "") or ""
+    top_k = _clamp_top_k(_body_arg(request, "top_k", 5), 5)
+    results = list(await vm.search(query, top_k=top_k) or [])[:top_k]
+    out = [dict(r.__dict__) for r in results]
+
+    # trellion's search() returns bare frame hits (text "", metadata {}); fill
+    # the body from the episode / traversal tables and name the kind.
+    engine = _trellion_engine() if out else None
+    views: dict[str, dict] = {}
+    if engine is not None:
+        try:
+            ids = [str(o.get("record_id") or o.get("frame_id") or "") for o in out]
+            views = await _episode_views(engine, [i for i in ids if i])
+        except Exception as e:
+            log.warning("recall_search_enrich_failed", error=str(e))
+    for o in out:
+        v = views.get(str(o.get("record_id") or o.get("frame_id") or ""))
+        if v:
+            o["kind"] = v["kind"]
+            if not o.get("text"):
+                o["text"] = v["text"]
+            o["metadata"] = {**v["metadata"], **(o.get("metadata") or {})}
+        else:
+            o["kind"] = _record_kind(o.get("record_type"))
+            o.setdefault("text", "")
+        if not o.get("text"):
+            o["text_unavailable"] = (
+                "traversal record: no stored text body" if o["kind"] == "traversal"
+                else "no stored text body for this record")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -457,17 +567,34 @@ async def _recall_lifecycle_preview(request: dict) -> Any:
 
 @worker_handler("worker.recall.prominent")
 async def _recall_prominent(request: dict) -> Any:
-    """Return top-K prominent records. Mirrors GET /prominent."""
+    """Return top-K prominent records (live episodes, traversals included).
+
+    Was: ``vm.get_prominent_records(...) if hasattr(...) else []`` -- trellion's
+    manager has no such method, so this answered ``records: []`` for every
+    store, however many episodes it held. Reads trellion_episodes directly.
+    """
     vm = _get_recall_manager_or_none()
     if vm is None:
         return {"success": True, "data": {
             "records": [], "unavailable": "recall_memory not initialized"}}
     try:
-        top_k = int(request.get("top_k", 20))
-        records = vm.get_prominent_records(top_k=top_k) if hasattr(vm, "get_prominent_records") else []
+        top_k = _clamp_top_k(_body_arg(request, "top_k", 20), 20)
+        engine = _trellion_engine()
+        if engine is None:
+            return {"success": False, "error": "prominent records unavailable: trellion DB engine unavailable"}
+        from sqlalchemy import text as _text
+        async with engine.connect() as conn:
+            rows = (await conn.execute(
+                _text(_EPISODE_SELECT +
+                      "WHERE e.is_tombstoned = FALSE "
+                      "ORDER BY e.prominence_score DESC, e.access_count DESC, e.created_at DESC "
+                      "LIMIT :k"),
+                {"k": top_k},
+            )).all()
+        records = [_episode_view(r) for r in rows]
         return {"success": True, "data": {"records": records}}
     except Exception as e:
-        # Was: success:True + records:[] — a failed lookup read as "nothing
+        # Was: success:True + records:[] -- a failed lookup read as "nothing
         # is prominent".
         log.warning("recall_prominent_failed", error=str(e))
         return {"success": False, "error": f"prominent records unavailable: {e}"}

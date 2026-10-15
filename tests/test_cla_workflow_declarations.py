@@ -22,6 +22,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 KIT = REPO / "internal/noomesh/licensing/cla.yml"
 OWN = REPO / ".github/workflows/cla.yml"
+if not KIT.is_file():
+    # The licensing kit lives in the private noomesh-internal repo; the public tree has no copy.
+    pytest.skip(f"licensing kit not in this tree ({KIT.relative_to(REPO)}); it lives in noomesh-internal", allow_module_level=True)
 # PAI_TRELLION_CHECKOUT points the comparison at a worktree of the sibling.
 SIBLING = Path(os.environ.get("PAI_TRELLION_CHECKOUT", REPO.parent / "trellion")) / ".github/workflows/cla.yml"
 

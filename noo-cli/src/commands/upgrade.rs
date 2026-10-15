@@ -13,13 +13,14 @@
 //! (`{arch}-unknown-linux-musl`), asset name `noo-{target}`, `.sha256` sidecar
 //! of the form `<hex>  <name>`.
 //!
-//! Private-repo auth also mirrors install.sh's `download()` precedence:
+//! The release repo is public, so an anonymous download is the normal path.
+//! Source precedence mirrors install.sh's `download()`:
 //!   1. `NOO_CLI_BASE_URL` — a mirror serving `noo-<target>` + `.sha256`
 //!      directly (no auth), used for internal/air-gapped mirrors.
-//!   2. `gh release download` when `gh` is on PATH — the reliable private-repo
-//!      path (handles the token dance GitHub requires for asset downloads).
-//!   3. a direct token'd fetch (`GH_TOKEN`/`GITHUB_TOKEN`/`PAI_REPOS_PAT`).
-//! With none of these and a private repo, it fails with actionable guidance
+//!   2. `gh release download` when `gh` is on PATH (authenticated: lifts the
+//!      anonymous rate limit, and reads a private `NOO_CLI_REPO` fork).
+//!   3. a direct fetch, with `GH_TOKEN`/`GITHUB_TOKEN` when set.
+//! A private `NOO_CLI_REPO` with none of these fails with actionable guidance
 //! rather than a bare 404 — same posture as the installer.
 
 use std::process::Command;
@@ -30,11 +31,10 @@ use crate::ui::{self, Glyph};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-/// The DEFAULT release repo. `NOO_CLI_REPO` overrides it — the distribution
-/// CHANNEL knob: internal installs use this default (private,
-/// gh/token-authenticated); the public noomesh channel is a config flip,
-/// not a code change. `NOO_CLI_BASE_URL` (a full asset mirror) still
-/// outranks both.
+/// The DEFAULT release repo (public). `NOO_CLI_REPO` overrides it — the
+/// distribution CHANNEL knob: another release repo (a private fork reads
+/// through gh or a token) is a config flip, not a code change.
+/// `NOO_CLI_BASE_URL` (a full asset mirror) still outranks both.
 const DEFAULT_REPO: &str = crate::registry::RELEASE_REPO;
 const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
@@ -1764,8 +1764,9 @@ fn sso_pub_blocker(path: &std::path::Path) -> Option<String> {
 
 /// The nodes `upgrade --nodes` restages over the rail: every live
 /// enrollment, minus the controller's own node when this box is the
-/// controller (it is upgraded by the local lane), with any self node that
-/// remains last so its restage lands after every remote one.
+/// controller (it is restaged by name at the end of the phase, from this
+/// machine's own facts — i11a, i67), with any self node that remains last
+/// so its restage lands after every remote one.
 fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_controller: bool) -> Vec<String> {
     if on_controller {
         names.retain(|n| !is_self(n));
@@ -1776,8 +1777,9 @@ fn rail_names(mut names: Vec<String>, is_self: impl Fn(&str) -> bool, on_control
 
 /// Restage a provision bundle for every pull-capable node on record (has a
 /// redeemed enrollment WITH a birth cert). Nodes collect + apply on their
-/// own noo-fetch timer — no SSH, no waiting here. Self/local agents are
-/// upgraded through the local lane at the end of this phase, not the rail.
+/// own noo-fetch timer — no SSH, no waiting here. The controller's own node
+/// rides the same rail, last (i67): no sudo, and a refusal with the remedy
+/// when its pull units are missing.
 fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // The gateway wait is the caller's Gateway phase (run_fleet_stages).
     let doc = crate::http::get_json(g, "/api/security/bootstrap-tokens", true, 15);
@@ -1792,11 +1794,10 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         .collect();
     names.sort();
     names.dedup();
-    // i11a: on a controller, its own node is never a rail node. It does not
-    // enroll with itself, so a record under its name is another machine
-    // that announced the same name, and restaging from it re-issued the
-    // controller's cert without the controller names (and kept the local
-    // lane below from running, since the name looked "on the rail").
+    // i11a: on a controller, its own node is never restaged from an
+    // enrollment record: one under its name may be another machine that
+    // announced the same name. It is restaged at the end of this phase by
+    // name, and `cluster provision` builds it from this machine's facts.
     let names = rail_names(names, crate::role::is_self_node, crate::role::detect().controller.is_some());
     // Put this controller's CLI release assets where the fleet can reach
     // them: the cache (bundles carry them) and the gateway (/bootstrap/cli
@@ -1818,7 +1819,15 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             .collect::<Vec<_>>()
             .join(", ");
         ui::done(&format!("no nodes yet — staged assets for {list} so the first provision bundle carries hostd and the harness"));
-        ui::guide(&[("noo cluster provision <node> --local", "local/self agents are provisioned directly, not through the pull rail")]);
+        // The controller's own node still rides the rail.
+        if let Some(me) = local_agent_node(&names) {
+            if !g.json { println!("{}", ui::phase("Nodes")); }
+            let mut failed: Vec<String> = Vec::new();
+            println!();
+            upgrade_self_node(g, &me, &mut failed);
+            return Ok(if failed.is_empty() { 0 } else { 1 });
+        }
+        ui::guide(&[("noo cluster bootstrap-token create --node <name>", "mints the paste that enrolls a first node")]);
         return Ok(0);
     }
     // Macs whose applier predates the svc-* kinds get this pass's bundle
@@ -1891,11 +1900,11 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
             _ => failed.push(n.clone()),
         }
     }
-    // The controller's OWN agent, which the rail structurally cannot reach.
+    // The controller's OWN node, last, over the same rail (i67).
     if let Some(me) = local_agent_node(&names) {
         // The child prints its own `ui::item` label, as the rail nodes do.
         println!();
-        upgrade_local_agent(g, &me, &mut failed);
+        upgrade_self_node(g, &me, &mut failed);
     }
     // A node whose first staging failed is already in `failed`; waiting
     // for it to apply a bundle it never got would only burn the budget.
@@ -2183,25 +2192,21 @@ fn mac_leaves_pass(g: &Globals, nodes: &[String], budget: u64) -> Vec<(String, M
     out
 }
 
-/// This host's own node name, when it runs an agent the pull rail cannot see.
+/// This host's own node name, when it runs a node agent that is not already
+/// in the rail list.
 ///
 /// A standalone controller runs `noo-node-agent` as a host systemd service
-/// exactly like every worker — the agents are not different. What differs is
-/// DELIVERY: workers are enrolled, so they hold a birth cert and run a
-/// `noo-fetch` timer that collects staged bundles. The controller mints its own
-/// certs from the local PKI and never enrolls with itself, so it has neither.
+/// exactly like every worker — the agents are not different. `upgrade_nodes`
+/// lists nodes from enrollment records, which made the controller invisible
+/// to `--all`: on 2026-09-05 it was the one machine in the fleet on a stale
+/// agent and nothing said so. Since i67 it is restaged over the same rail as
+/// every node, last; only the name comes from here.
 ///
-/// `upgrade_nodes` filters on the enrollment record, which made the controller
-/// invisible to `--all`. On 2026-09-05 it was the one machine in the fleet on a
-/// stale agent (stack-v0.2.4 against a v0.2.22 fleet) and nothing said so —
-/// `--all` reads as "everything" and silently meant "the stack, plus enrolled
-/// nodes".
-///
-/// `None` when there is no local agent, or when this host IS on the rail (a
-/// worker running `noo upgrade` for itself must not also try the local lane).
+/// `None` when there is no local agent, or when this host IS in the rail
+/// list (a worker running `noo upgrade` for itself is restaged once).
 fn local_agent_node(rail: &[String]) -> Option<String> {
     let present = std::path::Path::new(LOCAL_AGENT_BIN).is_file();
-    let me = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    let me = super::provision::self_node_name().unwrap_or_default();
     local_agent_name(present, &me, rail)
 }
 
@@ -2220,36 +2225,20 @@ fn local_agent_name(agent_present: bool, hostname: &str, rail: &[String]) -> Opt
 
 const LOCAL_AGENT_BIN: &str = "/usr/local/bin/noo-node-agent";
 
-/// Upgrade the local agent through `provision --local`, or say why not.
-///
-/// `provision_local` shells out to sudo. Under an unattended run that could
-/// block forever on a password prompt, so it is attempted only when sudo is
-/// known not to prompt, or when an operator is present at a TTY to answer.
-/// Otherwise this REPORTS the skip and the command — silence is the bug being
-/// fixed here, and a skip the operator can see is a fix; a hang is not.
-fn upgrade_local_agent(g: &Globals, me: &str, failed: &mut Vec<String>) {
-    let sudo_quiet = std::process::Command::new("sudo")
-        .args(["-n", "true"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !sudo_quiet && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        println!("{}", ui::item(me));
-        println!("{}", ui::sub(&ui::status_line(Glyph::Warn, &format!(
-            "{me} runs a local agent the pull rail cannot reach, and sudo would prompt here — not upgraded"))));
-        ui::guide(&[("noo cluster provision <node> --local",
-            "upgrades this controller's own agent; needs sudo, so run it attended")]);
-        failed.push(format!("{me} (local)"));
-        return;
-    }
-    // Same child-process isolation as the rail nodes: `provision --local`
-    // reports its failures through `fail` too, and an exit here would drop the
+/// Restage the controller's own node over the rail (i67), like any node.
+/// No sudo — except ONCE on a controller installed before 0.6.3, whose node
+/// identity (birth key, pull units) does not
+/// exist yet: the child creates it ("sudo once, never again") through the
+/// same prep path onboard uses, then rides the rail. When that sudo would
+/// prompt with nobody at a terminal the child refuses with the remedy
+/// (`noo onboard --only services`). There is no sudo agent install here.
+fn upgrade_self_node(g: &Globals, me: &str, failed: &mut Vec<String>) {
+    // Same child-process isolation as the rail nodes: `cluster provision`
+    // reports its failures through `fail`, and an exit here would drop the
     // summary line for every node staged before it.
-    match provision_one(g, me, &["--local"]) {
+    match provision_one(g, me, &[]) {
         Ok(0) => {}
-        _ => failed.push(format!("{me} (local)")),
+        _ => failed.push(format!("{me} (self node)")),
     }
 }
 
@@ -2288,7 +2277,7 @@ pub(crate) fn reexec_path(current: &std::path::Path) -> Option<std::path::PathBu
     if path.is_file() { Some(path) } else { None }
 }
 
-fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
+pub(crate) fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
     let exe = match std::env::current_exe().map(|p| reexec_path(&p)) {
         Ok(Some(p)) => p,
         // No path to ourselves: fall back to in-process, which is exactly the
@@ -2694,7 +2683,7 @@ fn ext_agent() -> ureq::Agent {
 }
 
 pub(crate) fn gh_token() -> Option<String> {
-    for k in ["GH_TOKEN", "GITHUB_TOKEN", "PAI_REPOS_PAT"] {
+    for k in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(v) = std::env::var(k) {
             let v = v.trim().to_string();
             if !v.is_empty() {
@@ -4199,8 +4188,9 @@ mod tests {
         assert_eq!(short_id("aaaaaaaaaaaa"), "aaaaaaaaaaaa");
     }
 
-    /// The controller is skipped by the RAIL filter, so the local lane must
-    /// pick it up — and must NOT double-handle a node the rail already has.
+    /// The controller is skipped by the enrollment-list filter, so the
+    /// self-node step must pick it up (over the rail since i67) — and must
+    /// NOT double-handle a node the list already has.
     ///
     /// This is the shape of the 2026-09-05 gap: host8 ran the same
     /// `noo-node-agent` as every worker, on a three-release-old build, and
@@ -4216,9 +4206,8 @@ mod tests {
         );
     }
 
-    /// A worker upgrading ITSELF must not also run the controller-only local
-    /// lane: the rail already delivers to it, and `--local` would bypass the
-    /// signed-bundle path that makes the rail trustworthy.
+    /// A worker upgrading ITSELF is restaged once, from its enrollment, and
+    /// not a second time by the controller-only self-node step.
     #[test]
     fn a_rail_node_is_not_also_a_local_one() {
         let rail = vec!["host3".to_string(), "host9".to_string()];
@@ -4227,9 +4216,10 @@ mod tests {
 
     /// i11a, the live case: a second Pop!_OS machine enrolled under the
     /// controller's own node name `host8`. On the controller that name is
-    /// dropped from the rail, so the controller's agent is upgraded by the
-    /// local lane (which re-issues its cert WITH the controller names)
-    /// instead of being restaged from the other machine's record.
+    /// dropped from the enrollment list, so the controller's node is
+    /// restaged by name from this machine's own facts (which re-issues its
+    /// cert WITH the controller names) instead of from the other machine's
+    /// record.
     #[test]
     fn the_controllers_name_never_rides_the_rail_on_the_controller() {
         let is_self = |n: &str| n.eq_ignore_ascii_case("host8");

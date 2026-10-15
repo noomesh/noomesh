@@ -41,6 +41,7 @@ from typing import Any
 import structlog
 
 from .. import json_fast as json
+from ..cluster import reply_ledger
 from . import bus_principal, inflight
 
 log = structlog.get_logger(__name__)
@@ -238,6 +239,8 @@ async def _handle_request(msg) -> None:
     """Inner request handler — parses, dispatches to the registered
     handler, publishes the reply. Always awaited from one of the
     wrappers below (never used as a NATS callback directly anymore)."""
+    # Owed from the moment it arrived, so a refused reply can be named (i69).
+    reply_ledger.received(msg.reply, msg.subject)
     try:
         request = json.loads(msg.data.decode())
     except Exception:

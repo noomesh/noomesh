@@ -88,7 +88,7 @@ version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; 
 # ── what the repo declares ────────────────────────────────────────────────
 PY_VERSION="$(tr -d '[:space:]' < .python-version 2>/dev/null || echo 3.12)"
 GO_VERSION="$(awk '/^go /{print $2; exit}' node-agent-go/go.mod 2>/dev/null || true)"
-GO_VERSION="${GO_VERSION:-1.25.0}"
+GO_VERSION="${GO_VERSION:-1.26.0}"
 # CI's actions/setup-node pin (ci.yml); ui/package.json declares no engines.
 NODE_MAJOR="$(awk '/node-version:/{print $2; exit}' .github/workflows/ci.yml 2>/dev/null | tr -dc '0-9')"
 NODE_MAJOR="${NODE_MAJOR:-22}"
