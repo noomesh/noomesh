@@ -138,3 +138,14 @@ def test_every_binary_block_consults_the_helper_and_hostd_keeps_its_floor() -> N
     assert 'applied="$applied cli-binary=unchanged"' in APPLIER
     assert 'echo "binary-sha:$binary_shas"' in APPLIER
     assert "hostd_generation_of" in APPLIER and "REVERTING" in APPLIER
+
+
+def test_the_binary_sha_marker_is_spelled_the_same_by_producers_and_the_reader() -> None:
+    # Linux applier and Mac fetch applier print it; the controller's bundle
+    # builder reads it. A rename in one place would silently turn every
+    # omission back into "carry", so the three spellings are pinned together.
+    mac = (REPO / "noo-cli/src/commands/node_fetch.rs").read_text()
+    prov = (REPO / "noo-cli/src/commands/provision.rs").read_text()
+    assert 'echo "binary-sha:$binary_shas"' in APPLIER
+    assert '" binary-sha: {}"' in mac
+    assert 'rfind("binary-sha:")' in prov
