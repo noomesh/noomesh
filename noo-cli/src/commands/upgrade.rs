@@ -3425,6 +3425,9 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if r.is_auth() {
         return crate::addons::resolve::TOKEN_FIX.to_string();
     }
+    if crate::addons::resolve::is_not_published(r) {
+        return format!("noo addons upgrade {addon} --check   # retry shortly; the vendor signs the lock minutes after a stack release");
+    }
     if matches!(r, crate::addons::resolve::Refusal::Downgrade { .. }) {
         return "noo upgrade --stack --allow-downgrade   # an explicit rollback of the add-on with the stack".to_string();
     }
@@ -3452,10 +3455,18 @@ fn addon_preflight(
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
         match crate::addons::prepare(&ctx, addon, &mut crate::addons::resolve::LiveDocker::new(root)) {
             Ok(p) => out.push(p),
-            Err(r) => fail(g.json, ExitCode::Generic, "addon_hold",
-                &format!("refusing to roll to {tag}: the {addon} add-on is on and {}. Nothing was changed",
-                    lowercase_first(&r.why(addon))),
-                Some(&addon_hold_fix(addon, &r))),
+            Err(r) => {
+                // A lock the vendor has not published yet is not a fault of
+                // the add-on or the credential: say so in its own words.
+                let why = if crate::addons::resolve::is_not_published(&r) {
+                    r.why(addon)
+                } else {
+                    format!("the {addon} add-on is on and {}", lowercase_first(&r.why(addon)))
+                };
+                fail(g.json, ExitCode::Generic, "addon_hold",
+                    &format!("refusing to roll to {tag}: {why}. Nothing was changed"),
+                    Some(&addon_hold_fix(addon, &r)))
+            }
         }
     }
     out
