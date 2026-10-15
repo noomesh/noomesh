@@ -4,6 +4,7 @@
 package docker
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -127,5 +128,20 @@ func TestSkillRunValidatesContainerName(t *testing.T) {
 	ok := &SkillRunRequest{Image: "busybox", ContainerName: "noo-skill-run-1", NetworkMode: "none"}
 	if err := ValidateSkillRunRequest(ok); err != nil {
 		t.Fatalf("a well-formed skill request must still be accepted: %v", err)
+	}
+}
+
+// A managed container's published ports are loopback-only: the browser
+// door serves plaintext HTTP behind a bearer and must not be LAN-reachable.
+func TestManagedPublishIsLoopbackOnly(t *testing.T) {
+	if got := managedPublishIP.String(); got != "127.0.0.1" {
+		t.Fatalf("managedPublishIP = %s, want 127.0.0.1", got)
+	}
+	src, err := os.ReadFile("containers.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "network.PortBinding{HostIP: managedPublishIP}") {
+		t.Fatal("StartManagedContainer must build every PortBinding with HostIP: managedPublishIP")
 	}
 }

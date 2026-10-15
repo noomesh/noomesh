@@ -1158,6 +1158,36 @@ fn browser_auth_header_with(secret: &str) -> Option<(String, String)> {
     Some(("Authorization".into(), format!("Bearer {token}")))
 }
 
+/// Header the node agent moves into `Authorization` on the way into the
+/// container (its own `Authorization` is spent on the agent's auth).
+const UPSTREAM_AUTH_HEADER: &str = "X-Noo-Upstream-Authorization";
+
+/// Where a session container is reached: THROUGH its node agent, which
+/// proxies to the container's loopback-published port
+/// (`node-agent-go/internal/api/containers.go`). The container's port is
+/// bound on 127.0.0.1 only, so there is no `http://<node>:<port>` to dial.
+fn browser_proxy_base(agent_url: &str, container_name: &str) -> String {
+    format!(
+        "{}/api/containers/{container_name}/proxy",
+        agent_url.trim_end_matches('/')
+    )
+}
+
+/// Add the two credentials a proxied browser call carries: the agent's own
+/// (`agent_auth`) and the browser door's bearer (upstream header).
+fn browser_proxied(
+    mut req: reqwest::RequestBuilder,
+    agent_auth: &Option<(String, String)>,
+) -> reqwest::RequestBuilder {
+    if let Some((k, v)) = agent_auth {
+        req = req.header(k, v);
+    }
+    if let Some((_, bearer)) = browser_auth_header() {
+        req = req.header(UPSTREAM_AUTH_HEADER, bearer);
+    }
+    req
+}
+
 /// The configured agent for a browser session with no node (`node_id`
 /// empty, or `"local"` on a stored session): `NOO_DEFAULT_AGENT_URL`, or a
 /// refusal that says what to do. Pure, so the refusal is testable.
@@ -1379,8 +1409,8 @@ async fn browser_start(
         .post(format!("{agent_url}/api/containers/start"))
         .json(&payload)
         .timeout(std::time::Duration::from_secs(60));
-    if let Some((k, v)) = agent_auth {
-        req = req.header(&k, &v);
+    if let Some((k, v)) = &agent_auth {
+        req = req.header(k, v);
     }
 
     let resp = req.send().await
@@ -1394,16 +1424,9 @@ async fn browser_start(
         ));
     }
 
-    let data: Value = resp.json().await.unwrap_or(json!({}));
-
-    // Determine the URL to reach the container
-    let host_port = data.get("host_port")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(BROWSER_PORT as u64);
-    let host = agent_url
-        .split("://").nth(1).unwrap_or("localhost")
-        .split(':').next().unwrap_or("localhost");
-    let base_url = format!("http://{host}:{host_port}");
+    // The container is published on the node's loopback only; the gateway
+    // reaches it through the node agent it already trusts.
+    let base_url = browser_proxy_base(&agent_url, &container_name);
 
     // Wait for the container to become healthy (poll /status)
     let health_client = crate::tls::cluster_client();
@@ -1411,12 +1434,12 @@ async fn browser_start(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut healthy = false;
     while std::time::Instant::now() < deadline {
-        let mut probe = health_client
-            .get(format!("{base_url}/status"))
-            .timeout(std::time::Duration::from_secs(5));
-        if let Some((k, v)) = browser_auth_header() {
-            probe = probe.header(&k, &v);
-        }
+        let probe = browser_proxied(
+            health_client
+                .get(format!("{base_url}/status"))
+                .timeout(std::time::Duration::from_secs(5)),
+            &agent_auth,
+        );
         if probe
             .send().await
             .map(|r| r.status().is_success())
@@ -1667,14 +1690,19 @@ async fn browser_action(
     let Some(mut session_data) = session_data else {
         return Ok(Json(json!({"error": format!("No browser session: {session_id}")})));
     };
-    let base_url = session_data
-        .get("base_url")
+    // Derive the route from the session's node and container, never from
+    // the stored `base_url`: a session stored by a pre-proxy gateway holds
+    // `http://<node>:<port>`, which is no longer published off-loopback.
+    // (Such a session's container is orphaned by the upgrade; it dies on
+    // the idle timeout, and stop still removes it by name.)
+    let node_id = session_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+    let container_name = session_data
+        .get("container_name")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if base_url.is_empty() {
-        return Ok(Json(json!({"error": format!("session {session_id} has no base_url")})));
-    }
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("noo-browser-{session_id}"));
+    let (agent_url, agent_auth) = browser_agent(&state, node_id).await?;
+    let base_url = browser_proxy_base(&agent_url, &container_name);
 
     // Map action → container endpoint + payload (BrowserTool's action_map).
     let (path, payload, is_get) = match action.as_str() {
@@ -1718,11 +1746,7 @@ async fn browser_action(
     };
 
     let client = crate::tls::cluster_client();
-    let auth = browser_auth_header();
-    let with_auth = |req: reqwest::RequestBuilder| match &auth {
-        Some((k, v)) => req.header(k, v),
-        None => req,
-    };
+    let with_auth = |req: reqwest::RequestBuilder| browser_proxied(req, &agent_auth);
     let result = if is_get {
         with_auth(
             client
@@ -1920,6 +1944,17 @@ mod browser_agent_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!code.contains(&needle), "ui.rs dials {needle} again");
+    }
+}
+
+#[cfg(test)]
+mod browser_proxy_tests {
+    #[test]
+    fn session_url_is_the_agents_proxy_route() {
+        assert_eq!(
+            super::browser_proxy_base("https://10.0.0.5:8081/", "noo-browser-ab12cd34"),
+            "https://10.0.0.5:8081/api/containers/noo-browser-ab12cd34/proxy"
+        );
     }
 }
 

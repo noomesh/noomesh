@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 )
@@ -138,4 +140,57 @@ func (s *Server) handleContainerStop(w http.ResponseWriter, r *http.Request) {
 		"status":         "stopped",
 		"container_name": req.ContainerName,
 	})
+}
+
+// UpstreamAuthHeader carries the credential for the CONTAINER on a proxied
+// request. Authorization is spent on this agent's own auth (the cluster
+// bearer, or none for the controller's leaf), so the container's bearer
+// rides here and is moved into Authorization on the way in.
+const UpstreamAuthHeader = "X-Noo-Upstream-Authorization"
+
+// handleContainerProxy serves ANY method on
+// /api/containers/{name}/proxy/{path...}: it forwards to the managed
+// container's loopback-published port, path and query intact. The route is
+// controller-only (ctrlMW), same as start/stop.
+func (s *Server) handleContainerProxy(w http.ResponseWriter, r *http.Request) {
+	resolve := s.proxyTarget
+	if resolve == nil {
+		if s.docker == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "Docker not available"})
+			return
+		}
+		resolve = s.docker.ProxyTarget
+	}
+	name := r.PathValue("name")
+	if err := dockerpkg.ValidateManagedContainerName(name); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
+		return
+	}
+	hostPort, err := resolve(name)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"detail": err.Error()})
+		return
+	}
+	target := &url.URL{Scheme: "http", Host: hostPort}
+	path := "/" + r.PathValue("path")
+	rp := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = target.Scheme
+			pr.Out.URL.Host = target.Host
+			pr.Out.URL.Path = path
+			pr.Out.URL.RawPath = ""
+			pr.Out.Host = target.Host
+			// Never forward this agent's own credential to a container.
+			pr.Out.Header.Del("Authorization")
+			if v := pr.In.Header.Get(UpstreamAuthHeader); v != "" {
+				pr.Out.Header.Set("Authorization", v)
+			}
+			pr.Out.Header.Del(UpstreamAuthHeader)
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			slog.Warn("container proxy failed", "container", name, "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"detail": "container unreachable"})
+		},
+	}
+	rp.ServeHTTP(w, r)
 }
