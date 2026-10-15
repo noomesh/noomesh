@@ -1239,7 +1239,7 @@ pub(crate) async fn erase_account(
     let mut total: i64 = 0;
     for t in &targets {
         let sql = t.count_sql();
-        let (n,): (i64,) = sqlx::query_as(&sql).bind(&username).fetch_one(db).await?;
+        let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql)).bind(&username).fetch_one(db).await?;
         total += n;
         plan.push(json!({ "store": t.label, "table": t.table, "rows": n }));
     }
@@ -1310,14 +1310,14 @@ pub(crate) async fn erase_account(
     for t in &targets {
         // $1 = username (in where_sql + snapshot SELECT list), $2 = run_id, $3 = store label.
         let snapshot = t.snapshot_sql();
-        sqlx::query(&snapshot)
+        sqlx::query(sqlx::AssertSqlSafe(&*snapshot))
             .bind(&username)
             .bind(run_id)
             .bind(t.label)
             .execute(&mut *tx)
             .await?;
         let del = t.delete_sql();
-        let r = sqlx::query(&del).bind(&username).execute(&mut *tx).await?;
+        let r = sqlx::query(sqlx::AssertSqlSafe(&*del)).bind(&username).execute(&mut *tx).await?;
         deleted.push(json!({ "store": t.label, "rows": r.rows_affected() }));
     }
     // Re-planned under the transaction, documents locked: what the preview
@@ -4593,8 +4593,8 @@ mod tests {
         }
         let run = uuid::Uuid::new_v4();
         for t in super::erase_targets(true, true).iter().filter(|t| t.table == "noo_ops") {
-            sqlx::query(&t.snapshot_sql()).bind("alice").bind(run).bind(t.label).execute(&db).await.unwrap();
-            sqlx::query(&t.delete_sql()).bind("alice").execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.snapshot_sql())).bind("alice").bind(run).bind(t.label).execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.delete_sql())).bind("alice").execute(&db).await.unwrap();
         }
         let left: Vec<String> = sqlx::query_scalar("SELECT COALESCE(result->>'private', 'none') FROM noo_ops ORDER BY 1")
             .fetch_all(&db)
@@ -4629,15 +4629,15 @@ mod tests {
             .after_connect(move |c, _| {
                 let s = s2.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {s}")).execute(&mut *c).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {s}"))).execute(&mut *c).await?;
                     Ok(())
                 })
             })
             .connect(&dsn)
             .await
             .expect("connect to the DSN under test");
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&db).await.unwrap();
-        sqlx::query(&format!("SET search_path TO {schema}")).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}"))).execute(&db).await.unwrap();
         for ddl in [
             "CREATE TABLE trellion_episodes (id uuid PRIMARY KEY, persona_id text NOT NULL, \
              content_summary text NOT NULL, user_id text)",
@@ -4671,8 +4671,8 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let wanted = ["trellion_episodes", "trellion_traversal_records", "noo_user_settings"];
         for t in super::erase_targets(true, true).iter().filter(|t| wanted.contains(&t.table)) {
-            sqlx::query(&t.snapshot_sql()).bind("xuser").bind(run).bind(t.label).execute(&db).await.unwrap();
-            sqlx::query(&t.delete_sql()).bind("xuser").execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.snapshot_sql())).bind("xuser").bind(run).bind(t.label).execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.delete_sql())).bind("xuser").execute(&db).await.unwrap();
         }
 
         let left = |sql: &'static str| {
@@ -4694,7 +4694,7 @@ mod tests {
 
         drop(db);
         let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
     }
 
     /// Erase user X against real tables: X's traversals AND episodes go (both
@@ -4740,15 +4740,15 @@ mod tests {
             .after_connect(move |c, _| {
                 let s = s2.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {s}")).execute(&mut *c).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {s}"))).execute(&mut *c).await?;
                     Ok(())
                 })
             })
             .connect(&dsn)
             .await
             .expect("connect to the DSN under test");
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&db).await.unwrap();
-        sqlx::query(&format!("SET search_path TO {schema}")).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}"))).execute(&db).await.unwrap();
         for ddl in [
             if owner_column {
                 "CREATE TABLE trellion_episodes (id uuid PRIMARY KEY, persona_id text NOT NULL, \
@@ -4793,8 +4793,8 @@ mod tests {
             .iter()
             .filter(|t| t.table == "trellion_episodes" || t.table == "trellion_traversal_records")
         {
-            sqlx::query(&t.snapshot_sql()).bind("xuser").bind(run).bind(t.label).execute(&db).await.unwrap();
-            sqlx::query(&t.delete_sql()).bind("xuser").execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.snapshot_sql())).bind("xuser").bind(run).bind(t.label).execute(&db).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(&*t.delete_sql())).bind("xuser").execute(&db).await.unwrap();
         }
 
         let left = |sql: &'static str| {
@@ -4816,7 +4816,7 @@ mod tests {
 
         drop(db);
         let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.unwrap();
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
     }
 
     /// Control scopes are issued on purpose, never by default: a key minted
@@ -5674,7 +5674,7 @@ mod rtbf_residue_tests {
 
     /// Run `sql` with `<u>` replaced by the account name.
     async fn run(db: &sqlx::PgPool, user: &str, sql: &str) {
-        sqlx::query(&sql.replace("<u>", user)).execute(db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(&*sql.replace("<u>", user))).execute(db).await.unwrap();
     }
 
     async fn seed(db: &sqlx::PgPool, user: &str, n_tasks: usize) {
@@ -5712,7 +5712,7 @@ mod rtbf_residue_tests {
     }
 
     async fn count(db: &sqlx::PgPool, table: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(db).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}"))).fetch_one(db).await.unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

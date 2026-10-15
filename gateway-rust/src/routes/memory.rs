@@ -498,7 +498,7 @@ pub(crate) async fn cleanup(
     let max_age_days = body.max_age_days.unwrap_or(90);
     let interval = format!("{max_age_days} days");
 
-    let rows = sqlx::query_scalar::<_, i64>(&format!(
+    let rows = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
         "WITH old_convos AS ( \
             SELECT id FROM noo_conversations \
             WHERE started_at < NOW() - INTERVAL '{interval}' \
@@ -510,7 +510,7 @@ pub(crate) async fn cleanup(
          DELETE FROM noo_conversations \
          WHERE id IN (SELECT id FROM old_convos) \
          RETURNING 1"
-    ))
+    )))
     .fetch_all(&state.db)
     .await?;
 

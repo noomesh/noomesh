@@ -236,7 +236,7 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
     };
     n += 1;
     sql.push_str(&format!(" ORDER BY ts DESC LIMIT ${n}"));
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(&*sql));
     for b in &binds { q = q.bind(b); }
     if let (Some(_), Some(s)) = (since_idx, f.since) { q = q.bind(s); }
     if let (Some(_), Some(r)) = (reader_idx, f.reader) { q = q.bind(r); }

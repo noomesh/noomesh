@@ -5280,7 +5280,7 @@ async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Option<String
             .await
             .ok()?;
         if exists {
-            let v: Option<String> = sqlx::query_scalar(&format!("SELECT version_num FROM {rel} LIMIT 1"))
+            let v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT version_num FROM {rel} LIMIT 1")))
                 .fetch_optional(db)
                 .await
                 .ok()

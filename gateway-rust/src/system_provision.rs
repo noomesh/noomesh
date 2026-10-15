@@ -165,10 +165,10 @@ async fn ensure_role(
             )
         })?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE {role} {ROLE_ATTRS} PASSWORD '{}'",
         quote_literal(&password)
-    ))
+    )))
     .execute(db)
     .await
     .map_err(|e| format!("CREATE ROLE {role} failed: {e}"))?;
@@ -190,19 +190,19 @@ async fn ensure_schema(db: &PgPool, system: &str, spec: &SystemConfig) -> Result
         // An existing schema is re-owned rather than left alone. Ownership is
         // the thing being asserted, and a schema created before the DDL role
         // existed would otherwise keep whoever made it as owner forever.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER SCHEMA {} OWNER TO {}",
             spec.schema, spec.ddl_role
-        ))
+        )))
         .execute(db)
         .await
         .map_err(|e| format!("ALTER SCHEMA {} OWNER failed: {e}", spec.schema))?;
         false
     } else {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE SCHEMA {} AUTHORIZATION {}",
             spec.schema, spec.ddl_role
-        ))
+        )))
         .execute(db)
         .await
         .map_err(|e| format!("CREATE SCHEMA {} failed: {e}", spec.schema))?;
@@ -213,10 +213,10 @@ async fn ensure_schema(db: &PgPool, system: &str, spec: &SystemConfig) -> Result
     // The runtime role gets USAGE and nothing structural. No CREATE — that is
     // the whole point of the split, and `runtime_role_cannot_create` asserts
     // it against the catalogue.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "GRANT USAGE ON SCHEMA {} TO {}",
         spec.schema, spec.role
-    ))
+    )))
     .execute(db)
     .await
     .map_err(|e| format!("GRANT USAGE ON SCHEMA {} failed: {e}", spec.schema))?;
@@ -249,7 +249,7 @@ async fn ensure_schema(db: &PgPool, system: &str, spec: &SystemConfig) -> Result
             spec.schema, spec.role
         ),
     ] {
-        sqlx::query(&stmt)
+        sqlx::query(sqlx::AssertSqlSafe(&*stmt))
             .execute(db)
             .await
             .map_err(|e| format!("{stmt} failed: {e}"))?;
@@ -299,7 +299,7 @@ async fn ensure_schema(db: &PgPool, system: &str, spec: &SystemConfig) -> Result
                 crate::role_provision::APP_ROLE
             ),
         ] {
-            sqlx::query(&stmt)
+            sqlx::query(sqlx::AssertSqlSafe(&*stmt))
                 .execute(db)
                 .await
                 .map_err(|e| format!("{stmt} failed: {e}"))?;
@@ -342,7 +342,7 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
         if installed {
             continue;
         }
-        sqlx::query(&format!("CREATE EXTENSION {ext}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION {ext}")))
             .execute(db)
             .await
             .map_err(|e| format!("CREATE EXTENSION {ext} failed: {e}"))?;
@@ -561,7 +561,7 @@ mod tests {
     }
 
     async fn cleanup(db: &PgPool, tag: &str) {
-        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS brokertest_schema_{tag} CASCADE"))
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA IF EXISTS brokertest_schema_{tag} CASCADE")))
             .execute(db)
             .await;
         for role in [
@@ -571,14 +571,14 @@ mod tests {
             // Default privileges are recorded against the granting role and
             // block DROP ROLE until removed, so a plain DROP would fail and
             // leave debris for the next run to trip over.
-            let _ = sqlx::query(&format!(
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA brokertest_schema_{tag} \
                  REVOKE ALL ON TABLES FROM PUBLIC"
-            ))
+            )))
             .execute(db)
             .await;
-            let _ = sqlx::query(&format!("DROP OWNED BY {role} CASCADE")).execute(db).await;
-            let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}")).execute(db).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP OWNED BY {role} CASCADE"))).execute(db).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}"))).execute(db).await;
         }
     }
 
@@ -676,13 +676,13 @@ mod tests {
         // this test did exactly that, and the table came out owned by `noo`,
         // which looked precisely like the default privileges being broken.
         let mut conn = db.acquire().await.expect("acquire");
-        sqlx::query(&format!("SET ROLE brokertest_ddl_{tag}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE brokertest_ddl_{tag}")))
             .execute(&mut *conn)
             .await
             .unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE brokertest_schema_{tag}.after_provision (id int primary key)"
-        ))
+        )))
         .execute(&mut *conn)
         .await
         .expect("the DDL role must be able to create in its own schema");
@@ -706,9 +706,9 @@ mod tests {
         drop(conn);
 
         for priv_name in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
-            let ok: bool = sqlx::query_scalar(&format!(
+            let ok: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT has_table_privilege($1, $2, '{priv_name}')"
-            ))
+            )))
             .bind(format!("brokertest_role_{tag}"))
             .bind(format!("brokertest_schema_{tag}.after_provision"))
             .fetch_one(&db)
@@ -737,9 +737,9 @@ mod tests {
         // set. If anything ALTERs the role, CREATEDB disappears and this
         // fails — a proxy for "the password was not rewritten either", which
         // cannot be read back directly.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE ROLE brokertest_role_{tag} LOGIN CREATEDB PASSWORD 'pre-existing'"
-        ))
+        )))
         .execute(&db)
         .await
         .unwrap();
@@ -751,7 +751,7 @@ mod tests {
         std::env::remove_var("BROKERTEST_DDLPW_existing");
         // The DDL role must exist too, or reconcile fails on the credential
         // rather than exercising the "existing role is untouched" path.
-        sqlx::query(&format!("CREATE ROLE brokertest_ddl_{tag} LOGIN PASSWORD 'pre-existing'"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE ROLE brokertest_ddl_{tag} LOGIN PASSWORD 'pre-existing'")))
             .execute(&db)
             .await
             .unwrap();

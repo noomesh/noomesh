@@ -467,14 +467,14 @@ mod tests {
         let db_name = format!("walks_routes_test_{test}");
         let dsn = std::env::var("NOO_BROKER_TEST_DSN").ok().filter(|s| !s.is_empty())?;
         let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.expect("connect");
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {db_name} (FORCE)")).execute(&admin).await;
-        sqlx::raw_sql(&format!("CREATE DATABASE {db_name}")).execute(&admin).await.expect("create scratch db");
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} (FORCE)"))).execute(&admin).await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&admin).await.expect("create scratch db");
         let (head, _) = dsn.rsplit_once('/').expect("dsn has a path");
         let scratch_dsn = format!("{head}/{db_name}");
         let build = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&scratch_dsn).await.expect("connect scratch");
         unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
         for ext in ["vector", "pg_trgm"] {
-            sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}")).execute(&build).await.expect("extension");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&build).await.expect("extension");
         }
         crate::mesh_migrate::apply(&build).await.expect("apply migrations");
         build.close().await;

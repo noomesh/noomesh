@@ -386,7 +386,9 @@ pub async fn collect_db_gauges(db: &sqlx::PgPool) -> DbGauges {
 }
 
 async fn scalar_count(db: &sqlx::PgPool, sql: &str) -> Option<i64> {
-    match sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await {
+    // Every caller passes a literal or `sql_unembedded_pages`, which is built
+    // from constants: nothing caller-supplied reaches the string.
+    match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).fetch_one(db).await {
         Ok(n) => Some(n),
         Err(e) => {
             tracing::debug!(sql, error = %e, "metrics_db_scalar_failed");

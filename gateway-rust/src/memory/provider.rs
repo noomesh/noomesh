@@ -1134,7 +1134,7 @@ impl NatsTrellion<'_> {
                     "{HELD}",
                     &crate::held_column::not_held("d", crate::held_column::present(self.db).await),
                 );
-                sqlx::query_as::<_, (String, Option<i32>, Option<String>)>(&sql)
+                sqlx::query_as::<_, (String, Option<i32>, Option<String>)>(sqlx::AssertSqlSafe(&*sql))
                     .bind(entity_id)
                     .fetch_all(self.db)
                     .await
@@ -1302,7 +1302,7 @@ impl NatsTrellion<'_> {
         sql.push_str(" ORDER BY staged_at DESC LIMIT $1");
 
         let q = sqlx::query_as::<_, (String, String, String, String, String,
-            String, Option<String>, Option<String>, i32, i32)>(&sql)
+            String, Option<String>, Option<String>, i32, i32)>(sqlx::AssertSqlSafe(&*sql))
             .bind(limit);
         let q = if let Some(r) = reason { q.bind(r) } else { q };
 
@@ -1351,7 +1351,7 @@ impl NatsTrellion<'_> {
         }
         edge_sql.push_str(" ORDER BY s.staged_at DESC LIMIT $1");
         let edge_rows = sqlx::query_as::<_, (String, String, String, String, String,
-            Option<String>, Option<f64>, Option<String>, Option<String>, String, String)>(&edge_sql)
+            Option<String>, Option<f64>, Option<String>, Option<String>, String, String)>(sqlx::AssertSqlSafe(&*edge_sql))
             .bind(limit)
             .fetch_all(self.db).await.unwrap_or_default();
         let staged_edges: Vec<Value> = edge_rows.iter().map(|r| json!({
@@ -1429,7 +1429,7 @@ impl NatsTrellion<'_> {
         };
         sql.push_str(&format!("ORDER BY created_at DESC LIMIT ${limit_idx}"));
 
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(&*sql));
         if let Some(k) = kind {
             q = q.bind(k);
         }
