@@ -3459,7 +3459,7 @@ fn addon_preflight(
                 // A lock the vendor has not published yet is not a fault of
                 // the add-on or the credential: say so in its own words.
                 let why = if crate::addons::resolve::is_not_published(&r) {
-                    r.why(addon)
+                    format!("{addon}: {}", r.why(addon))
                 } else {
                     format!("the {addon} add-on is on and {}", lowercase_first(&r.why(addon)))
                 };

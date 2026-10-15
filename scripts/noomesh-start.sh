@@ -475,7 +475,8 @@ if [ -z "$_data_root" ]; then
 fi
 
 # ── redis/grafana data re-owned to 65532 (i64) ────────────────────────
-# Both now run as `user: "65532:65532"` (docker-compose.cluster.yml); before
+# Both now run as uid 65532 (`user: nonroot` / `user: grafana`, each the
+# image's own name for 65532: docker-compose.cluster.yml); before
 # i64 they ran as the DHI -dev images' root, so on an existing install the
 # files they wrote under <data root>/redis (appendonlydir, dump.rdb) and
 # <data root>/grafana (grafana.db, plugins, png, ...) are root-owned and the

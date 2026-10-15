@@ -359,7 +359,7 @@ impl KeyReader {
 /// here that onboard does not issue is a table entry nothing uses.
 pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // dhi.io/redis:8.6-debian13-dev's image USER is 0, but the compose
-    // service runs it as `user: "65532:65532"` (i64, operator 2026-10-15:
+    // service runs it as `user: nonroot`, the image's uid 65532 (i64, operator 2026-10-15:
     // redis must not run as root). The -dev variant is kept because the
     // runtime variant has no shell and docker/redis-entrypoint.sh is sh.
     ("redis", KeyReader::ContainerUid(65532)),
@@ -396,7 +396,7 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // docker/Dockerfile.nvidia-exporter: nvidia/cuda base, no USER: root.
     ("nvidia-exporter", KeyReader::ContainerRoot),
     // dhi.io/grafana:12-debian13-dev's image USER is 0; the compose service
-    // runs it as `user: "65532:65532"` (i64). grafana-server reads
+    // runs it as `user: grafana`, the image's uid 65532 (i64). grafana-server reads
     // GF_SERVER_CERT_KEY itself, as that uid.
     ("grafana", KeyReader::ContainerUid(65532)),
     // nginx:1.27-alpine: the master process loads certificates as root.

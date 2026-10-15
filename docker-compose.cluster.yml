@@ -993,7 +993,12 @@ services:
     # install's root-written files once), the TLS key (pki.rs
     # SERVICE_KEY_READERS) and the password file below are all handed to it.
     # cluster_verify's "image family" row fails a redis running as uid 0.
-    user: "65532:65532"
+    # A NAME, not the uid: Docker 27 (compose v2.33) resolves `user:` against
+    # the image's /etc/passwd when it copies the secrets below in, and
+    # `65532:65532`, `65532` and `nonroot:nonroot` all fail onboard with
+    # `getent unable to find entry "65532:65532" in passwd database`. The
+    # image's `nonroot` is uid 65532 (tests/test_compose_named_users.py).
+    user: nonroot
     # No external port — only accessible via Docker network (noo-db)
     # The password as a FILE (0400, owned by the container's uid 65532);
     # docker/redis-entrypoint.sh reads REDIS_PASSWORD_FILE and writes its
@@ -2226,7 +2231,9 @@ services:
     # grafana.db once) and reads services/grafana/service.key (pki.rs
     # SERVICE_KEY_READERS); sso/grafana.pub is 0644. cluster_verify's
     # "image family" row fails a grafana running as uid 0.
-    user: "65532:65532"
+    # A NAME, not the uid (Docker 27 getent, see redis): the image's
+    # `grafana` is uid 65532 (tests/test_compose_named_users.py).
+    user: grafana
     secrets:
       - { source: grafana_admin_password, target: grafana_admin_password, uid: "65532", gid: "65532", mode: 0400 }
     ports:
