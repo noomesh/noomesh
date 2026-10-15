@@ -123,9 +123,9 @@ pub(crate) async fn prune_retired(db: &PgPool) -> Result<u64, sqlx::Error> {
 }
 
 fn mint() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{KEY_PREFIX}{hex}")
 }

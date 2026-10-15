@@ -186,9 +186,20 @@ async fn sha256_file(path: PathBuf) -> Result<[u8; 32], String> {
     tokio::task::spawn_blocking(move || {
         use sha2::{Digest, Sha256};
         let f = std::fs::File::open(&path).map_err(|e| format!("open: {e}"))?;
-        let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut reader = f;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut reader, &mut hasher).map_err(|e| format!("read: {e}"))?;
+        // sha2 0.11 hashers no longer implement io::Write, so this is the
+        // io::copy loop by hand (1 MiB reads, retry on EINTR as copy did).
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read: {e}")),
+            };
+            hasher.update(&buf[..n]);
+        }
         Ok::<[u8; 32], String>(hasher.finalize().into())
     })
     .await

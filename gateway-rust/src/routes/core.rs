@@ -347,9 +347,9 @@ async fn bootstrap_failures_remaining(state: &AppState, username: &str) -> bool 
 fn decoy_hash() -> &'static str {
     static DECOY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DECOY.get_or_init(|| {
-        use rand::RngCore;
+        use rand::Rng;
         let mut b = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rng().fill_bytes(&mut b);
         bcrypt::hash(hex::encode(b), bcrypt::DEFAULT_COST)
             .unwrap_or_else(|_| "$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin".into())
     })

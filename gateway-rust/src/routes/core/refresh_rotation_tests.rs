@@ -420,9 +420,9 @@ async fn a_cookie_minted_before_the_prefix_still_rotates_onto_a_prefixed_one() {
     // Exactly what the pre-1281 gateway minted: 32 CSPRNG bytes, unpadded
     // base64url, no prefix — stored as the hash of that bare string.
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use rand::RngCore as _;
+    use rand::Rng as _;
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let legacy = URL_SAFE_NO_PAD.encode(buf);
     assert_eq!(legacy.len(), 43);
     assert!(!legacy.starts_with(auth_refresh::REFRESH_TOKEN_PREFIX));

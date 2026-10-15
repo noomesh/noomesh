@@ -2013,7 +2013,7 @@ const CLUSTER_MAX_TOKEN_AGE_SECS: u64 = 300;
 /// Pure core of `verify_cluster_token`: no env / no wall-clock, so it is
 /// deterministically testable. `now` is the current unix time in seconds.
 pub(crate) fn verify_cluster_token_inner(token: &str, secret: &str, now: u64) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
@@ -3336,7 +3336,7 @@ pub(crate) fn consumer_quota_exceeded(consumer: &str, retry_after: i64) -> Respo
 /// rather than a hand-rolled approximation of it.
 #[cfg(test)]
 mod tests_support {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     pub fn mint(secret: &str, node: &str, ts: u64) -> String {
@@ -4453,7 +4453,7 @@ mod tests {
     /// Build a valid token: HMAC-SHA256 of `actor:ts`, full 64-hex width —
     /// the only width any generator emits and the only one accepted.
     fn make_cluster_token(secret: &str, actor: &str, ts: u64) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(format!("{actor}:{ts}").as_bytes());
@@ -4553,7 +4553,7 @@ mod tests {
         // truncated prefix had a one-release window and is
         // now refused even when it is the CORRECT prefix — that is the case
         // that proves the arm is gone rather than merely unexercised.
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
         mac.update(format!("gateway:{TEST_NOW}").as_bytes());
