@@ -1127,7 +1127,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         });
         let staged_sha = {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(&blob))
+            hex::encode(Sha256::digest(&blob))
         };
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(600);
