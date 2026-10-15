@@ -27,6 +27,7 @@ branch fix/grafana-bookmark-and-no-phone-home, which owns grafana.ini.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -521,14 +522,15 @@ def test_the_verify_remedy_names_the_apply_verb_and_the_verb_exists():
 
 # --- agent harnesses (docs/security/telemetry.md, "Agent harnesses") ---------
 
-CLUSTER_RS = ROOT / "gateway-rust/src/routes/cluster.rs"
-RECONCILE_GO = ROOT / "node-agent-go/internal/reconcile/reconcile.go"
+HARNESS_KINDS_JSON = ROOT / "config/harness-kinds.json"
 
 # The switches each third-party harness CLI must be launched with, with the
 # vendor's own documentation as the source (code.claude.com/docs/en/env-vars,
 # github.blog/changelog/2026-04-07-copilot-cli-now-supports-byok-and-local-models).
-# "noo" is our own binary: no phone-home code, so no switches. A new kind
-# must be added HERE, in harnessTelemetryOff, and in the doc.
+# "noo" is our own binary: no phone-home code, so no switches. "codex" has no
+# switches declared yet (the doc says so) and no runner ships for it. A new
+# kind must be added in config/harness-kinds.json (which both the gateway and
+# the node agent embed), HERE, and in the doc.
 HARNESS_SWITCHES: dict[str, dict[str, str]] = {
     "noo": {},
     "claude-code": {
@@ -544,38 +546,38 @@ HARNESS_SWITCHES: dict[str, dict[str, str]] = {
         "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
     },
     "copilot": {"COPILOT_OFFLINE": "true"},
+    "codex": {},
 }
 
 
-def _gateway_harness_kinds() -> set[str]:
-    m = re.search(r"pub const HARNESS_KINDS: &\[&str\] = &\[([^\]]*)\];", CLUSTER_RS.read_text())
-    assert m, "HARNESS_KINDS not found in gateway-rust/src/routes/cluster.rs"
-    return set(re.findall(r'"([a-z-]+)"', m.group(1)))
-
-
-def _go_harness_switches() -> dict[str, dict[str, str]]:
-    src = RECONCILE_GO.read_text()
-    block = _balanced_block(src, src.index("var harnessTelemetryOff = map[string]map[string]string"))
-    out: dict[str, dict[str, str]] = {}
-    for kind in re.findall(r'^\t"([a-z-]+)":', block, re.M):
-        body = _balanced_block(block, block.index(f'\t"{kind}":'))
-        out[kind] = dict(re.findall(r'"([A-Z0-9_]+)":\s*"([^"]*)"', body))
-    return out
+def _harness_kinds() -> list[dict]:
+    kinds = json.loads(HARNESS_KINDS_JSON.read_text())["kinds"]
+    assert kinds, "config/harness-kinds.json declares no kinds"
+    return kinds
 
 
 def test_every_harness_kind_has_its_switches_declared_once():
-    kinds = _gateway_harness_kinds()
-    assert kinds, "parsed no harness kinds"
-    go = _go_harness_switches()
-    assert set(go) == kinds, (
-        f"gateway HARNESS_KINDS {sorted(kinds)} vs node agent harnessTelemetryOff {sorted(go)}: a new "
-        "harness kind must declare its vendor telemetry switches (reconcile.go), HARNESS_SWITCHES here "
-        "and a row in docs/security/telemetry.md"
-    )
-    assert set(HARNESS_SWITCHES) == kinds, f"HARNESS_SWITCHES {sorted(HARNESS_SWITCHES)} != {sorted(kinds)}"
-    for kind in sorted(kinds):
-        assert go[kind] == HARNESS_SWITCHES[kind], f"{kind}: Go declares {go[kind]}, this guard says {HARNESS_SWITCHES[kind]}"
-    assert go["claude-code"] and go["copilot"], "a third-party harness with no switches phones home"
+    rows = _harness_kinds()
+    kinds = [r["kind"] for r in rows]
+    assert len(kinds) == len(set(kinds)), f"a harness kind is declared twice: {kinds}"
+    for r in rows:
+        assert isinstance(r.get("telemetry_off"), dict), (
+            f"harness kind {r['kind']!r} has no telemetry_off entry in config/harness-kinds.json: a new "
+            "harness kind must declare its vendor telemetry switches there (even an empty map), "
+            "HARNESS_SWITCHES here and a row in docs/security/telemetry.md"
+        )
+    declared = {r["kind"]: r["telemetry_off"] for r in rows}
+    assert set(HARNESS_SWITCHES) == set(declared), f"HARNESS_SWITCHES {sorted(HARNESS_SWITCHES)} != {sorted(declared)}"
+    for kind in sorted(declared):
+        assert declared[kind] == HARNESS_SWITCHES[kind], (
+            f"{kind}: config/harness-kinds.json declares {declared[kind]}, this guard says {HARNESS_SWITCHES[kind]}"
+        )
+    assert declared["claude-code"] and declared["copilot"], "a third-party harness with no switches phones home"
+    # A foreign kind with no switches declared must not have a runner: a
+    # runner that ships would launch a CLI nobody has switched off.
+    for r in rows:
+        if r["kind"] != "noo" and not r["telemetry_off"]:
+            assert r["runner"] is None, f"harness kind {r['kind']!r} ships a runner with no telemetry switches declared"
 
 
 def test_the_doc_has_a_row_and_a_switch_for_every_harness_kind():

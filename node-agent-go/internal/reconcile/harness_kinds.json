@@ -1,0 +1,48 @@
+{
+  "_comment": "The harness kinds a harness placement may name in NOO_HARNESS_KIND, declared ONCE. The gateway (gateway-rust/src/harness_kinds.rs) validates placements against it, the node agent embeds a byte-equal copy (node-agent-go/internal/reconcile/harness_kinds.json, held equal by TestHarnessKindsTableMatchesTheShippedFile) for wire compatibility, runner presence and vendor telemetry switches, and the noo CLI checks --kind against it. kind: the NOO_HARNESS_KIND value. wire: the API the harness speaks. wires: the node chat backend types that serve it (empty = no node backend serves it yet). runner: the executable the applier installs beside the agent (null = no runner ships yet; the node agent refuses the kind). telemetry_off: the vendor telemetry switches the runner must launch it with, merged after any placement value (docs/security/telemetry.md, Agent harnesses); every kind has an entry, empty when there is nothing to switch off or none is declared yet.",
+  "kinds": [
+    {
+      "kind": "noo",
+      "title": "noomesh's own loop (`noo-gateway harness`)",
+      "wire": "every node backend's wire",
+      "wires": ["vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"],
+      "runner": "noo-gateway",
+      "telemetry_off": {}
+    },
+    {
+      "kind": "claude-code",
+      "title": "Anthropic's Claude Code CLI",
+      "wire": "Anthropic's Messages API",
+      "wires": ["ollama"],
+      "runner": null,
+      "telemetry_off": {
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+        "DISABLE_FEEDBACK_COMMAND": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "DISABLE_UPDATES": "1",
+        "DO_NOT_TRACK": "1",
+        "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1"
+      }
+    },
+    {
+      "kind": "copilot",
+      "title": "GitHub's Copilot CLI",
+      "wire": "OpenAI's Chat Completions API",
+      "wires": ["vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"],
+      "runner": null,
+      "telemetry_off": {
+        "COPILOT_OFFLINE": "true"
+      }
+    },
+    {
+      "kind": "codex",
+      "title": "OpenAI's Codex CLI",
+      "wire": "OpenAI's Responses API",
+      "wires": [],
+      "runner": null,
+      "telemetry_off": {}
+    }
+  ]
+}

@@ -58,6 +58,7 @@ mod auth;
 mod birth_proof;
 mod bus;
 mod bus_principal;
+mod harness_kinds;
 mod harness_main;
 mod tasks;
 mod text;

@@ -996,7 +996,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // to the mesh embedder (host2 + harrier, 2026-09-09).
             "--role" => role = Some(iter.next().ok_or(Unhandled)?.clone()),
             // Which harness runs on the node: `noo` (the
-            // default), `claude-code`, `copilot`. Only meaningful with the
+            // default) or a kind from config/harness-kinds.json. Only meaningful with the
             // `harness` backend; travels in the placement's env.
             "--kind" => kind = Some(iter.next().ok_or(Unhandled)?.clone()),
             t if t.starts_with('-') => return Err(Unhandled),
@@ -1009,9 +1009,10 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_kind",
                 "--kind belongs to the `harness` backend only", None);
         }
-        if !matches!(k.as_str(), "noo" | "claude-code" | "copilot") {
+        let kinds = harness_kind_names();
+        if !kinds.iter().any(|n| n == k) {
             crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_kind",
-                "--kind must be noo, claude-code or copilot", None);
+                &format!("--kind must be one of {}", kinds.join(", ")), None);
         }
     }
     // The harness is placed like a backend but serves the
@@ -3683,6 +3684,36 @@ fn running_cell(backend: &str, model: Option<&str>, native: bool) -> String {
     match model.map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => format!("{name}:{m}"),
         None => name,
+    }
+}
+
+/// The harness kinds a `--kind` may name: config/harness-kinds.json, the
+/// table the gateway and the node agent are built with too.
+const HARNESS_KINDS_JSON: &str = include_str!("../../../config/harness-kinds.json");
+
+fn harness_kind_names() -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(HARNESS_KINDS_JSON).unwrap_or(serde_json::Value::Null);
+    v["kinds"].as_array().map(|ks| {
+        ks.iter().filter_map(|k| k["kind"].as_str().map(str::to_string)).collect()
+    }).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod harness_kind_tests {
+    use super::*;
+
+    #[test]
+    fn the_kinds_come_from_the_shipped_table() {
+        let kinds = harness_kind_names();
+        assert_eq!(kinds.first().map(String::as_str), Some("noo"), "{kinds:?}");
+        assert!(kinds.iter().any(|k| k == "codex"), "{kinds:?}");
+    }
+
+    #[test]
+    fn the_place_usage_line_names_every_kind() {
+        let (usage, _) = crate::usage::lookup(&["cluster", "place"]).expect("cluster place usage");
+        let want = format!("[--kind {}]", harness_kind_names().join("|"));
+        assert!(usage.contains(&want), "usage {usage:?} must carry {want:?}");
     }
 }
 

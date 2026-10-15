@@ -32,8 +32,9 @@ lists that traffic.
 | **Loki** | Sends anonymous usage statistics to `stats.grafana.org`. | `analytics: reporting_enabled: false` | `monitoring/loki/*.yml` |
 | **Grafana** | Usage reporting, version and plugin-update checks, the news feed, gravatar, plugin signing-key fetches, preinstalled plugins and external snapshots all reach grafana.com or Google storage. | `[analytics] reporting_enabled = false`, `check_for_updates = false`, `check_for_plugin_updates = false`, `feedback_links_enabled = false`; `[news] news_feed_enabled = false`; `[snapshots] external_enabled = false`; `[security] disable_gravatar = true`; `[plugins] plugin_admin_enabled = false`, `public_key_retrieval_disabled = true`, `preinstall_disabled = true`, `preinstall_auto_update = false`; `[cloud_migration] enabled = false`; and `[grafana_com] api_url = http://127.0.0.1:9/api` as a fallback, so any grafana.com call a setting above does not cover goes to a closed local port | `configs/grafana/grafana.ini`. `noo cluster verify --controller` FAILs its `grafana door` row if any of these is back on. |
 | **Agent harnesses: `noo`** (`noo-gateway harness`, kind `noo`) | noomesh's own binary; no phone-home code. | Nothing to switch off. | n/a |
-| **Agent harnesses: Claude Code** (kind `claude-code`) | Anthropic's CLI. Usage metrics to Anthropic and third-party logging, error reports to a third-party error tracker, `/feedback` transcripts, session-quality surveys, background auto-updates and, on a first interactive launch, automatic registration of the official plugin marketplace. Its own docs: "Claude Code sends two kinds of operational telemetry: usage metrics and error reports." | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (auto-updates, telemetry, error reporting, `/feedback`, release notes), plus `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`, `DISABLE_FEEDBACK_COMMAND=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`, `DISABLE_UPDATES=1`, `DO_NOT_TRACK=1`, plus `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1`, which the first variable does not cover. See [Agent harnesses](#agent-harnesses). | node agent `harnessTelemetryOff["claude-code"]` (`node-agent-go/internal/reconcile/reconcile.go`) |
-| **Agent harnesses: Copilot CLI** (kind `copilot`) | GitHub's CLI. Talks to GitHub's servers and sends telemetry unless offline. | `COPILOT_OFFLINE=true` ("prevent Copilot CLI from contacting GitHub's servers"; "In offline mode, all telemetry is disabled and the CLI only communicates with your configured provider"). See [Agent harnesses](#agent-harnesses). | node agent `harnessTelemetryOff["copilot"]` |
+| **Agent harnesses: Claude Code** (kind `claude-code`) | Anthropic's CLI. Usage metrics to Anthropic and third-party logging, error reports to a third-party error tracker, `/feedback` transcripts, session-quality surveys, background auto-updates and, on a first interactive launch, automatic registration of the official plugin marketplace. Its own docs: "Claude Code sends two kinds of operational telemetry: usage metrics and error reports." | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (auto-updates, telemetry, error reporting, `/feedback`, release notes), plus `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`, `DISABLE_FEEDBACK_COMMAND=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`, `DISABLE_UPDATES=1`, `DO_NOT_TRACK=1`, plus `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1`, which the first variable does not cover. See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `claude-code` in `config/harness-kinds.json` |
+| **Agent harnesses: Copilot CLI** (kind `copilot`) | GitHub's CLI. Talks to GitHub's servers and sends telemetry unless offline. | `COPILOT_OFFLINE=true` ("prevent Copilot CLI from contacting GitHub's servers"; "In offline mode, all telemetry is disabled and the CLI only communicates with your configured provider"). See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `copilot` in `config/harness-kinds.json` |
+| **Agent harnesses: Codex CLI** (kind `codex`) | OpenAI's CLI. No switches are declared for it yet, and no runner ships for it. | None declared yet. See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `codex` in `config/harness-kinds.json` (empty) |
 | **Prometheus, Alertmanager, node-exporter** | None. | — | — |
 | **NATS server** | None. It does not check for updates. | — | — |
 | **PostgreSQL** (pgvector), **Redis**, **nginx** (model cache), **stunnel** sidecars | None. | — | — |
@@ -60,23 +61,30 @@ switch and a row on this page are added with it.
 
 ### Agent harnesses
 
-A node can be placed with a harness of kind `noo`, `claude-code` or `copilot`
-(`noo cluster place <node> harness <model> --kind ...`). Which kinds run today
-and which chat backends each can use are in
+A node can be placed with a harness of kind `noo`, `claude-code`, `copilot`
+or `codex` (`noo cluster place <node> harness <model> --kind ...`). The kinds
+are declared once, in `config/harness-kinds.json`, which the gateway and the
+node agent both embed. Which kinds run today and which chat backends each can
+use are in
 [../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md). `noo` is noomesh's
-own loop. The other two are third-party CLIs with their own reporting.
+own loop. The other three are third-party CLIs with their own reporting.
 
 **Status: the foreign runners are not shipped.** The node agent accepts a
-`claude-code` or `copilot` placement, checks that the node's chat backend
-speaks the CLI's wire format, and then refuses to start it ("its runner is
-not shipped yet"). No noomesh image or installer provides
-either CLI. So today nothing launches them and nothing leaves the network
+`claude-code`, `copilot` or `codex` placement, checks that the node's chat
+backend speaks the CLI's wire format, and then refuses to start it ("its
+runner is not shipped yet"). No noomesh image or installer provides
+any of these CLIs. So today nothing launches them and nothing leaves the network
 because of them. The switches are declared now so the runner cannot ship
-without them: the node agent holds them in one table per kind
-(`harnessTelemetryOff`), and whatever launches a CLI must merge that table
+without them: each kind's `telemetry_off` entry in `config/harness-kinds.json`
+holds them, and whatever launches a CLI must merge that entry
 into the CLI's environment after any placement value, so a placement cannot
-turn reporting back on. A guard test fails if a kind accepted by the gateway
-has no entry, or if a switch below goes missing.
+turn reporting back on. A guard test fails if a kind has no entry, if a
+switch below goes missing, or if a foreign kind with no switches declared
+gets a runner.
+
+Codex CLI's switches are not declared yet: its `telemetry_off` entry is
+empty, so this page lists none for it, and the guard keeps it runner-less
+until they are.
 
 | Kind | Switch | What the vendor's documentation says |
 |---|---|---|
@@ -416,7 +424,7 @@ setting you chose. None of it is a report about you or your machines.
 | Tailnet | Tailscale coordination (`controlplane.tailscale.com`) and DERP relays; `api.tailscale.com` | Always while `tailscaled` runs on a host: this is how the node reaches the controller, so it is function, not telemetry, and is not switched off. Tailscale's client *log upload* is a different thing and is switched off (see [Host software](#host-software)). noomesh calls `api.tailscale.com` itself only when it provisions or removes a node with your Tailscale OAuth credentials. |
 | Channels | Google Chat, Google Pub/Sub, Telegram APIs; Meta's WhatsApp Cloud API (`graph.facebook.com`, outbound sends only) | Only for a channel you have configured |
 | Cloud models | Anthropic, OpenAI, Google Gemini APIs | Only when a `claude-*`, `gpt-*` or `gemini-*` model is selected and its key is configured |
-| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. Not reachable today: the foreign runners are not shipped. |
+| Agent harness on a cloud model | The model vendor (Anthropic for Claude Code, the provider you set for Copilot CLI, OpenAI for Codex CLI) | Only if a third-party harness is pointed at a cloud model instead of the node's own endpoint. The prompts go to that vendor: this is the cloud-model traffic above, not telemetry. Not reachable today: the foreign runners are not shipped. |
 | Web search | DuckDuckGo's HTML endpoint, or the provider set in `search.provider` (SearXNG, Brave, Tavily) | When an agent, a chat or a scheduled task uses `web_search` |
 | Browser tool | Whatever page it is sent to | When an agent uses the browser tool. `BROWSER_URL_ALLOWLIST` limits it. |
 | Build-time package installs | PyPI, the PyTorch wheel index, Go and crates.io registries, Debian/Alpine mirrors | Building images, not running them |

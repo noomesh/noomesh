@@ -23,7 +23,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "proposals"], "[--status <s>] [--limit <n>]", "List the enrolment proposals agents filed, with each host in full"),
         (&["cluster", "show"], "<node>", "Show one node in full: hardware, agent version, tier drift, bus principal, roles"),
         (&["cluster", "forget"], "<node> [--purge-tailscale] [-y|--yes]", "Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device"),
-        (&["cluster", "place"], "<node> <backend|harness> <model|auto> [--on cpu|gpu] [--env KEY=VALUE]... [--kind noo|claude-code|copilot] [--role chat|embed|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]", "Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env"),
+        (&["cluster", "place"], "<node> <backend|harness> <model|auto> [--on cpu|gpu] [--env KEY=VALUE]... [--kind noo|claude-code|copilot|codex] [--role chat|embed|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]", "Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env"),
         (&["cluster", "unplace"], "<node> <backend> [--role chat|embed|rerank]", "Remove a placement (one role); a container is left running, the harness is stopped"),
         (&["cluster", "fit"], "<node> [--with <backend> <model> [--on cpu|gpu] [--role <role>] [--env KEY=VALUE]...]", "Show whether placements fit a node's GPU memory and RAM, with or without one more"),
         (&["cluster", "class", "list"], "", "Show the model classes consumers may send as `model`, with candidate placement and health"),

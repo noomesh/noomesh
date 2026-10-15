@@ -34,7 +34,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		// starts: a foreign runner is not shipped, and a kind the node's
 		// chat backend cannot serve would take turns it cannot answer.
 		// Both are refusals at placement time, not failures at turn time.
-		if why := harnessKindRefusal(p, all); why != "" {
+		if why := harnessKindRefusal(p, all, r.runnerInstalled); why != "" {
 			slog.Error("reconcile.harness_kind_refused", "detail", why)
 			refusals.Record("backend_start", harnessRefusalTarget, why)
 			return
@@ -190,7 +190,11 @@ func (r *Reconciler) crashLooping(ctx context.Context) string {
 }
 
 // harnessKindRefusal is why a placement's kind cannot run here, or "".
-func harnessKindRefusal(p placement, all []placement) string {
+// A kind is refused for what is ABSENT: a wire no running chat backend
+// serves, a kind the table does not declare, a runner the table says does
+// not ship, or a runner that ships but is not installed on this node.
+// installed is the runner check (nil skips it).
+func harnessKindRefusal(p placement, all []placement, installed func(runner string) bool) string {
 	kind := strings.TrimSpace(p.Env["NOO_HARNESS_KIND"])
 	if kind == "" {
 		kind = "noo"
@@ -204,11 +208,15 @@ func harnessKindRefusal(p placement, all []placement) string {
 		}
 		break
 	}
-	if _, known := harnessKinds[kind]; !known {
-		return fmt.Sprintf("unknown harness kind %q (known: noo, claude-code, copilot)", kind)
+	k, known := harnessKindByName(kind)
+	if !known {
+		return fmt.Sprintf("unknown harness kind %q (known: %s)", kind, knownHarnessKinds())
 	}
-	if kind != "noo" {
+	if k.Runner == nil {
 		return fmt.Sprintf("harness kind %q: its runner is not shipped yet", kind)
+	}
+	if installed != nil && !installed(*k.Runner) {
+		return fmt.Sprintf("harness kind %q: its runner %q is not installed on this node", kind, *k.Runner)
 	}
 	return ""
 }

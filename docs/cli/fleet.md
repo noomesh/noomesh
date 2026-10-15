@@ -216,11 +216,13 @@ request named, else the node's default (`noo cluster set-config <node>
 smaller number; the task record shows which applied.
 
 Which harness runs on a node is part of the placement: `--kind noo`
-(the default, this gateway's own loop), `claude-code` or `copilot`. The
+(the default, this gateway's own loop), `claude-code`, `copilot` or
+`codex` (declared in `config/harness-kinds.json`). The
 node agent checks the kind against the node's chat backend before
 starting anything — Claude Code needs Anthropic's wire, which Ollama
 serves and vLLM and llama.cpp do not; Copilot CLI and our loop speak
-OpenAI's, which all three serve — and refuses a foreign kind until its
+OpenAI's, which all three serve; Codex CLI needs OpenAI's Responses API,
+which no node backend serves yet — and refuses a foreign kind until its
 runner ships, so the placement reports compatibility at once.
 
 A node can be born with its policy, so it is ready for a chat model
@@ -434,7 +436,7 @@ agent may execute.
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrolment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
