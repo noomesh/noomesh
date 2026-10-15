@@ -25,7 +25,7 @@ Two subcommands, one implementation for ci.yml and images-release.yml:
                    $GITHUB_OUTPUT (when set) and prints `<repo> <line> = <sha>`.
 
 The trellion sibling is public: no token is needed. An optional $SIBLING_TOKEN
-(or $PAI_REPOS_PAT) is used only if set, for a private fork. Run OUTSIDE any checkout (this script cds to a
+is used only if set, for a private fork. Run OUTSIDE any checkout (this script cds to a
 temp dir and clears http.extraheader): actions/checkout persists
 `AUTHORIZATION: basic <GITHUB_TOKEN>` in the workspace's .git/config, git
 sends it in place of the PAT in the URL, and GITHUB_TOKEN cannot see
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         print(line_for(a.base))
         return 0
 
-    token = "".join((os.environ.get("SIBLING_TOKEN") or os.environ.get("PAI_REPOS_PAT") or "").split())
+    token = "".join((os.environ.get("SIBLING_TOKEN") or "").split())
     if token and a.url_template == DEFAULT_URL:
         a.url_template = TOKEN_URL
     shas = resolve(a.line, a.keys or list(SIBLINGS), a.url_template, token)

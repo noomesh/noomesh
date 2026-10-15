@@ -244,7 +244,7 @@ from its own process environment (`noo-cli/src`).
 | `NOO_USER_DIRS`, `NOO_WORKSPACE_DIR` | — | non-interactive onboard: colon-separated read-only ingest directories, and the writable workspace |
 | `NOO_KIOSK_URL` | derived from this machine's tailnet DNS name | the controller URL `noo kiosk` hands a display (`--url` wins) |
 | `SOPS_AGE_KEY`, `SOPS_AGE_KEY_FILE` | — / `~/.config/sops/age/keys.txt` | the age key `sops` decrypts `secrets/env.sops` with (a key file path or the key itself) |
-| `GH_TOKEN`, `GITHUB_TOKEN`, `PAI_REPOS_PAT` | — | private-repo release download by `noo upgrade` when `gh` is not installed |
+| `GH_TOKEN`, `GITHUB_TOKEN` | — | optional GitHub token for `noo upgrade` release downloads when `gh` is not installed: the `noomesh/noomesh` releases are public, so this only lifts the anonymous rate limit or reads a private `NOO_CLI_REPO` fork |
 
 ## Node-agent and host daemon (Go)
 
