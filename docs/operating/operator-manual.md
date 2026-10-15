@@ -59,9 +59,9 @@ as much as on a worker.
 | Switch | Where | Adds |
 |---|---|---|
 | `addons.trellion: true` (default 1) | `noomesh.yaml` | the overlay `docker-compose.trellion.yml` → `noo-trellion`, the knowledge add-on (RAG, memory, graph, recall); composed as a file, no profile. Off: the container is not started and knowledge routes answer 503 with an explanation; `noo health` shows `addons.trellion=disabled` |
-| `addons.trellion_intel: true` (default 0) | `noomesh.yaml` | the overlay `docker-compose.trellion-intel.yml` → `noo-trellion-intel` (extends the trellion service; composed as a file, no profile) |
+| `addons.trellion_intel: true` (default 0) | `noomesh.yaml` | the add-on's own overlay from its signed bundle, `addons/trellion_intel/docker-compose.yml` → `noo-trellion-intel` (extends the trellion service; composed as a file, no profile). `noo addons enable` / `noo addons upgrade` put it there |
 | `addons.voice: true` (default 0) | `noomesh.yaml` | the overlay `docker-compose.voice.yml` → `noo-whisper` (STT) and `noo-piper` (TTS); composed as a file, no profile |
-| `addons.evolve: true` (default 0) | `noomesh.yaml` | the evolve overlay — `docker-compose.evolve.yml` beside the launcher (published image), or the dev overlay in a `NOO_EVOLVE_PATH` checkout — composed as a file; no profile |
+| `addons.evolve: true` (default 0) | `noomesh.yaml` | the evolve overlay — `addons/evolve/docker-compose.yml` from evolve's signed bundle, or the dev overlay in a `NOO_EVOLVE_PATH` checkout — composed as a file; no profile |
 | `noo stack start --profile <p>` | one-off | an extra compose profile on top of the base: `vllm-secondary`, `ollama`, `llamacpp`, `gpu-tier2`, `monitoring` are additive; any other name *replaces* the base profile |
 
 How the add-ons are licensed and switched on is

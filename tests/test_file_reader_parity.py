@@ -78,13 +78,11 @@ def go_manifest(src: str | None = None) -> list[str]:
 # ── the add-on readers ─────────────────────────────────
 #
 # The add-on images carry a SECOND reader beside noomesh's: trellion's
-# `trellion/live/secret_env.py` (in noo-trellion and noo-trellion-intel,
-# whose process entry is noomesh's worker_pool — so noomesh's manifest applies
-# there too) and the evolve add-on's `noo_evolve/secret_env.py` (the whole of
-# noo-evolve). Their manifests live in sibling repos CI does not check out, so
-# they are PINNED here — the names each reader reads through its helper at the
-# sha stack-v0.2.80's lock records (trellion 4d445003, evolve
-# 8e2f5d0c) — and `test_the_pinned_add_on_manifests_match_the_sibling_checkouts`
+# `trellion/live/secret_env.py` (in noo-trellion, whose process entry is
+# noomesh's worker_pool — so noomesh's manifest applies there too). Its
+# manifest lives in a sibling repo CI does not check out, so it is PINNED
+# here — the names the reader reads through its helper at the sha
+# stack-v0.2.80's lock records (trellion 4d445003) — and `test_the_pinned_add_on_manifests_match_the_sibling_checkouts`
 # re-reads them from a sibling checkout wherever one sits beside this repo.
 ADDON_MANIFESTS: dict[str, tuple[str, str, frozenset[str]]] = {
     # service → (sibling repo, manifest path in it, pinned names)
@@ -99,25 +97,19 @@ ADDON_MANIFESTS: dict[str, tuple[str, str, frozenset[str]]] = {
         "src/trellion/live/secret_env.py",
         frozenset({"NOO_GATEWAY_KEY"}),
     ),
-    "noo-evolve": (
-        "pai-evolve",
-        "src/noo_evolve/secret_env.py",
-        frozenset({"NOO_GATEWAY_KEY"}),
-    ),
+    # noo-evolve: moved with the overlay to the add-on repo (N6).
 }
 # The containers that run noomesh's Python (and so read through
-# src/noomesh/secret_env.py): the worker, its replica, and the trellion pair.
-PYTHON_CONTAINERS = ("worker", "worker-extra", "trellion", "trellion-intel")
+# src/noomesh/secret_env.py): the worker, its replica, and trellion.
+# (trellion-intel: moved with the overlay to the add-on repo (N6).)
+PYTHON_CONTAINERS = ("worker", "worker-extra", "trellion")
 
 
 def addon_reader_manifest(service: str) -> set[str]:
     """Every name a reader in `service`'s container reads through a
-    `_FILE`-aware helper: noomesh's manifest plus trellion's for the
-    trellion pair, evolve's alone for noo-evolve."""
-    if service in ("trellion", "trellion-intel"):
+    `_FILE`-aware helper: noomesh's manifest plus trellion's."""
+    if service == "trellion":
         return set(python_manifest()) | set(ADDON_MANIFESTS["trellion"][2])
-    if service == "noo-evolve":
-        return set(ADDON_MANIFESTS["noo-evolve"][2])
     raise KeyError(service)
 
 
@@ -211,8 +203,7 @@ WORKER_NOT_TIER1: dict[str, str] = {
 # Same for the add-on containers and their readers.
 ADDON_NOT_TIER1: dict[str, dict[str, str]] = {
     "trellion": dict(WORKER_NOT_TIER1),
-    "trellion-intel": dict(WORKER_NOT_TIER1),
-    "noo-evolve": {"NOO_EVOLVE_TLS_KEY": "a PATH to evolve's listener PEM, not the key"},
+    # trellion-intel, noo-evolve: moved with the overlay to the add-on repo (N6).
 }
 
 # Manifest names compose does not deliver to that container as env today.
@@ -319,15 +310,13 @@ def test_every_secret_shaped_env_reaching_the_worker_is_in_the_python_manifest()
 @pytest.mark.parametrize("service", sorted(ADDON_NOT_TIER1))
 def test_every_secret_shaped_env_reaching_an_add_on_is_read_through_a_file_aware_helper(service: str) -> None:
     """The add-on half of the direction that matters:
-    every secret-shaped name compose hands noo-trellion / noo-trellion-intel
-    / noo-evolve — plain or as `NAME_FILE` — is read in that container by a
-    `_FILE`-aware helper (noomesh's and/or the add-on's own `secret_env`),
-    so delivering it as a file cannot silently blank it."""
+    every secret-shaped name compose hands noo-trellion — plain or as
+    `NAME_FILE` — is read in that container by a `_FILE`-aware helper
+    (noomesh's and/or trellion's own `secret_env`), so delivering it as a
+    file cannot silently blank it."""
     p = full_projection()["services"]
     delivered = _secrety(delivered_to(p[service]))
-    # noo-evolve is handed two the earlier change dropped the shared secrets
-    # (its key and its TLS key path); the trellion pair still far more.
-    assert len(delivered) >= (2 if service == "noo-evolve" else 3), (service, delivered)
+    assert len(delivered) >= 3, (service, delivered)
     bad = sorted(delivered - addon_reader_manifest(service) - set(ADDON_NOT_TIER1[service]))
     assert not bad, (
         f"compose hands {service} {bad}, which no reader in that container reads through its "
@@ -549,9 +538,7 @@ def test_every_secret_in_the_host_agent_env_template_is_read_through_the_go_read
 def test_every_secret_reaching_the_containerised_agent_is_in_the_go_manifest(service: str) -> None:
     p = full_projection()["services"]
     delivered = _secrety(delivered_to(p[service]))
-    # noo-evolve is handed two the earlier change dropped the shared secrets
-    # (its key and its TLS key path); the trellion pair still far more.
-    assert len(delivered) >= (2 if service == "noo-evolve" else 3), (service, delivered)
+    assert len(delivered) >= 3, (service, delivered)
     bad = sorted(delivered - set(go_manifest()) - set(GO_NOT_TIER1))
     assert not bad, f"compose hands {service} {bad}, which secretenv.go does not read"
     missing = sorted(set(go_manifest()) - set(delivered_to(p[service])))

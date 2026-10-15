@@ -109,24 +109,10 @@ addons_guard_retired_flags
 warn_retired_env_keys
 
 
-# evolve — the pro self-tuning engines. The overlay travels with the code
-#: it lives in the noo-evolve checkout, and its
-# relative paths still resolve against THIS directory because compose
-# resolves them against the first -f file's directory.
-if addon_on evolve 0; then
-    PRO_COMPOSE="$(addons_evolve_overlay)"
-    if [ -n "$PRO_COMPOSE" ]; then
-        # `--profile pro` now comes from addon_compose_overlay_args (one home).
-        case "$PRO_COMPOSE" in
-            */noo-evolve/*|*/*-evolve/*)
-                echo "Add-on evolve: ENABLED (noo-evolve built from the checkout at $PRO_COMPOSE)" ;;
-            *)
-                echo "Add-on evolve: ENABLED (noo-evolve from the published image, via $PRO_COMPOSE)" ;;
-        esac
-    else
-        echo "addons.evolve is true but no evolve compose overlay was found — neither an evolve checkout (NOO_EVOLVE_PATH) nor docker-compose.evolve.yml beside this launcher — starting without it"
-    fi
-fi
+# Licensed add-ons (every add-on whose overlay is not in this tree): each
+# overlay arrives in the add-on's signed bundle, addons/<name>/docker-compose.yml
+# (N6), or from a development checkout. lib-addons.sh addon_overlay.
+addons_report_licensed
 
 # ── Trellion worker pool (always on) ───────────────────────────────────
 # The Python worker pool ALWAYS runs as its own noo-trellion container.
@@ -173,25 +159,6 @@ if ! addon_on trellion 1; then
     TRELLION_STOP_ON_OFF=1
     ui_warned "trellion add-on disabled — slim noo-worker serves the core surfaces"
     ui_note "knowledge features (RAG/memory/recall/graph) answer 503 by design"
-fi
-
-# ── Trellion Intelligent tier ─────────────────────────
-# Opt-in and licensed. ON → the launcher composes its OVERLAY
-# (docker-compose.trellion-intel.yml, via lib-compose.sh; an earlier change phase
-# C): a second trellion container running NOO_WORKER_SURFACES=ml-intel
-# (worker.temporal.* + the ML heartbeat action shell). OFF (default) → those
-# subjects refuse with the explained trellion-intel message (addons.rs);
-# everything open-tier is unaffected. The gateway reads the same `addons:`
-# map, so containers and behaviour cannot disagree.
-if addon_on trellion_intel 0; then
-    if ! addon_on trellion 1; then
-        ui_warned "trellion-intel enabled but trellion is disabled — starting it anyway"
-        ui_note "the intel container extends the trellion service and rides the open tier's stores; this combination is unsupported"
-    fi
-else
-    # Same leftover-container rule as trellion: `up` never touches an
-    # unselected profile, so opting out on a live stack must stop it.
-    TRELLION_INTEL_STOP_ON_OFF=1
 fi
 
 # ── Voice / STT switch ─────────────────────────────────────────────────
@@ -991,11 +958,8 @@ require_compose_v2 || exit 1
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    if [ "${TRELLION_INTEL_STOP_ON_OFF:-}" = "1" ]; then
-        # The overlay is not composed when the add-on is off, so name it
-        # here just to reach the service and stop it.
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_intel_overlay)" stop trellion-intel 2>/dev/null || true
-    fi
+    # Licensed add-ons switched off: stop the services their overlay adds.
+    addons_stop_disabled
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi

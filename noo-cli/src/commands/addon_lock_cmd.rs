@@ -10,6 +10,12 @@
 //! The seed is read from `--seed-file <path>`, or from standard input with
 //! `--seed-file -` so a workflow can pipe its secret without writing it to
 //! disk. It is never read from an environment variable and never printed.
+//!
+//! `--file <name>=<path>` (repeatable) makes `sign` write a BUNDLE lock
+//! (`noo-addon-lock/2`): each file's sha256 is listed under `files`, so the
+//! one signature covers the add-on's compose overlay and anything else it
+//! ships beside its images. `verify --files-dir <dir>` then holds the files
+//! in `<dir>` to those hashes.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -21,8 +27,8 @@ use crate::release_sig;
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-const SIGN_USAGE: &str = "usage: noo security addon-lock sign --addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--registry <root>] --seed-file <path|-> --out <path>";
-const VERIFY_USAGE: &str = "usage: noo security addon-lock verify <path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>]";
+const SIGN_USAGE: &str = "usage: noo security addon-lock sign --addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path|-> --out <path>";
+const VERIFY_USAGE: &str = "usage: noo security addon-lock verify <path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>]";
 
 fn usage_fail(g: &Globals, msg: &str, usage: &str) -> ! {
     fail(g.json, ExitCode::Usage, "usage", msg, Some(usage))
@@ -61,9 +67,26 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
         (None, None, None, None, None, None, None);
     let mut supports: Vec<String> = Vec::new();
     let mut images: BTreeMap<String, String> = BTreeMap::new();
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--file" => {
+                let v = take(g, &mut it, a, SIGN_USAGE);
+                let Some((name, path)) = split_pair(&v) else {
+                    usage_fail(g, &format!("--file {v}: expected <name>=<path>"), SIGN_USAGE)
+                };
+                if !addon_lock::valid_file_name(&name) {
+                    usage_fail(g, &format!("--file {name}: a bundle file name is one plain component ([A-Za-z0-9._-])"), SIGN_USAGE);
+                }
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => fail(g.json, ExitCode::Generic, "read_failed", &format!("{path}: {e}"), None),
+                };
+                if files.insert(name.clone(), addon_lock::sha256_ref(&bytes)).is_some() {
+                    usage_fail(g, &format!("--file {name} given twice"), SIGN_USAGE);
+                }
+            }
             "--addon" => addon = Some(take(g, &mut it, a, SIGN_USAGE)),
             "--version" => version = Some(take(g, &mut it, a, SIGN_USAGE)),
             "--source-commit" => commit = Some(take(g, &mut it, a, SIGN_USAGE)),
@@ -98,14 +121,16 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
     };
     let mut seen = std::collections::HashSet::new();
     supports.retain(|t| seen.insert(t.clone()));
+    let format = if files.is_empty() { addon_lock::FORMAT } else { addon_lock::FORMAT_V2 };
     let lock = AddonLock {
-        format: addon_lock::FORMAT.to_string(),
+        format: format.to_string(),
         addon: addon.clone(),
         version,
         source_commit: commit.to_lowercase(),
         supports_stack: supports,
         images,
         base,
+        files,
     };
     if let Some(r) = registry.as_deref() {
         if !addon_lock::valid_registry_root(r) {
@@ -134,7 +159,8 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
         }
     }
     if g.json {
-        println!("{}", serde_json::json!({"signed": out, "sig": sig_path, "addon": addon, "version": lock.version, "pubkey": pk}));
+        println!("{}", serde_json::json!({"signed": out, "sig": sig_path, "addon": addon, "version": lock.version,
+            "format": lock.format, "files": lock.files, "pubkey": pk}));
     } else {
         ui::done(&format!("signed {} {} lock to {}  {}", addon, lock.version, out.display(), ui::muted(&format!("key {}…", &pk[..12]))));
     }
@@ -142,7 +168,7 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
 }
 
 pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (mut file, mut sig_path, mut addon, mut registry, mut stack) = (None, None, None, None, None);
+    let (mut file, mut sig_path, mut addon, mut registry, mut stack, mut files_dir) = (None, None, None, None, None, None);
     let mut keys: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -152,6 +178,7 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
             "--registry" => registry = Some(take(g, &mut it, a, VERIFY_USAGE)),
             "--sig" => sig_path = Some(PathBuf::from(take(g, &mut it, a, VERIFY_USAGE))),
             "--stack" => stack = Some(take(g, &mut it, a, VERIFY_USAGE)),
+            "--files-dir" => files_dir = Some(PathBuf::from(take(g, &mut it, a, VERIFY_USAGE))),
             "--help" | "-h" => { println!("{VERIFY_USAGE}"); return Ok(0); }
             v if v.starts_with('-') => usage_fail(g, &format!("unknown flag {v}"), VERIFY_USAGE),
             v if file.is_none() => file = Some(PathBuf::from(v)),
@@ -179,6 +206,25 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
         Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_invalid", &e.to_string(),
             Some("the lock or its signature was altered, or it was signed for another add-on, key or registry")),
     };
+    if let Some(dir) = files_dir.as_deref() {
+        // Exactly the files the lock lists, read from <dir>; anything else in
+        // the directory is not the bundle's business.
+        let mut found = BTreeMap::new();
+        for name in v.lock.files.keys() {
+            if let Ok(b) = std::fs::read(dir.join(name)) {
+                found.insert(name.clone(), b);
+            }
+        }
+        if v.lock.files.is_empty() {
+            fail(g.json, ExitCode::Generic, "addon_lock_no_files",
+                &format!("Add-on lock {} is {} and lists no files to check in {}", file.display(), v.lock.format, dir.display()),
+                Some("sign with --file <name>=<path> to make a bundle"));
+        }
+        if let Err(e) = addon_lock::verify_files(&v.lock, &found) {
+            fail(g.json, ExitCode::Generic, "addon_bundle_file_mismatch", &format!("{e} (in {})", dir.display()),
+                Some("the file was altered after signing, or the bundle was packaged from other bytes"));
+        }
+    }
     if let Some(t) = stack.as_deref() {
         if !v.lock.supports(t) {
             fail(g.json, ExitCode::Generic, "addon_lock_unsupported_stack",
@@ -202,6 +248,10 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
         print!("{}", ui::kv(&rows));
         for (name, reference) in &v.lock.images {
             println!("  {name}  {}", ui::muted(reference));
+        }
+        for (name, digest) in &v.lock.files {
+            let checked = if files_dir.is_some() { " (checked)" } else { "" };
+            println!("  file {name}  {}{checked}", ui::muted(digest));
         }
     }
     Ok(0)

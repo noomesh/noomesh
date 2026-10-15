@@ -14,15 +14,13 @@ wrong containers (an earlier change's silence) or `provision` ask for a word the
 gateway refuses (PR 343's first live run).
 
 The blocks are read per file (tests/_addon_decls.py). What each container
-actually receives is read from the composed projection, because
-trellion-intel `extends` trellion and inherits across files.
+actually receives is read from the composed projection, so an overlay
+that `extends` another inherits across files.
 """
 
 from __future__ import annotations
 
-import os
 import re
-from pathlib import Path
 
 import pytest
 
@@ -208,47 +206,4 @@ def test_no_two_declarations_share_a_key_a_consumer_or_an_addon() -> None:
         )
 
 
-def _evolve_checkout() -> Path | None:
-    env = os.environ.get("NOO_EVOLVE_CHECKOUT")
-    candidates = [Path(env)] if env else []
-    candidates.append(ROOT.parent / "pai-evolve")
-    if ROOT.parent.name == ".worktrees":
-        candidates.append(ROOT.parents[2] / "pai-evolve")
-    return next((c for c in candidates if (c / "docker-compose.evolve.yml").is_file()), None)
-
-
-def test_evolves_dev_overlay_agrees_with_the_dist_declaration() -> None:
-    """The dist overlay here is the authority (evolve ships pre-built). The
-    evolve add-on's own dev overlay is what the launcher composes when a checkout
-    is present, so it must deliver the same key to the same container, and
-    if it carries its own block, that block must be identical."""
-    checkout = _evolve_checkout()
-    if checkout is None:
-        if os.environ.get("NOO_REQUIRE_SIBLINGS") == "1":
-            pytest.fail("NOO_REQUIRE_SIBLINGS=1 and no evolve add-on checkout was found")
-        pytest.skip("no evolve add-on checkout beside this one (set NOO_EVOLVE_CHECKOUT)")
-    dev = untag(load_raw(checkout / "docker-compose.evolve.yml"))
-    dist = next(d for d in decls() if d.addon == "evolve")
-    if BLOCK in dev:
-        assert dev[BLOCK] == block_of(dist.overlay), (
-            f"{checkout}/docker-compose.evolve.yml carries a {BLOCK} block that differs from "
-            f"{dist.overlay}'s; the dist copy is the authority"
-        )
-    services = dev.get("services") or {}
-    for c in dist.containers:
-        svc = next(
-            (s for s, v in services.items() if s == c or str(v.get("container_name", "")) == c),
-            None,
-        )
-        assert svc, f"the dev overlay has no {c}"
-        # Either shape: the plain `${KEY:-}` the dev overlay carried before
-        # the design, or the `NOO_GATEWAY_KEY_FILE: ${KEY:+/run/secrets/…}`
-        # pointer the dist overlay carries now — judged by the variable the
-        # pointer names (the dev overlay is read raw, not composed).
-        dev_env = env_of(services[svc])
-        ptr = dev_env.get(KEY_VAR + "_FILE", "")
-        m = re.fullmatch(r"\$\{([A-Z0-9_]+):\+/run/secrets/[a-z0-9_]+\}", ptr)
-        got = dev_env.get(KEY_VAR) or ("${" + m.group(1) + ":-}" if m else None)
-        assert got == "${" + dist.key + ":-}", (
-            f"the dev overlay's {c} does not receive {KEY_VAR} from ${{{dist.key}:-}}"
-        )
+# test_evolves_dev_overlay_agrees_with_the_dist_declaration: moved with the overlay to the add-on repo (N6)

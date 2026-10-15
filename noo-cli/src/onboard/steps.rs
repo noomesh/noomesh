@@ -2733,7 +2733,7 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // cluster-CA client certificate from every TCP client (2026-09-28).
     // Issued whether or not the add-on is on: a leaf is cheap, and an
     // add-on switched on later must not need the wizard re-run to reach
-    // the database. NOT the gateway leaf — see docker-compose.evolve.yml.
+    // the database. NOT the gateway leaf — see evolve's bundled overlay.
     "evolve",
     // A warm standby's replication identity: the
     // client certificate `scripts/bootstrap-standby.sh join` presents to
@@ -6883,7 +6883,7 @@ fn service_of_container(ctx: &Ctx, container: &str) -> String {
     container.strip_prefix(&format!("{prefix}-")).unwrap_or(container).to_string()
 }
 
-/// "svc:evolve granted: addon, temporal, … (docker-compose.evolve.yml)" — the
+/// "svc:evolve granted: addon, temporal, … (addons/evolve/docker-compose.yml)" — the
 /// line onboard prints for each key it mints.
 pub(crate) fn grant_line(t: &crate::commands::secrets::ProvisionTargets) -> String {
     let scopes = crate::commands::secrets::provisioned_scopes(&t.consumer, &[]);
@@ -7150,7 +7150,7 @@ mod service_key_tests {
         let t = crate::commands::secrets::provision_targets("evolve").unwrap();
         let line = grant_line(&t);
         assert!(line.starts_with("svc:evolve granted: addon, temporal,"), "{line}");
-        assert!(line.ends_with("(docker-compose.evolve.yml)"), "{line}");
+        assert!(line.ends_with("(addons/evolve/docker-compose.yml)"), "{line}");
         let w = grant_line(&crate::commands::secrets::provision_targets("worker").unwrap());
         assert_eq!(w, "svc:worker granted: addon, chat, embeddings (core service, docker-compose.cluster.yml)");
     }

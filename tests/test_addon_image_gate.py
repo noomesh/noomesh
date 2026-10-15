@@ -9,7 +9,13 @@ scripts/lib-dist.sh::require_addon_pins is exercised for real against a fake
 `docker` and a fake `noo` on PATH (no registry, no daemon). The fake `noo`
 answers `addons launch-pins` with the protocol the real one prints (one `pin`
 or `refuse` line per licensed add-on); the Rust side of that verb is unit-tested
-in noo-cli/src/commands/addon_pins.rs."""
+in noo-cli/src/commands/addon_pins.rs.
+
+Core ships no licensed add-on overlay (N6: each travels in its add-on's signed
+bundle, materialised at `addons/<name>/docker-compose.yml`). So the launcher
+libraries are copied into a tmp install root beside SYNTHETIC bundles for two
+made-up add-ons, `example_addon` and `other_addon` — the shell logic is what is
+under test, and it must not depend on which add-on it is."""
 
 from __future__ import annotations
 
@@ -21,8 +27,39 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
-INTEL_REF = "ghcr.io/example/trellion-intel@sha256:" + "1" * 64
-EVOLVE_REF = "ghcr.io/example/evolve@sha256:" + "2" * 64
+EXAMPLE_REF = "ghcr.io/example/example-addon@sha256:" + "1" * 64
+OTHER_REF = "ghcr.io/example/other-addon@sha256:" + "2" * 64
+
+# Synthetic add-on bundles, shaped like a real one: a service whose `image:`
+# reads its NOO_ADDON_IMAGE_<NAME> pin with an unpinned sentinel, and (in
+# example_addon) a one-shot that runs the same image.
+EXAMPLE_OVERLAY = """services:
+  example-addon:
+    image: ${NOO_ADDON_IMAGE_EXAMPLE_ADDON:-noo-addon-unpinned.invalid/example-addon:run-noo-addons-upgrade}
+    restart: unless-stopped
+  example-addon-routes:
+    image: ${NOO_ADDON_IMAGE_EXAMPLE_ADDON:-noo-addon-unpinned.invalid/example-addon:run-noo-addons-upgrade}
+    restart: "no"
+"""
+OTHER_OVERLAY = """services:
+  other-addon:
+    image: ${NOO_ADDON_IMAGE_OTHER_ADDON:-noo-addon-unpinned.invalid/other-addon:run-noo-addons-upgrade}
+"""
+
+
+def _root(tmp_path: Path) -> Path:
+    """A tmp install root: the two launcher libraries under scripts/ (they
+    locate the install root from their own path) and the synthetic bundles
+    under addons/<name>/docker-compose.yml, where the CLI materialises them."""
+    root = tmp_path / "root"
+    if not root.exists():
+        (root / "scripts").mkdir(parents=True)
+        for lib in ("lib-addons.sh", "lib-dist.sh"):
+            shutil.copy(REPO / "scripts" / lib, root / "scripts" / lib)
+        for name, text in (("example_addon", EXAMPLE_OVERLAY), ("other_addon", OTHER_OVERLAY)):
+            (root / "addons" / name).mkdir(parents=True)
+            (root / "addons" / name / "docker-compose.yml").write_text(text)
+    return root
 
 FAKE_DOCKER = """#!/bin/sh
 # FAKE_LOCAL: space-separated refs present locally.
@@ -54,25 +91,26 @@ def _bin(tmp_path: Path, name: str, text: str) -> None:
 def _run(tmp_path: Path, body: str, **env: str) -> subprocess.CompletedProcess:
     _bin(tmp_path, "docker", FAKE_DOCKER)
     _bin(tmp_path, "noo", FAKE_NOO)
+    root = _root(tmp_path)
     script = f"""
 set -u
 cd {tmp_path}
-. {REPO}/scripts/lib-addons.sh
-. {REPO}/scripts/lib-dist.sh
+. {root}/scripts/lib-addons.sh
+. {root}/scripts/lib-dist.sh
 {body}
 """
     full_env = {
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "NOO_ADDON_MAP_OVERRIDE": "1",
-        "NOO_ADDON_MAP": env.pop("MAP", "trellion_intel=1\nevolve=1\nvoice=0\n"),
+        "NOO_ADDON_MAP": env.pop("MAP", "example_addon=1\nother_addon=1\nvoice=0\n"),
         "DIST_MODE": "1",
         "DIST_TAG": "v0.6.0",
         "NOO_IMAGE_PREFIX": "ghcr.io/noomesh",
         "NOO_IMAGE_TAG": "v0.6.0",
-        "FAKE_LOCAL": f"{INTEL_REF} {EVOLVE_REF}",
-        "FAKE_PINS": (f"pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {INTEL_REF}\\n"
-                      f"pin evolve NOO_ADDON_IMAGE_EVOLVE {EVOLVE_REF}\\n"),
+        "FAKE_LOCAL": f"{EXAMPLE_REF} {OTHER_REF}",
+        "FAKE_PINS": (f"pin example_addon NOO_ADDON_IMAGE_EXAMPLE_ADDON {EXAMPLE_REF}\\n"
+                      f"pin other_addon NOO_ADDON_IMAGE_OTHER_ADDON {OTHER_REF}\\n"),
         "FAKE_LOG": str(tmp_path / "docker.log"),
         "FAKE_NOO_LOG": str(tmp_path / "noo.log"),
     }
@@ -90,56 +128,56 @@ SHOW = 'require_addon_pins; rc=$?; env | grep "^NOO_ADDON_IMAGE_" | sort; exit $
 def test_verified_local_pins_are_exported_for_the_overlays(tmp_path):
     r = _run(tmp_path, SHOW)
     assert r.returncode == 0, r.stderr
-    assert _exports(r) == {"NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "NOO_ADDON_IMAGE_EVOLVE": EVOLVE_REF}
+    assert _exports(r) == {"NOO_ADDON_IMAGE_EXAMPLE_ADDON": EXAMPLE_REF, "NOO_ADDON_IMAGE_OTHER_ADDON": OTHER_REF}
     asked = (tmp_path / "noo.log").read_text().split()
     # The pins are read from the launcher's install root, whatever the cwd is.
-    assert asked[:4] == ["addons", "launch-pins", "--root", str(REPO)], asked
+    assert asked[:4] == ["addons", "launch-pins", "--root", str(tmp_path / "root")], asked
     assert asked[4] == "v0.6.0", asked
-    assert set(asked[5:]) == {"trellion", "trellion_intel", "evolve"}, "only composed add-ons are asked about"
+    assert set(asked[5:]) == {"trellion", "example_addon", "other_addon"}, "only composed add-ons are asked about"
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull or log in"
 
 
 def test_addons_off_make_no_call_at_all(tmp_path):
-    r = _run(tmp_path, SHOW, MAP="trellion_intel=0\nevolve=0\n")
+    r = _run(tmp_path, SHOW, MAP="example_addon=0\nother_addon=0\n")
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / "noo.log").exists()
     # An unlicensed add-on that is on is the CLI's to ignore: no line, no pin.
-    r = _run(tmp_path, SHOW, MAP="trellion_intel=0\nvoice=1\n", FAKE_PINS="")
+    r = _run(tmp_path, SHOW, MAP="example_addon=0\nvoice=1\n", FAKE_PINS="")
     assert r.returncode == 0, r.stderr
     assert _exports(r) == {}
 
 
 def test_not_dist_mode_is_a_noop(tmp_path):
-    r = _run(tmp_path, SHOW, DIST_MODE="0", FAKE_PINS="refuse evolve nope\\n")
+    r = _run(tmp_path, SHOW, DIST_MODE="0", FAKE_PINS="refuse other_addon nope\\n")
     assert r.returncode == 0, r.stderr
 
 
 def test_a_refused_pin_names_the_addon_the_reason_and_the_remedy(tmp_path):
-    r = _run(tmp_path, SHOW, MAP="evolve=1\n",
-             FAKE_PINS="refuse evolve evolve's cached lock no longer verifies: Add-on lock signature invalid\\n")
+    r = _run(tmp_path, SHOW, MAP="other_addon=1\n",
+             FAKE_PINS="refuse other_addon other_addon's cached lock no longer verifies: Add-on lock signature invalid\\n")
     assert r.returncode == 1
-    assert "REFUSING: the evolve add-on is on and has no verified pin for v0.6.0" in r.stderr
+    assert "REFUSING: the other_addon add-on is on and has no verified pin for v0.6.0" in r.stderr
     assert "cached lock no longer verifies" in r.stderr
-    assert "noo addons upgrade evolve" in r.stderr
+    assert "noo addons upgrade other_addon" in r.stderr
     assert _exports(r) == {}
 
 
 def test_a_pinned_image_missing_locally_refuses_and_is_never_pulled(tmp_path):
-    r = _run(tmp_path, SHOW, FAKE_LOCAL=INTEL_REF)
+    r = _run(tmp_path, SHOW, FAKE_LOCAL=EXAMPLE_REF)
     assert r.returncode == 1
-    assert "REFUSING: the evolve add-on is on, and its pinned image is not on this host" in r.stderr
-    assert EVOLVE_REF in r.stderr and "noo addons upgrade evolve" in r.stderr
+    assert "REFUSING: the other_addon add-on is on, and its pinned image is not on this host" in r.stderr
+    assert OTHER_REF in r.stderr and "noo addons upgrade other_addon" in r.stderr
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull an add-on"
 
 
 def test_an_env_file_value_cannot_name_an_addon_image(tmp_path):
     # An operator export (or an .env line a loader exported) is dropped: only
     # a pin that verified may set the variable.
-    r = _run(tmp_path, SHOW, MAP="evolve=0\n", NOO_ADDON_IMAGE_EVOLVE="mine/evolve:latest")
+    r = _run(tmp_path, SHOW, MAP="other_addon=0\n", NOO_ADDON_IMAGE_OTHER_ADDON="mine/other-addon:latest")
     assert r.returncode == 0, r.stderr
     assert _exports(r) == {}
-    r = _run(tmp_path, SHOW, MAP="evolve=1\n", NOO_ADDON_IMAGE_EVOLVE="mine/evolve:latest",
-             FAKE_PINS="refuse evolve evolve has no pin in addons.lock\\n")
+    r = _run(tmp_path, SHOW, MAP="other_addon=1\n", NOO_ADDON_IMAGE_OTHER_ADDON="mine/other-addon:latest",
+             FAKE_PINS="refuse other_addon other_addon has no pin in addons.lock\\n")
     assert r.returncode == 1 and _exports(r) == {}
 
 
@@ -150,16 +188,21 @@ def test_a_failing_reader_refuses(tmp_path):
 
 
 def test_a_reader_line_that_is_not_an_addon_variable_is_refused(tmp_path):
-    r = _run(tmp_path, SHOW, MAP="evolve=1\n", FAKE_PINS=f"pin evolve PATH {EVOLVE_REF}\\n")
+    r = _run(tmp_path, SHOW, MAP="other_addon=1\n", FAKE_PINS=f"pin other_addon PATH {OTHER_REF}\\n")
     assert r.returncode == 1 and "not an add-on image variable" in r.stderr
 
 
-def test_addon_services_are_derived_from_the_overlays():
-    files = "-f docker-compose.cluster.yml -f docker-compose.trellion-intel.yml -f docker-compose.evolve.yml -f docker-compose.voice.yml"
+def test_addon_services_are_derived_from_the_overlays(tmp_path):
+    # Core's own files (the base and its overlays) contribute no add-on
+    # service; the bundles contribute every service that reads a pin.
+    root = _root(tmp_path)
+    files = (f"-f docker-compose.cluster.yml -f docker-compose.trellion.yml "
+             f"-f {root}/addons/example_addon/docker-compose.yml "
+             f"-f {root}/addons/other_addon/docker-compose.yml -f docker-compose.voice.yml")
     r = subprocess.run(["bash", "-c", f"cd {REPO}; . scripts/lib-dist.sh; addon_services {files}"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["noo-evolve", "noo-evolve-routes", "trellion-intel"]
+    assert r.stdout.split() == ["example-addon", "example-addon-routes", "other-addon"]
 
 
 # A compose whose `config` needs `--profile standalone` (else it rejects the
@@ -172,9 +215,9 @@ case "$*" in *"--profile standalone"*) ;; *)
   echo 'service "ollama-embed-cpu" depends on undefined service "ollama-embed": invalid compose project' >&2; exit 15 ;;
 esac
 [ -n "$FAKE_RENDER_FAIL" ] && { echo "boom: required variable X is missing" >&2; exit 1; }
-IMG="${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:run-noo-addons-upgrade}"
+IMG="${NOO_ADDON_IMAGE_OTHER_ADDON:-noo-addon-unpinned.invalid/other-addon:run-noo-addons-upgrade}"
 case "$*" in
-  *"--format json"*) printf '{"services":{"gateway":{"image":"ghcr.io/noomesh/gateway:v0.6.0"},"trellion-intel":{"image":"%s"}}}' "$IMG" ;;
+  *"--format json"*) printf '{"services":{"gateway":{"image":"ghcr.io/noomesh/gateway:v0.6.0"},"other-addon":{"image":"%s"}}}' "$IMG" ;;
   *"--images"*) echo ghcr.io/noomesh/gateway:v0.6.0; echo "$IMG" ;;
 esac
 exit 0
@@ -185,16 +228,17 @@ def test_rendered_addon_refs_must_be_their_pins(tmp_path):
     # A fake compose that renders the add-on service's image from the env.
     fake = FAKE_COMPOSE_RENDER
     _bin(tmp_path, "docker", fake)
-    body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}\"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml --profile standalone"
+    overlay = _root(tmp_path) / "addons/other_addon/docker-compose.yml"
+    body = f"cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=(\"NOO_ADDON_IMAGE_OTHER_ADDON={OTHER_REF}\"); dist_assert_addon_refs -f {overlay} --profile standalone"
     env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1"}
-    ok = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF},
+    ok = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_OTHER_ADDON": OTHER_REF},
                         capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr
     bad = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
     assert bad.returncode == 1
-    assert "trellion-intel would run noo-addon-unpinned.invalid/trellion-intel" in bad.stderr
+    assert "other-addon would run noo-addon-unpinned.invalid/other-addon" in bad.stderr
     # compose cannot render the ref: a refusal, never a skip.
-    broken = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF, "FAKE_RENDER_FAIL": "1"},
+    broken = subprocess.run(["bash", "-c", body], env={**env, "NOO_ADDON_IMAGE_OTHER_ADDON": OTHER_REF, "FAKE_RENDER_FAIL": "1"},
                             capture_output=True, text=True)
     assert broken.returncode == 1 and "could not render" in broken.stderr, broken.stderr
     # ...and the refusal carries compose's own error, indented, with the exit
@@ -231,29 +275,30 @@ exit 1
 
 
 def test_a_lock_image_name_the_overlay_does_not_read_is_refused(tmp_path):
-    # The lock calls the image `noo-evolve`, so the pin is exported as
-    # NOO_ADDON_IMAGE_NOO_EVOLVE; the overlay reads NOO_ADDON_IMAGE_EVOLVE and
-    # would render its unpinned sentinel. Refused, naming the variable.
-    r = _run(tmp_path, SHOW, MAP="trellion=0\nevolve=1\n",
-             FAKE_PINS=f"pin evolve NOO_ADDON_IMAGE_NOO_EVOLVE {EVOLVE_REF}\\n")
+    # The lock calls the image `noo-other-addon`, so the pin is exported as
+    # NOO_ADDON_IMAGE_NOO_OTHER_ADDON; the overlay reads
+    # NOO_ADDON_IMAGE_OTHER_ADDON and would render its unpinned sentinel.
+    # Refused, naming the variable.
+    r = _run(tmp_path, SHOW, MAP="trellion=0\nother_addon=1\n",
+             FAKE_PINS=f"pin other_addon NOO_ADDON_IMAGE_NOO_OTHER_ADDON {OTHER_REF}\\n")
     assert r.returncode == 1, r.stderr
-    assert "runs ${NOO_ADDON_IMAGE_EVOLVE}, and no verified pin supplies it" in r.stderr
+    assert "runs ${NOO_ADDON_IMAGE_OTHER_ADDON}, and no verified pin supplies it" in r.stderr
 
 
 def test_core_only_gates_exactly_what_is_composed(tmp_path):
-    # --core-only defers evolve and trellion_intel: their overlays are not
+    # --core-only defers every licensed add-on: their overlays are not
     # composed, so a declared-but-unpinned add-on does not refuse the start.
-    r = _run(tmp_path, SHOW, CORE_ONLY="true", FAKE_PINS="refuse evolve nope\\n")
+    r = _run(tmp_path, SHOW, CORE_ONLY="true", FAKE_PINS="refuse other_addon nope\\n")
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / "noo.log").exists()
 
 
 def test_a_dev_start_runs_the_dev_build_names(tmp_path):
     r = _run(tmp_path, SHOW, DIST_MODE="0", NOO_IMAGE_PREFIX="noomesh", NOO_IMAGE_TAG="latest",
-             NOO_ADDON_IMAGE_EVOLVE="mine/evolve:x")
+             NOO_ADDON_IMAGE_OTHER_ADDON="mine/other-addon:x")
     assert r.returncode == 0, r.stderr
-    assert _exports(r) == {"NOO_ADDON_IMAGE_EVOLVE": "noomesh/evolve:latest",
-                           "NOO_ADDON_IMAGE_TRELLION_INTEL": "noomesh/trellion-intel:latest"}
+    assert _exports(r) == {"NOO_ADDON_IMAGE_OTHER_ADDON": "noomesh/other-addon:latest",
+                           "NOO_ADDON_IMAGE_EXAMPLE_ADDON": "noomesh/example-addon:latest"}
     assert not (tmp_path / "noo.log").exists(), "a dev start verifies nothing and asks the CLI nothing"
 
 
@@ -273,10 +318,7 @@ def test_restart_gates_and_asserts_before_it_recreates():
     assert files < asserted < start.index('if [ "$PULL" = true ]; then')
 
 
-def test_evolve_routes_runs_the_same_image_as_evolve():
-    import yaml
-    svcs = yaml.safe_load((REPO / "docker-compose.evolve.yml").read_text())["services"]
-    assert svcs["noo-evolve-routes"]["image"] == svcs["noo-evolve"]["image"]
+# test_evolve_routes_runs_the_same_image_as_evolve: moved with the overlay to the add-on repo (N6)
 
 
 def test_both_launchers_call_the_gate_before_any_pull_and_the_old_paths_are_gone():
@@ -301,10 +343,10 @@ def test_the_retired_addon_image_keys_are_warned_about():
 
 def test_the_gate_needs_the_profile_flags_and_reads_the_services_own_image(tmp_path):
     _bin(tmp_path, "docker", FAKE_COMPOSE_RENDER)
-    base = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}"); '
+    base = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_OTHER_ADDON={OTHER_REF}"); '
     env = {"PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1",
-           "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF}
-    f = "-f docker-compose.trellion-intel.yml"
+           "NOO_ADDON_IMAGE_OTHER_ADDON": OTHER_REF}
+    f = f"-f {_root(tmp_path) / 'addons/other_addon/docker-compose.yml'}"
     # Without the launcher's profile flags compose rejects the project: refusal
     # carrying compose's own message.
     r = subprocess.run(["bash", "-c", base + f"dist_assert_addon_refs {f}"], env=env, capture_output=True, text=True)
@@ -323,8 +365,9 @@ def test_without_python3_the_pin_is_found_among_the_images_lines(tmp_path):
         src = shutil.which(t)
         if src:
             (nopy / t).symlink_to(src)
-    body = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_TRELLION_INTEL={INTEL_REF}"); dist_assert_addon_refs -f docker-compose.trellion-intel.yml --profile standalone'
+    overlay = _root(tmp_path) / "addons/other_addon/docker-compose.yml"
+    body = f'cd {REPO}; . scripts/lib-dist.sh; _ADDON_PINS=("NOO_ADDON_IMAGE_OTHER_ADDON={OTHER_REF}"); dist_assert_addon_refs -f {overlay} --profile standalone'
     env = {"PATH": f"{tmp_path / 'bin'}:{nopy}", "DIST_TAG": "v0.6.0", "DIST_MODE": "1",
-           "NOO_ADDON_IMAGE_TRELLION_INTEL": INTEL_REF}
+           "NOO_ADDON_IMAGE_OTHER_ADDON": OTHER_REF}
     r = subprocess.run([str(nopy / "bash"), "-c", body], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

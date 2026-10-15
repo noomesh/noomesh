@@ -72,9 +72,10 @@ OWNERS = _owners()
 REPLICAS = {"worker-extra": "worker"}
 # Services whose environment is a LIST rather than a mapping still merge the
 # same anchor; `_env` normalises both. Only the services that inherit the
-# shared block — trellion merges the anchor, trellion-intel EXTENDS trellion
-# — are checked for inheritance.
-ANCHOR_MERGERS = ("trellion", "trellion-intel")
+# shared block — trellion merges the anchor — are checked for inheritance.
+# (trellion-intel, which EXTENDS trellion: moved with the overlay to the
+# add-on repo (N6).)
+ANCHOR_MERGERS = ("trellion",)
 
 
 @pytest.fixture(scope="module")

@@ -37,7 +37,14 @@ NOT_THIS_INSTALL = {"test-rotation-rehearsal.sh"}
 # Helpers that run compose with the CALLER's $COMPOSE_FILES, never their
 # own: re-deriving the list here would be the second home this file forbids.
 # lib-bind-sources.sh renders the exact config the launcher's next `up` uses.
-CALLERS_LIST = {"lib-bind-sources.sh"}
+# lib-addons.sh (addon_own_services / addons_stop_disabled) reaches a
+# switched-off licensed add-on's containers by adding ITS overlay to the
+# caller's $COMPOSE_FILES: it is a library lib-compose.sh itself sources (the
+# reverse source would be circular), and every caller of those helpers is
+# held to building that list from lib-compose first by
+# test_callers_of_the_addon_stop_helpers_build_the_list_first below.
+CALLERS_LIST = {"lib-bind-sources.sh", "lib-addons.sh"}
+ADDON_STOP_HELPERS = ("addons_stop_disabled", "addon_own_services")
 
 # A `docker compose … -f <literal docker-compose.*.yml>` on a live line.
 HAND_PICKED = re.compile(r"docker compose\b[^\n]*\s-f\s+\"?\$?\{?[^ \"$]*docker-compose\.")
@@ -94,6 +101,27 @@ def test_every_compose_consumer_sources_the_one_home(script: str) -> None:
     )
 
 
+def test_callers_of_the_addon_stop_helpers_build_the_list_first() -> None:
+    """lib-addons.sh's exemption above holds only while each caller of its
+    compose-running helpers has set COMPOSE_FILES from lib-compose before the
+    call: an empty or hand-made list would stop the wrong project's services."""
+    callers = 0
+    for p in sorted(SCRIPTS.glob("*.sh")):
+        if p.name == "lib-addons.sh":
+            continue
+        lines = list(_live_lines(p))
+        calls = [n for n, l in lines if re.search(rf"(?:^|[\s;&(]){'|'.join(ADDON_STOP_HELPERS)}\b", l)]
+        if not calls:
+            continue
+        callers += 1
+        built = [n for n, l in lines if 'COMPOSE_FILES="$(compose_file_args' in l]
+        assert built and min(built) < min(calls), (
+            f"{p.name} calls {ADDON_STOP_HELPERS} (line {min(calls)}) before setting "
+            f"COMPOSE_FILES from {HOME}::compose_file_args"
+        )
+    assert callers, "no launcher calls the add-on stop helpers — the scan broke"
+
+
 def test_the_cli_takes_its_list_from_the_same_home() -> None:
     """The onboard wizard is a sanctioned launcher; its compose calls must
     compose the same files as `noo stack start` or it recreates a different
@@ -113,12 +141,15 @@ def test_the_helper_ships_with_a_standalone_install() -> None:
 
 # ── behaviour ──────────────────────────────────────────────────────────────
 
+# A licensed add-on's overlay is a bundle the CLI materialises under
+# addons/<name>/ (N6); `example_addon` is a synthetic one.
+ADDON_BUNDLE = "addons/example_addon/docker-compose.yml"
 ALL_FILES = (
     "docker-compose.cluster.yml",
     "docker-compose.gpu-embed.yml",
     "docker-compose.override.yml",
     "docker-compose.trellion.yml",
-    "docker-compose.evolve.yml",
+    ADDON_BUNDLE,
     "docker-compose.dist.yml",
 )
 
@@ -130,10 +161,11 @@ def install(tmp_path: Path):
     for lib in ("lib-compose.sh", "lib-addons.sh", "lib-dist.sh"):
         shutil.copy(SCRIPTS / lib, tmp_path / "scripts" / lib)
 
-    def make(*, files=ALL_FILES, evolve: bool | None = None, trellion: bool | None = None, gpu: str = "0", dist: bool = False) -> list[str]:
+    def make(*, files=ALL_FILES, example_addon: bool | None = None, trellion: bool | None = None, gpu: str = "0", dist: bool = False) -> list[str]:
         for f in files:
+            (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
             (tmp_path / f).write_text("services: {}\n")
-        decl = {k: v for k, v in (("evolve", evolve), ("trellion", trellion)) if v is not None}
+        decl = {k: v for k, v in (("example_addon", example_addon), ("trellion", trellion)) if v is not None}
         if decl:
             (tmp_path / "noomesh.yaml").write_text(
                 "addons:\n" + "".join(f"  {k}: {'true' if v else 'false'}\n" for k, v in decl.items())
@@ -145,7 +177,11 @@ def install(tmp_path: Path):
             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
         )
         assert out.returncode == 0, out.stderr
-        names = [Path(l).name for l in out.stdout.splitlines() if l.strip()]
+        root = tmp_path.resolve()
+        names = [
+            (Path(l).resolve().relative_to(root) if Path(l).is_absolute() else Path(l)).as_posix().removeprefix("./")
+            for l in out.stdout.splitlines() if l.strip()
+        ]
         assert names, "the helper printed nothing — a silent helper composes nothing"
         return names
 
@@ -156,7 +192,7 @@ def test_merge_order_is_base_gpu_override_addons_dist(install) -> None:
     """Load-bearing: later files win. dist LAST so pinned image refs beat
     the dev overlay's build: blocks; add-on overlays after the override so a
     site override cannot silently redefine an add-on's service."""
-    assert install(evolve=True, gpu="1", dist=True) == list(ALL_FILES)
+    assert install(example_addon=True, gpu="1", dist=True) == list(ALL_FILES)
 
 
 def test_gpu_overlay_follows_the_probe_not_the_file(install) -> None:
@@ -169,9 +205,9 @@ def test_gpu_overlay_follows_the_probe_not_the_file(install) -> None:
 def test_an_addon_overlay_follows_the_declaration_not_the_file(install) -> None:
     """The file is shipped with every install; PRESENCE of the file is not
     the switch (yet — phase B makes it so). The declaration is."""
-    assert "docker-compose.evolve.yml" not in install(evolve=None), "undeclared: evolve is opt-in"
-    assert "docker-compose.evolve.yml" not in install(evolve=False)
-    assert "docker-compose.evolve.yml" in install(evolve=True)
+    assert ADDON_BUNDLE not in install(example_addon=None), "undeclared: a licensed add-on is opt-in"
+    assert ADDON_BUNDLE not in install(example_addon=False)
+    assert ADDON_BUNDLE in install(example_addon=True)
 
 
 def test_an_opt_out_addon_is_composed_unless_declared_off(install) -> None:

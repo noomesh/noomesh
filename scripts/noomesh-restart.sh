@@ -83,8 +83,8 @@ service_profile() {
         tei-gpu)    echo "gpu-tier2" ;;
         # whisper / piper: the voice OVERLAY — no profile.
         # trellion: the trellion OVERLAY — no profile.
-        # trellion-intel: an OVERLAY — visible whenever
-        # the add-on is on, no profile to map.
+        # licensed add-ons: OVERLAYS from their signed bundles — visible
+        # whenever the add-on is on, no profile to map.
         *)          echo "" ;;
     esac
 }
@@ -150,8 +150,8 @@ if [ -z "$PROFILE" ]; then
     fi
     PROFILE="${NOO_DEFAULT_PROFILE:-$DEFAULT_PROFILE}"
 fi
-# evolve is an overlay, not a profile — restart must carry it or a rotation
-# recreates the stack without noo-evolve and leaves the old one running.
+# A licensed add-on is an overlay, not a profile — restart must carry it or a
+# rotation recreates the stack without it and leaves the old one running.
 # The file list has ONE home. Evaluated here, after
 # dist mode and the add-on map are both known.
 . "$_LIBDIR/lib-compose.sh"

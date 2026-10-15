@@ -60,8 +60,12 @@ def decls() -> list[Decl]:
         )
     # A parse miss (a renamed block, a list moved) must not make every guard
     # that iterates this pass vacuously.
-    assert len(out) >= 3, (
-        f"found only {len(out)} {BLOCK} block(s) across {ADDON_OVERLAYS} — trellion, "
-        "trellion-intel and evolve each declare one; the read broke"
+    # The licensed add-ons' overlays (trellion-intel, evolve) moved with their
+    # blocks to the add-on repos (N6); of core's overlays only trellion
+    # declares one (voice holds no gateway key).
+    addons = {d.addon for d in out}
+    assert addons >= {"trellion"}, (
+        f"found {sorted(addons)} {BLOCK} block(s) across {ADDON_OVERLAYS} — trellion "
+        "declares one; the read broke"
     )
     return out

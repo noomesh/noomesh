@@ -8,8 +8,10 @@
 //!   add-on's lock for the running stack tag, verifies it against the
 //!   entitlement, pulls by digest and rewrites its pin. `--check` only says
 //!   what is installed and what is offered.
-//! - `verify` re-verifies the cached locks offline, checks each pinned image
-//!   is local, and compares running containers with the pins.
+//! - `verify` re-verifies the cached locks offline, holds each add-on's
+//!   materialised bundle files (`<root>/addons/<name>/`) to its signed lock,
+//!   checks each pinned image is local, and compares running containers with
+//!   the pins.
 //! - `launch-pins <tag> [<name>…]` (hidden) is the launcher's reader: one
 //!   `pin <addon> <VAR> <ref>` or `refuse <addon> <why>` line per add-on.
 //!
@@ -183,8 +185,23 @@ pub(crate) fn verify_one(
             return v;
         }
     };
-    let pin = match resolve::offline_check(root, addon, tag, &anchor) {
-        Ok(p) => p,
+    let pin = match resolve::offline_check_bundle(root, addon, tag, &anchor) {
+        Ok((p, how)) => {
+            match how {
+                resolve::Overlay::Bundled => {}
+                resolve::Overlay::Legacy(Some(path)) => v.notes.push(format!(
+                    "its lock predates overlay bundles; running the deprecated {} (re-sign the add-on for this stack)",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("overlay")
+                )),
+                resolve::Overlay::Legacy(None) => {
+                    // Nothing can be composed: the images are beside the point.
+                    v.problem = Some(legacy_refusal(tag));
+                    v.pin = Some(p);
+                    return v;
+                }
+            }
+            p
+        }
         Err(e) => {
             v.problem = Some(e);
             return v;
@@ -276,6 +293,14 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(if bad == 0 { 0 } else { 1 })
 }
 
+/// Why an add-on whose lock predates bundles cannot be composed.
+fn legacy_refusal(tag: &str) -> String {
+    format!(
+        "its signed lock for {tag} predates overlay bundles, so no compose overlay came with it, and this install has \
+         no earlier overlay to fall back on (the add-on's release must re-sign a bundle for {tag})"
+    )
+}
+
 /// The launcher's protocol lines for `names` against `tag`.
 pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dyn Fn(&str) -> Result<crate::addon_lock::TrustAnchor, resolve::Refusal>) -> Vec<String> {
     let mut out = Vec::new();
@@ -286,9 +311,10 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
             continue;
         }
         let addon = r.key;
-        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check(root, addon, tag, &a));
+        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_bundle(root, addon, tag, &a));
         match res {
-            Ok(pin) => {
+            Ok((_, resolve::Overlay::Legacy(None))) => out.push(format!("refuse {addon} {}", legacy_refusal(tag))),
+            Ok((pin, _)) => {
                 for (image, reference) in &pin.images {
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
@@ -434,7 +460,7 @@ pub(crate) fn pin_cells(pin: Option<&pins::Pin>) -> [String; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addons::resolve::tests::{anchor, lock, signed, FakeDocker, ROOT};
+    use crate::addons::resolve::tests::{anchor, lock, signed, signed_bundle, FakeDocker, OVERLAY, ROOT};
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("noo-addon-pins-cmd-{}-{tag}", std::process::id()));
@@ -445,7 +471,7 @@ mod tests {
 
     fn pinned_root(tag: &str) -> (std::path::PathBuf, String) {
         let d = scratch(tag);
-        let f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
         let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
@@ -464,6 +490,30 @@ mod tests {
 
         let other_tag = launch_lines(&d, "v0.6.1", &names[..1], &|_| Ok(anchor()));
         assert!(other_tag[0].starts_with("refuse trellion_intel trellion_intel is pinned for stack v0.6.0"), "{other_tag:?}");
+    }
+
+    #[test]
+    fn a_lock_without_a_bundle_runs_the_legacy_overlay_or_is_refused() {
+        let d = scratch("legacy");
+        let f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        let names = vec!["trellion_intel".to_string()];
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert!(lines[0].starts_with("refuse trellion_intel its signed lock for v0.6.0 predates overlay bundles"), "{lines:?}");
+        let mut docker = FakeDocker::default();
+        assert!(verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]).problem.unwrap().contains("predates overlay bundles"));
+
+        // An earlier CLI left the overlay in the slice: it runs, with a note.
+        std::fs::write(crate::addons::pins::legacy_overlay(&d, "trellion_intel"), OVERLAY).unwrap();
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert!(lines[0].starts_with("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL "), "{lines:?}");
+        let reference = v.lock.images["trellion-intel"].clone();
+        let mut docker = FakeDocker { local: vec![reference.clone()], ids: vec![(reference, "sha256:x".into())], ..Default::default() };
+        let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(anchor()), &mut docker, &[]);
+        assert!(verdict.problem.is_none(), "{verdict:?}");
+        assert!(verdict.notes.iter().any(|n| n.contains("deprecated docker-compose.trellion-intel.yml")), "{verdict:?}");
     }
 
     #[test]
@@ -526,10 +576,7 @@ mod tests {
     }
 
     fn input<'a>(root: &'a std::path::Path, dist: bool, addons: &[&str]) -> PinEnvInput<'a> {
-        let overlay = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.trellion-intel.yml"),
-        )
-        .unwrap();
+        let overlay = OVERLAY.to_string();
         PinEnvInput {
             root,
             dist,

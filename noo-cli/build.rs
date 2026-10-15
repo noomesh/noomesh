@@ -44,16 +44,13 @@ const STANDALONE_FILES: &[&str] = &[
     // entry outlived the file and broke every repo-tree build.
     "noomesh.yaml.example",
     "docker-compose.gpu-embed.yml",
-    // The evolve add-on from the PUBLISHED image (no checkout). This list is
-    // an allowlist, so an overlay added to the tree but not here never
-    // reaches a dist install: stack-v0.2.47 published the evolve image and
-    // the launcher on the controller could not find the overlay that runs it
-    // (2026-09-14). The slice test now pins every root overlay to this list.
-    "docker-compose.evolve.yml",
+    // This list is an allowlist, so an overlay added to the tree but not
+    // here never reaches a dist install (stack-v0.2.47, 2026-09-14); the
+    // slice test pins every root overlay to this list. Licensed add-ons'
+    // overlays are NOT here: each travels in its add-on's signed bundle and
+    // is materialised under <install root>/addons/<name>/ (N6).
     // The knowledge pack as an overlay.
     "docker-compose.trellion.yml",
-    // The Intelligent tier as an overlay.
-    "docker-compose.trellion-intel.yml",
     // Voice (whisper + piper) as an overlay.
     "docker-compose.voice.yml",
     "config/tailscale-acl.hujson",
@@ -259,11 +256,13 @@ fn gen_standalone_assets() {
     gen_addon_decls(Some(&repo_root));
 }
 
-/// One overlay's `x-noo-addon`, validated. Vocabulary (is each scope one the
-/// gateway issues?) is NOT checked here — the vocabulary lives in
-/// gateway-rust, which this crate does not compile against; the Python guard
-/// tests/test_addon_declares_its_grant.py checks it, and `provision` asks the
-/// gateway before minting.
+// The `x-noo-addon` parser, shared with the CLI's run-time reader of an
+// add-on's bundled overlay (commands/secrets.rs `addon_decls`).
+#[path = "src/addon_decl_parse.rs"]
+#[allow(dead_code)]
+mod addon_decl_parse;
+
+/// One overlay's `x-noo-addon`, validated, with the file it came from.
 struct Decl {
     overlay: String,
     addon: String,
@@ -275,59 +274,19 @@ struct Decl {
 }
 
 fn decl_of(overlay: &str, text: &str) -> Option<Decl> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(text)
-        .unwrap_or_else(|e| panic!("{overlay}: not valid YAML ({e})"));
-    let block = doc.get("x-noo-addon")?;
-    fn refuse(overlay: &str, what: &str) -> ! {
-        panic!("{overlay}: x-noo-addon {what}")
-    }
-    let s = |k: &str| -> String {
-        block.get(k).and_then(|v| v.as_str()).map(str::to_string)
-            .unwrap_or_else(|| refuse(overlay, &format!("needs a string `{k}`")))
-    };
-    let list = |k: &str| -> Vec<String> {
-        let Some(seq) = block.get(k).and_then(|v| v.as_sequence()) else {
-            refuse(overlay, &format!("needs a list `{k}`"))
-        };
-        seq.iter().map(|v| v.as_str().map(str::to_string)
-            .unwrap_or_else(|| refuse(overlay, &format!("`{k}` holds a non-string"))) ).collect()
-    };
-    let d = Decl {
+    // Same fact as lib-addons.sh's file mapping: addon `trellion` is
+    // docker-compose.trellion.yml.
+    let expect = addon_decl_parse::addon_of_overlay_name(overlay);
+    let d = addon_decl_parse::parse_decl(overlay, text, expect.as_deref()).unwrap_or_else(|e| panic!("{e}"))?;
+    Some(Decl {
         overlay: overlay.to_string(),
-        addon: s("addon"),
-        consumer: s("consumer"),
-        key: s("key"),
-        containers: list("containers"),
-        scopes: list("scopes"),
-        why: block.get("why").and_then(|v| v.as_str()).map(|w| w.trim().to_string()),
-    };
-    // Same fact as lib-addons.sh's file mapping: addon `trellion_intel` is
-    // docker-compose.trellion-intel.yml.
-    if overlay != format!("docker-compose.{}.yml", d.addon.replace('_', "-")) {
-        refuse(overlay, &format!("addon `{}` does not match the file name", d.addon));
-    }
-    let Some(suffix) = d.key.strip_prefix("NOO_SVC_KEY_") else { refuse(overlay, "key must be NOO_SVC_KEY_*") };
-    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
-        refuse(overlay, "key must match ^NOO_SVC_KEY_[A-Z0-9_]+$");
-    }
-    // The consumer is what provision_targets has always derived from the key;
-    // declaring it lets a grep for `svc:evolve` land here, and the build
-    // insists the two agree rather than choosing one.
-    if d.consumer != format!("svc:{}", suffix.to_ascii_lowercase().replace('_', "-")) {
-        refuse(overlay, &format!("consumer `{}` is not svc:<kebab of the key suffix>", d.consumer));
-    }
-    if d.containers.is_empty() || d.containers.iter().any(|c| !c.starts_with("noo-")) {
-        refuse(overlay, "containers must be a non-empty list of noo-* names");
-    }
-    if d.scopes.is_empty() {
-        refuse(overlay, "scopes must not be empty");
-    }
-    for s in &d.scopes {
-        if matches!(s.as_str(), "addon" | "kiosk" | "mcp:operator" | "identity") {
-            refuse(overlay, &format!("may not ask for `{s}` (addon is always added; the rest are not add-on scopes)"));
-        }
-    }
-    Some(d)
+        addon: d.addon,
+        consumer: d.consumer,
+        key: d.key,
+        containers: d.containers,
+        scopes: d.scopes,
+        why: d.why,
+    })
 }
 
 /// `$OUT_DIR/addon_decls.rs`: the declarations and the registry rows derived
@@ -356,6 +315,7 @@ fn gen_addon_decls(repo_root: Option<&Path>) {
                   NOT embedded (the registry has no add-on rows)");
     }
     let strs = |v: &[String]| v.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ");
+    println!("cargo::rerun-if-changed=src/addon_decl_parse.rs");
     let mut out = String::from(
         "// @generated by build.rs from each overlay's x-noo-addon.\n");
     out.push_str("pub static ADDON_DECLS: &[AddonDecl] = &[\n");

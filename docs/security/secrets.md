@@ -725,7 +725,7 @@ noo security service-key provision trellion-intel
 That shows what the add-on asks for before minting anything:
 
 ```
-trellion-intel asks for a gateway key          declared in docker-compose.trellion-intel.yml
+trellion-intel asks for a gateway key          declared in addons/trellion_intel/docker-compose.yml
   consumer   svc:trellion-intel
   store key  NOO_SVC_KEY_TRELLION_INTEL
   recreates  noo-trellion-intel
@@ -759,8 +759,12 @@ x-noo-addon:
   scopes: [chat, embeddings, metrics]
 ```
 
-The CLI reads the copy compiled into it — never the one on disk — and derives
-from it the registry row that `secrets rotate`, `secrets audit` and `doctor
+For an overlay that ships in this tree (trellion), the CLI reads the copy
+compiled into it. A licensed add-on's overlay travels in the add-on's signed
+bundle, and the CLI reads it from `addons/<name>/docker-compose.yml` only
+while its bytes still hash to the signed lock the add-on is pinned to: an
+edited copy declares nothing, so it cannot widen the request. From the
+declaration the CLI derives the registry row that `secrets rotate`, `secrets audit` and `doctor
 secrets` use, the default grant `provision` shows, and the key `cluster
 verify` requires while the add-on is on. The overlay only asks: the operator
 grants at `provision`, and the gateway decides what each word opens.
