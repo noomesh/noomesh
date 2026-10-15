@@ -60,8 +60,10 @@ BASE = ROOT / "docker-compose.cluster.yml"
 # image's own: gateway/worker are DHI `nonroot` (65532, measured on the
 # gateway image's /etc/passwd); postgres is the alpine `postgres` user (70);
 # the Playwright image runs as root. The DHI redis/grafana -dev images'
-# USER is root, but compose pins both to `user: "65532:65532"` (i64: they
-# must not run as root), so their secrets are handed to 65532.
+# USER is root, but compose pins both to the image's own name for 65532
+# (`user: nonroot` / `user: grafana`; i64: they must not run as root; a name,
+# not the number: Docker 27 getent, tests/test_compose_named_users.py), so
+# their secrets are handed to 65532.
 # The add-on, measured on the stack-v0.2.80 image: trellion is `USER nonroot`
 # on the DHI deps-base (`os.getuid()` → 65532). (trellion-intel, noo-evolve:
 # moved with the overlay to the add-on repo (N6).)
