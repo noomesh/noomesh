@@ -869,8 +869,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libssl-dev
         fi
-        command -v sqlx || cargo install sqlx-cli --version '^0.8' \
-          --no-default-features --features postgres,rustls --locked
+        # Version-checked, not just present: a restored ~/.cargo/bin from an
+        # older cache key can hold a previous major. No `--locked`: sqlx 0.9
+        # stopped tracking its Cargo.lock, so `--locked` fails to install.
+        sqlx --version 2>/dev/null | grep -q ' 0\.9\.' || cargo install sqlx-cli --version '^0.9' \
+          --no-default-features --features postgres,rustls --force
 
     # `--check` writes nothing and fails on any disagreement. The clean is
     # required: cargo tracks only source files, so against a restored target/

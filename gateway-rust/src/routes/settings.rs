@@ -1546,10 +1546,10 @@ pub(crate) fn string_setting_default(key: &str) -> Option<&'static str> {
     STRING_REGISTRY.iter().find(|s| s.key == key).map(|s| s.default)
 }
 
-/// Truthy parse matching Python's `_TRUTHY = {"1","true","yes","on"}` on the
-/// trimmed, lowercased raw value.
+/// Truthy parse: the gateway's single settings parser (`settings::truthy`),
+/// so this route and the override cache the kiosk reads always agree.
 fn flag_truthy(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    crate::settings::truthy(raw)
 }
 
 /// GET /api/settings/flags — behavioral flags with current values.

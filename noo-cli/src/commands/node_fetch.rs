@@ -668,8 +668,8 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         // when root's copy really is the new one.
         if root_ok && std::env::var("NOO_FETCH_REEXEC").is_err() {
             let running = std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()).map(|b| {
-                use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&b)) });
-            let new = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(cli)) };
+                use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&b)) });
+            let new = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(cli)) };
             if running.as_deref() != Some(new.as_str()) {
                 return Err(REEXEC.into());
             }
@@ -1031,7 +1031,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     };
     let sum = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&blob))
+        hex::encode(Sha256::digest(&blob))
     };
     // The FETCH receipt. `fetched_at` used to be stamped by the
     // GET above — a state write any anonymous caller could make, so it meant
@@ -1361,7 +1361,7 @@ fn self_update_and_reexec(
             }
         })
         .next();
-    let have = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&payload)) };
+    let have = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&payload)) };
     match want {
         Some(w) if w == have => {}
         Some(_) => return Err("cli-binary payload does not match the signed manifest — refusing (74)".into()),
@@ -1370,7 +1370,7 @@ fn self_update_and_reexec(
     let running = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::read(p).ok())
-        .map(|b| { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&b)) });
+        .map(|b| { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&b)) });
     if running.as_deref() == Some(have.as_str()) {
         // Already this binary: the kind really is unknown to the newest CLI
         // the controller has, which is a genuine refusal, not a stale one.
@@ -2537,7 +2537,7 @@ fn verify_bundle_with(stage: &Path, ca: &Path, ca_pub: &Path, node: &str) -> Res
         let bytes = std::fs::read(&f).map_err(|_| format!("manifest names '{kind}' but the bundle lacks it (65)"))?;
         let actual = {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(&bytes))
+            hex::encode(Sha256::digest(&bytes))
         };
         if actual != sum {
             return Err(format!("sha256 mismatch for '{kind}' — refusing (74)"));
@@ -2696,7 +2696,7 @@ pub(crate) fn cert_der_sha256(pem: &[u8]) -> Result<String, String> {
     let der = base64::engine::general_purpose::STANDARD.decode(body.trim())
         .map_err(|e| format!("CA PEM body is not base64: {e}"))?;
     use sha2::{Digest, Sha256};
-    Ok(format!("{:x}", Sha256::digest(&der)))
+    Ok(hex::encode(Sha256::digest(&der)))
 }
 
 #[cfg(test)]
@@ -2982,7 +2982,7 @@ mod tests {
         for n in names {
             let bytes = std::fs::read(stage.join("files").join(&n)).unwrap();
             use sha2::{Digest as _, Sha256};
-            manifest.push_str(&format!("{:x}  {n}\n", Sha256::digest(&bytes)));
+            manifest.push_str(&format!("{}  {n}\n", hex::encode(Sha256::digest(&bytes))));
         }
         std::fs::write(stage.join("manifest"), &manifest).unwrap();
         let ok = Command::new("openssl")
@@ -3853,10 +3853,14 @@ mod tests {
 
     #[test]
     fn der_fingerprint_of_a_pem() {
-        // Tiny self-consistency check: the base64 body decodes and hashes.
-        let pem = b"-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n";
-        use sha2::{Digest, Sha256};
-        assert_eq!(cert_der_sha256(pem).unwrap(), format!("{:x}", Sha256::digest([0u8, 1, 2])));
+        // The base64 body ("test") decodes and hashes to the known SHA-256
+        // vector, as lowercase hex: this is the `--ca-sha256` pin format, so
+        // it is checked against a literal, not against the same expression.
+        let pem = b"-----BEGIN CERTIFICATE-----\ndGVzdA==\n-----END CERTIFICATE-----\n";
+        assert_eq!(
+            cert_der_sha256(pem).unwrap(),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
     }
 }
 

@@ -183,10 +183,10 @@ async fn ensure_role(db: &PgPool, role: &str, password_env: &str) -> Result<bool
             )
         })?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE {role} {ROLE_ATTRS} PASSWORD '{}'",
         quote_literal(&password)
-    ))
+    )))
     .execute(db)
     .await
     .map_err(|e| format!("CREATE ROLE {role} failed: {e}"))?;
@@ -230,7 +230,7 @@ async fn grant_runtime_access(db: &PgPool, role: &str) -> Result<(), String> {
                  GRANT USAGE, SELECT ON SEQUENCES TO {role}"
             ),
         ] {
-            sqlx::query(&stmt)
+            sqlx::query(sqlx::AssertSqlSafe(&*stmt))
                 .execute(db)
                 .await
                 .map_err(|e| format!("{stmt} failed: {e}"))?;
@@ -250,7 +250,7 @@ async fn assign_ownership(db: &PgPool, role: &str, tables: &[&str]) -> Result<us
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role}"),
     ] {
-        sqlx::query(&stmt)
+        sqlx::query(sqlx::AssertSqlSafe(&*stmt))
             .execute(db)
             .await
             .map_err(|e| format!("{stmt} failed: {e}"))?;
@@ -261,7 +261,7 @@ async fn assign_ownership(db: &PgPool, role: &str, tables: &[&str]) -> Result<us
         if !table_exists(db, table).await.map_err(|e| e.to_string())? {
             continue;
         }
-        sqlx::query(&format!("ALTER TABLE public.{table} OWNER TO {role}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE public.{table} OWNER TO {role}")))
             .execute(db)
             .await
             .map_err(|e| format!("ALTER TABLE {table} OWNER TO {role} failed: {e}"))?;

@@ -43,14 +43,14 @@ pub(crate) async fn scratch(test: &str) -> Option<PgPool> {
     };
     let db_name = format!("ops_test_{test}");
     let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.expect("connect");
-    let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {db_name} (FORCE)")).execute(&admin).await;
-    sqlx::raw_sql(&format!("CREATE DATABASE {db_name}")).execute(&admin).await.expect("create scratch db");
+    let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db_name} (FORCE)"))).execute(&admin).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}"))).execute(&admin).await.expect("create scratch db");
     let (head, _) = dsn.rsplit_once('/').expect("dsn has a path");
     let scratch_dsn = format!("{head}/{db_name}");
     let build = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&scratch_dsn).await.expect("connect scratch");
     unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
     for ext in ["vector", "pg_trgm"] {
-        sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}")).execute(&build).await.expect("extension");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&build).await.expect("extension");
     }
     crate::mesh_migrate::apply(&build).await.expect("apply migrations");
     build.close().await;
@@ -1335,10 +1335,10 @@ pub(crate) async fn stub_erase_stores(db: &PgPool) {
     for t in crate::routes::users::erase_store_tables() {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL").bind(t).fetch_one(db).await.unwrap();
         if !exists {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "CREATE TABLE {t} (id uuid, user_id text, conversation_id uuid, username text, from_user text, to_user text, \
                  video_frame_id uuid, content_summary text)"
-            ))
+            )))
             .execute(db)
             .await
             .unwrap();

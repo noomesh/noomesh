@@ -8,18 +8,22 @@
 //!   1. the trust anchor from the installed entitlement
 //!      (`addons.<name>` = keys + registry root);
 //!   2. fetch `<root>:stack-<tag>` ([`super::lock_fetch`]);
-//!   3. [`crate::addon_lock::verify`]: signature, add-on name, registry root;
+//!   3. [`crate::addon_lock::verify`]: signature, add-on name, registry root,
+//!      and for a bundle every fetched file against its signed hash
+//!      ([`crate::addon_lock::verify_files`]);
 //!   4. the lock lists `<tag>` (`supports`);
 //!   5. a lock built on a stack image matches that image's row in the
 //!      verified `stack.lock` for `<tag>` (`base_matches`);
 //!   6. not older than the pinned version unless `--allow-downgrade`
 //!      (`is_downgrade`);
 //!   7. pull every image by digest through a throwaway docker config;
-//!   8. cache the lock and write the pin.
+//!   8. cache the lock, write the pin, and materialise the bundle files under
+//!      `<root>/addons/<addon>/` (a lock without files removes that directory).
 //!
 //! Steps 1-6 decide; nothing is written until all of them pass. The offline
 //! twin ([`offline_check`]) re-runs 1, 3, 4 and the pin comparison from the
-//! cache, for `noo addons verify` and the launcher.
+//! cache, and holds the materialised files to the cached lock, for `noo
+//! addons verify` and the launcher.
 
 use std::path::Path;
 
@@ -48,7 +52,7 @@ pub struct Want<'a> {
 pub enum Refusal {
     NoEntitlement(String),
     NoAnchor,
-    Fetch { reference: String, err: FetchError },
+    Fetch { reference: String, stack_tag: String, err: FetchError },
     Lock(AddonLockError),
     NotForStack { tag: String, version: String, supports: Vec<String> },
     NoStackLock { image: String, tag: String },
@@ -70,8 +74,8 @@ impl Refusal {
                 "the installed entitlement names no signing key or registry for {addon}, so its lock cannot be verified \
                  (the token predates signed add-on locks)"
             ),
-            Refusal::Fetch { reference, err } => match err.class {
-                FetchClass::NotFound => format!("{reference} is not published: {addon} has no release for this stack yet"),
+            Refusal::Fetch { stack_tag, err, .. } if err.class == FetchClass::NotFound => not_published(stack_tag),
+            Refusal::Fetch { reference, err, .. } => match err.class {
                 FetchClass::Auth => format!(
                     "the registry refused {reference} (access refused): the controller's {} cannot read {addon}'s package",
                     lock_fetch::TOKEN_KEY
@@ -105,6 +109,26 @@ impl Refusal {
     }
 }
 
+/// The refusal for an add-on lock the registry does not have (HTTP 404,
+/// `manifest unknown`): the stack release is out, and the vendor's own
+/// release workflow signs the add-on lock for it minutes later. Distinct
+/// from an auth or signature failure, whose text and remedy are different.
+/// No `<addon>: ` prefix: every caller that prints it beside others already
+/// leads with the add-on's name (`x evolve: evolve: …` was the 0.6.4-rc.1
+/// rehearsal's output), and the one that does not adds it.
+pub fn not_published(stack_tag: &str) -> String {
+    let tag = format!("v{}", stack_tag.trim().trim_start_matches("stack-").trim_start_matches('v'));
+    format!(
+        "no signed lock published yet for {tag} — the vendor publishes it minutes after a stack release; \
+         retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
+    )
+}
+
+/// True when the refusal is "the registry has no lock for this stack".
+pub fn is_not_published(r: &Refusal) -> bool {
+    matches!(r, Refusal::Fetch { err, .. } if err.class == FetchClass::NotFound)
+}
+
 /// The remedy for a credential refusal, shared by every verb.
 pub const TOKEN_FIX: &str = "noo security secrets rotate NOO_ADDON_REGISTRY_TOKEN --set-from-stdin --yes";
 
@@ -126,6 +150,7 @@ pub fn installed_stack_lock(root: &Path, tag: &str) -> Option<String> {
 /// Steps 3-6 over fetched bytes. Pure.
 pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<VerifiedLock, Refusal> {
     let v = addon_lock::verify(&fetched.lock, &fetched.sig, anchor, want.addon).map_err(Refusal::Lock)?;
+    addon_lock::verify_files(&v.lock, &fetched.files).map_err(Refusal::Lock)?;
     if !v.lock.supports(want.stack_tag) {
         return Err(Refusal::NotForStack {
             tag: want.stack_tag.to_string(),
@@ -157,6 +182,7 @@ pub fn fetch_and_check(
 ) -> Result<(VerifiedLock, Fetched), Refusal> {
     let fetched = client.fetch(&anchor.registry, want.stack_tag).map_err(|err| Refusal::Fetch {
         reference: lock_fetch::artifact_ref(&anchor.registry, want.stack_tag),
+        stack_tag: want.stack_tag.to_string(),
         err,
     })?;
     let v = check(&fetched, anchor, want)?;
@@ -237,15 +263,39 @@ pub fn pull_images(docker: &mut dyn Docker, v: &VerifiedLock, cred: Option<&Cred
 
 /// Step 8: cache the lock and set this add-on's pin (other pins kept), as
 /// one atomic pair under the pins lock (`pins::set_pin`).
+/// Then the bundle files are materialised (or a stale bundle directory is
+/// removed for a lock without files). A failure there leaves the new pin
+/// with files that do not match it, which every offline check refuses, so
+/// the remedy (`noo addons upgrade`) is named rather than a mixed state run.
 pub fn record(root: &Path, addon: &str, v: &VerifiedLock, fetched: &Fetched, stack_tag: &str) -> Result<Pin, Refusal> {
     let pin = Pin::from_verified(v, stack_tag, &fetched.lock);
     pins::set_pin(root, addon, &pin, &fetched.lock, &fetched.sig).map_err(Refusal::Write)?;
+    pins::materialise(root, addon, &fetched.files).map_err(Refusal::Write)?;
     Ok(pin)
+}
+
+/// What the offline check found besides the pin: whether the lock is a
+/// bundle (its files verified on disk) or predates bundles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlay {
+    /// The lock lists files and `<root>/addons/<addon>/` holds exactly their
+    /// signed bytes.
+    Bundled,
+    /// A `noo-addon-lock/1` lock: no overlay travels with it. `Some(path)`
+    /// is the deprecated overlay an earlier CLI left in the slice, `None`
+    /// that there is none, so the add-on cannot be composed.
+    Legacy(Option<std::path::PathBuf>),
 }
 
 /// The offline check: the cached lock still verifies against `anchor`,
 /// lists `tag`, and is exactly what the pin says. Returns the pin.
+#[cfg(test)]
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
+    offline_check_bundle(root, addon, tag, anchor).map(|(p, _)| p)
+}
+
+/// [`offline_check`], also saying how the add-on's overlay arrives.
+pub fn offline_check_bundle(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<(Pin, Overlay), String> {
     let all = pins::read(root)?;
     let pin = all.get(addon).cloned().ok_or_else(|| format!("{addon} has no pin in {}", pins::PINS_FILE))?;
     if pin.stack != tag {
@@ -259,7 +309,18 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
     if v.lock.images != pin.images || v.lock.version != pin.version || v.key_index != pin.key_index {
         return Err(format!("{addon}'s pin does not match its signed lock ({} was edited)", pins::PINS_FILE));
     }
-    Ok(pin)
+    if v.lock.files.is_empty() {
+        let legacy = pins::legacy_overlay(root, addon);
+        return Ok((pin, Overlay::Legacy(legacy.is_file().then_some(legacy))));
+    }
+    let found = pins::materialised_files(root, addon, v.lock.files.keys());
+    addon_lock::verify_files(&v.lock, &found).map_err(|e| {
+        format!(
+            "{addon}'s bundle files in {} do not match its signed lock ({e}): they were edited or left from another version",
+            pins::addon_dir(root, addon).display()
+        )
+    })?;
+    Ok((pin, Overlay::Bundled))
 }
 
 /// The production [`Docker`]. Its throwaway docker configs live under the
@@ -600,12 +661,28 @@ pub(crate) mod tests {
             supports_stack: supports.iter().map(|s| s.to_string()).collect(),
             images: BTreeMap::from([("trellion-intel".into(), format!("{ROOT}@{}", digest('1')))]),
             base: base.map(|d| BaseImage { image: "trellion".into(), digest: d.into() }),
+            files: BTreeMap::new(),
         }
     }
 
     pub(crate) fn signed(l: &AddonLock) -> Fetched {
         let (bytes, sig) = addon_lock::sign(l, &seed()).unwrap();
-        Fetched { lock: bytes, sig }
+        Fetched { lock: bytes, sig, files: BTreeMap::new() }
+    }
+
+    /// The overlay text the bundle tests carry (any compose text works; the
+    /// image line is what the launcher reads).
+    pub(crate) const OVERLAY: &str =
+        "services:\n  trellion-intel:\n    image: ${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:x}\n";
+
+    /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
+    pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {
+        let mut l = l.clone();
+        l.format = addon_lock::FORMAT_V2.into();
+        let files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        Fetched { lock: bytes, sig, files }
     }
 
     fn want<'a>(stack_lock: Option<&'a str>, pinned: Option<&'a str>) -> Want<'a> {
@@ -618,6 +695,43 @@ pub(crate) mod tests {
         let f = signed(&lock("1.2.0", &["v0.6.0"], Some(&digest('2'))));
         let v = check(&f, &anchor(), &want(Some(&stack), Some("1.1.0"))).expect("passes");
         assert_eq!(v.key_index, 0);
+    }
+
+    /// The registry answers 404 for `<root>:stack-<tag>`: the stack is out and
+    /// the vendor has not signed its lock yet. That is "retry shortly", not an
+    /// auth or signature failure.
+    #[test]
+    fn a_lock_the_registry_does_not_have_yet_says_so_and_names_the_way_back() {
+        let reg = super::lock_fetch::fake::serve(|_| Default::default());
+        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")) };
+        let client = lock_fetch::Client::plain_http_for_tests(None);
+        let e = fetch_and_check(&client, &anchor, &want(None, None)).unwrap_err();
+        assert!(is_not_published(&e) && !e.is_auth(), "{e:?}");
+        let why = e.why("trellion_intel");
+        assert_eq!(
+            why,
+            "no signed lock published yet for v0.6.0 — the vendor publishes it minutes after a stack release; \
+             retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
+        );
+        assert!(!why.contains("access refused") && !why.contains("signature"), "{why}");
+    }
+
+    #[test]
+    fn the_not_published_tag_is_v_prefixed_whatever_form_it_arrives_in() {
+        for t in ["v0.6.4", "0.6.4", "stack-v0.6.4"] {
+            assert!(not_published(t).starts_with("no signed lock published yet for v0.6.4 —"), "{t}");
+        }
+    }
+
+    /// Auth and signature failures keep their own text (and remedy).
+    #[test]
+    fn auth_and_signature_refusals_keep_their_text() {
+        use crate::release_fetch::{FetchClass, FetchError};
+        let auth = Refusal::Fetch { reference: "r".into(), stack_tag: "v0.6.0".into(), err: FetchError::new(FetchClass::Auth, "x") };
+        assert!(auth.is_auth() && !is_not_published(&auth));
+        assert!(auth.why("evolve").contains("(access refused)"), "{}", auth.why("evolve"));
+        let bad = Refusal::Lock(AddonLockError::BadSignature("x".into()));
+        assert!(!is_not_published(&bad) && bad.why("evolve").contains("lock refused"));
     }
 
     #[test]
@@ -742,6 +856,43 @@ pub(crate) mod tests {
         all.get_mut("trellion_intel").unwrap().images.insert("trellion-intel".into(), format!("{ROOT}@{}", digest('7')));
         std::fs::write(d.join(pins::PINS_FILE), serde_json::to_vec(&all).unwrap()).unwrap();
         assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("was edited"));
+    }
+
+    #[test]
+    fn a_bundle_is_checked_materialised_and_tamper_refused_offline() {
+        let d = scratch("bundle");
+        let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
+        // A fetched file that is not the signed bytes never gets past check.
+        let mut bad = f.clone();
+        bad.files.get_mut(addon_lock::OVERLAY_FILE).unwrap().push(b'#');
+        assert!(matches!(check(&bad, &anchor(), &want(None, None)), Err(Refusal::Lock(AddonLockError::FileMismatch { .. }))));
+
+        let v = check(&f, &anchor(), &want(None, None)).unwrap();
+        record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        let overlay = pins::addon_dir(&d, "trellion_intel").join(addon_lock::OVERLAY_FILE);
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), OVERLAY);
+        let (_, how) = offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap();
+        assert_eq!(how, Overlay::Bundled);
+
+        // The materialised overlay edited on disk: refused like a lock tamper.
+        std::fs::write(&overlay, format!("{OVERLAY}    privileged: true\n")).unwrap();
+        let e = offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err();
+        assert!(e.contains("do not match its signed lock") && e.contains("hashes to"), "{e}");
+        std::fs::remove_file(&overlay).unwrap();
+        assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("is missing"));
+
+        // Moving back to a lock that predates bundles removes the directory,
+        // and the add-on is then Legacy: with the old slice overlay, or none.
+        let v1 = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let vv = check(&v1, &anchor(), &want(None, None)).unwrap();
+        record(&d, "trellion_intel", &vv, &v1, "v0.6.0").unwrap();
+        assert!(!pins::addon_dir(&d, "trellion_intel").exists());
+        assert_eq!(offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap().1, Overlay::Legacy(None));
+        std::fs::write(pins::legacy_overlay(&d, "trellion_intel"), OVERLAY).unwrap();
+        assert_eq!(
+            offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap().1,
+            Overlay::Legacy(Some(pins::legacy_overlay(&d, "trellion_intel")))
+        );
     }
 
     #[test]

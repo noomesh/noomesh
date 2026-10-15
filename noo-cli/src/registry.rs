@@ -26,8 +26,8 @@ pub(crate) const IMAGE_NAMESPACE: &str = "ghcr.io/noomesh";
 /// NESTED `dhi/` prefix (`dest_org: noomesh/dhi`, list in
 /// scripts/dhi-images.txt). Those are the images the stack is built around:
 /// every service-key reader in `pki::SERVICE_KEY_READERS` and every
-/// data-volume owner is the DHI image's uid (65532, or root for the `-dev`
-/// variants).
+/// data-volume owner is uid 65532 (the DHI runtime images' `nonroot`, and
+/// the compose `user:` of the two `-dev` variants, redis and grafana: i64).
 ///
 /// It is NOT `IMAGE_NAMESPACE`. `ghcr.io/noomesh/<name>` (no `dhi/`) holds
 /// the UPSTREAM official images under the same names and tags (prom/*,

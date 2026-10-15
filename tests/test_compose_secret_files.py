@@ -32,12 +32,11 @@ G4  The launcher writes no secret to disk: `lib-secrets.sh` and the three
     stack whose gateway reads the JWT secret — and every name this file
     points the gateway and worker at — through `secret_env`.
 
-Since an earlier change the add-on containers (noo-trellion,
-noo-trellion-intel, noo-evolve) are IN: their images read `_FILE`
-(noomesh's `secret_env` in the trellion pair, the add-ons' own
-readers) since stack-v0.2.80, their overlays deliver files and a
-pgpass, and trellion-intel — which `extends` trellion — must hold ITS OWN
-gateway key file, which the projection is checked for below. Only the Go
+Since an earlier change the add-on containers are IN: noo-trellion's image
+reads `_FILE` (noomesh's `secret_env` plus trellion's own reader) since
+stack-v0.2.80, and its overlay delivers files and a pgpass. The licensed
+add-ons' overlays (trellion-intel, evolve) and their delivery guards moved
+with the overlay to the add-on repos (N6). Only the Go
 node agent reads `_FILE` too and nats has no secret env
 since an earlier change, so nothing remains DEFERRED.
 """
@@ -60,28 +59,32 @@ BASE = ROOT / "docker-compose.cluster.yml"
 # other bits, and 0400 to the wrong uid is unreadable). Each uid is the
 # image's own: gateway/worker are DHI `nonroot` (65532, measured on the
 # gateway image's /etc/passwd); postgres is the alpine `postgres` user (70);
-# the DHI redis/grafana -dev images and the Playwright image run as root.
-# The add-ons, measured on the stack-v0.2.80 images:
-# trellion and trellion-intel are `USER nonroot` on the DHI deps-base
-# (`os.getuid()` → 65532); evolve is python:3.12-slim with no USER (0).
+# the Playwright image runs as root. The DHI redis/grafana -dev images'
+# USER is root, but compose pins both to the image's own name for 65532
+# (`user: nonroot` / `user: grafana`; i64: they must not run as root; a name,
+# not the number: Docker 27 getent, tests/test_compose_named_users.py), so
+# their secrets are handed to 65532.
+# The add-on, measured on the stack-v0.2.80 image: trellion is `USER nonroot`
+# on the DHI deps-base (`os.getuid()` → 65532). (trellion-intel, noo-evolve:
+# moved with the overlay to the add-on repo (N6).)
 OWNED_UIDS: dict[str, str] = {
     "gateway": "65532",
     "worker": "65532",
     "worker-extra": "65532",
-    "redis": "0",
+    "redis": "65532",
     "postgres": "70",
-    "grafana": "0",
+    "grafana": "65532",
     "browser": "0",
     "trellion": "65532",
-    "trellion-intel": "65532",
-    "noo-evolve": "0",
     # The opt-in containerised Go agent (profiles node-agent-compose /
     # sensors): its image is `USER 0` (docker/Dockerfile.node-agent-go).
     # the design
     "node-agent": "0",
     "node-agent-sensors": "0",
 }
-ADD_ONS = ("trellion", "trellion-intel", "noo-evolve")
+# The add-on services core composes (the licensed ones: moved with the
+# overlay to the add-on repo (N6)).
+ADD_ONS = ("trellion",)
 
 # Base-file services still handed secrets as env, and why. (The add-ons left
 # this map with the design, the containerised node agent with §2.)
@@ -100,8 +103,6 @@ NATIVE_POINTERS: dict[str, set[str]] = {
     "worker": {"PGPASSFILE"},  # libpq (psycopg), natively
     "worker-extra": {"PGPASSFILE"},
     "trellion": {"PGPASSFILE"},  # libpq (psycopg: noomesh's and trellion's engines)
-    "trellion-intel": {"PGPASSFILE"},
-    "noo-evolve": {"PGPASSFILE"},  # libpq (psycopg)
 }
 
 POINTER = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*):\+(?:\$\$__file\{)?/run/secrets/([a-z0-9_]+)\}?\}$")
@@ -313,10 +314,10 @@ def _file_source_var(svc: dict, pointer: str) -> str | None:
 
 
 def test_each_add_on_gateway_key_file_is_sourced_from_its_own_key() -> None:
-    """trellion-intel `extends` trellion, and compose merges both the
+    """An overlay that `extends` another's service inherits by merge both the
     environment map and the `secrets:` list (by target). Its pointer can
-    name intel's variable while the FILE behind it is still trellion's —
-    then intel presents trellion's key and nothing in the environment says
+    name its own variable while the FILE behind it is still the parent's —
+    then it presents the parent's key and nothing in the environment says
     so. Resolve pointer → target → source → variable in the projection and
     require each add-on's own declared key (x-noo-addon), and no plain
     NOO_GATEWAY_KEY beside the pointer (the readers refuse on both-set)."""
@@ -337,16 +338,18 @@ def test_each_add_on_gateway_key_file_is_sourced_from_its_own_key() -> None:
             )
             assert env["NOO_GATEWAY_KEY_FILE"].startswith("${" + d.key + ":+"), (c, env["NOO_GATEWAY_KEY_FILE"])
             checked += 1
-    assert checked >= 3, checked
-    # the two trellion containers hold DIFFERENT key files
-    assert _file_source_var(p["trellion"], "NOO_GATEWAY_KEY_FILE") != _file_source_var(p["trellion-intel"], "NOO_GATEWAY_KEY_FILE")
+    # trellion is core's one key holder; trellion-intel's distinct-file check
+    # moved with the overlay to the add-on repo (N6).
+    assert "noo-trellion" in {c for d in decls() for c in d.containers} and checked >= 1, checked
 
 
 def test_add_on_secrets_reach_only_their_own_add_on() -> None:
     """The add-on-only sources (a key, a pgpass body) are declared in the
     add-on's own overlay and taken by no noomesh-owned container."""
     p = full_projection()["services"]
-    for var in ("NOO_SVC_KEY_TRELLION", "NOO_SVC_KEY_TRELLION_INTEL", "NOO_SVC_KEY_EVOLVE", "NOO_PGPASS_TRELLION", "NOO_PGPASS_EVOLVE"):
+    # (NOO_SVC_KEY_TRELLION_INTEL, NOO_SVC_KEY_EVOLVE, NOO_PGPASS_EVOLVE: moved
+    # with the overlay to the add-on repo (N6).)
+    for var in ("NOO_SVC_KEY_TRELLION", "NOO_PGPASS_TRELLION"):
         names = [k for k, v in top_level_secrets().items() if v == var]
         assert len(names) == 1, (var, names)
         takers = sorted(n for n, svc in p.items() for e in _svc_secrets(svc) if e["source"] == names[0])
@@ -437,8 +440,7 @@ def test_the_pgpass_roles_match_the_dsn_users() -> None:
         ("gateway", "NOO_PGPASS_GATEWAY"),
         ("worker", "NOO_PGPASS_WORKER"),
         ("trellion", "NOO_PGPASS_TRELLION"),
-        ("trellion-intel", "NOO_PGPASS_TRELLION"),
-        ("noo-evolve", "NOO_PGPASS_EVOLVE"),
+        # trellion-intel, noo-evolve: moved with the overlay to the add-on repo (N6)
     ):
         users = {m.group(1) for v in env_of(p[svc]).values() for m in [re.match(r"postgresql://([a-z_]+)@postgres:5432/", v)] if m}
         assert users == {r for r, _ in roles[var][1]}, (svc, users, roles[var])
@@ -593,18 +595,16 @@ def test_a_tagged_floor_reads_every_name_this_file_points_at() -> None:
     p = full_projection()["services"]
     missing = []
     checked = 0
-    # The add-ons: the trellion pair runs the FLOOR's
-    # noomesh Python plus trellion's own reader, evolve its own alone.
-    # The sibling readers are pinned (ADDON_MANIFESTS) to the shas the
-    # floor's signed lock records (trellion 4d445003, evolve
-    # 8e2f5d0c) for stack-v0.2.80 — verified by hand at the flip.
+    # The add-on: trellion runs the FLOOR's noomesh Python plus trellion's
+    # own reader, pinned (ADDON_MANIFESTS) to the sha the floor's signed lock
+    # records (trellion 4d445003) for stack-v0.2.80 — verified by hand at the
+    # flip. (trellion-intel, noo-evolve: moved with the overlay to the add-on
+    # repo (N6).)
     trellion_side = py | set(ADDON_MANIFESTS["trellion"][2])
     for svc, manifest in (
         ("gateway", rust),
         ("worker", py),
         ("trellion", trellion_side),
-        ("trellion-intel", trellion_side),
-        ("noo-evolve", set(ADDON_MANIFESTS["noo-evolve"][2])),
     ):
         for key, val in env_of(p[svc]).items():
             if not POINTER.match(val) or not key.endswith("_FILE"):

@@ -8,7 +8,7 @@
 // PAI_API_TARGET. Resolution order: .env / .env.local (gitignored) → process env
 // → the mock on :9800. This keeps a private gateway URL out of git — set it in
 // apps/web/.env.local (see .env.example). The two @metis/* workspace packages
-// are aliased straight to their TS source so Vite/esbuild transpiles them.
+// are aliased straight to their TS source so Vite (Oxc) transpiles them.
 
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
@@ -42,7 +42,7 @@ export default defineConfig(({ mode }) => {
     // src/kiosk/isolation.test.ts, not left to convention. The gateway must
     // serve /kiosk from dist/kiosk.html explicitly; it has no SPA fallback.
     build: {
-      rollupOptions: {
+      rolldownOptions: {
         input: {
           main: path.resolve(dir, 'index.html'),
           kiosk: path.resolve(dir, 'kiosk.html'),

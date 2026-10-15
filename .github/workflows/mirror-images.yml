@@ -147,7 +147,10 @@ jobs:
           # ${NOO_BASE_REGISTRY}/redis:... resolves under both. The DEFAULT
           # (compose and registry.rs PUBLIC_BASE_REGISTRY) is
           # ghcr.io/noomesh/dhi: every service key and data volume is handed
-          # to these images' uids. 0.6.0/0.6.1 pointed the public channel at
+          # to uid 65532 (the runtime images' nonroot; redis and grafana stay
+          # the -dev variants, whose image USER is root, and compose pins
+          # them to 65532 with `user:` - i64. The runtime variants ship no
+          # shell, and docker/redis-entrypoint.sh is sh). 0.6.0/0.6.1 pointed the public channel at
           # ghcr.io/noomesh (the upstream lanes below, other uids) and the
           # monitoring set restart-looped on `permission denied`.
           # tests/test_image_namespace_declarations.py pins every compose

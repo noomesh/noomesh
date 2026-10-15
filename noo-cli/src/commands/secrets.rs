@@ -302,14 +302,18 @@ pub struct SecretSpec {
     pub required_when: Requirement,
 }
 
-/// One add-on overlay's `x-noo-addon` block, parsed and
-/// validated by build.rs from the overlay this binary embeds. The embedded
-/// copy is the authority: a stale or hand-edited `~/.noo` overlay cannot
-/// widen what `provision` asks for (it is compared and warned about, never
-/// obeyed).
+/// One add-on overlay's `x-noo-addon` block, parsed and validated
+/// (`crate::addon_decl_parse`). Two sources, each an authority the operator
+/// did not type: the overlays this binary embeds (build.rs: trellion), and a
+/// licensed add-on's overlay that arrived in its SIGNED bundle (N6), read
+/// only while its bytes still hash to the pinned lock ([`addon_decls`]). A
+/// hand-edited `~/.noo` overlay therefore cannot widen what `provision` asks
+/// for: an edited file no longer matches its lock and declares nothing.
 #[derive(Debug)]
 pub struct AddonDecl {
-    /// The overlay file that declares it, e.g. `docker-compose.evolve.yml`.
+    /// The overlay file that declares it, relative to the install root:
+    /// `docker-compose.trellion.yml`, or `addons/<name>/docker-compose.yml`
+    /// for an add-on's bundled overlay.
     pub overlay: &'static str,
     /// The `addons:<name>` key in noomesh.yaml (`addons::ADDON_ROWS`).
     pub addon: &'static str,
@@ -330,9 +334,202 @@ pub struct AddonDecl {
 include!(concat!(env!("OUT_DIR"), "/addon_decls.rs"));
 
 /// Every registry row: the hand-written core rows, then the add-on key rows
-/// derived from the overlays. The ONE way to read the registry.
+/// derived from the overlays (embedded, then bundled). The ONE way to read
+/// the registry.
 pub fn registry() -> impl Iterator<Item = &'static SecretSpec> {
-    CORE_REGISTRY.iter().chain(ADDON_KEY_SPECS.iter())
+    let bundled: Vec<&'static SecretSpec> = runtime_addon_rows().into_iter().map(|(_, s)| s).collect();
+    CORE_REGISTRY.iter().chain(ADDON_KEY_SPECS.iter()).chain(bundled)
+}
+
+/// Every add-on declaration: the embedded ones (`ADDON_DECLS`), then each
+/// licensed add-on's from the overlay its signed bundle brought. Readers
+/// never iterate `ADDON_DECLS` directly: that would skip every licensed
+/// add-on, whose overlay no longer ships in this tree.
+pub fn addon_decls() -> Vec<&'static AddonDecl> {
+    ADDON_DECLS.iter().chain(runtime_addon_rows().into_iter().map(|(d, _)| d)).collect()
+}
+
+/// The registry row text for one declaration (build.rs writes the same
+/// sentence for the embedded ones).
+fn addon_key_consequence(overlay: &str, d: &crate::addon_decl_parse::ParsedDecl) -> String {
+    let holders = d.containers.join(", ");
+    let why = d.why.as_deref().map(|w| format!(" Why: {w}")).unwrap_or_default();
+    format!(
+        "{holders}'s OWN gateway key ({consumer}), delivered to that container only as \
+         NOO_GATEWAY_KEY and exchanged at /api/addon/token for a 10-minute token carrying: \
+         {scopes}. Declared in {overlay} (x-noo-addon), which is what this row is derived \
+         from. It is the add-on's ONLY gateway credential: absent, every call it makes \
+         is refused (the shared-secret fallback is retired, and the gateway refuses an \
+         add-on's HMAC). `noo security service-key provision {name}` shows the request, mints, \
+         stores, recreates and proves it: a key that is stored but never presented is \
+         indistinguishable from no key at all.{why}",
+        consumer = d.consumer,
+        scopes = d.scopes.join(", "),
+        name = d.addon.replace('_', "-"),
+    )
+}
+
+/// The overlay text a licensed add-on's declaration may be read from, and
+/// the label it is reported under, or `None`. In order:
+///   1. its bundle, `<root>/addons/<addon>/docker-compose.yml`, only while
+///      the bytes hash to the `files` entry of the cached lock its pin names
+///      (the signature was checked when the pin was written; `noo addons
+///      verify` re-checks it);
+///   2. DEPRECATED (one release): the overlay an earlier CLI materialised at
+///      `<root>/docker-compose.<addon>.yml`, only while the bytes are exactly
+///      what that CLI recorded in `.noo-materialised`;
+///   3. a development install (no `NOO_IMAGE_TAG`): the add-on checkout's own
+///      overlay, `${NOO_<ADDON>_PATH:-../noo-<addon>}/docker-compose.<addon>.yml`.
+pub(crate) fn trusted_addon_overlay(root: &std::path::Path, addon: &str) -> Option<(String, String)> {
+    use crate::addons::pins;
+    let bundle = pins::addon_dir(root, addon).join(crate::addon_lock::OVERLAY_FILE);
+    if let Ok(bytes) = std::fs::read(&bundle) {
+        let pinned = pins::read(root).ok().and_then(|all| all.get(addon).cloned());
+        let signed = pinned
+            .and_then(|pin| pins::cached_lock(root, addon, &pin).ok())
+            .and_then(|(lock, _)| serde_json::from_slice::<crate::addon_lock::AddonLock>(&lock).ok())
+            .and_then(|l| l.files.get(crate::addon_lock::OVERLAY_FILE).cloned());
+        if signed.as_deref() == Some(crate::addon_lock::sha256_ref(&bytes).as_str()) {
+            let label = format!("{}/{addon}/{}", pins::ADDONS_DIR, crate::addon_lock::OVERLAY_FILE);
+            return String::from_utf8(bytes).ok().map(|t| (label, t));
+        }
+        return None;
+    }
+    let legacy = pins::legacy_overlay(root, addon);
+    if let Ok(bytes) = std::fs::read(&legacy) {
+        let rel = legacy.file_name()?.to_str()?.to_string();
+        let recorded = crate::onboard::standalone::materialised_sha(root, &rel);
+        if recorded.as_deref() == Some(pins::sha256_hex(&bytes).as_str()) {
+            return String::from_utf8(bytes).ok().map(|t| (rel, t));
+        }
+    }
+    if crate::addons::current_tag(root).is_none() {
+        let kebab = addon.replace('_', "-");
+        let var = format!("NOO_{}_PATH", addon.to_ascii_uppercase());
+        let base = std::env::var(&var).ok().filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("..").join(format!("noo-{kebab}")));
+        let base = if base.is_absolute() { base } else { root.join(base) };
+        let p = base.join(format!("docker-compose.{kebab}.yml"));
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            return Some((p.display().to_string(), t));
+        }
+    }
+    None
+}
+
+/// The licensed add-ons' declarations and registry rows, read at run time
+/// from [`trusted_addon_overlay`]. Leaked once per (label, bytes): the CLI is
+/// short-lived and a declaration is a few hundred bytes, and `&'static` keeps
+/// one row type for embedded and bundled declarations alike. A malformed
+/// block warns on stderr and declares nothing.
+fn runtime_addon_rows() -> Vec<(&'static AddonDecl, &'static SecretSpec)> {
+    #[cfg(test)]
+    {
+        test_runtime_rows()
+    }
+    #[cfg(not(test))]
+    {
+        runtime_addon_rows_at(&crate::envfile::repo_root())
+    }
+}
+
+type RuntimeRow = (&'static AddonDecl, &'static SecretSpec);
+static RUNTIME_ROWS: std::sync::Mutex<Vec<(String, RuntimeRow)>> = std::sync::Mutex::new(Vec::new());
+
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn leak_strs(v: &[String]) -> &'static [&'static str] {
+    Box::leak(v.iter().map(|s| leak_str(s.clone())).collect::<Vec<_>>().into_boxed_slice())
+}
+
+/// One declaration text to its leaked row (cached by label and bytes).
+fn runtime_row(label: &str, text: &str, addon: &str) -> Option<RuntimeRow> {
+    let cache_key = format!("{label}\0{}", crate::addons::pins::sha256_hex(text.as_bytes()));
+    let mut cache = RUNTIME_ROWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, row)) = cache.iter().find(|(k, _)| *k == cache_key) {
+        return Some(*row);
+    }
+    let d = match crate::addon_decl_parse::parse_decl(label, text, Some(addon)) {
+        Ok(Some(d)) => d,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("warning: {e}; the add-on's key declaration is ignored");
+            return None;
+        }
+    };
+    let decl: &'static AddonDecl = Box::leak(Box::new(AddonDecl {
+        overlay: leak_str(label.to_string()),
+        addon: leak_str(d.addon.clone()),
+        consumer: leak_str(d.consumer.clone()),
+        key: leak_str(d.key.clone()),
+        containers: leak_strs(&d.containers),
+        scopes: leak_strs(&d.scopes),
+        why: d.why.clone().map(leak_str),
+    }));
+    let spec: &'static SecretSpec = Box::leak(Box::new(SecretSpec {
+        key: decl.key,
+        class: Class::ProviderIssued,
+        gen_bytes: 0,
+        consequence: leak_str(addon_key_consequence(label, &d)),
+        consumers: decl.containers,
+        required_when: Requirement::Optional,
+    }));
+    cache.push((cache_key, (decl, spec)));
+    Some((decl, spec))
+}
+
+/// [`runtime_addon_rows`] for the install at `root`: each licensed add-on
+/// (`ADDON_ROWS`) that no embedded overlay declares, from its trusted
+/// overlay. Duplicates of an embedded key, consumer or add-on are dropped.
+pub(crate) fn runtime_addon_rows_at(root: &std::path::Path) -> Vec<RuntimeRow> {
+    let mut out: Vec<RuntimeRow> = Vec::new();
+    for row in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
+        if ADDON_DECLS.iter().any(|d| d.addon == row.key) {
+            continue;
+        }
+        let Some((label, text)) = trusted_addon_overlay(root, row.key) else { continue };
+        let Some((d, spec)) = runtime_row(&label, &text, row.key) else { continue };
+        let clash = ADDON_DECLS.iter().chain(out.iter().map(|(d, _)| *d))
+            .any(|o| o.key == d.key || o.consumer == d.consumer);
+        if clash {
+            eprintln!("warning: {label} declares a key or consumer another add-on already declares; ignored");
+            continue;
+        }
+        out.push((d, spec));
+    }
+    out
+}
+
+/// Tests see the two licensed add-ons' declarations as their bundles carry
+/// them (the add-on repos hold the overlays; these are their x-noo-addon
+/// blocks, so the provision and verify tests keep real shapes).
+#[cfg(test)]
+pub(crate) const TEST_BUNDLED_DECLS: &[(&str, &str)] = &[
+    (
+        "trellion_intel",
+        "x-noo-addon:\n  addon: trellion_intel\n  consumer: svc:trellion-intel\n  key: NOO_SVC_KEY_TRELLION_INTEL\n  \
+         containers: [noo-trellion-intel]\n  scopes: [chat, embeddings, metrics]\n  why: >-\n    the graph engine's \
+         extraction calls the gateway's chat and embeddings, and its counters post to the gateway's metrics door.\n",
+    ),
+    (
+        "evolve",
+        "x-noo-addon:\n  addon: evolve\n  consumer: svc:evolve\n  key: NOO_SVC_KEY_EVOLVE\n  containers: [noo-evolve]\n  \
+         scopes: [temporal, heartbeat, activities, channels:send, metrics, config:agent, config:memory, config:cluster, \
+         config:cache, config:web_search, config:self_identity, config:prompt_skills, config:recall_memory, config:ga, \
+         conversation_stats, prompt_skills:write]\n  why: >-\n    the evolve loop writes temporal edges, runs and toggles \
+         heartbeat tasks, files activities, sends operator alerts, posts its counters, tunes these config sections and \
+         reads fleet-wide conversation stats aggregates for its composite score, and writes evolved prompt skills.\n",
+    ),
+];
+
+#[cfg(test)]
+fn test_runtime_rows() -> Vec<RuntimeRow> {
+    TEST_BUNDLED_DECLS
+        .iter()
+        .filter_map(|(addon, text)| runtime_row(&format!("addons/{addon}/docker-compose.yml"), text, addon))
+        .collect()
 }
 
 /// The add-on declaration `by` names: an add-on key (`trellion_intel`), its
@@ -340,7 +537,7 @@ pub fn registry() -> impl Iterator<Item = &'static SecretSpec> {
 /// or its store key (`NOO_SVC_KEY_TRELLION_INTEL`).
 pub fn addon_decl(by: &str) -> Option<&'static AddonDecl> {
     let by = by.trim();
-    ADDON_DECLS.iter().find(|d| {
+    addon_decls().into_iter().find(|d| {
         d.addon == by
             || d.addon.replace('_', "-") == by
             || d.consumer == by
@@ -4194,7 +4391,7 @@ pub(crate) const CORE_DEFAULT_SCOPES: &[(&str, &[&str])] = &[("svc:worker", &["c
 /// its core row, else the inference pair — never a control scope, which only
 /// a declaration or an explicit `--scopes` can ask for.
 pub(crate) fn default_scopes_for(consumer: &str) -> &'static [&'static str] {
-    if let Some(d) = ADDON_DECLS.iter().find(|d| d.consumer == consumer) {
+    if let Some(d) = addon_decls().into_iter().find(|d| d.consumer == consumer) {
         return d.scopes;
     }
     CORE_DEFAULT_SCOPES
@@ -7213,7 +7410,7 @@ mod provision_tests {
         addon_decl, classify_provision, mint_mode, provision_request, provision_targets,
         provisioned_scopes, registry,
         scope_diff, MintMode, ProvisionOutcome, Requirement, ADDON_DECLS, ADDON_KEY_SPECS,
-        CORE_REGISTRY,
+        CORE_REGISTRY, addon_decls, runtime_addon_rows_at, trusted_addon_overlay, TEST_BUNDLED_DECLS,
     };
 
     /// One word resolves to all three names a per-consumer key answers to.
@@ -7225,7 +7422,7 @@ mod provision_tests {
         assert_eq!(t.secret_key, "NOO_SVC_KEY_TRELLION_INTEL");
         assert!(t.containers.contains(&"noo-trellion-intel".to_string()));
         assert_eq!(t.addon.as_deref(), Some("trellion_intel"));
-        assert_eq!(t.overlay.as_deref(), Some("docker-compose.trellion-intel.yml"));
+        assert_eq!(t.overlay.as_deref(), Some("addons/trellion_intel/docker-compose.yml"));
         // Every spelling of the same add-on lands on the same declaration.
         for word in ["trellion_intel", "svc:trellion-intel", "NOO_SVC_KEY_TRELLION_INTEL"] {
             assert_eq!(provision_targets(word).as_ref(), Some(&t), "{word}");
@@ -7237,34 +7434,90 @@ mod provision_tests {
     /// iterates the declarations pass over an empty table.
     #[test]
     fn addon_declarations_are_embedded() {
-        assert!(ADDON_DECLS.len() >= 3, "only {} declarations embedded", ADDON_DECLS.len());
+        assert!(!ADDON_DECLS.is_empty(), "no declaration embedded");
+        assert!(ADDON_DECLS.iter().any(|d| d.addon == "trellion"), "trellion's overlay ships in this tree");
         for a in ["trellion", "trellion_intel", "evolve"] {
             assert!(addon_decl(a).is_some(), "{a} declares no key");
         }
-        for d in ADDON_DECLS {
+        for d in addon_decls() {
             assert!(crate::commands::addons::row(d.addon).is_some(),
                 "{} declares addon {:?}, which is not an ADDON_ROWS key", d.overlay, d.addon);
         }
+        // N6: no licensed add-on's overlay is embedded; each comes from its bundle.
+        for d in ADDON_DECLS {
+            assert!(crate::commands::addons::row(d.addon).and_then(|r| r.licensed).is_none(),
+                "{} is a licensed add-on's overlay embedded in core", d.overlay);
+        }
+    }
+
+    /// The run-time reader trusts a bundled overlay only while it hashes to
+    /// the pinned lock, and a legacy slice overlay only while it is the bytes
+    /// the last materialise recorded. An edited file declares nothing.
+    #[test]
+    fn a_bundled_declaration_is_read_only_while_it_matches_its_signed_lock() {
+        use crate::addons::{pins, resolve};
+        let d = std::env::temp_dir().join(format!("noo-runtime-decls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".env"), "NOO_IMAGE_TAG=v0.6.0\n").unwrap();
+        let text = TEST_BUNDLED_DECLS[0].1;
+        let mut l = resolve::tests::lock("1.2.0", &["v0.6.0"], None);
+        l.format = crate::addon_lock::FORMAT_V2.into();
+        let files = std::collections::BTreeMap::from([(crate::addon_lock::OVERLAY_FILE.to_string(), text.as_bytes().to_vec())]);
+        l.files = files.iter().map(|(n, b)| (n.clone(), crate::addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = crate::addon_lock::sign(&l, &resolve::tests::seed()).unwrap();
+        let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files };
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+
+        let rows = runtime_addon_rows_at(&d);
+        assert_eq!(rows.len(), 1, "{:?}", rows.iter().map(|r| r.0).collect::<Vec<_>>());
+        assert_eq!(rows[0].0.key, "NOO_SVC_KEY_TRELLION_INTEL");
+        assert_eq!(rows[0].0.overlay, "addons/trellion_intel/docker-compose.yml");
+        assert!(rows[0].1.consequence.contains("addons/trellion_intel/docker-compose.yml"));
+
+        // Widened on disk: no longer the signed bytes, so nothing is declared.
+        let overlay = pins::addon_dir(&d, "trellion_intel").join("docker-compose.yml");
+        std::fs::write(&overlay, text.replace("metrics]", "metrics, config:agent]")).unwrap();
+        assert!(trusted_addon_overlay(&d, "trellion_intel").is_none());
+        assert!(runtime_addon_rows_at(&d).is_empty());
+
+        // A legacy slice overlay counts only with the bytes the manifest recorded.
+        std::fs::remove_dir_all(pins::addon_dir(&d, "trellion_intel")).unwrap();
+        let legacy = pins::legacy_overlay(&d, "evolve");
+        std::fs::write(&legacy, TEST_BUNDLED_DECLS[1].1).unwrap();
+        assert!(trusted_addon_overlay(&d, "evolve").is_none(), "no manifest records it");
+        let manifest = serde_json::json!({"version": 1, "cli": "0.6.3",
+            "files": {"docker-compose.evolve.yml": pins::sha256_hex(TEST_BUNDLED_DECLS[1].1.as_bytes())}});
+        std::fs::write(d.join(".noo-materialised"), manifest.to_string()).unwrap();
+        let (label, _) = trusted_addon_overlay(&d, "evolve").expect("the recorded legacy overlay");
+        assert_eq!(label, "docker-compose.evolve.yml");
+        std::fs::write(&legacy, format!("{}# edited\n", TEST_BUNDLED_DECLS[1].1)).unwrap();
+        assert!(trusted_addon_overlay(&d, "evolve").is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Each declaration yields exactly one registry row, holding exactly the
     /// declared containers — so `rotate` recreates what the overlay says.
     #[test]
     fn addon_rows_are_derived_from_overlays() {
-        for d in ADDON_DECLS {
+        for d in addon_decls() {
             let rows: Vec<_> = registry().filter(|s| s.key == d.key).collect();
             assert_eq!(rows.len(), 1, "{} has {} registry rows", d.key, rows.len());
             assert_eq!(rows[0].consumers, d.containers, "{}", d.key);
             assert!(rows[0].consequence.contains(d.overlay), "the row names where it came from");
         }
         assert_eq!(ADDON_KEY_SPECS.len(), ADDON_DECLS.len());
+        assert_eq!(registry().filter(|s| s.key.starts_with("NOO_SVC_KEY_") && !CORE_REGISTRY.iter().any(|c| c.key == s.key)).count(),
+            addon_decls().len());
     }
 
     /// A resurrected hand-written row would be a second answer to "who holds
     /// this key" — the drift the derivation exists to end.
     #[test]
     fn no_addon_row_is_hand_written() {
-        for d in ADDON_DECLS {
+        for d in addon_decls() {
             assert!(!CORE_REGISTRY.iter().any(|s| s.key == d.key),
                 "{} is hand-written in CORE_REGISTRY and declared by {}", d.key, d.overlay);
         }

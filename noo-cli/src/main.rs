@@ -47,6 +47,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::ptr_arg)]
 
+mod addon_decl_parse;
 mod addon_lock;
 mod addons;
 mod auth;

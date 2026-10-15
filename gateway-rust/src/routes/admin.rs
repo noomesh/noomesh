@@ -2918,9 +2918,9 @@ pub(crate) async fn host_spool_write_command(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let suffix: String = {
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
     };
     let name = format!("{nanos}-{suffix}");
@@ -5280,7 +5280,7 @@ async fn stamp_of(db: &sqlx::PgPool, schema: &str, table: &str) -> Option<String
             .await
             .ok()?;
         if exists {
-            let v: Option<String> = sqlx::query_scalar(&format!("SELECT version_num FROM {rel} LIMIT 1"))
+            let v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT version_num FROM {rel} LIMIT 1")))
                 .fetch_optional(db)
                 .await
                 .ok()

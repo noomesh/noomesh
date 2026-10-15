@@ -561,9 +561,9 @@ pub async fn start(
             // Leave the aborted transaction before reading.
             drop(tx);
             // The one-live-at-a-time index refused us: someone's run is live.
-            let existing = sqlx::query(&format!(
+            let existing = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {COLS} FROM noo_ops WHERE exclusive_key = $1 AND status IN ('queued','running')"
-            ))
+            )))
             .bind(spec.name)
             .fetch_optional(db)
             .await
@@ -757,7 +757,7 @@ async fn finish_inner(
 
 /// An op by id, with no visibility check (internal: the supervisor, waits).
 pub async fn get_row(db: &PgPool, op_id: Uuid) -> Result<Option<OpRow>, sqlx::Error> {
-    match sqlx::query(&format!("SELECT {COLS} FROM noo_ops WHERE op_id = $1")).bind(op_id).fetch_optional(db).await? {
+    match sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLS} FROM noo_ops WHERE op_id = $1"))).bind(op_id).fetch_optional(db).await? {
         Some(r) => Ok(Some(OpRow::from_row(&r)?)),
         None => Ok(None),
     }
@@ -797,7 +797,7 @@ fn who(requester: Option<&RequesterCtx>) -> (bool, Option<&str>, Option<&str>) {
 pub async fn get_visible(db: &PgPool, requester: Option<&RequesterCtx>, op_id: Uuid) -> Result<Option<OpRow>, sqlx::Error> {
     let sql = format!("SELECT {COLS} FROM noo_ops WHERE op_id = $1 AND {}", visible_sql(2, 3, 4));
     let (admin, account, consumer) = who(requester);
-    match sqlx::query(&sql)
+    match sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(op_id)
         .bind(admin)
         .bind(account)
@@ -826,7 +826,7 @@ pub async fn list(
          ORDER BY created_at DESC LIMIT $5",
         visible_sql(1, 2, 3)
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(admin_all)
         .bind(account)
         .bind(consumer)

@@ -87,19 +87,19 @@ fn b64url(bytes: &[u8]) -> String {
 
 /// A fresh, unguessable session id.
 fn new_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     b64url(&b)
 }
 
 /// The short suffix that tells two sessions of one key apart. Lowercase
 /// alphanumerics so the label stays inside the name class.
 fn suffix() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut r = rand::thread_rng();
-    (0..6).map(|_| ALPHABET[r.gen_range(0..ALPHABET.len())] as char).collect()
+    let mut r = rand::rng();
+    (0..6).map(|_| ALPHABET[r.random_range(0..ALPHABET.len())] as char).collect()
 }
 
 /// Build the label a session mints under: the key's label plus a suffix,

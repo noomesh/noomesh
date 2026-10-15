@@ -2586,7 +2586,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
                 Err(e) => { ui::warned(&format!("{name}: not fetched ({e}) — nodes will verify against GitHub instead")); continue; }
             },
         };
-        let sha = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&bytes)) };
+        let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/{name}?sha256={sha}&version={version}"), &bytes) {
             ui::warned(&format!("{name}: upload failed ({e})"));
@@ -2596,7 +2596,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // controller (no GitHub, no scp): curl …/bootstrap/cli/install.sh.
     {
         let bytes = INSTALLER.as_bytes();
-        let sha = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(bytes)) };
+        let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(bytes)) };
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/install.sh?sha256={sha}&version={version}"), bytes) {
             ui::warned(&format!("install.sh: upload failed ({e}) — new nodes fall back to the GitHub installer line"));
@@ -2622,7 +2622,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         };
         let sha = {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(&bytes))
+            hex::encode(Sha256::digest(&bytes))
         };
         match crate::commands::provision::put_bytes(
             g,
@@ -3425,6 +3425,9 @@ fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if r.is_auth() {
         return crate::addons::resolve::TOKEN_FIX.to_string();
     }
+    if crate::addons::resolve::is_not_published(r) {
+        return format!("noo addons upgrade {addon} --check   # retry shortly; the vendor signs the lock minutes after a stack release");
+    }
     if matches!(r, crate::addons::resolve::Refusal::Downgrade { .. }) {
         return "noo upgrade --stack --allow-downgrade   # an explicit rollback of the add-on with the stack".to_string();
     }
@@ -3452,10 +3455,18 @@ fn addon_preflight(
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
         match crate::addons::prepare(&ctx, addon, &mut crate::addons::resolve::LiveDocker::new(root)) {
             Ok(p) => out.push(p),
-            Err(r) => fail(g.json, ExitCode::Generic, "addon_hold",
-                &format!("refusing to roll to {tag}: the {addon} add-on is on and {}. Nothing was changed",
-                    lowercase_first(&r.why(addon))),
-                Some(&addon_hold_fix(addon, &r))),
+            Err(r) => {
+                // A lock the vendor has not published yet is not a fault of
+                // the add-on or the credential: say so in its own words.
+                let why = if crate::addons::resolve::is_not_published(&r) {
+                    format!("{addon}: {}", r.why(addon))
+                } else {
+                    format!("the {addon} add-on is on and {}", lowercase_first(&r.why(addon)))
+                };
+                fail(g.json, ExitCode::Generic, "addon_hold",
+                    &format!("refusing to roll to {tag}: {why}. Nothing was changed"),
+                    Some(&addon_hold_fix(addon, &r)))
+            }
         }
     }
     out

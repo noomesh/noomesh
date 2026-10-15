@@ -969,7 +969,9 @@ services:
   # runtime images (mirror-images.yml `dest_org: noomesh/dhi`), so an
   # un-seeded install never dials dhi.io. These are the images the stack is
   # built around: every service key and data volume is handed to their uids
-  # (pki.rs SERVICE_KEY_READERS: 65532, root for the -dev variants).
+  # (pki.rs SERVICE_KEY_READERS: 65532 for all six; the two -dev variants,
+  # redis and grafana, whose image USER is root, are pinned to it by
+  # `user:` below - i64, they must not run as root).
   # `ghcr.io/noomesh/<name>` (no dhi/) is a DIFFERENT image family under the
   # same names and tags - the upstream official images, which run as
   # nobody/10001/472 and restart-loop on `permission denied` against those
@@ -984,13 +986,26 @@ services:
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
     profiles: ["controller", "standalone"]
+    # NOT root (i64, operator 2026-10-15). The -dev image's USER is 0; it
+    # stays the -dev variant because the DHI runtime variant ships no shell
+    # and docker/redis-entrypoint.sh is /bin/sh. 65532 is the DHI `nonroot`
+    # uid: the data dir (onboard `subdir_owner`, and the launcher re-owns an
+    # install's root-written files once), the TLS key (pki.rs
+    # SERVICE_KEY_READERS) and the password file below are all handed to it.
+    # cluster_verify's "image family" row fails a redis running as uid 0.
+    # A NAME, not the uid: Docker 27 (compose v2.33) resolves `user:` against
+    # the image's /etc/passwd when it copies the secrets below in, and
+    # `65532:65532`, `65532` and `nonroot:nonroot` all fail onboard with
+    # `getent unable to find entry "65532:65532" in passwd database`. The
+    # image's `nonroot` is uid 65532 (tests/test_compose_named_users.py).
+    user: nonroot
     # No external port — only accessible via Docker network (noo-db)
-    # The password as a FILE (0400, uid 0 — the DHI -dev image runs as
-    # root, `USER 0`); docker/redis-entrypoint.sh reads REDIS_PASSWORD_FILE
-    # and writes its 0600 config from it. Empty store value → no file and no
-    # pointer → the entrypoint refuses, exactly as an empty env did.
+    # The password as a FILE (0400, owned by the container's uid 65532);
+    # docker/redis-entrypoint.sh reads REDIS_PASSWORD_FILE and writes its
+    # 0600 config from it. Empty store value → no file and no pointer → the
+    # entrypoint refuses, exactly as an empty env did.
     secrets:
-      - { source: redis_password, target: redis_password, uid: "0", gid: "0", mode: 0400 }
+      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
     environment:
       - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
       - NOO_REDIS_TLS=${NOO_REDIS_TLS:-}
@@ -2210,9 +2225,17 @@ services:
     image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
     profiles: ["monitoring", "controller", "standalone"]
-    # uid 0: the DHI -dev image runs as root (`USER 0`).
+    # NOT root (i64, operator 2026-10-15): the -dev image's USER is 0, so
+    # the uid is pinned here. 65532 owns the data dir (onboard
+    # `subdir_owner`; the launcher re-owns an install's root-written
+    # grafana.db once) and reads services/grafana/service.key (pki.rs
+    # SERVICE_KEY_READERS); sso/grafana.pub is 0644. cluster_verify's
+    # "image family" row fails a grafana running as uid 0.
+    # A NAME, not the uid (Docker 27 getent, see redis): the image's
+    # `grafana` is uid 65532 (tests/test_compose_named_users.py).
+    user: grafana
     secrets:
-      - { source: grafana_admin_password, target: grafana_admin_password, uid: "0", gid: "0", mode: 0400 }
+      - { source: grafana_admin_password, target: grafana_admin_password, uid: "65532", gid: "65532", mode: 0400 }
     ports:
       # §3f R28. NOT NOO_BIND_ADDR, whose default is 0.0.0.0: Grafana is the
       # one service here with its own user database and its own login, and

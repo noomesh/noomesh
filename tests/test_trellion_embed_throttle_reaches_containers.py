@@ -3,13 +3,15 @@
 
 """trellion's embed throttle can be set from config: both trellion processes
 receive TRELLION_EMBED_MAX_INFLIGHT and TRELLION_EMBED_BATCH_MAX.
+(The trellion-intel half rides its overlay: moved with the overlay to the
+add-on repo (N6); core guards the trellion service its overlay extends.)
 
 The throttle (trellion/live/embed_throttle.py) defaults to ONE request in
 flight per process. With three embed targets live and batches taking 10-60 s,
 that left most of the embedders idle and the backlog drained at ~30 chunks a
 minute (2026-10-09). Nothing passed the variables into the containers, so the
 documented knob could not be turned. Read over the composed projection
-(base + every add-on overlay), where trellion-intel's `extends` is resolved.
+(base + every add-on overlay in this tree).
 """
 
 from __future__ import annotations
@@ -26,7 +28,8 @@ def services() -> dict:
     return full_projection()["services"]
 
 
-@pytest.mark.parametrize("service", ["trellion", "trellion-intel"])
+# trellion-intel: moved with the overlay to the add-on repo (N6).
+@pytest.mark.parametrize("service", ["trellion"])
 @pytest.mark.parametrize("knob", KNOBS)
 def test_each_trellion_process_receives_the_throttle_knob(services, service, knob):
     env = env_of(services[service])

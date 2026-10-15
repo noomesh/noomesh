@@ -77,7 +77,7 @@
 //! checkpoint's `after:` link does detect deletion of the retired epoch's
 //! last rows, the one place it matters most.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -780,7 +780,7 @@ const SELECT_ROWS: &str = "SELECT id::text, \"timestamp\", event_type, severity,
 
 /// Read the whole table and judge it with the keys this process holds.
 pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
-    let rows: Vec<RowTuple> = sqlx::query_as(&format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC"))
+    let rows: Vec<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC")))
         .fetch_all(db)
         .await?;
     let rows: Vec<AuditRow> = rows.into_iter().map(to_row).collect();
@@ -855,7 +855,7 @@ pub(crate) async fn ensure_checkpoint_with(
         let sql = format!(
             "{SELECT_ROWS} WHERE entry_hash IS NOT NULL ORDER BY \"timestamp\" DESC, id DESC"
         );
-        let mut stream = sqlx::query_as::<_, RowTuple>(&sql).fetch(db);
+        let mut stream = sqlx::query_as::<_, RowTuple>(sqlx::AssertSqlSafe(&*sql)).fetch(db);
         loop {
             match stream.try_next().await {
                 Ok(Some(t)) => {
@@ -956,7 +956,7 @@ pub(crate) async fn ensure_hash_v2_marker_with(
 ) -> MarkerOutcome {
     let Some(current) = current else { return MarkerOutcome::KeyMissing };
     let existing: Vec<RowTuple> =
-        match sqlx::query_as(&format!("{SELECT_ROWS} WHERE event_type = $1"))
+        match sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT_ROWS} WHERE event_type = $1")))
             .bind(HASH_V2_MARKER_EVENT)
             .fetch_all(db)
             .await
@@ -1671,9 +1671,9 @@ mod tests {
         let Ok(url) = std::env::var("NOO_AUDIT_PROOF_DB_URL") else { return };
         let db = sqlx::PgPool::connect(&url).await.expect("connect");
         let key = b"proof-dedicated-audit-key-0123456789";
-        let rows: Vec<RowTuple> = sqlx::query_as(&format!(
+        let rows: Vec<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "{SELECT_ROWS} WHERE actor LIKE 'py-proof%' ORDER BY \"timestamp\" ASC, id ASC"
-        ))
+        )))
         .fetch_all(&db)
         .await
         .unwrap();
@@ -1717,7 +1717,7 @@ mod tests {
         };
         let read = || async {
             let rows: Vec<RowTuple> =
-                sqlx::query_as(&format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC"))
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC")))
                     .fetch_all(&db)
                     .await
                     .unwrap();

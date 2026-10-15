@@ -20,6 +20,15 @@
 //! lock looks tampered with. The read-modify-write of `addons.lock` holds an
 //! exclusive `flock` on `.addons.lock.lck`. Every file write is a temporary
 //! file plus rename and takes `stack.lock`'s permissions.
+//!
+//! A bundle lock (`noo-addon-lock/2`) also brings the add-on's files (its
+//! compose overlay at least). They are materialised under
+//! `<root>/addons/<addon>/` ([`materialise`]), never into the core slice,
+//! after the pin moves, by swapping in a fully written directory. The
+//! launcher composes `<root>/addons/<addon>/docker-compose.yml`, and every
+//! offline check holds those bytes to the cached signed lock, so a file
+//! edited on disk (or left over from another version) refuses like a
+//! tampered lock.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -31,6 +40,8 @@ use crate::addon_lock::VerifiedLock;
 
 pub const PINS_FILE: &str = "addons.lock";
 pub const CACHE_DIR: &str = "addon-locks";
+/// Where bundle files are materialised: `<root>/addons/<addon>/<name>`.
+pub const ADDONS_DIR: &str = "addons";
 
 /// One add-on's pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +225,98 @@ pub fn set_pin(root: &Path, addon: &str, pin: &Pin, lock: &[u8], sig: &str) -> R
     Ok(())
 }
 
+/// `<root>/addons/<addon>`: the add-on's materialised bundle files.
+pub fn addon_dir(root: &Path, addon: &str) -> PathBuf {
+    root.join(ADDONS_DIR).join(addon)
+}
+
+/// The overlay an add-on whose lock predates bundles (`noo-addon-lock/1`)
+/// still runs from, when an earlier CLI left it in the slice:
+/// `<root>/docker-compose.<addon, kebab>.yml`. DEPRECATED: honoured for one
+/// release (0.6.4) with a warning, then removed.
+pub fn legacy_overlay(root: &Path, addon: &str) -> PathBuf {
+    root.join(format!("docker-compose.{}.yml", addon.replace('_', "-")))
+}
+
+/// The bytes of each named file in `<root>/addons/<addon>/` that exists and
+/// is a regular file (a symlink is not read). Missing names are simply
+/// absent; `addon_lock::verify_files` says which.
+pub fn materialised_files<'a>(root: &Path, addon: &str, names: impl IntoIterator<Item = &'a String>) -> BTreeMap<String, Vec<u8>> {
+    let dir = addon_dir(root, addon);
+    let mut out = BTreeMap::new();
+    for n in names {
+        let p = dir.join(n);
+        let regular = std::fs::symlink_metadata(&p).map(|m| m.file_type().is_file()).unwrap_or(false);
+        if regular {
+            if let Ok(b) = std::fs::read(&p) {
+                out.insert(n.clone(), b);
+            }
+        }
+    }
+    out
+}
+
+/// Replace `<root>/addons/<addon>/` with exactly `files` (name to bytes;
+/// the caller has verified them against the signed lock). The new set is
+/// written to a sibling temporary directory first and swapped in by rename,
+/// so a failure leaves the previous directory whole. An empty `files` (a
+/// lock that predates bundles) removes the directory: a bundle left from
+/// another version must never be composed beside a pin that does not list it.
+pub fn materialise(root: &Path, addon: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    let dir = addon_dir(root, addon);
+    let parent = root.join(ADDONS_DIR);
+    let pid = std::process::id();
+    let old = parent.join(format!(".{addon}.old.{pid}"));
+    let remove_old = |p: &Path| -> Result<(), String> {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p).map_err(|e| format!("{}: {e}", p.display())),
+            Ok(_) => std::fs::remove_file(p).map_err(|e| format!("{}: {e}", p.display())),
+            Err(_) => Ok(()),
+        }
+    };
+    if files.is_empty() {
+        return remove_old(&dir);
+    }
+    for name in files.keys() {
+        if !crate::addon_lock::valid_file_name(name) {
+            return Err(format!("{addon}: bundle file name {name:?} is not a plain file name"));
+        }
+    }
+    std::fs::create_dir_all(&parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let new = parent.join(format!(".{addon}.new.{pid}"));
+    remove_old(&new)?;
+    std::fs::create_dir(&new).map_err(|e| format!("{}: {e}", new.display()))?;
+    let written = (|| -> Result<(), String> {
+        for (name, bytes) in files {
+            write_atomic(root, &new.join(name), bytes)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(e);
+    }
+    let had_old = std::fs::symlink_metadata(&dir).is_ok();
+    if had_old {
+        remove_old(&old)?;
+        std::fs::rename(&dir, &old).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&new);
+            format!("{}: {e}", dir.display())
+        })?;
+    }
+    if let Err(e) = std::fs::rename(&new, &dir) {
+        if had_old {
+            let _ = std::fs::rename(&old, &dir);
+        }
+        let _ = std::fs::remove_dir_all(&new);
+        return Err(format!("{}: {e}", dir.display()));
+    }
+    if had_old {
+        let _ = remove_old(&old);
+    }
+    Ok(())
+}
+
 /// The env var the launcher exports for an add-on image and the overlays
 /// read: `NOO_ADDON_IMAGE_<NAME>`, the lock's image name upper-cased with
 /// `-` and `.` as `_`. Derived, so core names no add-on image.
@@ -310,6 +413,30 @@ mod tests {
         for bad in ["", "9x", "a/b", "a:b", "a b"] {
             assert!(image_env_var(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn materialise_swaps_in_exactly_the_files_and_an_empty_set_removes_them() {
+        let d = scratch("materialise");
+        let one = BTreeMap::from([("docker-compose.yml".to_string(), b"a: 1\n".to_vec()), ("x.json".to_string(), b"{}".to_vec())]);
+        materialise(&d, "evolve", &one).unwrap();
+        let names: Vec<String> = one.keys().cloned().collect();
+        assert_eq!(materialised_files(&d, "evolve", &names), one);
+        // A second version replaces the set wholesale: x.json is gone.
+        let two = BTreeMap::from([("docker-compose.yml".to_string(), b"a: 2\n".to_vec())]);
+        materialise(&d, "evolve", &two).unwrap();
+        assert!(!addon_dir(&d, "evolve").join("x.json").exists());
+        assert_eq!(materialised_files(&d, "evolve", &names), two);
+        let left: Vec<_> = std::fs::read_dir(d.join(ADDONS_DIR)).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("evolve")], "no temporary directory left behind");
+        // A bundle-less lock removes the directory.
+        materialise(&d, "evolve", &BTreeMap::new()).unwrap();
+        assert!(!addon_dir(&d, "evolve").exists());
+        // A path is never written.
+        let bad = BTreeMap::from([("../x".to_string(), b"".to_vec())]);
+        assert!(materialise(&d, "evolve", &bad).is_err());
+        assert!(!d.join("x").exists());
+        assert_eq!(legacy_overlay(&d, "trellion_intel"), d.join("docker-compose.trellion-intel.yml"));
     }
 
     #[test]

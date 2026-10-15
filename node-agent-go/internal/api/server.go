@@ -71,6 +71,9 @@ type Server struct {
 	gpuWatch func() any
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
+
+	// proxyTarget overrides docker.ProxyTarget (tests only).
+	proxyTarget func(string) (string, error)
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
@@ -241,6 +244,9 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /cleanup/logs", ctrlMW(http.HandlerFunc(s.handleCleanupLogs)))
 	s.mux.Handle("POST /api/containers/start", ctrlMW(http.HandlerFunc(s.handleContainerStart)))
 	s.mux.Handle("POST /api/containers/stop", ctrlMW(http.HandlerFunc(s.handleContainerStop)))
+	// Reverse proxy into a managed container's loopback-published port (the
+	// only way in: the port is not bound on any other interface).
+	s.mux.Handle("/api/containers/{name}/proxy/{path...}", ctrlMW(http.HandlerFunc(s.handleContainerProxy)))
 
 	// The work routes are the controller's too.
 	//

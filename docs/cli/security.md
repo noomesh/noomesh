@@ -289,6 +289,16 @@ outside `--registry` or not pinned by digest, a lock with no stack version,
 and a lock that is not in canonical form. `--stack` also requires the lock to
 list that stack version exactly; an rc and its final are separate entries.
 
+A release also signs a **bundle** lock: the same command with one
+`--file <name>=<path>` per file the add-on ships beside its images (its
+compose overlay, `--file docker-compose.yml=bundle/docker-compose.yml`, at
+least). The lock then has format `noo-addon-lock/2` and lists each file's
+sha256 under `files`, so the one signature covers them. Write it to
+`--out addon-bundle.json`; `verify addon-bundle.json … --files-dir <dir>`
+also refuses any listed file in `<dir>` that is missing or does not hash to
+the lock. The layout both locks are published in is in
+[the add-on guide](../development/addons.md#the-signed-add-on-lock).
+
 ## Related guides
 
 - [../security/secrets.md](../security/secrets.md) — the secret store and `noo security secrets`
@@ -360,8 +370,8 @@ list that stack version exactly; an rc and its final are separate entries.
 | `noo security entitlement verify` | `<token>` | Verify a token offline against this build's entitlement key |
 | `noo security release-sign` | `<file> [--seed-file <path>] [--out <file.sig>]` | Hidden: sign sha256sums.txt with the release key (CI only) |
 | `noo security release-verify` | `<file> [<file.sig>]` | Verify a release manifest signature against the keys baked into this build |
-| `noo security addon-lock sign` | `--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--registry <root>] --seed-file <path\|-> --out <path>` | Hidden: sign an add-on lock with the add-on's own key (add-on CI only) |
-| `noo security addon-lock verify` | `<path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>]` | Verify a signed add-on lock against the add-on's keys and registry root |
+| `noo security addon-lock sign` | `--addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path\|-> --out <path>` | Hidden: sign an add-on lock with the add-on's own key (add-on CI only) |
+| `noo security addon-lock verify` | `<path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>]` | Verify a signed add-on lock against the add-on's keys and registry root |
 | `noo security secrets tidy` | `[-y\|--yes]` | Thin the store to secrets only: move config to .env, drop retired keys, blank .env copies |
 | `noo security secrets audit` | `[--sops-file <path>] [--env-file <path>]` | Compare env.sops against .env by digest and report findings (no values shown) |
 | `noo security secrets resync` | `<key>... \| --all [--dry-run] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]` | Make Postgres role passwords match the values already in the SOPS store |

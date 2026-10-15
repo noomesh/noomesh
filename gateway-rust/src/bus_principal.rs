@@ -73,7 +73,7 @@
 //! payload claimed.
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -539,13 +539,17 @@ mod publish_sites {
         ".publish_with_headers(",
         ".request_with_headers(",
         ".publish_with_reply_and_headers(",
+        // A request with a scoped reply inbox (i70) — still a publish.
+        ".send_request(",
     ];
 
     /// Every file that may publish a `worker.*` subject, with the header-
     /// bearing call it uses. A new entry is a deliberate decision to open a
     /// fifth door; opening one without a header fails the second test.
     const SIGNING_SITES: &[(&str, &str)] = &[
-        ("worker_client.rs", "request_with_headers"),
+        // `send_request` with `Request::headers` — the request carries the
+        // worker principal's own reply inbox (i70).
+        ("worker_client.rs", "send_request"),
         ("worker_client.rs", "publish_with_headers"),
         ("worker_client.rs", "publish_with_reply_and_headers"),
         ("dlq_drain.rs", "publish_with_headers"),
@@ -665,7 +669,8 @@ mod publish_sites {
         // path asks for a header first.
         let source = std::fs::read_to_string(src_dir().join("worker_client.rs")).unwrap();
         for call in [
-            "request_with_headers",
+            "send_request",
+            "request.headers(h)",
             "publish_with_headers",
             "publish_with_reply_and_headers",
         ] {

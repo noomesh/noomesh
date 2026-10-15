@@ -176,13 +176,18 @@ addon_image_vars() {
     done | sort -u
 }
 
-# _addon_composed_names — the add-on keys whose overlay is composed (the same
-# addon_on decisions addon_compose_overlay_args makes, --core-only included).
+# _addon_composed_names — the add-on keys declared on (the same addon_on
+# decisions addon_compose_overlay_args makes, --core-only included): the core
+# overlay add-ons, then every licensed one (lib-addons addon_licensed_names).
+# An add-on is listed whether or not its overlay was found, so a licensed
+# add-on that is on with no bundle materialised is refused by launch-pins
+# rather than silently left out of the stack.
 _addon_composed_names() {
-    local _n _d
-    for _n in trellion:1 voice:0 trellion_intel:0 evolve:0; do
-        _d="${_n#*:}"; _n="${_n%%:*}"
-        addon_on "$_n" "$_d" && printf '%s\n' "$_n"
+    local _n
+    addon_on trellion 1 && printf '%s\n' trellion
+    addon_on voice 0 && printf '%s\n' voice
+    for _n in $(addon_licensed_names); do
+        addon_on "$_n" 0 && printf '%s\n' "$_n"
     done
     return 0
 }
@@ -219,10 +224,16 @@ require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
     _ADDON_PINS=()
-    _args="$(addon_compose_overlay_args)"
+    _args="$(addon_compose_overlay_args 2>/dev/null)"
     # shellcheck disable=SC2086
     _vars="$(addon_image_vars $_args)"
-    [ -n "$_vars" ] || return 0
+    _on="$(_addon_composed_names | tr '\n' ' ')"
+    # Nothing to pin: no composed overlay reads an add-on image, and no add-on
+    # beyond the core overlays is on (a licensed add-on that is on always goes
+    # to launch-pins, which refuses it when its bundle is missing).
+    if [ -z "$_vars" ] && [ -z "$(printf '%s' "$_on" | tr ' ' '\n' | grep -vxE 'trellion|voice|' || true)" ]; then
+        return 0
+    fi
     if [ "${DIST_MODE:-0}" != 1 ]; then
         for _v in $_vars; do
             _name="$(printf '%s' "${_v#NOO_ADDON_IMAGE_}" | tr 'A-Z_' 'a-z-')"
@@ -230,7 +241,6 @@ require_addon_pins() {
         done
         return 0
     fi
-    _on="$(_addon_composed_names | tr '\n' ' ')"
     local _tag="${DIST_TAG:-${NOO_IMAGE_TAG:-}}"
     if ! _nb="$(_addon_noo)" || [ -z "$_nb" ]; then
         echo "REFUSING: add-on overlays are composed (${_on% }) and no noo CLI was found to verify their signed pins." >&2

@@ -196,7 +196,7 @@ jobs:
             "docker.io/mwader/static-ffmpeg:$FFMPEG_VERSION"
 
   # deps-core is the NON-ML tier of the shared Python base:
-  # base deps + web/cache/feedback/pgvector/google-chat/mcp extras, no
+  # base deps + web/cache/feedback/pgvector/mcp extras, no
   # torch and no noo-trellion — so no trellion checkout and no sibling read token
   # secret here. It must publish first: sandbox + worker FROM it
   # directly (DEPS_CORE build-arg), and deps-base FROMs it to add the ML
@@ -762,6 +762,9 @@ jobs:
     if: ${{ github.repository == 'noomesh/noomesh' && !cancelled() && needs.images.result == 'success' }}
     runs-on: ubuntu-latest
     environment: release   # the signing seed is an environment secret of `release` (tag/main only, required reviewer)
+    outputs:
+      tag: ${{ steps.published.outputs.tag }}
+      lock_digest: ${{ steps.published.outputs.lock_digest }}
     # The workflow default is contents:read (image pushes need only
     # packages:write); creating the release on the stack tag needs write.
     # v0.2.11's lock was published by hand after this job got a 403.
@@ -949,3 +952,74 @@ jobs:
             --notes "Image digest lock for stack $TAG. \`noo upgrade --stack\` verifies \`stack-$TAG.lock.sig\` against the release key baked into the CLI and pulls every image by digest." \
             "stack-$TAG.lock" "stack-$TAG.lock.sig" "stack-$TAG.bases" "stack-$TAG.bases.sig" \
           || gh release upload "stack-$TAG" --repo "${{ github.repository }}" --clobber "stack-$TAG.lock" "stack-$TAG.lock.sig" "stack-$TAG.bases" "stack-$TAG.bases.sig"
+      # What the add-on dispatch below sends: the bare tag and the sha256 of
+      # the lock file the release now carries. Only a published stack tag has
+      # either (a dispatch without a tag push publishes no release).
+      - name: Record what was published
+        id: published
+        if: startsWith(github.ref, 'refs/tags/stack-v')
+        run: |
+          set -eu
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "lock_digest=sha256:$(sha256sum "stack-$TAG.lock" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+  # Add-on bundles ride the stack tag (`<root>:stack-<tag>` carries the add-on
+  # lock + bundle), and each add-on repo signs its own. The moment the signed
+  # stack lock exists is the moment those repos can resign, so tell them now
+  # instead of letting them find out on a poll: a user must never see the gap
+  # between a stack tag and its add-on bundles. Each target runs its own
+  # release workflow's `resign` for the tag (`on: repository_dispatch: types:
+  # [stack-tag-published]`). Core names no add-on here: the targets are
+  # whatever the operator lists in the variable below.
+  #
+  # Inert unless configured, so public forks and OSS builds are unaffected:
+  #  - vars.NOO_ADDON_REPOS  space/comma separated `owner/repo` list, a repo
+  #    VARIABLE (not a hard-coded env) so this public file names no private
+  #    org; empty or unset = skip with a notice;
+  #  - secrets.NOO_ADDON_DISPATCH_TOKEN  in the `release` environment
+  #    (fine-grained PAT, below); absent = skip with a notice.
+  # A skip is never a failure; a configured dispatch that the API refuses IS
+  # (after every repo was tried), because a silent gap is what this exists to
+  # close. Idempotent: the add-ons' watcher and manual dispatch remain.
+  #
+  # Token: a fine-grained PAT whose resource owner is the add-ons' org, limited
+  # to the target repositories, with repository permissions `Contents: Read and
+  # write` (GitHub requires write on contents for POST /repos/{r}/dispatches)
+  # and the implicit `Metadata: Read`. Nothing else: no Actions, no packages.
+  addon-dispatch:
+    name: dispatch add-on resigns
+    needs: lock
+    if: ${{ github.repository == 'noomesh/noomesh' && !cancelled() && needs.lock.result == 'success' && needs.lock.outputs.tag != '' }}
+    runs-on: ubuntu-latest
+    environment: release   # NOO_ADDON_DISPATCH_TOKEN is a secret of `release`
+    permissions: {}        # the PAT is the only credential this job uses
+    steps:
+      - name: Dispatch stack-tag-published
+        env:
+          NOO_ADDON_DISPATCH_TOKEN: ${{ secrets.NOO_ADDON_DISPATCH_TOKEN }}
+          NOO_ADDON_REPOS: ${{ vars.NOO_ADDON_REPOS }}
+          TAG: ${{ needs.lock.outputs.tag }}
+          LOCK_DIGEST: ${{ needs.lock.outputs.lock_digest }}
+        run: |
+          set -eu   # never -x: the token is in this environment
+          repos="$(printf '%s' "${NOO_ADDON_REPOS:-}" | tr ',' ' ')"
+          if [ -z "$(printf '%s' "$repos" | tr -d ' ')" ]; then
+            echo "::notice::NOO_ADDON_REPOS is not set: no add-on repositories to notify (public forks and OSS builds run without add-ons)"; exit 0
+          fi
+          if [ -z "${NOO_ADDON_DISPATCH_TOKEN:-}" ]; then
+            echo "::notice::NOO_ADDON_DISPATCH_TOKEN is not set in the release environment: skipping the add-on resign dispatch. Add-ons will resign from their own watcher or by hand."; exit 0
+          fi
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' || { echo "::error::refusing to dispatch for tag '$TAG'"; exit 1; }
+          printf '%s' "$LOCK_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no lock digest to send"; exit 1; }
+          body="$(python3 -I -c 'import json,sys; print(json.dumps({"event_type":"stack-tag-published","client_payload":{"tag":sys.argv[1],"lock_digest":sys.argv[2]}}))' "$TAG" "$LOCK_DIGEST")"
+          bad=0
+          for r in $repos; do
+            printf '%s' "$r" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "::error::NOO_ADDON_REPOS entry '$r' is not owner/repo"; bad=1; continue; }
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $NOO_ADDON_DISPATCH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$r/dispatches" -d "$body")" || code=curl-failed
+            if [ "$code" = 204 ]; then echo "dispatched stack-tag-published $TAG to $r"
+            else echo "::error::dispatch to $r answered HTTP $code (token scope: Contents read+write on $r?)"; bad=1; fi
+          done
+          exit "$bad"

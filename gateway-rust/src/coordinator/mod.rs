@@ -54,7 +54,7 @@ pub(crate) use runtime::{HarnessRuntime, InProcessRuntime, TaskRuntime};
 #[allow(unused_imports)]
 pub(crate) use rail::HarnessOp;
 #[allow(unused_imports)]
-pub(crate) use dispatch::{harness_default_policy, harness_node_explained, harness_node_for, harness_run_subject, role_of, turn_deadline, TurnRequest};
+pub(crate) use dispatch::{harness_default_policy, harness_node_explained, harness_node_for, harness_run_subject, node_request, role_of, turn_deadline, TurnRequest};
 #[allow(unused_imports)]
 pub(crate) use agent_loop::{run_inner, run_streaming_on};
 #[allow(unused_imports)]

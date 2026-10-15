@@ -322,7 +322,7 @@ async fn usage_summary(
         month_bind.is_some(),
         scope.is_some(),
     );
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql));
     if let Some((year, month)) = month_bind {
         query = query.bind(year).bind(month);
     }
@@ -338,7 +338,7 @@ async fn usage_summary(
     if rows.is_empty() {
         if let (Some((year, month)), Some(monthly_key)) = (month_bind, monthly_key_expr) {
             let monthly_sql = monthly_fallback_sql(monthly_key, scope.is_some());
-            let mut monthly_q = sqlx::query(&monthly_sql).bind(year).bind(month);
+            let mut monthly_q = sqlx::query(sqlx::AssertSqlSafe(&*monthly_sql)).bind(year).bind(month);
             if let Some(ref u) = scope {
                 monthly_q = monthly_q.bind(u.clone());
             }

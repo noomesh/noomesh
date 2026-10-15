@@ -303,7 +303,7 @@ class ClusterMessaging:
                         "answer (it times out). The principal's grant must allow a publish "
                         "on the requester's reply inbox that survives a NATS config reload "
                         "— allow_responses entries are wiped by every reload "
-                        "(noo-cli nats_users.rs GATEWAY_REPLY_INBOX)",
+                        "(noo-cli nats_users.rs WORKER_REPLY_INBOX)",
             )
             return
         logger.error("nats_async_error", url=scrub_url_userinfo(self.nats_url), error=str(e))

@@ -10,7 +10,7 @@ use axum::{
     extract::{State, Path, Query},
     Json,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -6205,8 +6205,8 @@ mod placement_role_tests {
     async fn scratch(name: &str) -> Option<(sqlx::PgPool, sqlx::PgPool)> {
         let dsn = std::env::var("NOO_BROKER_TEST_DSN").ok().filter(|s| !s.is_empty())?;
         let admin = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&dsn).await.expect("connect");
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} (FORCE)")).execute(&admin).await;
-        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&admin).await.expect("create scratch db");
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} (FORCE)"))).execute(&admin).await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.expect("create scratch db");
         let db = pool(&dsn, name).await;
         Some((admin, db))
     }
@@ -6224,7 +6224,7 @@ mod placement_role_tests {
 
     async fn drop_db(admin: &sqlx::PgPool, db: sqlx::PgPool, name: &str) {
         db.close().await;
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} (FORCE)")).execute(admin).await;
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} (FORCE)"))).execute(admin).await;
     }
 
     async fn upsert(db: &sqlx::PgPool, backend: &str, model: Option<&str>, env: Option<Value>, role: &str) {
@@ -6245,7 +6245,7 @@ mod placement_role_tests {
         let Some((admin, db)) = scratch("mrp_roles_test").await else { return };
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
         for ext in ["vector", "pg_trgm"] {
-            sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}")).execute(&db).await.expect("extension");
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}"))).execute(&db).await.expect("extension");
         }
         crate::mesh_migrate::apply(&db).await.expect("apply");
         db.close().await;

@@ -479,7 +479,9 @@ async fn count_or_err(
     sql: &str,
     what: &str,
 ) -> Result<i64, AppError> {
-    match sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await {
+    // Every caller passes a literal or an `autonomy_evaluators::sql_unembedded_*`
+    // string, built from constants: nothing caller-supplied reaches the string.
+    match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).fetch_one(db).await {
         Ok(n) => Ok(n),
         Err(e) if missing_table(&e) => Ok(0),
         Err(e) => Err(AppError::Internal(format!("cannot count {what}: {e}"))),
@@ -667,7 +669,7 @@ pub(crate) async fn rag_status(State(state): State<Arc<AppState>>) -> AppResult 
 
     for (table, key) in &tables {
         let query = format!("SELECT COUNT(*) FROM {table}");
-        match sqlx::query_scalar::<_, i64>(&query)
+        match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*query))
             .fetch_one(&state.db)
             .await
         {

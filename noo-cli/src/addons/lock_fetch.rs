@@ -22,6 +22,16 @@
 //!   3. Each blob is fetched by digest, capped at [`MAX_BLOB`], and its
 //!      sha256 is checked against the manifest before it is used.
 //!
+//! The BUNDLE (N6). The same manifest may also carry the bundle lock
+//! ([`BUNDLE_TITLE`], format `noo-addon-lock/2`, which lists `files`), its
+//! signature ([`BUNDLE_SIG_TITLE`]) and one [`FILE_MEDIA_TYPE`] layer per
+//! listed file, titled with the file name. A CLI from before the bundle reads
+//! only the two v1 layers and ignores the rest, so a release publishes both
+//! forms in one artifact. When the bundle layers are present this client
+//! takes the bundle and its files and leaves the v1 pair alone; without them
+//! it takes the v1 pair and no files (the caller decides what a bundle-less
+//! add-on may do).
+//!
 //! TLS is always on: the agent is https-only with the platform verifier, so
 //! a realm or a redirect that leaves https fails loud. The Authorization
 //! header is never carried across a redirect (`RedirectAuthHeaders::Never`):
@@ -46,6 +56,14 @@ pub const SIG_MEDIA_TYPE: &str = "application/vnd.noomesh.addon-lock.sig.v1";
 /// names `noo security addon-lock sign --out addon-lock.json` writes.
 pub const LOCK_TITLE: &str = "addon-lock.json";
 pub const SIG_TITLE: &str = "addon-lock.json.sig";
+/// The bundle lock layer (format `noo-addon-lock/2`) and its signature.
+pub const BUNDLE_TITLE: &str = "addon-bundle.json";
+pub const BUNDLE_SIG_TITLE: &str = "addon-bundle.json.sig";
+pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.noomesh.addon-bundle.v1+json";
+/// One file the bundle lock lists, titled with its file name.
+pub const FILE_MEDIA_TYPE: &str = "application/vnd.noomesh.addon-file.v1";
+/// No add-on ships more files than this beside its images.
+pub const MAX_FILES: usize = 32;
 const TITLE_ANNOTATION: &str = "org.opencontainers.image.title";
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 /// No lock or signature is anywhere near this; a larger blob is refused
@@ -118,11 +136,16 @@ pub fn installed_credential() -> Result<Option<Credential>, String> {
     Ok(Some(Credential { user, token }))
 }
 
-/// The lock and signature as fetched, before any verification.
+/// The lock and signature as fetched, before any verification. From a
+/// bundle, `lock` is the bundle lock and `files` its files by name (each
+/// blob already checked against the manifest digest, and nothing else yet:
+/// `addon_lock::verify_files` holds them to the signed lock). From a
+/// v1-only artifact, `files` is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     pub lock: Vec<u8>,
     pub sig: String,
+    pub files: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 /// An OCI registry client for add-on locks.
@@ -277,11 +300,15 @@ impl Client {
             }
             Ok(bytes)
         };
-        let lock = blob(&layers.0)?;
-        let sig = blob(&layers.1)?;
+        let lock = blob(&layers.lock)?;
+        let sig = blob(&layers.sig)?;
         let sig = String::from_utf8(sig)
-            .map_err(|_| FetchError::new(FetchClass::Other, format!("{SIG_TITLE} is not text")))?;
-        Ok(Fetched { lock, sig })
+            .map_err(|_| FetchError::new(FetchClass::Other, format!("{} is not text", layers.sig.title)))?;
+        let mut files = std::collections::BTreeMap::new();
+        for l in &layers.files {
+            files.insert(l.title.clone(), blob(l)?);
+        }
+        Ok(Fetched { lock, sig, files })
     }
 }
 
@@ -351,22 +378,27 @@ struct Layer {
     digest: String,
 }
 
-/// The manifest's (lock, sig) layers, or why it is not an add-on lock.
-fn parse_manifest(bytes: &[u8]) -> Result<(Layer, Layer), String> {
+/// The layers this client fetches: the bundle pair and its files when the
+/// manifest carries a bundle, else the v1 pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Layers {
+    lock: Layer,
+    sig: Layer,
+    files: Vec<Layer>,
+}
+
+/// The manifest's layers to fetch, or why it is not an add-on lock.
+fn parse_manifest(bytes: &[u8]) -> Result<Layers, String> {
     let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("manifest is not JSON: {e}"))?;
     let at = v.get("artifactType").and_then(|a| a.as_str()).unwrap_or("");
     if at != ARTIFACT_TYPE {
         return Err(format!("artifactType is {at:?}, not {ARTIFACT_TYPE}"));
     }
     let layers = v.get("layers").and_then(|l| l.as_array()).ok_or("manifest has no layers")?;
-    let find = |title: &str, media: &str| -> Result<Layer, String> {
-        let hits: Vec<&serde_json::Value> = layers
-            .iter()
-            .filter(|l| l.pointer(&format!("/annotations/{}", TITLE_ANNOTATION.replace('/', "~1"))).and_then(|t| t.as_str()) == Some(title))
-            .collect();
-        let [l] = hits.as_slice() else {
-            return Err(format!("manifest needs exactly one layer titled {title}, found {}", hits.len()));
-        };
+    let title_of = |l: &serde_json::Value| -> Option<String> {
+        l.pointer(&format!("/annotations/{}", TITLE_ANNOTATION.replace('/', "~1"))).and_then(|t| t.as_str()).map(str::to_string)
+    };
+    let check = |l: &serde_json::Value, title: &str, media: &str| -> Result<Layer, String> {
         let mt = l.get("mediaType").and_then(|m| m.as_str()).unwrap_or("");
         if mt != media {
             return Err(format!("layer {title} has mediaType {mt:?}, not {media}"));
@@ -380,7 +412,59 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Layer, Layer), String> {
         }
         Ok(Layer { title: title.to_string(), digest })
     };
-    Ok((find(LOCK_TITLE, LOCK_MEDIA_TYPE)?, find(SIG_TITLE, SIG_MEDIA_TYPE)?))
+    // Zero or one layer per title; `required` makes zero an error.
+    let find = |title: &str, media: &str, required: bool| -> Result<Option<Layer>, String> {
+        let hits: Vec<&serde_json::Value> = layers.iter().filter(|l| title_of(l).as_deref() == Some(title)).collect();
+        match hits.as_slice() {
+            [] if !required => Ok(None),
+            [l] => check(l, title, media).map(Some),
+            _ => Err(format!("manifest needs exactly one layer titled {title}, found {}", hits.len())),
+        }
+    };
+    let bundle = find(BUNDLE_TITLE, BUNDLE_MEDIA_TYPE, false)?;
+    let bundle_sig = find(BUNDLE_SIG_TITLE, SIG_MEDIA_TYPE, false)?;
+    let mut files = Vec::new();
+    for l in layers.iter().filter(|l| l.get("mediaType").and_then(|m| m.as_str()) == Some(FILE_MEDIA_TYPE)) {
+        let title = title_of(l).unwrap_or_default();
+        if !crate::addon_lock::valid_file_name(&title) {
+            return Err(format!("bundle file layer title {title:?} is not a plain file name"));
+        }
+        if files.iter().any(|f: &Layer| f.title == title) {
+            return Err(format!("manifest has two bundle file layers titled {title}"));
+        }
+        files.push(check(l, &title, FILE_MEDIA_TYPE)?);
+    }
+    if files.len() > MAX_FILES {
+        return Err(format!("manifest carries {} bundle files; at most {MAX_FILES} are read", files.len()));
+    }
+    match (bundle, bundle_sig) {
+        (Some(lock), Some(sig)) => Ok(Layers { lock, sig, files }),
+        (None, None) if files.is_empty() => {
+            let lock = find(LOCK_TITLE, LOCK_MEDIA_TYPE, true)?.expect("required");
+            let sig = find(SIG_TITLE, SIG_MEDIA_TYPE, true)?.expect("required");
+            Ok(Layers { lock, sig, files })
+        }
+        (None, None) => Err(format!("manifest carries bundle files and no {BUNDLE_TITLE}")),
+        (Some(_), None) => Err(format!("manifest has {BUNDLE_TITLE} and no {BUNDLE_SIG_TITLE}")),
+        (None, Some(_)) => Err(format!("manifest has {BUNDLE_SIG_TITLE} and no {BUNDLE_TITLE}")),
+    }
+}
+
+/// The manifest of a bundle release: the v1 pair, the bundle pair and one
+/// layer per file, as the fake registry in tests serves it.
+#[cfg(test)]
+pub(crate) fn bundle_manifest_for(v1: (&[u8], &[u8]), bundle: (&[u8], &[u8]), files: &[(&str, &[u8])]) -> String {
+    let d = |b: &[u8]| format!("sha256:{}", hex(&sha2::Sha256::digest(b)));
+    let mut m: serde_json::Value = serde_json::from_str(&manifest_for(v1.0, v1.1)).unwrap();
+    let layers = m["layers"].as_array_mut().unwrap();
+    for (media, title, b) in [(BUNDLE_MEDIA_TYPE, BUNDLE_TITLE, bundle.0), (SIG_MEDIA_TYPE, BUNDLE_SIG_TITLE, bundle.1)]
+        .into_iter()
+        .chain(files.iter().map(|(n, b)| (FILE_MEDIA_TYPE, *n, *b)))
+    {
+        layers.push(serde_json::json!({"mediaType": media, "digest": d(b), "size": b.len(),
+            "annotations": {TITLE_ANNOTATION: title}}));
+    }
+    m.to_string()
 }
 
 /// The OCI manifest an add-on release publishes for `lock` and `sig`, as the
@@ -603,6 +687,70 @@ mod tests {
         });
         let e = Client::plain_http_for_tests(None).fetch(&root(&reg.base), "v0.6.0").unwrap_err();
         assert!(e.detail.contains("does not match its digest"), "{e}");
+    }
+
+    #[test]
+    fn a_bundle_artifact_yields_the_bundle_lock_and_its_files_and_skips_the_v1_pair() {
+        let (v1, v1s): (&'static [u8], &'static [u8]) = (b"V1", b"V1SIG");
+        let (b, bs): (&'static [u8], &'static [u8]) = (b"BUNDLE", b"BSIG");
+        let overlay: &'static [u8] = b"services: {}\n";
+        let reg = serve(move |_| {
+            let mut r = Routes::new();
+            r.insert(
+                format!("/v2/{ROOT_PATH}/manifests/stack-v0.6.0"),
+                (200, vec![], bundle_manifest_for((v1, v1s), (b, bs), &[("docker-compose.yml", overlay)]).into_bytes()),
+            );
+            for x in [b, bs, overlay] {
+                r.insert(blob_path(x), (200, vec![], x.to_vec()));
+            }
+            r
+        });
+        let f = Client::plain_http_for_tests(None).fetch(&root(&reg.base), "v0.6.0").expect("fetch");
+        assert_eq!(f.lock, b);
+        assert_eq!(f.sig, "BSIG");
+        assert_eq!(f.files.len(), 1);
+        assert_eq!(f.files["docker-compose.yml"], overlay);
+        let seen = reg.seen.lock().unwrap().clone();
+        assert!(!seen.iter().any(|s| s.path == blob_path(v1)), "the v1 lock was fetched beside the bundle: {seen:?}");
+
+        // A v1-only artifact: the v1 pair and no files, as before.
+        let reg = serve(move |_| {
+            let mut r = Routes::new();
+            r.insert(format!("/v2/{ROOT_PATH}/manifests/stack-v0.6.0"), (200, vec![], manifest_for(v1, v1s).into_bytes()));
+            for x in [v1, v1s] {
+                r.insert(blob_path(x), (200, vec![], x.to_vec()));
+            }
+            r
+        });
+        let f = Client::plain_http_for_tests(None).fetch(&root(&reg.base), "v0.6.0").expect("fetch");
+        assert_eq!((f.lock.as_slice(), f.sig.as_str(), f.files.len()), (v1, "V1SIG", 0));
+    }
+
+    #[test]
+    fn bundle_manifest_rules() {
+        let ok = bundle_manifest_for((b"L", b"S"), (b"B", b"BS"), &[("docker-compose.yml", b"x")]);
+        let l = parse_manifest(ok.as_bytes()).unwrap();
+        assert_eq!((l.lock.title.as_str(), l.sig.title.as_str(), l.files.len()), (BUNDLE_TITLE, BUNDLE_SIG_TITLE, 1));
+        let no_bundle_sig = ok.replace(BUNDLE_SIG_TITLE, "other");
+        assert!(parse_manifest(no_bundle_sig.as_bytes()).unwrap_err().contains(BUNDLE_SIG_TITLE));
+        let a_path = bundle_manifest_for((b"L", b"S"), (b"B", b"BS"), &[("../x", b"x")]);
+        assert!(parse_manifest(a_path.as_bytes()).unwrap_err().contains("plain file name"));
+        let twice = bundle_manifest_for((b"L", b"S"), (b"B", b"BS"), &[("a.yml", b"x"), ("a.yml", b"y")]);
+        assert!(parse_manifest(twice.as_bytes()).unwrap_err().contains("two bundle file layers"));
+        // Files with no bundle lock to list them are refused, not ignored.
+        let mut m: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        m["layers"].as_array_mut().unwrap().retain(|l| {
+            let t = l["annotations"][TITLE_ANNOTATION].as_str().unwrap_or("");
+            t != BUNDLE_TITLE && t != BUNDLE_SIG_TITLE
+        });
+        assert!(parse_manifest(m.to_string().as_bytes()).unwrap_err().contains("no addon-bundle.json"));
+        // A bundle-only artifact (no v1 pair) is enough for this client.
+        let mut m: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        m["layers"].as_array_mut().unwrap().retain(|l| {
+            let t = l["annotations"][TITLE_ANNOTATION].as_str().unwrap_or("");
+            t != LOCK_TITLE && t != SIG_TITLE
+        });
+        assert!(parse_manifest(m.to_string().as_bytes()).is_ok());
     }
 
     #[test]

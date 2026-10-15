@@ -26,7 +26,9 @@ exists but echoes the wrong flags would pass every shape check.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -66,7 +68,7 @@ def test_no_launcher_branches_on_a_retired_flag(launcher: str, flag: str) -> Non
 def test_restart_selects_every_addon_profile_and_overlay() -> None:
     """Restart is what `secrets rotate --force` runs. It must ask the helper
     for the profiles, and take its compose FILE list from the one home
-    (an earlier change: lib-compose.sh carries the evolve overlay)."""
+    (an earlier change: lib-compose.sh composes every add-on overlay)."""
     body = _body("noomesh-restart.sh")
     assert "addon_profile_args" not in body, (
         "there is no add-on profile helper since an earlier change — every add-on is "
@@ -74,7 +76,7 @@ def test_restart_selects_every_addon_profile_and_overlay() -> None:
     )
     assert "lib-compose.sh" in body and "compose_file_args" in body, (
         "noomesh-restart.sh must take COMPOSE_FILES from lib-compose.sh::"
-        "compose_file_args — that is where the evolve overlay is decided"
+        "compose_file_args — that is where every add-on overlay is decided"
     )
     assert 'trellion-intel) echo' not in body, (
         "trellion-intel is an overlay: compose sees it whenever "
@@ -83,58 +85,152 @@ def test_restart_selects_every_addon_profile_and_overlay() -> None:
 
 
 @pytest.mark.parametrize("launcher", ("noomesh-start.sh", "noomesh-rebuild.sh"))
-def test_start_and_rebuild_resolve_intel_and_voice_through_addon_on(launcher: str) -> None:
+def test_start_and_rebuild_resolve_addons_through_the_helper(launcher: str) -> None:
+    """Voice (a core overlay) is decided by `addon_on`; every licensed
+    add-on is reported and, when off, stopped by the generic helpers — the
+    launcher names none of them (N6: their overlays travel in their
+    bundles)."""
     body = _body(launcher)
-    assert "addon_on trellion_intel 0" in body, f"{launcher}: intel via addon_on (opt-in)"
     assert "addon_on voice 0" in body, f"{launcher}: voice via addon_on (opt-in)"
+    assert "addons_report_licensed" in body, f"{launcher}: licensed add-ons via addons_report_licensed"
+    assert "addons_stop_disabled" in body, f"{launcher}: a switched-off licensed add-on is stopped"
+    for retired in ("addons_evolve_overlay", "addons_trellion_intel_overlay"):
+        assert retired not in body, f"{launcher} still calls {retired} — the generic loop replaced it"
 
 
-def _run_helper(addon_map: str, fn: str) -> str:
-    """Source lib-addons.sh with a canned NOO_ADDON_MAP and echo one helper.
+def _run_helper(addon_map: str, fn: str, *, root: Path | None = None,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Source lib-addons.sh with a canned NOO_ADDON_MAP and run one helper.
 
     The yaml loader is bypassed on purpose: this tests the DECISION, not the
-    parser. `addon_on` reads $NOO_ADDON_MAP directly.
+    parser. `addon_on` reads $NOO_ADDON_MAP directly. `root` is an install
+    tree holding its own copy of scripts/lib-addons.sh (the helper resolves
+    overlays relative to the file it was sourced from).
     """
+    root = root or SCRIPTS.parent
     script = f"""
 set -e
-cd "{SCRIPTS.parent}"
+cd "{root}"
 NOO_ADDON_MAP_OVERRIDE=1
 . scripts/lib-addons.sh
 NOO_ADDON_MAP=$'{addon_map}'
 {fn}
 """
+    full_env = {k: v for k, v in os.environ.items()
+                if not (k.startswith("NOO_") and k.endswith("_PATH")) and k != "CORE_ONLY"}
+    full_env.update(env or {})
     out = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, timeout=30
+        ["bash", "-c", script], capture_output=True, text=True, timeout=30, env=full_env
     )
     assert out.returncode == 0, out.stderr
-    return out.stdout.strip()
+    return out
 
 
-def _overlays(addon_map: str) -> list[str]:
-    got = _run_helper(addon_map, "addon_compose_overlay_args").split()
-    return [Path(p).name for p in got if p != "-f"]
+def _overlays(addon_map: str, **kw) -> list[str]:
+    got = _run_helper(addon_map, "addon_compose_overlay_args", **kw).stdout.split()
+    return [p for p in got if p != "-f"]
 
 
-def test_helper_composes_exactly_the_enabled_overlays() -> None:
-    """Every add-on is an overlay: the helper composes one file
-    per enabled add-on, trellion first (the Intelligent tier extends it)."""
-    assert _overlays("trellion=1\\ntrellion_intel=1\\nvoice=0") == [
-        "docker-compose.trellion.yml", "docker-compose.trellion-intel.yml",
-    ]
-    assert _overlays("trellion=1\\ntrellion_intel=1\\nvoice=1\\nevolve=1") == [
+def _names(addon_map: str, **kw) -> list[str]:
+    return [Path(p).name for p in _overlays(addon_map, **kw)]
+
+
+_SYNTH_OVERLAY = """services:
+  noo-example-addon:
+    image: ${NOO_ADDON_IMAGE_EXAMPLE:-ghcr.io/example/noo-example-addon:0.0.0}
+"""
+
+
+@pytest.fixture
+def install(tmp_path: Path) -> Path:
+    """A synthetic install: the shipped helper, the two core overlays, and
+    a licensed add-on (`example_addon`) materialised from its bundle at
+    addons/<name>/docker-compose.yml. Nested one level so the dev-checkout
+    default (`../noo-<kebab>`) cannot find anything by accident."""
+    root = tmp_path / "box" / "install"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(SCRIPTS / "lib-addons.sh", root / "scripts" / "lib-addons.sh")
+    for core in ("docker-compose.trellion.yml", "docker-compose.voice.yml"):
+        (root / core).write_text("services: {}\n")
+    bundle = root / "addons" / "example_addon"
+    bundle.mkdir(parents=True)
+    (bundle / "docker-compose.yml").write_text(_SYNTH_OVERLAY)
+    return root
+
+
+def test_core_overlays_compose_in_order(install: Path) -> None:
+    """trellion first (a licensed add-on's overlay may extend it), then voice."""
+    assert _names("trellion=1\\nvoice=1", root=install) == [
         "docker-compose.trellion.yml", "docker-compose.voice.yml",
-        "docker-compose.trellion-intel.yml", "docker-compose.evolve.yml",
     ]
+    assert _names("trellion=1\\nvoice=0", root=install) == ["docker-compose.trellion.yml"]
+
+
+def test_a_licensed_addon_that_is_on_composes_its_bundle(install: Path) -> None:
+    got = _overlays("trellion=1\\nvoice=0\\nexample_addon=1", root=install)
+    assert [Path(p).name for p in got[:1]] == ["docker-compose.trellion.yml"], got
+    assert got[1:] == [str(install / "addons" / "example_addon" / "docker-compose.yml")], got
+
+
+def test_a_licensed_addon_that_is_off_or_unstated_is_not_composed(install: Path) -> None:
+    assert _names("trellion=1\\nexample_addon=0", root=install) == ["docker-compose.trellion.yml"]
+    # a bundle on disk is not a switch: licensed add-ons default OFF
+    assert _names("trellion=1", root=install) == ["docker-compose.trellion.yml"]
+
+
+def test_the_legacy_root_overlay_composes_with_a_warn_only_without_a_bundle(install: Path) -> None:
+    legacy = install / "docker-compose.example-addon.yml"
+    legacy.write_text(_SYNTH_OVERLAY)
+    # bundle present: the bundle wins, no warning
+    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
+    assert out.stdout.split() == ["-f", str(install / "addons" / "example_addon" / "docker-compose.yml")]
+    assert "WARN" not in out.stderr, out.stderr
+    # no bundle: the deprecated root file composes, and says so
+    shutil.rmtree(install / "addons" / "example_addon")
+    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
+    assert out.stdout.split() == ["-f", str(legacy)]
+    assert "WARN" in out.stderr and "example_addon" in out.stderr, out.stderr
+    # neither: nothing composes, nothing to warn about
+    legacy.unlink()
+    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
+    assert out.stdout.strip() == "" and "WARN" not in out.stderr, (out.stdout, out.stderr)
+
+
+def test_a_dev_checkout_wins_over_the_bundle(install: Path, tmp_path: Path) -> None:
+    dev = tmp_path / "dev-example"
+    dev.mkdir()
+    (dev / "docker-compose.example-addon.yml").write_text(_SYNTH_OVERLAY)
+    (install / "docker-compose.example-addon.yml").write_text(_SYNTH_OVERLAY)
+    got = _overlays("trellion=0\\nexample_addon=1", root=install,
+                    env={"NOO_EXAMPLE_ADDON_PATH": str(dev)})
+    assert got == [str(dev / "docker-compose.example-addon.yml")], got
+    # a NOO_<NAME>_PATH with no overlay in it falls through to the bundle
+    got = _overlays("trellion=0\\nexample_addon=1", root=install,
+                    env={"NOO_EXAMPLE_ADDON_PATH": str(tmp_path / "nope")})
+    assert got == [str(install / "addons" / "example_addon" / "docker-compose.yml")], got
+
+
+def test_core_only_defers_every_non_core_addon_but_not_trellion(install: Path) -> None:
+    (install / "addons" / "other_addon").mkdir()
+    (install / "addons" / "other_addon" / "docker-compose.yml").write_text(_SYNTH_OVERLAY)
+    m = "trellion=1\\nvoice=1\\nexample_addon=1\\nother_addon=1"
+    assert len(_overlays(m, root=install)) == 4  # the premise: all on without CORE_ONLY
+    assert _names(m, root=install, env={"CORE_ONLY": "true"}) == ["docker-compose.trellion.yml"]
+
+
+def test_licensed_names_come_from_the_map_and_the_bundles(install: Path) -> None:
+    got = _run_helper("trellion=1\\nvoice=1\\nmap_only=0", "addon_licensed_names", root=install)
+    assert got.stdout.split() == ["example_addon", "map_only"], got.stdout
 
 
 def test_helper_honours_trellion_opt_out_polarity() -> None:
     # No declaration at all: trellion defaults ON, the rest default OFF.
-    assert _overlays("") == ["docker-compose.trellion.yml"]
-    assert _overlays("trellion=0") == []
+    assert _names("") == ["docker-compose.trellion.yml"]
+    assert _names("trellion=0") == []
 
 
 def test_helper_is_silent_when_nothing_is_on() -> None:
-    got = _run_helper("trellion=0\\ntrellion_intel=0\\nvoice=0\\nevolve=0", "addon_compose_overlay_args")
+    got = _run_helper("trellion=0\\nvoice=0", "addon_compose_overlay_args").stdout.strip()
     assert got == "", f"a fully-off map must echo nothing, got {got!r}"
 
 

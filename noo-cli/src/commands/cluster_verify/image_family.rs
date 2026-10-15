@@ -7,15 +7,27 @@
 //! `${NOO_BASE_REGISTRY}/<name>:<tag>`. Two image families are published
 //! under the SAME names and tags: the DHI mirrors at `ghcr.io/noomesh/dhi/`
 //! and the upstream official images at `ghcr.io/noomesh/`. Every service key
-//! and data volume is handed to the DHI images' uids
-//! (`pki::SERVICE_KEY_READERS`: 65532, root for the `-dev` variants); the
+//! and data volume is handed to uid 65532 (`pki::SERVICE_KEY_READERS`):
+//! the DHI runtime images' `nonroot`, and the compose `user:` of the two
+//! `-dev` variants (redis, grafana), whose image USER is root (i64); the
 //! upstream ones run as nobody / 10001 / 472. 0.6.0 and 0.6.1 seeded the
 //! upstream path on the public channel, and after `noo upgrade --channel
 //! public` all five monitoring containers restart-looped on `permission
 //! denied` (2026-10-14) with nothing saying why. This row says why: each
 //! running container's image must come from the base registry, the base
-//! registry must not be the upstream-family path, and the container's
-//! `.Config.User` must be the uid its key is handed to AND able to read it.
+//! registry must not be the upstream-family path, and the uid the container
+//! RUNS AS must be the uid its key is handed to AND able to read it.
+//! None of them may run as uid 0 (i64, operator 2026-10-15): a redis or
+//! grafana container created from a compose that predates the `user:` pin
+//! runs as the -dev image's root and fails here.
+//!
+//! The uid judged is the LIVE one (`docker exec <c> id -u`, else `docker top`;
+//! BusyBox hosts' `ps` has no `-o uid`), not the `.Config.User` string: compose
+//! names redis/grafana's user (`nonroot` / `grafana`, because Docker 27
+//! cannot resolve a numeric `user:` when it copies secrets in), and a name
+//! means a uid only inside its image (`grafana` is 65532 in the DHI image and
+//! 472 upstream). The string is the fallback only when the container is not
+//! running; a name it cannot map then is "not judged", a warning.
 
 use super::{fail, ok, warn, Check};
 use std::process::Command;
@@ -30,12 +42,23 @@ pub(crate) const RUNTIME_SERVICES: [&str; 6] = ["redis", "loki", "prometheus", "
 pub(crate) struct Running {
     pub svc: &'static str,
     pub image: String,
+    /// `.Config.User`, as written in compose (or empty: the image's USER).
     pub user: String,
+    /// The uid its processes run as, from `docker top`; `None` when it is
+    /// not running (or docker could not say).
+    pub live_uid: Option<u32>,
+    /// `.State.Running`. A running container whose uid could not be read
+    /// is "uid unreadable", never "not running".
+    pub running: bool,
+    /// Why the live uid could not be read (running containers only).
+    pub uid_err: String,
 }
 
-/// The uid a `.Config.User` runs as. Empty / `root` is 0; the two names
-/// the images in play use are mapped; `uid[:gid]` is parsed. Any other
-/// name is `None` (cannot judge from outside the image).
+/// The uid a `.Config.User` runs as, for a container that is not running
+/// (a running one is judged by its live uid). Empty / `root` is 0; the two
+/// names that mean one uid in every image in play are mapped; `uid[:gid]` is
+/// parsed. Any other name is `None` (cannot judge from outside the image):
+/// `grafana` is 65532 in the DHI image but 472 in the upstream one.
 pub(crate) fn user_uid(user: &str) -> Option<u32> {
     match user.split(':').next().unwrap_or("").trim() {
         "" | "root" => Some(0),
@@ -66,6 +89,10 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
     let base = base.trim().trim_end_matches('/');
     let legacy = base == crate::registry::LEGACY_PUBLIC_BASE_REGISTRY;
     let mut problems: Vec<String> = Vec::new();
+    // A container running as root, from a compose that predates the
+    // `user:` pin: recreating it is the fix, not a registry change.
+    let mut as_root = false;
+    let mut unjudged: Vec<String> = Vec::new();
     if legacy {
         problems.push(format!(
             "NOO_BASE_REGISTRY is {base}, the UPSTREAM image family (other uids); the runtime images are the DHI mirrors at {}",
@@ -75,10 +102,22 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
         if !r.image.starts_with(&format!("{base}/")) {
             problems.push(format!("{} runs {}, not an image from {base}/", r.svc, r.image));
         }
-        let Some(uid) = user_uid(&r.user) else {
-            problems.push(format!("{} runs as user {:?}, which this row cannot map to a uid", r.svc, r.user));
+        let Some(uid) = r.live_uid.or_else(|| user_uid(&r.user)) else {
+            if r.running {
+                unjudged.push(format!("{} is running but its live uid could not be read ({}), and its user {:?} cannot be mapped to a uid from outside the image",
+                    r.svc, r.uid_err, r.user));
+            } else {
+                unjudged.push(format!("{} is not running and its user {:?} cannot be mapped to a uid from outside the image", r.svc, r.user));
+            }
             continue;
         };
+        if uid == 0 {
+            as_root = true;
+            problems.push(format!(
+                "{} runs as root ({}): the runtime services run non-root, its key and data are handed to uid {}",
+                r.svc, r.image, expected_uid(r.svc).map_or_else(|| "?".to_string(), |u| u.to_string())));
+            continue;
+        }
         if let Some(want) = expected_uid(r.svc) {
             if uid != want {
                 problems.push(format!(
@@ -87,13 +126,15 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
                 continue;
             }
         }
-        if uid != 0 && key_readable(r.svc, uid) == Some(false) {
+        if key_readable(r.svc, uid) == Some(false) {
             problems.push(format!("{} (uid {uid}) cannot read services/{}/service.key", r.svc, r.svc));
         }
     }
     if !problems.is_empty() {
         let remedy = if legacy {
             format!("noo upgrade   # corrects NOO_BASE_REGISTRY to {}; then: noo upgrade --stack", crate::registry::PUBLIC_BASE_REGISTRY)
+        } else if as_root && problems.iter().all(|p| p.contains("runs as root")) {
+            "noo upgrade --stack   # recreates them under the compose `user:` (uid 65532)".to_string()
         } else if problems.iter().all(|p| p.contains("cannot read")) {
             "noo security pki fix-modes   # re-hands each key to its reader; then: noo stack restart".to_string()
         } else {
@@ -106,7 +147,10 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
         return ok(NAME, format!("no runtime container is running; images resolve under {base}/"));
     }
     let names: Vec<&str> = running.iter().map(|r| r.svc).collect();
-    let detail = format!("{} run images from {base}/ as the uid their key is handed to", names.join(", "));
+    let detail = format!("{} run images from {base}/ as non-root uids, each the uid its key is handed to", names.join(", "));
+    if !unjudged.is_empty() {
+        return warn(NAME, format!("{detail}; not judged: {}", unjudged.join("; ")), None);
+    }
     if is_dhi_path(base) {
         ok(NAME, detail)
     } else {
@@ -122,23 +166,78 @@ pub(crate) fn effective_base() -> String {
         .unwrap_or_else(|| crate::registry::PUBLIC_BASE_REGISTRY.to_string())
 }
 
-/// `docker inspect` of each runtime container that exists. `Err` when
-/// docker cannot be asked at all.
+/// The uid a container's processes run as, from `docker top <c> -o pid,uid`
+/// output: root if any process is root, else the first process's (the
+/// container's init). `None` when no process row parses.
+pub(crate) fn live_uid_from_top(text: &str) -> Option<u32> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<&str> = lines.next()?.split_whitespace().collect();
+    let col = header.iter().position(|h| h.eq_ignore_ascii_case("UID"))?;
+    let uids: Vec<u32> = lines.filter_map(|l| l.split_whitespace().nth(col)?.parse().ok()).collect();
+    if uids.contains(&0) {
+        return Some(0);
+    }
+    uids.first().copied()
+}
+
+/// Run `docker <args>`: stdout on success, else the stderr (or spawn error).
+fn docker_text(args: &[&str]) -> Result<String, String> {
+    let o = Command::new("docker").args(args).output().map_err(|e| format!("docker: {e}"))?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+    }
+}
+
+/// The live uid of a running container. `docker exec <c> id -u` first (every
+/// image with coreutils or busybox `id`; `docker top` shells out to the
+/// HOST's `ps`, which on BusyBox hosts (Alpine, dind) has no `-o uid`), then
+/// `docker top` parsing. `Err` carries why the exec failed.
+pub(crate) fn live_uid_via(docker: &dyn Fn(&[&str]) -> Result<String, String>, name: &str) -> Result<u32, String> {
+    let exec_err = match docker(&["exec", name, "id", "-u"]) {
+        Ok(t) => match t.trim().parse::<u32>() {
+            Ok(u) => return Ok(u),
+            Err(_) => format!("docker exec id -u printed {:?}", t.trim()),
+        },
+        Err(e) => format!("docker exec id -u failed: {e}"),
+    };
+    if let Ok(t) = docker(&["top", name, "-o", "pid,uid"]) {
+        if let Some(u) = live_uid_from_top(&t) {
+            return Ok(u);
+        }
+    }
+    Err(exec_err)
+}
+
+/// `docker inspect` of each runtime container that exists, with its live
+/// uid when it is running. `Err` when docker cannot be asked at all.
 fn inspect_running() -> Result<Vec<Running>, String> {
     let prefix = crate::envfile::container_prefix();
     let mut out = Vec::new();
     for svc in RUNTIME_SERVICES {
         let name = format!("{prefix}-{svc}");
         let o = Command::new("docker")
-            .args(["inspect", "--format", "{{.Config.Image}}|{{.Config.User}}", &name])
+            .args(["inspect", "--format", "{{.Config.Image}}|{{.Config.User}}|{{.State.Running}}", &name])
             .output()
             .map_err(|e| format!("docker: {e}"))?;
         if !o.status.success() {
             continue; // not created on this box (profile off): nothing to judge
         }
         let text = String::from_utf8_lossy(&o.stdout);
-        let (image, user) = text.trim().split_once('|').unwrap_or((text.trim(), ""));
-        out.push(Running { svc, image: image.to_string(), user: user.to_string() });
+        let mut parts = text.trim().splitn(3, '|');
+        let image = parts.next().unwrap_or("").to_string();
+        let user = parts.next().unwrap_or("").to_string();
+        let running = parts.next() == Some("true");
+        let (live_uid, uid_err) = if running {
+            match live_uid_via(&docker_text, &name) {
+                Ok(u) => (Some(u), String::new()),
+                Err(e) => (None, e),
+            }
+        } else {
+            (None, String::new())
+        };
+        out.push(Running { svc, image, user, live_uid, running, uid_err });
     }
     Ok(out)
 }
@@ -164,20 +263,27 @@ mod tests {
     const DHI: &str = crate::registry::PUBLIC_BASE_REGISTRY;
     const LEGACY: &str = crate::registry::LEGACY_PUBLIC_BASE_REGISTRY;
 
+    /// A stopped container: judged by its `.Config.User` string only.
     fn run(svc: &'static str, image: String, user: &str) -> Running {
-        Running { svc, image, user: user.into() }
+        Running { svc, image, user: user.into(), live_uid: None, running: false, uid_err: String::new() }
     }
 
-    /// The DHI family as measured: 65532 for the runtime images, root for
-    /// the -dev variants (redis, grafana).
+    /// A running container: judged by the uid it runs as.
+    fn live(svc: &'static str, image: String, user: &str, uid: u32) -> Running {
+        Running { svc, image, user: user.into(), live_uid: Some(uid), running: true, uid_err: String::new() }
+    }
+
+    /// The DHI family as it runs: 65532 for the runtime images, and the
+    /// compose `user: nonroot` / `user: grafana` for the -dev variants
+    /// (redis, grafana), each that image's name for 65532.
     fn dhi_fleet(base: &str) -> Vec<Running> {
         vec![
-            run("redis", format!("{base}/redis:8.6-debian13-dev"), "0"),
-            run("loki", format!("{base}/loki:3"), "65532"),
-            run("prometheus", format!("{base}/prometheus:3"), "65532"),
-            run("alertmanager", format!("{base}/alertmanager:0"), "65532:65532"),
-            run("grafana", format!("{base}/grafana:12-debian13-dev"), ""),
-            run("node-exporter", format!("{base}/node-exporter:1"), "nonroot"),
+            live("redis", format!("{base}/redis:8.6-debian13-dev"), "nonroot", 65532),
+            live("loki", format!("{base}/loki:3"), "65532", 65532),
+            live("prometheus", format!("{base}/prometheus:3"), "65532", 65532),
+            live("alertmanager", format!("{base}/alertmanager:0"), "65532:65532", 65532),
+            live("grafana", format!("{base}/grafana:12-debian13-dev"), "grafana", 65532),
+            live("node-exporter", format!("{base}/node-exporter:1"), "nonroot", 65532),
         ]
     }
 
@@ -195,7 +301,7 @@ mod tests {
             run("loki", format!("{LEGACY}/loki:3"), "10001"),
             run("prometheus", format!("{LEGACY}/prometheus:3"), "nobody"),
             run("alertmanager", format!("{LEGACY}/alertmanager:0"), "nobody"),
-            run("grafana", format!("{LEGACY}/grafana:12-debian13-dev"), "472"),
+            live("grafana", format!("{LEGACY}/grafana:12-debian13-dev"), "grafana", 472),
             run("node-exporter", format!("{LEGACY}/node-exporter:1"), "nobody"),
         ];
         let c = image_family_check(LEGACY, &upstream, &|_, _| Some(false));
@@ -220,14 +326,67 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("prometheus (uid 65532) cannot read services/prometheus/service.key"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().contains("fix-modes"), "{:?}", c.remedy);
-        // Root reads any owner-only key: never asked.
-        let c = image_family_check(DHI, &dhi_fleet(DHI), &|svc, _| {
-            assert!(svc != "redis" && svc != "grafana", "asked about a root container: {svc}");
-            Some(true)
-        });
-        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // redis and grafana run as 65532 now, so their keys are asked too.
+        let c = image_family_check(DHI, &dhi_fleet(DHI), &|svc, _| Some(svc != "redis"));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("redis (uid 65532) cannot read services/redis/service.key"), "{}", c.detail);
         // An absent key is not judged.
         assert_eq!(image_family_check(DHI, &dhi_fleet(DHI), &|_, _| None).verdict, Verdict::Ok);
+    }
+
+    /// i64: a redis or grafana container created by a compose without the
+    /// `user:` pin runs as the -dev image's root. That fails, names root,
+    /// and the remedy is recreating it, not a registry change.
+    #[test]
+    fn a_runtime_container_running_as_root_fails() {
+        for user in ["", "0", "root", "0:0"] {
+            let mut fleet = dhi_fleet(DHI);
+            fleet[0] = run("redis", fleet[0].image.clone(), user); // stopped: judged by the string
+            fleet[4].user = user.into(); // grafana, running:
+            fleet[4].live_uid = Some(0); // judged by its live uid
+            let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+            assert_eq!(c.verdict, Verdict::Fail, "user {user:?}: {}", c.detail);
+            assert!(c.detail.contains("redis runs as root") && c.detail.contains("grafana runs as root"), "{}", c.detail);
+            assert!(c.remedy.as_deref().unwrap().starts_with("noo upgrade --stack"), "{:?}", c.remedy);
+        }
+    }
+
+    /// Every runtime service's key is handed to a non-root uid: the table
+    /// cannot quietly go back to root for redis or grafana.
+    #[test]
+    fn every_runtime_service_reader_is_non_root() {
+        for svc in RUNTIME_SERVICES {
+            let uid = expected_uid(svc).unwrap_or_else(|| panic!("{svc} has no reader"));
+            assert_ne!(uid, 0, "{svc} is handed to root");
+        }
+        assert_eq!(expected_uid("redis"), Some(65532));
+        assert_eq!(expected_uid("grafana"), Some(65532));
+    }
+
+    /// The compose pins redis and grafana to the image's NAME for the uid
+    /// their keys are handed to (the -dev images' own USER is root). A name,
+    /// not the number: Docker 27 resolves `user:` through the image's passwd
+    /// when it copies secrets in, and `getent` fails on "65532:65532".
+    /// Measured in each image's /etc/passwd (tests never pull images):
+    /// dhi/redis:8.6-debian13-dev `nonroot:x:65532`, dhi/grafana:12-debian13-dev
+    /// `grafana:x:65532`.
+    #[test]
+    fn compose_pins_the_dev_variants_to_their_reader_uid() {
+        const NAME_UID: [(&str, &str, u32); 2] = [("redis", "nonroot", 65532), ("grafana", "grafana", 65532)];
+        let compose = include_str!("../../../../docker-compose.cluster.yml");
+        for (svc, name, uid) in NAME_UID {
+            let head = format!("  {svc}:");
+            let block: Vec<&str> = compose
+                .lines()
+                .skip_while(|l| *l != head)
+                .skip(1)
+                .take_while(|l| !(l.starts_with("  ") && !l.starts_with("   ") && !l.trim_start().starts_with('#')))
+                .collect();
+            assert!(!block.is_empty(), "no {svc} service in compose");
+            assert_eq!(expected_uid(svc), Some(uid), "{svc}: the name's uid is not its key reader's");
+            let want = format!("user: {name}");
+            assert!(block.iter().any(|l| l.trim() == want), "{svc} has no `{want}` in compose");
+        }
     }
 
     #[test]
@@ -237,11 +396,96 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         let c = image_family_check("registry.example.com/mirror/dhi", &dhi_fleet("registry.example.com/mirror/dhi"), &|_, _| Some(true));
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
-        let mut odd = dhi_fleet(base);
-        odd[2].user = "prometheus".into();
-        let c = image_family_check(base, &odd, &|_, _| Some(true));
+    }
+
+    /// i64 follow-up: compose names the user (`nonroot`, `grafana`), so the
+    /// row judges the uid the container RUNS AS, not the string.
+    #[test]
+    fn a_named_user_is_judged_by_its_live_uid() {
+        // The named DHI fleet passes on its live uids.
+        let c = image_family_check(DHI, &dhi_fleet(DHI), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // The same name at another live uid (the upstream grafana's 472) fails.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4].live_uid = Some(472);
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("cannot map"), "{}", c.detail);
+        assert!(c.detail.contains("grafana runs as uid 472"), "{}", c.detail);
+        // A live root under a non-root name still fails as root.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[0].live_uid = Some(0);
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert!(c.verdict == Verdict::Fail && c.detail.contains("redis runs as root"), "{}", c.detail);
+        // A stopped container with a name the row cannot map is not judged:
+        // a warning, not a failure, and it says so.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4] = run("grafana", fleet[4].image.clone(), "grafana");
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("grafana is not running") && c.detail.contains("not judged"), "{}", c.detail);
+        // A stopped container with a numeric or mapped user is still judged.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[2] = run("prometheus", fleet[2].image.clone(), "10001");
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert!(c.verdict == Verdict::Fail && c.detail.contains("prometheus runs as uid 10001"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_live_uid_is_read_from_docker_top() {
+        // `docker top <c> -o pid,uid`, as Docker 29 printed it for a
+        // throwaway dhi/grafana:12-debian13-dev run with `--user grafana`.
+        assert_eq!(live_uid_from_top("PID                 UID\n4096315             65532\n"), Some(65532));
+        // Any root process makes the container root.
+        assert_eq!(live_uid_from_top("PID UID\n10 65532\n11 0\n"), Some(0));
+        assert_eq!(live_uid_from_top("UID PID\n472 10\n"), Some(472));
+        assert_eq!(live_uid_from_top("PID UID\n"), None);
+        assert_eq!(live_uid_from_top(""), None);
+        assert_eq!(live_uid_from_top("PID UID\n10 grafana\n"), None);
+    }
+
+    const BUSYBOX: &str = "ps: bad -o argument 'uid', supported arguments: user,group,comm,args,pid,ppid,pgid,etime,nice,rgroup,ruser,time,tty,vsz,stat,rss";
+
+    #[test]
+    fn busybox_ps_does_not_hide_the_live_uid() {
+        // docker top fails on a BusyBox host; exec id -u answers.
+        let d = |a: &[&str]| -> Result<String, String> {
+            if a[0] == "top" { Err(BUSYBOX.into()) } else { Ok("65532\n".into()) }
+        };
+        assert_eq!(live_uid_via(&d, "c"), Ok(65532));
+        // The row then judges it: grafana at 65532 is `+`, not `!`.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4].live_uid = live_uid_via(&d, "c").ok();
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // exec fails, top works: top is the fallback.
+        let d = |a: &[&str]| -> Result<String, String> {
+            if a[0] == "exec" { Err("no id".into()) } else { Ok("PID UID\n9 472\n".into()) }
+        };
+        assert_eq!(live_uid_via(&d, "c"), Ok(472));
+        // root via exec still fails the row.
+        let d = |_: &[&str]| -> Result<String, String> { Ok("0\n".into()) };
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4].live_uid = live_uid_via(&d, "c").ok();
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert!(c.verdict == Verdict::Fail && c.detail.contains("grafana runs as root"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_running_container_with_an_unreadable_uid_is_not_called_stopped() {
+        let d = |a: &[&str]| -> Result<String, String> {
+            Err(if a[0] == "top" { BUSYBOX.into() } else { "exec: \"id\": executable file not found".into() })
+        };
+        let err = live_uid_via(&d, "c").unwrap_err();
+        assert!(err.starts_with("docker exec id -u failed:"), "{err}");
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4] = Running { svc: "grafana", image: fleet[4].image.clone(), user: "grafana".into(), live_uid: None, running: true, uid_err: err };
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("its live uid could not be read") || c.detail.contains("live uid could not be read (docker exec id -u failed:"), "{}", c.detail);
+        assert!(!c.detail.contains("grafana is not running"), "{}", c.detail);
+        // A mappable .Config.User is still the fallback for a running one.
+        fleet[4].user = "65532".into();
+        assert_eq!(image_family_check(DHI, &fleet, &|_, _| Some(true)).verdict, Verdict::Ok);
     }
 
     #[test]
