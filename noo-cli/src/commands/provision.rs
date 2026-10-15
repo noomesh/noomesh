@@ -349,7 +349,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         match self_node_lane(&node, &missing, !missing.is_empty() && can_sudo_here()) {
             SelfLane::Rail => {}
             SelfLane::CreateIdentity => {
-                if let Err(e) = ensure_self_identity(g, &node) {
+                if let Err(e) = ensure_self_identity(&node) {
                     fail(g.json, ExitCode::Generic, "self_identity", &e, Some(SELF_RAIL_REMEDY));
                 }
             }
@@ -396,9 +396,13 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         redemption_record(g, &node)
     };
     // The gateway verifies the fetch receipt and the apply report against
-    // the self node's birth cert, read from its host mount: confirm it sees
-    // THIS cert before staging anything it could not verify.
+    // the self node's birth cert, read from the PKI's certificate-only view:
+    // put THIS cert there (no sudo), then confirm the gateway sees it before
+    // staging anything it could not verify.
     if is_self {
+        if let Err(e) = sync_self_birth_cert(&crate::pki::pki_dir(), &node, Path::new(SELF_BIRTH_CRT)) {
+            fail(g.json, ExitCode::Generic, "self_birth_cert_sync", &e, Some("noo security pki fix-modes"));
+        }
         let local_fp = record.as_ref().and_then(|r| r.birth_cert.as_deref())
             .map(|c| crate::commands::node_fetch::cert_der_sha256(c.as_bytes()))
             .unwrap_or_else(|| Err("no birth cert".into()))
@@ -1288,6 +1292,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
 /// them leaves every placed backend refused on the node, and the operator
 /// would learn that from `cluster verify` instead of here.
 fn ensure_door_leaves(g: &Globals, ca: &crate::pki::ClusterCa, node: &str) {
+    if let Err(e) = ensure_door_leaves_try(ca, node) {
+        fail(g.json, ExitCode::Generic, "leaf_issue_failed", &e,
+            Some("is the cluster CA readable here? `noo security pki status`"));
+    }
+}
+
+/// [`ensure_door_leaves`], returning the error instead of exiting.
+fn ensure_door_leaves_try(ca: &crate::pki::ClusterCa, node: &str) -> Result<(), String> {
     match super::node_leaves::ensure_node_leaves(ca, node, crate::pki::DEFAULT_DAYS) {
         Ok(issued) if issued.is_empty() => nstep("backend door leaves: current (none re-issued)"),
         Ok(issued) => {
@@ -1295,9 +1307,7 @@ fn ensure_door_leaves(g: &Globals, ca: &crate::pki::ClusterCa, node: &str) {
                 nstep(&format!("backend door leaf {svc}: issued ({why})"));
             }
         }
-        Err(e) => fail(g.json, ExitCode::Generic, "leaf_issue_failed",
-            &format!("could not issue {node}'s backend door leaves: {e}"),
-            Some("is the cluster CA readable here? `noo security pki status`")),
+        Err(e) => return Err(format!("could not issue {node}'s backend door leaves: {e}")),
     }
     // The keys this bundle packs are the CLI's alone on this disk (0600,
     // `pki::KeyReader::Cli`). Issuance sets that; a key from before
@@ -1310,6 +1320,7 @@ fn ensure_door_leaves(g: &Globals, ca: &crate::pki::ClusterCa, node: &str) {
             None => {}
         }
     }
+    Ok(())
 }
 
 /// A node's live record from `/api/cluster/nodes` (its heartbeat view), or
@@ -1354,14 +1365,13 @@ pub(crate) const PULL_UNITS: &[(&str, &str)] = &[
     ("/usr/local/bin/noo-apply", "noo-apply"),
     ("/etc/systemd/system/noo-fetch.timer", "noo-fetch.timer"),
     (SELF_BIRTH_CRT, "the birth cert"),
-    (SELF_BIRTH_CRT_GATEWAY, "the gateway's copy of the birth cert"),
 ];
 /// The self node's birth cert (0644; the key beside it is root 0600).
 const SELF_BIRTH_CRT: &str = "/etc/noo/birth.crt";
-/// The copy the gateway reads through its read-only bind of
-/// `/etc/noo/self-node` (gateway-rust `bootstrap::SELF_BIRTH_CRT`). Only
-/// root writes it, in the one-time identity step; no API can change it.
-const SELF_BIRTH_CRT_GATEWAY: &str = "/etc/noo/self-node/birth.crt";
+/// Where the gateway sees it: `<pki>/nodes/<self>/birth.crt`, mirrored into
+/// the certificate-only view it mounts read-only (`public/nodes`), the same
+/// path every node cert takes (gateway-rust `bootstrap::self_birth_cert_path`).
+pub(crate) const SELF_BIRTH_CRT_PKI_NAME: &str = "birth.crt";
 /// The node name noo-fetch asks the controller for.
 const SELF_NODE_NAME_FILE: &str = "/etc/noo/node-name";
 /// The command that installs the pull units on a controller (its services
@@ -1371,14 +1381,11 @@ pub(crate) const SELF_RAIL_REMEDY: &str = "noo onboard --only services";
 /// The pull units missing for `node`, by name; empty = the rail can reach
 /// it. `exists` and the recorded node name are passed in so the rule is
 /// testable without a prepped host.
-pub(crate) fn missing_pull_units(node: &str, exists: &dyn Fn(&str) -> bool, node_name: Option<&str>, gateway_copy_current: bool) -> Vec<String> {
+pub(crate) fn missing_pull_units(node: &str, exists: &dyn Fn(&str) -> bool, node_name: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = PULL_UNITS.iter()
         .filter(|(p, _)| !exists(p))
         .map(|(_, n)| (*n).to_string())
         .collect();
-    if exists(SELF_BIRTH_CRT) && exists(SELF_BIRTH_CRT_GATEWAY) && !gateway_copy_current {
-        out.push("the gateway's copy of the birth cert (stale)".to_string());
-    }
     match node_name.map(str::trim).filter(|n| !n.is_empty()) {
         None => out.push(format!("{SELF_NODE_NAME_FILE} (no node name)")),
         // noo-fetch would collect another name's bundle.
@@ -1391,9 +1398,39 @@ pub(crate) fn missing_pull_units(node: &str, exists: &dyn Fn(&str) -> bool, node
 /// [`missing_pull_units`] on this machine.
 pub(crate) fn pull_units_missing(node: &str) -> Vec<String> {
     let name = std::fs::read_to_string(SELF_NODE_NAME_FILE).ok();
-    let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
-    let current = read(SELF_BIRTH_CRT).is_some_and(|a| Some(a) == read(SELF_BIRTH_CRT_GATEWAY));
-    missing_pull_units(node, &|p| Path::new(p).is_file(), name.as_deref(), current)
+    missing_pull_units(node, &|p| Path::new(p).is_file(), name.as_deref())
+}
+
+/// Put the host's birth cert where the gateway reads it: copy `host_crt`
+/// (the cert host prep installed beside the key it holds) to
+/// `<pki>/nodes/<node>/birth.crt` when it differs, then re-sync the PKI's
+/// certificate-only view, which the gateway mounts read-only. No sudo (the
+/// cert is 0644; the PKI is the operator's), no API, and the gateway cannot
+/// write it. Returns whether the copy changed.
+pub(crate) fn sync_self_birth_cert(pki: &Path, node: &str, host_crt: &Path) -> Result<bool, String> {
+    let pem = std::fs::read(host_crt).map_err(|e| format!("cannot read {} ({e})", host_crt.display()))?;
+    if !String::from_utf8_lossy(&pem).trim_start().starts_with("-----BEGIN CERTIFICATE-----") {
+        return Err(format!("{} is not a PEM certificate", host_crt.display()));
+    }
+    let dir = pki.join("nodes").join(node);
+    let dst = dir.join(SELF_BIRTH_CRT_PKI_NAME);
+    let changed = std::fs::read(&dst).ok().as_deref() != Some(pem.as_slice());
+    if changed {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {} ({e})", dir.display()))?;
+        let tmp = dir.join(".birth.crt.next");
+        std::fs::write(&tmp, &pem)
+            .and_then(|_| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+            })
+            .and_then(|_| std::fs::rename(&tmp, &dst))
+            .map_err(|e| format!("write {} ({e})", dst.display()))?;
+    }
+    let sync = crate::pki::ClusterCa::new(pki.to_path_buf()).sync_public_view();
+    if let Some(e) = sync.errors.first() {
+        return Err(format!("the PKI's public view did not sync ({e})"));
+    }
+    Ok(changed)
 }
 
 /// How the controller's own node is provisioned by the rail verb.
@@ -1401,8 +1438,8 @@ pub(crate) fn pull_units_missing(node: &str) -> Vec<String> {
 pub(crate) enum SelfLane {
     /// Staged on the rail, like any node. No sudo.
     Rail,
-    /// Its node identity (birth key, pull units, the gateway's copy of the
-    /// cert) is missing — a controller installed before i67. Created ONCE,
+    /// Its node identity (birth key, pull units) is missing — a
+    /// controller installed before i67. Created ONCE,
     /// with the one sudo, by the same prep path onboard uses; then the rail.
     CreateIdentity,
     /// Identity missing and sudo would prompt where nobody can answer:
@@ -1478,8 +1515,9 @@ pub(crate) fn can_sudo_here() -> bool {
 
 /// The root script that creates (or repairs) the self node's identity: a
 /// birth keypair when `etc` holds none, host prep (`prep_line`, which
-/// installs it and arms noo-fetch.timer), the gateway's read-only copy of the
-/// cert, and the staged keypair removed. `etc` is `/etc/noo` in production.
+/// installs it and arms noo-fetch.timer), and the staged keypair removed.
+/// `etc` is `/etc/noo` in production. The gateway's view of the cert is the
+/// CLI's job afterwards ([`sync_self_birth_cert`], no root).
 pub(crate) fn self_identity_script(node: &str, work: &Path, etc: &Path, prep_line: &str) -> String {
     let (w, e) = (work.display(), etc.display());
     format!(
@@ -1489,19 +1527,14 @@ pub(crate) fn self_identity_script(node: &str, work: &Path, etc: &Path, prep_lin
          || echo \"birth keypair generation failed — the pull units stay unarmed\" >&2\n\
          fi\n\
          {prep_line}\
-         rm -f \"{w}/birth.key\" \"{w}/birth.crt\"\n\
-         if [ -s \"{e}/birth.crt\" ]; then\n\
-         \x20 install -d -m 755 \"{e}/self-node\"\n\
-         \x20 install -m 644 \"{e}/birth.crt\" \"{e}/self-node/.birth.crt.next\"\n\
-         \x20 mv -f \"{e}/self-node/.birth.crt.next\" \"{e}/self-node/birth.crt\"\n\
-         fi\n"
+         rm -f \"{w}/birth.key\" \"{w}/birth.crt\"\n"
     )
 }
 
 /// The host-prep line for the self node, rendered for a root script: the
 /// CA pin beside the insecure switch, and the birth keypair the identity
 /// script generates into `work`.
-fn self_prep_line(g: &Globals, node: &str, prep: &Path, data_root: &str, work: &Path) -> String {
+fn self_prep_line(node: &str, prep: &Path, data_root: &str, work: &Path) -> Result<String, String> {
     let pki = crate::pki::pki_dir();
     let user = std::env::var("USER").unwrap_or_default();
     let ctrl_host = controller_dnsname().unwrap_or_else(|| "localhost".into());
@@ -1513,9 +1546,9 @@ fn self_prep_line(g: &Globals, node: &str, prep: &Path, data_root: &str, work: &
     let ca_pin = std::fs::read(pki.join("ca.crt"))
         .map_err(|e| e.to_string())
         .and_then(|pem| crate::commands::node_fetch::cert_der_sha256(&pem))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "ca_pin",
-            &format!("cannot fingerprint {}: {e}", pki.join("ca.crt").display()),
-            Some("host prep would fetch the cluster CA unpinned; run `noo onboard --only security` first")));
+        .map_err(|e| format!(
+            "cannot fingerprint {} ({e}) — host prep would fetch the cluster CA unpinned; \
+             run `noo onboard --only security` first", pki.join("ca.crt").display()))?;
     let mut c = Command::new("env");
     c.arg(format!("PREP_ENROLL_USER={user}"))
         .arg(format!("PREP_NOO_URL=https://{ctrl_host}:8080"))
@@ -1527,14 +1560,14 @@ fn self_prep_line(g: &Globals, node: &str, prep: &Path, data_root: &str, work: &
         .arg(format!("PREP_BIRTH_KEY={}/birth.key", work.display()))
         .arg(format!("PREP_BIRTH_CRT={}/birth.crt", work.display()))
         .arg("bash").arg(prep);
-    format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c))
+    Ok(format!("{} || echo \"host prep exited $? — continuing\" >&2\n", command_line(&c)))
 }
 
 /// The ONE-TIME creation of this controller's node identity (i67 migration:
 /// a controller installed before 0.6.3 has no birth key, pull units or
 /// gateway copy). One sudo, said as such; afterwards every install of this
 /// node rides the rail. `Err` names what is still missing.
-pub(crate) fn ensure_self_identity(g: &Globals, node: &str) -> Result<(), String> {
+pub(crate) fn ensure_self_identity(node: &str) -> Result<(), String> {
     nstep("creating this controller's node identity — sudo once, never again (later upgrades of this node ride the rail)");
     let root = crate::envfile::repo_root();
     let (prep, _guard) = stage_prep_host(&root)?;
@@ -1544,7 +1577,10 @@ pub(crate) fn ensure_self_identity(g: &Globals, node: &str) -> Result<(), String
     let _ = std::fs::set_permissions(&work, {
         use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
     });
-    let line = self_prep_line(g, node, &prep, &local_data_root(&root), &work);
+    let line = match self_prep_line(node, &prep, &local_data_root(&root), &work) {
+        Ok(l) => l,
+        Err(e) => { let _ = std::fs::remove_dir_all(&work); return Err(e); }
+    };
     let script = format!("set -e\n{}", self_identity_script(node, &work, Path::new("/etc/noo"), &line));
     let ok = Command::new("sudo").args(["sh", "-c", &script]).status().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&work);
@@ -1553,6 +1589,7 @@ pub(crate) fn ensure_self_identity(g: &Globals, node: &str) -> Result<(), String
     }
     match pull_units_missing(node) {
         m if m.is_empty() => {
+            sync_self_birth_cert(&crate::pki::pki_dir(), node, Path::new(SELF_BIRTH_CRT))?;
             nnote("node identity created — this was the one sudo; upgrades of this node now ride the rail");
             Ok(())
         }
@@ -1677,12 +1714,15 @@ pub(crate) fn judge_gateway_self_view(node: &str, local_fp: &str, answer: Option
             if gw_node.is_empty() { "(unset)" } else { gw_node }), "noo upgrade --stack");
     }
     match v.get("birth_cert_sha256").and_then(|f| f.as_str()) {
-        None => p("gateway_no_self_cert",
-            "the gateway cannot read this node's birth cert (its /etc/noo/self-node mount is missing or empty)".into(),
+        None => p("gateway_no_self_cert", format!(
+            "the gateway cannot read this node's birth cert (pki/public/nodes/{node}/birth.crt, its \
+             read-only view) — a gateway from before this release reads it elsewhere"),
             "noo upgrade --stack"),
-        Some(fp) if !fp.eq_ignore_ascii_case(local_fp) => p("gateway_self_cert_stale",
-            format!("the gateway's copy of the birth cert ({fp}) is not /etc/noo/birth.crt ({local_fp})"),
-            "noo onboard --only services"),
+        Some(fp) if !fp.eq_ignore_ascii_case(local_fp) => Err(SelfViewProblem {
+            code: "gateway_self_cert_stale",
+            msg: format!("the gateway's view of the birth cert ({fp}) is not /etc/noo/birth.crt ({local_fp})"),
+            remedy: format!("noo cluster provision {node}"),
+        }),
         Some(_) => Ok(()),
     }
 }
@@ -2178,9 +2218,16 @@ fn local_install_script(s: &LocalScript) -> String {
     out
 }
 
-pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i32, Unhandled> {
-    let root = crate::envfile::repo_root();
-    let pki = crate::pki::pki_dir();
+/// Returns `Err` instead of exiting: its only caller is onboard, which warns
+/// and goes on with the rest of the services step (hostd, placement, the
+/// embed model, …) rather than stopping at exit 1.
+pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i32, String> {
+    provision_local_in(g, node, tier, &crate::envfile::repo_root(), &crate::pki::pki_dir())
+}
+
+/// [`provision_local`] over an explicit install root and PKI dir (tests).
+fn provision_local_in(g: &Globals, node: &str, tier: Option<&str>, root: &Path, pki: &Path) -> Result<i32, String> {
+    let (root, pki) = (root.to_path_buf(), pki.to_path_buf());
 
     // Facts from the machine itself.
     let goarch = match std::env::consts::ARCH { "aarch64" => "arm64", _ => "amd64" };
@@ -2202,11 +2249,8 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
     // dist controller has no scripts/ tree, and this used to be an
     // `if prep.exists()` that skipped host prep SILENTLY there, so provision
     // went on to bundle a node whose controller-side prep never ran.
-    let (prep, _prep_guard) = match stage_prep_host(&root) {
-        Ok(v) => v,
-        Err(e) => fail(g.json, ExitCode::Generic, "prep_unavailable", &e,
-            Some("install a released noo binary (it embeds prep-host.sh) or run from a checkout")),
-    };
+    let (prep, _prep_guard) = stage_prep_host(&root).map_err(|e| format!(
+        "{e} — install a released noo binary (it embeds prep-host.sh) or run from a checkout"))?;
     // Host prep runs inside the ONE sudo script below, and only when the
     // marker it last wrote does not name this prep, these inputs and this
     // release — or a pull unit is missing (prep is what installs them).
@@ -2229,7 +2273,7 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
     let prep_cmd = if prep_current && units_missing.is_empty() {
         None
     } else {
-        Some(self_prep_line(g, node, &prep, &data_root, &work))
+        Some(self_prep_line(node, &prep, &data_root, &work)?)
     };
 
     // Certs must exist in the local PKI (the wizard's security step issues
@@ -2255,31 +2299,31 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         // The address is this box's own LAN address, as onboarding issues
         // it: without one the issuer would look the node NAME up on the
         // tailnet, which for a controller answers with another device.
-        match super::security_local::pki_issue_node(
-            g, &[node.to_string(), crate::onboard::util::detect_ip(), "--mint-only".to_string()]) {
-            Ok(0) => {}
-            _ => fail(g.json, ExitCode::Generic, "issue_failed",
-                &format!("could not issue a cert for {node}"), None),
+        // Issued directly (not through the `pki issue-node` verb, which
+        // exits on failure): an error here returns to onboard.
+        let ca = crate::pki::ClusterCa::new(pki.clone());
+        if !ca.ca_exists() {
+            return Err("no cluster CA found — run `noo onboard --only security` first".into());
         }
+        let ts_ip: Vec<String> = role.tailnet_ip4(node).into_iter().collect();
+        ca.issue_node_cert(node, &crate::onboard::util::detect_ip(), crate::pki::DEFAULT_DAYS,
+                &["node-agent".to_string()], &ts_ip, &role)
+            .map_err(|e| format!("could not issue a cert for {node}: {e}"))?;
     }
 
     // The self-node's backend doors need their leaves exactly as a remote
     // node's do; the same node-scoped issue, installed by
     // the same sudo script below instead of a bundle.
     let leaf_ca = crate::pki::ClusterCa::new(pki.clone());
-    ensure_door_leaves(g, &leaf_ca, node);
+    ensure_door_leaves_try(&leaf_ca, node)?;
 
-    let creds = sops_credentials(&root).unwrap_or_else(|e| {
-        fail(g.json, ExitCode::Generic, "secrets", &e, None)
-    });
+    let creds = sops_credentials(&root)?;
     nstep(&format!("obtaining noo-node-agent ({goarch})"));
-    let binary = obtain_agent_binary(&root, goarch).unwrap_or_else(|e| {
-        fail(g.json, ExitCode::Generic, "agent_binary", &e,
-            Some("is docker logged in to the registry, and NOO_IMAGE_TAG set?"));
-    });
+    let binary = obtain_agent_binary(&root, goarch).map_err(|e| format!(
+        "{e} — is docker logged in to the registry, and NOO_IMAGE_TAG set?"))?;
 
     let tmpl = std::fs::read_to_string(root.join("node-agent-go/deploy/noo-node-agent.env.tmpl"))
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "template", &e.to_string(), None));
+        .map_err(|e| format!("cannot read the agent env template ({e})"))?;
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
     vars.insert("na_node_id", node.to_string());
     vars.insert("node_ip", String::new());
@@ -2326,9 +2370,7 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
     vars.insert("noo_ollama_gpu_count", String::new());
     vars.insert("node_agent_port", String::from("8081"));
     vars.insert("log_level", String::from("info"));
-    let env_body = render_env_template(&tmpl, &vars).unwrap_or_else(|e| {
-        fail(g.json, ExitCode::Generic, "render", &e, None)
-    });
+    let env_body = render_env_template(&tmpl, &vars)?;
 
     // ── the controller's own NATS credential ──────────────
     // The same source of truth and the same bundle kind as the rail lane
@@ -2336,30 +2378,26 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
     // and carry no `nats-creds`, so every `noo upgrade --nodes` dropped the
     // controller agent's bus pair while it still registered over HTTP.
     // REQUIRED, as on the rail: nothing is installed without it.
-    let nats_creds = super::nats_users::node_credential_payload(&root, node).unwrap_or_else(|e| {
-        fail(g.json, ExitCode::Generic, "nats_credential",
-            &format!("could not mint {node}'s own NATS credential ({e}) — the agent has no other \
-                      bus credential, so nothing was installed"),
-            Some("check the secret store (`noo security secrets audit`), then re-run \
-                  `noo onboard --only services`"))
-    });
+    let nats_creds = super::nats_users::node_credential_payload(&root, node).map_err(|e| format!(
+        "could not mint {node}'s own NATS credential ({e}) — the agent has no other bus credential, \
+         so nothing was installed; check the secret store (`noo security secrets audit`), then re-run \
+         `noo onboard --only services`"))?;
 
-    let (leaves, _) = super::node_leaves::leaf_payloads(&leaf_ca, node)
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "leaf_read", &e, None));
-    let read_or_fail = |p: std::path::PathBuf, kind: &str| std::fs::read(&p)
-        .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, kind, &format!("{}: {e}", p.display()), None));
+    let (leaves, _) = super::node_leaves::leaf_payloads(&leaf_ca, node)?;
+    let read_or_fail = |p: std::path::PathBuf| std::fs::read(&p)
+        .map_err(|e| format!("{}: {e}", p.display()));
     let asf = local_agent_secret_files_script(super::enroll::asset_apply());
     let staged = local_bundle(node, LocalInputs {
         agent_env: env_body.into_bytes(),
         nats_creds,
         agent_binary: binary,
-        agent_unit: read_or_fail(root.join("node-agent-go/deploy/noo-node-agent.service"), "unit"),
-        ca_crt: read_or_fail(pki.join("ca.crt"), "pki"),
-        node_crt: read_or_fail(pki.join(format!("nodes/{node}/node.crt")), "pki"),
-        node_key: read_or_fail(pki.join(format!("nodes/{node}/node.key")), "pki"),
+        agent_unit: read_or_fail(root.join("node-agent-go/deploy/noo-node-agent.service"))?,
+        ca_crt: read_or_fail(pki.join("ca.crt"))?,
+        node_crt: read_or_fail(pki.join(format!("nodes/{node}/node.crt")))?,
+        node_key: read_or_fail(pki.join(format!("nodes/{node}/node.key")))?,
         leaves: leaves.iter().map(|(k, b)| (k.to_string(), b.clone())).collect(),
         secret_files_script: asf.clone().into_bytes(),
-    }).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "nats_credential", &e, None));
+    })?;
 
     // What changed since this lane last installed successfully: the state
     // file (kind → sha256, in the operator's own PKI dir beside node.key)
@@ -2396,14 +2434,16 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         // Stage in a private dir, install what changed with ONE sudo script,
         // scrub the staged secrets either way.
         let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work).unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
+        std::fs::create_dir_all(&work).map_err(|e| format!("cannot stage {} ({e})", work.display()))?;
         let _ = std::fs::set_permissions(&work, {
             use std::os::unix::fs::PermissionsExt; std::fs::Permissions::from_mode(0o700)
         });
         for (kind, bytes) in &staged {
             if kind == "secret-files" { continue; }
-            std::fs::write(work.join(kind), bytes)
-                .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "stage", &e.to_string(), None));
+            if let Err(e) = std::fs::write(work.join(kind), bytes) {
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(format!("cannot stage {kind} ({e})"));
+            }
         }
         let what: Vec<&str> = changed.iter().map(String::as_str).collect();
         nstep(&format!("installing the host agent (one sudo, the first install){}{}",
@@ -2426,12 +2466,10 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         let _ = std::fs::remove_dir_all(&work);
         match code {
             Some(0) => {}
-            Some(NATS_PAIR_MISSING_EXIT) => fail(g.json, ExitCode::Generic, "nats_pair_missing",
-                &format!("{node}'s agent env holds no NATS pair after the install — the agent would \
-                          register over HTTP with no bus connection; it was NOT restarted"),
-                Some(format!("noo cluster nats-creds rotate {node}").as_str())),
-            _ => fail(g.json, ExitCode::Generic, "install_failed",
-                "local agent install failed (see output above)", None),
+            Some(NATS_PAIR_MISSING_EXIT) => return Err(format!(
+                "{node}'s agent env holds no NATS pair after the install — the agent would register \
+                 over HTTP with no bus connection; it was NOT restarted (`noo cluster nats-creds rotate {node}`)")),
+            _ => return Err("local agent install failed (see output above)".into()),
         }
         // Recorded only after a successful install whose env presented a pair.
         let body = render_lane_state(&staged);
@@ -2449,13 +2487,16 @@ pub fn provision_local(g: &Globals, node: &str, tier: Option<&str>) -> Result<i3
         }
     }
     write_self_lane(node, SelfLaneRecord::Onboard);
-    // The rail from here on: the gateway reads the copy of the birth cert
-    // the script above installed (its read-only /etc/noo/self-node mount).
+    // The rail from here on: the gateway reads the birth cert from the
+    // PKI's certificate-only view, which the CLI keeps (no sudo).
     match pull_units_missing(node) {
         missing if !missing.is_empty() => nnote(&format!(
             "the pull units are still missing ({}) — upgrades cannot reach this node until `{SELF_RAIL_REMEDY}` installs them",
             missing.join(", "))),
-        _ => nnote("node identity and pull units in place — upgrades of this node ride the rail (no sudo)"),
+        _ => match sync_self_birth_cert(&pki, node, Path::new(SELF_BIRTH_CRT)) {
+            Ok(_) => nnote("node identity and pull units in place — upgrades of this node ride the rail (no sudo)"),
+            Err(e) => nnote(&format!("pull units in place; the gateway's view of the birth cert is not ({e}) — the next `noo cluster provision {node}` puts it there")),
+        },
     }
 
     nstep(&format!("waiting for {node} to register on the mesh"));
@@ -3611,10 +3652,11 @@ mod tests {
     fn the_local_lane_reissues_on_missing_controller_names() {
         let whole = include_str!("provision.rs");
         let src = whole.split("#[cfg(test)]").next().unwrap();
-        let local = &src[src.find("pub fn provision_local(").expect("provision_local")..];
-        let body = &local[..local.find("ensure_door_leaves(").expect("door leaves step")];
+        let local = &src[src.find("fn provision_local_in(").expect("provision_local_in")..];
+        let body = &local[..local.find("ensure_door_leaves_try(").expect("door leaves step")];
         assert!(body.contains("cert_covers_sans(&node_crt, role.required_dns()"), "coverage test missing");
         assert!(body.contains("crate::onboard::util::detect_ip()"), "explicit address missing");
+        assert!(body.contains("&ts_ip, &role)"), "the controller role (names, own tailnet address) is issued");
     }
 
     #[test]
@@ -4009,28 +4051,23 @@ mod self_node_rail_tests {
     fn units<'a>(present: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |p: &str| present.contains(&p)
     }
-    const ALL: [&str; 5] = ["/usr/local/bin/noo-fetch", "/usr/local/bin/noo-apply",
-        "/etc/systemd/system/noo-fetch.timer", "/etc/noo/birth.crt", "/etc/noo/self-node/birth.crt"];
+    const ALL: [&str; 4] = ["/usr/local/bin/noo-fetch", "/usr/local/bin/noo-apply",
+        "/etc/systemd/system/noo-fetch.timer", "/etc/noo/birth.crt"];
 
     #[test]
     fn a_prepped_controller_has_no_missing_units() {
-        assert!(missing_pull_units("pop-os", &units(&ALL), Some("pop-os\n"), true).is_empty());
-        assert!(missing_pull_units("pop-os", &units(&ALL), Some("Pop-OS"), true).is_empty());
+        assert!(missing_pull_units("pop-os", &units(&ALL), Some("pop-os\n")).is_empty());
+        assert!(missing_pull_units("pop-os", &units(&ALL), Some("Pop-OS")).is_empty());
     }
 
     #[test]
     fn each_missing_unit_is_named() {
-        let m = missing_pull_units("pop-os", &units(&ALL[..2]), Some("pop-os"), true);
-        assert_eq!(m, vec!["noo-fetch.timer".to_string(), "the birth cert".to_string(),
-            "the gateway's copy of the birth cert".to_string()]);
-        let m = missing_pull_units("pop-os", &units(&ALL), None, true);
+        let m = missing_pull_units("pop-os", &units(&ALL[..2]), Some("pop-os"));
+        assert_eq!(m, vec!["noo-fetch.timer".to_string(), "the birth cert".to_string()]);
+        let m = missing_pull_units("pop-os", &units(&ALL), None);
         assert!(m.len() == 1 && m[0].contains("no node name"), "{m:?}");
-        let m = missing_pull_units("pop-os", &units(&ALL), Some("host8"), true);
+        let m = missing_pull_units("pop-os", &units(&ALL), Some("host8"));
         assert!(m[0].contains("names 'host8', not 'pop-os'"), "{m:?}");
-        // The gateway's copy present but not the local cert: the identity
-        // step refreshes it.
-        let m = missing_pull_units("pop-os", &units(&ALL), Some("pop-os"), false);
-        assert_eq!(m, vec!["the gateway's copy of the birth cert (stale)".to_string()]);
     }
 
     /// pop-os before 0.6.3: prepped by the old local lane, no birth key, no
@@ -4038,10 +4075,10 @@ mod self_node_rail_tests {
     #[test]
     fn a_pre_i67_controller_creates_its_identity_once_then_rides_the_rail() {
         let pre = ["/usr/local/bin/noo-fetch", "/usr/local/bin/noo-apply"];
-        let missing = missing_pull_units("pop-os", &units(&pre), Some("pop-os"), false);
+        let missing = missing_pull_units("pop-os", &units(&pre), Some("pop-os"));
         assert_eq!(self_node_lane("pop-os", &missing, true), SelfLane::CreateIdentity);
         // Once created, nothing is missing: the rail, no sudo.
-        let after = missing_pull_units("pop-os", &units(&ALL), Some("pop-os"), true);
+        let after = missing_pull_units("pop-os", &units(&ALL), Some("pop-os"));
         assert_eq!(self_node_lane("pop-os", &after, true), SelfLane::Rail);
         assert_eq!(self_node_lane("pop-os", &after, false), SelfLane::Rail, "the rail never needs sudo");
     }
@@ -4057,10 +4094,64 @@ mod self_node_rail_tests {
         assert_eq!(SELF_RAIL_REMEDY, "noo onboard --only services");
     }
 
+    /// F1 (0.6.3-rc.1): the gateway reads the self node's birth cert from
+    /// the PKI's certificate-only view, which the CLI fills without sudo:
+    /// `<pki>/nodes/<self>/birth.crt`, mirrored to `public/nodes/<self>/`.
+    #[test]
+    fn the_birth_cert_reaches_the_gateways_view_without_root() {
+        let base = std::env::temp_dir().join(format!("noo-selfcert-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pki = base.join("pki");
+        std::fs::create_dir_all(pki.join("nodes/pop-os")).unwrap();
+        let host = base.join("birth.crt");
+        let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        std::fs::write(&host, pem).unwrap();
+        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(true));
+        assert_eq!(std::fs::read_to_string(pki.join("nodes/pop-os/birth.crt")).unwrap(), pem);
+        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/pop-os/birth.crt")).unwrap(), pem,
+            "mirrored into the view the gateway mounts at /app/pki/nodes");
+        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(false), "idempotent");
+        // A new identity replaces the view's copy.
+        let pem2 = pem.replace("AAAA", "BBBB");
+        std::fs::write(&host, &pem2).unwrap();
+        assert_eq!(sync_self_birth_cert(&pki, "pop-os", &host), Ok(true));
+        assert_eq!(std::fs::read_to_string(pki.join("public/nodes/pop-os/birth.crt")).unwrap(), pem2);
+        // Not a certificate, or no file: an error, nothing written.
+        std::fs::write(&host, "garbage").unwrap();
+        assert!(sync_self_birth_cert(&pki, "pop-os", &host).unwrap_err().contains("not a PEM"));
+        assert!(sync_self_birth_cert(&pki, "pop-os", &base.join("nope")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F2 (0.6.3-rc.1): the first install RETURNS its errors — onboard warns
+    /// and continues with hostd, placement and the rest. A PKI with no CA
+    /// fails at the prep line's CA pin; the test process is still here to
+    /// see the Err.
+    #[test]
+    fn the_first_install_returns_its_error_instead_of_exiting() {
+        let base = std::env::temp_dir().join(format!("noo-firstinstall-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, pki) = (base.join("root"), base.join("pki"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pki).unwrap();
+        let g = crate::Globals { json: false, verbose: false, gateway_override: None, timeout_secs: None, token: None, quiet: true };
+        let r = provision_local_in(&g, "noo-test-node-i67b", Some("3"), &root, &pki);
+        let e = r.expect_err("an install with no CA must fail — by returning");
+        assert!(e.contains("ca.crt") || e.contains("prep-host"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
+        // And the onboard caller warns and goes on, never `fail`s.
+        let steps = include_str!("../onboard/steps.rs");
+        let f = &steps[steps.find("fn ensure_self_agent(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(f.contains("if let Err(e) = crate::commands::provision::provision_local("), "{f}");
+        assert!(f.contains("provision_one(ctx.g, &node_id, &[])"), "the rail branch runs in a child");
+        assert!(!f.contains("fail("), "{f}");
+    }
+
     /// Behaviour of the identity script itself, run with a temp dir for
     /// /etc/noo and stubs for openssl and prep: keypair generated BEFORE
-    /// prep when absent, the staged copy removed after, the gateway's copy
-    /// installed from the cert prep left, and a present keypair left alone.
+    /// prep when absent, the staged copy removed after, no root-written
+    /// copy for the gateway, and a present keypair left alone.
     #[test]
     fn the_identity_script_creates_the_key_prep_arms_it_and_the_gateway_gets_its_copy() {
         let base = std::env::temp_dir().join(format!("noo-selfid-test-{}", std::process::id()));
@@ -4085,13 +4176,11 @@ mod self_node_rail_tests {
         let first = run();
         assert_eq!(first.lines().collect::<Vec<_>>(), vec!["openssl", "prep"], "keypair before prep");
         assert_eq!(std::fs::read_to_string(etc.join("birth.crt")).unwrap(), "CERT\n");
-        assert_eq!(std::fs::read_to_string(etc.join("self-node/birth.crt")).unwrap(), "CERT\n",
-            "the gateway's copy is the cert prep installed");
+        assert!(!etc.join("self-node").exists(), "no root-owned copy for the gateway any more");
         assert!(!work.join("birth.key").exists(), "the staged key is removed");
         // Second run: the pair exists, nothing regenerates; the copy holds.
         std::fs::remove_file(&log).unwrap();
         assert_eq!(run().lines().collect::<Vec<_>>(), vec!["prep"]);
-        assert_eq!(std::fs::read_to_string(etc.join("self-node/birth.crt")).unwrap(), "CERT\n");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4130,7 +4219,7 @@ mod self_node_rail_tests {
         let p = e(Some((200, r#"{"node":"pop-os","birth_cert_sha256":null}"#)));
         assert_eq!((p.code, p.remedy.as_str()), ("gateway_no_self_cert", "noo upgrade --stack"));
         let p = e(Some((200, &format!(r#"{{"node":"pop-os","birth_cert_sha256":"{}"}}"#, "cd".repeat(32)))));
-        assert_eq!((p.code, p.remedy.as_str()), ("gateway_self_cert_stale", "noo onboard --only services"));
+        assert_eq!((p.code, p.remedy.as_str()), ("gateway_self_cert_stale", "noo cluster provision pop-os"));
     }
 
     /// onboard's self-agent step: standalone/checkout × interactive/--ci.
@@ -4173,7 +4262,7 @@ mod self_node_rail_tests {
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
         assert!(!body.contains("provision_local("), "the rail verb must not call the first-install lane");
         assert!(!body.contains(r#"Command::new("sudo")"#), "the rail verb runs no sudo itself");
-        assert!(body.contains("SelfLane::CreateIdentity => {") && body.contains("ensure_self_identity(g, &node)"));
+        assert!(body.contains("SelfLane::CreateIdentity => {") && body.contains("ensure_self_identity(&node)"));
         let local = body.find("self_node_redemption(&node)").expect("self node built locally");
         let view = body.find("judge_gateway_self_view(").expect("the gateway's view checked");
         let stage = body.find("/api/cluster/provision-bundle/{node}\"), &blob)").expect("the stage");
@@ -4369,7 +4458,7 @@ mod local_lane_tests {
     }
 
     /// i67: the first install carries the node identity: the keypair (when
-    /// the box has none) before host prep, the gateway's copy after.
+    /// the box has none) before host prep; no root-written gateway copy.
     #[test]
     fn the_first_install_leaves_the_pull_units_behind() {
         let changed = std::collections::BTreeSet::new();
@@ -4380,8 +4469,8 @@ mod local_lane_tests {
         assert!(s.contains(&self_identity_script("ctrl", Path::new("/w"), Path::new("/etc/noo"), "PREP_LINE\n")), "{s}");
         let gen = s.find("openssl req -x509 -newkey rsa:4096").expect("keypair generated");
         let prep = s.find("PREP_LINE").expect("prep runs");
-        let copy = s.find("/etc/noo/self-node/birth.crt").expect("the gateway's copy");
-        assert!(gen < prep && prep < copy, "{s}");
+        assert!(gen < prep, "{s}");
+        assert!(!s.contains("/etc/noo/self-node"), "no root-written copy for the gateway: {s}");
         assert!(!script(&[], false).contains("openssl req"), "no prep: no identity step");
         let whole = include_str!("provision.rs");
         let src = whole.split("#[cfg(test)]").next().unwrap();

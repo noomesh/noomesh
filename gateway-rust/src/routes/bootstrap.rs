@@ -1449,17 +1449,23 @@ async fn provision_bundle_status(
     }
 }
 
-/// Where the controller's own node's birth cert is visible to the gateway: a
-/// read-only bind of the host directory `/etc/noo/self-node`
-/// (docker-compose.cluster.yml), which only root on the host writes — the
-/// controller's one-time identity step copies `/etc/noo/birth.crt` there.
+/// Where the controller's own node's birth cert is visible to the gateway
+/// (i67): `<pki>/nodes/<self>/birth.crt` in the certificate-only view the
+/// gateway already mounts read-only (`public/nodes` → `/app/pki/nodes`).
+/// The CLI copies it there from the host's `/etc/noo/birth.crt` — the cert
+/// host prep installed with the key it holds — and the public-view sync
+/// mirrors it like every other certificate. The gateway cannot write it, and
+/// no API sets it.
 ///
-/// A DIRECTORY, not the file: compose creates a missing bind source, and
-/// creates it as a directory, so binding `/etc/noo/birth.crt` itself on a
-/// controller whose identity does not exist yet (every fresh onboard starts
-/// the stack before the self agent) would plant a directory where host prep
-/// later installs the cert.
-pub const SELF_BIRTH_CRT: &str = "/etc/noo/self-node/birth.crt";
+/// Not a host `/etc/noo` bind: that source does not exist before the self
+/// node's identity does, which on a fresh install is after the stack starts,
+/// and the launcher's bind-source preflight rightly refuses a missing one.
+pub fn self_birth_cert_path(self_id: &str) -> String {
+    format!("{}/{}/birth.crt", SELF_NODES_VIEW, self_id.trim())
+}
+
+/// The gateway's mount of the PKI's `public/nodes` view.
+const SELF_NODES_VIEW: &str = "/app/pki/nodes";
 
 /// Is `node` this controller's own node? Case-insensitive, as node names are;
 /// never when the controller does not know its own id.
@@ -1484,7 +1490,8 @@ pub fn self_birth_cert(node: &str, self_id: Option<&str>, read: impl FnOnce() ->
 }
 
 fn read_self_birth_cert() -> Option<String> {
-    std::fs::read_to_string(SELF_BIRTH_CRT).ok()
+    let id = crate::self_node::self_node_id()?;
+    std::fs::read_to_string(self_birth_cert_path(&id)).ok()
 }
 
 /// GET /api/cluster/self-node — the controller's own node id and the
@@ -1500,7 +1507,7 @@ async fn self_node_identity(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
     let fingerprint = cert.as_deref().and_then(|c| ca_der_sha256(c.as_bytes()).ok());
     Ok(Json(json!({
         "node": self_id,
-        "birth_cert_path": SELF_BIRTH_CRT,
+        "birth_cert_path": self_id.as_deref().map(self_birth_cert_path),
         "birth_cert_sha256": fingerprint,
     })))
 }
@@ -2299,6 +2306,18 @@ mod tests {
         assert_eq!(self_birth_cert("aserve", Some("pop-os"), || panic!("read for a remote node")), None);
         assert_eq!(self_birth_cert("pop-os", None, || panic!("read with no self id")), None);
         assert_eq!(self_birth_cert("pop-os", Some(" "), || panic!("read with a blank self id")), None);
+    }
+
+    /// 0.6.3-rc.1 F1: the gateway reads the self node's cert from the PKI's
+    /// read-only certificate view it already mounts, not a host /etc bind
+    /// (which does not exist before the node identity does).
+    #[test]
+    fn the_self_nodes_cert_is_read_from_the_pki_view() {
+        assert_eq!(self_birth_cert_path("pop-os"), "/app/pki/nodes/pop-os/birth.crt");
+        assert_eq!(self_birth_cert_path(" pop-os "), "/app/pki/nodes/pop-os/birth.crt");
+        let src = include_str!("bootstrap.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains(&["\"/etc/noo/", "self-node"].concat()), "no host /etc path is read");
     }
 
     /// No route writes the self node's identity: the only self-node route is

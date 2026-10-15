@@ -2227,7 +2227,7 @@ const LOCAL_AGENT_BIN: &str = "/usr/local/bin/noo-node-agent";
 
 /// Restage the controller's own node over the rail (i67), like any node.
 /// No sudo — except ONCE on a controller installed before 0.6.3, whose node
-/// identity (birth key, pull units, the gateway's copy of the cert) does not
+/// identity (birth key, pull units) does not
 /// exist yet: the child creates it ("sudo once, never again") through the
 /// same prep path onboard uses, then rides the rail. When that sudo would
 /// prompt with nobody at a terminal the child refuses with the remedy
@@ -2277,7 +2277,7 @@ pub(crate) fn reexec_path(current: &std::path::Path) -> Option<std::path::PathBu
     if path.is_file() { Some(path) } else { None }
 }
 
-fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
+pub(crate) fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
     let exe = match std::env::current_exe().map(|p| reexec_path(&p)) {
         Ok(Some(p)) => p,
         // No path to ourselves: fall back to in-process, which is exactly the
