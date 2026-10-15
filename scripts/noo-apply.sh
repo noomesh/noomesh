@@ -467,6 +467,23 @@ hostd_generation_of() {
 }
 # END env_unit_shape
 
+# BEGIN binary_unchanged
+# binary_unchanged PAYLOAD INSTALLED — true only when INSTALLED exists, is
+# readable, and has the same sha256 as PAYLOAD. A missing file (first
+# install), an unreadable one, or a sha that cannot be computed all return
+# false, so the caller INSTALLS: the skip path needs positive proof of
+# identity, never the absence of a difference. A restage that carries the
+# bytes the node already runs then neither rewrites the file nor restarts the
+# service for it, and the applied: summary says `<kind>=unchanged` (a
+# different token from `<kind>`, which the controller reads as "installed").
+binary_unchanged() {
+    [ -f "$2" ] || return 1
+    _bu_new="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+    _bu_cur="$(sha256sum "$2" 2>/dev/null | awk '{print $1}')"
+    [ -n "$_bu_new" ] && [ "$_bu_new" = "$_bu_cur" ]
+}
+# END binary_unchanged
+
 for _k in $TEXT_KINDS; do
     [ -f "$WORK/files/$_k" ] && { text_payload_ok "$WORK/files/$_k" "$_k" || exit 65; }
 done
@@ -1103,9 +1120,13 @@ if [ -f "$WORK/files/agent-binary" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: agent-binary is not an ELF executable" >&2; exit 65 ;;
     esac
-    install -m 755 -o root -g root "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent.next
-    mv /usr/local/bin/noo-node-agent.next /usr/local/bin/noo-node-agent
-    applied="$applied agent-binary"; need_restart=1
+    if binary_unchanged "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent; then
+        applied="$applied agent-binary=unchanged"
+    else
+        install -m 755 -o root -g root "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent.next
+        mv /usr/local/bin/noo-node-agent.next /usr/local/bin/noo-node-agent
+        applied="$applied agent-binary"; need_restart=1
+    fi
 fi
 
 # cli-binary — the noo CLI for the node's user (an earlier change rail work:
@@ -1122,7 +1143,17 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: cli-binary is not an ELF executable" >&2; exit 65 ;;
     esac
+    # The installed CLI is hashed AS THE USER too (root must not follow a
+    # symlink the user planted); any failure there leaves the hash empty and
+    # the CLI is installed.
+    _cli_cur=""
     if [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ]; then
+        _cli_cur="$(runuser -u "$CLI_USER" -- env HOME="$CLI_HOME" sh -c 'sha256sum "$HOME/.local/bin/noo" 2>/dev/null' | awk '{print $1}')" || _cli_cur=""
+    fi
+    _cli_new="$(sha256sum "$WORK/files/cli-binary" | awk '{print $1}')"
+    if [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ] && [ -n "$_cli_cur" ] && [ "$_cli_cur" = "$_cli_new" ]; then
+        applied="$applied cli-binary=unchanged"
+    elif [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ]; then
         # Written AS THE USER, never by root into a user-owned tree: root
         # following a symlink the user planted under ~/.local would write
         # (and chown) wherever it pointed ( second review, L4).
@@ -1176,43 +1207,49 @@ if [ -f "$WORK/files/hostd-binary" ]; then
     esac
     HOSTD=/usr/local/bin/noo-hostd
     HB=/var/lib/noo-node-agent/spool/hostd.heartbeat.json
-    # Downgrade floor for the root helper ( review L3): never
-    # replace an installed hostd with one of a lower generation marker.
-    _hg_new="$(hostd_generation_of "$WORK/files/hostd-binary")"
-    _hg_cur="$(hostd_generation_of "$HOSTD")"
-    if [ "$_hg_new" -lt "$_hg_cur" ]; then
-        echo "noo-apply: REFUSED — hostd-binary is generation $_hg_new, older than the installed one ($_hg_cur)" >&2
-        logger -t noo-apply "REFUSED hostd-binary downgrade ($_hg_new < $_hg_cur)" 2>/dev/null || true
-        exit 65
-    fi
-    [ -f "$HOSTD" ] && cp -f "$HOSTD" "$HOSTD.prev"
-    install -m 755 -o root -g root "$WORK/files/hostd-binary" "$HOSTD.next"
-    mv "$HOSTD.next" "$HOSTD"
-    if ! "$HOSTD" install --mode worker >/dev/null 2>&1; then
-        echo "noo-apply: new hostd failed to install — restoring previous" >&2
-        [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-        exit 65
-    fi
-    hostd_ok=0
-    start_epoch=$(date +%s)
-    for _ in $(seq 1 20); do
-        if [ -f "$HB" ]; then
-            hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
-            if [ "$hb_mtime" -ge "$start_epoch" ] && grep -q 'swap-agent' "$HB"; then
-                hostd_ok=1
-                break
-            fi
-        fi
-        sleep 3
-    done
-    if [ "$hostd_ok" = 1 ]; then
-        rm -f "$HOSTD.prev"
-        applied="$applied hostd-binary"
-        logger -t noo-apply "hostd upgraded (fresh heartbeat from the new binary)" 2>/dev/null || true
+    if binary_unchanged "$WORK/files/hostd-binary" "$HOSTD"; then
+        # Same bytes as the running helper: nothing to swap, no `install`
+        # (which restarts the unit), no heartbeat wait, no revert to arm.
+        applied="$applied hostd-binary=unchanged"
     else
-        echo "noo-apply: new hostd produced no fresh heartbeat in 60s — REVERTING" >&2
-        [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-        exit 65
+        # Downgrade floor for the root helper ( review L3): never
+        # replace an installed hostd with one of a lower generation marker.
+        _hg_new="$(hostd_generation_of "$WORK/files/hostd-binary")"
+        _hg_cur="$(hostd_generation_of "$HOSTD")"
+        if [ "$_hg_new" -lt "$_hg_cur" ]; then
+            echo "noo-apply: REFUSED — hostd-binary is generation $_hg_new, older than the installed one ($_hg_cur)" >&2
+            logger -t noo-apply "REFUSED hostd-binary downgrade ($_hg_new < $_hg_cur)" 2>/dev/null || true
+            exit 65
+        fi
+        [ -f "$HOSTD" ] && cp -f "$HOSTD" "$HOSTD.prev"
+        install -m 755 -o root -g root "$WORK/files/hostd-binary" "$HOSTD.next"
+        mv "$HOSTD.next" "$HOSTD"
+        if ! "$HOSTD" install --mode worker >/dev/null 2>&1; then
+            echo "noo-apply: new hostd failed to install — restoring previous" >&2
+            [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
+            exit 65
+        fi
+        hostd_ok=0
+        start_epoch=$(date +%s)
+        for _ in $(seq 1 20); do
+            if [ -f "$HB" ]; then
+                hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
+                if [ "$hb_mtime" -ge "$start_epoch" ] && grep -q 'swap-agent' "$HB"; then
+                    hostd_ok=1
+                    break
+                fi
+            fi
+            sleep 3
+        done
+        if [ "$hostd_ok" = 1 ]; then
+            rm -f "$HOSTD.prev"
+            applied="$applied hostd-binary"
+            logger -t noo-apply "hostd upgraded (fresh heartbeat from the new binary)" 2>/dev/null || true
+        else
+            echo "noo-apply: new hostd produced no fresh heartbeat in 60s — REVERTING" >&2
+            [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
+            exit 65
+        fi
     fi
 fi
 
@@ -1325,9 +1362,13 @@ if [ -f "$WORK/files/harness-binary" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: harness-binary is not an ELF executable" >&2; exit 65 ;;
     esac
-    install -m 755 -o root -g root "$WORK/files/harness-binary" /usr/local/bin/noo-gateway.next
-    mv /usr/local/bin/noo-gateway.next /usr/local/bin/noo-gateway
-    applied="$applied harness-binary"; need_harness_restart=1
+    if binary_unchanged "$WORK/files/harness-binary" /usr/local/bin/noo-gateway; then
+        applied="$applied harness-binary=unchanged"
+    else
+        install -m 755 -o root -g root "$WORK/files/harness-binary" /usr/local/bin/noo-gateway.next
+        mv /usr/local/bin/noo-gateway.next /usr/local/bin/noo-gateway
+        applied="$applied harness-binary"; need_harness_restart=1
+    fi
 fi
 
 # harness-unit — first install creates the user. NO sudo grant: see below.

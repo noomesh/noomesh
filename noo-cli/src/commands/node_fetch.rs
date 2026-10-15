@@ -519,7 +519,27 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     let inst = |kind: &str, dst: PathBuf, mode: u32| -> bool {
         payloads.get(kind).is_some_and(|b| user_write(&dst, b, mode).is_ok())
     };
+    // A binary kind: skipped (and reported `=unchanged`) when the node already
+    // holds exactly these bytes at that mode; installed otherwise. A missing
+    // or unreadable installed file is the install path, never the skip path.
+    let inst_bin = |kind: &str, dst: PathBuf, mode: u32| -> bool {
+        match payloads.get(kind) {
+            Some(b) if installed_matches(&dst, b, mode) => {
+                crate::ui::done(&format!("noo node fetch: {kind} unchanged — already the bytes this node runs, not rewritten"));
+                note_binary(kind, true);
+                true
+            }
+            _ => {
+                let ok = inst(kind, dst, mode);
+                if ok { note_binary(kind, false); }
+                ok
+            }
+        }
+    };
     let text = |kind: &str| payloads.get(kind).map(|b| String::from_utf8_lossy(b).into_owned());
+    let daemon_plist = format!("/Library/LaunchDaemons/{AGENT_LABEL}.plist");
+    // What the agent loads, before this apply touches any of it.
+    let inputs_before = agent_inputs_fingerprint(base, Path::new(&daemon_plist));
     // signing-pub rides with the certs: a public key, 644 like ca.crt, and
     // installing it is what moves this node off the CA-signed lane. It is
     // optional, so it is NOT part of `all_ok` — a bundle without one is a
@@ -535,7 +555,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         && inst("node.key", base.join("pki/node.key"), 0o600)
         && inst("agent-env", base.join("agent.env"), 0o600)
         && inst("run-agent", base.join("run-agent.sh"), 0o700)
-        && inst("agent-binary", base.join("bin/noo-node-agent"), 0o755);
+        && inst_bin("agent-binary", base.join("bin/noo-node-agent"), 0o755);
     // The node's own NATS pair rides beside agent-env and is
     // merged into it AFTER the whole-file write, so the rendered env (which
     // carries only the shared pair) does not overwrite it. Same shape as the
@@ -572,7 +592,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     // gateway binary, its env (merged with the NATS pair below when one is
     // carried), a runner that sources the env, and a LaunchDaemon. All
     // optional — a bundle without them is a pre-52 bundle, not a broken one.
-    let _ = inst("harness-binary", base.join("bin/noo-gateway"), 0o755);
+    let _ = inst_bin("harness-binary", base.join("bin/noo-gateway"), 0o755);
     if inst("harness-env", base.join("harness.env"), 0o600) {
         if let Some(body) = text("nats-creds") {
             if let Err(e) = merge_nats_creds(&body, &base.join("harness.env"), me) {
@@ -600,7 +620,15 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     // heartbeat advertising the op we need — i.e. the NEW daemon is the one
     // running — restoring .prev on failure.
     if let (true, Some(hostd_bytes)) = (as_root, payloads.get("hostd-binary")) {
-        install_hostd(hostd_bytes);
+        if installed_matches(Path::new(HOSTD_BIN), hostd_bytes, 0o755) {
+            // Same bytes as the running helper: no swap, no `install` (which
+            // restarts its daemon), no heartbeat wait. Absent or unreadable
+            // is not a match, so a first install takes the path below.
+            crate::ui::done("noo node fetch: hostd-binary unchanged — noo-hostd already runs these bytes, not touched");
+            note_binary("hostd-binary", true);
+        } else if install_hostd(hostd_bytes) {
+            note_binary("hostd-binary", false);
+        }
     }
     // The agent's state directory is root's again, and its working
     // subdirectories the user's, on EVERY root apply — not only when a hostd
@@ -640,7 +668,16 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     }
     // The CLI rides the rail: root-owned copy for the fetch daemon, and the
     // user's own under ~/.local/bin.
-    if let Some(cli) = payloads.get("cli-binary").filter(|b| !b.is_empty()) {
+    let cli_unchanged = payloads.get("cli-binary").filter(|b| !b.is_empty()).is_some_and(|cli| {
+        // Both copies must already be these bytes: the user's under
+        // ~/.local/bin and, when root applies, root's for the fetch daemon.
+        installed_matches(&PathBuf::from(format!("/Users/{user}/.local/bin/noo")), cli, 0o755)
+            && (!as_root || installed_matches(Path::new(NOO_ROOT_BIN), cli, 0o755))
+    });
+    if cli_unchanged {
+        crate::ui::done("noo node fetch: cli-binary unchanged — the CLI already is these bytes, not rewritten");
+        note_binary("cli-binary", true);
+    } else if let Some(cli) = payloads.get("cli-binary").filter(|b| !b.is_empty()) {
         // The user's copy as the user (no root chmod/chown into the user's
         // tree, H2); root's copy from the verified bytes.
         let user_bin = PathBuf::from(format!("/Users/{user}/.local/bin"));
@@ -656,6 +693,9 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
                 false
             }
         };
+        if root_ok || !as_root {
+            note_binary("cli-binary", false);
+        }
         if root_ok {
             crate::ui::done("noo node fetch: CLI updated from the bundle");
         } else if !as_root {
@@ -675,7 +715,6 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
             }
         }
     }
-    let daemon_plist = format!("/Library/LaunchDaemons/{AGENT_LABEL}.plist");
     let plist_ok = match payloads.get("agent-plist") {
         None => false,
         Some(b) if as_root => root_install(b, Path::new(&daemon_plist), 0o644).is_ok(),
@@ -699,6 +738,14 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
     // SSH session at all — host6, 2026-09-02).
     let launchctl = |args: &[&str]| -> (i32, String) { run(launchctl_cmd().args(args)) };
     let target = format!("system/{AGENT_LABEL}");
+    // Nothing the agent loads changed (a restage of bytes it already runs):
+    // restarting it would only drop its connections. Only on proof — equal
+    // digests AND the daemon is loaded now; otherwise the full reload below.
+    let inputs_after = agent_inputs_fingerprint(base, Path::new(&daemon_plist));
+    if inputs_before == inputs_after && launchctl(&["print", &target]).0 == 0 {
+        crate::ui::done("noo node fetch: nothing the agent loads changed — agent left running, not restarted");
+        return Ok(());
+    }
     let _ = launchctl(&["bootout", &target]);
     // bootout is asynchronous: a bootstrap issued while the old instance is
     // still tearing down fails with "Bootstrap failed: 5: Input/output
@@ -795,7 +842,7 @@ fn verified_payloads(
 /// Install `noo-hostd` (root, from the verified bytes), keep the previous
 /// copy, and require the NEW daemon's heartbeat — polled as the user — or
 /// put the previous one back. A refusal is recorded for the apply report.
-fn install_hostd(hostd_bytes: &[u8]) {
+fn install_hostd(hostd_bytes: &[u8]) -> bool {
     let hostd = Path::new(HOSTD_BIN);
     let prev = PathBuf::from(format!("{HOSTD_BIN}.prev"));
     let hb = PathBuf::from(format!("{AGENT_STATE_DIR}/spool/hostd.heartbeat.json"));
@@ -804,7 +851,7 @@ fn install_hostd(hostd_bytes: &[u8]) {
         if let Err(e) = hostd.parent().map_or(Ok(()), root_dir_trustworthy) {
             crate::ui::warned(&format!("noo node fetch: noo-hostd not installed: {e}"));
             note_root_refused("noo-hostd");
-            return;
+            return false;
         }
         std::fs::read(hostd).ok()
     };
@@ -814,7 +861,7 @@ fn install_hostd(hostd_bytes: &[u8]) {
     if let Err(e) = root_install(hostd_bytes, hostd, 0o755) {
         crate::ui::warned(&format!("noo node fetch: noo-hostd not installed: {e}"));
         note_root_refused("noo-hostd");
-        return;
+        return false;
     }
     let start = std::time::SystemTime::now();
     let install = || run(Command::new(HOSTD_BIN).args(["install", "--mode", "worker"])).0 == 0;
@@ -835,6 +882,7 @@ fn install_hostd(hostd_bytes: &[u8]) {
             }
         }
     }
+    fresh
 }
 
 /// Give the agent its working directories (`claim_agent_dirs`) as root.
@@ -1205,7 +1253,7 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     refused.join(", ")
                 ));
             }
-            report(0, &apply_report_msg(&last_verified(), &refused));
+            report(0, &with_binary_summary(apply_report_msg(&last_verified(), &refused), &binary_outcomes()));
             Ok(0)
         }
         Err(e) => {
@@ -2015,6 +2063,85 @@ static TEARDOWN_DETAIL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new
 
 /// The tag `cluster verify` reads out of an apply report (`with_node_root_refusals`).
 pub(crate) const ROOT_REFUSED_TAG: &str = "root-refused:";
+
+/// The binary kinds this apply handled, as the Linux applier prints them in
+/// its `applied:` summary: `<kind>` when the bytes were installed, and
+/// `<kind>=unchanged` when the node already ran exactly those bytes and the
+/// write was skipped. A different token on purpose: the controller's
+/// whole-token lookup (`applier_applied`) for `<kind>` means "installed".
+static BINARY_OUTCOMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note_binary(kind: &str, unchanged: bool) {
+    if let Ok(mut g) = BINARY_OUTCOMES.lock() {
+        g.retain(|t| t.split('=').next() != Some(kind));
+        g.push(if unchanged { format!("{kind}=unchanged") } else { kind.to_string() });
+    }
+}
+
+fn binary_outcomes() -> Vec<String> {
+    BINARY_OUTCOMES.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Append the binary summary to an apply report message as ` applied: <tokens>`
+/// (nothing when this bundle carried no binary, so such a message is unchanged).
+fn with_binary_summary(msg: String, tokens: &[String]) -> String {
+    if tokens.is_empty() {
+        msg
+    } else {
+        format!("{msg} applied: {}", tokens.join(" "))
+    }
+}
+
+/// Is `path` already exactly these bytes with exactly this mode? True only on
+/// positive proof: an absent, unreadable or empty file, an empty payload, or a
+/// different mode all say "not the same", so the caller installs. Compares the
+/// bytes themselves, not a version string.
+fn installed_matches(path: &Path, want: &[u8], mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if want.is_empty() {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() || meta.permissions().mode() & 0o777 != mode {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|have| have == want)
+}
+
+/// A digest of everything the agent LaunchDaemon loads at start: its TLS
+/// material, env, runner, binary, the backend door leaves, the secret files
+/// and the daemon plist. Equal before and after an apply means a restart would
+/// load nothing new. An unreadable file digests as absent, which can only make
+/// two digests differ less often than the truth; the caller also requires the
+/// daemon to be loaded, so a wrongly equal digest never leaves it dead.
+fn agent_inputs_fingerprint(base: &Path, plist: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut feed = |label: &str, p: &Path| {
+        h.update(label.as_bytes());
+        h.update([0]);
+        match std::fs::read(p) {
+            Ok(b) => { h.update([1]); h.update(Sha256::digest(&b)); }
+            Err(_) => h.update([0]),
+        }
+    };
+    for rel in ["pki/ca.crt", "pki/node.crt", "pki/node.key", "agent.env", "run-agent.sh", "bin/noo-node-agent"] {
+        feed(rel, &base.join(rel));
+    }
+    // The directories whose members vary: service leaves and secret files.
+    for dir in ["pki", "secrets"] {
+        let mut names: Vec<String> = std::fs::read_dir(base.join(dir)).into_iter().flatten().flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| dir == "secrets" || n.starts_with("svc-"))
+            .collect();
+        names.sort();
+        for n in names {
+            feed(&format!("{dir}/{n}"), &base.join(dir).join(&n));
+        }
+    }
+    feed("plist", plist);
+    hex::encode(h.finalize())
+}
 
 /// The apply report message: `applied <verified-by …>` and, when root
 /// binaries were refused, ` root-refused: noo-cli,noo-hostd`. Pure, so the
@@ -4440,5 +4567,82 @@ mod user_writes_tests {
         let s = private_stage_dir_in(&d, "x").unwrap();
         assert_eq!(std::fs::metadata(&s).unwrap().mode() & 0o777, 0o700);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ── a restage of bytes the node already runs ───────────────────────
+
+    #[test]
+    fn installed_matches_needs_positive_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("unchanged-bytes");
+        let f = d.join("noo-node-agent");
+        // First install: nothing on disk.
+        assert!(!installed_matches(&f, b"v1", 0o755), "an absent file is not a match");
+        std::fs::write(&f, b"v1").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(installed_matches(&f, b"v1", 0o755));
+        assert!(!installed_matches(&f, b"v2", 0o755), "different bytes install");
+        assert!(!installed_matches(&f, b"v1", 0o700), "same bytes at another mode install");
+        assert!(!installed_matches(&f, b"", 0o755), "an empty payload is never a match");
+        std::fs::write(&f, b"").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!installed_matches(&f, b"v1", 0o755), "an empty installed file is installed over");
+        assert!(!installed_matches(&d, b"v1", 0o755), "a directory is not a binary");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unchanged_binaries_ride_the_report_as_a_distinct_token() {
+        let m = with_binary_summary("applied v".into(), &["agent-binary=unchanged".into(), "hostd-binary".into()]);
+        assert_eq!(m, "applied v applied: agent-binary=unchanged hostd-binary");
+        assert_eq!(with_binary_summary("applied v".into(), &[]), "applied v", "no binary, message unchanged");
+        // The controller's whole-token lookup: `=unchanged` is NOT "installed".
+        assert!(!crate::commands::provision::applier_applied(&m, "agent-binary"));
+        assert!(crate::commands::provision::applier_applied(&m, "agent-binary=unchanged"));
+        assert!(crate::commands::provision::applier_applied(&m, "hostd-binary"));
+        // The root-refusal tag still parses when both are present.
+        let both = with_binary_summary(apply_report_msg("v", &["noo-cli".into()]), &["cli-binary".into()]);
+        assert!(both.contains(&format!("{ROOT_REFUSED_TAG} noo-cli")));
+    }
+
+    #[test]
+    fn the_agent_inputs_fingerprint_moves_only_with_what_the_agent_loads() {
+        let d = scratch("agent-inputs");
+        let base = d.join("noomesh");
+        for sub in ["pki", "bin", "secrets"] {
+            std::fs::create_dir_all(base.join(sub)).unwrap();
+        }
+        let plist = d.join("agent.plist");
+        std::fs::write(&plist, "p").unwrap();
+        std::fs::write(base.join("agent.env"), "A=1\n").unwrap();
+        std::fs::write(base.join("bin/noo-node-agent"), "bin1").unwrap();
+        let a = agent_inputs_fingerprint(&base, &plist);
+        assert_eq!(a, agent_inputs_fingerprint(&base, &plist), "stable");
+        // Rewriting identical bytes (what a restage does) changes nothing.
+        std::fs::write(base.join("agent.env"), "A=1\n").unwrap();
+        assert_eq!(a, agent_inputs_fingerprint(&base, &plist));
+        // Files the agent does not load do not count.
+        std::fs::write(base.join("harness.env"), "H=1").unwrap();
+        std::fs::write(base.join("bin/noo-gateway"), "gw").unwrap();
+        assert_eq!(a, agent_inputs_fingerprint(&base, &plist));
+        for (rel, body) in [("agent.env", "A=2\n"), ("bin/noo-node-agent", "bin2"), ("secrets/tok", "t"), ("pki/svc-vllm.crt", "c")] {
+            let before = agent_inputs_fingerprint(&base, &plist);
+            std::fs::write(base.join(rel), body).unwrap();
+            assert_ne!(before, agent_inputs_fingerprint(&base, &plist), "{rel} must move the digest");
+        }
+        let before = agent_inputs_fingerprint(&base, &plist);
+        std::fs::write(&plist, "p2").unwrap();
+        assert_ne!(before, agent_inputs_fingerprint(&base, &plist), "the plist moves it");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_agent_restart_is_gated_on_proof_and_a_loaded_daemon() {
+        let f = body("darwin_apply");
+        let gate = f.find("inputs_before == inputs_after").expect("restart gate");
+        assert!(f[gate..].contains(r#"launchctl(&["print", &target]).0 == 0"#), "skip needs the daemon loaded");
+        assert!(gate < f.find(r#"launchctl(&["bootout", &target])"#).unwrap());
+        assert!(f.contains(r#"inst_bin("agent-binary""#) && f.contains(r#"inst_bin("harness-binary""#));
+        assert!(f.contains(r#"note_binary("hostd-binary", true)"#) && f.contains(r#"note_binary("cli-binary", true)"#));
     }
 }
