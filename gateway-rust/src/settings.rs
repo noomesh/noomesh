@@ -21,8 +21,14 @@ fn overrides() -> &'static RwLock<HashMap<String, String>> {
     OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn truthy(v: &str) -> bool {
-    matches!(v.trim(), "1" | "true" | "yes" | "on" | "TRUE" | "YES" | "ON")
+/// The one truthiness parse for a settings value (DB row or env var):
+/// trimmed, ASCII-case-insensitive `1|true|yes|on`, matching Python's
+/// `_TRUTHY`. Shared by the override cache ([`flag`], [`db_flag`] — the
+/// kiosk reads these) and GET /api/settings/flags (which `noo cluster
+/// verify` reads), so a row like `True` or ` On ` cannot read ON in one
+/// and OFF in the other.
+pub fn truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// Resolve a boolean behavioral flag: DB override → env → `default`.
@@ -81,23 +87,81 @@ pub fn remove_override(key: &str) {
 
 /// Spawn the background refresher for the `noo_settings` override cache.
 /// Called once at startup with the shared pool.
+///
+/// A failed reload keeps the previous map (the cache stays usable), and is
+/// logged at WARN once per failure streak — the first failure after a
+/// success, then silence until a reload succeeds again (logged at INFO), so
+/// a stale cache is visible without a line every 15 s.
 pub fn spawn_refresh(db: sqlx::PgPool) {
     tokio::spawn(async move {
+        let mut failing: u64 = 0;
         loop {
-            if let Ok(rows) =
-                sqlx::query_as::<_, (String, String)>("SELECT key, value FROM noo_settings")
-                    .fetch_all(&db)
-                    .await
+            match sqlx::query_as::<_, (String, String)>("SELECT key, value FROM noo_settings")
+                .fetch_all(&db)
+                .await
             {
-                let mut m = HashMap::with_capacity(rows.len());
-                for (k, v) in rows {
-                    m.insert(k, v);
+                Ok(rows) => {
+                    if failing > 0 {
+                        tracing::info!(
+                            failed_reloads = failing,
+                            "settings_cache_refresh_recovered"
+                        );
+                        failing = 0;
+                    }
+                    let mut m = HashMap::with_capacity(rows.len());
+                    for (k, v) in rows {
+                        m.insert(k, v);
+                    }
+                    if let Ok(mut w) = overrides().write() {
+                        *w = m;
+                    }
                 }
-                if let Ok(mut w) = overrides().write() {
-                    *w = m;
+                Err(e) => {
+                    if failing == 0 {
+                        tracing::warn!(
+                            error = %e,
+                            "settings_cache_refresh_failed: keeping the previous noo_settings \
+                             overrides until a reload succeeds"
+                        );
+                    }
+                    failing += 1;
                 }
             }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truthy;
+
+    #[test]
+    fn truthy_is_trimmed_and_case_insensitive() {
+        for v in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On", " on ", "\tON\n"] {
+            assert!(truthy(v), "{v:?} should read ON");
+        }
+    }
+
+    #[test]
+    fn truthy_rejects_falsy_and_garbage() {
+        for v in ["0", "false", "False", "no", "off", "OFF", " off ", "", "  ", "garbage", "2", "y", "onn"] {
+            assert!(!truthy(v), "{v:?} should read OFF");
+        }
+    }
+
+    /// The kiosk path (db_flag via the cache) and the flags route
+    /// (verify's source) agree on a mixed-case row.
+    #[test]
+    fn db_flag_honours_mixed_case_row() {
+        let key = "__TEST_TRUTHY_MIXED_CASE";
+        super::set_override(key, "True");
+        assert!(super::db_flag(key, false));
+        super::set_override(key, " On ");
+        assert!(super::db_flag(key, false));
+        super::set_override(key, "off");
+        assert!(!super::db_flag(key, true));
+        super::remove_override(key);
+        assert!(!super::db_flag(key, false));
+    }
 }
