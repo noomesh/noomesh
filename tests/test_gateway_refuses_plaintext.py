@@ -37,6 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "gateway-rust/src/main.rs"
 TLS = ROOT / "gateway-rust/src/tls.rs"
+UI_ROUTES = ROOT / "gateway-rust/src/routes/ui.rs"
 SCAN_ROOTS = ("gateway-rust/src", "src/noomesh", "noo-cli/src")
 
 # A stack service name a plaintext URL must never target. `ollama-embed` is
@@ -225,3 +226,22 @@ def test_cache_refuses_a_plaintext_redis_url_and_says_why() -> None:
     with pytest.raises(ValueError, match=r"plaintext \(redis://\).*TLS only.*rediss://"):
         _apply_redis_tls("redis://redis:6379")
     assert _apply_redis_tls("rediss://redis:6379") == "rediss://redis:6379"
+
+
+def test_browser_session_is_reached_through_the_node_agent_not_a_plain_node_url() -> None:
+    """`format!("http://{host}:{port}")` built the browser session URL, which
+    the SERVICE regex cannot see: plaintext HTTP straight at a published
+    container port, guarded only by a bearer. The container is now published
+    on the node's loopback and the gateway goes through the agent's
+    authenticated proxy route. A plain http://{...} format! in ui.rs is back
+    if this fails."""
+    code = _code_only(UI_ROUTES, UI_ROUTES.read_text())
+    assert 'format!("http://' not in code, "ui.rs builds a plaintext http:// URL again"
+    assert "{}/api/containers/{container_name}/proxy" in code, (
+        "the browser session URL no longer goes via the agent's proxy route — the parse found no route"
+    )
+    assert "browser_proxy_base(&agent_url" in code
+    agent = (ROOT / "node-agent-go/internal/docker/containers.go").read_text()
+    assert "network.PortBinding{HostIP: managedPublishIP}" in agent, (
+        "managed container ports are published without the loopback HostIP"
+    )
