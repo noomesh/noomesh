@@ -107,7 +107,7 @@ fn cache() -> &'static RwLock<Option<Cache>> {
 pub fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Service-key scopes that were RETIRED, with what replaced them. A key

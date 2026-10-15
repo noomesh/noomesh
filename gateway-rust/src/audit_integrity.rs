@@ -77,7 +77,7 @@
 //! checkpoint's `after:` link does detect deletion of the retired epoch's
 //! last rows, the one place it matters most.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 

@@ -2160,13 +2160,13 @@ async fn proposal_decide(
     let exec: Result<Value, String> = async {
         match action.as_str() {
             "create" => {
-                use rand::Rng;
+                use rand::RngExt;
                 let pw: String = {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     (0..16)
                         .map(|_| {
                             let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-                            chars[rng.gen_range(0..chars.len())] as char
+                            chars[rng.random_range(0..chars.len())] as char
                         })
                         .collect()
                 };
@@ -2538,9 +2538,9 @@ fn validate_identity_key_binding(
 }
 
 fn new_raw_key() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     use base64::Engine;
     format!(
         "noo-sk-{}",

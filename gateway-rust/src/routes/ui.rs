@@ -1011,8 +1011,8 @@ async fn tools_registry_raw(
     // captured at ITS startup — possibly older than the repo's
     // config/tools.json — without diffing the whole body.
     let fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&body).unwrap_or_default())
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&body).unwrap_or_default()))
     );
     let mut resp = Json(body).into_response();
     if let Ok(v) = fingerprint.parse() {

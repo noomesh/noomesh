@@ -10,7 +10,7 @@ use axum::{
     extract::{State, Path, Query},
     Json,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};

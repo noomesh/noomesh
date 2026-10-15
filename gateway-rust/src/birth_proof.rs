@@ -67,7 +67,10 @@ use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use rsa::RsaPublicKey;
-use sha2::Sha256;
+// rsa 0.9 is built on digest 0.10 (its digest-0.11 line, 0.10, is still a
+// release candidate), so the hash it is parameterised by must be the sha2
+// 0.10 it re-exports, not the crate's own sha2 0.11.
+use rsa::sha2::Sha256;
 
 /// How far a node's clock may be from the controller's. The same ±300 s the
 /// cluster HMAC rail already allows, for the same reason: a node whose NTP has
