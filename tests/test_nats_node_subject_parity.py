@@ -136,6 +136,20 @@ def _published_subjects() -> dict[str, str]:
     m = re.search(r'pub fn ready_subject\([^)]*\)\s*->\s*String\s*\{\s*format!\("([^"{]+)\{', tasks)
     assert m, "ready_subject no longer builds a literal prefix + node id"
     found[f"{m.group(1)}{ID}"] = "gateway-rust/src/tasks.rs"
+    # i70: the harness ACKs `harness.run.<node>` / `harness.task.<node>` by
+    # publishing on the request's reply subject, which the gateway addresses
+    # to this node's own prefix (`nats_credentials::node_reply_prefix`). The
+    # grant is that prefix, kept static so the ack survives a NATS reload
+    # (allow_responses does not); tests/test_nats_principal_reply_grant_parity.py
+    # pins the two crates' constants equal. Here: the harness really does
+    # publish replies, and the gateway really builds the prefix from the node.
+    harness = (ROOT / "gateway-rust/src/harness_main.rs").read_text()
+    assert harness.count("msg.reply.clone()") >= 2, "the harness no longer acks both its subjects on msg.reply"
+    creds = (ROOT / "gateway-rust/src/nats_credentials.rs").read_text()
+    assert re.search(r'format!\("\{NODE_REPLY_ROOT\}\.\{\}", subject_token\(node_id\)\)', creds), (
+        "node_reply_prefix no longer builds <root>.<node token>"
+    )
+    found["{NODE_REPLY_ROOT}.{tok}.>"] = "gateway-rust/src/harness_main.rs (msg.reply)"
     return found
 
 

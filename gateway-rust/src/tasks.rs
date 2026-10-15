@@ -772,7 +772,8 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
                 };
                 let ack = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    state.nats.request(task_subject(&node), serde_json::to_vec(&req)?.into()),
+                    // Reply on the node's own prefix: survives a NATS reload (i70).
+                    state.nats.send_request(task_subject(&node), crate::coordinator::node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
                 )
                 .await;
                 if let Ok(Ok(msg)) = ack {

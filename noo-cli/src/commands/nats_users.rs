@@ -306,7 +306,7 @@ fn subject_token(id: &str) -> String {
 /// timeout outgrows it.
 pub(crate) const RESPONSE_EXPIRES: &str = "20m";
 
-/// The gateway's reply inboxes, granted to the WORKER as a static publish.
+/// The WORKER principal's reply inbox, granted to it as a static publish.
 ///
 /// `allow_responses` is not durable. nats-server keeps the "you may answer
 /// this one reply subject" entries in a per-connection map, and every
@@ -320,14 +320,28 @@ pub(crate) const RESPONSE_EXPIRES: &str = "20m";
 /// re-render + HUP), and the reply at 20:54:44 was refused (i69). A slow
 /// answer is simply more likely to straddle a reload.
 ///
-/// The gateway is the only principal allowed to publish `worker.>`, so every
-/// request the worker answers carries a gateway reply subject: this is the
-/// worker's own reply path, nothing wider. It must equal the gateway's
-/// `nats_credentials::INBOX_PREFIX` + `.>` —
-/// tests/test_nats_worker_reply_grant_parity.py compares the two crates.
-/// `allow_responses` stays for the other requesters the worker answers
-/// (`agent.msg.direct.*`, `agent.peer.*.task.*`).
-pub(crate) const GATEWAY_REPLY_INBOX: &str = "_INBOX_gw.>";
+/// PER PRINCIPAL, not the gateway's whole inbox (i70). #74 granted the
+/// worker `_INBOX_gw.>`, which also covered every reply the gateway awaits
+/// from a node. Now the gateway addresses each remote principal's replies
+/// to a prefix of its own — `worker_client` uses `_INBOX_gw.worker.<nuid>`
+/// for every `worker.>` request, a node's harness requests use
+/// `_INBOX_gw.node.<token>.<nuid>` — and each principal holds a static
+/// grant on its own prefix only. noo-trellion and noo-trellion-intel
+/// present the worker principal, so this is the add-ons' grant too.
+///
+/// Must equal the gateway's `nats_credentials::WORKER_REPLY_PREFIX` + `.>`
+/// — tests/test_nats_principal_reply_grant_parity.py compares the two
+/// crates. `allow_responses` stays for the other requesters the worker
+/// answers (`agent.msg.direct.*`, `agent.peer.*.task.*`).
+pub(crate) const WORKER_REPLY_INBOX: &str = "_INBOX_gw.worker.>";
+
+/// The root of every node principal's reply inbox. A node is granted
+/// `<root>.<subject_token(id)>.>` — its own requests' replies and nothing
+/// wider; never the root. Must equal the gateway's
+/// `nats_credentials::NODE_REPLY_ROOT` (same parity test). Discovery
+/// (`mesh.inference.discover`) is a queue request ANY node may answer, so it
+/// cannot be addressed to one node's prefix and stays on `allow_responses`.
+pub(crate) const NODE_REPLY_ROOT: &str = "_INBOX_gw.node";
 
 fn perms_for(role: Role, id: &str) -> String {
     let ind = "          ";
@@ -339,7 +353,7 @@ fn perms_for(role: Role, id: &str) -> String {
         ),
         Role::Worker => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{GATEWAY_REPLY_INBOX}\"]\n\
+             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{WORKER_REPLY_INBOX}\"]\n\
              {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
@@ -365,7 +379,7 @@ fn perms_for(role: Role, id: &str) -> String {
         // That was #1218.
         Role::Node => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.STREAM.NAMES\"]\n\
+             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.STREAM.NAMES\", \"{NODE_REPLY_ROOT}.{tok}.>\"]\n\
              {ind}  deny: [\"tasks.>\", \"worker.>\", \"$KV.>\", \"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.CONSUMER.DELETE.>\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
@@ -1220,14 +1234,24 @@ mod tests {
         assert!(w.contains("\"$KV.>\""));
         assert!(w.contains("$JS.API.STREAM.PURGE.>"));
         assert!(w.contains("allow_responses: { max: 1, expires: \"20m\" }"), "{w}");
-        // i69: the worker's reply to the gateway must survive a NATS reload,
-        // which wipes allow_responses entries — a static publish on the
-        // gateway's inbox, and ONLY the worker holds it.
+        // i69/i70: a reply to the gateway must survive a NATS reload, which
+        // wipes allow_responses entries — so each remote principal holds a
+        // static publish on ITS OWN reply prefix, and on nobody else's.
         let w_block = w.split("user: \"node-").next().unwrap();
-        assert!(w_block.contains("\"_INBOX_gw.>\""), "{w_block}");
+        let w_publish = w_block.split("subscribe:").next().unwrap();
+        assert!(w_publish.contains("\"_INBOX_gw.worker.>\""), "{w_block}");
+        assert!(!w_publish.contains("\"_INBOX_gw.>\""), "the worker may not answer into every gateway reply:\n{w_block}");
+        assert!(!w_publish.contains("_INBOX_gw.node"), "the worker may not answer a node's replies:\n{w_block}");
         for node in text.split("user: \"node-").skip(1) {
+            let id = node.split('"').next().unwrap();
             let publish = node.split("subscribe:").next().unwrap();
-            assert!(!publish.contains("_INBOX_gw"), "a node may not answer into the gateway inbox statically:\n{node}");
+            let grants: Vec<&str> = publish
+                .split('"')
+                .filter(|g| g.starts_with("_INBOX"))
+                .collect();
+            // Exactly one inbox grant: its own prefix. Not the root, not
+            // the worker's, not another node's.
+            assert_eq!(grants, vec![format!("_INBOX_gw.node.{id}.>")], "node {id}:\n{node}");
         }
         assert!(!text.contains("allow_responses: true"), "a bare `true` is a 2-minute reply window");
     }
