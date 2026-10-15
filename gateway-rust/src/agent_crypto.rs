@@ -202,14 +202,23 @@ fn wrap_key_v2(
 /// Seal `body` to every recipient (v2). `aad` binds the ciphertext to the
 /// envelope it belongs to — see [`crate::agent_messages::envelope_aad`] —
 /// so a body lifted into a different envelope no longer authenticates.
+/// A fresh X25519 secret from the OS-seeded thread RNG. x25519-dalek 2 takes a
+/// rand_core 0.6 RNG in `random_from_rng`, which rand 0.10's RNGs are not, so
+/// fill the 32 bytes here and clamp via `From` (what `random_from_rng` does).
+fn random_static_secret() -> StaticSecret {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rand::fill(seed.as_mut_slice());
+    StaticSecret::from(*seed)
+}
+
 pub fn seal(body: &Value, recipients: &[Recipient<'_>], aad: &[u8]) -> Result<Sealed, String> {
     if recipients.is_empty() {
         return Err("no recipients to seal to".into());
     }
     let mut msg_key = Zeroizing::new([0u8; 32]);
     let mut nonce = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), msg_key.as_mut_slice());
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+    rand::fill(msg_key.as_mut_slice());
+    rand::fill(&mut nonce);
     let plaintext = Zeroizing::new(serde_json::to_vec(body).map_err(|e| e.to_string())?);
     let ct = ChaCha20Poly1305::new(&Key::from(*msg_key))
         .encrypt(&Nonce::from(nonce), Payload { msg: plaintext.as_slice(), aad })
@@ -217,7 +226,7 @@ pub fn seal(body: &Value, recipients: &[Recipient<'_>], aad: &[u8]) -> Result<Se
     // One ephemeral X25519 key per message; each recipient gets the message
     // key wrapped under ECDH(ephemeral, recipient) — the v2 KDF binds both
     // public keys and the label, so wraps are distinct and non-replayable.
-    let epk_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let epk_secret = random_static_secret();
     let epk = PublicKey::from(&epk_secret);
     let mut wraps = serde_json::Map::new();
     for r in recipients {
@@ -509,7 +518,7 @@ mod tests {
         assert!(open(&bad, REVIEW_WRAP, &ctrl.seal, aad).unwrap_err().contains("nonce"));
         // A wrap that authenticates but carries a 5-byte "key": anyone can
         // mint one, since the review public key is public.
-        let epk_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let epk_secret = random_static_secret();
         let epk = PublicKey::from(&epk_secret);
         let wk = wrap_key_v2(&epk_secret, &ctrl.seal_public(), &epk, &ctrl.seal_public(), REVIEW_WRAP).unwrap();
         let wrapped = ChaCha20Poly1305::new(&wk)

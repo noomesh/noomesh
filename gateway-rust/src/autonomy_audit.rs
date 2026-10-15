@@ -203,7 +203,7 @@ pub async fn recent(
     }
     sql.push_str(&format!(" ORDER BY at DESC LIMIT ${}", clauses.len() + 1));
 
-    let mut q = sqlx::query_as::<_, AuditRow>(&sql);
+    let mut q = sqlx::query_as::<_, AuditRow>(sqlx::AssertSqlSafe(&*sql));
     if let Some(loc) = location {
         q = q.bind(loc);
     }

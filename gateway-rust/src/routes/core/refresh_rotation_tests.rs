@@ -37,10 +37,10 @@ async fn scratch() -> Option<PgPool> {
         .connect(&dsn)
         .await
         .expect("connect to NOO_BROKER_TEST_DSN");
-    let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)"))
+    let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)")))
         .execute(&admin)
         .await;
-    sqlx::raw_sql(&format!("CREATE DATABASE {DB_NAME}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {DB_NAME}")))
         .execute(&admin)
         .await
         .expect("create scratch db");
@@ -54,7 +54,7 @@ async fn scratch() -> Option<PgPool> {
         .expect("connect scratch");
     unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
     for ext in ["vector", "pg_trgm"] {
-        sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
             .execute(&build)
             .await
             .expect("extension");
@@ -140,10 +140,10 @@ async fn live_token(db: &PgPool, username: &str) -> String {
 /// so moving it is moving the clock — and a test that slept through a real
 /// 10 s window would be a 10 s test that still proved only one boundary.
 async fn age_rotation(db: &PgPool, raw: &str, interval: &str) {
-    let n = sqlx::query(&format!(
+    let n = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE noo_refresh_tokens SET revoked_at = NOW() - INTERVAL '{interval}' \
           WHERE token_hash = $1 AND revoked_at IS NOT NULL"
-    ))
+    )))
     .bind(auth_refresh::hash_token(raw))
     .execute(db)
     .await
@@ -420,9 +420,9 @@ async fn a_cookie_minted_before_the_prefix_still_rotates_onto_a_prefixed_one() {
     // Exactly what the pre-1281 gateway minted: 32 CSPRNG bytes, unpadded
     // base64url, no prefix — stored as the hash of that bare string.
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use rand::RngCore as _;
+    use rand::Rng as _;
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     let legacy = URL_SAFE_NO_PAD.encode(buf);
     assert_eq!(legacy.len(), 43);
     assert!(!legacy.starts_with(auth_refresh::REFRESH_TOKEN_PREFIX));

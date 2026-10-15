@@ -49,7 +49,7 @@ use std::time::Duration;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 
@@ -86,7 +86,7 @@ pub const BOOTSTRAP_TOKEN_PREFIX: &str = "noo-bt-";
 /// of both token kinds; never handed out without its prefix.
 fn random_body() -> String {
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
 }
 

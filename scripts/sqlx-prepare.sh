@@ -32,8 +32,8 @@ if [[ "${1:-}" == "--check" ]]; then MODE=check; fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NETWORK="${NOO_DB_NETWORK:-pai-assistant_noo-db}"
-CLI_IMAGE="${NOO_SQLX_IMAGE:-noo-sqlx-cli:local}"
-SQLX_VERSION="${NOO_SQLX_VERSION:-^0.8}"
+CLI_IMAGE="${NOO_SQLX_IMAGE:-noo-sqlx-cli:0.9}"
+SQLX_VERSION="${NOO_SQLX_VERSION:-^0.9}"
 
 if ! docker image inspect "$CLI_IMAGE" >/dev/null 2>&1; then
   echo "==> building $CLI_IMAGE (one-off, a few minutes)"

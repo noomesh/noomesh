@@ -281,7 +281,7 @@ pub async fn apply_node_budget(db: &sqlx::PgPool, task: &Task, node: &str) -> Re
 /// The children of a task, oldest first.
 pub async fn children(db: &sqlx::PgPool, parent_id: &str) -> Result<Vec<Task>> {
     let Ok(uuid) = uuid::Uuid::parse_str(parent_id) else { return Ok(Vec::new()) };
-    let rows = sqlx::query(&format!("{SELECT} WHERE t.parent_id = $1 ORDER BY t.created_at"))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.parent_id = $1 ORDER BY t.created_at")))
         .bind(uuid)
         .fetch_all(db)
         .await?;
@@ -359,15 +359,15 @@ pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Opti
 
 pub async fn get(db: &sqlx::PgPool, id: &str) -> Result<Option<Task>> {
     let Ok(uuid) = uuid::Uuid::parse_str(id) else { return Ok(None) };
-    let row = sqlx::query(&format!("{SELECT} WHERE t.id = $1")).bind(uuid).fetch_optional(db).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.id = $1"))).bind(uuid).fetch_optional(db).await?;
     Ok(row.as_ref().map(row_to_task))
 }
 
 pub async fn list(db: &sqlx::PgPool, owner: Option<&str>, state: Option<&str>, limit: i64) -> Result<Vec<Task>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SELECT} WHERE ($1::text IS NULL OR u.username = $1) AND ($2::text IS NULL OR t.state = $2) \
          AND t.parent_id IS NULL ORDER BY t.created_at DESC LIMIT $3"
-    ))
+    )))
     .bind(owner)
     .bind(state)
     .bind(limit.clamp(1, 500))
@@ -380,10 +380,10 @@ pub async fn list(db: &sqlx::PgPool, owner: Option<&str>, state: Option<&str>, l
 /// `noo_task_done` acts on.
 pub async fn for_conversation(db: &sqlx::PgPool, conversation_id: &str, owner: &str) -> Result<Option<Task>> {
     let Ok(conv) = uuid::Uuid::parse_str(conversation_id) else { return Ok(None) };
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SELECT} WHERE t.conversation_id = $1 AND u.username = $2 AND t.state IN ('open','running','checkpointed') \
          ORDER BY t.created_at DESC LIMIT 1"
-    ))
+    )))
     .bind(conv)
     .bind(owner)
     .fetch_optional(db)
@@ -554,10 +554,10 @@ async fn tools_used(db: &sqlx::PgPool, conversation_id: &str) -> i64 {
 async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
     let (state, col) = if ok { ("done", "result") } else { ("failed", "error") };
-    let n = sqlx::query(&format!(
+    let n = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE noo_tasks SET state = $2, {col} = $3, updated_at = now() \
          WHERE id = $1 AND state IN ('open','running','checkpointed')"
-    ))
+    )))
     .bind(uuid)
     .bind(state)
     .bind(text)
@@ -899,7 +899,7 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
 
 /// Every live task that has gone quiet (see [`is_stale`]), oldest first.
 pub async fn list_stale(db: &sqlx::PgPool) -> Result<Vec<Task>> {
-    let rows = sqlx::query(&format!("{SELECT} WHERE t.state IN ('running','checkpointed') AND t.loop_budget > 0 ORDER BY t.updated_at"))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.state IN ('running','checkpointed') AND t.loop_budget > 0 ORDER BY t.updated_at")))
         .fetch_all(db)
         .await?;
     Ok(rows.iter().map(row_to_task).filter(|t| t.stale).collect())
@@ -955,7 +955,7 @@ fn describe_runner(node: Option<&str>) -> String {
 }
 
 async fn list_unfinished_on(db: &sqlx::PgPool, node: &str) -> Result<Vec<Task>> {
-    let rows = sqlx::query(&format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') ORDER BY t.created_at"))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') ORDER BY t.created_at")))
         .bind(node)
         .fetch_all(db)
         .await?;

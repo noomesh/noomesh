@@ -29,10 +29,10 @@ async fn scratch() -> Option<PgPool> {
         .connect(&dsn)
         .await
         .expect("connect to NOO_BROKER_TEST_DSN");
-    let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)"))
+    let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)")))
         .execute(&admin)
         .await;
-    sqlx::raw_sql(&format!("CREATE DATABASE {DB_NAME}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {DB_NAME}")))
         .execute(&admin)
         .await
         .expect("create scratch db");
@@ -46,7 +46,7 @@ async fn scratch() -> Option<PgPool> {
         .expect("connect scratch");
     unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
     for ext in ["vector", "pg_trgm"] {
-        sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
             .execute(&build)
             .await
             .expect("extension");
@@ -97,11 +97,11 @@ async fn recipient(db: &PgPool, id: &str, channel: &str, owner: Option<&str>) {
 }
 
 async fn visible_recipients(db: &PgPool, scope: Option<&str>, channel: Option<&str>) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(super::communication::RECIPIENT_LIST_SQL.replace(
+    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(super::communication::RECIPIENT_LIST_SQL.replace(
         "SELECT id, channel, recipient_id, display_name, notes, \
         is_default, metadata, created_at, updated_at, owner",
         "SELECT id",
-    ).as_str())
+    )))
     .bind(scope)
     .bind(channel)
     .fetch_all(db)
@@ -202,7 +202,7 @@ async fn pending_ids(db: &PgPool, scope: Option<&str>) -> Vec<String> {
         requester, conversation_id, channel, chat_id",
         "SELECT request_id",
     );
-    sqlx::query_scalar::<_, String>(&sql)
+    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*sql))
         .bind(scope)
         .fetch_all(db)
         .await
@@ -330,7 +330,7 @@ async fn every_usage_summary_shape_parses_against_the_real_schema() {
                 // ($1,$2) = the month ints and/or the username, so declare
                 // exactly what this shape binds.
                 let explain = format!("EXPLAIN {sql}");
-                let mut q = sqlx::query(&explain);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(&*explain));
                 if month_window {
                     q = q.bind(2026_i32).bind(8_i32);
                 }
@@ -347,7 +347,7 @@ async fn every_usage_summary_shape_parses_against_the_real_schema() {
                 if let (true, Some(monthly_key)) = (month_window, monthly_key_expr) {
                     let sql = super::usage::monthly_fallback_sql(monthly_key, scoped);
                     let explain = format!("EXPLAIN {sql}");
-                    let mut q = sqlx::query(&explain).bind(2026_i32).bind(8_i32);
+                    let mut q = sqlx::query(sqlx::AssertSqlSafe(&*explain)).bind(2026_i32).bind(8_i32);
                     if scoped {
                         q = q.bind("ada");
                     }

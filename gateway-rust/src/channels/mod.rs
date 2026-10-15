@@ -88,10 +88,10 @@ mod ingress_and_approval_binding_tests {
             .connect(&dsn)
             .await
             .expect("connect to NOO_BROKER_TEST_DSN");
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)"))
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB_NAME} (FORCE)")))
             .execute(&admin)
             .await;
-        sqlx::raw_sql(&format!("CREATE DATABASE {DB_NAME}"))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {DB_NAME}")))
             .execute(&admin)
             .await
             .expect("create scratch db");
@@ -108,7 +108,7 @@ mod ingress_and_approval_binding_tests {
         // `apply` provisions noo_app and needs a credential for it.
         unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
         for ext in ["vector", "pg_trgm"] {
-            sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
                 .execute(&build)
                 .await
                 .expect("extension");
