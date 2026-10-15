@@ -531,7 +531,7 @@ mod gate_tests {
     }
 
     fn keys(names: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
-        move |n: &str| names.iter().any(|k| *k == n).then(|| format!("key-for-{n}"))
+        move |n: &str| names.contains(&n).then(|| format!("key-for-{n}"))
     }
 
     #[test]
@@ -552,10 +552,10 @@ mod gate_tests {
         // No key never goes into the backend (it crosses the harness rail).
         assert!(!serde_json::to_string(&a).unwrap().contains("key-for"));
         for b in [&a, &o, &g] {
-            assert!(crate::coordinator::is_cloud_backend(b));
+            assert!(super::super::backend::is_cloud_backend(b));
         }
         let node = crate::coordinator::ResolvedBackend { url: "https://noo-vllm:8000".into(), model: "q".into(), backend_type: "vllm".into(), api_format: "openai".into() };
-        assert!(!crate::coordinator::is_cloud_backend(&node));
+        assert!(!super::super::backend::is_cloud_backend(&node));
     }
 
     #[test]
