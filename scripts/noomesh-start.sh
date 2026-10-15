@@ -507,6 +507,27 @@ if [ -z "$_data_root" ]; then
     ui_note "pin one path: run 'noo onboard --only storage', or set NOO_DATA_ROOT in .env"
 fi
 
+# ── redis/grafana data re-owned to 65532 (i64) ────────────────────────
+# Both now run as `user: "65532:65532"` (docker-compose.cluster.yml); before
+# i64 they ran as the DHI -dev images' root, so on an existing install the
+# files they wrote under <data root>/redis (appendonlydir, dump.rdb) and
+# <data root>/grafana (grafana.db, plugins, png, ...) are root-owned and the
+# new uid cannot write them. Re-own them once, through the same throwaway
+# container pattern as the ingest dir below (no sudo). Idempotent: the
+# `find -quit` probe makes a box already on 65532 a no-op, and a missing dir
+# (not this profile, fresh install before onboard) is skipped.
+if [ -n "$_data_root" ]; then
+    for _svc_dir in redis grafana; do
+        [ -d "$_data_root/$_svc_dir" ] || continue
+        if ! docker run --rm -v "$_data_root/$_svc_dir":/d alpine \
+                sh -c 'if [ -n "$(find /d \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then chown -R 65532:65532 /d; fi' \
+                2>/dev/null; then
+            echo "NOTE: could not re-own $_data_root/$_svc_dir to uid 65532; $_svc_dir runs as 65532 (i64) and \
+may fail with 'permission denied'. To fix: docker run --rm -v \"$_data_root/$_svc_dir\":/d alpine chown -R 65532:65532 /d" >&2
+        fi
+    done
+fi
+
 # ── HF_CACHE_DIR must be an HF_HOME, not a bare hub archive ───────────
 # HF_CACHE_DIR is bound to /root/.cache/huggingface for the vLLM-family
 # backends and to /hf-store for the weight cache, whose nginx serves

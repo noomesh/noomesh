@@ -5542,11 +5542,11 @@ mod tests {
         assert!(c.detail.contains("nodes/host3/node.key 0644"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().starts_with("noo security pki fix-modes"), "{:?}", c.remedy);
         // Owned by another uid and unreadable here: only the sudo line helps.
-        let foreign = KeyIssue { rel: "services/redis/service.key".into(), mode: 0o600, reader: KeyReader::ContainerRoot, kind: KeyIssueKind::WrongOwner };
-        let chown = "sudo chown 1000:1000 /p/services/redis/service.key && sudo chmod 600 /p/services/redis/service.key".to_string();
+        let foreign = KeyIssue { rel: "services/nats/service.key".into(), mode: 0o600, reader: KeyReader::ContainerRoot, kind: KeyIssueKind::WrongOwner };
+        let chown = "sudo chown 1000:1000 /p/services/nats/service.key && sudo chmod 600 /p/services/nats/service.key".to_string();
         let c = pki_key_modes_check(std::slice::from_ref(&foreign), std::slice::from_ref(&chown), 5);
         assert_eq!(c.verdict, Verdict::Fail);
-        assert!(c.detail.contains("services/redis/service.key 0600") && c.detail.contains("another uid"), "{}", c.detail);
+        assert!(c.detail.contains("services/nats/service.key 0600") && c.detail.contains("another uid"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some(chown.as_str()));
         let unreadable = KeyIssue { rel: "services/loki/service.key".into(), mode: 0o640, reader: KeyReader::ContainerUid(65532), kind: KeyIssueKind::Unreadable };
         let line = "sudo chgrp 65532 /p/services/loki/service.key && sudo chmod 640 /p/services/loki/service.key".to_string();
