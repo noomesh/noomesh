@@ -13,13 +13,14 @@
 //! (`{arch}-unknown-linux-musl`), asset name `noo-{target}`, `.sha256` sidecar
 //! of the form `<hex>  <name>`.
 //!
-//! Private-repo auth also mirrors install.sh's `download()` precedence:
+//! The release repo is public, so an anonymous download is the normal path.
+//! Source precedence mirrors install.sh's `download()`:
 //!   1. `NOO_CLI_BASE_URL` — a mirror serving `noo-<target>` + `.sha256`
 //!      directly (no auth), used for internal/air-gapped mirrors.
-//!   2. `gh release download` when `gh` is on PATH — the reliable private-repo
-//!      path (handles the token dance GitHub requires for asset downloads).
-//!   3. a direct token'd fetch (`GH_TOKEN`/`GITHUB_TOKEN`/`PAI_REPOS_PAT`).
-//! With none of these and a private repo, it fails with actionable guidance
+//!   2. `gh release download` when `gh` is on PATH (authenticated: lifts the
+//!      anonymous rate limit, and reads a private `NOO_CLI_REPO` fork).
+//!   3. a direct fetch, with `GH_TOKEN`/`GITHUB_TOKEN` when set.
+//! A private `NOO_CLI_REPO` with none of these fails with actionable guidance
 //! rather than a bare 404 — same posture as the installer.
 
 use std::process::Command;
@@ -30,11 +31,10 @@ use crate::ui::{self, Glyph};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-/// The DEFAULT release repo. `NOO_CLI_REPO` overrides it — the distribution
-/// CHANNEL knob: internal installs use this default (private,
-/// gh/token-authenticated); the public noomesh channel is a config flip,
-/// not a code change. `NOO_CLI_BASE_URL` (a full asset mirror) still
-/// outranks both.
+/// The DEFAULT release repo (public). `NOO_CLI_REPO` overrides it — the
+/// distribution CHANNEL knob: another release repo (a private fork reads
+/// through gh or a token) is a config flip, not a code change.
+/// `NOO_CLI_BASE_URL` (a full asset mirror) still outranks both.
 const DEFAULT_REPO: &str = crate::registry::RELEASE_REPO;
 const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
@@ -2227,7 +2227,7 @@ const LOCAL_AGENT_BIN: &str = "/usr/local/bin/noo-node-agent";
 
 /// Restage the controller's own node over the rail (i67), like any node.
 /// No sudo — except ONCE on a controller installed before 0.6.3, whose node
-/// identity (birth key, pull units, the gateway's copy of the cert) does not
+/// identity (birth key, pull units) does not
 /// exist yet: the child creates it ("sudo once, never again") through the
 /// same prep path onboard uses, then rides the rail. When that sudo would
 /// prompt with nobody at a terminal the child refuses with the remedy
@@ -2277,7 +2277,7 @@ pub(crate) fn reexec_path(current: &std::path::Path) -> Option<std::path::PathBu
     if path.is_file() { Some(path) } else { None }
 }
 
-fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
+pub(crate) fn provision_one(g: &Globals, node: &str, extra: &[&str]) -> Result<i32, Unhandled> {
     let exe = match std::env::current_exe().map(|p| reexec_path(&p)) {
         Ok(Some(p)) => p,
         // No path to ourselves: fall back to in-process, which is exactly the
@@ -2683,7 +2683,7 @@ fn ext_agent() -> ureq::Agent {
 }
 
 pub(crate) fn gh_token() -> Option<String> {
-    for k in ["GH_TOKEN", "GITHUB_TOKEN", "PAI_REPOS_PAT"] {
+    for k in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(v) = std::env::var(k) {
             let v = v.trim().to_string();
             if !v.is_empty() {

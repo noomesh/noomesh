@@ -449,7 +449,7 @@ pub(crate) fn gh_then_direct(
 /// Mask GitHub tokens (and `token`, if given) in text that will be shown.
 pub(crate) fn redact(s: &str) -> String {
     let mut out = s.to_string();
-    for k in ["GH_TOKEN", "GITHUB_TOKEN", "PAI_REPOS_PAT"] {
+    for k in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(v) = std::env::var(k) {
             let v = v.trim();
             if v.len() >= 8 {

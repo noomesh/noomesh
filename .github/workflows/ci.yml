@@ -273,7 +273,7 @@ jobs:
       run: |
         mkdir -p "$RUNNER_TEMP/.docker"
         echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
-    - uses: docker/setup-compose-action@2fe291b7677a45ee1269ec56a42604c143505e7e   # v1
+    - uses: docker/setup-compose-action@54042514f505b273907334ae2b9cdbb9a0213c1a   # v2.4.0
       with:
         version: v5.0.2
 
@@ -281,7 +281,7 @@ jobs:
       with:
         python-version-file: .python-version
     - name: Cache pip packages
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-py${{ hashFiles('.python-version') }}-pipcore-${{ hashFiles('**/pyproject.toml') }}
@@ -377,8 +377,6 @@ jobs:
           # Read release/image workflows, private docs or sibling checkouts that
           # are not part of this tree.
           --deselect=tests/test_dist_mode.py
-          --deselect=tests/test_cla_workflow_declarations.py
-          --deselect=tests/test_cla_text_one_source.py::test_public_cla_equals_kit_master
           --deselect=tests/test_release_lock_retries_the_network.py
           --deselect=tests/test_hygiene_defaults.py
           --deselect=tests/test_ci_scope_declarations.py::test_the_console_artifact_tag_matches_what_the_gateway_pulls
@@ -603,7 +601,7 @@ jobs:
     - name: Save cargo cache (dev pushes only)
       if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -953,7 +951,7 @@ jobs:
     - name: Save cargo cache (dev pushes only)
       if: needs.scope.outputs.sqlx == 'true' && steps.trellion.outputs.public == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -1167,7 +1165,7 @@ jobs:
     - name: Save cargo cache (dev pushes only)
       if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
         path: |
           ~/.cargo/registry

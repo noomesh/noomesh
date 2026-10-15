@@ -26,8 +26,8 @@ TOOL = ROOT / "internal" / "noomesh" / "licensing" / "spdx.py"
 ID = "AGPL-3.0-only"
 
 if not TOOL.is_file():
-    # The checker lives under internal/, which the public sync excludes.
-    pytest.skip(f"SPDX checker not in this tree ({TOOL.relative_to(ROOT)})", allow_module_level=True)
+    # The licensing kit lives in the private noomesh-internal repo; the public tree has no copy.
+    pytest.skip(f"SPDX checker not in this tree ({TOOL.relative_to(ROOT)}); it lives in noomesh-internal", allow_module_level=True)
 
 _spec = importlib.util.spec_from_file_location("spdx_tool", TOOL)
 spdx = importlib.util.module_from_spec(_spec)
