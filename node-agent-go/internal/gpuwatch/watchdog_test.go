@@ -302,3 +302,36 @@ func TestWithoutAServingProbeTheOldBehaviourStands(t *testing.T) {
 		t.Fatalf("with no serving probe the watchdog must still restart: %v", f.restarts)
 	}
 }
+
+// The serving verdict must not climb a failure streak or repeat as a warning:
+// the streak is held, and it resets once the probe passes again.
+func TestServingVerdictHoldsTheStreakAndResetsWhenTheProbePasses(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.GPUContainer{ctr("noo-vllm")},
+		probeCode:  map[string]int{"id-noo-vllm": 9},
+	}
+	w := newTestWatchdog(f, true)
+	w.SetServingProbe(func(context.Context, string) bool { return true })
+
+	for i := 0; i < 6; i++ {
+		w.Check(context.Background())
+	}
+	if got := w.failStreak["noo-vllm"]; got != 2 {
+		t.Fatalf("streak must not climb while the backend serves: %d", got)
+	}
+	if !w.servingNoted["noo-vllm"] {
+		t.Fatal("the first serving verdict must be recorded as noted")
+	}
+
+	f.probeCode["id-noo-vllm"] = 0
+	w.Check(context.Background())
+	if got := w.failStreak["noo-vllm"]; got != 0 {
+		t.Fatalf("streak must reset when the probe passes: %d", got)
+	}
+	if w.servingNoted["noo-vllm"] {
+		t.Fatal("noted flag must clear so a later regression warns again")
+	}
+	if st := w.State(); st.Containers[0].Status != statusOK {
+		t.Fatalf("expected ok, got %+v", st.Containers[0])
+	}
+}

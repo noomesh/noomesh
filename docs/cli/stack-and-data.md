@@ -199,7 +199,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 |---|---|---|
 | `noo stack status` | — | Show stack container status (from docker ps) |
 | `noo stack logs` | `[<service>...] [--follow] [--tail <n>]` | Show container logs for one service or compose logs for many |
-| `noo stack restart` | `[--profile <p>] [--force] [<service>...]` | Restart stack services; --force recreates to reload env and secrets |
+| `noo stack restart` | `[--profile <p>] [--force] [<service>...]` | Restart services by status name or add-on key; --force recreates (reloads env, secrets) |
 | `noo stack start` | `[--profile <p>] [--pull] [--build] [--dist] [--dev] [--tag <tag>]` | Start the stack via scripts/noomesh-start.sh |
 | `noo stack stop` | `[--volumes [-y\|--yes]]` | Stop the stack; --volumes deletes the database and every volume, after a typed confirm |
 | `noo stack rebuild` | `[<service>...] [-q\|--quick] [--no-cache] [--profile <p>] [--gateway-engine <e>] [--node-engine <e>] [-b\|--background]` | Rebuild stack images in the foreground, or queue it for noo-hostd with --background |

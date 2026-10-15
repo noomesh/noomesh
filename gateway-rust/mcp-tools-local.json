@@ -3348,7 +3348,7 @@
               }
             ],
             "default": null,
-            "description": "Exact `name` label: the container without its 'noo-' prefix ('gateway', 'vllm') or a host unit ('noo-hostd', 'noo-harness').",
+            "description": "Exact `name` label: a container ('noo-worker' as Loki carries it; the bare 'worker' is accepted and matches the same streams) or a host unit ('noo-hostd', 'noo-harness').",
             "title": "Name"
           },
           "node": {
@@ -3478,7 +3478,7 @@
               }
             ],
             "default": null,
-            "description": "Exact `name` label: the container without its 'noo-' prefix ('gateway', 'vllm') or a host unit ('noo-hostd', 'noo-harness').",
+            "description": "Exact `name` label: a container ('noo-worker' as Loki carries it; the bare 'worker' is accepted and matches the same streams) or a host unit ('noo-hostd', 'noo-harness').",
             "title": "Name"
           },
           "node": {
@@ -3615,7 +3615,7 @@
               }
             ],
             "default": null,
-            "description": "Exact `name` label: the container without its 'noo-' prefix ('gateway', 'vllm') or a host unit ('noo-hostd', 'noo-harness').",
+            "description": "Exact `name` label: a container ('noo-worker' as Loki carries it; the bare 'worker' is accepted and matches the same streams) or a host unit ('noo-hostd', 'noo-harness').",
             "title": "Name"
           },
           "node": {

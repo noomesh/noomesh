@@ -82,6 +82,8 @@ const STANDALONE_FILES: &[&str] = &[
     // The compose file list has one home; every
     // launcher sources it, so a standalone install must ship it.
     "scripts/lib-compose.sh",
+    // Name resolution + compose exit status for `noo stack restart <name>`.
+    "scripts/lib-restart.sh",
     // Every launcher sources this for its glyphs/colours; it was NOT
     // embedded, so a standalone install had none of them (host8,
     // 2026-09-03). The launcher-lib guard test never caught it: the

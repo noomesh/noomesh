@@ -281,8 +281,8 @@ installed agent binary can read them (it looks for a marker string in the
 binary; it never runs it), and inlines the values back when an older agent
 is installed, so neither roll order boots an agent without its credentials.
 Because it runs on every apply, `noo upgrade --nodes` converts a node that is
-never re-provisioned; `noo cluster provision --local` runs the same step for
-the controller's own node, and a Mac's applier does it under
+never re-provisioned; the controller's own node rides the same rail (onboard's
+first install runs the same step), and a Mac's applier does it under
 `~/noomesh/secrets/`. The container-era backup
 `/etc/noo-node-agent.env.container-backup` loses its secret lines at the
 same time. No operator step is involved.

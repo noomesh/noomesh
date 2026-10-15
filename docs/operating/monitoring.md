@@ -558,7 +558,7 @@ drops anything else and overwrites `node`:
 | --- | --- |
 | `node` | the node id **as the gateway verified it** (`node-1`, `controller-1`); never what the body claimed |
 | `source` | `docker` (a container), `journal` (a host unit), `self` (the node-agent's own ring), `file` (macOS plist logs) |
-| `name` | the container **without its `noo-` prefix** (`gateway`, `vllm`, `postgres`) or the unit (`noo-hostd`, `noo-harness`, `docker`) |
+| `name` | the container (`noo-gateway`, `noo-vllm`, `noo-postgres`; the bare form `gateway` is accepted by the log tools and matches the same streams) or the unit (`noo-hostd`, `noo-harness`, `docker`) |
 | `stream` | `stdout` / `stderr` |
 | `level` | `debug` / `info` / `warn` / `error` / `unknown` — extracted from the line by a small matcher; a line the matcher cannot read stays `unknown` |
 | `compose_service` | the compose service label, controller containers only |

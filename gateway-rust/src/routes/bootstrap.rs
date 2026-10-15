@@ -94,6 +94,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/provision-bundle/{node}",
             post(provision_bundle_put).layer(DefaultBodyLimit::max(MAX_RAIL_BODY)))
         .route("/api/cluster/provision-bundle/{node}/status", get(provision_bundle_status))
+        // i67: what the gateway sees as the controller's own node's birth
+        // cert — a read of the host file, never a write (no API sets it).
+        .route("/api/cluster/self-node", get(self_node_identity))
         .route("/bootstrap/bundle/{node}/applied", post(bundle_apply_report))
         // The node's FETCH receipt. The GET cannot carry a
         // proof over the bundle's sha — at that moment the node has not seen
@@ -1446,6 +1449,62 @@ async fn provision_bundle_status(
     }
 }
 
+/// Where the controller's own node's birth cert is visible to the gateway: a
+/// read-only bind of the host directory `/etc/noo/self-node`
+/// (docker-compose.cluster.yml), which only root on the host writes — the
+/// controller's one-time identity step copies `/etc/noo/birth.crt` there.
+///
+/// A DIRECTORY, not the file: compose creates a missing bind source, and
+/// creates it as a directory, so binding `/etc/noo/birth.crt` itself on a
+/// controller whose identity does not exist yet (every fresh onboard starts
+/// the stack before the self agent) would plant a directory where host prep
+/// later installs the cert.
+pub const SELF_BIRTH_CRT: &str = "/etc/noo/self-node/birth.crt";
+
+/// Is `node` this controller's own node? Case-insensitive, as node names are;
+/// never when the controller does not know its own id.
+pub fn is_self_name(node: &str, self_id: Option<&str>) -> bool {
+    self_id.is_some_and(|s| !s.trim().is_empty() && s.trim().eq_ignore_ascii_case(node.trim()))
+}
+
+/// The self node's birth cert, from the machine (i67).
+///
+/// `Some(cert)` answers for the controller's own node and is AUTHORITATIVE:
+/// the host file or nothing. An enrollment row under that name is never
+/// consulted — it may belong to another machine that announced the same name
+/// (i11a), and no API can make one stand in for the file. `None` = not the
+/// self node; the enrollment record decides. Pure, so the rule is testable.
+pub fn self_birth_cert(node: &str, self_id: Option<&str>, read: impl FnOnce() -> Option<String>) -> Option<Option<String>> {
+    if !is_self_name(node, self_id) {
+        return None;
+    }
+    Some(read()
+        .map(|c| c.trim().to_string())
+        .filter(|c| c.starts_with("-----BEGIN CERTIFICATE-----") && c.len() < 16_384))
+}
+
+fn read_self_birth_cert() -> Option<String> {
+    std::fs::read_to_string(SELF_BIRTH_CRT).ok()
+}
+
+/// GET /api/cluster/self-node — the controller's own node id and the
+/// DER-sha256 fingerprint of the birth cert the gateway verifies its fetch
+/// receipts and apply reports against (i67). Read-only: the cert is a host
+/// file, and nothing here can change it. `noo cluster provision <self>`
+/// compares the fingerprint with `/etc/noo/birth.crt` before staging.
+async fn self_node_identity(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
+    let _ = bootstrap_admin_guard(&ctx)?;
+    let self_id = crate::self_node::self_node_id();
+    let cert = self_id.as_deref()
+        .and_then(|id| self_birth_cert(id, Some(id), read_self_birth_cert).flatten());
+    let fingerprint = cert.as_deref().and_then(|c| ca_der_sha256(c.as_bytes()).ok());
+    Ok(Json(json!({
+        "node": self_id,
+        "birth_cert_path": SELF_BIRTH_CRT,
+        "birth_cert_sha256": fingerprint,
+    })))
+}
+
 /// POST /bootstrap/bundle/{node}/applied — the node's fetcher reports the
 /// applier's outcome for the bundle it just processed: `{sha, rc, msg}`.
 ///
@@ -1597,6 +1656,10 @@ pub const BIRTH_PROOF_HEADER: &str = "x-noo-birth-proof";
 /// live identity, so ordering is on `created_at` and rows with no cert are
 /// skipped rather than shadowing an older row that has one.
 async fn birth_cert_for(db: &sqlx::PgPool, node: &str) -> Option<String> {
+    // The controller's own node: the host file, never a row (i67).
+    if let Some(cert) = self_birth_cert(node, crate::self_node::self_node_id().as_deref(), read_self_birth_cert) {
+        return cert;
+    }
     sqlx::query_scalar::<_, String>(
         "SELECT birth_cert FROM noo_bootstrap_tokens \
          WHERE node_name = $1 AND birth_cert IS NOT NULL AND birth_cert <> '' \
@@ -2216,6 +2279,41 @@ mod tests {
             apply_report_decision(false, &ProofStatus::Unsigned(ProofError::NoBirthCert)),
             Err(())
         );
+    }
+
+    /// i67: the controller's own node's birth cert is the host file, and
+    /// only the host file — an enrollment row under its name is never read,
+    /// and a missing or malformed file is "no cert" (refused), not a fallback.
+    #[test]
+    fn the_self_nodes_birth_cert_is_the_host_file_alone() {
+        const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || Some(PEM.into())),
+            Some(Some(PEM.trim().to_string())));
+        assert_eq!(self_birth_cert("Pop-OS", Some("pop-os"), || Some(PEM.into())),
+            Some(Some(PEM.trim().to_string())), "case-insensitive, as node names are");
+        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || None), Some(None),
+            "no file: no cert, and the DB is NOT consulted");
+        assert_eq!(self_birth_cert("pop-os", Some("pop-os"), || Some("garbage".into())), Some(None));
+        // Every other node: the enrollment record decides (the reader is
+        // not even called).
+        assert_eq!(self_birth_cert("aserve", Some("pop-os"), || panic!("read for a remote node")), None);
+        assert_eq!(self_birth_cert("pop-os", None, || panic!("read with no self id")), None);
+        assert_eq!(self_birth_cert("pop-os", Some(" "), || panic!("read with a blank self id")), None);
+    }
+
+    /// No route writes the self node's identity: the only self-node route is
+    /// a GET, and `birth_cert_for` asks the host file first.
+    #[test]
+    fn no_api_writes_the_self_nodes_birth_cert() {
+        let src = include_str!("bootstrap.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        for line in code.lines().filter(|l| l.contains("\"/api/cluster/self-node")) {
+            assert!(line.contains("get(") && !line.contains("post(") && !line.contains("put("), "{line}");
+        }
+        let f = &code[code.find("async fn birth_cert_for(").unwrap()..];
+        let file = f.find("self_birth_cert(").expect("host file first");
+        let row = f.find("FROM noo_bootstrap_tokens").expect("then the row");
+        assert!(file < row);
     }
 
     /// The retired unsigned-write window (`NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH`)

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -258,16 +259,41 @@ func (c *Client) EnsureHostDir(ctx context.Context, dir, owner string) error {
 	if err != nil {
 		return fmt.Errorf("EnsureHostDir %s: %w", dir, err)
 	}
-	if err := os.Chown(dir, uid, gid); err != nil {
-		// A directory that exists with the wrong owner is still usable by a
-		// backend running as that owner, so this names the gap rather than
-		// failing the whole reconcile over it.
-		slog.Warn("host dir created but not chowned",
-			"dir", dir, "owner", owner, "error", err,
-			"effect", "a backend running as that user may not be able to write here")
-	}
+	chownHostDir(dir, owner, uid, gid)
 	slog.Info("host dir ensured", "dir", dir, "owner", owner)
 	return nil
+}
+
+// chownWarned remembers the (dir, owner) pairs whose "cannot chown" warning has
+// been logged. EnsureHostDir runs every reconcile tick (5 min), the agent is
+// unprivileged, and on WSL2 the data root is owned by another uid, so the same
+// chown failed and logged forever (awolf, 2026-10) and drowned real faults.
+var chownWarned sync.Map
+
+// chownHostDir makes dir owned by uid:gid when it is not already, and never
+// fails the reconcile: a directory with the wrong owner is still usable by a
+// backend running as that owner. Ownership is checked FIRST, so a directory that
+// is already right costs nothing and never warns; a chown that is not permitted
+// warns exactly once per (dir, owner) for the life of the process, with the fix.
+func chownHostDir(dir, owner string, uid, gid int) {
+	if st, err := os.Stat(dir); err == nil {
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok && int(sys.Uid) == uid && int(sys.Gid) == gid {
+			return
+		}
+	}
+	err := os.Chown(dir, uid, gid)
+	if err == nil {
+		return
+	}
+	key := dir + "\x00" + owner
+	if _, seen := chownWarned.LoadOrStore(key, true); seen {
+		return
+	}
+	slog.Warn("host dir not chowned; this agent cannot change its owner and will not retry",
+		"dir", dir, "owner", owner, "error", err,
+		"effect", "a backend running as that user may not be able to write here",
+		"fix", fmt.Sprintf("run `noo cluster provision` for this node (the applier owns data-root "+
+			"ownership), or as root: chown %d:%d %s", uid, gid, dir))
 }
 
 // untraversableAncestor walks from dir towards / and returns the first

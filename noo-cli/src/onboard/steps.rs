@@ -4788,47 +4788,66 @@ fn services_tail(ctx: &mut Ctx) {
     show_service_status(ctx);
 }
 
-/// Standalone self-agent (finding #15), idempotent: a running agent unit
-/// short-circuits so re-runs and the already-healthy path don't re-ask.
+/// The controller's own node agent (finding #15; i67), idempotent. Runs for
+/// any controller that runs (or, standalone, should run) a host agent —
+/// standalone or source checkout, interactive or `--ci` — and always says
+/// why when it does nothing, because `noo onboard --only services` is the
+/// remedy the rail prints for a controller without its node identity.
+///
+/// The only sudo is creating the node identity (the first install, or once
+/// for a controller installed before i67); everything else rides the rail.
 fn ensure_self_agent(ctx: &mut Ctx) {
     if ctx.dry_run {
-        // `provision_local` installs a systemd unit with sudo — the one
-        // thing a dry run must never do, and the only guard it lacked.
-        ctx.dry("install the host node agent (noo cluster provision --local <node>)");
+        // The first install uses sudo — the one thing a dry run must never do.
+        ctx.dry("install the host node agent (first install, sudo once) or restage it over the rail");
         return;
     }
-    if std::env::var("NOO_STANDALONE").as_deref() != Ok("1")
-        || ctx.non_interactive
-        || !ctx.ui.inherit_stdio()
-        || !super::prompt::stdin_is_tty()
-    {
-        return;
-    }
-    let active = Command::new("systemctl")
+    let systemctl_active = Command::new("systemctl")
         .args(["is-active", "--quiet", "noo-node-agent"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if active {
-        ctx.info("Self-agent already running (noo-node-agent).");
-        return;
-    }
     let node_id = {
         let n = ctx.read_env("NODE_ID");
         if n.is_empty() { "controller".to_string() } else { n }
     };
-    ctx.info("This controller also needs its own node agent (a host process —");
-    ctx.info("containers can't run it) to serve models and appear in the mesh.");
-    if ctx.asker.confirm(
-        &format!("Install the host agent for '{node_id}' now? (uses sudo)"), true)
+    let identity_ok = crate::commands::provision::pull_units_missing(&node_id).is_empty();
+    let interactive = !ctx.non_interactive && ctx.ui.inherit_stdio() && super::prompt::stdin_is_tty();
+    let sudo_quiet = Command::new("sudo").args(["-n", "true"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
+    let controller = crate::role::detect().controller;
+    use crate::commands::provision::{self_agent_step, SelfAgentStep};
+    match self_agent_step(controller.as_ref(),
+        std::path::Path::new("/usr/local/bin/noo-node-agent").is_file(),
+        systemctl_active, identity_ok, interactive, sudo_quiet)
     {
-        hydrate_process_env(ctx);
-        match crate::commands::provision::provision_local(ctx.g, &node_id, None) {
-            Ok(0) => {}
-            _ => ctx.warn("Self-agent install did not complete — retry later: noo cluster provision --local <name>"),
+        SelfAgentStep::Skip(why) => ctx.info(&format!("Self-agent: skipped — {why}.")),
+        SelfAgentStep::AlreadyOnRail => ctx.info("Self-agent already running (noo-node-agent); upgrades reach it over the rail."),
+        SelfAgentStep::Rail => {
+            ctx.info(&format!("Restaging the self-agent for '{node_id}' over the rail{}.",
+                if identity_ok { " (no sudo)" } else { " — its node identity is created first, sudo once" }));
+            hydrate_process_env(ctx);
+            match crate::commands::provision::cluster_provision(ctx.g, std::slice::from_ref(&node_id)) {
+                Ok(0) => {}
+                _ => ctx.warn(&format!("Self-agent restage did not complete — retry: noo cluster provision {node_id}")),
+            }
         }
-    } else {
-        ctx.info("Skipped — install any time: noo cluster provision --local <name>");
+        SelfAgentStep::FirstInstall => {
+            ctx.info("This controller also needs its own node agent (a host process —");
+            ctx.info("containers can't run it) to serve models and appear in the mesh.");
+            let go = !interactive || ctx.asker.confirm(
+                &format!("Install the host agent and its node identity for '{node_id}' now? (uses sudo, once)"), true);
+            if go {
+                hydrate_process_env(ctx);
+                match crate::commands::provision::provision_local(ctx.g, &node_id, None) {
+                    Ok(0) => {}
+                    _ => ctx.warn("Self-agent install did not complete — retry later: noo onboard --only services"),
+                }
+            } else {
+                ctx.info("Skipped — install any time: noo onboard --only services");
+            }
+        }
     }
 }
 
@@ -5164,7 +5183,7 @@ fn ensure_hostd_worker(ctx: &mut Ctx) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !agent_active {
-        ctx.info(&format!("Worker-mode hostd follows the self-agent: noo cluster provision --local <name>, then sudo {HOSTD_BIN} install --mode worker"));
+        ctx.info(&format!("Worker-mode hostd follows the self-agent: noo onboard --only services, then sudo {HOSTD_BIN} install --mode worker"));
         return;
     }
     if !hostd_can_run_here(ctx) {
@@ -5217,7 +5236,7 @@ fn show_service_status(ctx: &Ctx) {
 /// starts it. Best-effort — a failure is a warning. Parity with
 /// `_ensure_llm_placement`.
 /// Hydrate-OUT (findings #58/#59): the wizard writes config to FILES, but
-/// its own in-process command calls (login, provision --local) resolve via
+/// its own in-process command calls (login, the self-agent install) resolve via
 /// the PROCESS env — which, on a true fresh box (no .env at CLI startup),
 /// is empty: auto-login dialed http:// at an HTTPS gateway, and the
 /// self-agent's cert issuance reported "no cluster CA found" two steps
