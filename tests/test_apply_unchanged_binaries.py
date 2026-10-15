@@ -21,6 +21,7 @@ for `<kind>`.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -62,16 +63,16 @@ def run(tmp: Path, kind: str, installed_name: str, payload: bytes, installed: by
             dst.chmod(0)
     body = block(kind).replace("/usr/local/bin", str(bindir))
     script = f"""set -eu
-WORK="{work}"; applied=""; need_restart=0; need_harness_restart=0
+WORK="{work}"; applied=""; binary_shas=""; need_restart=0; need_harness_restart=0
 install() {{ eval "s=\\${{$(($#-1))}} d=\\${{$#}}"; cp "$s" "$d"; chmod 755 "$d"; }}
 {helper()}
 {body}
-echo "applied=$applied"; echo "need_restart=$need_restart"; echo "need_harness_restart=$need_harness_restart"
+echo "applied=$applied"; echo "binary_shas=$binary_shas"; echo "need_restart=$need_restart"; echo "need_harness_restart=$need_harness_restart"
 """
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     out = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l and l.split("=")[0] in
-               ("applied", "need_restart", "need_harness_restart"))
+               ("applied", "binary_shas", "need_restart", "need_harness_restart"))
     out["installed_bytes"] = dst.read_bytes().hex() if os.access(dst, os.R_OK) else ""
     return out
 
@@ -86,6 +87,7 @@ def test_first_install_installs_and_restarts(tmp_path: Path, kind: str, name: st
     assert o["applied"].split() == [kind]
     assert o[flag] == "1"
     assert o["installed_bytes"] == ELF.hex()
+    assert o["binary_shas"].split() == [f"{kind}={hashlib.sha256(ELF).hexdigest()}"]
 
 
 @pytest.mark.parametrize("kind,name,flag", KINDS)
@@ -95,6 +97,8 @@ def test_second_apply_of_the_same_bytes_is_unchanged_and_restarts_nothing(tmp_pa
     second = run(tmp_path, kind, name, ELF, ELF, flag)
     assert second["applied"].split() == [f"{kind}=unchanged"]
     assert second["need_restart"] == "0" and second["need_harness_restart"] == "0"
+    # The node still states what it runs, so the controller can omit it next time.
+    assert second["binary_shas"].split() == [f"{kind}={hashlib.sha256(ELF).hexdigest()}"]
 
 
 @pytest.mark.parametrize("kind,name,flag", KINDS)
@@ -132,4 +136,5 @@ def test_every_binary_block_consults_the_helper_and_hostd_keeps_its_floor() -> N
         assert re.search(r'binary_unchanged "\$WORK/files/%s"' % kind, APPLIER), kind
         assert f'applied="$applied {kind}=unchanged"' in APPLIER, kind
     assert 'applied="$applied cli-binary=unchanged"' in APPLIER
+    assert 'echo "binary-sha:$binary_shas"' in APPLIER
     assert "hostd_generation_of" in APPLIER and "REVERTING" in APPLIER
