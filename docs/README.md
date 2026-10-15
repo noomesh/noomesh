@@ -107,6 +107,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | [reference/config.md](reference/config.md) | Every `noomesh.yaml` section and key, precedence, and where a value goes: secrets, config, posture, bootstrap flags, `compose_env`, behavioural flags |
 | [reference/env.md](reference/env.md) | Every environment variable something actually reads, grouped by component: bootstrap, transport security, posture, gateway, node-agent, workers, compose |
 | [reference/api.md](reference/api.md) | Every gateway route by area, the auth model, the WebSocket event format, and the two MCP doors |
+| [reference/harness-protocol.md](reference/harness-protocol.md) | The contract between the gateway and any harness: bus subjects, the per-turn token, the `/api/harness/call` operation table, the events a harness publishes, and what a foreign runner must implement |
 
 Outside `docs/`: `scripts/setup-dev.sh` prepares a Linux, WSL2 or macOS box
 for development on this repo (toolchains, Docker, the venv, hooks and `noo`;

@@ -8,7 +8,7 @@
 //! node's principal, takes turns on `harness.run.<node>`, and runs each
 //! one with [`RemoteRuntime`] against the gateway's rail under the token
 //! the turn arrived with, pointed at the ONE model endpoint it was placed
-//! next to. Events go back on `harness.turn.<conversation>`; the result
+//! next to. Events go back on `harness.turn.<node>.<conversation>`; the result
 //! goes last as `harness_result`.
 //!
 //! Environment (the node agent sets all of it from the placement):
