@@ -1001,9 +1001,9 @@ mod reconcile_tests {
     fn the_upgrade_reconcile_repairs_the_modes_it_owns() {
         let ca = scratch("repair");
         let (node_crt, node_key) = ca.issue_node_cert("host3", "10.0.0.3", 90, &[], &[], &crate::pki::NodeRole::Worker).unwrap();
-        let (_, redis_key) = ca.issue_service_cert("redis", &[], &[], 90).unwrap();
+        let (_, nats_key) = ca.issue_service_cert("nats", &[], &[], 90).unwrap();
         let (_, standby_key) = ca.issue_service_cert("postgres-standby", &[], &[], 90).unwrap();
-        for k in [&node_key, &redis_key, &standby_key] {
+        for k in [&node_key, &nats_key, &standby_key] {
             set(k, 0o644);
         }
         set(node_key.parent().unwrap(), 0o775);
@@ -1011,7 +1011,7 @@ mod reconcile_tests {
 
         let repair = ModeRepair::run(&ca);
         assert!(repair.changed() >= 5, "keys, dir and cert: {} changed", repair.changed());
-        for k in [&node_key, &redis_key, &standby_key] {
+        for k in [&node_key, &nats_key, &standby_key] {
             assert_eq!(mode_of(k), 0o600, "{}", k.display());
         }
         assert_eq!(mode_of(node_key.parent().unwrap()), 0o755);

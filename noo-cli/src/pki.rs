@@ -348,15 +348,21 @@ impl KeyReader {
 /// Who reads each service leaf's private key inside its container —
 /// the image's `USER`, verified 2026-09-28 by `docker image inspect`
 /// of the mirrored DHI images (`.github/workflows/mirror-images.yml`)
-/// and the Dockerfiles under `docker/`. A DHI `-dev` variant runs as
-/// root; a DHI runtime image runs as `nonroot` = 65532.
+/// and the Dockerfiles under `docker/` — or the compose `user:` where the
+/// service overrides the image. A DHI runtime image runs as `nonroot` =
+/// 65532; a DHI `-dev` variant's image USER is root, so redis and grafana
+/// (the two `-dev` runtime services) are pinned to 65532 by compose `user:`
+/// (i64) and the "image family" verify row asserts they are not uid 0.
 ///
 /// Every name in `onboard::steps::SVC_LIST` must be here (pinned by
 /// `service_key_reader_table_covers_every_onboarded_service`); a name
 /// here that onboard does not issue is a table entry nothing uses.
 pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
-    // dhi.io/redis:8.6-debian13-dev: USER 0; redis-server never drops privileges.
-    ("redis", KeyReader::ContainerRoot),
+    // dhi.io/redis:8.6-debian13-dev's image USER is 0, but the compose
+    // service runs it as `user: "65532:65532"` (i64, operator 2026-10-15:
+    // redis must not run as root). The -dev variant is kept because the
+    // runtime variant has no shell and docker/redis-entrypoint.sh is sh.
+    ("redis", KeyReader::ContainerUid(65532)),
     // nats:latest (official): root.
     ("nats", KeyReader::ContainerRoot),
     // docker/Dockerfile.postgres ends `USER postgres` (alpine uid 70) and the
@@ -389,8 +395,10 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("worker", KeyReader::ContainerUid(65532)),
     // docker/Dockerfile.nvidia-exporter: nvidia/cuda base, no USER: root.
     ("nvidia-exporter", KeyReader::ContainerRoot),
-    // dhi.io/grafana:12-debian13-dev: USER 0; grafana-server reads GF_SERVER_CERT_KEY itself.
-    ("grafana", KeyReader::ContainerRoot),
+    // dhi.io/grafana:12-debian13-dev's image USER is 0; the compose service
+    // runs it as `user: "65532:65532"` (i64). grafana-server reads
+    // GF_SERVER_CERT_KEY itself, as that uid.
+    ("grafana", KeyReader::ContainerUid(65532)),
     // nginx:1.27-alpine: the master process loads certificates as root.
     ("model-cache", KeyReader::ContainerRoot),
     // evolve: python:3.12-slim with no USER line (root); the overlay's
@@ -2402,7 +2410,9 @@ mod key_mode_tests {
         assert_eq!(r("gateway/gateway.key"), KeyReader::ContainerUid(65532));
         assert_eq!(r("sso/grafana.key"), KeyReader::ContainerUid(65532));
         assert_eq!(r("nodes/host3/node.key"), KeyReader::Cli, "the CLI builds node bundles; the gateway only serves them");
-        assert_eq!(r("services/redis/service.key"), KeyReader::ContainerRoot);
+        assert_eq!(r("services/redis/service.key"), KeyReader::ContainerUid(65532), "compose user: 65532 (i64)");
+        assert_eq!(r("services/grafana/service.key"), KeyReader::ContainerUid(65532), "compose user: 65532 (i64)");
+        assert_eq!(r("services/nats/service.key"), KeyReader::ContainerRoot);
         assert_eq!(r("services/loki/service.key"), KeyReader::ContainerUid(65532));
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
@@ -2426,8 +2436,8 @@ mod key_mode_tests {
         assert_eq!(mode_of(&ca.ca_key_path()), 0o600);
         let (_, node_key) = ca.issue_node_cert("host9", "10.0.0.2", 90, &[], &[], &crate::pki::NodeRole::Worker).unwrap();
         assert_eq!(mode_of(&node_key), 0o600, "nodes/*/node.key: the CLI alone");
-        let (_, redis_key) = ca.issue_service_cert("redis", &[], &[], 90).unwrap();
-        assert_eq!(mode_of(&redis_key), 0o600, "redis runs as root in its container");
+        let (_, nats_key) = ca.issue_service_cert("nats", &[], &[], 90).unwrap();
+        assert_eq!(mode_of(&nats_key), 0o600, "nats runs as root in its container");
         let (_, odd_key) = ca.issue_service_cert("not-a-thing", &[], &[], 90).unwrap();
         assert_eq!(mode_of(&odd_key), 0o644, "no reader row: left readable, reported by the scan");
         // The gateway key (uid 65532): handed over and not world-readable,

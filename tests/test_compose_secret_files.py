@@ -60,7 +60,9 @@ BASE = ROOT / "docker-compose.cluster.yml"
 # other bits, and 0400 to the wrong uid is unreadable). Each uid is the
 # image's own: gateway/worker are DHI `nonroot` (65532, measured on the
 # gateway image's /etc/passwd); postgres is the alpine `postgres` user (70);
-# the DHI redis/grafana -dev images and the Playwright image run as root.
+# the Playwright image runs as root. The DHI redis/grafana -dev images'
+# USER is root, but compose pins both to `user: "65532:65532"` (i64: they
+# must not run as root), so their secrets are handed to 65532.
 # The add-ons, measured on the stack-v0.2.80 images:
 # trellion and trellion-intel are `USER nonroot` on the DHI deps-base
 # (`os.getuid()` → 65532); evolve is python:3.12-slim with no USER (0).
@@ -68,9 +70,9 @@ OWNED_UIDS: dict[str, str] = {
     "gateway": "65532",
     "worker": "65532",
     "worker-extra": "65532",
-    "redis": "0",
+    "redis": "65532",
     "postgres": "70",
-    "grafana": "0",
+    "grafana": "65532",
     "browser": "0",
     "trellion": "65532",
     "trellion-intel": "65532",
