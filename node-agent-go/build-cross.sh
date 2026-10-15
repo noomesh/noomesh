@@ -38,7 +38,7 @@ case "$TARGET" in
   */*) GOOS="${TARGET%/*}"; GOARCH="${TARGET#*/}" ;;
   *)   GOOS="linux";        GOARCH="$TARGET" ;;
 esac
-IMAGE="${BUILD_IMAGE:-dhi.io/golang:1.25-debian13-dev}"
+IMAGE="${BUILD_IMAGE:-dhi.io/golang:1.26-debian13-dev}"
 
 # Which binary. This module ships two: noo-node-agent (workers — listens on
 # :8081 with mTLS) and noo-hostd (controller — no network surface at all).
