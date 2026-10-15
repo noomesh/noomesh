@@ -21,8 +21,8 @@
 //! grafana container created from a compose that predates the `user:` pin
 //! runs as the -dev image's root and fails here.
 //!
-//! The uid judged is the LIVE one (`docker top <c> -o pid,uid`, the daemon's
-//! view of the container's processes), not the `.Config.User` string: compose
+//! The uid judged is the LIVE one (`docker exec <c> id -u`, else `docker top`;
+//! BusyBox hosts' `ps` has no `-o uid`), not the `.Config.User` string: compose
 //! names redis/grafana's user (`nonroot` / `grafana`, because Docker 27
 //! cannot resolve a numeric `user:` when it copies secrets in), and a name
 //! means a uid only inside its image (`grafana` is 65532 in the DHI image and
@@ -47,6 +47,11 @@ pub(crate) struct Running {
     /// The uid its processes run as, from `docker top`; `None` when it is
     /// not running (or docker could not say).
     pub live_uid: Option<u32>,
+    /// `.State.Running`. A running container whose uid could not be read
+    /// is "uid unreadable", never "not running".
+    pub running: bool,
+    /// Why the live uid could not be read (running containers only).
+    pub uid_err: String,
 }
 
 /// The uid a `.Config.User` runs as, for a container that is not running
@@ -98,7 +103,12 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
             problems.push(format!("{} runs {}, not an image from {base}/", r.svc, r.image));
         }
         let Some(uid) = r.live_uid.or_else(|| user_uid(&r.user)) else {
-            unjudged.push(format!("{} is not running and its user {:?} cannot be mapped to a uid from outside the image", r.svc, r.user));
+            if r.running {
+                unjudged.push(format!("{} is running but its live uid could not be read ({}), and its user {:?} cannot be mapped to a uid from outside the image",
+                    r.svc, r.uid_err, r.user));
+            } else {
+                unjudged.push(format!("{} is not running and its user {:?} cannot be mapped to a uid from outside the image", r.svc, r.user));
+            }
             continue;
         };
         if uid == 0 {
@@ -170,13 +180,34 @@ pub(crate) fn live_uid_from_top(text: &str) -> Option<u32> {
     uids.first().copied()
 }
 
-/// The live uid of a running container (see `live_uid_from_top`).
-fn live_uid(name: &str) -> Option<u32> {
-    let o = Command::new("docker").args(["top", name, "-o", "pid,uid"]).output().ok()?;
-    if !o.status.success() {
-        return None;
+/// Run `docker <args>`: stdout on success, else the stderr (or spawn error).
+fn docker_text(args: &[&str]) -> Result<String, String> {
+    let o = Command::new("docker").args(args).output().map_err(|e| format!("docker: {e}"))?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
     }
-    live_uid_from_top(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// The live uid of a running container. `docker exec <c> id -u` first (every
+/// image with coreutils or busybox `id`; `docker top` shells out to the
+/// HOST's `ps`, which on BusyBox hosts (Alpine, dind) has no `-o uid`), then
+/// `docker top` parsing. `Err` carries why the exec failed.
+pub(crate) fn live_uid_via(docker: &dyn Fn(&[&str]) -> Result<String, String>, name: &str) -> Result<u32, String> {
+    let exec_err = match docker(&["exec", name, "id", "-u"]) {
+        Ok(t) => match t.trim().parse::<u32>() {
+            Ok(u) => return Ok(u),
+            Err(_) => format!("docker exec id -u printed {:?}", t.trim()),
+        },
+        Err(e) => format!("docker exec id -u failed: {e}"),
+    };
+    if let Ok(t) = docker(&["top", name, "-o", "pid,uid"]) {
+        if let Some(u) = live_uid_from_top(&t) {
+            return Ok(u);
+        }
+    }
+    Err(exec_err)
 }
 
 /// `docker inspect` of each runtime container that exists, with its live
@@ -197,8 +228,16 @@ fn inspect_running() -> Result<Vec<Running>, String> {
         let mut parts = text.trim().splitn(3, '|');
         let image = parts.next().unwrap_or("").to_string();
         let user = parts.next().unwrap_or("").to_string();
-        let live_uid = if parts.next() == Some("true") { live_uid(&name) } else { None };
-        out.push(Running { svc, image, user, live_uid });
+        let running = parts.next() == Some("true");
+        let (live_uid, uid_err) = if running {
+            match live_uid_via(&docker_text, &name) {
+                Ok(u) => (Some(u), String::new()),
+                Err(e) => (None, e),
+            }
+        } else {
+            (None, String::new())
+        };
+        out.push(Running { svc, image, user, live_uid, running, uid_err });
     }
     Ok(out)
 }
@@ -226,12 +265,12 @@ mod tests {
 
     /// A stopped container: judged by its `.Config.User` string only.
     fn run(svc: &'static str, image: String, user: &str) -> Running {
-        Running { svc, image, user: user.into(), live_uid: None }
+        Running { svc, image, user: user.into(), live_uid: None, running: false, uid_err: String::new() }
     }
 
     /// A running container: judged by the uid it runs as.
     fn live(svc: &'static str, image: String, user: &str, uid: u32) -> Running {
-        Running { svc, image, user: user.into(), live_uid: Some(uid) }
+        Running { svc, image, user: user.into(), live_uid: Some(uid), running: true, uid_err: String::new() }
     }
 
     /// The DHI family as it runs: 65532 for the runtime images, and the
@@ -402,6 +441,51 @@ mod tests {
         assert_eq!(live_uid_from_top("PID UID\n"), None);
         assert_eq!(live_uid_from_top(""), None);
         assert_eq!(live_uid_from_top("PID UID\n10 grafana\n"), None);
+    }
+
+    const BUSYBOX: &str = "ps: bad -o argument 'uid', supported arguments: user,group,comm,args,pid,ppid,pgid,etime,nice,rgroup,ruser,time,tty,vsz,stat,rss";
+
+    #[test]
+    fn busybox_ps_does_not_hide_the_live_uid() {
+        // docker top fails on a BusyBox host; exec id -u answers.
+        let d = |a: &[&str]| -> Result<String, String> {
+            if a[0] == "top" { Err(BUSYBOX.into()) } else { Ok("65532\n".into()) }
+        };
+        assert_eq!(live_uid_via(&d, "c"), Ok(65532));
+        // The row then judges it: grafana at 65532 is `+`, not `!`.
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4].live_uid = live_uid_via(&d, "c").ok();
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // exec fails, top works: top is the fallback.
+        let d = |a: &[&str]| -> Result<String, String> {
+            if a[0] == "exec" { Err("no id".into()) } else { Ok("PID UID\n9 472\n".into()) }
+        };
+        assert_eq!(live_uid_via(&d, "c"), Ok(472));
+        // root via exec still fails the row.
+        let d = |_: &[&str]| -> Result<String, String> { Ok("0\n".into()) };
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4].live_uid = live_uid_via(&d, "c").ok();
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert!(c.verdict == Verdict::Fail && c.detail.contains("grafana runs as root"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_running_container_with_an_unreadable_uid_is_not_called_stopped() {
+        let d = |a: &[&str]| -> Result<String, String> {
+            Err(if a[0] == "top" { BUSYBOX.into() } else { "exec: \"id\": executable file not found".into() })
+        };
+        let err = live_uid_via(&d, "c").unwrap_err();
+        assert!(err.starts_with("docker exec id -u failed:"), "{err}");
+        let mut fleet = dhi_fleet(DHI);
+        fleet[4] = Running { svc: "grafana", image: fleet[4].image.clone(), user: "grafana".into(), live_uid: None, running: true, uid_err: err };
+        let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("its live uid could not be read") || c.detail.contains("live uid could not be read (docker exec id -u failed:"), "{}", c.detail);
+        assert!(!c.detail.contains("grafana is not running"), "{}", c.detail);
+        // A mappable .Config.User is still the fallback for a running one.
+        fleet[4].user = "65532".into();
+        assert_eq!(image_family_check(DHI, &fleet, &|_, _| Some(true)).verdict, Verdict::Ok);
     }
 
     #[test]
