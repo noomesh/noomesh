@@ -225,13 +225,14 @@ def test_the_shipped_set_includes_ci_and_the_release_workflows():
 
 
 def test_e_the_public_release_workflow_is_core_only():
-    """The stack release is core-only: no add-on job,
+    """The stack release is core-only: no add-on build job (the generic
+    `addon-dispatch` notifier names no repo: its targets are a repo variable),
     no add-on repo name, no add-on image, and the app token reads only the open
     library. The add-ons release from their own repos with their own lock."""
     if not (WORKFLOWS_DIR / "images-release.yml").exists():
         pytest.skip("images-release.yml not present")
     doc = _load("images-release.yml")
-    assert set(doc["jobs"]) == {"release-line", "static-ffmpeg", "deps-core", "deps-base", "images", "lock"}, sorted(doc["jobs"])
+    assert set(doc["jobs"]) == {"release-line", "static-ffmpeg", "deps-core", "deps-base", "images", "lock", "addon-dispatch"}, sorted(doc["jobs"])
     text = (WORKFLOWS_DIR / "images-release.yml").read_text()
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
     for private in ("trellion-intel", "trellion-evolve", "evolve", "addon-image-resolve", "PRIVATE_UPSTREAM", "PAI_REPOS_PAT"):

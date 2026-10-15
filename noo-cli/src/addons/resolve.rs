@@ -52,7 +52,7 @@ pub struct Want<'a> {
 pub enum Refusal {
     NoEntitlement(String),
     NoAnchor,
-    Fetch { reference: String, err: FetchError },
+    Fetch { reference: String, stack_tag: String, err: FetchError },
     Lock(AddonLockError),
     NotForStack { tag: String, version: String, supports: Vec<String> },
     NoStackLock { image: String, tag: String },
@@ -74,8 +74,8 @@ impl Refusal {
                 "the installed entitlement names no signing key or registry for {addon}, so its lock cannot be verified \
                  (the token predates signed add-on locks)"
             ),
-            Refusal::Fetch { reference, err } => match err.class {
-                FetchClass::NotFound => format!("{reference} is not published: {addon} has no release for this stack yet"),
+            Refusal::Fetch { stack_tag, err, .. } if err.class == FetchClass::NotFound => not_published(addon, stack_tag),
+            Refusal::Fetch { reference, err, .. } => match err.class {
                 FetchClass::Auth => format!(
                     "the registry refused {reference} (access refused): the controller's {} cannot read {addon}'s package",
                     lock_fetch::TOKEN_KEY
@@ -107,6 +107,23 @@ impl Refusal {
     pub fn is_auth(&self) -> bool {
         matches!(self, Refusal::Fetch { err, .. } if err.class == FetchClass::Auth)
     }
+}
+
+/// The refusal for an add-on lock the registry does not have (HTTP 404,
+/// `manifest unknown`): the stack release is out, and the vendor's own
+/// release workflow signs the add-on lock for it minutes later. Distinct
+/// from an auth or signature failure, whose text and remedy are different.
+pub fn not_published(addon: &str, stack_tag: &str) -> String {
+    let tag = format!("v{}", stack_tag.trim().trim_start_matches("stack-").trim_start_matches('v'));
+    format!(
+        "{addon}: no signed lock published yet for {tag} — the vendor publishes it minutes after a stack release; \
+         retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
+    )
+}
+
+/// True when the refusal is "the registry has no lock for this stack".
+pub fn is_not_published(r: &Refusal) -> bool {
+    matches!(r, Refusal::Fetch { err, .. } if err.class == FetchClass::NotFound)
 }
 
 /// The remedy for a credential refusal, shared by every verb.
@@ -162,6 +179,7 @@ pub fn fetch_and_check(
 ) -> Result<(VerifiedLock, Fetched), Refusal> {
     let fetched = client.fetch(&anchor.registry, want.stack_tag).map_err(|err| Refusal::Fetch {
         reference: lock_fetch::artifact_ref(&anchor.registry, want.stack_tag),
+        stack_tag: want.stack_tag.to_string(),
         err,
     })?;
     let v = check(&fetched, anchor, want)?;
@@ -674,6 +692,43 @@ pub(crate) mod tests {
         let f = signed(&lock("1.2.0", &["v0.6.0"], Some(&digest('2'))));
         let v = check(&f, &anchor(), &want(Some(&stack), Some("1.1.0"))).expect("passes");
         assert_eq!(v.key_index, 0);
+    }
+
+    /// The registry answers 404 for `<root>:stack-<tag>`: the stack is out and
+    /// the vendor has not signed its lock yet. That is "retry shortly", not an
+    /// auth or signature failure.
+    #[test]
+    fn a_lock_the_registry_does_not_have_yet_says_so_and_names_the_way_back() {
+        let reg = super::lock_fetch::fake::serve(|_| Default::default());
+        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")) };
+        let client = lock_fetch::Client::plain_http_for_tests(None);
+        let e = fetch_and_check(&client, &anchor, &want(None, None)).unwrap_err();
+        assert!(is_not_published(&e) && !e.is_auth(), "{e:?}");
+        let why = e.why("trellion_intel");
+        assert_eq!(
+            why,
+            "trellion_intel: no signed lock published yet for v0.6.0 — the vendor publishes it minutes after a stack release; \
+             retry shortly, or roll back with `noo upgrade --stack --tag <vX.Y.Z>`"
+        );
+        assert!(!why.contains("access refused") && !why.contains("signature"), "{why}");
+    }
+
+    #[test]
+    fn the_not_published_tag_is_v_prefixed_whatever_form_it_arrives_in() {
+        for t in ["v0.6.4", "0.6.4", "stack-v0.6.4"] {
+            assert!(not_published("evolve", t).contains("for v0.6.4 —"), "{t}");
+        }
+    }
+
+    /// Auth and signature failures keep their own text (and remedy).
+    #[test]
+    fn auth_and_signature_refusals_keep_their_text() {
+        use crate::release_fetch::{FetchClass, FetchError};
+        let auth = Refusal::Fetch { reference: "r".into(), stack_tag: "v0.6.0".into(), err: FetchError::new(FetchClass::Auth, "x") };
+        assert!(auth.is_auth() && !is_not_published(&auth));
+        assert!(auth.why("evolve").contains("(access refused)"), "{}", auth.why("evolve"));
+        let bad = Refusal::Lock(AddonLockError::BadSignature("x".into()));
+        assert!(!is_not_published(&bad) && bad.why("evolve").contains("lock refused"));
     }
 
     #[test]

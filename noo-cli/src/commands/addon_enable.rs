@@ -195,6 +195,9 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
         R::Store(_) => "noo security secrets audit".into(),
         R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),
         R::Downgrade { .. } => format!("noo addons upgrade {addon} --allow-downgrade"),
+        r @ R::Fetch { .. } if crate::addons::resolve::is_not_published(r) => {
+            format!("noo addons upgrade {addon} --check   # retry shortly: the vendor signs the lock minutes after a stack release")
+        }
         R::Fetch { .. } | R::NotForStack { .. } | R::NoStackLock { .. } | R::BaseRowMissing { .. } => {
             format!("noo addons upgrade {addon} --check   # shows what the add-on publishes for this stack")
         }
@@ -592,9 +595,9 @@ addons:
     fn pin_remedies_name_real_causes() {
         use crate::addons::resolve::Refusal as R;
         use crate::release_fetch::{FetchClass, FetchError};
-        let auth = R::Fetch { reference: "r".into(), err: FetchError::new(FetchClass::Auth, "x") };
+        let auth = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: FetchError::new(FetchClass::Auth, "x") };
         assert_eq!(pin_fix("evolve", &auth), crate::addons::resolve::TOKEN_FIX);
-        let nf = R::Fetch { reference: "r".into(), err: FetchError::new(FetchClass::NotFound, "x") };
+        let nf = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: FetchError::new(FetchClass::NotFound, "x") };
         assert!(pin_fix("evolve", &nf).starts_with("noo addons upgrade evolve --check"));
         assert!(pin_fix("evolve", &R::NoEntitlement("none".into())).starts_with("noo security entitlement install"));
         let d = R::Downgrade { pinned: "2".into(), offered: "1".into() };
