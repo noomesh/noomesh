@@ -83,11 +83,7 @@ fn compose_files_in(
 pub(crate) fn addon_pin_env(ctx: &Ctx) -> Result<Vec<(String, String)>, Vec<crate::commands::addon_pins::PinRefusal>> {
     let files = compose_files(ctx);
     let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
-    let composed: Vec<String> = ADDON_COMPOSE
-        .iter()
-        .filter(|a| crate::onboard::yamlcfg::read_yaml_addon(ctx, a.key).unwrap_or(a.default_on))
-        .map(|a| a.key.to_string())
-        .collect();
+    let composed: Vec<String> = addons_on(ctx).into_iter().map(|(k, _)| k).collect();
     let tag = ctx.read_env("NOO_IMAGE_TAG");
     let prefix = std::env::var("NOO_IMAGE_PREFIX").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "noomesh".into());
     let input = crate::commands::addon_pins::PinEnvInput {
@@ -221,7 +217,9 @@ pub(crate) const PGPASS_ROLES: &[PgpassSpec] = &[
 /// (the add-on overlays declare their own top-level `secrets:`, which compose
 /// merges across `-f` files). Same reading as lib-secrets.sh
 /// `file_secret_sources`: a source for an overlay that is not composed is
-/// inert; one missed for an overlay that is stops compose creating it.
+/// inert; one missed for an overlay that is stops compose creating it. A
+/// licensed add-on's overlay sits under `addons/<name>/docker-compose.yml`
+/// (its signed bundle, N6) and is read after those.
 fn compose_texts_beside(base: &Path) -> Vec<String> {
     let mut out = vec![std::fs::read_to_string(base).unwrap_or_default()];
     let dir = base.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -237,6 +235,11 @@ fn compose_texts_beside(base: &Path) -> Vec<String> {
         })
         .unwrap_or_default();
     overlays.sort();
+    let mut bundled: Vec<PathBuf> = std::fs::read_dir(dir.join(crate::addons::pins::ADDONS_DIR))
+        .map(|rd| rd.flatten().map(|e| e.path().join(crate::addon_lock::OVERLAY_FILE)).filter(|p| p.is_file()).collect())
+        .unwrap_or_default();
+    bundled.sort();
+    overlays.extend(bundled);
     out.extend(overlays.iter().filter_map(|p| std::fs::read_to_string(p).ok()));
     out
 }
@@ -648,13 +651,56 @@ pub(crate) struct AddonCompose {
 pub(crate) const ADDON_COMPOSE: &[AddonCompose] = &[
     // Every add-on is an OVERLAY: composed by file, no profile.
     // Same order as scripts/lib-addons.sh::addon_compose_overlay_args — trellion
-    // first because the Intelligent tier's overlay extends its service.
+    // first because a licensed add-on's overlay may extend its service. Only
+    // the overlays that ship in this tree: a licensed add-on's services are
+    // read from the overlay its signed bundle brought ([`addons_on`]).
     AddonCompose { key: "trellion", default_on: true, services: &["trellion"] },
     AddonCompose { key: "voice", default_on: false, services: &["whisper", "piper"] },
-    AddonCompose { key: "trellion_intel", default_on: false, services: &["trellion-intel"] },
-    // The service is `noo-evolve` (its overlay names it so).
-    AddonCompose { key: "evolve", default_on: false, services: &["noo-evolve"] },
 ];
+
+/// The `services:` keys of one compose text, in file order.
+fn compose_service_names(text: &str) -> Vec<String> {
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|d| d.get("services").and_then(|s| s.as_mapping()).cloned())
+        .map(|m| m.keys().filter_map(|k| k.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The services a licensed add-on's overlay ADDS (its `services:` keys that
+/// the base and this tree's overlays do not define) — lib-addons.sh
+/// `addon_own_services`, in Rust. Read from its bundled overlay, else the
+/// deprecated slice copy; empty when neither is there.
+pub(crate) fn licensed_addon_services(root: &Path, addon: &str) -> Vec<String> {
+    let bundled = crate::addons::pins::addon_dir(root, addon).join(crate::addon_lock::OVERLAY_FILE);
+    let legacy = crate::addons::pins::legacy_overlay(root, addon);
+    let Some(text) = std::fs::read_to_string(&bundled).ok().or_else(|| std::fs::read_to_string(&legacy).ok()) else {
+        return Vec::new();
+    };
+    let core: Vec<String> = ["docker-compose.cluster.yml", "docker-compose.trellion.yml", "docker-compose.voice.yml"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(root.join(f)).ok())
+        .flat_map(|t| compose_service_names(&t))
+        .collect();
+    compose_service_names(&text).into_iter().filter(|s| !core.contains(s)).collect()
+}
+
+/// Every add-on that is ON for this install with the services it runs: the
+/// core overlays (`ADDON_COMPOSE`), then each licensed add-on declared on,
+/// with its services from its overlay.
+pub(crate) fn addons_on(ctx: &Ctx) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = ADDON_COMPOSE
+        .iter()
+        .filter(|a| crate::onboard::yamlcfg::read_yaml_addon(ctx, a.key).unwrap_or(a.default_on))
+        .map(|a| (a.key.to_string(), a.services.iter().map(|s| s.to_string()).collect()))
+        .collect();
+    for r in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
+        if crate::onboard::yamlcfg::read_yaml_addon(ctx, r.key).unwrap_or(false) {
+            out.push((r.key.to_string(), licensed_addon_services(&ctx.repo_root, r.key)));
+        }
+    }
+    out
+}
 
 /// `--profile X` flags and service names for every add-on that is ON.
 ///
@@ -665,14 +711,7 @@ pub(crate) const ADDON_COMPOSE: &[AddonCompose] = &[
 /// either: a service absent from the argument list is not recreated even when
 /// its profile is selected, which is why this returns both.
 pub(crate) fn addon_recreate_targets(ctx: &Ctx) -> Vec<String> {
-    let mut services = Vec::new();
-    for a in ADDON_COMPOSE {
-        let on = crate::onboard::yamlcfg::read_yaml_addon(ctx, a.key).unwrap_or(a.default_on);
-        if on {
-            services.extend(a.services.iter().map(|s| s.to_string()));
-        }
-    }
-    services
+    addons_on(ctx).into_iter().flat_map(|(_, s)| s).collect()
 }
 
 /// Services in the `controller` profile that the wizard must NOT name on a
@@ -861,8 +900,17 @@ mod addon_compose_tests {
             let Some(i) = t.find("addon_on ") else { continue };
             let mut it = t[i + "addon_on ".len()..].split_whitespace();
             let (Some(key), Some(default)) = (it.next(), it.next()) else { continue };
+            // The licensed add-ons' generic loop (`addon_on "$_aco_n" 0`):
+            // no name in core, pinned below.
+            if key.contains('$') {
+                continue;
+            }
             shell.push((key.to_string(), default.trim_end_matches(';') == "1"));
         }
+        assert!(
+            helper.contains("for _aco_n in $(addon_licensed_names); do") && helper.contains("addon_on \"$_aco_n\" 0"),
+            "addon_compose_overlay_args no longer composes the licensed add-ons generically (default off)"
+        );
         assert!(
             !shell.is_empty(),
             "parsed ZERO add-ons out of addon_compose_overlay_args — the parse broke, and an \
@@ -893,6 +941,25 @@ mod addon_compose_tests {
         for a in ADDON_COMPOSE {
             assert!(!a.services.is_empty(), "{} names no service", a.key);
         }
+    }
+
+    /// A licensed add-on's services come from its bundled overlay: what it
+    /// adds, never a base service it patches (evolve's overlay patches the
+    /// gateway; recreating "gateway" as an add-on service would be wrong).
+    #[test]
+    fn a_licensed_addons_services_are_what_its_overlay_adds() {
+        let d = std::env::temp_dir().join(format!("noo-addon-svcs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("addons/evolve")).unwrap();
+        std::fs::write(d.join("docker-compose.cluster.yml"), "services:\n  gateway: {}\n  postgres: {}\n").unwrap();
+        std::fs::write(
+            d.join("addons/evolve/docker-compose.yml"),
+            "services:\n  gateway:\n    volumes: []\n  noo-evolve-routes: {}\n  noo-evolve: {}\n",
+        )
+        .unwrap();
+        assert_eq!(licensed_addon_services(&d, "evolve"), ["noo-evolve-routes", "noo-evolve"]);
+        assert!(licensed_addon_services(&d, "trellion_intel").is_empty(), "no overlay, no services");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
@@ -940,9 +1007,12 @@ mod compose_files_tests {
             "docker-compose.cluster.yml",
             "docker-compose.gpu-embed.yml",
             "docker-compose.override.yml",
-            "docker-compose.evolve.yml",
+            // evolve's overlay as its signed bundle materialises it (N6).
+            "addons/evolve/docker-compose.yml",
         ] {
-            std::fs::write(t.path().join(f), "services: {}\n").unwrap();
+            let p = t.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "services: {}\n").unwrap();
         }
         // The declaration, through lib-addons' explicit override seam rather
         // than noomesh.yaml: the yaml reader needs python3-yaml, which the
@@ -985,14 +1055,31 @@ mod compose_files_tests {
                 "docker-compose.cluster.yml",
                 "docker-compose.gpu-embed.yml",
                 "docker-compose.override.yml",
-                "docker-compose.evolve.yml",
+                "docker-compose.yml",
             ],
             "the CLI must take base → gpu → override → add-on overlays from lib-compose.sh; got {got:?}"
         );
+        assert!(got[3].ends_with("/addons/evolve/docker-compose.yml"), "{got:?}");
         assert!(
             got.iter().all(|p| Path::new(p).is_absolute()),
             "paths must be absolute — compose is invoked from the wizard's cwd, not the install: {got:?}"
         );
+    }
+
+    #[test]
+    fn a_legacy_slice_overlay_is_composed_only_without_a_bundle() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let t = scratch(true);
+        let root = t.path();
+        std::fs::write(root.join("docker-compose.evolve.yml"), "services: {}\n").unwrap();
+        std::env::set_var("NOO_COMPOSE_GPU", "0");
+        let args = (root, false, root.join("docker-compose.cluster.yml"), root.join("docker-compose.override.yml"));
+        let with_bundle = compose_files_in(args.0, args.1, &args.2, &args.3);
+        assert!(with_bundle.last().unwrap().ends_with("/addons/evolve/docker-compose.yml"), "{with_bundle:?}");
+        std::fs::remove_dir_all(root.join("addons")).unwrap();
+        let legacy = compose_files_in(args.0, args.1, &args.2, &args.3);
+        clear_env();
+        assert_eq!(names(&legacy).last().map(String::as_str), Some("docker-compose.evolve.yml"), "{legacy:?}");
     }
 
     #[test]
@@ -1116,10 +1203,13 @@ mod file_secret_env_tests {
         std::fs::write(dir.join("docker-compose.cluster.yml"), COMPOSE).unwrap();
         std::fs::write(dir.join("docker-compose.evolve.yml"), "secrets:\n  k:\n    environment: NOO_SVC_KEY_EVOLVE\n").unwrap();
         std::fs::write(dir.join("unrelated.yml"), "secrets:\n  x:\n    environment: NOT_ME\n").unwrap();
+        std::fs::create_dir_all(dir.join("addons/trellion_intel")).unwrap();
+        std::fs::write(dir.join("addons/trellion_intel/docker-compose.yml"), "secrets:\n  k:\n    environment: NOO_SVC_KEY_TRELLION_INTEL\n").unwrap();
         let texts = compose_texts_beside(&dir.join("docker-compose.cluster.yml"));
         let srcs: Vec<String> = texts.iter().flat_map(|t| file_secret_sources(t)).collect();
         std::fs::remove_dir_all(&dir).ok();
         assert!(srcs.iter().any(|s| s == "NOO_SVC_KEY_EVOLVE"), "{srcs:?}");
+        assert!(srcs.iter().any(|s| s == "NOO_SVC_KEY_TRELLION_INTEL"), "a bundled overlay was not read: {srcs:?}");
         assert!(srcs.iter().any(|s| s == "NOO_JWT_SECRET"), "{srcs:?}");
         assert!(!srcs.iter().any(|s| s == "NOT_ME"), "{srcs:?}");
         assert_eq!(srcs.iter().filter(|s| *s == "NOO_JWT_SECRET").count(), 1, "the base is read once: {srcs:?}");
@@ -1130,14 +1220,16 @@ mod file_secret_env_tests {
         let srcs: Vec<String> = [
             include_str!("../../../docker-compose.cluster.yml"),
             include_str!("../../../docker-compose.trellion.yml"),
-            include_str!("../../../docker-compose.trellion-intel.yml"),
-            include_str!("../../../docker-compose.evolve.yml"),
         ]
         .iter()
         .flat_map(|c| file_secret_sources(c))
         .collect();
         assert!(srcs.len() >= 20, "{srcs:?}");
         for (var, _, _) in PGPASS_ROLES {
+            // evolve's overlay (which sources it) travels in evolve's bundle.
+            if *var == "NOO_PGPASS_EVOLVE" {
+                continue;
+            }
             assert!(srcs.iter().any(|s| s == var), "{var} is derived but no compose secret uses it");
         }
     }

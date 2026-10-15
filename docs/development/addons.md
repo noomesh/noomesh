@@ -577,14 +577,23 @@ configuration a list someone can read rather than whatever happened to be
 exported. Put no `profiles:` inside it: composing the file is the switch, and
 a profile inside an overlay is a second switch a launcher can forget.
 
-The launcher composes your overlay when `addons.<name>` is declared on — the
-file list has one home, `scripts/lib-compose.sh`.
+The overlay lives in **your** repository and ships in your signed bundle (see
+[the signed add-on lock](#the-signed-add-on-lock)): core carries no add-on's
+overlay. `noo addons enable|upgrade` materialises it at
+`<install root>/addons/<name>/docker-compose.yml`, and the launcher composes
+it when `addons.<name>` is declared on — the file list has one home,
+`scripts/lib-compose.sh` (`lib-addons.sh` `addon_overlay`). Two things follow
+from where it sits:
 
-Add your overlay to `ADDON_OVERLAYS` in `tests/_compose_projection.py` — the
-env-allowlist and secret guards read the fully composed projection
-(`docker compose config --no-interpolate` with every profile selected), not
-the raw YAML, so an overlay missing from that list is never checked. Running
-that guard locally needs Docker Compose ≥ 2.40. `pull_policy` in your overlay
+- Ordinary relative paths resolve against the **project directory** (the
+  install root, where `docker-compose.cluster.yml` is), as for every `-f` file.
+- So does `extends.file` when several `-f` files are composed (Compose v2):
+  an overlay that extends trellion says `file: docker-compose.trellion.yml`,
+  not `../../docker-compose.trellion.yml`.
+
+A development checkout of your add-on wins over the bundle:
+`${NOO_<NAME>_PATH:-../noo-<name>}/docker-compose.<name>.yml`. Guard your
+overlay's env allowlist, secrets and mounts in your own repository's CI. `pull_policy` in your overlay
 should follow `${NOO_PULL_POLICY:-build}`, which `--dist` installs set to
 `missing`.
 
@@ -618,6 +627,14 @@ with the current key first, and is issued with
 `--addon <name>=<root>:<key>[,<key>]`. The public tree names no add-on key and
 no add-on registry.
 
+**The bundle.** A release also signs a second lock, `addon-bundle.json`, in
+the format `noo-addon-lock/2`: the same fields plus `files`, each file the
+add-on ships beside its images (its compose overlay, `docker-compose.yml`, at
+least) by name and `sha256:…`. One signature therefore covers the overlay too.
+Sign it with the same command and one `--file <name>=<path>` per file, then
+check it with `verify … --files-dir <dir>`. File names are one plain component
+(`[A-Za-z0-9._-]`).
+
 **Where the lock is published.** It is an OCI artifact in the add-on's
 **own registry package**: the `registry` root from the licence (for example
 `ghcr.io/<owner>/<image>`), which is the same package as the image. One
@@ -629,6 +646,9 @@ no add-on registry.
 | Manifest | OCI image manifest (`application/vnd.oci.image.manifest.v1+json`) with `artifactType: application/vnd.noomesh.addon-lock.v1` and the empty config (`application/vnd.oci.empty.v1+json`) |
 | Layer 1 | `mediaType: application/vnd.noomesh.addon-lock.v1+json`, annotation `org.opencontainers.image.title: addon-lock.json` |
 | Layer 2 | `mediaType: application/vnd.noomesh.addon-lock.sig.v1`, annotation `org.opencontainers.image.title: addon-lock.json.sig` |
+| Bundle lock | `mediaType: application/vnd.noomesh.addon-bundle.v1+json`, title `addon-bundle.json` |
+| Bundle signature | `mediaType: application/vnd.noomesh.addon-lock.sig.v1`, title `addon-bundle.json.sig` |
+| Bundle files | one layer per entry in `files`: `mediaType: application/vnd.noomesh.addon-file.v1`, title = the file name |
 | Limits | each layer at most 1 MiB; each blob's sha256 is checked against the manifest |
 
 A release publishes it with oras (1.2 or later), run from the directory
@@ -638,8 +658,17 @@ that holds the two files:
 oras push <root>:stack-v0.6.0 \
   --artifact-type application/vnd.noomesh.addon-lock.v1 \
   addon-lock.json:application/vnd.noomesh.addon-lock.v1+json \
-  addon-lock.json.sig:application/vnd.noomesh.addon-lock.sig.v1
+  addon-lock.json.sig:application/vnd.noomesh.addon-lock.sig.v1 \
+  addon-bundle.json:application/vnd.noomesh.addon-bundle.v1+json \
+  addon-bundle.json.sig:application/vnd.noomesh.addon-lock.sig.v1 \
+  docker-compose.yml:application/vnd.noomesh.addon-file.v1
 ```
+
+Publish **both** locks. A CLI from before the bundle (0.6.3 and earlier)
+reads only the `addon-lock.json` pair and ignores the other layers; it would
+refuse the bundle lock's unknown field. A current CLI takes the bundle when
+the artifact carries one: it verifies the signature, then that the file
+layers are exactly the files the lock lists, each hashing to its entry.
 
 The signed content is the authority. The tag is only a lookup, and a newer
 build for the same stack moves it.
@@ -656,7 +685,9 @@ the same steps:
 4. pull every image by digest through a throwaway docker config holding the
    store's `NOO_ADDON_REGISTRY_TOKEN`;
 5. cache the lock under `addon-locks/` and write the pin to `addons.lock`,
-   beside `stack.lock`.
+   beside `stack.lock`;
+6. materialise the bundle files under `addons/<name>/`, replacing the
+   directory whole (a lock without files removes it).
 
 A refusal at any step changes nothing. An add-on with no lock for the target
 stack holds the stack roll, and `noo upgrade --check --stack` says which
@@ -675,7 +706,13 @@ image: ${NOO_ADDON_IMAGE_<NAME>:-${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE
 
 The fallback is the development build's name and is never used by a dist start.
 `noo addons verify` and `noo cluster verify` (row `add-on pins`) re-check
-three things: the pins, the local images, and what runs.
+four things: the pins, the materialised bundle files (each must still hash to
+the signed lock; an edited overlay is refused like an edited lock), the local
+images, and what runs.
 
-The overlay (`docker-compose.<addon>.yml`) stays here; the add-on repo's
-release is the only thing that must agree with it.
+**Locks without a bundle (deprecated).** A `noo-addon-lock/1` lock carries no
+overlay. For one release (0.6.4) the launcher still composes the
+`docker-compose.<name>.yml` an earlier CLI left beside it, with a warning,
+and the upgrade that stops shipping that file keeps it in place for this one
+release. With no such file, the add-on is refused at start until its release
+re-signs a bundle for the stack and `noo addons upgrade <name>` fetches it.

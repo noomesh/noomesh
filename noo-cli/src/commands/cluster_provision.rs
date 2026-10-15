@@ -1965,7 +1965,7 @@ pub fn cluster_bootstrap_token_create(g: &Globals, args: &[String]) -> Result<i3
                     .filter(|o| o.status.success() && !o.stdout.is_empty())
                     .map(|o| {
                         use sha2::{Digest, Sha256};
-                        format!("{:x}", Sha256::digest(&o.stdout))
+                        hex::encode(Sha256::digest(&o.stdout))
                     });
                 // ONE lane (operator 2026-09-02: "should we just try the one
                 // approach — noo cli on both devices? since that's going to be

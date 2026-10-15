@@ -157,7 +157,9 @@ def test_every_addon_overlay_image_is_published() -> None:
             )
             checked += 1
     assert checked >= 2, f"checked only {checked} published add-on images — the overlay scan broke"
-    assert pinned == 3, f"expected trellion-intel, noo-evolve and noo-evolve-routes pin-sourced, found {pinned}"
+    # The pin-sourced (licensed) overlays: moved with the overlay to the add-on
+    # repo (N6). A core overlay is released with the stack, so never pin-sourced.
+    assert pinned == 0, f"a core overlay reads a licensed add-on pin ({pinned} services)"
 
 
 # Profiles the CONTROLLER host starts. `noo stack start` selects controller
@@ -398,35 +400,9 @@ def test_both_dist_implementations_export_the_same_vars() -> None:
 
 # ── evolve ships as a release image (2026-09-14) ─────────────────────────
 #
-# `addons.evolve: true` used to require a checkout of the evolve add-on that the
-# product never delivered: the gateway provisioned the add-on's role and
-# schema, /health reported it enabled, its routes were mounted — and nothing
-# served them. The other licensed tier (trellion-intel) had shipped as a
-# release image since P2. These pin evolve to the same shape.
-
-EVOLVE_OVERLAY = REPO_ROOT / "docker-compose.evolve.yml"
-
-
-def test_the_evolve_overlay_runs_the_pinned_image_and_builds_nothing() -> None:
-    svc = _load(EVOLVE_OVERLAY)["services"]["noo-evolve"]
-    assert "build" not in svc, "the dist overlay must not need a checkout to build from"
-    assert svc["image"] == "${NOO_ADDON_IMAGE_EVOLVE:-noo-addon-unpinned.invalid/evolve:run-noo-addons-upgrade}"
-
-
-def test_evolve_and_intel_overlays_resolve_their_image_the_same_way() -> None:
-    """Both licensed add-ons: the pin (NOO_ADDON_IMAGE_<NAME>) and nothing
-    else. No tag fallback, no override variable, no add-on prefix, no
-    stack-lock digest: unset, the ref is a sentinel under the reserved
-    `.invalid` domain, which can never be pulled or exist locally."""
-    from tests._compose_projection import load_raw, untag
-
-    intel = untag(load_raw(REPO_ROOT / "docker-compose.trellion-intel.yml"))["services"]["trellion-intel"]["image"]
-    evolve = _load(EVOLVE_OVERLAY)["services"]["noo-evolve"]["image"]
-    for ref, var, name in (
-        (intel, "NOO_ADDON_IMAGE_TRELLION_INTEL", "trellion-intel"),
-        (evolve, "NOO_ADDON_IMAGE_EVOLVE", "evolve"),
-    ):
-        assert ref == "${" + var + ":-noo-addon-unpinned.invalid/" + name + ":run-noo-addons-upgrade}", ref
+# test_the_evolve_overlay_runs_the_pinned_image_and_builds_nothing and
+# test_evolve_and_intel_overlays_resolve_their_image_the_same_way: moved with
+# the overlay to the add-on repo (N6).
 
 
 def test_the_stack_lock_does_not_wait_for_an_addon_image() -> None:

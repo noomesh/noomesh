@@ -43,6 +43,8 @@ var gatewayCalledRoutes = append([]struct{ method, path string }{
 	{"POST", "/cleanup/logs"},
 	{"POST", "/api/containers/start"},
 	{"POST", "/api/containers/stop"},
+	{"GET", "/api/containers/noo-browser-x/proxy/status"},
+	{"POST", "/api/containers/noo-browser-x/proxy/navigate"},
 	{"POST", "/api/skills/run"},
 	{"POST", "/tailnet/dialback"},
 	{"GET", "/tailnet/whois"},

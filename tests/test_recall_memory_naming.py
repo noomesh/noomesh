@@ -94,7 +94,7 @@ CODE = [
     "noomesh.yaml.example",
     "docker-compose.yml",
     "docker-compose.trellion.yml",
-    "docker-compose.trellion-intel.yml",
+    # docker-compose.trellion-intel.yml: moved with the overlay to the add-on repo (N6).
 ]
 CODE_SUFFIXES = SUFFIXES | {".sh", ".toml", ".example", ""}
 # Generated from the alias routes (each old operation is `deprecated: true`).

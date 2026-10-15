@@ -113,15 +113,10 @@ fi
 addons_guard_retired_flags
 warn_retired_env_keys
 
-if addon_on evolve 0; then
-    PRO_COMPOSE="$(addons_evolve_overlay)"
-    if [ -n "$PRO_COMPOSE" ]; then
-        # `--profile pro` now comes from addon_compose_overlay_args (one home).
-        echo "Add-on evolve: ENABLED (noo-evolve via $PRO_COMPOSE)"
-    else
-        echo "addons.evolve is true but no evolve compose overlay was found (set NOO_EVOLVE_PATH to the noo-evolve checkout) — starting without it"
-    fi
-fi
+# Licensed add-ons (every add-on whose overlay is not in this tree): each
+# overlay arrives in the add-on's signed bundle, addons/<name>/docker-compose.yml
+# (N6), or from a development checkout. lib-addons.sh addon_overlay.
+addons_report_licensed
 
 # ── Trellion worker pool (always on) ───────────────────────────────────
 # The add-on decision itself now comes from lib-addons.sh, shared with
@@ -161,21 +156,6 @@ else
     # actively stop it (live rehearsal round 2, 2026-08-13).
     TRELLION_STOP_ON_OFF=1
     echo "Trellion add-on: DISABLED (building the slim noo-worker instead)"
-fi
-
-# Trellion Intelligent tier — same contract as noomesh-start.sh
-#: opt-in, default OFF. No image of its own to rebuild
-# (it runs the trellion image with NOO_WORKER_SURFACES=ml-intel); the
-# switch only decides whether the profile is selected so the container
-# gets recreated alongside the rest.
-# Resolved through the shared helper, like trellion above. This block used
-# to parse NOO_TRELLION_INTEL_ENABLED out of .env by hand — a flag
-# addons_guard_retired_flags refuses to START on — so rebuild always saw the
-# intel add-on as OFF while start saw the noomesh.yaml declaration.
-# Since an earlier change the tier is an OVERLAY composed by lib-compose.sh
-# when the add-on is on; nothing to select here beyond the opt-out stop.
-if ! addon_on trellion_intel 0; then
-    TRELLION_INTEL_STOP_ON_OFF=1
 fi
 
 # ── Voice switch (STT + TTS) ───────────────────────────────────────────
@@ -678,9 +658,8 @@ if [ "$START_STACK" = true ]; then
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    if [ "${TRELLION_INTEL_STOP_ON_OFF:-}" = "1" ]; then
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_intel_overlay)" stop trellion-intel 2>/dev/null || true
-    fi
+    # Licensed add-ons switched off: stop the services their overlay adds.
+    addons_stop_disabled
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi

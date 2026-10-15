@@ -7,8 +7,9 @@
 //! `${NOO_BASE_REGISTRY}/<name>:<tag>`. Two image families are published
 //! under the SAME names and tags: the DHI mirrors at `ghcr.io/noomesh/dhi/`
 //! and the upstream official images at `ghcr.io/noomesh/`. Every service key
-//! and data volume is handed to the DHI images' uids
-//! (`pki::SERVICE_KEY_READERS`: 65532, root for the `-dev` variants); the
+//! and data volume is handed to uid 65532 (`pki::SERVICE_KEY_READERS`):
+//! the DHI runtime images' `nonroot`, and the compose `user:` of the two
+//! `-dev` variants (redis, grafana), whose image USER is root (i64); the
 //! upstream ones run as nobody / 10001 / 472. 0.6.0 and 0.6.1 seeded the
 //! upstream path on the public channel, and after `noo upgrade --channel
 //! public` all five monitoring containers restart-looped on `permission
@@ -16,6 +17,9 @@
 //! running container's image must come from the base registry, the base
 //! registry must not be the upstream-family path, and the container's
 //! `.Config.User` must be the uid its key is handed to AND able to read it.
+//! None of them may run as uid 0 (i64, operator 2026-10-15): a redis or
+//! grafana container created from a compose that predates the `user:` pin
+//! reports `.Config.User` empty (the -dev image's root) and fails here.
 
 use super::{fail, ok, warn, Check};
 use std::process::Command;
@@ -66,6 +70,9 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
     let base = base.trim().trim_end_matches('/');
     let legacy = base == crate::registry::LEGACY_PUBLIC_BASE_REGISTRY;
     let mut problems: Vec<String> = Vec::new();
+    // A container running as root, from a compose that predates the
+    // `user:` pin: recreating it is the fix, not a registry change.
+    let mut as_root = false;
     if legacy {
         problems.push(format!(
             "NOO_BASE_REGISTRY is {base}, the UPSTREAM image family (other uids); the runtime images are the DHI mirrors at {}",
@@ -79,6 +86,13 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
             problems.push(format!("{} runs as user {:?}, which this row cannot map to a uid", r.svc, r.user));
             continue;
         };
+        if uid == 0 {
+            as_root = true;
+            problems.push(format!(
+                "{} runs as root ({}): the runtime services run non-root, its key and data are handed to uid {}",
+                r.svc, r.image, expected_uid(r.svc).map_or_else(|| "?".to_string(), |u| u.to_string())));
+            continue;
+        }
         if let Some(want) = expected_uid(r.svc) {
             if uid != want {
                 problems.push(format!(
@@ -87,13 +101,15 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
                 continue;
             }
         }
-        if uid != 0 && key_readable(r.svc, uid) == Some(false) {
+        if key_readable(r.svc, uid) == Some(false) {
             problems.push(format!("{} (uid {uid}) cannot read services/{}/service.key", r.svc, r.svc));
         }
     }
     if !problems.is_empty() {
         let remedy = if legacy {
             format!("noo upgrade   # corrects NOO_BASE_REGISTRY to {}; then: noo upgrade --stack", crate::registry::PUBLIC_BASE_REGISTRY)
+        } else if as_root && problems.iter().all(|p| p.contains("runs as root")) {
+            "noo upgrade --stack   # recreates them under the compose `user:` (uid 65532)".to_string()
         } else if problems.iter().all(|p| p.contains("cannot read")) {
             "noo security pki fix-modes   # re-hands each key to its reader; then: noo stack restart".to_string()
         } else {
@@ -106,7 +122,7 @@ pub(crate) fn image_family_check(base: &str, running: &[Running], key_readable: 
         return ok(NAME, format!("no runtime container is running; images resolve under {base}/"));
     }
     let names: Vec<&str> = running.iter().map(|r| r.svc).collect();
-    let detail = format!("{} run images from {base}/ as the uid their key is handed to", names.join(", "));
+    let detail = format!("{} run images from {base}/ as non-root uids, each the uid its key is handed to", names.join(", "));
     if is_dhi_path(base) {
         ok(NAME, detail)
     } else {
@@ -168,15 +184,15 @@ mod tests {
         Running { svc, image, user: user.into() }
     }
 
-    /// The DHI family as measured: 65532 for the runtime images, root for
-    /// the -dev variants (redis, grafana).
+    /// The DHI family as it runs: 65532 for the runtime images, and the
+    /// compose `user: "65532:65532"` for the -dev variants (redis, grafana).
     fn dhi_fleet(base: &str) -> Vec<Running> {
         vec![
-            run("redis", format!("{base}/redis:8.6-debian13-dev"), "0"),
+            run("redis", format!("{base}/redis:8.6-debian13-dev"), "65532:65532"),
             run("loki", format!("{base}/loki:3"), "65532"),
             run("prometheus", format!("{base}/prometheus:3"), "65532"),
             run("alertmanager", format!("{base}/alertmanager:0"), "65532:65532"),
-            run("grafana", format!("{base}/grafana:12-debian13-dev"), ""),
+            run("grafana", format!("{base}/grafana:12-debian13-dev"), "65532:65532"),
             run("node-exporter", format!("{base}/node-exporter:1"), "nonroot"),
         ]
     }
@@ -220,14 +236,59 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("prometheus (uid 65532) cannot read services/prometheus/service.key"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap().contains("fix-modes"), "{:?}", c.remedy);
-        // Root reads any owner-only key: never asked.
-        let c = image_family_check(DHI, &dhi_fleet(DHI), &|svc, _| {
-            assert!(svc != "redis" && svc != "grafana", "asked about a root container: {svc}");
-            Some(true)
-        });
-        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // redis and grafana run as 65532 now, so their keys are asked too.
+        let c = image_family_check(DHI, &dhi_fleet(DHI), &|svc, _| Some(svc != "redis"));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("redis (uid 65532) cannot read services/redis/service.key"), "{}", c.detail);
         // An absent key is not judged.
         assert_eq!(image_family_check(DHI, &dhi_fleet(DHI), &|_, _| None).verdict, Verdict::Ok);
+    }
+
+    /// i64: a redis or grafana container created by a compose without the
+    /// `user:` pin runs as the -dev image's root. That fails, names root,
+    /// and the remedy is recreating it, not a registry change.
+    #[test]
+    fn a_runtime_container_running_as_root_fails() {
+        for user in ["", "0", "root", "0:0"] {
+            let mut fleet = dhi_fleet(DHI);
+            fleet[0].user = user.into(); // redis
+            fleet[4].user = user.into(); // grafana
+            let c = image_family_check(DHI, &fleet, &|_, _| Some(true));
+            assert_eq!(c.verdict, Verdict::Fail, "user {user:?}: {}", c.detail);
+            assert!(c.detail.contains("redis runs as root") && c.detail.contains("grafana runs as root"), "{}", c.detail);
+            assert!(c.remedy.as_deref().unwrap().starts_with("noo upgrade --stack"), "{:?}", c.remedy);
+        }
+    }
+
+    /// Every runtime service's key is handed to a non-root uid: the table
+    /// cannot quietly go back to root for redis or grafana.
+    #[test]
+    fn every_runtime_service_reader_is_non_root() {
+        for svc in RUNTIME_SERVICES {
+            let uid = expected_uid(svc).unwrap_or_else(|| panic!("{svc} has no reader"));
+            assert_ne!(uid, 0, "{svc} is handed to root");
+        }
+        assert_eq!(expected_uid("redis"), Some(65532));
+        assert_eq!(expected_uid("grafana"), Some(65532));
+    }
+
+    /// The compose pins redis and grafana to the uid their keys are handed
+    /// to (the -dev images' own USER is root).
+    #[test]
+    fn compose_pins_the_dev_variants_to_their_reader_uid() {
+        let compose = include_str!("../../../../docker-compose.cluster.yml");
+        for svc in ["redis", "grafana"] {
+            let head = format!("  {svc}:");
+            let block: Vec<&str> = compose
+                .lines()
+                .skip_while(|l| *l != head)
+                .skip(1)
+                .take_while(|l| !(l.starts_with("  ") && !l.starts_with("   ") && !l.trim_start().starts_with('#')))
+                .collect();
+            assert!(!block.is_empty(), "no {svc} service in compose");
+            let want = format!("user: \"{0}:{0}\"", expected_uid(svc).unwrap());
+            assert!(block.iter().any(|l| l.trim() == want), "{svc} has no `{want}` in compose");
+        }
     }
 
     #[test]

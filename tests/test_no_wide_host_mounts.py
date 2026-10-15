@@ -25,7 +25,8 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPOSE_FILES = ["docker-compose.cluster.yml", "docker-compose.dist.yml", "docker-compose.trellion.yml", "docker-compose.trellion-intel.yml", "docker-compose.voice.yml", "docker-compose.evolve.yml", "docker-compose.gpu-embed.yml"]
+# trellion-intel / evolve overlays: moved with the overlay to the add-on repo (N6).
+COMPOSE_FILES = ["docker-compose.cluster.yml", "docker-compose.dist.yml", "docker-compose.trellion.yml", "docker-compose.voice.yml", "docker-compose.gpu-embed.yml"]
 
 # Sources no service may mount, at any mode, under any target. `/` is here
 # because "read-only" is not a defence against READING, which is the whole

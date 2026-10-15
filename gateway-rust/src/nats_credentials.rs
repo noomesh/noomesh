@@ -57,6 +57,55 @@ pub const NODE_REMEDY: &str = "`noo cluster nats-creds rotate <node>` on the con
 /// because every principal uses it.
 pub const INBOX_PREFIX: &str = "_INBOX_gw";
 
+/// The reply inbox for a request the WORKER principal answers (noo-worker,
+/// noo-trellion, noo-trellion-intel all present it): every `worker.>`
+/// request leaves `worker_client` with a reply subject under this prefix.
+///
+/// Why a per-principal prefix at all (i69, i70): nats-server keeps the
+/// `allow_responses` "you may answer this one reply" entries in a
+/// per-connection map that every config reload replaces with an empty one,
+/// so a request in flight across a SIGHUP has its reply refused. The fix is
+/// a STATIC publish grant on the reply inbox — and least privilege says a
+/// principal may hold that grant only on the replies addressed to IT. The
+/// gateway's default prefix (`_INBOX_gw.<nuid>`) is shared by every request
+/// it makes, so each remote principal gets a sub-prefix of its own.
+///
+/// noo-cli `nats_users.rs` `WORKER_REPLY_INBOX` must equal this + `.>`;
+/// tests/test_nats_principal_reply_grant_parity.py compares the two crates.
+pub const WORKER_REPLY_PREFIX: &str = "_INBOX_gw.worker";
+
+/// The root of every NODE principal's reply inbox. A node's own prefix is
+/// `<root>.<token>` ([`node_reply_prefix`]), and its static grant is that
+/// prefix + `.>` — never the root, so one node cannot answer into another's
+/// requests. noo-cli `nats_users.rs` `NODE_REPLY_ROOT` must equal this.
+pub const NODE_REPLY_ROOT: &str = "_INBOX_gw.node";
+
+/// A node id as ONE subject token, byte for byte noo-cli's `subject_token`
+/// and the Go agent's `messaging.SubjectToken`: `[A-Za-z0-9_-]` kept,
+/// anything else (`.` `*` `>` space…) becomes `_`, empty becomes `unknown`.
+pub fn subject_token(id: &str) -> String {
+    let out: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if out.is_empty() { "unknown".to_string() } else { out }
+}
+
+/// The reply prefix for a request a node's principal answers
+/// (`harness.run.<node>`, `harness.task.<node>`).
+pub fn node_reply_prefix(node_id: &str) -> String {
+    format!("{NODE_REPLY_ROOT}.{}", subject_token(node_id))
+}
+
+/// One unique reply subject under `prefix`. The unique token is the one the
+/// client would have used for its own inbox, so the shape matches
+/// `Client::new_inbox` with the prefix swapped.
+pub fn scoped_inbox(nats: &async_nats::Client, prefix: &str) -> String {
+    let own = nats.new_inbox();
+    let token = own.rsplit('.').next().unwrap_or(own.as_str());
+    format!("{prefix}.{token}")
+}
+
 fn truthy(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
@@ -245,5 +294,34 @@ mod tests {
     fn inbox_prefix_is_gateway_scoped() {
         assert_eq!(INBOX_PREFIX, "_INBOX_gw");
         assert!(!INBOX_PREFIX.contains('.'), "a dot would create a subject hierarchy");
+    }
+
+    /// i70: each remote principal's reply prefix is its own, under the
+    /// gateway's inbox, and no prefix contains another (a grant on one must
+    /// not cover the other's replies).
+    #[test]
+    fn per_principal_reply_prefixes_do_not_overlap() {
+        assert_eq!(WORKER_REPLY_PREFIX, format!("{INBOX_PREFIX}.worker"));
+        assert_eq!(NODE_REPLY_ROOT, format!("{INBOX_PREFIX}.node"));
+        assert_eq!(node_reply_prefix("host8"), "_INBOX_gw.node.host8");
+        // A hostile id cannot widen into a sibling's prefix or a wildcard.
+        assert_eq!(node_reply_prefix("a.b"), "_INBOX_gw.node.a_b");
+        assert_eq!(node_reply_prefix("x.>"), "_INBOX_gw.node.x__");
+        assert_eq!(node_reply_prefix(""), "_INBOX_gw.node.unknown");
+        let prefixes = [
+            WORKER_REPLY_PREFIX.to_string(),
+            node_reply_prefix("host8"),
+            node_reply_prefix("host9"),
+            node_reply_prefix("worker"),
+        ];
+        for a in &prefixes {
+            for b in &prefixes {
+                if a != b {
+                    assert!(!b.starts_with(&format!("{a}.")), "{a} would cover {b}");
+                }
+            }
+        }
+        // The node harness agrees on the token (its own inbox uses it).
+        assert_eq!(crate::harness_main::inbox_prefix("a.b c"), format!("_INBOX_node_{}", subject_token("a.b c")));
     }
 }

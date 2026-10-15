@@ -211,8 +211,8 @@ pub fn seal(body: &Value, recipients: &[Recipient<'_>], aad: &[u8]) -> Result<Se
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), msg_key.as_mut_slice());
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
     let plaintext = Zeroizing::new(serde_json::to_vec(body).map_err(|e| e.to_string())?);
-    let ct = ChaCha20Poly1305::new(Key::from_slice(msg_key.as_slice()))
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext.as_slice(), aad })
+    let ct = ChaCha20Poly1305::new(&Key::from(*msg_key))
+        .encrypt(&Nonce::from(nonce), Payload { msg: plaintext.as_slice(), aad })
         .map_err(|_| "encrypt failed".to_string())?;
     // One ephemeral X25519 key per message; each recipient gets the message
     // key wrapped under ECDH(ephemeral, recipient) — the v2 KDF binds both
@@ -223,7 +223,7 @@ pub fn seal(body: &Value, recipients: &[Recipient<'_>], aad: &[u8]) -> Result<Se
     for r in recipients {
         let wk = wrap_key_v2(&epk_secret, &r.key, &epk, &r.key, r.label)?;
         let wrapped = ChaCha20Poly1305::new(&wk)
-            .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: msg_key.as_slice(), aad: r.label.as_bytes() })
+            .encrypt(&Nonce::from([0u8; 12]), Payload { msg: msg_key.as_slice(), aad: r.label.as_bytes() })
             .map_err(|_| "wrap failed".to_string())?;
         wraps.insert(r.label.to_string(), Value::String(b64(&wrapped)));
     }
@@ -252,22 +252,18 @@ pub fn open(sealed: &Sealed, label: &str, secret: &StaticSecret, aad: &[u8]) -> 
         wrap_key_for(secret, &epk, label)
     };
     let msg_key = ChaCha20Poly1305::new(&wk)
-        .decrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: &wrapped, aad: label.as_bytes() })
+        .decrypt(&Nonce::from([0u8; 12]), Payload { msg: &wrapped, aad: label.as_bytes() })
         .map_err(|_| "wrap does not open with this key".to_string())?;
-    // `from_slice` asserts length — anyone can mint a wrap under the public
-    // review key, so a short key or nonce must be an Err, never a panic.
-    if msg_key.len() != 32 {
-        return Err("wrapped key has the wrong length".into());
-    }
-    let nonce = b64d(sealed.meta["nonce"].as_str().ok_or("missing nonce")?)?;
-    if nonce.len() != 12 {
-        return Err("nonce has the wrong length".into());
-    }
-    let ct = b64d(&sealed.ct)?;
+    // Anyone can mint a wrap under the public review key, so a short key or
+    // nonce must be an Err, never a panic: convert with `try_from`.
     let msg_key = Zeroizing::new(msg_key);
+    let key = Key::try_from(msg_key.as_slice()).map_err(|_| "wrapped key has the wrong length".to_string())?;
+    let nonce = b64d(sealed.meta["nonce"].as_str().ok_or("missing nonce")?)?;
+    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| "nonce has the wrong length".to_string())?;
+    let ct = b64d(&sealed.ct)?;
     let plaintext = Zeroizing::new(
-        ChaCha20Poly1305::new(Key::from_slice(&msg_key))
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: body_aad })
+        ChaCha20Poly1305::new(&key)
+            .decrypt(&nonce, Payload { msg: &ct, aad: body_aad })
             .map_err(|_| "ciphertext does not authenticate".to_string())?,
     );
     serde_json::from_slice(&plaintext).map_err(|e| e.to_string())
@@ -517,7 +513,7 @@ mod tests {
         let epk = PublicKey::from(&epk_secret);
         let wk = wrap_key_v2(&epk_secret, &ctrl.seal_public(), &epk, &ctrl.seal_public(), REVIEW_WRAP).unwrap();
         let wrapped = ChaCha20Poly1305::new(&wk)
-            .encrypt(Nonce::from_slice(&[0u8; 12]), Payload { msg: &[7u8; 5], aad: REVIEW_WRAP.as_bytes() })
+            .encrypt(&Nonce::from([0u8; 12]), Payload { msg: &[7u8; 5], aad: REVIEW_WRAP.as_bytes() })
             .unwrap();
         let mut bad = sealed.clone();
         bad.meta["epk"] = Value::String(b64(epk.as_bytes()));

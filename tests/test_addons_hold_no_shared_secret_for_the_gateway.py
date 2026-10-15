@@ -37,7 +37,9 @@ SHARED = ("NOO_CONTROLLER_SECRET", "NOO_CLUSTER_SECRET")
 # fleet secret's last use there, the browser door, has its own key now.
 KEPT: dict[tuple[str, str], tuple[str, str]] = {}
 
-ADD_ONS = ("trellion", "trellion-intel", "noo-evolve")
+# The add-on services core composes. The licensed add-ons' overlays
+# (trellion-intel, evolve) moved with their guards to the add-on repos (N6).
+ADD_ONS = ("trellion",)
 
 
 def _delivered(svc: dict) -> set[str]:
@@ -53,12 +55,7 @@ def _delivered(svc: dict) -> set[str]:
     return out
 
 
-def test_evolve_is_handed_neither_shared_secret() -> None:
-    p = full_projection()["services"]
-    assert "noo-evolve" in p, "the evolve overlay is not in the projection — this test would be vacuous"
-    got = _delivered(p["noo-evolve"])
-    assert not got, f"noo-evolve is handed {sorted(got)}; nothing in the add-on reads it since an earlier change"
-    assert "NOO_GATEWAY_KEY_FILE" in env_of(p["noo-evolve"]), "evolve's own key is its only credential and must be delivered"
+# test_evolve_is_handed_neither_shared_secret: moved with the overlay to the add-on repo (N6)
 
 
 def test_every_shared_secret_an_add_on_still_gets_is_a_named_noomesh_reader() -> None:
@@ -164,7 +161,7 @@ def test_no_worker_plane_container_is_handed_the_fleet_secret() -> None:
     """an earlier change (review H1): the fleet secret is a
     node's credential. Among the controller's own services only the gateway
     (it verifies node tokens) and the containerised node agents hold it — not
-    the worker, its replica, the trellion pair, evolve or the browser."""
+    the worker, its replica, trellion or the browser."""
     p = full_projection()["services"]
 
     def holds_fleet(svc: str, spec: dict) -> bool:
@@ -181,7 +178,8 @@ def test_no_worker_plane_container_is_handed_the_fleet_secret() -> None:
     holders = sorted(svc for svc, spec in p.items() if holds_fleet(svc, spec))
     assert set(holders) <= {"gateway", "node-agent", "node-agent-sensors"}, holders
     assert "gateway" in holders
-    for svc in ("worker", "trellion", "trellion-intel", "noo-evolve"):
+    # (trellion-intel and noo-evolve: moved with the overlay to the add-on repo (N6))
+    for svc in ("worker", "trellion"):
         assert svc in p, svc
 
 

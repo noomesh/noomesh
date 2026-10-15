@@ -109,24 +109,10 @@ addons_guard_retired_flags
 warn_retired_env_keys
 
 
-# evolve — the pro self-tuning engines. The overlay travels with the code
-#: it lives in the noo-evolve checkout, and its
-# relative paths still resolve against THIS directory because compose
-# resolves them against the first -f file's directory.
-if addon_on evolve 0; then
-    PRO_COMPOSE="$(addons_evolve_overlay)"
-    if [ -n "$PRO_COMPOSE" ]; then
-        # `--profile pro` now comes from addon_compose_overlay_args (one home).
-        case "$PRO_COMPOSE" in
-            */noo-evolve/*|*/*-evolve/*)
-                echo "Add-on evolve: ENABLED (noo-evolve built from the checkout at $PRO_COMPOSE)" ;;
-            *)
-                echo "Add-on evolve: ENABLED (noo-evolve from the published image, via $PRO_COMPOSE)" ;;
-        esac
-    else
-        echo "addons.evolve is true but no evolve compose overlay was found — neither an evolve checkout (NOO_EVOLVE_PATH) nor docker-compose.evolve.yml beside this launcher — starting without it"
-    fi
-fi
+# Licensed add-ons (every add-on whose overlay is not in this tree): each
+# overlay arrives in the add-on's signed bundle, addons/<name>/docker-compose.yml
+# (N6), or from a development checkout. lib-addons.sh addon_overlay.
+addons_report_licensed
 
 # ── Trellion worker pool (always on) ───────────────────────────────────
 # The Python worker pool ALWAYS runs as its own noo-trellion container.
@@ -173,25 +159,6 @@ if ! addon_on trellion 1; then
     TRELLION_STOP_ON_OFF=1
     ui_warned "trellion add-on disabled — slim noo-worker serves the core surfaces"
     ui_note "knowledge features (RAG/memory/recall/graph) answer 503 by design"
-fi
-
-# ── Trellion Intelligent tier ─────────────────────────
-# Opt-in and licensed. ON → the launcher composes its OVERLAY
-# (docker-compose.trellion-intel.yml, via lib-compose.sh; an earlier change phase
-# C): a second trellion container running NOO_WORKER_SURFACES=ml-intel
-# (worker.temporal.* + the ML heartbeat action shell). OFF (default) → those
-# subjects refuse with the explained trellion-intel message (addons.rs);
-# everything open-tier is unaffected. The gateway reads the same `addons:`
-# map, so containers and behaviour cannot disagree.
-if addon_on trellion_intel 0; then
-    if ! addon_on trellion 1; then
-        ui_warned "trellion-intel enabled but trellion is disabled — starting it anyway"
-        ui_note "the intel container extends the trellion service and rides the open tier's stores; this combination is unsupported"
-    fi
-else
-    # Same leftover-container rule as trellion: `up` never touches an
-    # unselected profile, so opting out on a live stack must stop it.
-    TRELLION_INTEL_STOP_ON_OFF=1
 fi
 
 # ── Voice / STT switch ─────────────────────────────────────────────────
@@ -505,6 +472,27 @@ fi
 if [ -z "$_data_root" ]; then
     ui_warned "NOO_DATA_ROOT is not set — compose will refuse to start"
     ui_note "pin one path: run 'noo onboard --only storage', or set NOO_DATA_ROOT in .env"
+fi
+
+# ── redis/grafana data re-owned to 65532 (i64) ────────────────────────
+# Both now run as `user: "65532:65532"` (docker-compose.cluster.yml); before
+# i64 they ran as the DHI -dev images' root, so on an existing install the
+# files they wrote under <data root>/redis (appendonlydir, dump.rdb) and
+# <data root>/grafana (grafana.db, plugins, png, ...) are root-owned and the
+# new uid cannot write them. Re-own them once, through the same throwaway
+# container pattern as the ingest dir below (no sudo). Idempotent: the
+# `find -quit` probe makes a box already on 65532 a no-op, and a missing dir
+# (not this profile, fresh install before onboard) is skipped.
+if [ -n "$_data_root" ]; then
+    for _svc_dir in redis grafana; do
+        [ -d "$_data_root/$_svc_dir" ] || continue
+        if ! docker run --rm -v "$_data_root/$_svc_dir":/d alpine \
+                sh -c 'if [ -n "$(find /d \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then chown -R 65532:65532 /d; fi' \
+                2>/dev/null; then
+            echo "NOTE: could not re-own $_data_root/$_svc_dir to uid 65532; $_svc_dir runs as 65532 (i64) and \
+may fail with 'permission denied'. To fix: docker run --rm -v \"$_data_root/$_svc_dir\":/d alpine chown -R 65532:65532 /d" >&2
+        fi
+    done
 fi
 
 # ── HF_CACHE_DIR must be an HF_HOME, not a bare hub archive ───────────
@@ -970,11 +958,8 @@ require_compose_v2 || exit 1
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    if [ "${TRELLION_INTEL_STOP_ON_OFF:-}" = "1" ]; then
-        # The overlay is not composed when the add-on is off, so name it
-        # here just to reach the service and stop it.
-        docker compose $COMPOSE_FILES -f "$(addons_trellion_intel_overlay)" stop trellion-intel 2>/dev/null || true
-    fi
+    # Licensed add-ons switched off: stop the services their overlay adds.
+    addons_stop_disabled
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi

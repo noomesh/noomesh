@@ -19,7 +19,7 @@ The rule, over the composed projection and every compose file as written:
   ``gateway.crt`` in an identity position (a DSN's ``sslcert``, a ``*_CERT``
   or ``*_KEY`` variable, a command). TRUSTING the gateway's certificate —
   ``sslrootcert``, a ``*_CA`` variable — is fine and not flagged.
-* The trellion add-ons and noo-worker (with worker-extra) each mount exactly
+* trellion and noo-worker (with worker-extra) each mount exactly
   one leaf, their own, and every certificate path they name resolves into it.
 
 ``KNOWN_HOLDERS`` is EMPTY and pinned empty (an earlier change closed). The
@@ -49,7 +49,7 @@ KNOWN_HOLDERS: frozenset[str] = frozenset()
 # service -> (its own leaf dir, the fewest Postgres DSNs it names)
 OWN_LEAVES = {
     "trellion": ("services/trellion", 5),
-    "trellion-intel": ("services/trellion-intel", 5),
+    # trellion-intel: moved with the overlay to the add-on repo (N6)
     "worker": ("services/worker", 2),
     "worker-extra": ("services/worker", 2),
 }

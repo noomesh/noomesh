@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -43,9 +44,15 @@ type ContainerStartRequest struct {
 	GPU           bool              `json:"gpu"`
 	// Ports maps container port ("9222" or "9222/tcp") to a desired host
 	// port; null/0 requests an ephemeral host port. Every entry is
-	// published on 0.0.0.0 so the gateway can reach it.
+	// published on 127.0.0.1 ONLY (managedPublishIP): the gateway reaches
+	// the container through this agent's authenticated
+	// /api/containers/{name}/proxy/... route, never by dialing the port.
 	Ports map[string]*int `json:"ports"`
 }
+
+// managedPublishIP is the host address every managed-container port is
+// published on. Not request-controllable.
+var managedPublishIP = netip.MustParseAddr("127.0.0.1")
 
 // ContainerStartResult reports the started container and its first published
 // host port (the gateway reads `host_port` to build the service URL).
@@ -228,7 +235,9 @@ func (c *Client) StartManagedContainer(req ContainerStartRequest) (*ContainerSta
 	}
 
 	// Port publishing: each requested container port is exposed and bound
-	// on all interfaces; empty HostPort lets Docker pick an ephemeral one.
+	// on loopback only; empty HostPort lets Docker pick an ephemeral one.
+	// A container that speaks plaintext HTTP behind a bearer must not be
+	// reachable from the LAN/tailnet; see ProxyTarget / api proxy route.
 	if len(req.Ports) > 0 {
 		containerCfg.ExposedPorts = make(network.PortSet, len(req.Ports))
 		hostCfg.PortBindings = make(network.PortMap, len(req.Ports))
@@ -237,7 +246,7 @@ func (c *Client) StartManagedContainer(req ContainerStartRequest) (*ContainerSta
 			if err != nil {
 				return nil, fmt.Errorf("invalid port %q: %w", portStr, err)
 			}
-			binding := network.PortBinding{}
+			binding := network.PortBinding{HostIP: managedPublishIP}
 			if hostPort != nil && *hostPort > 0 {
 				binding.HostPort = strconv.Itoa(*hostPort)
 			}
@@ -348,4 +357,38 @@ func (c *Client) StopManagedContainer(name string) error {
 	}
 	slog.Info("generic container stopped", "container", name)
 	return nil
+}
+
+// ProxyTarget returns the loopback "127.0.0.1:<port>" a managed container's
+// first published port is bound to. Only containers this agent started
+// through StartManagedContainer (label noo.generic=true) qualify, so the
+// proxy route cannot be pointed at a backend or any other container.
+func (c *Client) ProxyTarget(name string) (string, error) {
+	if err := ValidateManagedContainerName(name); err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ins, err := c.docker.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if ins.Container.Config == nil || ins.Container.Config.Labels["noo.generic"] != "true" {
+		return "", fmt.Errorf("%s is not a managed container", name)
+	}
+	if ins.Container.NetworkSettings == nil {
+		return "", fmt.Errorf("%s has no published port", name)
+	}
+	best := 0
+	for _, bindings := range ins.Container.NetworkSettings.Ports {
+		for _, b := range bindings {
+			if hp, err := strconv.Atoi(b.HostPort); err == nil && hp > 0 && (best == 0 || hp < best) {
+				best = hp
+			}
+		}
+	}
+	if best == 0 {
+		return "", fmt.Errorf("%s has no published port", name)
+	}
+	return "127.0.0.1:" + strconv.Itoa(best), nil
 }

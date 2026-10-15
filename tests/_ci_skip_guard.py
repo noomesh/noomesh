@@ -213,7 +213,10 @@ def _skip_reason(report) -> str:
     return str(longrepr)
 
 
-@dataclass
+# eq=False: pluggy (subset_hook_caller) puts registered plugins in a set; a
+# default dataclass sets __hash__ = None and crashes the session with
+# "unhashable type" on newer pluggy. Plugins need identity hash/eq.
+@dataclass(eq=False)
 class _SkipCollector:
     """Per-session skip collector, registered fresh in pytest_configure.
 

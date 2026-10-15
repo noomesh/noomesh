@@ -61,6 +61,20 @@ pub fn harness_run_subject(node: &str) -> String {
     format!("harness.run.{}", node.replace(['.', '*', '>', ' '], "_"))
 }
 
+/// A request a node's principal answers, with its reply addressed to that
+/// node's own inbox prefix (`_INBOX_gw.node.<token>.<nuid>`).
+///
+/// `allow_responses` alone does not survive a NATS config reload (the
+/// server rebuilds each connection's reply map empty on every SIGHUP), so
+/// a node that took a request before a reload could not answer it. The
+/// node's grant carries a static publish on exactly this prefix, and no
+/// other node's (noo-cli `nats_users.rs`, i70).
+pub fn node_request(nats: &async_nats::Client, node: &str, payload: Vec<u8>) -> async_nats::Request {
+    async_nats::Request::new()
+        .payload(payload.into())
+        .inbox(crate::nats_credentials::scoped_inbox(nats, &crate::nats_credentials::node_reply_prefix(node)))
+}
+
 /// `NOO_HARNESS_DISPATCH=0` keeps every turn on the controller even
 /// where a harness is placed — the operator's brake.
 pub fn dispatch_enabled() -> bool {
@@ -391,7 +405,9 @@ pub async fn try_dispatch<S: TurnSink>(
     };
     let ack = tokio::time::timeout(
         ACK_TIMEOUT,
-        state.nats.request(harness_run_subject(&node), serde_json::to_vec(&req)?.into()),
+        // The ack comes back on THIS node's reply prefix, which its principal
+        // holds a static grant on: it survives a NATS reload (i70).
+        state.nats.send_request(harness_run_subject(&node), node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
     )
     .await;
     match ack {

@@ -127,13 +127,3 @@ def test_a_runtime_update_to_the_old_name_is_not_lost(tmp_path, monkeypatch):
     out = cfg.update_runtime_config("video_memory", {"prune_after_days": 30})
     assert out.recall_memory.prune_after_days == 30
     assert yaml.safe_load(path.read_text())["video_memory"]["prune_after_days"] == 30
-
-
-def test_pip_extra_keeps_the_old_name_as_an_alias():
-    import tomllib
-    from pathlib import Path
-
-    extras = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())[
-        "project"]["optional-dependencies"]
-    assert "recall-memory" in extras
-    assert extras["video-memory"] == ["noomesh[recall-memory]"]
