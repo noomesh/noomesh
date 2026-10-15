@@ -662,6 +662,15 @@ default, cached and refreshed every 15 s. The registry
 | `NOO_REPORTS_DRIVE_FOLDER_ID` (string) | heartbeat | empty (reports are sent inline) |
 | `NOO_OPS_WAIT_<TYPE>_SECS`, `NOO_OPS_RESULT_TTL_SECS` (strings) | ops | see [Asynchronous operations](#asynchronous-operations) |
 
+`CLOUD_PROVIDERS_ENABLED` gates every `claude-*`, `gpt-*` and `gemini-*`
+model. With it on and the provider's key in the secret store
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or
+`GOOGLE_API_KEY`), such a model runs the same agent loop as a node model —
+tools, memory, retrieved context, session — on the controller, calling the
+provider directly. A provider that fails is reported as that provider's
+error; the turn never falls back to a node model, and a failing node never
+falls back to a cloud provider.
+
 `NOO_SELF_MODIFY_ENABLED` (category `selfdev`) was also removed: the
 state-changing self-admin MCP tools it gated are gone, so the model can no
 longer restart or rebuild its own stack and the flag had nothing left to
