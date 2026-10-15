@@ -410,15 +410,19 @@ export function paint(ctx: CanvasRenderingContext2D, frame: Frame, o: PaintOptio
   ctx.font = `500 ${fs}px ui-monospace, "Cascadia Code", Consolas, Menlo, monospace`;
   ctx.textBaseline = 'middle';
   if (!flat) {
-  // Tags only when the camera has pushed in: at wide, forty hubs' worth of
-  // text collides into mud; in the push-in there is room. They fade in with
-  // the zoom. Who gets one is a legible rule: any hub on screen is eligible
+  // Tags without names (labels off) only when the camera has pushed in: at
+  // wide, forty hubs' worth of text collides into mud; in the push-in there
+  // is room. They fade in with the zoom, and those are UUID fragments nobody
+  // wants on a wall at a distance. With the names switch ON the tags are the
+  // point of the switch, so they are drawn at wide too, at full strength;
+  // the cap and the overlap skip below keep the wide view from going to mud.
+  // Who gets one is a legible rule: any hub on screen is eligible
   // (no depth cliff — two hubs on the same plane must be treated the same);
   // active hubs first, then the nearest to what the camera is looking at,
   // with nearer-in-depth preferred; the cap is applied after the visibility
   // check; and a tag whose box would overlap one already placed is skipped,
   // so the nearest wins and nothing overlaps.
-  const tagA = Math.max(0, Math.min(1, (o.focus.zoom - 1.15) / 0.9));
+  const tagA = tagAlpha(o.focus.zoom, o.labels);
   const cap = o.labels ? 7 : 5;
   const onScreen = frame.order.filter((i) => {
     const { x, y } = pos[i]!;
@@ -511,6 +515,12 @@ export function paint(ctx: CanvasRenderingContext2D, frame: Frame, o: PaintOptio
  * switch, said on the picture itself: the strip can be cropped by a bezel
  * or scrolled past in a screenshot, and the canvas is what gets shared.
  */
+/** How strongly hub tags are drawn: 1 whenever names are on, else the push-in fade. */
+export function tagAlpha(zoom: number, labels: boolean): number {
+  if (labels) return 1;
+  return Math.max(0, Math.min(1, (zoom - 1.15) / 0.9));
+}
+
 export function rightReadout(growing: number, zoom: number, tier: Quality | undefined, labels: boolean): string[] {
   return [
     `GROWING ${growing}`,
