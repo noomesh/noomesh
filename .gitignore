@@ -153,3 +153,6 @@ addon-terms-acceptances.jsonl
 
 # onboarding film output (scripts/demo)
 demo-out/
+
+# Licensed add-ons materialised from their signed bundles (noo addons enable|upgrade)
+/addons/

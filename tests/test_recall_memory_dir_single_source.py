@@ -42,10 +42,10 @@ def test_worker_pool_passes_the_env_dir_to_the_manager():
     assert "vm_config.storage_dir = _vm_dir" in src
 
 
-def test_compose_sets_the_single_path_for_both_trellion_services():
+def test_compose_sets_the_single_path_for_the_trellion_service():
     base = (ROOT / "docker-compose.trellion.yml").read_text()
     assert "NOO_RECALL_MEMORY_PATH: '/data/video_memory'" in base
     # trellion reads only the old name until its sibling change ships.
     assert "NOO_VIDEO_MEMORY_PATH: '/data/video_memory'" in base
-    intel = (ROOT / "docker-compose.trellion-intel.yml").read_text()
-    assert "video-memory" not in intel  # inherits the base env via extends
+    # trellion-intel's "inherits the base env via extends" check: moved with the
+    # overlay to the add-on repo (N6).

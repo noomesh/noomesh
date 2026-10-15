@@ -259,7 +259,7 @@ def test_every_dsn_in_the_composed_stack_presents_a_mounted_certificate():
         p, n = dsn_problems(name, svc)
         problems += p
         seen += n
-    # gateway 3, worker 2 (+ worker-extra 2), trellion 5, evolve 2
+    # gateway 3, worker 2 (+ worker-extra 2), trellion 5
     assert seen >= 12, f"only {seen} DSNs found — the sweep is broken"
     assert problems == [], "\n".join(problems)
 
@@ -275,7 +275,8 @@ def test_every_compose_file_as_written_carries_the_transport():
             assert q.get("sslmode") in SECURE_SSLMODES, f"{path.name}: {m.group(0)[:60]}…"
             for param in ("sslrootcert", "sslcert", "sslkey"):
                 assert q.get(param), f"{path.name}: no {param} in {m.group(0)[:60]}…"
-    assert seen >= 12, f"only {seen} DSN literals across the compose files"
+    # cluster 5 + trellion 5 (the licensed add-ons' overlays left core, N6)
+    assert seen >= 10, f"only {seen} DSN literals across the compose files"
 
 
 def test_the_dsn_checker_catches_each_gap():
@@ -314,21 +315,8 @@ def test_the_policy_is_in_the_standalone_manifest():
 
 
 # ── evolve stages the key it presents ───────────────────────────────────
-
-
-def test_evolve_stages_its_key_and_rewrites_both_dsns():
-    """libpq refuses the 0644 mounted key; evolve's image has no entrypoint
-    of its own, so the overlay's does the staging and points the DSNs at
-    the 0600 copy. Pinned because a DSN naming an unusable key is a
-    container that cannot reach the database, with no guard above noticing."""
-    svc = untag(load_raw(ROOT / "docker-compose.evolve.yml"))["services"]["noo-evolve"]
-    script = "\n".join(svc["command"])
-    assert "cp /tls/services/evolve/service.key /tmp/pki/services/evolve/service.key" in script
-    assert "chmod 600 /tmp/pki/services/evolve/service.key" in script
-    for var in ("NOO_EVOLVE_DATABASE_URL", "NOO_EVOLVE_DDL_DATABASE_URL"):
-        assert re.search(rf"{var}=.*sed 's#sslkey=/tls/#sslkey=/tmp/pki/#'", script), f"{var} is not rewritten"
-    assert "exec python -m noo_evolve" in script
-    assert any("/services/evolve:/tls/services/evolve:ro" in v for v in svc["volumes"]), "evolve does not mount its own leaf"
+# test_evolve_stages_its_key_and_rewrites_both_dsns: moved with the overlay to
+# the add-on repo (N6).
 
 
 # ── 5. the warm standby streams with its own leaf ──

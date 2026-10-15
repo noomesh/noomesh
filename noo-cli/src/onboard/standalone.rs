@@ -465,6 +465,15 @@ fn read_manifest(home: &Path) -> Result<Option<Manifest>, String> {
     Ok(Some(manifest))
 }
 
+/// Paths an earlier release embedded that this one no longer does, kept in
+/// place for ONE release instead of retired: the licensed add-ons' overlays,
+/// which now travel in each add-on's signed bundle (N6). An add-on whose
+/// lock predates bundles still composes the copy an earlier CLI left here
+/// (with a deprecation warning) until its release re-signs a bundle. The
+/// manifest keeps recording their old sha so the next release, which drops
+/// this list, retires them like any other file.
+const COMPAT_KEEP: &[&str] = &["docker-compose.evolve.yml", "docker-compose.trellion-intel.yml"];
+
 /// Resolve `rel` under `home`, refusing anything that is absolute, has a
 /// `..` component, or whose nearest existing ancestor canonicalises outside
 /// `home` (a symlinked parent pointed elsewhere). Returns the joined path
@@ -496,6 +505,13 @@ fn safe_home_path(home: &Path, rel: &str) -> Option<PathBuf> {
         canon.push(name);
     }
     if canon.starts_with(&home_canon) { Some(dest) } else { None }
+}
+
+/// The sha256 (hex) `.noo-materialised` records for `rel`, the bytes the
+/// CLI that last materialised `home` wrote there. `None` when there is no
+/// manifest, it is unreadable, or it does not list `rel`.
+pub(crate) fn materialised_sha(home: &Path, rel: &str) -> Option<String> {
+    read_manifest(home).ok().flatten()?.files.get(rel).cloned().flatten()
 }
 
 /// Unique `<path>.retired-<version>` — appends `.2`, `.3`, … if that name is
@@ -555,9 +571,16 @@ fn finish_materialize(
         candidates.insert((*path).to_string());
     }
 
+    let mut kept: Vec<(String, String)> = Vec::new();
     for path in candidates {
         if current.contains(path.as_str()) {
             continue; // still shipped — not retired
+        }
+        if COMPAT_KEEP.contains(&path.as_str()) {
+            if let Some(sha) = old_manifest.as_ref().and_then(|m| m.files.get(&path)).cloned().flatten() {
+                kept.push((path.clone(), sha));
+            }
+            continue;
         }
         let Some(dest) = safe_home_path(home, &path) else {
             report.skipped.push(format!("{path}: refusing to retire (not a safe relative path under the install)"));
@@ -608,6 +631,9 @@ fn finish_materialize(
     for (rel, bytes, _) in current_assets {
         let sha = if rendered_once.contains(rel) { None } else { Some(sha256_hex(bytes)) };
         files.insert((*rel).to_string(), sha);
+    }
+    for (path, sha) in kept {
+        files.entry(path).or_insert(Some(sha));
     }
     let manifest = Manifest { version: MANIFEST_VERSION, cli: cli_version.to_string(), files };
     if let Err(e) = write_manifest_atomic(home, &manifest) {
@@ -1046,6 +1072,21 @@ mod tests {
         assert!(!home.join("stale.conf").exists());
         assert!(home.join("stale.conf.retired-1.0.0").is_file());
         assert!(report.moved_aside.iter().any(|l| l.contains("stale.conf")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_compat_kept_addon_overlay_survives_one_release_and_keeps_its_manifest_sha() {
+        let home = fresh_home("compat-keep");
+        let name = COMPAT_KEEP[0];
+        let old_assets: &[(&str, &[u8], bool)] = &[(name, b"OVERLAY", false)];
+        write_assets_for_test(&home, old_assets, &[]);
+        finish_materialize(&home, old_assets, &[], &[], "0.6.3");
+        // The release that stops embedding it keeps it, and its recorded sha.
+        let report = finish_materialize(&home, &[], &[], &[], "0.6.4");
+        assert!(home.join(name).is_file(), "the legacy overlay was retired a release early");
+        assert!(report.retired.is_empty() && report.moved_aside.is_empty());
+        assert_eq!(materialised_sha(&home, name), Some(sha256_hex(b"OVERLAY")));
         let _ = std::fs::remove_dir_all(&home);
     }
 

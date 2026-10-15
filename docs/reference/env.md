@@ -64,7 +64,7 @@ docker diff noo-gateway | grep /run/secrets     # which secret files it was give
 | `NOO_INSTALL_MODE` | `dev` | `scripts/noomesh-start.sh` | `dist` starts from published images (`docker-compose.dist.yml`); `dev` builds from source |
 | `NOO_INSTANCE`, `NOO_PORT_OFFSET` | unset, `0` | `scripts/lib-instance.sh` | a second stack on one host: compose project `noo-<instance>`, container prefix, network, and every host port shifted by the offset ([multi-instance](../getting-started/multi-instance.md)) |
 | `NOO_IMAGE_PREFIX`, `NOO_IMAGE_TAG` | `ghcr.io/<owner>`, newest `stack-v*` tag | launcher, compose | which images dist mode pulls; `NOO_IMAGE_DIGEST_<IMAGE>` pins are exported from `stack.lock` |
-| `NOO_EVOLVE_PATH` | unset | launcher | a local checkout of the evolve add-on whose overlay is composed instead of the shipped `docker-compose.evolve.yml` |
+| `NOO_<NAME>_PATH` | `../noo-<name>` (`_` in the add-on name becomes `-`) | `scripts/lib-addons.sh` `addon_overlay`, `noo security secrets` | a development checkout of a licensed add-on (`<NAME>` is its `addons:` key upper-cased, e.g. NOO_EVOLVE_PATH): its own `docker-compose.<name>.yml` is composed instead of the overlay from its signed bundle, `addons/<name>/docker-compose.yml` |
 | `NOO_PULL_POLICY` | `build` in dev, `missing` in dist | launcher exports it; the trellion overlay's `pull_policy:` | whether compose builds or pulls the add-on images. Set by `NOO_INSTALL_MODE`, not by hand |
 | `NOO_DATA_ROOT` | — | compose, `lib-instance.sh` | host root for every stateful volume; instances must use `<root>/instances/<name>` |
 | `NOO_BIND_MODE` | unset (loopback) | `scripts/lib-bind-addr.sh`, `noo cluster verify` | where the published ports bind: `tailnet` (auto-detect this box's 100.64.0.0/10 address — recommended for a controller), `local` (`127.0.0.1`), `all` (`0.0.0.0`) or a literal IP. Sets `NOO_BIND_ADDR`, `NOO_GRAFANA_BIND_ADDR` and `GRAFANA_ROOT_URL`; apply with `noo stack restart --force` |
@@ -371,10 +371,10 @@ Variables the stack sets for them:
   (default `/data/video_memory`; the directory keeps its historical name), and
   the deprecated `NOO_VIDEO_MEMORY_PATH` is still honoured with a warning
   (the new name wins when both differ).
-- **Intelligent tier** (`docker-compose.trellion-intel.yml`): reads
+- **Intelligent tier** (its bundled overlay, `addons/trellion_intel/docker-compose.yml`): reads
   `RETRIEVAL_TRACKER_PATH` / `RETRIEVAL_BANDIT_PATH` plus the trellion
   variables above.
-- **evolve** (`docker-compose.evolve.yml`): the `NOO_EVOLVE_*` variables
+- **evolve** (its bundled overlay, `addons/evolve/docker-compose.yml`): the `NOO_EVOLVE_*` variables
   and the `NOO_AGENT_*` gates above are read by the evolve container from its
   compose environment, not by the gateway.
 

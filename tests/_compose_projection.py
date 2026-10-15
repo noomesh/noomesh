@@ -28,14 +28,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "docker-compose.cluster.yml"
-# Every add-on overlay that extends or adds services to the base. Listed, not
-# globbed: dist and gpu-embed are not add-ons, and the site override is
-# generated.
+# Every add-on overlay IN THIS TREE that extends or adds services to the base.
+# Listed, not globbed: dist and gpu-embed are not add-ons, and the site
+# override is generated. Licensed add-ons' overlays are not here: each travels
+# in its add-on's signed bundle (N6) and is guarded in its own repository.
 ADDON_OVERLAYS = (
     "docker-compose.trellion.yml",
-    "docker-compose.trellion-intel.yml",
     "docker-compose.voice.yml",
-    "docker-compose.evolve.yml",
 )
 
 

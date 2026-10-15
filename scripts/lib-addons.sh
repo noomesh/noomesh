@@ -73,7 +73,13 @@ fi
 # Turning trellion off is a genuine, bootable configuration (the preflight
 # asks for its tables only when it is enabled). It is simply not something
 # --core-only can decide on the operator's behalf mid-wizard.
-CORE_ONLY_DEFERS="evolve trellion_intel voice"
+#
+# Every licensed add-on is deferred too (addon_on: anything not trellion),
+# without naming one here: they are puzzle pieces core does not list.
+CORE_ONLY_DEFERS="voice"
+# The add-ons whose overlay ships in this tree. Every other add-on's overlay
+# arrives in its own signed bundle (N6): addons/<name>/docker-compose.yml.
+CORE_OVERLAY_ADDONS="trellion voice"
 
 # addon_on NAME DEFAULT(0|1) — is this add-on switched on?
 #
@@ -89,6 +95,10 @@ addon_on() {
         case " $CORE_ONLY_DEFERS " in
             *" $1 "*) return 1 ;;
         esac
+        case " $CORE_OVERLAY_ADDONS " in
+            *" $1 "*) : ;;
+            *) return 1 ;;
+        esac
     fi
     _ao_line="$(printf '%s\n' "$NOO_ADDON_MAP" | grep -E "^$1=" | tail -1)"
     if [ -n "$_ao_line" ]; then
@@ -103,12 +113,14 @@ addon_on() {
 # (controller, standalone, gpu-tier*, monitoring…), which are not add-ons.
 
 
-# The overlay add-ons (trellion, voice, trellion_intel, evolve): echoes `-f <overlay>` pairs
-# or nothing. Same contract — append unquoted to COMPOSE_FILES (lib-compose.sh
-# is the one caller).
+# The overlay add-ons: echoes `-f <overlay>` pairs or nothing. Same contract —
+# append unquoted to COMPOSE_FILES (lib-compose.sh is the one caller).
+# The core overlays first (trellion FIRST: a licensed add-on's overlay may
+# extend its service), then every other add-on declared ON in the map, by
+# name, from addon_overlay. Licensed add-ons default off, so only an explicit
+# `<name>: true` composes one.
 addon_compose_overlay_args() {
     _aco_out=""
-    # trellion FIRST: the Intelligent tier's overlay extends its service.
     if addon_on trellion 1; then
         _aco="$(addons_trellion_overlay)"
         [ -n "$_aco" ] && _aco_out="$_aco_out -f $_aco"
@@ -117,15 +129,72 @@ addon_compose_overlay_args() {
         _aco="$(addons_voice_overlay)"
         [ -n "$_aco" ] && _aco_out="$_aco_out -f $_aco"
     fi
-    if addon_on trellion_intel 0; then
-        _aco="$(addons_trellion_intel_overlay)"
+    for _aco_n in $(addon_licensed_names); do
+        addon_on "$_aco_n" 0 || continue
+        _aco="$(addon_overlay "$_aco_n")"
         [ -n "$_aco" ] && _aco_out="$_aco_out -f $_aco"
-    fi
-    if addon_on evolve 0; then
-        _aco="$(addons_evolve_overlay)"
-        [ -n "$_aco" ] && _aco_out="$_aco_out -f $_aco"
-    fi
+    done
     printf '%s' "${_aco_out# }"
+    return 0
+}
+
+# addon_licensed_names — every add-on that is not a core overlay add-on and
+# that the map names or that has a bundle materialised, one per line, sorted
+# (a stable compose order). Never a fixed list: core names no licensed add-on.
+addon_licensed_names() {
+    _aln_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    {
+        printf '%s\n' "$NOO_ADDON_MAP" | sed -n 's/^\([a-z][a-z0-9_]*\)=.*/\1/p'
+        for _aln_d in "$_aln_here"/addons/*/; do
+            [ -f "${_aln_d}docker-compose.yml" ] && basename "$_aln_d"
+        done
+    } | while read -r _aln_n; do
+        case " $CORE_OVERLAY_ADDONS " in *" $_aln_n "*) continue ;; esac
+        [ -n "$_aln_n" ] && printf '%s\n' "$_aln_n"
+    done | sort -u
+    return 0
+}
+
+# addon_overlay NAME — the compose overlay for a licensed add-on, or nothing:
+#   1. a development checkout of the add-on, when one is there:
+#      ${NOO_<NAME>_PATH:-../noo-<name>}/docker-compose.<name>.yml (name with
+#      `-` for `_`); it bind-mounts source for live editing;
+#   2. its signed bundle: addons/<name>/docker-compose.yml under this install,
+#      written by `noo addons enable|upgrade` after verifying the add-on's
+#      signed lock (dist starts re-verify the bytes: lib-dist.sh
+#      require_addon_pins → `noo addons launch-pins`);
+#   3. DEPRECATED, one release (0.6.4): docker-compose.<name>.yml beside this
+#      launcher, which an earlier CLI shipped, for an add-on whose lock
+#      predates bundles. Warns.
+addon_overlay() {
+    _ao_name="$1"
+    _ao_kebab="$(printf '%s' "$_ao_name" | tr '_' '-')"
+    _ao_var="NOO_$(printf '%s' "$_ao_name" | tr 'a-z' 'A-Z')_PATH"
+    _ao_base="${!_ao_var:-../noo-$_ao_kebab}"
+    _ao_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if [ -f "$_ao_base/docker-compose.$_ao_kebab.yml" ]; then
+        printf '%s' "$_ao_base/docker-compose.$_ao_kebab.yml"
+    elif [ -f "$_ao_here/addons/$_ao_name/docker-compose.yml" ]; then
+        printf '%s' "$_ao_here/addons/$_ao_name/docker-compose.yml"
+    elif [ -f "$_ao_here/docker-compose.$_ao_kebab.yml" ]; then
+        echo "WARN: add-on $_ao_name runs the deprecated overlay $_ao_here/docker-compose.$_ao_kebab.yml: its signed lock predates overlay bundles. This fallback is removed in the next release — the add-on's release must re-sign a bundle for this stack, then: noo addons upgrade $_ao_name" >&2
+        printf '%s' "$_ao_here/docker-compose.$_ao_kebab.yml"
+    fi
+    return 0
+}
+
+# addon_own_services OVERLAY — the services OVERLAY adds to the stack (its
+# `services:` keys that the composed base, $COMPOSE_FILES, does not already
+# define): what to stop when the add-on is switched off on a live stack.
+# Derived, so core names no add-on service.
+addon_own_services() {
+    _aos_base="$(docker compose $COMPOSE_FILES config --services 2>/dev/null || true)"
+    awk '/^services:[[:space:]]*$/ { s = 1; next }
+         s && /^[^[:space:]#]/ { s = 0 }
+         s && /^  [A-Za-z0-9][A-Za-z0-9_.-]*:/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$1" \
+        | while read -r _aos_s; do
+            printf '%s\n' "$_aos_base" | grep -qx "$_aos_s" || printf '%s\n' "$_aos_s"
+        done
     return 0
 }
 
@@ -143,16 +212,6 @@ addons_voice_overlay() {
     _ao_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     if [ -f "$_ao_here/docker-compose.voice.yml" ]; then
         printf '%s' "$_ao_here/docker-compose.voice.yml"
-    fi
-}
-
-# addons_trellion_intel_overlay — the Intelligent tier's overlay, shipped in
-# this tree. It EXTENDS the base's trellion service, so
-# it is only meaningful beside docker-compose.cluster.yml.
-addons_trellion_intel_overlay() {
-    _ao_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    if [ -f "$_ao_here/docker-compose.trellion-intel.yml" ]; then
-        printf '%s' "$_ao_here/docker-compose.trellion-intel.yml"
     fi
 }
 
@@ -199,27 +258,34 @@ warn_retired_env_keys() {
     return 0
 }
 
-# addons_evolve_overlay — echo the evolve compose overlay path, if present.
-# The overlay travels with the code: it lives in the
-# noo-evolve checkout, and its relative paths still resolve against the
-# CALLER's directory, because compose resolves them against the first -f
-# file's location.
-addons_evolve_overlay() {
-    _ao_base="${NOO_EVOLVE_PATH:-../noo-evolve}"
-    if [ -f "$_ao_base/docker-compose.evolve.yml" ]; then
-        printf '%s' "$_ao_base/docker-compose.evolve.yml"
-    elif [ -f "$_ao_base/docker-compose.pro.yml" ]; then
-        # The dev overlay's pre-proposal-54 name; a checkout that has not
-        # pulled the rename still composes.
-        printf '%s' "$_ao_base/docker-compose.pro.yml"
-    else
-        # No checkout: the PUBLISHED image, through the overlay that ships in
-        # this tree. Before this fallback, `addons.evolve: true` with no
-        # checkout meant the gateway provisioned the add-on and /health
-        # reported it enabled while nothing served it (2026-09-14).
-        _ao_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-        if [ -f "$_ao_here/docker-compose.evolve.yml" ]; then
-            printf '%s' "$_ao_here/docker-compose.evolve.yml"
-        fi
-    fi
+# addons_report_licensed — one line per licensed add-on declared on, saying
+# where its overlay comes from (or that none was found, in which case a dist
+# start refuses it in require_addon_pins and a dev start runs without it).
+addons_report_licensed() {
+    for _arl_n in $(addon_licensed_names); do
+        addon_on "$_arl_n" 0 || continue
+        _arl_o="$(addon_overlay "$_arl_n" 2>/dev/null)"
+        case "$_arl_o" in
+            '') echo "addons.$_arl_n is true but no overlay was found: not in its signed bundle (noo addons upgrade $_arl_n) nor in a development checkout (NOO_$(printf '%s' "$_arl_n" | tr 'a-z' 'A-Z')_PATH)" ;;
+            */addons/"$_arl_n"/docker-compose.yml) echo "Add-on $_arl_n: ENABLED (its signed bundle, $_arl_o)" ;;
+            *) echo "Add-on $_arl_n: ENABLED (via $_arl_o)" ;;
+        esac
+    done
+    return 0
+}
+
+# addons_stop_disabled — a licensed add-on switched OFF on a live stack: its
+# overlay is not composed, so `up` never touches its containers. Name the
+# overlay just to reach them, and stop the services it adds.
+addons_stop_disabled() {
+    for _asd_n in $(addon_licensed_names); do
+        addon_on "$_asd_n" 0 && continue
+        _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
+        [ -n "$_asd_o" ] || continue
+        _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
+        [ -n "${_asd_s// /}" ] || continue
+        # shellcheck disable=SC2086
+        docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
+    done
+    return 0
 }

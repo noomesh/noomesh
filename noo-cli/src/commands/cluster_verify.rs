@@ -1468,7 +1468,7 @@ pub(crate) fn required_service_keys(addon_on: &dyn Fn(&str) -> bool) -> Vec<(Str
         let name = short.to_ascii_lowercase().replace('_', "-");
         out.push((name.clone(), format!("svc:{name}")));
     }
-    for d in crate::commands::secrets::ADDON_DECLS {
+    for d in crate::commands::secrets::addon_decls() {
         if addon_on(d.addon) {
             out.push((d.addon.replace('_', "-"), d.consumer.to_string()));
         }

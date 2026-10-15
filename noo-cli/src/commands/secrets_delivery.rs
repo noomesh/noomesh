@@ -869,20 +869,38 @@ pub(crate) fn delivery_finding(d: &Delivery, added: Option<&[String]>, set: &[St
     }
 }
 
-/// The compose files whose deliveries the audit checks: the base, then the
-/// add-on overlays beside it. An overlay whose add-on is
+/// The compose files in this tree whose deliveries the audit checks: the
+/// base, then the add-on overlay beside it. An overlay whose add-on is
 /// off has no running container, and `delivery_finding` judges nothing for
-/// a container that is not running here.
-pub(crate) const DELIVERING_FILES: &[&str] =
-    &["docker-compose.cluster.yml", "docker-compose.trellion.yml", "docker-compose.trellion-intel.yml", "docker-compose.evolve.yml"];
+/// a container that is not running here. Licensed add-ons' overlays are
+/// read from where their bundles put them ([`delivering_paths`]).
+pub(crate) const DELIVERING_FILES: &[&str] = &["docker-compose.cluster.yml", "docker-compose.trellion.yml"];
+
+/// Every compose file under `root` whose deliveries the audit reads:
+/// [`DELIVERING_FILES`], then each licensed add-on's bundled overlay
+/// (`addons/<name>/docker-compose.yml`), else the deprecated overlay an
+/// earlier CLI left beside the base.
+pub(crate) fn delivering_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = DELIVERING_FILES.iter().map(|f| root.join(f)).collect();
+    for row in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
+        let bundled = crate::addons::pins::addon_dir(root, row.key).join(crate::addon_lock::OVERLAY_FILE);
+        let legacy = crate::addons::pins::legacy_overlay(root, row.key);
+        if bundled.is_file() {
+            out.push(bundled);
+        } else if legacy.is_file() {
+            out.push(legacy);
+        }
+    }
+    out
+}
 
 /// The `secrets audit` findings for file delivery, against the running
 /// compose files at the repo root. Silent when they deliver nothing.
 pub fn file_delivery_findings() -> Vec<Finding> {
     let root = crate::envfile::repo_root();
-    let all: Vec<Delivery> = DELIVERING_FILES
+    let all: Vec<Delivery> = delivering_paths(&root)
         .iter()
-        .flat_map(|f| deliveries(&std::fs::read_to_string(root.join(f)).unwrap_or_default()))
+        .flat_map(|f| deliveries(&std::fs::read_to_string(f).unwrap_or_default()))
         .collect();
     let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for d in &all {
@@ -1254,46 +1272,52 @@ mod tests {
         }
     }
 
-    /// The audit reads the add-on overlays too, and each
-    /// add-on's key file is pointed at by its own `NOO_GATEWAY_KEY_FILE`.
+    /// The audit reads the add-on overlay too, and the add-on's key file is
+    /// pointed at by its own `NOO_GATEWAY_KEY_FILE`. (The licensed add-ons'
+    /// overlays and their delivery guards live in the add-on repositories
+    /// now; the audit reads them where their bundles put them.)
     #[test]
     fn the_shipped_add_on_overlays_deliver_with_pointers() {
-        let mut ds = deliveries(include_str!("../../../docker-compose.trellion.yml"));
-        ds.extend(deliveries(include_str!("../../../docker-compose.trellion-intel.yml")));
-        ds.extend(deliveries(include_str!("../../../docker-compose.evolve.yml")));
+        let ds = deliveries(include_str!("../../../docker-compose.trellion.yml"));
         for (svc, container, target, ptr) in [
             ("trellion", "noo-trellion", "noo_gateway_key", "NOO_GATEWAY_KEY_FILE"),
             ("trellion", "noo-trellion", "pgpass", "PGPASSFILE"),
-            ("trellion-intel", "noo-trellion-intel", "noo_gateway_key", "NOO_GATEWAY_KEY_FILE"),
-            ("noo-evolve", "noo-evolve", "noo_gateway_key", "NOO_GATEWAY_KEY_FILE"),
-            ("noo-evolve", "noo-evolve", "pgpass", "PGPASSFILE"),
         ] {
-            // (evolve's shared-secret deliveries are asserted ABSENT below.)
             let d = ds
                 .iter()
                 .find(|d| d.service == svc && d.target == target)
                 .unwrap_or_else(|| panic!("{svc}/{target} not delivered"));
-            // `${NOO_CONTAINER_PREFIX:-noo}-x` resolves per instance; evolve
-            // names its container outright.
-            let want = if container == "noo-evolve" { container.to_string() } else { crate::envfile::container(&container["noo-".len()..]) };
-            assert_eq!(d.container, want, "{svc}");
+            // `${NOO_CONTAINER_PREFIX:-noo}-x` resolves per instance.
+            assert_eq!(d.container, crate::envfile::container(&container["noo-".len()..]), "{svc}");
             assert_eq!(d.pointer.as_deref(), Some(ptr), "{svc}/{target}");
         }
         assert!(ds.iter().all(|d| d.pointer.is_some()), "{ds:?}");
-        // Evolve's own key is its only gateway credential, so
-        // neither shared secret is delivered to it any more.
-        for target in ["noo_controller_secret", "noo_cluster_secret"] {
-            assert!(
-                !ds.iter().any(|d| d.service == "noo-evolve" && d.target == target),
-                "noo-evolve is handed {target} again: {ds:?}"
-            );
-        }
         for d in &ds {
             let p = d.pointer.as_deref().unwrap();
             if let Some(n) = p.strip_suffix("_FILE") {
                 assert!(TIER1.contains(&n), "{n} is delivered as a file but is not in TIER1");
             }
         }
+    }
+
+    #[test]
+    fn the_audit_reads_a_bundled_overlay_and_falls_back_to_a_legacy_one() {
+        let d = std::env::temp_dir().join(format!("noo-delivering-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let base = delivering_paths(&d);
+        assert_eq!(base.len(), DELIVERING_FILES.len());
+        let bundled = crate::addons::pins::addon_dir(&d, "evolve").join("docker-compose.yml");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "services: {}\n").unwrap();
+        let legacy = crate::addons::pins::legacy_overlay(&d, "trellion_intel");
+        std::fs::write(&legacy, "services: {}\n").unwrap();
+        let got = delivering_paths(&d);
+        assert!(got.contains(&bundled) && got.contains(&legacy), "{got:?}");
+        // A bundle wins over a legacy copy of the same add-on.
+        std::fs::write(crate::addons::pins::legacy_overlay(&d, "evolve"), "services: {}\n").unwrap();
+        assert!(!delivering_paths(&d).contains(&crate::addons::pins::legacy_overlay(&d, "evolve")));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

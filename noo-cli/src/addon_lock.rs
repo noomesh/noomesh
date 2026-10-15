@@ -30,6 +30,15 @@
 //! base digest and downgrades are separate pure helpers, because the
 //! caller knows the stack tag, the stack lock and the pinned version; the
 //! lock alone does not.
+//!
+//! Two formats. `noo-addon-lock/1` pins images only. `noo-addon-lock/2`
+//! (N6, the add-on BUNDLE) adds `files`: every file core used to ship for
+//! the add-on (its compose overlay first of all), by name and sha256, so the
+//! one signature covers them too. The files travel as extra layers of the
+//! same OCI artifact (`crate::addons::lock_fetch`) and are materialised under
+//! `<install root>/addons/<addon>/`; [`verify_files`] holds their bytes to
+//! the signed hashes. A release publishes both forms side by side, because
+//! a CLI from before v2 refuses an unknown field and an unknown format.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,8 +48,13 @@ use serde::{Deserialize, Serialize};
 use crate::commands::upgrade::cmp_cli_semver;
 use crate::release_sig;
 
-/// The one lock format this build reads.
+/// The images-only lock format.
 pub const FORMAT: &str = "noo-addon-lock/1";
+/// The bundle format: [`FORMAT`] plus `files`.
+pub const FORMAT_V2: &str = "noo-addon-lock/2";
+/// The one file every bundle carries: the add-on's compose overlay, which
+/// the launcher composes from `<install root>/addons/<addon>/`.
+pub const OVERLAY_FILE: &str = "docker-compose.yml";
 
 /// The base image an add-on is built `FROM`, by its stack-lock row name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +84,10 @@ pub struct AddonLock {
     /// Set when the add-on is built on a stack image and must match it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<BaseImage>,
+    /// Bundle files (v2 only): file name to `sha256:<64 hex>` of its bytes.
+    /// Empty, and absent from the canonical bytes, in a v1 lock.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
 }
 
 /// Whom to trust for one add-on: its signing keys (current first) and the
@@ -115,6 +133,14 @@ pub enum AddonLockError {
     NotDigestRef { image: String, reference: String },
     OutsideRegistry { image: String, reference: String, root: String },
     BaseMismatch { image: String, locked: String, stack: String },
+    /// A v1 lock carries `files`, or a v2 lock carries none.
+    FilesFormat(String),
+    /// A bundle file name that is not a plain file name.
+    BadFileName(String),
+    /// A v2 lock without the compose overlay.
+    NoOverlay,
+    /// A bundle file is missing, extra, or does not hash to the lock.
+    FileMismatch { name: String, why: String },
 }
 
 impl fmt::Display for AddonLockError {
@@ -142,6 +168,10 @@ impl fmt::Display for AddonLockError {
                 f,
                 "Add-on base {image} mismatch: built on {locked}, the stack lock pins {stack}"
             ),
+            FilesFormat(why) => write!(f, "Add-on lock files invalid: {why}"),
+            BadFileName(n) => write!(f, "Add-on bundle file name {n:?} is not a plain file name"),
+            NoOverlay => write!(f, "Add-on bundle carries no {OVERLAY_FILE}"),
+            FileMismatch { name, why } => write!(f, "Add-on bundle file {name} {why}"),
         }
     }
 }
@@ -156,6 +186,22 @@ pub fn is_sha256_digest(d: &str) -> bool {
 
 fn is_stack_tag(t: &str) -> bool {
     t.starts_with('v') && cmp_cli_semver(t, t).is_some()
+}
+
+/// A bundle file name: one path component of `[A-Za-z0-9._-]`, not
+/// starting with a dot or dash, at most 128 bytes. Never a path.
+pub fn valid_file_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 128
+        && n.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// `sha256:<hex>` of `bytes`.
+pub fn sha256_ref(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let h: String = sha2::Sha256::digest(bytes).iter().map(|x| format!("{x:02x}")).collect();
+    format!("sha256:{h}")
 }
 
 fn is_commit(c: &str) -> bool {
@@ -214,8 +260,28 @@ impl AddonLock {
     /// runs it with the anchor's root; a signer runs it before signing, with
     /// `None` when it has no root to hold the refs to.
     pub fn validate(&self, expected_addon: &str, registry_root: Option<&str>) -> Result<(), AddonLockError> {
-        if self.format != FORMAT {
-            return Err(AddonLockError::UnknownFormat(self.format.clone()));
+        match self.format.as_str() {
+            FORMAT if !self.files.is_empty() => {
+                return Err(AddonLockError::FilesFormat(format!("a {FORMAT} lock carries no files ({FORMAT_V2} does)")));
+            }
+            FORMAT => {}
+            FORMAT_V2 => {
+                if self.files.is_empty() {
+                    return Err(AddonLockError::FilesFormat(format!("a {FORMAT_V2} lock lists its files")));
+                }
+                for (name, digest) in &self.files {
+                    if !valid_file_name(name) {
+                        return Err(AddonLockError::BadFileName(name.clone()));
+                    }
+                    if !is_sha256_digest(digest) {
+                        return Err(AddonLockError::BadDigest { image: name.clone(), digest: digest.clone() });
+                    }
+                }
+                if !self.files.contains_key(OVERLAY_FILE) {
+                    return Err(AddonLockError::NoOverlay);
+                }
+            }
+            _ => return Err(AddonLockError::UnknownFormat(self.format.clone())),
         }
         if self.addon != expected_addon {
             return Err(AddonLockError::AddonMismatch { expected: expected_addon.to_string(), found: self.addon.clone() });
@@ -266,6 +332,30 @@ impl AddonLock {
         }
         Ok(())
     }
+}
+
+/// Hold bundle files to a verified lock: exactly the names it lists, each
+/// hashing to its signed digest. A v1 lock (no `files`) accepts only no
+/// files. `files` is name to bytes.
+pub fn verify_files(lock: &AddonLock, files: &BTreeMap<String, Vec<u8>>) -> Result<(), AddonLockError> {
+    for name in files.keys() {
+        if !lock.files.contains_key(name) {
+            return Err(AddonLockError::FileMismatch { name: name.clone(), why: "is not listed in the signed lock".into() });
+        }
+    }
+    for (name, want) in &lock.files {
+        let Some(bytes) = files.get(name) else {
+            return Err(AddonLockError::FileMismatch { name: name.clone(), why: "is missing".into() });
+        };
+        let got = sha256_ref(bytes);
+        if &got != want {
+            return Err(AddonLockError::FileMismatch {
+                name: name.clone(),
+                why: format!("hashes to {got}, and the signed lock says {want}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Sign a lock with an add-on seed (64 hex). Returns the canonical bytes
@@ -348,7 +438,58 @@ mod tests {
             supports_stack: vec!["v0.6.0".into(), "v0.6.1-rc.1".into()],
             images,
             base: Some(BaseImage { image: "trellion".into(), digest: d('c') }),
+            files: BTreeMap::new(),
         }
+    }
+    fn bundle() -> (AddonLock, BTreeMap<String, Vec<u8>>) {
+        let mut l = lock();
+        l.format = FORMAT_V2.into();
+        let files: BTreeMap<String, Vec<u8>> =
+            BTreeMap::from([(OVERLAY_FILE.to_string(), b"services: {}\n".to_vec())]);
+        l.files = files.iter().map(|(n, b)| (n.clone(), sha256_ref(b))).collect();
+        (l, files)
+    }
+
+    #[test]
+    fn a_bundle_signs_verifies_and_holds_its_files_to_the_signature() {
+        let (l, files) = bundle();
+        let (bytes, sig) = signed(&l);
+        let v = verify(&bytes, &sig, &anchor(), "example_addon").unwrap();
+        assert_eq!(v.lock, l);
+        assert!(String::from_utf8(bytes.clone()).unwrap().ends_with(&format!(r#""files":{{"{OVERLAY_FILE}":"{}"}}}}"#, l.files[OVERLAY_FILE])));
+        assert_eq!(verify_files(&v.lock, &files), Ok(()));
+        // A changed byte, a missing file and an unlisted file are each refused.
+        let mut tampered = files.clone();
+        tampered.get_mut(OVERLAY_FILE).unwrap().push(b'#');
+        assert!(matches!(verify_files(&v.lock, &tampered), Err(AddonLockError::FileMismatch { ref why, .. }) if why.contains("hashes to")));
+        assert!(matches!(verify_files(&v.lock, &BTreeMap::new()), Err(AddonLockError::FileMismatch { ref why, .. }) if why == "is missing"));
+        let mut extra = files.clone();
+        extra.insert("routes.json".into(), b"{}".to_vec());
+        assert!(matches!(verify_files(&v.lock, &extra), Err(AddonLockError::FileMismatch { ref name, .. }) if name == "routes.json"));
+        // A v1 lock accepts no files at all.
+        assert_eq!(verify_files(&lock(), &BTreeMap::new()), Ok(()));
+        assert!(verify_files(&lock(), &files).is_err());
+    }
+
+    #[test]
+    fn bundle_format_rules() {
+        type Mutate = fn(&mut AddonLock);
+        let cases: Vec<Mutate> = vec![
+            |l| l.format = FORMAT.into(),                       // v1 with files
+            |l| l.files.clear(),                                // v2 without files
+            |l| { let d = l.files.remove(OVERLAY_FILE).unwrap(); l.files.insert("other.yml".into(), d); }, // no overlay
+            |l| { l.files.insert("../x".into(), d('a')); },     // a path
+            |l| { l.files.insert(".hidden".into(), d('a')); },
+            |l| { l.files.insert("a/b".into(), d('a')); },
+            |l| { l.files.insert("x.yml".into(), "sha256:no".into()); },
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let (mut l, _) = bundle();
+            mutate(&mut l);
+            let (bytes, sig) = signed(&l);
+            assert!(verify(&bytes, &sig, &anchor(), "example_addon").is_err(), "case {i} verified");
+        }
+        assert!(valid_file_name("docker-compose.yml") && valid_file_name("routes.json"));
     }
     fn anchor() -> TrustAnchor {
         TrustAnchor { keys: vec![pk(&seed())], registry: ROOT.into() }

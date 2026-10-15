@@ -20,13 +20,13 @@ What this pins, from the shipped files:
      validated at startup, `addon_proxy::validate`; the Rust unit test
      `every_addon_door_is_https` plants `http://`);
   2. every such add-on has a row in LISTENER_TLS below (a new HTTP add-on
-     without one fails, naming it), and its service in the composed
-     projection declares that row's cert / key / client-CA env, each naming
-     a file under one of the service's own mounts — the add-on's OWN
-     `services/<addon>` leaf (never the gateway's) and the cluster CA;
+     without one fails, naming it). That its service declares the row's
+     cert / key / client-CA env under its own `services/<addon>` leaf and
+     the cluster CA is pinned in the add-on's repo, beside its overlay (N6:
+     the licensed overlays left core);
   3. the leaf's SANs (onboard `svc_extra_hostnames`) cover the host the
      manifest dials, so the gateway's verification can succeed at all;
-  4. no compose healthcheck on the service dials plain `http://`;
+  4. (no healthcheck dialling plain `http://`: pinned in the add-on's repo, N6);
   5. the proxy dials through `crate::tls::cluster_client()` (presents the
      gateway leaf, verifies against the cluster CA) and refuses a
      non-`https://` base URL before sending;
@@ -42,15 +42,11 @@ rows of `addons::ADDONS`, and the host each is dialled at is `noo-<addon>`,
 the only upstream `addon_proxy::validate` accepts.
 
 Planted 2026-09-29: `https://` → `http://` in evolve's manifest →
-the gateway's manifest check failed naming evolve; the NOO_EVOLVE_TLS_CERT
-line removed from docker-compose.evolve.yml →
-`test_each_addon_listener_declares_its_mtls_material` fails. Both restored
-from `.bak`.
+the gateway's manifest check failed naming evolve. Restored from `.bak`.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -58,7 +54,6 @@ from urllib.parse import urlparse
 
 import pytest
 
-from tests._compose_projection import env_of, full_projection
 
 ROOT = Path(__file__).resolve().parents[1]
 ADDONS_RS = ROOT / "gateway-rust" / "src" / "addons.rs"
@@ -87,16 +82,6 @@ def _manifests() -> list[dict]:
     return out
 
 
-def _service_for(host: str, services: dict) -> tuple[str, dict]:
-    for name, svc in services.items():
-        if name == host or svc.get("container_name") == host:
-            return name, svc
-    raise AssertionError(
-        f"no composed service answers to {host!r} (by service or container name) — "
-        "the manifest dials a host no overlay provides"
-    )
-
-
 def test_every_manifest_dials_https() -> None:
     """The gateway refuses any manifest whose upstream is not https://."""
     src = PROXY.read_text()
@@ -117,50 +102,7 @@ def test_every_http_addon_has_a_listener_tls_row() -> None:
     )
 
 
-def _mount_targets(svc: dict) -> dict[str, str]:
-    out = {}
-    for v in svc.get("volumes") or []:
-        if isinstance(v, dict):
-            out[v["target"]] = str(v.get("source", ""))
-        else:
-            src, _, rest = str(v).partition(":")
-            out[rest.split(":")[0]] = src
-    return out
-
-
-def _under(path: str, targets: dict[str, str]) -> str | None:
-    for t in targets:
-        if path == t or path.startswith(t.rstrip("/") + "/"):
-            return t
-    return None
-
-
-def test_each_addon_listener_declares_its_mtls_material() -> None:
-    services = full_projection()["services"]
-    for m in _manifests():
-        addon = m["addon"]
-        host = urlparse(m["base_url_default"]).hostname
-        name, svc = _service_for(host, services)
-        env = env_of(svc)
-        targets = _mount_targets(svc)
-        cert_env, key_env, ca_env = LISTENER_TLS[addon]
-        for var in (cert_env, key_env, ca_env):
-            assert env.get(var, "").strip(), (
-                f"{name} does not declare {var}: its listener would refuse to start "
-                "(or, on an older image, serve plaintext)"
-            )
-            t = _under(env[var], targets)
-            assert t, f"{name} {var}={env[var]} is not under any of its mounts {sorted(targets)}"
-        for var in (cert_env, key_env):
-            t = _under(env[var], targets)
-            assert targets[t].rstrip("/").endswith(f"services/{addon}"), (
-                f"{name} {var} comes from {targets[t]!r}: an add-on serves with its OWN "
-                f"services/{addon} leaf, never the gateway's"
-            )
-        ca_src = targets[_under(env[ca_env], targets)]
-        assert ca_src.endswith("/ca.crt") and env[ca_env].endswith("ca.crt"), (
-            f"{name} {ca_env} does not come from the cluster CA mount ({ca_src!r})"
-        )
+# test_each_addon_listener_declares_its_mtls_material: moved with the overlay to the add-on repo (N6)
 
 
 def test_the_leaf_covers_the_host_the_gateway_dials() -> None:
@@ -179,12 +121,7 @@ def test_the_leaf_covers_the_host_the_gateway_dials() -> None:
         )
 
 
-def test_no_addon_healthcheck_dials_plaintext() -> None:
-    services = full_projection()["services"]
-    for m in _manifests():
-        name, svc = _service_for(urlparse(m["base_url_default"]).hostname, services)
-        hc = json.dumps(svc.get("healthcheck") or {})
-        assert "http://" not in hc, f"{name} healthcheck dials plain http: {hc}"
+# test_no_addon_healthcheck_dials_plaintext: moved with the overlay to the add-on repo (N6)
 
 
 def test_the_proxy_dials_through_the_cluster_client_and_refuses_plaintext() -> None:

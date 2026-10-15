@@ -163,11 +163,13 @@ NOO_PGPASS_ROLES_EVOLVE="libpq noo_evolve:NOO_EVOLVE_DB_PASSWORD noo_evolve_ddl:
 # merges them across `-f` files), so every `docker-compose.*.yml` next to the
 # base is read too — a source exported for an overlay that is not composed is
 # inert, and one missed for an overlay that IS composed stops compose
-# creating that service ("required by secret … is not set").
+# creating that service ("required by secret … is not set"). A licensed
+# add-on's overlay arrives in its signed bundle and sits under
+# addons/<name>/docker-compose.yml below the base (N6), so those are read too.
 file_secret_sources() {
     local compose="${1:-docker-compose.cluster.yml}" f
     [ -f "$compose" ] || return 0
-    for f in "$compose" "$(dirname "$compose")"/docker-compose.*.yml; do
+    for f in "$compose" "$(dirname "$compose")"/docker-compose.*.yml "$(dirname "$compose")"/addons/*/docker-compose.yml; do
         [ -f "$f" ] || continue
         _file_secret_sources_one "$f"
     done | awk '!seen[$0]++'

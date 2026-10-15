@@ -246,7 +246,8 @@ def test_every_audit_writer_is_given_the_key_and_the_registry_says_so():
         n for n, svc in services.items()
         if n == "gateway" or "NOO_WORKER_SURFACES" in env_of(svc)
     )
-    assert {"gateway", "worker", "trellion", "trellion-intel"} <= set(writers), writers
+    # trellion-intel's row: moved with the overlay to the add-on repo (N6)
+    assert {"gateway", "worker", "trellion"} <= set(writers), writers
     for n in writers:
         assert _file_source_var(services[n], "NOO_AUDIT_HMAC_KEY_FILE") == "NOO_AUDIT_HMAC_KEY", (
             f"{n} writes security audit rows but is not given NOO_AUDIT_HMAC_KEY as a file"
@@ -257,7 +258,23 @@ def test_every_audit_writer_is_given_the_key_and_the_registry_says_so():
     block = block[:block.index("required_when")]
     consumers = set(re.findall(r'"(noo-[a-z-]+)"', block[block.index("consumers"):]))
     assert consumers, "parsed no consumers from the NOO_AUDIT_HMAC_KEY registry row"
-    assert consumers == {"noo-" + n for n in writers}, (consumers, writers)
+    # A licensed add-on's container (its overlay arrives in its signed bundle,
+    # N6) is a writer core cannot compose, so the row may name it beyond the
+    # composed writers — but only as `noo-<add-on>` for an ADDON_ROWS row with
+    # `licensed: Some(..)`, and never a container core composes as a non-writer.
+    rows = (Path(__file__).resolve().parents[1] / "noo-cli/src/commands/addons.rs").read_text()
+    licensed = {
+        "noo-" + k.replace("_", "-")
+        for k in re.findall(r'key:\s*"([a-z_]+)",[^}]*?licensed:\s*Some\(', rows, re.S)
+    }
+    assert licensed, "parsed no licensed add-on from ADDON_ROWS — the parse broke"
+    composed = {"noo-" + n for n in services}
+    extra = consumers - {"noo-" + n for n in writers}
+    assert extra <= licensed - composed, (
+        f"the NOO_AUDIT_HMAC_KEY row names {sorted(extra - (licensed - composed))}, which is "
+        "neither a composed audit writer nor a licensed add-on's container"
+    )
+    assert {"noo-" + n for n in writers} <= consumers, (consumers, writers)
 
 
 if __name__ == "__main__":
