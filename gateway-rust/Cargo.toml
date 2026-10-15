@@ -20,7 +20,7 @@ ed25519-dalek = "2"
 # Agent-message sealing: X25519 key agreement +
 # ChaCha20-Poly1305 AEAD. Pure Rust, same dalek family as the entitlement key.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 zeroize = "1"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace", "add-extension", "catch-panic"] }
 
