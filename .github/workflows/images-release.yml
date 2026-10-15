@@ -196,7 +196,7 @@ jobs:
             "docker.io/mwader/static-ffmpeg:$FFMPEG_VERSION"
 
   # deps-core is the NON-ML tier of the shared Python base:
-  # base deps + web/cache/feedback/pgvector/google-chat/mcp extras, no
+  # base deps + web/cache/feedback/pgvector/mcp extras, no
   # torch and no noo-trellion — so no trellion checkout and no sibling read token
   # secret here. It must publish first: sandbox + worker FROM it
   # directly (DEPS_CORE build-arg), and deps-base FROMs it to add the ML

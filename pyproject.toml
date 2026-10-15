@@ -37,6 +37,9 @@ classifiers = [
 
 dependencies = [
   "typer>=0.12",
+  # Imported directly (cli_utils.py: click.get_current_context); typer pulls
+  # it in, but a direct import is declared, not borrowed.
+  "click>=8.0",
   "rich>=13.7",
   "pydantic>=2.6",
   "pyyaml>=6.0",
@@ -45,8 +48,6 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "structlog>=24.0",
   "tenacity>=8.0",
-  "python-jose[cryptography]>=3.3",
-  "bcrypt>=5.0.0",
   "cryptography>=41.0",
   "nats-py>=2.6.0",
   "croniter>=1.3",
@@ -75,8 +76,13 @@ Issues = "https://github.com/noomesh/noomesh/issues"
 # Anything importing trellion must tolerate its absence via the project's
 # try/except ImportError + X_AVAILABLE convention. The ref is the literal
 # `@main` below: a PEP 508 direct URL cannot be templated.
+#
+# trellion declares its own packages: core imports none of numpy, faiss,
+# networkx, igraph, scipy or pymupdf, so the old core `graph`,
+# `recall-memory` and `rag`-pymupdf lines are gone; the feature extras named
+# here (video = faiss, rag = pymupdf, graph-igraph) keep the image closure.
 trellion = [
-  "trellion[transport,video] @ git+https://github.com/personifAI/trellion.git@main",
+  "trellion[transport,video,rag,graph-igraph] @ git+https://github.com/personifAI/trellion.git@main",
 ]
 web = ["ddgs>=6.0"]
 # Pinned to 1.x: mcp 2.0 removed the decorator API on Server, so the
@@ -92,7 +98,7 @@ mcp = ["mcp[cli]>=1.2,<2"]
 # scheduler uninitialised. tests/test_worker_image_dependency_set.py pins it.
 db = ["psycopg[binary]>=3.1", "sqlalchemy[asyncio]>=2.0", "alembic>=1.13", "pgvector>=0.3"]
 pgvector = ["noomesh[db]"]
-rag = ["noomesh[db]", "pymupdf>=1.23", "markitdown[all]>=0.1"]
+rag = ["noomesh[db]", "markitdown[all]>=0.1"]
 voice = [
   "faster-whisper>=1.0.0",
   "piper-tts>=1.2.0",
@@ -100,34 +106,11 @@ voice = [
 ]
 cloud = ["anthropic>=0.25", "openai>=1.12", "google-generativeai>=0.5"]
 cache = ["redis[hiredis]>=4.5.0,<5.0.0"]
-recall-memory = [
-    # Postgres+FAISS (an earlier change recall v2 — drops MP4/QR/cv2/pyzbar)
-    "numpy>=1.24",
-    "faiss-cpu>=1.7.4",
-]
-# Deprecated name of `recall-memory`; image builds and
-# installs that pin it keep working until the release after 0.6.0.
-video-memory = ["noomesh[recall-memory]"]
-graph = [
-    "networkx>=3.1",
-    "python-igraph>=0.11",
-    "scipy>=1.11",
-]
 feedback = ["noomesh[db]"]
-google-chat = ["google-auth>=2.61.0", "requests>=2.28"]
 monitoring = [
-  "prometheus-client>=0.19",
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
   "opentelemetry-exporter-otlp>=1.45.1",
-]
-
-# LLM Backend options
-backends-llamacpp = ["llama-cpp-python[server]>=0.2.0"]
-backends-airllm = ["airllm>=2.8.0"]
-backends-all = [
-  "llama-cpp-python[server]>=0.2.0",
-  "airllm>=2.8.0",
 ]
 
 dev = [
@@ -138,11 +121,12 @@ dev = [
   "mypy>=1.8",
   "pre-commit>=3.6",
   "bandit[toml]>=1.7",
-  "detect-secrets>=1.5",
+  # tests/test_worker_image_dependency_set.py parses requirements with it.
+  "packaging>=23",
 ]
 
 all = [
-  "noomesh[web,mcp,db,rag,voice,cloud,cache,feedback,monitoring,google-chat,backends-all,recall-memory]",
+  "noomesh[web,mcp,db,rag,voice,cloud,cache,feedback,monitoring]",
 ]
 
 [project.scripts]

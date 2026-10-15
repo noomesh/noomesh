@@ -5,8 +5,8 @@
 # (an earlier change: deps-core holds the non-ML tier; this image adds the ML
 # extras and trellion on top).
 #
-# FROM deps-core (base deps + web/cache/feedback/pgvector/google-chat/mcp)
-# plus the ML extras (trellion, rag, voice, graph, recall-memory) and the
+# FROM deps-core (base deps + web/cache/feedback/pgvector/mcp)
+# plus the ML extras (trellion, rag, voice) and the
 # vendored trellion package. Rebuilt only when pyproject.toml or
 # trellion changes; the downstream trellion image FROMs this and adds
 # only its service-specific bits.
@@ -105,7 +105,7 @@ ENV UV_EXTRA_INDEX_URL=${TORCH_INDEX} \
 # are cache hits, not re-downloads).
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
     uv pip install --system --overrides /tmp/uv-overrides.txt \
-    -e ".[trellion,web,cache,feedback,pgvector,google-chat,mcp,recall-memory,rag,voice,graph]" \
+    -e ".[trellion,web,cache,feedback,pgvector,mcp,rag,voice]" \
     /tmp/noo-gateway-client
 
 # Marker so downstream images can verify they're built on top of a

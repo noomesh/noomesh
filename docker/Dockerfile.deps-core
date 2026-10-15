@@ -5,8 +5,8 @@
 #.
 #
 # Contains the noomesh site-packages for the web/db/cache/mcp surface
-# ONLY: base dependencies plus the web, cache, feedback, pgvector,
-# google-chat and mcp extras. No torch, no transformers, no whisper, no
+# ONLY: base dependencies plus the web, cache, feedback, pgvector
+# and mcp extras. No torch, no transformers, no whisper, no
 # faiss, no noo-trellion — the ML tier lives in Dockerfile.deps-base,
 # which is FROM this image.
 #
@@ -72,14 +72,14 @@ COPY pyproject.toml README.md ./
 RUN mkdir -p src/noomesh && touch src/noomesh/__init__.py
 
 # The non-ML extras only. Everything trellion-, torch- or model-adjacent
-# (trellion, rag, voice, graph, recall-memory) is installed by
+# (trellion, rag, voice) is installed by
 # Dockerfile.deps-base on top of this image — adding one here silently
 # re-fattens sandbox and the worker, which is exactly what this
 # split exists to prevent. No torch index pin needed: nothing in this
 # set resolves torch.
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
     uv pip install --system \
-    -e ".[web,cache,feedback,pgvector,google-chat,mcp]"
+    -e ".[web,cache,feedback,pgvector,mcp]"
 
 # Marker so downstream images can verify they're built on top of a
 # compatible base (handy for debugging mismatched layers).
