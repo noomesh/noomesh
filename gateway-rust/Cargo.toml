@@ -11,7 +11,7 @@ description = "Mesh Gateway — Rust implementation"
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
-axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
 rand = "0.8"
 base64 = "0.22"
 # Intelligent-tier entitlement verification (entitlement.rs). Already in the
@@ -72,7 +72,6 @@ serde_yaml = "0.9"
 # TLS
 rustls = "0.23"
 tokio-rustls = "0.26"
-tower-layer = "0.3"
 x509-parser = "0.16"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls-pemfile = "2"
