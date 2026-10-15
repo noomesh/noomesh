@@ -4883,7 +4883,7 @@ mod local_lane_tests {
         let msg = format!("applied: x binary-sha: harness-binary={} cli-binary={} agent-binary={} hostd-binary={}",
             sha256_hex(&hb), sha256_hex(&cb), sha256_hex(b"agent"), sha256_hex(b"hostd"));
         let status = st(0, "s", "s", &msg);
-        let names = |f: &Vec<(&str, Vec<u8>)>| f.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
 
         let mut f = mk();
         let notes = drop_proven_binaries(&mut f, Some(&status), false, false);
