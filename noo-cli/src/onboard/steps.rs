@@ -4828,9 +4828,11 @@ fn ensure_self_agent(ctx: &mut Ctx) {
             ctx.info(&format!("Restaging the self-agent for '{node_id}' over the rail{}.",
                 if identity_ok { " (no sudo)" } else { " — its node identity is created first, sudo once" }));
             hydrate_process_env(ctx);
-            match crate::commands::provision::cluster_provision(ctx.g, std::slice::from_ref(&node_id)) {
+            // In a child process: `cluster provision` reports failures by
+            // exiting, and that must not end onboard here.
+            match crate::commands::upgrade::provision_one(ctx.g, &node_id, &[]) {
                 Ok(0) => {}
-                _ => ctx.warn(&format!("Self-agent restage did not complete — retry: noo cluster provision {node_id}")),
+                _ => ctx.warn(&format!("Self-agent restage did not complete — onboard continues; retry: noo cluster provision {node_id}")),
             }
         }
         SelfAgentStep::FirstInstall => {
@@ -4840,9 +4842,11 @@ fn ensure_self_agent(ctx: &mut Ctx) {
                 &format!("Install the host agent and its node identity for '{node_id}' now? (uses sudo, once)"), true);
             if go {
                 hydrate_process_env(ctx);
-                match crate::commands::provision::provision_local(ctx.g, &node_id, None) {
-                    Ok(0) => {}
-                    _ => ctx.warn("Self-agent install did not complete — retry later: noo onboard --only services"),
+                // An error comes back here (provision_local never exits):
+                // warn and go on with hostd, placement, the embed model and
+                // the rest of the services step.
+                if let Err(e) = crate::commands::provision::provision_local(ctx.g, &node_id, None) {
+                    ctx.warn(&format!("Self-agent install did not complete ({e}) — onboard continues; retry later: noo onboard --only services"));
                 }
             } else {
                 ctx.info("Skipped — install any time: noo onboard --only services");
