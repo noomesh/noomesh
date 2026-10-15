@@ -119,7 +119,7 @@ monitoring = [
   "prometheus-client>=0.19",
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
-  "opentelemetry-exporter-otlp>=1.20",
+  "opentelemetry-exporter-otlp>=1.45.1",
 ]
 
 # LLM Backend options
