@@ -48,7 +48,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 async-nats = "0.49"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "tls-rustls"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "tls-rustls"] }
 
 # Redis
 fred = { version = "10", features = ["i-all", "enable-rustls"] }
