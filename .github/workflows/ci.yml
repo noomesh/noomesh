@@ -377,8 +377,6 @@ jobs:
           # Read release/image workflows, private docs or sibling checkouts that
           # are not part of this tree.
           --deselect=tests/test_dist_mode.py
-          --deselect=tests/test_cla_workflow_declarations.py
-          --deselect=tests/test_cla_text_one_source.py::test_public_cla_equals_kit_master
           --deselect=tests/test_release_lock_retries_the_network.py
           --deselect=tests/test_hygiene_defaults.py
           --deselect=tests/test_ci_scope_declarations.py::test_the_console_artifact_tag_matches_what_the_gateway_pulls
