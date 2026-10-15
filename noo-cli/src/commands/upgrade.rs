@@ -2586,7 +2586,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
                 Err(e) => { ui::warned(&format!("{name}: not fetched ({e}) — nodes will verify against GitHub instead")); continue; }
             },
         };
-        let sha = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(&bytes)) };
+        let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/{name}?sha256={sha}&version={version}"), &bytes) {
             ui::warned(&format!("{name}: upload failed ({e})"));
@@ -2596,7 +2596,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     // controller (no GitHub, no scp): curl …/bootstrap/cli/install.sh.
     {
         let bytes = INSTALLER.as_bytes();
-        let sha = { use sha2::{Digest, Sha256}; format!("{:x}", Sha256::digest(bytes)) };
+        let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(bytes)) };
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/install.sh?sha256={sha}&version={version}"), bytes) {
             ui::warned(&format!("install.sh: upload failed ({e}) — new nodes fall back to the GitHub installer line"));
@@ -2622,7 +2622,7 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
         };
         let sha = {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(&bytes))
+            hex::encode(Sha256::digest(&bytes))
         };
         match crate::commands::provision::put_bytes(
             g,
