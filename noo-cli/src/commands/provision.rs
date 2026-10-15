@@ -283,16 +283,22 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // --move-data: acknowledge that this bundle moves the
     // node's data root off the one it runs on. Moves nothing itself.
     let mut move_data = false;
+    // --stage-only: stage + poke, then return without waiting for the node
+    // to apply (`noo upgrade --nodes` stages every node this way and waits
+    // for them together). It removes ONLY the apply wait: `--wait` still
+    // governs the enrollment wait at step 1, exactly as it always has.
+    let mut stage_only = false;
     let mut it = args.iter().peekable();
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--local" => local = true,
             "--move-data" => move_data = true,
+            "--stage-only" => stage_only = true,
             "--harness" => {
                 let v = it.next().cloned().unwrap_or_default();
                 if !matches!(v.as_str(), "auto" | "manual" | "off") {
                     fail(g.json, ExitCode::Usage, "usage", "--harness must be auto, manual or off",
-                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
+                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
                 }
                 harness = Some(v);
             }
@@ -308,17 +314,17 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             // through to the Python CLI (which has no `provision`).
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
             t if node.is_none() => node = Some(t.to_string()),
             t if tier.is_none() => tier = Some(t.to_string()),
             t => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unexpected argument: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
         }
     }
     let Some(node) = node else {
         fail(g.json, ExitCode::Usage, "usage", "node name required",
-            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
+            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
     };
 
     if !g.json && !ui::quiet() {
@@ -1063,10 +1069,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         // kind it does not know, and its fetcher cannot report. Stage an
         // applier-only bundle first — the one kind every applier accepts —
         // so the full bundle below is applied by the new applier.
-        let legacy = crate::http::get_json_opt(
-                g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
-            .map(|st| st.get("applied_at").map(|v| v.is_null()).unwrap_or(true))
-            .unwrap_or(true);
+        let legacy = node_never_reported_apply(g, &node);
         if legacy && !darwin {
             let apply = super::enroll::asset_apply();
             if !apply.is_empty() {
@@ -1083,6 +1086,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                     Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "encrypt_failed", &e, None); }
                 };
                 scrub(&w2);
+                let applier_sha = sha256_hex(&blob2);
                 if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob2) {
                     fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
                 }
@@ -1096,8 +1100,20 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                           ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
                           (&format!("noo cluster provision {node} --wait"), "re-stage once the poll reaches the controller")]);
                 }
-                nstep(&format!("{node} fetched the applier — giving it 30s to install before the full bundle"));
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // The new applier reports its own apply (that is the point of
+                // the handshake), so wait for THAT report instead of a fixed
+                // 30 s guess. A node whose report never arrives (a fetcher
+                // that cannot report, a gateway that lost the POST) is not
+                // stuck: after the cap we proceed exactly as the old fixed
+                // sleep did, and say so.
+                nstep(&format!("{node} fetched the applier — waiting for it to report the install before the full bundle"));
+                match wait_applier_reported(g, &node, &applier_sha, APPLIER_REPORT_CAP_SECS, APPLIER_REPORT_POLL_SECS) {
+                    Some(0) => nstep(&format!("{node} installed the applier (reported exit 0)")),
+                    Some(rc) => warn_line(&format!(
+                        "{node}: the applier-only bundle reported exit {rc} — staging the full bundle anyway; it will likely be refused the same way")),
+                    None => warn_line(&format!(
+                        "{node}: no apply report for the applier within {APPLIER_REPORT_CAP_SECS}s — proceeding with the full bundle without confirmation")),
+                }
             }
         }
         nstep(&format!("encrypting the bundle to {node}'s birth cert"));
@@ -1113,6 +1129,21 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
         }
         let poked = poke_fetch(g, &node);
+        let staged_sha = sha256_hex(&blob);
+        if stage_only {
+            // Everything up to and including the poke is done; the caller
+            // (`noo upgrade --nodes`) waits for the apply, for every node at
+            // once. Nothing here has judged the node: "staged" is printed
+            // as exactly that, and the verdict is the caller's, from the
+            // node's own report.
+            nstep(&format!("{node} staged (sha {}) — not waiting for the apply (--stage-only)", &staged_sha[..12]));
+            if g.json {
+                println!("{}", serde_json::json!({
+                    "status": "staged", "node": node, "staged_sha": staged_sha, "poked": poked,
+                }));
+            }
+            return Ok(0);
+        }
 
         // Verification (2026-09-03): the node's fetcher REPORTS the applier's
         // exit code (POST /bootstrap/bundle/{node}/applied) and the status
@@ -1125,10 +1156,6 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         } else {
             format!("staged — waiting for {node} to pull, apply and report (up to 10 min; an idle node polls about every 5)")
         });
-        let staged_sha = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&blob))
-        };
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(600);
         let mut seen_fetch = false;
@@ -1138,34 +1165,20 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             if let Some(st) = crate::http::get_json_opt(
                 g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
             {
-                if !seen_fetch && st.get("fetched_at").and_then(|v| v.as_str()).is_some() {
-                    seen_fetch = true;
-                    poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
-                }
-                let reported_sha = st.get("applied_sha").and_then(|v| v.as_str()).unwrap_or("");
-                if reported_sha == staged_sha {
-                    let rc = st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    let msg = st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    outcome = Some((rc, msg));
-                    break;
+                match judge_bundle_status(&st, &staged_sha) {
+                    BundleVerdict::Applied { rc, msg } => {
+                        outcome = Some((rc, msg));
+                        break;
+                    }
+                    BundleVerdict::Fetched if !seen_fetch => {
+                        seen_fetch = true;
+                        poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
+                    }
+                    BundleVerdict::Fetched | BundleVerdict::Nothing => {}
                 }
             }
-            if legacy && seen_fetch && started.elapsed().as_secs() > 45 {
-                // No report will come from an old fetcher; fall back to
-                // "agent registered" and say the confirmation is missing.
-                if let Some(doc) = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10) {
-                    let found = doc.get("nodes").and_then(|n| n.as_array()).map(|arr| {
-                        arr.iter().any(|nd| {
-                            nd.get("id").and_then(|v| v.as_str())
-                                .or_else(|| nd.get("node_id").and_then(|v| v.as_str()))
-                                .or_else(|| nd.get("name").and_then(|v| v.as_str()))
-                                .is_some_and(|id| id.eq_ignore_ascii_case(&node))
-                                && nd.get("status").and_then(|v| v.as_str())
-                                    .is_some_and(|st| st == "online" || st == "busy")
-                        })
-                    }).unwrap_or(false);
-                    if found { break; }
-                }
+            if legacy_fallback_due(legacy, seen_fetch, started.elapsed().as_secs()) && node_is_online(g, &node) {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
@@ -3218,12 +3231,14 @@ pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
             true
         }
         Ok(v) => {
-            nstep(&format!("poke not accepted ({}) — {node} fetches on its timer",
+            warn_line(&format!(
+                "poke not accepted ({}) — {node} will only fetch on its own timer, up to about 5 minutes",
                 v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")));
             false
         }
         Err(e) => {
-            nstep(&format!("poke failed ({e}) — {node} fetches on its timer"));
+            warn_line(&format!(
+                "poke failed ({e}) — {node} will only fetch on its own timer, up to about 5 minutes"));
             false
         }
     }
@@ -3250,6 +3265,225 @@ pub(crate) fn is_live_enrollment(t: &serde_json::Value) -> bool {
     t.get("used_at").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
         && t.get("birth_cert").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
         && !t.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// What the status route says about the bundle CURRENTLY staged for a node.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BundleVerdict {
+    /// The node's report names the staged sha: it applied (rc 0) or refused
+    /// (rc != 0, -1 when the report carried no code).
+    Applied { rc: i64, msg: String },
+    /// Fetched (`fetched_at` stamped for this staging) but no report for it yet.
+    Fetched,
+    /// Not fetched yet, or only an older bundle's report is on the row.
+    Nothing,
+}
+
+/// The one judgement of `/api/cluster/provision-bundle/<node>/status`,
+/// shared by `cluster provision` (one node) and the combined wait of
+/// `noo upgrade --nodes`. Success is `applied_sha == staged_sha`, then
+/// `apply_rc`; an `applied_sha` for any OTHER bundle is not evidence about
+/// this one. An empty `staged_sha` matches nothing (an empty reported sha
+/// must never equal an empty staged one).
+pub(crate) fn judge_bundle_status(st: &serde_json::Value, staged_sha: &str) -> BundleVerdict {
+    let reported = st.get("applied_sha").and_then(|v| v.as_str()).unwrap_or("");
+    if !staged_sha.is_empty() && reported == staged_sha {
+        return BundleVerdict::Applied {
+            rc: st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1),
+            msg: st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        };
+    }
+    if st.get("fetched_at").and_then(|v| v.as_str()).is_some() {
+        BundleVerdict::Fetched
+    } else {
+        BundleVerdict::Nothing
+    }
+}
+
+/// A node that had never reported an apply (old fetcher, cannot report)
+/// gets no report ever; once it fetched and 45 s passed, the caller may
+/// fall back to "the agent is online" (see `node_is_online`) and must say
+/// the confirmation is missing.
+pub(crate) fn legacy_fallback_due(legacy: bool, fetched: bool, elapsed_secs: u64) -> bool {
+    legacy && fetched && elapsed_secs > 45
+}
+
+/// Is `node` online/busy in the registry? False when the gateway does not
+/// answer or does not list it (the fallback then simply does not fire).
+pub(crate) fn node_is_online(g: &Globals, node: &str) -> bool {
+    let Some(doc) = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10) else { return false };
+    doc.get("nodes").and_then(|n| n.as_array()).map(|arr| {
+        arr.iter().any(|nd| {
+            nd.get("id").and_then(|v| v.as_str())
+                .or_else(|| nd.get("node_id").and_then(|v| v.as_str()))
+                .or_else(|| nd.get("name").and_then(|v| v.as_str()))
+                .is_some_and(|id| id.eq_ignore_ascii_case(node))
+                && nd.get("status").and_then(|v| v.as_str())
+                    .is_some_and(|st| st == "online" || st == "busy")
+        })
+    }).unwrap_or(false)
+}
+
+/// True when the node has never reported an apply (no `applied_at` on its
+/// status row, or no row / no answer). Read BEFORE a staging replaces the row.
+pub(crate) fn node_never_reported_apply(g: &Globals, node: &str) -> bool {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .map(|st| st.get("applied_at").map(|v| v.is_null()).unwrap_or(true))
+        .unwrap_or(true)
+}
+
+/// The sha256 of the ciphertext currently staged for `node`, from the
+/// status route; None when nothing is staged or the gateway does not answer.
+pub(crate) fn staged_sha_of(g: &Globals, node: &str) -> Option<String> {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .and_then(|st| st.get("sha256").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+/// An indented warned line under a node's label (the poke and handshake
+/// notices; a plain step line reads as routine, these are not).
+fn warn_line(msg: &str) {
+    if !ui::quiet() {
+        println!("{}", ui::sub(&ui::status_line(Glyph::Warn, msg)));
+    }
+}
+
+/// Longest the applier-first handshake waits for the new applier's own apply
+/// report, and how often it looks.
+const APPLIER_REPORT_CAP_SECS: u64 = 60;
+const APPLIER_REPORT_POLL_SECS: u64 = 5;
+
+/// Poll the status route until it reports an apply of `applier_sha` (the
+/// applier-only bundle), returning its rc; None when the cap passes first.
+/// ABSENT report / unreachable gateway / old fetcher: None, never an error —
+/// the handshake then proceeds as the old fixed sleep did.
+fn wait_applier_reported(g: &Globals, node: &str, applier_sha: &str, cap_secs: u64, every_secs: u64) -> Option<i64> {
+    let start = std::time::Instant::now();
+    let mut poll = ui::Poll::start_under(&format!("waiting for {node}'s applier to report (up to {cap_secs}s)"));
+    while start.elapsed().as_secs() < cap_secs {
+        if let Some(st) = crate::http::get_json_opt(
+            g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        {
+            if let BundleVerdict::Applied { rc, .. } = judge_bundle_status(&st, applier_sha) {
+                drop(poll);
+                return Some(rc);
+            }
+        }
+        poll.tick(start.elapsed().as_secs());
+        std::thread::sleep(std::time::Duration::from_secs(every_secs));
+    }
+    drop(poll);
+    None
+}
+
+/// One node staged with `--stage-only`, waiting for its apply report.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingApply {
+    pub node: String,
+    /// sha256 of the staged ciphertext (the status route's `sha256`).
+    pub sha: String,
+    /// The node had never reported an apply before this staging (see the
+    /// legacy fallback in `cluster_provision`).
+    pub legacy: bool,
+}
+
+/// How one pending node ended.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ApplyEnd {
+    Applied { rc: i64, msg: String },
+    /// Legacy fetcher: fetched, cannot report, agent online. Not a failure,
+    /// and not confirmed either.
+    LegacyUnconfirmed,
+    /// No report for the staged sha within the budget; `fetched` says which
+    /// stage it died at.
+    NotReported { fetched: bool },
+}
+
+/// A fetch that has not happened this long after the staging was poked is
+/// on the node's own ~5-minute timer: say so once, early.
+pub(crate) const SLOW_TIMER_WARN_SECS: u64 = 150;
+
+/// Wait for EVERY pending node together: one poll of each node's status
+/// route per `every_secs`, `budget_secs` overall (measured from the call,
+/// i.e. from when the last node was staged), one `ui::Poll` for the group,
+/// and a progress line as each node reports. The judgement per node is
+/// `judge_bundle_status` + `legacy_fallback_due`, the same as the single
+/// node wait. An unreachable status route leaves a node unresolved for that
+/// round (it can still resolve in a later one); it is never counted done.
+/// Results come back in the order of `pending`.
+pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd)> {
+    let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
+    let mut fetched = vec![false; pending.len()];
+    let mut slow_warned = vec![false; pending.len()];
+    let started = std::time::Instant::now();
+    let names: Vec<&str> = pending.iter().map(|p| p.node.as_str()).collect();
+    let mut poll = ui::Poll::start(&format!(
+        "waiting for {} node(s) to pull, apply and report (up to {}m): {}",
+        pending.len(), budget_secs / 60, names.join(", ")));
+    // Printing over a live spinner line would leave its tail behind.
+    let say = |line: String| {
+        if ui::stderr_is_tty() { ui::clear_line(); }
+        if !ui::quiet() { println!("{}", ui::sub(&line)); }
+    };
+    while started.elapsed().as_secs() < budget_secs && ends.iter().any(|e| e.is_none()) {
+        let elapsed = started.elapsed().as_secs();
+        for (i, p) in pending.iter().enumerate() {
+            if ends[i].is_some() { continue; }
+            let st = crate::http::get_json_opt(
+                g, &format!("/api/cluster/provision-bundle/{}/status", p.node), true, 10);
+            if let Some(st) = &st {
+                match judge_bundle_status(st, &p.sha) {
+                    BundleVerdict::Applied { rc, msg } => {
+                        say(if rc == 0 {
+                            ui::status_line(Glyph::Ok, &format!("{}: applied (exit 0)", p.node))
+                        } else {
+                            ui::status_line(Glyph::Err, &format!("{}: the applier refused the bundle (exit {rc})", p.node))
+                        });
+                        ends[i] = Some(ApplyEnd::Applied { rc, msg });
+                        continue;
+                    }
+                    BundleVerdict::Fetched if !fetched[i] => {
+                        fetched[i] = true;
+                        say(ui::status_line(Glyph::Step, &format!("{}: fetched the bundle — waiting for decrypt + apply", p.node)));
+                    }
+                    BundleVerdict::Fetched | BundleVerdict::Nothing => {}
+                }
+            }
+            if legacy_fallback_due(p.legacy, fetched[i], elapsed) && node_is_online(g, &p.node) {
+                say(ui::status_line(Glyph::Warn, &format!(
+                    "{}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms", p.node)));
+                ends[i] = Some(ApplyEnd::LegacyUnconfirmed);
+                continue;
+            }
+            if !fetched[i] && !slow_warned[i] && elapsed >= SLOW_TIMER_WARN_SECS {
+                slow_warned[i] = true;
+                say(ui::status_line(Glyph::Warn, &format!(
+                    "{}: not fetched after {SLOW_TIMER_WARN_SECS}s — the poke likely did not reach it; it is on its own 5-minute timer", p.node)));
+            }
+        }
+        if ends.iter().all(|e| e.is_some()) { break; }
+        poll.tick(started.elapsed().as_secs());
+        std::thread::sleep(std::time::Duration::from_secs(every_secs));
+    }
+    drop(poll);
+    pending.iter().zip(ends).zip(fetched).map(|((p, end), f)| {
+        (p.node.clone(), end.unwrap_or(ApplyEnd::NotReported { fetched: f }))
+    }).collect()
+}
+
+/// What `cluster provision` does after a node reports exit 0, for a node
+/// restaged by the combined wait: the applier's verification lane note, the
+/// signing-key adoption marker, and the invariant check. (The self node's
+/// extra steps — lane record, controller hostd restart — stay in
+/// `cluster_provision`, which the self node still runs in full.)
+pub(crate) fn after_remote_applied(g: &Globals, node: &str, msg: &str) {
+    if let Some(lane) = verification_lane(msg) {
+        nnote(&lane);
+    }
+    record_signing_adoption(node, msg);
+    if !crate::commands::cluster_verify::verify_node_after_apply(g, node) {
+        nnote(&format!("{node}: applied, and an invariant does not hold yet — `noo cluster verify {node}` re-checks"));
+    }
 }
 
 fn wait_bundle_fetched(g: &Globals, node: &str, secs: u64) -> bool {
@@ -4498,5 +4732,85 @@ mod local_lane_tests {
         c.arg("PREP_INSECURE=1").arg("PREP_CA_SHA256=ab").arg("NOO_DATA_ROOT=/a b").arg("bash").arg("/tmp/p'q.sh");
         assert_eq!(command_line(&c),
             "'env' 'PREP_INSECURE=1' 'PREP_CA_SHA256=ab' 'NOO_DATA_ROOT=/a b' 'bash' '/tmp/p'\\''q.sh'");
+    }
+}
+
+#[cfg(test)]
+mod bundle_status_judgement_tests {
+    use super::{judge_bundle_status, legacy_fallback_due, BundleVerdict};
+    use serde_json::json;
+
+    const SHA: &str = "aaaa";
+
+    #[test]
+    fn applied_ok_is_rc_zero_with_the_appliers_message() {
+        let st = json!({"fetched_at":"t","applied_at":"t","applied_sha":SHA,"apply_rc":0,"apply_msg":"applied: agent-env"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 0, msg: "applied: agent-env".into() });
+    }
+
+    #[test]
+    fn applied_refused_carries_the_nonzero_rc() {
+        let st = json!({"fetched_at":"t","applied_sha":SHA,"apply_rc":76,"apply_msg":"unknown kind"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 76, msg: "unknown kind".into() });
+    }
+
+    #[test]
+    fn a_report_without_a_code_is_minus_one_not_success() {
+        let st = json!({"applied_sha":SHA});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: -1, msg: String::new() });
+    }
+
+    #[test]
+    fn fetched_but_not_applied_is_fetched() {
+        let st = json!({"fetched_at":"t","applied_sha":null,"apply_rc":null});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Fetched);
+    }
+
+    #[test]
+    fn an_older_bundles_report_is_not_evidence_about_this_one() {
+        let st = json!({"fetched_at":null,"applied_sha":"old","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Nothing);
+        let st = json!({"fetched_at":"t","applied_sha":"old","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Fetched);
+    }
+
+    #[test]
+    fn nothing_reported_is_nothing() {
+        assert_eq!(judge_bundle_status(&json!({}), SHA), BundleVerdict::Nothing);
+        assert_eq!(judge_bundle_status(&json!({"fetched_at":null}), SHA), BundleVerdict::Nothing);
+    }
+
+    #[test]
+    fn an_empty_staged_sha_never_matches_an_empty_report() {
+        let st = json!({"applied_sha":"","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, ""), BundleVerdict::Nothing);
+    }
+
+    #[test]
+    fn the_legacy_fallback_needs_legacy_a_fetch_and_45_seconds() {
+        assert!(legacy_fallback_due(true, true, 46));
+        assert!(!legacy_fallback_due(true, true, 45));
+        assert!(!legacy_fallback_due(true, false, 600), "never fetched: no fallback");
+        assert!(!legacy_fallback_due(false, true, 600), "a node that reports is judged by its report");
+    }
+}
+
+#[cfg(test)]
+mod upgrade_stages_every_node_before_waiting_tests {
+    /// `noo upgrade --nodes` must stage+poke every node before it blocks on
+    /// any apply, and the self node (staged last) still comes after the
+    /// remote nodes have been staged.
+    #[test]
+    fn the_nodes_phase_stages_all_then_waits_once() {
+        let up = include_str!("upgrade.rs");
+        let up = up.split("#[cfg(test)]").next().unwrap();
+        let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
+        let me = f.rfind("upgrade_self_node(g, &me, &mut failed)").expect("the self node");
+        let wait = f.find("wait_and_settle_nodes(g, &pending").expect("the combined wait");
+        let mac = f.find("mac_leaves_pass(").expect("the mac pass");
+        assert!(stage < me && me < wait && wait < mac, "stage remotes, self node, one wait, then the Mac pass");
+        assert_eq!(f.matches("provision_one(g, n,").count(), 1, "no per-node full provision left in the loop");
     }
 }

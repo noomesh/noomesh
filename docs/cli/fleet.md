@@ -453,7 +453,7 @@ agent may execute.
 | `noo cluster add-companion` | `<node> [-p\|--platform <p>] [--hostname <host>] [--ip <ip>] [-s\|--sensors <a,b>] [-b\|--backends <a,b>] [--battery <n>] [-n\|--network <type>] [--npu-tops <n>] [--app-version <v>]` | Register a Tier-5 companion device with the gateway and send a first heartbeat |
 | `noo cluster add-monitor` | `<node> [--hostname <host>] [--ip <ip>] [-s\|--services <a,b>]` | Register a Tier-6 monitor node with the gateway and send an initial heartbeat |
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
-| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--move-data]` | Stage the signed bundle for a pull-enrolled node; --wait blocks until enrolled |
+| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
 | `noo cluster auto-place` | `<model>... [-b\|--backend <backend>] [--apply]` | Plan placement of a set of models across the fleet; --apply starts them |
 | `noo cluster place-model` | `<model> [-b\|--backend <backend>] [--node <node>] [--apply]` | Pick the best node for a model by capability and cache; --apply starts it there |
