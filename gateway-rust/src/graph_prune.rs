@@ -398,7 +398,7 @@ async fn run_locked(
 
     // ── 1. Orphans: no edges, no mentions, older than min age ───────
     if p.remove_orphans && *budget > 0 {
-        let rows: Vec<EntityRow> = sqlx::query_as(&format!(
+        let rows: Vec<EntityRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENTITY_COLS} FROM entities e \
              WHERE NOT EXISTS (SELECT 1 FROM edges ed \
                                WHERE ed.src_entity_id = e.entity_id \
@@ -407,7 +407,7 @@ async fn run_locked(
                                WHERE m.entity_id = e.entity_id) \
                AND e.created_at < now() - ($1 * interval '1 day') \
              LIMIT $2"
-        ))
+        )))
         .bind(p.orphan_min_age_days)
         .bind(*budget)
         .fetch_all(&mut *conn)
@@ -441,12 +441,12 @@ async fn run_locked(
 
     // ── 2. Junk names: too short or containing no letters ───────────
     if p.remove_junk && *budget > 0 {
-        let rows: Vec<EntityRow> = sqlx::query_as(&format!(
+        let rows: Vec<EntityRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENTITY_COLS} FROM entities \
              WHERE length(canonical_name) < $1 \
                 OR canonical_name !~ '[a-zA-Z]' \
              LIMIT $2"
-        ))
+        )))
         .bind(p.min_name_length as i32)
         .bind(*budget)
         .fetch_all(&mut *conn)
@@ -484,9 +484,9 @@ async fn run_locked(
 
     // ── 3. Near-duplicate names: merge, staging the loser ───────────
     if p.merge_duplicates && *budget > 0 {
-        let sample: Vec<EntityRow> = sqlx::query_as(&format!(
+        let sample: Vec<EntityRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {ENTITY_COLS} FROM entities ORDER BY RANDOM() LIMIT $1"
-        ))
+        )))
         .bind(p.max_entities)
         .fetch_all(&mut *conn)
         .await

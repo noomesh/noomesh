@@ -168,18 +168,18 @@ pub(crate) async fn plan(conn: &mut PgConnection, username: &str, lock: bool) ->
         return Ok(KbPlan::default());
     }
     let for_update = if lock { " FOR UPDATE" } else { "" };
-    let personal: Vec<String> = sqlx::query_scalar(&format!(
+    let personal: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT d.doc_id::text FROM docs d WHERE {}{for_update}",
         personal_where()
-    ))
+    )))
     .bind(username)
     .fetch_all(&mut *conn)
     .await?;
-    let shared: Vec<(String, Option<Value>)> = sqlx::query_as(&format!(
+    let shared: Vec<(String, Option<Value>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT d.doc_id::text, d.metadata FROM docs d WHERE {} AND NOT {}{for_update}",
         touched_where(),
         personal_where()
-    ))
+    )))
     .bind(username)
     .fetch_all(&mut *conn)
     .await?;
@@ -193,12 +193,12 @@ pub(crate) async fn plan(conn: &mut PgConnection, username: &str, lock: bool) ->
         .bind(&personal)
         .fetch_all(&mut *conn)
         .await?;
-    let edges_deleted: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM edges WHERE {EDGE_DELETE_WHERE}"))
+    let edges_deleted: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM edges WHERE {EDGE_DELETE_WHERE}")))
         .bind(&personal)
         .bind(&entities)
         .fetch_one(&mut *conn)
         .await?;
-    let edges_scrubbed: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM edges WHERE {}", edge_scrub_where()))
+    let edges_scrubbed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM edges WHERE {}", edge_scrub_where())))
         .bind(&personal)
         .bind(&entities)
         .fetch_one(&mut *conn)
@@ -232,27 +232,27 @@ pub(crate) async fn apply(
     };
 
     // Edges first (the archive must hold what the entity cascade would take).
-    sqlx::query(&stage("kb_edges", "edges", EDGE_DELETE_WHERE))
+    sqlx::query(sqlx::AssertSqlSafe(&*stage("kb_edges", "edges", EDGE_DELETE_WHERE)))
         .bind(&plan.personal)
         .bind(&plan.entities)
         .bind(run_id)
         .bind(username)
         .execute(&mut *conn)
         .await?;
-    let edges_deleted = sqlx::query(&format!("DELETE FROM edges WHERE {EDGE_DELETE_WHERE}"))
+    let edges_deleted = sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM edges WHERE {EDGE_DELETE_WHERE}")))
         .bind(&plan.personal)
         .bind(&plan.entities)
         .execute(&mut *conn)
         .await?
         .rows_affected();
-    sqlx::query(&stage("kb_edges_scrubbed", "edges", &edge_scrub_where()))
+    sqlx::query(sqlx::AssertSqlSafe(&*stage("kb_edges_scrubbed", "edges", &edge_scrub_where())))
         .bind(&plan.personal)
         .bind(&plan.entities)
         .bind(run_id)
         .bind(username)
         .execute(&mut *conn)
         .await?;
-    let edges_scrubbed = sqlx::query(&format!("UPDATE edges SET {EDGE_SCRUB_SET} WHERE {}", edge_scrub_where()))
+    let edges_scrubbed = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE edges SET {EDGE_SCRUB_SET} WHERE {}", edge_scrub_where())))
         .bind(&plan.personal)
         .bind(&plan.entities)
         .execute(&mut *conn)
@@ -261,7 +261,7 @@ pub(crate) async fn apply(
 
     // Entities only the personal documents mention (cascade: their mentions,
     // embeddings, graph signals, cluster memberships).
-    sqlx::query(&stage_ids("kb_entities", "entities", "entity_id"))
+    sqlx::query(sqlx::AssertSqlSafe(&*stage_ids("kb_entities", "entities", "entity_id")))
         .bind(&plan.entities)
         .bind(run_id)
         .bind(username)
@@ -276,7 +276,7 @@ pub(crate) async fn apply(
     // The documents and their pages (cascade: chunks, page/chunk embeddings,
     // mentions). Pages carry the text; chunks and vectors are derived from it.
     for (store, table) in [("kb_pages", "pages"), ("kb_docs", "docs")] {
-        sqlx::query(&stage_ids(store, table, "doc_id"))
+        sqlx::query(sqlx::AssertSqlSafe(&*stage_ids(store, table, "doc_id")))
             .bind(&plan.personal)
             .bind(run_id)
             .bind(username)

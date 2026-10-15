@@ -148,10 +148,10 @@ mod tests {
             .connect(&dsn)
             .await
             .expect("connect to NOO_BROKER_TEST_DSN");
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {DB} (FORCE)"))
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB} (FORCE)")))
             .execute(&admin)
             .await;
-        sqlx::raw_sql(&format!("CREATE DATABASE {DB}"))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {DB}")))
             .execute(&admin)
             .await
             .expect("create scratch db");
@@ -165,7 +165,7 @@ mod tests {
             .expect("connect scratch");
         unsafe { std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret") };
         for ext in ["vector", "pg_trgm"] {
-            sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
                 .execute(&build)
                 .await
                 .expect("extension");
@@ -212,7 +212,7 @@ mod tests {
         assert!(!again, "the second call is a no-op, not a duplicate");
 
         db.close().await;
-        let _ = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {DB} (FORCE)"))
+        let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {DB} (FORCE)")))
             .execute(&admin)
             .await;
     }

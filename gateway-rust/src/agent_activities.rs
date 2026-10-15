@@ -108,7 +108,7 @@ pub async fn list_activities(
             Value, Value, Value,
             String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>,
         ),
-    >(&sql);
+    >(sqlx::AssertSqlSafe(&*sql));
     if let Some(s) = status_filter {
         q = q.bind(s);
     }

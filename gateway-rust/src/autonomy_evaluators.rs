@@ -1109,7 +1109,7 @@ fn sql_unembedded_total(held: bool) -> String {
 ///    backlog said everything was done.
 pub async fn count_unembedded(db: &sqlx::PgPool) -> Result<i64, String> {
     let sql = sql_unembedded_total(crate::held_column::present(db).await);
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
     .fetch_one(db)
     .await
     .map_err(|e| format!("unembedded count query failed: {e}"))
@@ -1307,7 +1307,7 @@ pub async fn eval_missing_graph_entities(state: &AppState) -> Result<bool, Strin
         "SELECT COUNT(*) FROM pages p JOIN docs d ON d.doc_id = p.doc_id WHERE {}",
         crate::held_column::not_held("d", crate::held_column::present(&state.db).await)
     );
-    let pages: i64 = sqlx::query_scalar(&pages_sql)
+    let pages: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*pages_sql))
         .fetch_one(&state.db)
         .await
         .map_err(|e| format!("page count query failed: {e}"))?;

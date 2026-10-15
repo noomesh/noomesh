@@ -1687,9 +1687,9 @@ pub async fn apply_baseline(db: &PgPool) -> Result<bool, sqlx::Error> {
         .execute(&mut *tx)
         .await?;
     sqlx::raw_sql(BASELINE_OSS).execute(&mut *tx).await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {VERSION_TABLE} (version_num) VALUES ($1)"
-    ))
+    )))
     .bind(BASELINE_REVISION)
     .execute(&mut *tx)
     .await?;
@@ -1950,7 +1950,7 @@ pub async fn current_revision(db: &PgPool) -> Result<Option<String>, sqlx::Error
         return Ok(None);
     }
     let rev: Option<String> =
-        sqlx::query_scalar(&format!("SELECT version_num FROM {vt} LIMIT 1"))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT version_num FROM {vt} LIMIT 1")))
             .fetch_optional(db)
             .await?;
     Ok(rev)
@@ -2011,7 +2011,7 @@ pub async fn apply(db: &PgPool) -> Result<(), String> {
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("{} failed: {e}", m.revision))?;
-        sqlx::query(&format!("UPDATE {vt} SET version_num = $1"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {vt} SET version_num = $1")))
             .bind(m.revision)
             .execute(&mut *tx)
             .await
@@ -2507,7 +2507,7 @@ mod layout_tests {
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
         // extensions are the broker's job; here that job is the test's
         for ext in ["vector", "pg_trgm"] {
-            sqlx::query(&format!("CREATE EXTENSION IF NOT EXISTS {ext}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE EXTENSION IF NOT EXISTS {ext}")))
                 .execute(&db)
                 .await
                 .expect("extension");
@@ -2606,7 +2606,7 @@ mod legacy_layout_tests {
         // in PUBLIC, and 047's dependencies (parent table + noo_app, which
         // the shared cluster already has from the fresh-layout test).
         std::env::set_var("NOO_APP_DB_PASSWORD", "ephemeral-not-a-secret");
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE public.{VERSION_TABLE} (version_num varchar(64) NOT NULL);
              INSERT INTO public.{VERSION_TABLE} VALUES ('{BASELINE_REVISION}');
              CREATE TABLE public.noo_security_audit (id bigserial, at timestamptz NOT NULL)
@@ -2682,7 +2682,7 @@ mod legacy_layout_tests {
              CREATE TRIGGER noo_conv_set_org_trg BEFORE INSERT
                  ON public.noo_conversations
                  FOR EACH ROW EXECUTE FUNCTION public.noo_conv_set_org();"
-        ))
+        )))
         .execute(&db)
         .await
         .expect("legacy shape");
@@ -2759,9 +2759,9 @@ mod legacy_layout_tests {
         .unwrap();
         assert!(!nullable, "061 must leave noo_conversations.org_id NOT NULL");
 
-        let stamp: String = sqlx::query_scalar(&format!(
+        let stamp: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT version_num FROM public.{VERSION_TABLE}"
-        ))
+        )))
         .fetch_one(&db)
         .await
         .unwrap();

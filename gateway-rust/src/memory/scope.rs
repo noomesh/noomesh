@@ -349,7 +349,7 @@ pub async fn docs_list(
          ORDER BY d.created_at DESC, d.doc_id LIMIT {limit} OFFSET {offset}",
         docs_where(f, crate::held_column::present(db).await)
     );
-    bind_filter(sqlx::query_as::<_, DocRow>(&sql), roles, f).fetch_all(db).await
+    bind_filter(sqlx::query_as::<_, DocRow>(sqlx::AssertSqlSafe(&*sql)), roles, f).fetch_all(db).await
 }
 
 /// `metadata.roles` of every readable document matching the filter, for the
@@ -361,7 +361,7 @@ pub async fn docs_roles_all(
     f: &DocFilter,
 ) -> Result<Vec<Option<Value>>, sqlx::Error> {
     let sql = format!("SELECT d.metadata->'roles' FROM docs d WHERE {}", docs_where(f, crate::held_column::present(db).await));
-    let rows: Vec<(Option<Value>,)> = bind_filter(sqlx::query_as(&sql), roles, f).fetch_all(db).await?;
+    let rows: Vec<(Option<Value>,)> = bind_filter(sqlx::query_as(sqlx::AssertSqlSafe(&*sql)), roles, f).fetch_all(db).await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
@@ -394,7 +394,7 @@ pub async fn doc_detail(
                    WHERE doc_id = d.doc_id ORDER BY page_no LIMIT 3) x) \
          FROM docs d WHERE d.doc_id = $2::uuid AND ($1::text[] IS NULL OR {DOC_VISIBLE})"
     );
-    sqlx::query_as::<_, DocDetailRow>(&sql)
+    sqlx::query_as::<_, DocDetailRow>(sqlx::AssertSqlSafe(&*sql))
         .bind(roles)
         .bind(doc_id)
         .fetch_optional(db)
@@ -414,7 +414,7 @@ pub async fn entity_search(
          ORDER BY canonical_name LIMIT 50",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as::<_, EntityRow>(&sql).bind(roles).bind(pattern).fetch_all(db).await
+    sqlx::query_as::<_, EntityRow>(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(pattern).fetch_all(db).await
 }
 
 pub async fn entity_get(
@@ -427,7 +427,7 @@ pub async fn entity_get(
          FROM scoped_entities WHERE entity_id = $2::uuid",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as::<_, EntityRow>(&sql).bind(roles).bind(entity_id).fetch_optional(db).await
+    sqlx::query_as::<_, EntityRow>(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(entity_id).fetch_optional(db).await
 }
 
 pub async fn entity_edges_1hop(
@@ -440,7 +440,7 @@ pub async fn entity_edges_1hop(
          FROM scoped_edges WHERE src_entity_id = $2::uuid OR dst_entity_id = $2::uuid",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as(&sql).bind(roles).bind(entity_id).fetch_all(db).await
+    sqlx::query_as(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(entity_id).fetch_all(db).await
 }
 
 pub async fn entity_names(
@@ -453,7 +453,7 @@ pub async fn entity_names(
          WHERE entity_id = ANY($2::uuid[])",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as::<_, EntityNameRow>(&sql).bind(roles).bind(ids).fetch_all(db).await
+    sqlx::query_as::<_, EntityNameRow>(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(ids).fetch_all(db).await
 }
 
 /// The SQL of [`entity_pages`]; `held` as for [`scope_ctes`].
@@ -484,7 +484,7 @@ pub async fn entity_pages(
     entity_id: &str,
 ) -> Result<Vec<(String, Option<i32>, Option<String>)>, sqlx::Error> {
     let sql = entity_pages_sql(crate::held_column::present(db).await);
-    sqlx::query_as(&sql).bind(roles).bind(entity_id).fetch_all(db).await
+    sqlx::query_as(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(entity_id).fetch_all(db).await
 }
 
 /// Which of these edge ids the caller may see (neighbour traversal
@@ -501,13 +501,13 @@ pub async fn readable_edge_ids(
         "{} SELECT edge_id::text FROM scoped_edges WHERE edge_id = ANY($2::uuid[])",
         scope_ctes(crate::held_column::present(db).await)
     );
-    let rows: Vec<(String,)> = sqlx::query_as(&sql).bind(roles).bind(edge_ids).fetch_all(db).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(edge_ids).fetch_all(db).await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
 pub async fn entity_count(db: &PgPool, roles: &[String]) -> Result<i64, sqlx::Error> {
     let sql = format!("{} SELECT COUNT(*) FROM scoped_entities", scope_ctes(crate::held_column::present(db).await));
-    sqlx::query_scalar(&sql).bind(roles).fetch_one(db).await
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql)).bind(roles).fetch_one(db).await
 }
 
 // ── overview / clusters ──────────────────────────────────────────────
@@ -532,7 +532,7 @@ pub async fn top_entities(
          ORDER BY d.deg DESC LIMIT $4",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as(&sql)
+    sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(roles)
         .bind(i64::from(min_degree))
         .bind(entity_type)
@@ -553,7 +553,7 @@ pub async fn overview_edges(
          LIMIT 5000",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as::<_, OverviewEdgeRow>(&sql).bind(roles).bind(node_ids).fetch_all(db).await
+    sqlx::query_as::<_, OverviewEdgeRow>(sqlx::AssertSqlSafe(&*sql)).bind(roles).bind(node_ids).fetch_all(db).await
 }
 
 /// Clusters with at least one readable member (see the module docs): each is
@@ -584,7 +584,7 @@ pub async fn clusters(
          ORDER BY cnt.readable DESC, c.cluster_id LIMIT $4",
         scope_ctes(crate::held_column::present(db).await)
     );
-    let rows: Vec<(String, String, i32, i32, i64, i64, Vec<String>)> = sqlx::query_as(&sql)
+    let rows: Vec<(String, String, i32, i32, i64, i64, Vec<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(roles)
         .bind(level)
         .bind(min_members)
@@ -624,7 +624,7 @@ pub async fn cluster_edges(
          ORDER BY weight DESC LIMIT 2000",
         scope_ctes(crate::held_column::present(db).await)
     );
-    sqlx::query_as::<_, ClusterEdgeRow>(&sql)
+    sqlx::query_as::<_, ClusterEdgeRow>(sqlx::AssertSqlSafe(&*sql))
         .bind(roles)
         .bind(level)
         .bind(cluster_ids)
@@ -787,18 +787,18 @@ mod tests {
             .after_connect(move |c, _| {
                 let s = s2.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {s}")).execute(&mut *c).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {s}"))).execute(&mut *c).await?;
                     Ok(())
                 })
             })
             .connect(&dsn)
             .await
             .expect("connect to the DSN under test");
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&db).await.unwrap();
         // The pool pins one connection; give it the path now that the schema exists.
-        sqlx::query(&format!("SET search_path TO {schema}")).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}"))).execute(&db).await.unwrap();
         for ddl in DDL {
-            sqlx::query(ddl).execute(&db).await.unwrap();
+            sqlx::query(*ddl).execute(&db).await.unwrap();
         }
         let fx: Value = serde_json::from_str(FIXTURE).unwrap();
         let mut doc = HashMap::new();
@@ -867,7 +867,7 @@ mod tests {
     }
 
     async fn drop_world(w: World) {
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", w.schema)).execute(&w.db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {} CASCADE", w.schema))).execute(&w.db).await.unwrap();
     }
 
     fn titles(rows: &[DocRow]) -> BTreeSet<String> {

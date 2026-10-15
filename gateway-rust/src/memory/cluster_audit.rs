@@ -128,7 +128,7 @@ pub struct RawAudit {
 pub async fn fetch(db: &PgPool) -> Result<RawAudit, sqlx::Error> {
     let reader: Vec<String> = READER_ROLES.iter().map(|s| s.to_string()).collect();
     let heads: Vec<HeadRow> = sqlx::query_as(HEADS_SQL).fetch_all(db).await?;
-    let sigs: Vec<SigRow> = sqlx::query_as(&entity_tiers_sql()).bind(&reader).fetch_all(db).await?;
+    let sigs: Vec<SigRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*entity_tiers_sql())).bind(&reader).fetch_all(db).await?;
     let (total_entities, clustered_entities): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM entities), \
                 (SELECT COUNT(DISTINCT entity_id) FROM entity_cluster_members)",
@@ -501,17 +501,17 @@ mod tests {
             .after_connect(move |c, _| {
                 let s = s2.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("SET search_path TO {s}")).execute(&mut *c).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {s}"))).execute(&mut *c).await?;
                     Ok(())
                 })
             })
             .connect(&dsn)
             .await
             .expect("connect to the DSN under test");
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&db).await.unwrap();
-        sqlx::query(&format!("SET search_path TO {schema}")).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).execute(&db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}"))).execute(&db).await.unwrap();
         for ddl in DDL {
-            sqlx::query(ddl).execute(&db).await.unwrap();
+            sqlx::query(*ddl).execute(&db).await.unwrap();
         }
         Some(World { db, schema })
     }
@@ -679,7 +679,7 @@ mod tests {
         assert!(names.contains("pure-company"), "{names:?}");
         assert!(!names.contains("mixed-company-users") && !names.contains("untagged-only") && !names.contains("team-ops"));
 
-        sqlx::query(&format!("DROP SCHEMA {} CASCADE", w.schema)).execute(db).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {} CASCADE", w.schema))).execute(db).await.unwrap();
     }
 
     use std::collections::BTreeSet;
