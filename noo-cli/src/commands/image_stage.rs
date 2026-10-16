@@ -751,36 +751,92 @@ fn print_summary(g: &Globals, sum: &Summary) {
     }
 }
 
-/// Called by `noo upgrade --stack` BEFORE the launcher recreates anything:
-/// stage the release's node-bound images from the release-signed lock the
-/// roll already holds (`lock`, the bytes verified for `tag`; None when the
-/// release publishes no lock). The lock and the tag are passed in, never
-/// re-read from `.env` or the process environment, which still name the
-/// RUNNING release until the roll rewrites them.
+/// What the staging thread hands back.
+enum StageOutcome {
+    /// The release publishes no digest lock: nothing to stage.
+    NoLock,
+    Done(Summary),
+}
+
+/// A node-image staging pass running on its own thread, started BEFORE the
+/// launcher so the registry pulls and `docker save` exports overlap the
+/// compose pull/recreate. The thread prints NOTHING (it would interleave
+/// with the launcher's output): it returns a [`Summary`] and
+/// [`StageRun::finish`] prints it under one "Node images" step.
+pub(crate) struct StageRun {
+    handle: std::thread::JoinHandle<StageOutcome>,
+    tag: String,
+}
+
+/// Start staging the release's node-bound images from the release-signed lock
+/// the roll already holds (`lock`, the bytes verified for `tag`; None when the
+/// release publishes no lock). The lock and tag are passed in, never re-read
+/// from `.env` or the process environment, which still name the RUNNING
+/// release until the roll rewrites them.
 ///
-/// Never fails the roll: a failure is printed per image with the retry
-/// command, and is recorded in the staged index, where the nodes stage's
-/// `lock_stage_blocker` finds it and refuses to restage nodes on it. A
-/// gateway that does not answer the fleet-architecture probe falls back to
-/// the controller's own architecture (`fleet_arches`). Already-staged
-/// images are skipped by their `.imageid` marker, so a re-apply of the same
-/// tag is cheap.
-pub(crate) fn stage_release_images(g: &Globals, lock: Option<&str>, tag: &str) {
-    let Some(lock) = lock else {
-        if !g.json {
-            ui::warned("no stack.lock (a release without a digest lock) — node images were not staged; `noo cluster sync-images <node> -i <image>` stages one by name");
+/// Docker safety while the launcher shares the daemon (every path staged here
+/// was read): same-arch pulls and the foreign-arch pulls on the containerd
+/// store are by lock DIGEST, then tagged `<image>:<this tag>` at that same
+/// digest, a reference the running stack does not use and the launcher pins
+/// to the identical digest; the foreign-arch pull on the classic store is by
+/// platform manifest digest and is saved BY ID, never tagged. No path
+/// re-points a reference the controller's compose uses. Concurrent pulls of
+/// the same digest are safe in Docker.
+///
+/// Never fails the roll. Already-staged images are skipped by their
+/// `.imageid` marker (or hard-linked from a sibling release's identical
+/// export), so a same-tag re-apply is near-free.
+pub(crate) fn start_stage_release_images(g: &Globals, lock: Option<String>, tag: &str) -> StageRun {
+    // json=true silences every per-image line stage_lock/save_tar would print.
+    let mut quiet = g.clone();
+    quiet.json = true;
+    let tag_owned = tag.to_string();
+    let t = tag.to_string();
+    let handle = std::thread::spawn(move || {
+        let Some(lock) = lock else { return StageOutcome::NoLock };
+        let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
+        let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
+        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false))
+    });
+    StageRun { handle, tag: tag_owned }
+}
+
+impl StageRun {
+    /// Join the thread (always; never detach, so no `.exporting` tar is cut
+    /// off by a process exit) and print what it did. A panic is reported as a
+    /// staging failure AND recorded in the staged index, so the nodes stage's
+    /// `lock_stage_blocker` still refuses.
+    pub(crate) fn finish(self, g: &Globals) {
+        match self.handle.join() {
+            Ok(StageOutcome::NoLock) => {
+                if !g.json {
+                    ui::warned("no stack.lock (a release without a digest lock) — node images were not staged; `noo cluster sync-images <node> -i <image>` stages one by name");
+                }
+            }
+            Ok(StageOutcome::Done(sum)) => {
+                if !g.json {
+                    ui::step("Node images (staged on the artifact rail while the stack rolled; nodes pull them from here, never from a registry)");
+                }
+                print_summary(g, &sum);
+                if !sum.failed.is_empty() && !g.json {
+                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                }
+            }
+            Err(_) => {
+                let dir = images_store_dir();
+                let mut idx = read_index(&dir);
+                idx.lock_stage = Some(LockStage {
+                    tag: self.tag.clone(),
+                    failed: vec!["the staging thread panicked".to_string()],
+                    at: now_unix(),
+                });
+                let _ = write_index(&dir, &idx);
+                ui::warned("node image staging crashed (the roll itself is unaffected) — the nodes stage will refuse until it is retried");
+                if !g.json {
+                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                }
+            }
         }
-        return;
-    };
-    let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
-    let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
-    if !g.json {
-        ui::step("staging node images on the artifact rail before the roll (nodes pull them from here, never from a registry)");
-    }
-    let sum = stage_lock(g, lock, &prefix, tag, &fleet_arches_from_gateway(g), false);
-    print_summary(g, &sum);
-    if !sum.failed.is_empty() && !g.json {
-        ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
     }
 }
 

@@ -1220,7 +1220,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    source, and Docker would otherwise create it as root.
     sync_gateway_pki_view(g);
 
-    // 2.7. Stage the release's node images on the artifact rail NOW, while the
+    // 2.7. Stage the release's node images on the artifact rail, while the
     //    old gateway still serves: it is controller-only work (registry pull +
     //    docker save) and used to sit AFTER the roll, ahead of the nodes
     //    phase. It uses the lock bytes verified above for `tag` (not .env,
@@ -1228,7 +1228,9 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    warns per image and is recorded for the nodes stage's
     //    lock_stage_blocker; it never aborts the roll. The prune below keeps
     //    `tag`, so it cannot delete what was just staged.
-    crate::commands::image_stage::stage_release_images(g, target_stack_lock.as_deref(), &tag);
+    //    It runs on a thread OVERLAPPING the launcher's compose pull/recreate
+    //    and is joined (always) as soon as the launcher returns.
+    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag);
 
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
@@ -1250,6 +1252,16 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         ui::warned("launcher failed — retrying once in 5s (transient registry errors are common)");
         std::thread::sleep(Duration::from_secs(5));
         status = launch();
+    }
+    // Join the staging thread whatever the launcher did (a detached thread
+    // could be killed mid-export by the process exit). Its result prints
+    // right after the launcher's own output; on a launcher failure it prints
+    // after the failure message (below). Not at the gateway health wait,
+    // which lives in the caller (run_fleet_stages): joining here keeps the
+    // overlap with the whole launcher run.
+    let mut staging = Some(staging);
+    if matches!(&status, Ok(s) if s.success()) {
+        if let Some(st) = staging.take() { st.finish(g); }
     }
     match status {
         Ok(s) if s.success() => {
@@ -1362,10 +1374,15 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         }
         Ok(s) => {
             ui::close_failed(&format!("launcher exited with {} twice; the pin IS moved to {tag}", s.code().unwrap_or(-1)), Some("noo stack logs"));
+            if let Some(st) = staging.take() { st.finish(g); }
             Ok(1)
         }
-        Err(e) => fail(g.json, ExitCode::Generic, "launch_failed",
-            &format!("could not run the launcher: {e}"), None),
+        Err(e) => {
+            // fail() exits the process: join first.
+            if let Some(st) = staging.take() { st.finish(g); }
+            fail(g.json, ExitCode::Generic, "launch_failed",
+            &format!("could not run the launcher: {e}"), None)
+        }
     }
 }
 
@@ -4379,22 +4396,31 @@ mod tests {
         }
     }
 
-    /// Node images are staged from the verified lock BEFORE the launcher
-    /// recreates the gateway, and after the last refusal that could abort the
-    /// roll; the post-roll pass is gone.
+    /// Node images are staged on a thread started from the verified lock
+    /// BEFORE the launcher (overlapping it), after the last refusal that could
+    /// abort the roll, and joined (on every launcher outcome) before the
+    /// prune and before the function returns.
     #[test]
     fn upgrade_stack_stages_node_images_before_the_launcher_tests() {
         let src = include_str!("upgrade.rs");
         let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
         let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let stage = at("image_stage::stage_release_images(g, target_stack_lock.as_deref(), &tag)");
-        assert!(at("fetch_stack_lock(g, &tag)") < stage, "stage from a lock that has been fetched and verified");
+        let spawn = at("image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag)");
+        assert!(at("fetch_stack_lock(g, &tag)") < spawn, "stage from a lock that has been fetched and verified");
         for before in ["addon_preflight(", "reconcile_audit_key(&root)", "write_stack_lock(g, &tag", "NOO_IMAGE_TAG\", &tag", "sync_gateway_pki_view(g)"] {
-            assert!(at(before) < stage, "`{before}` can abort or shape the roll and must run before staging");
+            assert!(at(before) < spawn, "`{before}` can abort or shape the roll and must run before staging");
         }
-        assert!(stage < at("root.join(\"scripts/noomesh-start.sh\")"), "staging must precede the launcher");
-        assert!(!body.contains("stage_after_roll"), "no second staging pass after the roll");
+        let launcher = at("let mut status = launch();");
+        assert!(spawn < launcher, "staging must start before the launcher runs, to overlap it");
+        let join = at("st.finish(g)");
+        assert!(launcher < join, "joined after the launcher returns");
+        assert!(join < at("docker_image_ids_in_use()"), "joined before the prune");
+        assert!(join < at("Ok(0)"), "joined before the function returns");
+        // Every exit after the spawn joins first: the success join, the failed
+        // launcher arm, and the spawn-error arm that calls fail() (process exit).
+        assert_eq!(body.matches("st.finish(g)").count(), 3, "join on success, launcher failure and spawn error");
+        assert!(!body.contains("stage_after_roll") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
     }
 
     #[test]
