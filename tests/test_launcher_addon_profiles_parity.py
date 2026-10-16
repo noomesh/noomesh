@@ -178,21 +178,16 @@ def test_a_licensed_addon_that_is_off_or_unstated_is_not_composed(install: Path)
     assert _names("trellion=1", root=install) == ["docker-compose.trellion.yml"]
 
 
-def test_the_legacy_root_overlay_composes_with_a_warn_only_without_a_bundle(install: Path) -> None:
+def test_a_root_overlay_left_by_an_earlier_cli_is_never_composed(install: Path) -> None:
     legacy = install / "docker-compose.example-addon.yml"
     legacy.write_text(_SYNTH_OVERLAY)
     # bundle present: the bundle wins, no warning
-    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
+    out = _run_helper("trellion=0\nexample_addon=1", "addon_compose_overlay_args", root=install)
     assert out.stdout.split() == ["-f", str(install / "addons" / "example_addon" / "docker-compose.yml")]
     assert "WARN" not in out.stderr, out.stderr
-    # no bundle: the deprecated root file composes, and says so
+    # no bundle: the root file is NOT a fallback any more (N6 compat removed)
     shutil.rmtree(install / "addons" / "example_addon")
-    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
-    assert out.stdout.split() == ["-f", str(legacy)]
-    assert "WARN" in out.stderr and "example_addon" in out.stderr, out.stderr
-    # neither: nothing composes, nothing to warn about
-    legacy.unlink()
-    out = _run_helper("trellion=0\\nexample_addon=1", "addon_compose_overlay_args", root=install)
+    out = _run_helper("trellion=0\nexample_addon=1", "addon_compose_overlay_args", root=install)
     assert out.stdout.strip() == "" and "WARN" not in out.stderr, (out.stdout, out.stderr)
 
 

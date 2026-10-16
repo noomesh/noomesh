@@ -878,17 +878,13 @@ pub(crate) const DELIVERING_FILES: &[&str] = &["docker-compose.cluster.yml", "do
 
 /// Every compose file under `root` whose deliveries the audit reads:
 /// [`DELIVERING_FILES`], then each licensed add-on's bundled overlay
-/// (`addons/<name>/docker-compose.yml`), else the deprecated overlay an
-/// earlier CLI left beside the base.
+/// (`addons/<name>/docker-compose.yml`).
 pub(crate) fn delivering_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = DELIVERING_FILES.iter().map(|f| root.join(f)).collect();
     for row in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
         let bundled = crate::addons::pins::addon_dir(root, row.key).join(crate::addon_lock::OVERLAY_FILE);
-        let legacy = crate::addons::pins::legacy_overlay(root, row.key);
         if bundled.is_file() {
             out.push(bundled);
-        } else if legacy.is_file() {
-            out.push(legacy);
         }
     }
     out
@@ -1301,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn the_audit_reads_a_bundled_overlay_and_falls_back_to_a_legacy_one() {
+    fn the_audit_reads_a_bundled_overlay_and_ignores_a_root_one() {
         let d = std::env::temp_dir().join(format!("noo-delivering-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1310,13 +1306,12 @@ mod tests {
         let bundled = crate::addons::pins::addon_dir(&d, "evolve").join("docker-compose.yml");
         std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
         std::fs::write(&bundled, "services: {}\n").unwrap();
-        let legacy = crate::addons::pins::legacy_overlay(&d, "trellion_intel");
-        std::fs::write(&legacy, "services: {}\n").unwrap();
+        // An overlay left in the install root by an earlier CLI is not read.
+        std::fs::write(d.join("docker-compose.trellion-intel.yml"), "services: {}\n").unwrap();
+        std::fs::write(d.join("docker-compose.evolve.yml"), "services: {}\n").unwrap();
         let got = delivering_paths(&d);
-        assert!(got.contains(&bundled) && got.contains(&legacy), "{got:?}");
-        // A bundle wins over a legacy copy of the same add-on.
-        std::fs::write(crate::addons::pins::legacy_overlay(&d, "evolve"), "services: {}\n").unwrap();
-        assert!(!delivering_paths(&d).contains(&crate::addons::pins::legacy_overlay(&d, "evolve")));
+        assert!(got.contains(&bundled), "{got:?}");
+        assert_eq!(got.len(), base.len() + 1, "{got:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -739,9 +739,14 @@ four things: the pins, the materialised bundle files (each must still hash to
 the signed lock; an edited overlay is refused like an edited lock), the local
 images, and what runs.
 
-**Locks without a bundle (deprecated).** A `noo-addon-lock/1` lock carries no
-overlay. For one release (0.6.4) the launcher still composes the
-`docker-compose.<name>.yml` an earlier CLI left beside it, with a warning,
-and the upgrade that stops shipping that file keeps it in place for this one
-release. With no such file, the add-on is refused at start until its release
-re-signs a bundle for the stack and `noo addons upgrade <name>` fetches it.
+**Locks without a bundle (refused).** A `noo-addon-lock/1` lock carries no
+overlay, so there is nothing to compose. Through 0.6.5 the launcher still
+composed the `docker-compose.<name>.yml` an earlier CLI left in the install
+root; 0.6.6 removed that path. `noo addons enable|upgrade|verify` and the
+launcher's pins now refuse such a lock ("this add-on lock predates signed
+bundles; the vendor must re-sign it for <tag>"; check with `noo addons
+upgrade <name> --check`), and the upgrade that installs 0.6.6 removes any
+leftover root overlay (`docker-compose.evolve.yml`,
+`docker-compose.trellion-intel.yml`), moving it aside as `.retired-<version>`
+if it was edited. Every add-on lock published for stack v0.6.2 and later is a
+bundle.
