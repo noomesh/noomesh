@@ -18114,6 +18114,207 @@
           }
         }
       }
+    },
+    "/api/tasks/{id}/answer": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create answer",
+        "description": "[native] Answer the question a task asked: a new loop starts with the question and the answer.",
+        "operationId": "tasks_answer",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/ask": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create ask",
+        "description": "[native] Ask the task's owner a question the loop cannot go on without: posted to its thread; the task waits for the answer from the next loop boundary.",
+        "operationId": "tasks_ask",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/resubmit": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create resubmit",
+        "description": "[native] Give a task more tokens: a task parked because its budget ran out resumes from its checkpoint; on a running task only its cap changes.",
+        "operationId": "tasks_resubmit",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/usage/me": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Get me",
+        "description": "[native] GET /api/usage/me \u2014 one person's spend this period: node, cloud and per-harness-kind columns (never merged), the allowance and what is left, and cost_usd per column.",
+        "operationId": "usage_me",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/users/{username}/allowance": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Get allowance",
+        "description": "[native] GET /api/users/{username}/allowance \u2014 a person's token allowance and its use this period (Admin, or the person).",
+        "operationId": "allowance_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Update allowance",
+        "description": "[native] PUT /api/users/{username}/allowance \u2014 set a person's standing token allowance per period (Admin): body {tokens, period?=month}.",
+        "operationId": "allowance_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "usage"
+        ],
+        "summary": "Delete allowance",
+        "description": "[native] DELETE /api/users/{username}/allowance \u2014 remove a person's allowance: no standing cap (Admin).",
+        "operationId": "allowance_delete",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

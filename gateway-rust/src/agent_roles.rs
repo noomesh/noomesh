@@ -256,7 +256,7 @@ pub async fn collaborate(
         return Err(json!({"error": "prompt is required"}));
     }
     let parent = crate::tasks::create_task(&state.db, crate::tasks::NewTask {
-        owner, objective: prompt, model: None, loop_budget: Some(0), parent: None, role: None,
+        owner, objective: prompt, model: None, loop_budget: Some(0), parent: None, role: None, token_budget: None,
     })
     .await
     .map_err(|e| json!({"error": e.to_string()}))?;
@@ -264,7 +264,7 @@ pub async fn collaborate(
     let mut children = Vec::new();
     for role in &workflow {
         let child = crate::tasks::create_task(&state.db, crate::tasks::NewTask {
-            owner, objective: prompt, model: None, loop_budget: Some(role.max_tool_loops().max(1)), parent: Some(&parent), role: Some(role.as_str()),
+            owner, objective: prompt, model: None, loop_budget: Some(role.max_tool_loops().max(1)), parent: Some(&parent), role: Some(role.as_str()), token_budget: None,
         })
         .await
         .map_err(|e| json!({"error": e.to_string()}))?;

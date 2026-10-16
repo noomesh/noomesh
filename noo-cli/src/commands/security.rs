@@ -275,6 +275,77 @@ pub fn security_user_revoke_role(g: &Globals, args: &[String]) -> Result<i32, Un
 /// full intended set: `--scope read --scope write`, not just `--scope write`.
 /// An empty list is refused locally rather than sent, because the gateway
 /// would reject it anyway and a local error names the mistake better.
+/// `noo security user allowance <username> [--tokens <n>] [--period day|week|month] [--clear]`
+/// — a person's standing token allowance (i83 G). With no flag it shows the
+/// allowance and its use; `--tokens` sets it (Admin); `--clear` removes it.
+pub fn security_user_allowance(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut username: Option<String> = None;
+    let mut tokens: Option<i64> = None;
+    let mut period: Option<String> = None;
+    let mut clear = false;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--tokens" | "-t" => tokens = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n: &i64| *n >= 0).ok_or(Unhandled)?),
+            "--period" | "-p" => period = Some(iter.next().ok_or(Unhandled)?.clone()),
+            "--clear" => clear = true,
+            s if !s.starts_with('-') && username.is_none() => username = Some(s.to_string()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let username = username.ok_or(Unhandled)?;
+    if clear && (tokens.is_some() || period.is_some()) {
+        fail(g.json, ExitCode::Usage, "usage", "--clear takes no --tokens or --period", None);
+    }
+    if let Some(p) = &period {
+        if !super::usage::valid_period(p) {
+            fail(g.json, ExitCode::Usage, "usage", &format!("invalid --period '{p}' (expected day|week|month)"), None);
+        }
+        if tokens.is_none() {
+            fail(g.json, ExitCode::Usage, "usage", "--period sets the allowance's period: give --tokens too", None);
+        }
+    }
+    let path = format!("/api/users/{}/allowance", super::urlencode(&username));
+    let body = if clear {
+        crate::http::delete_json(g, &path, true, TIMEOUT)
+    } else if let Some(n) = tokens {
+        let mut b = json!({"tokens": n});
+        if let Some(p) = &period {
+            b["period"] = json!(p);
+        }
+        put_json(g, &path, &b, true, TIMEOUT)
+    } else {
+        get_json(g, &path, true, TIMEOUT)
+    };
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    if clear {
+        ui::done(&format!("{username} has no token allowance now (no standing cap)"));
+        return Ok(0);
+    }
+    match body["allowance"].as_object() {
+        Some(a) => {
+            let line = format!(
+                "{username}: {} of {} tokens this {} — {} left",
+                a.get("spent").and_then(Value::as_i64).unwrap_or(0),
+                a.get("limit").and_then(Value::as_i64).unwrap_or(0),
+                a.get("period").and_then(Value::as_str).unwrap_or("month"),
+                a.get("remaining").and_then(Value::as_i64).unwrap_or(0)
+            );
+            if tokens.is_some() {
+                ui::done(&line);
+            } else {
+                println!("{line}");
+            }
+        }
+        None => println!("{}", ui::muted(&format!("{username} has no token allowance (no standing cap)"))),
+    }
+    ui::guide(&[("noo usage me --user <user>", "their node, cloud and harness spend this period")]);
+    Ok(0)
+}
+
 pub fn security_user_set_scopes(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut username: Option<String> = None;
     let mut scopes: Vec<String> = Vec::new();

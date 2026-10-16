@@ -4,7 +4,10 @@
 //! The task tools on the user MCP door (`/mcp/user`): `noo_task_delegate`,
 //! `noo_task_status`, `noo_task_wait`, `noo_task_done` — for a caller with no
 //! native loop around it (a foreign CLI harness, a person's own client on a
-//! laptop) to open, watch, wait on and finish mesh tasks (i83 E1d).
+//! laptop) to open, watch, wait on and finish mesh tasks (i83 E1d) — and the
+//! token-budget tools (i83 G): `noo_task_ask` (a question to the owner, as
+//! the in-loop tool), `noo_task_resubmit` (raise the budget, resume) and
+//! `noo_task_answer` (answer the question, start a new loop).
 //!
 //! **Why these are not manifest tools.** Every other door tool is a
 //! `mcp-tools.json` entry the door turns into an HTTP self-call under the
@@ -42,9 +45,16 @@ pub const DELEGATE: &str = "noo_task_delegate";
 pub const STATUS: &str = "noo_task_status";
 pub const WAIT: &str = "noo_task_wait";
 pub const DONE: &str = "noo_task_done";
+pub const ASK: &str = "noo_task_ask";
+pub const RESUBMIT: &str = "noo_task_resubmit";
+pub const ANSWER: &str = "noo_task_answer";
 
-/// The four, in the order `tools/list` advertises them.
-pub const TOOLS: &[&str] = &[DELEGATE, DONE, STATUS, WAIT];
+/// All of them, in the order `tools/list` advertises them.
+pub const TOOLS: &[&str] = &[DELEGATE, DONE, STATUS, ASK, RESUBMIT, ANSWER, WAIT];
+
+/// The ones a task's own loop also has, under the same name (`tools.rs`).
+/// Resubmit and answer are the OWNER's moves, never the loop's.
+pub const LOOP_TOOLS: &[&str] = &[DELEGATE, DONE, STATUS, WAIT, ASK];
 
 /// The longest one `noo_task_wait` call holds the door: the gateway's bound
 /// for holding any request (`ops::MAX_WAIT_SECS`, short of every proxy
@@ -90,7 +100,8 @@ pub fn tool_list() -> Vec<Value> {
                     "parent_task_id": {"type": "string", "description": "One of your live tasks to delegate under. Omit for a top-level task."},
                     "role": {"type": "string", "description": format!("Role its loops run under: {roles}.")},
                     "model": {"type": "string", "description": "Model to run it on. Omit for the default."},
-                    "loop_budget": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Loops it may take. Omit for the default of the node it lands on (else the cluster's)."}
+                    "loop_budget": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Loops it may take. Omit for the default of the node it lands on (else the cluster's)."},
+                    "token_budget": {"type": "integer", "minimum": 1, "description": "Tokens its loops may spend (prompt + completion). Omit for no cap of its own."}
                 },
                 "required": ["objective"]
             }
@@ -118,6 +129,47 @@ pub fn tool_list() -> Vec<Value> {
                 "properties": {
                     "task_id": {"type": "string", "description": "Your task. Omit to list your recent tasks."}
                 }
+            }
+        }),
+        json!({
+            "name": ASK,
+            "description": "Ask the owner of one of your tasks a question it cannot go on without. The question is posted \
+                            to the task's thread; the running loop finishes, then the task waits for the answer \
+                            (budget_state awaiting_clarification).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Your task."},
+                    "question": {"type": "string", "description": "One clear question."}
+                },
+                "required": ["task_id", "question"]
+            }
+        }),
+        json!({
+            "name": RESUBMIT,
+            "description": "Give one of your tasks more tokens. A task stopped because its token budget ran out \
+                            (budget_state exhausted) resumes from its checkpoint; on a running task this only \
+                            changes its cap.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Your task."},
+                    "token_budget": {"type": "integer", "minimum": 1, "description": "The new cap, in tokens. Omit to resume under the same cap (after an allowance was raised or turned over)."}
+                },
+                "required": ["task_id"]
+            }
+        }),
+        json!({
+            "name": ANSWER,
+            "description": "Answer the question one of your tasks asked (budget_state awaiting_clarification): a new \
+                            loop starts with the question and your answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Your task."},
+                    "text": {"type": "string", "description": "Your answer."}
+                },
+                "required": ["task_id", "text"]
             }
         }),
         json!({
@@ -262,7 +314,13 @@ async fn finish<S: TaskStore>(store: &S, user: &str, args: &Map<String, Value>) 
     }
 }
 
-/// Run one of the four for the door's caller (`user` is the key's bound account).
+/// The caller's task the arguments name, or why not.
+async fn named<S: TaskStore>(store: &S, user: &str, args: &Map<String, Value>) -> Result<Task, String> {
+    let Some(id) = arg(args, "task_id") else { return Err("task_id is required".into()) };
+    owned(store, user, id).await
+}
+
+/// Run one of the task tools for the door's caller (`user` is the key's bound account).
 pub async fn call(state: &Arc<AppState>, user: &str, name: &str, args: &Map<String, Value>) -> Result<Value, String> {
     let store = Db(&state.db);
     match name {
@@ -277,6 +335,33 @@ pub async fn call(state: &Arc<AppState>, user: &str, name: &str, args: &Map<Stri
             let (task, ok, text) = finish(&store, user, args).await?;
             crate::tools::post_task_result(state, &task, user, ok, &text).await;
             Ok(json!({"task_id": task.id, "state": if ok { "done" } else { "failed" }}))
+        }
+        ASK => {
+            let task = named(&store, user, args).await?;
+            let q = arg(args, "question").unwrap_or_default();
+            crate::task_budget::ask(state, &task, q).await.map_err(|e| e.to_string())?;
+            Ok(json!({"task_id": task.id, "asked": true}))
+        }
+        RESUBMIT => {
+            let task = named(&store, user, args).await?;
+            let budget = args.get("token_budget").and_then(Value::as_i64);
+            let (after, started) = crate::task_budget::resubmit(state, &task, budget).await.map_err(|e| e.to_string())?;
+            let mut out = brief(&after);
+            out["resumed"] = json!(started.is_some());
+            if let Some(s) = started {
+                out["node"] = json!(s.node);
+                out["dispatched"] = json!(s.dispatched);
+            }
+            Ok(out)
+        }
+        ANSWER => {
+            let task = named(&store, user, args).await?;
+            let text = arg(args, "text").or_else(|| arg(args, "answer")).unwrap_or_default();
+            let (after, started) = crate::task_budget::answer(state, &task, text).await.map_err(|e| e.to_string())?;
+            let mut out = brief(&after);
+            out["node"] = json!(started.node);
+            out["dispatched"] = json!(started.dispatched);
+            Ok(out)
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -310,6 +395,10 @@ mod tests {
             role: None,
             budget_default: false,
             stale: false,
+            token_budget: None,
+            tokens_spent: 0,
+            budget_state: None,
+            remaining: None,
         }
     }
 
@@ -381,9 +470,9 @@ mod tests {
         ])
     }
 
-    /// The four are advertised in the door's tool shape, each with a schema.
+    /// Every task tool is advertised in the door's tool shape, each with a schema.
     #[test]
-    fn the_four_are_listed_with_schemas() {
+    fn the_task_tools_are_listed_with_schemas() {
         let list = tool_list();
         let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOLS, "listed in TOOLS order");
@@ -396,6 +485,9 @@ mod tests {
         assert_eq!(req(DONE), json!(["task_id", "result"]));
         assert_eq!(req(WAIT), json!(["task_id"]));
         assert!(req(STATUS).is_null(), "status takes no required argument");
+        assert_eq!(req(ASK), json!(["task_id", "question"]));
+        assert_eq!(req(RESUBMIT), json!(["task_id"]));
+        assert_eq!(req(ANSWER), json!(["task_id", "text"]));
         assert!(TOOLS.iter().all(|n| is_tool(n)) && !is_tool("noo_rag_query"));
     }
 
@@ -407,8 +499,13 @@ mod tests {
             assert!(crate::mcp_external::tool(n).is_none(), "{n} must not also be a manifest tool");
         }
         let src = include_str!("tools.rs");
-        for n in TOOLS {
+        for n in LOOP_TOOLS {
             assert!(src.contains(&format!("\"{n}\" => Some(")), "{n} is a native tool in tools.rs");
+        }
+        // The owner's moves are not the loop's: a task cannot raise its own
+        // budget or answer its own question.
+        for n in [RESUBMIT, ANSWER] {
+            assert!(!src.contains(&format!("\"{n}\"")), "{n} must not be a loop tool");
         }
     }
 
@@ -441,6 +538,8 @@ mod tests {
             assert_eq!(wait(&store, "alice", &a, std::time::Duration::from_millis(1)).await.unwrap_err(), NOT_FOUND, "wait {id}");
             assert_eq!(finish(&store, "alice", &a).await.unwrap_err(), NOT_FOUND, "done {id}");
             assert_eq!(parent_for(&store, "alice", &a).await.unwrap_err(), NOT_FOUND, "delegate under {id}");
+            // ask, resubmit and answer resolve their task through `named`.
+            assert_eq!(named(&store, "alice", &a).await.unwrap_err(), NOT_FOUND, "ask/resubmit/answer {id}");
         }
         assert!(store.finished.lock().unwrap().is_empty(), "nothing was finished");
         assert_eq!(store.tasks.lock().unwrap().iter().find(|t| t.id == "theirs").unwrap().state, "running");

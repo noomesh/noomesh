@@ -261,6 +261,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo usage` | `[-m <YYYY-MM> \| --all-time] [-g node\|model\|backend\|source\|user\|consumer\|day]` | Show token-usage totals for a month or all time, grouped by a dimension |
+| `noo usage me` | `[-p\|--period day\|week\|month] [-u\|--user <user>]` | Show your token spend this period: node, cloud and harness apart, and your allowance |
 
 ### `noo plugins` — Plugin management
 | Command | Arguments | What it does |

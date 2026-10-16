@@ -325,6 +325,30 @@
     {
       "type": "function",
       "function": {
+        "name": "noo_task_ask",
+        "description": "Ask the owner of the task this conversation is running one clear question you cannot go on without. Finish this loop after asking: the task waits, and the owner's answer starts the next loop with your question and their answer.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "One clear question for the owner"
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      },
+      "tags": [
+        "core",
+        "agents"
+      ],
+      "speed": "fast"
+    },
+    {
+      "type": "function",
+      "function": {
         "name": "noo_task_delegate",
         "description": "Hand part of your task to a sub-task that runs as you, on the node holding its model, under a role. It loops on its own; its notes and result arrive in this task's thread. Use noo_task_wait to wait for it.",
         "parameters": {

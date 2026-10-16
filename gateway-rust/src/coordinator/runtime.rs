@@ -132,6 +132,12 @@ pub(crate) trait TaskRuntime: HarnessRuntime {
     /// Returns the task's state after the checkpoint. `exhausted` ends the
     /// task as failed (loop budget) before reading the state.
     async fn checkpoint(&mut self, task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String>;
+    /// The token switch (i83 G), called at the loop boundary BEFORE a loop
+    /// starts: may it start? Parks the task when the answer is no.
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck>;
+    /// One finished loop's tokens, against the task and in the usage table
+    /// with the task id and the backend that served it.
+    async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()>;
 }
 
 /// The gateway's own runtime: the loop running in the same process as
@@ -150,6 +156,26 @@ impl<'a> InProcessRuntime<'a> {
 impl TaskRuntime for InProcessRuntime<'_> {
     async fn checkpoint(&mut self, task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String> {
         crate::tasks::checkpoint(self.state, task_id, loops, note, exhausted).await
+    }
+
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+        crate::task_budget::check(self.state, task_id).await
+    }
+
+    async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()> {
+        let Some(task) = crate::tasks::get(&self.state.db, task_id).await? else { return Ok(()) };
+        let usage = crate::usage::TaskUsage {
+            node_id: result.node.clone(),
+            backend: result.backend.clone(),
+            model: result.model.clone(),
+            source: crate::usage::TASK_SOURCE,
+            username: task.owner.clone().unwrap_or_default(),
+            harness_kind: None,
+            task_id: task.id.clone(),
+            prompt_tokens: result.usage.prompt_tokens,
+            completion_tokens: result.usage.completion_tokens,
+        };
+        crate::task_budget::account(&self.state.db, &usage).await.map(|_| ())
     }
 }
 

@@ -1643,7 +1643,61 @@ ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text;
     sql: r#"
 ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS expires_at timestamptz
 "#,
+}, Migration {
+    revision: TOKEN_BUDGETS_REVISION,
+    down_revision: Some("090_service_key_expiry"),
+    // i83 G: token budgets as a switch at the loop boundary
+    // (`task_budget.rs`).
+    //
+    // On a task: `token_budget` (NULL = no per-task cap), `tokens_spent`
+    // (prompt + completion across its loops, native and harness, added one
+    // loop at a time by an UPDATE … RETURNING), `budget_state` (NULL, or
+    // `exhausted` / `awaiting_clarification` — set ONLY at the loop
+    // boundary, so a set state means the runner has stopped) and
+    // `clarification` (the question a loop asked, then the owner's answer
+    // until the next loop reads it).
+    //
+    // `noo_token_allowances`: a person's standing allowance per period,
+    // set by an operator. Keyed on the account's uuid like the usage rows
+    // (063), so a rename keeps it and deleting the account drops it.
+    //
+    // `noo_token_usage.task_id`: the task a row was spent on, for both the
+    // native loop and the `usage` rail op. On the partitioned parent, so
+    // every partition gets it; nullable, no default, no rewrite.
+    sql: r#"
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS token_budget bigint;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS tokens_spent bigint NOT NULL DEFAULT 0;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS budget_state text;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS clarification jsonb;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'noo_tasks_budget_state_chk') THEN
+        ALTER TABLE noo_tasks ADD CONSTRAINT noo_tasks_budget_state_chk
+            CHECK (budget_state IS NULL OR budget_state IN ('exhausted', 'awaiting_clarification'));
+    END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS noo_token_allowances (
+    user_uuid    uuid PRIMARY KEY REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    period       text NOT NULL DEFAULT 'month',
+    limit_tokens bigint NOT NULL,
+    updated_by   text,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT noo_token_allowances_period_chk CHECK (period IN ('day', 'week', 'month')),
+    CONSTRAINT noo_token_allowances_limit_chk CHECK (limit_tokens >= 0)
+);
+ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_token_allowances TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
+
+/// The token-budget revision (i83 G). A constant so a renumber at rebase is
+/// one line.
+pub const TOKEN_BUDGETS_REVISION: &str = "091_token_budgets";
 
 /// The Alembic revision the baselines reproduce.
 ///
@@ -2403,7 +2457,22 @@ mod tests {
         assert_eq!(m.down_revision, Some("088_placement_target_usage"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text"));
         let writer = include_str!("usage.rs");
-        assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind)"), "usage::insert must write harness_kind");
+        assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind"), "usage::insert must write harness_kind");
+    }
+
+    /// 091 sits on 090 and adds what `task_budget` and `usage::insert` name.
+    #[test]
+    fn token_budgets_revision_sits_on_090_and_adds_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == TOKEN_BUDGETS_REVISION).expect("091 must be in the chain");
+        assert_eq!(m.revision, "091_token_budgets");
+        assert_eq!(m.down_revision, Some("090_service_key_expiry"));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(TOKEN_BUDGETS_REVISION), "091 is the head");
+        for col in ["token_budget bigint", "tokens_spent bigint NOT NULL DEFAULT 0", "budget_state text", "clarification jsonb"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_token_allowances"));
+        assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text"));
+        assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
     }
 
     /// Post-cut-over revisions only. Anything up to BASELINE_REVISION is the
