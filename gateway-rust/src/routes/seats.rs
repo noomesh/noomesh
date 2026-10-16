@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn a_seat_token_redeems_once_unexpired_unrevoked_for_its_own_seat() {
         assert_eq!(judge_seat_token(false, false, false, "seat", "lobby", "lobby"), Ok(()));
-        assert_eq!(judge_seat_token(false, false, false, "seat", "lobby", "HomeServer"), Ok(()));
+        assert_eq!(judge_seat_token(false, false, false, "seat", "lobby", "Lobby"), Ok(()));
         assert_eq!(judge_seat_token(false, true, false, "seat", "lobby", "lobby"), Err(SeatDeny::AlreadyUsed));
         assert_eq!(judge_seat_token(false, false, true, "seat", "lobby", "lobby"), Err(SeatDeny::Expired));
         assert_eq!(judge_seat_token(true, false, false, "seat", "lobby", "lobby"), Err(SeatDeny::Revoked));
