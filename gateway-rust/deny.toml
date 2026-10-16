@@ -1,0 +1,29 @@
+# cargo-deny config for the advisory gate (ci.yml job `rust-advisories`).
+# Scope: RustSec advisories only. Licences and bans are not gated here.
+#
+# Vulnerabilities fail the job. Every ignore below is a decision with a reason;
+# add nothing without one, and delete the entry when the reason stops holding.
+
+[advisories]
+# Fetched fresh per run; a stale db would pass what the world has since flagged.
+version = 2
+yanked = "deny"
+ignore = [
+    # rsa 0.9 "Marvin Attack" (timing side channel in PRIVATE-key operations),
+    # no fixed release exists. It is reachable only as:
+    #   - src/birth_proof.rs: RSA PKCS#1 v1.5 signature VERIFICATION against a
+    #     node's public key (this crate never holds or uses an RSA private key
+    #     outside #[cfg(test)]); verification has no secret to leak.
+    #   - jsonwebtoken's rust_crypto backend compiles it in, but the gateway
+    #     mints and accepts only HS256 and ES256 (auth.rs, jwks.rs); no RS*
+    #     algorithm is configured.
+    #   - TLS is rustls (ring), which does not use this crate.
+    # Revisit when a patched rsa ships or if any RSA private-key use is added.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: verify-only (birth_proof.rs), no RSA private key in JWT or TLS; no upstream fix" },
+    # Unmaintained, not vulnerable. rustls-pemfile is pulled by axum-server and
+    # used directly for PEM parsing; migrating to rustls-pki-types' PemObject is
+    # tracked work, not part of the advisory gate.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration to rustls-pki-types pending" },
+    # Unmaintained, not vulnerable: serde_yaml's libyaml port.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (serde_yaml); migration pending" },
+]
