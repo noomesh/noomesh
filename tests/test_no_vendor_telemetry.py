@@ -528,9 +528,11 @@ HARNESS_KINDS_JSON = ROOT / "config/harness-kinds.json"
 # vendor's own documentation as the source (code.claude.com/docs/en/env-vars,
 # github.blog/changelog/2026-04-07-copilot-cli-now-supports-byok-and-local-models).
 # "noo" is our own binary: no phone-home code, so no switches. "codex" has no
-# switches declared yet (the doc says so) and no runner ships for it. A new
-# kind must be added in config/harness-kinds.json (which both the gateway and
-# the node agent embed), HERE, and in the doc.
+# environment switches: Codex CLI's reporting is configured in its
+# config.toml, which the harness driver writes for every run
+# (`config-file:codex-toml`, CODEX_CONFIG_SWITCHES below). A new kind must be
+# added in config/harness-kinds.json (which both the gateway and the node
+# agent embed), HERE, and in the doc.
 HARNESS_SWITCHES: dict[str, dict[str, str]] = {
     "noo": {},
     "claude-code": {
@@ -548,6 +550,26 @@ HARNESS_SWITCHES: dict[str, dict[str, str]] = {
     "copilot": {"COPILOT_OFFLINE": "true"},
     "codex": {},
 }
+
+
+# The lines of the config.toml the driver writes for Codex CLI
+# (gateway-rust/src/harness/driver.rs, `codex_config`) that switch its vendor
+# channels off, as they appear in that source; the vendor's config reference
+# (learn.chatgpt.com/docs/config-file/config-reference) names each key.
+CODEX_DRIVER = ROOT / "gateway-rust/src/harness/driver.rs"
+CODEX_CONFIG_SWITCHES = (
+    "check_for_update_on_startup = false",
+    'web_search = \\"disabled\\"',
+    "[analytics]",
+    "[feedback]",
+    "enabled = false",
+    "[history]",
+    'persistence = \\"none\\"',
+    'exporter = \\"none\\"',
+    'trace_exporter = \\"none\\"',
+    'metrics_exporter = \\"none\\"',
+)
+CODEX_CONFIG_MODE = "config-file:codex-toml"
 
 
 def _harness_kinds() -> list[dict]:
@@ -579,11 +601,27 @@ def test_every_harness_kind_has_its_switches_declared_once():
     # `cli` PLUS a backend that can serve its wire (`wires` non-empty; an
     # empty `wires` is refused by data). A kind that is launchable would run
     # a CLI nobody has switched off.
+    # The one exception is a CLI whose switches are in the config file the
+    # driver writes (Codex CLI); then that file must carry every one.
     for r in rows:
         if r["kind"] != "noo" and not r["telemetry_off"]:
+            if (r.get("launch") or {}).get("mcp") == CODEX_CONFIG_MODE:
+                continue
             assert r.get("cli") is None or not r["wires"], (
                 f"harness kind {r['kind']!r} names a vendor CLI and a serving backend with no telemetry switches declared"
             )
+
+
+def test_the_codex_config_the_driver_writes_switches_its_reporting_off():
+    codex = next(r for r in _harness_kinds() if r["kind"] == "codex")
+    assert codex["launch"]["mcp"] == CODEX_CONFIG_MODE, "codex's switches live in the config the driver writes"
+    src = CODEX_DRIVER.read_text()
+    body = src[src.index("pub fn codex_config(") :]
+    body = body[: body.index("\n}\n")]
+    for needle in CODEX_CONFIG_SWITCHES:
+        assert needle in body, f"the Codex config.toml the driver writes no longer has {needle!r}"
+    assert body.count("enabled = false") >= 2, "analytics AND feedback must be off"
+    assert "env_key" not in body, "the loopback provider needs no vendor key"
 
 
 def test_the_doc_has_a_row_and_a_switch_for_every_harness_kind():

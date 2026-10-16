@@ -473,16 +473,26 @@ func TestHarnessKindIsRefusedForAnAbsentRunnerOrCLI(t *testing.T) {
 		t.Fatalf("a kind with no runner must not be looked for on disk: %v %v", asked, askedCLI)
 	}
 	restore()
-	// codex's wire is served by no node backend: the refusal says so from
-	// the table rather than listing nothing.
-	got = harnessKindRefusal(h("codex"), chat, present, present)
-	if !strings.Contains(got, `no chat backend on this node can serve harness kind "codex" (it needs OpenAI's Responses API)`) ||
+	// A kind whose wire no node backend serves (none in the table now:
+	// codex's Responses API is translated since i83 E2) is refused from the
+	// table rather than listing nothing. Synthetic kind for the code path.
+	harnessKindTable = append(append([]harnessKind(nil), saved...), harnessKind{Kind: "wireless", Wire: "a future API", Wires: []string{}, TelemetryOff: map[string]string{}})
+	harnessKinds["wireless"] = []string{}
+	t.Cleanup(func() { harnessKindTable = saved; delete(harnessKinds, "wireless") })
+	got = harnessKindRefusal(h("wireless"), chat, present, present)
+	if !strings.Contains(got, `no chat backend on this node can serve harness kind "wireless" (it needs a future API)`) ||
 		!strings.Contains(got, "its wire is not served by any backend yet") {
-		t.Fatalf("codex: %q", got)
+		t.Fatalf("wireless: %q", got)
 	}
-	// With no chat backend to check against, codex is refused for its CLI.
-	if got := harnessKindRefusal(h("codex"), nil, present, cliAbsent); got != `harness kind "codex": its runner is present but the "codex" command is not installed on this node` {
-		t.Fatalf("codex without a chat backend: %q", got)
+	harnessKindTable = saved
+	delete(harnessKinds, "wireless")
+	// codex runs on every node backend through the loopback translator; with
+	// its runner and CLI present it is not refused, without its CLI it is.
+	if got := harnessKindRefusal(h("codex"), chat, present, present); got != "" {
+		t.Fatalf("codex with runner and CLI: %q", got)
+	}
+	if got := harnessKindRefusal(h("codex"), chat, present, cliAbsent); got != `harness kind "codex": its runner is present but the "codex" command is not installed on this node` {
+		t.Fatalf("codex without its CLI: %q", got)
 	}
 	// An unknown kind lists the table's kinds.
 	if got := harnessKindRefusal(h("hermes"), nil, present, present); got != `unknown harness kind "hermes" (known: noo, claude-code, copilot, codex)` {

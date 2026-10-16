@@ -334,12 +334,29 @@ URL. The port is ephemeral and the translator stops when the invocation ends.
 |---|---|---|
 | `POST /v1/chat/completions` | OpenAI chat (Copilot CLI) | the same body on an OpenAI-wire backend (vLLM, llama.cpp, the node agent), or Ollama's `/api/chat` with the reply converted back |
 | `POST /v1/messages` | Anthropic Messages (Claude Code) | the request converted to OpenAI chat, with the reply converted back to a Messages response or a Messages event stream |
+| `POST /v1/responses` | OpenAI Responses (Codex CLI) | the request converted to OpenAI chat, with the reply converted back to a Responses object or the Responses event stream (`response.created` ... `response.completed`) |
 | `GET /v1/models` | | nothing. The answer is one entry, the pinned model |
 
-Streaming and non-streaming both work on both routes. The translator
+Streaming and non-streaming both work on every route. The translator
 replaces whatever model the CLI names with the pinned model. Any other path
-gets a 404 with a JSON error body. The Responses API (Codex) is not served
-yet.
+gets a 404 with a JSON error body.
+
+The Responses route is stateless. Codex CLI sends the whole conversation in
+`input` on every request (its HTTP requests carry no
+`previous_response_id`), so the translator keeps nothing between calls and
+serves no `GET /v1/responses/{id}`; a request that names a
+`previous_response_id` gets a 400. The conversion (in
+`gateway-rust/src/coordinator/responses_wire.rs`, shared with the gateway's
+own `/v1/responses`) hoists the instructions and every developer message
+into one leading system message, merges consecutive user messages, turns
+`function_call` and `custom_tool_call` items into chat tool calls and their
+outputs into tool messages, and drops `reasoning` items. Function tools,
+freeform `custom` tools (as a function with one string argument `input`)
+and the tools inside a `namespace` (as `<namespace>__<name>`) go to the
+backend; hosted tools such as `web_search` do not. On the way back each call
+is returned under the name, namespace and item type the CLI declared.
+Request fields with no chat equivalent (`store`, `include`, `reasoning`,
+`prompt_cache_key`, ...) are dropped.
 
 The translator counts every model call: the reply's usage, or, for a
 stream, its final usage chunk or Ollama's closing object. A reply without
@@ -369,10 +386,22 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    that becomes the CLI's `HOME` (its config and state directory too, via
    `launch.home_env`), and the MCP config file naming
    `{NOO_GATEWAY_URL}/mcp/user` with the door key as the bearer (mode 0600).
+   `launch.mcp` says which file: `config-file` is a `{"mcpServers": ...}`
+   JSON file beside `home/`, passed as `{mcp_config}`;
+   `config-file:codex-toml` is Codex CLI's whole `config.toml` in its
+   `CODEX_HOME` (`home/.codex/`). Codex takes its model URL from no
+   variable, so that file names the translator as a provider
+   (`base_url = <translator>/v1`, `wire_api = "responses"`) and the pinned
+   model, adds the user door as a streamable-HTTP MCP server, sets
+   `approval_policy = "never"` inside `sandbox_mode = "workspace-write"`,
+   and switches Codex's reporting off
+   ([../security/telemetry.md](../security/telemetry.md#agent-harnesses)).
 4. Build the CLI's environment from nothing: `PATH`, `HOME`, `LANG`,
    `TMPDIR`, the translator's URL and the pinned model under the kind's
-   variable names, a placeholder provider key, `NODE_EXTRA_CA_CERTS` (the
-   cluster CA), then the kind's `lane`, then its `telemetry_off`, last. No
+   variable names (none for Codex), a placeholder provider key,
+   `NODE_EXTRA_CA_CERTS` (the cluster CA, also under `launch.ca_env`, which
+   is `CODEX_CA_CERTIFICATE` for Codex), then the kind's `lane`, then its
+   `telemetry_off`, last. No
    `NATS_*` and no `NOO_*` variable reaches the CLI: not the bus pair, not
    the node-agent bearer, not the turn token.
 5. Run `launch.command` with `{prompt}` and `{mcp_config}` filled in, in

@@ -192,7 +192,13 @@
       "kind": "codex",
       "title": "OpenAI's Codex CLI",
       "wire": "OpenAI's Responses API",
-      "wires": [],
+      "wires": [
+        "vllm",
+        "vllm-secondary",
+        "llamacpp",
+        "ollama",
+        "airllm"
+      ],
       "runner": "noo-gateway",
       "cli": "codex",
       "lane": {},
@@ -200,11 +206,21 @@
         "command": [
           "codex",
           "exec",
+          "--skip-git-repo-check",
+          "--ephemeral",
+          "--sandbox",
+          "workspace-write",
+          "--",
           "{prompt}"
         ],
-        "model_url_env": "unverified:no env var documented; config.toml [model_providers.<name>] base_url",
-        "model_env": "unverified:config.toml model",
-        "mcp": "config-file:{CODEX_HOME}/config.toml [mcp_servers.<name>]"
+        "model_url_env": "",
+        "model_env": "",
+        "mcp": "config-file:codex-toml",
+        "model_url_suffix": "/v1",
+        "api_key_env": null,
+        "model_alias_envs": [],
+        "home_env": "CODEX_HOME",
+        "ca_env": "CODEX_CA_CERTIFICATE"
       },
       "telemetry_off": {},
       "distribution": {
