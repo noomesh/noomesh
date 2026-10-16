@@ -72,6 +72,10 @@ type Server struct {
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
 
+	// harnessPlacement reports the desired harness placement for
+	// GET /harness/placement. nil until the agent installs it.
+	harnessPlacement func() HarnessPlacement
+
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
 }
@@ -277,6 +281,11 @@ func (s *Server) registerRoutes() {
 		return auth.OwnHarnessLeafOrToken(s.cfg)(auth.ControllerOrOwnHarness(s.cfg)(h))
 	}
 	s.mux.Handle("POST /v1/chat/completions", harnessMW(http.HandlerFunc(s.handleInferenceProxy)))
+	// The harness learns its kind here (read-only). Same door as its chat
+	// route (own leaf, loopback, bearer optional), narrowed to the harness
+	// ALONE by ownHarnessOnly: the controller has the database and needs
+	// nothing from this.
+	s.mux.Handle("GET /harness/placement", harnessMW(ownHarnessOnly(http.HandlerFunc(s.handleHarnessPlacement))))
 	s.mux.Handle("POST /v1/completions", modelMW(http.HandlerFunc(s.handleInferenceProxy)))
 	s.mux.Handle("POST /v1/embeddings", ctrlMW(http.HandlerFunc(s.handleInferenceProxy)))
 	s.mux.Handle("GET /v1/models", modelMW(http.HandlerFunc(s.handleListModels)))

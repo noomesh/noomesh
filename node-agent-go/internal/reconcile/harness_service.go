@@ -59,8 +59,25 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 			refusals.Record("backend_start", harnessRefusalTarget, why)
 			return
 		}
+		desiredKind := desiredHarnessKind(p)
 		switch state {
 		case hostsvc.Running:
+			if r.harnessStartedKind == "" {
+				// Running before this agent knew its kind (agent restart):
+				// adopt the desired kind rather than bounce a live harness.
+				r.harnessStartedKind = desiredKind
+			}
+			if harnessKindDecision(r.harnessStartedKind, desiredKind) == "restart" {
+				slog.Info("reconcile.restarting_backend", "backend", "harness",
+					"detail", "the placement's kind changed; restarting so the harness re-reads it",
+					"from", r.harnessStartedKind, "to", desiredKind)
+				if err := r.harness.Restart(ctx); err != nil {
+					slog.Error("reconcile.restart_failed", "backend", "harness", "error", err)
+					refusals.Record("backend_start", harnessRefusalTarget, err.Error())
+					return
+				}
+				r.harnessStartedKind = desiredKind
+			}
 			refusals.Clear("backend_start", harnessRefusalTarget)
 		case hostsvc.Absent:
 			slog.Error("reconcile.harness_absent",
@@ -73,6 +90,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 				refusals.Record("backend_start", harnessRefusalTarget, err.Error())
 				return
 			}
+			r.harnessStartedKind = desiredKind
 			// Deliberately NOT followed by a "did it come up?" check: the
 			// unit is Type=simple with Restart=always and no start limit,
 			// so `is-active` cycles and a point-in-time look would pass
@@ -83,8 +101,79 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 			refusals.Clear("backend_start", harnessRefusalTarget)
 		}
 	case "stopped":
-		r.stopHarness(ctx, state)
+		if r.stopHarness(ctx, state) {
+			r.harnessStartedKind = ""
+		}
 	}
+}
+
+// desiredHarnessKind is the kind a harness placement names; `noo` when it
+// names none.
+func desiredHarnessKind(p placement) string {
+	if k := strings.TrimSpace(p.Env["NOO_HARNESS_KIND"]); k != "" {
+		return k
+	}
+	return "noo"
+}
+
+// harnessKindDecision is the pure restart decision: a harness started with
+// one kind must be restarted when the placement now names another, so it
+// re-reads its kind at startup. An unknown started kind ("") is kept.
+func harnessKindDecision(startedKind, desiredKind string) string {
+	if startedKind != "" && startedKind != desiredKind {
+		return "restart"
+	}
+	return "keep"
+}
+
+// secretLookingEnvKey says whether a placement env key reads as a credential.
+// GET /harness/placement leaves these out; the placement env is a tuning
+// vocabulary (the node agent already refuses credentials in it) but the
+// route fails closed.
+func secretLookingEnvKey(k string) bool {
+	u := strings.ToUpper(k)
+	for _, s := range []string{"SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH", "KEY", "SIGNATURE"} {
+		if strings.Contains(u, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordHarnessPlacement remembers the harness placement the controller
+// currently desires (nil when none), for HarnessPlacementView.
+func (r *Reconciler) recordHarnessPlacement(all []placement) {
+	var found *placement
+	for i := range all {
+		if all[i].Backend == "harness" {
+			cp := all[i]
+			found = &cp
+			break
+		}
+	}
+	r.harnessMu.Lock()
+	r.harnessDesired = found
+	r.harnessMu.Unlock()
+}
+
+// HarnessPlacementView is the desired harness placement for the loopback
+// route: kind, env without anything secret-looking, desired state. placed is
+// false when no harness placement is desired (or it is stopped: a stopped
+// harness has nothing to learn).
+func (r *Reconciler) HarnessPlacementView() (kind string, env map[string]string, desiredState string, placed bool) {
+	r.harnessMu.RLock()
+	p := r.harnessDesired
+	r.harnessMu.RUnlock()
+	if p == nil {
+		return "", nil, "", false
+	}
+	env = map[string]string{}
+	for k, v := range p.Env {
+		if !secretLookingEnvKey(k) {
+			env[k] = v
+		}
+	}
+	return desiredHarnessKind(*p), env, p.DesiredState, p.DesiredState != "stopped"
 }
 
 // reapUnplacedHarness stops a harness the controller no longer places.
