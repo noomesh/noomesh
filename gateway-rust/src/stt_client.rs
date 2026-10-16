@@ -29,7 +29,7 @@
 //!
 //! Config resolution (env → yaml → default, phase-2 pattern):
 //!   NOO_STT_URL         / services.stt_url         → legacy voice.whisper_url
-//!                                                     → http://noo-whisper:8000
+//!                                                     → https://noo-whisper:8000
 //!   NOO_STT_BACKEND     / services.stt_backend     → "whisper" when the legacy
 //!       voice.whisper_url is what supplied the URL, else "openai"
 //!   NOO_STT_MODEL       / services.stt_model       → "" (empty = honour the
@@ -45,14 +45,29 @@
 //! advertises an `stt` capability, so env → yaml → default is the honest
 //! source of truth and there is nothing for config to restate.
 //!
-//! TLS: endpoints may sit behind the cluster PKI, so all requests go through
-//! `tls::cluster_client()` exactly like the embedding client.
+//! TLS (mTLS doors phase 2, i77): noo-whisper serves TLS and REQUIRES a
+//! cluster-CA client certificate, so the default is `https://noo-whisper:8000`
+//! and an `http://` URL is refused, never dialled ([`STT_DOOR`]). An https
+//! URL on the cluster's own names dials with the cluster client (the
+//! gateway's leaf); any other https host — a cloud provider — dials with
+//! `tls::external_client()` (public roots, no client certificate).
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::config::env_or_yaml;
+
+/// The default STT door: the voice overlay's `whisper` service.
+pub const STT_DEFAULT_URL: &str = "https://noo-whisper:8000";
+
+/// The STT door's trust rule (see `tls::HttpsDoor`): the cluster's voice
+/// names dial with the cluster client, any other https host publicly.
+pub const STT_DOOR: crate::tls::HttpsDoor = crate::tls::HttpsDoor {
+    setting: "NOO_STT_URL",
+    default_url: STT_DEFAULT_URL,
+    cluster_hosts: crate::tls::VOICE_CLUSTER_HOSTS,
+};
 
 /// Resolved STT endpoint: where to POST, which wire format, which model.
 #[derive(Debug, Clone)]
@@ -86,6 +101,8 @@ pub enum SttError {
     BadStatus(reqwest::StatusCode, String),
     /// Provider answered 2xx but the body didn't match the wire format.
     Parse(String),
+    /// The configured URL is refused before any dial (plaintext).
+    Refused(String),
 }
 
 impl std::fmt::Display for SttError {
@@ -94,6 +111,7 @@ impl std::fmt::Display for SttError {
             SttError::Unavailable(e) => write!(f, "STT provider unreachable: {e}"),
             SttError::BadStatus(s, body) => write!(f, "STT provider returned {s}: {body}"),
             SttError::Parse(e) => write!(f, "STT provider parse error: {e}"),
+            SttError::Refused(e) => write!(f, "STT provider refused: {e}"),
         }
     }
 }
@@ -103,6 +121,7 @@ impl SttError {
     pub fn http_status(&self) -> axum::http::StatusCode {
         match self {
             SttError::Unavailable(_) | SttError::Parse(_) => axum::http::StatusCode::BAD_GATEWAY,
+            SttError::Refused(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             SttError::BadStatus(s, _) => axum::http::StatusCode::from_u16(s.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
         }
@@ -126,9 +145,8 @@ pub fn resolve(legacy_whisper_url: Option<String>) -> SttEndpoint {
     } else if let Some(l) = legacy {
         (l, "whisper")
     } else {
-        // Plaintext by named exception: voice is deferred by the operator
-        // (tests/test_gateway_refuses_plaintext.py ALLOW).
-        ("http://noo-whisper:8000".to_string(), "openai")
+        // mTLS (i77 phase 2): noo-whisper requires the gateway's leaf.
+        (STT_DEFAULT_URL.to_string(), "openai")
     };
 
     let api_format = env_or_yaml(
@@ -276,6 +294,22 @@ impl SttEndpoint {
         opts: &TranscribeOptions,
         timeout: Duration,
     ) -> Result<Value, SttError> {
+        // The cluster client for noo-whisper (presents the gateway's leaf),
+        // the public client for a cloud provider; http:// never dials.
+        let client = STT_DOOR.client(&self.url).map_err(SttError::Refused)?;
+        self.transcribe_via(&client, audio, filename, mime, opts, timeout).await
+    }
+
+    /// The round-trip itself, on a client already chosen by [`STT_DOOR`].
+    async fn transcribe_via(
+        &self,
+        client: &reqwest::Client,
+        audio: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        opts: &TranscribeOptions,
+        timeout: Duration,
+    ) -> Result<Value, SttError> {
         let part = reqwest::multipart::Part::bytes(audio.clone())
             .file_name(filename.to_string())
             .mime_str(mime)
@@ -285,8 +319,6 @@ impl SttEndpoint {
             form = form.text(name, value);
         }
 
-        // mTLS-aware client — the endpoint may sit behind the cluster PKI.
-        let client = crate::tls::cluster_client();
         let mut req = client
             .post(self.request_url(opts.detailed))
             .multipart(form)
@@ -322,6 +354,21 @@ impl SttEndpoint {
             "whisper" => format!("{}/health", self.url),
             _ => format!("{}/v1/models", self.url),
         }
+    }
+
+    /// Is this endpoint answering right now? Used by `/api/voice/status`.
+    /// A refused (plaintext) URL is simply not available.
+    pub async fn probe(&self, timeout: Duration) -> bool {
+        let Ok(client) = STT_DOOR.client(&self.url) else {
+            return false;
+        };
+        client
+            .get(self.health_url())
+            .timeout(timeout)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 }
 
@@ -546,8 +593,11 @@ mod tests {
             model: String::new(),
             api_key_env: String::new(),
         };
+        // The mock is loopback plaintext, so the wire path is driven with a
+        // plain client; the door's client choice is pinned separately.
         let out = e
-            .transcribe(
+            .transcribe_via(
+                &reqwest::Client::new(),
                 b"RIFFfakewav".to_vec(),
                 "a.wav",
                 "audio/wav",
@@ -584,7 +634,7 @@ mod tests {
             api_key_env: String::new(),
         };
         match e
-            .transcribe(vec![1], "a.wav", "audio/wav", &TranscribeOptions::default(), Duration::from_secs(2))
+            .transcribe_via(&reqwest::Client::new(), vec![1], "a.wav", "audio/wav", &TranscribeOptions::default(), Duration::from_secs(2))
             .await
         {
             Err(SttError::Unavailable(_)) => {}
@@ -592,11 +642,55 @@ mod tests {
         }
     }
 
+    /// mTLS doors phase 2: the default door is https on noo-whisper (a
+    /// cluster name, so the gateway's leaf is presented), and a plaintext
+    /// URL is refused BEFORE any connection — the listener here would
+    /// record one.
+    #[tokio::test]
+    async fn the_default_is_https_and_a_plaintext_url_is_refused_not_dialled() {
+        assert_eq!(STT_DEFAULT_URL, "https://noo-whisper:8000");
+        assert_eq!(STT_DOOR.classify(STT_DEFAULT_URL), Ok(crate::tls::DoorTrust::Cluster));
+        assert_eq!(STT_DOOR.classify("https://api.openai.com"), Ok(crate::tls::DoorTrust::Public));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e = SttEndpoint {
+            url: format!("{}://{addr}", "http"),
+            api_format: "openai".into(),
+            model: String::new(),
+            api_key_env: String::new(),
+        };
+        match e
+            .transcribe(vec![1], "a.wav", "audio/wav", &TranscribeOptions::default(), Duration::from_secs(2))
+            .await
+        {
+            Err(err @ SttError::Refused(_)) => {
+                assert!(err.to_string().contains("not https"), "{err}");
+                assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(!e.probe(Duration::from_secs(1)).await);
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "a plaintext STT URL was dialled");
+    }
+
+    /// Every dial in this module goes through the door; nothing reaches
+    /// for the cluster client directly (which would present the gateway's
+    /// leaf to a cloud provider and fail to verify its public CA).
+    #[test]
+    fn every_stt_dial_goes_through_the_door() {
+        let src = include_str!("stt_client.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("tls::cluster_client()"), "a direct cluster_client() dial bypasses STT_DOOR");
+        assert_eq!(prod.matches("STT_DOOR.client(").count(), 2, "transcribe + probe");
+    }
+
     // ── REAL provider round-trip (opt-in) ──
     //
     // Run against a live server (e.g. the compose `whisper` service on a
     // throwaway network):
-    //   NOO_STT_TEST_URL=http://whisper:8000 NOO_TTS_TEST_URL=http://noo-piper:8000 \
+    //   NOO_STT_TEST_URL=https://whisper:8000 NOO_TTS_TEST_URL=https://noo-piper:8000 \
     //   NOO_STT_TEST_EXPECT="hello" cargo test real_provider -- --nocapture
     // Skips when NOO_STT_TEST_URL or NOO_TTS_TEST_URL is unset so CI stays hermetic.
     #[tokio::test]

@@ -524,7 +524,7 @@ services:
       - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}
       # STT provider (generic layer — gateway-rust/src/stt_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
-      # the opt-in `whisper` compose service (http://noo-whisper:8000,
+      # the opt-in `whisper` compose service (https://noo-whisper:8000, mTLS,
       # wire format "openai"), so these stay empty for the default path.
       - NOO_STT_URL=${NOO_STT_URL:-}
       - NOO_STT_BACKEND=${NOO_STT_BACKEND:-}
@@ -532,7 +532,7 @@ services:
       - NOO_STT_API_KEY_ENV=${NOO_STT_API_KEY_ENV:-}
       # TTS provider (generic layer — gateway-rust/src/tts_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
-      # the opt-in `piper` compose service (http://noo-piper:8000, wire
+      # the opt-in `piper` compose service (https://noo-piper:8000, mTLS, wire
       # format "openai"), so these stay empty for the default path.
       - NOO_TTS_URL=${NOO_TTS_URL:-}
       - NOO_TTS_BACKEND=${NOO_TTS_BACKEND:-}

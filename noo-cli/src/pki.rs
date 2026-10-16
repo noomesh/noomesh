@@ -410,6 +410,12 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // which is not in the sandbox's bwrap RO_PATHS, so code run by /exec
     // never sees it.
     ("sandbox", KeyReader::ContainerUid(65532)),
+    // The voice add-on's doors: docker/Dockerfile.whisper and
+    // Dockerfile.piper (python:3.12-slim) have no USER line, so uvicorn runs
+    // as root — uid=0 measured with `docker run --rm --entrypoint id` on
+    // ghcr.io/noomesh/{whisper,piper}:v0.6.4. uvicorn reads the key itself.
+    ("whisper", KeyReader::ContainerRoot),
+    ("piper", KeyReader::ContainerRoot),
     // A warm standby's replication client identity.
     // No container on THIS box mounts it: the operator's CLI reads it, and
     // `scripts/bootstrap-standby.sh join` stages a 0600 copy owned by the
@@ -2439,6 +2445,40 @@ mod key_mode_tests {
         assert_eq!(readable_by_uid(&key, 65532), Some(true), "noo-sandbox (nonroot) can start");
     }
 
+    /// The voice doors (mTLS doors phase 2): each its own SERVICE leaf,
+    /// onboarded and upgrade-issued like every SVC_LIST name, serving the
+    /// container name the gateway dials (`noo-whisper` / `noo-piper`), the
+    /// compose service name, and `localhost` (the healthcheck). Neither
+    /// claims the other's names nor any controller name; the keys go to the
+    /// images' reader, root.
+    #[test]
+    fn the_voice_doors_are_issued_their_own_server_leaves() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        for (svc, other) in [("whisper", "piper"), ("piper", "whisper")] {
+            assert!(crate::onboard::steps::SVC_LIST.contains(&svc), "onboard and upgrade --stack would never issue {svc}");
+            let (extra, ips) = crate::onboard::steps::service_cert_sans(svc, "Pop-Host", "10.0.0.1", "pop.ts.net");
+            assert!(ips.is_empty(), "{svc} is compose-network only: no LAN IP in its leaf: {ips:?}");
+            let (crt, key) = ca.issue_service_cert(svc, &extra, &ips, 90).unwrap();
+            let data = std::fs::read(&crt).unwrap();
+            let (_, pem) = x509_parser::pem::parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+            let orgs: Vec<&str> = cert.subject().iter_organization().filter_map(|a| a.as_str().ok()).collect();
+            assert_eq!(orgs, vec!["Mesh Cluster Service"], "a service leaf names no node and no controller");
+            assert!(cert.extended_key_usage().unwrap().expect("EKU").value.server_auth, "uvicorn serves it");
+            let dns: Vec<String> = cert.subject_alternative_name().unwrap().unwrap().value.general_names.iter()
+                .filter_map(|g| if let x509_parser::extensions::GeneralName::DNSName(d) = g { Some(d.to_string()) } else { None })
+                .collect();
+            for name in [svc.to_string(), format!("noo-{svc}"), "localhost".into()] {
+                assert!(dns.contains(&name), "{name} missing: {dns:?}");
+            }
+            for wrong in [other.to_string(), format!("noo-{other}"), "gateway".into(), "noo-controller".into(), "Pop-Host".into(), "pop.ts.net".into()] {
+                assert!(!dns.contains(&wrong), "{svc} claims {wrong}: {dns:?}");
+            }
+            assert_eq!(ca.key_reader(&key), KeyReader::ContainerRoot, "{svc}: uvicorn runs as root in the image");
+        }
+    }
+
     /// The mode table, file by file: who reads it decides the bits.
     #[test]
     fn the_reader_of_each_key_follows_its_path() {
@@ -2454,6 +2494,8 @@ mod key_mode_tests {
         assert_eq!(r("services/nats/service.key"), KeyReader::ContainerRoot);
         assert_eq!(r("services/loki/service.key"), KeyReader::ContainerUid(65532));
         assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.sandbox USER nonroot");
+        assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerRoot, "Dockerfile.whisper has no USER (uid 0)");
+        assert_eq!(r("services/piper/service.key"), KeyReader::ContainerRoot, "Dockerfile.piper has no USER (uid 0)");
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
         assert_eq!(r("stray.key"), KeyReader::Unknown);

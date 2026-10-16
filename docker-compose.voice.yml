@@ -25,7 +25,7 @@
 # Whisper STT — faster-whisper behind the OpenAI-compatible audio API
 # (docker/whisper_server.py). The gateway's generic STT provider layer
 # (gateway-rust/src/stt_client.rs) points at it by default
-# (http://noo-whisper:8000, wire format "openai"), so enabling the add-on is
+# (https://noo-whisper:8000, wire format "openai"), so enabling the add-on is
 # the whole setup. CPU (int8) by default; WHISPER_MODEL picks the preloaded
 # model (tiny/base/small/medium/large-v3 or an HF CTranslate2 repo id). The
 # long-term GPU home is a node-agent backend spec (backends.go), like
@@ -34,12 +34,24 @@
 # Piper TTS — piper-tts behind the OpenAI-compatible speech API
 # (docker/piper_server.py). The gateway's generic TTS provider layer
 # (gateway-rust/src/tts_client.rs) points at it by default
-# (http://noo-piper:8000, wire format "openai"); its native /synthesize shape
+# (https://noo-piper:8000, wire format "openai"); its native /synthesize shape
 # is wire format "piper".
+#
+# mTLS doors phase 2 (i77): both doors serve TLS from uvicorn itself and
+# REQUIRE a cluster-CA client certificate (--ssl-cert-reqs 2 =
+# ssl.CERT_REQUIRED), the listener shape the sandbox and vLLM run — no
+# stunnel sidecar, no plaintext port. Each mounts only the CA and its OWN
+# leaf (services/whisper, services/piper; issued by onboard and by
+# `noo upgrade --stack`), read-only. The gateway dials them with its own
+# leaf and refuses an http:// URL; `noo cluster verify --controller` →
+# `voice listeners` probes both live from inside the gateway.
 #
 # To use a DIFFERENT provider instead (OpenAI cloud, vLLM audio model,
 # speaches, LocalAI, kokoro-fastapi, openedai-speech):
-#   NOO_STT_URL / NOO_TTS_URL              (e.g. https://api.openai.com)
+#   NOO_STT_URL / NOO_TTS_URL              (e.g. https://api.openai.com; https
+#                                           only — an https host that is not
+#                                           the cluster's is dialled with the
+#                                           public roots and no client cert)
 #   NOO_STT_BACKEND / NOO_TTS_BACKEND      (openai; "whisper"/"piper" for the native shapes)
 #   NOO_STT_MODEL                          (e.g. whisper-1; empty = client hint)
 #   NOO_STT_API_KEY_ENV / NOO_TTS_API_KEY_ENV (e.g. OPENAI_API_KEY)
@@ -68,7 +80,27 @@ services:
     pull_policy: ${NOO_PULL_POLICY:-build}
     image: ${NOO_IMAGE_PREFIX:-noomesh}/whisper:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_WHISPER:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-whisper
-    # No external port — gateway reaches it via the Docker network.
+    # The image's CMD with the mTLS listener added: uvicorn terminates TLS
+    # with whisper's own leaf and refuses a caller with no cluster-CA client
+    # certificate in the handshake, before any route runs.
+    command:
+      - uvicorn
+      - whisper_server:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --ssl-certfile
+      - /tls/services/whisper/service.crt
+      - --ssl-keyfile
+      - /tls/services/whisper/service.key
+      - --ssl-ca-certs
+      - /tls/ca.crt
+      - --ssl-cert-reqs
+      - "2"
+    # No published port — reachable only on noo-cluster, over mTLS.
+    expose:
+      - "8000"
     environment:
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
@@ -80,6 +112,18 @@ services:
     volumes:
       # Same HF cache volume as tei — model downloads land on the data disk.
       - hf-cache:/models
+      # The CA and whisper's OWN leaf, read-only.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/whisper:/tls/services/whisper:ro
+    # Over the door itself (replaces the image's plaintext probe): the CA
+    # verifies the server (`localhost` is in the leaf) and the container's
+    # own leaf is the client certificate the listener requires.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/whisper/service.crt','/tls/services/whisper/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:8000/health',context=c,timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
     networks:
       - noo-cluster
     restart: unless-stopped
@@ -97,7 +141,25 @@ services:
     pull_policy: ${NOO_PULL_POLICY:-build}
     image: ${NOO_IMAGE_PREFIX:-noomesh}/piper:${NOO_IMAGE_TAG:-latest}${NOO_IMAGE_DIGEST_PIPER:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-piper
-    # No external port — gateway reaches it via the Docker network.
+    # The same mTLS listener over piper's own leaf.
+    command:
+      - uvicorn
+      - piper_server:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --ssl-certfile
+      - /tls/services/piper/service.crt
+      - --ssl-keyfile
+      - /tls/services/piper/service.key
+      - --ssl-ca-certs
+      - /tls/ca.crt
+      - --ssl-cert-reqs
+      - "2"
+    # No published port — reachable only on noo-cluster, over mTLS.
+    expose:
+      - "8000"
     environment:
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
@@ -108,6 +170,15 @@ services:
     volumes:
       # Voice models (~60MB each) survive container recreation.
       - piper-voices:/voices
+      # The CA and piper's OWN leaf, read-only.
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/piper:/tls/services/piper:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/piper/service.crt','/tls/services/piper/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:8000/health',context=c,timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
     networks:
       - noo-cluster
     restart: unless-stopped

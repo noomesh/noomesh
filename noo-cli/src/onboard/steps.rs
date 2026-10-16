@@ -2749,6 +2749,13 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // (upgrade.rs reconcile_service_certs). sandbox-extra replicas answer
     // to the `sandbox` alias and mount this same leaf.
     "sandbox",
+    // The voice add-on's doors (mTLS doors phase 2, i77): uvicorn in
+    // noo-whisper / noo-piper serves each leaf with `--ssl-cert-reqs 2`,
+    // and the gateway dials them with its own. Issued whether or not
+    // `addons.voice` is on, like `evolve`: a leaf is cheap, the add-on
+    // switched on later must not need the wizard re-run, and a missing
+    // bind source would be created root-owned by Docker on first start.
+    "whisper", "piper",
 ];
 /// Dialled from OTHER hosts by the controller's reachable names, so the leaf
 /// carries `noo-controller`, the LAN IP and the tailnet name. `model-cache`
@@ -2804,6 +2811,11 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // container and replica service names ride along so a probe by
         // either still verifies.
         "sandbox" => &["noo-sandbox", "sandbox-extra"],
+        // The gateway's default voice URLs dial the container names
+        // (https://noo-whisper:8000, https://noo-piper:8000); the compose
+        // service name rides in as the leaf's CN SAN.
+        "whisper" => &["noo-whisper"],
+        "piper" => &["noo-piper"],
         _ => &[],
     };
     v.iter().map(|s| s.to_string()).collect()
