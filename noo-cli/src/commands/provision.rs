@@ -1126,15 +1126,33 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                 }
             }
         }
+        // Compress BEFORE encrypting (AES output does not compress) — but only
+        // for a node whose fetcher reads gzip (bundle_gzip_gate).
+        let (to_encrypt, gzip_note) = match bundle_gzip_gate(&node_app_version) {
+            Err(why) => {
+                nstep(&format!("bundle not compressed: {why}"));
+                (bundle.clone(), None)
+            }
+            Ok(()) => match gzip_bundle(&bundle, &work) {
+                Ok(gz) => {
+                    let from = std::fs::metadata(&bundle).map(|m| m.len() as usize).unwrap_or(0);
+                    (gz, Some(format!(", gzip from {}", human_bytes(from))))
+                }
+                Err(e) => {
+                    warn_line(&format!("bundle not compressed: {e} — staging it uncompressed"));
+                    (bundle.clone(), None)
+                }
+            },
+        };
         nstep(&format!("encrypting the bundle to {node}'s birth cert"));
-        let blob = match encrypt_bundle_cms(&bundle, cert, &work) {
+        let blob = match encrypt_bundle_cms(&to_encrypt, cert, &work) {
             Ok(b) => b,
             Err(e) => { scrub(&work);
                 fail(g.json, ExitCode::Generic, "encrypt_failed", &e,
                     Some("is openssl installed on the controller?")); }
         };
         scrub(&work);
-        nstep(&format!("staging the encrypted bundle at the gateway ({})", human_bytes(blob.len())));
+        nstep(&format!("staging the encrypted bundle at the gateway ({}{})", human_bytes(blob.len()), gzip_note.as_deref().unwrap_or("")));
         if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob) {
             fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
         }
@@ -2910,6 +2928,59 @@ fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<
     std::fs::read(&out).map_err(|e| e.to_string())
 }
 
+/// The first CLI release whose fetcher (`noo-fetch.sh` on Linux, `noo node
+/// fetch` on macOS) unwraps a gzip-compressed bundle after decrypting it.
+/// A guard test keeps this at or above the CLI's own version while the
+/// feature is unreleased, and below-or-equal once it has shipped.
+const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
+
+/// "noo-cli-v0.6.5+abc1234" -> (0, 6, 5); anything else -> None.
+fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
+    let rest = app_version.split("noo-cli-v").nth(1)?;
+    let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
+    let [maj, min, pat] = nums[..] else { return None };
+    Some((maj, min, pat))
+}
+
+/// May this node be sent a gzip-wrapped bundle? Ok(()) yes; Err(reason) no.
+///
+/// The FETCHER must decompress, and on Linux it runs before the applier can
+/// self-update, so the applier's trick does not help. An old fetcher handed
+/// gzip bytes passes them to `noo-apply`, which refuses "not a readable tar":
+/// a wrong YES bricks the apply. So an unknown or unparseable version is NO
+/// (the opposite default from `applier_knows_harness_kinds`).
+pub(crate) fn bundle_gzip_gate(app_version: &str) -> Result<(), String> {
+    let (a, b, c) = GZIP_BUNDLE_MIN_VERSION;
+    match parse_cli_version(app_version) {
+        None if app_version.is_empty() => Err("the node reports no CLI version, so its fetcher may predate gzip".into()),
+        None => Err(format!("the node's version {app_version:?} is unreadable, so its fetcher may predate gzip")),
+        Some(v) if v < GZIP_BUNDLE_MIN_VERSION =>
+            Err(format!("{app_version} predates the gzip-aware fetcher (needs >= {a}.{b}.{c})")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// gzip `bundle` (level 6, one member, no filename, mtime 0) into
+/// `work/bundle.tar.gz`. The signed tar inside is untouched; the node's
+/// fetcher restores it byte for byte. A failure is returned, never fatal:
+/// the caller stages the uncompressed tar and says so.
+pub(crate) fn gzip_bundle(bundle: &Path, work: &Path) -> Result<std::path::PathBuf, String> {
+    use std::io::{Read, Write};
+    let out = work.join("bundle.tar.gz");
+    let mut src = std::fs::File::open(bundle).map_err(|e| format!("gzip: cannot read the bundle ({e})"))?;
+    let dst = std::fs::File::create(&out).map_err(|e| format!("gzip: cannot write {} ({e})", out.display()))?;
+    let mut enc = flate2::GzBuilder::new().mtime(0)
+        .write(std::io::BufWriter::new(dst), flate2::Compression::new(6));
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("gzip: read failed ({e})"))?;
+        if n == 0 { break; }
+        enc.write_all(&buf[..n]).map_err(|e| format!("gzip: compress failed ({e})"))?;
+    }
+    enc.finish().and_then(|mut w| w.flush()).map_err(|e| format!("gzip: finish failed ({e})"))?;
+    Ok(out)
+}
+
 /// POST raw bytes to a gateway path (the encrypted bundle — too large and
 /// too binary for the JSON helpers). Same base-url/TLS posture as http.rs;
 /// bearer from the standard resolution.
@@ -3791,6 +3862,56 @@ mod tests {
     // parse. host6 sat in that deadlock for a day (2026-09-19): every
     // restage refused with `unknown kind 'harness-binary'`, and the fix
     // for it shipped inside the CLI it was refusing.
+    #[test]
+    fn the_gzip_gate_opens_only_at_or_above_the_fetcher_that_reads_it() {
+        for v in ["noo-cli-v0.6.4", "noo-cli-v0.6.4+abc1234", "noo-cli-v0.5.99", "noo-cli-v0.0.1"] {
+            assert!(bundle_gzip_gate(v).is_err(), "gzip sent to {v}");
+        }
+        for v in ["noo-cli-v0.6.5", "noo-cli-v0.6.5+7b00c90", "noo-cli-v0.6.6", "noo-cli-v0.7.0", "noo-cli-v1.0.0"] {
+            assert!(bundle_gzip_gate(v).is_ok(), "gzip withheld from {v}");
+        }
+        // Unknown / unparseable: NO (a wrong yes bricks the apply).
+        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1"] {
+            assert!(bundle_gzip_gate(v).is_err(), "gzip sent to unreadable {v:?}");
+        }
+    }
+
+    /// The gate constant must not sit below the CLI this tree is building:
+    /// the gzip-aware fetcher ships in the NEXT cut after the CLI version that
+    /// was current when it was written, so a constant at or above Cargo.toml's
+    /// version cannot name a release that predates the feature. If a version
+    /// bump trips this, confirm which release actually carries the
+    /// gzip-aware `noo-fetch.sh` and `node_fetch.rs`: that release is the
+    /// correct constant, and this assert is then moved to match it.
+    #[test]
+    fn the_gzip_gate_constant_is_not_below_the_cli_version() {
+        let me = env!("CARGO_PKG_VERSION");
+        let v: Vec<u32> = me.split(['.', '-', '+']).take(3).map(|s| s.parse().unwrap()).collect();
+        let cur = (v[0], v[1], v[2]);
+        assert!(GZIP_BUNDLE_MIN_VERSION >= cur,
+            "GZIP_BUNDLE_MIN_VERSION {GZIP_BUNDLE_MIN_VERSION:?} is below the CLI's own version {cur:?}; \
+             see the doc comment on this test before changing either");
+    }
+
+    #[test]
+    fn gzip_bundle_is_one_member_gzip_that_inflates_to_the_input() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("noo-gzip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bundle.tar");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let gz = gzip_bundle(&src, &dir).unwrap();
+        let raw = std::fs::read(&gz).unwrap();
+        assert_eq!(&raw[..2], &[0x1f, 0x8b]);
+        assert_eq!(raw[3], 0, "no FNAME/FEXTRA/FCOMMENT header flags");
+        assert!(raw.len() < data.len() / 2, "level-6 gzip should shrink a repetitive input");
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut back).unwrap();
+        assert_eq!(back, data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_mac_older_than_the_harness_kinds_is_not_sent_them() {
         // The version host6 was actually stuck on.
