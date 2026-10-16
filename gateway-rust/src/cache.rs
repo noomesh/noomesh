@@ -152,23 +152,23 @@ impl RedisSlot {
         // reconnect policy it dials until it connects, and redials after
         // every drop, for the life of the process.
         let _connection_task = cache.client.connect();
+        // Scrubbed once here; each log re-applies the (idempotent) scrubber so the
+        // source guard (tests/test_url_userinfo_scrub.py) sees it at every site.
         let url = crate::redact::scrub_url_userinfo(redis_url).to_string();
         let started = std::time::Instant::now();
         if wait_connected(&cache, Some(budget), REDIS_PROBE_EVERY, &url).await {
-            tracing::info!(url = %url, "Redis connected");
+            tracing::info!(url = %crate::redact::scrub_url_userinfo(&url), "Redis connected");
             let _ = slot.inner.cell.set(cache);
             return slot;
         }
-        tracing::warn!(
-            url = %url,
+        tracing::warn!(url = %crate::redact::scrub_url_userinfo(&url),
             waited_secs = started.elapsed().as_secs(),
             "Redis still not connected — serving WITHOUT Redis (rate limiting local, jobs/cache degraded); reconnecting in the background"
         );
         let late = slot.clone();
         tokio::spawn(async move {
             wait_connected(&cache, None, Duration::from_secs(30), &url).await;
-            tracing::info!(
-                url = %url,
+            tracing::info!(url = %crate::redact::scrub_url_userinfo(&url),
                 after_secs = started.elapsed().as_secs(),
                 "Redis connected (late) — rate limiting, jobs and cache restored"
             );
@@ -209,7 +209,7 @@ async fn wait_connected(cache: &RedisCache, budget: Option<Duration>, every: Dur
         if !cache.is_connected() {
             attempt += 1;
             tracing::warn!(
-                url = %url,
+                url = %crate::redact::scrub_url_userinfo(url),
                 attempt,
                 elapsed_secs = started.elapsed().as_secs(),
                 "Redis not accepting connections yet — still retrying"
