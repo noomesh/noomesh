@@ -228,11 +228,12 @@ Which harness runs on a node is part of the placement: `--kind noo`
 (the default, this gateway's own loop), `claude-code`, `copilot` or
 `codex` (declared in `config/harness-kinds.json`). The
 node agent checks the kind against the node's chat backend before
-starting anything — Claude Code needs Anthropic's wire, which Ollama
-serves and vLLM and llama.cpp do not; Copilot CLI and our loop speak
-OpenAI's, which all three serve; Codex CLI needs OpenAI's Responses API,
-which no node backend serves yet — and refuses a foreign kind until its
-runner ships, so the placement reports compatibility at once.
+starting anything — Claude Code and Copilot CLI run on every node
+backend (the harness translates their wire to the node's), as does our own
+loop; Codex CLI needs OpenAI's Responses API, which has no translator yet —
+and refuses a foreign kind until its vendor CLI is installed on the node
+(the runner is the same `noo-gateway` for every kind), so the placement
+reports compatibility at once.
 
 A node can be born with its policy, so it is ready for a chat model
 before it has one: `noo cluster provision <node> --harness auto`, or

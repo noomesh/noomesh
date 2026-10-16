@@ -32,8 +32,26 @@ pub struct HarnessKind {
     /// The executable the applier installs beside the agent; `None` = no
     /// runner ships yet, and the node agent refuses the kind.
     pub runner: Option<String>,
+    /// The vendor executable that must be on PATH on the node (`None` for `noo`).
+    pub cli: Option<String>,
+    /// Env vars that keep the CLI one-shot and inside its lane.
+    pub lane: BTreeMap<String, String>,
+    /// How the driver invokes the CLI (`None` for `noo`).
+    pub launch: Option<Launch>,
     /// Vendor telemetry switches the runner must launch it with.
     pub telemetry_off: BTreeMap<String, String>,
+}
+
+/// How the driver invokes a foreign CLI. A value starting `unverified:` is
+/// for the driver to settle.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct Launch {
+    /// argv; `{prompt}` is filled in by the driver.
+    pub command: Vec<String>,
+    pub model_url_env: String,
+    pub model_env: String,
+    pub mcp: String,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +102,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(RAW).unwrap();
         for k in v["kinds"].as_array().unwrap() {
             assert!(k.get("telemetry_off").is_some_and(|t| t.is_object()), "{} has no telemetry_off object", k["kind"]);
+        }
+    }
+
+    #[test]
+    fn one_runner_for_every_kind() {
+        for k in all() {
+            assert_eq!(k.runner.as_deref(), Some("noo-gateway"), "{} runner", k.kind);
+        }
+    }
+
+    #[test]
+    fn foreign_kinds_carry_a_cli_and_a_launch_recipe() {
+        for k in all() {
+            if k.kind == "noo" {
+                assert!(k.cli.is_none() && k.launch.is_none(), "noo has no vendor CLI");
+                continue;
+            }
+            let cli = k.cli.as_deref().unwrap_or_else(|| panic!("{} has no cli", k.kind));
+            let l = k.launch.as_ref().unwrap_or_else(|| panic!("{} has no launch", k.kind));
+            assert!(!l.command.is_empty(), "{} launch.command empty", k.kind);
+            assert_eq!(l.command[0], cli, "{} launch.command[0] must be its cli", k.kind);
         }
     }
 
