@@ -84,6 +84,15 @@ pub enum HarnessOp {
         #[serde(default)]
         task_id: Option<String>,
     },
+    /// A foreign CLI's verdict on its task (`harness::driver`): the
+    /// `noo_task_done` a native loop calls as a tool, for a loop the gateway
+    /// cannot see into.
+    TaskDone { task_id: String, result: String, #[serde(default)] failed: bool },
+    // a foreign CLI's way back in
+    /// Mint the short-lived user-door key a foreign CLI reaches noomesh's
+    /// tools with: bound to the token's person, expiring with the turn.
+    DoorKey,
+    DoorKeyRevoke { key_id: String },
 }
 
 impl HarnessOp {
@@ -125,6 +134,9 @@ impl HarnessOp {
         "operator_alert",
         "task_checkpoint",
         "usage",
+        "task_done",
+        "door_key",
+        "door_key_revoke",
     ];
 
     /// The op's wire name, for audit rows and logs.
@@ -165,6 +177,9 @@ impl HarnessOp {
             HarnessOp::OperatorAlert { .. } => "operator_alert",
             HarnessOp::TaskCheckpoint { .. } => "task_checkpoint",
             HarnessOp::Usage { .. } => "usage",
+            HarnessOp::TaskDone { .. } => "task_done",
+            HarnessOp::DoorKey => "door_key",
+            HarnessOp::DoorKeyRevoke { .. } => "door_key_revoke",
         }
     }
 }
@@ -183,6 +198,9 @@ mod tests {
             HarnessOp::ExecuteTool { call: ToolCall { id: "1".into(), name: "web_search".into(), arguments: json!({"query": "x"}) } },
             HarnessOp::MaybeSummary { backend: ResolvedBackend { url: "u".into(), model: "m".into(), backend_type: "vllm".into(), api_format: "openai".into() }, turn: 4 },
             HarnessOp::Usage { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, calls: 3, model: "qwen".into(), kind: "copilot".into(), task_id: Some("t1".into()) },
+            HarnessOp::TaskDone { task_id: "t1".into(), result: "shipped".into(), failed: false },
+            HarnessOp::DoorKey,
+            HarnessOp::DoorKeyRevoke { key_id: "k1".into() },
         ];
         for op in ops {
             let wire = serde_json::to_value(&op).unwrap();
@@ -233,6 +251,9 @@ mod tests {
             HarnessOp::OperatorAlert { kind: String::new(), target: String::new(), cooldown_secs: 0, message: String::new() },
             HarnessOp::TaskCheckpoint { task_id: String::new(), loops: 0, note: None, exhausted: false },
             HarnessOp::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, calls: 0, model: String::new(), kind: String::new(), task_id: None },
+            HarnessOp::TaskDone { task_id: String::new(), result: String::new(), failed: false },
+            HarnessOp::DoorKey,
+            HarnessOp::DoorKeyRevoke { key_id: String::new() },
         ]
     }
 

@@ -1632,6 +1632,17 @@ END $$
     sql: r#"
 ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text;
 "#,
+}, Migration {
+    revision: "090_service_key_expiry",
+    down_revision: Some("089_usage_harness_kind"),
+    // An expiry on a service key. Set only on the keys a node harness mints
+    // for a foreign CLI (`service_keys::mint_door_key`): a user-door key that
+    // lives as long as one turn. `service_keys::resolve` refuses a row past
+    // it; NULL (every existing row) never expires. Additive, nullable, no
+    // rewrite; IF EXISTS like 078.
+    sql: r#"
+ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS expires_at timestamptz
+"#,
 }];
 
 /// The Alembic revision the baselines reproduce.

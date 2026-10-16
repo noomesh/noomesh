@@ -21,6 +21,7 @@
 //! | `NATS_URL`, `NATS_NODE_USER`, `NATS_NODE_PASSWORD` | the node's bus principal — the ONLY credential it presents (the shared pair was retired); the password also as `NATS_NODE_PASSWORD_FILE` |
 //! | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type |
 //! | `NOO_HARNESS_MAX_TURNS` | concurrent turns (default 8) |
+//! | `NOO_HARNESS_KIND` | the loop: `noo` (default) runs ours; any other kind runs that vendor's headless CLI through [`crate::harness::driver`] |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,6 +140,20 @@ pub async fn run() -> Result<()> {
     if coordinator::is_node_agent_url(&model_url) {
         crate::node_agent_auth::watch_own_agent(client.clone(), model_url.clone()).await;
     }
+    // Which loop: ours, or a vendor's CLI through the driver. After the
+    // agent watch, so the placement read carries the right credential. A
+    // foreign kind this binary cannot drive is a refusal at start, not a
+    // turn failure.
+    let (kind, source) = resolve_kind(std::env::var("NOO_HARNESS_KIND").ok(), &model_url, &client).await;
+    tracing::info!("harness: kind={kind} source={source}");
+    let driver: Option<Arc<crate::harness::driver::DriverCtx>> = if kind == "noo" {
+        None
+    } else {
+        let ctx = crate::harness::driver::DriverCtx::from_env(&node, &gateway, &kind, pinned.clone())
+            .map_err(|e| anyhow!("harness: kind {kind}: {e}"))?;
+        tracing::info!(kind = %kind, cli = ?ctx.kind.cli, workdir = %ctx.workdir_root.display(), timeout_secs = ctx.timeout.as_secs(), "harness: driving a foreign CLI");
+        Some(Arc::new(ctx))
+    };
     let subject = coordinator::harness_run_subject(&node);
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
@@ -153,6 +168,7 @@ pub async fn run() -> Result<()> {
         let pinned_t = pinned.clone();
         let limit_t = limit.clone();
         let node_t = node.clone();
+        let driver_t = driver.clone();
         tokio::spawn(async move {
             while let Some(msg) = tasks.next().await {
                 let req: crate::tasks::TaskRequest = match serde_json::from_slice(&msg.payload) {
@@ -172,9 +188,14 @@ pub async fn run() -> Result<()> {
                 let gateway = gateway_t.clone();
                 let client = client_t.clone();
                 let pinned = pinned_t.clone();
+                let driver = driver_t.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let outcome = async {
+                        // One CLI invocation per loop, same checkpoints.
+                        if let Some(ctx) = driver.as_deref() {
+                            return crate::harness::driver::run_task(ctx, client, &req).await;
+                        }
                         let rt = RemoteRuntime::connect(&gateway, &req.token, client).await?.pin_backend(pinned);
                         crate::tasks::run_task_loops(rt, &req).await
                     }
@@ -211,11 +232,20 @@ pub async fn run() -> Result<()> {
         let client = client.clone();
         let pinned = pinned.clone();
         let node = node.clone();
+        let driver = driver.clone();
         tokio::spawn(async move {
             let _permit = permit;
             // Our OWN node id on the subject — the grant is written against it.
             let sink = NatsTurnSink::new(nats.clone(), &node, &req.conversation_id);
-            let outcome = run_turn(&gateway, client, pinned, &sink, &req).await;
+            let outcome = match driver.as_deref() {
+                // Nothing streams mid-run: one `content` with the answer,
+                // then the result.
+                Some(ctx) => crate::harness::driver::run_turn(ctx, client, &req).await,
+                None => run_turn(&gateway, client, pinned, &sink, &req).await,
+            };
+            if let (Some(_), Ok(r), true) = (driver.as_deref(), &outcome, req.stream) {
+                let _ = sink.send_event("content", json!(r.response)).await;
+            }
             match outcome {
                 Ok(result) => {
                     let _ = sink.send_event(HARNESS_RESULT_EVENT, json!({"result": result, "node": node})).await;
@@ -228,6 +258,63 @@ pub async fn run() -> Result<()> {
         });
     }
     Err(anyhow!("harness: the turn subscription ended"))
+}
+
+/// Which loop this harness runs, and where that came from.
+///
+/// `NOO_HARNESS_KIND` is NOT in the harness's env file (the template omits
+/// it on purpose), so: the variable when set (dev and tests), else the
+/// node agent's own answer — `GET {agent}/harness/placement` on the same
+/// loopback proxy the model calls go to — else `noo`. A 404, `placed:
+/// false`, an empty kind or an unreachable agent is `noo` with a warning:
+/// running our own loop is never the wrong thing to fall back to.
+async fn resolve_kind(env_kind: Option<String>, model_url: &str, client: &reqwest::Client) -> (String, &'static str) {
+    if let Some(k) = env_kind.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+        return (k, "env");
+    }
+    if !coordinator::is_node_agent_url(model_url) {
+        tracing::warn!(endpoint = %model_url, "harness: the model endpoint is not a node agent; no placement to read, running kind noo");
+        return ("noo".into(), "default");
+    }
+    match placement_kind(client, model_url).await {
+        Ok(Some(k)) => (k, "agent"),
+        Ok(None) => ("noo".into(), "default"),
+        Err(e) => {
+            tracing::warn!(error = %e, "harness: could not read the placement from the node agent; running kind noo");
+            ("noo".into(), "default")
+        }
+    }
+}
+
+/// `GET {base of agent_url}/harness/placement` → the placed kind. `Ok(None)`
+/// = the agent answered that nothing (or nothing with a kind) is placed.
+async fn placement_kind(client: &reqwest::Client, agent_url: &str) -> Result<Option<String>> {
+    let mut u = reqwest::Url::parse(agent_url.trim())?;
+    u.set_path("/harness/placement");
+    u.set_query(None);
+    let mut req = client.get(u).timeout(Duration::from_secs(10));
+    if let Some((k, v)) = crate::node_agent_auth::header_for(agent_url) {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        tracing::warn!("harness: the node agent has no harness placement route (404); running kind noo");
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP {}", resp.status().as_u16()));
+    }
+    Ok(kind_from_placement(&resp.json::<serde_json::Value>().await?))
+}
+
+/// The kind in a placement answer `{"kind", "env", "desired_state",
+/// "placed"}`; `None` when not placed or no kind is named.
+fn kind_from_placement(v: &serde_json::Value) -> Option<String> {
+    if v.get("placed").and_then(|p| p.as_bool()) != Some(true) {
+        tracing::warn!("harness: the node agent says no harness is placed; running kind noo");
+        return None;
+    }
+    v.get("kind").and_then(|k| k.as_str()).map(str::trim).filter(|k| !k.is_empty()).map(str::to_string)
 }
 
 async fn run_turn<S: TurnSink>(
@@ -272,6 +359,44 @@ async fn run_turn<S: TurnSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in node agent answering `/harness/placement` with `status`
+    /// and `body`; returns its base URL.
+    async fn fake_agent(status: u16, body: serde_json::Value) -> String {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route(
+            "/harness/placement",
+            get(move || {
+                let body = body.clone();
+                async move { (axum::http::StatusCode::from_u16(status).unwrap(), Json(body)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn the_kind_comes_from_env_then_the_agent_then_noo() {
+        let c = reqwest::Client::new();
+        // The variable wins, and needs no agent at all.
+        assert_eq!(resolve_kind(Some(" copilot ".into()), "http://127.0.0.1:9/v1", &c).await, ("copilot".into(), "env"));
+        // A model endpoint that is not a node agent has no placement to read.
+        assert_eq!(resolve_kind(Some("  ".into()), "http://vllm:8000/v1", &c).await, ("noo".into(), "default"));
+
+        let placed = fake_agent(200, json!({"kind": "claude-code", "env": {"X": "1"}, "desired_state": "running", "placed": true})).await;
+        assert_eq!(placement_kind(&c, &placed).await.unwrap().as_deref(), Some("claude-code"));
+        let unplaced = fake_agent(200, json!({"kind": "copilot", "env": {}, "desired_state": "stopped", "placed": false})).await;
+        assert_eq!(placement_kind(&c, &unplaced).await.unwrap(), None);
+        let old_agent = fake_agent(404, json!({"error": "not found"})).await;
+        assert_eq!(placement_kind(&c, &old_agent).await.unwrap(), None);
+        let broken = fake_agent(500, json!({})).await;
+        assert!(placement_kind(&c, &broken).await.is_err());
+        assert!(placement_kind(&c, "http://127.0.0.1:9/v1").await.is_err(), "unreachable is an error, resolved to noo");
+        assert_eq!(kind_from_placement(&json!({"placed": true, "kind": ""})), None);
+        assert_eq!(kind_from_placement(&json!({"kind": "copilot"})), None, "no placed flag is not placed");
+    }
 
     #[test]
     fn the_inbox_prefix_matches_the_bus_permission() {
