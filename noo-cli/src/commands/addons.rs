@@ -747,8 +747,7 @@ compose_env:
     ///
     /// One-directional on purpose. Every gateway add-on must be offered
     /// here, because the gateway routes and refuses on it. The reverse is
-    /// allowed: `voice` is containers-only with no gateway surface, so it
-    /// has a row here and none there.
+    /// allowed for any add-on the gateway does not need to name.
     #[test]
     fn every_gateway_addon_is_offered_here() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();

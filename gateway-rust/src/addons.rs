@@ -78,6 +78,18 @@ pub const ADDONS: &[Addon] = &[
         unlicensed_msg: INTEL_UNLICENSED_MSG,
         routes_manifest: false,
     },
+    Addon {
+        name: "voice",
+        // Voice is containers-only (whisper STT + piper TTS) and opt-in. The
+        // gateway never refuses on it; it is declared so `/health` reports
+        // `addons.voice`, which lets the console tell "voice off" from "voice
+        // on but its providers are down" (`/api/voice/status` says the latter).
+        default_on: false,
+        disabled_msg: VOICE_DISABLED_MSG,
+        requires_feature: None,
+        unlicensed_msg: "",
+        routes_manifest: false,
+    },
 ];
 
 /// Is this add-on switched on?
@@ -302,6 +314,12 @@ pub const IDENTITY_DISABLED_MSG: &str =
      (set `addons.identity: true` in noomesh.yaml to enable minting short-lived \
      per-agent tokens from a provisioning key)";
 
+/// The explanation when `addons.voice` is off.
+pub const VOICE_DISABLED_MSG: &str =
+    "voice add-on disabled — this install runs without the whisper and piper \
+     containers (declare `addons.voice: true` in noomesh.yaml — `noo addons enable \
+     voice` — and run `noo stack start`)";
+
 /// Is the agent identity exchange usable? Free and on
 /// unless an operator turned it off.
 pub fn identity_enabled() -> bool {
@@ -359,6 +377,17 @@ mod tests {
         for a in ADDONS {
             assert_eq!(a.requires_feature.is_some(), !a.unlicensed_msg.is_empty(), "{}: a licensed add-on needs its unlicensed message and vice versa", a.name);
         }
+    }
+
+    #[test]
+    fn voice_is_declared_so_health_reports_it() {
+        // /health renders one key per ADDONS row. Without this row the console
+        // cannot tell "voice off" from "voice on, providers down".
+        let v = ADDONS.iter().find(|a| a.name == "voice").expect("voice must be in ADDONS");
+        assert!(!v.default_on, "voice is opt-in");
+        assert_eq!(v.requires_feature, None, "voice is not licensed");
+        assert!(!v.routes_manifest, "voice has no proxied routes");
+        assert!(v.disabled_msg.contains("addons.voice"));
     }
 
     #[test]
