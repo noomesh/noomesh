@@ -37,6 +37,7 @@ use std::process::Command;
 
 mod image_family;
 mod warmup;
+pub(crate) mod restart_loops;
 
 /// One invariant, judged.
 #[derive(Debug, Clone, PartialEq)]
@@ -3929,6 +3930,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).
         checks.push(image_family::image_family_row());
+        // A container docker keeps restarting reads "Up" between restarts;
+        // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
+        checks.push(restart_loops::restart_loops_row());
         // Every container that bind-mounts noomesh.yaml still
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());

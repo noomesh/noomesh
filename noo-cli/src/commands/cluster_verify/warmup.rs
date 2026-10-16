@@ -101,7 +101,7 @@ pub(crate) struct ContainerState {
     pub exit_code: i64,
 }
 
-const INSPECT_TEMPLATE: &str = "{{.State.Running}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.RestartCount}}|{{.State.Restarting}}|{{.State.ExitCode}}";
+pub(crate) const INSPECT_TEMPLATE: &str = "{{.State.Running}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.RestartCount}}|{{.State.Restarting}}|{{.State.ExitCode}}";
 
 /// Parse one line of [`INSPECT_TEMPLATE`] output.
 pub(crate) fn parse_inspect(line: &str) -> Option<ContainerState> {
