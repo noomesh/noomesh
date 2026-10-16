@@ -1,20 +1,47 @@
 {
-  "_comment": "The harness kinds a harness placement may name in NOO_HARNESS_KIND, declared ONCE. The gateway (gateway-rust/src/harness_kinds.rs) validates placements against it, the node agent embeds a byte-equal copy (node-agent-go/internal/reconcile/harness_kinds.json, held equal by TestHarnessKindsTableMatchesTheShippedFile) for wire compatibility, runner presence and vendor telemetry switches, and the noo CLI checks --kind against it. kind: the NOO_HARNESS_KIND value. wire: the API the harness speaks. wires: the node chat backend types that serve it (empty = no node backend serves it yet). runner: the executable the applier installs beside the agent (null = no runner ships yet; the node agent refuses the kind). telemetry_off: the vendor telemetry switches the runner must launch it with, merged after any placement value (docs/security/telemetry.md, Agent harnesses); every kind has an entry, empty when there is nothing to switch off or none is declared yet.",
+  "_comment": "The harness kinds a harness placement may name in NOO_HARNESS_KIND, declared ONCE. The gateway (gateway-rust/src/harness_kinds.rs) validates placements against it, the node agent embeds a byte-equal copy (node-agent-go/internal/reconcile/harness_kinds.json, held equal by TestHarnessKindsTableMatchesTheShippedFile) for wire compatibility, runner and vendor-CLI presence, lane and telemetry switches, and the noo CLI checks --kind against it. kind: the NOO_HARNESS_KIND value. wire: the API the harness speaks. wires: the node chat backend types that serve it (empty = no node backend serves it yet). runner: the executable the applier installs beside the agent; ONE runner serves every kind, the gateway binary in harness mode (`noo-gateway harness`), which for a foreign kind launches the vendor's headless CLI and fronts the node's model with a loopback wire translator (null = no runner ships yet; the node agent refuses the kind). cli: the vendor executable that must be on PATH on the node for a foreign kind (null for `noo`); the node agent refuses the kind while it is absent. lane: env vars the runner sets to keep the CLI one-shot and inside its lane (no auto-update, no interactive prompt, no vendor login flow), merged after any placement value; only variables verified in vendor documentation are listed, empty when none are. launch: how the driver invokes the CLI (null for `noo`): command is the argv with {prompt} filled in, model_url_env and model_env name the variables that point the CLI at the loopback translator and name its model, mcp says how the CLI takes an MCP server. A value starting `unverified:` is documented-but-unconfirmed or undocumented and is for the driver (i83 phase E1c) to settle. telemetry_off: the vendor telemetry switches the runner must launch it with, merged after any placement value (docs/security/telemetry.md, Agent harnesses); every kind has an entry, empty when there is nothing to switch off or none is declared yet.",
   "kinds": [
     {
       "kind": "noo",
       "title": "noomesh's own loop (`noo-gateway harness`)",
       "wire": "every node backend's wire",
-      "wires": ["vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"],
+      "wires": [
+        "vllm",
+        "vllm-secondary",
+        "llamacpp",
+        "ollama",
+        "airllm"
+      ],
       "runner": "noo-gateway",
+      "cli": null,
+      "lane": {},
+      "launch": null,
       "telemetry_off": {}
     },
     {
       "kind": "claude-code",
       "title": "Anthropic's Claude Code CLI",
       "wire": "Anthropic's Messages API",
-      "wires": ["ollama"],
-      "runner": null,
+      "wires": [
+        "vllm",
+        "vllm-secondary",
+        "llamacpp",
+        "ollama",
+        "airllm"
+      ],
+      "runner": "noo-gateway",
+      "cli": "claude",
+      "lane": {},
+      "launch": {
+        "command": [
+          "claude",
+          "-p",
+          "{prompt}"
+        ],
+        "model_url_env": "ANTHROPIC_BASE_URL",
+        "model_env": "ANTHROPIC_MODEL",
+        "mcp": "claude-mcp-config-flag"
+      },
       "telemetry_off": {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_TELEMETRY": "1",
@@ -30,8 +57,26 @@
       "kind": "copilot",
       "title": "GitHub's Copilot CLI",
       "wire": "OpenAI's Chat Completions API",
-      "wires": ["vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"],
-      "runner": null,
+      "wires": [
+        "vllm",
+        "vllm-secondary",
+        "llamacpp",
+        "ollama",
+        "airllm"
+      ],
+      "runner": "noo-gateway",
+      "cli": "copilot",
+      "lane": {},
+      "launch": {
+        "command": [
+          "copilot",
+          "-p",
+          "{prompt}"
+        ],
+        "model_url_env": "COPILOT_PROVIDER_BASE_URL",
+        "model_env": "COPILOT_MODEL",
+        "mcp": "unverified:flag --additional-mcp-config <json|@file>; also ~/.copilot/mcp-config.json"
+      },
       "telemetry_off": {
         "COPILOT_OFFLINE": "true"
       }
@@ -41,7 +86,19 @@
       "title": "OpenAI's Codex CLI",
       "wire": "OpenAI's Responses API",
       "wires": [],
-      "runner": null,
+      "runner": "noo-gateway",
+      "cli": "codex",
+      "lane": {},
+      "launch": {
+        "command": [
+          "codex",
+          "exec",
+          "{prompt}"
+        ],
+        "model_url_env": "unverified:no env var documented; config.toml [model_providers.<name>] base_url",
+        "model_env": "unverified:config.toml model",
+        "mcp": "config-file:{CODEX_HOME}/config.toml [mcp_servers.<name>]"
+      },
       "telemetry_off": {}
     }
   ]

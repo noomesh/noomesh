@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -30,7 +31,14 @@ type harnessKind struct {
 	Wires []string `json:"wires"`
 	// Runner is the executable the applier installs beside the agent; nil
 	// means no runner ships for this kind yet and the kind is refused.
-	Runner       *string           `json:"runner"`
+	Runner *string `json:"runner"`
+	// CLI is the vendor executable that must be on PATH on the node; nil
+	// for `noo`, which needs none.
+	CLI *string `json:"cli"`
+	// Lane is the env that keeps the CLI one-shot and inside its lane.
+	Lane map[string]string `json:"lane"`
+	// Launch is how the driver invokes the CLI; the driver parses it.
+	Launch       json.RawMessage   `json:"launch"`
 	TelemetryOff map[string]string `json:"telemetry_off"`
 }
 
@@ -38,10 +46,9 @@ var (
 	// harnessKindTable is the table in declared order (`noo` first).
 	harnessKindTable []harnessKind
 	// harnessKinds is kind → the node chat backend types that serve its
-	// wire. `noo` speaks every backend's wire; Claude Code speaks
-	// Anthropic's Messages API (ollama serves it, vllm/llamacpp do not);
-	// Copilot CLI speaks OpenAI's Chat Completions; Codex CLI needs
-	// OpenAI's Responses API, which no node backend serves yet.
+	// wire. `noo` speaks every backend's wire; Claude Code and Copilot CLI
+	// run on every backend through the harness's loopback translator;
+	// Codex CLI needs OpenAI's Responses API, which has no translator yet.
 	harnessKinds map[string][]string
 	// harnessTelemetryOff is kind → the vendor telemetry switches its
 	// runner must launch the CLI with (docs/security/telemetry.md, "Agent
@@ -51,6 +58,9 @@ var (
 	// any operator or placement value, so a placement cannot switch a
 	// vendor's reporting back on.
 	harnessTelemetryOff map[string]map[string]string
+	// harnessLane is kind → the env that keeps its CLI one-shot and inside
+	// its lane; merged AFTER placement env like the telemetry switches.
+	harnessLane map[string]map[string]string
 )
 
 func init() {
@@ -61,9 +71,11 @@ func init() {
 	harnessKindTable = t
 	harnessKinds = make(map[string][]string, len(t))
 	harnessTelemetryOff = make(map[string]map[string]string, len(t))
+	harnessLane = make(map[string]map[string]string, len(t))
 	for _, k := range t {
 		harnessKinds[k.Kind] = k.Wires
 		harnessTelemetryOff[k.Kind] = k.TelemetryOff
+		harnessLane[k.Kind] = k.Lane
 	}
 }
 
@@ -125,6 +137,22 @@ func HarnessTelemetryEnv(kind string) (env map[string]string, ok bool) {
 	return out, true
 }
 
+// HarnessLaneEnv returns a copy of the env a harness kind's CLI must be
+// launched with to stay one-shot and inside its lane (nil for a kind with
+// none). Merge it AFTER any placement value, like HarnessTelemetryEnv. An
+// UNKNOWN kind returns ok=false.
+func HarnessLaneEnv(kind string) (env map[string]string, ok bool) {
+	m, known := harnessLane[kind]
+	if !known {
+		return nil, false
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out, true
+}
+
 // harnessKindCompatible says whether `kind` can talk to `backend`; the
 // error names the backends that would do, or says that none would.
 func harnessKindCompatible(kind, backend string) error {
@@ -141,6 +169,12 @@ func harnessKindCompatible(kind, backend string) error {
 		}
 	}
 	return fmt.Errorf("harness kind %q cannot use a %s backend; it needs one of %s", kind, backend, strings.Join(k.Wires, ", "))
+}
+
+// cliOnPath says whether a vendor CLI is on the PATH this agent sees.
+func cliOnPath(cli string) bool {
+	_, err := exec.LookPath(cli)
+	return err == nil
 }
 
 // runnerOnDisk says whether a harness runner is installed where the

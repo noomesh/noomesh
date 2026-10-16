@@ -119,6 +119,9 @@ type Reconciler struct {
 	// on this node (runnerOnDisk in production, set by New). nil skips the
 	// check: tests that build a bare Reconciler around a fake service.
 	runnerInstalled func(runner string) bool
+	// cliInstalled says whether a foreign kind's vendor CLI is on this
+	// node's PATH (cliOnPath in production). nil skips the check.
+	cliInstalled func(cli string) bool
 
 	// driftRecreated records, per backend, the desired spec hash we last
 	// recreated the container for on a spec-drift detection. It bounds the
@@ -191,6 +194,7 @@ func New(cfg *config.Config, docker *dockerpkg.Client, client *http.Client, harn
 		native:          backendrt.NewAdopted(),
 		harness:         harness,
 		runnerInstalled: runnerOnDisk,
+		cliInstalled:    cliOnPath,
 		driftRecreated:  map[string]string{},
 	}
 }

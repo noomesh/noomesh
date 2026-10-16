@@ -573,11 +573,17 @@ def test_every_harness_kind_has_its_switches_declared_once():
             f"{kind}: config/harness-kinds.json declares {declared[kind]}, this guard says {HARNESS_SWITCHES[kind]}"
         )
     assert declared["claude-code"] and declared["copilot"], "a third-party harness with no switches phones home"
-    # A foreign kind with no switches declared must not have a runner: a
-    # runner that ships would launch a CLI nobody has switched off.
+    # A foreign kind with no switches declared must not be launchable: every
+    # runner is now `noo-gateway`, so the runner no longer says whether a
+    # kind can launch anything. What makes a kind launchable is a vendor
+    # `cli` PLUS a backend that can serve its wire (`wires` non-empty; an
+    # empty `wires` is refused by data). A kind that is launchable would run
+    # a CLI nobody has switched off.
     for r in rows:
         if r["kind"] != "noo" and not r["telemetry_off"]:
-            assert r["runner"] is None, f"harness kind {r['kind']!r} ships a runner with no telemetry switches declared"
+            assert r.get("cli") is None or not r["wires"], (
+                f"harness kind {r['kind']!r} names a vendor CLI and a serving backend with no telemetry switches declared"
+            )
 
 
 def test_the_doc_has_a_row_and_a_switch_for_every_harness_kind():
