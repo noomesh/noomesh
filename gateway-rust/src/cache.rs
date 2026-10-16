@@ -664,6 +664,25 @@ impl RedisCache {
             .unwrap_or(false)
     }
 
+    /// SET key 1 NX EX <ttl>, telling "already there" apart from "Redis
+    /// failed": `Some(true)` = newly claimed, `Some(false)` = it existed (a
+    /// replay), `None` = the command errored (the caller falls back to its
+    /// process-local set rather than treating an outage as either answer).
+    /// Used to spend a cluster-token v2 nonce.
+    pub async fn claim_once(&self, key: &str, ttl_secs: i64) -> Option<bool> {
+        self.client
+            .set::<fred::types::Value, _, _>(
+                key,
+                "1".to_string(),
+                Some(fred::types::Expiration::EX(ttl_secs)),
+                Some(fred::types::SetOptions::NX),
+                false,
+            )
+            .await
+            .ok()
+            .map(|v| !v.is_null())
+    }
+
     /// Set TTL on a key. Returns true if the TTL was set successfully.
     /// (Trait methods come in via `use fred::prelude::*` at module top.)
     pub async fn expire(&self, key: &str, seconds: i64) -> bool {

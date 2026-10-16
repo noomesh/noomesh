@@ -186,11 +186,26 @@ node_bearer() {
     fi
     [ -n "$_sec" ] || return 1
     _ts="$(date +%s)"
-    _sig="$(printf '%s:%s' "$NODE" "$_ts" \
+    if [ "${NOO_BEARER_FORM:-v2}" = v1 ]; then
+        # The legacy form: HMAC over "<node>:<ts>" only. Kept for a controller
+        # that predates v2 (retry after a 401), never the first attempt.
+        _sig="$(printf '%s:%s' "$NODE" "$_ts" \
+            | openssl dgst -sha256 -hmac "$_sec" -hex 2>/dev/null \
+            | sed 's/.*= *//')"
+        [ -n "$_sig" ] || return 1
+        printf '%s:%s:%s' "$NODE" "$_ts" "$_sig"
+        return 0
+    fi
+    # v2 binds the request: METHOD, path, sha256(body), node, time and a
+    # 128-bit nonce the gateway spends once. $1 method, $2 path, $3 body.
+    _bsha="$(printf '%s' "$3" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//')"
+    _nonce="$(openssl rand -hex 16 2>/dev/null)"
+    [ -n "$_bsha" ] && [ -n "$_nonce" ] || return 1
+    _sig="$(printf 'v2\n%s\n%s\n%s\n%s\n%s\n%s' "$1" "$2" "$_bsha" "$NODE" "$_ts" "$_nonce" \
         | openssl dgst -sha256 -hmac "$_sec" -hex 2>/dev/null \
         | sed 's/.*= *//')"
     [ -n "$_sig" ] || return 1
-    printf '%s:%s:%s' "$NODE" "$_ts" "$_sig"
+    printf 'v2:%s:%s:%s:%s' "$NODE" "$_ts" "$_nonce" "$_sig"
 }
 
 # The node's client certificate, as `--cert <crt> --key <key>` curl words
@@ -226,8 +241,11 @@ report() {
     _proof=""
     _proof="$(birth_proof apply "$SUM")" || _proof=""
     _hdrs=""
-    if _tls="$(node_tls)" && _bearer="$(node_bearer)"; then
-        _hdrs="$_tls|-H|authorization: Bearer $_bearer"
+    # The bearer is minted per ATTEMPT inside report_post (a v2 token is bound
+    # to its request and its nonce is spent once, so a retry needs a fresh one);
+    # here we only check that one can be made.
+    if _tls="$(node_tls)" && node_bearer POST /x "" >/dev/null; then
+        _hdrs="$_tls|-H|authorization: Bearer @NODE_BEARER@"
     fi
     if [ -n "$_proof" ]; then
         _hdrs="$_hdrs${_hdrs:+|}-H|x-noo-birth-proof: $_proof"
@@ -298,12 +316,45 @@ report_post() {
     # REPORT_ERR (curl's own words); returns 0 only on a 2xx. The code is the
     # only thing that distinguishes "controller said no" from "no route".
     _errf="${TMP:-/tmp}/report.err"
-    if REPORT_CODE="$(curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \
-        -w '%{http_code}' \
-        -H 'content-type: application/json' \
-        "$@" \
-        -d "{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"}" \
-        "$URL/bootstrap/bundle/$NODE/applied" 2>"$_errf")"; then :; else REPORT_CODE=000; fi
+    _path="/bootstrap/bundle/$NODE/applied"
+    _body="{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"}"
+    _form=v2
+    while :; do
+        # Substitute the bearer placeholder with a token for THIS request.
+        _n=$#; _i=0; _used=0
+        while [ "$_i" -lt "$_n" ]; do
+            _a="$1"; shift
+            case "$_a" in
+                "authorization: Bearer @NODE_BEARER@")
+                    _used=1
+                    _a="authorization: Bearer $(NOO_BEARER_FORM=$_form node_bearer POST "$_path" "$_body")" ;;
+            esac
+            set -- "$@" "$_a"
+            _i=$((_i + 1))
+        done
+        if REPORT_CODE="$(curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \
+            -w '%{http_code}' \
+            -H 'content-type: application/json' \
+            -H "x-noo-content-sha256: $(printf '%s' "$_body" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//')" \
+            "$@" \
+            -d "$_body" \
+            "$URL/bootstrap/bundle/$NODE/applied" 2>"$_errf")"; then :; else REPORT_CODE=000; fi
+        # A controller that predates v2 answers 401 to it: say the same thing
+        # once in the legacy form rather than lose the report. The placeholder
+        # was replaced in place, so rebuild it for the second pass.
+        if [ "$REPORT_CODE" = 401 ] && [ "$_form" = v2 ] && [ "$_used" = 1 ]; then
+            _form=v1
+            _n=$#; _i=0
+            while [ "$_i" -lt "$_n" ]; do
+                _a="$1"; shift
+                case "$_a" in "authorization: Bearer v2:"*) _a="authorization: Bearer @NODE_BEARER@" ;; esac
+                set -- "$@" "$_a"
+                _i=$((_i + 1))
+            done
+            continue
+        fi
+        break
+    done
     case "$REPORT_CODE" in [0-9][0-9][0-9]) ;; *) REPORT_CODE=000 ;; esac
     REPORT_ERR="$(head -c 200 "$_errf" 2>/dev/null | tr '\n\r\t' '   ' || true)"
     case "$REPORT_CODE" in 2??) return 0 ;; esac

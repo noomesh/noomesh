@@ -15,6 +15,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -56,7 +57,12 @@ func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 			// signed with a secret every node holds — recorded, never
 			// trusted for authorization.
 			if cfg.ClusterSecret != "" {
-				if valid, actor := verifyClusterToken(token, cfg.ClusterSecret); valid {
+				valid, actor, refusal := checkClusterToken(token, cfg.ClusterSecret, r)
+				if refusal != "" {
+					http.Error(w, `{"detail":"`+refusal+`"}`, http.StatusForbidden)
+					return
+				}
+				if valid {
 					if IsCLIActor(actor) {
 						// No CLI signs with the fleet secret any more (the
 						// Python passthrough's `cli` fallback was removed,
@@ -228,14 +234,45 @@ func HasValidToken(cfg *config.Config, r *http.Request) bool {
 		return true
 	}
 	if cfg.ClusterSecret != "" {
-		if ok, _ := verifyClusterToken(token, cfg.ClusterSecret); ok {
+		if ok, _, refusal := checkClusterToken(token, cfg.ClusterSecret, r); ok && refusal == "" {
 			return true
 		}
 	}
 	return false
 }
 
-// verifyClusterToken verifies an HMAC cluster token.
+// checkClusterToken is the one door for a bearer that might be a cluster
+// token, v1 or v2. A v2 token is verified against THIS request (method,
+// target, body) and its nonce is spent; a v1 token is accepted and counted
+// (LaneHMACv1) until NOO_CLUSTER_TOKEN_V1=0 closes it, when it is refused with
+// a reason that names the fix. refusal is non-empty only for an explained
+// refusal; an ordinary bad token is (false, "", "").
+func checkClusterToken(token, secret string, r *http.Request) (bool, string, string) {
+	if IsV2Token(token) {
+		body, err := bufferBody(r)
+		if err != nil {
+			if errors.Is(err, errBodyTooLarge) {
+				return false, "", "request body too large to verify against a v2 cluster token"
+			}
+			return false, "", ""
+		}
+		ok, actor := verifyClusterTokenV2(token, secret, r, body)
+		return ok, actor, ""
+	}
+	ok, actor := verifyClusterToken(token, secret)
+	if !ok {
+		return false, "", ""
+	}
+	if !V1Allowed() {
+		noteHMACv1Refused(actor, r)
+		return false, "", "v1 cluster tokens are refused here (NOO_CLUSTER_TOKEN_V1=0); upgrade the calling node so it signs v2 (`noo update`), or set NOO_CLUSTER_TOKEN_V1=1 on this node while the fleet rolls"
+	}
+	noteHMACv1(actor, r)
+	return true, actor, ""
+}
+
+// verifyClusterToken verifies a v1 HMAC cluster token (not request-bound;
+// see clustertoken_v2.go for the bound form).
 //
 // Token format: "<node_id>:<timestamp>:<hex_signature>"
 // The signature is HMAC-SHA256 over "node_id:timestamp" with the cluster secret.
