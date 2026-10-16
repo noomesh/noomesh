@@ -299,6 +299,10 @@ mod tests {
             }
             if let Some(rt) = d["runtime"].as_str() {
                 assert!(v["runtimes"][rt].is_object(), "{} needs runtime {rt}, not pinned", k["kind"]);
+            }
+        }
+    }
+
     const FIXTURE: &str = r#"{
       "runtimes": {"node": {"version": "22.11.0",
         "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
