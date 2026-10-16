@@ -3,17 +3,15 @@
 
 //! `config/harness-kinds.json`, as the CLI reads it: the kind names a
 //! `--kind` may name, and — for a kind whose vendor CLI the controller
-//! stages — where that CLI (and the runtime it needs) comes from and the
+//! stages — where that CLI comes from and the
 //! sha256 it must hash to (i83 E1e).
 //!
 //! The gateway (`gateway-rust/src/harness_kinds.rs`) and the node agent read
 //! the same file. Only the fields the CLI acts on are typed here; the rest
-//! of a row is ignored. `runtimes` and `distribution` are optional: a kind
-//! with a `cli` and no `distribution` is a manual install, and a table with
-//! no `runtimes` names none.
+//! of a row is ignored. `distribution` is optional: a kind with a `cli` and
+//! no `distribution` is a manual install.
 //!
-//! A pin is `sha256` keyed `any` (one artefact for every platform, an npm
-//! tarball) or keyed by noomesh's own platform facts, `<os>-<arch>` with os
+//! A pin is `sha256` keyed `any` (one artefact for every platform) or keyed by noomesh's own platform facts, `<os>-<arch>` with os
 //! `linux`/`macos` and arch `x86_64`/`aarch64`. `names` maps those facts to
 //! the vendor's own spelling inside the `source` URL template, which may use
 //! `{version}`, `{os}` and `{arch}`.
@@ -27,8 +25,6 @@ pub const HARNESS_KINDS_JSON: &str = include_str!("../../config/harness-kinds.js
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Table {
-    #[serde(default)]
-    pub runtimes: BTreeMap<String, Runtime>,
     pub kinds: Vec<Kind>,
 }
 
@@ -48,8 +44,6 @@ pub struct Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Format {
-    /// An npm package tarball (`package/…`), run by a runtime.
-    NpmTarball,
     /// An archive holding the CLI.
     Tarball,
     /// A single executable.
@@ -61,8 +55,6 @@ pub enum Format {
 pub enum Unpack {
     #[serde(rename = "tgz")]
     Tgz,
-    #[serde(rename = "tar.xz")]
-    TarXz,
     #[serde(rename = "zip")]
     Zip,
     #[serde(rename = "none")]
@@ -74,7 +66,6 @@ impl Unpack {
     pub fn as_str(self) -> &'static str {
         match self {
             Unpack::Tgz => "tgz",
-            Unpack::TarXz => "tar.xz",
             Unpack::Zip => "zip",
             Unpack::None => "none",
         }
@@ -91,7 +82,6 @@ impl Unpack {
 impl Format {
     pub fn as_str(self) -> &'static str {
         match self {
-            Format::NpmTarball => "npm-tarball",
             Format::Tarball => "tarball",
             Format::Binary => "binary",
         }
@@ -115,25 +105,11 @@ pub struct Distribution {
     pub names: Option<Names>,
     pub version: String,
     pub sha256: BTreeMap<String, String>,
-    #[serde(default)]
-    pub runtime: Option<String>,
     pub entry: String,
     pub unpack: Unpack,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Runtime {
-    pub version: String,
-    pub source: String,
-    #[serde(default)]
-    pub names: Option<Names>,
-    pub sha256: BTreeMap<String, String>,
-    pub unpack: Unpack,
-    pub bin_dir: String,
-}
-
-/// The part of a pin `artifact_url` needs; both a distribution and a
-/// runtime are one.
+/// The part of a pin `artifact_url` needs; a distribution is one.
 pub trait Pinned {
     fn source(&self) -> &str;
     fn names(&self) -> Option<&Names>;
@@ -146,13 +122,6 @@ pub trait Pinned {
 }
 
 impl Pinned for Distribution {
-    fn source(&self) -> &str { &self.source }
-    fn names(&self) -> Option<&Names> { self.names.as_ref() }
-    fn version(&self) -> &str { &self.version }
-    fn sha256(&self) -> &BTreeMap<String, String> { &self.sha256 }
-}
-
-impl Pinned for Runtime {
     fn source(&self) -> &str { &self.source }
     fn names(&self) -> Option<&Names> { self.names.as_ref() }
     fn version(&self) -> &str { &self.version }
@@ -224,7 +193,7 @@ pub fn parse(raw: &str) -> Result<Table, String> {
 /// The shipped table. Built in, so a parse failure is a build-time defect
 /// the tests below catch; at run time it reads as an empty table.
 pub fn shipped() -> Table {
-    parse(HARNESS_KINDS_JSON).unwrap_or(Table { runtimes: BTreeMap::new(), kinds: Vec::new() })
+    parse(HARNESS_KINDS_JSON).unwrap_or(Table { kinds: Vec::new() })
 }
 
 /// The kind names, in declared order.
@@ -234,22 +203,14 @@ pub fn names() -> Vec<String> {
 
 #[cfg(test)]
 pub(crate) const FIXTURE: &str = r#"{
-  "runtimes": {
-    "node": { "version": "22.11.0",
-              "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
-              "names": {"os": {"linux": "linux", "macos": "darwin"}, "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-              "sha256": {"linux-x86_64": "1111111111111111111111111111111111111111111111111111111111111111",
-                         "linux-aarch64": "2222222222222222222222222222222222222222222222222222222222222222",
-                         "macos-aarch64": "3333333333333333333333333333333333333333333333333333333333333333"},
-              "unpack": "tar.xz", "bin_dir": "bin" } },
   "kinds": [
     { "kind": "noo", "cli": null, "title": "x", "extra": [1, 2] },
     { "kind": "copilot", "cli": "copilot",
-      "distribution": { "format": "npm-tarball",
-                        "source": "https://registry.npmjs.org/@github/copilot/-/copilot-{version}.tgz",
+      "distribution": { "format": "tarball",
+                        "source": "https://example.invalid/copilot/{version}/copilot.tgz",
                         "names": null, "version": "0.0.339",
                         "sha256": {"any": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
-                        "runtime": "node", "entry": "package/index.js", "unpack": "tgz" } },
+                        "entry": "bin/copilot", "unpack": "tgz" } },
     { "kind": "codex", "cli": "codex",
       "distribution": { "format": "binary",
                         "source": "https://example.invalid/codex/{version}/codex-{arch}-{os}",
@@ -257,7 +218,7 @@ pub(crate) const FIXTURE: &str = r#"{
                         "version": "0.46.0",
                         "sha256": {"linux-x86_64": "4444444444444444444444444444444444444444444444444444444444444444",
                                    "macos-aarch64": "5555555555555555555555555555555555555555555555555555555555555555"},
-                        "runtime": null, "entry": "codex", "unpack": "none" } },
+                        "entry": "codex", "unpack": "none" } },
     { "kind": "manual", "cli": "manualcli" },
     { "kind": "zipped", "cli": "zcli",
       "distribution": { "format": "tarball", "source": "https://example.invalid/z-{version}-{os}-{arch}.zip",
@@ -280,14 +241,12 @@ mod tests {
     #[test]
     fn every_variant_of_the_fixture_parses() {
         let t = parse(FIXTURE).unwrap();
-        assert_eq!(t.runtimes["node"].unpack, Unpack::TarXz);
-        assert_eq!(t.runtimes["node"].bin_dir, "bin");
         let by = |k: &str| t.kinds.iter().find(|r| r.kind == k).unwrap().clone();
         let cop = by("copilot").distribution.unwrap();
-        assert_eq!((cop.format, cop.unpack, cop.runtime.as_deref()), (Format::NpmTarball, Unpack::Tgz, Some("node")));
+        assert_eq!((cop.format, cop.unpack), (Format::Tarball, Unpack::Tgz));
         assert!(cop.names.is_none() && cop.is_any());
         let cx = by("codex").distribution.unwrap();
-        assert_eq!((cx.format, cx.unpack, cx.runtime.as_deref()), (Format::Binary, Unpack::None, None));
+        assert_eq!((cx.format, cx.unpack), (Format::Binary, Unpack::None));
         assert!(!cx.is_any());
         assert!(by("manual").distribution.is_none(), "a cli with no distribution is a manual install");
         assert_eq!(by("manual").cli.as_deref(), Some("manualcli"));
@@ -297,9 +256,8 @@ mod tests {
     }
 
     #[test]
-    fn a_table_without_runtimes_or_distributions_still_parses() {
+    fn a_table_without_distributions_still_parses() {
         let t = parse(r#"{"kinds": [{"kind": "noo", "cli": null}, {"kind": "x", "cli": "x"}]}"#).unwrap();
-        assert!(t.runtimes.is_empty());
         assert!(t.kinds.iter().all(|k| k.distribution.is_none()));
     }
 
@@ -314,19 +272,15 @@ mod tests {
     #[test]
     fn artifact_url_applies_names_and_the_platform_pin() {
         let t = parse(FIXTURE).unwrap();
-        let node = &t.runtimes["node"];
-        let (u, s) = artifact_url(node, "macos", "aarch64").unwrap();
-        assert_eq!(u, "https://nodejs.org/dist/v22.11.0/node-v22.11.0-darwin-arm64.tar.xz");
-        assert_eq!(s, "3".repeat(64));
-        let (u, _) = artifact_url(node, "linux", "x86_64").unwrap();
-        assert_eq!(u, "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz");
-        let e = artifact_url(node, "macos", "x86_64").unwrap_err();
-        assert!(e.contains("no sha256 pin for macos-x86_64"), "{e}");
-
         let cx = t.kinds.iter().find(|k| k.kind == "codex").unwrap().distribution.clone().unwrap();
         let (u, s) = artifact_url(&cx, "linux", "x86_64").unwrap();
         assert_eq!(u, "https://example.invalid/codex/0.46.0/codex-x86_64-unknown-linux-musl");
         assert_eq!(s, "4".repeat(64));
+        let (u, s) = artifact_url(&cx, "macos", "aarch64").unwrap();
+        assert_eq!(u, "https://example.invalid/codex/0.46.0/codex-aarch64-apple-darwin");
+        assert_eq!(s, "5".repeat(64));
+        let e = artifact_url(&cx, "macos", "x86_64").unwrap_err();
+        assert!(e.contains("no sha256 pin for macos-x86_64"), "{e}");
     }
 
     #[test]
@@ -336,7 +290,7 @@ mod tests {
         for os in OSES {
             for arch in ARCHES {
                 let (u, s) = artifact_url(&cop, os, arch).unwrap();
-                assert_eq!(u, "https://registry.npmjs.org/@github/copilot/-/copilot-0.0.339.tgz");
+                assert_eq!(u, "https://example.invalid/copilot/0.0.339/copilot.tgz");
                 assert_eq!(s, "a".repeat(64));
             }
         }
@@ -344,22 +298,22 @@ mod tests {
 
     #[test]
     fn a_names_map_that_does_not_spell_the_platform_is_refused() {
-        let mut t = parse(FIXTURE).unwrap();
-        let node = t.runtimes.get_mut("node").unwrap();
-        node.names.as_mut().unwrap().os.remove("macos");
-        let e = artifact_url(node, "macos", "aarch64").unwrap_err();
+        let t = parse(FIXTURE).unwrap();
+        let mut cx = t.kinds.iter().find(|k| k.kind == "codex").unwrap().distribution.clone().unwrap();
+        cx.names.as_mut().unwrap().os.remove("macos");
+        let e = artifact_url(&cx, "macos", "aarch64").unwrap_err();
         assert!(e.contains("names.os does not spell macos"), "{e}");
     }
 
     #[test]
     fn a_malformed_pin_or_plain_http_is_refused() {
-        let mut t = parse(FIXTURE).unwrap();
-        let node = t.runtimes.get_mut("node").unwrap();
-        node.sha256.insert("linux-x86_64".into(), "abc".into());
-        assert!(artifact_url(node, "linux", "x86_64").unwrap_err().contains("not 64 hex"));
-        node.sha256.insert("linux-x86_64".into(), "1".repeat(64));
-        node.source = node.source.replace("https://", "http://");
-        assert!(artifact_url(node, "linux", "x86_64").unwrap_err().contains("not an https URL"));
+        let t = parse(FIXTURE).unwrap();
+        let mut cx = t.kinds.iter().find(|k| k.kind == "codex").unwrap().distribution.clone().unwrap();
+        cx.sha256.insert("linux-x86_64".into(), "abc".into());
+        assert!(artifact_url(&cx, "linux", "x86_64").unwrap_err().contains("not 64 hex"));
+        cx.sha256.insert("linux-x86_64".into(), "1".repeat(64));
+        cx.source = cx.source.replace("https://", "http://");
+        assert!(artifact_url(&cx, "linux", "x86_64").unwrap_err().contains("not an https URL"));
     }
 
     #[test]

@@ -110,8 +110,12 @@ pub struct Principal {
 pub enum Role {
     /// The only JetStream administrator and the only KV writer.
     Gateway,
-    /// noo-worker, noo-trellion, noo-trellion-intel.
+    /// noo-worker — and, for ONE release, an add-on whose own principal is
+    /// not rendered yet (it falls back to presenting this one).
     Worker,
+    /// An add-on's own principal ([`ADDON_PRINCIPALS`]): the user name is the
+    /// add-on key, and the grant is exactly the subjects that add-on serves.
+    Addon,
     /// One per node. The `&str` is the node id, which appears in every
     /// subject this user may touch.
     Node,
@@ -343,9 +347,124 @@ pub(crate) const WORKER_REPLY_INBOX: &str = "_INBOX_gw.worker.>";
 /// cannot be addressed to one node's prefix and stays on `allow_responses`.
 pub(crate) const NODE_REPLY_ROOT: &str = "_INBOX_gw.node";
 
-fn perms_for(role: Role, id: &str) -> String {
+/// The gateway's own inbox prefix; every remote principal's reply prefix is
+/// one token under it. Must equal `nats_credentials::INBOX_PREFIX`.
+pub(crate) const GATEWAY_INBOX: &str = "_INBOX_gw";
+
+/// An add-on that answers its `worker.*` subjects as a NATS principal of its
+/// OWN (i70 residue). Until this, noo-trellion and noo-trellion-intel logged
+/// in as the worker and so held every grant the worker holds — each other's
+/// subjects, the core worker's, and the worker's reply prefix.
+#[derive(Debug)]
+pub struct AddonPrincipal {
+    /// The NATS user, which is also the add-on key (`addons.<name>` in
+    /// noomesh.yaml, the `addon:` of its overlay's `x-noo-addon`). One name.
+    pub name: &'static str,
+    /// The secret-store key that holds its password.
+    pub secret_key: &'static str,
+    /// The overlay that declares it when the add-on ships in this tree;
+    /// `None` = read through the add-on's SIGNED bundle
+    /// (`secrets::trusted_addon_overlay`).
+    pub core_overlay: Option<&'static str>,
+    /// The subjects it SERVES — subscribe, nothing else. These are the
+    /// gateway's ownership predicates (`addons::is_trellion_subject`,
+    /// `addons::is_trellion_intel_subject`) as NATS wildcards, family for
+    /// family: the gateway routes a subject to the add-on by the same
+    /// predicate, and tests/test_nats_addon_principal_subjects.py holds the
+    /// two, and every `@worker_handler` the add-on's surface registers, together.
+    pub subjects: &'static [&'static str],
+    /// The containers that present it (recreated on a rotation).
+    pub containers: &'static [&'static str],
+}
+
+/// Every add-on principal. evolve is absent on purpose: it uses no NATS.
+pub const ADDON_PRINCIPALS: &[AddonPrincipal] = &[
+    AddonPrincipal {
+        name: "trellion",
+        secret_key: "NATS_TRELLION_PASSWORD",
+        core_overlay: Some("docker-compose.trellion.yml"),
+        subjects: &["worker.rag.>", "worker.memory.>", "worker.recall.>", "worker.api.snapshots.>", "worker.autonomy.check_rag"],
+        containers: &["noo-trellion"],
+    },
+    AddonPrincipal {
+        name: "trellion_intel",
+        secret_key: "NATS_TRELLION_INTEL_PASSWORD",
+        core_overlay: None,
+        subjects: &["worker.temporal.>", "worker.graph.>", "worker.retrieval.>", "worker.api.heartbeat.run_ml"],
+        containers: &["noo-trellion-intel"],
+    },
+];
+
+/// An add-on principal's reply prefix grant: `_INBOX_gw.<name>.>`. The
+/// gateway addresses every request for that add-on's subjects to
+/// `_INBOX_gw.<name>.<nuid>` (`nats_credentials::reply_prefix_for`).
+pub(crate) fn addon_reply_inbox(name: &str) -> String {
+    format!("{GATEWAY_INBOX}.{name}.>")
+}
+
+fn quoted_list(items: &[&str]) -> String {
+    items.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
+}
+
+/// Does this overlay text declare `name` as its NATS principal
+/// (`x-noo-addon.nats_principal: <name>`)? The name must be the add-on key
+/// itself — a block naming another add-on's principal declares nothing.
+pub fn overlay_declares_principal(text: &str, name: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|d| d.get("x-noo-addon")?.get("nats_principal")?.as_str().map(|p| p == name))
+        .unwrap_or(false)
+}
+
+/// The add-on principals this install's overlays declare, in
+/// [`ADDON_PRINCIPALS`] order. Declaration, not config: an add-on's
+/// principal is rendered only once the overlay that starts its container
+/// delivers the password — otherwise the server would move the add-on's
+/// subjects off the worker while the container still presents the worker
+/// (an older trellion-intel bundle does).
+pub fn declared_addon_principals(root: &std::path::Path) -> Vec<&'static str> {
+    ADDON_PRINCIPALS
+        .iter()
+        .filter(|a| {
+            let text = match a.core_overlay {
+                Some(f) => std::fs::read_to_string(root.join(f)).ok(),
+                None => crate::commands::secrets::trusted_addon_overlay(root, a.name).map(|(_, t)| t),
+            };
+            text.is_some_and(|t| overlay_declares_principal(&t, a.name))
+        })
+        .map(|a| a.name)
+        .collect()
+}
+
+/// Add-on principals a rendered users.conf already names. Pure.
+pub fn addon_users_in_conf(text: &str) -> Vec<&'static str> {
+    let users: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("user:").map(|u| u.trim().trim_matches('"').to_string()))
+        .collect();
+    ADDON_PRINCIPALS.iter().filter(|a| users.iter().any(|u| u == a.name)).map(|a| a.name).collect()
+}
+
+fn perms_for(role: Role, id: &str, addons_rendered: &[&str]) -> String {
     let ind = "          ";
     let tok = subject_token(id);
+    // The worker serves what no add-on principal serves. An add-on that HAS
+    // its own principal takes its subjects with it (denied to the worker);
+    // one that does not yet (an older bundle, one release) still presents
+    // the worker, so the worker keeps that add-on's reply prefix.
+    let worker_addon_replies: String = ADDON_PRINCIPALS
+        .iter()
+        .filter(|a| !addons_rendered.contains(&a.name))
+        .map(|a| format!(", \"{}\"", addon_reply_inbox(a.name)))
+        .collect();
+    let worker_sub_deny: String = ADDON_PRINCIPALS
+        .iter()
+        .filter(|a| addons_rendered.contains(&a.name))
+        .flat_map(|a| a.subjects.iter())
+        .map(|s| format!(", \"{s}\""))
+        .collect();
+    let addon_subjects = ADDON_PRINCIPALS.iter().find(|a| a.name == id).map(|a| quoted_list(a.subjects)).unwrap_or_default();
+    let addon_reply = addon_reply_inbox(id);
     match role {
         Role::Gateway => format!(
             "{ind}publish: {{ allow: [\">\"] }}\n\
@@ -353,11 +472,29 @@ fn perms_for(role: Role, id: &str) -> String {
         ),
         Role::Worker => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{WORKER_REPLY_INBOX}\"]\n\
+             {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{WORKER_REPLY_INBOX}\"{worker_addon_replies}]\n\
              {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
              {ind}  allow: [\"worker.>\", \"_INBOX_worker.>\", \"agent.msg.direct.*\", \"agent.peer.*.task.*\"]\n\
+             {ind}  deny: [\"$KV.>\", \"tasks.>\"{worker_sub_deny}]\n\
+             {ind}}}\n\
+             {ind}allow_responses: {{ max: 1, expires: \"{RESPONSE_EXPIRES}\" }}\n"
+        ),
+        // An add-on: subscribe on exactly the subjects it serves and its own
+        // client inbox (`_INBOX_<name>`, nats-py's `inbox_prefix`, where its
+        // JetStream `STREAM.INFO` answers land); publish on its own reply
+        // prefix and that one JetStream read. Nothing the worker holds beyond
+        // that — no agent.*, no events.*, no other add-on's subjects, no
+        // worker reply prefix. allow_responses stays, as for the worker, for
+        // a requester that is not the gateway.
+        Role::Addon => format!(
+            "{ind}publish: {{\n\
+             {ind}  allow: [\"$JS.API.STREAM.INFO.*\", \"{addon_reply}\"]\n\
+             {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\", \"worker.>\"]\n\
+             {ind}}}\n\
+             {ind}subscribe: {{\n\
+             {ind}  allow: [{addon_subjects}, \"_INBOX_{id}.>\"]\n\
              {ind}  deny: [\"$KV.>\", \"tasks.>\"]\n\
              {ind}}}\n\
              {ind}allow_responses: {{ max: 1, expires: \"{RESPONSE_EXPIRES}\" }}\n"
@@ -419,13 +556,18 @@ pub fn render_users_conf(principals: &[Principal]) -> String {
     s.push_str(&format!("  {ACCOUNT}: {{\n"));
     s.push_str("    jetstream: enabled\n");
     s.push_str("    users: [\n");
+    let addons_rendered: Vec<&str> =
+        principals.iter().filter(|p| p.role == Role::Addon).map(|p| p.user.as_str()).collect();
     for p in principals {
-        let id = p.user.strip_prefix("node-").unwrap_or("");
+        let id = match p.role {
+            Role::Addon => p.user.as_str(),
+            _ => p.user.strip_prefix("node-").unwrap_or(""),
+        };
         s.push_str("      {\n");
         s.push_str(&format!("        user: {}\n", nats_value(&p.user)));
         s.push_str(&format!("        password: {}\n", nats_value(&p.hash)));
         s.push_str("        permissions: {\n");
-        s.push_str(&perms_for(p.role, id));
+        s.push_str(&perms_for(p.role, id, &addons_rendered));
         s.push_str("        }\n");
         s.push_str("      }\n");
     }
@@ -457,6 +599,28 @@ pub type RenderPlan = (Vec<Principal>, Vec<(String, String)>);
 /// nodes have their own verb (`nats-creds rotate <node>`) that delivers
 /// FIRST and re-renders LAST.
 pub const CONTROLLER_PRINCIPALS: &[&str] = &["gateway", "worker"];
+
+/// Every principal whose credential lives on the controller and is rotated
+/// by a re-render + HUP + recreate: [`CONTROLLER_PRINCIPALS`] and the add-on
+/// principals ([`ADDON_PRINCIPALS`]). `render --rotate` still re-mints only
+/// the first two; `nats-creds rotate <name>` takes any of these.
+pub fn rotatable_principals() -> Vec<&'static str> {
+    CONTROLLER_PRINCIPALS.iter().copied().chain(ADDON_PRINCIPALS.iter().map(|a| a.name)).collect()
+}
+
+/// Store keys whose plaintexts are equal — two principals sharing one
+/// password are one principal, whatever the users.conf says. Pure.
+pub fn shared_passwords(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, (ka, va)) in pairs.iter().enumerate() {
+        for (kb, vb) in &pairs[i + 1..] {
+            if !va.is_empty() && va == vb {
+                out.push((ka.clone(), kb.clone()));
+            }
+        }
+    }
+    out
+}
 
 /// Bcrypt digests an existing users.conf already carries, by user name.
 ///
@@ -490,19 +654,34 @@ pub fn digests_in_conf(text: &str) -> BTreeMap<String, String> {
 /// stored password nor a kept digest — mint one (the operator's verb, a
 /// fresh onboard) or refuse (the upgrade roll, which must change no
 /// credential at all).
+///
+/// `addons` is [`declared_addon_principals`]: each is rendered with its
+/// own grant when the store holds its password (or it is minted here). One
+/// with neither on a render that mints nothing (the upgrade roll) is left
+/// out — its container presents the worker for one more release, and the
+/// worker keeps its subjects ([`perms_for`]).
 pub fn principals_for(
     store: &crate::commands::secrets::SecretStore,
     nodes: &[String],
     rotate: &[String],
     kept: &BTreeMap<String, String>,
     mint_missing: bool,
+    addons: &[&str],
 ) -> Result<RenderPlan, String> {
+    let rotatable = rotatable_principals();
     for r in rotate {
-        if !CONTROLLER_PRINCIPALS.contains(&r.as_str()) {
+        if !rotatable.contains(&r.as_str()) {
             return Err(format!(
                 "'{r}' cannot be rotated by a render: only {} live on the controller. \
                  A node's credential must be DELIVERED — `noo cluster nats-creds rotate <node>`",
-                CONTROLLER_PRINCIPALS.join("/")
+                rotatable.join("/")
+            ));
+        }
+        if ADDON_PRINCIPALS.iter().any(|a| a.name == r) && !addons.contains(&r.as_str()) {
+            return Err(format!(
+                "'{r}' has no principal on this install: its overlay does not declare one \
+                 (x-noo-addon.nats_principal), so its container presents the worker — \
+                 `noo addons upgrade {r}` brings a bundle that does"
             ));
         }
     }
@@ -539,8 +718,37 @@ pub fn principals_for(
     };
     take("gateway".into(), Role::Gateway, "NATS_GATEWAY_PASSWORD".into(), &mut out, &mut fresh)?;
     take("worker".into(), Role::Worker, "NATS_WORKER_PASSWORD".into(), &mut out, &mut fresh)?;
+    for a in ADDON_PRINCIPALS.iter().filter(|a| addons.contains(&a.name)) {
+        let stored = store.get(a.secret_key).is_some_and(|v| !v.is_empty());
+        let re_mint = rotate.iter().any(|r| r == a.name);
+        if !stored && !kept.contains_key(a.name) && !mint_missing && !re_mint {
+            continue;
+        }
+        take(a.name.into(), Role::Addon, a.secret_key.into(), &mut out, &mut fresh)?;
+    }
     for id in nodes {
         take(format!("node-{id}"), Role::Node, node_secret_key(id), &mut out, &mut fresh)?;
+    }
+    // No two principals may share a password: a shared one makes the grants
+    // above one grant, whichever user name the holder presents.
+    let mut plain: Vec<(String, String)> = Vec::new();
+    for p in &out {
+        let key = match p.role {
+            Role::Gateway => "NATS_GATEWAY_PASSWORD".to_string(),
+            Role::Worker => "NATS_WORKER_PASSWORD".to_string(),
+            Role::Addon => ADDON_PRINCIPALS.iter().find(|a| a.name == p.user).map(|a| a.secret_key.to_string()).unwrap_or_default(),
+            Role::Node => node_secret_key(p.user.strip_prefix("node-").unwrap_or("")),
+        };
+        let v = fresh.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+            .or_else(|| store.get(&key).map(str::to_string))
+            .unwrap_or_default();
+        plain.push((key, v));
+    }
+    if let Some((a, b)) = shared_passwords(&plain).first() {
+        return Err(format!(
+            "{a} and {b} hold the SAME password — two principals sharing one are one principal, so \
+             nothing was rendered. Rotate one: `noo cluster nats-creds rotate <principal|node>`"
+        ));
     }
     Ok((out, fresh))
 }
@@ -580,7 +788,8 @@ pub fn render_to_mode(
     let sops = repo.join("secrets/env.sops");
     let store = crate::commands::secrets::SecretStore::load_sops(&sops)?;
     let kept = digests_in_conf(&std::fs::read_to_string(repo.join(USERS_CONF)).unwrap_or_default());
-    let (principals, fresh) = principals_for(&store, nodes, rotate, &kept, mint_missing)?;
+    let addons = declared_addon_principals(repo);
+    let (principals, fresh) = principals_for(&store, nodes, rotate, &kept, mint_missing, &addons)?;
     // The controller principals need their USER NAMES in the environment as
     // well as their passwords in the store, or the render is only half a
     // migration: the server would demand `gateway`/`worker` while the
@@ -685,6 +894,51 @@ pub fn rerender_for_roll(g: &Globals, repo: &std::path::Path) -> Result<Option<R
     render_to_mode(repo, &nodes, &[], false).map(Some)
 }
 
+/// Give every DECLARED add-on its own principal on an install that predates
+/// it — `noo upgrade --stack` (after the new overlays and add-on pins are
+/// written, before the launcher) and `noo addons enable` run this.
+///
+/// Mints each declared add-on's missing password (the same alphabet as every
+/// NATS password), then re-renders users.conf the way the upgrade roll does —
+/// node list = what the file already authorises ∪ the registry, no node or
+/// controller credential minted — so the add-on's principal appears and the
+/// worker's grant loses that add-on's subjects. The caller HUPs.
+///
+/// `Ok(None)`: nothing to do (every declared add-on is already rendered, or
+/// there is no users.conf yet — onboarding renders it whole).
+pub fn reconcile_addon_principals(g: &Globals, root: &std::path::Path) -> Result<Option<RenderOutcome>, String> {
+    let Ok(conf) = std::fs::read_to_string(root.join(USERS_CONF)) else { return Ok(None) };
+    let declared = declared_addon_principals(root);
+    let rendered = addon_users_in_conf(&conf);
+    if declared.iter().all(|d| rendered.contains(d)) {
+        return Ok(None);
+    }
+    let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"))?;
+    let fresh: Vec<(String, String)> = ADDON_PRINCIPALS
+        .iter()
+        .filter(|a| declared.contains(&a.name))
+        .filter(|a| !store.get(a.secret_key).is_some_and(|v| !v.is_empty()))
+        .map(|a| (a.secret_key.to_string(), mint_password()))
+        .collect();
+    if !fresh.is_empty() {
+        crate::commands::secrets::store_upsert(&fresh)
+            .map_err(|e| format!("could not write {} to the store: {e} — nothing was rendered",
+                fresh.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")))?;
+    }
+    let mut nodes = node_users_in_conf(&conf);
+    if let Some(doc) = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10) {
+        for n in nodes_from_registry(&doc) {
+            if !nodes.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                nodes.push(n);
+            }
+        }
+    }
+    nodes.sort();
+    let mut out = render_to_mode(root, &nodes, &[], false)?;
+    out.minted = fresh.into_iter().map(|(k, _)| k).collect();
+    Ok(Some(out))
+}
+
 /// This node's own bus credential, as the `nats-creds` bundle payload.
 ///
 /// Minted at PROVISION time, not at onboard time, for the obvious reason:
@@ -766,15 +1020,18 @@ pub fn cluster_nats_users_render(g: &Globals, args: &[String]) -> Result<i32, Un
 
     if dry_run {
         let target = repo.join(USERS_CONF);
+        let addons = declared_addon_principals(&repo);
         if g.json {
             println!("{}", serde_json::json!({
                 "dry_run": true, "target": target, "nodes": nodes,
-                "users": nodes.len() + 2,
+                "addon_principals": addons,
+                "users": nodes.len() + 2 + addons.len(),
                 "legacy_user_kept": false, "rotate": rotate,
             }));
         } else {
+            let addon_part: String = addons.iter().map(|a| format!("{a}, ")).collect();
             ui::done(&format!(
-                "would render {} — gateway, worker, {} node user(s)",
+                "would render {} — gateway, worker, {addon_part}{} node user(s)",
                 target.display(), nodes.len()));
             println!("{}", ui::note("nothing was minted or written"));
         }
@@ -844,9 +1101,9 @@ pub fn creds_payload(node: &str, password: &str) -> String {
 }
 
 const ROTATE_USAGE: &str =
-    "usage: noo cluster nats-creds rotate <node|gateway|worker>... [--mint-only] [--restart] [-y|--yes]\n\
+    "usage: noo cluster nats-creds rotate <node|gateway|worker|trellion|trellion_intel>... [--mint-only] [--restart] [-y|--yes]\n\
      nodes: mint, deliver over the rail, confirm, then re-render + HUP\n\
-     gateway/worker: mint, re-render + HUP, then recreate the holders (--restart does it)";
+     gateway/worker/trellion/trellion_intel: mint, re-render + HUP, then recreate the holders (--restart does it)";
 
 /// Which of the named targets are controller principals. Mixing them with
 /// nodes is refused: the two rotations have OPPOSITE orders (a node gets
@@ -857,7 +1114,7 @@ pub(crate) fn split_targets(targets: &[String]) -> Result<(Vec<String>, Vec<Stri
     let (principals, nodes): (Vec<String>, Vec<String>) = targets
         .iter()
         .cloned()
-        .partition(|t| CONTROLLER_PRINCIPALS.contains(&t.to_ascii_lowercase().as_str()));
+        .partition(|t| rotatable_principals().contains(&t.to_ascii_lowercase().as_str()));
     if !principals.is_empty() && !nodes.is_empty() {
         return Err(format!(
             "rotate controller principals ({}) and nodes ({}) in separate runs — their \
@@ -890,7 +1147,11 @@ fn rotate_controller_principals(g: &Globals, principals: &[String], restart: boo
         .iter()
         .flat_map(|p| match p.as_str() {
             "gateway" => vec!["noo-gateway"],
-            _ => vec!["noo-worker", "noo-trellion", "noo-trellion-intel"],
+            // An add-on presents its own principal; for one release an add-on
+            // without one still presents the worker, so the worker's holders
+            // keep naming them.
+            "worker" => vec!["noo-worker", "noo-trellion", "noo-trellion-intel"],
+            other => ADDON_PRINCIPALS.iter().find(|a| a.name == other).map(|a| a.containers.to_vec()).unwrap_or_default(),
         })
         .collect();
     if g.json {
@@ -1098,6 +1359,45 @@ pub fn cluster_nats_creds_rotate(g: &Globals, args: &[String]) -> Result<i32, Un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i77's NATS half of "a seat can never obtain node credentials": the bus
+    /// principals come from the NODE registry (`/api/cluster/nodes`) and the
+    /// two controller principals, and nothing else. A kiosk seat lives in its
+    /// own registry (`/api/cluster/seats`), which no code here reads, so a
+    /// seat cannot have a principal — not by name, not by role. The gateway
+    /// half is `auth::tests::seat_cannot_reach_node_routes`.
+    #[test]
+    fn seat_has_no_bus_principal() {
+        // The fleet as the gateway lists it: the nodes, and separately a seat.
+        let nodes = serde_json::json!({"nodes": [{"id": "host3"}, {"id": "pop-os"}]});
+        let seats = serde_json::json!({"seats": [{"seat_name": "lobby", "role": "seat"}]});
+        let ids = nodes_from_registry(&nodes);
+        assert_eq!(ids, ["host3", "pop-os"]);
+        // The seats document is not a nodes document: read as one, it
+        // yields nothing (it has no `nodes` array).
+        assert!(nodes_from_registry(&seats).is_empty());
+        let mut principals: Vec<Principal> = vec![
+            Principal { user: "gateway".into(), hash: "$2b$11$g".into(), role: Role::Gateway },
+            Principal { user: "worker".into(), hash: "$2b$11$w".into(), role: Role::Worker },
+        ];
+        for id in &ids {
+            principals.push(Principal { user: format!("node-{id}"), hash: "$2b$11$n".into(), role: Role::Node });
+        }
+        let conf = render_users_conf(&principals);
+        assert!(!conf.contains("lobby"), "a seat must never be a bus principal:\n{conf}");
+        assert!(!conf.to_ascii_lowercase().contains("seat"), "{conf}");
+        // Structural: the renderer's only fleet source is the node registry.
+        let src = include_str!("nats_users.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("/api/cluster/seats") && !prod.contains("kiosk_seat"),
+            "nats_users must never enumerate seats");
+        assert!(prod.contains("\"/api/cluster/nodes\""));
+        // And the shipped server config has no seat user either.
+        let shipped = include_str!("../../../monitoring/nats/nats-tls.conf");
+        assert!(!shipped.to_ascii_lowercase().contains("seat"), "nats-tls.conf names a seat");
+        let users = include_str!("../../../monitoring/nats/users.conf");
+        assert!(!users.to_ascii_lowercase().contains("seat"), "the shipped users.conf names a seat");
+    }
 
     // ── users.conf value quoting (the v0.2.22 outage) ─────────────────
 
@@ -1333,7 +1633,7 @@ mod tests {
         let nodes = vec!["host9".to_string(), "host8".to_string()];
 
         let none = BTreeMap::new();
-        let (principals, fresh) = principals_for(&store, &nodes, &[], &none, true).unwrap();
+        let (principals, fresh) = principals_for(&store, &nodes, &[], &none, true, &[]).unwrap();
         // gateway + worker + 2 nodes — and no legacy principal
         assert_eq!(principals.len(), 4);
         // Only what was ABSENT is minted — names only, never values.
@@ -1349,16 +1649,16 @@ mod tests {
         // password is never re-minted by a render: minted-but-undelivered
         // is a node off the bus (N10).
         let both: Vec<String> = CONTROLLER_PRINCIPALS.iter().map(|p| p.to_string()).collect();
-        let (_, fresh) = principals_for(&store, &nodes, &both, &none, true).unwrap();
+        let (_, fresh) = principals_for(&store, &nodes, &both, &none, true, &[]).unwrap();
         let keys: Vec<&str> = fresh.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["NATS_GATEWAY_PASSWORD", "NATS_WORKER_PASSWORD", "NATS_NODE_PASSWORD_HOST8"]);
         // One principal at a time is the rotate verb's shape.
-        let (_, fresh) = principals_for(&store, &nodes, &["gateway".to_string()], &none, true).unwrap();
+        let (_, fresh) = principals_for(&store, &nodes, &["gateway".to_string()], &none, true, &[]).unwrap();
         let keys: Vec<&str> = fresh.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["NATS_GATEWAY_PASSWORD", "NATS_WORKER_PASSWORD", "NATS_NODE_PASSWORD_HOST8"],
             "gateway re-minted, worker minted because ABSENT, host9 kept");
         // Naming a node as a rotate target is refused, not silently honoured.
-        assert!(principals_for(&store, &nodes, &["node-host9".to_string()], &none, true).is_err());
+        assert!(principals_for(&store, &nodes, &["node-host9".to_string()], &none, true, &[]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1373,6 +1673,7 @@ mod tests {
             &[],
             &BTreeMap::new(),
             true,
+            &[],
         )
         .unwrap();
         assert_eq!(principals.len(), 3, "gateway + worker + host9, nothing else");
@@ -1412,7 +1713,7 @@ mod tests {
         assert_eq!(node_users_in_conf(&on_disk), ["host3"]);
 
         let empty = crate::commands::secrets::SecretStore::load_env(std::path::Path::new("/nonexistent"));
-        let (p, fresh) = principals_for(&empty, &["host3".to_string()], &[], &kept, false).unwrap();
+        let (p, fresh) = principals_for(&empty, &["host3".to_string()], &[], &kept, false, &[]).unwrap();
         assert!(fresh.is_empty(), "the roll minted {:?}", fresh.iter().map(|(k, _)| k).collect::<Vec<_>>());
         assert_eq!(p.iter().map(|x| x.hash.as_str()).collect::<Vec<_>>(),
             ["$2b$11$GWDIGEST", "$2b$11$WKDIGEST", "$2b$11$AWDIGEST"]);
@@ -1420,7 +1721,7 @@ mod tests {
         assert!(env_refs_in_conf(&text).is_empty(), "{text}");
 
         // A node the registry knows but neither store nor file does: refused.
-        let err = principals_for(&empty, &["host3".to_string(), "newbie".to_string()], &[], &kept, false)
+        let err = principals_for(&empty, &["host3".to_string(), "newbie".to_string()], &[], &kept, false, &[])
             .unwrap_err();
         assert!(err.contains("NATS_NODE_PASSWORD_NEWBIE") && err.contains("nats-creds rotate"), "{err}");
     }
@@ -1525,7 +1826,7 @@ mod tests {
         let store = crate::commands::secrets::SecretStore::load_env(&envp);
         assert!(store.contains("NATS_GATEWAY_PASSWORD"), "the fixture did not load");
         let nodes = vec!["host8".to_string(), "host9".to_string()];
-        let (principals, fresh) = principals_for(&store, &nodes, &[], &BTreeMap::new(), true).unwrap();
+        let (principals, fresh) = principals_for(&store, &nodes, &[], &BTreeMap::new(), true, &[]).unwrap();
         assert_eq!(principals.len(), 4, "gateway + worker + 2 nodes");
         // Only the node with NO stored password is minted.
         assert_eq!(
@@ -1539,6 +1840,143 @@ mod tests {
         let node = principals.iter().find(|p| p.user == "node-host8").unwrap();
         assert!(bcrypt::verify("node-existing", &node.hash).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── add-on principals (i70 residue) ───────────────────────────────
+
+    fn with_addons() -> Vec<Principal> {
+        let mut p = sample();
+        p.insert(2, Principal { user: "trellion".into(), hash: "$2b$11$t".into(), role: Role::Addon });
+        p.insert(3, Principal { user: "trellion_intel".into(), hash: "$2b$11$i".into(), role: Role::Addon });
+        p
+    }
+
+    /// One principal's block of a rendered file.
+    fn block<'a>(text: &'a str, user: &str) -> &'a str {
+        text.split("      {\n").find(|b| b.contains(&format!("user: \"{user}\""))).unwrap_or_else(|| panic!("no {user} in:\n{text}"))
+    }
+
+    fn list_after<'a>(section: &'a str, key: &str) -> Vec<&'a str> {
+        let rest = section.split(key).nth(1).unwrap_or("");
+        let inner = rest.split('[').nth(1).unwrap_or("").split(']').next().unwrap_or("");
+        inner.split(", ").map(|x| x.trim_matches('"')).filter(|x| !x.is_empty()).collect()
+    }
+
+    #[test]
+    fn an_addon_principal_subscribes_on_its_subjects_and_publishes_on_its_own_prefix() {
+        let text = render_users_conf(&with_addons());
+        assert_eq!(text.matches('{').count(), text.matches('}').count());
+        for a in ADDON_PRINCIPALS {
+            let b = block(&text, a.name);
+            let (publish, subscribe) = b.split_once("subscribe:").unwrap();
+            let pub_allow = list_after(publish, "allow:");
+            assert_eq!(pub_allow, ["$JS.API.STREAM.INFO.*", &format!("_INBOX_gw.{}.>", a.name)], "{b}");
+            let mut sub_allow = list_after(subscribe, "allow:");
+            assert_eq!(sub_allow.pop(), Some(format!("_INBOX_{}.>", a.name).as_str()), "{b}");
+            assert_eq!(sub_allow, a.subjects, "{b}");
+            assert!(b.contains("allow_responses: { max: 1, expires: \"20m\" }"), "{b}");
+            // Nothing of the worker's: not its reply prefix, not its subject tree.
+            assert!(!b.contains("_INBOX_gw.worker"), "{b}");
+            assert!(!sub_allow.contains(&"worker.>"), "{b}");
+            assert!(!b.contains("agent."), "{b}");
+        }
+        // Neither add-on may serve the other's subjects.
+        let t = block(&text, "trellion");
+        let i = block(&text, "trellion_intel");
+        assert!(!t.contains("worker.graph") && !t.contains("_INBOX_gw.trellion_intel"), "{t}");
+        assert!(!i.contains("worker.rag") && !i.contains("\"_INBOX_gw.trellion.>\""), "{i}");
+    }
+
+    /// The worker's grant no longer covers an add-on's subjects once that
+    /// add-on has a principal of its own — and keeps them (with the add-on's
+    /// reply prefix) for one release while it does not.
+    #[test]
+    fn the_worker_grant_no_longer_covers_addon_subjects() {
+        let text = render_users_conf(&with_addons());
+        let w = block(&text, "worker");
+        let (publish, subscribe) = w.split_once("subscribe:").unwrap();
+        let sub_deny: Vec<&str> = {
+            let rest = subscribe.split("deny: [").nth(1).unwrap().split(']').next().unwrap();
+            rest.split(", ").map(|x| x.trim_matches('"')).collect()
+        };
+        for a in ADDON_PRINCIPALS {
+            for s in a.subjects {
+                assert!(sub_deny.contains(s), "the worker may still subscribe {s}:\n{w}");
+            }
+            assert!(!publish.contains(&format!("_INBOX_gw.{}", a.name)), "the worker answers into {}'s prefix:\n{w}", a.name);
+        }
+        // Core subjects stay the worker's.
+        assert!(!sub_deny.iter().any(|d| d.starts_with("worker.tool") || *d == "worker.>"), "{w}");
+
+        // Fallback: no add-on principal rendered → the worker keeps the
+        // subjects AND the add-ons' reply prefixes (they present it).
+        let text = render_users_conf(&sample());
+        let w = block(&text, "worker");
+        let (publish, subscribe) = w.split_once("subscribe:").unwrap();
+        for a in ADDON_PRINCIPALS {
+            assert!(publish.contains(&format!("\"_INBOX_gw.{}.>\"", a.name)), "{w}");
+            for s in a.subjects {
+                assert!(!subscribe.contains(&format!("\"{s}\"")), "{w}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_principals_share_a_password() {
+        let dir = std::env::temp_dir().join(format!("noo-nats-dup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let envp = dir.join("dup.env");
+        std::fs::write(&envp, "NATS_GATEWAY_PASSWORD=Gwone\nNATS_WORKER_PASSWORD=Same\nNATS_TRELLION_PASSWORD=Same\n").unwrap();
+        let store = crate::commands::secrets::SecretStore::load_env(&envp);
+        let err = principals_for(&store, &[], &[], &BTreeMap::new(), true, &["trellion"]).unwrap_err();
+        assert!(err.contains("NATS_WORKER_PASSWORD") && err.contains("NATS_TRELLION_PASSWORD"), "{err}");
+        // Distinct passwords render, each add-on its own principal, and the
+        // digests verify only their own plaintext.
+        std::fs::write(&envp, "NATS_GATEWAY_PASSWORD=Gwone\nNATS_WORKER_PASSWORD=Wkone\nNATS_TRELLION_PASSWORD=Trone\n").unwrap();
+        let store = crate::commands::secrets::SecretStore::load_env(&envp);
+        let (p, fresh) = principals_for(&store, &[], &[], &BTreeMap::new(), true, &["trellion", "trellion_intel"]).unwrap();
+        assert_eq!(p.iter().map(|x| x.user.as_str()).collect::<Vec<_>>(), ["gateway", "worker", "trellion", "trellion_intel"]);
+        assert_eq!(fresh.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["NATS_TRELLION_INTEL_PASSWORD"]);
+        let t = p.iter().find(|x| x.user == "trellion").unwrap();
+        assert_eq!(t.role, Role::Addon);
+        assert!(bcrypt::verify("Trone", &t.hash).unwrap());
+        assert!(!bcrypt::verify("Wkone", &t.hash).unwrap());
+        assert_eq!(shared_passwords(&[("A".into(), "x".into()), ("B".into(), "y".into()), ("C".into(), "x".into())]),
+            [("A".to_string(), "C".to_string())]);
+        assert!(shared_passwords(&[("A".into(), String::new()), ("B".into(), String::new())]).is_empty(),
+            "an absent password is not a shared one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The roll mints nothing: an add-on with no stored password and no
+    /// digest is left out (its container falls back to the worker for one
+    /// release), never refused and never minted.
+    #[test]
+    fn the_roll_leaves_an_unminted_addon_on_the_worker() {
+        let empty = crate::commands::secrets::SecretStore::load_env(std::path::Path::new("/nonexistent"));
+        let kept: BTreeMap<String, String> =
+            [("gateway", "$2b$11$G"), ("worker", "$2b$11$W")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let (p, fresh) = principals_for(&empty, &[], &[], &kept, false, &["trellion"]).unwrap();
+        assert!(fresh.is_empty());
+        assert_eq!(p.len(), 2, "{p:?}");
+        // An undeclared add-on cannot be rotated into existence.
+        let err = principals_for(&empty, &[], &["trellion_intel".to_string()], &kept, true, &["trellion"]).unwrap_err();
+        assert!(err.contains("nats_principal"), "{err}");
+        assert_eq!(split_targets(&["trellion".into(), "Trellion_Intel".into()]).unwrap().0, ["trellion", "trellion_intel"]);
+    }
+
+    #[test]
+    fn a_principal_is_declared_by_its_overlay_and_only_under_its_own_name() {
+        let yes = "x-noo-addon:\n  addon: trellion\n  nats_principal: trellion\n";
+        assert!(overlay_declares_principal(yes, "trellion"));
+        assert!(!overlay_declares_principal(yes, "trellion_intel"), "a block declares its own add-on's principal only");
+        assert!(!overlay_declares_principal("x-noo-addon:\n  addon: trellion\n", "trellion"));
+        assert!(!overlay_declares_principal("not: [yaml", "trellion"));
+        // The core overlay declares trellion's.
+        let core = include_str!("../../../docker-compose.trellion.yml");
+        assert!(overlay_declares_principal(core, "trellion"));
+        assert_eq!(addon_users_in_conf(&render_users_conf(&with_addons())), ["trellion", "trellion_intel"]);
+        assert!(addon_users_in_conf(&render_users_conf(&sample())).is_empty());
     }
 
     #[test]

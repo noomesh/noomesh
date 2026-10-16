@@ -6,7 +6,7 @@
 This is the compose `whisper` service (profile "voice") — the first concrete
 provider behind the gateway's generic STT layer (gateway-rust/src/stt_client.rs,
 wire format "openai"). Deliberately tiny and auditable instead of pulling a
-full model-management stack: one endpoint, one health probe, one model cache.
+full model-management stack: one endpoint, one health probe, no downloads.
 
 Endpoints:
   POST /v1/audio/transcriptions  — multipart: file, model, [language],
@@ -15,13 +15,20 @@ Endpoints:
   GET  /health                   — liveness
 
 Model names: faster-whisper sizes (tiny/base/small/medium/large-v3, *.en)
-or any HuggingFace CTranslate2 repo id. "whisper-1" (the OpenAI cloud name)
+or a HuggingFace CTranslate2 repo id. "whisper-1" (the OpenAI cloud name)
 maps to WHISPER_MODEL so OpenAI-shaped clients work unchanged.
+
+Models are loaded ONLY from the controller's staged files (i105): compose
+mounts `<MODELS_DIR>/voice/whisper` read-only at WHISPER_MODEL_DIR and sets
+HF_HUB_OFFLINE=1. A model that is not staged is a 404 naming
+`noo models pull whisper:<name>` (docker/voice_local.py); nothing here can
+download one.
 
 Env:
   WHISPER_MODEL   default model (default: base) — preloaded at startup
   WHISPER_DEVICE  auto|cpu|cuda (default: auto; cuda needs a CUDA-lib image)
   WHISPER_PRELOAD set to "0" to skip startup preload (load on first request)
+  WHISPER_MODEL_DIR  staged models, read-only (default: /models)
 """
 
 from __future__ import annotations
@@ -37,7 +44,10 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
 
+from voice_local import NotStaged, staged_whisper_models, whisper_model_dir
+
 DEFAULT_MODEL = os.environ.get("WHISPER_MODEL", "base")
+MODEL_DIR = Path(os.environ.get("WHISPER_MODEL_DIR", "/models"))
 
 app = FastAPI(title="noo-whisper", version="1.0")
 
@@ -70,8 +80,11 @@ def _resolve_model_name(requested: Optional[str]) -> str:
 def _get_model(name: str) -> WhisperModel:
     with _lock:
         if name not in _models:
+            # A local directory, never a size name: faster-whisper resolves a
+            # name through huggingface_hub (a download). Raises NotStaged.
+            path = whisper_model_dir(MODEL_DIR, name)
             device, compute = _device()
-            _models[name] = WhisperModel(name, device=device, compute_type=compute)
+            _models[name] = WhisperModel(str(path), device=device, compute_type=compute, local_files_only=True)
         return _models[name]
 
 
@@ -82,7 +95,7 @@ def health() -> dict:
 
 @app.get("/v1/models")
 def models() -> dict:
-    ids = sorted(set(_models.keys()) | {DEFAULT_MODEL})
+    ids = sorted(set(_models.keys()) | {DEFAULT_MODEL} | set(staged_whisper_models(MODEL_DIR)))
     return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "noo-whisper"} for m in ids]}
 
 
@@ -101,7 +114,9 @@ async def transcriptions(
     model_name = _resolve_model_name(model)
     try:
         wm = _get_model(model_name)
-    except Exception as e:  # unknown model / download failure
+    except NotStaged as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:  # a staged model that will not load
         raise HTTPException(status_code=404, detail=f"model {model_name!r} not available: {e}")
 
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
@@ -167,8 +182,8 @@ if os.environ.get("WHISPER_PRELOAD", "1") != "0":  # pragma: no cover
     try:
         _get_model(DEFAULT_MODEL)
     except Exception as e:
-        # Don't crash-loop on a cold cache with no network — first request
-        # will retry the download.
+        # Don't crash-loop on a model that is not staged yet — the first
+        # request after `noo models pull whisper:<name>` loads it.
         print(f"whisper preload of {DEFAULT_MODEL!r} failed (will retry on demand): {e}", flush=True)
 
 

@@ -176,9 +176,12 @@ def test_an_agent_unit_that_is_not_the_shipped_bytes_is_refused(tmp_path: Path, 
     ("ExecStart=/usr/local/bin/noo-gateway harness", "ExecStart=/usr/local/bin/noo-gateway harness --evil"),
     ("User=noo-harness", "User=root"),
     ("ProtectSystem=strict", "ProtectSystem=false"),
-    ("Group=noo-agent", "Group=docker"),
+    ("Group=noo-harness", "Group=docker"),
+    # i119: back into the agent's group, where the node pair is readable.
+    ("Group=noo-harness", "Group=noo-agent"),
+    ("InaccessiblePaths=-/etc/noo/pki/nodes ", "InaccessiblePaths="),
     ("Type=simple", "Type=simple\nSupplementaryGroups=docker"),
-], ids=["execstart", "user", "protectsystem", "group", "docker"])
+], ids=["execstart", "user", "protectsystem", "group", "group-noo-agent", "inaccessible", "docker"])
 def test_a_harness_unit_that_is_not_the_shipped_bytes_is_refused(tmp_path: Path, old: str, new: str):
     r = run("unit_payload_ok", mutate(tmp_path, HARNESS_UNIT, old, new), "harness-unit")
     assert r.returncode == 65, (new, r.stdout, r.stderr)

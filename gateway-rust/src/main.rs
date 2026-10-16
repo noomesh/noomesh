@@ -62,6 +62,7 @@ mod harness_kinds;
 mod harness;
 mod harness_main;
 mod tasks;
+mod task_budget;
 mod text;
 mod auth_refresh;
 mod cache;
@@ -272,6 +273,21 @@ async fn main() -> Result<()> {
     // migrations.
     if std::env::args().nth(1).as_deref() == Some("--health") {
         health_probe().await;
+    }
+
+    // `harness probe`: one operator-run check of a vendor CLI against the
+    // node's model or a mock. Its report is stdout, so its logs go to
+    // stderr (warnings only unless RUST_LOG says otherwise); bare `harness`
+    // is untouched below.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some("harness") && argv.get(2).map(String::as_str) == Some("probe") {
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .init();
+            std::process::exit(harness::probe::main(&argv[3..]).await);
+        }
     }
 
     // Structured logging (matches Python structlog output)
@@ -673,10 +689,15 @@ async fn main() -> Result<()> {
     let acceptor = node_identity::NodeIdentityAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
     );
-    if tls::mtls_enabled() {
-        tracing::info!("TLS: peer certificate identity attached and ENFORCED — a token whose actor disagrees with the presented cert is refused");
-    } else {
-        tracing::info!("TLS: peer certificate identity attached (observe only) — set NOO_MTLS_GATEWAY=true to refuse mismatches");
+    match tls::mtls_mode() {
+        tls::MtlsMode::On | tls::MtlsMode::OnButCaMissing => tracing::info!(
+            "TLS: peer certificate identity attached and ENFORCED (the default when a cluster CA exists) — a token whose actor disagrees with the presented cert is refused, and so is a fleet token with no node certificate (loopback excepted)"
+        ),
+        // The WARN naming what this leaves open was already logged by
+        // `tls::load_rustls_config`; this line says what is still true.
+        tls::MtlsMode::OffExplicit | tls::MtlsMode::OffNoCa => tracing::info!(
+            "TLS: peer certificate identity attached (observe only) — NOT enforced; unset NOO_MTLS_GATEWAY (with NOO_TLS_CA present) to enforce"
+        ),
     }
     // `into_make_service_with_connect_info` injects the peer `SocketAddr` into
     // each request's extensions so the rate limiter can key on the real client

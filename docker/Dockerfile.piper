@@ -50,18 +50,35 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
     DO_NOT_TRACK=1
 
 WORKDIR /app
+COPY docker/voice_local.py /app/voice_local.py
 COPY docker/piper_server.py /app/piper_server.py
 
-# Voice cache on a volume so downloads survive container recreation.
+# Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
+# rest of the stack runs as. Nothing here writes a voice: the controller
+# stages them (`noo models pull piper:<voice>`, the CLI's voice_models.rs)
+# and compose mounts `<MODELS_DIR>/voice/piper` READ-ONLY at /voices; the
+# server loads `/voices/<voice>.onnx` and never calls piper's download_voice
+# (docker/voice_local.py), offline (HF_HUB_OFFLINE=1). Synthesis is in
+# memory. /voices is just the mount point, root-owned and read-only to
+# nonroot. The service key is handed to this uid (noo-cli pki.rs
+# SERVICE_KEY_READERS).
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
+        --shell /usr/sbin/nologin nonroot \
+    && mkdir -p /voices
+
 ENV PIPER_VOICE=en_US-lessac-medium \
     PIPER_VOICE_DIR=/voices \
-    PIPER_USE_CUDA=0
-VOLUME /voices
+    PIPER_USE_CUDA=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 
 # curl-less healthcheck (slim image): python stdlib probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+USER nonroot
 
 CMD ["uvicorn", "piper_server:app", "--host", "0.0.0.0", "--port", "8000"]

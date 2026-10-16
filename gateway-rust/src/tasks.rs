@@ -101,6 +101,19 @@ pub struct Task {
     /// operator decides.
     #[serde(default)]
     pub stale: bool,
+    /// The task's own token cap (i83 G); `None` = no cap.
+    #[serde(default)]
+    pub token_budget: Option<i64>,
+    /// Prompt + completion tokens its loops have spent, native and harness.
+    #[serde(default)]
+    pub tokens_spent: i64,
+    /// `exhausted` | `awaiting_clarification` when the loop-boundary switch
+    /// has parked it (`task_budget`); `None` otherwise.
+    #[serde(default)]
+    pub budget_state: Option<String>,
+    /// Computed on read: tokens left under `token_budget`; `None` = no cap.
+    #[serde(default)]
+    pub remaining: Option<i64>,
 }
 
 impl Task {
@@ -155,6 +168,13 @@ fn row_to_task(r: &sqlx::postgres::PgRow) -> Task {
         parent_id: r.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten().map(|u| u.to_string()),
         role: r.try_get("role").ok().flatten(),
         budget_default: r.try_get("budget_default").unwrap_or(false),
+        token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
+        tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
+        budget_state: r.try_get::<Option<String>, _>("budget_state").ok().flatten(),
+        remaining: crate::task_budget::remaining_task(crate::task_budget::TaskSpend {
+            token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
+            tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
+        }),
         stale: {
             let state: String = r.try_get("state").unwrap_or_default();
             let last: Option<chrono::DateTime<chrono::Utc>> = r
@@ -163,7 +183,10 @@ fn row_to_task(r: &sqlx::postgres::PgRow) -> Task {
                 .flatten()
                 .or_else(|| r.try_get("updated_at").ok());
             let budget: i32 = r.try_get("loop_budget").unwrap_or(0);
-            is_stale(&state, last, budget > 0, chrono::Utc::now())
+            // A parked task (out of budget, or waiting for its owner) is
+            // quiet on purpose: its runner stopped at the boundary.
+            let parked = r.try_get::<Option<String>, _>("budget_state").ok().flatten().is_some();
+            is_stale(&state, last, budget > 0 && !parked, chrono::Utc::now())
         },
     }
 }
@@ -195,7 +218,7 @@ pub fn is_stale(state: &str, last: Option<chrono::DateTime<chrono::Utc>>, loops_
 
 const SELECT: &str = "SELECT t.id, t.objective, u.username AS owner, t.node, t.state, t.conversation_id, t.thread_id, \
     t.channel, t.model, t.loops, t.loop_budget, t.last_checkpoint, t.last_note, t.result, t.error, t.created_at, t.updated_at, \
-    t.parent_id, t.role, t.budget_default \
+    t.parent_id, t.role, t.budget_default, t.token_budget, t.tokens_spent, t.budget_state \
     FROM noo_tasks t LEFT JOIN noo_users u ON u.user_uuid = t.owner_uuid";
 
 /// How a task is created: who for, under which parent, in which thread.
@@ -209,6 +232,8 @@ pub struct NewTask<'a> {
     pub loop_budget: Option<u32>,
     pub parent: Option<&'a Task>,
     pub role: Option<&'a str>,
+    /// The task's token cap (i83 G); `None` = no cap.
+    pub token_budget: Option<i64>,
 }
 
 /// The most children one task may fan out or delegate, and how deep a
@@ -243,8 +268,8 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
     sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11)",
+        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget) \
+         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(new.objective)
@@ -257,6 +282,7 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     .bind(parent_uuid)
     .bind(new.role)
     .bind(budget_default)
+    .bind(new.token_budget.filter(|b| *b > 0))
     .execute(db)
     .await?;
     get(db, &id.to_string()).await?.ok_or_else(|| anyhow!("task vanished after insert"))
@@ -353,8 +379,8 @@ pub async fn settle_parent(db: &sqlx::PgPool, child: &Task) -> Result<()> {
     Ok(())
 }
 
-pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>) -> Result<Task> {
-    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None }).await
+pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>, token_budget: Option<i64>) -> Result<Task> {
+    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None, token_budget }).await
 }
 
 pub async fn get(db: &sqlx::PgPool, id: &str) -> Result<Option<Task>> {
@@ -455,7 +481,7 @@ pub async fn finish(db: &sqlx::PgPool, id: &str, ok: bool, text: &str, require_t
 pub const NO_TOOLS_MARK: &str = "[completed without calling any tool]";
 
 /// Tools that are not looking at anything: the loop's own bookkeeping.
-const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_agent_message"];
+const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_task_ask", "noo_agent_message"];
 
 /// What the evidence gate says about a success claim.
 #[derive(Debug, PartialEq, Eq)]
@@ -631,7 +657,9 @@ pub fn objective_prompt(objective: &str, thread_id: &str, budget: u32) -> String
          this conversation carries what you did in earlier loops. Post progress notes with \
          noo_agent_message (kind \"note\", to \"thread\", thread_id \"{thread_id}\"). When the objective is fully \
          achieved, call noo_task_done with a short result. If it cannot be achieved, call noo_task_done \
-         with failed=true and the reason. Do not claim completion without calling noo_task_done."
+         with failed=true and the reason. If you cannot go on without the owner deciding something, call \
+         noo_task_ask with one clear question and end the loop: the task waits for the answer. Do not claim \
+         completion without calling noo_task_done."
     )
 }
 
@@ -669,10 +697,26 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
         if loops >= req.loop_budget {
             return rt.checkpoint(&req.task_id, loops, Some("loop budget exhausted"), true).await;
         }
-        let prompt = if loops == 0 {
-            objective_prompt(&req.objective, &req.thread_id, req.loop_budget)
-        } else {
-            continuation_prompt(&req.objective, loops + 1, req.loop_budget)
+        // THE TOKEN SWITCH (i83 G): before a loop starts, never inside one.
+        // A loop that crossed the budget has finished and checkpointed; this
+        // is where the task stops, parked, for its owner.
+        let check = match rt.budget_check(&req.task_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                // No verdict, no loop: stop at the checkpoint (not failed), so
+                // a restart of the runner picks the task up again.
+                tracing::warn!(task = %req.task_id, error = %e, "task: budget check failed; stopping at the checkpoint");
+                return rt.checkpoint(&req.task_id, loops, Some(&format!("budget check failed: {e}")), false).await;
+            }
+        };
+        if !check.proceed {
+            tracing::info!(task = %req.task_id, reason = check.reason.as_deref().unwrap_or(""), "task: budget switch says no more loops");
+            return Ok(check.state);
+        }
+        let prompt = match &check.clarification {
+            Some(c) => crate::task_budget::clarification_prompt(&req.objective, c, loops + 1, req.loop_budget),
+            None if loops == 0 => objective_prompt(&req.objective, &req.thread_id, req.loop_budget),
+            None => continuation_prompt(&req.objective, loops + 1, req.loop_budget),
         };
         let outcome = crate::coordinator::run_inner(
             &rt,
@@ -687,6 +731,13 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
         )
         .await;
         loops += 1;
+        // The loop's tokens, against the task (and in the usage table with
+        // its id and real backend) before the next boundary reads them.
+        if let Ok(r) = &outcome {
+            if let Err(e) = rt.loop_usage(&req.task_id, r).await {
+                tracing::warn!(task = %req.task_id, error = %e, "task: loop usage not recorded");
+            }
+        }
         let note = match &outcome {
             Ok(r) => {
                 failures = 0;
@@ -906,7 +957,7 @@ pub fn spawn_ready_watcher(state: std::sync::Arc<AppState>) {
 
 /// Every live task that has gone quiet (see [`is_stale`]), oldest first.
 pub async fn list_stale(db: &sqlx::PgPool) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.state IN ('running','checkpointed') AND t.loop_budget > 0 ORDER BY t.updated_at")))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.state IN ('running','checkpointed') AND t.loop_budget > 0 AND t.budget_state IS NULL ORDER BY t.updated_at")))
         .fetch_all(db)
         .await?;
     Ok(rows.iter().map(row_to_task).filter(|t| t.stale).collect())
@@ -961,8 +1012,10 @@ fn describe_runner(node: Option<&str>) -> String {
     }
 }
 
+/// A node's tasks to hand back. A PARKED task (`budget_state` set) is not
+/// one: it waits for its owner's resubmit or answer, not for a harness.
 async fn list_unfinished_on(db: &sqlx::PgPool, node: &str) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') ORDER BY t.created_at")))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') AND t.budget_state IS NULL ORDER BY t.created_at")))
         .bind(node)
         .fetch_all(db)
         .await?;
@@ -1087,6 +1140,10 @@ mod tests {
             role: None,
             budget_default: false,
             stale: true,
+            token_budget: None,
+            tokens_spent: 0,
+            budget_state: None,
+            remaining: None,
         };
         let alert = stale_alert(&t, "2026-09-22T00:20:26Z");
         let text = crate::egress::system(&alert, "ref-0").into_string();
@@ -1129,6 +1186,7 @@ mod tests {
             thread_id: "thr".into(), channel: "task".into(), model: None, loops: 0, loop_budget: 5, last_checkpoint: None,
             last_note: None, result: result.map(str::to_string), error: error.map(str::to_string), created_at: String::new(),
             updated_at: String::new(), parent_id: Some("p".into()), role: Some(role.into()), budget_default: false, stale: false,
+            token_budget: None, tokens_spent: 0, budget_state: None, remaining: None,
         }
     }
 
@@ -1163,6 +1221,42 @@ mod tests {
         assert!(!is_stale("running", old, false, now), "an aggregation parent never loops");
         assert!(!is_stale("running", None, true, now));
         std::env::remove_var("NOO_TASK_STALE_SECS");
+    }
+
+    /// PINNED (i83 G): the token switch runs at the loop boundary — once per
+    /// loop, BEFORE the loop's `run_inner`, after the loop-budget check —
+    /// and the loop's tokens are accounted AFTER it. Nothing inside a turn
+    /// (the agent loop, the coordinator) ever consults the budget, so a
+    /// running turn is never interrupted.
+    #[test]
+    fn the_budget_switch_sits_at_the_loop_boundary_never_inside_a_turn() {
+        let src = include_str!("tasks.rs");
+        let body = &src[src.find("pub async fn run_task_loops").unwrap()..src.find("// ── dispatch and resume").unwrap()];
+        assert_eq!(body.matches("rt.budget_check(").count(), 1, "one check per loop");
+        let check = body.find("rt.budget_check(").unwrap();
+        let run = body.find("crate::coordinator::run_inner(").expect("the loop");
+        let loop_budget = body.find("if loops >= req.loop_budget").unwrap();
+        let usage = body.find("rt.loop_usage(").expect("the loop's tokens are accounted");
+        assert!(loop_budget < check && check < run, "the check comes before the loop starts");
+        assert!(run < usage, "the tokens are accounted after the loop ends");
+        assert!(body[check..run].contains("if !check.proceed"), "a no stops the runner before the loop");
+        for (name, other) in [
+            ("coordinator/agent_loop.rs", include_str!("coordinator/agent_loop.rs")),
+            ("tools.rs", include_str!("tools.rs")),
+        ] {
+            assert!(!other.contains("task_budget::check("), "{name} must not check the budget mid-turn");
+        }
+    }
+
+    /// A parked task is neither handed back to a harness nor paged stale:
+    /// it waits for its owner.
+    #[test]
+    fn parked_tasks_are_not_resumed_or_paged() {
+        let src = include_str!("tasks.rs");
+        let unfinished = &src[src.find("async fn list_unfinished_on").unwrap()..];
+        assert!(unfinished[..400].contains("t.budget_state IS NULL"));
+        let stale = &src[src.find("pub async fn list_stale").unwrap()..];
+        assert!(stale[..400].contains("t.budget_state IS NULL"));
     }
 
     #[test]
@@ -1245,6 +1339,10 @@ mod stale_alert_tests {
             role: None,
             budget_default: false,
             stale: true,
+            token_budget: None,
+            tokens_spent: 0,
+            budget_state: None,
+            remaining: None,
         };
         let alert = super::stale_alert(&t, "t1");
         assert!(alert.detail.contains("NODE_ID"), "it must say how to stop it recurring: {}", alert.detail);

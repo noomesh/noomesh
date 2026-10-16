@@ -1520,15 +1520,16 @@ pub(crate) fn service_key_grants_check(keys: &Value, required: &[(String, String
 
 /// Can Prometheus scrape this controller's `/metrics`? Since an earlier release
 /// the page answers an Operator/Admin login or the scraper's service leaf,
-/// and the gateway sees that leaf only with `NOO_MTLS_GATEWAY` on. Either
+/// and the gateway sees that leaf only while mTLS is enforced (the default;
+/// `NOO_MTLS_GATEWAY=false` in `.env` is the explicit opt-out). Either
 /// missing means empty dashboards, never a public page — so say which.
 /// A warning, not a failure: a controller may run no Prometheus at all.
 pub(crate) fn metrics_scrape_check(mtls: Option<bool>, missing_leaves: &[&str]) -> Check {
     if mtls != Some(true) {
         return warn(
             "metrics scrape",
-            "the gateway does not read client certificates (NOO_MTLS_GATEWAY is not on), so Prometheus cannot scrape /metrics",
-            Some("set NOO_MTLS_GATEWAY=true in .env and recreate the gateway (noo stack restart --force)".into()),
+            "mTLS enforcement is switched off (NOO_MTLS_GATEWAY=false in .env): the gateway does not read client certificates, so Prometheus cannot scrape /metrics, and a node can present a fleet token naming another node",
+            Some("remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway (noo stack restart --force)".into()),
         );
     }
     if let Some(first) = missing_leaves.first() {
@@ -3377,10 +3378,23 @@ pub(crate) fn logs_access_check(anonymous: Option<u16>) -> Check {
     }
 }
 
-/// `NOO_MTLS_GATEWAY` as the controller's `.env` sets it; None when unreadable.
+/// Is mTLS enforced, per the controller's `.env`? None when `.env` is
+/// unreadable. Enforcement is the DEFAULT: an unset, empty or unrecognised
+/// value is on (the gateway also needs a CA, which a controller always has);
+/// only an explicit `false/0/no/off` is off.
 fn controller_mtls_on() -> Option<bool> {
-    let v = dotenv_value("NOO_MTLS_GATEWAY")?;
-    Some(matches!(v.trim().trim_matches('"').to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    let text = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok()?;
+    Some(mtls_on_in_dotenv(&text))
+}
+
+fn mtls_on_in_dotenv(text: &str) -> bool {
+    let v = text
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("NOO_MTLS_GATEWAY="))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase())
+        .unwrap_or_default();
+    !matches!(v.as_str(), "0" | "false" | "no" | "off")
 }
 
 /// One key from the controller's `.env` (last assignment wins, as compose
@@ -3486,7 +3500,14 @@ pub(crate) fn retired_bridge_sites(env_value: Option<&str>, posture: &Value) -> 
 /// under the current compose NATS refuses that file), or when the retired
 /// bridge is still set ON anywhere. A retired bridge left at a closed value
 /// changes nothing and is a WARN with the cleanup.
-pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(String, String)]) -> Check {
+///
+/// `declared_addons` is `nats_users::declared_addon_principals`: an add-on
+/// whose overlay declares a principal the file does not render is the
+/// one-release fallback (it presents the worker) — a WARN naming the render;
+/// one the file renders but no overlay declares is a FAIL: its subjects are
+/// off the worker's grant while its container presents the worker, so
+/// nothing may serve them.
+pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(String, String)], declared_addons: &[&str]) -> Check {
     let Some(conf) = users_conf else {
         return warn("nats principals", "could not read monitoring/nats/users.conf from the running checkout", None);
     };
@@ -3549,8 +3570,43 @@ pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(S
             Some(cleanup(&all, false)),
         );
     }
+    let rendered = crate::commands::nats_users::addon_users_in_conf(conf);
+    let orphaned: Vec<&str> = rendered.iter().copied().filter(|a| !declared_addons.contains(a)).collect();
+    if !orphaned.is_empty() {
+        return fail(
+            "nats principals",
+            format!(
+                "users.conf renders {} but no overlay on this install declares it (x-noo-addon.nats_principal) — \
+                 its subjects are off the worker's grant while its container presents the worker, so nothing may serve them",
+                orphaned.join(", ")
+            ),
+            "noo cluster nats-users render   # renders only the declared add-on principals, then HUPs noo-nats",
+        );
+    }
     let principals = conf.lines().filter(|l| l.trim().starts_with("user:")).count();
-    ok("nats principals", format!("{principals} per-principal user(s), each a bcrypt digest; no shared user, no bridge"))
+    let nodes = crate::commands::nats_users::node_users_in_conf(conf).len();
+    let mut named: Vec<&str> = ["gateway", "worker"].into_iter().filter(|u| conf.contains(&format!("user: \"{u}\""))).collect();
+    named.extend(rendered.iter().copied());
+    let pending: Vec<&str> = declared_addons.iter().copied().filter(|a| !rendered.contains(a)).collect();
+    let detail = format!(
+        "{principals} per-principal user(s) ({}{}{nodes} node(s)), each a bcrypt digest; no shared user, no bridge; \
+         add-on subjects off the worker's grant: {}",
+        named.join(", "),
+        if named.is_empty() { "" } else { ", " },
+        if rendered.is_empty() { "none".to_string() } else { rendered.join(", ") },
+    );
+    if !pending.is_empty() {
+        return warn(
+            "nats principals",
+            format!(
+                "{detail} — {} present(s) the WORKER principal (the one-release fallback): its overlay declares its own \
+                 principal but users.conf does not render it yet",
+                pending.join(", ")
+            ),
+            Some("noo cluster nats-users render   # mints the add-on's password, renders it, HUPs noo-nats; then: noo stack restart --force".into()),
+        );
+    }
+    ok("nats principals", detail)
 }
 
 /// Judge the posture, key and doctor outputs. Pure over the JSON so the
@@ -4141,6 +4197,31 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
+
+        // Kiosk SEATS (i77): their own registry, joined here explicitly — a
+        // seat never appears in /api/cluster/nodes, so nothing above judged
+        // it. Fleet-wide only (a named-node verify is about those nodes).
+        // An older gateway without the registry, or no seat enrolled, adds
+        // nothing.
+        if nodes.is_empty() {
+            let seats = crate::commands::kiosk_seat::list_seats(g).unwrap_or_default();
+            let mut seat_json = Vec::new();
+            if !seats.is_empty() && !g.json {
+                println!("{}", ui::section(&format!("Seats ({})", seats.len())));
+            }
+            for s in &seats {
+                let name = s["seat_name"].as_str().unwrap_or("?");
+                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &tag, now);
+                let seat_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
+                all_ok &= seat_ok;
+                if g.json {
+                    seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
+                } else {
+                    render(&format!("seat {name}"), &checks);
+                }
+            }
+            json_out.insert("seats".into(), Value::Array(seat_json));
+        }
     }
 
     if controller {
@@ -4301,6 +4382,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let voice_overlay = if voice_on { std::fs::read_to_string(root.join("docker-compose.voice.yml")).ok() } else { None };
         let voice_probe = if voice_on { voice_live_probe() } else { None };
         checks.push(voice_listeners_check(voice_on, voice_overlay.as_deref(), voice_probe.as_ref()));
+        // ... and run as non-root uid 65532, the uid their keys are handed
+        // to (i105): the live uid, `docker exec id -u` first.
+        checks.push(image_family::voice_images_row(voice_on));
+        // ... and load models the controller staged, offline (i105).
+        checks.push(image_family::voice_models_row(voice_on));
         // Every compose inference backend requires a client certificate at
         // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
@@ -4321,6 +4407,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(nats_principals_check(
             users_conf.as_deref(),
             &retired_bridge_sites(dotenv_value(RETIRED_NATS_BRIDGE).as_deref(), &posture),
+            &crate::commands::nats_users::declared_addon_principals(&root),
         ));
         // Postgres is TLS-only with a required cluster-CA client certificate
         // (2026-09-28): the shipped policy, and a live refusal of a client
@@ -5605,12 +5692,12 @@ mod tests {
             Principal { user: "gateway".into(), hash: "$2b$11$g".into(), role: Role::Gateway },
             Principal { user: "node-host3".into(), hash: "$2b$11$a".into(), role: Role::Node },
         ]);
-        let c = nats_principals_check(Some(&clean), &[]);
+        let c = nats_principals_check(Some(&clean), &[], &[]);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert!(c.detail.starts_with("2 per-principal"), "{}", c.detail);
 
         let legacy = format!("{clean}      {{\n        user: $NATS_USER\n        password: $NATS_PASSWORD\n      }}\n");
-        let c = nats_principals_check(Some(&legacy), &[]);
+        let c = nats_principals_check(Some(&legacy), &[], &[]);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("$NATS_USER, $NATS_PASSWORD"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster nats-users render"), "{:?}", c.remedy);
@@ -5620,26 +5707,54 @@ mod tests {
         let posture = serde_json::json!({"posture": [], "retired": [{"key": RETIRED_NATS_BRIDGE, "value": "1"}]});
         let sites = retired_bridge_sites(Some("0"), &posture);
         assert_eq!(sites.len(), 2, "{sites:?}");
-        let c = nats_principals_check(Some(&clean), &sites);
+        let c = nats_principals_check(Some(&clean), &sites, &[]);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("the posture DB (=1)") && !c.detail.contains(".env"), "{}", c.detail);
         // Every remedy is a `noo` verb, never SQL (2026-10-02: the WARN's
         // remedy was `docker exec noo-postgres psql … DELETE`).
         let r = c.remedy.clone().unwrap_or_default();
         assert!(r.starts_with("noo security posture set NOO_NATS_LEGACY_SHARED_CREDS 0") && !r.contains("psql"), "{r}");
-        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(Some("0"), &serde_json::json!({})));
+        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(Some("0"), &serde_json::json!({})), &[]);
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.contains(".env (=0)"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("remove the NOO_NATS_LEGACY_SHARED_CREDS line from .env"));
         // host8: a closed row in the DB only — the gateway deletes it at boot.
         let db_closed = serde_json::json!({"posture": [], "retired": [{"key": RETIRED_NATS_BRIDGE, "value": "0"}]});
-        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(None, &db_closed));
+        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(None, &db_closed), &[]);
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         let r = c.remedy.unwrap_or_default();
         assert!(r.starts_with("noo stack restart gateway") && !r.contains("psql"), "{r}");
         assert!(retired_bridge_sites(None, &serde_json::json!({"posture": []})).is_empty());
         assert!(retired_bridge_sites(Some("  "), &serde_json::json!({"retired": [{"key": "OTHER", "value": "1"}]})).is_empty());
-        assert_eq!(nats_principals_check(None, &[]).verdict, Verdict::Warn);
+        assert_eq!(nats_principals_check(None, &[], &[]).verdict, Verdict::Warn);
+    }
+
+    /// i70 residue: the row counts and names the add-on principals, warns on
+    /// the one-release fallback and fails on a principal nothing presents.
+    #[test]
+    fn the_nats_principals_row_names_each_addon_principal() {
+        use crate::commands::nats_users::{render_users_conf, Principal, Role};
+        let p = |u: &str, r: Role| Principal { user: u.into(), hash: "$2b$11$x".into(), role: r };
+        let both = render_users_conf(&[
+            p("gateway", Role::Gateway), p("worker", Role::Worker), p("trellion", Role::Addon),
+            p("trellion_intel", Role::Addon), p("node-host3", Role::Node),
+        ]);
+        let c = nats_principals_check(Some(&both), &[], &["trellion", "trellion_intel"]);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("5 per-principal user(s) (gateway, worker, trellion, trellion_intel, 1 node(s))"), "{}", c.detail);
+        assert!(c.detail.ends_with("add-on subjects off the worker's grant: trellion, trellion_intel"), "{}", c.detail);
+
+        // Declared but not rendered: the fallback, a WARN naming the render.
+        let only_t = render_users_conf(&[p("gateway", Role::Gateway), p("worker", Role::Worker), p("trellion", Role::Addon)]);
+        let c = nats_principals_check(Some(&only_t), &[], &["trellion", "trellion_intel"]);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("trellion_intel present(s) the WORKER principal"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().starts_with("noo cluster nats-users render"));
+
+        // Rendered but undeclared: nothing serves its subjects.
+        let c = nats_principals_check(Some(&both), &[], &["trellion"]);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("renders trellion_intel"), "{}", c.detail);
     }
 
     #[test]
@@ -5937,11 +6052,25 @@ mod tests {
         assert_eq!(metrics_scrape_check(Some(true), &[]).verdict, Verdict::Ok);
         let no_mtls = metrics_scrape_check(Some(false), &[]);
         assert_eq!(no_mtls.verdict, Verdict::Warn);
-        assert!(no_mtls.remedy.unwrap().contains("NOO_MTLS_GATEWAY"));
+        assert!(no_mtls.remedy.unwrap().contains("NOO_MTLS_GATEWAY=false"));
         let no_leaf = metrics_scrape_check(Some(true), &["alertmanager"]);
         assert_eq!(no_leaf.verdict, Verdict::Warn);
         assert!(no_leaf.remedy.unwrap().contains("issue-service alertmanager"));
         assert_eq!(metrics_scrape_check(None, &[]).verdict, Verdict::Warn);
+    }
+
+    /// Enforcement is the default: only an explicit off in `.env` is off.
+    #[test]
+    fn mtls_is_on_unless_the_dotenv_says_off() {
+        for on in ["", "FOO=1\n", "NOO_MTLS_GATEWAY=\n", "NOO_MTLS_GATEWAY=true\n", "NOO_MTLS_GATEWAY=maybe\n",
+                   "NOO_MTLS_GATEWAY=false\nNOO_MTLS_GATEWAY=true\n"] {
+            assert!(mtls_on_in_dotenv(on), "{on:?}");
+        }
+        for off in ["NOO_MTLS_GATEWAY=false\n", "NOO_MTLS_GATEWAY=\"off\"\n", "NOO_MTLS_GATEWAY=0", "A=1\n NOO_MTLS_GATEWAY=No\n"] {
+            assert!(!mtls_on_in_dotenv(off), "{off:?}");
+        }
+        let w = metrics_scrape_check(Some(false), &[]);
+        assert!(w.remedy.unwrap().contains("remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway"));
     }
 
     /// Every leaf this row checks is one onboard issues — otherwise the row

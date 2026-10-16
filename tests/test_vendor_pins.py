@@ -3,8 +3,7 @@
 
 """The pinned vendor artefacts in config/harness-kinds.json are well-formed.
 
-The controller stages each foreign harness kind's vendor CLI (and any
-runtime it needs) to the nodes, so what it stages is pinned by version AND
+The controller stages each foreign harness kind's vendor CLI to the nodes, so what it stages is pinned by version AND
 sha256, written by scripts/vendor-pin.py. This holds the SHAPE offline:
 every platform the fleet has is covered, digests are 64 hex, versions are
 x.y.z, sources are https templates that name only known placeholders.
@@ -33,8 +32,8 @@ OSES, ARCHES = {"linux", "macos"}, {"x86_64", "aarch64"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
-FORMATS = {"npm-tarball", "tarball", "binary"}
-UNPACKS = {"tgz", "tar.xz", "zip", "none"}
+FORMATS = {"tarball", "binary"}
+UNPACKS = {"tgz", "zip", "none"}
 
 
 def _doc() -> dict:
@@ -88,23 +87,6 @@ def test_the_file_is_in_the_layout_vendor_pin_writes():
     assert json.dumps(json.loads(text), indent=2, ensure_ascii=False) + "\n" == text
 
 
-def test_runtimes_are_pinned_for_every_fleet_platform():
-    rts = _doc().get("runtimes")
-    assert isinstance(rts, dict) and "node" in rts, "runtimes.node is not pinned"
-    for name, rt in rts.items():
-        where = f"runtimes.{name}"
-        assert SEMVER.match(rt.get("version", "")), f"{where}: version {rt.get('version')!r}"
-        _check_names(where, rt.get("names"))
-        assert _check_sha(where, rt["sha256"]), f"{where}: a runtime is per platform"
-        _check_source(where, rt["source"], per_platform=True)
-        assert rt.get("unpack") in UNPACKS - {"none"}, f"{where}: unpack {rt.get('unpack')!r}"
-        assert isinstance(rt.get("bin_dir"), str) and rt["bin_dir"], f"{where}: bin_dir"
-
-
-def test_node_runtime_is_the_lts_line():
-    assert _doc()["runtimes"]["node"]["version"].startswith("22."), "node is pinned to the 22.x LTS line"
-
-
 @pytest.mark.parametrize("row", _kinds(), ids=lambda r: r["kind"])
 def test_every_kind_declares_its_distribution(row):
     assert "distribution" in row, f"{row['kind']} has no distribution key (null for none)"
@@ -114,7 +96,7 @@ def test_every_kind_declares_its_distribution(row):
         return
     where = f"{row['kind']}.distribution"
     assert isinstance(d, dict), f"{row['kind']} launches {row['cli']!r} but pins no distribution"
-    assert set(d) == {"format", "source", "names", "version", "sha256", "runtime", "entry", "unpack"}, (
+    assert set(d) == {"format", "source", "names", "version", "sha256", "entry", "unpack"}, (
         f"{where}: keys {sorted(d)}"
     )
     assert d["format"] in FORMATS, f"{where}: format {d['format']!r}"
@@ -124,13 +106,9 @@ def test_every_kind_declares_its_distribution(row):
     _check_names(where, d["names"])
     per_platform = _check_sha(where, d["sha256"])
     _check_source(where, d["source"], per_platform)
-    if d["format"] == "npm-tarball":
-        assert not per_platform and d["unpack"] == "tgz", f"{where}: an npm tarball is one `any` .tgz"
     if d["format"] == "binary":
         assert d["unpack"] == "none", f"{where}: a binary is not unpacked"
         assert "/" not in d["entry"], f"{where}: a binary's entry is its file name"
-    if d["runtime"] is not None:
-        assert d["runtime"] in (_doc().get("runtimes") or {}), f"{where}: runtime {d['runtime']!r} is not pinned"
 
 
 def test_vendor_pin_knows_every_pinned_name_and_is_not_run_in_ci():
@@ -149,7 +127,6 @@ def test_vendor_pin_knows_every_pinned_name_and_is_not_run_in_ci():
     [
         (["no-such-kind", "1.0.0"], "unknown kind 'no-such-kind'"),
         (["noo", "1.0.0"], "no vendor CLI"),
-        (["runtime:python", "3.12.0"], "unknown runtime 'python'"),
         (["copilot", "latest"], "is not x.y.z"),
     ],
 )

@@ -72,6 +72,9 @@ pub enum Refusal {
     /// The encrypted store could not be read (a decrypt failure is never
     /// "nothing installed").
     Store(String),
+    /// The lock is a `noo-addon-lock/1` lock: it lists no `files`, so no
+    /// compose overlay travels with it (N6 retired that path).
+    Unbundled { tag: String },
 }
 
 impl Refusal {
@@ -115,6 +118,7 @@ impl Refusal {
             Refusal::Pull(e) => format!("{addon}'s images could not be pulled: {e}"),
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
             Refusal::Store(e) => format!("the encrypted store could not be read to resolve {addon}: {e}"),
+            Refusal::Unbundled { tag } => unbundled(addon, tag),
         }
     }
 
@@ -177,6 +181,22 @@ pub fn stack_lock_row(text: &str, image: &str) -> Option<String> {
 pub fn installed_stack_lock(root: &Path, tag: &str) -> Option<String> {
     let text = std::fs::read_to_string(root.join("stack.lock")).ok()?;
     text.lines().any(|l| l.trim() == format!("# tag {tag}")).then_some(text)
+}
+
+/// The refusal text for an add-on lock that lists no bundle files.
+pub fn unbundled(addon: &str, tag: &str) -> String {
+    format!(
+        "{addon}: this add-on lock predates signed bundles; the vendor must re-sign it for {tag} — noo addons upgrade {addon} --check"
+    )
+}
+
+/// A v1-only lock (no `files`) is refused: there is no overlay to compose.
+/// Called where a lock is about to be acted on (enable, upgrade, `--check`).
+pub fn require_bundle(v: &VerifiedLock, tag: &str) -> Result<(), Refusal> {
+    if v.lock.files.is_empty() {
+        return Err(Refusal::Unbundled { tag: tag.to_string() });
+    }
+    Ok(())
 }
 
 /// Steps 3-6 over fetched bytes. Pure.
@@ -339,28 +359,9 @@ pub fn record(
     Ok(pin)
 }
 
-/// What the offline check found besides the pin: whether the lock is a
-/// bundle (its files verified on disk) or predates bundles.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Overlay {
-    /// The lock lists files and `<root>/addons/<addon>/` holds exactly their
-    /// signed bytes.
-    Bundled,
-    /// A `noo-addon-lock/1` lock: no overlay travels with it. `Some(path)`
-    /// is the deprecated overlay an earlier CLI left in the slice, `None`
-    /// that there is none, so the add-on cannot be composed.
-    Legacy(Option<std::path::PathBuf>),
-}
-
 /// The offline check: the cached lock still verifies against `anchor`,
 /// lists `tag`, and is exactly what the pin says. Returns the pin.
-#[cfg(test)]
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
-    offline_check_bundle(root, addon, tag, anchor).map(|(p, _)| p)
-}
-
-/// [`offline_check`], also saying how the add-on's overlay arrives.
-pub fn offline_check_bundle(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<(Pin, Overlay), String> {
     let all = pins::read(root)?;
     let pin = all.get(addon).cloned().ok_or_else(|| format!("{addon} has no pin in {}", pins::PINS_FILE))?;
     if pin.stack != tag {
@@ -385,8 +386,7 @@ pub fn offline_check_bundle(root: &Path, addon: &str, tag: &str, anchor: &TrustA
         }
     }
     if v.lock.files.is_empty() {
-        let legacy = pins::legacy_overlay(root, addon);
-        return Ok((pin, Overlay::Legacy(legacy.is_file().then_some(legacy))));
+        return Err(unbundled(addon, tag));
     }
     let found = pins::materialised_files(root, addon, v.lock.files.keys());
     addon_lock::verify_files(&v.lock, &found).map_err(|e| {
@@ -395,7 +395,7 @@ pub fn offline_check_bundle(root: &Path, addon: &str, tag: &str, anchor: &TrustA
             pins::addon_dir(root, addon).display()
         )
     })?;
-    Ok((pin, Overlay::Bundled))
+    Ok(pin)
 }
 
 /// The production [`Docker`]. Its throwaway docker configs live under the
@@ -986,7 +986,7 @@ pub(crate) mod tests {
         let pull = "addons.noomesh.ai/example/intel".to_string();
         record(&d, "trellion_intel", &v, &f, "v0.6.0", Some(pull.clone())).unwrap();
         let with_pull = TrustAnchor { pull: Some(pull.clone()), ..anchor() };
-        let (pin, _) = offline_check_bundle(&d, "trellion_intel", "v0.6.0", &with_pull).expect("pulled_from is the named pull root");
+        let pin = offline_check(&d, "trellion_intel", "v0.6.0", &with_pull).expect("pulled_from is the named pull root");
         assert_eq!(pin.pulled_from.as_deref(), Some(pull.as_str()));
         assert_eq!(pin.images["trellion-intel"], format!("{ROOT}@{}", digest('1')), "the signed ref is what the pin keeps");
         assert_eq!(pin.local_images()["trellion-intel"], format!("{pull}@{}", digest('1')), "compose runs the pulled ref");
@@ -1036,7 +1036,8 @@ pub(crate) mod tests {
         let root = scratch("e2e-proxy");
         let pin = record(&root, "trellion_intel", &v, &fetched, "v0.6.0", route.pulled_from()).unwrap();
         assert_eq!(pin.pulled_from, a.pull);
-        assert!(offline_check(&root, "trellion_intel", "v0.6.0", &a).is_ok());
+        // The fake serves a v1 lock (no bundle), which is no longer runnable.
+        assert!(offline_check(&root, "trellion_intel", "v0.6.0", &a).unwrap_err().contains("predates signed bundles"));
     }
 
     /// A proxy that refuses the entitlement: its reason is quoted, the remedy
@@ -1116,7 +1117,7 @@ pub(crate) mod tests {
     #[test]
     fn record_then_offline_check_and_tamper_detection() {
         let d = scratch("offline");
-        let f = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
         let v = check(&f, &anchor(), &want(None, None)).unwrap();
         record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let pin = offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).expect("verifies");
@@ -1155,8 +1156,7 @@ pub(crate) mod tests {
         record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let overlay = pins::addon_dir(&d, "trellion_intel").join(addon_lock::OVERLAY_FILE);
         assert_eq!(std::fs::read_to_string(&overlay).unwrap(), OVERLAY);
-        let (_, how) = offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap();
-        assert_eq!(how, Overlay::Bundled);
+        offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap();
 
         // The materialised overlay edited on disk: refused like a lock tamper.
         std::fs::write(&overlay, format!("{OVERLAY}    privileged: true\n")).unwrap();
@@ -1166,16 +1166,27 @@ pub(crate) mod tests {
         assert!(offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err().contains("is missing"));
 
         // Moving back to a lock that predates bundles removes the directory,
-        // and the add-on is then Legacy: with the old slice overlay, or none.
+        // and the offline check then refuses it: no overlay, no compose.
         let v1 = signed(&lock("1.2.0", &["v0.6.0"], None));
         let vv = check(&v1, &anchor(), &want(None, None)).unwrap();
+        assert!(matches!(require_bundle(&vv, "v0.6.0"), Err(Refusal::Unbundled { .. })));
         record(&d, "trellion_intel", &vv, &v1, "v0.6.0", None).unwrap();
         assert!(!pins::addon_dir(&d, "trellion_intel").exists());
-        assert_eq!(offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap().1, Overlay::Legacy(None));
-        std::fs::write(pins::legacy_overlay(&d, "trellion_intel"), OVERLAY).unwrap();
+        let e = offline_check(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap_err();
+        assert!(e.contains("predates signed bundles") && e.contains("noo addons upgrade trellion_intel --check") && e.contains("v0.6.0"), "{e}");
+    }
+
+    #[test]
+    fn a_bundled_lock_passes_require_bundle_and_a_v1_lock_is_refused_with_the_remedy() {
+        let b = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
+        let vb = check(&b, &anchor(), &want(None, None)).unwrap();
+        assert!(require_bundle(&vb, "v0.6.0").is_ok());
+        let v1 = signed(&lock("1.2.0", &["v0.6.0"], None));
+        let v = check(&v1, &anchor(), &want(None, None)).unwrap();
+        let e = require_bundle(&v, "v0.6.0").unwrap_err();
         assert_eq!(
-            offline_check_bundle(&d, "trellion_intel", "v0.6.0", &anchor()).unwrap().1,
-            Overlay::Legacy(Some(pins::legacy_overlay(&d, "trellion_intel")))
+            e.why("evolve"),
+            "evolve: this add-on lock predates signed bundles; the vendor must re-sign it for v0.6.0 — noo addons upgrade evolve --check"
         );
     }
 

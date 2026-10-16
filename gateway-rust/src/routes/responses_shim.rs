@@ -7,333 +7,71 @@
 //! API (Codex CLI removed `wire_api = "chat"` in 2026-02) can use a mesh model
 //! as its provider. A backend that serves `/v1/responses` natively is proxied
 //! straight through (see `inference::v1_responses`); every other backend is
-//! reached through the pure translators in this file, which have no I/O so
-//! they can be tested on JSON alone.
+//! reached by translating to chat completions. The translation itself is
+//! `coordinator::responses_wire`, shared with the node harness's loopback
+//! wire translator; this file adapts it to the gateway route (the served
+//! model, the usage request, a byte stream in and SSE frames out).
 //!
 //! Event names and field sets follow the openai-python SDK types
 //! (`openai/types/responses/response_*_event.py`): each event carries
 //! `type` and a monotonically increasing `sequence_number`.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// A Responses content value (string, or array of typed parts) as plain text.
-fn content_text(c: &Value) -> String {
-    match c {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| {
-                let t = p.get("type").and_then(Value::as_str).unwrap_or("");
-                if matches!(t, "input_text" | "output_text" | "text" | "") {
-                    p.get("text").and_then(Value::as_str).map(str::to_string)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
+use crate::coordinator::responses_wire::{self as wire, ChatToResponsesSse, ToolNames};
 
 /// Translate a Responses request body into a chat-completions body.
 /// `model` is the backend's served name (the caller's value is only a hint).
 pub fn responses_to_chat_request(body: &Value, model: &str) -> Value {
-    let mut messages: Vec<Value> = Vec::new();
-
-    if let Some(ins) = body.get("instructions").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
-        messages.push(json!({"role": "system", "content": ins}));
+    let mut out = wire::request_body_from_responses(body);
+    out["model"] = json!(model);
+    if out["stream"] == json!(true) {
+        out["stream_options"] = json!({"include_usage": true});
+    } else if let Some(o) = out.as_object_mut() {
+        o.remove("stream");
     }
-
-    match body.get("input") {
-        Some(Value::String(s)) => messages.push(json!({"role": "user", "content": s})),
-        Some(Value::Array(items)) => {
-            for item in items {
-                let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
-                match ty {
-                    "function_call" => {
-                        let call = json!({
-                            "id": item.get("call_id").cloned().unwrap_or(json!("")),
-                            "type": "function",
-                            "function": {
-                                "name": item.get("name").cloned().unwrap_or(json!("")),
-                                "arguments": item.get("arguments").cloned().unwrap_or(json!("{}")),
-                            },
-                        });
-                        // Consecutive calls are one assistant turn.
-                        if let Some(last) = messages.last_mut() {
-                            if last.get("role") == Some(&json!("assistant")) && last.get("tool_calls").is_some() {
-                                if let Some(arr) = last["tool_calls"].as_array_mut() {
-                                    arr.push(call);
-                                    continue;
-                                }
-                            }
-                        }
-                        messages.push(json!({"role": "assistant", "content": null, "tool_calls": [call]}));
-                    }
-                    "function_call_output" => {
-                        let out = match item.get("output") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(other) => content_text(other),
-                            None => String::new(),
-                        };
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": item.get("call_id").cloned().unwrap_or(json!("")),
-                            "content": out,
-                        }));
-                    }
-                    // "message", or a bare {role, content} item.
-                    _ => {
-                        let role = match item.get("role").and_then(Value::as_str).unwrap_or("user") {
-                            "developer" => "system",
-                            r => r,
-                        };
-                        let text = content_text(item.get("content").unwrap_or(&Value::Null));
-                        messages.push(json!({"role": role, "content": text}));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    let mut out = Map::new();
-    out.insert("model".into(), json!(model));
-    out.insert("messages".into(), Value::Array(messages));
-    if let Some(v) = body.get("max_output_tokens").filter(|v| v.is_number()) {
-        out.insert("max_tokens".into(), v.clone());
-    }
-    for k in ["temperature", "top_p"] {
-        if let Some(v) = body.get(k).filter(|v| v.is_number()) {
-            out.insert(k.into(), v.clone());
-        }
-    }
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let chat_tools: Vec<Value> = tools
-            .iter()
-            .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.get("name").cloned().unwrap_or(json!("")),
-                        "description": t.get("description").cloned().unwrap_or(json!("")),
-                        "parameters": t.get("parameters").cloned()
-                            .unwrap_or(json!({"type": "object", "properties": {}})),
-                    },
-                })
-            })
-            .collect();
-        if !chat_tools.is_empty() {
-            out.insert("tools".into(), Value::Array(chat_tools));
-            if let Some(tc) = body.get("tool_choice").and_then(Value::as_str) {
-                out.insert("tool_choice".into(), json!(tc));
-            }
-        }
-    }
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        out.insert("stream".into(), json!(true));
-        out.insert("stream_options".into(), json!({"include_usage": true}));
-    }
-    Value::Object(out)
-}
-
-fn usage_json(p: u32, c: u32) -> Value {
-    json!({
-        "input_tokens": p,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": c,
-        "output_tokens_details": {"reasoning_tokens": 0},
-        "total_tokens": p + c,
-    })
-}
-
-fn response_object(id: &str, model: &str, created_at: u64, status: &str, output: Vec<Value>, usage: Option<(u32, u32)>) -> Value {
-    json!({
-        "id": id,
-        "object": "response",
-        "created_at": created_at,
-        "status": status,
-        "model": model,
-        "output": output,
-        "parallel_tool_calls": true,
-        "tool_choice": "auto",
-        "tools": [],
-        "usage": usage.map(|(p, c)| usage_json(p, c)),
-    })
-}
-
-fn message_item(id: &str, text: &str, status: &str) -> Value {
-    json!({
-        "id": id, "type": "message", "role": "assistant", "status": status,
-        "content": [{"type": "output_text", "text": text, "annotations": []}],
-    })
-}
-
-fn function_call_item(id: &str, call_id: &str, name: &str, args: &str, status: &str) -> Value {
-    json!({
-        "id": id, "type": "function_call", "status": status,
-        "call_id": call_id, "name": name, "arguments": args,
-    })
-}
-
-fn chat_usage(chat: &Value) -> Option<(u32, u32)> {
-    let u = chat.get("usage")?;
-    let n = |k: &str| u.get(k).and_then(Value::as_u64).map(|x| x.min(u32::MAX as u64) as u32);
-    Some((n("prompt_tokens")?, n("completion_tokens")?))
+    out
 }
 
 /// Translate a non-streaming chat completion into a Responses object.
-pub fn chat_to_response(chat: &Value, model: &str) -> Value {
+/// `request` is the Responses body it answers: its tools say which names
+/// come back as namespaced or freeform calls.
+pub fn chat_to_response(chat: &Value, model: &str, request: &Value) -> Value {
     let msg = chat.pointer("/choices/0/message").cloned().unwrap_or(json!({}));
-    let mut output = Vec::new();
-    let text = msg.get("content").and_then(Value::as_str).unwrap_or("");
-    let calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
-    if !text.is_empty() || calls.is_empty() {
-        output.push(message_item(&format!("msg_{}", uuid::Uuid::new_v4().simple()), text, "completed"));
-    }
-    for c in &calls {
-        let args = match c.pointer("/function/arguments") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => "{}".into(),
-        };
-        output.push(function_call_item(
-            &format!("fc_{}", uuid::Uuid::new_v4().simple()),
-            c.get("id").and_then(Value::as_str).unwrap_or(""),
-            c.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
-            &args,
-            "completed",
-        ));
-    }
-    response_object(
-        &format!("resp_{}", uuid::Uuid::new_v4().simple()),
-        model, now_secs(), "completed", output, chat_usage(chat),
-    )
+    let fr = chat.pointer("/choices/0/finish_reason").and_then(Value::as_str);
+    let usage = chat.get("usage").filter(|u| u.is_object()).map(|u| {
+        let (p, c, _) = crate::coordinator::anthropic_wire::usage_tokens(u);
+        (p, c)
+    });
+    wire::response_from_chat(&msg, fr, usage, model, &ToolNames::from_request(request))
 }
 
 /// Turns a chat-completions SSE byte stream into the Responses event
 /// sequence. Feed bytes with [`push`](Self::push); call
 /// [`finish`](Self::finish) when the upstream ends.
 pub struct StreamTranslator {
-    resp_id: String,
-    msg_id: String,
-    model: String,
-    created_at: u64,
-    seq: u64,
+    inner: ChatToResponsesSse,
     carry: String,
-    text: String,
-    msg_open: bool,
-    /// (call_id, name, arguments), in first-seen order.
-    tools: Vec<(String, String, String)>,
-    usage: Option<(u32, u32)>,
-    started: bool,
-    done: bool,
 }
 
 impl StreamTranslator {
-    pub fn new(model: &str) -> Self {
-        Self {
-            resp_id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
-            msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
-            model: model.to_string(),
-            created_at: now_secs(),
-            seq: 0,
-            carry: String::new(),
-            text: String::new(),
-            msg_open: false,
-            tools: Vec::new(),
-            usage: None,
-            started: false,
-            done: false,
-        }
+    pub fn new(model: &str, request: &Value) -> Self {
+        Self { inner: ChatToResponsesSse::new(model, ToolNames::from_request(request)), carry: String::new() }
     }
 
-    fn ev(&mut self, ty: &str, mut data: Value) -> String {
-        data["type"] = json!(ty);
-        data["sequence_number"] = json!(self.seq);
-        self.seq += 1;
-        format!("event: {ty}\ndata: {data}\n\n")
-    }
-
-    fn start(&mut self, out: &mut Vec<String>) {
-        if self.started {
-            return;
-        }
-        self.started = true;
-        let r = response_object(&self.resp_id, &self.model, self.created_at, "in_progress", vec![], None);
-        out.push(self.ev("response.created", json!({"response": r.clone()})));
-        out.push(self.ev("response.in_progress", json!({"response": r})));
-    }
-
-    fn open_message(&mut self, out: &mut Vec<String>) {
-        if self.msg_open {
-            return;
-        }
-        self.msg_open = true;
-        let item = json!({"id": self.msg_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []});
-        out.push(self.ev("response.output_item.added", json!({"output_index": 0, "item": item})));
-        out.push(self.ev("response.content_part.added", json!({
-            "item_id": self.msg_id, "output_index": 0, "content_index": 0,
-            "part": {"type": "output_text", "text": "", "annotations": []},
-        })));
-    }
-
-    fn line(&mut self, line: &str, out: &mut Vec<String>) {
-        let line = line.trim();
-        let Some(payload) = line.strip_prefix("data:").map(str::trim) else { return };
+    fn line(&mut self, line: &str, out: &mut String) {
+        let Some(payload) = line.trim().strip_prefix("data:").map(str::trim) else { return };
         if payload.is_empty() || payload == "[DONE]" {
             return;
         }
-        let Ok(v) = serde_json::from_str::<Value>(payload) else { return };
-        if let Some(u) = chat_usage(&v) {
-            self.usage = Some(u);
-        }
-        let delta = v.pointer("/choices/0/delta");
-        if let Some(t) = delta.and_then(|d| d.get("content")).and_then(Value::as_str).filter(|t| !t.is_empty()) {
-            self.start(out);
-            self.open_message(out);
-            self.text.push_str(t);
-            let id = self.msg_id.clone();
-            out.push(self.ev("response.output_text.delta", json!({
-                "item_id": id, "output_index": 0, "content_index": 0, "delta": t, "logprobs": [],
-            })));
-        }
-        if let Some(calls) = delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array) {
-            for (pos, c) in calls.iter().enumerate() {
-                let idx = c.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or(pos);
-                while self.tools.len() <= idx {
-                    self.tools.push((String::new(), String::new(), String::new()));
-                }
-                let slot = &mut self.tools[idx];
-                if let Some(id) = c.get("id").and_then(Value::as_str) {
-                    slot.0 = id.to_string();
-                }
-                if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
-                    slot.1.push_str(n);
-                }
-                if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str) {
-                    slot.2.push_str(a);
-                }
-            }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            out.push_str(&wire::sse_frames(&self.inner.on_chunk(&v)));
         }
     }
 
     /// Consume upstream bytes; returns the Responses SSE events they produced.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.done {
-            return out;
-        }
-        self.start(&mut out);
+        let mut out = String::new();
         self.carry.push_str(&String::from_utf8_lossy(chunk));
         if let Some(upto) = self.carry.rfind('\n').map(|i| i + 1) {
             let complete: String = self.carry.drain(..upto).collect();
@@ -341,62 +79,24 @@ impl StreamTranslator {
                 self.line(l, &mut out);
             }
         }
-        out
+        split_frames(out)
     }
 
     /// Upstream ended: close the open items and emit `response.completed`.
     pub fn finish(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.done {
-            return out;
-        }
-        self.start(&mut out);
+        let mut out = String::new();
         let tail = std::mem::take(&mut self.carry);
         for l in tail.lines() {
             self.line(l, &mut out);
         }
-        self.done = true;
-
-        let mut output: Vec<Value> = Vec::new();
-        if !self.msg_open && self.tools.is_empty() {
-            self.open_message(&mut out);
-        }
-        if self.msg_open {
-            let (id, text) = (self.msg_id.clone(), self.text.clone());
-            out.push(self.ev("response.output_text.done", json!({
-                "item_id": id, "output_index": 0, "content_index": 0, "text": text, "logprobs": [],
-            })));
-            out.push(self.ev("response.content_part.done", json!({
-                "item_id": id, "output_index": 0, "content_index": 0,
-                "part": {"type": "output_text", "text": text, "annotations": []},
-            })));
-            let item = message_item(&id, &text, "completed");
-            out.push(self.ev("response.output_item.done", json!({"output_index": 0, "item": item.clone()})));
-            output.push(item);
-        }
-        let base = output.len();
-        for (i, (call_id, name, args)) in self.tools.clone().into_iter().enumerate() {
-            let oi = base + i;
-            let fid = format!("fc_{}", uuid::Uuid::new_v4().simple());
-            let args = if args.is_empty() { "{}".to_string() } else { args };
-            out.push(self.ev("response.output_item.added", json!({
-                "output_index": oi,
-                "item": function_call_item(&fid, &call_id, &name, "", "in_progress"),
-            })));
-            out.push(self.ev("response.function_call_arguments.delta", json!({
-                "item_id": fid, "output_index": oi, "delta": args,
-            })));
-            out.push(self.ev("response.function_call_arguments.done", json!({
-                "item_id": fid, "output_index": oi, "arguments": args,
-            })));
-            let item = function_call_item(&fid, &call_id, &name, &args, "completed");
-            out.push(self.ev("response.output_item.done", json!({"output_index": oi, "item": item.clone()})));
-            output.push(item);
-        }
-        let r = response_object(&self.resp_id, &self.model, self.created_at, "completed", output, self.usage);
-        out.push(self.ev("response.completed", json!({"response": r})));
-        out
+        out.push_str(&wire::sse_frames(&self.inner.finish()));
+        split_frames(out)
     }
+}
+
+/// One string per `event:`/`data:` frame.
+fn split_frames(s: String) -> Vec<String> {
+    s.split_inclusive("\n\n").filter(|f| !f.trim().is_empty()).map(str::to_string).collect()
 }
 
 #[cfg(test)]
@@ -457,7 +157,7 @@ mod tests {
         let r = chat_to_response(&json!({
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
             "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-        }), "served");
+        }), "served", &json!({}));
         assert_eq!(r["object"], "response");
         assert_eq!(r["status"], "completed");
         assert_eq!(r["output"][0]["type"], "message");
@@ -475,7 +175,7 @@ mod tests {
         let r = chat_to_response(&json!({
             "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [
                 {"id": "call_1", "type": "function", "function": {"name": "ls", "arguments": "{\"p\":1}"}}]}}],
-        }), "served");
+        }), "served", &json!({}));
         assert_eq!(r["output"].as_array().unwrap().len(), 1);
         assert_eq!(r["output"][0]["type"], "function_call");
         assert_eq!(r["output"][0]["name"], "ls");
@@ -493,7 +193,7 @@ mod tests {
 
     #[test]
     fn stream_two_deltas_and_usage_frame() {
-        let mut t = StreamTranslator::new("served");
+        let mut t = StreamTranslator::new("served", &json!({}));
         let mut ev = Vec::new();
         // The second frame is split across two chunks on purpose.
         ev.extend(t.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"));
@@ -527,7 +227,7 @@ mod tests {
 
     #[test]
     fn stream_tool_call_accumulates() {
-        let mut t = StreamTranslator::new("m");
+        let mut t = StreamTranslator::new("m", &json!({}));
         let mut ev = t.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c9\",\"function\":{\"name\":\"ls\",\"arguments\":\"{\\\"a\"}}]}}]}\n\n");
         ev.extend(t.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":1}\"}}]}}]}\n\n"));
         ev.extend(t.finish());

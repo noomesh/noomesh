@@ -482,12 +482,12 @@ agent may execute.
 | `noo cluster restart-backends` | `<node> <noo-svc>... [-y\|--yes\|--force]` | Restart noo-* backend containers on a node via a rail-delivered bundle |
 | `noo cluster host-telemetry apply` | `[<node>...] [--all] [--include-controller] [-y\|--yes]` | Switch off tailscaled's log upload on nodes over the pull rail, one at a time |
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
-| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI (and runtime) on the controller, checked against its pin |
-| `noo cluster vendor status` | — | List staged vendor CLIs and runtimes per platform, and which nodes need which |
+| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
+| `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
 | `noo cluster vendor` | — | Print vendor subcommand usage (stage, status) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
-| `noo cluster nats-creds rotate` | `<node\|gateway\|worker>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; gateway/worker re-render + recreate |
+| `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
 | `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a published GGUF + Modelfile from the controller store into a node's ollama |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
 | `noo cluster clean` | `<node>\|all [--deep] [-y\|--yes]` | Remove this stack's containers on node(s) through their agents; --deep removes images too |
@@ -497,7 +497,7 @@ agent may execute.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo models cached` | — | List models currently loaded on running node backends |
-| `noo models pull` | `<model> [--backend <b>]` | Pull a model onto the gateway's Ollama (not a chosen node) with streamed progress |
+| `noo models pull` | `<model> [--backend <b>]` | Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model |
 | `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified) |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh]` | List popular models per backend from the HuggingFace catalog cache |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |

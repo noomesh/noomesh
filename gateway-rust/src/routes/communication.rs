@@ -18,7 +18,8 @@ use std::sync::Arc;
 use axum::{
     Router,
     routing::{get, post, put, delete},
-    extract::{Path, Query, State, Multipart},
+    extract::{DefaultBodyLimit, Path, Query, State, Multipart},
+    routing::MethodRouter,
     Extension,
     Json,
     response::IntoResponse,
@@ -51,11 +52,25 @@ crate::ported! {
     POST "/api/channels/send" => "worker.channels.send",
 }
 
+/// Body limit for the two transcribe routes: 10 MiB.
+///
+/// axum's default is 2 MiB, which cuts a recording off after a minute or
+/// two. Browser MediaRecorder webm/opus is 32-128 kbit/s (4-16 kB/s); ten
+/// minutes at the 128 kbit/s worst case is ~9.6 MB, so 10 MiB covers a
+/// ten-minute recording at any bitrate the browser picks.
+/// Applied to these two routes only; every other route keeps its own limit.
+pub const TRANSCRIBE_BODY_LIMIT: usize = 10 * 1024 * 1024;
+
+/// Wrap an audio-upload route in [`TRANSCRIBE_BODY_LIMIT`].
+fn audio_upload<S: Clone + Send + Sync + 'static>(r: MethodRouter<S>) -> MethodRouter<S> {
+    r.layer(DefaultBodyLimit::max(TRANSCRIBE_BODY_LIMIT))
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ── Voice: Native Rust (HTTP proxy to whisper/TTS services, ported 2026-03-31) ──
-        .route("/api/voice/transcribe", post(voice_transcribe))
-        .route("/api/voice/transcribe/detailed", post(voice_transcribe_detailed))
+        .route("/api/voice/transcribe", audio_upload(post(voice_transcribe)))
+        .route("/api/voice/transcribe/detailed", audio_upload(post(voice_transcribe_detailed)))
         .route("/api/voice/synthesize", post(voice_synthesize))
         // ── Voice: Native Rust (config scan + HTTP health checks, ported 2026-03-31) ──
         .route("/api/voice/voices", get(voice_voices))
@@ -1724,6 +1739,12 @@ async fn voice_transcribe_detailed(
     transcribe_via_provider(state, multipart, true).await
 }
 
+/// A multipart read failure, with the status axum chose: 413 when the body
+/// limit was hit, 400 for a malformed upload.
+fn multipart_error_response(e: &axum::extract::multipart::MultipartError) -> axum::response::Response {
+    (e.status(), Json(json!({"error": format!("Failed to read audio: {e}")}))).into_response()
+}
+
 /// Shared handler body: collect the multipart upload, hand it to the STT
 /// provider client, relay the contract-shaped reply.
 async fn transcribe_via_provider(
@@ -1734,7 +1755,12 @@ async fn transcribe_via_provider(
     let mut audio: Option<(Vec<u8>, String, String)> = None; // bytes, filename, mime
     let mut opts = crate::stt_client::TranscribeOptions { detailed, ..Default::default() };
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return multipart_error_response(&e),
+        };
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "file" => {
@@ -1754,13 +1780,7 @@ async fn transcribe_via_provider(
                         }
                         audio = Some((bytes.to_vec(), filename, content_type));
                     }
-                    Err(e) => {
-                        return (
-                            axum::http::StatusCode::BAD_REQUEST,
-                            Json(json!({"error": format!("Failed to read audio: {e}")})),
-                        )
-                            .into_response();
-                    }
+                    Err(e) => return multipart_error_response(&e),
                 }
             }
             "model" => {
@@ -1966,7 +1986,12 @@ async fn voice_voices(
 /// reports honest reachability plus the provider identity/config.
 async fn voice_status(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
 ) -> AppResult {
+    let operator = requester
+        .as_ref()
+        .map(|Extension(r)| r.role >= crate::auth::Role::Operator)
+        .unwrap_or(false);
     // STT: probe the CONFIGURED provider (whatever it is) at the health URL
     // appropriate to its wire format — honest reachability, not a hardcoded
     // whisper assumption.
@@ -2024,7 +2049,7 @@ async fn voice_status(
         stt.api_format.clone()
     };
 
-    Ok(Json(json!({
+    Ok(Json(redact_service_urls(json!({
         "stt_available": stt_available,
         "stt_backend": stt_backend_label,
         "stt_provider": stt.api_format,
@@ -2039,7 +2064,19 @@ async fn voice_status(
         "piper_available": piper_available,
         "edge_tts_available": edge_tts_available,
         "engine": "rust",
-    })))
+    }), operator)))
+}
+
+/// `stt_url`/`tts_url` are internal service addresses: only Operator and
+/// Admin see them. Everyone keeps the booleans and provider names.
+fn redact_service_urls(mut body: Value, operator: bool) -> Value {
+    if !operator {
+        if let Some(o) = body.as_object_mut() {
+            o.remove("stt_url");
+            o.remove("tts_url");
+        }
+    }
+    body
 }
 
 /// Convert standard Markdown to Google Chat's lightweight format.
@@ -2378,5 +2415,77 @@ mod chat_recipient_tests {
     fn refuses_a_space_with_extra_segments() {
         assert!(validate_chat_recipient("spaces/AAA/messages").is_err());
         assert!(validate_chat_recipient("spaces/").is_err());
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    #[test]
+    fn service_urls_are_operator_only() {
+        let full = json!({"stt_available": true, "stt_url": "https://noo-whisper:8000",
+                          "tts_available": false, "tts_url": "https://noo-piper:5000"});
+        let user = redact_service_urls(full.clone(), false);
+        assert!(user.get("stt_url").is_none() && user.get("tts_url").is_none());
+        assert_eq!(user["stt_available"], true);
+        assert_eq!(user["tts_available"], false);
+        let op = redact_service_urls(full.clone(), true);
+        assert_eq!(op, full);
+    }
+
+    #[test]
+    fn transcribe_limit_is_ten_mib() {
+        assert_eq!(TRANSCRIBE_BODY_LIMIT, 10 * 1024 * 1024);
+    }
+
+    // Built outside a `.route("...")` literal so the OpenAPI drift scan does not
+    // mistake a test-only path for a registered route.
+    const TEST_PATH: &str = "/upload";
+
+    /// Drains the `file` field the way the real handler does.
+    async fn drain(mut mp: Multipart) -> axum::response::Response {
+        let mut n = 0usize;
+        loop {
+            match mp.next_field().await {
+                Ok(Some(f)) => match f.bytes().await {
+                    Ok(b) => n += b.len(),
+                    Err(e) => return multipart_error_response(&e),
+                },
+                Ok(None) => break,
+                Err(e) => return multipart_error_response(&e),
+            }
+        }
+        (axum::http::StatusCode::OK, Json(json!({"bytes": n}))).into_response()
+    }
+
+    async fn post_audio(app: Router, size: usize) -> reqwest::StatusCode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(vec![0u8; size]).file_name("a.webm"),
+        );
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{TEST_PATH}"))
+            .multipart(form)
+            .send()
+            .await
+            .map(|r| r.status())
+            .unwrap_or(reqwest::StatusCode::PAYLOAD_TOO_LARGE)
+    }
+
+    #[tokio::test]
+    async fn transcribe_accepts_5_mib_and_refuses_20_mib() {
+        let mk = || Router::new().route(TEST_PATH, audio_upload(post(drain)));
+        assert_eq!(post_audio(mk(), 5 * 1024 * 1024).await, reqwest::StatusCode::OK);
+        assert_eq!(post_audio(mk(), 20 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn other_routes_keep_the_default_limit() {
+        let app = Router::new().route(TEST_PATH, post(drain));
+        assert_eq!(post_audio(app, 5 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

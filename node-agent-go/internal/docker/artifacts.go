@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -67,6 +68,25 @@ func fetchImageManifest(ctx context.Context, ref, arch string) (m *artifactManif
 	return m, name, err
 }
 
+// imageRefLocks holds one mutex per image ref being pulled. Entries are
+// never removed: a node has a handful of refs and a mutex is 8 bytes.
+var imageRefLocks sync.Map // ref -> *sync.Mutex
+
+// lockImageRef serialises pulls of one ref and returns the unlock. Different
+// refs do not contend. It is held across a pull (by design) and is NOT the
+// railFail mutex, which only ever guards a map lookup.
+//
+// waited reports that another pull of the ref held the lock first.
+func lockImageRef(ref string) (unlock func(), waited bool) {
+	v, _ := imageRefLocks.LoadOrStore(ref, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	if !mu.TryLock() {
+		waited = true
+		mu.Lock()
+	}
+	return mu.Unlock, waited
+}
+
 // PullImageArtifactResult is the honest outcome of one pull.
 type PullImageArtifactResult struct {
 	Status  string `json:"status"` // "loaded" | "up_to_date"
@@ -103,6 +123,25 @@ func stagingDir() string {
 func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, removeContainer string) (*PullImageArtifactResult, error) {
 	if ref == "" || strings.ContainsAny(ref, " \t\n") {
 		return nil, fmt.Errorf("invalid image ref %q", ref)
+	}
+	// One pull of a ref at a time: two writers on one staged .partial would
+	// corrupt it (a prefetch and a start path can overlap on one image).
+	unlock, waited := lockImageRef(ref)
+	defer unlock()
+	if waited {
+		// The pull we waited for has most likely just landed this ref:
+		// do not download the same multi-GB tar again back to back. Only
+		// after a wait: an uncontended caller asked for a pull on purpose
+		// (the local copy may be the stale one). When controllerImageID is
+		// given the local ID must match it, as in the check below; if the
+		// image is absent or differs, we fall through and pull as usual.
+		if id, ok := imageLocalID(ctx, c, ref); ok && (controllerImageID == "" || id == controllerImageID) {
+			out := &PullImageArtifactResult{Status: "up_to_date", Image: ref, Tar: ImageTarGzName(ref, runtime.GOARCH), Arch: runtime.GOARCH}
+			// The replace this caller asked for still needs the old
+			// container gone, whoever loaded the image.
+			c.removeAfterLoad(ctx, removeContainer, out)
+			return out, nil
+		}
 	}
 	cacheURL := preseed.CacheURL()
 	if cacheURL == "" {
@@ -184,15 +223,30 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	rememberRailImage(sha, id)
 
 	out := &PullImageArtifactResult{Status: "loaded", Image: ref, Tar: tarName, Arch: arch}
-	if removeContainer != "" {
-		if _, err := c.docker.ContainerRemove(ctx, removeContainer, client.ContainerRemoveOptions{Force: true}); err != nil {
-			slog.Warn("post-load container remove failed (continuing — image is loaded)",
-				"container", removeContainer, "err", err)
-		} else {
-			out.Removed = removeContainer
-		}
-	}
+	c.removeAfterLoad(ctx, removeContainer, out)
 	return out, nil
+}
+
+// removeContainerFn force-removes a container; a seam so the post-load
+// removal is testable without a daemon.
+var removeContainerFn = func(ctx context.Context, c *Client, name string) error {
+	_, err := c.docker.ContainerRemove(ctx, name, client.ContainerRemoveOptions{Force: true})
+	return err
+}
+
+// removeAfterLoad force-removes name (when non-empty) so the next backend
+// start recreates it on the new image, and records it in out.Removed. A
+// failure is logged and not fatal: the image is loaded either way.
+func (c *Client) removeAfterLoad(ctx context.Context, name string, out *PullImageArtifactResult) {
+	if name == "" {
+		return
+	}
+	if err := removeContainerFn(ctx, c, name); err != nil {
+		slog.Warn("post-load container remove failed (continuing — image is loaded)",
+			"container", name, "err", err)
+		return
+	}
+	out.Removed = name
 }
 
 // imageManifestFetch is the control-plane half of an image pull — a seam so

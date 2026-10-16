@@ -333,6 +333,7 @@ the lock. The layout both locks are published in is in
 | `noo security user set-password` | `<username> [--password-stdin]` | Set a user's password (prompts unless --password-stdin) |
 | `noo security admin-password reset` | `[--stdout] [--yes]` | On the controller, no login needed: reset the admin account and show the new password once |
 | `noo security user set-scopes` | `<username> --scope <scope>...` | Replace a user's auth scopes with the given set (admin-only) |
+| `noo security user allowance` | `<username> [-t\|--tokens <n>] [-p\|--period day\|week\|month] [--clear]` | Show, set or clear a user's standing token allowance per period (setting is admin-only) |
 | `noo security user set-org` | `<username> <org_id>` | Assign a user to an org |
 | `noo security user disable` | `<username> [-y\|--yes]` | Disable a user account (undo with `user enable`); asks for confirmation (-y) |
 | `noo security user enable` | `<username>` | Re-enable a disabled user account |

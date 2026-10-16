@@ -880,6 +880,8 @@ pub(crate) const NATIVE_TOOLS: &[&str] = &[
     "noo_agent_thread",
     // the model finishes its task.
     "noo_task_done",
+    // the model asks its owner a question it cannot go on without (i83 G).
+    "noo_task_ask",
     // a task delegates, watches, and waits for its
     // children — collaboration as tasks plus messages.
     "noo_task_delegate",
@@ -941,6 +943,7 @@ async fn execute_native(state: &AppState, call: &ToolCall) -> Option<ToolResult>
         "noo_agent_inbox" => Some(agent_messaging::native_agent_inbox(state, call, &args).await),
         "noo_agent_ack" => Some(agent_messaging::native_agent_ack(state, call, &args).await),
         "noo_task_done" => Some(native_task_done(state, call, &args).await),
+        "noo_task_ask" => Some(native_task_ask(state, call, &args).await),
         "noo_task_delegate" => Some(task_tree::native_task_delegate(state, call, &args).await),
         "noo_task_status" => Some(task_tree::native_task_status(state, call, &args).await),
         "noo_task_wait" => Some(task_tree::native_task_wait(state, call, &args).await),
@@ -1270,7 +1273,12 @@ async fn native_memory_search(state: &AppState, call: &ToolCall, args: &Value) -
     };
     let vec_str = crate::embedding_client::pgvector_literal(&embedding);
 
-    match crate::routes::memory::memory_search_rows(state, &query, &vec_str, None, top_k).await {
+    // The person the loop runs for (harness, dashboard, channel), as the
+    // HTTP route scopes a non-operator: their conversations plus unowned
+    // ones. With no caller bound (internal callers) the search stays global.
+    let caller = crate::mcp_bridge::current_caller();
+    let scope = caller.as_deref().map(crate::auth::account_of);
+    match crate::routes::memory::memory_search_rows(state, &query, &vec_str, scope, top_k).await {
         Ok(body) => ok_result(
             call,
             serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
@@ -1388,6 +1396,29 @@ async fn native_task_done(state: &AppState, call: &ToolCall, args: &Value) -> To
     }
 }
 
+/// `noo_task_ask` — the model cannot go on without its owner deciding
+/// something (i83 G). The question is recorded and posted to the task's
+/// thread; the turn runs on to its end, and at the next loop boundary the
+/// task parks `awaiting_clarification`. The owner's answer starts a new loop.
+async fn native_task_ask(state: &AppState, call: &ToolCall, args: &Value) -> ToolResult {
+    let (Some(user), Some(conv)) = (crate::mcp_bridge::current_caller(), crate::mcp_bridge::current_conversation()) else {
+        return err_result(call, "not inside a task".into());
+    };
+    let task = match crate::tasks::for_conversation(&state.db, &conv, &user).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return err_result(call, "this conversation is not running a task".into()),
+        Err(e) => return err_result(call, format!("task lookup failed: {e}")),
+    };
+    let question = arg_str(args, &["question", "text"]).unwrap_or_default();
+    match crate::task_budget::ask(state, &task, &question).await {
+        Ok(()) => ok_result(
+            call,
+            json!({"task_id": task.id, "asked": true, "next": "finish this loop; the task waits for the owner's answer"}).to_string(),
+        ),
+        Err(e) => err_result(call, format!("could not ask: {e}")),
+    }
+}
+
 /// Post a finished task's result to its thread, from the person, with the
 /// evidence of which tools the task really called. Shared by the loop's
 /// `noo_task_done` and the user door's (`mcp_user_tasks`), so a task
@@ -1440,6 +1471,7 @@ pub(crate) mod task_tree {
         json!({
             "task_id": t.id, "role": t.role, "state": t.state, "loops": t.loops, "loop_budget": t.loop_budget,
             "objective": crate::tasks::excerpt(&t.objective), "last_note": t.last_note, "result": t.result, "error": t.error,
+            "token_budget": t.token_budget, "tokens_spent": t.tokens_spent, "budget_state": t.budget_state, "remaining": t.remaining,
         })
     }
 
@@ -1481,6 +1513,7 @@ pub(crate) mod task_tree {
         let role = arg_str(args, &["role"]);
         let model = arg_str(args, &["model"]);
         let budget = args.get("loop_budget").and_then(|v| v.as_u64()).map(|b| (b as u32).max(1));
+        let token_budget = args.get("token_budget").and_then(|v| v.as_i64()).filter(|b| *b > 0);
         let new = crate::tasks::NewTask {
             owner,
             objective: &objective,
@@ -1488,6 +1521,7 @@ pub(crate) mod task_tree {
             loop_budget: budget,
             parent,
             role: role.as_deref(),
+            token_budget,
         };
         let child = match crate::tasks::create_task(&state.db, new).await {
             Ok(c) => c,

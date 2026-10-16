@@ -1643,7 +1643,125 @@ ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text;
     sql: r#"
 ALTER TABLE IF EXISTS noo_service_keys ADD COLUMN IF NOT EXISTS expires_at timestamptz
 "#,
+}, Migration {
+    revision: TOKEN_BUDGETS_REVISION,
+    down_revision: Some("090_service_key_expiry"),
+    // i83 G: token budgets as a switch at the loop boundary
+    // (`task_budget.rs`).
+    //
+    // On a task: `token_budget` (NULL = no per-task cap), `tokens_spent`
+    // (prompt + completion across its loops, native and harness, added one
+    // loop at a time by an UPDATE … RETURNING), `budget_state` (NULL, or
+    // `exhausted` / `awaiting_clarification` — set ONLY at the loop
+    // boundary, so a set state means the runner has stopped) and
+    // `clarification` (the question a loop asked, then the owner's answer
+    // until the next loop reads it).
+    //
+    // `noo_token_allowances`: a person's standing allowance per period,
+    // set by an operator. Keyed on the account's uuid like the usage rows
+    // (063), so a rename keeps it and deleting the account drops it.
+    //
+    // `noo_token_usage.task_id`: the task a row was spent on, for both the
+    // native loop and the `usage` rail op. On the partitioned parent, so
+    // every partition gets it; nullable, no default, no rewrite.
+    sql: r#"
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS token_budget bigint;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS tokens_spent bigint NOT NULL DEFAULT 0;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS budget_state text;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS clarification jsonb;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'noo_tasks_budget_state_chk') THEN
+        ALTER TABLE noo_tasks ADD CONSTRAINT noo_tasks_budget_state_chk
+            CHECK (budget_state IS NULL OR budget_state IN ('exhausted', 'awaiting_clarification'));
+    END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS noo_token_allowances (
+    user_uuid    uuid PRIMARY KEY REFERENCES noo_users(user_uuid) ON DELETE CASCADE,
+    period       text NOT NULL DEFAULT 'month',
+    limit_tokens bigint NOT NULL,
+    updated_by   text,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT noo_token_allowances_period_chk CHECK (period IN ('day', 'week', 'month')),
+    CONSTRAINT noo_token_allowances_limit_chk CHECK (limit_tokens >= 0)
+);
+ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_token_allowances TO noo_app;
+    END IF;
+END $$;
+"#,
+}, Migration {
+    revision: KIOSK_SEATS_REVISION,
+    down_revision: Some(TOKEN_BUDGETS_REVISION),
+    // i77: kiosk SEATS. A display is a seat, a role that can never hold a
+    // node's credentials, so seats get their OWN tables rather than a `role`
+    // column on the node rows: no existing node selector (placement,
+    // `cluster verify`, idle scale-down, fleet-secrets push, NATS principal
+    // render) can treat a seat as a node, because a seat never appears in a
+    // node query. The upgrade and verify lanes each join these explicitly.
+    //
+    // `noo_seat_tokens`: one-time enrolment tokens, sha256 only (the
+    // bootstrap-token machinery, a distinct table). `role` is the token's
+    // claim and the CHECK pins it: a row here can only ever mint a seat.
+    // `noo_seats`: the registry — the seat's self-signed BIRTH cert (what its
+    // bundles are encrypted to and its proofs verify against), facts, and the
+    // last signed heartbeat. `noo_seat_bundles`: the staged CMS ciphertext
+    // and the seat's signed fetch/apply receipts, the twin of
+    // `noo_provision_bundles` for seats.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_seat_tokens (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    token_hash  text NOT NULL UNIQUE,
+    role        text NOT NULL DEFAULT 'seat',
+    seat_name   text NOT NULL,
+    created_by  text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at  timestamptz NOT NULL,
+    used_at     timestamptz,
+    used_by_ip  text,
+    revoked     boolean NOT NULL DEFAULT false,
+    CONSTRAINT noo_seat_tokens_role_chk CHECK (role = 'seat')
+);
+CREATE TABLE IF NOT EXISTS noo_seats (
+    seat_name    text PRIMARY KEY,
+    birth_cert   text NOT NULL,
+    facts        jsonb,
+    enroll_user  text,
+    token_id     uuid,
+    enrolled_at  timestamptz NOT NULL DEFAULT now(),
+    last_seen    timestamptz,
+    heartbeat    jsonb
+);
+CREATE TABLE IF NOT EXISTS noo_seat_bundles (
+    seat_name   text PRIMARY KEY REFERENCES noo_seats(seat_name) ON DELETE CASCADE,
+    blob        bytea NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    fetched_at  timestamptz,
+    applied_at  timestamptz,
+    applied_sha text,
+    apply_rc    integer,
+    apply_msg   text
+);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE ON noo_seat_tokens TO noo_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_seats TO noo_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_seat_bundles TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
+
+/// The kiosk-seat revision (i77). The chain head.
+pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
+
+/// The token-budget revision (i83 G). A constant so a renumber at rebase is
+/// one line.
+pub const TOKEN_BUDGETS_REVISION: &str = "091_token_budgets";
 
 /// The Alembic revision the baselines reproduce.
 ///
@@ -2403,7 +2521,22 @@ mod tests {
         assert_eq!(m.down_revision, Some("088_placement_target_usage"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text"));
         let writer = include_str!("usage.rs");
-        assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind)"), "usage::insert must write harness_kind");
+        assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind"), "usage::insert must write harness_kind");
+    }
+
+    /// 091 sits on 090 and adds what `task_budget` and `usage::insert` name.
+    #[test]
+    fn token_budgets_revision_sits_on_090_and_adds_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == TOKEN_BUDGETS_REVISION).expect("091 must be in the chain");
+        assert_eq!(m.revision, "091_token_budgets");
+        assert_eq!(m.down_revision, Some("090_service_key_expiry"));
+        assert!(MIGRATIONS.iter().any(|m| m.down_revision == Some(TOKEN_BUDGETS_REVISION)), "092 sits on 091");
+        for col in ["token_budget bigint", "tokens_spent bigint NOT NULL DEFAULT 0", "budget_state text", "clarification jsonb"] {
+            assert!(m.sql.contains(&format!("ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_token_allowances"));
+        assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text"));
+        assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
     }
 
     /// Post-cut-over revisions only. Anything up to BASELINE_REVISION is the

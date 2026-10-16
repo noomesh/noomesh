@@ -71,6 +71,8 @@ pub(crate) const TIER1: &[&str] = &[
     "NOO_TRELLION_DDL_PASSWORD",
     "NATS_GATEWAY_PASSWORD",
     "NATS_WORKER_PASSWORD",
+    // An add-on's own bus password (noo-trellion, noo-trellion-intel).
+    "NATS_ADDON_PASSWORD",
     // The Go node agent's own bus password.
     "NATS_NODE_PASSWORD",
     "NOO_GATEWAY_KEY",
@@ -397,6 +399,24 @@ pub(crate) const BROWSER_KEY_HOLDERS: &[&str] = &["gateway", "worker", "worker-e
 pub(crate) const STORE_PER_SERVICE_KEYS: &[&str] =
     &["NOO_BUS_KEY_WORKER", "NOO_BUS_KEY_TRELLION", "NOO_BUS_KEY_TRELLION_INTEL", "NOO_BROWSER_KEY"];
 
+/// The bus PASSWORDS judged distinct in the store (i70 residue): each NATS
+/// principal on the controller presents its own. Not required to be set —
+/// the `nats principals` row owns "is it rendered" — but two that are set
+/// and equal are one principal.
+pub(crate) const STORE_NATS_PASSWORDS: &[&str] =
+    &["NATS_GATEWAY_PASSWORD", "NATS_WORKER_PASSWORD", "NATS_TRELLION_PASSWORD", "NATS_TRELLION_INTEL_PASSWORD"];
+
+/// The `/run/secrets` target an add-on's own NATS password is delivered to
+/// (compose `NATS_ADDON_PASSWORD_FILE`). The same target in each add-on:
+/// trellion-intel re-sources it from its own password, as it does the bus key.
+pub(crate) const ADDON_NATS_TARGET: &str = "nats_addon_password";
+
+/// The store key for one add-on audience's NATS password:
+/// `NATS_<AUD>_PASSWORD` (`trellion-intel` → `NATS_TRELLION_INTEL_PASSWORD`).
+pub(crate) fn nats_store_key(audience: &str) -> String {
+    format!("NATS_{}_PASSWORD", audience.to_ascii_uppercase().replace('-', "_"))
+}
+
 /// The store key for one audience: `NOO_BUS_KEY_<AUD>`.
 pub(crate) fn bus_store_key(audience: &str) -> String {
     format!("NOO_BUS_KEY_{}", audience.to_ascii_uppercase().replace('-', "_"))
@@ -470,6 +490,8 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
     }
     let mut fails: Vec<String> = Vec::new();
 
+    let mut warns: Vec<String> = Vec::new();
+
     // The store: three distinct bus keys, none equal to a shared secret.
     match store {
         None => fails.push("not judged: the encrypted store could not be read for digests".into()),
@@ -487,6 +509,15 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
                     if d.get(shared) == Some(v) {
                         fails.push(format!("{key} equals {shared} in the store"));
                     }
+                }
+                seen.push((key, v));
+            }
+            // Each controller-side NATS principal its own password.
+            let mut seen: Vec<(&str, &String)> = Vec::new();
+            for key in STORE_NATS_PASSWORDS {
+                let Some(v) = d.get(*key) else { continue };
+                if let Some((other, _)) = seen.iter().find(|(_, dv)| *dv == v) {
+                    fails.push(format!("{key} equals {other} in the store — two bus principals sharing a password are one principal"));
                 }
                 seen.push((key, v));
             }
@@ -536,6 +567,44 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
             if d != want {
                 fails.push(format!("{}'s /run/secrets/noo_bus_key is not {} from the store (a stale or foreign copy)", f.container, bus_store_key(aud)));
             }
+        }
+    }
+
+    // Each add-on's OWN bus password (i70 residue): only an add-on holds
+    // one, and the one it holds is its own. Absent is the one-release
+    // fallback (it presents the worker) — the `nats principals` row warns.
+    let mut own_nats: Vec<&str> = Vec::new();
+    for f in facts {
+        let Some(files) = &f.run_secrets else { continue };
+        if !files.iter().any(|x| x == ADDON_NATS_TARGET) {
+            continue;
+        }
+        let aud = BUS_VERIFIERS.iter().find(|(svc, _)| *svc == f.service).map(|(_, a)| *a).filter(|a| *a != "worker");
+        let Some(aud) = aud else {
+            fails.push(format!("{} holds an add-on's NATS password (/run/secrets/{ADDON_NATS_TARGET}) — only an add-on may", f.container));
+            continue;
+        };
+        let Some(d) = f.digests.get(ADDON_NATS_TARGET) else {
+            fails.push(format!("not judged: {}'s /run/secrets/{ADDON_NATS_TARGET} could not be digested", f.container));
+            continue;
+        };
+        let Some(st) = store.as_ref() else { continue };
+        let want = nats_store_key(aud);
+        if st.get(&want) == Some(d) {
+            own_nats.push(aud);
+            continue;
+        }
+        match STORE_NATS_PASSWORDS.iter().find(|k| st.get(**k) == Some(d)) {
+            // trellion-intel `extends` trellion: a bundle that predates its own
+            // principal inherits trellion's file. Its worker pool refuses to
+            // present it (not its audience) — held, never presented.
+            Some(k) if aud == "trellion-intel" && *k == "NATS_TRELLION_PASSWORD" => warns.push(format!(
+                "{} holds {k}, not {want} — inherited from the trellion service by a bundle that predates \
+                 its own principal; it presents the worker instead (`noo addons upgrade trellion_intel`)",
+                f.container
+            )),
+            Some(k) => fails.push(format!("{} holds {k} as its add-on NATS password, not {want}", f.container)),
+            None => fails.push(format!("{}'s /run/secrets/{ADDON_NATS_TARGET} is not {want} from the store (a stale or foreign copy)", f.container)),
         }
     }
 
@@ -610,10 +679,19 @@ pub(crate) fn shared_secrets_check(facts: &[SecretFacts], store: &StoreDigests) 
     }
     let mine = format!(
         "the controller secret is held by the gateway alone, the fleet secret by the gateway and the node agents \
-         alone; {verifiers} bus verifier(s) each hold their own key ({}), and the browser door its own — \
-         digest-checked against four distinct store keys",
-        if audiences.is_empty() { "none running".to_string() } else { audiences.join(", ") }
+         alone; {verifiers} bus verifier(s) each hold their own key ({}), each add-on its own bus password ({}), \
+         and the browser door its own — digest-checked against four distinct store keys and distinct bus passwords",
+        if audiences.is_empty() { "none running".to_string() } else { audiences.join(", ") },
+        if own_nats.is_empty() { "none yet: the worker's, the one-release fallback".to_string() } else { own_nats.join(", ") },
     );
+    if !warns.is_empty() {
+        return Check {
+            name: NAME,
+            verdict: Verdict::Warn,
+            detail: format!("{mine}; but {}", warns.join("; ")),
+            remedy: Some("noo addons upgrade trellion_intel   # a bundle that re-sources nats_addon_password from its own key".into()),
+        };
+    }
     Check { name: NAME, verdict: Verdict::Ok, detail: mine, remedy: None }
 }
 
@@ -642,6 +720,7 @@ pub(crate) const JUDGED_FILES: &[&str] = &[
     "noo_bus_key_trellion",
     "noo_bus_key_trellion_intel",
     "noo_browser_key",
+    "nats_addon_password",
 ];
 
 /// The judged files present in each container, and the salted digests of
@@ -669,7 +748,7 @@ fn run_secrets_of_all(containers: &[String], salt: &str) -> BTreeMap<String, Pro
             };
             let facts = present.map(|names| {
                 let mut digests = BTreeMap::new();
-                for n in names.iter().filter(|n| n.starts_with("noo_bus_key") || n.as_str() == "noo_browser_key") {
+                for n in names.iter().filter(|n| n.starts_with("noo_bus_key") || n.as_str() == "noo_browser_key" || n.as_str() == ADDON_NATS_TARGET) {
                     if let Some(d) = digest_one(c, n, salt) {
                         digests.insert(n.clone(), d);
                     }
@@ -711,7 +790,7 @@ pub(crate) fn tar_names_and_bus_digests(tar: &[u8], salt: &str) -> (Vec<String>,
         if kind == b'0' || kind == 0 {
             let base = name.rsplit('/').next().unwrap_or(&name).to_string();
             if !base.is_empty() {
-                if (base.starts_with("noo_bus_key") || base == "noo_browser_key") && body + size <= tar.len() {
+                if (base.starts_with("noo_bus_key") || base == "noo_browser_key" || base == ADDON_NATS_TARGET) && body + size <= tar.len() {
                     let v = String::from_utf8_lossy(&tar[body..body + size]);
                     digests.insert(base.clone(), super::cluster_push_secrets::salted_digest(salt, v.trim_end_matches('\n')));
                 }
@@ -728,7 +807,7 @@ pub(crate) fn tar_names_and_bus_digests(tar: &[u8], salt: &str) -> (Vec<String>,
 fn store_digests(salt: &str) -> StoreDigests {
     let store = crate::commands::secrets::SecretStore::load_sops(&crate::envfile::repo_root().join("secrets/env.sops")).ok()?;
     let mut out = BTreeMap::new();
-    for k in STORE_PER_SERVICE_KEYS.iter().chain(&["NOO_CONTROLLER_SECRET", "NOO_CLUSTER_SECRET"]) {
+    for k in STORE_PER_SERVICE_KEYS.iter().chain(STORE_NATS_PASSWORDS).chain(&["NOO_CONTROLLER_SECRET", "NOO_CLUSTER_SECRET"]) {
         if let Some(d) = store.salted_digest(k, salt) {
             out.insert(k.to_string(), d);
         }
@@ -878,17 +957,13 @@ pub(crate) const DELIVERING_FILES: &[&str] = &["docker-compose.cluster.yml", "do
 
 /// Every compose file under `root` whose deliveries the audit reads:
 /// [`DELIVERING_FILES`], then each licensed add-on's bundled overlay
-/// (`addons/<name>/docker-compose.yml`), else the deprecated overlay an
-/// earlier CLI left beside the base.
+/// (`addons/<name>/docker-compose.yml`).
 pub(crate) fn delivering_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = DELIVERING_FILES.iter().map(|f| root.join(f)).collect();
     for row in crate::commands::addons::ADDON_ROWS.iter().filter(|r| r.licensed.is_some()) {
         let bundled = crate::addons::pins::addon_dir(root, row.key).join(crate::addon_lock::OVERLAY_FILE);
-        let legacy = crate::addons::pins::legacy_overlay(root, row.key);
         if bundled.is_file() {
             out.push(bundled);
-        } else if legacy.is_file() {
-            out.push(legacy);
         }
     }
     out
@@ -1301,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn the_audit_reads_a_bundled_overlay_and_falls_back_to_a_legacy_one() {
+    fn the_audit_reads_a_bundled_overlay_and_ignores_a_root_one() {
         let d = std::env::temp_dir().join(format!("noo-delivering-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1310,13 +1385,12 @@ mod tests {
         let bundled = crate::addons::pins::addon_dir(&d, "evolve").join("docker-compose.yml");
         std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
         std::fs::write(&bundled, "services: {}\n").unwrap();
-        let legacy = crate::addons::pins::legacy_overlay(&d, "trellion_intel");
-        std::fs::write(&legacy, "services: {}\n").unwrap();
+        // An overlay left in the install root by an earlier CLI is not read.
+        std::fs::write(d.join("docker-compose.trellion-intel.yml"), "services: {}\n").unwrap();
+        std::fs::write(d.join("docker-compose.evolve.yml"), "services: {}\n").unwrap();
         let got = delivering_paths(&d);
-        assert!(got.contains(&bundled) && got.contains(&legacy), "{got:?}");
-        // A bundle wins over a legacy copy of the same add-on.
-        std::fs::write(crate::addons::pins::legacy_overlay(&d, "evolve"), "services: {}\n").unwrap();
-        assert!(!delivering_paths(&d).contains(&crate::addons::pins::legacy_overlay(&d, "evolve")));
+        assert!(got.contains(&bundled), "{got:?}");
+        assert_eq!(got.len(), base.len() + 1, "{got:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1396,6 +1470,8 @@ mod tests {
     const STORE: &[(&str, &str)] = &[
         ("NOO_BUS_KEY_WORKER", "dw"), ("NOO_BUS_KEY_TRELLION", "dt"), ("NOO_BUS_KEY_TRELLION_INTEL", "di"),
         ("NOO_BROWSER_KEY", "db"), ("NOO_CONTROLLER_SECRET", "dc"), ("NOO_CLUSTER_SECRET", "df"),
+        ("NATS_GATEWAY_PASSWORD", "ng"), ("NATS_WORKER_PASSWORD", "nw"),
+        ("NATS_TRELLION_PASSWORD", "nt"), ("NATS_TRELLION_INTEL_PASSWORD", "ni"),
     ];
 
     fn store() -> StoreDigests {
@@ -1421,8 +1497,10 @@ mod tests {
                 &[("noo_bus_key_worker", "dw"), ("noo_bus_key_trellion", "dt"), ("noo_bus_key_trellion_intel", "di")]),
             fact("noo-worker", "worker", &["NOO_BUS_KEY_FILE", "NOO_BUS_AUDIENCE", "NOO_GATEWAY_KEY_FILE", "NOO_BROWSER_KEY_FILE"], Some("worker"),
                 &["noo_bus_key", "noo_gateway_key", "noo_browser_key"], &[("noo_bus_key", "dw"), ("noo_browser_key", "db")]),
-            fact("noo-trellion", "trellion", &["NOO_BUS_KEY_FILE", "NOO_BUS_AUDIENCE"], Some("trellion"), &["noo_bus_key"], &[("noo_bus_key", "dt")]),
-            fact("noo-trellion-intel", "trellion-intel", &["NOO_BUS_KEY_FILE", "NOO_BUS_AUDIENCE"], Some("trellion-intel"), &["noo_bus_key"], &[("noo_bus_key", "di")]),
+            fact("noo-trellion", "trellion", &["NOO_BUS_KEY_FILE", "NOO_BUS_AUDIENCE", "NATS_ADDON_PASSWORD_FILE"], Some("trellion"),
+                &["noo_bus_key", "nats_addon_password"], &[("noo_bus_key", "dt"), ("nats_addon_password", "nt")]),
+            fact("noo-trellion-intel", "trellion-intel", &["NOO_BUS_KEY_FILE", "NOO_BUS_AUDIENCE", "NATS_ADDON_PASSWORD_FILE"], Some("trellion-intel"),
+                &["noo_bus_key", "nats_addon_password"], &[("noo_bus_key", "di"), ("nats_addon_password", "ni")]),
             fact("noo-browser", "browser", &["NOO_BROWSER_KEY_FILE", "NOO_CLUSTER_SECRET_FILE"], None, &["noo_browser_key"], &[("noo_browser_key", "db")]),
         ]
     }
@@ -1433,6 +1511,52 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert!(c.detail.contains("gateway alone") && c.detail.contains("worker, trellion, trellion-intel"), "{}", c.detail);
         assert!(c.detail.contains("browser door its own"), "{}", c.detail);
+        assert!(c.detail.contains("each add-on its own bus password (trellion, trellion-intel)"), "{}", c.detail);
+    }
+
+    /// i70 residue: each add-on holds its OWN NATS password, nothing else
+    /// holds one, and the store's bus passwords are distinct.
+    #[test]
+    fn each_addon_holds_its_own_bus_password() {
+        // The worker holding an add-on's password: FAIL.
+        let mut s = healthy();
+        s[1].run_secrets.as_mut().unwrap().push("nats_addon_password".into());
+        s[1].digests.insert("nats_addon_password".into(), "nt".into());
+        let c = shared_secrets_check(&s, &store());
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo-worker holds an add-on's NATS password"), "{}", c.detail);
+        // trellion holding the worker's password as its own: FAIL.
+        let mut s = healthy();
+        s[2].digests.insert("nats_addon_password".into(), "nw".into());
+        let c = shared_secrets_check(&s, &store());
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo-trellion holds NATS_WORKER_PASSWORD as its add-on NATS password"), "{}", c.detail);
+        // A stale copy: FAIL.
+        let mut s = healthy();
+        s[3].digests.insert("nats_addon_password".into(), "old".into());
+        assert!(shared_secrets_check(&s, &store()).detail.contains("noo-trellion-intel's /run/secrets/nats_addon_password is not NATS_TRELLION_INTEL_PASSWORD"));
+        // An intel bundle that predates its principal inherits trellion's: WARN, named.
+        let mut s = healthy();
+        s[3].digests.insert("nats_addon_password".into(), "nt".into());
+        let c = shared_secrets_check(&s, &store());
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("noo-trellion-intel holds NATS_TRELLION_PASSWORD"), "{}", c.detail);
+        // The fallback (no add-on password delivered yet) is not this row's FAIL.
+        let mut s = healthy();
+        for f in &mut s[2..4] {
+            f.run_secrets.as_mut().unwrap().retain(|x| x != "nats_addon_password");
+            f.digests.remove("nats_addon_password");
+        }
+        let c = shared_secrets_check(&s, &store());
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("none yet: the worker's"), "{}", c.detail);
+        // No two principals share a password in the store.
+        let mut d = store().unwrap();
+        d.insert("NATS_TRELLION_PASSWORD".into(), "nw".into());
+        let c = shared_secrets_check(&healthy(), &Some(d));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("NATS_TRELLION_PASSWORD equals NATS_WORKER_PASSWORD"), "{}", c.detail);
+        assert_eq!(nats_store_key("trellion-intel"), "NATS_TRELLION_INTEL_PASSWORD");
     }
 
     /// Review H1, the operator's decision: once the browser door has its

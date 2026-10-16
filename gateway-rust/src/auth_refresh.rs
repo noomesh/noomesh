@@ -113,6 +113,17 @@ pub fn generate_bootstrap_token() -> String {
     format!("{BOOTSTRAP_TOKEN_PREFIX}{}", random_body())
 }
 
+/// Prefix of a kiosk SEAT enrolment token (i77). Distinct from a node's
+/// `noo-bt-` so a paste says what it is — but the separation that matters is
+/// the TABLE: a seat token's hash lives in `noo_seat_tokens`, which only
+/// `/api/cluster/seat-enroll` reads, and `/api/cluster/bootstrap` never does.
+pub const SEAT_TOKEN_PREFIX: &str = "noo-st-";
+
+/// A fresh one-time seat enrolment token: `noo-st-` + 43 base64url.
+pub fn generate_seat_token() -> String {
+    format!("{SEAT_TOKEN_PREFIX}{}", random_body())
+}
+
 /// Hash a raw refresh token for storage. Hex-encoded sha256 is plenty
 /// — the input is already 256 bits of entropy, so we don't need a
 /// stretching KDF.

@@ -373,20 +373,82 @@ pub fn plaintext_refusal(faults: &[String]) -> String {
     )
 }
 
-/// Is client-certificate identity ENFORCED (`NOO_MTLS_GATEWAY`)? A
-/// mismatch between the presented certificate and a token's claimed actor
-/// is a 403 only when this is on.
+/// What `NOO_MTLS_GATEWAY` and the cluster CA add up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtlsMode {
+    /// Enforcing: a usable CA and the flag unset, empty, or explicitly on.
+    On,
+    /// Explicitly on, but `NOO_TLS_CA` is unset or missing. `mtls_enabled()`
+    /// stays true so `load_rustls_config` refuses to start, as it always did.
+    OnButCaMissing,
+    /// Unset or empty and no usable CA: nothing to verify against.
+    OffNoCa,
+    /// Explicitly switched off (`false/0/no/off`): the operator's choice.
+    OffExplicit,
+}
+
+/// The pure decision behind [`mtls_enabled`]: the raw env value (`None` =
+/// unset) and whether `NOO_TLS_CA` names an existing file.
 ///
-/// Kept as a flag because enforcement can lock out a node whose existing
-/// certificate does not name its registered id — drift that
-/// `provision` now repairs going forward, but that already-issued certs
-/// still carry. A fresh install has no such history, so `noo onboard`
-/// turns it on; an upgrade opts in after reading its logs.
+/// * unset or empty → `On` with a usable CA, else `OffNoCa`;
+/// * `true/1/yes/on` → `On` (`OnButCaMissing` without a CA: refuse to start);
+/// * `false/0/no/off` → `OffExplicit`;
+/// * anything else is a typo, not a decision, and fails SECURE: it is read as
+///   unset (the caller logs the value).
+pub fn mtls_mode_of(raw: Option<&str>, ca_usable: bool) -> MtlsMode {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" if ca_usable => MtlsMode::On,
+        "1" | "true" | "yes" | "on" => MtlsMode::OnButCaMissing,
+        "0" | "false" | "no" | "off" => MtlsMode::OffExplicit,
+        _ if ca_usable => MtlsMode::On,
+        _ => MtlsMode::OffNoCa,
+    }
+}
+
+fn ca_file_usable() -> bool {
+    let ca = std::env::var("NOO_TLS_CA").unwrap_or_default();
+    let ca = ca.trim();
+    !ca.is_empty() && Path::new(ca).is_file()
+}
+
+/// The mode the environment says right now.
+pub fn mtls_mode() -> MtlsMode {
+    let raw = std::env::var("NOO_MTLS_GATEWAY").ok();
+    mtls_mode_of(raw.as_deref(), ca_file_usable())
+}
+
+/// Is client-certificate identity ENFORCED? ON BY DEFAULT: with
+/// `NOO_MTLS_GATEWAY` unset or empty it is on whenever `NOO_TLS_CA` names an
+/// existing file (see [`mtls_mode_of`]). Enforcement means a presented
+/// certificate that disagrees with a token's claimed actor is a 403, and a
+/// fleet token that arrives with NO node certificate (other than from this
+/// host's loopback) is a 403 too (`controller_hmac_refusal`).
+///
+/// Why default-on: the fleet secret is on every node, so a token's actor is
+/// only a claim; without enforcement a node on the tailnet could omit its
+/// certificate and name another node. Live, every node presents its leaf
+/// (`node_token_no_cert` read 0 for seven days), so enforcing locks nobody
+/// out. `NOO_MTLS_GATEWAY=false` is the explicit, loudly-logged opt-out.
 pub fn mtls_enabled() -> bool {
-    matches!(
-        std::env::var("NOO_MTLS_GATEWAY").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    matches!(mtls_mode(), MtlsMode::On | MtlsMode::OnButCaMissing)
+}
+
+/// The boot line that says what the mode leaves open. Warn-level for the
+/// two OFF modes; the text names the exposure and the way back.
+pub fn log_mtls_mode(mode: MtlsMode) {
+    match mode {
+        MtlsMode::On | MtlsMode::OnButCaMissing => {}
+        MtlsMode::OffExplicit => tracing::warn!(
+            "mTLS enforcement is OFF (NOO_MTLS_GATEWAY is explicitly false): a node can present \
+             a fleet token naming another node, and a forged apply claim is only stopped by the \
+             birth-key proof. Remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway"
+        ),
+        MtlsMode::OffNoCa => tracing::warn!(
+            "mTLS enforcement is OFF because NOO_TLS_CA is unset or missing: a node can present \
+             a fleet token naming another node. Point NOO_TLS_CA at the cluster CA and recreate \
+             the gateway"
+        ),
+    }
 }
 
 /// Load axum-server RustlsConfig from NOO_TLS_CERT + NOO_TLS_KEY.
@@ -396,6 +458,14 @@ pub async fn load_rustls_config() -> Result<axum_server::tls_rustls::RustlsConfi
     let key_path = std::env::var("NOO_TLS_KEY")
         .map_err(|_| anyhow::anyhow!("NOO_TLS_KEY not set"))?;
 
+    let mode = mtls_mode();
+    if let Ok(raw) = std::env::var("NOO_MTLS_GATEWAY") {
+        let r = raw.trim().to_ascii_lowercase();
+        if !matches!(r.as_str(), "" | "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off") {
+            tracing::warn!(value = %raw, "NOO_MTLS_GATEWAY is not a boolean; read as UNSET (enforcing when a CA exists)");
+        }
+    }
+    log_mtls_mode(mode);
     if !mtls_enabled() {
         let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
             &cert_path, &key_path,
@@ -422,7 +492,7 @@ pub async fn load_rustls_config() -> Result<axum_server::tls_rustls::RustlsConfi
     let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
     if ca_path.is_empty() || !Path::new(&ca_path).exists() {
         anyhow::bail!(
-            "NOO_MTLS_GATEWAY is on but NOO_TLS_CA is unset or missing ({ca_path:?}) — \
+            "NOO_MTLS_GATEWAY is explicitly on but NOO_TLS_CA is unset or missing ({ca_path:?}) — \
              refusing to start, because serving without client verification while the \
              flag says otherwise is worse than not starting"
         );
@@ -477,7 +547,7 @@ mod loopback_verification_tests {
     use std::sync::Arc;
 
     /// `NOO_TLS_CA` is process-global; `cargo test` runs these on threads.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey, rcgen::CertifiedKey) {
         let mut ca_params = rcgen::CertificateParams::new(vec![ca_cn.to_string()]).unwrap();
@@ -808,5 +878,69 @@ mod tests {
         assert!(resolve_backend_timeout_secs("15m").is_err());
         assert!(resolve_backend_timeout_secs("900.5").is_err());
         assert!(resolve_backend_timeout_secs("abc").is_err());
+    }
+}
+
+#[cfg(test)]
+mod mtls_mode_tests {
+    use super::*;
+
+    // `NOO_MTLS_GATEWAY` / `NOO_TLS_CA` are process-global: one mutex with
+    // the loopback tests, which also set `NOO_TLS_CA`.
+    use super::loopback_verification_tests::ENV;
+
+    #[test]
+    fn the_mode_table() {
+        use MtlsMode::*;
+        for (raw, ca, want) in [
+            (None, true, On),
+            (Some(""), true, On),
+            (Some("  "), true, On),
+            (None, false, OffNoCa),
+            (Some(""), false, OffNoCa),
+            (Some("true"), true, On),
+            (Some("1"), true, On),
+            (Some("YES"), true, On),
+            (Some("on"), true, On),
+            (Some("true"), false, OnButCaMissing),
+            (Some("on"), false, OnButCaMissing),
+            (Some("false"), true, OffExplicit),
+            (Some("0"), true, OffExplicit),
+            (Some("No"), false, OffExplicit),
+            (Some(" off "), true, OffExplicit),
+            // A typo is not a decision: fail secure.
+            (Some("disabled"), true, On),
+            (Some("disabled"), false, OffNoCa),
+        ] {
+            assert_eq!(mtls_mode_of(raw, ca), want, "raw={raw:?} ca={ca}");
+        }
+    }
+
+    #[test]
+    fn mtls_enabled_reads_the_env_and_the_ca_file() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("noo-mtls-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, "x").unwrap();
+        let missing = dir.join("absent.pem");
+        let check = |flag: Option<&str>, ca_path: &std::path::Path, want: bool| {
+            match flag {
+                Some(v) => std::env::set_var("NOO_MTLS_GATEWAY", v),
+                None => std::env::remove_var("NOO_MTLS_GATEWAY"),
+            }
+            std::env::set_var("NOO_TLS_CA", ca_path);
+            assert_eq!(mtls_enabled(), want, "flag={flag:?} ca={}", ca_path.display());
+        };
+        check(None, &ca, true);
+        check(Some(""), &ca, true);
+        check(None, &missing, false);
+        check(Some("true"), &missing, true); // refuses to start in load_rustls_config
+        check(Some("false"), &ca, false);
+        check(Some("off"), &ca, false);
+        std::env::remove_var("NOO_MTLS_GATEWAY");
+        std::env::remove_var("NOO_TLS_CA");
+        assert!(!mtls_enabled(), "no CA at all: nothing to enforce against");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

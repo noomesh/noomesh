@@ -3,10 +3,17 @@
 
 //! Tasks.
 //!
-//!   POST /api/tasks              {objective, model?, loop_budget?}  → the task, started
+//!   POST /api/tasks              {objective, model?, loop_budget?, token_budget?}  → the task, started
 //!   GET  /api/tasks?state=&limit=                                 → own tasks (operators: all)
-//!   GET  /api/tasks/{id}
+//!   GET  /api/tasks/{id}                                          → with its budget and the owner's allowance
 //!   POST /api/tasks/{id}/stop                                     → stopped at the next checkpoint
+//!   POST /api/tasks/{id}/resubmit {token_budget?}                 → more tokens; a parked task resumes
+//!   POST /api/tasks/{id}/ask      {question}                      → a question to the owner; parks at the boundary
+//!   POST /api/tasks/{id}/answer   {text}                          → the owner's answer; a new loop starts
+//!
+//! Resubmit, ask and answer are the token-budget switch's ways out (i83 G,
+//! `task_budget`): only the task's OWNER may use them — an operator reads
+//! and stops anyone's task, but does not spend or answer for them.
 //!
 //! A task is created FOR the caller — the person — and runs as them: on
 //! the harness of the node holding its model, or in this process. Only
@@ -31,6 +38,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/tasks", get(tasks_list).post(tasks_create))
         .route("/api/tasks/{id}", get(tasks_get))
         .route("/api/tasks/{id}/stop", post(tasks_stop))
+        .route("/api/tasks/{id}/resubmit", post(tasks_resubmit))
+        .route("/api/tasks/{id}/ask", post(tasks_ask))
+        .route("/api/tasks/{id}/answer", post(tasks_answer))
 }
 
 #[derive(Deserialize)]
@@ -40,6 +50,9 @@ struct CreateReq {
     model: Option<String>,
     #[serde(default)]
     loop_budget: Option<u32>,
+    /// Tokens its loops may spend; omit for no cap of its own.
+    #[serde(default)]
+    token_budget: Option<i64>,
 }
 
 /// Whose task this is, and whether they may see everyone's.
@@ -69,11 +82,14 @@ async fn tasks_create(State(state): State<Arc<AppState>>, ctx: Option<Extension<
     if objective.is_empty() || objective.len() > 8000 {
         return Err(AppError::BadRequest("objective must be 1–8000 characters".into()));
     }
-    let task = crate::tasks::create(&state.db, &user, objective, req.model.as_deref(), req.loop_budget)
+    if req.token_budget.is_some_and(|b| b <= 0) {
+        return Err(AppError::BadRequest("token_budget must be a positive number of tokens".into()));
+    }
+    let task = crate::tasks::create(&state.db, &user, objective, req.model.as_deref(), req.loop_budget, req.token_budget)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let started = crate::tasks::start(&state, &task).await.map_err(|e| AppError::Internal(e.to_string()))?;
-    crate::routes::core::audit_event(&state.db, "task_created", "info", &user, &task.id, "started", json!({"node": started.node, "dispatched": started.dispatched, "loop_budget": task.loop_budget})).await;
+    crate::routes::core::audit_event(&state.db, "task_created", "info", &user, &task.id, "started", json!({"node": started.node, "dispatched": started.dispatched, "loop_budget": task.loop_budget, "token_budget": task.token_budget})).await;
     let task = crate::tasks::get(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?.unwrap_or(task);
     // `dispatched` and `why` say whether a NODE took the turn and, when
     // none did, what stopped it. Without them the answer is a container
@@ -123,7 +139,72 @@ async fn tasks_get(State(state): State<Arc<AppState>>, ctx: Option<Extension<Req
     if let Some(t) = crate::tasks::tools_called(&state.db, &task.conversation_id).await {
         out["tools"] = json!({"count": t.count, "names": t.names});
     }
+    // The owner's allowance beside the task's own budget: the switch reads
+    // both. Null when the owner has none (or it could not be read).
+    if let Some(owner) = task.owner.as_deref() {
+        if let Ok(Some(a)) = crate::task_budget::allowance_use(&state.db, owner).await {
+            out["allowance"] = json!({"period": a.period, "limit": a.limit, "spent": a.spent, "remaining": a.remaining()});
+        }
+    }
     Ok(Json(out))
+}
+
+/// The task, if the caller OWNS it — not merely may read it. The budget's
+/// ways out spend the owner's tokens and speak for the owner.
+async fn owner_only(state: &AppState, ctx: &Option<Extension<RequesterCtx>>, id: &str) -> Result<crate::tasks::Task, AppError> {
+    let (user, _) = person(ctx)?;
+    let task = owned(state, ctx, id).await?;
+    if task.owner.as_deref() != Some(user.as_str()) {
+        return Err(AppError::Forbidden("only the task's owner may do this".into()));
+    }
+    Ok(task)
+}
+
+#[derive(Deserialize, Default)]
+struct ResubmitReq {
+    #[serde(default)]
+    token_budget: Option<i64>,
+}
+
+/// Give a task more tokens: a task parked because its budget ran out resumes from its checkpoint; on a running task only its cap changes.
+async fn tasks_resubmit(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, Path(id): Path<String>, body: Option<Json<ResubmitReq>>) -> AppResult {
+    let task = owner_only(&state, &ctx, &id).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let (after, started) = crate::task_budget::resubmit(&state, &task, req.token_budget).await?;
+    let (user, _) = person(&ctx)?;
+    crate::routes::core::audit_event(&state.db, "task_resubmitted", "info", &user, &task.id, if started.is_some() { "resumed" } else { "adjusted" }, json!({"token_budget": after.token_budget, "tokens_spent": after.tokens_spent})).await;
+    Ok(Json(json!({
+        "task": after,
+        "resumed": started.is_some(),
+        "node": started.as_ref().map(|s| s.node.clone()),
+        "dispatched": started.as_ref().map(|s| s.dispatched),
+    })))
+}
+
+#[derive(Deserialize)]
+struct AskReq {
+    question: String,
+}
+
+/// Ask the task's owner a question the loop cannot go on without: posted to its thread; the task waits for the answer from the next loop boundary.
+async fn tasks_ask(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, Path(id): Path<String>, Json(req): Json<AskReq>) -> AppResult {
+    let task = owner_only(&state, &ctx, &id).await?;
+    crate::task_budget::ask(&state, &task, &req.question).await?;
+    Ok(Json(json!({"asked": true, "task_id": task.id})))
+}
+
+#[derive(Deserialize)]
+struct AnswerReq {
+    text: String,
+}
+
+/// Answer the question a task asked: a new loop starts with the question and the answer.
+async fn tasks_answer(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, Path(id): Path<String>, Json(req): Json<AnswerReq>) -> AppResult {
+    let task = owner_only(&state, &ctx, &id).await?;
+    let (after, started) = crate::task_budget::answer(&state, &task, &req.text).await?;
+    let (user, _) = person(&ctx)?;
+    crate::routes::core::audit_event(&state.db, "task_answered", "info", &user, &task.id, "resumed", json!({"node": started.node})).await;
+    Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "why": started.why})))
 }
 
 /// Stop a task: it ends at its next checkpoint, and its loops' tool calls stand.
@@ -176,6 +257,20 @@ mod owner_tests {
     fn an_account_owns_its_task_as_itself() {
         let (owner, _) = person(&ctx("owner")).expect("a person");
         assert_eq!(owner, "owner");
+    }
+
+    /// PINNED (i83 G): resubmit, ask and answer go through `owner_only` —
+    /// an operator who may READ a task may not spend or answer for it.
+    #[test]
+    fn the_budget_ways_out_are_owner_only() {
+        let src = include_str!("tasks.rs");
+        for f in ["async fn tasks_resubmit(", "async fn tasks_ask(", "async fn tasks_answer("] {
+            let body = &src[src.find(f).expect(f)..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            assert!(body.contains("owner_only(&state, &ctx, &id)"), "{f} must check the owner");
+        }
+        let guard = &src[src.find("async fn owner_only(").unwrap()..];
+        assert!(guard[..600].contains("task.owner.as_deref() != Some(user.as_str())"));
     }
 
     /// No identity at all is still a refusal, not an ownerless task.

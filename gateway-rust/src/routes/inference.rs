@@ -998,7 +998,7 @@ async fn v1_responses(
             use futures::StreamExt as _;
             // No metadata frame here: a Responses-API consumer expects every
             // event to carry a `type`; the headers say what served.
-            let mut tr = shim::StreamTranslator::new(&served.model);
+            let mut tr = shim::StreamTranslator::new(&served.model, &body);
             let tapped = crate::usage::tap_stream(resp.bytes_stream(), usage);
             let events = tapped
                 .map(Some)
@@ -1017,7 +1017,7 @@ async fn v1_responses(
             if let Ok(v) = axum::http::HeaderValue::from_str(&served.model) { r.headers_mut().insert(raw_chat::HEADER_MODEL, v); }
             r
         }
-        Ok(Outcome::Json { data, served }) => raw_chat::json_response(shim::chat_to_response(&data, &served.model), &served),
+        Ok(Outcome::Json { data, served }) => raw_chat::json_response(shim::chat_to_response(&data, &served.model, &body), &served),
         Err(e) => e.into_response("v1"),
     }
 }

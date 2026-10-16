@@ -96,6 +96,55 @@ pub fn record(
     spawn_record(db, node_id, backend, model, source, actor, None, prompt_tokens, completion_tokens);
 }
 
+/// The `source` of a row a task's NATIVE loop spent (i83 G): one row per
+/// loop, carrying the task id.
+pub const TASK_SOURCE: &str = "task";
+
+/// One loop's tokens, as a task spent them. What [`record_task`] writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskUsage {
+    /// The node that served it; `None` for a cloud model (no node did).
+    pub node_id: Option<String>,
+    /// The backend type: `vllm`, `llamacpp`, `cloud-anthropic`, … or
+    /// `harness:<kind>` for a foreign loop.
+    pub backend: String,
+    pub model: String,
+    /// [`TASK_SOURCE`] for a native loop, [`HARNESS_SOURCE`] for a foreign one.
+    pub source: &'static str,
+    /// The task's owner.
+    pub username: String,
+    pub harness_kind: Option<String>,
+    pub task_id: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+/// Record a task loop's tokens and WAIT for the write, so the loop-boundary
+/// budget check that follows sees them (`task_budget`). Still never an error
+/// to the caller: a failed write is a warning, exactly as for [`record`].
+pub async fn record_task(db: &sqlx::PgPool, u: &TaskUsage) {
+    if u.prompt_tokens == 0 && u.completion_tokens == 0 {
+        return;
+    }
+    let actor = UsageActor::user(u.username.clone(), if u.harness_kind.is_some() { "harness" } else { "task" }).normalised();
+    let node_id = match &u.node_id {
+        Some(host) => Some(resolve_node_id(db, host).await),
+        None => None,
+    };
+    let row = Row {
+        node_id: &node_id,
+        backend: &u.backend,
+        model: &u.model,
+        source: u.source,
+        actor: &actor,
+        harness_kind: u.harness_kind.as_deref(),
+        task_id: Some(&u.task_id),
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+    };
+    write(db, &row).await;
+}
+
 /// The `source` of a row a node harness reported (the `usage` rail op).
 pub const HARNESS_SOURCE: &str = "harness";
 
@@ -156,36 +205,98 @@ fn spawn_record(
             source,
             actor: &actor,
             harness_kind: harness_kind.as_deref(),
+            task_id: None,
             prompt_tokens,
             completion_tokens,
         };
-        match insert(&db, &row).await {
-            Ok(()) => {}
-            // The month rolled over onto a partition nobody created yet:
-            // ensure current + next month, then retry the insert ONCE.
-            Err(e) if e.to_string().contains("no partition of relation") => {
-                for months_ahead in ["0 months", "1 month"] {
-                    if let Err(e2) = sqlx::query(
-                        "SELECT noo_ensure_usage_partition(
-                             EXTRACT(YEAR FROM now() + $1::interval)::int,
-                             EXTRACT(MONTH FROM now() + $1::interval)::int)",
-                    )
-                    .bind(months_ahead)
-                    .execute(&db)
-                    .await
-                    {
-                        tracing::warn!(error = %e2, "usage_partition_ensure_failed");
-                    }
-                }
-                if let Err(e2) = insert(&db, &row).await {
-                    tracing::warn!(error = %e2, "usage_record_failed_after_heal");
+        write(&db, &row).await;
+    });
+}
+
+/// Insert one row, healing a missing month partition once. Every failure
+/// ends in a warning, never an error.
+async fn write(db: &sqlx::PgPool, row: &Row<'_>) {
+    match insert(db, row).await {
+        Ok(()) => {}
+        // The month rolled over onto a partition nobody created yet:
+        // ensure current + next month, then retry the insert ONCE.
+        Err(e) if e.to_string().contains("no partition of relation") => {
+            for months_ahead in ["0 months", "1 month"] {
+                if let Err(e2) = sqlx::query(
+                    "SELECT noo_ensure_usage_partition(
+                         EXTRACT(YEAR FROM now() + $1::interval)::int,
+                         EXTRACT(MONTH FROM now() + $1::interval)::int)",
+                )
+                .bind(months_ahead)
+                .execute(db)
+                .await
+                {
+                    tracing::warn!(error = %e2, "usage_partition_ensure_failed");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "usage_record_failed");
+            if let Err(e2) = insert(db, row).await {
+                tracing::warn!(error = %e2, "usage_record_failed_after_heal");
             }
         }
-    });
+        Err(e) => {
+            tracing::warn!(error = %e, "usage_record_failed");
+        }
+    }
+}
+
+// ─── Node vs cloud (i83 G) ───────────────────────────────────────────────
+//
+// A report never merges what a node served with what a cloud provider
+// billed: rows fall on exactly one side, by what the writer recorded. A
+// cloud completion's backend is `cloud-<provider>` (no node served it); a
+// foreign loop's is `harness:<kind>` with `harness_kind` set; everything
+// else a node served.
+
+/// Which column a usage row is reported in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    /// A node's own backend served it.
+    Node,
+    /// A cloud provider served it (`cloud-anthropic`, `cloud-openai`, …).
+    Cloud,
+    /// A foreign loop on a node harness, by kind.
+    Harness(String),
+}
+
+/// The one classification, from a row's own columns.
+pub fn side_of(backend: &str, harness_kind: Option<&str>) -> Side {
+    if let Some(k) = harness_kind.map(str::trim).filter(|k| !k.is_empty()) {
+        return Side::Harness(k.to_string());
+    }
+    if let Some(k) = backend.strip_prefix("harness:") {
+        return Side::Harness(k.to_string());
+    }
+    if backend.starts_with("cloud-") {
+        return Side::Cloud;
+    }
+    Side::Node
+}
+
+/// The setting that prices models: a JSON object of model-name prefix →
+/// USD per million tokens (prompt + completion), e.g.
+/// `{"claude-": 6.0, "gpt-4o": 5.0}`. Reported, never enforced.
+pub const COST_SETTING: &str = "NOO_MODEL_COST_USD_PER_MTOK";
+
+/// Parse the price map; anything unreadable is no prices at all.
+pub fn parse_cost_map(raw: Option<&str>) -> Vec<(String, f64)> {
+    let Some(v) = raw.and_then(|r| serde_json::from_str::<Value>(r).ok()) else { return Vec::new() };
+    let Some(obj) = v.as_object() else { return Vec::new() };
+    obj.iter().filter_map(|(k, v)| v.as_f64().filter(|p| p.is_finite() && *p >= 0.0).map(|p| (k.clone(), p))).collect()
+}
+
+/// The price map in force (`noo_settings` → env).
+pub fn cost_map() -> Vec<(String, f64)> {
+    parse_cost_map(crate::settings::get(COST_SETTING).as_deref())
+}
+
+/// A model's price per million tokens: the LONGEST matching prefix wins.
+pub fn usd_per_mtok(model: &str, map: &[(String, f64)]) -> Option<f64> {
+    map.iter().filter(|(p, _)| model.starts_with(p.as_str())).max_by_key(|(p, _)| p.len()).map(|(_, v)| *v)
 }
 
 // ─── Streamed completions ───────────────────────────────────────────────
@@ -415,6 +526,8 @@ struct Row<'a> {
     /// The harness kind, for a row a node harness reported (089); NULL
     /// for every other writer.
     harness_kind: Option<&'a str>,
+    /// The task the tokens were spent on (091); NULL outside a task.
+    task_id: Option<&'a str>,
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -428,10 +541,10 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO noo_token_usage
              (node_id, backend, model, source, user_uuid, consumer,
-              prompt_tokens, completion_tokens, harness_kind)
+              prompt_tokens, completion_tokens, harness_kind, task_id)
          VALUES ($1, $2, $3, $4,
                  (SELECT u.user_uuid FROM noo_users u WHERE u.username = $5),
-                 $6, $7, $8, $9)",
+                 $6, $7, $8, $9, $10)",
     )
     .bind(row.node_id.as_deref())
     .bind(row.backend)
@@ -442,6 +555,7 @@ async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     .bind(row.prompt_tokens as i32)
     .bind(row.completion_tokens as i32)
     .bind(row.harness_kind)
+    .bind(row.task_id)
     .execute(db)
     .await
     .map(|_| ())
@@ -481,6 +595,31 @@ mod tests {
         assert_eq!(map_host_to_node(&m, "10.0.0.99"), "10.0.0.99");
         assert_eq!(map_host_to_node(&m, "controller"), "controller");
         assert_eq!(map_host_to_node(&HashMap::new(), "host9"), "host9");
+    }
+
+    /// PINNED (i83 G): cloud rows, harness rows and node rows fall on
+    /// exactly one side each.
+    #[test]
+    fn rows_fall_on_exactly_one_side() {
+        assert_eq!(side_of("cloud-anthropic", None), Side::Cloud);
+        assert_eq!(side_of("cloud-openai", None), Side::Cloud);
+        assert_eq!(side_of("cloud-gemini", None), Side::Cloud);
+        assert_eq!(side_of("harness:copilot", Some("copilot")), Side::Harness("copilot".into()));
+        assert_eq!(side_of("harness:claude-code", None), Side::Harness("claude-code".into()));
+        assert_eq!(side_of("vllm", None), Side::Node);
+        assert_eq!(side_of("llamacpp", Some("")), Side::Node);
+        assert_eq!(side_of("ollama", None), Side::Node);
+    }
+
+    #[test]
+    fn prices_match_the_longest_prefix_and_ignore_junk() {
+        let map = parse_cost_map(Some(r#"{"claude-": 6.0, "claude-opus": 30, "gpt-4o": 5, "bad": "x", "neg": -1}"#));
+        assert_eq!(usd_per_mtok("claude-opus-5", &map), Some(30.0));
+        assert_eq!(usd_per_mtok("claude-sonnet-5", &map), Some(6.0));
+        assert_eq!(usd_per_mtok("gemma-4", &map), None);
+        assert_eq!(usd_per_mtok("bad", &map), None);
+        assert!(parse_cost_map(Some("not json")).is_empty());
+        assert!(parse_cost_map(None).is_empty());
     }
 
     #[test]

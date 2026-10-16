@@ -2851,8 +2851,6 @@ volumes:
       o: bind
       device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama
   airllm-cache:
-  # Piper voice models for the opt-in `piper` service (profile "voice").
-  piper-voices:
   hf-cache:
     driver: local
     driver_opts:

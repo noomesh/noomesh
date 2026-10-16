@@ -262,16 +262,76 @@ async fn harness_call(
                 "harness_usage"
             );
             let clamp = |n: u64| n.min(i32::MAX as u64) as u32;
-            crate::usage::record_harness(
-                state.db.clone(),
-                turn.node.clone(),
-                model,
-                kind,
-                user.to_string(),
-                clamp(prompt_tokens),
-                clamp(completion_tokens),
-            );
-            json!({})
+            // A task's loop (i83 G): the row carries the task id and the
+            // tokens count against the task, before the driver's next
+            // boundary check reads them. Only the turn's own task; anything
+            // else is still recorded, just not charged to a task.
+            let task = match task_id.as_deref() {
+                Some(id) => turn_task(&state, id, conv, user).await.ok(),
+                None => None,
+            };
+            match task {
+                Some(task) => {
+                    let u = crate::usage::TaskUsage {
+                        node_id: Some(turn.node.clone()),
+                        backend: format!("harness:{kind}"),
+                        model,
+                        source: crate::usage::HARNESS_SOURCE,
+                        username: user.to_string(),
+                        harness_kind: Some(kind),
+                        task_id: task.id.clone(),
+                        prompt_tokens: clamp(prompt_tokens),
+                        completion_tokens: clamp(completion_tokens),
+                    };
+                    let spent = crate::task_budget::account(&state.db, &u).await.map_err(|e| AppError::Internal(e.to_string()))?;
+                    json!({"tokens_spent": spent})
+                }
+                None => {
+                    crate::usage::record_harness(
+                        state.db.clone(),
+                        turn.node.clone(),
+                        model,
+                        kind,
+                        user.to_string(),
+                        clamp(prompt_tokens),
+                        clamp(completion_tokens),
+                    );
+                    json!({})
+                }
+            }
+        }
+        HarnessOp::BudgetCheck { task_id } => {
+            let task = turn_task(&state, &task_id, conv, user).await?;
+            let check = crate::task_budget::check(&state, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?;
+            serde_json::to_value(check).map_err(|e| AppError::Internal(e.to_string()))?
+        }
+        HarnessOp::TaskUsage { task_id, prompt_tokens, completion_tokens, model, backend } => {
+            // A native loop on a node: it ran on this token's node, never on
+            // a cloud model (those run on the controller), and is not a
+            // foreign kind (that is the `usage` op).
+            let task = turn_task(&state, &task_id, conv, user).await?;
+            if backend.starts_with("cloud-") || backend.starts_with("harness:") {
+                return Err(AppError::BadRequest(format!("harness rail: backend {backend:?} is not a node backend")).into());
+            }
+            let clamp = |n: u64| n.min(i32::MAX as u64) as u32;
+            let u = crate::usage::TaskUsage {
+                node_id: Some(turn.node.clone()),
+                backend: if backend.trim().is_empty() { "unknown".into() } else { backend },
+                model: if model.trim().is_empty() { "unknown".into() } else { model },
+                source: crate::usage::TASK_SOURCE,
+                username: user.to_string(),
+                harness_kind: None,
+                task_id: task.id.clone(),
+                prompt_tokens: clamp(prompt_tokens),
+                completion_tokens: clamp(completion_tokens),
+            };
+            let spent = crate::task_budget::account(&state.db, &u).await.map_err(|e| AppError::Internal(e.to_string()))?;
+            json!({"tokens_spent": spent})
+        }
+        HarnessOp::TaskAsk { task_id, question } => {
+            let task = turn_task(&state, &task_id, conv, user).await?;
+            crate::task_budget::ask(&state, &task, &question).await.map_err(AppError::from)?;
+            json!({"asked": true})
         }
         HarnessOp::TaskDone { task_id, result, failed } => {
             // The same ownership rule as the checkpoint: this token's
@@ -331,6 +391,14 @@ async fn harness_call(
         obj.insert("ok".into(), json!(true));
     }
     Ok(Json(body))
+}
+
+/// The task a rail op names, if it is this turn's: same conversation, same
+/// person. Anything else is refused — a token reaches only its own task.
+async fn turn_task(state: &AppState, task_id: &str, conv: &str, user: &str) -> Result<crate::tasks::Task, AppError> {
+    let task = crate::tasks::get(&state.db, task_id).await.map_err(|e| AppError::Internal(e.to_string()))?;
+    task.filter(|t| t.conversation_id == conv && t.owner.as_deref() == Some(user))
+        .ok_or_else(|| AppError::Forbidden("harness rail: that task is not this turn's".into()))
 }
 
 /// How long a door key may live: until the turn's token expires, and never

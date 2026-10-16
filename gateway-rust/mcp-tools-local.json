@@ -4519,7 +4519,7 @@
               }
             ],
             "default": null,
-            "description": "File path, URL, glob, or directory to ingest",
+            "description": "ONE file already on the server, inside a directory an operator allowed (tools.allowed_paths or a watched folder); symlinks are followed and the service's own secrets/config are never allowed. URLs, directories and globs are refused: to ingest a web page or pasted content, send it as `text`.",
             "title": "Source"
           },
           "text": {
@@ -4532,7 +4532,7 @@
               }
             ],
             "default": null,
-            "description": "Raw text to ingest directly",
+            "description": "Raw text to ingest directly (stored as text, never read as a path)",
             "title": "Text"
           },
           "title": {

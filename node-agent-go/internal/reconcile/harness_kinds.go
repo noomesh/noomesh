@@ -51,9 +51,9 @@ var (
 	// harnessKindTable is the table in declared order (`noo` first).
 	harnessKindTable []harnessKind
 	// harnessKinds is kind → the node chat backend types that serve its
-	// wire. `noo` speaks every backend's wire; Claude Code and Copilot CLI
-	// run on every backend through the harness's loopback translator;
-	// Codex CLI needs OpenAI's Responses API, which has no translator yet.
+	// wire. `noo` speaks every backend's wire; Claude Code, Copilot CLI and
+	// Codex CLI run on every backend through the harness's loopback
+	// translator (Anthropic Messages, OpenAI chat, OpenAI Responses).
 	harnessKinds map[string][]string
 	// harnessTelemetryOff is kind → the vendor telemetry switches its
 	// runner must launch the CLI with (docs/security/telemetry.md, "Agent

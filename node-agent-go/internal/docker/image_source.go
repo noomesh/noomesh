@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -337,4 +338,145 @@ func (c *Client) registryPull(ctx context.Context, ref string) error {
 		return fmt.Errorf("registry pull reported: %s", strings.TrimSpace(lastLine(out)))
 	}
 	return nil
+}
+
+// ImagePullParallelismEnv overrides imagePullParallelism. "1" disables the
+// concurrency (pulls run one after another, as before the prefetch existed).
+const ImagePullParallelismEnv = "NOO_IMAGE_PULL_PARALLELISM"
+
+// imagePullParallelism is how many image tars one prefetch pulls at once.
+// It is also the disk bound: each worker stages at most one tar at a time
+// (PullImageArtifact removes it after the load), so a node never holds more
+// than this many multi-GB tars in its staging dir.
+const imagePullParallelism = 2
+
+// imagePullParallelismNow reads ImagePullParallelismEnv. Unset, empty,
+// non-numeric or < 1 → the default (a typo must not turn the prefetch into
+// something other than the documented bound); logged once per bad value.
+func imagePullParallelismNow() int {
+	v := strings.TrimSpace(os.Getenv(ImagePullParallelismEnv))
+	if v == "" {
+		return imagePullParallelism
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		slog.Warn("ignoring "+ImagePullParallelismEnv+"; using the default",
+			"value", v, "default", imagePullParallelism)
+		return imagePullParallelism
+	}
+	return n
+}
+
+// PrefetchResult is what one PrefetchImages call did, for the caller's log.
+type PrefetchResult struct {
+	Wanted  int // distinct refs asked for
+	Pulled  int // refs EnsureImage resolved
+	Failed  int // refs EnsureImage refused (each is logged; the start path reports it again)
+	Skipped int // refs already local
+}
+
+// PrefetchImages makes every ref in refs available locally, concurrently
+// (bounded by imagePullParallelismNow), BEFORE the caller's ordered start
+// loop. It exists because the start loop calls EnsureImage per placement,
+// so a node placed with several backends after a release pulled their
+// multi-GB tars one after another.
+//
+// What it does NOT do: decide anything. A ref already local is left to its
+// start path (which still runs the full resolveImage comparison against the
+// controller's manifest); a pull that fails is logged and counted, never
+// returned as an error, because the placement's own start path reports the
+// same failure through its own error text and refusal record. When the
+// controller or the rail is ABSENT, OLD or failing, the pull errors exactly
+// as EnsureImage would and the start path repeats it.
+//
+// Two placements on one image produce one pull (refs are deduplicated here;
+// PullImageArtifact additionally serialises on a per-ref lock so a start
+// path overlapping this prefetch cannot write the same staged .partial).
+func (c *Client) PrefetchImages(ctx context.Context, refs []string, placements int) PrefetchResult {
+	seen := map[string]bool{}
+	var res PrefetchResult
+	var missing []string
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		res.Wanted++
+		if _, ok := imageLocalID(ctx, c, ref); ok {
+			res.Skipped++
+			continue
+		}
+		missing = append(missing, ref)
+	}
+	if len(missing) == 0 {
+		return res
+	}
+	par := imagePullParallelismNow()
+	if par > len(missing) {
+		par = len(missing)
+	}
+	slog.Info(fmt.Sprintf("prefetching %d image(s) for %d placement(s) (parallelism %d)",
+		len(missing), placements, par), "images", missing)
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		jobs = make(chan string)
+	)
+	for i := 0; i < par; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ref := range jobs {
+				err := ensureImageFn(ctx, c, ref)
+				mu.Lock()
+				if err != nil {
+					res.Failed++
+				} else {
+					res.Pulled++
+				}
+				mu.Unlock()
+				if err != nil {
+					slog.Warn("image.prefetch_failed: the placement's start will report it",
+						"image", ref, "err", err)
+				}
+			}
+		}()
+	}
+	for _, ref := range missing {
+		jobs <- ref
+	}
+	close(jobs)
+	wg.Wait()
+	return res
+}
+
+// BackendImageRef is the image StartBackend will use for backend, so the
+// reconciler can prefetch it. It mirrors the image choices at the top of
+// StartBackendSDK (CPU image on a node without NVIDIA, the controller's
+// override, ${VAR} substitution). It returns "" when it cannot tell (unknown
+// backend) or when StartBackendSDK would swap in a locally-built hardened
+// llama.cpp (present locally, so nothing to fetch). A wrong answer here only
+// costs a missed or wasted prefetch: the start path decides by itself.
+func BackendImageRef(backend, override string) string {
+	spec, ok := backendSpecs[backend]
+	if !ok {
+		return ""
+	}
+	if spec.CPUImage != "" && !hasNvidiaGPU() {
+		spec.Image = spec.CPUImage
+	}
+	if override != "" {
+		spec.Image = override
+	} else {
+		spec.Image = resolveEnv(spec.Image)
+	}
+	if backend == "llamacpp" && spec.Image == "ghcr.io/ggml-org/llama.cpp:server" {
+		// StartBackendSDK prefers a locally-present hardened build; if one
+		// is here the upstream image is not needed, and if none is, the
+		// start path pulls the upstream one itself.
+		return ""
+	}
+	return spec.Image
 }

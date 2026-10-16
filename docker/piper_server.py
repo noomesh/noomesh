@@ -7,7 +7,7 @@ This is the compose `piper` service (profile "voice") — the first concrete
 provider behind the gateway's generic TTS layer (gateway-rust/src/tts_client.rs,
 wire format "openai"). Deliberately tiny and auditable instead of pulling a
 full model-management stack: two synthesis endpoints, one inventory, one
-health probe, one voice cache. Twin of docker/whisper_server.py.
+health probe, no downloads. Twin of docker/whisper_server.py.
 
 Endpoints:
   POST /v1/audio/speech   — json: {model, input, voice, speed,
@@ -20,10 +20,13 @@ Endpoints:
   GET  /v1/models         — loaded/loadable voices (openai health probe)
   GET  /health            — liveness
 
-Voice names are piper voice ids (e.g. en_US-lessac-medium). A voice that is
-not in the cache is downloaded from the piper-voices HuggingFace repo on
-first use. "tts-1"/"tts-1-hd"/"default" (the OpenAI cloud model names) map to
-PIPER_VOICE so OpenAI-shaped clients work unchanged.
+Voice names are piper voice ids (e.g. en_US-lessac-medium). Voices are
+loaded ONLY from the controller's staged files (i105): compose mounts
+`<MODELS_DIR>/voice/piper` read-only at PIPER_VOICE_DIR and sets
+HF_HUB_OFFLINE=1. A voice that is not staged is a 404 naming
+`noo models pull piper:<voice>` (docker/voice_local.py); this server never
+calls piper's download_voice. "tts-1"/"tts-1-hd"/"default" (the OpenAI cloud
+model names) map to PIPER_VOICE so OpenAI-shaped clients work unchanged.
 
 Only WAV/PCM come out: piper synthesises PCM and this image ships no mp3
 encoder. Clients asking for another response_format get 400 rather than a
@@ -31,7 +34,7 @@ mislabelled body.
 
 Env:
   PIPER_VOICE      default voice (default: en_US-lessac-medium) — preloaded
-  PIPER_VOICE_DIR  voice cache dir (default: /voices) — mount a volume
+  PIPER_VOICE_DIR  staged voices, read-only (default: /voices)
   PIPER_PRELOAD    set to "0" to skip startup preload (load on first request)
   PIPER_USE_CUDA   set to "1" to run onnxruntime on GPU (needs a CUDA image)
 """
@@ -49,7 +52,8 @@ from typing import Optional
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from piper import PiperVoice, SynthesisConfig
-from piper.download_voices import download_voice
+
+from voice_local import NotStaged, piper_voice_files
 
 DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_US-lessac-medium")
 VOICE_DIR = Path(os.environ.get("PIPER_VOICE_DIR", "/voices"))
@@ -71,15 +75,11 @@ def _resolve_voice_name(requested: Optional[str]) -> str:
 
 
 def _get_voice(name: str) -> PiperVoice:
-    """Load (downloading on first use) a piper voice, cached in-process."""
+    """Load a staged piper voice, cached in-process. Raises NotStaged."""
     with _lock:
         if name not in _voices:
-            VOICE_DIR.mkdir(parents=True, exist_ok=True)
-            model_path = VOICE_DIR / f"{name}.onnx"
-            if not model_path.exists():
-                # Network fetch from the piper-voices repo. Raises on an
-                # unknown voice id — surfaced as 404 by the callers.
-                download_voice(name, VOICE_DIR)
+            model_path, _config = piper_voice_files(VOICE_DIR, name)
+            # The config is the `<voice>.onnx.json` beside it (piper's default).
             _voices[name] = PiperVoice.load(model_path, use_cuda=USE_CUDA)
         return _voices[name]
 
@@ -125,7 +125,9 @@ def _synthesize_wav(text: str, voice_name: str, speed: float) -> bytes:
     computed it (src/noomesh/voice/tts.py)."""
     try:
         voice = _get_voice(voice_name)
-    except Exception as e:  # unknown voice / download failure
+    except NotStaged as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:  # a staged voice that will not load
         raise HTTPException(status_code=404, detail=f"voice {voice_name!r} not available: {e}")
 
     syn = SynthesisConfig(length_scale=(1.0 / speed) if speed > 0 else 1.0)
@@ -234,6 +236,6 @@ if os.environ.get("PIPER_PRELOAD", "1") != "0":  # pragma: no cover
     try:
         _get_voice(DEFAULT_VOICE)
     except Exception as e:
-        # Don't crash-loop on a cold cache with no network — the first
-        # request retries the download.
+        # Don't crash-loop on a voice that is not staged yet — the first
+        # request after `noo models pull piper:<voice>` loads it.
         print(f"piper preload of {DEFAULT_VOICE!r} failed (will retry on demand): {e}", flush=True)

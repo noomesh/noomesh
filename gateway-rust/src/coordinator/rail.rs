@@ -93,6 +93,16 @@ pub enum HarnessOp {
     /// tools with: bound to the token's person, expiring with the turn.
     DoorKey,
     DoorKeyRevoke { key_id: String },
+    // token budgets (i83 G)
+    /// The loop-boundary switch: may the task's next loop start? Asked
+    /// BEFORE a loop, never inside one; a no parks the task.
+    BudgetCheck { task_id: String },
+    /// A native loop's tokens, run on a node: charged to the task and to the
+    /// token's user on the token's node, under the backend that served it.
+    TaskUsage { task_id: String, prompt_tokens: u64, completion_tokens: u64, model: String, backend: String },
+    /// A loop's question to its owner: the task parks at the next boundary
+    /// and the owner's answer starts a new loop.
+    TaskAsk { task_id: String, question: String },
 }
 
 impl HarnessOp {
@@ -137,6 +147,9 @@ impl HarnessOp {
         "task_done",
         "door_key",
         "door_key_revoke",
+        "budget_check",
+        "task_usage",
+        "task_ask",
     ];
 
     /// The op's wire name, for audit rows and logs.
@@ -180,6 +193,9 @@ impl HarnessOp {
             HarnessOp::TaskDone { .. } => "task_done",
             HarnessOp::DoorKey => "door_key",
             HarnessOp::DoorKeyRevoke { .. } => "door_key_revoke",
+            HarnessOp::BudgetCheck { .. } => "budget_check",
+            HarnessOp::TaskUsage { .. } => "task_usage",
+            HarnessOp::TaskAsk { .. } => "task_ask",
         }
     }
 }
@@ -201,6 +217,9 @@ mod tests {
             HarnessOp::TaskDone { task_id: "t1".into(), result: "shipped".into(), failed: false },
             HarnessOp::DoorKey,
             HarnessOp::DoorKeyRevoke { key_id: "k1".into() },
+            HarnessOp::BudgetCheck { task_id: "t1".into() },
+            HarnessOp::TaskUsage { task_id: "t1".into(), prompt_tokens: 9, completion_tokens: 3, model: "qwen".into(), backend: "vllm".into() },
+            HarnessOp::TaskAsk { task_id: "t1".into(), question: "eu or us?".into() },
         ];
         for op in ops {
             let wire = serde_json::to_value(&op).unwrap();
@@ -254,6 +273,9 @@ mod tests {
             HarnessOp::TaskDone { task_id: String::new(), result: String::new(), failed: false },
             HarnessOp::DoorKey,
             HarnessOp::DoorKeyRevoke { key_id: String::new() },
+            HarnessOp::BudgetCheck { task_id: String::new() },
+            HarnessOp::TaskUsage { task_id: String::new(), prompt_tokens: 0, completion_tokens: 0, model: String::new(), backend: String::new() },
+            HarnessOp::TaskAsk { task_id: String::new(), question: String::new() },
         ]
     }
 

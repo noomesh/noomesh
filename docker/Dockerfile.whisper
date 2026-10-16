@@ -45,18 +45,35 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
     DO_NOT_TRACK=1
 
 WORKDIR /app
+COPY docker/voice_local.py /app/voice_local.py
 COPY docker/whisper_server.py /app/whisper_server.py
 
-# Model cache on a volume so pulls survive container recreation.
-ENV HF_HOME=/models \
+# Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
+# rest of the stack runs as. Nothing here writes a model: the controller
+# stages them (`noo models pull whisper:<size>`, the CLI's voice_models.rs)
+# and compose mounts `<MODELS_DIR>/voice/whisper` READ-ONLY at /models; the
+# server loads `/models/<name>` with local_files_only (docker/voice_local.py)
+# and runs offline (HF_HUB_OFFLINE=1). The only run-time write is one
+# tempfile per request in /tmp (already 1777). /models is just the mount
+# point, root-owned and read-only to nonroot. The service key is handed to
+# this uid (noo-cli pki.rs SERVICE_KEY_READERS).
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
+        --shell /usr/sbin/nologin nonroot \
+    && mkdir -p /models
+
+ENV WHISPER_MODEL_DIR=/models \
     WHISPER_MODEL=base \
-    WHISPER_DEVICE=auto
-VOLUME /models
+    WHISPER_DEVICE=auto \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 
 # curl-less healthcheck (slim image): python stdlib probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+USER nonroot
 
 CMD ["uvicorn", "whisper_server:app", "--host", "0.0.0.0", "--port", "8000"]

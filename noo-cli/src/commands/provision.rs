@@ -952,6 +952,12 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                             vars.get("node_agent_port").cloned().unwrap_or_else(|| "8081".to_string())));
                         hvars.insert("noo_harness_max_turns", String::from("2"));
                         hvars.insert("harness_log", String::from("noo_gateway=info"));
+                        // The harness's own copy of the node pair (i119):
+                        // the applier installs it root:noo-harness 0640 on
+                        // Linux; a Mac runs both as one user, same files.
+                        let (hcert, hkey) = harness_tls_paths(darwin, &vars);
+                        hvars.insert("harness_tls_cert", hcert);
+                        hvars.insert("harness_tls_key", hkey);
                         let henv = render_env_template(&htmpl, &hvars)
                             .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "harness_env", &e, None));
                         nnote(&format!("bundle carries the harness ({asset}, {})", human_bytes(bytes.len())));
@@ -1012,9 +1018,8 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             {
                 Ok(vf) => {
                     let size: usize = vf.iter().filter(|(k, _)| !k.ends_with("-manifest")).map(|(_, b)| b.len()).sum();
-                    nnote(&format!("bundle carries the {} vendor CLI{} ({})",
+                    nnote(&format!("bundle carries the {} vendor CLI ({})",
                         kind.as_deref().unwrap_or("?"),
-                        if vf.iter().any(|(k, _)| *k == "vendor-runtime") { " and its runtime" } else { "" },
                         human_bytes(size)));
                     files.extend(vf);
                 }
@@ -1952,11 +1957,9 @@ fn drop_proven_binaries(
         files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
         notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
     }
-    // The vendor CLI and its runtime go as ONE group, manifests included:
-    // the wrapper names both versions, so carrying one without the other
-    // would rewrite it against a half the node may have pruned.
+    // The vendor CLI goes with its manifest.
     let vendor: Vec<(&str, String)> = files.iter()
-        .filter(|(k, _)| matches!(*k, "vendor-cli" | "vendor-runtime"))
+        .filter(|(k, _)| *k == "vendor-cli")
         .map(|(k, b)| (*k, sha256_hex(b))).collect();
     if !vendor.is_empty() && vendor.iter().all(|(k, sha)| node_runs_asset(status, k, sha)) {
         files.retain(|(k, _)| !k.starts_with("vendor-"));
@@ -2960,7 +2963,7 @@ pub(crate) fn stage_bundle_pull(
 }
 
 
-fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<u8>, String> {
     let cert_path = work.join("birth.crt");
     std::fs::write(&cert_path, cert_pem).map_err(|e| e.to_string())?;
     let out = work.join("bundle.der");
@@ -2982,8 +2985,20 @@ fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<
 const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
 
 /// "noo-cli-v0.6.5+abc1234" -> (0, 6, 5); anything else -> None.
+/// The release a node's fetcher came from, from the version its agent
+/// reports. Three shapes are live: a Mac reports its CLI
+/// (`noo-cli-v0.6.4+ff91728`), a Linux agent reports its stack tag
+/// (`stack-v0.6.4+<40-hex>`), and a bare `v0.6.4` is accepted for builds
+/// that report the tag alone. The stack tag stands for the fetcher on Linux
+/// because the fetcher rides EVERY Linux bundle next to the agent binary, and
+/// stack and CLI tags move in lock-step since 0.6.0, so an agent at stack
+/// X.Y.Z was installed by a bundle that also installed fetcher X.Y.Z or newer.
+/// Anything else (bare digits, a missing patch, a fourth field) is unreadable.
 fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
-    let rest = app_version.split("noo-cli-v").nth(1)?;
+    let v = app_version.trim();
+    let rest = v.strip_prefix("noo-cli-v")
+        .or_else(|| v.strip_prefix("stack-v"))
+        .or_else(|| v.strip_prefix('v'))?;
     let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
     let [maj, min, pat] = nums[..] else { return None };
     Some((maj, min, pat))
@@ -3143,7 +3158,7 @@ pub(crate) fn cli_asset_for(os: &str, arch: &str) -> Option<String> {
 /// asset within this process: a fleet restage during an outage asks once,
 /// not once per node. The bytes ride the CA-signed bundle, as cached bytes
 /// always have.
-fn cached_release_asset(g: &Globals, root: &Path, asset: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn cached_release_asset(g: &Globals, root: &Path, asset: &str) -> Result<Vec<u8>, String> {
     static FAILED: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
     let cached = cli_asset_cache_dir(root).join(asset);
     if let Some(b) = std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
@@ -3199,7 +3214,7 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
     Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
 }
 
-fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
+pub(crate) fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
@@ -3629,13 +3644,28 @@ pub(crate) const SLOW_TIMER_WARN_SECS: u64 = 150;
 /// round (it can still resolve in a later one); it is never counted done.
 /// Results come back in the order of `pending`.
 pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd)> {
+    wait_applied_via(g, pending, budget_secs, every_secs, &|n| format!("/api/cluster/provision-bundle/{n}/status"), "node")
+}
+
+/// The combined wait over any status route of the provision-bundle SHAPE
+/// (`sha256`, `fetched_at`, `applied_sha`, `apply_rc`, `apply_msg`): the
+/// nodes' route, or the kiosk seats' (`/api/cluster/seats/<seat>/status`,
+/// i77). One wait, one judgement (`judge_bundle_status`), two registries.
+pub(crate) fn wait_applied_via(
+    g: &Globals,
+    pending: &[PendingApply],
+    budget_secs: u64,
+    every_secs: u64,
+    status_path: &dyn Fn(&str) -> String,
+    noun: &str,
+) -> Vec<(String, ApplyEnd)> {
     let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
     let mut fetched = vec![false; pending.len()];
     let mut slow_warned = vec![false; pending.len()];
     let started = std::time::Instant::now();
     let names: Vec<&str> = pending.iter().map(|p| p.node.as_str()).collect();
     let mut poll = ui::Poll::start(&format!(
-        "waiting for {} node(s) to pull, apply and report (up to {}m): {}",
+        "waiting for {} {noun}(s) to pull, apply and report (up to {}m): {}",
         pending.len(), budget_secs / 60, names.join(", ")));
     // Printing over a live spinner line would leave its tail behind.
     let say = |line: String| {
@@ -3646,8 +3676,7 @@ pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_s
         let elapsed = started.elapsed().as_secs();
         for (i, p) in pending.iter().enumerate() {
             if ends[i].is_some() { continue; }
-            let st = crate::http::get_json_opt(
-                g, &format!("/api/cluster/provision-bundle/{}/status", p.node), true, 10);
+            let st = crate::http::get_json_opt(g, &status_path(&p.node), true, 10);
             if let Some(st) = &st {
                 match judge_bundle_status(st, &p.sha) {
                     BundleVerdict::Applied { rc, msg } => {
@@ -3946,6 +3975,21 @@ agent-binary applier fetcher agent-unit verified-by: signing-key ca-lane: retire
     }
 }
 
+/// Where the harness reads its TLS pair (`harness_tls_cert` /
+/// `harness_tls_key` in `noo-harness.env.tmpl`): its OWN copy on Linux
+/// (`scripts/noo-apply.sh`, harness-pair), the agent's files on a Mac.
+pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> (String, String) {
+    if darwin {
+        (vars.get("na_tls_cert").cloned().unwrap_or_default(), vars.get("na_tls_key").cloned().unwrap_or_default())
+    } else {
+        (HARNESS_TLS_CERT.to_string(), HARNESS_TLS_KEY.to_string())
+    }
+}
+
+/// The harness's own copy of the node pair on a Linux node.
+pub(crate) const HARNESS_TLS_CERT: &str = "/etc/noo/pki/harness/node.crt";
+pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
+
 #[cfg(test)]
 mod tests {
     // The controller must never stage a bundle the node's applier cannot
@@ -3960,8 +4004,21 @@ mod tests {
         for v in ["noo-cli-v0.6.5", "noo-cli-v0.6.5+7b00c90", "noo-cli-v0.6.6", "noo-cli-v0.7.0", "noo-cli-v1.0.0"] {
             assert!(bundle_gzip_gate(v).is_ok(), "gzip withheld from {v}");
         }
+        // The Linux agents report the stack tag (live, 0.6.5 roll on pop-os):
+        // `stack-v<semver>+<40-hex>`. And a bare `v<semver>`.
+        let sha = "ff917285b5cb2f43bc2b249393af91dffcf0c298";
+        for v in [format!("stack-v0.6.4+{sha}"), "stack-v0.6.4".into(), "v0.6.4".into(), "v0.6.4+abc".into()] {
+            assert!(bundle_gzip_gate(&v).is_err(), "gzip sent to {v}");
+            assert!(!bundle_gzip_gate(&v).unwrap_err().contains("unreadable"), "{v} must parse: {:?}", bundle_gzip_gate(&v));
+        }
+        for v in [format!("stack-v0.6.5+{sha}"), "stack-v0.6.5".into(), "stack-v0.7.0".into(), "v0.6.5".into(), "v1.0.0+abc".into()] {
+            assert!(bundle_gzip_gate(&v).is_ok(), "gzip withheld from {v}");
+        }
+        assert_eq!(parse_cli_version(&format!("stack-v0.6.4+{sha}")), Some((0, 6, 4)));
+        assert_eq!(parse_cli_version("noo-cli-v0.6.4+ff91728"), Some((0, 6, 4)));
+        assert_eq!(parse_cli_version("v0.6.5"), Some((0, 6, 5)));
         // Unknown / unparseable: NO (a wrong yes bricks the apply).
-        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1"] {
+        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1", "stack-v0.6", "stack-vx.y.z", "xstack-v0.6.5", "vv0.6.5"] {
             assert!(bundle_gzip_gate(v).is_err(), "gzip sent to unreadable {v:?}");
         }
     }
@@ -4307,9 +4364,12 @@ mod tests {
         v.insert("noo_harness_model_url", "V_model_url".into());
         v.insert("noo_harness_max_turns", "V_max_turns".into());
         v.insert("harness_log", "V_log".into());
+        let (hc, hk) = harness_tls_paths(false, &v);
+        v.insert("harness_tls_cert", hc);
+        v.insert("harness_tls_key", hk);
         let out = render_env_template(&tmpl, &v).unwrap();
         for line in ["NODE_ID=V_na_node_id", "NOO_GATEWAY_URL=V_controller_url", "NATS_URL=V_nats_url",
-                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=V_na_tls_cert", "NOO_TLS_KEY=V_na_tls_key",
+                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=/etc/noo/pki/harness/node.crt", "NOO_TLS_KEY=/etc/noo/pki/harness/node.key",
                      "NOO_HARNESS_MODEL_URL=V_model_url", "NOO_HARNESS_MAX_TURNS=V_max_turns", "RUST_LOG=V_log"] {
             assert!(out.contains(line), "harness env lacks {line}:\n{out}");
         }
@@ -4317,6 +4377,9 @@ mod tests {
         // leaves it empty on purpose, never absent.
         assert!(out.contains("NATS_NODE_USER=\n"), "{out}");
         assert!(!out.contains("default("), "a default survived into the rendered env: {out}");
+        // i119: never the agent's pair on Linux; the agent's files on a Mac.
+        assert!(!out.contains("/pki/nodes/"), "{out}");
+        assert_eq!(harness_tls_paths(true, &v), ("V_na_tls_cert".to_string(), "V_na_tls_key".to_string()));
     }
 
     /// The REAL template must render with the exact vars cluster_provision
@@ -5143,23 +5206,21 @@ mod local_lane_tests {
     }
 
     #[test]
-    fn the_vendor_cli_and_runtime_drop_only_together_with_their_manifests() {
+    fn the_vendor_cli_drops_only_with_its_manifest() {
         let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
             ("agent-env", b"E".to_vec()), ("vendor-cli", b"cli".to_vec()), ("vendor-cli-manifest", b"{}".to_vec()),
-            ("vendor-runtime", b"rt".to_vec()), ("vendor-runtime-manifest", b"{}".to_vec()),
         ] };
         fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
-        let both = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={} vendor-runtime={}",
-            sha256_hex(b"cli"), sha256_hex(b"rt")));
+        let proven = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={}", sha256_hex(b"cli")));
         let mut f = mk();
-        let notes = drop_proven_binaries(&mut f, Some(&both), false, false);
+        let notes = drop_proven_binaries(&mut f, Some(&proven), false, false);
         assert_eq!(names(&f), ["agent-env"], "{notes:?}");
         assert!(notes.iter().any(|n| n.starts_with("vendor CLI: unchanged")));
-        // Only the CLI proven (the runtime moved): the whole group rides.
-        let half = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"cli")));
+        // A CLI the node did not report running: the group rides.
+        let other = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"other")));
         let mut f = mk();
-        drop_proven_binaries(&mut f, Some(&half), false, false);
-        assert_eq!(f.len(), 5);
+        drop_proven_binaries(&mut f, Some(&other), false, false);
+        assert_eq!(f.len(), 3);
     }
 
     #[test]
@@ -5280,5 +5341,74 @@ mod upgrade_stages_every_node_before_waiting_tests {
     fn the_combined_wait_polls_every_five_seconds() {
         let up = include_str!("upgrade.rs");
         assert!(up.contains("const NODES_APPLY_POLL_SECS: u64 = 5;"));
+    }
+}
+
+/// What a same-uid process on a Mac could read: the environment the run
+/// scripts hand to the agent and the harness. After the applier's
+/// conversion it holds `NAME_FILE` pointers into `~/noomesh/…` (which the
+/// harness jail denies) and no secret value — proved by running the real
+/// runner with `env` in place of the binary.
+#[cfg(test)]
+mod mac_runner_env_tests {
+    use super::{darwin_run_agent, darwin_run_harness};
+    use crate::commands::agent_secret_files::{
+        converge, converge_harness, AGENT_SECRET_CAPABILITY, AGENT_SECRET_KEYS, HARNESS_SECRET_CAPABILITY,
+        HARNESS_SECRET_KEYS,
+    };
+
+    const VALUES: &[(&str, &str)] = &[
+        ("NOO_NODE_AGENT_TOKEN", "tok-mac-1234"),
+        ("NOO_CLUSTER_SECRET", "cluster-mac-5678"),
+        ("NATS_NODE_PASSWORD", "nats-mac-9012"),
+    ];
+
+    fn exported(script: &str, exec_line: &str, home: &std::path::Path) -> String {
+        let script = script.replace(exec_line, "exec /usr/bin/env");
+        assert!(script.contains("exec /usr/bin/env"), "the exec line moved: {script}");
+        let out = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn the_mac_runners_export_pointers_and_no_secret_value() {
+        let home = std::env::temp_dir().join(format!("noo-mac-runner-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let base = home.join("noomesh");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let mut env = String::from("NODE_ID=host6\nNATS_NODE_USER=node-host6\nNOO_TLS_KEY=\"$HOME/noomesh/pki/node.key\"\n");
+        for (k, v) in VALUES {
+            env.push_str(&format!("{k}={v}\n"));
+        }
+        std::fs::write(base.join("agent.env"), &env).unwrap();
+        std::fs::write(base.join("harness.env"), &env).unwrap();
+        std::fs::write(base.join("bin/noo-node-agent"), format!("\u{cf}bin {AGENT_SECRET_CAPABILITY} x")).unwrap();
+        std::fs::write(base.join("bin/noo-gateway"), format!("\u{cf}bin {HARNESS_SECRET_CAPABILITY} x")).unwrap();
+        assert!(converge(&base.join("agent.env"), &base.join("secrets"), &base.join("bin/noo-node-agent")).unwrap());
+        assert!(converge_harness(&base.join("harness.env"), &base.join("harness-secrets"), &base.join("bin/noo-gateway")).unwrap());
+        for (script, exec, keys, dir) in [
+            (darwin_run_agent(), "exec \"$HOME/noomesh/bin/noo-node-agent\"", AGENT_SECRET_KEYS, "secrets"),
+            (darwin_run_harness(), "exec \"$HOME/noomesh/bin/noo-gateway\" harness", HARNESS_SECRET_KEYS, "harness-secrets"),
+        ] {
+            let got = exported(&script, exec, &home);
+            for (k, v) in VALUES {
+                assert!(!got.contains(v), "{k}'s value is in the {dir} runner's environment:\n{got}");
+            }
+            for k in keys {
+                let want = format!("{k}_FILE={}", base.join(dir).join(k).display());
+                assert!(got.lines().any(|l| l == want), "{want} missing:\n{got}");
+                assert!(!got.lines().any(|l| l.starts_with(&format!("{k}="))), "{k} plain:\n{got}");
+            }
+            assert!(got.lines().any(|l| l == "NODE_ID=host6"));
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

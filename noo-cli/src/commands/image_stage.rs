@@ -323,8 +323,13 @@ pub(crate) fn lock_tags_to_prune(idx: &StagedIndex, current: &str) -> Vec<String
     others.into_iter().skip(1).map(|(t, _)| t.to_string()).collect()
 }
 
+/// Serialises the index's read-modify-write: `stage_lock` records from several
+/// worker threads (a lost update would drop a staged image from the index).
+static INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record a staged image (read-modify-write of the index).
 pub(crate) fn record_staged(rec: StagedRecord, release: Option<Release>) -> Result<(), String> {
+    let _held = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = images_store_dir();
     let mut idx = read_index(&dir);
     if release.is_some() {
@@ -344,7 +349,16 @@ type FakeDocker = Box<dyn FnMut(&[&str]) -> Result<String, String>>;
 thread_local! {
     /// Tests script the daemon here: every `docker` invocation goes to it.
     static FAKE_DOCKER: std::cell::RefCell<Option<FakeDocker>> = const { std::cell::RefCell::new(None) };
+    /// Pool size for a test that wants `stage_lock` to run its workers
+    /// (default: 1, serial, on the test's own thread).
+    static PARALLELISM_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// A scripted daemon the pool's worker threads may all call: `stage_lock`
+    /// installs a forwarder to it as each worker's FAKE_DOCKER.
+    static SHARED_FAKE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<SharedFake>>>> = const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+type SharedFake = Box<dyn FnMut(&[&str]) -> Result<String, String> + Send>;
 
 fn docker(args: &[&str]) -> Result<String, String> {
     #[cfg(test)]
@@ -522,7 +536,7 @@ fn save_tar(dir: &Path, tar: &str, save_args: &[&str], id: &str, g: &Globals) ->
     let sidecar = dir.join(format!("{tar}.imageid"));
     let kept = !id.is_empty() && path.is_file() && std::fs::read_to_string(&sidecar).unwrap_or_default().trim() == id;
     if kept && !g.json && !ui::quiet() {
-        println!("  {tar}: already staged (same image id)");
+        emit(Line::Text(format!("  {tar}: already staged (same image id)")));
     }
     if !kept {
         // The file NAME embeds the release tag, so across releases the name
@@ -536,11 +550,11 @@ fn save_tar(dir: &Path, tar: &str, save_args: &[&str], id: &str, g: &Globals) ->
         let reused = by_id && link_same_id_export(dir, tar, id);
         if reused {
             if !g.json && !ui::quiet() {
-                println!("  {tar}: already staged (same image id)");
+                emit(Line::Text(format!("  {tar}: already staged (same image id)")));
             }
         } else {
             if !g.json && !ui::quiet() {
-                println!("  exporting → {tar}");
+                emit(Line::Text(format!("  exporting → {tar}")));
             }
             let tmp = dir.join(format!("{tar}.exporting"));
             if let Err(e) = docker_save_gz(save_args, &tmp) {
@@ -567,7 +581,7 @@ fn save_tar(dir: &Path, tar: &str, save_args: &[&str], id: &str, g: &Globals) ->
             let _ = std::fs::remove_file(dir.join(format!("{stem}.imageid")));
             let _ = std::fs::remove_file(&old);
             if !g.json && !ui::quiet() {
-                println!("  removed the stale uncompressed {stem} (superseded by {tar})");
+                emit(Line::Text(format!("  removed the stale uncompressed {stem} (superseded by {tar})")));
             }
         }
     }
@@ -676,33 +690,162 @@ pub(crate) struct Summary {
     pub failed: Vec<String>,
 }
 
+impl Summary {
+    fn absorb(&mut self, r: Staged) {
+        match r {
+            Staged::Done(l) => self.staged.push(l),
+            Staged::Skipped(l) => self.skipped.push(l),
+            Staged::Failed(l) => self.failed.push(l),
+        }
+    }
+}
+
+/// Images exported at once by [`stage_lock`]. Each job is a registry pull plus
+/// a `docker save | gzip`: three overlap network and CPU without starving the
+/// controller's own services (it is also the build/roll host).
+/// `NOO_STAGE_PARALLELISM` overrides (read once; `1` is the old serial pass;
+/// unset, empty, zero or unparsable keeps this default).
+#[cfg_attr(test, allow(dead_code))]
+const STAGE_PARALLELISM: usize = 3;
+
+// Tests are serial unless one asks for the pool: the scripted daemon is
+// thread-local and invisible to worker threads (see SHARED_FAKE).
+#[cfg(test)]
+fn stage_parallelism() -> usize {
+    PARALLELISM_OVERRIDE.with(|p| p.get()).unwrap_or(1)
+}
+
+#[cfg(not(test))]
+fn stage_parallelism() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NOO_STAGE_PARALLELISM").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(STAGE_PARALLELISM)
+    })
+}
+
+/// One line a staging job would print.
+enum Line {
+    Text(String),
+    Step(String),
+}
+
+thread_local! {
+    /// While a pooled job runs, its lines collect here instead of printing, so
+    /// the caller prints them in lock order and jobs never interleave. None =
+    /// print as they happen (the serial pass, and every other caller).
+    static JOB_LOG: std::cell::RefCell<Option<Vec<Line>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn emit(line: Line) {
+    let line = JOB_LOG.with(|l| match l.borrow_mut().as_mut() {
+        Some(buf) => {
+            buf.push(line);
+            None
+        }
+        None => Some(line),
+    });
+    match line {
+        Some(Line::Text(t)) => println!("{t}"),
+        Some(Line::Step(t)) => ui::step(&t),
+        None => {}
+    }
+}
+
+type JobResult = (Vec<Line>, Vec<Staged>);
+
+enum Staged {
+    Done(String),
+    Skipped(String),
+    Failed(String),
+}
+
+/// Every arch of ONE lock image, in order, on the calling thread.
+fn stage_lock_image(g: &Globals, image: &str, digest: &str, tag: &str, arches: &[String], release: &Release) -> Vec<Staged> {
+    let mut out = Vec::new();
+    for arch in arches {
+        let label = format!("{image} ({arch})");
+        if !g.json {
+            emit(Line::Step(format!("staging {label}")));
+        }
+        out.push(match stage_image(g, image, arch, Some(digest), "lock") {
+            Ok(mut rec) => {
+                rec.release_tag = tag.to_string();
+                let tar = rec.tar.clone();
+                match record_staged(rec, Some(release.clone())) {
+                    Ok(()) => {
+                        prewarm(g, &tar);
+                        Staged::Done(label)
+                    }
+                    Err(e) => Staged::Failed(format!("{label}: {e}")),
+                }
+            }
+            Err(e) if e.starts_with(NO_VARIANT) => Staged::Skipped(format!("{label}: not published for {arch}")),
+            Err(e) => Staged::Failed(format!("{label}: {e}")),
+        });
+    }
+    out
+}
+
 /// Stage every (node-bound, unless `all`) lock image for every arch.
+///
+/// Up to [`stage_parallelism`] IMAGES run at once; the arches of one image run
+/// in order on one worker. That is deliberate: the same-arch path and the
+/// containerd foreign-arch path both `docker tag <digest-ref> <image>:<tag>`
+/// under ONE reference per image, so two arches of the same image in flight
+/// could race on that tag (and on the platform-specific pull behind it).
+/// Different images share no reference, and `save_tar`'s tmp+rename and
+/// `.imageid` sidecar are per tar name, so they cannot collide on files. The
+/// one shared file is the staged index, written under [`INDEX_LOCK`].
+///
+/// A failing job never cancels the others. Output of a pooled run is printed
+/// in lock order after every job finished (not interleaved); the serial pass
+/// (parallelism 1) prints as it goes, as it always did.
 pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arches: &[String], all: bool) -> Summary {
     let prefix = prefix.trim_end_matches('/');
     let mut sum = Summary::default();
     let dir = images_store_dir();
     let release = Release { prefix: prefix.to_string(), tag: tag.to_string() };
-    for row in parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, all)) {
-        let image = format!("{prefix}/{}:{tag}", row.name);
-        for arch in arches {
-            let label = format!("{image} ({arch})");
-            if !g.json {
-                ui::step(&format!("staging {label}"));
+    let rows: Vec<(String, String)> = parse_lock(lock)
+        .into_iter()
+        .filter(|r| stages_from_lock(&r.name, all))
+        .map(|r| (format!("{prefix}/{}:{tag}", r.name), r.digest))
+        .collect();
+    let workers = stage_parallelism().min(rows.len());
+    if workers <= 1 {
+        for (image, digest) in &rows {
+            for r in stage_lock_image(g, image, digest, tag, arches, &release) {
+                sum.absorb(r);
             }
-            match stage_image(g, &image, arch, Some(&row.digest), "lock") {
-                Ok(mut rec) => {
-                    rec.release_tag = tag.to_string();
-                    let tar = rec.tar.clone();
-                    match record_staged(rec, Some(release.clone())) {
-                        Ok(()) => {
-                            prewarm(g, &tar);
-                            sum.staged.push(label);
-                        }
-                        Err(e) => sum.failed.push(format!("{label}: {e}")),
+        }
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done: std::sync::Mutex<Vec<Option<JobResult>>> = std::sync::Mutex::new((0..rows.len()).map(|_| None).collect());
+        #[cfg(test)]
+        let shared = SHARED_FAKE.with(|s| s.borrow().clone());
+        std::thread::scope(|sc| {
+            for _ in 0..workers {
+                sc.spawn(|| {
+                    #[cfg(test)]
+                    if let Some(sh) = shared.clone() {
+                        FAKE_DOCKER.with(|f| *f.borrow_mut() = Some(Box::new(move |a: &[&str]| (sh.lock().unwrap_or_else(|e| e.into_inner()))(a))));
                     }
-                }
-                Err(e) if e.starts_with(NO_VARIANT) => sum.skipped.push(format!("{label}: not published for {arch}")),
-                Err(e) => sum.failed.push(format!("{label}: {e}")),
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some((image, digest)) = rows.get(i) else { break };
+                        JOB_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+                        let res = stage_lock_image(g, image, digest, tag, arches, &release);
+                        let lines = JOB_LOG.with(|l| l.borrow_mut().take()).unwrap_or_default();
+                        done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some((lines, res));
+                    }
+                });
+            }
+        });
+        for (lines, res) in done.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten() {
+            for l in lines {
+                emit(l);
+            }
+            for r in res {
+                sum.absorb(r);
             }
         }
     }
@@ -751,24 +894,105 @@ fn print_summary(g: &Globals, sum: &Summary) {
     }
 }
 
-/// Called by `noo upgrade` after the stack rolled: stage the lock's
-/// node-bound images. Never fails the roll — it says what to run instead.
-pub(crate) fn stage_after_roll(g: &Globals, root: &Path, tag: &str) {
-    let Ok(lock) = std::fs::read_to_string(root.join("stack.lock")) else {
-        if !g.json {
-            ui::warned("no stack.lock (a release without a digest lock) — node images were not staged; `noo cluster sync-images <node> -i <image>` stages one by name");
+/// What the staging thread hands back.
+enum StageOutcome {
+    /// The release publishes no digest lock: nothing to stage.
+    NoLock,
+    Done(Summary),
+}
+
+/// A node-image staging pass running on its own thread, started BEFORE the
+/// launcher so the registry pulls and `docker save` exports overlap the
+/// compose pull/recreate. The thread prints NOTHING (it would interleave
+/// with the launcher's output): it returns a [`Summary`] and
+/// [`StageRun::finish`] prints it under one "Node images" step.
+pub(crate) struct StageRun {
+    handle: Option<std::thread::JoinHandle<StageOutcome>>,
+    tag: String,
+}
+
+/// Belt and braces: a run dropped without `finish` (an early return the
+/// callers did not anticipate) still joins, so no export is cut off by the
+/// process exiting. It cannot print the summary (no Globals), so it says so.
+impl Drop for StageRun {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            ui::warned("node image staging was not joined by its caller — waiting for it to finish; its summary is not shown (re-run `noo cluster stage-images --lock` to see it)");
+            let _ = h.join();
         }
-        return;
-    };
-    let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
-    let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
-    if !g.json {
-        ui::step("staging node images on the artifact rail (nodes pull them from here, never from a registry)");
     }
-    let sum = stage_lock(g, &lock, &prefix, tag, &fleet_arches_from_gateway(g), false);
-    print_summary(g, &sum);
-    if !sum.failed.is_empty() && !g.json {
-        ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+}
+
+/// Start staging the release's node-bound images from the release-signed lock
+/// the roll already holds (`lock`, the bytes verified for `tag`; None when the
+/// release publishes no lock). The lock and tag are passed in, never re-read
+/// from `.env` or the process environment, which still name the RUNNING
+/// release until the roll rewrites them.
+///
+/// Docker safety while the launcher shares the daemon (every path staged here
+/// was read): same-arch pulls and the foreign-arch pulls on the containerd
+/// store are by lock DIGEST, then tagged `<image>:<this tag>` at that same
+/// digest, a reference the running stack does not use and the launcher pins
+/// to the identical digest; the foreign-arch pull on the classic store is by
+/// platform manifest digest and is saved BY ID, never tagged. No path
+/// re-points a reference the controller's compose uses. Concurrent pulls of
+/// the same digest are safe in Docker.
+///
+/// Never fails the roll. Already-staged images are skipped by their
+/// `.imageid` marker (or hard-linked from a sibling release's identical
+/// export), so a same-tag re-apply is near-free.
+pub(crate) fn start_stage_release_images(g: &Globals, lock: Option<String>, tag: &str) -> StageRun {
+    // json=true silences every per-image line stage_lock/save_tar would print.
+    let mut quiet = g.clone();
+    quiet.json = true;
+    let tag_owned = tag.to_string();
+    let t = tag.to_string();
+    let handle = std::thread::spawn(move || {
+        let Some(lock) = lock else { return StageOutcome::NoLock };
+        let prefix = crate::commands::provision::release_var("NOO_IMAGE_PREFIX");
+        let prefix = if prefix.is_empty() { crate::registry::IMAGE_NAMESPACE.to_string() } else { prefix };
+        StageOutcome::Done(stage_lock(&quiet, &lock, &prefix, &t, &fleet_arches_from_gateway(&quiet), false))
+    });
+    StageRun { handle: Some(handle), tag: tag_owned }
+}
+
+impl StageRun {
+    /// Join the thread (always; never detach, so no `.exporting` tar is cut
+    /// off by a process exit) and print what it did. A panic is reported as a
+    /// staging failure AND recorded in the staged index, so the nodes stage's
+    /// `lock_stage_blocker` still refuses.
+    pub(crate) fn finish(mut self, g: &Globals) {
+        let Some(handle) = self.handle.take() else { return };
+        match handle.join() {
+            Ok(StageOutcome::NoLock) => {
+                if !g.json {
+                    ui::warned("no stack.lock (a release without a digest lock) — node images were not staged; `noo cluster sync-images <node> -i <image>` stages one by name");
+                }
+            }
+            Ok(StageOutcome::Done(sum)) => {
+                if !g.json {
+                    ui::step("Node images (staged on the artifact rail while the stack rolled; nodes pull them from here, never from a registry)");
+                }
+                print_summary(g, &sum);
+                if !sum.failed.is_empty() && !g.json {
+                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                }
+            }
+            Err(_) => {
+                let dir = images_store_dir();
+                let mut idx = read_index(&dir);
+                idx.lock_stage = Some(LockStage {
+                    tag: self.tag.clone(),
+                    failed: vec!["the staging thread panicked".to_string()],
+                    at: now_unix(),
+                });
+                let _ = write_index(&dir, &idx);
+                ui::warned("node image staging crashed (the roll itself is unaffected) — the nodes stage will refuse until it is retried");
+                if !g.json {
+                    ui::guide(&[("noo cluster stage-images --lock", "retries staging the release images for every fleet architecture")]);
+                }
+            }
+        }
     }
 }
 
@@ -1294,4 +1518,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── the parallel pool ──
+
+    /// A containerd-store daemon every worker thread can call: records
+    /// (thread, args).
+    fn shared_daemon() -> std::sync::Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>> {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c2 = calls.clone();
+        let fake: SharedFake = Box::new(move |args: &[&str]| {
+            let line = args.join(" ");
+            c2.lock().unwrap().push((std::thread::current().id(), line.clone()));
+            match args.first().copied() {
+                Some("version") => Ok("amd64".into()),
+                Some("info") => Ok("[[\"driver-type\",\"io.containerd.snapshotter.v1\"]]".into()),
+                Some("pull") => {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    Ok(String::new())
+                }
+                Some("tag") => Ok(String::new()),
+                Some("save") if line.contains("bbb") => Err("boom".to_string()), // one image fails; the rest go on
+                Some("save") => {
+                    std::fs::write(args[2], b"tar").map_err(|e| e.to_string())?;
+                    Ok(String::new())
+                }
+                Some("image") => {
+                    let name = line.split('/').next_back().unwrap_or("").split(['@', ':']).next().unwrap_or("").to_string();
+                    if line.contains("--platform") {
+                        Ok(format!("sha256:{name}"))
+                    } else {
+                        Ok(format!("sha256:{name} amd64"))
+                    }
+                }
+                _ => Err(format!("unexpected: {line}")),
+            }
+        });
+        SHARED_FAKE.with(|s| *s.borrow_mut() = Some(std::sync::Arc::new(std::sync::Mutex::new(fake))));
+        calls
+    }
+
+    /// Several images run at once, but all arches of ONE image stay on one
+    /// worker thread in order (the `docker tag` race), a failing image does
+    /// not cancel the rest, and the summary is in lock order.
+    #[test]
+    fn stage_lock_pool_parallelises_across_images_not_within_one() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("pool");
+        let lock: String = ["aaa", "bbb", "ccc", "ddd"].iter().map(|n| format!("{n}@sha256:{}\n", "c".repeat(64))).collect();
+        let calls = shared_daemon();
+        PARALLELISM_OVERRIDE.with(|p| p.set(Some(3)));
+        let mut gl = g();
+        gl.gateway_override = Some("http://127.0.0.1:9".into()); // prewarm is best-effort; refuse fast
+        let arches = vec!["amd64".to_string(), "arm64".to_string()];
+        let sum = stage_lock(&gl, &lock, "reg.example/acme", "v1", &arches, true);
+        PARALLELISM_OVERRIDE.with(|p| p.set(None));
+        SHARED_FAKE.with(|s| *s.borrow_mut() = None);
+
+        let img = |n: &str, a: &str| format!("reg.example/acme/{n}:v1 ({a})");
+        assert_eq!(
+            sum.staged,
+            vec![img("aaa", "amd64"), img("aaa", "arm64"), img("ccc", "amd64"), img("ccc", "arm64"), img("ddd", "amd64"), img("ddd", "arm64")],
+            "lock order, whatever order the workers finished in; summary: {sum:?}"
+        );
+        assert_eq!(sum.failed.len(), 2, "bbb fails for both arches (its export fails): {sum:?}");
+        assert!(sum.failed.iter().all(|f| f.contains("/bbb:v1")), "{sum:?}");
+
+        let calls = calls.lock().unwrap();
+        // The shared fake serialises its own calls (one Mutex), so overlap
+        // itself cannot be timed here; what shows the pool ran is that jobs
+        // were spread over several threads (the sleep in `pull` lets the
+        // other workers claim images while one holds the daemon).
+        let all_threads: std::collections::HashSet<_> = calls.iter().map(|(t, _)| *t).collect();
+        assert!(all_threads.len() >= 2, "images must be spread over the pool's workers");
+        for n in ["aaa", "ccc", "ddd"] {
+            let threads: std::collections::HashSet<_> = calls.iter().filter(|(_, l)| l.contains(&format!("/{n}"))).map(|(t, _)| *t).collect();
+            assert_eq!(threads.len(), 1, "all arches of {n} run on one worker");
+            // amd64 (the host arch) is already local and only saves; the
+            // arm64 pull must come after that save, not interleave with it.
+            let pos = |pred: &dyn Fn(&str) -> bool| calls.iter().position(|(_, l)| l.contains(&format!("/{n}")) && pred(l));
+            let first_save = pos(&|l| l.starts_with("save")).expect("amd64 saved");
+            let arm_pull = pos(&|l| l.starts_with("pull") && l.contains("linux/arm64")).expect("arm64 pulled");
+            assert!(first_save < arm_pull, "arches in order for {n}");
+        }
+        let idx = read_index(&dir);
+        assert_eq!(idx.images.len(), 6, "no lost update in the staged index: {:?}", idx.images.iter().map(|r| (&r.image, &r.arch)).collect::<Vec<_>>());
+        assert_eq!(idx.lock_stage.as_ref().map(|l| l.failed.len()), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_parallelism_is_serial_in_tests_unless_asked() {
+        assert_eq!(stage_parallelism(), 1);
+        PARALLELISM_OVERRIDE.with(|p| p.set(Some(3)));
+        assert_eq!(stage_parallelism(), 3);
+        PARALLELISM_OVERRIDE.with(|p| p.set(None));
+        assert_eq!(STAGE_PARALLELISM, 3);
+    }
+
+    /// A run dropped without `finish` still joins its thread.
+    #[test]
+    fn a_dropped_stage_run_still_joins() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = flag.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+            StageOutcome::NoLock
+        });
+        drop(StageRun { handle: Some(handle), tag: "v1".into() });
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "drop must have waited for the thread");
+    }
 }

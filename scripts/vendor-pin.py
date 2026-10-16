@@ -2,23 +2,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Pin a vendor CLI (or the runtime one needs) by version AND sha256.
+"""Pin a vendor CLI by version AND sha256.
 
-    vendor-pin.py <kind|runtime:NAME> <version> [--dl-dir DIR]
-    vendor-pin.py --check [<kind|runtime:NAME> ...] [--dl-dir DIR]
+    vendor-pin.py <kind> <version> [--dl-dir DIR]
+    vendor-pin.py --check [<kind> ...] [--dl-dir DIR]
 
 The controller stages each foreign harness kind's vendor CLI to the nodes
 (the node never touches the internet), so what it stages is pinned in
-config/harness-kinds.json: per kind a `distribution` block, per runtime a
-`runtimes.<name>` block, each with a version and a sha256 per platform the
-fleet has (linux-x86_64, linux-aarch64, macos-aarch64), or one `any` digest
-for a platform-independent artefact (an npm tarball).
+config/harness-kinds.json: per kind a `distribution` block with a version
+and a sha256 per platform the fleet has (linux-x86_64, linux-aarch64,
+macos-aarch64), or one `any` digest
+for a platform-independent artefact.
 
 Pin mode resolves the block's `source` URL template for every platform,
 DOWNLOADS each artefact, computes its sha256, cross-checks it against the
-checksums the vendor publishes (nodejs.org SHASUMS256.txt, a GitHub release
-SHA256SUMS file, Claude Code's release manifest.json, the npm registry's
-dist.integrity), and rewrites the block in config/harness-kinds.json AND its
+checksums the vendor publishes (a GitHub release
+SHA256SUMS file, Claude Code's release manifest.json), and rewrites the block in config/harness-kinds.json AND its
 byte-equal copy node-agent-go/internal/reconcile/harness_kinds.json. The
 block's source/names/format/entry/unpack already in the file win; RECIPES
 below only seeds a block that does not exist yet. To change the artefact
@@ -38,7 +37,6 @@ digest or cross-check mismatch); 2 = usage.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
@@ -78,21 +76,12 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 # Seeds for a block that is not in the file yet. Field order is the order
 # written. `version`/`sha256` are filled by the pin.
 RECIPES: dict[str, dict] = {
-    "runtime:node": {
-        "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
-        "names": {"os": {"linux": "linux", "macos": "darwin"},
-                  "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "unpack": "tar.xz",
-        "bin_dir": "bin",
-    },
-    # Native single-file executable per platform (Bun-compiled); the npm
-    # package is only a loader for per-platform optional dependencies.
+    # Native single-file executable per platform (Bun-compiled).
     "claude-code": {
         "format": "binary",
         "source": "https://downloads.claude.ai/claude-code-releases/{version}/{os}-{arch}/claude",
         "names": {"os": {"linux": "linux", "macos": "darwin"},
                   "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "runtime": None,
         "entry": "claude",
         "unpack": "none",
     },
@@ -102,7 +91,6 @@ RECIPES: dict[str, dict] = {
         "source": "https://github.com/github/copilot-cli/releases/download/v{version}/copilot-{os}-{arch}.tar.gz",
         "names": {"os": {"linux": "linux", "macos": "darwin"},
                   "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "runtime": None,
         "entry": "copilot",
         "unpack": "tgz",
     },
@@ -112,7 +100,6 @@ RECIPES: dict[str, dict] = {
         "source": "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package-{arch}-{os}.tar.gz",
         "names": {"os": {"linux": "unknown-linux-musl", "macos": "apple-darwin"},
                   "arch": {"x86_64": "x86_64", "aarch64": "aarch64"}},
-        "runtime": None,
         "entry": "bin/codex",
         "unpack": "tgz",
     },
@@ -120,10 +107,8 @@ RECIPES: dict[str, dict] = {
 
 # Where each vendor publishes the checksums to cross-check against. A
 # `sums` file is `<hex>  <filename>` lines keyed by the artefact's basename;
-# `claude-manifest` is manifest.json's platforms.<os>-<arch>.checksum. Any
-# registry.npmjs.org tarball is cross-checked against dist.integrity.
+# `claude-manifest` is manifest.json's platforms.<os>-<arch>.checksum.
 CROSSCHECK: dict[str, tuple[str, str]] = {
-    "runtime:node": ("sums", "https://nodejs.org/dist/v{version}/SHASUMS256.txt"),
     "copilot": ("sums", "https://github.com/github/copilot-cli/releases/download/v{version}/SHA256SUMS.txt"),
     "codex": ("sums", "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package_SHA256SUMS"),
     "claude-code": ("claude-manifest", "https://downloads.claude.ai/claude-code-releases/{version}/manifest.json"),
@@ -146,16 +131,15 @@ def _get(url: str) -> bytes:
         raise Refused(f"{url}: {e.reason}") from None
 
 
-def _download(url: str, dest: Path) -> tuple[int, str, str]:
-    """Stream url to dest; (size, sha256 hex, sha512 base64)."""
-    h256, h512, size = hashlib.sha256(), hashlib.sha512(), 0
+def _download(url: str, dest: Path) -> tuple[int, str]:
+    """Stream url to dest; (size, sha256 hex)."""
+    h256, size = hashlib.sha256(), 0
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=120) as r, \
                 open(dest, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)
                 h256.update(chunk)
-                h512.update(chunk)
                 size += len(chunk)
     except urllib.error.HTTPError as e:
         raise Refused(f"artefact missing: {url}: HTTP {e.code}") from None
@@ -163,7 +147,7 @@ def _download(url: str, dest: Path) -> tuple[int, str, str]:
         raise Refused(f"artefact unreachable: {url}: {e.reason}") from None
     if size == 0:
         raise Refused(f"artefact empty: {url}")
-    return size, h256.hexdigest(), base64.b64encode(h512.digest()).decode()
+    return size, h256.hexdigest()
 
 
 def _fill(template: str, version: str, platform: str | None, names: dict | None) -> str:
@@ -224,27 +208,14 @@ class CrossCheck:
         return None
 
 
-def _npm_integrity(url: str) -> str | None:
-    """dist.integrity (sha512 base64) for a registry.npmjs.org tarball URL."""
-    m = re.match(r"https://registry\.npmjs\.org/((?:@[^/]+/)?[^/]+)/-/[^/]+-([0-9][^/]*)\.tgz$", url)
-    if not m:
-        return None
-    pkg, ver = m.group(1), m.group(2)
-    meta = json.loads(_get(f"https://registry.npmjs.org/{pkg}/{ver}"))
-    integ = (meta.get("dist") or {}).get("integrity", "")
-    if not integ.startswith("sha512-"):
-        raise Refused(f"npm registry has no sha512 integrity for {pkg}@{ver}")
-    return integ[len("sha512-"):]
-
-
 def _resolve(name: str, version: str, block: dict, dl: Path) -> dict[str, str]:
     """Download every artefact of block at version; {sha256 key: hex}."""
     names = block.get("names")
     keys = list((block.get("sha256") or {}).keys())
-    any_ = keys == ["any"] or (not keys and block.get("format") == "npm-tarball")
+    any_ = keys == ["any"]
     platforms: list[str | None] = [None] if any_ else list(PLATFORMS)
     cc = CrossCheck(name, version)
-    if cc.kind is None and not block["source"].startswith("https://registry.npmjs.org/"):
+    if cc.kind is None:
         print(f"  WARNING {name}: no vendor checksum to cross-check against; the pin is trust-on-first-use")
     out: dict[str, str] = {}
     sub = dl / name.replace(":", "-")
@@ -253,18 +224,13 @@ def _resolve(name: str, version: str, block: dict, dl: Path) -> dict[str, str]:
         url = _fill(block["source"], version, p, names)
         key = p or "any"
         dest = sub / f"{key}--{url.rsplit('/', 1)[1]}"
-        size, sha, sha512 = _download(url, dest)
+        size, sha = _download(url, dest)
         source = "none"
         exp = cc.expected(url, p, names)
         if exp is not None:
             if exp[0] != sha:
                 raise Refused(f"checksum mismatch for {url}:\n    downloaded {sha}\n    {exp[1]} says {exp[0]}")
             source = exp[1]
-        integ = _npm_integrity(url)
-        if integ is not None:
-            if integ != sha512:
-                raise Refused(f"npm integrity mismatch for {url}:\n    downloaded sha512-{sha512}\n    registry   sha512-{integ}")
-            source = f"npm dist.integrity ({source})" if source != "none" else "npm dist.integrity"
         print(f"  {key:14} {url}\n  {'':14} {size} bytes  sha256 {sha}  cross-check: {source}")
         out[key] = sha
     return out
@@ -289,14 +255,6 @@ def _dump(doc: dict) -> str:
 
 def _find(doc: dict, name: str) -> tuple[dict | None, dict | None]:
     """(the block, the kind row) for name; refuse an unknown name."""
-    if name.startswith("runtime:"):
-        rt = name.split(":", 1)[1]
-        block = (doc.get("runtimes") or {}).get(rt)
-        if block is None and name not in RECIPES:
-            raise Refused(f"unknown runtime {rt!r} (known: "
-                          + ", ".join(sorted({k for k in RECIPES if k.startswith('runtime:')}
-                                             | {f'runtime:{r}' for r in doc.get('runtimes') or {}})) + ")")
-        return block, None
     for k in doc["kinds"]:
         if k["kind"] == name:
             if k.get("cli") is None:
@@ -305,9 +263,8 @@ def _find(doc: dict, name: str) -> tuple[dict | None, dict | None]:
     raise Refused(f"unknown kind {name!r} (known: {', '.join(k['kind'] for k in doc['kinds'])})")
 
 
-def _ordered(block: dict, runtime: bool) -> dict:
-    order = (["version", "source", "names", "sha256", "unpack", "bin_dir"] if runtime else
-             ["format", "source", "names", "version", "sha256", "runtime", "entry", "unpack"])
+def _ordered(block: dict) -> dict:
+    order = ["format", "source", "names", "version", "sha256", "entry", "unpack"]
     out = {k: block[k] for k in order if k in block}
     out.update({k: v for k, v in block.items() if k not in out})
     return out
@@ -325,19 +282,7 @@ def pin(name: str, version: str, dl: Path) -> None:
     print(f"pinning {name} {version}")
     block["version"] = version
     block["sha256"] = _resolve(name, version, block, dl)
-    runtime = row is None
-    block = _ordered(block, runtime)
-    if runtime:
-        rts = dict(doc.get("runtimes") or {})
-        rts[name.split(":", 1)[1]] = block
-        rebuilt = {}
-        for k, v in doc.items():
-            if k == "kinds" and "runtimes" not in doc:
-                rebuilt["runtimes"] = rts
-            rebuilt[k] = rts if k == "runtimes" else v
-        doc = rebuilt
-    else:
-        row["distribution"] = block
+    row["distribution"] = _ordered(block)
     # Every kind carries the key: `noo` (no CLI) null, a foreign kind not
     # pinned yet null until it is.
     for k in doc["kinds"]:
@@ -354,8 +299,7 @@ def pin(name: str, version: str, dl: Path) -> None:
 def check(names: list[str], dl: Path) -> int:
     doc, _ = _load()
     if not names:
-        names = [f"runtime:{r}" for r in doc.get("runtimes") or {}]
-        names += [k["kind"] for k in doc["kinds"] if k.get("distribution")]
+        names = [k["kind"] for k in doc["kinds"] if k.get("distribution")]
     bad = 0
     for name in names:
         try:
