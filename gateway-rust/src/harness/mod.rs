@@ -7,8 +7,9 @@
 //!   instead of the node's model endpoint. It speaks the CLI's wire
 //!   (OpenAI chat, Anthropic Messages) in front of the backend's wire, and
 //!   counts every token on the way through.
+//! - [`driver`]: runs the vendor's headless CLI as the node's task executor,
+//!   against the translator, with a per-turn user-door key for noomesh's
+//!   tools.
 
-// The driver that runs a vendor CLI against it (E1c) is the caller; until
-// it lands, nothing in the binary outside the tests reaches this module.
-#[allow(dead_code)]
+pub mod driver;
 pub mod translator;

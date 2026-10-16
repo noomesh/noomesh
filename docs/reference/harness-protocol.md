@@ -80,7 +80,10 @@ The node agent sets all of this from the placement.
 | `NATS_NODE_USER`, `NATS_NODE_PASSWORD` | the node's bus principal; the password may arrive as `NATS_NODE_PASSWORD_FILE`, never both |
 | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type (default `openai`) |
 | `NOO_HARNESS_MAX_TURNS` | concurrent turns and tasks (default 8) |
-| `NOO_HARNESS_KIND` | the loop kind of the placement (a kind from `config/harness-kinds.json`); the node agent reads it to choose the runner, the reference harness does not |
+| `NOO_HARNESS_KIND` | the loop kind (a kind from `config/harness-kinds.json`). Not in the shipped env file: when unset, the reference harness asks its node agent, `GET /harness/placement` on the model endpoint's agent (`{"kind", "env", "desired_state", "placed"}`), and runs `noo` when the agent answers 404, `placed: false`, or not at all. It runs its own loop for `noo` and the foreign-CLI driver (section 9) for any other kind |
+| `NOO_HARNESS_TURN_TIMEOUT_SECS` | a foreign CLI's wall-clock limit per invocation (default 900) |
+| `NOO_HARNESS_WORKDIR` | where the driver makes each task's workspace (default: the process temp dir, which the shipped unit makes private) |
+| `NOO_HARNESS_KEEP_WORKDIR` | `1` keeps a task's workspace after it ends, for debugging |
 
 `NODE_ID`, `NOO_GATEWAY_URL`, `NATS_URL`, `NOO_HARNESS_MODEL_URL` and
 `NOO_HARNESS_MODEL` are required; the reference harness refuses to start
@@ -229,6 +232,14 @@ request object beside `op`.
 | `op` | Purpose |
 |---|---|
 | `task_checkpoint` | record a loop boundary (`task_id`, `loops`, `note`, `exhausted`); replies `state` and a fresh `token` that replaces the old one |
+| `task_done` | a foreign CLI's verdict on its task (`task_id`, `result`, `failed`): what `noo_task_done` is for a native loop. The task must be this token's (403 otherwise). As for `noo_task_done` from the user door, there is no tool-use evidence gate (the CLI's tools ran on the node, outside noomesh's record); the result is recorded as given and posted to the task's thread; replies `state` |
+
+**A foreign CLI's way back in**
+
+| `op` | Purpose |
+|---|---|
+| `door_key` | mint a user-door key for the token's person: a `noo_service_keys` row with scope `mcp`, bound to that user, consumer `harness:<node>:<conversation prefix>`, expiring with the turn (never later than the token, never longer than `NOO_HARNESS_TURN_TIMEOUT_SECS`). Replies `key` (shown once), `key_id` and `expires_at`. 403 when the person has no active account |
+| `door_key_revoke` | revoke a key `door_key` minted (`key_id`), for the same person only; replies `revoked`. An unrevoked key stops working at `expires_at` and is deleted by the next mint |
 
 ## 6. Outbound: events
 
@@ -314,10 +325,10 @@ must not execute gated tools locally.
 
 A foreign loop is a vendor CLI, and the CLI speaks its vendor's wire, not
 the node backend's. The harness does not point the CLI at
-`NOO_HARNESS_MODEL_URL`. For each task or turn it starts a wire translator
+`NOO_HARNESS_MODEL_URL`. For each CLI invocation (one task loop, or one turn) it starts a wire translator
 (`gateway-rust/src/harness/translator.rs`) and gives the CLI that
 translator's base URL, `http://127.0.0.1:<port>`, as the CLI's model base
-URL. The port is ephemeral and the translator stops when the task ends.
+URL. The port is ephemeral and the translator stops when the invocation ends.
 
 | Route | The CLI sends | The translator sends to the endpoint |
 |---|---|---|
@@ -332,7 +343,7 @@ yet.
 
 The translator counts every model call: the reply's usage, or, for a
 stream, its final usage chunk or Ollama's closing object. A reply without
-usage still counts as a call. When the task ends, the harness reports the
+usage still counts as a call. When the invocation ends, the harness reports the
 totals with the `usage` operation, so the gateway meters a foreign loop's
 model calls the same way it meters its own.
 
@@ -343,3 +354,42 @@ already runs on the node as a local user and can read the credentials the
 harness itself uses. The translator forwards only to the one pinned
 endpoint and holds no credential of its own. Its upstream calls use the
 cluster CA and the node agent's bearer, the same as the reference loop's.
+
+## 9. The foreign-CLI driver
+
+For a kind other than `noo`, `noo-gateway harness` is still the runner:
+the bus, the ack, the permit, `harness_result` and `task_checkpoint` are
+exactly as above. What changes is the loop. Each task loop (and each turn)
+is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
+`config/harness-kinds.json`), driven by `gateway-rust/src/harness/driver.rs`:
+
+1. Start the wire translator on loopback, in front of the pinned endpoint.
+2. Mint a user-door key (`door_key`).
+3. Make the task's workspace under `NOO_HARNESS_WORKDIR`: a `home/`
+   that becomes the CLI's `HOME` (its config and state directory too, via
+   `launch.home_env`), and the MCP config file naming
+   `{NOO_GATEWAY_URL}/mcp/user` with the door key as the bearer (mode 0600).
+4. Build the CLI's environment from nothing: `PATH`, `HOME`, `LANG`,
+   `TMPDIR`, the translator's URL and the pinned model under the kind's
+   variable names, a placeholder provider key, `NODE_EXTRA_CA_CERTS` (the
+   cluster CA), then the kind's `lane`, then its `telemetry_off`, last. No
+   `NATS_*` and no `NOO_*` variable reaches the CLI: not the bus pair, not
+   the node-agent bearer, not the turn token.
+5. Run `launch.command` with `{prompt}` and `{mcp_config}` filled in, in
+   the workspace, stdin closed, output captured up to a cap, killed (its
+   whole process group) at `NOO_HARNESS_TURN_TIMEOUT_SECS` or the key's
+   expiry, whichever is sooner.
+6. Read the verdict. A task prompt asks for a last line
+   `NOO_RESULT: <summary>` when the objective is achieved or
+   `NOO_FAILED: <reason>` when it cannot be; either one becomes `task_done`.
+   Neither means more loops. A non-zero exit is a failed loop, its stderr
+   tail the note; three in a row end the task, as for the native loop.
+7. Save the prompt and the answer (`session_save`), report the translator's
+   token counts (`usage`), `task_checkpoint` (exhausted when the loop reached the
+   budget without a verdict), revoke the key, stop the translator, and
+   remove the workspace when the task ends (unless
+   `NOO_HARNESS_KEEP_WORKDIR=1`).
+
+A turn sends one `content` event with the answer, then `harness_result`.
+A kind whose `launch` still carries an `unverified:` value is refused at
+start.

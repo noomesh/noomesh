@@ -1,0 +1,1035 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
+//! The foreign-CLI driver: a vendor's headless CLI (Copilot CLI, Claude
+//! Code) as the node's task executor.
+//!
+//! `noo-gateway harness` stays the runner for every kind: it holds the bus,
+//! acks, takes the concurrency permit, publishes `harness_result` and
+//! checkpoints through the rail. For a kind other than `noo` it hands each
+//! task (and each turn) here instead of to the native loop. One CLI
+//! invocation is one loop:
+//!
+//! 1. the loopback wire translator starts in front of the pinned endpoint;
+//! 2. a user-door key is minted over the rail (`door_key`): an ordinary,
+//!    short-lived `noo_service_keys` row bound to the turn's person;
+//! 3. the CLI runs in the task's own workspace, with a HOME of its own, an
+//!    environment built from NOTHING (no bus pair, no node-agent bearer, no
+//!    turn token), the kind's `lane` and `telemetry_off` merged last, and an
+//!    MCP config naming `{NOO_GATEWAY_URL}/mcp/user` with the door key;
+//! 4. its verdict (`NOO_RESULT:` / `NOO_FAILED:` on the last such line) is
+//!    the task's `noo_task_done`, carried by the rail op `task_done`;
+//! 5. usage is reported, the loop is checkpointed, the key revoked, the
+//!    translator stopped.
+//!
+//! Nothing streams mid-run in this cut: a turn gets one `content` event with
+//! the answer, then `harness_result` (sent by the caller).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
+
+use crate::coordinator::{CoordinatorResult, HarnessOp, RemoteRuntime, ResolvedBackend, TaskRuntime, TurnRequest, UsageStats};
+use crate::harness::translator::{Translator, UsageTotals};
+use crate::harness_kinds::{HarnessKind, Launch};
+use crate::tasks::TaskRequest;
+
+/// Bytes kept of each of the CLI's stdout and stderr; the rest is read and
+/// dropped, so a chatty CLI cannot fill the harness's memory (the unit caps
+/// it at 1 GiB).
+pub const OUTPUT_CAP: usize = 256 * 1024;
+/// The line a CLI ends with when the task's objective is achieved.
+pub const RESULT_MARK: &str = "NOO_RESULT:";
+/// The line a CLI ends with when the objective cannot be achieved.
+pub const FAILED_MARK: &str = "NOO_FAILED:";
+/// What goes in a CLI's provider-key variable: the loopback translator takes
+/// no key, but a CLI may refuse to start without one.
+pub const PLACEHOLDER_KEY: &str = "noo-loopback-no-key";
+/// The MCP server name the CLI sees noomesh's tools under. The kind table's
+/// tool allowlists (`mcp__noomesh`, `--allow-tool=noomesh`) name it too.
+pub const MCP_SERVER_NAME: &str = "noomesh";
+/// The `launch.mcp` value this driver implements.
+pub const MCP_CONFIG_FILE: &str = "config-file";
+
+/// Everything a driven invocation needs that does not change per task.
+#[derive(Debug, Clone)]
+pub struct DriverCtx {
+    pub node: String,
+    pub gateway: String,
+    pub kind: HarnessKind,
+    pub launch: Launch,
+    pub pinned: ResolvedBackend,
+    /// Where per-task workspaces go (`NOO_HARNESS_WORKDIR`).
+    pub workdir_root: PathBuf,
+    /// `NOO_HARNESS_KEEP_WORKDIR=1`: leave workspaces for debugging.
+    pub keep_workdir: bool,
+    /// One invocation's wall-clock limit (`NOO_HARNESS_TURN_TIMEOUT_SECS`).
+    pub timeout: Duration,
+    /// The cluster CA, handed to the CLI as `NODE_EXTRA_CA_CERTS` so it can
+    /// reach the user door over the cluster's TLS.
+    pub ca_path: Option<String>,
+    /// `PATH` and `LANG` for the CLI: the only values taken from the
+    /// harness's own environment.
+    pub path: String,
+    pub lang: String,
+}
+
+impl DriverCtx {
+    /// Build from the harness's environment. Refuses a kind this driver
+    /// cannot run: `noo`, an unknown kind, or a launch recipe that is
+    /// missing, still `unverified:`, or wants an MCP wiring not implemented.
+    pub fn from_env(node: &str, gateway: &str, kind_name: &str, pinned: ResolvedBackend) -> Result<Self> {
+        let kind = crate::harness_kinds::get(kind_name).ok_or_else(|| anyhow!("unknown harness kind {kind_name:?}"))?;
+        Self::new(node, gateway, kind, pinned, &|k| std::env::var(k).ok())
+    }
+
+    pub fn new(node: &str, gateway: &str, kind: &HarnessKind, pinned: ResolvedBackend, get: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
+        let launch = validate_kind(kind)?;
+        let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        let workdir_root = set("NOO_HARNESS_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("noo-harness"));
+        let timeout = Duration::from_secs(set("NOO_HARNESS_TURN_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(900));
+        Ok(Self {
+            node: node.to_string(),
+            gateway: gateway.trim_end_matches('/').to_string(),
+            kind: kind.clone(),
+            launch,
+            pinned,
+            workdir_root,
+            keep_workdir: set("NOO_HARNESS_KEEP_WORKDIR").is_some_and(|v| v.trim() == "1"),
+            timeout,
+            ca_path: set("NOO_TLS_CA"),
+            path: set("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
+            lang: set("LANG").unwrap_or_else(|| "C.UTF-8".into()),
+        })
+    }
+}
+
+/// The launch recipe of a kind this driver can run, or why not.
+pub fn validate_kind(kind: &HarnessKind) -> Result<Launch> {
+    if kind.kind == "noo" {
+        bail!("kind noo runs the native loop, not the driver");
+    }
+    let launch = kind.launch.clone().ok_or_else(|| anyhow!("kind {} has no launch recipe", kind.kind))?;
+    if launch.command.is_empty() {
+        bail!("kind {}: launch.command is empty", kind.kind);
+    }
+    let mut fields: Vec<&str> = vec![&launch.model_url_env, &launch.model_env, &launch.mcp, &launch.model_url_suffix];
+    fields.extend(launch.command.iter().map(String::as_str));
+    if let Some(v) = fields.iter().find(|v| v.starts_with("unverified:")) {
+        bail!("kind {}: its launch recipe is not verified yet ({v})", kind.kind);
+    }
+    if launch.mcp != MCP_CONFIG_FILE {
+        bail!("kind {}: MCP wiring {:?} is not one this driver implements ({MCP_CONFIG_FILE:?})", kind.kind, launch.mcp);
+    }
+    if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
+        bail!("kind {}: launch names no model variables", kind.kind);
+    }
+    Ok(launch)
+}
+
+// ── the rail, as the driver needs it ────────────────────────────────────
+
+/// A door key as the rail hands it over.
+#[derive(Debug, Clone)]
+pub struct DoorKey {
+    pub key: String,
+    pub key_id: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What the driver asks of the gateway. [`RemoteRuntime`] in production; a
+/// recording double in the tests.
+#[allow(async_fn_in_trait)]
+pub(crate) trait DriverRail {
+    /// `task_checkpoint`; returns the task's state after it.
+    async fn checkpoint(&mut self, task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String>;
+    /// `task_done`: the CLI's verdict on its task.
+    async fn task_done(&self, task_id: &str, result: &str, failed: bool) -> Result<String>;
+    async fn door_key(&self) -> Result<DoorKey>;
+    /// Best effort: an unrevoked key still dies at its expiry.
+    async fn door_key_revoke(&self, key_id: &str);
+    /// `session_save`, best effort.
+    async fn save(&self, role: &str, content: &str);
+    async fn report_usage(&self, usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>);
+}
+
+impl DriverRail for RemoteRuntime {
+    async fn checkpoint(&mut self, task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String> {
+        TaskRuntime::checkpoint(self, task_id, loops, note, exhausted).await
+    }
+
+    async fn task_done(&self, task_id: &str, result: &str, failed: bool) -> Result<String> {
+        let v = self.call(HarnessOp::TaskDone { task_id: task_id.to_string(), result: result.to_string(), failed }).await?;
+        Ok(v.get("state").and_then(|s| s.as_str()).unwrap_or("").to_string())
+    }
+
+    async fn door_key(&self) -> Result<DoorKey> {
+        let v = self.call(HarnessOp::DoorKey).await?;
+        parse_door_key(&v)
+    }
+
+    async fn door_key_revoke(&self, key_id: &str) {
+        if let Err(e) = self.call(HarnessOp::DoorKeyRevoke { key_id: key_id.to_string() }).await {
+            tracing::warn!(error = %e, key_id, "harness driver: door key not revoked; it dies at its expiry");
+        }
+    }
+
+    async fn save(&self, role: &str, content: &str) {
+        if let Err(e) = self.call(HarnessOp::SessionSave { role: role.to_string(), content: content.to_string(), metadata: None }).await {
+            tracing::warn!(error = %e, role, "harness driver: session message not saved");
+        }
+    }
+
+    async fn report_usage(&self, usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>) {
+        if let Err(e) = RemoteRuntime::report_usage(self, usage, model, kind, task_id).await {
+            tracing::warn!(error = %e, kind, "harness driver: usage not reported");
+        }
+    }
+}
+
+fn parse_door_key(v: &Value) -> Result<DoorKey> {
+    let key = v.get("key").and_then(|k| k.as_str()).filter(|k| !k.is_empty()).ok_or_else(|| anyhow!("door_key: reply has no key"))?;
+    let key_id = v.get("key_id").and_then(|k| k.as_str()).unwrap_or_default();
+    let expires_at = v
+        .get("expires_at")
+        .and_then(|e| e.as_str())
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+        .map(|e| e.with_timezone(&chrono::Utc));
+    Ok(DoorKey { key: key.to_string(), key_id: key_id.to_string(), expires_at })
+}
+
+// ── the workspace ───────────────────────────────────────────────────────
+
+/// One task's (or turn's) directory: `work/` is the CLI's cwd, `home/` its
+/// HOME (and its config dir), `tmp/` its TMPDIR, and the MCP config file
+/// with the door key sits beside them, mode 0600, removed after each run.
+#[derive(Debug)]
+pub struct Workspace {
+    pub root: PathBuf,
+    pub work: PathBuf,
+    pub home: PathBuf,
+    pub tmp: PathBuf,
+    keep: bool,
+}
+
+impl Workspace {
+    pub fn create(base: &Path, id: &str, keep: bool) -> Result<Self> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            bail!("workspace id {id:?} is not a plain name");
+        }
+        let root = base.join(id);
+        let ws = Self { work: root.join("work"), home: root.join("home"), tmp: root.join("tmp"), root, keep };
+        for d in [&ws.work, &ws.home, &ws.tmp] {
+            std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ws.root, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(ws)
+    }
+
+    pub fn mcp_path(&self) -> PathBuf {
+        self.root.join("noomesh-mcp.json")
+    }
+
+    /// Write the MCP config naming the user door, readable by this user only.
+    pub fn write_mcp_config(&self, gateway: &str, key: &str) -> Result<PathBuf> {
+        use std::io::Write;
+        let path = self.mcp_path();
+        let _ = std::fs::remove_file(&path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path).with_context(|| format!("writing {}", path.display()))?;
+        f.write_all(serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
+        Ok(path)
+    }
+
+    /// Remove the workspace, unless it is kept for debugging.
+    pub fn finish(self) {
+        if self.keep {
+            tracing::info!(path = %self.root.display(), "harness driver: workspace kept (NOO_HARNESS_KEEP_WORKDIR=1)");
+        } else if let Err(e) = std::fs::remove_dir_all(&self.root) {
+            tracing::warn!(path = %self.root.display(), error = %e, "harness driver: workspace not removed");
+        }
+    }
+}
+
+/// The MCP config a CLI loads: one HTTP server, the user door, the door key
+/// as the bearer. The `{"mcpServers": {...}}` shape both Claude Code
+/// (`--mcp-config`) and Copilot CLI (`--additional-mcp-config`) read; `tools`
+/// is Copilot's required field, ignored by Claude Code.
+pub fn mcp_config(gateway: &str, key: &str) -> Value {
+    json!({"mcpServers": {MCP_SERVER_NAME: {
+        "type": "http",
+        "url": format!("{}/mcp/user", gateway.trim_end_matches('/')),
+        "headers": {"Authorization": format!("Bearer {key}")},
+        "tools": ["*"],
+    }}})
+}
+
+// ── the environment ─────────────────────────────────────────────────────
+
+/// A variable the CLI must never receive, whatever a table row says: the
+/// bus pair and everything of noomesh's own (the node-agent bearer, the
+/// cluster secret, the gateway's secrets, the turn token's carriers).
+pub fn is_forbidden(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with("NATS_") || n.starts_with("NOO_")
+}
+
+/// The CLI's whole environment, built from nothing. Order matters and is
+/// pinned by a test: the driver's own values, then the kind's `lane`, then
+/// its `telemetry_off` LAST (a value earlier in the chain cannot switch a
+/// vendor's reporting back on, as the node agent merges it), then every
+/// forbidden name is stripped.
+pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTreeMap<String, String> {
+    let l = &ctx.launch;
+    let mut env = BTreeMap::new();
+    env.insert("PATH".to_string(), ctx.path.clone());
+    env.insert("HOME".to_string(), ws.home.display().to_string());
+    env.insert("LANG".to_string(), ctx.lang.clone());
+    env.insert("TMPDIR".to_string(), ws.tmp.display().to_string());
+    env.insert("NO_COLOR".to_string(), "1".to_string());
+    env.insert(l.model_url_env.clone(), format!("{}{}", translator_url.trim_end_matches('/'), l.model_url_suffix));
+    env.insert(l.model_env.clone(), ctx.pinned.model.clone());
+    for alias in &l.model_alias_envs {
+        env.insert(alias.clone(), ctx.pinned.model.clone());
+    }
+    if let Some(k) = l.api_key_env.as_deref().filter(|k| !k.is_empty()) {
+        env.insert(k.to_string(), PLACEHOLDER_KEY.to_string());
+    }
+    if let Some(h) = l.home_env.as_deref().filter(|h| !h.is_empty()) {
+        let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
+        env.insert(h.to_string(), ws.home.join(format!(".{cli}")).display().to_string());
+    }
+    if let Some(ca) = &ctx.ca_path {
+        env.insert("NODE_EXTRA_CA_CERTS".to_string(), ca.clone());
+    }
+    for (k, v) in &ctx.kind.lane {
+        env.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &ctx.kind.telemetry_off {
+        env.insert(k.clone(), v.clone());
+    }
+    env.retain(|k, _| !is_forbidden(k));
+    env
+}
+
+/// `launch.command` with `{prompt}` and `{mcp_config}` filled in.
+pub fn fill_command(command: &[String], prompt: &str, mcp_config: &Path) -> Vec<String> {
+    let mcp = mcp_config.display().to_string();
+    command.iter().map(|a| a.replace("{mcp_config}", &mcp).replace("{prompt}", prompt)).collect()
+}
+
+/// An invocation's limit: the configured timeout, cut to the door key's
+/// expiry — a CLI never runs on past the credential it was given.
+pub fn effective_timeout(configured: Duration, key_expires: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> Duration {
+    match key_expires {
+        Some(e) => {
+            let left = (e - now).to_std().unwrap_or(Duration::ZERO);
+            configured.min(left).max(Duration::from_secs(1))
+        }
+        None => configured,
+    }
+}
+
+// ── running the CLI ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RunOutput {
+    /// `None` when killed by a signal (the timeout included).
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub elapsed: Duration,
+}
+
+impl RunOutput {
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out && self.code == Some(0)
+    }
+
+    /// Why the run failed, for a checkpoint note or a turn's error.
+    pub fn failure(&self) -> String {
+        let tail = tail_lines(&self.stderr, 8);
+        let what = if self.timed_out {
+            format!("timed out after {}s", self.elapsed.as_secs())
+        } else {
+            match self.code {
+                Some(c) => format!("exit {c}"),
+                None => "killed by a signal".into(),
+            }
+        };
+        if tail.is_empty() { what } else { format!("{what}: {tail}") }
+    }
+}
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// Run `argv` in `cwd` with exactly `env`, stdin closed, output captured up
+/// to [`OUTPUT_CAP`], in a process group of its own that is killed whole at
+/// `timeout`.
+pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration) -> Result<RunOutput> {
+    let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
+    // The program is looked up on the CLI's PATH, not the harness's.
+    let resolved = resolve_program(prog, env.get("PATH").map(String::as_str)).unwrap_or_else(|| PathBuf::from(prog));
+    let mut cmd = tokio::process::Command::new(&resolved);
+    cmd.args(args)
+        .env_clear()
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let started = Instant::now();
+    let mut child = cmd.spawn().with_context(|| format!("starting {prog}"))?;
+    let out = child.stdout.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
+    let err = child.stderr.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
+    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(s) => (s.ok(), false),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // SAFETY: kill(2) on the process group this child leads.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.start_kill();
+            (child.wait().await.ok(), true)
+        }
+    };
+    // A grandchild that left the group could hold a pipe open: bound the wait.
+    let collect = |h: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
+        match h {
+            Some(h) => tokio::time::timeout(Duration::from_secs(5), h).await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    let stdout = collect(out).await;
+    let stderr = collect(err).await;
+    Ok(RunOutput {
+        code: status.and_then(|s| s.code()),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn resolve_program(prog: &str, path: Option<&str>) -> Option<PathBuf> {
+    if prog.contains('/') {
+        return Some(PathBuf::from(prog));
+    }
+    path?.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(prog)).find(|p| p.is_file())
+}
+
+// ── reading the answer ──────────────────────────────────────────────────
+
+/// What a run said about its task.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Done(String),
+    Failed(String),
+    Continue,
+}
+
+/// The LAST `NOO_RESULT:` / `NOO_FAILED:` line decides.
+pub fn verdict(stdout: &str) -> Verdict {
+    for line in stdout.lines().rev() {
+        let t = line.trim().trim_matches('`').trim();
+        if let Some(r) = t.strip_prefix(RESULT_MARK) {
+            return Verdict::Done(r.trim().to_string());
+        }
+        if let Some(r) = t.strip_prefix(FAILED_MARK) {
+            return Verdict::Failed(r.trim().to_string());
+        }
+    }
+    Verdict::Continue
+}
+
+/// The last `n` non-empty lines, joined.
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// A run's result: the verdict's text if there is one, else the last lines
+/// of what it printed.
+pub fn result_text(stdout: &str) -> String {
+    match verdict(stdout) {
+        Verdict::Done(t) | Verdict::Failed(t) if !t.is_empty() => t,
+        _ => tail_lines(stdout, 20),
+    }
+}
+
+/// One task loop's prompt.
+pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>) -> String {
+    let mut p = String::new();
+    if let Some(role) = req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
+        p.push_str(role.trim());
+        p.push_str("\n\n");
+    }
+    p.push_str(&format!(
+        "You are working on a TASK (loop {loop_no} of {budget}). Objective:\n\n{objective}\n\n",
+        budget = req.loop_budget,
+        objective = req.objective.trim()
+    ));
+    if let Some(n) = last_note.filter(|n| !n.trim().is_empty()) {
+        p.push_str(&format!("Where the previous loop left off:\n{}\n\n", n.trim()));
+    }
+    p.push_str(&format!(
+        "Your working directory persists between loops of this task. noomesh's tools (knowledge base, memory, \
+         agent messages to thread {thread}) are available as the MCP server `{MCP_SERVER_NAME}`.\n\
+         When the objective is fully achieved, end your answer with one line:\n{RESULT_MARK} <one-line summary>\n\
+         If it cannot be achieved, end with:\n{FAILED_MARK} <reason>\n\
+         If more work remains, end with neither; you will be run again.",
+        thread = req.thread_id
+    ));
+    p
+}
+
+// ── one invocation ──────────────────────────────────────────────────────
+
+/// Translator up, door key minted, CLI run, usage reported, key revoked,
+/// translator down — in that order whatever the CLI did.
+async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt: &str, task_id: Option<&str>) -> Result<(RunOutput, UsageTotals)> {
+    let translator = Translator::start(ctx.pinned.clone()).await.context("starting the wire translator")?;
+    let key = match rail.door_key().await {
+        Ok(k) => k,
+        Err(e) => {
+            translator.shutdown().await;
+            return Err(e.context("minting the user-door key"));
+        }
+    };
+    let run = async {
+        let mcp = ws.write_mcp_config(&ctx.gateway, &key.key)?;
+        let env = build_env(ctx, ws, translator.base_url());
+        let argv = fill_command(&ctx.launch.command, prompt, &mcp);
+        let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
+        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
+        spawn_cli(&argv, &env, &ws.work, timeout).await
+    }
+    .await;
+    let _ = std::fs::remove_file(ws.mcp_path());
+    let usage = translator.usage();
+    rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
+    rail.door_key_revoke(&key.key_id).await;
+    translator.shutdown().await;
+    if let Ok(o) = &run {
+        tracing::info!(kind = %ctx.kind.kind, task = task_id.unwrap_or(""), code = ?o.code, timed_out = o.timed_out, secs = o.elapsed.as_secs(), "harness driver: CLI finished");
+    }
+    run.map(|o| (o, usage))
+}
+
+// ── a task ──────────────────────────────────────────────────────────────
+
+/// Run a task to its end on the driven CLI: one invocation per loop, a
+/// checkpoint after each, until a verdict, the budget, three failures in a
+/// row, or a state that is no longer live.
+pub async fn run_task(ctx: &DriverCtx, client: reqwest::Client, req: &TaskRequest) -> Result<String> {
+    let mut rt = RemoteRuntime::connect(&ctx.gateway, &req.token, client).await?;
+    run_task_on(ctx, &mut rt, req).await
+}
+
+pub(crate) async fn run_task_on<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequest) -> Result<String> {
+    let ws = Workspace::create(&ctx.workdir_root, &req.task_id, ctx.keep_workdir)?;
+    let out = task_loops(ctx, rail, req, &ws).await;
+    ws.finish();
+    out
+}
+
+async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequest, ws: &Workspace) -> Result<String> {
+    let mut loops = req.loops_done;
+    let mut failures = 0u32;
+    let mut last_note: Option<String> = None;
+    loop {
+        if loops >= req.loop_budget {
+            return rail.checkpoint(&req.task_id, loops, Some("loop budget exhausted"), true).await;
+        }
+        let prompt = task_prompt(req, loops + 1, last_note.as_deref());
+        let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
+        loops += 1;
+        let mut decided = false;
+        let note = match &outcome {
+            Ok((o, _)) if o.succeeded() => {
+                failures = 0;
+                rail.save("user", &prompt).await;
+                rail.save("assistant", o.stdout.trim()).await;
+                match verdict(&o.stdout) {
+                    Verdict::Done(r) => {
+                        decided = true;
+                        rail.task_done(&req.task_id, &r, false).await?;
+                    }
+                    Verdict::Failed(r) => {
+                        decided = true;
+                        rail.task_done(&req.task_id, &r, true).await?;
+                    }
+                    Verdict::Continue => {}
+                }
+                crate::tasks::excerpt(&result_text(&o.stdout))
+            }
+            Ok((o, _)) => {
+                failures += 1;
+                format!("loop {loops} failed: {}", o.failure())
+            }
+            Err(e) => {
+                failures += 1;
+                format!("loop {loops} failed: {e:#}")
+            }
+        };
+        let exhausted = !decided && loops >= req.loop_budget;
+        let after = rail.checkpoint(&req.task_id, loops, Some(&note), exhausted).await?;
+        if failures >= 3 && !exhausted {
+            return rail.checkpoint(&req.task_id, loops, Some("three consecutive loop failures; giving up"), true).await;
+        }
+        if !crate::tasks::keep_looping(&after, loops, req.loop_budget) {
+            return Ok(after);
+        }
+        last_note = Some(note);
+    }
+}
+
+// ── a turn ──────────────────────────────────────────────────────────────
+
+/// One turn on the driven CLI: its answer is the turn's response.
+pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnRequest) -> Result<CoordinatorResult> {
+    let rt = RemoteRuntime::connect(&ctx.gateway, &req.token, client).await?;
+    run_turn_on(ctx, &rt, req).await
+}
+
+pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
+    let id = format!("turn-{}", uuid::Uuid::new_v4().simple());
+    let ws = Workspace::create(&ctx.workdir_root, &id, ctx.keep_workdir)?;
+    let prompt = match req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(role) => format!("{}\n\n{}", role.trim(), req.prompt),
+        None => req.prompt.clone(),
+    };
+    let outcome = invoke(ctx, rail, &ws, &prompt, None).await;
+    ws.finish();
+    let (o, usage) = outcome?;
+    if !o.succeeded() {
+        bail!("{} CLI: {}", ctx.kind.kind, o.failure());
+    }
+    let response = o.stdout.trim().to_string();
+    rail.save("user", &req.prompt).await;
+    rail.save("assistant", &response).await;
+    let clamp = |v: u64| v.min(u32::MAX as u64) as u32;
+    Ok(CoordinatorResult {
+        response,
+        model: ctx.pinned.model.clone(),
+        backend: ctx.pinned.backend_type.clone(),
+        node: Some(ctx.node.clone()),
+        iterations: 1,
+        tool_calls: Vec::new(),
+        elapsed_secs: o.elapsed.as_secs_f64(),
+        usage: UsageStats {
+            prompt_tokens: clamp(usage.prompt_tokens),
+            completion_tokens: clamp(usage.completion_tokens),
+            total_tokens: clamp(usage.total_tokens),
+            total_tool_calls: 0,
+            total_latency_ms: o.elapsed.as_millis().min(u64::MAX as u128) as u64,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    const TURN_TOKEN: &str = "eyJturn.token.secret";
+
+    fn kind(command: &[&str], lane: &[(&str, &str)], telemetry: &[(&str, &str)]) -> HarnessKind {
+        serde_json::from_value(json!({
+            "kind": "fake",
+            "title": "a fake CLI",
+            "wire": "OpenAI's Chat Completions API",
+            "wires": ["llamacpp"],
+            "runner": "noo-gateway",
+            "cli": command[0],
+            "lane": lane.iter().cloned().collect::<BTreeMap<_, _>>(),
+            "launch": {
+                "command": command,
+                "model_url_env": "FAKE_BASE_URL",
+                "model_env": "FAKE_MODEL",
+                "mcp": "config-file",
+                "model_url_suffix": "/v1",
+                "api_key_env": "FAKE_API_KEY",
+                "model_alias_envs": ["FAKE_SMALL_MODEL"],
+                "home_env": "FAKE_HOME"
+            },
+            "telemetry_off": telemetry.iter().cloned().collect::<BTreeMap<_, _>>(),
+        }))
+        .unwrap()
+    }
+
+    fn pinned() -> ResolvedBackend {
+        ResolvedBackend { url: "http://127.0.0.1:8085".into(), model: "gemma-4".into(), backend_type: "llamacpp".into(), api_format: "openai".into() }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("noo-driver-test-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn ctx_for(k: &HarnessKind, root: &Path, timeout_secs: &str) -> DriverCtx {
+        let root = root.display().to_string();
+        let timeout = timeout_secs.to_string();
+        // The harness's own env as the unit hands it: the bus pair, the
+        // node-agent bearer, the cluster secret. None of it may reach the CLI.
+        let parent: BTreeMap<&str, String> = [
+            ("NOO_HARNESS_WORKDIR", root),
+            ("NOO_HARNESS_TURN_TIMEOUT_SECS", timeout),
+            ("NOO_TLS_CA", "/etc/noo/pki/ca.crt".to_string()),
+            ("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())),
+            ("NATS_NODE_PASSWORD", "bus-secret".into()),
+            ("NOO_NODE_AGENT_TOKEN", "agent-bearer".into()),
+            ("NOO_CLUSTER_SECRET", "cluster-secret".into()),
+        ]
+        .into_iter()
+        .collect();
+        DriverCtx::new("awolf", "https://gateway:8080/", k, pinned(), &|n| parent.get(n).cloned()).unwrap()
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        checkpoints: Vec<(u32, Option<String>, bool)>,
+        done: Vec<(String, bool)>,
+        keys_minted: u32,
+        keys_revoked: Vec<String>,
+        saved: Vec<(String, String)>,
+        usage: Vec<(String, String, Option<String>)>,
+    }
+
+    struct FakeRail {
+        calls: Mutex<Calls>,
+        key_ttl_secs: i64,
+    }
+
+    impl FakeRail {
+        fn new() -> Self {
+            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900 }
+        }
+    }
+
+    impl DriverRail for FakeRail {
+        async fn checkpoint(&mut self, _task_id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String> {
+            let mut c = self.calls.lock().unwrap();
+            c.checkpoints.push((loops, note.map(str::to_string), exhausted));
+            Ok(match (c.done.last(), exhausted) {
+                (Some((_, false)), _) => "done",
+                (Some((_, true)), _) | (None, true) => "failed",
+                (None, false) => "checkpointed",
+            }
+            .to_string())
+        }
+        async fn task_done(&self, _task_id: &str, result: &str, failed: bool) -> Result<String> {
+            self.calls.lock().unwrap().done.push((result.to_string(), failed));
+            Ok(if failed { "failed" } else { "done" }.to_string())
+        }
+        async fn door_key(&self) -> Result<DoorKey> {
+            let mut c = self.calls.lock().unwrap();
+            c.keys_minted += 1;
+            Ok(DoorKey {
+                key: format!("noo-sk-door-{}", c.keys_minted),
+                key_id: format!("key-{}", c.keys_minted),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(self.key_ttl_secs)),
+            })
+        }
+        async fn door_key_revoke(&self, key_id: &str) {
+            self.calls.lock().unwrap().keys_revoked.push(key_id.to_string());
+        }
+        async fn save(&self, role: &str, content: &str) {
+            self.calls.lock().unwrap().saved.push((role.to_string(), content.to_string()));
+        }
+        async fn report_usage(&self, _usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>) {
+            self.calls.lock().unwrap().usage.push((model.to_string(), kind.to_string(), task_id.map(str::to_string)));
+        }
+    }
+
+    fn task(id: &str, budget: u32) -> TaskRequest {
+        TaskRequest {
+            task_id: id.into(),
+            objective: "count the documents".into(),
+            conversation_id: "c0ffee00-0000-0000-0000-000000000000".into(),
+            thread_id: "thr_1".into(),
+            channel: "task".into(),
+            user: "alice".into(),
+            model: None,
+            loops_done: 0,
+            loop_budget: budget,
+            max_iterations: 10,
+            token: TURN_TOKEN.into(),
+            role_prompt: Some("You are the researcher.".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_reports_a_result_finishes_its_task_in_one_loop() {
+        let root = scratch("ok");
+        let k = kind(&["sh", "-c", "echo hello; echo NOO_RESULT: ok"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        let state = run_task_on(&ctx, &mut rail, &task("t-ok", 3)).await.unwrap();
+        assert_eq!(state, "done");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.done, vec![("ok".to_string(), false)]);
+        assert_eq!(c.checkpoints, vec![(1, Some("ok".to_string()), false)]);
+        assert_eq!(c.keys_minted, 1);
+        assert_eq!(c.keys_revoked, vec!["key-1".to_string()], "every minted key is revoked");
+        assert_eq!(c.usage, vec![("gemma-4".to_string(), "fake".to_string(), Some("t-ok".to_string()))]);
+        assert_eq!(c.saved.len(), 2);
+        assert!(c.saved[0].1.contains("count the documents") && c.saved[0].1.contains("You are the researcher."));
+        assert!(c.saved[1].1.contains("hello"));
+        assert!(!root.join("t-ok").exists(), "the workspace is removed when the task ends");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_failing_cli_is_a_failed_loop_with_its_stderr_and_exhausts_the_budget() {
+        let root = scratch("fail");
+        let k = kind(&["sh", "-c", "echo partial; echo 'boom: no provider' >&2; exit 3"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        let state = run_task_on(&ctx, &mut rail, &task("t-fail", 1)).await.unwrap();
+        assert_eq!(state, "failed");
+        let c = rail.calls.lock().unwrap();
+        assert!(c.done.is_empty(), "a failed run is no verdict");
+        assert_eq!(c.checkpoints.len(), 1);
+        let (loops, note, exhausted) = &c.checkpoints[0];
+        assert_eq!(*loops, 1);
+        assert!(*exhausted, "the loop that reaches the budget exhausts it");
+        let note = note.as_deref().unwrap();
+        assert!(note.contains("exit 3") && note.contains("boom: no provider"), "{note}");
+        assert_eq!(c.keys_revoked.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn three_failed_loops_in_a_row_end_the_task() {
+        let root = scratch("three");
+        let k = kind(&["sh", "-c", "exit 1"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        let state = run_task_on(&ctx, &mut rail, &task("t-three", 10)).await.unwrap();
+        assert_eq!(state, "failed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.keys_minted, 3);
+        let last = c.checkpoints.last().unwrap();
+        assert!(last.2 && last.1.as_deref().unwrap().contains("three consecutive"), "{last:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cli_past_its_deadline_is_killed() {
+        let root = scratch("slow");
+        let k = kind(&["sh", "-c", "sleep 30; echo NOO_RESULT: too late"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "1");
+        let mut rail = FakeRail::new();
+        let started = Instant::now();
+        let state = run_task_on(&ctx, &mut rail, &task("t-slow", 1)).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "the sleep was not killed: {:?}", started.elapsed());
+        assert_eq!(state, "failed");
+        let c = rail.calls.lock().unwrap();
+        assert!(c.done.is_empty());
+        let note = c.checkpoints[0].1.as_deref().unwrap();
+        assert!(note.contains("timed out"), "{note}");
+        assert_eq!(c.keys_revoked.len(), 1, "a killed run still revokes its key");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED: what the CLI process actually sees carries none of the
+    /// harness's secrets and not the turn token — `env_clear`, not hope.
+    #[tokio::test]
+    async fn the_cli_process_sees_no_harness_secret() {
+        let root = scratch("env");
+        let k = kind(&["sh", "-c", "env; echo NOO_RESULT: ok"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        run_task_on(&ctx, &mut rail, &task("t-env", 1)).await.unwrap();
+        let c = rail.calls.lock().unwrap();
+        let seen = &c.saved[1].1;
+        for bad in ["NATS_", "NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "bus-secret", "agent-bearer", "cluster-secret", TURN_TOKEN, "noo-sk-door"] {
+            assert!(!seen.contains(bad), "the CLI saw {bad}:\n{seen}");
+        }
+        assert!(seen.contains("FAKE_MODEL=gemma-4"), "{seen}");
+        // The CLI is pointed at the loopback translator, never at the model
+        // endpoint itself.
+        let base = seen.lines().find_map(|l| l.strip_prefix("FAKE_BASE_URL=")).expect("FAKE_BASE_URL set");
+        assert!(base.starts_with("http://127.0.0.1:") && base.ends_with("/v1") && !base.contains(":8085"), "{base}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED: lane and telemetry_off are merged LAST, telemetry after lane,
+    /// and a forbidden name never survives, whoever set it.
+    #[test]
+    fn the_env_is_built_from_nothing_and_telemetry_is_merged_last() {
+        let root = scratch("envunit");
+        let k = kind(
+            &["fake"],
+            &[("DO_NOT_TRACK", "0"), ("FAKE_AUTO_UPDATE", "false"), ("NATS_URL", "nats://leak"), ("FAKE_MODEL", "lane-model")],
+            &[("DO_NOT_TRACK", "1"), ("NOO_CLUSTER_SECRET", "leak")],
+        );
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-envunit", false).unwrap();
+        let env = build_env(&ctx, &ws, "http://127.0.0.1:41234/");
+        assert!(env.keys().all(|k| !is_forbidden(k)), "{env:?}");
+        assert!(env.values().all(|v| !v.contains(TURN_TOKEN) && !v.contains("secret") && !v.contains("bearer")), "{env:?}");
+        assert_eq!(env["DO_NOT_TRACK"], "1", "telemetry_off wins over the lane");
+        assert_eq!(env["FAKE_AUTO_UPDATE"], "false");
+        assert_eq!(env["FAKE_MODEL"], "lane-model", "the lane is merged after the driver's own values");
+        assert_eq!(env["FAKE_BASE_URL"], "http://127.0.0.1:41234/v1");
+        assert_eq!(env["FAKE_SMALL_MODEL"], "gemma-4");
+        assert_eq!(env["FAKE_API_KEY"], PLACEHOLDER_KEY);
+        assert_eq!(env["HOME"], ws.home.display().to_string());
+        assert!(env["FAKE_HOME"].starts_with(&ws.home.display().to_string()));
+        assert_eq!(env["NODE_EXTRA_CA_CERTS"], "/etc/noo/pki/ca.crt");
+        for n in ["NATS_URL", "NATS_NODE_PASSWORD", "NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "NOO_GATEWAY_URL"] {
+            assert!(!env.contains_key(n), "{n}");
+        }
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_door_key_reaches_the_cli_only_through_the_mcp_file() {
+        let root = scratch("mcp");
+        let ws = Workspace::create(&root, "t-mcp", false).unwrap();
+        let p = ws.write_mcp_config("https://gateway:8080/", "noo-sk-door-1").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let s = &v["mcpServers"][MCP_SERVER_NAME];
+        assert_eq!(s["url"], "https://gateway:8080/mcp/user");
+        assert_eq!(s["headers"]["Authorization"], "Bearer noo-sk-door-1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(!p.starts_with(&ws.work), "the key file is outside the CLI's working directory");
+        let argv = fill_command(&["c".into(), "-p".into(), "{prompt}".into(), "@{mcp_config}".into()], "do it", &p);
+        assert_eq!(argv[2], "do it");
+        assert_eq!(argv[3], format!("@{}", p.display()));
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED: one workspace per task; a task id cannot climb out of the root.
+    #[test]
+    fn workspaces_are_per_task() {
+        let root = scratch("ws");
+        let a = Workspace::create(&root, "task-a", false).unwrap();
+        let b = Workspace::create(&root, "task-b", false).unwrap();
+        assert_ne!(a.root, b.root);
+        assert!(a.root.starts_with(&root) && b.root.starts_with(&root));
+        for bad in ["../x", "a/b", "", "."] {
+            assert!(Workspace::create(&root, bad, false).is_err(), "{bad:?}");
+        }
+        a.finish();
+        b.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_run_never_outlives_its_door_key() {
+        let now = chrono::Utc::now();
+        let t = Duration::from_secs(900);
+        assert_eq!(effective_timeout(t, None, now), t);
+        assert_eq!(effective_timeout(t, Some(now + chrono::Duration::seconds(120)), now), Duration::from_secs(120));
+        assert_eq!(effective_timeout(t, Some(now + chrono::Duration::seconds(5000)), now), t);
+        assert_eq!(effective_timeout(t, Some(now - chrono::Duration::seconds(5)), now), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_last_marker_line_is_the_verdict() {
+        assert_eq!(verdict("a\nNOO_RESULT: 42 documents\n"), Verdict::Done("42 documents".into()));
+        assert_eq!(verdict("NOO_RESULT: early\nthen\nNOO_FAILED: no access"), Verdict::Failed("no access".into()));
+        assert_eq!(verdict("`NOO_RESULT: fenced`"), Verdict::Done("fenced".into()));
+        assert_eq!(verdict("working on it"), Verdict::Continue);
+        assert_eq!(result_text("x\n\ny\nz\n"), "x\ny\nz");
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+    }
+
+    /// The shipped table: Copilot and Claude Code are runnable, Codex is
+    /// refused until its recipe is verified, `noo` is never driven.
+    #[test]
+    fn the_shipped_foreign_kinds_validate() {
+        for name in ["copilot", "claude-code"] {
+            let k = crate::harness_kinds::get(name).unwrap();
+            let l = validate_kind(k).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(l.command.iter().any(|a| a.contains("{prompt}")), "{name}: no {{prompt}}");
+            assert!(l.command.iter().any(|a| a.contains("{mcp_config}")), "{name}: no {{mcp_config}}");
+            assert_eq!(l.command[0], k.cli.clone().unwrap(), "{name}");
+            let ctx = DriverCtx::new("n", "https://g", k, pinned(), &|_| None).unwrap();
+            let root = scratch(name);
+            let ws = Workspace::create(&root, "t", false).unwrap();
+            let env = build_env(&ctx, &ws, "http://127.0.0.1:1");
+            for (tk, tv) in &k.telemetry_off {
+                assert_eq!(env.get(tk), Some(tv), "{name}: telemetry switch {tk}");
+            }
+            ws.finish();
+            let _ = std::fs::remove_dir_all(root);
+        }
+        assert!(validate_kind(crate::harness_kinds::get("codex").unwrap()).is_err());
+        assert!(validate_kind(crate::harness_kinds::get("noo").unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_turn_returns_the_cli_answer_and_saves_both_sides() {
+        let root = scratch("turn");
+        let k = kind(&["sh", "-c", "echo the answer is 42"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let rail = FakeRail::new();
+        let req = TurnRequest {
+            conversation_id: "c1".into(),
+            prompt: "what is it?".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: true,
+            token: TURN_TOKEN.into(),
+        };
+        let r = run_turn_on(&ctx, &rail, &req).await.unwrap();
+        assert_eq!(r.response, "the answer is 42");
+        assert_eq!(r.node.as_deref(), Some("awolf"));
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.saved, vec![("user".to_string(), "what is it?".to_string()), ("assistant".to_string(), "the answer is 42".to_string())]);
+        assert_eq!(c.keys_revoked.len(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "the turn's workspace is removed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

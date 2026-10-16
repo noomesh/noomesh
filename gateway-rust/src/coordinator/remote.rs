@@ -108,7 +108,6 @@ impl RemoteRuntime {
     /// them as this token's user on this token's node; `kind` is the
     /// harness kind (`copilot`, `claude-code`, ...). An error is the
     /// caller's to log — the turn's answer does not depend on it.
-    #[allow(dead_code)] // the foreign-loop driver (E1c) is the caller
     pub async fn report_usage(
         &self,
         totals: &crate::harness::translator::UsageTotals,

@@ -42,16 +42,40 @@ pub struct HarnessKind {
     pub telemetry_off: BTreeMap<String, String>,
 }
 
-/// How the driver invokes a foreign CLI. A value starting `unverified:` is
-/// for the driver to settle.
+/// How the driver (`harness::driver`) invokes a foreign CLI. A value
+/// starting `unverified:` is documented-but-unconfirmed, and the driver
+/// refuses a kind that still carries one.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct Launch {
-    /// argv; `{prompt}` is filled in by the driver.
+    /// argv; `{prompt}` and `{mcp_config}` (the MCP config file the driver
+    /// writes) are filled in by the driver, inside any argument.
     pub command: Vec<String>,
+    /// The variable that points the CLI at the loopback translator.
     pub model_url_env: String,
+    /// The variable that names the CLI's model.
     pub model_env: String,
+    /// How the CLI takes an MCP server. `config-file`: the driver writes
+    /// `{"mcpServers": {"noomesh": {...}}}` and passes its path as
+    /// `{mcp_config}` in `command`.
     pub mcp: String,
+    /// Appended to the translator's base URL (`/v1` for a CLI that appends
+    /// `/chat/completions` to the URL it is given).
+    #[serde(default)]
+    pub model_url_suffix: String,
+    /// A variable the CLI insists on before it calls a provider; the driver
+    /// fills it with a placeholder, the loopback translator takes no key.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// More variables that name a model (a CLI's background/sub-agent
+    /// models); all set to the pinned model, so nothing asks for one the
+    /// node does not serve.
+    #[serde(default)]
+    pub model_alias_envs: Vec<String>,
+    /// The variable naming the CLI's config/state directory; the driver
+    /// points it inside the task's own HOME.
+    #[serde(default)]
+    pub home_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +93,11 @@ static KINDS: LazyLock<Vec<HarnessKind>> = LazyLock::new(|| {
 #[allow(dead_code)]
 pub fn all() -> &'static [HarnessKind] {
     &KINDS
+}
+
+/// One kind by name.
+pub fn get(kind: &str) -> Option<&'static HarnessKind> {
+    KINDS.iter().find(|k| k.kind == kind)
 }
 
 /// The kind names, in declared order.
