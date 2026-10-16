@@ -1,0 +1,14 @@
+# cargo-deny config for the advisory gate (ci.yml job `rust-advisories`).
+# Scope: RustSec advisories only. Licences and bans are not gated here.
+#
+# Vulnerabilities fail the job. Every ignore below needs a reason; delete the
+# entry when the reason stops holding.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Unmaintained, not vulnerable: serde_yaml's libyaml port. Migration is
+    # separate work, not part of the advisory gate.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (serde_yaml); migration pending" },
+]
