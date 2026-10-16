@@ -119,6 +119,24 @@ services:
     # the operator account isn't gid 1000.
     group_add:
       - "${NOO_HOST_GID:-1000}"
+    # Container hardening, the sandbox's first two lines (the sandbox below
+    # also drops to a read-only rootfs; see why this service does not).
+    # The gateway runs as uid 65532 and holds no capability it uses: it binds
+    # 8080 (> 1024), opens no raw socket and execs no setuid binary, so
+    # dropping ALL removes nothing it needs and denies a compromised process
+    # the defaults Docker would grant (NET_RAW, SETUID, SETGID, CHOWN,
+    # DAC_OVERRIDE, ...). `no-new-privileges` stops any exec from gaining
+    # more than the process has. NOT `read_only`: the gateway writes the
+    # mounted noomesh.yaml, prompts/ and the compose override (rw, on
+    # purpose), spawns the coding-harness CLIs, python3 (worker delegation)
+    # and openssl, each of which writes under HOME and /tmp, and the set of
+    # paths cannot be enumerated statically with confidence. A path missed
+    # there is a runtime EROFS in a live controller, not a build failure.
+    # tests/test_gateway_worker_hardening.py pins this block.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       # NOO_BIND_ADDR (H-N2/N3/N5): host interface every cluster-plane port binds to.
       # Defaults to 0.0.0.0 (non-breaking). Set NOO_BIND_ADDR=<tailnet-ip> in .env to
@@ -832,6 +850,15 @@ services:
       - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
       - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
       - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
+    # Same two hardening lines as the gateway (anchored: worker-extra gets
+    # them too). uid 65532, listens on 8090, no capability in use. NOT
+    # `read_only`: tool code the worker runs writes where the operator's
+    # config says (`workspace_dir`, the audit archive's `./audit-archive`,
+    # `output_dir`), so the writable set is not a fixed list of paths.
+    cap_drop: &worker-cap-drop
+      - ALL
+    security_opt: &worker-security-opt
+      - no-new-privileges:true
     environment: &worker-env
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
@@ -922,7 +949,10 @@ services:
       # gchat SA key for the approval ping, and noo-data for CRUD stores
       # that write artifacts. No ingest/watched-folder mounts — those are
       # the ML pack's.
-      - ./noomesh.yaml:/app/noomesh.yaml
+      # `:ro`: the worker reads its config and never writes it (the only
+      # writer, config.update_runtime_config, has no caller in the worker);
+      # settings changes go through the gateway, which holds the rw mount.
+      - ./noomesh.yaml:/app/noomesh.yaml:ro
       - noo-data:/data
       # ca.crt + the worker's OWN leaf (NOO_TLS_* above);
       # never the whole PKI dir (ca.key, nodes/*/node.key) and never
@@ -933,6 +963,9 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/worker:/app/pki/leaf:ro
     networks: &worker-networks
       - noo-cluster
+      # Postgres and Redis live on `noo-db` alone: the worker is one of their
+      # clients (DATABASE_URL / REDIS_URL above), so it joins that network.
+      - noo-db
       - noo-sandbox
       - noo-browser
     restart: unless-stopped
@@ -959,6 +992,8 @@ services:
     deploy:
       replicas: ${NOO_WORKER_EXTRA:-0}
     secrets: *worker-secrets
+    cap_drop: *worker-cap-drop
+    security_opt: *worker-security-opt
     environment: *worker-env
     volumes: *worker-volumes
     networks: *worker-networks
@@ -1015,8 +1050,13 @@ services:
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/redis:/tls/services/redis:ro
       - ./docker/redis-entrypoint.sh:/usr/local/bin/redis-entrypoint.sh:ro
+    # `noo-db` ONLY. It used to sit on `noo-cluster` as well, so every
+    # container on that network (backends parsing untrusted model files,
+    # nginx, the monitoring images, the worker's tool code) had a TCP path to
+    # redis:6379 and only the shared password stood between them and the
+    # cache. Every client — gateway, worker, trellion and the add-ons — joins
+    # `noo-db` itself. tests/test_db_networks_are_isolated.py pins this.
     networks:
-      - noo-cluster
       - noo-db
     restart: unless-stopped
     # The password is NOT on this command line, and must never be put back
@@ -1965,10 +2005,13 @@ services:
     restart: unless-stopped
     # CRIT-4: node-agent privilege. `privileged` historically supplied GPU
     # device access (no nvidia runtime). It's now env-gated so you can drop it
-    # per node — default true = non-breaking; set NOO_NODE_AGENT_PRIVILEGED=false
-    # to run unprivileged (then a GPU node needs the nvidia device reservation /
-    # /dev/dxg on WSL). Roll out on one node first. no-new-privileges is always
-    # on (safe even with privileged).
+    # per node. DEFAULT NOW false: this service has no docker.sock (see the
+    # volumes above), so it can no longer start a backend and has no GPU
+    # function left that privileged would serve; the fleet runs the host
+    # binary instead. A GPU bootstrap run of this lane that still wants a
+    # device sets NOO_NODE_AGENT_PRIVILEGED=true explicitly, or adds a
+    # `devices:` entry / nvidia reservation (/dev/dxg on WSL).
+    # no-new-privileges is always on.
     #
     # This comment used to add "and docker.sock should front a socket-proxy".
     # Removed because it is not true for THIS service and reads as if it were a
@@ -1982,7 +2025,7 @@ services:
     # contain a compromised node-agent, because the socket alone is
     # host-root-equivalent. See an earlier change for the options that actually
     # change that.
-    privileged: ${NOO_NODE_AGENT_PRIVILEGED:-true}
+    privileged: ${NOO_NODE_AGENT_PRIVILEGED:-false}
     security_opt:
       - no-new-privileges:true
 
@@ -2689,9 +2732,17 @@ services:
       # replication is reachable over the overlay only — never the LAN/WAN.
       # See scripts/bootstrap-standby.sh.
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
+    # `noo-db` (every client's network) plus `noo-pg-host`, a bridge that
+    # carries NOTHING but this container. Never `noo-cluster`: it used to be
+    # here, which put the database one TCP hop from every container on the
+    # cluster network. `noo-db` is `internal: true`, and Docker does not
+    # publish a port for a container attached only to internal networks, so
+    # the host publish above (admin, warm-standby replication) needs a
+    # non-internal network of its own; no other service may join it.
+    # tests/test_db_networks_are_isolated.py pins both lists.
     networks:
-      - noo-cluster
       - noo-db
+      - noo-pg-host
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U noo -d noomesh"]
@@ -2787,10 +2838,19 @@ networks:
     # literal `noo-cluster` their provisioning created.
     name: ${NOO_CLUSTER_NETWORK:-noo-cluster}
     external: true
-  # Internal DB network — only gateway can reach postgres/redis
+  # Internal DB network — the ONLY network postgres and redis answer on.
+  # Members: their clients (gateway, worker, worker-extra, trellion, and the
+  # add-ons that use the database) and nothing else.
+  # tests/test_db_networks_are_isolated.py holds the member list.
   noo-db:
     driver: bridge
     internal: true
+  # Postgres' host-publish path (127.0.0.1:${POSTGRES_PORT:-5433}, or the
+  # tailnet IP in POSTGRES_BIND for a warm standby). An internal network
+  # cannot publish a port, so postgres has this bridge too. It carries one
+  # container; no client dials postgres over it.
+  noo-pg-host:
+    driver: bridge
   # Code-execution network (audit M-3) — carries exactly one link:
   # gateway/trellion → sandbox:9000 (mTLS). The sandbox executes LLM-generated
   # code, so it must not share a network with the bus (NATS monitoring
