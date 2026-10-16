@@ -30,6 +30,7 @@ pub mod classes;
 mod cloud;
 mod context;
 mod dispatch;
+mod gemma_channel;
 mod rail;
 mod remote;
 mod runtime;
