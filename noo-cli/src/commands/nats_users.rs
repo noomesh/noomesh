@@ -1099,6 +1099,45 @@ pub fn cluster_nats_creds_rotate(g: &Globals, args: &[String]) -> Result<i32, Un
 mod tests {
     use super::*;
 
+    /// i77's NATS half of "a seat can never obtain node credentials": the bus
+    /// principals come from the NODE registry (`/api/cluster/nodes`) and the
+    /// two controller principals, and nothing else. A kiosk seat lives in its
+    /// own registry (`/api/cluster/seats`), which no code here reads, so a
+    /// seat cannot have a principal — not by name, not by role. The gateway
+    /// half is `auth::tests::seat_cannot_reach_node_routes`.
+    #[test]
+    fn seat_has_no_bus_principal() {
+        // The fleet as the gateway lists it: the nodes, and separately a seat.
+        let nodes = serde_json::json!({"nodes": [{"id": "host3"}, {"id": "pop-os"}]});
+        let seats = serde_json::json!({"seats": [{"seat_name": "lobby", "role": "seat"}]});
+        let ids = nodes_from_registry(&nodes);
+        assert_eq!(ids, ["host3", "pop-os"]);
+        // The seats document is not a nodes document: read as one, it
+        // yields nothing (it has no `nodes` array).
+        assert!(nodes_from_registry(&seats).is_empty());
+        let mut principals: Vec<Principal> = vec![
+            Principal { user: "gateway".into(), hash: "$2b$11$g".into(), role: Role::Gateway },
+            Principal { user: "worker".into(), hash: "$2b$11$w".into(), role: Role::Worker },
+        ];
+        for id in &ids {
+            principals.push(Principal { user: format!("node-{id}"), hash: "$2b$11$n".into(), role: Role::Node });
+        }
+        let conf = render_users_conf(&principals);
+        assert!(!conf.contains("lobby"), "a seat must never be a bus principal:\n{conf}");
+        assert!(!conf.to_ascii_lowercase().contains("seat"), "{conf}");
+        // Structural: the renderer's only fleet source is the node registry.
+        let src = include_str!("nats_users.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("/api/cluster/seats") && !prod.contains("kiosk_seat"),
+            "nats_users must never enumerate seats");
+        assert!(prod.contains("\"/api/cluster/nodes\""));
+        // And the shipped server config has no seat user either.
+        let shipped = include_str!("../../../monitoring/nats/nats-tls.conf");
+        assert!(!shipped.to_ascii_lowercase().contains("seat"), "nats-tls.conf names a seat");
+        let users = include_str!("../../../monitoring/nats/users.conf");
+        assert!(!users.to_ascii_lowercase().contains("seat"), "the shipped users.conf names a seat");
+    }
+
     // ── users.conf value quoting (the v0.2.22 outage) ─────────────────
 
     /// What an older CLI rendered for the legacy principal — the text still

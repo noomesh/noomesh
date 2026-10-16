@@ -154,7 +154,7 @@ const DENIED_MSG: &str = "bootstrap token rejected";
 /// > onboarding. Sub-operator JWTs are refused even on GET — `scope_allows`
 /// > admits every GET, so without this a read-tier account could enumerate
 /// > token issuance metadata.
-fn bootstrap_admin_guard(
+pub(crate) fn bootstrap_admin_guard(
     ctx: &Option<Extension<RequesterCtx>>,
 ) -> Result<String, AppError> {
     match ctx {
@@ -171,7 +171,7 @@ fn bootstrap_admin_guard(
 /// REJECTED rather than clamped — silently shortening a requested 7-day
 /// token to 24h would hand the caller a credential with different properties
 /// than they asked for.
-fn validate_ttl(ttl_seconds: Option<i64>) -> Result<i64, String> {
+pub(crate) fn validate_ttl(ttl_seconds: Option<i64>) -> Result<i64, String> {
     let ttl = ttl_seconds.unwrap_or(3600);
     if ttl <= 0 {
         return Err("ttl_seconds must be positive".into());
@@ -278,7 +278,7 @@ fn controller_ssh_pubkey() -> Option<String> {
 
 /// The controller URL the enrollment paste and the enrollment hint point at. Same
 /// declaration the AgentCard serves (`peers.rs`): env → yaml → default.
-fn controller_url() -> String {
+pub(crate) fn controller_url() -> String {
     crate::config::env_or_yaml(
         "NOO_GATEWAY_URL",
         |c| c.services.gateway_url.clone(),
@@ -372,7 +372,7 @@ fn compose_enroll_command(url: &str, token: &str, tsk: &str, ca_sha256: &str, no
 /// serves it: the env override, the compose mount (`${NOO_PKI_DIR}:/app/pki`),
 /// the repo-relative dev path. ONE list, because the pin in the paste must be
 /// the fingerprint of the very file the node will fetch.
-fn cluster_ca_candidates() -> [String; 3] {
+pub(crate) fn cluster_ca_candidates() -> [String; 3] {
     [
         std::env::var("NOO_TLS_CA").unwrap_or_default(),
         "/app/pki/ca.crt".to_string(),
@@ -398,7 +398,7 @@ fn ca_der_sha256(pem: &[u8]) -> Result<String, String> {
 }
 
 /// The pin for the enrollment paste, from the CA this gateway serves.
-fn cluster_ca_fingerprint_from(candidates: &[String]) -> Result<String, String> {
+pub(crate) fn cluster_ca_fingerprint_from(candidates: &[String]) -> Result<String, String> {
     for cand in candidates.iter().filter(|c| !c.is_empty()) {
         let Ok(bytes) = std::fs::read(cand) else { continue };
         if !bytes.windows(27).any(|w| w == b"-----BEGIN CERTIFICATE-----") {
@@ -416,7 +416,7 @@ fn cluster_ca_fingerprint_from(candidates: &[String]) -> Result<String, String> 
 /// loopback or docker-internal name no other machine can reach. Onboarding
 /// writes the tailnet address to `services.gateway_url`; the example config
 /// seeds `https://localhost:8080`, which would poison every join.
-fn enroll_url(url: &str) -> Result<String, String> {
+pub(crate) fn enroll_url(url: &str) -> Result<String, String> {
     let host = url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -1359,7 +1359,7 @@ async fn cli_asset_get(
     }
 }
 
-fn valid_node_name(n: &str) -> bool {
+pub(crate) fn valid_node_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 64
         && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))

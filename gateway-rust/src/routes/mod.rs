@@ -16,6 +16,7 @@ mod cli_piece;
 mod console_piece;
 mod artifacts;
 mod bootstrap;
+mod seats;
 pub(crate) mod cluster;
 pub(crate) mod communication;
 pub(crate) mod core;
@@ -252,6 +253,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(cluster::router())
         .merge(artifacts::router())
         .merge(bootstrap::router())
+        .merge(seats::router())
         .merge(inference::router())
         .merge(addon_token::router())
         .merge(kiosk::router())

@@ -2957,7 +2957,7 @@ pub(crate) fn stage_bundle_pull(
 }
 
 
-fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<u8>, String> {
     let cert_path = work.join("birth.crt");
     std::fs::write(&cert_path, cert_pem).map_err(|e| e.to_string())?;
     let out = work.join("bundle.der");
@@ -3152,7 +3152,7 @@ pub(crate) fn cli_asset_for(os: &str, arch: &str) -> Option<String> {
 /// asset within this process: a fleet restage during an outage asks once,
 /// not once per node. The bytes ride the CA-signed bundle, as cached bytes
 /// always have.
-fn cached_release_asset(g: &Globals, root: &Path, asset: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn cached_release_asset(g: &Globals, root: &Path, asset: &str) -> Result<Vec<u8>, String> {
     static FAILED: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
     let cached = cli_asset_cache_dir(root).join(asset);
     if let Some(b) = std::fs::read(&cached).ok().filter(|b| !b.is_empty()) {
@@ -3208,7 +3208,7 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
     Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
 }
 
-fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
+pub(crate) fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
@@ -3638,13 +3638,28 @@ pub(crate) const SLOW_TIMER_WARN_SECS: u64 = 150;
 /// round (it can still resolve in a later one); it is never counted done.
 /// Results come back in the order of `pending`.
 pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd)> {
+    wait_applied_via(g, pending, budget_secs, every_secs, &|n| format!("/api/cluster/provision-bundle/{n}/status"), "node")
+}
+
+/// The combined wait over any status route of the provision-bundle SHAPE
+/// (`sha256`, `fetched_at`, `applied_sha`, `apply_rc`, `apply_msg`): the
+/// nodes' route, or the kiosk seats' (`/api/cluster/seats/<seat>/status`,
+/// i77). One wait, one judgement (`judge_bundle_status`), two registries.
+pub(crate) fn wait_applied_via(
+    g: &Globals,
+    pending: &[PendingApply],
+    budget_secs: u64,
+    every_secs: u64,
+    status_path: &dyn Fn(&str) -> String,
+    noun: &str,
+) -> Vec<(String, ApplyEnd)> {
     let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
     let mut fetched = vec![false; pending.len()];
     let mut slow_warned = vec![false; pending.len()];
     let started = std::time::Instant::now();
     let names: Vec<&str> = pending.iter().map(|p| p.node.as_str()).collect();
     let mut poll = ui::Poll::start(&format!(
-        "waiting for {} node(s) to pull, apply and report (up to {}m): {}",
+        "waiting for {} {noun}(s) to pull, apply and report (up to {}m): {}",
         pending.len(), budget_secs / 60, names.join(", ")));
     // Printing over a live spinner line would leave its tail behind.
     let say = |line: String| {
@@ -3655,8 +3670,7 @@ pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_s
         let elapsed = started.elapsed().as_secs();
         for (i, p) in pending.iter().enumerate() {
             if ends[i].is_some() { continue; }
-            let st = crate::http::get_json_opt(
-                g, &format!("/api/cluster/provision-bundle/{}/status", p.node), true, 10);
+            let st = crate::http::get_json_opt(g, &status_path(&p.node), true, 10);
             if let Some(st) = &st {
                 match judge_bundle_status(st, &p.sha) {
                     BundleVerdict::Applied { rc, msg } => {

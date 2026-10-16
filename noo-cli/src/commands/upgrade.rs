@@ -40,7 +40,7 @@ const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
 const INSTALLER: &str = include_str!("../../install.sh");
 const UPGRADE_USAGE: &str =
-    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
+    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
 
 /// THE release repo, for every caller. `NOO_CLI_REPO` overrides the default.
 ///
@@ -95,6 +95,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut pin: Option<String> = None;
     let mut stack = false;
     let mut nodes = false;
+    // Kiosk seats (i77): `--nodes`/`--all` include them ("the fleet");
+    // `--seats` alone restages only the seats; `--no-seats` leaves them out.
+    let mut seats_only = false;
+    let mut no_seats = false;
     let mut stage2 = false;
     let mut tag_override: Option<String> = None;
     let mut allow_unsigned = std::env::var("NOO_ALLOW_UNSIGNED").map(|v| v == "1").unwrap_or(false);
@@ -118,6 +122,8 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--stack" => stack = true,
             "--controller" => return upgrade_controller(g),
             "--nodes" => nodes = true,
+            "--seats" => seats_only = true,
+            "--no-seats" => no_seats = true,
             "--all" => { stack = true; nodes = true; }
             "--stage2" => stage2 = true,
             "--allow-unsigned" => allow_unsigned = true,
@@ -170,6 +176,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    if seats_only && no_seats {
+        fail(g.json, ExitCode::Usage, "usage", "--seats and --no-seats contradict each other", Some(UPGRADE_USAGE));
+    }
+    let seats = seats_only || (nodes && !no_seats);
     if allow_downgrade && !stack {
         fail(g.json, ExitCode::Usage, "usage", "--allow-downgrade applies to the stack roll only (--stack or --all)",
             Some(UPGRADE_USAGE));
@@ -181,7 +191,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The fresh binary corrects what an older one could not know about
         // (the parent of a self-update is the previous release).
         super::channel::migrate_legacy_base_registry(g, false);
-        return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -325,10 +335,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 println!("{}", ui::note(&format!("installed tab completion: {}", p.display())));
             }
         }
-        if stack || nodes {
+        if stack || nodes || seats {
             // No swap happened — this process IS the current build, so its
             // paired tag and assets are already the right ones.
-            return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
         }
         return Ok(0);
     }
@@ -475,7 +485,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     }
 
-    if stack || nodes {
+    if stack || nodes || seats {
         // The running process is still the OLD build — its baked stack tag
         // and embedded assets are stale. Re-exec the binary we just
         // installed so the fleet stages use the NEW release's pairing.
@@ -486,6 +496,8 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             cmd.arg("upgrade").arg("--stage2");
             if stack { cmd.arg("--stack"); }
             if nodes { cmd.arg("--nodes"); }
+            if seats_only { cmd.arg("--seats"); }
+            if no_seats { cmd.arg("--no-seats"); }
             if let Some(t) = &tag_override { cmd.arg("--tag").arg(t); }
             if skip_gw_key_check { cmd.arg("--skip-gateway-key-check"); }
             if allow_downgrade { cmd.arg("--allow-downgrade"); }
@@ -744,7 +756,7 @@ fn version_less_than(a: &str, b: &str) -> bool {
 
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
-fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
     -> Result<i32, Unhandled>
 {
     let mut rc = 0;
@@ -757,7 +769,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
     let mut staging: Option<crate::commands::image_stage::StageRun> = None;
     // `--stack` alone is one unit of work; anything with `--nodes` has at
     // least Gateway · CLI Assets · Nodes, so every stage gets its phase.
-    let phased = nodes;
+    let phased = nodes || seats;
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
@@ -770,7 +782,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             if let Some(st) = staging.take() { st.finish(g); }
             failed_stage = "stack";
         }
-        else if !nodes {
+        else if !nodes && !seats {
             // The roll returns the moment compose is up; the gateway reports
             // healthy 20-40 s later. `noo upgrade --stack` used to return
             // inside that window, so the very next command — `noo cluster
@@ -793,7 +805,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             }
         }
     }
-    if nodes && rc == 0 {
+    if (nodes || seats) && rc == 0 {
         // The stack stage just recreated the gateway; it reports healthy
         // ~20-40 s later. Running the nodes stage the same instant hit
         // "cannot reach gateway: unexpected end of file" (host8,
@@ -823,19 +835,31 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             ui::close_failed(&err, Some("noo upgrade --stack"));
             rc = 1;
             failed_stage = "nodes";
-        } else if let Some(err) = lock_stage_blocker(
+        } else if let Some(err) = if !nodes { None } else { lock_stage_blocker(
             g,
             &crate::commands::image_stage::lock_stage_failures(&crate::commands::provision::release_var("NOO_IMAGE_TAG")),
             force,
-        ) {
+        ) } {
             // Nodes on the rail pull their images from the controller's
             // store; rolling them on top of a failed stage strands them.
             ui::close_failed(&err, Some("noo cluster stage-images --lock"));
             rc = 1;
             failed_stage = "nodes";
         } else {
-            rc = upgrade_nodes(g)?;
-            if rc != 0 { failed_stage = "nodes"; }
+            if nodes {
+                rc = upgrade_nodes(g)?;
+                if rc != 0 { failed_stage = "nodes"; }
+            }
+            // Kiosk seats AFTER the nodes (i77), whatever the nodes did: a
+            // node that failed to apply is no reason to leave a display on
+            // the old CLI. With no seat enrolled this stages nothing.
+            if seats {
+                let seats_rc = crate::commands::kiosk_seat::upgrade_seats(g);
+                if seats_rc != 0 && rc == 0 {
+                    rc = seats_rc;
+                    failed_stage = "seats";
+                }
+            }
         }
     }
     if rc != 0 && !g.json {
@@ -845,7 +869,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
         // in seconds. Pointing at `noo stack start` (the old hint) dropped
         // the operator out of the flow and skipped the nodes stage.
         let mut resume = String::from("noo upgrade");
-        resume.push_str(if stack && nodes { " --all" } else if stack { " --stack" } else { " --nodes" });
+        resume.push_str(if stack && nodes { " --all" } else if nodes { " --nodes" } else if stack && seats { " --stack --seats" } else if seats { " --seats" } else { " --stack" });
         if let Some(t) = tag_override { resume.push_str(&format!(" --tag {t}")); }
         ui::close_failed(&format!("upgrade stopped at the {failed_stage} stage — fix the cause above, then resume"), Some(&resume));
         eprintln!("{}", ui::note("stages are idempotent — the CLI stays current, the stack re-pulls on the moved pin, nodes restage"));

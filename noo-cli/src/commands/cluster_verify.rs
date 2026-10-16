@@ -4155,6 +4155,31 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
         }
         json_out.insert("nodes".into(), Value::Array(node_json));
+
+        // Kiosk SEATS (i77): their own registry, joined here explicitly — a
+        // seat never appears in /api/cluster/nodes, so nothing above judged
+        // it. Fleet-wide only (a named-node verify is about those nodes).
+        // An older gateway without the registry, or no seat enrolled, adds
+        // nothing.
+        if nodes.is_empty() {
+            let seats = crate::commands::kiosk_seat::list_seats(g).unwrap_or_default();
+            let mut seat_json = Vec::new();
+            if !seats.is_empty() && !g.json {
+                println!("{}", ui::section(&format!("Seats ({})", seats.len())));
+            }
+            for s in &seats {
+                let name = s["seat_name"].as_str().unwrap_or("?");
+                let checks = crate::commands::kiosk_seat::seat_checks(s, env!("CARGO_PKG_VERSION"), &tag, now);
+                let seat_ok = checks.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting);
+                all_ok &= seat_ok;
+                if g.json {
+                    seat_json.push(serde_json::json!({ "seat": name, "ok": seat_ok, "checks": checks_json(&checks) }));
+                } else {
+                    render(&format!("seat {name}"), &checks);
+                }
+            }
+            json_out.insert("seats".into(), Value::Array(seat_json));
+        }
     }
 
     if controller {
