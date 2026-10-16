@@ -10,7 +10,7 @@
 //! scoped, quota-able and revocable one consumer at a time. The auth layer (`auth::require_any_auth`) resolves a
 //! presented bearer to a [`Consumer`] and attaches it to the request as an
 //! axum extension; `/api/external/*` handlers read it for scope checks and
-//! attribution. Resolution is cached in-process (60s TTL) to avoid a DB hit
+//! attribution. Resolution is cached in-process (5 s TTL) to avoid a DB hit
 //! per request.
 //!
 //! Also hosts [`record_external_request`] — the writer for the
@@ -101,7 +101,12 @@ struct Cache {
 }
 
 static CACHE: OnceLock<RwLock<Option<Cache>>> = OnceLock::new();
-const TTL: Duration = Duration::from_secs(60);
+/// How long a resolved-key snapshot is trusted. Short on purpose: a key
+/// revoked or an account disabled by anything other than this process's own
+/// handlers (direct SQL, another gateway instance) stops working within this
+/// interval; the handlers here also call [`invalidate_cache`] so their own
+/// changes take effect at once.
+const TTL: Duration = Duration::from_secs(5);
 
 fn cache() -> &'static RwLock<Option<Cache>> {
     CACHE.get_or_init(|| RwLock::new(None))
@@ -275,6 +280,40 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
 /// Whether a key with this expiry is usable at `now`.
 fn live(expires_at: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> bool {
     expires_at.is_none_or(|e| e > now)
+}
+
+/// Requests per minute an MCP-door consumer gets when its key carries no
+/// `rpm_limit` of its own. The doors' tool calls are self-calls over
+/// loopback, which the coarse per-IP limiter skips, so the per-consumer
+/// quota is the only brake on tool fan-out: a key with no cap is not left
+/// unmetered here. `service-key set-quota` raises or lowers a key's own
+/// figure; `set-quota <c> 0` ("uncapped") still means uncapped on
+/// `/api/external` but falls back to this on the MCP doors.
+pub const MCP_DOOR_DEFAULT_RPM: i64 = 600;
+
+/// The cap the MCP doors enforce for `c`: its own, else
+/// [`MCP_DOOR_DEFAULT_RPM`]. Always positive.
+pub fn door_rpm(c: &Consumer) -> i64 {
+    c.rpm_limit.filter(|n| *n > 0).unwrap_or(MCP_DOOR_DEFAULT_RPM)
+}
+
+/// Process-local per-consumer minute counter: the MCP doors' answer when
+/// Redis is absent or erroring, so "no Redis" tightens the quota to a
+/// per-process one instead of removing it (the rate limiter's precedent).
+/// `Some(retry_after_secs)` when `name` is over `limit` this minute.
+pub fn local_quota_exceeded(name: &str, limit: i64) -> Option<i64> {
+    static W: OnceLock<std::sync::Mutex<HashMap<String, (Instant, i64)>>> = OnceLock::new();
+    let mut m = W.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    if m.len() > 4096 {
+        m.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(60));
+    }
+    let e = m.entry(name.to_string()).or_insert((now, 0));
+    if now.duration_since(e.0) >= Duration::from_secs(60) {
+        *e = (now, 0);
+    }
+    e.1 += 1;
+    (e.1 > limit).then(|| 60 - now.duration_since(e.0).as_secs() as i64)
 }
 
 /// Drop the resolved-key cache, so the next `resolve` reads the table: a
@@ -454,5 +493,45 @@ mod retired_scope_tests {
         let s: Vec<String> = vec!["chat".into(), "kiosk".into()];
         assert_eq!(retired_scopes_in(&s), vec!["kiosk"]);
         assert!(retired_scopes_in(&["mcp".to_string()]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod door_quota_tests {
+    use super::*;
+
+    fn c(rpm: Option<i64>) -> Consumer {
+        Consumer {
+            name: "self:alice".into(),
+            scopes: vec!["mcp".into()],
+            rpm_limit: rpm,
+            user: Some("alice".into()),
+            user_scopes: vec![],
+            user_role: Some(crate::auth::Role::User),
+        }
+    }
+
+    #[test]
+    fn a_key_without_a_cap_gets_the_door_default_not_an_unbounded_budget() {
+        assert_eq!(door_rpm(&c(None)), MCP_DOOR_DEFAULT_RPM);
+        assert_eq!(door_rpm(&c(Some(0))), MCP_DOOR_DEFAULT_RPM);
+        assert_eq!(door_rpm(&c(Some(-3))), MCP_DOOR_DEFAULT_RPM);
+        assert_eq!(door_rpm(&c(Some(120))), 120);
+    }
+
+    #[test]
+    fn the_process_local_meter_refuses_past_the_limit() {
+        let name = "door-quota-test-consumer";
+        for i in 1..=3 {
+            assert!(local_quota_exceeded(name, 3).is_none(), "request {i} is within the cap");
+        }
+        let retry = local_quota_exceeded(name, 3).expect("4th request in the minute is refused");
+        assert!((1..=60).contains(&retry));
+        assert!(local_quota_exceeded("another-consumer", 3).is_none(), "buckets are per consumer");
+    }
+
+    #[test]
+    fn the_cache_interval_is_short() {
+        assert!(TTL <= Duration::from_secs(5));
     }
 }

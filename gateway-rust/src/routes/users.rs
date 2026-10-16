@@ -293,11 +293,7 @@ async fn user_create(
     if body.username.trim().is_empty() {
         return Err(AppError::BadRequest("username is required".into()));
     }
-    if body.password.len() < 8 {
-        return Err(AppError::BadRequest(
-            "password must be at least 8 characters".into(),
-        ));
-    }
+    check_new_password(&body.password, body.username.trim())?;
     let hashed = hash_password(&body.password)?;
     // disabled/failed_login_count set explicitly for pre-migration-020 schemas.
     let result = crate::repo::users::create(&state.db, &body.username, &hashed, &json!(body.scopes), None)
@@ -327,6 +323,17 @@ async fn user_create(
     })))
 }
 
+/// The shared password policy (`crate::password_policy`) for a password being
+/// SET. Existing accounts are never re-checked: login does not call this.
+fn check_new_password(password: &str, username: &str) -> Result<(), AppError> {
+    match crate::password_policy::weak_password(password, username) {
+        None => Ok(()),
+        Some(why) => Err(AppError::BadRequest(format!(
+            "{why} Existing passwords keep working; only new or changed ones are checked."
+        ))),
+    }
+}
+
 #[derive(Deserialize)]
 struct PasswordBody {
     password: String,
@@ -345,11 +352,7 @@ async fn user_set_password(
     // a password reset is a full account takeover — and this statement
     // also clears `locked_until`, so it is the lockout bypass too.
     require_may_manage(&state.db, &ctx, &username).await?;
-    if body.password.len() < 8 {
-        return Err(AppError::BadRequest(
-            "password must be at least 8 characters".into(),
-        ));
-    }
+    check_new_password(&body.password, username.trim())?;
     let hashed = hash_password(&body.password)?;
     let result = sqlx::query(
         "UPDATE noo_users SET hashed_password = $1, password_changed_at = NOW(), \
@@ -363,6 +366,8 @@ async fn user_set_password(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
+    // A new password ends every session the old one opened.
+    crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username, by = %by, "password_changed");
     crate::routes::core::audit_event(
         &state.db,
@@ -400,6 +405,9 @@ async fn user_disable(
     if result == 0 {
         return Err(AppError::NotFound(format!("user '{username}' not found")));
     }
+    // Disable ends the account's sessions NOW: refresh chain, open sockets,
+    // the not-before floor that kills the access JWT, the service-key cache.
+    crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username, by = %by, "user_disabled");
     crate::routes::core::audit_event(
         &state.db,
@@ -457,6 +465,7 @@ async fn user_set_scopes(
         json!({ "scopes": outcome["scopes"] }),
     )
     .await;
+    crate::session_floor::end_account_sessions(&state, username.trim(), crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username.trim(), by = %by, "user_set_scopes");
     Ok(Json(outcome))
 }
@@ -522,6 +531,7 @@ async fn user_set_role(
         json!({ "role": role.as_str() }),
     )
     .await;
+    crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
     tracing::info!(user = %username, role = %role.as_str(), by = %by, "user_set_role");
     Ok(Json(json!({ "username": username, "role": role.as_str() })))
 }
@@ -2264,6 +2274,11 @@ async fn proposal_decide(
         Ok(result) => {
             finalise(&mut tx, id, &by, "approved", &result).await?;
             tx.commit().await?;
+            // An approved `scopes` change or `disable` ends the account's
+            // sessions exactly as the direct routes do.
+            if action == "scopes" || (action == "disable" && result["disabled"].as_bool() == Some(true)) {
+                crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
+            }
             tracing::info!(id, action = %action, user = %username, by = %by, "proposal_approved");
             // `result` only — never `generated_password`. An approved `create`
             // mints a password and returns it once; putting it in the audit
@@ -2654,7 +2669,7 @@ async fn service_key_issue(
         "rpm_limit": body.rpm,
         "user_id": body.user_id,
         "key": raw,
-        "note": "shown once — store it now; gateway key cache refreshes within ~60s",
+        "note": "shown once — store it now; gateway key cache refreshes within ~5s",
     })))
 }
 
@@ -2785,7 +2800,7 @@ async fn service_key_self_issue(
         "rpm_limit": SELF_KEY_DEFAULT_RPM,
         "replaced_active": replaced,
         "key": raw,
-        "note": "shown once — store it now; gateway key cache refreshes within ~60s",
+        "note": "shown once — store it now; gateway key cache refreshes within ~5s",
     })))
 }
 
@@ -3088,6 +3103,7 @@ async fn service_key_revoke_and_disable(
         )));
     }
     tx.commit().await?;
+    crate::session_floor::end_account_sessions(&state, &username, crate::session_floor::Reason::AccountChange).await;
 
     tracing::warn!(
         consumer = %consumer, user = %username, revoked,
@@ -3793,6 +3809,9 @@ async fn api_users_disable(
         json!({ "disabled": outcome["disabled"] }),
     )
     .await;
+    if outcome["disabled"].as_bool() == Some(true) {
+        crate::session_floor::end_account_sessions(&state, username.trim(), crate::session_floor::Reason::AccountChange).await;
+    }
     tracing::info!(user = %username.trim(), by = %by, "user_set_disabled (mesh-ui surface)");
     Ok(Json(outcome))
 }
@@ -5861,5 +5880,77 @@ mod rtbf_residue_tests {
         assert_eq!(left, ["aaaab_other.txt", "bbbb_keep.txt"]);
         assert_eq!(crate::routes::ui::remove_upload_files(&dir, &[]).await, 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// An account change ends the account's sessions. Source-level pins (the
+/// handlers need a database): each mutation calls the one shared routine AFTER
+/// its write succeeded, and the routine does all five things.
+#[cfg(test)]
+mod session_end_tests {
+    fn handler<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[start + sig.len()..];
+        let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_account_changing_route_ends_the_sessions() {
+        let src = include_str!("users.rs");
+        for (sig, write) in [
+            ("async fn user_set_password(", "UPDATE noo_users SET hashed_password"),
+            ("async fn user_disable(", "set_disabled(&state.db"),
+            ("async fn user_set_scopes(", "exec_user_set_scopes("),
+            ("async fn user_set_role(", "users::set_role("),
+            ("async fn api_users_disable(", "exec_user_set_disabled("),
+            ("async fn service_key_revoke_and_disable(", "set_disabled(&mut *tx"),
+            ("async fn proposal_decide(", "tx.commit().await?;\n            // An approved `scopes`"),
+        ] {
+            let body = handler(src, sig);
+            let w = body.find(write).unwrap_or_else(|| panic!("{sig}: write marker {write:?} missing"));
+            let e = body
+                .find("session_floor::end_account_sessions(")
+                .unwrap_or_else(|| panic!("{sig} does not end the account's sessions"));
+            assert!(e > w, "{sig}: sessions must end AFTER the change is written");
+            assert!(body.contains("Reason::AccountChange"), "{sig}");
+        }
+    }
+
+    #[test]
+    fn the_routine_does_all_of_it() {
+        let src = include_str!("../session_floor.rs");
+        let body = src.split("pub async fn end_account_sessions(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        for step in [
+            "revoke_all_for_user(",
+            "raise(state, account, reason)",
+            "alert_hub.end_sessions(account)",
+            "service_keys::invalidate_cache()",
+        ] {
+            assert!(body.contains(step), "end_account_sessions lost: {step}");
+        }
+    }
+
+    #[test]
+    fn logout_and_me_use_the_floor_and_a_deleted_account_is_401() {
+        let core = include_str!("core.rs");
+        let logout = handler(core, "async fn auth_logout_handler(");
+        assert!(logout.contains("session_floor::raise("));
+        assert!(logout.contains("Reason::Logout"));
+        assert!(logout.contains("end_sessions("));
+        assert!(logout.contains("Authorization") || logout.contains("AUTHORIZATION"), "a bearer-only (CLI) logout must count");
+        let me = handler(core, "async fn auth_me(");
+        assert!(me.contains("session_floor::refuses("));
+        assert!(!me.contains("still return from token claims"), "a deleted account must not be echoed as live identity");
+        assert!(me.contains("User no longer exists"));
+    }
+
+    #[test]
+    fn password_policy_gates_create_and_set_password() {
+        let src = include_str!("users.rs");
+        for sig in ["async fn user_create(", "async fn user_set_password("] {
+            assert!(handler(src, sig).contains("check_new_password("), "{sig}");
+        }
+        assert!(!src.contains(concat!("body.password.len()", " < 8")));
     }
 }

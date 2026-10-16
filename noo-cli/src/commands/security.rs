@@ -102,27 +102,20 @@ fn prompt_secret(label: &str) -> String {
 }
 
 /// Obtain a password with the agent-first contract:
-///   `--password-stdin`  → one line from stdin, no confirm (>= 8 chars, the
-///                         same check Python applies on this path);
+///   `--password-stdin`  → one line from stdin, no confirm (the shared
+///                         password policy: 12 characters, not a common
+///                         password, not containing the username);
 ///   `--json` w/o flag   → error (never prompt in machine mode);
 ///   non-TTY w/o flag    → error instead of blocking on a pipe;
 ///   TTY                 → getpass-style double prompt, echo off, must match.
 /// The password itself is never echoed or printed anywhere.
-fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str) -> String {
+fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str, username: &str) -> String {
     use std::io::BufRead as _;
     if password_stdin {
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
         let password = line.trim_end_matches(['\n', '\r']).to_string();
-        if password.len() < 8 {
-            fail(
-                g.json,
-                ExitCode::Generic,
-                "weak_password",
-                "Password must be at least 8 characters",
-                None,
-            );
-        }
+        refuse_weak(g, &password, username);
         return password;
     }
     if g.json {
@@ -148,7 +141,25 @@ fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str)
     if password != confirmed {
         fail(false, ExitCode::Generic, "password_mismatch", "Passwords do not match", None);
     }
+    refuse_weak(g, &password, username);
     password
+}
+
+/// Exit with `weak_password` unless the shared policy
+/// ([`crate::password_policy`]) accepts `password` for `username`. The gateway
+/// applies the same rule; checking here saves the round trip and keeps the
+/// password off the wire when it would be refused. Only a password being SET
+/// is checked: existing accounts keep logging in.
+fn refuse_weak(g: &Globals, password: &str, username: &str) {
+    if let Some(why) = crate::password_policy::weak_password(password, username) {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "weak_password",
+            why,
+            Some("use at least 12 characters that are not a common password and do not contain the username"),
+        );
+    }
 }
 
 // ── security user ───────────────────────────────────────────────────────────
@@ -231,7 +242,7 @@ pub fn security_user_create(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         // `noo security users set-scopes <user> read write`.
         scopes = vec!["read".into()];
     }
-    let password = read_password(g, password_stdin, "Password: ", "Confirm password: ");
+    let password = read_password(g, password_stdin, "Password: ", "Confirm password: ", &username);
     let body = post_json(
         g,
         "/api/security/users",
@@ -549,7 +560,7 @@ pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, U
         }
     }
     let username = username.ok_or(Unhandled)?;
-    let password = read_password(g, password_stdin, "New password: ", "Confirm: ");
+    let password = read_password(g, password_stdin, "New password: ", "Confirm: ", &username);
     let body = put_json(
         g,
         &format!("/api/security/users/{username}/password"),
@@ -2993,5 +3004,34 @@ mod clifix_security_tests {
         confirm_precedes(src, "pub fn security_user_disable(", "post_json(");
         confirm_precedes(src, "pub fn security_service_key_revoke(", "post_json(");
         confirm_precedes(src, "pub fn security_team_delete(", "delete_json(");
+    }
+}
+
+#[cfg(test)]
+mod password_policy_tests {
+    /// Both the `--password-stdin` path and the prompt path run the shared
+    /// policy before the password is sent anywhere.
+    #[test]
+    fn read_password_applies_the_shared_policy_on_both_paths() {
+        let src = include_str!("security.rs");
+        let start = src.find("fn read_password(").expect("read_password");
+        let rest = &src[start..];
+        let end = rest.find("\n/// Exit with `weak_password`").expect("refuse_weak follows");
+        let body = &rest[..end];
+        assert_eq!(body.matches("refuse_weak(g, &password, username)").count(), 2, "stdin and prompt paths");
+        assert!(!body.contains(".len() < 8"), "the old 8-character rule is gone");
+        for sig in ["pub fn security_user_create(", "pub fn security_user_set_password("] {
+            let s = src.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            let r = &src[s..];
+            let e = r[sig.len()..].find("\npub fn ").map(|i| i + sig.len()).unwrap_or(r.len());
+            assert!(r[..e].contains("&username)"), "{sig} must pass the username to the policy");
+        }
+    }
+
+    #[test]
+    fn a_short_or_common_password_is_refused_by_the_shared_rule() {
+        assert!(crate::password_policy::weak_password("hunter22", "alice").is_some());
+        assert!(crate::password_policy::weak_password("Password123!", "alice").is_some());
+        assert!(crate::password_policy::weak_password("a-long-enough-phrase", "alice").is_none());
     }
 }

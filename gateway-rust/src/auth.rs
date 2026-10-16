@@ -2714,7 +2714,7 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return true;
+        return user_may_read(path);
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
@@ -2781,6 +2781,128 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return true;
     }
     control_scope_allows(scopes, method, path)
+}
+
+/// GET paths a `User`-tier token may read, exact match. Everything a person
+/// needs to chat, search, browse the graph, see their own history, and have
+/// the dashboard render. This is an ALLOW-LIST like the kiosk's
+/// ([`KIOSK_READ_PATHS`]): a route added next year is closed to a User until
+/// someone puts it here on purpose. Until 2026-10 the tier gate waved every
+/// GET through, which let a `read` account list the audit/violation/PKI
+/// views, every node's desired config and the whole `noomesh.yaml`.
+///
+/// Handlers that return installation-wide data ALSO guard themselves
+/// (`routes/admin.rs`, `routes/settings.rs`, `routes/cluster.rs`): the tier
+/// gate is the front door, the in-handler guard is the second lock.
+pub const USER_READ_PATHS: &[&str] = &[
+    "/health",
+    "/auth/me",
+    "/v1/models",
+    "/tools/list",
+    "/api/version",
+    "/api/events/stream",
+    // Dashboard overview sources. `desired-config`, `maintenance`,
+    // `model-classes`, `provision-bundle`, `proposals` are NOT here.
+    "/api/cluster/status",
+    "/api/cluster/nodes",
+    "/api/cluster/backends",
+    "/api/cluster/gpu-metrics",
+    "/api/cluster/replication-status",
+    "/api/scheduler/status",
+    "/api/models/cached",
+    "/api/ollama/models",
+    "/api/jobs",
+    "/api/jobs/history",
+    "/api/heartbeat/status",
+    "/api/heartbeat/tasks",
+    "/api/heartbeat/history",
+    "/api/heartbeat/actions",
+    "/api/heartbeat/artifacts",
+    "/api/autonomy/status",
+    "/api/autonomy/decisions",
+    "/api/alerts/clients",
+    "/api/approval/stats",
+    "/api/channels/status",
+    "/api/coordinator/context",
+    "/api/memory/health",
+    "/api/memory/status",
+    "/api/memory/storage-stats",
+    "/api/memory/embed/status",
+    "/api/memory/search",
+    "/api/v1/rag/status",
+    "/api/v1/settings/user-dirs",
+    "/api/v1/settings/preference",
+    "/api/docs/openapi",
+    "/api/docs/runbooks",
+    "/api/skills/list",
+    "/api/prompt-skills",
+    "/api/tags",
+    "/api/workflows",
+    "/api/usage/me",
+    "/api/usage/summary",
+    "/api/voice/status",
+    "/api/voice/voices",
+    "/api/agent/loops",
+    "/api/external/capabilities",
+    "/api/external/models",
+    "/api/external/usage",
+    "/api/activities",
+    "/api/tasks",
+    "/api/cloud-providers/status",
+    "/api/mcp/status",
+    "/api/security/service-keys/self",
+];
+
+/// GET prefixes a `User` may read (boundary-aware: see [`user_may_read`]).
+pub const USER_READ_PREFIXES: &[&str] = &[
+    "/ws/",
+    "/upload/",
+    "/api/conversations",
+    "/api/inference",
+    "/api/memory/relationships/",
+    "/api/memory/stats/",
+    "/api/v1/docs",
+    "/api/v1/graph/",
+    "/api/v1/recall/",
+    "/api/v1/video-memory/",
+    "/api/v1/walks",
+    "/api/v1/ops",
+    "/api/agents/messages",
+    "/api/agents/threads",
+    "/api/agents/presence",
+    "/api/agents/roles",
+    "/api/agents/peer/",
+    "/api/heartbeat/tasks/",
+    "/api/jobs/",
+    "/api/docs/runbooks/",
+    "/api/skills/",
+    "/api/prompt-skills/",
+    "/api/persona/",
+    "/api/temporal/",
+    "/api/proactive/",
+    "/api/tasks/",
+    "/api/activities/",
+    "/api/addons/",
+    "/api/artifacts/manifest/",
+    "/api/users/",
+    "/v1/models/",
+];
+
+/// Whether a `User`-tier token may GET `path`: the allow-list above, plus the
+/// GET routes of mounted add-on manifests (validated at load; they are the
+/// add-on's own surface and were reachable before this list existed).
+pub fn user_may_read(path: &str) -> bool {
+    USER_READ_PATHS.contains(&path)
+        || USER_READ_PREFIXES.iter().any(|p| {
+            // `/x/` prefixes match by starts_with; a bare `/x` entry matches
+            // `/x` and `/x/...` only (a directory, not a stem).
+            if p.ends_with('/') {
+                path.starts_with(p)
+            } else {
+                path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/'))
+            }
+        })
+        || crate::addon_proxy::is_mounted_get_route(path)
 }
 
 /// Metric READS: Operator and Admin only. The metrics describe the whole
@@ -3010,6 +3132,15 @@ pub async fn require_any_auth(
     // authenticated infra, but the forgeable-token door is shut.
     if !jwt_secret_is_insecure(&secret) {
         if let Ok(claims) = verify_token(&t, &secret) {
+            // The per-account not-before floor: a still-valid access token of
+            // an account that was since disabled, demoted, re-passworded or
+            // logged out is refused HERE, on every bearer path — including the
+            // `/ws/*` handshake, so a socket closed with 4401 cannot simply
+            // reconnect with the same JWT. See `session_floor`.
+            if crate::session_floor::refuses(&state, &claims.sub, &t).await {
+                tracing::info!(target: "security", sub = %claims.sub, "token refused: issued before the account's session floor");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
             // Peer tokens (scopes=["peer"], sub="peer:{id}") are confined to the
             // peer surface (/ws/agent + /api/agents/peer/*). Without this a peer
             // token is effectively a full-access token: it would receive
@@ -5835,5 +5966,202 @@ mod old_cli_refusal_tests {
         assert!(out.contains("controller_shared_secret_refused") && out.contains("cli_shared_secret_refused")
             && out.contains("addon_shared_secret_refused"), "{out}");
         assert!(!out.contains("cluster_hmac_non_inference") && !out.contains("self_call_shared_secret"), "{out}");
+    }
+}
+
+/// The tier gate's GET default for a `User` is an allow-list (`USER_READ_PATHS`
+/// / `USER_READ_PREFIXES`), not "every GET". These tests pin both halves: the
+/// console still renders for a User, and the installation-wide reads that used
+/// to pass (audit views, violations, PKI, config, fleet desired-config) do not.
+#[cfg(test)]
+mod user_read_allowlist_tests {
+    use super::*;
+    use axum::http::Method;
+
+    fn tier(role: &str, scopes: &[&str]) -> Claims {
+        Claims {
+            sub: "alice".into(),
+            exp: 4102444800,
+            role: role.into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            harness: None,
+            conv: None,
+            act: None,
+            cnf: None,
+        }
+    }
+
+    /// Every GET `ui/apps/web` makes for a signed-in person (typed client +
+    /// `apiGet` + raw fetches), minus the admin-only panes' sources (below).
+    /// If a console pane for a plain account stops rendering, a path is
+    /// missing from `USER_READ_PATHS` / `USER_READ_PREFIXES`.
+    const CONSOLE_GETS_FOR_A_USER: &[&str] = &[
+        "/health",
+        "/auth/me",
+        "/v1/models",
+        "/api/version",
+        "/api/events/stream",
+        "/api/cluster/status",
+        "/api/cluster/nodes",
+        "/api/cluster/backends",
+        "/api/cluster/gpu-metrics",
+        "/api/scheduler/status",
+        "/api/models/cached",
+        "/api/jobs",
+        "/api/jobs/history",
+        "/api/jobs/0f9c1d2e-0000-4000-8000-000000000001",
+        "/api/heartbeat/status",
+        "/api/heartbeat/tasks",
+        "/api/heartbeat/tasks/t1/artifacts",
+        "/api/autonomy/status",
+        "/api/autonomy/decisions",
+        "/api/alerts/clients",
+        "/api/approval/stats",
+        "/api/channels/status",
+        "/api/coordinator/context",
+        "/api/conversations",
+        "/api/conversations/with-preview",
+        "/api/conversations/c1",
+        "/api/conversations/stats/overview",
+        "/api/conversations/stats/tools",
+        "/api/memory/health",
+        "/api/memory/status",
+        "/api/memory/storage-stats",
+        "/api/memory/embed/status",
+        "/api/memory/search",
+        "/api/v1/rag/status",
+        "/api/v1/docs",
+        "/api/v1/docs/d1",
+        "/api/v1/graph/overview",
+        "/api/v1/graph/stats",
+        "/api/v1/graph/prune/staged",
+        "/api/v1/graph/entities",
+        "/api/v1/recall/status",
+        "/api/v1/walks",
+        "/api/v1/walks/settings",
+        "/api/v1/ops",
+        "/api/v1/ops/op1",
+        "/api/v1/settings/user-dirs",
+        "/api/docs/openapi",
+        "/api/docs/runbooks",
+        "/api/docs/runbooks/upgrade",
+        "/api/addons/trellion/console-piece",
+        "/api/usage/summary",
+        "/api/usage/me",
+        "/api/agents/messages",
+        "/api/security/service-keys/self",
+        "/ws/coordinator",
+        "/upload/f1",
+    ];
+
+    /// Reads that describe the installation, not the person. Closed to a
+    /// `User`; open to Operator and Admin.
+    const OPERATOR_ONLY_GETS: &[&str] = &[
+        "/api/security/audit-history",
+        "/api/security/audit/stats",
+        "/api/security/audit/verify",
+        "/api/security/violations",
+        "/api/security/pki/status",
+        "/api/security/posture",
+        "/api/security/users",
+        "/api/security/service-keys",
+        "/api/config",
+        "/api/config/search",
+        "/api/settings",
+        "/api/settings/export",
+        "/api/settings/flags",
+        "/api/v1/settings",
+        "/api/v1/settings/export",
+        "/api/v1/settings/browse",
+        "/api/v1/settings/restart-status",
+        "/api/cluster/nodes/host3/desired-config",
+        "/api/cluster/maintenance",
+        "/api/cluster/model-classes",
+        "/api/cluster/self-node",
+        "/api/cluster/proposals/p1",
+        "/api/cluster/provision-bundle/host3/status",
+        "/api/db/migrations",
+        "/api/snapshots",
+        "/api/kb/rules",
+        "/api/kb/grants",
+        "/api/agents/trust",
+        "/api/agents/keys/review",
+        "/api/channels/telegram/messages",
+        "/api/users",
+        "/api/mesh/status",
+        "/api/tools/registry/raw",
+        "/api/exec-approval/status",
+        "/api/v1/admin/walks",
+        "/api/an/invented/route/next/year",
+    ];
+
+    #[test]
+    fn the_console_still_renders_for_a_user() {
+        let user = tier("user", &["read"]);
+        for p in CONSOLE_GETS_FOR_A_USER {
+            assert!(scope_allows(&user, &Method::GET, p), "User must still GET {p}");
+        }
+    }
+
+    #[test]
+    fn a_user_cannot_read_installation_wide_data() {
+        let user = tier("user", &["read"]);
+        for p in OPERATOR_ONLY_GETS {
+            assert!(!scope_allows(&user, &Method::GET, p), "User must NOT GET {p}");
+            assert!(!scope_allows(&user, &Method::HEAD, p), "User must NOT HEAD {p}");
+        }
+    }
+
+    #[test]
+    fn operators_and_admins_read_all_of_it() {
+        let op = tier("operator", &["read", "write"]);
+        let admin = tier("admin", &["read", "write", "admin"]);
+        for p in OPERATOR_ONLY_GETS.iter().chain(CONSOLE_GETS_FOR_A_USER) {
+            assert!(scope_allows(&op, &Method::GET, p), "operator GET {p}");
+            assert!(scope_allows(&admin, &Method::GET, p), "admin GET {p}");
+        }
+    }
+
+    /// A route added next year is closed to a User until it is listed.
+    #[test]
+    fn an_unlisted_route_is_closed_to_a_user_by_default() {
+        let user = tier("user", &["read"]);
+        assert!(!user_may_read("/api/brand/new/route"));
+        assert!(!scope_allows(&user, &Method::GET, "/api/brand/new/route"));
+        // prefixes are directories, not stems
+        assert!(!user_may_read("/api/conversationsx"));
+        assert!(!user_may_read("/wsdl"));
+    }
+
+    /// The writes a User had before are untouched by the GET change.
+    #[test]
+    fn user_writes_are_unchanged() {
+        let user = tier("user", &["read"]);
+        assert!(scope_allows(&user, &Method::POST, "/api/inference"));
+        assert!(!scope_allows(&user, &Method::PUT, "/api/config/search"));
+    }
+
+    /// The allow-list entries all resolve: no entry names a prefix or path
+    /// that is not a clean absolute path (typo guard).
+    #[test]
+    fn allow_list_entries_are_absolute_paths() {
+        for p in USER_READ_PATHS.iter().chain(USER_READ_PREFIXES) {
+            assert!(p.starts_with('/'), "{p}");
+            assert!(!p.contains("//") && !p.contains(' '), "{p}");
+        }
+    }
+
+    /// The floor is checked on the JWT branch before any role, kiosk, peer or
+    /// harness handling, so it covers every bearer path and the `/ws/*`
+    /// handshake (which passes the same middleware).
+    #[test]
+    fn the_session_floor_is_checked_right_after_the_token_verifies() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let verify = body.find("if let Ok(claims) = verify_token(&t, &secret) {").expect("jwt branch");
+        let floor = body.find("crate::session_floor::refuses(&state, &claims.sub, &t)").expect("floor check");
+        let first_branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
+        assert!(verify < floor && floor < first_branch, "floor must precede every other use of the claims");
+        assert!(body[floor..first_branch].contains("StatusCode::UNAUTHORIZED"));
     }
 }

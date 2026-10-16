@@ -584,8 +584,10 @@ struct AuditStatsParams {
 /// Mirrors the Python `security_audit_history()` endpoint.
 async fn security_audit_history(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Query(params): Query<AuditHistoryParams>,
 ) -> AppResult {
+    super::operator_read_guard(&ctx)?;
     let limit = params.limit.unwrap_or(20).min(200);
 
     let rows = sqlx::query_as::<_, (
@@ -645,8 +647,10 @@ async fn security_audit_history(
 /// version uses the right column.
 async fn security_audit_stats(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Query(params): Query<AuditStatsParams>,
 ) -> AppResult {
+    super::operator_read_guard(&ctx)?;
     let minutes = params.minutes.unwrap_or(5).clamp(1, 1440);
     let interval = format!("{minutes} minutes");
 
@@ -2170,8 +2174,10 @@ struct ViolationParams {
 /// Matches Python response: {violations: {...}, risk_level, period_hours}.
 async fn security_violations(
     State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<RequesterCtx>>,
     Query(params): Query<ViolationParams>,
-) -> AppJson {
+) -> AppResult {
+    super::operator_read_guard(&ctx)?;
     let period_hours = params.period_hours.unwrap_or(24);
 
     // Try to read violation counters from Redis (matching Python SecurityManager keys)
@@ -2216,11 +2222,11 @@ async fn security_violations(
 
     let risk_level = if total < 5 { "LOW" } else if total < 15 { "MEDIUM" } else { "HIGH" };
 
-    Json(json!({
+    Ok(Json(json!({
         "violations": stats,
         "risk_level": risk_level,
         "period_hours": period_hours,
-    }))
+    })))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2298,7 +2304,8 @@ async fn security_pki_rotate_expiring() -> AppJson {
 /// ~/.config/mesh/pki). Reports existence, subject, issuer, and
 /// not_after for each cert found. Matches the Python pki.manager
 /// get_status() response shape.
-async fn security_pki_status() -> AppJson {
+async fn security_pki_status(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
+    super::operator_read_guard(&ctx)?;
     let pki_dir = std::env::var("NOO_PKI_DIR")
         .ok()
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
@@ -2315,7 +2322,7 @@ async fn security_pki_status() -> AppJson {
 
     let pki_path = std::path::Path::new(&pki_dir);
     if !pki_path.exists() || !pki_path.join("ca.crt").exists() {
-        return Json(json!({"status": "not_initialized"}));
+        return Ok(Json(json!({"status": "not_initialized"})));
     }
 
     let ca_cert_path = pki_path.join("ca.crt");
@@ -2363,11 +2370,11 @@ async fn security_pki_status() -> AppJson {
         "not_initialized"
     };
 
-    Json(json!({
+    Ok(Json(json!({
         "status": status,
         "pki_dir": pki_dir,
         "certs": certs,
-    }))
+    })))
 }
 
 /// Read a PEM certificate file and extract basic info.

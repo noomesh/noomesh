@@ -1026,18 +1026,44 @@ mod refresh_rotation_tests;
 /// from the browser. Idempotent.
 async fn auth_logout_handler(
     State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    // Whose session is this? The refresh cookie names the account (browser);
+    // a CLI logout has no cookie but presents the bearer it is giving up.
+    let mut account: Option<String> = None;
     if let Some(c) = jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         let raw = c.value().to_string();
         if let Ok(Some(rec)) = auth_refresh::lookup_token(&state.db, &raw).await {
             let _ = auth_refresh::revoke_token(&state.db, &rec.id).await;
             audit_auth(&state.db, "auth_logout", &rec.user_id, "ok", None).await;
-            // Every open browser socket for this account closes with 4401;
-            // a WebSocket authenticates only at its handshake.
-            let closed = state.alert_hub.end_sessions(&rec.user_id);
-            tracing::info!(user_id = %rec.user_id, sockets = closed, "auth_logout ended open sockets");
+            account = Some(rec.user_id);
         }
+    }
+    if account.is_none() {
+        let secret = jwt_secret();
+        if !crate::auth::jwt_secret_is_insecure(&secret) {
+            if let Some(Ok(claims)) = headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| verify_token(t, &secret))
+            {
+                audit_auth(&state.db, "auth_logout", crate::auth::account_of(&claims.sub), "ok", None).await;
+                account = Some(crate::auth::account_of(&claims.sub).to_string());
+            }
+        }
+    }
+    if let Some(account) = account {
+        // The not-before floor kills the bearer this person is logging out
+        // of (the access token used to live on for up to 15 minutes), the
+        // refresh chains are left to the cookie revoke above, and every open
+        // socket for the account closes with 4401 — a WebSocket
+        // authenticates only at its handshake, and the floor stops it
+        // reconnecting with the same JWT.
+        let raised = crate::session_floor::raise(&state, &account, crate::session_floor::Reason::Logout).await;
+        let closed = state.alert_hub.end_sessions(&account);
+        tracing::info!(user_id = %account, sockets = closed, floor_shared = raised.shared, "auth_logout ended open sockets");
     }
     let clear = auth_refresh::build_clear_cookie(is_secure());
     let jar = CookieJar::new().add(clear);
@@ -1090,6 +1116,13 @@ async fn auth_me(
         }
     };
 
+    // Same floor `require_any_auth` applies: a token issued before the
+    // account was disabled/demoted/logged out is not an identity.
+    if crate::session_floor::refuses(&state, &claims.sub, &token).await {
+        return (StatusCode::UNAUTHORIZED,
+            Json(json!({"detail": "Session ended"}))).into_response();
+    }
+
     // Look up user for full details (scopes may have changed since token was
     // issued). On lookup failure, say so — do not fall through to the
     // bootstrap credential, and do not report stale claims as current truth.
@@ -1120,13 +1153,11 @@ async fn auth_me(
                 Json(json!({"detail": "User is disabled"}))).into_response()
         }
         None => {
-            // User deleted after token issued — still return from token claims
-            Json(json!({
-                "username": claims.sub,
-                "disabled": false,
-                "scopes": claims.scopes,
-                "role": claims.resolved_role().as_str(),
-            })).into_response()
+            // The account no longer exists (deleted after the token was
+            // issued). The token's claims are not a live identity: answer
+            // 401 like the disabled branch instead of echoing them.
+            (StatusCode::UNAUTHORIZED,
+                Json(json!({"detail": "User no longer exists"}))).into_response()
         }
     }
 }

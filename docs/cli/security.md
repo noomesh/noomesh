@@ -37,8 +37,12 @@ config root and how it was chosen, and a line for any config file whose
 transport keys were ignored because it lives in a checkout this box is not
 installed from. There is no unverified-TLS fallback: an unusable anchor, or a
 non-loopback `http://` gateway, exits 3 (`tls_untrusted`) instead. `logout`
-revokes the refresh token server-side and deletes the file; an
-already-issued access token stays valid until it expires (15 minutes).
+revokes the refresh token server-side, deletes the file, and ends the
+access token it was holding: the gateway keeps a per-account "not before"
+time, so a bearer issued before the logout is refused at once (a
+re-login gets a fresh one) and the account's open dashboard sockets close.
+The floor lives in Redis for one access-token lifetime; with no Redis it is
+held in the gateway's memory only and does not survive a restart.
 Scripts pass `--token` or `NOO_TOKEN`; the resolution order is in
 [README.md#contracts](README.md#contracts).
 
@@ -52,16 +56,26 @@ noo security user list
 noo security user link alice telegram 123456789 --name "Alice"
 ```
 
-`create` prompts for the password (eight characters minimum;
-`--password-stdin` for scripts) and prints `user 'alice' created with
+`create` prompts for the password (12 characters minimum, not a common
+password, not containing the username; the CLI and the gateway enforce the
+same rule on `create` and `set-password`, so `--password-stdin` is checked
+too, and existing accounts keep logging in; only a new or changed password
+is checked) and prints `user 'alice' created with
 scopes read, write` (`read` alone when `--scope` is omitted: new accounts are read-only, and `read` + `write` is the Operator tier). `team
 create` makes the team and its `team:ops` KB role; `grant-role` adds it
 (`alice KB roles: team:ops`; everyone already has `user:<name>`,
 `company` and `system`). `link` maps a channel identity (a Telegram chat
 id, a Google Chat `users/123`, a WhatsApp number) to the account so
 messages from that sender run as alice; `links alice` lists them.
-`set-scopes` **replaces** the scope set and is admin-only — scopes are
-baked into the JWT, so the user must log out and back in.
+`set-scopes` **replaces** the scope set and is admin-only. Scopes are baked
+into the JWT, so the change **ends every session of that account
+immediately** (its refresh tokens are revoked, open sockets close, and a
+token issued before the change is refused): the user logs in again and gets
+the new scopes. `disable`, `set-role` and `set-password` do the same, and
+`service-key revoke --disable-account` too. A disabled account's bound MCP
+keys stop within the key cache interval (5 s) and its refresh cookie is
+refused. `disable` does not revoke keys that are not bound to the account
+(machine keys issued with `service-key issue`); revoke those by name.
 
 <a id="graph-scope"></a>
 **The `graph` scope.** A plain `read` account is refused every

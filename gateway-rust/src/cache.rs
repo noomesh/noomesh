@@ -599,6 +599,21 @@ impl RedisCache {
         self.client.get::<Option<String>, _>(key).await.ok()?
     }
 
+    /// `SET key value EX ttl`; `true` only when Redis acknowledged it.
+    pub async fn set_string_ex(&self, key: &str, value: &str, ttl_secs: i64) -> bool {
+        self.client
+            .set::<(), _, _>(key, value.to_string(), Some(fred::types::Expiration::EX(ttl_secs)), None, false)
+            .await
+            .is_ok()
+    }
+
+    /// Get a string key, telling "absent" (`Ok(None)`) from "Redis failed"
+    /// (`Err`). [`get_string`] cannot: callers that must not treat an outage
+    /// as "no value" (the session not-before floor) use this one.
+    pub async fn get_string_checked(&self, key: &str) -> Result<Option<String>, String> {
+        self.client.get::<Option<String>, _>(key).await.map_err(|e| e.to_string())
+    }
+
     /// Delete a key.
     pub async fn del_key(&self, key: &str) -> bool {
         self.client.del::<i64, _>(key).await.unwrap_or(0) > 0
