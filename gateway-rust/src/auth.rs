@@ -3159,8 +3159,15 @@ pub async fn require_any_auth(
                 .get::<Option<crate::node_identity::VerifiedPeer>>()
                 .is_some_and(|p| p.is_some());
             let compose_peer = peer.ip.as_deref().is_some_and(crate::middleware::is_compose_peer);
-            if let Some(why) = crate::controller_hmac_refusal::fleet_token_out_of_place(service_leaf.as_deref(), node_leaf, compose_peer) {
-                return Ok(crate::controller_hmac_refusal::refuse_fleet_off_node(&state.metrics, &actor, &path, &peer, &why).await);
+            // With mTLS enforced, a fleet token must also come with the
+            // node's own leaf (loopback self-calls excepted): without one the
+            // actor is only a claim any node can make about another. Not
+            // enforcing, it is admitted and counted as `node_token_no_cert`.
+            let loopback = crate::controller_hmac_refusal::is_loopback_peer(peer.ip.as_deref());
+            if let Some((why, lane)) = crate::controller_hmac_refusal::fleet_token_placement(
+                service_leaf.as_deref(), node_leaf, compose_peer, loopback, crate::tls::mtls_enabled(),
+            ) {
+                return Ok(crate::controller_hmac_refusal::refuse_fleet(&state.metrics, lane, &actor, &path, &peer, &why).await);
             }
         }
         // A verified client certificate outranks the token's actor field
@@ -5657,8 +5664,8 @@ mod old_cli_refusal_tests {
         let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
         let door = body.split("    if verify_cluster_token(&t) {").nth(1).expect("the fleet door");
         let addon = door.find("crate::addon_hmac_refusal::refuse_addon_hmac(").expect("add-on refusal");
-        let check = door.find("crate::controller_hmac_refusal::fleet_token_out_of_place(").expect("the out-of-place check");
-        let refuse = door.find("return Ok(crate::controller_hmac_refusal::refuse_fleet_off_node(").expect("its refusal is returned");
+        let check = door.find("crate::controller_hmac_refusal::fleet_token_placement(").expect("the out-of-place check");
+        let refuse = door.find("return Ok(crate::controller_hmac_refusal::refuse_fleet(").expect("its refusal is returned");
         assert!(addon < check && check < refuse);
         for later in ["actor != peer.node", "node_route_allowed(", "if is_inference_surface {", "hmac_lane_uses("] {
             let at = door.find(later).unwrap_or_else(|| panic!("{later} missing from the fleet door"));
