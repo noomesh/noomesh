@@ -111,6 +111,14 @@ type Reconciler struct {
 	// loop is detected without a timing window (crashLooping).
 	harnessRestarts     uint64
 	harnessRestartsSeen bool
+	// harnessStartedKind is the kind the harness was last started with (or
+	// first seen running with, after an agent restart); "" = unknown/not
+	// running. A change in the desired kind restarts it (harnessKindDecision).
+	harnessStartedKind string
+	// harnessDesired is the last desired harness placement the controller
+	// answered with, for GET /harness/placement. Guarded by harnessMu.
+	harnessMu      sync.RWMutex
+	harnessDesired *placement
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -347,6 +355,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// Multi-role placements: ONE effective placement per backend (a lone
 	// placement is passed through untouched; several running ollama rows
 	// merge into one daemon spec - see multirole.go).
+	r.recordHarnessPlacement(desired.Placements)
 	effective, envWarnings := effectivePlacements(desired.Placements)
 	r.surfaceEnvConflicts(envWarnings)
 	ollamaRows := runningOllama(desired.Placements)

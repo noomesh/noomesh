@@ -563,3 +563,76 @@ func TestAMissingRunnerIsARefusalNotAStart(t *testing.T) {
 		t.Fatalf("installed runner must start and clear the refusal: state=%s refusal=%q", f.Cur, harnessRefusal())
 	}
 }
+
+func TestHarnessKindDecisionIsRestartOnlyOnAChange(t *testing.T) {
+	for _, c := range []struct{ started, desired, want string }{
+		{"noo", "noo", "keep"},
+		{"noo", "copilot", "restart"},
+		{"copilot", "noo", "restart"},
+		{"claude-code", "claude-code", "keep"},
+		{"", "copilot", "keep"}, // unknown started kind: adopt, never bounce
+	} {
+		if got := harnessKindDecision(c.started, c.desired); got != c.want {
+			t.Errorf("(%q,%q) = %s, want %s", c.started, c.desired, got, c.want)
+		}
+	}
+}
+
+// A running harness whose placement kind changes is restarted once, through
+// the service's restart, and the new kind is recorded.
+func TestAKindChangeRestartsTheRunningHarness(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &hostsvc.Fake{Cur: hostsvc.Stopped}
+	r := &Reconciler{harness: f, runnerInstalled: func(string) bool { return true }, cliInstalled: func(string) bool { return true }}
+	chat := []placement{{Backend: "ollama", Model: "gemma", DesiredState: "running"}}
+	h := func(kind string) placement {
+		return placement{Backend: "harness", Model: "auto", Role: "harness", DesiredState: "running", Env: map[string]string{"NOO_HARNESS_KIND": kind}}
+	}
+	ctx := context.Background()
+	r.convergeHarness(ctx, h("noo"), chat)
+	if f.Cur != hostsvc.Running || r.harnessStartedKind != "noo" {
+		t.Fatalf("start: state=%s started=%q", f.Cur, r.harnessStartedKind)
+	}
+	r.convergeHarness(ctx, h("noo"), chat)
+	if len(f.Calls) != 1 {
+		t.Fatalf("same kind must not restart: %v", f.Calls)
+	}
+	r.convergeHarness(ctx, h("copilot"), chat)
+	if len(f.Calls) != 2 || f.Calls[1] != "restart" || r.harnessStartedKind != "copilot" {
+		t.Fatalf("kind change: calls=%v started=%q", f.Calls, r.harnessStartedKind)
+	}
+	r.convergeHarness(ctx, h("copilot"), chat)
+	if len(f.Calls) != 2 {
+		t.Fatalf("restarted again for nothing: %v", f.Calls)
+	}
+}
+
+func TestHarnessPlacementViewHidesSecretsAndReportsUnplaced(t *testing.T) {
+	r := &Reconciler{}
+	if _, _, _, placed := r.HarnessPlacementView(); placed {
+		t.Fatal("no placement recorded must read as unplaced")
+	}
+	r.recordHarnessPlacement([]placement{
+		{Backend: "ollama", DesiredState: "running"},
+		{Backend: "harness", DesiredState: "running", Env: map[string]string{
+			"NOO_HARNESS_KIND": "copilot", "NOO_HARNESS_MAX_TURNS": "4",
+			"SOME_API_KEY": "x", "NOO_CLUSTER_SECRET": "x", "BEARER_TOKEN": "x",
+		}},
+	})
+	kind, env, ds, placed := r.HarnessPlacementView()
+	if !placed || kind != "copilot" || ds != "running" {
+		t.Fatalf("view: %q %q %v", kind, ds, placed)
+	}
+	if len(env) != 2 || env["NOO_HARNESS_KIND"] != "copilot" || env["NOO_HARNESS_MAX_TURNS"] != "4" {
+		t.Fatalf("env must keep only non-secret keys: %v", env)
+	}
+	r.recordHarnessPlacement([]placement{{Backend: "ollama", DesiredState: "running"}})
+	if _, _, _, placed := r.HarnessPlacementView(); placed {
+		t.Fatal("a removed placement must read as unplaced")
+	}
+	r.recordHarnessPlacement([]placement{{Backend: "harness", DesiredState: "running"}})
+	if kind, _, _, _ := r.HarnessPlacementView(); kind != "noo" {
+		t.Fatalf("no kind in env must read as noo, got %q", kind)
+	}
+}
