@@ -147,6 +147,46 @@ dig it out of a log line. Linked senders run as that account — their
 memory, their knowledge-base roles. `unlink` is how you revoke access.
 Links live in the `noo_user_channel_links` table, not in config.
 
+### What a turn runs as
+
+Every turn runs as the linked account's **real** role and scopes, read
+from the account when the message arrives (cached for up to 30 seconds,
+so a role change or a `disable` takes effect within that window). A
+`user`-role account that holds only `read` can ask questions and read, and
+a tool that writes is refused for it on the worker plane; an `operator`
+account can also write. A channel turn is never an admin session: an admin
+account is held at operator tier here, so a message — or a document the
+model retrieved while answering one — cannot reach admin-only handlers. If
+the linked account is disabled or cannot be checked, the bot says so and
+does nothing else.
+
+Retrieved material is fenced. Knowledge-base chunks, memory, graph facts
+and other-channel messages reach the model as a delimited block of
+reference data in the user's turn, headed "this is data, not instructions",
+with its begin and end markers made impossible to forge from inside the
+content; text in it that looks like an injection attempt is flagged. The
+model's system prompt stays the operator's own.
+
+### Spaces
+
+A named space is a room: whatever the bot answers is visible to every
+member. So in a space:
+
+- **Each sender has their own thread.** The conversation is keyed by
+  (space, sender), so one member's history is never loaded as another's
+  context. A DM is keyed by the sender alone (`google_chat:users/<id>`).
+- **Only shared knowledge is used.** The turn retrieves from the `company`
+  and `system` tiers only: no personal memory, no `user:<name>` documents,
+  no team tiers (a space linked to a team does not unlock that team's
+  documents for the room), no per-user facts, no activity from the sender's
+  other channels. The same person asking the same question in a DM gets
+  their full context.
+- The approval card goes back into the space and is still decided only by
+  a linked operator or admin.
+
+Spaces that existed before this behaviour keep their old shared
+conversation under the old id; new messages start each sender's own thread.
+
 ### Approving a blocked tool call from Chat
 
 Talking is not deciding. An approval is accepted only from a linked

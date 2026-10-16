@@ -1947,7 +1947,9 @@ async fn run_llm_action_inner(
     // the STREAMING path turns into a virtual <think>. Through `run` the
     // report came back as reasoning-plus-answer, the quality gate rejected it
     // as a stub, and the operator got nothing (2026-09-27, weekly_research).
-    let cr = crate::coordinator::run_with_thinking(
+    let cr = crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         prompt,
         conversation_id,
@@ -1956,6 +1958,7 @@ async fn run_llm_action_inner(
         model_ref,
         Some(HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await?;
     crate::usage::record(
@@ -2022,7 +2025,9 @@ pub async fn research_corrective_retry(
          Begin immediately with `## Summary`. Write the actual headings and \
          paragraphs — do not describe yourself or the process."
     );
-    match crate::coordinator::run_with_thinking(
+    match crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         &retry_prompt,
         // The `-retry` suffix makes this a SEPARATE conversation from the
@@ -2035,6 +2040,7 @@ pub async fn research_corrective_retry(
         None, // model (use default)
         Some(HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await
     {
@@ -4632,7 +4638,9 @@ async fn action_self_benchmark(
         let start = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            crate::coordinator::run(
+            crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run(
                 state,
                 prompt,
                 &conversation_id,
@@ -4641,6 +4649,7 @@ async fn action_self_benchmark(
                 None,
                 Some(HEARTBEAT_CONVERSATION_OWNER),
             ),
+    ),
         )
         .await;
 

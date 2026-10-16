@@ -192,24 +192,146 @@ pub fn current() -> Principal {
     }
     let turn = crate::routes::communication::turn_principal();
     if !turn.requester.is_empty() {
-        // Scopes are a DELIBERATE over-grant, and the honest way to read it
-        // is "strictly less than today". Before this change a channel turn's
-        // tool call reached the gateway as the controller HMAC — an internal
-        // service with full access and no subject at all. It is now that
-        // turn's named user, at operator tier, which is what keeps write
-        // tools working from Telegram and Google Chat; `admin` is withheld,
-        // which is the R32 escalation this change is about.
-        //
-        // Resolving the requester's REAL role needs a DB read per turn and
-        // a place to cache it; the design does that and this drops to
-        // exactly the user's tier.
-        return Principal::user(
-            turn.requester,
-            crate::auth::Role::Operator,
-            vec!["read".into(), "write".into()],
-        );
+        // LEAST PRIVILEGE. This used to be `Operator, [read, write]` for
+        // whoever the turn named, because resolving the real role needed a
+        // DB read and there was nowhere to put it. Every caller that has a
+        // person (a channel turn, a task owner) now resolves the real
+        // principal with [`account_principal`] and scopes it with
+        // [`with_principal`], and the unattended `system:*` turns name
+        // themselves with [`unattended_principal`]. What reaches here is a
+        // caller that did neither: it is a named user with `read` and
+        // nothing else, so a missed call site loses a write, never gains
+        // one.
+        warn_turn_fallback(&turn.requester, &turn.channel);
+        return Principal::user(turn.requester, crate::auth::Role::User, vec!["read".into()]);
     }
     Principal::unattributed()
+}
+
+/// Loud, rate-limited (once a minute per requester): a turn reached the bus
+/// with no principal scoped and was given the floor.
+fn warn_turn_fallback(requester: &str, channel: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let now = now_secs();
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashMap::new);
+    if now.saturating_sub(seen.get(requester).copied().unwrap_or(0)) < 60 {
+        return;
+    }
+    seen.insert(requester.to_string(), now);
+    drop(guard);
+    tracing::warn!(
+        requester,
+        channel,
+        "turn_principal_fallback: no principal in scope; signing as role=user scopes=[read]. \
+         The entry point must scope `bus_principal::account_principal` / `with_principal` \
+         around the turn."
+    );
+}
+
+/// The principal for gateway-owned turns that act as a `system:*` label (the
+/// heartbeat) rather than for a person. It keeps the tier those turns have
+/// always run at - `operator`, `read` + `write`, never `admin` and never
+/// `kb:unrestricted` - but as an explicit declaration at the call site
+/// instead of a side effect of the fallback.
+pub fn unattended_principal(label: &str) -> Principal {
+    Principal::user(
+        label,
+        crate::auth::Role::Operator,
+        vec!["read".into(), "write".into()],
+    )
+}
+
+/// What a linked channel account (or a task's owner) may do on the bus,
+/// from its `noo_users` row. `None` when the account is disabled: such a
+/// turn must not run at all.
+///
+/// - role = the higher of the `role` column and the role the `scopes`
+///   column implies (the same "never the lower" rule as `effective_tier`),
+///   an unparseable column reading as `User` - this grants authority, so it
+///   fails to the floor, not the ceiling.
+/// - scopes = the row's scopes plus the role's own, so a `user` row that
+///   lists only `read` is exactly `[read]`.
+/// - CAPPED AT OPERATOR. A chat message is not an admin session: `admin`
+///   (the role and the scope) is withheld here, as it always was on this
+///   path, so a prompt-injected channel turn cannot reach admin handlers.
+///   An admin who needs those uses the dashboard.
+pub fn principal_from_row(
+    username: &str,
+    role_col: &str,
+    scopes_col: &serde_json::Value,
+    disabled: bool,
+) -> Option<Principal> {
+    use crate::auth::Role;
+    if disabled {
+        return None;
+    }
+    let from_col: Role = role_col.trim().parse().unwrap_or(Role::User);
+    let list: Vec<String> = serde_json::from_value(scopes_col.clone()).unwrap_or_default();
+    let mut role = from_col.max(Role::from_scopes(&list));
+    if role == Role::Admin {
+        role = Role::Operator;
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for s in list
+        .iter()
+        .map(String::as_str)
+        .chain(role.legacy_scopes().iter().copied())
+    {
+        if s != "admin" && s != SCOPE_KB_UNRESTRICTED && !scopes.iter().any(|x| x == s) {
+            scopes.push(s.to_string());
+        }
+    }
+    Some(Principal::user(username, role, scopes))
+}
+
+/// How long a resolved account principal is reused. A role change or a
+/// disable takes at most this long to reach a channel turn.
+const ACCOUNT_PRINCIPAL_TTL_SECS: u64 = 30;
+
+type AccountCache = std::collections::HashMap<String, (u64, Option<Principal>)>;
+
+fn account_cache() -> &'static std::sync::Mutex<AccountCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<AccountCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Resolve `username`'s real principal: one `noo_users` read, cached for
+/// [`ACCOUNT_PRINCIPAL_TTL_SECS`]. `None` = disabled, or no such account, or
+/// the read failed (fail closed: the caller refuses the turn with a message,
+/// it does not fall back to a wider identity). A failed read is not cached.
+pub async fn account_principal(db: &sqlx::PgPool, username: &str) -> Option<Principal> {
+    let now = now_secs();
+    if let Ok(c) = account_cache().lock() {
+        if let Some((at, p)) = c.get(username) {
+            if now.saturating_sub(*at) < ACCOUNT_PRINCIPAL_TTL_SECS {
+                return p.clone();
+            }
+        }
+    }
+    let row: Result<Option<(String, serde_json::Value, bool)>, _> = sqlx::query_as(
+        "SELECT role, scopes, COALESCE(disabled, false) FROM noo_users WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(db)
+    .await;
+    let resolved = match row {
+        Ok(Some((role, scopes, disabled))) => principal_from_row(username, &role, &scopes, disabled),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(username, error = %e, "account_principal_lookup_failed");
+            return None;
+        }
+    };
+    if let Ok(mut c) = account_cache().lock() {
+        c.insert(username.to_string(), (now, resolved.clone()));
+    }
+    resolved
 }
 
 /// Run `fut` with `principal` in scope.
@@ -862,5 +984,70 @@ mod tests {
         let p = from_extensions(&ext).expect("a principal");
         assert_eq!(p.sub, "internal:cluster:gateway");
         assert!(!p.scopes.iter().any(|s| s == "admin"));
+    }
+
+    // ── channel / task turns sign as the account's real principal ──────
+
+    #[test]
+    fn a_read_scope_account_is_user_read_and_nothing_else() {
+        let p = principal_from_row("ada", "user", &serde_json::json!(["read"]), false).unwrap();
+        assert_eq!(p.role, "user");
+        assert_eq!(p.scopes, vec!["read".to_string()]);
+        assert_eq!(p.kind, Kind::User);
+        assert_eq!(p.sub, "ada");
+    }
+
+    #[test]
+    fn an_empty_scopes_column_takes_the_roles_own_scopes() {
+        let p = principal_from_row("op", "operator", &serde_json::json!([]), false).unwrap();
+        assert_eq!(p.role, "operator");
+        assert_eq!(p.scopes, vec!["read".to_string(), "write".to_string()]);
+    }
+
+    #[test]
+    fn a_channel_principal_is_capped_below_admin() {
+        let p = principal_from_row("root", "admin", &serde_json::json!(["read", "write", "admin"]), false).unwrap();
+        assert_eq!(p.role, "operator", "a chat turn is not an admin session");
+        assert!(!p.scopes.iter().any(|s| s == "admin"));
+        assert!(!p.scopes.iter().any(|s| s == SCOPE_KB_UNRESTRICTED));
+    }
+
+    #[test]
+    fn a_disabled_account_has_no_principal_and_a_bad_role_reads_as_user() {
+        assert!(principal_from_row("x", "operator", &serde_json::json!(["write"]), true).is_none());
+        let p = principal_from_row("x", "???", &serde_json::json!([]), false).unwrap();
+        assert_eq!(p.role, "user");
+    }
+
+    /// The fallback used to be `Operator, [read, write]` for any named
+    /// requester. It is the floor now.
+    #[tokio::test]
+    async fn the_no_principal_fallback_is_not_operator() {
+        let turn = crate::routes::communication::TurnPrincipal {
+            requester: "ada".into(),
+            channel: "telegram".into(),
+            ..Default::default()
+        };
+        let p = crate::routes::communication::with_turn_principal(turn, async { current() }).await;
+        assert_eq!(p.sub, "ada");
+        assert_eq!(p.role, "user");
+        assert_eq!(p.scopes, vec!["read".to_string()]);
+        assert!(!p.scopes.iter().any(|s| s == "write"));
+    }
+
+    #[tokio::test]
+    async fn a_scoped_principal_wins_over_the_fallback() {
+        let turn = crate::routes::communication::TurnPrincipal { requester: "ada".into(), ..Default::default() };
+        let real = Principal::user("ada", crate::auth::Role::Operator, vec!["read".into(), "write".into()]);
+        let p = crate::routes::communication::with_turn_principal(turn, with_principal(real, async { current() })).await;
+        assert_eq!(p.role, "operator");
+    }
+
+    #[test]
+    fn unattended_turns_keep_operator_read_write_explicitly() {
+        let p = unattended_principal("system:heartbeat");
+        assert_eq!(p.sub, "system:heartbeat");
+        assert_eq!(p.role, "operator");
+        assert_eq!(p.scopes, vec!["read".to_string(), "write".to_string()]);
     }
 }

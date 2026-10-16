@@ -888,7 +888,19 @@ fn run_in_process(st: std::sync::Arc<AppState>, req: TaskRequest) -> std::pin::P
         // it and a resume does not pick a poisoned task back up.
         let outcome = std::panic::AssertUnwindSafe(async {
             let rt = crate::coordinator::InProcessRuntime::new(&st);
-            run_task_loops(rt, &req).await
+            // The owner's REAL role and scopes. This runner is spawned, so
+            // no request principal reaches it, and the no-principal fallback
+            // is the read-only floor. A disabled or unresolvable owner (and a
+            // task with no owner) runs on that floor, never wider.
+            let principal = if req.user.is_empty() {
+                None
+            } else {
+                crate::bus_principal::account_principal(&st.db, &req.user).await
+            };
+            match principal {
+                Some(p) => crate::bus_principal::with_principal(p, run_task_loops(rt, &req)).await,
+                None => run_task_loops(rt, &req).await,
+            }
         })
         .catch_unwind()
         .await;

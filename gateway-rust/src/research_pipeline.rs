@@ -437,7 +437,9 @@ pub async fn run_research_pipeline(
         "{conversation_id}-gather-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let gather = crate::coordinator::run_with_thinking(
+    let gather = crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         &gather_prompt,
         &gather_conversation,
@@ -446,6 +448,7 @@ pub async fn run_research_pipeline(
         model,
         Some(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await?;
     record_usage(state, &gather);
@@ -507,7 +510,9 @@ pub async fn run_research_pipeline(
             // already ran are in view and a notes-only answer is possible;
             // the old `-gather-retry` id was a separate, stable thread that
             // saw none of them.
-            let retry = crate::coordinator::run_with_thinking(
+            let retry = crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
                 state,
                 &retry_prompt,
                 &gather_conversation,
@@ -516,7 +521,8 @@ pub async fn run_research_pipeline(
                 model,
                 Some(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
                 false,
-            )
+            ),
+    )
             .await?;
             record_usage(state, &retry);
             gather_calls.extend_from_slice(&retry.tool_calls);
@@ -679,7 +685,9 @@ async fn run_section(
     index: usize,
     model: Option<&str>,
 ) -> Option<String> {
-    match crate::coordinator::run_with_thinking(
+    match crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         prompt,
         &format!("{conversation_id}-s{}", index + 1),
@@ -688,6 +696,7 @@ async fn run_section(
         model,
         Some(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await
     {
