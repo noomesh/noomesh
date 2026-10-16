@@ -57,6 +57,16 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
     "gateway", "worker", "trellion", "trellion-intel", "trellion-evolve", "evolve", "postgres-pgvector",
 ];
 
+/// Lock rows that are NOT `<prefix>/<name>:<tag>` release images: third-party
+/// images the stack runs straight from their upstream registry by a fixed
+/// compose tag, which the lock pins by digest (scripts/stack-lock-third-party.py)
+/// so the controller's start pulls them by digest. They are pulled by the
+/// controller only and never staged from the lock, `--all-images` included:
+/// the release prefix does not carry them, and staging a multi-GB ollama
+/// for every architecture would slow every roll. A node that needs one is
+/// staged by name (`noo cluster sync-images <node> -i <image>`).
+pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &["ollama"];
+
 /// Error prefix for "this image is not published for that architecture" —
 /// a skip, not a failure (llama.cpp on ARM uses the upstream image).
 pub(crate) const NO_VARIANT: &str = "no variant for";
@@ -83,7 +93,13 @@ pub(crate) fn parse_lock(text: &str) -> Vec<LockRow> {
 }
 
 pub(crate) fn node_bound(name: &str) -> bool {
-    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-")
+    !CONTROLLER_ONLY.contains(&name) && !name.starts_with("deps-") && !THIRD_PARTY_LOCK_ROWS.contains(&name)
+}
+
+/// Does `stage_lock` stage this lock row? Node-bound release images, or
+/// every release image with `--all-images`; a third-party row never.
+pub(crate) fn stages_from_lock(name: &str, all: bool) -> bool {
+    !THIRD_PARTY_LOCK_ROWS.contains(&name) && (all || node_bound(name))
 }
 
 /// Docker/uname arch spellings → the two the rail serves.
@@ -666,7 +682,7 @@ pub(crate) fn stage_lock(g: &Globals, lock: &str, prefix: &str, tag: &str, arche
     let mut sum = Summary::default();
     let dir = images_store_dir();
     let release = Release { prefix: prefix.to_string(), tag: tag.to_string() };
-    for row in parse_lock(lock).into_iter().filter(|r| all || node_bound(&r.name)) {
+    for row in parse_lock(lock).into_iter().filter(|r| stages_from_lock(&r.name, all)) {
         let image = format!("{prefix}/{}:{tag}", row.name);
         for arch in arches {
             let label = format!("{image} ({arch})");
@@ -887,6 +903,22 @@ mod tests {
         assert_eq!(bound, ["llamacpp", "node-agent", "stunnel"]);
         assert!(!node_bound("deps-core"));
         assert!(!node_bound("evolve") && !node_bound("trellion-intel"));
+    }
+
+    #[test]
+    fn a_third_party_lock_row_is_never_staged() {
+        // `ollama@sha256:` pins docker.io/ollama/ollama:<version> for the
+        // controller's own start; it is not `<prefix>/ollama:<tag>`, so a
+        // stage would ask the release registry for an image it never had.
+        let lock = format!("# tag v0.6.5\ngateway@{D}\nollama@{D}\nllamacpp@{D}\n");
+        let rows = parse_lock(&lock);
+        assert!(rows.iter().any(|r| r.name == "ollama"), "the row parses like any other");
+        for all in [false, true] {
+            let staged: Vec<&str> = rows.iter().map(|r| r.name.as_str()).filter(|n| stages_from_lock(n, all)).collect();
+            assert!(!staged.contains(&"ollama"), "all={all}: {staged:?}");
+            assert!(staged.contains(&"llamacpp"), "all={all}: {staged:?}");
+        }
+        assert!(stages_from_lock("gateway", true) && !stages_from_lock("gateway", false));
     }
 
     #[test]

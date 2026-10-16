@@ -1488,6 +1488,28 @@ impl Default for JobOptions<'_> {
     }
 }
 
+/// How long a caller of `/api/jobs/submit` is told to wait when the gateway
+/// has no Redis client.
+pub(crate) const REDIS_RETRY_AFTER_SECS: u64 = 5;
+
+/// The refusal `/api/jobs/submit` answers while the gateway holds no Redis
+/// client: 503 + `Retry-After` + `{"error":"redis_reconnecting"}`, never a
+/// bare 500. The queue IS Redis, so nothing can be queued; the caller (the
+/// CLI's node poke during `noo upgrade --all`) retries on the code.
+///
+/// NOTE: today the client is made once, at boot (`state.rs`): a gateway that
+/// came up before Redis accepted connections keeps answering this until it
+/// is restarted. The code says "reconnecting" because that is what a caller
+/// should do about it (wait and retry), and because a reconnecting client is
+/// the fix this body is shaped for.
+pub(crate) fn redis_not_connected() -> AppError {
+    AppError::UnavailableRetry {
+        code: "redis_reconnecting",
+        detail: "Redis not connected: the job queue is unavailable until the gateway's Redis client connects".into(),
+        retry_after_secs: REDIS_RETRY_AFTER_SECS,
+    }
+}
+
 /// Submit a job to the scheduler queue (full form with backend/force_node).
 ///
 /// POST /api/jobs/submit
@@ -1548,7 +1570,7 @@ async fn scheduler_submit_job(
         knobs = k;
         // AFTER validation: a refused request is not charged to the quota.
         let Some(redis) = &state.redis else {
-            return Err(AppError::Internal("Redis not connected".into()));
+            return Err(redis_not_connected());
         };
         match redis
             .check_named_limit("job-submit", account_of(actor_sub), USER_JOB_SUBMITS_PER_WINDOW, USER_JOB_SUBMIT_WINDOW_SECS)
@@ -1579,7 +1601,7 @@ async fn scheduler_submit_job(
 
     let redis = match &state.redis {
         Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
+        None => return Err(redis_not_connected()),
     };
     // refuse a job that names a backend nobody is serving
     // instead of queuing it to die. A pinned job is the operator's call.
@@ -4658,6 +4680,24 @@ mod job_type_routing_tests {
                 );
             }
         }
+    }
+
+    /// A submit while the gateway has no Redis client is a retryable 503
+    /// with a machine-readable code and `Retry-After` (2026-10-15: every node
+    /// poke of a `noo upgrade --all` got a bare 500 "Redis not connected").
+    #[tokio::test]
+    async fn no_redis_client_is_a_retryable_503_with_a_code() {
+        let r = redis_not_connected().into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some(REDIS_RETRY_AFTER_SECS.to_string().as_str()),
+        );
+        let body = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "redis_reconnecting");
+        assert_eq!(v["retry_after_secs"], REDIS_RETRY_AFTER_SECS);
+        assert!(v["detail"].as_str().is_some_and(|d| d.contains("Redis not connected")));
     }
 
     #[test]
