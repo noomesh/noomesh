@@ -18,6 +18,11 @@
 //! | `POST /v1/messages` | Anthropic Messages | converted to OpenAI chat, the reply converted back |
 //! | `GET /v1/models` | | nothing: the pinned model, as the one entry |
 //!
+//! openapi-drift: not-gateway-routes — this router is bound on a loopback
+//! port inside the harness process for one task, never mounted on the
+//! gateway's listener, so its paths are not gateway API and are left out of
+//! the OpenAPI spec (`scripts/check-openapi-drift.py`, `scripts/gen-openapi.py`).
+//!
 //! Anything else is a 404 with a JSON error body. Streaming and
 //! non-streaming both work on both routes. A `model` the CLI names is
 //! replaced with the pinned model (logged once): the harness is placed

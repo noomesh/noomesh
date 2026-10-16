@@ -46,6 +46,21 @@ BASELINE = ROOT / "scripts" / "openapi-drift-baseline.json"
 ROUTE_RE = re.compile(r'\.route\(\s*"([^"]+)"')
 NEST_RE = re.compile(r'\.nest\(\s*"')
 
+# A Rust file whose `.route("…")` calls build a router that is NOT mounted on
+# the gateway's listener (the node harness's loopback wire translator, for
+# one) declares that with this exact marker in its module doc, followed by
+# the reason. The scan then skips the file. It is a per-file, in-tree,
+# reviewable opt-out — unlike the baseline, which records drift to pay down.
+# scripts/gen-openapi.py honours the same marker, and
+# tests/test_openapi_route_scan_exemption.py pins that both scripts read it
+# and that every marked file is one that really serves another listener.
+NOT_GATEWAY_ROUTES_MARKER = "openapi-drift: not-gateway-routes"
+MARKER_WINDOW = 4000  # bytes from the top of the file the marker must sit in
+
+
+def declares_not_gateway_routes(text: str) -> bool:
+    return NOT_GATEWAY_ROUTES_MARKER in text[:MARKER_WINDOW]
+
 
 def rust_routes() -> set[str]:
     """Every path registered with `.route("…")` under gateway-rust/src."""
@@ -53,6 +68,8 @@ def rust_routes() -> set[str]:
     nested: list[str] = []
     for path in sorted(RUST_SRC.rglob("*.rs")):
         text = path.read_text(encoding="utf-8", errors="ignore")
+        if declares_not_gateway_routes(text):
+            continue
         if NEST_RE.search(text):
             nested.append(str(path.relative_to(ROOT)))
         for m in ROUTE_RE.finditer(text):
