@@ -88,6 +88,13 @@ async def _kb_source_rules() -> list:
     return rules
 
 
+# Signed-principal scope the gateway adds for a turn in a group chat or a
+# shared space (`channels::scoped_turn`). Every KB read is clamped to the
+# tiers the whole room may see, and personal memory search is refused.
+SHARED_ROOM_SCOPE = "kb:shared-room"
+SHARED_ROOM_KB_ROLES = ("company", "system")
+
+
 def _resolve_kb_roles(params: dict, grants: "list[str] | None" = None) -> "list[str] | None":
     """Resolve the KB role set for a request (KB role segmentation).
 
@@ -123,6 +130,14 @@ def _resolve_kb_roles(params: dict, grants: "list[str] | None" = None) -> "list[
         explicit = [explicit]
 
     principal = bus_principal.of(params)
+    if principal is not None and principal.has_scope(SHARED_ROOM_SCOPE):
+        # A turn in a group chat or shared space (the gateway adds this scope
+        # to the SIGNED principal for the whole turn, tool calls included):
+        # the reply is posted to the room, so every read is clamped to what
+        # the whole room may see. It is checked before kb_unrestricted, and
+        # it can only narrow.
+        wanted = list(explicit) if explicit else list(SHARED_ROOM_KB_ROLES)
+        return [r for r in wanted if r in SHARED_ROOM_KB_ROLES] or list(SHARED_ROOM_KB_ROLES)
     if principal is not None:
         if principal.kb_unrestricted:
             return list(explicit) if explicit else None

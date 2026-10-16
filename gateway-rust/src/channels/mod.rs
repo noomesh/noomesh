@@ -38,11 +38,30 @@ pub async fn scoped_turn<F: std::future::Future>(
     chat_type: &str,
     fut: F,
 ) -> F::Output {
+    let shared = is_shared_room(chat_type);
     crate::bus_principal::with_principal(
-        principal,
-        crate::coordinator::with_shared_room(is_shared_room(chat_type), fut),
+        room_principal(principal, shared),
+        crate::coordinator::with_shared_room(shared, fut),
     )
     .await
+}
+
+/// Signed-principal scope that marks a turn in a group chat or shared space.
+/// The worker's KB resolver clamps every read to the shared tiers when it
+/// sees it (tool calls included, not only the injected context), and the
+/// personal memory handlers answer nothing. It can only narrow.
+pub const SHARED_ROOM_SCOPE: &str = "kb:shared-room";
+
+/// The principal a room turn signs its bus messages with: the account's own,
+/// plus [`SHARED_ROOM_SCOPE`] when the reply goes to a room.
+pub fn room_principal(
+    mut principal: crate::bus_principal::Principal,
+    shared: bool,
+) -> crate::bus_principal::Principal {
+    if shared && !principal.scopes.iter().any(|s| s == SHARED_ROOM_SCOPE) {
+        principal.scopes.push(SHARED_ROOM_SCOPE.to_string());
+    }
+    principal
 }
 
 /// Warn when an operator still has a retired engine selector pinned to
@@ -539,5 +558,24 @@ mod scoped_turn_tests {
             assert!(scoped < run, "{name}: coordinator::run must sit inside scoped_turn");
             assert!(code.contains("is_shared_room("), "{name} must mark rooms");
         }
+    }
+
+    #[test]
+    fn a_room_turn_signs_with_the_shared_room_scope_and_a_private_one_does_not() {
+        use crate::bus_principal::Principal;
+        let base = || Principal::user("ada", crate::auth::Role::Operator, vec!["read".into(), "write".into()]);
+        let room = room_principal(base(), true);
+        assert!(room.scopes.iter().any(|s| s == SHARED_ROOM_SCOPE));
+        assert_eq!(room.sub, "ada", "the account is unchanged");
+        assert_eq!(room_principal(room.clone(), true).scopes.iter().filter(|s| *s == SHARED_ROOM_SCOPE).count(), 1, "added once");
+        let private = room_principal(base(), false);
+        assert!(!private.scopes.iter().any(|s| s == SHARED_ROOM_SCOPE));
+    }
+
+    #[test]
+    fn scoped_turn_uses_the_room_principal() {
+        let src = include_str!("mod.rs");
+        let body = src.split("pub async fn scoped_turn").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("room_principal(principal, shared)"));
     }
 }
