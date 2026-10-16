@@ -436,6 +436,49 @@ you add it to the public allow-list in `auth.rs` — do not. Use the shared
 HTTP clients from `tls.rs` for anything outbound
 and `sqlx::query!` (then `scripts/sqlx-prepare.sh`) for SQL.
 
+### Pin a vendor CLI
+
+The controller stages each foreign harness kind's vendor CLI (Claude Code,
+Copilot CLI, Codex CLI) to the nodes; a node never downloads it. What it
+stages is pinned in `config/harness-kinds.json`: each kind's `distribution`
+(and any interpreter it needs under `runtimes`) carries a version and a
+sha256 for every platform the fleet has (`linux-x86_64`, `linux-aarch64`,
+`macos-aarch64`), or one `any` digest for a platform-independent artefact.
+`scripts/vendor-pin.py` writes those blocks; nobody edits a digest by hand.
+
+**When to bump:** a vendor ships a fix or a flag the harness driver needs, a
+security advisory names the pinned version, or the Node LTS line moves.
+Pick the vendor's stable channel (Claude Code's `stable`, not `latest`), and
+never a prerelease.
+
+**How:**
+
+```bash
+python3 -I scripts/vendor-pin.py copilot 1.0.98         # a kind
+python3 -I scripts/vendor-pin.py runtime:node 22.23.3   # a runtime
+python3 -I scripts/vendor-pin.py --check                # re-verify every pin, writes nothing
+```
+
+It fills the block's `source` template for each platform, downloads every
+artefact (hash only: it never unpacks or runs one), cross-checks the digest
+against what the vendor publishes (nodejs.org `SHASUMS256.txt`, the GitHub
+release `SHA256SUMS` file, Claude Code's release `manifest.json`, the npm
+registry's `dist.integrity`), and rewrites both `config/harness-kinds.json`
+and its byte-equal copy `node-agent-go/internal/reconcile/harness_kinds.json`.
+It refuses an unknown kind, a missing artefact, and a cross-check mismatch,
+printing both digests. `--dl-dir DIR` keeps the downloads. If a vendor
+renames its assets, edit the block's `source`/`names`/`entry`/`unpack` in
+the file and re-run; the script's seed recipes only apply to a block that
+does not exist yet. `--check` needs the internet and is not part of CI;
+`tests/test_vendor_pins.py` holds only the shape.
+
+**What to review in the diff:** only `version` and the `sha256` values
+should move on a bump; a changed `source`, `entry` or `format` is a layout
+change and needs the applier checked against it. Confirm the run printed a
+cross-check source for every platform (a `WARNING … trust-on-first-use`
+line means the vendor published nothing to check against). Both JSON files
+change identically, or the parity tests fail.
+
 ## Conventions
 
 - **Python:** `from __future__ import annotations`; Pydantic `BaseModel` for
