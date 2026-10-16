@@ -7,7 +7,10 @@ properties an earlier change decided on — read as unit-file LINES, not as a
 substring search over the whole file (an earlier change: a guard that greps
 prose passes on its own comment).
 
-  - runs as the dedicated user, in group noo-agent and nothing more
+  - runs as the dedicated user, in its OWN group and nothing more — not
+    noo-agent (i119: it reads its own copy of the node pair, so a foreign
+    CLI that escaped its jail meets a gid that reads none of the agent's
+    key material)
   - never the docker group (an earlier change: that is root on the host)
   - no privilege escalation, read-only PKI, the caps the container had
   - NOT enabled by the applier: the agent starts it per placement, so the
@@ -47,9 +50,13 @@ def test_service_section_is_what_the_applier_demands() -> None:
     svc = _directives("Service")
     assert svc, "no [Service] section — the applier refuses this unit (exit 65)"
     assert svc.get("User") == ["noo-harness"], svc.get("User")
-    assert svc.get("Group") == ["noo-agent"], svc.get("Group")
+    assert svc.get("Group") == ["noo-harness"], svc.get("Group")
     groups = " ".join(svc.get("SupplementaryGroups", []))
     assert "docker" not in groups, "the applier refuses a unit that grants docker; so does this test"
+    assert "noo-agent" not in groups, "i119: the harness is in no group that reads the agent's pair"
+    hidden = " ".join(svc.get("InaccessiblePaths", [])).split()
+    for p in ("-/etc/noo/pki/nodes", "-/etc/noo-node-agent.env", "-/etc/noo/agent-secrets"):
+        assert p in hidden, f"i119: {p} must be inaccessible to the harness"
     assert svc.get("NoNewPrivileges") == ["true"]
     assert svc.get("ProtectSystem") == ["strict"]
     assert "/etc/noo/pki" in " ".join(svc.get("ReadOnlyPaths", []))
@@ -66,7 +73,13 @@ def test_applier_refusals_match_the_unit() -> None:
     block = block[: block.index("applied=\"$applied harness-unit\"")]
     assert "grep -qE '^User=noo-harness$'" in block
     assert "SupplementaryGroups=.*docker" in block
-    assert "useradd --system" in block and "--gid noo-agent noo-harness" in block
+    assert "useradd --system" in block and "--gid noo-harness noo-harness" in block
+    # i119: its own group, and a node upgrading from the noo-agent layout
+    # is moved — primary group, membership, and its secret files' group.
+    assert "groupadd --system noo-harness" in block
+    assert "usermod -g noo-harness noo-harness" in block
+    assert 'for _hg in docker noo-agent; do' in block and 'gpasswd -d noo-harness "$_hg"' in block
+    assert "chgrp -R noo-harness /etc/noo/harness-secrets" in block
     # The sudoers grant is REMOVED, not installed — and the applier must
     # delete an existing one, so a node upgrading from a release that wrote
     # it does not keep a standing NOPASSWD root rule nothing takes.
@@ -247,3 +260,23 @@ def test_the_env_file_still_carries_the_bootstrap_floor() -> None:
     keys = _env_template_keys()
     for k in ("NODE_ID", "NOO_GATEWAY_URL", "NATS_URL", "NOO_TLS_CA", "NOO_TLS_CERT", "NOO_TLS_KEY"):
         assert k in keys, f"{k} must stay in the env file — the harness needs it to reach anything"
+
+
+# ── i119: the harness's own copy of the node pair ─────────────────────────
+def test_the_harness_reads_its_own_copy_of_the_node_pair() -> None:
+    """The env names the copy; the applier installs it from the agent's
+    installed pair, root:noo-harness 0640, AFTER the harness-unit block
+    created the group and BEFORE the restart that would read it."""
+    tmpl = re.sub(r"\{#.*?#\}", "", HARNESS_ENV_TMPL.read_text(), flags=re.S)
+    assert "NOO_TLS_CERT={{ harness_tls_cert }}" in tmpl and "NOO_TLS_KEY={{ harness_tls_key }}" in tmpl
+    assert "na_tls_key" not in tmpl, "the harness must not be pointed at the agent's key"
+    prov = (REPO / "noo-cli/src/commands/provision.rs").read_text()
+    assert '"/etc/noo/pki/harness/node.crt"' in prov and '"/etc/noo/pki/harness/node.key"' in prov
+    text = APPLY.read_text()
+    pair = text[text.index("# harness-pair"):]
+    pair = pair[: pair.index("# vendor-cli")]
+    assert 'install -d -m 750 -o root -g noo-harness "$PKI/harness"' in pair
+    assert 'install -m 640 -o root -g noo-harness "$PKI/nodes/$NODE_ID/$_nk" "$PKI/harness/$_nk"' in pair
+    assert 'config_unchanged "$PKI/nodes/$NODE_ID/$_nk" "$PKI/harness/$_nk" 640 root:noo-harness' in pair
+    assert text.index('if [ -f "$WORK/files/harness-unit" ]') < text.index("# harness-pair")
+    assert text.index("# harness-pair") < text.index('systemctl restart noo-harness')

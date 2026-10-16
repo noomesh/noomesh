@@ -428,7 +428,7 @@ env_payload_ok() {
 # the wrong section, a `StandardOutput=file:` that pid 1 opens as root, or a
 # line hidden behind a CR through; an exact match lets nothing through.
 AGENT_UNIT_SHA256="946dede0eb81ab164afb4d61e9000ffc38d550dc0424333ff792c4dc16bf02e4"
-HARNESS_UNIT_SHA256="ad98f59951ee7347866dd3cae9788fac0458814413db61e87a77e50a5648d3ee"
+HARNESS_UNIT_SHA256="0381295b535fd8084cc33667901dc3d02317cfe5307b95a02a2f404d470173d7"
 unit_payload_ok() {
     _f="$1"; _kind="$2"
     case "$_kind" in
@@ -1715,9 +1715,14 @@ fi
 
 # harness-unit — first install creates the user. NO sudo grant: see below.
 #
-# The user: `noo-harness`, system, no login, primary group noo-agent so it
-# can read the node's certificate and key (0640 root:noo-agent), and in NO
-# other group — not docker, which is root on the host.
+# The user: `noo-harness`, system, no login, primary group `noo-harness`
+# (its own), and in NO other group — not docker, which is root on the host,
+# and not noo-agent (i119). It used to be in noo-agent to read the node's
+# certificate and key (0640 root:noo-agent); it reads its own copy now
+# (the harness-pair step below), so a foreign CLI that escaped its jail still meets a
+# uid and gid that can read none of the agent's key material. A node
+# upgrading from that layout is moved: primary group switched, noo-agent
+# membership dropped, its secret files' group carried over.
 #
 # The lifecycle used to be a sudoers drop-in letting noo-agent run
 # `systemctl start|stop|restart noo-harness`. It COULD NOT WORK and is now
@@ -1742,12 +1747,21 @@ if [ -f "$WORK/files/harness-unit" ]; then
     grep -qiE '^SupplementaryGroups=.*docker' "$WORK/files/harness-unit" \
         && { echo "noo-apply: harness-unit grants the docker group — refusing" >&2; exit 65; }
     getent group noo-agent >/dev/null || { echo "noo-apply: group noo-agent is missing — this host was not prepped as a node" >&2; exit 78; }
+    getent group noo-harness >/dev/null || groupadd --system noo-harness
     id -u noo-harness >/dev/null 2>&1 \
-        || useradd --system --shell /usr/sbin/nologin --no-create-home --gid noo-agent noo-harness
-    # Never let an earlier hand-edit leave it in docker.
-    if id -nG noo-harness | tr ' ' '\n' | grep -qx docker; then
-        gpasswd -d noo-harness docker >/dev/null
-    fi
+        || useradd --system --shell /usr/sbin/nologin --no-create-home --gid noo-harness noo-harness
+    [ "$(id -gn noo-harness)" = noo-harness ] || usermod -g noo-harness noo-harness
+    # Never let an earlier hand-edit leave it in docker; never leave it in
+    # noo-agent (i119).
+    for _hg in docker noo-agent; do
+        if id -nG noo-harness | tr ' ' '\n' | grep -qx "$_hg"; then
+            gpasswd -d noo-harness "$_hg" >/dev/null
+        fi
+    done
+    # Its secret files (agent_secret_files, below) were written with its
+    # primary group, which was noo-agent: the directory is 0750, so it must
+    # follow the group or the harness loses its own secrets.
+    [ -d /etc/noo/harness-secrets ] && chgrp -R noo-harness /etc/noo/harness-secrets
     # Retire the grant that could never be used. Left behind it would be a
     # standing NOPASSWD root rule for a path nothing takes.
     rm -f /etc/sudoers.d/noo-harness-lifecycle /etc/sudoers.d/noo-harness-lifecycle.next
@@ -1760,6 +1774,23 @@ if [ -f "$WORK/files/harness-unit" ]; then
         install -m 644 -o root -g root "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service
         applied="$applied harness-unit"; need_daemon_reload=1; need_harness_restart=1
     fi
+fi
+
+# harness-pair — the harness's OWN copy of the node pair (i119), which
+# NOO_TLS_CERT / NOO_TLS_KEY in /etc/noo-harness.env name: copied from the
+# agent's pair as installed above (the same bundle files, or the pair
+# already on the node when this bundle carried none), root:noo-harness 0640
+# under a 0750 root:noo-harness directory. Only where the harness exists (its
+# group does); an identical copy is left alone and restarts nothing.
+if getent group noo-harness >/dev/null 2>&1; then
+    install -d -m 750 -o root -g noo-harness "$PKI/harness"
+    for _nk in node.crt node.key; do
+        [ -f "$PKI/nodes/$NODE_ID/$_nk" ] || continue
+        if ! config_unchanged "$PKI/nodes/$NODE_ID/$_nk" "$PKI/harness/$_nk" 640 root:noo-harness; then
+            install -m 640 -o root -g noo-harness "$PKI/nodes/$NODE_ID/$_nk" "$PKI/harness/$_nk"
+            applied="$applied harness-$_nk"; need_harness_restart=1
+        fi
+    done
 fi
 
 # vendor-cli — see vendor_install. No harness restart: the

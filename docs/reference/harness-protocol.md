@@ -396,7 +396,7 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    variable, so that file names the translator as a provider
    (`base_url = <translator>/v1`, `wire_api = "responses"`) and the pinned
    model, adds the user door as a streamable-HTTP MCP server, sets
-   `approval_policy = "never"` inside `sandbox_mode = "workspace-write"`,
+   `approval_policy = "never"` with `sandbox_mode = "danger-full-access"` (the harness's Landlock jail is the sandbox; Codex's own bubblewrap cannot run inside it),
    and switches Codex's reporting off
    ([../security/telemetry.md](../security/telemetry.md#agent-harnesses)).
 4. Build the CLI's environment from nothing: `PATH`, `HOME`, `LANG`,
@@ -428,3 +428,9 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
 A turn sends one `content` event with the answer, then `harness_result`.
 A kind whose `launch` still carries an `unverified:` value is refused at
 start.
+
+`noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
+with no door key and no MCP wiring. That means no `{mcp_config}`
+arguments and no `[mcp_servers]` table. The probe uses either the node's
+model or a scripted mock, and changes nothing outside its temp workspace.
+See [../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md#probe-a-kind-before-placing-it).

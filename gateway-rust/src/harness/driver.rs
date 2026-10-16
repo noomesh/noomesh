@@ -75,6 +75,17 @@ pub const MCP_CODEX_TOML: &str = "config-file:codex-toml";
 /// `lmstudio` are Codex's reserved ids).
 pub const CODEX_PROVIDER: &str = "noomesh";
 
+/// Whether a run gets noomesh's tools. Production always wires the user door
+/// ([`McpWiring::Door`]); `noo-gateway harness probe` runs a CLI with NO MCP
+/// server and no gateway at all ([`McpWiring::None`]): no door key is
+/// minted, no `mcpServers` file is written, and the command's
+/// `{mcp_config}` arguments (with the flag that takes each) are left out.
+#[derive(Debug, Clone, Copy)]
+pub enum McpWiring<'a> {
+    Door { gateway: &'a str, key: &'a str },
+    None,
+}
+
 /// Everything a driven invocation needs that does not change per task.
 #[derive(Debug, Clone)]
 pub struct DriverCtx {
@@ -96,6 +107,10 @@ pub struct DriverCtx {
     /// harness's own environment.
     pub path: String,
     pub lang: String,
+    /// Whether a jail can be built here and, once the startup self-test
+    /// has run, whether it passed (i119, `jail::gate`); a refusal
+    /// checkpoints the task with the reason and the CLI never runs.
+    pub jail_probe: crate::harness::jail::Probe,
 }
 
 impl DriverCtx {
@@ -124,6 +139,7 @@ impl DriverCtx {
             ca_path: set("NOO_TLS_CA"),
             path: set("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
             lang: set("LANG").unwrap_or_else(|| "C.UTF-8".into()),
+            jail_probe: crate::harness::jail::gate,
         })
     }
 }
@@ -291,8 +307,20 @@ impl Workspace {
     /// The config a kind's `launch.mcp` asks for, written 0600; its path is
     /// `{mcp_config}` in the command. Removed after each run.
     pub fn write_cli_config(&self, ctx: &DriverCtx, translator_url: &str, key: &str) -> Result<PathBuf> {
+        self.write_cli_config_wired(ctx, translator_url, McpWiring::Door { gateway: &ctx.gateway, key })?
+            .ok_or_else(|| anyhow!("kind {}: no CLI config written", ctx.kind.kind))
+    }
+
+    /// [`write_cli_config`](Self::write_cli_config) for either wiring.
+    /// `None` = nothing to pass as `{mcp_config}` (a `config-file` kind run
+    /// without MCP); Codex always gets its `config.toml`, which carries the
+    /// model provider, with the `mcp_servers` table only under a door.
+    pub fn write_cli_config_wired(&self, ctx: &DriverCtx, translator_url: &str, wiring: McpWiring<'_>) -> Result<Option<PathBuf>> {
         if ctx.launch.mcp != MCP_CODEX_TOML {
-            return self.write_mcp_config(&ctx.gateway, key);
+            return match wiring {
+                McpWiring::Door { gateway, key } => self.write_mcp_config(gateway, key).map(Some),
+                McpWiring::None => Ok(None),
+            };
         }
         let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
         let base = format!("{}{}", translator_url.trim_end_matches('/'), ctx.launch.model_url_suffix);
@@ -300,8 +328,12 @@ impl Workspace {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        write_private(&path, codex_config(&base, &ctx.pinned.model, &ctx.gateway, key).as_bytes())?;
-        Ok(path)
+        let door = match wiring {
+            McpWiring::Door { gateway, key } => Some((gateway, key)),
+            McpWiring::None => None,
+        };
+        write_private(&path, codex_config(&base, &ctx.pinned.model, door).as_bytes())?;
+        Ok(Some(path))
     }
 
     /// Write the MCP config naming the user door, readable by this user only.
@@ -309,6 +341,20 @@ impl Workspace {
         let path = self.mcp_path();
         write_private(&path, serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
         Ok(path)
+    }
+
+    /// The jail for one run in this workspace: work, HOME and TMP
+    /// read-write, the CLI config file and the cluster CA file read-only.
+    pub fn jail_spec(&self, ctx: &DriverCtx, cli_config: &Path) -> crate::harness::jail::JailSpec {
+        crate::harness::jail::JailSpec {
+            workspace: self.work.clone(),
+            home: self.home.clone(),
+            tmp: self.tmp.clone(),
+            ca_file: ctx.ca_path.as_deref().map(PathBuf::from),
+            // The Codex config is inside HOME already; the MCP file is not.
+            extra_ro: if cli_config.starts_with(&self.home) { Vec::new() } else { vec![cli_config.to_path_buf()] },
+            data_root: None,
+        }
     }
 
     /// Remove the workspace, unless it is kept for debugging.
@@ -352,21 +398,42 @@ fn toml_str(s: &str) -> String {
 /// - The user door is the one MCP server, a streamable-HTTP server with the
 ///   door key as its bearer: the key is in this 0600 file only, never in
 ///   the CLI's environment.
-/// - No approvals (`never`: a headless run has nobody to ask) inside the
-///   `workspace-write` sandbox: the CLI writes its working directory, and
-///   anything outside it, or the network, fails instead of escalating.
+/// - No approvals (`never`: a headless run has nobody to ask), and Codex's
+///   OWN sandbox off (`danger-full-access`): every foreign CLI already runs
+///   inside the harness's Landlock jail (harness/jail.rs), which confines
+///   writes to the task's workspace, HOME and TMP and refuses to start the
+///   CLI at all when it cannot jail. Codex's sandbox is bubblewrap, which
+///   needs to mount; a process inside a Landlock domain may not change its
+///   mounts, so the nested sandbox fails and Codex's shell tool silently
+///   does nothing (seen in `harness probe`, 2026-10-16). One jail, ours.
 /// - Every vendor channel off (docs/security/telemetry.md): analytics,
 ///   feedback, the OpenTelemetry exporters (metrics default to Statsig),
 ///   the update check, saved history, hosted web search.
-pub fn codex_config(base_url: &str, model: &str, gateway: &str, key: &str) -> String {
-    let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
-    let bearer = format!("Bearer {key}");
+///
+/// `door` is the user door's `(gateway, key)`; `None` writes no
+/// `[mcp_servers]` table at all (`harness probe`'s no-MCP run).
+pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> String {
+    let mcp = match door {
+        Some((gateway, key)) => {
+            let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
+            let bearer = format!("Bearer {key}");
+            format!(
+                "[mcp_servers.{MCP_SERVER_NAME}]\n\
+                 url = {mcp_url}\n\
+                 http_headers = {{ Authorization = {bearer} }}\n\
+                 \n",
+                mcp_url = toml_str(&mcp_url),
+                bearer = toml_str(&bearer),
+            )
+        }
+        None => String::new(),
+    };
     format!(
         "# Written by the noomesh harness for one run; removed when it ends.\n\
          model = {model}\n\
          model_provider = {provider}\n\
          approval_policy = \"never\"\n\
-         sandbox_mode = \"workspace-write\"\n\
+         sandbox_mode = \"danger-full-access\"\n\
          web_search = \"disabled\"\n\
          check_for_update_on_startup = false\n\
          \n\
@@ -375,10 +442,7 @@ pub fn codex_config(base_url: &str, model: &str, gateway: &str, key: &str) -> St
          base_url = {base}\n\
          wire_api = \"responses\"\n\
          \n\
-         [mcp_servers.{MCP_SERVER_NAME}]\n\
-         url = {mcp_url}\n\
-         http_headers = {{ Authorization = {bearer} }}\n\
-         \n\
+         {mcp}\
          [analytics]\n\
          enabled = false\n\
          \n\
@@ -395,8 +459,6 @@ pub fn codex_config(base_url: &str, model: &str, gateway: &str, key: &str) -> St
         model = toml_str(model),
         provider = toml_str(CODEX_PROVIDER),
         base = toml_str(base_url),
-        mcp_url = toml_str(&mcp_url),
-        bearer = toml_str(&bearer),
     )
 }
 
@@ -476,6 +538,25 @@ pub fn fill_command(command: &[String], prompt: &str, mcp_config: &Path) -> Vec<
     command.iter().map(|a| a.replace("{mcp_config}", &mcp).replace("{prompt}", prompt)).collect()
 }
 
+/// `launch.command` for a run with no MCP config ([`McpWiring::None`]): every
+/// argument naming `{mcp_config}` is dropped, with the flag before it when
+/// that flag takes it as its value (`--mcp-config {mcp_config}`); then
+/// `{prompt}` is filled in. A flag that only switches MCP behaviour
+/// (`--strict-mcp-config`) stays: strict with no config is no servers.
+pub fn fill_command_without_mcp(command: &[String], prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(command.len());
+    for a in command {
+        if a.contains("{mcp_config}") {
+            if !a.starts_with('-') && out.last().is_some_and(|p| p.starts_with('-') && !p.contains('=')) {
+                out.pop();
+            }
+            continue;
+        }
+        out.push(a.replace("{prompt}", prompt));
+    }
+    out
+}
+
 /// An invocation's limit: the configured timeout, cut to the door key's
 /// expiry — a CLI never runs on past the credential it was given.
 pub fn effective_timeout(configured: Duration, key_expires: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> Duration {
@@ -540,11 +621,32 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> V
 /// Run `argv` in `cwd` with exactly `env`, stdin closed, output captured up
 /// to [`OUTPUT_CAP`], in a process group of its own that is killed whole at
 /// `timeout`.
-pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration) -> Result<RunOutput> {
+pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec) -> Result<RunOutput> {
+    spawn_cli_as(argv, env, cwd, timeout, jail, None).await
+}
+
+/// Who a CLI runs as when it is not the harness's own uid: the child
+/// switches to `gid` then `uid` before exec (std drops supplementary groups
+/// when it changes uid from root). Never uid 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// [`spawn_cli`], optionally as another user. The ONE place a CLI process
+/// is constructed: the production driver and `harness probe` both come
+/// through here, and so both run the CLI inside the jail. Order in the
+/// child (std's `do_exec`): setgid/setuid first, then the `pre_exec` hook
+/// that applies the jail, then exec — so the jail binds the dropped user.
+pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>) -> Result<RunOutput> {
     let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
+    if run_as.is_some_and(|r| r.uid == 0) {
+        bail!("refusing to run a CLI as uid 0");
+    }
     // The program is looked up on the CLI's PATH, not the harness's.
     let resolved = resolve_program(prog, env.get("PATH").map(String::as_str)).unwrap_or_else(|| PathBuf::from(prog));
-    let mut cmd = tokio::process::Command::new(&resolved);
+    let mut cmd = crate::harness::jail::command(&resolved, jail).map_err(|r| anyhow!(r.note()))?;
     cmd.args(args)
         .env_clear()
         .envs(env)
@@ -555,6 +657,10 @@ pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Pa
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(unix)]
+    if let Some(r) = run_as {
+        cmd.gid(r.gid).uid(r.uid);
+    }
     let started = Instant::now();
     let mut child = cmd.spawn().with_context(|| format!("starting {prog}"))?;
     let out = child.stdout.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
@@ -695,7 +801,7 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
         let argv = fill_command(&ctx.launch.command, prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
         tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
-        spawn_cli(&argv, &env, &ws.work, timeout).await
+        spawn_cli(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp)).await
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
@@ -721,6 +827,10 @@ pub async fn run_task(ctx: &DriverCtx, client: reqwest::Client, req: &TaskReques
 }
 
 pub(crate) async fn run_task_on<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequest) -> Result<String> {
+    if let Err(r) = (ctx.jail_probe)() {
+        tracing::error!(event = "harness_jail_refused", task = %req.task_id, reason = %r, "harness_jail_refused: {}", r.note());
+        return rail.checkpoint(&req.task_id, req.loops_done, Some(&r.note()), false).await;
+    }
     let ws = Workspace::create(&ctx.workdir_root, &req.task_id, ctx.keep_workdir)?;
     let out = task_loops(ctx, rail, req, &ws).await;
     ws.finish();
@@ -807,6 +917,10 @@ pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnReques
 }
 
 pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
+    if let Err(r) = (ctx.jail_probe)() {
+        tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
+        bail!("{}", r.note());
+    }
     let id = format!("turn-{}", uuid::Uuid::new_v4().simple());
     let ws = Workspace::create(&ctx.workdir_root, &id, ctx.keep_workdir)?;
     let prompt = match req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
@@ -1141,6 +1255,66 @@ mod tests {
         assert_eq!(verdict("NOO_QUESTION:   "), Verdict::Continue, "an empty question is no question");
     }
 
+    /// PINNED (i119): where no jail can be built, a foreign task checkpoints
+    /// with the reason and the CLI never starts — no key, no translator, no
+    /// process. A turn is an error with the same words.
+    #[tokio::test]
+    async fn a_refused_jail_checkpoints_and_never_spawns() {
+        let root = scratch("nojail");
+        let marker = root.join("ran");
+        let script = format!("touch {}; echo NOO_RESULT: ok", marker.display());
+        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.jail_probe = || Err(crate::harness::jail::Refusal("this kernel has no Landlock".into()));
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-nojail", 10)).await.unwrap(), "checkpointed");
+        {
+            let c = rail.calls.lock().unwrap();
+            let note = "harness jail unavailable: this kernel has no Landlock; foreign CLIs never run unjailed";
+            assert_eq!(c.checkpoints, vec![(0, Some(note.to_string()), false)], "checkpointed, not failed, not exhausted");
+            assert_eq!((c.keys_minted, c.checks, c.done.len(), c.saved.len()), (0, 0, 0, 0), "nothing ran");
+        }
+        assert!(!marker.exists(), "the CLI never started");
+        let turn = TurnRequest {
+            conversation_id: "c1".into(),
+            prompt: "hi".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: false,
+            token: TURN_TOKEN.into(),
+        };
+        let e = run_turn_on(&ctx, &rail, &turn).await.unwrap_err();
+        assert!(e.to_string().contains("foreign CLIs never run unjailed"), "{e}");
+        assert!(!marker.exists());
+        assert_eq!(rail.calls.lock().unwrap().keys_minted, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A failed startup self-test is the gate's answer for the process: the
+    /// task checkpoints with the leak named and the CLI never starts.
+    #[tokio::test]
+    async fn a_failed_jail_self_test_checkpoints_with_the_leak_named() {
+        let root = scratch("selftest-failed");
+        let marker = root.join("ran");
+        let script = format!("touch {}; echo NOO_RESULT: ok", marker.display());
+        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.jail_probe = || Err(crate::harness::jail::Refusal("jail self-test failed: the planted secret /tmp/p/node.key was readable inside the jail".into()));
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-selftest", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        let note = c.checkpoints[0].1.clone().unwrap();
+        assert!(note.contains("the planted secret /tmp/p/node.key was readable inside the jail") && note.contains("never run unjailed"), "{note}");
+        assert_eq!(c.keys_minted, 0);
+        assert!(!marker.exists(), "the CLI never started");
+        drop(c);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// PINNED: what the CLI process actually sees carries none of the
     /// harness's secrets and not the turn token — `env_clear`, not hope.
     #[tokio::test]
@@ -1324,7 +1498,7 @@ mod tests {
             "model = \"gemma-4\"",
             "model_provider = \"noomesh\"",
             "approval_policy = \"never\"",
-            "sandbox_mode = \"workspace-write\"",
+            "sandbox_mode = \"danger-full-access\"",
             "web_search = \"disabled\"",
             "check_for_update_on_startup = false",
             "[model_providers.noomesh]",
@@ -1367,6 +1541,51 @@ mod tests {
         assert!(root.join("t-codexrun/home/.codex").is_dir());
         assert!(!root.join("t-codexrun/home/.codex/config.toml").exists(), "the key file is removed when the run ends");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn without_mcp_no_door_is_written_and_the_mcp_arguments_are_dropped() {
+        let root = scratch("nomcp");
+        // config-file kinds: nothing to write, the flag and its value go.
+        let k = kind(&["fake", "-p", "{prompt}", "--mcp-config", "{mcp_config}", "--strict-mcp-config", "--x=@{mcp_config}", "--allow"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-nomcp", false).unwrap();
+        assert_eq!(ws.write_cli_config_wired(&ctx, "http://127.0.0.1:1", McpWiring::None).unwrap(), None);
+        assert!(!ws.mcp_path().exists());
+        assert_eq!(fill_command_without_mcp(&ctx.launch.command, "hi"), ["fake", "-p", "hi", "--strict-mcp-config", "--allow"]);
+        // The shipped rows lose exactly their MCP arguments.
+        let copilot = crate::harness_kinds::get("copilot").unwrap().launch.clone().unwrap();
+        let argv = fill_command_without_mcp(&copilot.command, "P");
+        assert!(!argv.iter().any(|a| a.contains("mcp_config") || a == "--additional-mcp-config"), "{argv:?}");
+        assert_eq!(argv.len(), copilot.command.len() - 2);
+        let claude = crate::harness_kinds::get("claude-code").unwrap().launch.clone().unwrap();
+        let argv = fill_command_without_mcp(&claude.command, "P");
+        assert!(!argv.iter().any(|a| a.contains("mcp_config") || a == "--mcp-config"), "{argv:?}");
+        assert_eq!(argv.len(), claude.command.len() - 2);
+        // The door path is unchanged.
+        let p = ws.write_cli_config(&ctx, "http://127.0.0.1:1", "noo-sk-door-9").unwrap();
+        assert_eq!(p, ws.mcp_path());
+        ws.finish();
+
+        // Codex: the provider still, the MCP table not.
+        let k = codex_kind(&["codex", "exec", "{prompt}"]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-nomcp-codex", false).unwrap();
+        let p = ws.write_cli_config_wired(&ctx, "http://127.0.0.1:41234", McpWiring::None).unwrap().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("base_url = \"http://127.0.0.1:41234/v1\"") && text.contains("[analytics]"), "{text}");
+        assert!(!text.contains("mcp_servers") && !text.contains("Bearer"), "{text}");
+        assert!(codex_config("b", "m", Some(("https://g", "k"))).contains("[mcp_servers.noomesh]"));
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cli_is_never_run_as_root() {
+        let env: BTreeMap<String, String> = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
+        let jail = crate::harness::jail::JailSpec { workspace: PathBuf::from("/nonexistent-ws"), home: PathBuf::from("/nonexistent-home"), tmp: PathBuf::from("/nonexistent-tmp"), ca_file: None, extra_ro: Vec::new(), data_root: None };
+        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 })).await.unwrap_err();
+        assert!(err.to_string().contains("uid 0"), "{err}");
     }
 
     #[test]

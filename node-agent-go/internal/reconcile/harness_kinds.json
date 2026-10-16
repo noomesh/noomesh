@@ -184,7 +184,7 @@
           "--skip-git-repo-check",
           "--ephemeral",
           "--sandbox",
-          "workspace-write",
+          "danger-full-access",
           "--",
           "{prompt}"
         ],

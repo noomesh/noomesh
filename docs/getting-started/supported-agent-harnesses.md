@@ -72,6 +72,20 @@ harness runs the CLI, and the harness reports the CLI's own error. A bundle
 that carries a vendor CLI is large (each artefact is 100-250 MB), so the
 first restage after a placement takes longer to stage and to fetch.
 
+### The CLI runs jailed
+
+The harness never runs a vendor CLI unconfined. On Linux the CLI runs in
+a Landlock jail: it can write only its task's working directory, HOME and
+TMPDIR, and read only the system trees a runtime needs, a short list of
+`/etc` files and the cluster CA file. It cannot read the node's keys, env
+files, secrets or data root, nor the harness's environment. The network is
+not restricted. A node whose kernel cannot provide Landlock (or a Mac
+without `sandbox-exec`) cannot run a foreign kind. Its tasks are
+checkpointed with `harness jail unavailable: …; foreign CLIs never run
+unjailed`, and the harness logs the reason at startup (`noo cluster logs
+<node> harness`). The exact allow-list is in
+[../security/node-agent.md](../security/node-agent.md#foreign-clis-run-in-a-jail).
+
 ## Place a harness
 
 ```sh
@@ -91,6 +105,60 @@ itself, and that agent is what starts the harness
 that harness only when one is placed there and the node's agent reports it
 running. Without one, the controller runs the turn in process, as it
 always has, and a task's `why` says which of the two is missing.
+
+## Probe a kind before placing it
+
+`noo-gateway harness probe` runs a kind's real vendor CLI once per test,
+exactly as the harness driver would run it for a task: the same launch
+recipe, the same environment built from nothing (the kind's `lane` and
+`telemetry_off` included), the same loopback wire translator, the same
+process group, timeout and output caps. It does not mint a door key or
+wire noomesh's MCP tools, and it never calls the gateway. Two tests:
+
+- `reply`: the CLI is asked to answer `NOO_RESULT: ok`. It passes when the
+  driver's verdict parser reads `ok`.
+- `file`: the CLI is asked to create `probe.txt` containing `noomesh` and
+  answer `NOO_RESULT: done`. It passes when the file is there with that
+  content and the verdict is `done`. This shows that the model drives the
+  CLI's own tool loop through the translator.
+
+There are two modes:
+
+- **Mock** (`--mock-model`): an in-process scripted model answers every
+  call. It tests the wire and the flags, and needs no model and no root.
+  For `file`, it calls whichever file-writing tool the CLI advertised and
+  records that tool's name and argument keys in the report.
+- **Real**: the node's own model. Settings come from `--model-url`,
+  `--model` and `--backend`. Without those flags it reads
+  `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL` and `NOO_HARNESS_BACKEND`.
+  When `/etc/noo-harness.env` is readable, the probe fills in every
+  variable that is not already set, the node certificate
+  (`NOO_TLS_CA`, `NOO_TLS_CERT`, `NOO_TLS_KEY`) and the node-agent bearer
+  included. The model calls then carry the same client identity the
+  harness presents. That file is root-only, so the real mode runs with
+  `sudo`. As root, the probe runs the CLI as `--run-as <user>` (default
+  `nobody`) and refuses to run it as uid 0.
+
+```sh
+# mock: the wire and the flags, as yourself
+noo-gateway harness probe --kind copilot --mock-model
+noo-gateway harness probe --kind claude-code --cli /opt/claude/claude --mock-model --json
+# real: the node's model, the CLI as an unprivileged user
+sudo noo-gateway harness probe --kind codex --run-as nobody --json
+```
+
+Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
+`--test reply|file|both` (default `both`), `--timeout <secs>` (default
+300), `--keep` (keep the workspace and print its path) and `--json`. For
+each test the report gives the CLI version, PASS or FAIL with the first
+concrete reason, the exit code, seconds, whether it timed out, every
+translator route the CLI hit (method, path, status), token usage, and the
+last 20 lines of stdout and stderr. The exit code is 0 only when every
+selected test passed.
+
+The probe changes no service, no placement and no file outside its
+workspace under the system temp directory. It removes that workspace when
+it finishes unless you pass `--keep`.
 
 ## What happens when a kind cannot run
 

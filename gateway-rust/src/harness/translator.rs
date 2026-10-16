@@ -98,6 +98,16 @@ pub struct UsageTotals {
     pub models: Vec<String>,
 }
 
+/// One request the translator answered, as `noo-gateway harness probe`
+/// reports it. Recorded only on a translator started with
+/// [`Translator::start_logged`]; production translators keep no log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RouteHit {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+}
+
 /// The backend's wire, as far as the translator is concerned.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Wire {
@@ -113,6 +123,8 @@ struct Shared {
     logged_rewrite: AtomicBool,
     logged_no_usage: AtomicBool,
     logged_dropped: AtomicBool,
+    /// The probe's request log (`start_logged`); `None` in production.
+    route_log: Option<Mutex<Vec<RouteHit>>>,
 }
 
 impl Shared {
@@ -168,6 +180,17 @@ pub struct Translator {
 impl Translator {
     /// Bind 127.0.0.1:0 (one translator PER TASK/TURN, ephemeral port) and serve until shutdown.
     pub async fn start(upstream: ResolvedBackend) -> Result<Translator> {
+        Self::start_with(upstream, false).await
+    }
+
+    /// [`start`](Self::start), recording every request's method, path and
+    /// status for [`routes`](Self::routes). The probe's hook: routing is the
+    /// same router either way.
+    pub async fn start_logged(upstream: ResolvedBackend) -> Result<Translator> {
+        Self::start_with(upstream, true).await
+    }
+
+    async fn start_with(upstream: ResolvedBackend, log_routes: bool) -> Result<Translator> {
         let wire = match upstream.api_format.as_str() {
             "ollama" => Wire::Ollama,
             // A node backend is never Anthropic: cloud models run on the
@@ -183,6 +206,7 @@ impl Translator {
             logged_rewrite: AtomicBool::new(false),
             logged_no_usage: AtomicBool::new(false),
             logged_dropped: AtomicBool::new(false),
+            route_log: log_routes.then(|| Mutex::new(Vec::new())),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -211,6 +235,12 @@ impl Translator {
     /// Snapshot of everything counted so far.
     pub fn usage(&self) -> UsageTotals {
         self.shared.usage.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Every request answered so far, in order (empty unless started with
+    /// [`start_logged`](Self::start_logged)).
+    pub fn routes(&self) -> Vec<RouteHit> {
+        self.shared.route_log.as_ref().map(|l| l.lock().unwrap_or_else(|p| p.into_inner()).clone()).unwrap_or_default()
     }
 
     /// Stop accepting, let in-flight replies finish for up to five seconds,
@@ -242,8 +272,21 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(models))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn_with_state(shared.clone(), log_route))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(shared)
+}
+
+/// Records method, path and status when the probe asked for a log; a no-op
+/// pass-through otherwise.
+async fn log_route(State(sh): State<Arc<Shared>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let Some(log) = sh.route_log.as_ref() else {
+        return next.run(req).await;
+    };
+    let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+    let resp = next.run(req).await;
+    log.lock().unwrap_or_else(|p| p.into_inner()).push(RouteHit { method, path, status: resp.status().as_u16() });
+    resp
 }
 
 // ── replies ─────────────────────────────────────────────────────────────
@@ -1193,6 +1236,24 @@ mod tests {
         let u = t.usage();
         assert_eq!((u.calls, u.prompt_tokens, u.completion_tokens), (2, 20, 10));
         t.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_logged_translator_records_every_route_and_a_plain_one_none() {
+        let m = mock().await;
+        let t = Translator::start_logged(backend(&m.url, "openai")).await.unwrap();
+        let c = client();
+        let r = c.post(format!("{}/v1/chat/completions", t.base_url())).json(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]})).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let r = c.post(format!("{}/v1/messages/count_tokens", t.base_url())).json(&json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 404);
+        let hits: Vec<(String, String, u16)> = t.routes().into_iter().map(|h| (h.method, h.path, h.status)).collect();
+        assert_eq!(hits, [("POST".into(), "/v1/chat/completions".into(), 200), ("POST".into(), "/v1/messages/count_tokens".into(), 404)]);
+        t.shutdown().await;
+        let plain = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let _ = c.get(format!("{}/v1/models", plain.base_url())).send().await.unwrap();
+        assert!(plain.routes().is_empty(), "production keeps no log");
+        plain.shutdown().await;
     }
 
     #[tokio::test]

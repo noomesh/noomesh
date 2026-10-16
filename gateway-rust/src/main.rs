@@ -275,6 +275,21 @@ async fn main() -> Result<()> {
         health_probe().await;
     }
 
+    // `harness probe`: one operator-run check of a vendor CLI against the
+    // node's model or a mock. Its report is stdout, so its logs go to
+    // stderr (warnings only unless RUST_LOG says otherwise); bare `harness`
+    // is untouched below.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some("harness") && argv.get(2).map(String::as_str) == Some("probe") {
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .init();
+            std::process::exit(harness::probe::main(&argv[3..]).await);
+        }
+    }
+
     // Structured logging (matches Python structlog output)
     tracing_subscriber::registry()
         .with(
