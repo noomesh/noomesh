@@ -2979,8 +2979,20 @@ fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<
 const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
 
 /// "noo-cli-v0.6.5+abc1234" -> (0, 6, 5); anything else -> None.
+/// The release a node's fetcher came from, from the version its agent
+/// reports. Three shapes are live: a Mac reports its CLI
+/// (`noo-cli-v0.6.4+ff91728`), a Linux agent reports its stack tag
+/// (`stack-v0.6.4+<40-hex>`), and a bare `v0.6.4` is accepted for builds
+/// that report the tag alone. The stack tag stands for the fetcher on Linux
+/// because the fetcher rides EVERY Linux bundle next to the agent binary, and
+/// stack and CLI tags move in lock-step since 0.6.0, so an agent at stack
+/// X.Y.Z was installed by a bundle that also installed fetcher X.Y.Z or newer.
+/// Anything else (bare digits, a missing patch, a fourth field) is unreadable.
 fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
-    let rest = app_version.split("noo-cli-v").nth(1)?;
+    let v = app_version.trim();
+    let rest = v.strip_prefix("noo-cli-v")
+        .or_else(|| v.strip_prefix("stack-v"))
+        .or_else(|| v.strip_prefix('v'))?;
     let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
     let [maj, min, pat] = nums[..] else { return None };
     Some((maj, min, pat))
@@ -3957,8 +3969,21 @@ mod tests {
         for v in ["noo-cli-v0.6.5", "noo-cli-v0.6.5+7b00c90", "noo-cli-v0.6.6", "noo-cli-v0.7.0", "noo-cli-v1.0.0"] {
             assert!(bundle_gzip_gate(v).is_ok(), "gzip withheld from {v}");
         }
+        // The Linux agents report the stack tag (live, 0.6.5 roll on pop-os):
+        // `stack-v<semver>+<40-hex>`. And a bare `v<semver>`.
+        let sha = "ff917285b5cb2f43bc2b249393af91dffcf0c298";
+        for v in [format!("stack-v0.6.4+{sha}"), "stack-v0.6.4".into(), "v0.6.4".into(), "v0.6.4+abc".into()] {
+            assert!(bundle_gzip_gate(&v).is_err(), "gzip sent to {v}");
+            assert!(!bundle_gzip_gate(&v).unwrap_err().contains("unreadable"), "{v} must parse: {:?}", bundle_gzip_gate(&v));
+        }
+        for v in [format!("stack-v0.6.5+{sha}"), "stack-v0.6.5".into(), "stack-v0.7.0".into(), "v0.6.5".into(), "v1.0.0+abc".into()] {
+            assert!(bundle_gzip_gate(&v).is_ok(), "gzip withheld from {v}");
+        }
+        assert_eq!(parse_cli_version(&format!("stack-v0.6.4+{sha}")), Some((0, 6, 4)));
+        assert_eq!(parse_cli_version("noo-cli-v0.6.4+ff91728"), Some((0, 6, 4)));
+        assert_eq!(parse_cli_version("v0.6.5"), Some((0, 6, 5)));
         // Unknown / unparseable: NO (a wrong yes bricks the apply).
-        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1"] {
+        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1", "stack-v0.6", "stack-vx.y.z", "xstack-v0.6.5", "vv0.6.5"] {
             assert!(bundle_gzip_gate(v).is_err(), "gzip sent to unreadable {v:?}");
         }
     }
