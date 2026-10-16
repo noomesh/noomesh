@@ -173,6 +173,11 @@ const RUST_NATIVE_ACTIONS: &[&str] = &[
     // with NOTHING scheduling it, so the table grew unbounded.
     "heartbeat_retention",
     "agent_messages_retention",
+    // Export-then-drop for noo_security_audit partitions past the retention
+    // window. It lived only in Python, behind a scheduler that does not run
+    // in production, so no audit partition was ever rotated. SQL + a JSONL
+    // file write on /data, no ML. See audit_partition.rs.
+    "audit_log_rotate",
     // Retention for noo_token_usage: roll expired raw partitions into the
     // monthly table, then drop them. SQL only, no ML.
     "usage_rollup",
@@ -2197,6 +2202,7 @@ pub async fn run_rust_native_action(
         "heartbeat_retention" => action_heartbeat_retention(state, config).await.map(Into::into),
         "agent_messages_retention" => action_agent_messages_retention(state, config).await.map(Into::into),
         "usage_rollup" => action_usage_rollup(state, config).await.map(Into::into),
+        "audit_log_rotate" => crate::audit_partition::action_audit_log_rotate(state, config).await.map(Into::into),
         "channel_keepalive" => action_channel_keepalive(config).await.map(Into::into),
         "model_cache_warm" => action_model_cache_warm(state, config).await.map(Into::into),
         // Agent turns: only through `run_rust_native_task`, which puts them under the task's ceiling.

@@ -429,6 +429,14 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
+    // A gateway with no audit key does not serve either: every audit row
+    // would be refused, i.e. "audit logging on by default" would be false.
+    if let Some(msg) = crate::audit_integrity::boot_refusal() {
+        tracing::error!("{msg}");
+        eprintln!("noo-gateway: {msg}");
+        std::process::exit(2);
+    }
+
     // A NOO_TRUSTED_PROXIES entry covering this gateway's own attachment
     // point does not serve either: on a published port every remote
     // client arrives from the docker bridge, so trusting the bridge hands the
@@ -550,9 +558,11 @@ async fn main() -> Result<()> {
     // audit insert runs. Mirrors gateway/audit_archive.py::ensure_current_and_next
     // (Python lifespan was dead in prod; this restores it).
     audit_partition::ensure_current_and_next(&state).await;
+    // The retention job (export then drop) as a seeded weekly heartbeat task.
+    audit_partition::seed_rotation_task(&state.db).await;
     // The audit key's one-time hand-over row (or genesis row), before any
-    // loop can write an audit row under the new key. Idempotent; a missing
-    // NOO_AUDIT_HMAC_KEY is logged at error! and every audit row is refused.
+    // loop can write an audit row under the new key. Idempotent. A missing
+    // NOO_AUDIT_HMAC_KEY never reaches here: it is a boot refusal above.
     audit_integrity::ensure_checkpoint(&state.db).await;
     // Then the hash-v2 marker: after it, a row hashed v1
     // (time not covered) fails verification. Once; idempotent.
