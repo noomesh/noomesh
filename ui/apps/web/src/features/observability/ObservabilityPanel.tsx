@@ -46,7 +46,7 @@ const ADDON_HINT: Record<AddonState, (label: string) => string> = {
  * blocker leaves it alone), then the gateway mints a session for this
  * account and the tab is sent there. The gateway decides the Grafana role
  * from the LIVE account (admin→Admin, operator→Editor, user→Viewer) and
- * refuses a disabled one; the session lasts 15 minutes by default, after
+ * refuses a disabled one; the session lasts 5 minutes by default, after
  * which Grafana shows its login-disabled page and the fix is to click again.
  */
 function OpenGrafana() {
@@ -102,7 +102,7 @@ function OpenGrafana() {
         size="sm"
         onClick={open}
         disabled={mint.isPending}
-        title="Open Grafana as your noomesh account (admin→Admin, operator→Editor, user→Viewer); the session lasts 15 minutes"
+        title="Open Grafana as your noomesh account (admin→Admin, operator→Editor, user→Viewer); the session lasts 5 minutes"
       >
         {mint.isPending ? 'Opening…' : 'Open Grafana'}
       </Button>

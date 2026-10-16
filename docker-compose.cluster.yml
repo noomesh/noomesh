@@ -499,7 +499,7 @@ services:
       # the route answers 503 "not configured", never a half-working link.
       - NOO_GRAFANA_URL=${GRAFANA_ROOT_URL:-}
       - NOO_GRAFANA_SSO_KEY=/app/pki/sso/grafana.key
-      - NOO_GRAFANA_SESSION_TTL=${NOO_GRAFANA_SESSION_TTL:-15}
+      - NOO_GRAFANA_SESSION_TTL=${NOO_GRAFANA_SESSION_TTL:-5}
       # an earlier change (fail closed): this compose file ships in the SAME CLI
       # release as configs/grafana/ that points Grafana's data sources at the
       # gateway, so this literal says "the configs beside me are the gateway
