@@ -15,6 +15,36 @@ pub mod ingress;
 pub mod google_chat_pipeline;
 pub mod telegram;
 
+/// Whether a chat is a ROOM rather than a one-to-one conversation: anything
+/// that is not explicitly `private` (a Telegram group, supergroup or channel,
+/// a Google Chat space). An unknown or empty type counts as a room - the
+/// reply is posted where everyone can read it, so doubt narrows.
+pub fn is_shared_room(chat_type: &str) -> bool {
+    chat_type != "private"
+}
+
+/// What a refused channel turn says. The account is linked, but cannot act.
+pub const ACCOUNT_UNAVAILABLE_REPLY: &str = "I can't act for your noomesh account right now \
+(it is disabled or could not be checked). Ask an operator to check it with `noo security user list`.";
+
+/// Run one channel turn as the linked account's REAL principal, in a shared
+/// room when `chat_type` says so.
+///
+/// `principal` is what `bus_principal::account_principal` resolved (role and
+/// scopes from the account row), so every `worker.*` message the turn sends
+/// is signed with that and not with a blanket operator tier.
+pub async fn scoped_turn<F: std::future::Future>(
+    principal: crate::bus_principal::Principal,
+    chat_type: &str,
+    fut: F,
+) -> F::Output {
+    crate::bus_principal::with_principal(
+        principal,
+        crate::coordinator::with_shared_room(is_shared_room(chat_type), fut),
+    )
+    .await
+}
+
 /// Warn when an operator still has a retired engine selector pinned to
 /// `python` (`NOO_TELEGRAM_ENGINE`, `NOO_GCHAT_PUBSUB_ENGINE`,
 /// `NOO_GCHAT_PIPELINE`). The Python channel engine is gone — the design
@@ -439,5 +469,75 @@ mod ingress_and_approval_binding_tests {
         // Nothing above decided req-beta.
         pending(&db, "req-beta", "ada", "conv-A").await;
         assert_eq!(status(&db, "req-beta").await, "pending");
+    }
+}
+
+#[cfg(test)]
+mod scoped_turn_tests {
+    use super::*;
+
+    fn principal(role: &str, scopes: serde_json::Value) -> crate::bus_principal::Principal {
+        crate::bus_principal::principal_from_row("ada", role, &scopes, false).unwrap()
+    }
+
+    #[test]
+    fn only_private_chats_are_not_rooms() {
+        assert!(!is_shared_room("private"));
+        for t in ["group", "supergroup", "channel", "space", "", "unknown"] {
+            assert!(is_shared_room(t), "{t}");
+        }
+    }
+
+    /// The bus signs `current()`. A read-scope linked user's turn must sign as
+    /// role user, scopes [read] - not the old blanket operator read+write.
+    #[tokio::test]
+    async fn a_read_scope_users_turn_publishes_as_user_read() {
+        let p = scoped_turn(principal("user", serde_json::json!(["read"])), "private", async {
+            crate::bus_principal::current()
+        })
+        .await;
+        assert_eq!(p.sub, "ada");
+        assert_eq!(p.role, "user");
+        assert_eq!(p.scopes, vec!["read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_operator_users_turn_keeps_write_but_never_admin() {
+        let p = scoped_turn(principal("admin", serde_json::json!(["read", "write", "admin"])), "private", async {
+            crate::bus_principal::current()
+        })
+        .await;
+        assert_eq!(p.role, "operator");
+        assert!(p.scopes.contains(&"write".to_string()) && !p.scopes.contains(&"admin".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_turn_knows_whether_it_is_in_a_room() {
+        let in_room = scoped_turn(principal("user", serde_json::json!([])), "supergroup", async {
+            crate::coordinator::in_shared_room()
+        })
+        .await;
+        let in_dm = scoped_turn(principal("user", serde_json::json!([])), "private", async {
+            crate::coordinator::in_shared_room()
+        })
+        .await;
+        assert!(in_room && !in_dm);
+    }
+
+    /// Both pipelines resolve the account's principal and run the turn
+    /// through `scoped_turn`; neither calls the coordinator bare any more.
+    #[test]
+    fn both_pipelines_scope_the_turn() {
+        for (name, src) in [
+            ("telegram", include_str!("telegram.rs")),
+            ("google_chat", include_str!("google_chat_pipeline.rs")),
+        ] {
+            let code = &src[..src.find("#[cfg(test)]").unwrap()];
+            assert!(code.contains("account_principal("), "{name} must resolve the account's principal");
+            let run = code.find("coordinator::run(").unwrap_or_else(|| panic!("{name}: no coordinator::run"));
+            let scoped = code.find("super::scoped_turn(").unwrap_or_else(|| panic!("{name}: no scoped_turn"));
+            assert!(scoped < run, "{name}: coordinator::run must sit inside scoped_turn");
+            assert!(code.contains("is_shared_room("), "{name} must mark rooms");
+        }
     }
 }

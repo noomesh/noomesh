@@ -121,7 +121,9 @@ pub fn parse_update(update: &Value) -> Option<ParsedUpdate> {
         chat_type: chat
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or("private")
+            // A missing type is NOT assumed to be a DM: `unknown` is
+            // treated as a shared room (see `channels::is_shared_room`).
+            .unwrap_or("unknown")
             .to_string(),
         chat_title: chat
             .get("title")
@@ -145,11 +147,17 @@ fn display_name(user: &Value) -> String {
         .to_string()
 }
 
-fn chat_context_id(chat_id: &str) -> String {
-    // Keyed by CHAT, not user: a group shares one conversation, and for a
-    // DM the chat id is the user's id anyway. Mirrors the Google Chat rule
-    // where a named space is keyed by the space.
-    format!("telegram:{chat_id}")
+fn chat_context_id(chat_id: &str, user_id: &str, chat_type: &str) -> String {
+    // A DM is keyed by the chat (which is the user's id anyway). A group,
+    // supergroup or channel is keyed by (chat, SENDER): each member has their
+    // own thread, so one member's history is never loaded as another's
+    // context. The room is shared for delivery and for knowledge (see
+    // `channels::is_shared_room`), not for conversation.
+    if super::is_shared_room(chat_type) {
+        format!("telegram:{chat_id}:{user_id}")
+    } else {
+        format!("telegram:{chat_id}")
+    }
 }
 
 /// Start the long-poll loop. Returns immediately; the loop runs until the
@@ -305,7 +313,7 @@ pub async fn handle_update(state: Arc<AppState>, update: &Value) -> Result<()> {
     // bare `y` is now scoped to, so it has to exist before a shorthand can
     // be interpreted. It is the same conversation the turn would use, so
     // this costs one lookup, not a second identity.
-    let context_id = chat_context_id(&parsed.chat_id);
+    let context_id = chat_context_id(&parsed.chat_id, &parsed.user_id, &parsed.chat_type);
     let conversation_id = super::conversation::resolve(
         &state,
         "telegram",
@@ -408,9 +416,24 @@ pub async fn handle_update(state: Arc<AppState>, update: &Value) -> Result<()> {
         channel: "telegram",
         recipient: parsed.chat_id.clone(),
         thread_id: None,
-        chat_type: "private".to_string(),
+        // The real type: the approval card goes back into THIS chat, and
+        // the target must say whether that is a room.
+        chat_type: parsed.chat_type.clone(),
     };
-    let (result, banner) = crate::routes::communication::CHANNEL_APPROVAL_TARGET
+    // The linked account's REAL role and scopes, not a blanket tier.
+    let Some(principal) = crate::bus_principal::account_principal(&state.db, &canonical_user).await else {
+        if let Err(e) = crate::routes::communication::send_telegram_reply(
+            &parsed.chat_id,
+            super::ACCOUNT_UNAVAILABLE_REPLY,
+        )
+        .await
+        {
+            tracing::warn!(error = %crate::redact::scrub(&e), "telegram_refusal_send_failed");
+        }
+        tracing::warn!(user = %canonical_user, "telegram_turn_refused: account disabled or unresolvable");
+        return Ok(());
+    };
+    let (result, banner) = super::scoped_turn(principal, &parsed.chat_type, crate::routes::communication::CHANNEL_APPROVAL_TARGET
         .scope(Some(approval_target), async {
             crate::routes::communication::GATED_TOOL_FAILURES
                 .scope(Default::default(), async {
@@ -438,7 +461,7 @@ pub async fn handle_update(state: Arc<AppState>, update: &Value) -> Result<()> {
                         .await
                 })
                 .await
-        })
+        }))
         .await;
     // A failed turn used to answer with silence. Tier 2 of the egress
     // boundary: the chat gets a general sentence and a reference id, the
@@ -530,14 +553,46 @@ mod tests {
     }
 
     #[test]
-    fn group_keys_by_chat_not_user() {
-        // Everyone in a group must share one conversation.
-        let a = chat_context_id(&parse_update(&msg(-100, "group", "a")).unwrap().chat_id);
+    fn group_keys_by_chat_and_sender() {
+        // Each member of a group has their OWN thread: one member's history
+        // must never load as another's context.
+        let pa = parse_update(&msg(-100, "group", "a")).unwrap();
+        let a = chat_context_id(&pa.chat_id, &pa.user_id, &pa.chat_type);
         let mut other = msg(-100, "group", "b");
         other["message"]["from"]["id"] = json!(99);
-        let b = chat_context_id(&parse_update(&other).unwrap().chat_id);
-        assert_eq!(a, b);
-        assert_eq!(a, "telegram:-100");
+        let pb = parse_update(&other).unwrap();
+        let b = chat_context_id(&pb.chat_id, &pb.user_id, &pb.chat_type);
+        assert_ne!(a, b);
+        assert_eq!(a, "telegram:-100:42");
+        assert_eq!(b, "telegram:-100:99");
+        // The same member in the same group keeps the same thread.
+        assert_eq!(a, chat_context_id("-100", "42", "supergroup"));
+    }
+
+    #[test]
+    fn a_dm_is_keyed_by_the_chat_alone() {
+        let p = parse_update(&msg(1234, "private", "hi")).unwrap();
+        assert_eq!(chat_context_id(&p.chat_id, &p.user_id, &p.chat_type), "telegram:1234");
+    }
+
+    #[test]
+    fn a_missing_chat_type_is_a_room_not_a_dm() {
+        let mut m = msg(7, "private", "hi");
+        m["message"]["chat"].as_object_mut().unwrap().remove("type");
+        let p = parse_update(&m).unwrap();
+        assert_eq!(p.chat_type, "unknown");
+        assert!(super::super::is_shared_room(&p.chat_type));
+        assert_eq!(chat_context_id(&p.chat_id, &p.user_id, &p.chat_type), "telegram:7:42");
+    }
+
+    /// The approval target carries the chat's real type (it was hard-coded
+    /// `private`), and the turn is scoped as the linked account.
+    #[test]
+    fn the_approval_target_uses_the_real_chat_type() {
+        let src = include_str!("telegram.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(!code.contains("chat_type: \"private\".to_string()"));
+        assert!(code.contains("chat_type: parsed.chat_type.clone()"));
     }
 
     #[test]
