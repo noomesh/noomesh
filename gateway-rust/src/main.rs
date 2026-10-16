@@ -674,10 +674,15 @@ async fn main() -> Result<()> {
     let acceptor = node_identity::NodeIdentityAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
     );
-    if tls::mtls_enabled() {
-        tracing::info!("TLS: peer certificate identity attached and ENFORCED — a token whose actor disagrees with the presented cert is refused");
-    } else {
-        tracing::info!("TLS: peer certificate identity attached (observe only) — set NOO_MTLS_GATEWAY=true to refuse mismatches");
+    match tls::mtls_mode() {
+        tls::MtlsMode::On | tls::MtlsMode::OnButCaMissing => tracing::info!(
+            "TLS: peer certificate identity attached and ENFORCED (the default when a cluster CA exists) — a token whose actor disagrees with the presented cert is refused, and so is a fleet token with no node certificate (loopback excepted)"
+        ),
+        // The WARN naming what this leaves open was already logged by
+        // `tls::load_rustls_config`; this line says what is still true.
+        tls::MtlsMode::OffExplicit | tls::MtlsMode::OffNoCa => tracing::info!(
+            "TLS: peer certificate identity attached (observe only) — NOT enforced; unset NOO_MTLS_GATEWAY (with NOO_TLS_CA present) to enforce"
+        ),
     }
     // `into_make_service_with_connect_info` injects the peer `SocketAddr` into
     // each request's extensions so the rate limiter can key on the real client
