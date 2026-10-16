@@ -363,6 +363,14 @@ services:
       # (lib-secrets.sh derive_file_secrets → NOO_PGPASS_GATEWAY) from the
       # store; it never touches disk outside this container.
       - PGPASSFILE=${NOO_PGPASS_GATEWAY:+/run/secrets/pgpass}
+      # The image a node is told to run for each third-party backend: the
+      # digest-pinned ref from the signed stack lock (NOO_IMAGE_DIGEST_*),
+      # sent in the node's start request (routes/cluster.rs backend_image_ref).
+      # An operator's VLLM_IMAGE / VLLM2_IMAGE / OLLAMA_IMAGE wins, as on the
+      # controller's own containers. tests/test_third_party_image_lock.py pins it.
+      - NOO_BACKEND_IMAGE_VLLM=${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+      - NOO_BACKEND_IMAGE_VLLM_SECONDARY=${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
+      - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
       - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
       - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
       - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
@@ -1019,7 +1027,7 @@ services:
   # Redis (controller node only)
   redis:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/redis:8.6-debian13-dev${NOO_IMAGE_DIGEST_REDIS:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-redis
     profiles: ["controller", "standalone"]
     # NOT root (i64, operator 2026-10-15). The -dev image's USER is 0; it
@@ -1073,8 +1081,10 @@ services:
   # NATS (messaging broker with persistence)
   nats:
     logging: *default-logging
-    # Pinned by digest (H-N4) — controller-only, x86. Bump deliberately, not via :latest drift.
-    image: ${NATS_IMAGE:-nats:latest@sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c}
+    # Pinned by digest (H-N4) — controller-only, x86. The signed stack lock carries the
+    # release's digest (NOO_IMAGE_DIGEST_NATS, scripts/stack-lock-third-party.py); the
+    # default digest below is the dev checkout's. Bump the tag deliberately.
+    image: ${NATS_IMAGE:-nats:2.14.3${NOO_IMAGE_DIGEST_NATS:-@sha256:7ff2e641c33dbdb0dd13a943ba0b70d841b71275c607baa53ef9b8661f0b2d8c}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-nats
     profiles: ["controller", "standalone"]
     ports:
@@ -1120,7 +1130,7 @@ services:
   # vLLM backend
   vllm:
     logging: *default-logging
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm
     # Placement-managed since 2026-07-11: the node-agent's desired-state
     # reconciler owns noo-vllm (noo cluster place <node> vllm <model>).
@@ -1281,7 +1291,7 @@ services:
   #   VLLM2_MODEL=Qwen/Qwen3-4B
   vllm-secondary:
     logging: *default-logging
-    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0}
+    image: ${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-vllm-secondary
     profiles: ["vllm-secondary"]
     environment:
@@ -1704,7 +1714,7 @@ services:
   # PAGEINDEX_EMBEDDING_URL at it explicitly to use it.
   tei:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6${NOO_IMAGE_DIGEST_TEI_CPU:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei
     profiles: ["tei-compose"]  # opt-in only (default: rerank=LLM fallback, embed=Ollama/node-agent)
     # No external port — gateway reaches TEI via Docker network
@@ -1726,7 +1736,7 @@ services:
   # Use this on nodes with a GPU for faster embedding throughput.
   tei-gpu:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
     # (`noo cluster up embedding <model> --node <node>`). Gated to an
@@ -1824,7 +1834,7 @@ services:
   # opt-in `tei-compose` profile; removing them is separate cleanup.
   reranker:
     logging: *default-logging
-    image: ghcr.io/huggingface/text-embeddings-inference:1.6
+    image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
     # (`noo cluster up reranker <model> --node <node>`). Gated to opt-in
@@ -2146,7 +2156,7 @@ services:
   # `controller` service onto `standalone` too.
   loki:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/loki:3${NOO_IMAGE_DIGEST_LOKI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-loki
     profiles: ["monitoring", "controller", "standalone"]
     # No external port — the gateway reaches Loki over the Docker network
@@ -2195,7 +2205,7 @@ services:
   # Prometheus (every controller, standalone included)
   prometheus:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/prometheus:3${NOO_IMAGE_DIGEST_PROMETHEUS:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-prometheus
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2237,7 +2247,7 @@ services:
   # registry (mirrors the dhi.io/prometheus:3 convention).
   alertmanager:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/alertmanager:0${NOO_IMAGE_DIGEST_ALERTMANAGER:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-alertmanager
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2275,7 +2285,7 @@ services:
   # Grafana (every controller, standalone included)
   grafana:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/grafana:12-debian13-dev${NOO_IMAGE_DIGEST_GRAFANA:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-grafana
     profiles: ["monitoring", "controller", "standalone"]
     # NOT root (i64, operator 2026-10-15): the -dev image's USER is 0, so
@@ -2357,7 +2367,7 @@ services:
   # metrics are a feature to design, not a profile to re-add.
   node-exporter:
     logging: *default-logging
-    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1
+    image: ${NOO_BASE_REGISTRY:-ghcr.io/noomesh/dhi}/node-exporter:1${NOO_IMAGE_DIGEST_NODE_EXPORTER:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-node-exporter
     profiles: ["monitoring", "controller", "standalone"]
     ports:
@@ -2771,7 +2781,7 @@ services:
   # of re-downloading from HuggingFace. No HF proxy, no CDN. See
   # docs/models/weight-cache.md.
   model-cache:
-    image: nginx:1.27-alpine
+    image: nginx:1.27-alpine${NOO_IMAGE_DIGEST_NGINX:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-model-cache
     profiles: ["controller", "standalone"]
     ports:
