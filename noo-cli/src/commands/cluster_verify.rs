@@ -4318,6 +4318,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // ... and run as non-root uid 65532, the uid their keys are handed
         // to (i105): the live uid, `docker exec id -u` first.
         checks.push(image_family::voice_images_row(voice_on));
+        // ... and load models the controller staged, offline (i105).
+        checks.push(image_family::voice_models_row(voice_on));
         // Every compose inference backend requires a client certificate at
         // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {

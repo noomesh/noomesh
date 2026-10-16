@@ -19,19 +19,19 @@
 # for a service the overlay did not compose is a bare service with no image,
 # and compose refuses the whole project.
 #
-# The volumes (whisper-models, piper-voices) are declared in the base file's
-# top-level `volumes:`; an overlay may reference them.
+# Models are staged by the CONTROLLER, never fetched by these containers
+# (i105). `noo models pull whisper:<size>` / `noo models pull piper:<voice>`
+# (also run by `noo addons enable voice`, `noo upgrade --stack` and onboard
+# while voice is on) download, verify and lay them out under the model store
+# (MODELS_DIR, default <data root>/models) in voice/whisper and voice/piper.
+# Each service mounts its half READ-ONLY and runs with HF_HUB_OFFLINE=1 /
+# TRANSFORMERS_OFFLINE=1 and no HF token; a model or voice that is not
+# staged is a 404 naming the `noo models pull` line (docker/voice_local.py).
+# Nothing writes a model at run time, so there is no writable model volume.
 #
 # Non-root (i105): both images run as `nonroot` (uid/gid 65532, the image's
 # USER; no `user:` here — a numeric one breaks Docker 27, see
-# tests/test_compose_named_users.py). Each writes only to its own plain named
-# volume, which a fresh install copies up from the image already owned by
-# 65532; the launcher re-owns a volume an older (root) container filled
-# before `up` (scripts/lib-reown.sh, reown_nonroot_volumes). whisper used to
-# share `hf-cache` (the data-root bind that the operator's host tooling and
-# root vLLM/TEI also write), which cannot be handed to 65532 without taking
-# it from them, so its model cache moved to `whisper-models`: a 0.6.5 install
-# downloads the whisper model once more on the first start.
+# tests/test_compose_named_users.py). The read-only mounts need no re-own.
 #
 # Whisper STT — faster-whisper behind the OpenAI-compatible audio API
 # (docker/whisper_server.py). The gateway's generic STT provider layer
@@ -119,10 +119,13 @@ services:
       - DO_NOT_TRACK=1
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - WHISPER_DEVICE=${WHISPER_DEVICE:-auto}
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - WHISPER_MODEL_DIR=/models
+      # Offline: the controller staged the model; nothing here may fetch.
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
     volumes:
-      # whisper's own HF cache (HF_HOME=/models), owned by uid 65532 (i105).
-      - whisper-models:/models
+      # The staged whisper models, read-only (noo models pull whisper:<size>).
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}/voice/whisper:/models:ro
       # The CA and whisper's OWN leaf, read-only.
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/whisper:/tls/services/whisper:ro
@@ -178,9 +181,13 @@ services:
       - DO_NOT_TRACK=1
       - PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
       - PIPER_USE_CUDA=${PIPER_USE_CUDA:-0}
+      - PIPER_VOICE_DIR=/voices
+      # Offline: the controller staged the voice; nothing here may fetch.
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
     volumes:
-      # Voice models (~60MB each) survive container recreation.
-      - piper-voices:/voices
+      # The staged piper voices, read-only (noo models pull piper:<voice>).
+      - ${MODELS_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/models}/voice/piper:/voices:ro
       # The CA and piper's OWN leaf, read-only.
       - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
       - ${NOO_PKI_DIR:-./.pki-placeholder}/services/piper:/tls/services/piper:ro

@@ -125,90 +125,6 @@ def test_grafana_too_and_a_missing_dir_is_skipped(tmp_path: Path) -> None:
     assert "stop grafana" in log.read_text()
 
 
-# ── the voice add-on's cache volumes (i105) ──────────────────────────
-# whisper/piper run as 65532 from i105; a volume an older root container
-# filled is re-owned the same way, on the VOLUME (`-v <vol>:/d`). The fake
-# runner's ledger for a volume lives at <cwd>/<volume>/.ledger; a fake
-# `docker volume inspect` says which volumes exist.
-
-def _volume_env(tmp: Path, existing: list[str]) -> dict[str, str]:
-    bindir = tmp / "vbin"
-    bindir.mkdir(exist_ok=True)
-    logf = tmp / "log"
-    (bindir / "docker").write_text(
-        "#!/bin/bash\n"
-        f'echo "docker $*" >> "{logf}"\n'
-        '[ "$1 $2" = "volume inspect" ] || exit 0\n'
-        f'case " {" ".join(existing)} " in *" $3 "*) exit 0 ;; esac\n'
-        "exit 1\n")
-    (bindir / "docker").chmod(0o755)
-    return {"PATH": f"{bindir}:{os.environ['PATH']}"}
-
-
-def _run_volumes(tmp: Path, runner: Path, log: Path, args: str, extra: dict[str, str]) -> subprocess.CompletedProcess:
-    env = dict(os.environ, NOO_REOWN_CMD=str(runner), LOG=str(log))
-    env.update(extra)
-    script = (
-        f'set -e; source "{LIB}"; '
-        f'reown_stop_service() {{ echo "stop $1" >> "{log}"; }}; '
-        f"reown_nonroot_volumes {args}"
-    )
-    return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False, cwd=tmp)
-
-
-def test_a_root_filled_voice_volume_is_reowned_and_verified(tmp_path: Path) -> None:
-    _, runner, log = _setup(tmp_path)
-    vol = tmp_path / "noomesh_piper-voices"
-    vol.mkdir()
-    (vol / ".ledger").write_text("/d\n/d/en_US-lessac-medium.onnx\n/d/en_US-lessac-medium.onnx.json\n")
-    env = _volume_env(tmp_path, ["noomesh_piper-voices", "noomesh_whisper-models"])
-    r = _run_volumes(tmp_path, runner, log, "noomesh whisper piper", env)
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "re-owned 3 path(s) in volume noomesh_piper-voices to 65532", r.stdout
-    calls = log.read_text().splitlines()
-    chowns = [c for c in calls if c.startswith("chown")]
-    assert chowns == ["chown -R 65532:65532 noomesh_piper-voices"], calls
-    assert calls.index("stop piper") < calls.index(chowns[0]), calls
-    # whisper's volume was probed (it exists) and found clean: not stopped
-    assert "stop whisper" not in calls, calls
-    assert "find noomesh_whisper-models ( ! -user 65532 -o ! -group 65532 ) -print" in calls, calls
-
-
-def test_a_volume_compose_has_not_made_yet_is_skipped_not_created(tmp_path: Path) -> None:
-    _, runner, log = _setup(tmp_path)
-    env = _volume_env(tmp_path, [])
-    r = _run_volumes(tmp_path, runner, log, "noo-galaxy whisper piper", env)
-    assert r.returncode == 0 and r.stdout == "" and r.stderr == "", r
-    calls = log.read_text().splitlines()
-    # Only the existence questions, by the project's names; no runner call
-    # (which would create the volume outside compose).
-    assert [c for c in calls if c.startswith("docker")] == [
-        "docker volume inspect noo-galaxy_whisper-models",
-        "docker volume inspect noo-galaxy_piper-voices",
-    ], calls
-    assert not any(c.startswith(("find", "chown", "stop")) for c in calls), calls
-
-
-def test_a_volume_still_root_owned_refuses_the_start(tmp_path: Path) -> None:
-    _, runner, log = _setup(tmp_path)
-    vol = tmp_path / "noomesh_whisper-models"
-    vol.mkdir()
-    (vol / ".ledger").write_text("/d/hub/models--Systran--faster-whisper-base\n")
-    env = _volume_env(tmp_path, ["noomesh_whisper-models"])
-    env["REOWN_STUCK"] = "1"
-    r = _run_volumes(tmp_path, runner, log, "noomesh whisper", env)
-    assert r.returncode == 1, r
-    assert "/d/hub/models--Systran--faster-whisper-base" in r.stderr, r.stderr
-    assert "docker run --rm -v noomesh_whisper-models:/d alpine chown -R 65532:65532 /d" in r.stderr, r.stderr
-
-
-def test_services_without_a_cache_volume_are_ignored(tmp_path: Path) -> None:
-    _, runner, log = _setup(tmp_path)
-    r = _run_volumes(tmp_path, runner, log, "noomesh redis grafana", _volume_env(tmp_path, []))
-    assert r.returncode == 0 and r.stdout == "" and r.stderr == "", r
-    assert log.read_text() == "", log.read_text()
-
-
 # ── the REAL launcher, run end to end with fakes ──────────────────────
 # 0.6.5-rc.1 rehearsal (2026-10-16): the re-own above never ran. The launcher
 # `unset _data_root` ~400 lines before the call sites, both guarded by
@@ -225,7 +141,7 @@ args="$*"
 echo "DOCKER $args" >> "$LOGF"
 case "$args" in
   "compose version") echo "Docker Compose version v2.30.0" ;;
-  *"config --services"*) echo gateway; echo redis; echo worker; [ -n "${EXTRA_SVCS:-}" ] && printf '%s\n' $EXTRA_SVCS ;;
+  *"config --services"*) echo gateway; echo redis; echo worker ;;
   *"config --images"*)
      echo "${NOO_IMAGE_PREFIX}/gateway:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_GATEWAY:-}"
      echo "${NOO_IMAGE_PREFIX}/worker:${NOO_IMAGE_TAG}${NOO_IMAGE_DIGEST_WORKER:-}" ;;
@@ -321,30 +237,3 @@ def test_the_real_launcher_reowns_redis_before_the_bind_check_and_the_up(tmp_pat
 
 def test_the_lib_is_embedded_in_the_cli() -> None:
     assert '"scripts/lib-reown.sh"' in (ROOT / "noo-cli" / "build.rs").read_text()
-
-
-def test_the_real_launcher_reowns_the_piper_volume_before_the_up(tmp_path: Path) -> None:
-    """voice ON (the overlay composes piper): its volume is re-owned, with
-    piper stopped first, before the bind check and the `up` (i105)."""
-    work, env, _ = _launch_tree(tmp_path)
-    env["EXTRA_SVCS"] = "piper"
-    vol = work / "noomesh_piper-voices"
-    vol.mkdir()
-    (vol / ".ledger").write_text("/d/en_US-lessac-medium.onnx\n")
-    r = subprocess.run(["bash", "scripts/noomesh-start.sh", "--dist"], cwd=work, env=env,
-                       capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
-    log = (tmp_path / "log").read_text().splitlines() if (tmp_path / "log").exists() else []
-    dump = f"rc={r.returncode}\nSTDOUT:\n{r.stdout[-3000:]}\nSTDERR:\n{r.stderr[-3000:]}\nLOG:\n" + "\n".join(log)
-
-    def first(pred) -> int:
-        hits = [i for i, l in enumerate(log) if pred(l)]
-        assert hits, dump
-        return hits[0]
-
-    up = first(lambda l: l.startswith("DOCKER compose") and " up -d " in l)
-    chown = first(lambda l: l == "REOWN noomesh_piper-voices :: chown -R 65532:65532 \"$D\"")
-    stop = first(lambda l: l.startswith("DOCKER compose") and l.endswith(" stop piper"))
-    bind = first(lambda l: l.startswith("NOO config launch-check bind-sources"))
-    assert stop < chown < bind < up, dump
-    assert "re-owned 1 path(s) in volume noomesh_piper-voices to 65532" in r.stdout, dump
-    assert r.returncode == 0, dump

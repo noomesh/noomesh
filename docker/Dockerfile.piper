@@ -50,28 +50,28 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
     DO_NOT_TRACK=1
 
 WORKDIR /app
+COPY docker/voice_local.py /app/voice_local.py
 COPY docker/piper_server.py /app/piper_server.py
 
 # Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
-# rest of the stack runs as. Everything this server WRITES at run time is
-# under PIPER_VOICE_DIR (/voices: download_voice puts <voice>.onnx and
-# <voice>.onnx.json there); synthesis is in memory. /voices is chowned BEFORE
-# the VOLUME line (changes after it are discarded), so a fresh `piper-voices`
-# volume is copied up from the image owned by 65532; a volume an older root
-# piper filled is re-owned by the launcher before `up` (scripts/lib-reown.sh,
-# reown_nonroot_volumes). The service key is handed to this uid (noo-cli
-# pki.rs SERVICE_KEY_READERS).
+# rest of the stack runs as. Nothing here writes a voice: the controller
+# stages them (`noo models pull piper:<voice>`, the CLI's voice_models.rs)
+# and compose mounts `<MODELS_DIR>/voice/piper` READ-ONLY at /voices; the
+# server loads `/voices/<voice>.onnx` and never calls piper's download_voice
+# (docker/voice_local.py), offline (HF_HUB_OFFLINE=1). Synthesis is in
+# memory. /voices is just the mount point, root-owned and read-only to
+# nonroot. The service key is handed to this uid (noo-cli pki.rs
+# SERVICE_KEY_READERS).
 RUN groupadd --gid 65532 nonroot \
     && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
         --shell /usr/sbin/nologin nonroot \
-    && mkdir -p /voices \
-    && chown 65532:65532 /voices
+    && mkdir -p /voices
 
-# Voice cache on a volume so downloads survive container recreation.
 ENV PIPER_VOICE=en_US-lessac-medium \
     PIPER_VOICE_DIR=/voices \
-    PIPER_USE_CUDA=0
-VOLUME /voices
+    PIPER_USE_CUDA=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 

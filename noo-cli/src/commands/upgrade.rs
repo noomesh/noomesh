@@ -1240,6 +1240,12 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    before the launcher: its bind-source check refuses a missing
     //    source, and Docker would otherwise create it as root.
     sync_gateway_pki_view(g);
+    // 2.65. The voice add-on's models, while voice is on (i105): the
+    //    containers mount them read-only and run offline, so the controller
+    //    stages them here, before the launcher (whose bind check needs the
+    //    mount sources). Best effort: a failure is printed with its
+    //    `noo models pull` line and never aborts the roll.
+    crate::commands::voice_models::stage_if_on(g);
 
     // 2.7. Stage the release's node images on the artifact rail, while the
     //    old gateway still serves: it is controller-only work (registry pull +

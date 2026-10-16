@@ -2851,12 +2851,6 @@ volumes:
       o: bind
       device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/ollama
   airllm-cache:
-  # Piper voice models for the opt-in `piper` service (profile "voice").
-  piper-voices:
-  # faster-whisper models (HF_HOME) for the opt-in `whisper` service. Its
-  # own volume, not hf-cache: whisper runs as uid 65532 (i105) and hf-cache
-  # is the operator's data-root dir that other writers share.
-  whisper-models:
   hf-cache:
     driver: local
     driver_opts:

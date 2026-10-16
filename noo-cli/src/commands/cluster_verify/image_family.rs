@@ -378,6 +378,78 @@ pub(crate) fn voice_images_row(voice_on: bool) -> Check {
     })
 }
 
+/// The "voice models" row (i105).
+///
+/// The controller stages the voice models; the containers mount them
+/// read-only and run offline (`HF_HUB_OFFLINE=1`), so a model that is not
+/// staged is not "downloaded on first use" any more, it is a 404. This row
+/// says so before a user finds out: the configured whisper model and piper
+/// voice (`WHISPER_MODEL` / `PIPER_VOICE`) are present in the store, and each
+/// container's own env (`docker inspect .Config.Env`) is offline.
+pub(crate) const VOICE_MODELS_NAME: &str = "voice models";
+
+/// Judge the row. `staged`: (`whisper:<name>` / `piper:<voice>`, present).
+/// `offline`: per container, `Some(true)` when its env has
+/// `HF_HUB_OFFLINE=1`, `Some(false)` when it does not, `None` when there is
+/// no container to read.
+pub(crate) fn voice_models_check(voice_on: bool, root: &str, staged: &[(String, bool)], offline: &[(&'static str, Option<bool>)]) -> Check {
+    if !voice_on {
+        return ok(VOICE_MODELS_NAME, "voice off — not checked");
+    }
+    let missing: Vec<&str> = staged.iter().filter(|(_, have)| !have).map(|(id, _)| id.as_str()).collect();
+    if !missing.is_empty() {
+        let pulls: Vec<String> = missing.iter().map(|id| format!("noo models pull {id}")).collect();
+        return fail(
+            VOICE_MODELS_NAME,
+            format!("not staged under {root}: {} — the voice containers never download, so every request for it is a 404", missing.join(", ")),
+            pulls.join(" && "),
+        );
+    }
+    let online: Vec<&str> = offline.iter().filter(|(_, o)| *o == Some(false)).map(|(s, _)| *s).collect();
+    if !online.is_empty() {
+        return fail(
+            VOICE_MODELS_NAME,
+            format!("{} run(s) without HF_HUB_OFFLINE=1 — a container from before i105 or an edited overlay, free to fetch from Hugging Face", online.join(", ")),
+            "noo upgrade --stack   # the shipped overlay (offline, read-only model mounts); then: noo cluster verify --controller",
+        );
+    }
+    let ids: Vec<&str> = staged.iter().map(|(id, _)| id.as_str()).collect();
+    let unread: Vec<&str> = offline.iter().filter(|(_, o)| o.is_none()).map(|(s, _)| *s).collect();
+    if !unread.is_empty() {
+        return warn(
+            VOICE_MODELS_NAME,
+            format!("{} staged under {root}; not judged offline: no {} container", ids.join(" and "), unread.join(" / ")),
+            Some("noo stack status".into()),
+        );
+    }
+    ok(VOICE_MODELS_NAME, format!("{} staged under {root}; whisper and piper run offline (HF_HUB_OFFLINE=1)", ids.join(" and ")))
+}
+
+/// `Some(true)` when a `.Config.Env` JSON array carries `HF_HUB_OFFLINE=1`.
+pub(crate) fn env_is_offline(env_json: &str) -> Option<bool> {
+    let v: Vec<String> = serde_json::from_str(env_json.trim()).ok()?;
+    Some(v.iter().any(|e| e.trim() == "HF_HUB_OFFLINE=1"))
+}
+
+/// The row, from the live box.
+pub(crate) fn voice_models_row(voice_on: bool) -> Check {
+    use crate::commands::voice_models as vm;
+    if !voice_on {
+        return voice_models_check(false, "", &[], &[]);
+    }
+    let root = vm::voice_root();
+    let staged: Vec<(String, bool)> = vm::configured().iter().map(|m| (m.id(), vm::is_staged(&root, m))).collect();
+    let prefix = crate::envfile::container_prefix();
+    let offline: Vec<(&'static str, Option<bool>)> = VOICE_SERVICES
+        .iter()
+        .map(|svc| {
+            let name = format!("{prefix}-{svc}");
+            (*svc, docker_text(&["inspect", "--format", "{{json .Config.Env}}", &name]).ok().and_then(|t| env_is_offline(&t)))
+        })
+        .collect();
+    voice_models_check(true, &root.display().to_string(), &staged, &offline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,5 +813,57 @@ mod tests {
         };
         assert_eq!(live_uid_via(&docker, "noo-piper"), Ok(65532));
         assert_eq!(*calls.borrow(), vec!["exec noo-piper id -u".to_string()]);
+    }
+
+    // ── voice models (i105) ──
+
+    fn pair(w: bool, p: bool) -> Vec<(String, bool)> {
+        vec![("whisper:base".into(), w), ("piper:en_US-lessac-medium".into(), p)]
+    }
+
+    #[test]
+    fn voice_models_off_is_not_checked() {
+        let c = voice_models_check(false, "/s/voice", &pair(false, false), &[("whisper", Some(false))]);
+        assert_eq!((c.verdict, c.detail.as_str(), c.name), (Verdict::Ok, "voice off — not checked", "voice models"));
+    }
+
+    #[test]
+    fn staged_and_offline_passes() {
+        let c = voice_models_check(true, "/s/voice", &pair(true, true), &[("whisper", Some(true)), ("piper", Some(true))]);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("whisper:base and piper:en_US-lessac-medium staged under /s/voice"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_model_not_staged_fails_with_the_exact_pull() {
+        let c = voice_models_check(true, "/s/voice", &pair(true, false), &[("whisper", Some(true)), ("piper", Some(true))]);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("not staged under /s/voice: piper:en_US-lessac-medium"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo models pull piper:en_US-lessac-medium"));
+        let c = voice_models_check(true, "/s/voice", &pair(false, false), &[]);
+        assert_eq!(c.remedy.as_deref(), Some("noo models pull whisper:base && noo models pull piper:en_US-lessac-medium"));
+    }
+
+    #[test]
+    fn a_container_that_may_fetch_fails() {
+        let c = voice_models_check(true, "/s/voice", &pair(true, true), &[("whisper", Some(false)), ("piper", Some(true))]);
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("whisper run(s) without HF_HUB_OFFLINE=1"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().starts_with("noo upgrade --stack"));
+    }
+
+    #[test]
+    fn no_container_to_read_is_a_warning() {
+        let c = voice_models_check(true, "/s/voice", &pair(true, true), &[("whisper", Some(true)), ("piper", None)]);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("no piper container"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_offline_flag_is_read_from_the_container_env() {
+        assert_eq!(env_is_offline(r#"["PATH=/usr/bin","HF_HUB_OFFLINE=1","TRANSFORMERS_OFFLINE=1"]"#), Some(true));
+        assert_eq!(env_is_offline(r#"["PATH=/usr/bin","HF_HUB_OFFLINE=0"]"#), Some(false));
+        assert_eq!(env_is_offline("[]\n"), Some(false));
+        assert_eq!(env_is_offline("not json"), None);
     }
 }
