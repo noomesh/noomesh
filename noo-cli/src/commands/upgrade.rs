@@ -1220,6 +1220,16 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    source, and Docker would otherwise create it as root.
     sync_gateway_pki_view(g);
 
+    // 2.7. Stage the release's node images on the artifact rail NOW, while the
+    //    old gateway still serves: it is controller-only work (registry pull +
+    //    docker save) and used to sit AFTER the roll, ahead of the nodes
+    //    phase. It uses the lock bytes verified above for `tag` (not .env,
+    //    which still names the running release). Best-effort: a failure
+    //    warns per image and is recorded for the nodes stage's
+    //    lock_stage_blocker; it never aborts the roll. The prune below keeps
+    //    `tag`, so it cannot delete what was just staged.
+    crate::commands::image_stage::stage_release_images(g, target_stack_lock.as_deref(), &tag);
+
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
     if !g.json { ui::step("starting the stack (launcher)"); }
@@ -1345,12 +1355,9 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                     }
                 }
             }
-            // Stage the release's node images on the artifact rail (pulled
-            // by lock digest with THIS controller's registry login, exported
-            // for every fleet architecture). Nodes pull images only from
-            // there and hold no registry credential.
-            // Best-effort: never taints the roll, names the retry.
-            crate::commands::image_stage::stage_after_roll(g, &root, &tag);
+            // Node images were staged BEFORE the launcher (see the call above
+            // it): nothing the roll does changes what the signed lock says, so
+            // there is no second pass here.
             Ok(0)
         }
         Ok(s) => {
@@ -2714,6 +2721,26 @@ fn asset_platforms(toks: &[serde_json::Value], own_os: &str, own_arch: &str) -> 
     v
 }
 
+/// Does a `/bootstrap/cli/<name>.sha256` answer (`<hex>  <name>`) say the
+/// gateway already holds `name` with exactly `sha`? The hash must match;
+/// size or presence alone never counts. The gateway verified the hash
+/// against the bytes when it stored them.
+fn cli_asset_sha_line_matches(body: &str, name: &str, sha: &str) -> bool {
+    let mut it = body.split_whitespace();
+    matches!((it.next(), it.next(), it.next()), (Some(h), Some(n), None) if n == name && h.eq_ignore_ascii_case(sha))
+}
+
+/// True only when the gateway positively says it holds `name` at `sha`.
+/// ABSENT route (an older gateway), 404 (never uploaded), a different hash,
+/// or any transport error all answer false, and the caller uploads as it
+/// always did.
+fn gateway_holds_cli_asset(g: &Globals, name: &str, sha: &str) -> bool {
+    match crate::http::get_raw_opt(g, &format!("/bootstrap/cli/{name}.sha256"), false, 10) {
+        Some((200, body)) => cli_asset_sha_line_matches(&body, name, sha),
+        _ => false,
+    }
+}
+
 /// For every platform in the fleet (plus the always-staged set above): fetch
 /// the CLI asset of THIS version into the controller's cache (if missing)
 /// and upload it to the gateway.
@@ -2776,6 +2803,9 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             Err(e) => ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it")),
         }
     }
+    // Assets the gateway already holds at the same sha256: not re-sent, and
+    // said so below (a skip is never counted as an upload).
+    let mut already_held: Vec<String> = Vec::new();
     // The signed manifest rides along: without it a node treats this mirror
     // as an old controller and goes to GitHub instead.
     let m = crate::release_sig::MANIFEST;
@@ -2789,6 +2819,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             },
         };
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
+        if gateway_holds_cli_asset(g, &name, &sha) {
+            already_held.push(name.clone());
+            continue;
+        }
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/{name}?sha256={sha}&version={version}"), &bytes) {
             ui::warned(&format!("{name}: upload failed ({e})"));
@@ -2799,7 +2833,9 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     {
         let bytes = INSTALLER.as_bytes();
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(bytes)) };
-        if let Err(e) = crate::commands::provision::put_bytes(
+        if gateway_holds_cli_asset(g, "install.sh", &sha) {
+            already_held.push("install.sh".to_string());
+        } else if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/install.sh?sha256={sha}&version={version}"), bytes) {
             ui::warned(&format!("install.sh: upload failed ({e}) — new nodes fall back to the GitHub installer line"));
         }
@@ -2826,6 +2862,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(&bytes))
         };
+        if gateway_holds_cli_asset(g, &asset, &sha) {
+            already_held.push(asset.clone());
+            continue;
+        }
         match crate::commands::provision::put_bytes(
             g,
             &format!("/api/cluster/cli-asset/{asset}?sha256={sha}&version={version}"),
@@ -2840,6 +2880,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     if !uploaded.is_empty() {
         ui::done(&format!("{} CLI asset(s) uploaded to the controller ({version})", uploaded.len()));
         println!("{}", ui::note(&uploaded.join(", ")));
+    }
+    if !already_held.is_empty() {
+        ui::done(&format!("{} CLI asset(s) already on the gateway (sha256 matches, not re-uploaded)", already_held.len()));
+        println!("{}", ui::note(&already_held.join(", ")));
     }
 }
 
@@ -4333,6 +4377,45 @@ mod tests {
         for later in ["migrate_retired_yaml_gates(", "standalone::materialize(", "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
             assert!(mint < at(later), "enabled systems' credentials must be minted before `{later}`");
         }
+    }
+
+    /// Node images are staged from the verified lock BEFORE the launcher
+    /// recreates the gateway, and after the last refusal that could abort the
+    /// roll; the post-roll pass is gone.
+    #[test]
+    fn upgrade_stack_stages_node_images_before_the_launcher_tests() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
+        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
+        let stage = at("image_stage::stage_release_images(g, target_stack_lock.as_deref(), &tag)");
+        assert!(at("fetch_stack_lock(g, &tag)") < stage, "stage from a lock that has been fetched and verified");
+        for before in ["addon_preflight(", "reconcile_audit_key(&root)", "write_stack_lock(g, &tag", "NOO_IMAGE_TAG\", &tag", "sync_gateway_pki_view(g)"] {
+            assert!(at(before) < stage, "`{before}` can abort or shape the roll and must run before staging");
+        }
+        assert!(stage < at("root.join(\"scripts/noomesh-start.sh\")"), "staging must precede the launcher");
+        assert!(!body.contains("stage_after_roll"), "no second staging pass after the roll");
+    }
+
+    #[test]
+    fn an_asset_is_skipped_only_when_the_gateway_names_the_same_hash() {
+        use super::cli_asset_sha_line_matches as m;
+        let h = "a".repeat(64);
+        assert!(m(&format!("{h}  noo-x86_64-unknown-linux-gnu\n"), "noo-x86_64-unknown-linux-gnu", &h));
+        assert!(m(&format!("{}  install.sh\n", h.to_uppercase()), "install.sh", &h));
+        let other = "b".repeat(64);
+        assert!(!m(&format!("{other}  install.sh\n"), "install.sh", &h), "a different hash uploads");
+        assert!(!m(&format!("{h}  other-name\n"), "install.sh", &h), "a line for another asset uploads");
+        assert!(!m("", "install.sh", &h) && !m("no such asset on this controller", "install.sh", &h));
+    }
+
+    /// Every upload in `upload_cli_assets` asks the gateway first.
+    #[test]
+    fn every_cli_asset_upload_checks_the_gateway_first() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upload_cli_assets(").expect("upload_cli_assets")..];
+        let body = &body[..body.find("\nfn ").expect("end")];
+        assert_eq!(body.matches("put_bytes(").count(), body.matches("gateway_holds_cli_asset(").count());
     }
 
     #[test]
