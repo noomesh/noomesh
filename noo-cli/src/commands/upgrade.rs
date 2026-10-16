@@ -750,14 +750,26 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
     let mut rc = 0;
     let mut failed_stage = "";
     let mut roll_started: Option<i64> = None;
+    // The node-image staging started inside upgrade_stack (overlapping the
+    // launcher). It is joined AFTER the gateway health wait below, so the
+    // 20-40 s wait overlaps the last exports; every path that leaves this
+    // function with it still live joins it first (StageRun also joins on drop).
+    let mut staging: Option<crate::commands::image_stage::StageRun> = None;
     // `--stack` alone is one unit of work; anything with `--nodes` has at
     // least Gateway · CLI Assets · Nodes, so every stage gets its phase.
     let phased = nodes;
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
-        rc = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
-        if rc != 0 { failed_stage = "stack"; }
+        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
+        rc = stack_rc;
+        staging = run;
+        if rc != 0 {
+            // upgrade_stack joins on its failure paths, so this is normally
+            // None; a live run is joined here rather than dropped.
+            if let Some(st) = staging.take() { st.finish(g); }
+            failed_stage = "stack";
+        }
         else if !nodes {
             // The roll returns the moment compose is up; the gateway reports
             // healthy 20-40 s later. `noo upgrade --stack` used to return
@@ -766,7 +778,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             // and failed. With `--nodes` the Gateway phase below already
             // waits; without it, wait here, so "Stack now on" means serving.
             if phased && !g.json { println!("{}", ui::phase("Gateway")); }
-            if let Err((why, remedy)) = wait_for_gateway(g, 180) {
+            let waited = wait_for_gateway(g, 180);
+            if let Some(st) = staging.take() { st.finish(g); }
+            if let Err((why, remedy)) = waited {
                 ui::close_failed(
                     &format!("{why} within 180s after the stack roll"),
                     Some(remedy),
@@ -788,7 +802,12 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
         // one Gateway phase covers both, with a longer budget after a roll.
         if !g.json { println!("{}", ui::phase("Gateway")); }
         let budget = if stack { 180 } else { 60 };
-        if let Err((why, remedy)) = wait_for_gateway(g, budget) {
+        let waited = wait_for_gateway(g, budget);
+        // Joined whether or not the gateway came up, and BEFORE the stage
+        // record (lock_stage_failures) is read below: it is written when the
+        // staging pass ends.
+        if let Some(st) = staging.take() { st.finish(g); }
+        if let Err((why, remedy)) = waited {
             ui::close_failed(
                 &format!("{why} within {budget}s{}", if stack { " after the stack roll" } else { " — is the stack running?" }),
                 Some(remedy),
@@ -877,7 +896,9 @@ fn rerender_nats_users_for_roll(g: &Globals, root: &std::path::Path) {
     }
 }
 
-fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool) -> Result<i32, Unhandled> {
+fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+    -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
+{
     // repo_root() ranks a python-venv-derived root above the standalone
     // home, so a STALE clone (e.g. ~/pai-assistant left from an early
     // manual attempt) shadowed a healthy ~/.noo and --stack refused a
@@ -1229,7 +1250,8 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    lock_stage_blocker; it never aborts the roll. The prune below keeps
     //    `tag`, so it cannot delete what was just staged.
     //    It runs on a thread OVERLAPPING the launcher's compose pull/recreate
-    //    and is joined (always) as soon as the launcher returns.
+    //    and the caller's gateway health wait; it is handed back to
+    //    run_fleet_stages to join. The failure paths below join it here.
     let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag);
 
     // The launcher's own output (compose pull/up progress) follows this
@@ -1253,16 +1275,11 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         std::thread::sleep(Duration::from_secs(5));
         status = launch();
     }
-    // Join the staging thread whatever the launcher did (a detached thread
-    // could be killed mid-export by the process exit). Its result prints
-    // right after the launcher's own output; on a launcher failure it prints
-    // after the failure message (below). Not at the gateway health wait,
-    // which lives in the caller (run_fleet_stages): joining here keeps the
-    // overlap with the whole launcher run.
+    // On success the live run is returned to the caller, which joins it after
+    // the gateway health wait (nothing here depends on it). The two failure
+    // arms below join it themselves: a detached thread could be killed
+    // mid-export by the process exit, and fail() exits.
     let mut staging = Some(staging);
-    if matches!(&status, Ok(s) if s.success()) {
-        if let Some(st) = staging.take() { st.finish(g); }
-    }
     match status {
         Ok(s) if s.success() => {
             // The process's idea of NOO_IMAGE_TAG is now STALE, and the
@@ -1369,13 +1386,13 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             }
             // Node images were staged BEFORE the launcher (see the call above
             // it): nothing the roll does changes what the signed lock says, so
-            // there is no second pass here.
-            Ok(0)
+            // there is no second pass here. The run is joined by the caller.
+            Ok((0, staging.take()))
         }
         Ok(s) => {
             ui::close_failed(&format!("launcher exited with {} twice; the pin IS moved to {tag}", s.code().unwrap_or(-1)), Some("noo stack logs"));
             if let Some(st) = staging.take() { st.finish(g); }
-            Ok(1)
+            Ok((1, None))
         }
         Err(e) => {
             // fail() exits the process: join first.
@@ -4398,8 +4415,9 @@ mod tests {
 
     /// Node images are staged on a thread started from the verified lock
     /// BEFORE the launcher (overlapping it), after the last refusal that could
-    /// abort the roll, and joined (on every launcher outcome) before the
-    /// prune and before the function returns.
+    /// abort the roll. `upgrade_stack` joins it only on its two failure paths
+    /// and otherwise HANDS IT BACK; `run_fleet_stages` joins it after the
+    /// gateway health wait (both branches) and before the stage record is read.
     #[test]
     fn upgrade_stack_stages_node_images_before_the_launcher_tests() {
         let src = include_str!("upgrade.rs");
@@ -4413,14 +4431,30 @@ mod tests {
         }
         let launcher = at("let mut status = launch();");
         assert!(spawn < launcher, "staging must start before the launcher runs, to overlap it");
-        let join = at("st.finish(g)");
-        assert!(launcher < join, "joined after the launcher returns");
-        assert!(join < at("docker_image_ids_in_use()"), "joined before the prune");
-        assert!(join < at("Ok(0)"), "joined before the function returns");
-        // Every exit after the spawn joins first: the success join, the failed
-        // launcher arm, and the spawn-error arm that calls fail() (process exit).
-        assert_eq!(body.matches("st.finish(g)").count(), 3, "join on success, launcher failure and spawn error");
+        // Inside upgrade_stack only the two failure paths join (launcher
+        // failure; spawn error, whose fail() exits the process), each after the launcher.
+        assert_eq!(body.matches("st.finish(g)").count(), 2, "join only on launcher failure and spawn error");
+        assert!(launcher < at("st.finish(g)"), "joined after the launcher returns");
+        let success = &body[at("Ok(s) if s.success() => {")..at("Ok(s) => {")];
+        assert!(!success.contains("finish("), "the success arm hands the run back, it does not join");
+        assert!(success.contains("Ok((0, staging.take()))"), "the live run is returned to the caller on success");
         assert!(!body.contains("stage_after_roll") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
+
+        // The caller joins after the gateway health wait, before the blocker read.
+        let src = include_str!("upgrade.rs");
+        let f = &src[src.find("fn run_fleet_stages(").expect("run_fleet_stages")..];
+        let f = &f[..f.find("\n/// Normalize a stack tag").expect("end of run_fleet_stages")];
+        let waits: Vec<usize> = f.match_indices("wait_for_gateway(g, ").map(|(i, _)| i).collect();
+        let joins: Vec<usize> = f.match_indices("st.finish(g)").map(|(i, _)| i).collect();
+        assert_eq!(waits.len(), 2, "stack-only and stack+nodes branches each wait for the gateway");
+        for w in &waits {
+            let j = joins.iter().find(|j| **j > *w).unwrap_or_else(|| panic!("no join after the gateway wait at {w}"));
+            let next_branch = f[*w..].find("if let Err((why, remedy))").expect("wait verdict");
+            assert!(*j < w + next_branch, "the join sits between the wait and its verdict");
+        }
+        let join_nodes = *joins.iter().find(|j| **j > waits[1]).unwrap();
+        assert!(join_nodes < f.find("lock_stage_failures(").expect("blocker read"), "joined before lock_stage_failures is read");
+        assert!(join_nodes < f.find("gateway_older_than_bundle(").expect("bundle gate"), "joined before the nodes-phase gates");
     }
 
     #[test]
