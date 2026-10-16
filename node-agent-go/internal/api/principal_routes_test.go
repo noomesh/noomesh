@@ -98,6 +98,9 @@ func TestFleetCommandRoutesRefuseANode(t *testing.T) {
 		{"POST", "/api/containers/stop"},
 		{"POST", "/api/skills/run"},
 		{"POST", "/tailnet/dialback"},
+		// whois names tailnet identities for any IP asked about; a peer
+		// holding the fleet secret has no business enumerating them.
+		{"GET", "/tailnet/whois"},
 		{"GET", "/logs/containers"},
 		{"GET", "/logs/noo-gateway"},
 		{"POST", "/api/device/screenshot"},
