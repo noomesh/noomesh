@@ -5186,6 +5186,25 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert!(replica_consumers("nodes/sandbox/node.crt", &running).is_empty());
     }
 
+    /// A rotated voice leaf restarts its own door and nothing else: the
+    /// whisper leaf reloads noo-whisper, the piper leaf noo-piper (both
+    /// filtered against the running set by rotate-all, so voice off means
+    /// nothing to restart), and neither has replicas.
+    #[test]
+    fn a_voice_rotation_restarts_whisper_and_piper() {
+        assert_eq!(
+            cert_consumers("services/whisper/service.crt", "service", "host1"),
+            vec!["noo-whisper".to_string(), "noo-stunnel-whisper".to_string()]
+        );
+        assert_eq!(
+            cert_consumers("services/piper/service.crt", "service", "host1"),
+            vec!["noo-piper".to_string(), "noo-stunnel-piper".to_string()]
+        );
+        let running: Vec<String> = ["noo-whisper", "noo-piper", "noo-gateway"].iter().map(|s| s.to_string()).collect();
+        assert!(replica_consumers("services/whisper/service.crt", &running).is_empty());
+        assert!(replica_consumers("services/piper/service.crt", &running).is_empty());
+    }
+
     #[test]
     fn gateway_restarts_last() {
         let mut v: Vec<String> = vec![

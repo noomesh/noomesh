@@ -167,7 +167,7 @@ fi
 # OVERLAY (docker-compose.voice.yml via lib-compose.sh; an earlier change phase
 # D), so the containers survive `noo stack start` and a reboot. Provider selection
 # stays in NOO_STT_* / NOO_TTS_* (the gateway defaults to
-# http://noo-whisper:8000 and http://noo-piper:8000, wire format "openai" for
+# https://noo-whisper:8000 and https://noo-piper:8000 (mTLS), wire format "openai" for
 # both); this switch only decides whether the containers are deployed.
 #
 # `voice` is in the same map but is NOT in the gateway's add-on table: it

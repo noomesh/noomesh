@@ -2315,6 +2315,128 @@ fn sandbox_live_probe() -> Option<SandboxProbe> {
     serde_json::from_str(text.lines().last()?.trim()).ok()
 }
 
+/// What `voice_live_probe` saw at each voice door, from inside the gateway
+/// container: the same three dials as the sandbox's ([`SandboxProbe`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct VoiceProbe {
+    pub whisper: SandboxProbe,
+    pub piper: SandboxProbe,
+}
+
+/// The voice doors: compose service name → the leaf it must serve.
+const VOICE_DOORS: [&str; 2] = ["whisper", "piper"];
+
+/// The "voice listeners" row (mTLS doors phase 2, i77). noo-whisper and
+/// noo-piper take audio and text from the gateway, so each door must
+/// refuse a caller with no cluster leaf in the TLS handshake. Voice is an
+/// overlay add-on: with `addons.voice` off the containers are never
+/// composed, and the row says so instead of failing. With it on, the same
+/// two halves as the sandbox row: the overlay file the launcher composes
+/// (uvicorn with `--ssl-cert-reqs 2` on both, no published port), and a
+/// live probe from inside the gateway — no cert and plaintext get no HTTP
+/// answer at either door, the gateway's own leaf does.
+pub(crate) fn voice_listeners_check(voice_on: bool, overlay: Option<&str>, probe: Option<&VoiceProbe>) -> Check {
+    const ROW: &str = "voice listeners";
+    if !voice_on {
+        return ok(ROW, "voice off — not checked");
+    }
+    let Some(overlay) = overlay else {
+        return warn(ROW, "voice is on but docker-compose.voice.yml could not be read from the running checkout", None);
+    };
+    let reshipped = "restore the shipped docker-compose.voice.yml (noo upgrade --stack re-materialises it), then: noo stack restart --force whisper piper";
+    for door in VOICE_DOORS {
+        let Some(block) = compose_service_block(overlay, door) else {
+            return fail(ROW, format!("docker-compose.voice.yml has no {door} service"), reshipped);
+        };
+        if !uvicorn_requires_client_cert(&block) {
+            return fail(
+                ROW,
+                format!("{door}'s uvicorn does not run with --ssl-cert-reqs 2 and its leaf — any container on noo-cluster could call it"),
+                reshipped,
+            );
+        }
+        if block.lines().any(|l| l.trim() == "ports:") {
+            return fail(
+                ROW,
+                format!("{door} publishes a host port — the voice doors are reachable on noo-cluster only by design"),
+                format!("remove the ports: block from {door} in docker-compose.voice.yml, then: noo stack restart --force {door}"),
+            );
+        }
+    }
+    let Some(p) = probe else {
+        return warn(
+            ROW,
+            "both listeners require a client certificate in compose; not probed live (gateway, whisper or piper container not running)",
+            Some("noo stack status".into()),
+        );
+    };
+    let answered = |s: &str| s.starts_with("answered");
+    for (door, d) in [("whisper", &p.whisper), ("piper", &p.piper)] {
+        let restart = format!("noo stack restart --force {door}");
+        if d.no_cert.starts_with("unreachable") || d.leaf.starts_with("unreachable") {
+            return fail(ROW, format!("the gateway cannot reach {door}:8000 ({})", d.leaf), restart);
+        }
+        if answered(&d.no_cert) {
+            return fail(
+                ROW,
+                format!("{door}: a connection WITHOUT a client certificate was answered ({}) — the listener does not require one", d.no_cert),
+                restart,
+            );
+        }
+        if answered(&d.plain) {
+            return fail(ROW, format!("{door}: a PLAINTEXT request was answered ({})", d.plain), restart);
+        }
+        if !answered(&d.leaf) {
+            return fail(
+                ROW,
+                format!("{door}: the gateway's own leaf was refused ({}) — {door}'s leaf or CA does not match the gateway's", d.leaf),
+                format!("noo security pki issue-service {door}   # then: noo stack restart --force {door}"),
+            );
+        }
+    }
+    ok(ROW, "whisper and piper require a client certificate from every caller (none and plaintext refused, the gateway's leaf accepted); no published port")
+}
+
+/// The sandbox probe's dial, run against both voice doors by their compose
+/// service names (each leaf carries its own). Same rules: TCP before TLS so
+/// a down door reads `unreachable`, never a passing refusal.
+const VOICE_PROBE_PY: &str = r#"import json,os,socket,ssl
+def dial(host,tls,cert):
+    try:
+        raw=socket.create_connection((host,8000),timeout=5)
+    except OSError as e:
+        return 'unreachable: %s'%e
+    try:
+        s=raw
+        if tls:
+            c=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA'])
+            if cert:
+                c.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY'])
+            s=c.wrap_socket(raw,server_hostname=host)
+        s.sendall(b'GET /health HTTP/1.1\r\nHost: '+host.encode()+b'\r\nConnection: close\r\n\r\n')
+        b=s.recv(64)
+        return 'answered '+b.split(b'\r\n')[0].decode('ascii','replace') if b.startswith(b'HTTP/') else 'refused: closed without an answer'
+    except (ssl.SSLError,OSError,KeyError) as e:
+        return 'refused: %s'%(e,)
+    finally:
+        raw.close()
+print(json.dumps({h:{'no_cert':dial(h,True,False),'leaf':dial(h,True,True),'plain':dial(h,False,False)} for h in ('whisper','piper')}))
+"#;
+
+fn voice_live_probe() -> Option<VoiceProbe> {
+    let gateway = crate::envfile::container("gateway");
+    let running = |c: &str| crate::commands::secrets::container_running(c);
+    if !running(&gateway) || !VOICE_DOORS.iter().all(|d| running(&crate::envfile::container(d))) {
+        return None;
+    }
+    let out = std::process::Command::new("docker")
+        .args(["exec", &gateway, "python", "-c", VOICE_PROBE_PY])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(text.lines().last()?.trim()).ok()
+}
+
 /// How each compose-run inference backend on the controller is fronted.
 /// `Native`: the server itself terminates TLS and must run with
 /// `--ssl-cert-reqs 2` (vLLM). `Stunnel(name)`: the server has no TLS
@@ -4119,6 +4241,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // container proves it live — no cert and plaintext refused, its own
         // leaf accepted.
         checks.push(sandbox_listener_check(compose.as_deref(), sandbox_live_probe().as_ref()));
+        // The voice doors (mTLS doors phase 2): only when the overlay is
+        // composed; then the same static + live three-way proof per door.
+        let voice_on = addon_on("voice");
+        let voice_overlay = if voice_on { std::fs::read_to_string(root.join("docker-compose.voice.yml")).ok() } else { None };
+        let voice_probe = if voice_on { voice_live_probe() } else { None };
+        checks.push(voice_listeners_check(voice_on, voice_overlay.as_deref(), voice_probe.as_ref()));
         // Every compose inference backend requires a client certificate at
         // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
@@ -6157,6 +6285,89 @@ mod tests {
         assert_eq!(parsed, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
         assert!(SANDBOX_PROBE_PY.contains("('sandbox',9000)") && SANDBOX_PROBE_PY.contains("NOO_TLS_CERT"));
         assert!(!SANDBOX_PROBE_PY.contains("CERT_NONE") && !SANDBOX_PROBE_PY.contains("check_hostname"));
+    }
+
+    fn voice_overlay_ok() -> String {
+        let door = |svc: &str| format!(
+            "  {svc}:\n    command:\n      - uvicorn\n      - {svc}_server:app\n      - --port\n      - \"8000\"\n      - --ssl-certfile\n      - /tls/services/{svc}/service.crt\n      - --ssl-keyfile\n      - /tls/services/{svc}/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"8000\"\n"
+        );
+        format!("services:\n{}{}", door("whisper"), door("piper"))
+    }
+
+    /// The voice row: off is said, never failed; on, OK only when both
+    /// doors require a client certificate in the overlay AND the live probe
+    /// saw no-cert and plaintext refused and the gateway's leaf answered at
+    /// each. Every other combination names the door and its remedy.
+    #[test]
+    fn the_voice_listeners_row_is_off_or_proves_both_doors_live() {
+        let good_door = sandbox_probe("refused: [SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED]", "answered HTTP/1.1 200 OK", "refused: closed without an answer");
+        let good = VoiceProbe { whisper: good_door.clone(), piper: good_door.clone() };
+        let overlay = voice_overlay_ok();
+
+        // Off: not composed, nothing to probe — said, not failed, whatever the inputs.
+        for (o, p) in [(None, None), (Some(overlay.as_str()), Some(&good))] {
+            let c = voice_listeners_check(false, o, p);
+            assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+            assert_eq!(c.detail, "voice off — not checked");
+        }
+
+        let c = voice_listeners_check(true, Some(&overlay), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "whisper and piper require a client certificate from every caller (none and plaintext refused, the gateway's leaf accepted); no published port");
+
+        // Static half: piper optional (1), whisper plaintext, a published port, a missing door.
+        let optional = overlay.replacen("      - \"2\"\n", "      - \"1\"\n", 2).replacen("      - \"1\"\n", "      - \"2\"\n", 1);
+        let c = voice_listeners_check(true, Some(&optional), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("piper's uvicorn") && c.detail.contains("--ssl-cert-reqs 2"), "{}", c.detail);
+        let plain = overlay.replace("      - --ssl-certfile\n      - /tls/services/whisper/service.crt\n", "");
+        let c = voice_listeners_check(true, Some(&plain), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("whisper's uvicorn"), "{}", c.detail);
+        let published = overlay.replacen("    expose:\n", "    ports:\n      - \"8000:8000\"\n    expose:\n", 1);
+        let c = voice_listeners_check(true, Some(&published), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("whisper publishes a host port"), "{}", c.detail);
+        let no_piper = overlay.split("  piper:\n").next().unwrap().to_string();
+        assert_eq!(voice_listeners_check(true, Some(&no_piper), Some(&good)).verdict, Verdict::Fail);
+
+        // Live half, per door.
+        let with = |w: SandboxProbe, p: SandboxProbe| VoiceProbe { whisper: w, piper: p };
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(good_door.clone(), sandbox_probe("answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK", "refused: x"))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("piper: a connection WITHOUT a client certificate"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo stack restart --force piper"));
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK"), good_door.clone())));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("whisper: a PLAINTEXT request"), "{}", c.detail);
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(good_door.clone(), sandbox_probe("refused: x", "refused: [SSL: CERTIFICATE_VERIFY_FAILED]", "refused: y"))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.remedy.unwrap().contains("issue-service piper"));
+        let down = sandbox_probe("unreachable: [Errno -2]", "unreachable: [Errno -2]", "unreachable: [Errno -2]");
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(down, good_door.clone())));
+        assert_eq!(c.verdict, Verdict::Fail, "a down door must not read as a refusal");
+        assert!(c.detail.contains("cannot reach whisper:8000"), "{}", c.detail);
+
+        // On but not probed / not readable: said, never passed.
+        assert_eq!(voice_listeners_check(true, Some(&overlay), None).verdict, Verdict::Warn);
+        assert_eq!(voice_listeners_check(true, None, Some(&good)).verdict, Verdict::Warn);
+    }
+
+    /// The shipped overlay passes the static half (the row reads the same
+    /// file on the running controller), and the probe output parses.
+    #[test]
+    fn the_shipped_voice_overlay_passes_the_row_and_the_probe_output_parses() {
+        let overlay = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.voice.yml")).unwrap();
+        let door = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        let good = VoiceProbe { whisper: door.clone(), piper: door.clone() };
+        let c = voice_listeners_check(true, Some(&overlay), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let parsed: VoiceProbe = serde_json::from_str(
+            r#"{"whisper": {"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}, "piper": {"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}}"#,
+        ).unwrap();
+        assert_eq!(parsed.whisper, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
+        assert!(VOICE_PROBE_PY.contains("('whisper','piper')") && VOICE_PROBE_PY.contains("NOO_TLS_CERT"));
+        assert!(!VOICE_PROBE_PY.contains("CERT_NONE") && !VOICE_PROBE_PY.contains("check_hostname"));
     }
 
     const NATS_TLS_CFG: &str = "jetstream {\n  store_dir: /data\n}\nhttps_port: 8222\ninclude users.conf\n\ntls {\n  cert_file: /tls/services/nats/service.crt\n  key_file: /tls/services/nats/service.key\n  ca_file: /tls/ca.crt\n  verify: true\n}\n";
