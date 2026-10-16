@@ -1242,6 +1242,7 @@ fn run_all(ctx: &mut Ctx) {
     } else {
         steps::addons(ctx);
         steps::provision_service_keys(ctx);
+        steps::stage_voice_models(ctx);
     }
     ctx.pause(10, TOTAL);
 }

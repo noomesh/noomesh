@@ -100,6 +100,15 @@ pub fn models_pull(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
     let Some(model) = model else { return Err(Unhandled) };
+    // The voice add-on's models (i105): `whisper:<size>` / `piper:<voice>`
+    // are staged into the controller's model store, never pulled by Ollama
+    // and never fetched by the voice containers themselves.
+    if let Some(parsed) = crate::commands::voice_models::VoiceModel::parse(&model) {
+        return match parsed {
+            Ok(m) => crate::commands::voice_models::pull(g, m),
+            Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("noo models pull whisper:base | noo models pull piper:en_US-lessac-medium")),
+        };
+    }
     if backend != "ollama" {
         // Python parity: only the ollama backend supports pull; exit 1.
         fail(

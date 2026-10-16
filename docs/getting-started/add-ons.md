@@ -40,6 +40,47 @@ add-on the flag is not enough: it also needs an entitlement (below).
 From the command line, `noo addons enable <name>` mints what the add-on needs
 and declares it on; `noo addons list` shows the state of each.
 
+## Voice models are staged by the controller
+
+The voice containers never download anything. The controller fetches the
+models, verifies them and stores them in its model store (`MODELS_DIR`,
+default `<data root>/models`):
+
+| What | Default | Stored in | Mounted read-only at |
+|---|---|---|---|
+| faster-whisper model (`WHISPER_MODEL`) | `base`, from `Systran/faster-whisper-base` | `<models>/voice/whisper/base/` | `noo-whisper:/models` |
+| piper voice (`PIPER_VOICE`) | `en_US-lessac-medium`, from `rhasspy/piper-voices` (`.onnx` + `.onnx.json`) | `<models>/voice/piper/` | `noo-piper:/voices` |
+
+Both containers run as `nonroot` (uid 65532) with `HF_HUB_OFFLINE=1`, have
+no Hugging Face token, and have no writable model volume.
+`noo addons enable voice` stages the configured pair and prints each file
+and its size. `noo upgrade --stack` and `noo onboard --only addons` stage it
+too while voice is on. To stage another size or voice by name:
+
+```bash
+noo models pull whisper:small          # tiny, base, small, medium, large-v3, *.en, turbo, or <org>/<ct2-repo>
+noo models pull piper:en_GB-alba-medium
+```
+
+Downloads use the controller's `HF_TOKEN` when one is stored, and each file
+is checked against Hugging Face's digest before it goes in place. A request
+for a model or voice that is not staged gets a 404 that names the
+`noo models pull` line to run, and no download is attempted.
+`noo cluster verify --controller` reports this in two rows:
+
+- **`voice models`**: the configured pair is staged and both containers run
+  offline.
+- **`voice images`**: both containers run as uid 65532.
+
+**Upgrading an install whose voice containers downloaded their own models.** Older images downloaded into the
+`hf-cache` and `piper-voices` volumes as root. The new containers ignore
+both. `noo upgrade --stack` stages the configured pair before the restart,
+so the default model and voice download once more. A controller with no
+internet keeps a working voice only once you copy the files into
+`<models>/voice/` with the layout above. After that you may delete the old
+`noomesh_piper-voices` volume (`docker volume rm noomesh_piper-voices`) and the
+`<data root>/hf-cache/hub/models--Systran--faster-whisper-*` directories.
+
 ## What a disabled add-on does
 
 Nothing else breaks. The gateway keeps serving; only the add-on's own surface

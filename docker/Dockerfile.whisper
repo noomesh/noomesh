@@ -45,28 +45,28 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
     DO_NOT_TRACK=1
 
 WORKDIR /app
+COPY docker/voice_local.py /app/voice_local.py
 COPY docker/whisper_server.py /app/whisper_server.py
 
 # Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
-# rest of the stack runs as. Everything this server WRITES at run time is
-# under HF_HOME (/models: huggingface_hub's hub/ cache and its .locks, where
-# faster-whisper downloads the model) plus one tempfile per request in /tmp
-# (already 1777). /models is chowned BEFORE the VOLUME line (changes after it
-# are discarded), so a fresh `whisper-models` volume is copied up from the
-# image owned by 65532; a volume an older root whisper filled is re-owned by
-# the launcher before `up` (scripts/lib-reown.sh, reown_nonroot_volumes).
-# The service key is handed to this uid (noo-cli pki.rs SERVICE_KEY_READERS).
+# rest of the stack runs as. Nothing here writes a model: the controller
+# stages them (`noo models pull whisper:<size>`, the CLI's voice_models.rs)
+# and compose mounts `<MODELS_DIR>/voice/whisper` READ-ONLY at /models; the
+# server loads `/models/<name>` with local_files_only (docker/voice_local.py)
+# and runs offline (HF_HUB_OFFLINE=1). The only run-time write is one
+# tempfile per request in /tmp (already 1777). /models is just the mount
+# point, root-owned and read-only to nonroot. The service key is handed to
+# this uid (noo-cli pki.rs SERVICE_KEY_READERS).
 RUN groupadd --gid 65532 nonroot \
     && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
         --shell /usr/sbin/nologin nonroot \
-    && mkdir -p /models \
-    && chown 65532:65532 /models
+    && mkdir -p /models
 
-# Model cache on a volume so pulls survive container recreation.
-ENV HF_HOME=/models \
+ENV WHISPER_MODEL_DIR=/models \
     WHISPER_MODEL=base \
-    WHISPER_DEVICE=auto
-VOLUME /models
+    WHISPER_DEVICE=auto \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 

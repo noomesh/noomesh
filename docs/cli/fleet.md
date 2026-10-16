@@ -497,7 +497,7 @@ agent may execute.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo models cached` | — | List models currently loaded on running node backends |
-| `noo models pull` | `<model> [--backend <b>]` | Pull a model onto the gateway's Ollama (not a chosen node) with streamed progress |
+| `noo models pull` | `<model> [--backend <b>]` | Pull a model onto the gateway's Ollama (not a chosen node) with streamed progress; whisper:<size> / piper:<voice> stage a voice model on the controller |
 | `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified) |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh]` | List popular models per backend from the HuggingFace catalog cache |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |

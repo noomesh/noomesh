@@ -497,6 +497,21 @@ source "$SCRIPT_DIR/lib-created-guard.sh"
 source "$SCRIPT_DIR/lib-bind-sources.sh"
 # Hand redis/grafana data to uid 65532 right before `up` (i64), verified.
 source "$SCRIPT_DIR/lib-reown.sh"
+
+# <MODELS_DIR>/voice/{whisper,piper}: the voice add-on's read-only model
+# mounts (docker-compose.voice.yml, i105). Same resolution as compose and
+# `noo models pull`: MODELS_DIR, else <data root>/models.
+noo_voice_model_dirs() {
+    local models="${MODELS_DIR:-}"
+    if [ -z "$models" ] && [ -f ".env" ]; then
+        models="$(grep -E '^[[:space:]]*MODELS_DIR=' .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
+    fi
+    [ -n "$models" ] || { [ -n "$_data_root" ] && models="$_data_root/models"; }
+    [ -n "$models" ] || return 0
+    mkdir -p "$models/voice/whisper" "$models/voice/piper" 2>/dev/null || \
+        echo "NOTE: could not create $models/voice/{whisper,piper} (the voice add-on's model mounts); run: noo models pull whisper:base" >&2
+    return 0
+}
 # An enabled system without its credentials is a gateway crash-loop once
 # `up` runs — refuse before pulling or recreating anything.
 check_system_credentials || exit 1
@@ -889,9 +904,14 @@ require_compose_v2 || exit 1
         # shellcheck disable=SC2046  # one service name per word
         reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
     fi
-    # The voice add-on's cache volumes (i105): whisper/piper run as 65532.
-    # shellcheck disable=SC2046
-    reown_nonroot_volumes "${COMPOSE_PROJECT_NAME:-noomesh}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'whisper|piper' || true) || exit 1
+    # The voice add-on mounts the controller's staged models read-only
+    # (<MODELS_DIR>/voice/{whisper,piper}, i105). `noo models pull` and
+    # `noo addons enable voice` create them; make sure they exist even when
+    # nothing is staged yet, so the containers start and name the missing
+    # model instead of the bind check refusing the whole stack.
+    if printf '%s\n' "$ACTIVE_SVCS" | grep -qxE 'whisper|piper'; then
+        noo_voice_model_dirs
+    fi
     # Every bind source of what this `up` starts must already exist, with
     # the right type — else refuse NOW, before anything is recreated
     # (lib-bind-sources.sh). $ACTIVE_SVCS is that set, minus the scaled-out
@@ -956,8 +976,9 @@ else
         # shellcheck disable=SC2046
         reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
-    # shellcheck disable=SC2046
-    reown_nonroot_volumes "${COMPOSE_PROJECT_NAME:-noomesh}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'whisper|piper' || true) || exit 1
+    if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
+        noo_voice_model_dirs
+    fi
     check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
