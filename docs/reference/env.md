@@ -110,7 +110,7 @@ its environment at boot. See [config.md](config.md#where-does-a-value-go).
 | Variable | Default | Read by |
 |---|---|---|
 | `NOO_EXEC_APPROVAL_MODE` | `strict` | `middleware.rs`, workers. Posture-only: a `noomesh.yaml` `security.exec_approval_mode` is a startup refusal, not an override |
-| `NOO_NODE_AGENT_PRIVILEGED` | `true` | compose (`privileged:` on the node-agent service) |
+| `NOO_NODE_AGENT_PRIVILEGED` | `false` | compose (`privileged:` on the node-agent service) |
 | `NOO_MCP_EXTERNAL_ENABLED` | off | `mcp_external.rs`, compose |
 | `NOO_APPROVAL_BREAK_GLASS` | **retired** | approval decisions always take a named operator login. A posture row or gateway env value still open (`1`, `true`, `yes`, `on`) makes the gateway **refuse to start**, naming it; clear it with `noo security posture set NOO_APPROVAL_BREAK_GLASS 0` (a closed row is deleted at the next start) |
 | `NOO_SELF_CALL_SHARED_SECRET` | closed (unset = closed; `1` opens it) | `auth.rs`, `posture.rs`. Proposal-53 bridge: whether a shared-secret token still buys inference, instead of a per-consumer key. Does **not** retire `NOO_CONTROLLER_SECRET`, whose one remaining job is the gateway's boot guard (no controller secret, no start) |

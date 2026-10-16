@@ -91,6 +91,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | Document | Description |
 |----------|-------------|
 | [security/node-agent.md](security/node-agent.md) | The node-agent trust contract: what the controller may make a node do and what it may not — declared host roots, the placement env allow-list, the container floor, MCP placements, and how a node reports a refusal |
+| [security/networks-and-containers.md](security/networks-and-containers.md) | Which Docker network carries what, why Postgres and Redis answer on `noo-db` only, what the stunnel backend doors accept, and the container hardening the gateway and worker run under |
 | [security/telemetry.md](security/telemetry.md) | No vendor telemetry: every component noomesh runs, what it would phone home with, the switch that stops it and how to verify it; and the outbound traffic that is not telemetry |
 | [security/secrets.md](security/secrets.md) | The three configuration planes, the SOPS+age secret store, `noo security secrets audit / resync / rotate / absorb-files`, and backing up the age key |
 

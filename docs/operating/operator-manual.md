@@ -46,8 +46,12 @@ start (until 2026-09-28 a standalone install ran it only after
 
 Three Docker networks separate the planes: `noo-cluster` (everything that
 talks to the gateway; created by the launcher, `external` to compose),
-`noo-db` (internal; only the gateway and trellion reach Postgres and
-Redis) and `noo-sandbox` (internal; the executor's only link).
+`noo-db` (internal; the only network Postgres and Redis answer on, and
+only their clients join it: the gateway, the worker, trellion and the
+add-ons that use the database) and `noo-sandbox` (internal; the executor's
+only link). Postgres also sits on `noo-pg-host`, a bridge that exists only
+so Docker can publish its host port. See
+[networks-and-containers.md](../security/networks-and-containers.md).
 
 Inference backends (`noo-vllm`, `noo-ollama`, `noo-llamacpp`) are **not**
 started by the stack. They are started by a node-agent
