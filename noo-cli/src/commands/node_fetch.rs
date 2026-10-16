@@ -29,6 +29,9 @@ const HARNESS_LABEL: &str = "net.noomesh.harness";
 /// name resolves through PATH, which a manual `sudo noo node fetch` inherits
 /// from the caller (H2 third review). Homebrew prefixes are never on it.
 const OPENSSL: &str = "/usr/bin/openssl";
+/// Unwraps a gzip-compressed bundle (controller >= 0.6.5 compresses before
+/// encrypting). Absent or failing: the apply reports why and applies nothing.
+const GZIP: &str = "/usr/bin/gzip";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const ID: &str = "/usr/bin/id";
 const SH: &str = "/bin/sh";
@@ -798,6 +801,28 @@ fn verified_payloads(
     let _ = std::fs::remove_file(&der);
     if code != 0 {
         return Err(format!("bundle decrypt failed ({out}) — staged for a different birth cert? re-enroll"));
+    }
+    // A gzip-wrapped bundle (magic 1f 8b) is unwrapped here, after decrypt and
+    // before anything reads it; the tar inside is byte-identical to the
+    // uncompressed form, so every check below is unchanged. gzip ABSENT or
+    // FAILING is an error with its own message (the apply report carries it),
+    // not a tar parse failure on gzip bytes.
+    let mut magic = [0u8; 2];
+    let gzipped = std::fs::File::open(&tarp)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok() && magic == [0x1f, 0x8b];
+    if gzipped {
+        let gz = stage.join("bundle.tar.gz");
+        let plain = stage.join("bundle.tar.plain");
+        std::fs::rename(&tarp, &gz).map_err(|e| format!("stage write: {e}"))?;
+        let (gcode, gout) = run(Command::new(GZIP).args(["-dc", &gz.to_string_lossy()]).stdout(std::process::Stdio::from(
+            std::fs::File::create(&plain).map_err(|e| format!("stage write: {e}"))?)));
+        let _ = std::fs::remove_file(&gz);
+        if gcode != 0 {
+            let _ = std::fs::remove_file(&plain);
+            return Err(format!("bundle gzip decompress failed ({gout}) — is {GZIP} present? re-stage"));
+        }
+        std::fs::rename(&plain, &tarp).map_err(|e| format!("stage write: {e}"))?;
     }
     // Extracted by THIS code, not tar(1): only regular files under the fixed
     // layout are ever written, so a symlink or hardlink member cannot turn a
@@ -3324,6 +3349,32 @@ mod tests {
             &ca, "host3", &[("signing-pub", pubkey)], &w2, &ca.ca_key_path()).expect("rollover");
         unpack(&f, &bundle);
         assert_eq!(lane(&f), Ok("ca-rollover"));
+        assert!(verify(&f).is_ok(), "{:?}", verify(&f));
+    }
+
+    /// The gzip wrapper is transparent: a signed bundle, gzipped by the
+    /// controller (provision::gzip_bundle) and gunzipped by the system gzip
+    /// the fetchers call, is the identical tar, and still verifies.
+    #[test]
+    fn a_gzipped_bundle_round_trips_to_the_identical_verifying_tar() {
+        let f = fixture("ctl-gzip");
+        let ca = ca_of(&f);
+        ca.ensure_signing_key().unwrap();
+        let pubkey = std::fs::read(ca.signing_pub_path()).unwrap();
+        let w = f.dir.join("work-gz");
+        std::fs::create_dir_all(&w).unwrap();
+        let bundle = crate::commands::security_local::build_signed_bundle_with_key(
+            &ca, "host3", &[("signing-pub", pubkey)], &w, &ca.ca_key_path()).expect("rollover");
+        let gz = crate::commands::provision::gzip_bundle(&bundle, &w).expect("gzip");
+        let gz_bytes = std::fs::read(&gz).unwrap();
+        assert_eq!(&gz_bytes[..2], &[0x1f, 0x8b], "gzip magic");
+        let plain = w.join("bundle.round.tar");
+        let ok = Command::new("gzip").arg("-dc").arg(&gz)
+            .stdout(std::fs::File::create(&plain).unwrap()).status();
+        let Ok(st) = ok else { eprintln!("gzip(1) absent on this host; skipping the decompress half"); return; };
+        assert!(st.success());
+        assert_eq!(std::fs::read(&plain).unwrap(), std::fs::read(&bundle).unwrap(), "tar bytes differ after the round trip");
+        unpack(&f, &plain);
         assert!(verify(&f).is_ok(), "{:?}", verify(&f));
     }
 
