@@ -733,6 +733,8 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
     // override this — the real `<think>` open will set in_think=true
     // and we never inject a virtual one.
     let mut gemma_thought_pending = true;
+    let mut reasoning_filter = super::gemma_channel::ChannelFilter::reasoning();
+    let mut content_filter = super::gemma_channel::ChannelFilter::content();
 
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -765,17 +767,16 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
             let reasoning_val = delta.get("reasoning").and_then(|r| r.as_str())
                 .or_else(|| delta.get("reasoning_content").and_then(|r| r.as_str()));
             if let Some(reasoning) = reasoning_val {
-                if !reasoning.is_empty() {
-                    full_reasoning.push_str(reasoning);
-                }
+                full_reasoning.push_str(&reasoning_filter.push(reasoning));
             }
 
             // Content tokens — buffer-based <think> tag parsing, mirrors
             // the streaming path in `run_streaming` so reasoning split via
             // <think>...</think> in content is routed to full_reasoning.
             if let Some(token) = delta.get("content").and_then(|c| c.as_str()) {
+                let token = content_filter.push(token);
                 if !token.is_empty() {
-                    tag_buffer.push_str(token);
+                    tag_buffer.push_str(&token);
                     // gemma-4: detect the literal `thought\n` (or
                     // `Thought\n`) prefix and convert to a virtual
                     // <think> open. Only applies if the buffer hasn't
@@ -875,6 +876,8 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
     }
 
     // Flush remaining tag buffer
+    full_reasoning.push_str(&reasoning_filter.finish());
+    tag_buffer.push_str(&content_filter.finish());
     if !tag_buffer.is_empty() {
         if in_think { full_reasoning.push_str(&tag_buffer); }
         else { full_content.push_str(&tag_buffer); }
@@ -940,12 +943,20 @@ fn parse_llm_response(api_format: &str, body: &Value) -> Value {
             // send_content_with_thinking can split them for the UI.
             let reasoning_text = msg.get("reasoning").and_then(|r| r.as_str())
                 .or_else(|| msg.get("reasoning_content").and_then(|r| r.as_str()));
-            if let Some(reasoning) = reasoning_text {
-                if !reasoning.is_empty() {
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let merged = format!("<think>{}</think>\n\n{}", reasoning, content);
-                    msg["content"] = json!(merged);
-                }
+            // gemma's channel tokens: dropped from reasoning, think tags in content.
+            let reasoning = reasoning_text.map(super::gemma_channel::drop_channel_tokens).unwrap_or_default();
+            let content = msg.get("content").and_then(|c| c.as_str()).map(|c| {
+                let mut f = super::gemma_channel::ChannelFilter::content();
+                let mut out = f.push(c);
+                out.push_str(&f.finish());
+                out
+            });
+            if let Some(content) = &content {
+                msg["content"] = json!(content);
+            }
+            if !reasoning.is_empty() {
+                let merged = format!("<think>{}</think>\n\n{}", reasoning, content.unwrap_or_default());
+                msg["content"] = json!(merged);
             }
             msg
         }
@@ -1962,6 +1973,8 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         // dashboard's collapsible thinking panel. Closes on first tool
         // call delta (transition reasoning → action).
         let mut gemma_thought_pending = true;
+        let mut reasoning_filter = super::gemma_channel::ChannelFilter::reasoning();
+        let mut content_filter = super::gemma_channel::ChannelFilter::content();
 
         // Buffer for reading SSE lines
         let mut stream = resp.bytes_stream();
@@ -2029,8 +2042,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     let reasoning_val = delta.get("reasoning").and_then(|r| r.as_str())
                         .or_else(|| delta.get("reasoning_content").and_then(|r| r.as_str()));
                     if let Some(reasoning) = reasoning_val {
+                        let reasoning = reasoning_filter.push(reasoning);
                         if !reasoning.is_empty() {
-                            full_reasoning.push_str(reasoning);
+                            full_reasoning.push_str(&reasoning);
                             let _ = writer.send_event("thinking", json!(reasoning)).await;
                         }
                     }
@@ -2038,8 +2052,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                     // Handle content tokens — buffer-based <think> tag parsing
                     // (matches Python coordinator.py:1476-1511)
                     if let Some(token) = delta.get("content").and_then(|c| c.as_str()) {
+                        let token = content_filter.push(token);
                         if !token.is_empty() {
-                            tag_buffer.push_str(token);
+                            tag_buffer.push_str(&token);
 
                             // gemma-4 virtual <think> open: detect literal
                             // "thought\n" or "thought:" prefix at start of
@@ -2170,6 +2185,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
 
         // Flush remaining tag buffer after stream ends
+        let reasoning_tail = reasoning_filter.finish();
+        if !reasoning_tail.is_empty() {
+            full_reasoning.push_str(&reasoning_tail);
+            let _ = writer.send_event("thinking", json!(reasoning_tail)).await;
+        }
+        tag_buffer.push_str(&content_filter.finish());
         if !tag_buffer.is_empty() {
             if in_think {
                 full_reasoning.push_str(&tag_buffer);
