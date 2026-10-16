@@ -69,7 +69,7 @@ they authenticate a service key themselves ([MCP doors](#mcp-doors)).
 
 **`/metrics` is not public.** It answers an Operator or Admin login, or the
 Prometheus service certificate (`noo security pki issue-service prometheus`)
-when `NOO_MTLS_GATEWAY` is on. The `/api/grafana-ds/*` routes answer only
+while mTLS enforcement is on (the default; `NOO_MTLS_GATEWAY=false` turns it off). The `/api/grafana-ds/*` routes answer only
 Grafana's own service leaf.
 
 `/health` is **credential-optional**, not flatly public: an anonymous

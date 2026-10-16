@@ -445,6 +445,12 @@ func (s *Supervisor) report(ctx context.Context, id string, tools []Tool) error 
 	if s.cfg == nil || s.cfg.ControllerURL == "" {
 		return errors.New("no controller URL")
 	}
+	// The report carries the fleet bearer, which the gateway accepts only
+	// with this node's leaf. A nil client would be http.DefaultClient (no
+	// leaf), so refuse instead of sending a token that cannot identify us.
+	if s.http == nil {
+		return errors.New("no controller client: the supervisor was built without the agent's mTLS client")
+	}
 	body, err := json.Marshal(map[string]any{"tools": tools})
 	if err != nil {
 		return err
@@ -458,11 +464,7 @@ func (s *Supervisor) report(ctx context.Context, id string, tools []Tool) error 
 	if s.cfg.ClusterSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.CreateClusterToken(s.cfg.NodeID, s.cfg.ClusterSecret))
 	}
-	hc := s.http
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-	resp, err := hc.Do(req)
+	resp, err := s.http.Do(req)
 	if err != nil {
 		return err
 	}

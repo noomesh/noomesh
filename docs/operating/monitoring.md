@@ -114,7 +114,7 @@ Existing installs mint the leaves once (`noo security --help`).
 
 | Job | Target | Notes |
 |---|---|---|
-| `gateway` | `gateway:8080/metrics` | the service leaf alone: the gateway admits `CN=prometheus` on `GET /metrics` and nothing else (needs `NOO_MTLS_GATEWAY`, which onboard sets); people need an Operator or Admin login |
+| `gateway` | `gateway:8080/metrics` | the service leaf alone: the gateway admits `CN=prometheus` on `GET /metrics` and nothing else (needs mTLS enforcement, which is the default; `NOO_MTLS_GATEWAY=false` turns it off); people need an Operator or Admin login |
 | `noo_node_agent` | `node-agent:8081/metrics` | the service leaf alone, no bearer — the agent refuses this route to anything that is not the controller or a cluster service |
 | `node` | `node-exporter:9100` | host CPU, memory, disk, network |
 | `nvidia_gpu` | `nvidia-exporter:9400` | GPU temperature, power, memory, utilisation (`nvidia_gpu_*`); the launcher scales this exporter to 0 on hosts without an NVIDIA runtime |
