@@ -1354,20 +1354,28 @@ async fn native_task_done(state: &AppState, call: &ToolCall, args: &Value) -> To
     let text = arg_str(args, &["result", "reason", "text"]).unwrap_or_default();
     match crate::tasks::finish(&state.db, &task.id, !failed, &text).await {
         Ok(true) => {
-            // The evidence: which tools the task really called. Unreadable
-            // record = no `tools` field and no refs (not a claim of zero).
-            let called = crate::tasks::tools_called(&state.db, &task.conversation_id).await;
-            let env = crate::agent_messages::Envelope::new(
-                &user, "thread", "result", result_body(&text, &task.id, !failed, called.as_ref()), Some(&task.thread_id),
-                called.as_ref().map(|t| t.refs()).unwrap_or_default(),
-            )
-            .with_from(crate::agent_messages::Identity::new(Some(&user), task.node.as_deref(), Some(&user), Some("task")));
-            let _ = crate::agent_messages::publish(&state.js, &env).await;
+            post_task_result(state, &task, &user, !failed, &text).await;
             ok_result(call, json!({"task_id": task.id, "state": if failed { "failed" } else { "done" }}).to_string())
         }
         Ok(false) => err_result(call, format!("task {} is already {}", task.id, task.state)),
         Err(e) => err_result(call, format!("could not finish task: {e}")),
     }
+}
+
+/// Post a finished task's result to its thread, from the person, with the
+/// evidence of which tools the task really called. Shared by the loop's
+/// `noo_task_done` and the user door's (`mcp_user_tasks`), so a task
+/// finished from either place leaves the same record.
+pub(crate) async fn post_task_result(state: &AppState, task: &crate::tasks::Task, user: &str, ok: bool, text: &str) {
+    // The evidence: which tools the task really called. Unreadable
+    // record = no `tools` field and no refs (not a claim of zero).
+    let called = crate::tasks::tools_called(&state.db, &task.conversation_id).await;
+    let env = crate::agent_messages::Envelope::new(
+        user, "thread", "result", result_body(text, &task.id, ok, called.as_ref()), Some(&task.thread_id),
+        called.as_ref().map(|t| t.refs()).unwrap_or_default(),
+    )
+    .with_from(crate::agent_messages::Identity::new(Some(user), task.node.as_deref(), Some(user), Some("task")));
+    let _ = crate::agent_messages::publish(&state.js, &env).await;
 }
 
 /// The body of a task's result message. `tools` is the evidence (count and
@@ -1402,7 +1410,7 @@ pub(crate) mod task_tree {
         }
     }
 
-    fn brief(t: &crate::tasks::Task) -> Value {
+    pub(crate) fn brief(t: &crate::tasks::Task) -> Value {
         json!({
             "task_id": t.id, "role": t.role, "state": t.state, "loops": t.loops, "loop_budget": t.loop_budget,
             "objective": crate::tasks::excerpt(&t.objective), "last_note": t.last_note, "result": t.result, "error": t.error,
@@ -1414,54 +1422,69 @@ pub(crate) mod task_tree {
             Ok(t) => t,
             Err(e) => return err_result(call, e),
         };
-        let Some(objective) = arg_str(args, &["objective", "task"]).filter(|o| !o.trim().is_empty()) else {
-            return err_result(call, "objective is required".into());
+        let Some(state_arc) = state.arc() else {
+            return err_result(call, "the state handle is not registered".into());
         };
-        match crate::tasks::depth(&state.db, &me).await {
-            Ok(d) if d + 1 >= crate::tasks::MAX_DEPTH => return err_result(call, format!("delegation is at most {} deep", crate::tasks::MAX_DEPTH)),
-            Err(e) => return err_result(call, format!("depth check failed: {e}")),
-            _ => {}
+        match delegate(&state_arc, me.owner.as_deref(), Some(&me), args).await {
+            Ok(v) => ok_result(call, v.to_string()),
+            Err(e) => err_result(call, e),
         }
-        match crate::tasks::children(&state.db, &me.id).await {
-            Ok(c) if c.len() as i64 >= crate::tasks::MAX_CHILDREN => return err_result(call, format!("a task may delegate at most {} sub-tasks", crate::tasks::MAX_CHILDREN)),
-            Err(e) => return err_result(call, format!("children lookup failed: {e}")),
-            _ => {}
+    }
+
+    /// Open a task for `owner` — a sub-task of `parent`, or a top-level
+    /// one when there is none — post the delegation to its thread, and
+    /// start it. The loop's `noo_task_delegate` passes its own task; the
+    /// user door (`mcp_user_tasks`) passes the caller's task it named, or
+    /// none. The caps apply only under a parent: a top-level task is depth 0.
+    pub(crate) async fn delegate(state: &std::sync::Arc<AppState>, owner: Option<&str>, parent: Option<&crate::tasks::Task>, args: &Value) -> Result<Value, String> {
+        let Some(objective) = arg_str(args, &["objective", "task"]).filter(|o| !o.trim().is_empty()) else {
+            return Err("objective is required".into());
+        };
+        if let Some(me) = parent {
+            match crate::tasks::depth(&state.db, me).await {
+                Ok(d) if d + 1 >= crate::tasks::MAX_DEPTH => return Err(format!("delegation is at most {} deep", crate::tasks::MAX_DEPTH)),
+                Err(e) => return Err(format!("depth check failed: {e}")),
+                _ => {}
+            }
+            match crate::tasks::children(&state.db, &me.id).await {
+                Ok(c) if c.len() as i64 >= crate::tasks::MAX_CHILDREN => return Err(format!("a task may delegate at most {} sub-tasks", crate::tasks::MAX_CHILDREN)),
+                Err(e) => return Err(format!("children lookup failed: {e}")),
+                _ => {}
+            }
         }
         let role = arg_str(args, &["role"]);
         let model = arg_str(args, &["model"]);
         let budget = args.get("loop_budget").and_then(|v| v.as_u64()).map(|b| (b as u32).max(1));
         let new = crate::tasks::NewTask {
-            owner: me.owner.as_deref(),
+            owner,
             objective: &objective,
             model: model.as_deref(),
             loop_budget: budget,
-            parent: Some(&me),
+            parent,
             role: role.as_deref(),
         };
         let child = match crate::tasks::create_task(&state.db, new).await {
             Ok(c) => c,
-            Err(e) => return err_result(call, format!("could not create the sub-task: {e}")),
+            Err(e) => return Err(format!("could not create the sub-task: {e}")),
         };
         // The delegation is a `task` message in the shared thread, from the
-        // person, so the record shows who asked whom for what.
-        if let Some(owner) = me.owner.as_deref() {
+        // person, so the record shows who asked whom for what. A child posts
+        // to its parent's thread, so `child.thread_id` is that thread.
+        if let Some(owner) = owner {
             let env = crate::agent_messages::Envelope::new(
-                owner, "thread", "task", json!({"text": objective, "task_id": child.id, "role": child.role, "parent_id": me.id}), Some(&me.thread_id), vec![],
+                owner, "thread", "task", json!({"text": objective, "task_id": child.id, "role": child.role, "parent_id": parent.map(|p| p.id.clone())}), Some(&child.thread_id), vec![],
             )
-            .with_from(crate::agent_messages::Identity::new(Some(owner), me.node.as_deref(), Some(owner), Some("task")));
+            .with_from(crate::agent_messages::Identity::new(Some(owner), parent.and_then(|p| p.node.as_deref()), Some(owner), Some("task")));
             let _ = crate::agent_messages::publish(&state.js, &env).await;
         }
-        let Some(state_arc) = state.arc() else {
-            return err_result(call, "sub-task created but the state handle is not registered".into());
-        };
         // Boxed to cut the future cycle: a loop's tool call starts a
         // runner whose loops make tool calls (same shape as `noo_inference`
         // → `coordinator::run` above).
         let started: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::tasks::Started>> + Send + '_>> =
-            Box::pin(crate::tasks::start(&state_arc, &child));
+            Box::pin(crate::tasks::start(state, &child));
         match started.await {
-            Ok(s) => ok_result(call, json!({"task_id": child.id, "role": child.role, "node": s.node, "dispatched": s.dispatched, "why": s.why, "thread_id": child.thread_id}).to_string()),
-            Err(e) => err_result(call, format!("sub-task created but not started: {e}")),
+            Ok(s) => Ok(json!({"task_id": child.id, "role": child.role, "node": s.node, "dispatched": s.dispatched, "why": s.why, "thread_id": child.thread_id, "parent_id": child.parent_id})),
+            Err(e) => Err(format!("sub-task {} created but not started: {e}", child.id)),
         }
     }
 

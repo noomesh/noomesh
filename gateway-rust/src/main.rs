@@ -88,6 +88,7 @@ mod google_auth;
 mod host_daemon;
 mod mcp_external;
 mod mcp_local;
+mod mcp_user_tasks;
 mod mcp_bridge;
 mod mcp_protocol;
 mod confine;
