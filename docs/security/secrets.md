@@ -614,6 +614,16 @@ written before then carry hash **v1** (bare hex), which covered only
 Editing a row without the key is detectable; that is the whole point, so
 the key is its own secret:
 
+- **The gateway does not start without it.** A missing or blank
+  `NOO_AUDIT_HMAC_KEY` is a boot refusal (exit 2, naming the fix), not a
+  gateway that serves while every audit row is refused. It cannot strand an
+  upgrade: `noo upgrade --stack` mints the key into `secrets/env.sops` before
+  anything else moves, and `noo stack start|restart|rebuild` mints it first if
+  it is still absent (an existing key is never rotated). An install with no
+  encrypted store is refused with the command that moves it onto one, and the
+  key is never written to plaintext `.env`. `noo security scan` reports a
+  missing key as CRITICAL and `noo cluster verify` fails its `audit key` row
+  (read locally, so it answers even when the gateway is down).
 - **It is the only signing key.** The gateway, the worker and the two
   knowledge add-ons (every process that writes audit rows) receive it as a
   file. A process without it REFUSES to write the row and logs
@@ -697,6 +707,23 @@ concurrently, so it detects an EDITED row (since v2, a re-timed or copied
 one too) and a row signed with the wrong key, not a row deleted from the
 middle of an epoch. The checkpoint's link
 does catch deletion of the derived-key epoch's newest rows.
+
+### Audit retention
+
+Audit rows live in monthly partitions. The weekly `audit_log_rotate`
+heartbeat task (seeded at gateway boot, enabled, `created_by system`) exports
+every partition older than the retention window (12 months by default,
+`retention_months` on the task, 1 to 120) to
+`/data/audit-archive/noo_security_audit_YYYY_MM.jsonl` on the persistent
+`noo-data` volume, one JSON object per row with every column (so the archive
+can still be verified against the key), checks the file against the row
+count, and only then drops the partition. An export that cannot be verified
+drops nothing and fails the run; the current and future months are never
+dropped. Only the `local_dir` backend is implemented in the gateway; with any
+other `backend` the partitions are kept and the task fails, so the gap is
+visible. `archive_dir` must stay under `/data/`. The task defaults to a dry
+run if its `dry_run` is removed; the seeded row applies. Disable it with
+`noo heartbeat toggle audit_log_rotate --off`, or tune it with the task's config.
 
 ## A service that holds its own gateway key
 

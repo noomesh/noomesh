@@ -254,22 +254,62 @@ The gates are `NOO_EXEC_APPROVAL_MODE`, `NOO_NODE_AGENT_PRIVILEGED`,
 and `NOO_MCP_EXTERNAL_ENABLED`; `list` shows
 `gate | running | desired (db) | source | restart` and how many are pending
 a restart. (Tenant isolation is not among them — it is unconditional, not a
-gate.) The profiles are `hardened` (approval mode, unprivileged agents) and
+gate.) `NOO_NODE_AGENT_PRIVILEGED` is consumed by compose when the node-agent
+container is created, not by the gateway, so `set` and `apply-profile` mirror
+it into `.env` (as `true`/`false`) and **recreate the node-agent container**
+when it differs; `list` and `cluster verify` report the container's actual
+`HostConfig.Privileged` (`docker inspect`), so "at desired" means the
+container. On a host with no such container the row says "container not
+checked". The profiles are `hardened` (approval mode, unprivileged agents) and
 `dev` (the opposite); **both** leave the external MCP door closed —
 opening it is a decision about a specific person,
 never a side effect of a bundle. `set` and `apply-profile` are
 operator-only (your operator client certificate plus a token bound to it,
 never an app admin and never a shared secret) and take effect at the next
-gateway boot. `noo security scan` is the local complement: it
-checks secrets, plaintext residue under `secrets/`, retired shared NATS names (`NATS_USER`, `NATS_PASSWORD`) still set,
-inline registry logins in
-`~/.docker/config.json`, `.env` permissions, TLS, the PKI, and the
-**gateway transport** on this host, and prints findings by severity (exit 1
-on a CRITICAL, or on anything with `--strict`; `--json` for CI). A store
-that is present but cannot be decrypted — `sops` off `PATH`, no age key —
-is one HIGH finding that says so, not a CRITICAL "unset" per secret. A gateway URL the CLI could not verify — a non-loopback
-`http://` URL, or an `https://` one with no usable trust anchor — is
-reported as `CRITICAL / Gateway Transport`; `http://` to loopback is
+gateway boot. `noo security scan` is the local complement.
+
+**What it scanned.** The first line says which root it read and how that root
+was chosen (`$NOO_REPO_ROOT`, the standalone install home, the checkout you
+are standing in, or derived), and `--json` carries the same as `scanned`. On
+a host that is an **enrolled node** (it has `/etc/noo/controller-url`) and has
+no install of its own, it scans the node's real surfaces instead: the modes
+and ownership of everything under `/etc/noo/pki` (a world-readable key is
+CRITICAL), `/etc/noo-node-agent.env` (must be `0600` root), the birth key
+`/etc/noo/birth.key`, a stale legacy `NATS_USER`/`NATS_PASSWORD` in the
+agent's env file, and the node-agent unit (`User=` not root,
+`NoNewPrivileges=true`). The controller-only rows (JWT, cluster and
+controller secrets, Redis, TLS, Grafana, the audit key, mTLS, CSP, exec
+approval) are listed as "not applicable on a node", never as passed. With no
+install and no enrollment there is nothing to scan: it says so and exits 1.
+
+**Never "ok" for what it could not see.** Anything it could not read is
+printed as `NOT CHECKED` (and listed under `not_checked` in `--json`): the
+agent's env file is `0600 root`, so a non-root scan reports the file's mode
+but says its contents were not read; the gateway-side rows need an operator
+login (`noo auth login`); the node-agent container needs docker. "No issues
+found" then says how many surfaces were not checked.
+
+**What it checks on a controller.** Secrets (JWT, cluster, **controller**,
+node-agent token, Redis, Grafana, the bootstrap `NOO_ADMIN_PASSWORD`) for
+empty values and for the **published placeholders** (`changeme`, `admin`,
+`password`, `secret`, `test`, `example`, `dev-secret-change-in-production`);
+the **audit key** (`NOO_AUDIT_HMAC_KEY` missing is CRITICAL: the gateway
+refuses to start without it); **mTLS enforcement** judged on its effective
+value (explicitly off, or no cluster CA, is HIGH); an explicit `NOO_CSP=0`/`off`
+(MEDIUM; CSP is opt-in); the env-only hatches `NOO_SELF_CALL_SHARED_SECRET`,
+`NOO_NATS_ALLOW_ANONYMOUS` and `NOO_ALLOW_LOCAL_PYTHON_EXEC` (HIGH each);
+the gateway's running **exec approval mode** when it is neither `strict` nor
+`approval` (HIGH; a not-yet-restarted `auto` row is MEDIUM);
+`NOO_SANDBOX_ISOLATION=process` (MEDIUM, a downgrade from `bwrap`); the
+node-agent container actually running **privileged** (HIGH, from `docker
+inspect`); plaintext residue under `secrets/`; retired shared NATS names;
+inline registry logins in `~/.docker/config.json`; `.env` permissions; TLS;
+the PKI; and the **gateway transport**. Exit 1 on a CRITICAL, or on anything
+with `--strict`; `--json` for CI. A store that is present but cannot be
+decrypted — `sops` off `PATH`, no age key — is one HIGH finding that says so,
+not a CRITICAL "unset" per secret. A gateway URL the CLI could not verify — a
+non-loopback `http://` URL, or an `https://` one with no usable trust anchor —
+is reported as `CRITICAL / Gateway Transport`; `http://` to loopback is
 reported as `LOW`, because that is the local-development default.
 
 ### Sign and verify an add-on lock
@@ -394,7 +434,7 @@ the lock. The layout both locks are published in is in
 | `noo security secrets remove` | `<key>... [--yes] [--dry-run] [--sops-file <path>]` | Remove unused keys from env.sops; refuses any key something reads, keeps a backup |
 | `noo security secrets rotate` | `<key>... [--all-generated] [--dry-run] [--yes] [--prompt] [--set-from-stdin] [--stdout] [--restart] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]` | Rotate secrets in env.sops, Postgres and the backup files atomically; confirms unless -y |
 | `noo security secrets reveal` | `<NAME> [--no-clipboard] [--stdout] [--sops-file <path>]` | Show one human-held secret once on this terminal and offer it to the clipboard |
-| `noo security scan` | `[--strict]` | Scan this host's posture; exits 1 on a CRITICAL finding, or on any finding with --strict |
+| `noo security scan` | `[--strict]` | Scan this host's posture (names the root it scanned; on an enrolled node scans the node's own surfaces); exits 1 on a CRITICAL finding, or on any finding with --strict |
 | `noo security pki rotate-all` | `[--warn-days <n>] [--new-days <n>] [--yes] [--reload \| --no-reload] [--no-deliver]` | Re-issue expiring certs, deliver to nodes, restart consumers; asks for confirmation (-y) |
 | `noo security pki rotate-ca` | `[--ca-days <n>] [--leaf-days <n>] [--yes] [--retire-old]` | Cross-signed CA rotation across every node; asks for confirmation (-y) |
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |

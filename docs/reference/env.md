@@ -110,7 +110,7 @@ its environment at boot. See [config.md](config.md#where-does-a-value-go).
 | Variable | Default | Read by |
 |---|---|---|
 | `NOO_EXEC_APPROVAL_MODE` | `strict` | `middleware.rs`, workers. Posture-only: a `noomesh.yaml` `security.exec_approval_mode` is a startup refusal, not an override |
-| `NOO_NODE_AGENT_PRIVILEGED` | `false` | compose (`privileged:` on the node-agent service) |
+| `NOO_NODE_AGENT_PRIVILEGED` | `false` | compose (`privileged:` on the node-agent service). A posture gate: `noo security posture set` / `apply-profile` mirror it into `.env` as `true`/`false` and recreate the node-agent container when its actual state differs; `posture list` and `cluster verify` read `docker inspect` |
 | `NOO_MCP_EXTERNAL_ENABLED` | off | `mcp_external.rs`, compose |
 | `NOO_APPROVAL_BREAK_GLASS` | **retired** | approval decisions always take a named operator login. A posture row or gateway env value still open (`1`, `true`, `yes`, `on`) makes the gateway **refuse to start**, naming it; clear it with `noo security posture set NOO_APPROVAL_BREAK_GLASS 0` (a closed row is deleted at the next start) |
 | `NOO_SELF_CALL_SHARED_SECRET` | closed (unset = closed; `1` opens it) | `auth.rs`, `posture.rs`. Proposal-53 bridge: whether a shared-secret token still buys inference, instead of a per-consumer key. Does **not** retire `NOO_CONTROLLER_SECRET`, whose one remaining job is the gateway's boot guard (no controller secret, no start) |
@@ -154,7 +154,7 @@ override. Everything else below is env-only.
 | `NOO_NODE_AGENT_TOKEN` | — | bearer the gateway presents to node-agents; **secret store** |
 | `NOO_AGENT_REVIEW_KEY` | unset (bodies travel in plaintext, boot log warns) | seals agent-to-agent message bodies; rotating it makes older sealed messages unreadable (`agent_crypto.rs`) |
 | `NOO_AGENT_SIGNING_KEY` | unset (signatures derive from the review key) | optional second secret: when set, agent-message signatures derive from it and the review key becomes decrypt-only, so reading history no longer implies being able to forge it |
-| `NOO_AUDIT_HMAC_KEY` | — (minted by `noo onboard`) | the security audit log's signing key — the only one; unset, audit rows are refused. Secret store, delivered as a file ([secrets.md](../security/secrets.md#the-audit-key)) |
+| `NOO_AUDIT_HMAC_KEY` | — (minted by `noo onboard`) | the security audit log's signing key — the only one. **Unset, the gateway refuses to start** (every audit row would be refused); `noo upgrade --stack` and `noo stack start|restart|rebuild` mint it into the encrypted store when absent, `noo security scan` reports it CRITICAL and `noo cluster verify` fails its `audit key` row. Secret store, delivered as a file ([secrets.md](../security/secrets.md#the-audit-key)) |
 | `NOO_ADMIN_USER`, `NOO_ADMIN_PASSWORD`, `NOO_OPERATOR_USER` | `admin`, —, — | bootstrap admin login before users exist; the operator identity for posture writes. The password reaches the **gateway only** (`routes/core.rs`); the Python images receive `NOO_ADMIN_USER` alone (`heartbeat.py`) |
 | `NOO_TOKEN_EXPIRE_MINUTES`, `NOO_REFRESH_TOKEN_DAYS` | `15`, `30` | access / refresh token lifetimes (`auth_refresh.rs`) |
 | `NOO_REFRESH_GRACE_SECS` | `10` | how long after a rotation a re-presentation of the OLD refresh token reads as a benign double-refresh (two tabs) rather than a stolen chain: `409`, no sweep, no audit row, only while the successor is still live and unused. `0` disables the window — every re-presentation is a replay (`auth_refresh.rs`) |
@@ -334,7 +334,7 @@ The agent does not read `noomesh.yaml`; `noo cluster provision` renders
 | `NOO_GATEWAY_URL`, `CONTROLLER_URL`, `PIPELINE_GATEWAY_URL` | — | the gateway, for handlers that call back over HTTP |
 | `NOO_JWT_SECRET`, `NOO_CLUSTER_SECRET`, `NOO_NODE_AGENT_TOKEN`, `NOO_AUDIT_HMAC_KEY`, `NOO_ENCRYPTION_KEY` | — | shared credentials; **secret store** |
 | `NOO_EXEC_APPROVAL_MODE` | posture (unset → `strict`) | same gates as the gateway |
-| `NOO_ALLOW_LOCAL_PYTHON_EXEC` | off | run `python_exec` in-process instead of the sandbox (dev only) |
+| `NOO_ALLOW_LOCAL_PYTHON_EXEC` | off | run `python_exec` in-process instead of the sandbox. Honoured only from a source checkout; **ignored (and logged) inside a container or under the launcher** (`/.dockerenv`, `/run/.containerenv`, `NOO_LAUNCHED=1`). `noo security scan` reports it set as HIGH |
 | `NOO_EGRESS_ALLOWLIST` | — | hosts tools may reach |
 | `NOO_PROACTIVE_ENABLED` | — | the proactive loop |
 | `NOO_DESIRED_MODELS`, `NOO_MODEL_VENDORS`, `NOO_MODEL_TASKS`, `NOO_MODEL_PUBLISHERS`, `NOO_MODEL_PUBLISHER_MODE`, `NOO_MODEL_FILTER_MODE` | — | model catalog filters |

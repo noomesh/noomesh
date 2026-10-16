@@ -267,7 +267,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo onboard` — Setup wizard
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model) |
+| `noo onboard` | `[--tui\|--web [--port <n>]] [--non-interactive\|--ci] [--dry-run] [--reconfigure] [--standalone [--bundle <url\|path>]] [--from-archive <f> [--passphrase-file <f>]] [--only <sections>] [--skip-tailscale] [--skip-security] [--skip-storage] [--skip-services] [--skip-trellion] [--skip-model] [--skip-channels] [--mcp-door\|--no-mcp-door] [--skip-addons] [--secrets-backend sops]` | Run the setup wizard to bootstrap a controller (secrets, PKI, .env, compose, model); --skip-security forgoes secret minting, the admin account and the PKI/mTLS enrollment, --skip-services forgoes the stack start, service keys and the hardened posture profile (the closing summary lists what was not applied) |
 
 ### `noo enroll` — Join this machine to a noomesh fleet as a worker
 | Command | Arguments | What it does |
