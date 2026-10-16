@@ -86,16 +86,15 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         return Ok(0);
     }
     let stack_lock = resolve::installed_stack_lock(&root, &tag);
-    let cred = match addons::lock_fetch::installed_credential() {
+    let client = match addons::installed_client() {
         Ok(c) => c,
         Err(e) => fail(g.json, ExitCode::Generic, "store_unreadable", &e, Some("noo security secrets audit")),
     };
-    let client = addons::lock_fetch::Client::new(cred.clone());
     let current = match pins::read(&root) {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
     };
-    let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client: &client, cred: cred.as_ref() };
+    let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client: &client };
     let mut rows = Vec::new();
     let mut failed = 0;
     for addon in list {
@@ -110,28 +109,30 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         pinned: installed.as_ref().map(|p| p.version.as_str()),
                         allow_downgrade,
                     };
+                    let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
                     resolve::fetch_and_check(&client, &anchor, &want)
+                        .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
                 })
-                .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock), 0usize))
         } else {
             addons::prepare(&ctx, addon, &mut resolve::LiveDocker::new(&root))
-                .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled)))
+                .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone())))
         };
         match outcome {
-            Ok((offered, pulled)) => {
+            Ok((offered, pulled, via)) => {
                 let changed = installed.as_ref() != Some(&offered);
                 rows.push(json!({
                     "addon": addon, "installed": installed.as_ref().map(|p| &p.version),
                     "offered": offered.version, "stack": tag, "key_index": offered.key_index,
-                    "changed": changed, "pulled": pulled, "pinned": !check,
+                    "changed": changed, "pulled": pulled, "pinned": !check, "via": via,
+                    "pulled_from": offered.pulled_from,
                 }));
                 if !g.json {
                     let was = installed.as_ref().map(|p| format!("{} for {}", p.version, p.stack)).unwrap_or_else(|| "not pinned".into());
                     if check {
                         let state = if changed { ui::bad("update available") } else { ui::good("current") };
-                        println!("  {addon}  installed {was}; offered {} (add-on key #{})  {state}", offered.version, offered.key_index);
+                        println!("  {addon}  installed {was}; offered {} (add-on key #{}; {via})  {state}", offered.version, offered.key_index);
                     } else if changed {
-                        ui::done(&format!("{addon} {} pinned for stack {tag} (was {was}; add-on key #{}; {pulled} image(s) pulled)",
+                        ui::done(&format!("{addon} {} pinned for stack {tag} (was {was}; add-on key #{}; {pulled} image(s) pulled {via})",
                             offered.version, offered.key_index));
                     } else {
                         ui::done(&format!("{addon} {} already pinned for stack {tag}: nothing changed", offered.version));
@@ -207,7 +208,7 @@ pub(crate) fn verify_one(
             return v;
         }
     };
-    for (name, r) in &pin.images {
+    for (name, r) in &pin.local_images() {
         let pinned_id = if docker.image_present(r) {
             match docker.image_id(r) {
                 Ok(id) => Some(id),
@@ -266,6 +267,7 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "addon": v.addon, "ok": v.problem.is_none(), "problem": v.problem, "notes": v.notes,
                 "version": v.pin.as_ref().map(|p| &p.version), "stack": v.pin.as_ref().map(|p| &p.stack),
                 "key_index": v.pin.as_ref().map(|p| p.key_index), "images": v.pin.as_ref().map(|p| &p.images),
+                "pulled_from": v.pin.as_ref().and_then(|p| p.pulled_from.as_ref()),
             }))
             .collect();
         println!("{}", json!({"stack": tag, "verified": verdicts.len() - bad, "failed": bad, "addons": rows}));
@@ -315,7 +317,7 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
         match res {
             Ok((_, resolve::Overlay::Legacy(None))) => out.push(format!("refuse {addon} {}", legacy_refusal(tag))),
             Ok((pin, _)) => {
-                for (image, reference) in &pin.images {
+                for (image, reference) in &pin.local_images() {
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
                         None => out.push(format!("refuse {addon} its lock names image {image:?}, which has no variable name")),
@@ -474,7 +476,7 @@ mod tests {
         let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
         let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
-        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let r = v.lock.images["trellion-intel"].clone();
         (d, r)
     }
@@ -492,13 +494,51 @@ mod tests {
         assert!(other_tag[0].starts_with("refuse trellion_intel trellion_intel is pinned for stack v0.6.0"), "{other_tag:?}");
     }
 
+    /// Pulled through the proxy: compose runs, and verify compares with,
+    /// the pulled ref (same digest, the proxy host), never the GHCR ref
+    /// docker does not hold.
+    #[test]
+    fn a_proxy_pin_launches_and_verifies_the_pulled_ref() {
+        let d = scratch("proxy-pin");
+        let f = signed_bundle(&lock("1.2.0", &["v0.6.0"], None));
+        let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        let pull = "addons.noomesh.ai/example/intel";
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", Some(pull.into())).unwrap();
+        let a = crate::addon_lock::TrustAnchor { pull: Some(pull.into()), ..anchor() };
+        let signed_ref = v.lock.images["trellion-intel"].clone();
+        let local = signed_ref.replacen("ghcr.io", "addons.noomesh.ai", 1);
+        let names = vec!["trellion_intel".to_string()];
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(a.clone()));
+        assert_eq!(lines, [format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
+        let running = vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: local.clone(), image_id: "sha256:x".into() }];
+        let mut docker = FakeDocker { local: vec![local.clone()], ids: vec![(local.clone(), "sha256:x".into())], ..Default::default() };
+        let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(a.clone()), &mut docker, &running);
+        assert!(verdict.problem.is_none() && verdict.notes.is_empty(), "{verdict:?}");
+        // Only the GHCR ref local: the pulled ref is missing, and that is what is said.
+        let mut ghcr_only = FakeDocker { local: vec![signed_ref.clone()], ..Default::default() };
+        let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(a), &mut ghcr_only, &[]);
+        assert!(verdict.problem.as_deref().is_some_and(|p| p.contains(&local)), "{verdict:?}");
+    }
+
+    /// Every docker-facing use of a pin goes through `local_images` (i91
+    /// §4.2): a direct walk over `pin.images` would hand compose a ref docker
+    /// does not hold on the proxy path.
+    #[test]
+    fn docker_facing_pin_refs_go_through_local_images() {
+        let src = include_str!("addon_pins.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("in &pin.images"), "iterate pin.local_images(), not pin.images");
+        assert!(prod.matches("pin.local_images()").count() >= 2, "verify and launch-pins both map refs");
+    }
+
     #[test]
     fn a_lock_without_a_bundle_runs_the_legacy_overlay_or_is_refused() {
         let d = scratch("legacy");
         let f = signed(&lock("1.2.0", &["v0.6.0"], None));
         let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
         let v = resolve::check(&f, &anchor(), &want).unwrap();
-        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let names = vec!["trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
         assert!(lines[0].starts_with("refuse trellion_intel its signed lock for v0.6.0 predates overlay bundles"), "{lines:?}");

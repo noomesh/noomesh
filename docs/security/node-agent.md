@@ -671,6 +671,12 @@ What this does and does not add:
 - **Our images are rail-only.** A not-staged image of ours is a refusal
   naming `noo cluster sync-images <node> -i <image>` / `noo upgrade`, never
   a registry pull.
+- **Vendor CLIs are rail-only too.** A harness kind's vendor CLI (and the
+  runtime it runs on) is fetched by the controller with
+  `noo cluster vendor stage`, verified against the sha256 pinned in
+  `config/harness-kinds.json`, and carried in the node's signed bundle; the
+  node never fetches it
+  ([../getting-started/supported-agent-harnesses.md](../getting-started/supported-agent-harnesses.md#vendor-clis-are-staged-by-the-controller)).
 - **Rollout switch.** `NOO_IMAGE_SOURCE=rail|legacy` (node-local env). The
   first release that ships the rail defaults to `legacy` — the pre-rail
   behaviour (local image, else its registry) — while the controller stages

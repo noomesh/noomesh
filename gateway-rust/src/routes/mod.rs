@@ -100,6 +100,14 @@ pub enum AppError {
     RetryLater { msg: String, retry_after_secs: u64 },
     /// 429 with a `Retry-After` header: a per-caller quota is spent.
     TooManyRequests { msg: String, retry_after_secs: u64 },
+    /// 503 with a `Retry-After` header and a MACHINE-READABLE `error` code
+    /// (`detail` carries the prose): a dependency is not connected yet, so a
+    /// caller may retry on the code instead of matching an English sentence.
+    /// First use: `redis_reconnecting` from `/api/jobs/submit`, which used to
+    /// answer a bare `500 {"error":"Redis not connected"}` to every node poke
+    /// of a `noo upgrade --all` that ran while the gateway had no Redis
+    /// client (0.6.3 -> 0.6.4 roll, 2026-10-15).
+    UnavailableRetry { code: &'static str, detail: String, retry_after_secs: u64 },
 }
 
 /// The message the error carries, without the variant name.
@@ -119,6 +127,7 @@ impl std::fmt::Display for AppError {
             | Self::Forbidden(m)
             | Self::Unavailable(m) => m,
             Self::RetryLater { msg, .. } | Self::TooManyRequests { msg, .. } => msg,
+            Self::UnavailableRetry { detail, .. } => detail,
         };
         f.write_str(msg)
     }
@@ -135,6 +144,14 @@ impl IntoResponse for AppError {
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::TooManyRequests { msg, retry_after_secs } => {
                 let mut r = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg, "retry_after_secs": retry_after_secs}))).into_response();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+                }
+                return r;
+            }
+            Self::UnavailableRetry { code, detail, retry_after_secs } => {
+                let body = json!({"error": code, "detail": detail, "retry_after_secs": retry_after_secs});
+                let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
                 if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
                     r.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
                 }

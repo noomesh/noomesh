@@ -32,6 +32,16 @@ PROVISION = REPO / "noo-cli/src/commands/provision.rs"
 # that with room for the next arrival, not sit just above today's number.
 LARGEST_OBSERVED_BUNDLE_MB = 82
 
+# i83 E1e: a node whose harness placement names a vendor CLI carries that
+# native binary too, 100-250 MB per artefact (Copilot's is an already
+# compressed tarball), so its bundle is up to ~330 MB. An ESTIMATE from the
+# pinned artefacts' sizes, not an observed bundle; the cap must clear it
+# twice as well.
+LARGEST_EXPECTED_VENDOR_BUNDLE_MB = 330
+
+# Postgres refuses a bytea (noo_provision_bundles.blob) over 1 GB.
+POSTGRES_FIELD_LIMIT_MB = 1024
+
 
 def _cap_bytes() -> int:
     text = BOOTSTRAP.read_text()
@@ -47,6 +57,15 @@ def test_the_cap_clears_the_largest_bundle_with_headroom() -> None:
         f"{LARGEST_OBSERVED_BUNDLE_MB} MB. A cap just above today's bundle is how "
         "this broke twice; leave room for the next thing that joins one."
     )
+
+
+def test_the_cap_clears_a_vendor_cli_bundle_and_fits_the_database() -> None:
+    cap_mb = _cap_bytes() // (1024 * 1024)
+    assert cap_mb >= LARGEST_EXPECTED_VENDOR_BUNDLE_MB * 2, (
+        f"the rail cap is {cap_mb} MB; a bundle carrying a vendor CLI is up to "
+        f"{LARGEST_EXPECTED_VENDOR_BUNDLE_MB} MB"
+    )
+    assert cap_mb < POSTGRES_FIELD_LIMIT_MB, "a staged bundle is one bytea; Postgres refuses one over 1 GB"
 
 
 def test_both_rail_upload_routes_use_the_named_cap() -> None:

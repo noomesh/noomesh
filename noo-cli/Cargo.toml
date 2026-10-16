@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
@@ -17,6 +17,8 @@ ureq = { version = "3", default-features = false, features = ["rustls", "json", 
 serde_json = "1"
 sha2 = "0.11.1"
 hex = "0.4"
+# Provision bundles are gzipped before CMS encryption (provision.rs gzip_bundle).
+flate2 = "1"
 base64 = "0.22"
 # Intelligent-tier entitlement tokens (entitlement.rs): sign + verify.
 ed25519-dalek = "3"

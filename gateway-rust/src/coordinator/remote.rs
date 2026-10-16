@@ -103,6 +103,31 @@ impl RemoteRuntime {
         self
     }
 
+    /// Report what a foreign loop's model calls used (i83 E1b): the wire
+    /// translator's totals, posted as the `usage` op. The gateway records
+    /// them as this token's user on this token's node; `kind` is the
+    /// harness kind (`copilot`, `claude-code`, ...). An error is the
+    /// caller's to log — the turn's answer does not depend on it.
+    pub async fn report_usage(
+        &self,
+        totals: &crate::harness::translator::UsageTotals,
+        model: &str,
+        kind: &str,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        self.call(HarnessOp::Usage {
+            prompt_tokens: totals.prompt_tokens,
+            completion_tokens: totals.completion_tokens,
+            total_tokens: totals.total_tokens,
+            calls: totals.calls,
+            model: model.to_string(),
+            kind: kind.to_string(),
+            task_id: task_id.map(str::to_string),
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// One rail call. Non-2xx and non-JSON answers are errors; the body's
     /// `error` field, when the gateway sent one, is the message.
     pub async fn call(&self, op: HarnessOp) -> Result<Value> {
@@ -195,6 +220,12 @@ impl HarnessRuntime for RemoteRuntime {
     }
 
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend> {
+        // Cloud models run on the controller, which holds the provider keys
+        // (dispatch keeps such turns in process). Should one reach a node
+        // harness anyway, refuse it rather than answer with the node's model.
+        if let Some(m) = model.filter(|m| super::backend::is_cloud_model(m)) {
+            anyhow::bail!("harness: '{m}' is a cloud model; cloud models run on the controller, not on a node harness");
+        }
         if let Some(pinned) = &self.pinned {
             if exclude_urls.contains(&pinned.url) {
                 anyhow::bail!("harness: the placed model endpoint {} failed and a harness has no other", pinned.url);
@@ -471,5 +502,8 @@ mod tests {
         .pin_backend(pinned.clone());
         assert_eq!(rt.resolve_backend_for_model(Some("anything")).await.unwrap(), pinned);
         assert!(rt.resolve_backend_excluding(None, std::slice::from_ref(&pinned.url)).await.is_err());
+        // A cloud model is never silently answered by the pinned node model.
+        let e = rt.resolve_backend_for_model(Some("claude-sonnet-4-5")).await.unwrap_err();
+        assert!(e.to_string().contains("run on the controller"), "{e}");
     }
 }

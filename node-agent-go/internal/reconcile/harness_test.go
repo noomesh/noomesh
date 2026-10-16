@@ -5,6 +5,10 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -147,8 +151,12 @@ func TestHarnessKindCompatibility(t *testing.T) {
 	if err := harnessKindCompatible("claude-code", "ollama"); err != nil {
 		t.Fatal(err)
 	}
-	if err := harnessKindCompatible("claude-code", "llamacpp"); err == nil {
-		t.Fatal("claude-code needs Anthropic's wire; llamacpp must be refused")
+	// The loopback translator lets claude-code use every chat backend.
+	if err := harnessKindCompatible("claude-code", "llamacpp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := harnessKindCompatible("claude-code", "tei"); err == nil {
+		t.Fatal("tei is not a chat backend; claude-code must be refused on it")
 	}
 	if err := harnessKindCompatible("copilot", "vllm"); err != nil {
 		t.Fatal(err)
@@ -161,17 +169,17 @@ func TestHarnessKindCompatibility(t *testing.T) {
 	refusals.Reset()
 	t.Cleanup(refusals.Reset)
 	f := &hostsvc.Fake{Cur: hostsvc.Stopped}
-	r := &Reconciler{harness: f}
+	r := &Reconciler{harness: f, runnerInstalled: func(string) bool { return true }, cliInstalled: func(string) bool { return false }}
 	chat := []placement{{Backend: "ollama", Model: "gemma", DesiredState: "running"}}
 	h := placement{Backend: "harness", Model: "auto", Role: "harness", DesiredState: "running", Env: map[string]string{"NOO_HARNESS_KIND": "claude-code"}}
 	r.convergeHarness(context.Background(), h, chat)
-	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "not shipped yet") {
-		t.Fatalf("a compatible foreign kind must be refused until its runner ships: calls=%v refusal=%q", f.Calls, harnessRefusal())
+	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "command is not installed on this node") {
+		t.Fatalf("a compatible foreign kind must be refused until its CLI is installed: calls=%v refusal=%q", f.Calls, harnessRefusal())
 	}
 	// An incompatible kind names the backends that would do.
 	h.Env["NOO_HARNESS_KIND"] = "claude-code"
-	r.convergeHarness(context.Background(), h, []placement{{Backend: "vllm", Model: "m", DesiredState: "running"}})
-	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "cannot use a vllm backend") {
+	r.convergeHarness(context.Background(), h, []placement{{Backend: "tei", Model: "m", DesiredState: "running"}})
+	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), "cannot use a tei backend") {
 		t.Fatalf("incompatible kind: calls=%v refusal=%q", f.Calls, harnessRefusal())
 	}
 	// The native kind starts.
@@ -373,5 +381,258 @@ func TestForeignHarnessKindsCarryTheirVendorSwitches(t *testing.T) {
 	again, _ := HarnessTelemetryEnv("claude-code")
 	if again["DISABLE_TELEMETRY"] != "1" {
 		t.Error("HarnessTelemetryEnv handed out the table itself")
+	}
+}
+
+// The node agent's embedded table is a COPY of config/harness-kinds.json
+// (go:embed cannot reach outside the module). Equal after JSON
+// normalisation, or a kind added to the shipped file is one the gateway
+// accepts and this agent calls unknown.
+func TestHarnessKindsTableMatchesTheShippedFile(t *testing.T) {
+	shipped, err := os.ReadFile(filepath.Join("..", "..", "..", "config", "harness-kinds.json"))
+	if err != nil {
+		t.Fatalf("config/harness-kinds.json: %v", err)
+	}
+	var a, b any
+	if err := json.Unmarshal(shipped, &a); err != nil {
+		t.Fatalf("config/harness-kinds.json: %v", err)
+	}
+	if err := json.Unmarshal(harnessKindsJSON, &b); err != nil {
+		t.Fatalf("embedded harness_kinds.json: %v", err)
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatal("node-agent-go/internal/reconcile/harness_kinds.json differs from config/harness-kinds.json: copy the shipped file over the embedded one")
+	}
+	if len(harnessKindTable) == 0 || harnessKindTable[0].Kind != "noo" || harnessKindTable[0].Runner == nil {
+		t.Fatalf("`noo` must be the first kind and have a runner: %+v", harnessKindTable)
+	}
+	if got := knownHarnessKinds(); got != "noo, claude-code, copilot, codex" {
+		t.Fatalf("known kinds = %q", got)
+	}
+}
+
+// Refusal by absence: a kind is refused because its runner does not ship
+// (runner null in the table), is not installed on this node, or because the
+// vendor CLI it launches is not on PATH, never because its name is not `noo`.
+func TestHarnessKindIsRefusedForAnAbsentRunnerOrCLI(t *testing.T) {
+	chat := []placement{{Backend: "ollama", Model: "gemma", DesiredState: "running"}}
+	h := func(kind string) placement {
+		return placement{Backend: "harness", Model: "auto", Role: "harness", DesiredState: "running", Env: map[string]string{"NOO_HARNESS_KIND": kind}}
+	}
+	present := func(string) bool { return true }
+	var asked []string
+	absent := func(r string) bool { asked = append(asked, r); return false }
+	var askedCLI []string
+	cliAbsent := func(c string) bool { askedCLI = append(askedCLI, c); return false }
+
+	if got := harnessKindRefusal(h("noo"), chat, present, cliAbsent); got != "" {
+		t.Fatalf("noo with its runner installed must not be refused (it needs no CLI): %q", got)
+	}
+	if len(askedCLI) != 0 {
+		t.Fatalf("noo has no vendor CLI to look for: %v", askedCLI)
+	}
+	got := harnessKindRefusal(h("noo"), chat, absent, present)
+	if got != `harness kind "noo": its runner "noo-gateway" is not installed on this node` {
+		t.Fatalf("noo without its runner: %q", got)
+	}
+	if len(asked) != 1 || asked[0] != "noo-gateway" {
+		t.Fatalf("the check must ask for the table's runner, asked %v", asked)
+	}
+	// Every runner is noo-gateway; a foreign kind with the runner but not
+	// its CLI is refused for the CLI, after the runner check.
+	asked, askedCLI = nil, nil
+	if got := harnessKindRefusal(h("copilot"), chat, present, cliAbsent); got != `harness kind "copilot": its runner is present but the "copilot" command is not installed on this node` {
+		t.Fatalf("copilot without its CLI: %q", got)
+	}
+	if len(askedCLI) != 1 || askedCLI[0] != "copilot" {
+		t.Fatalf("asked for CLI %v", askedCLI)
+	}
+	// The runner is checked FIRST: no runner means the CLI is not asked for.
+	askedCLI = nil
+	if got := harnessKindRefusal(h("copilot"), chat, absent, cliAbsent); got != `harness kind "copilot": its runner "noo-gateway" is not installed on this node` {
+		t.Fatalf("copilot without runner: %q", got)
+	}
+	if len(askedCLI) != 0 {
+		t.Fatalf("CLI looked for before the runner: %v", askedCLI)
+	}
+	if got := harnessKindRefusal(h("copilot"), chat, present, present); got != "" {
+		t.Fatalf("copilot with runner and CLI: %q", got)
+	}
+	// A kind whose runner does not ship (none in the table now) is refused
+	// before anything looks at the disk. Synthetic kind for the code path.
+	saved := harnessKindTable
+	harnessKindTable = append(append([]harnessKind(nil), saved...), harnessKind{Kind: "synthetic", Wires: []string{"ollama"}, TelemetryOff: map[string]string{}})
+	harnessKinds["synthetic"] = []string{"ollama"}
+	restore := func() { harnessKindTable = saved; delete(harnessKinds, "synthetic") }
+	t.Cleanup(restore)
+	asked, askedCLI = nil, nil
+	if got := harnessKindRefusal(h("synthetic"), chat, absent, cliAbsent); got != `harness kind "synthetic": its runner is not shipped yet` {
+		t.Fatalf("synthetic: %q", got)
+	}
+	if len(asked) != 0 || len(askedCLI) != 0 {
+		t.Fatalf("a kind with no runner must not be looked for on disk: %v %v", asked, askedCLI)
+	}
+	restore()
+	// codex's wire is served by no node backend: the refusal says so from
+	// the table rather than listing nothing.
+	got = harnessKindRefusal(h("codex"), chat, present, present)
+	if !strings.Contains(got, `no chat backend on this node can serve harness kind "codex" (it needs OpenAI's Responses API)`) ||
+		!strings.Contains(got, "its wire is not served by any backend yet") {
+		t.Fatalf("codex: %q", got)
+	}
+	// With no chat backend to check against, codex is refused for its CLI.
+	if got := harnessKindRefusal(h("codex"), nil, present, cliAbsent); got != `harness kind "codex": its runner is present but the "codex" command is not installed on this node` {
+		t.Fatalf("codex without a chat backend: %q", got)
+	}
+	// An unknown kind lists the table's kinds.
+	if got := harnessKindRefusal(h("hermes"), nil, present, present); got != `unknown harness kind "hermes" (known: noo, claude-code, copilot, codex)` {
+		t.Fatalf("unknown kind: %q", got)
+	}
+	// Telemetry: codex has an entry, empty until its switches are declared.
+	if env, ok := HarnessTelemetryEnv("codex"); !ok || len(env) != 0 {
+		t.Fatalf("codex telemetry entry: %v %v", env, ok)
+	}
+}
+
+// Every kind declares a lane (an object, maybe empty); the returned map is
+// a copy; and a unit that merges lane env must do so AFTER placement env, as
+// for telemetry_off. The merge order is pinned here on the helper the
+// launcher uses: a placement value for a lane key is overwritten.
+func TestHarnessLaneEnvIsDeclaredCopiedAndWinsOverPlacement(t *testing.T) {
+	for _, k := range harnessKindTable {
+		if k.Lane == nil {
+			t.Errorf("kind %q has no lane object", k.Kind)
+		}
+		if _, ok := HarnessLaneEnv(k.Kind); !ok {
+			t.Errorf("HarnessLaneEnv(%q) not ok", k.Kind)
+		}
+	}
+	if _, ok := HarnessLaneEnv("no-such-kind"); ok {
+		t.Error("an unknown kind must not read as 'no lane'")
+	}
+	// Foreign kinds: the lane is merged after the placement env.
+	for _, k := range harnessKindTable {
+		if k.Kind == "noo" {
+			continue
+		}
+		lane, _ := HarnessLaneEnv(k.Kind)
+		tel, _ := HarnessTelemetryEnv(k.Kind)
+		env := map[string]string{"NOO_HARNESS_KIND": k.Kind}
+		for key := range lane {
+			env[key] = "placement-says-otherwise"
+		}
+		for key := range tel {
+			env[key] = "placement-says-otherwise"
+		}
+		for key, v := range lane {
+			env[key] = v
+		}
+		for key, v := range tel {
+			env[key] = v
+		}
+		for key, v := range lane {
+			if env[key] != v {
+				t.Errorf("%s: lane %s = %q, want %q", k.Kind, key, env[key], v)
+			}
+		}
+	}
+	// Copy, not the table itself.
+	synth := map[string]string{"X": "1"}
+	harnessLane["synthetic-lane"] = synth
+	t.Cleanup(func() { delete(harnessLane, "synthetic-lane") })
+	got, _ := HarnessLaneEnv("synthetic-lane")
+	got["X"] = "2"
+	if synth["X"] != "1" {
+		t.Error("HarnessLaneEnv handed out the table itself")
+	}
+}
+
+// Through the reconciler: a missing runner is a refusal and nothing starts.
+func TestAMissingRunnerIsARefusalNotAStart(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &hostsvc.Fake{Cur: hostsvc.Stopped}
+	r := &Reconciler{harness: f, runnerInstalled: func(string) bool { return false }}
+	r.convergeHarness(context.Background(), placement{Backend: "harness", DesiredState: "running"}, nil)
+	if len(f.Calls) != 0 || !strings.Contains(harnessRefusal(), `its runner "noo-gateway" is not installed on this node`) {
+		t.Fatalf("calls=%v refusal=%q", f.Calls, harnessRefusal())
+	}
+	r.runnerInstalled = func(string) bool { return true }
+	r.convergeHarness(context.Background(), placement{Backend: "harness", DesiredState: "running"}, nil)
+	if f.Cur != hostsvc.Running || harnessRefusal() != "" {
+		t.Fatalf("installed runner must start and clear the refusal: state=%s refusal=%q", f.Cur, harnessRefusal())
+	}
+}
+
+func TestHarnessKindDecisionIsRestartOnlyOnAChange(t *testing.T) {
+	for _, c := range []struct{ started, desired, want string }{
+		{"noo", "noo", "keep"},
+		{"noo", "copilot", "restart"},
+		{"copilot", "noo", "restart"},
+		{"claude-code", "claude-code", "keep"},
+		{"", "copilot", "keep"}, // unknown started kind: adopt, never bounce
+	} {
+		if got := harnessKindDecision(c.started, c.desired); got != c.want {
+			t.Errorf("(%q,%q) = %s, want %s", c.started, c.desired, got, c.want)
+		}
+	}
+}
+
+// A running harness whose placement kind changes is restarted once, through
+// the service's restart, and the new kind is recorded.
+func TestAKindChangeRestartsTheRunningHarness(t *testing.T) {
+	refusals.Reset()
+	t.Cleanup(refusals.Reset)
+	f := &hostsvc.Fake{Cur: hostsvc.Stopped}
+	r := &Reconciler{harness: f, runnerInstalled: func(string) bool { return true }, cliInstalled: func(string) bool { return true }}
+	chat := []placement{{Backend: "ollama", Model: "gemma", DesiredState: "running"}}
+	h := func(kind string) placement {
+		return placement{Backend: "harness", Model: "auto", Role: "harness", DesiredState: "running", Env: map[string]string{"NOO_HARNESS_KIND": kind}}
+	}
+	ctx := context.Background()
+	r.convergeHarness(ctx, h("noo"), chat)
+	if f.Cur != hostsvc.Running || r.harnessStartedKind != "noo" {
+		t.Fatalf("start: state=%s started=%q", f.Cur, r.harnessStartedKind)
+	}
+	r.convergeHarness(ctx, h("noo"), chat)
+	if len(f.Calls) != 1 {
+		t.Fatalf("same kind must not restart: %v", f.Calls)
+	}
+	r.convergeHarness(ctx, h("copilot"), chat)
+	if len(f.Calls) != 2 || f.Calls[1] != "restart" || r.harnessStartedKind != "copilot" {
+		t.Fatalf("kind change: calls=%v started=%q", f.Calls, r.harnessStartedKind)
+	}
+	r.convergeHarness(ctx, h("copilot"), chat)
+	if len(f.Calls) != 2 {
+		t.Fatalf("restarted again for nothing: %v", f.Calls)
+	}
+}
+
+func TestHarnessPlacementViewHidesSecretsAndReportsUnplaced(t *testing.T) {
+	r := &Reconciler{}
+	if _, _, _, placed := r.HarnessPlacementView(); placed {
+		t.Fatal("no placement recorded must read as unplaced")
+	}
+	r.recordHarnessPlacement([]placement{
+		{Backend: "ollama", DesiredState: "running"},
+		{Backend: "harness", DesiredState: "running", Env: map[string]string{
+			"NOO_HARNESS_KIND": "copilot", "NOO_HARNESS_MAX_TURNS": "4",
+			"SOME_API_KEY": "x", "NOO_CLUSTER_SECRET": "x", "BEARER_TOKEN": "x",
+		}},
+	})
+	kind, env, ds, placed := r.HarnessPlacementView()
+	if !placed || kind != "copilot" || ds != "running" {
+		t.Fatalf("view: %q %q %v", kind, ds, placed)
+	}
+	if len(env) != 2 || env["NOO_HARNESS_KIND"] != "copilot" || env["NOO_HARNESS_MAX_TURNS"] != "4" {
+		t.Fatalf("env must keep only non-secret keys: %v", env)
+	}
+	r.recordHarnessPlacement([]placement{{Backend: "ollama", DesiredState: "running"}})
+	if _, _, _, placed := r.HarnessPlacementView(); placed {
+		t.Fatal("a removed placement must read as unplaced")
+	}
+	r.recordHarnessPlacement([]placement{{Backend: "harness", DesiredState: "running"}})
+	if kind, _, _, _ := r.HarnessPlacementView(); kind != "noo" {
+		t.Fatalf("no kind in env must read as noo, got %q", kind)
 	}
 }

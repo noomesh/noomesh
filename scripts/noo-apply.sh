@@ -73,7 +73,7 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
 
-KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key"
+KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-runtime vendor-runtime-manifest"
 
 # ── 0. The tar's SHAPE, before a single byte is extracted ────
 # This applier runs as root and writes into the extraction directory. A
@@ -449,7 +449,7 @@ unit_payload_ok() {
 # a directive or key hidden behind either would reach pid 1 unchecked. Every
 # text kind is held to this, including the merges (nats-creds,
 # fleet-secrets), whose lines land in an EnvironmentFile.
-TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends"
+TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-runtime-manifest"
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
@@ -467,9 +467,310 @@ hostd_generation_of() {
 }
 # END env_unit_shape
 
+# BEGIN binary_unchanged
+# binary_unchanged PAYLOAD INSTALLED — true only when INSTALLED exists, is
+# readable, and has the same sha256 as PAYLOAD. A missing file (first
+# install), an unreadable one, or a sha that cannot be computed all return
+# false, so the caller INSTALLS: the skip path needs positive proof of
+# identity, never the absence of a difference. A restage that carries the
+# bytes the node already runs then neither rewrites the file nor restarts the
+# service for it, and the applied: summary says `<kind>=unchanged` (a
+# different token from `<kind>`, which the controller reads as "installed").
+binary_unchanged() {
+    [ -f "$2" ] || return 1
+    _bu_new="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+    _bu_cur="$(sha256sum "$2" 2>/dev/null | awk '{print $1}')"
+    [ -n "$_bu_new" ] && [ "$_bu_new" = "$_bu_cur" ]
+}
+
+# note_binary_sha KIND PAYLOAD — remember the sha256 of a binary this apply
+# left running (installed or proven unchanged). Printed once at the very end
+# as `binary-sha: kind=<sha256> …`: the node's own statement of what it runs,
+# which is what lets the controller leave an identical binary out of the next
+# bundle. Only kinds that reached a successful end are recorded; an applier
+# that predates this prints none, and the controller then carries everything.
+note_binary_sha() {
+    _nb="$(sha256sum "$2" 2>/dev/null | awk '{print $1}')"
+    [ -z "$_nb" ] || binary_shas="$binary_shas $1=$_nb"
+}
+# END binary_unchanged
+
+# BEGIN config_unchanged
+# config_unchanged PAYLOAD INSTALLED MODE OWNER:GROUP — the non-binary twin of
+# binary_unchanged: true only when INSTALLED exists, is readable, has the same
+# bytes as PAYLOAD, AND already carries the mode and owner:group the install
+# would give it. A missing file (first install), an unreadable one, a stat
+# that fails, or ANY difference in bytes, mode or owner returns false, so the
+# caller INSTALLS exactly as before: the skip path needs positive proof of
+# identity. A skipped kind sets no restart/reload flag and reports
+# `<kind>=unchanged`, a token the controller's whole-token applier_applied
+# lookup does not read as "installed".
+config_unchanged() {
+    [ -f "$2" ] || return 1
+    cmp -s "$1" "$2" 2>/dev/null || return 1
+    _cu_have="$(stat -c '%a %U:%G' "$2" 2>/dev/null)" || return 1
+    [ "$_cu_have" = "$3 $4" ]
+}
+# END config_unchanged
+# BEGIN vendor_install
+# The vendor CLI a harness kind runs, and the runtime it runs on (i83 E1e).
+# The controller fetched each one, verified it against the sha256 pinned in
+# config/harness-kinds.json (`noo cluster vendor stage`), and the bundle
+# carries it as `vendor-cli` / `vendor-runtime`, each with a manifest
+# (`vendor-cli-manifest` / `vendor-runtime-manifest`, JSON with one key per
+# line, every value a plain string or null — read here with sed). This node
+# never fetches it. Installed under $VENDOR_ROOT/<name>/<version>/ (a runtime
+# archive's single top-level directory is flattened, so its bin_dir is
+# relative to that root), and the CLI gets a root-owned 0755 wrapper at
+# $VENDOR_BIN/<name>, which is on the PATH of both the agent (its
+# cliOnPath check) and the noo-harness unit (systemd's default PATH). The
+# wrapper text is the same as noo-cli's cluster_vendor::wrapper_script
+# (tests/test_vendor_apply_block.py holds them equal).
+VENDOR_ROOT=/opt/noo/vendor
+VENDOR_BIN=/usr/local/bin
+VENDOR_OWN=1   # chown root:root; the block's test runs unprivileged with 0
+VENDOR_MARK="# noomesh vendor wrapper:"
+
+# vendor_get MANIFEST KEY — "KEY": "value" on its own line → value; empty for
+# null or absent.
+vendor_get() {
+    sed -n "s/^  \"$2\": \"\\([^\"\\\\]*\\)\",\\{0,1\\}\$/\\1/p" "$1" | head -1
+}
+_vendor_re() { [ -n "$1" ] && printf '%s\n' "$1" | LC_ALL=C grep -qxE "$2"; }
+_vendor_path_ok() {
+    _vendor_re "$1" '[A-Za-z0-9._/@+-]{1,200}' || return 1
+    case "/$1/" in */../*|*/./*|*//*) return 1 ;; esac
+    return 0
+}
+_vendor_refuse() {
+    echo "noo-apply: REFUSED $1 — $2" >&2
+    logger -t noo-apply "REFUSED $1: $2" 2>/dev/null || true
+    return 65
+}
+# vendor_manifest_ok MANIFEST KIND — the manifest's every value is one this
+# block may interpolate into a path or a script; KIND is vendor-cli or
+# vendor-runtime. 0, or 65 with the reason.
+vendor_manifest_ok() {
+    _vm_n="$(vendor_get "$1" name)"; _vm_v="$(vendor_get "$1" version)"
+    _vm_s="$(vendor_get "$1" sha256)"; _vm_u="$(vendor_get "$1" unpack)"
+    _vendor_re "$_vm_n" '[a-z][a-z0-9-]{0,63}' || { _vendor_refuse "$2" "name '$_vm_n' is not a plain name"; return 65; }
+    case "$_vm_n" in noo*) _vendor_refuse "$2" "name '$_vm_n' would shadow a noomesh binary"; return 65 ;; esac
+    _vendor_re "$_vm_v" '[A-Za-z0-9][A-Za-z0-9._+-]{0,63}' || { _vendor_refuse "$2" "version '$_vm_v' is not a plain version"; return 65; }
+    _vendor_re "$_vm_s" '[0-9a-f]{64}' || { _vendor_refuse "$2" "sha256 is not 64 lowercase hex"; return 65; }
+    case "$_vm_u" in tgz|tar.xz|zip|none) : ;; *) _vendor_refuse "$2" "unpack '$_vm_u' is not tgz, tar.xz, zip or none"; return 65 ;; esac
+    if [ "$2" = vendor-runtime ]; then
+        [ "$(vendor_get "$1" kind)" = runtime ] || { _vendor_refuse "$2" "the manifest is not a runtime's"; return 65; }
+        _vendor_path_ok "$(vendor_get "$1" bin_dir)" || { _vendor_refuse "$2" "bin_dir is not a plain relative path"; return 65; }
+        [ "$_vm_u" != none ] || { _vendor_refuse "$2" "a runtime is an archive"; return 65; }
+    else
+        [ "$_vm_n" != node ] || { _vendor_refuse "$2" "a CLI may not be named node"; return 65; }
+        _vendor_path_ok "$(vendor_get "$1" entry)" || { _vendor_refuse "$2" "entry is not a plain relative path"; return 65; }
+        _vm_r="$(vendor_get "$1" runtime)"; _vm_rv="$(vendor_get "$1" runtime_version)"
+        if [ -n "$_vm_r$_vm_rv" ]; then
+            _vendor_re "$_vm_r" '[a-z][a-z0-9-]{0,63}' && _vendor_re "$_vm_rv" '[A-Za-z0-9][A-Za-z0-9._+-]{0,63}' \
+                || { _vendor_refuse "$2" "runtime '$_vm_r' '$_vm_rv' is not a plain name and version"; return 65; }
+        fi
+    fi
+    return 0
+}
+# _vendor_members_ok LISTING — no member is absolute or climbs out with ..
+_vendor_members_ok() {
+    ! printf '%s\n' "$1" | LC_ALL=C grep -qE '^/|(^|/)\.\.(/|$)'
+}
+# vendor_unpack PAYLOAD UNPACK DEST ENTRY — DEST exists and is empty.
+vendor_unpack() {
+    case "$2" in
+        tgz|tar.xz)
+            if [ "$2" = tgz ]; then _vu_z=z; else _vu_z=J; fi
+            _vu_l="$(LC_ALL=C tar -t${_vu_z}f "$1" 2>/dev/null)" || { echo "noo-apply: vendor: $2 artefact is not a readable archive" >&2; return 65; }
+            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; return 65; }
+            LC_ALL=C tar -tv${_vu_z}f "$1" 2>/dev/null | LC_ALL=C grep -qE ' -> /' \
+                && { echo "noo-apply: vendor: the archive carries an absolute symlink" >&2; return 65; }
+            tar --no-same-owner -x${_vu_z}f "$1" -C "$3" ;;
+        zip)
+            command -v unzip >/dev/null 2>&1 || { echo "noo-apply: vendor: a zip artefact needs unzip on this node" >&2; return 69; }
+            _vu_l="$(unzip -Z1 "$1" 2>/dev/null)" || { echo "noo-apply: vendor: zip artefact is not readable" >&2; return 65; }
+            _vendor_members_ok "$_vu_l" || { echo "noo-apply: vendor: the archive names a path outside its own directory" >&2; return 65; }
+            unzip -q -o "$1" -d "$3" ;;
+        none)
+            install -m 755 "$1" "$3/$4" ;;
+    esac
+}
+# _vendor_flatten DIR — a runtime archive's one top-level directory becomes DIR.
+_vendor_flatten() {
+    _vf_c="$(ls -A "$1")"
+    [ -n "$_vf_c" ] && [ "$(printf '%s\n' "$_vf_c" | wc -l)" = 1 ] && [ -d "$1/$_vf_c" ] || return 0
+    mv "$1/$_vf_c" "$1.flat" && rmdir "$1" && mv "$1.flat" "$1"
+}
+# vendor_install PAYLOAD MANIFEST KIND — verify PAYLOAD against the manifest's
+# sha256 again (the bundle's own manifest already did; defence in depth),
+# unpack it to $VENDOR_ROOT/<name>/<version>/ through a staging directory
+# and an atomic rename. Sets _vi_outcome to installed or unchanged (that
+# version, from those exact bytes, is already there).
+vendor_install() {
+    _vi_n="$(vendor_get "$2" name)"; _vi_v="$(vendor_get "$2" version)"
+    _vi_s="$(vendor_get "$2" sha256)"; _vi_u="$(vendor_get "$2" unpack)"
+    _vi_got="$(sha256sum "$1" | awk '{print $1}')"
+    [ "$_vi_got" = "$_vi_s" ] || { _vendor_refuse "$3" "payload sha256 $_vi_got is not the manifest's $_vi_s"; return 65; }
+    _vi_dest="$VENDOR_ROOT/$_vi_n/$_vi_v"
+    if [ -f "$_vi_dest/.noo-sha256" ] && [ "$(cat "$_vi_dest/.noo-sha256")" = "$_vi_s" ]; then
+        _vi_outcome=unchanged; return 0
+    fi
+    mkdir -p "$VENDOR_ROOT/$_vi_n" && chmod 755 "$VENDOR_ROOT" "$VENDOR_ROOT/$_vi_n"
+    _vi_stage="$VENDOR_ROOT/$_vi_n/.$_vi_v.next"
+    rm -rf "$_vi_stage"; mkdir -m 755 "$_vi_stage"
+    if [ "$3" = vendor-runtime ]; then _vi_e=""; else _vi_e="$(vendor_get "$2" entry)"; fi
+    vendor_unpack "$1" "$_vi_u" "$_vi_stage" "$_vi_e" || { _vi_rc=$?; rm -rf "$_vi_stage"; return $_vi_rc; }
+    if [ "$3" = vendor-runtime ]; then
+        _vendor_flatten "$_vi_stage"
+        _vi_b="$(vendor_get "$2" bin_dir)"
+        [ -f "$_vi_stage/$_vi_b/$_vi_n" ] || { rm -rf "$_vi_stage"; _vendor_refuse "$3" "$_vi_b/$_vi_n is not in the runtime archive"; return 65; }
+        printf '%s\n' "$_vi_b" > "$_vi_stage/.noo-bin-dir"
+    else
+        [ -f "$_vi_stage/$_vi_e" ] || { rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not in the artefact"; return 65; }
+        # A CLI that runs on no runtime is a native executable: ELF-checked
+        # like the agent and harness binaries. (The vendors' Linux builds of
+        # Claude Code and Copilot CLI are glibc-dynamic, unlike the static
+        # noomesh node binaries; a node below their glibc floor fails at
+        # exec, which the harness reports as the CLI's own error.)
+        if [ -z "$(vendor_get "$2" runtime)" ]; then
+            case "$(head -c 4 "$_vi_stage/$_vi_e" | od -An -tx1 | tr -d ' \n')" in
+                7f454c46) : ;;
+                *) rm -rf "$_vi_stage"; _vendor_refuse "$3" "entry $_vi_e is not an ELF executable"; return 65 ;;
+            esac
+        fi
+        chmod 755 "$_vi_stage/$_vi_e"
+    fi
+    [ "$VENDOR_OWN" = 1 ] && chown -R root:root "$_vi_stage"
+    chmod -R go-w "$_vi_stage"
+    printf '%s\n' "$_vi_s" > "$_vi_stage/.noo-sha256"
+    rm -rf "$_vi_dest"
+    mv "$_vi_stage" "$_vi_dest"
+    _vi_outcome=installed
+}
+# vendor_wrapper NAME VERSION ENTRY [RT_NAME RT_VERSION RT_BIN_DIR] — the
+# wrapper's text on stdout.
+vendor_wrapper() {
+    _vw_t="$VENDOR_ROOT/$1/$2/$3"
+    echo '#!/bin/sh'
+    if [ -n "${4:-}" ]; then
+        _vw_rb="$VENDOR_ROOT/$4/$5/$6"
+        echo "$VENDOR_MARK $1 $2 on $4 $5, staged by the controller; do not edit"
+        echo "PATH=\"$_vw_rb:\$PATH\""
+        echo "export PATH"
+        case "$3" in
+            *.js|*.mjs|*.cjs) echo "exec \"$_vw_rb/$4\" \"$_vw_t\" \"\$@\"" ;;
+            *) echo "exec \"$_vw_t\" \"\$@\"" ;;
+        esac
+    else
+        echo "$VENDOR_MARK $1 $2, staged by the controller; do not edit"
+        echo "exec \"$_vw_t\" \"\$@\""
+    fi
+}
+# vendor_write_wrapper NAME TEXTFILE — atomic replace at $VENDOR_BIN/NAME;
+# _vw_outcome = written or unchanged.
+vendor_write_wrapper() {
+    if [ -f "$VENDOR_BIN/$1" ] && cmp -s "$2" "$VENDOR_BIN/$1"; then _vw_outcome=unchanged; return 0; fi
+    if [ -e "$VENDOR_BIN/$1" ] && ! head -2 "$VENDOR_BIN/$1" 2>/dev/null | grep -qF "$VENDOR_MARK"; then
+        echo "noo-apply: vendor: replacing $VENDOR_BIN/$1, which this applier did not write (a manual install)" >&2
+    fi
+    if [ "$VENDOR_OWN" = 1 ]; then
+        install -m 755 -o root -g root "$2" "$VENDOR_BIN/.$1.next"
+    else
+        install -m 755 "$2" "$VENDOR_BIN/.$1.next"
+    fi
+    mv -f "$VENDOR_BIN/.$1.next" "$VENDOR_BIN/$1"
+    _vw_outcome=written
+}
+# vendor_prune NAME KEEP — remove NAME's other versions. A runtime's other
+# versions are kept while any wrapper this applier wrote still names them.
+vendor_prune() {
+    for _vp_d in "$VENDOR_ROOT/$1"/*; do
+        [ -d "$_vp_d" ] || continue
+        _vp_v="$(basename "$_vp_d")"
+        [ "$_vp_v" = "$2" ] && continue
+        _vp_used=0
+        for _vp_w in "$VENDOR_BIN"/*; do
+            [ -f "$_vp_w" ] && [ "$(head -c 9 "$_vp_w" 2>/dev/null)" = '#!/bin/sh' ] || continue
+            head -2 "$_vp_w" | grep -qF "$VENDOR_MARK" || continue
+            grep -qF "$VENDOR_ROOT/$1/$_vp_v/" "$_vp_w" && { _vp_used=1; break; }
+        done
+        [ "$_vp_used" = 1 ] || rm -rf "$_vp_d"
+    done
+}
+# vendor_apply DIR — the whole step over a bundle's files/ directory: the
+# runtime first, then the CLI and its wrapper, then pruning. Appends to
+# $applied and records binary shas like the binary kinds above; prints one
+# `vendor-cli: …` line for the report.
+vendor_apply() {
+    _va_rt=""; _va_rtv=""; _va_rtb=""
+    if [ -f "$1/vendor-runtime" ]; then
+        vendor_install "$1/vendor-runtime" "$1/vendor-runtime-manifest" vendor-runtime || return $?
+        _va_rt="$(vendor_get "$1/vendor-runtime-manifest" name)"; _va_rtv="$(vendor_get "$1/vendor-runtime-manifest" version)"
+        _va_rtb="$(vendor_get "$1/vendor-runtime-manifest" bin_dir)"
+        if [ "$_vi_outcome" = unchanged ]; then applied="$applied vendor-runtime=unchanged"; else applied="$applied vendor-runtime"; fi
+        note_binary_sha vendor-runtime "$1/vendor-runtime"
+        echo "vendor-runtime: $_va_rt $_va_rtv $_vi_outcome ($VENDOR_ROOT/$_va_rt/$_va_rtv)"
+    fi
+    [ -f "$1/vendor-cli" ] || return 0
+    _va_m="$1/vendor-cli-manifest"
+    _va_n="$(vendor_get "$_va_m" name)"; _va_v="$(vendor_get "$_va_m" version)"; _va_e="$(vendor_get "$_va_m" entry)"
+    _va_r="$(vendor_get "$_va_m" runtime)"; _va_rv="$(vendor_get "$_va_m" runtime_version)"
+    if [ -n "$_va_r" ]; then
+        if [ "$_va_r/$_va_rv" != "$_va_rt/$_va_rtv" ]; then
+            # Not in this bundle: it must already be here, from an earlier one.
+            [ -f "$VENDOR_ROOT/$_va_r/$_va_rv/.noo-bin-dir" ] \
+                || { _vendor_refuse vendor-cli "$_va_n runs on $_va_r $_va_rv, which neither this bundle nor this node carries"; return 65; }
+            _va_rtb="$(cat "$VENDOR_ROOT/$_va_r/$_va_rv/.noo-bin-dir")"
+            _vendor_path_ok "$_va_rtb" || { _vendor_refuse vendor-cli "the installed $_va_r $_va_rv has no usable bin_dir"; return 65; }
+        fi
+    fi
+    vendor_install "$1/vendor-cli" "$_va_m" vendor-cli || return $?
+    _va_cli="$_vi_outcome"
+    _va_w="$(mktemp)"
+    if [ -n "$_va_r" ]; then
+        vendor_wrapper "$_va_n" "$_va_v" "$_va_e" "$_va_r" "$_va_rv" "$_va_rtb" > "$_va_w"
+    else
+        vendor_wrapper "$_va_n" "$_va_v" "$_va_e" > "$_va_w"
+    fi
+    vendor_write_wrapper "$_va_n" "$_va_w"; rm -f "$_va_w"
+    vendor_prune "$_va_n" "$_va_v"
+    [ -z "$_va_r" ] || vendor_prune "$_va_r" "$_va_rv"
+    if [ "$_va_cli" = unchanged ] && [ "$_vw_outcome" = unchanged ]; then
+        applied="$applied vendor-cli=unchanged"
+        echo "vendor-cli: $_va_n $_va_v unchanged — already installed, nothing to do"
+    else
+        applied="$applied vendor-cli"
+        echo "vendor-cli: $_va_n $_va_v installed ($VENDOR_ROOT/$_va_n/$_va_v, wrapper $VENDOR_BIN/$_va_n)"
+    fi
+    note_binary_sha vendor-cli "$1/vendor-cli"
+    return 0
+}
+# vendor_check DIR — before anything installs: each vendor payload rides with
+# its manifest, the manifest is well-formed, and the payload hashes to it.
+vendor_check() {
+    for _vc_k in vendor-cli vendor-runtime; do
+        [ -f "$1/$_vc_k" ] || [ -f "$1/$_vc_k-manifest" ] || continue
+        [ -f "$1/$_vc_k" ] && [ -f "$1/$_vc_k-manifest" ] \
+            || { _vendor_refuse "$_vc_k" "the payload and its manifest must ride together"; return 65; }
+        vendor_manifest_ok "$1/$_vc_k-manifest" "$_vc_k" || return 65
+        _vc_s="$(vendor_get "$1/$_vc_k-manifest" sha256)"
+        [ "$(sha256sum "$1/$_vc_k" | awk '{print $1}')" = "$_vc_s" ] \
+            || { _vendor_refuse "$_vc_k" "the payload does not hash to its manifest's sha256"; return 65; }
+    done
+    if [ -f "$1/vendor-runtime" ] && [ -f "$1/vendor-cli-manifest" ]; then
+        [ "$(vendor_get "$1/vendor-cli-manifest" runtime)" = "$(vendor_get "$1/vendor-runtime-manifest" name)" ] \
+            || { _vendor_refuse vendor-runtime "the CLI's manifest names a different runtime"; return 65; }
+    fi
+    return 0
+}
+# END vendor_install
+
 for _k in $TEXT_KINDS; do
     [ -f "$WORK/files/$_k" ] && { text_payload_ok "$WORK/files/$_k" "$_k" || exit 65; }
 done
+# The vendor CLI and runtime (vendor_install above), judged before anything installs.
+vendor_check "$WORK/files" || exit 65
 case "$(ls "$WORK"/files/svc-*.crt "$WORK"/files/svc-*.key 2>/dev/null | head -1)" in
     "") : ;;
     *) for _f in "$WORK"/files/svc-*; do text_payload_ok "$_f" "$(basename "$_f")" || exit 65; done ;;
@@ -561,6 +862,7 @@ fi
 install -d -m 750 -o root -g noo-agent "$PKI/nodes/$NODE_ID"
 
 applied=""
+binary_shas=""
 need_restart=0
 need_daemon_reload=0
 need_harness_restart=0
@@ -569,14 +871,28 @@ fresh_unit=0
 # certs — root:noo-agent, group-readable
 # ca.crt is a PUBLIC certificate: 644 so an unprivileged `noo upgrade` can
 # pin the controller mirror to it (2026-09-03); the keys stay 640.
-[ -f "$WORK/files/ca.crt" ]   && { install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1; }
+if [ -f "$WORK/files/ca.crt" ]; then
+    if config_unchanged "$WORK/files/ca.crt" "$PKI/ca.crt" 644 root:noo-agent; then
+        applied="$applied ca.crt=unchanged"
+    else
+        install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1
+    fi
+fi
 # signing-pub — the fleet code-signing PUBLIC key (§3f R26). A public key:
 # 644, same as ca.crt. Installing it is what moves this node off the
 # CA-signed compatibility lane, so it is applied on the same pass that
 # verified it, and no agent restart is needed — only noo-apply reads it.
 [ -f "$WORK/files/signing-pub" ] && { install -m 644 -o root -g noo-agent "$WORK/files/signing-pub" "$PKI/signing.pub"; applied="$applied signing-pub"; }
-[ -f "$WORK/files/node.crt" ] && { install -m 640 -o root -g noo-agent "$WORK/files/node.crt" "$PKI/nodes/$NODE_ID/node.crt"; applied="$applied node.crt"; need_restart=1; }
-[ -f "$WORK/files/node.key" ] && { install -m 640 -o root -g noo-agent "$WORK/files/node.key" "$PKI/nodes/$NODE_ID/node.key"; applied="$applied node.key"; need_restart=1; }
+# node.crt / node.key: an identical file (bytes, 640, root:noo-agent) is left
+# alone and does not bounce the agent.
+for _nk in node.crt node.key; do
+    [ -f "$WORK/files/$_nk" ] || continue
+    if config_unchanged "$WORK/files/$_nk" "$PKI/nodes/$NODE_ID/$_nk" 640 root:noo-agent; then
+        applied="$applied $_nk=unchanged"
+    else
+        install -m 640 -o root -g noo-agent "$WORK/files/$_nk" "$PKI/nodes/$NODE_ID/$_nk"; applied="$applied $_nk"; need_restart=1
+    fi
+done
 
 # svc-<x>.crt / svc-<x>.key — this node's backend door leaves (an earlier change
 # A). Every backend the agent starts serves through a door that requires a
@@ -602,6 +918,18 @@ for _svc in vllm llamacpp ollama tei reranker; do
     _c="$WORK/files/svc-$_svc.crt"; _k="$WORK/files/svc-$_svc.key"
     [ -f "$_c" ] || [ -f "$_k" ] || continue
     [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; exit 65; }
+    # Identical to what is installed (bytes, key 600 / cert 644, root:root):
+    # nothing to install, so no .next file is written and no rename happens.
+    # The CA/key verification below is for what we are ABOUT TO INSTALL; an
+    # unchanged file was verified when it was installed and is already
+    # trusted, so it is not re-judged here. Any difference (or a missing or
+    # unreadable file) falls through to verify + install as before.
+    _d="$PKI/services/$_svc"
+    if config_unchanged "$_k" "$_d/service.key" 600 root:root \
+        && config_unchanged "$_c" "$_d/service.crt" 644 root:root; then
+        applied="$applied svc-$_svc=unchanged"
+        continue
+    fi
     openssl verify -CAfile "$PKI/ca.crt" "$_c" >/dev/null 2>&1 \
         || { echo "noo-apply: svc-$_svc.crt does not verify against $PKI/ca.crt — refusing" >&2; exit 65; }
     # Compared as text, and each side must be non-empty: two failed
@@ -947,6 +1275,69 @@ agent_secret_files() {
 }
 # END agent_secret_files
 
+# BEGIN asf_unchanged
+# asf_owner — the user that owns the agent's secret files: the unit's User=
+# (the unit this bundle carries when it carries one, else the installed one),
+# falling back to root on a host with no such user (provision --local).
+asf_owner() {
+    _ao="$(sed -n 's/^User=//p' "${WORK:-/nonexistent}/files/agent-unit" /etc/systemd/system/noo-node-agent.service 2>/dev/null | head -1)"
+    { [ -n "$_ao" ] && id -u "$_ao" >/dev/null 2>&1; } || _ao=root
+    printf '%s\n' "$_ao"
+}
+
+# asf_unchanged CANDIDATE ENV DIR BIN OWNER [KEYS] [MARKER] — would installing
+# CANDIDATE as ENV and then running agent_secret_files leave exactly what is on
+# disk now? Answered by running the REAL agent_secret_files on a copy of
+# CANDIDATE against a scratch secrets directory (so the normalisation, the
+# pointer shape, the quoting rules and the capability test cannot drift from
+# what the applier does), pointing its `KEY_FILE=` lines back at the real DIR,
+# then comparing: (a) the normalised env against ENV (bytes, 600 root:root) and
+# (b) every secret value it would write against the file at DIR/KEY (bytes,
+# 600, OWNER:its group). A pointer already aimed at DIR keeps whatever file is
+# there. Any difference, a missing file, a scratch run that fails, or an owner
+# that does not exist yet returns 1, and the caller installs exactly as it
+# always did. Nothing under the real DIR or ENV is touched.
+asf_unchanged() {
+    _au_cand="$1"; _au_env="$2"; _au_dir="$3"; _au_bin="$4"; _au_own="$5"
+    _au_keys="${6:-$AGENT_SECRET_KEYS}"; _au_marker="${7:-$AGENT_SECRET_CAPABILITY}"
+    [ -f "$_au_env" ] || return 1
+    id -u "$_au_own" >/dev/null 2>&1 || return 1
+    _au_grp="$(id -gn "$_au_own" 2>/dev/null || echo "$_au_own")"
+    _au_root="$(mktemp -d)" || return 1
+    _au_rc=1
+    if cp "$_au_cand" "$_au_root/env" && chmod 600 "$_au_root/env" \
+        && agent_secret_files "$_au_root/env" "$_au_root/s" "$_au_bin" "$_au_own" "" "$_au_keys" "$_au_marker" >/dev/null 2>&1 \
+        && sed "s|^\([A-Za-z0-9_]*_FILE\)=$_au_root/s/|\1=$_au_dir/|" "$_au_root/env" > "$_au_root/env.final" \
+        && config_unchanged "$_au_root/env.final" "$_au_env" 600 root:root; then
+        _au_rc=0
+        for _au_k in $_au_keys; do
+            if [ -f "$_au_root/s/$_au_k" ]; then
+                config_unchanged "$_au_root/s/$_au_k" "$_au_dir/$_au_k" 600 "$_au_own:$_au_grp" || _au_rc=1
+            elif grep -qE "^${_au_k}_FILE=$_au_dir/$_au_k\$" "$_au_root/env.final"; then
+                [ -f "$_au_dir/$_au_k" ] || _au_rc=1
+            else
+                [ ! -e "$_au_dir/$_au_k" ] || _au_rc=1
+            fi
+        done
+    fi
+    rm -rf "$_au_root"
+    return $_au_rc
+}
+
+# agent_env_same CANDIDATE INSTALLED / harness_env_same CANDIDATE INSTALLED —
+# the question every env-writing kind asks: is this already what the node holds
+# (as written, or as agent_secret_files leaves it)?
+agent_env_same() {
+    config_unchanged "$1" "$2" 600 root:root \
+        || asf_unchanged "$1" "$2" /etc/noo/agent-secrets /usr/local/bin/noo-node-agent "$(asf_owner)"
+}
+harness_env_same() {
+    config_unchanged "$1" "$2" 600 root:root \
+        || asf_unchanged "$1" "$2" /etc/noo/harness-secrets /usr/local/bin/noo-gateway noo-harness \
+            "$HARNESS_SECRET_KEYS" "$HARNESS_SECRET_CAPABILITY"
+}
+# END asf_unchanged
+
 # agent-env replaces /etc/noo-node-agent.env WHOLE, and the node's NATS pair
 # is not an agent-env key: it arrives only as `nats-creds`. A bundle that
 # carries agent-env WITHOUT nats-creds therefore used to drop the pair the
@@ -992,7 +1383,14 @@ if [ -f "$WORK/files/agent-env" ]; then
         agent_env_carry_nats_pair "$STAGED_ENV" /etc/noo-node-agent.env \
             "$(grep -E '^NODE_ID=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
     fi
-    install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
+    # STAGED_ENV is the FINAL content (payload plus any carried NATS pair),
+    # so that is what is compared with the installed file.
+    if agent_env_same "$STAGED_ENV" /etc/noo-node-agent.env; then
+        ae_state="agent-env=unchanged"
+    else
+        install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
+        ae_state="agent-env"; need_restart=1
+    fi
     rm -f "$STAGED_ENV"
     # The roots the controller declared for this node: reachable by the
     # agent's user, or the agent reports the drive as missing.
@@ -1001,7 +1399,7 @@ if [ -f "$WORK/files/agent-env" ]; then
         [ -n "$_v" ] && grant_traverse noo-agent "$_v"
     done
     grant_traverse_flush_missing
-    applied="$applied agent-env"; need_restart=1
+    applied="$applied $ae_state"
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
@@ -1031,9 +1429,15 @@ if [ -f "$WORK/files/nats-creds" ]; then
     # Never leave the agent without its identity: the NODE_ID line that
     # agent-env is refused for lacking must survive this rewrite too.
     grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
-    install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+    # The MERGED result is compared with the installed env, not the
+    # fragment. The harness env below is judged the same way; the kind is
+    # `unchanged` only when neither file needed rewriting.
+    nc_changed=0
+    if ! agent_env_same "$TMPENV" "$AGENT_ENV"; then
+        install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+        nc_changed=1; need_restart=1
+    fi
     rm -f "$TMPENV"
-    applied="$applied nats-creds"; need_restart=1
     # The harness is the same principal on the bus: the same
     # pair, merged the same way, into its own env — when it already has one
     # on disk. A node with no installed harness env has no harness YET; if
@@ -1046,10 +1450,13 @@ if [ -f "$WORK/files/nats-creds" ]; then
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$HARNESS_ENV" > "$TMPH" || true
         grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/nats-creds" >> "$TMPH"
         grep -qE '^NODE_ID=.+' "$TMPH" || { echo "noo-apply: harness env merge lost NODE_ID — aborting" >&2; rm -f "$TMPH"; exit 70; }
-        install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
+        if ! harness_env_same "$TMPH" "$HARNESS_ENV"; then
+            install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
+            nc_changed=1; need_harness_restart=1
+        fi
         rm -f "$TMPH"
-        need_harness_restart=1
     fi
+    if [ "$nc_changed" = 1 ]; then applied="$applied nats-creds"; else applied="$applied nats-creds=unchanged"; fi
 fi
 
 # fleet-secrets — the FLEET-WIDE credentials every node holds.
@@ -1091,9 +1498,18 @@ if [ -f "$WORK/files/fleet-secrets" ]; then
     grep -vE "^($carried)=" "$AGENT_ENV" > "$TMPENV" || true
     grep -E "^($FS_KEYS)=" "$WORK/files/fleet-secrets" >> "$TMPENV"
     grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
-    install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+    # Merged result vs the installed env, like nats-creds above.
+    fs_unchanged=0
+    agent_env_same "$TMPENV" "$AGENT_ENV" && fs_unchanged=1
+    if [ "$fs_unchanged" != 1 ]; then
+        install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+        need_restart=1
+    fi
     rm -f "$TMPENV"
-    applied="$applied fleet-secrets"; need_restart=1
+    applied="$applied fleet-secrets"
+    # (the line above keeps its shape: tests/test_fleet_secret_declarations.py
+    # lifts the merge up to it.) Unchanged is reported as its own token.
+    [ "$fs_unchanged" != 1 ] || applied="${applied% fleet-secrets} fleet-secrets=unchanged"
 fi
 
 # agent-binary — staged then atomically moved, never written in place
@@ -1103,9 +1519,13 @@ if [ -f "$WORK/files/agent-binary" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: agent-binary is not an ELF executable" >&2; exit 65 ;;
     esac
-    install -m 755 -o root -g root "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent.next
-    mv /usr/local/bin/noo-node-agent.next /usr/local/bin/noo-node-agent
-    applied="$applied agent-binary"; need_restart=1
+    if binary_unchanged "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent; then
+        applied="$applied agent-binary=unchanged"; note_binary_sha agent-binary "$WORK/files/agent-binary"
+    else
+        install -m 755 -o root -g root "$WORK/files/agent-binary" /usr/local/bin/noo-node-agent.next
+        mv /usr/local/bin/noo-node-agent.next /usr/local/bin/noo-node-agent
+        applied="$applied agent-binary"; need_restart=1; note_binary_sha agent-binary "$WORK/files/agent-binary"
+    fi
 fi
 
 # cli-binary — the noo CLI for the node's user (an earlier change rail work:
@@ -1122,7 +1542,17 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: cli-binary is not an ELF executable" >&2; exit 65 ;;
     esac
+    # The installed CLI is hashed AS THE USER too (root must not follow a
+    # symlink the user planted); any failure there leaves the hash empty and
+    # the CLI is installed.
+    _cli_cur=""
     if [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ]; then
+        _cli_cur="$(runuser -u "$CLI_USER" -- env HOME="$CLI_HOME" sh -c 'sha256sum "$HOME/.local/bin/noo" 2>/dev/null' | awk '{print $1}')" || _cli_cur=""
+    fi
+    _cli_new="$(sha256sum "$WORK/files/cli-binary" | awk '{print $1}')"
+    if [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ] && [ -n "$_cli_cur" ] && [ "$_cli_cur" = "$_cli_new" ]; then
+        applied="$applied cli-binary=unchanged"; note_binary_sha cli-binary "$WORK/files/cli-binary"
+    elif [ -n "$CLI_HOME" ] && [ -d "$CLI_HOME" ]; then
         # Written AS THE USER, never by root into a user-owned tree: root
         # following a symlink the user planted under ~/.local would write
         # (and chown) wherever it pointed ( second review, L4).
@@ -1135,7 +1565,7 @@ if [ -f "$WORK/files/cli-binary" ] && [ -s "$WORK/files/cli-user" ]; then
             [ -e "$HOME/.local/bin/pai" ] || ln -s noo "$HOME/.local/bin/pai" 2>/dev/null || true
         ' < "$WORK/files/cli-binary" \
             || { echo "noo-apply: cli-binary install as $CLI_USER failed" >&2; exit 73; }
-        applied="$applied cli-binary"
+        applied="$applied cli-binary"; note_binary_sha cli-binary "$WORK/files/cli-binary"
     else
         echo "noo-apply: cli-user '$CLI_USER' has no home — CLI not installed" >&2
     fi
@@ -1176,43 +1606,49 @@ if [ -f "$WORK/files/hostd-binary" ]; then
     esac
     HOSTD=/usr/local/bin/noo-hostd
     HB=/var/lib/noo-node-agent/spool/hostd.heartbeat.json
-    # Downgrade floor for the root helper ( review L3): never
-    # replace an installed hostd with one of a lower generation marker.
-    _hg_new="$(hostd_generation_of "$WORK/files/hostd-binary")"
-    _hg_cur="$(hostd_generation_of "$HOSTD")"
-    if [ "$_hg_new" -lt "$_hg_cur" ]; then
-        echo "noo-apply: REFUSED — hostd-binary is generation $_hg_new, older than the installed one ($_hg_cur)" >&2
-        logger -t noo-apply "REFUSED hostd-binary downgrade ($_hg_new < $_hg_cur)" 2>/dev/null || true
-        exit 65
-    fi
-    [ -f "$HOSTD" ] && cp -f "$HOSTD" "$HOSTD.prev"
-    install -m 755 -o root -g root "$WORK/files/hostd-binary" "$HOSTD.next"
-    mv "$HOSTD.next" "$HOSTD"
-    if ! "$HOSTD" install --mode worker >/dev/null 2>&1; then
-        echo "noo-apply: new hostd failed to install — restoring previous" >&2
-        [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-        exit 65
-    fi
-    hostd_ok=0
-    start_epoch=$(date +%s)
-    for _ in $(seq 1 20); do
-        if [ -f "$HB" ]; then
-            hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
-            if [ "$hb_mtime" -ge "$start_epoch" ] && grep -q 'swap-agent' "$HB"; then
-                hostd_ok=1
-                break
-            fi
-        fi
-        sleep 3
-    done
-    if [ "$hostd_ok" = 1 ]; then
-        rm -f "$HOSTD.prev"
-        applied="$applied hostd-binary"
-        logger -t noo-apply "hostd upgraded (fresh heartbeat from the new binary)" 2>/dev/null || true
+    if binary_unchanged "$WORK/files/hostd-binary" "$HOSTD"; then
+        # Same bytes as the running helper: nothing to swap, no `install`
+        # (which restarts the unit), no heartbeat wait, no revert to arm.
+        applied="$applied hostd-binary=unchanged"; note_binary_sha hostd-binary "$WORK/files/hostd-binary"
     else
-        echo "noo-apply: new hostd produced no fresh heartbeat in 60s — REVERTING" >&2
-        [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
-        exit 65
+        # Downgrade floor for the root helper ( review L3): never
+        # replace an installed hostd with one of a lower generation marker.
+        _hg_new="$(hostd_generation_of "$WORK/files/hostd-binary")"
+        _hg_cur="$(hostd_generation_of "$HOSTD")"
+        if [ "$_hg_new" -lt "$_hg_cur" ]; then
+            echo "noo-apply: REFUSED — hostd-binary is generation $_hg_new, older than the installed one ($_hg_cur)" >&2
+            logger -t noo-apply "REFUSED hostd-binary downgrade ($_hg_new < $_hg_cur)" 2>/dev/null || true
+            exit 65
+        fi
+        [ -f "$HOSTD" ] && cp -f "$HOSTD" "$HOSTD.prev"
+        install -m 755 -o root -g root "$WORK/files/hostd-binary" "$HOSTD.next"
+        mv "$HOSTD.next" "$HOSTD"
+        if ! "$HOSTD" install --mode worker >/dev/null 2>&1; then
+            echo "noo-apply: new hostd failed to install — restoring previous" >&2
+            [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
+            exit 65
+        fi
+        hostd_ok=0
+        start_epoch=$(date +%s)
+        for _ in $(seq 1 20); do
+            if [ -f "$HB" ]; then
+                hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
+                if [ "$hb_mtime" -ge "$start_epoch" ] && grep -q 'swap-agent' "$HB"; then
+                    hostd_ok=1
+                    break
+                fi
+            fi
+            sleep 3
+        done
+        if [ "$hostd_ok" = 1 ]; then
+            rm -f "$HOSTD.prev"
+            applied="$applied hostd-binary"; note_binary_sha hostd-binary "$WORK/files/hostd-binary"
+            logger -t noo-apply "hostd upgraded (fresh heartbeat from the new binary)" 2>/dev/null || true
+        else
+            echo "noo-apply: new hostd produced no fresh heartbeat in 60s — REVERTING" >&2
+            [ -f "$HOSTD.prev" ] && { mv "$HOSTD.prev" "$HOSTD"; "$HOSTD" install --mode worker >/dev/null 2>&1 || true; }
+            exit 65
+        fi
     fi
 fi
 
@@ -1254,8 +1690,14 @@ if [ -f "$WORK/files/agent-unit" ]; then
     grep -q '^\[Service\]' "$WORK/files/agent-unit" \
         || { echo "noo-apply: agent-unit has no [Service] section" >&2; exit 65; }
     [ -f /etc/systemd/system/noo-node-agent.service ] || fresh_unit=1
-    install -m 644 -o root -g root "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service
-    applied="$applied agent-unit"; need_daemon_reload=1; need_restart=1
+    # Identical unit (bytes, 644, root:root): no rewrite, no daemon-reload,
+    # no restart. A first install (no file) is never "unchanged".
+    if config_unchanged "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service 644 root:root; then
+        applied="$applied agent-unit=unchanged"
+    else
+        install -m 644 -o root -g root "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service
+        applied="$applied agent-unit"; need_daemon_reload=1; need_restart=1
+    fi
 fi
 
 # ── the harness: the loop beside this node's model, delivered
@@ -1288,8 +1730,9 @@ if [ -f "$WORK/files/harness-env" ]; then
     grep -qE '^NODE_ID=.+' "$WORK/files/harness-env" \
         || { echo "noo-apply: harness-env lacks NODE_ID — refusing a config that boots an anonymous harness" >&2; exit 65; }
     HARNESS_ENV=/etc/noo-harness.env
+    TMPH=""
     if grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/harness-env"; then
-        install -m 600 -o root -g root "$WORK/files/harness-env" "$HARNESS_ENV"
+        HE_FINAL="$WORK/files/harness-env"
     else
         NATS_SRC=""
         if [ -f "$WORK/files/nats-creds" ] && grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/nats-creds"; then
@@ -1312,10 +1755,18 @@ if [ -f "$WORK/files/harness-env" ]; then
         TMPH="$(mktemp)"; chmod 600 "$TMPH"
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/harness-env" > "$TMPH"
         [ -n "$NATS_SRC" ] && grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$NATS_SRC" >> "$TMPH"
-        install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"; rm -f "$TMPH"
+        HE_FINAL="$TMPH"
         unset NATS_SRC
     fi
-    applied="$applied harness-env"; need_harness_restart=1
+    # HE_FINAL is the FINAL content (payload, or payload plus the resolved
+    # NATS pair); an identical installed env is left alone.
+    if harness_env_same "$HE_FINAL" "$HARNESS_ENV"; then
+        applied="$applied harness-env=unchanged"
+    else
+        install -m 600 -o root -g root "$HE_FINAL" "$HARNESS_ENV"
+        applied="$applied harness-env"; need_harness_restart=1
+    fi
+    [ -z "$TMPH" ] || rm -f "$TMPH"
 fi
 
 # harness-binary — the gateway binary (the harness is its subcommand);
@@ -1325,9 +1776,13 @@ if [ -f "$WORK/files/harness-binary" ]; then
         7f454c46*) : ;;
         *) echo "noo-apply: harness-binary is not an ELF executable" >&2; exit 65 ;;
     esac
-    install -m 755 -o root -g root "$WORK/files/harness-binary" /usr/local/bin/noo-gateway.next
-    mv /usr/local/bin/noo-gateway.next /usr/local/bin/noo-gateway
-    applied="$applied harness-binary"; need_harness_restart=1
+    if binary_unchanged "$WORK/files/harness-binary" /usr/local/bin/noo-gateway; then
+        applied="$applied harness-binary=unchanged"; note_binary_sha harness-binary "$WORK/files/harness-binary"
+    else
+        install -m 755 -o root -g root "$WORK/files/harness-binary" /usr/local/bin/noo-gateway.next
+        mv /usr/local/bin/noo-gateway.next /usr/local/bin/noo-gateway
+        applied="$applied harness-binary"; need_harness_restart=1; note_binary_sha harness-binary "$WORK/files/harness-binary"
+    fi
 fi
 
 # harness-unit — first install creates the user. NO sudo grant: see below.
@@ -1365,11 +1820,25 @@ if [ -f "$WORK/files/harness-unit" ]; then
     if id -nG noo-harness | tr ' ' '\n' | grep -qx docker; then
         gpasswd -d noo-harness docker >/dev/null
     fi
-    install -m 644 -o root -g root "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service
     # Retire the grant that could never be used. Left behind it would be a
     # standing NOPASSWD root rule for a path nothing takes.
     rm -f /etc/sudoers.d/noo-harness-lifecycle /etc/sudoers.d/noo-harness-lifecycle.next
-    applied="$applied harness-unit"; need_daemon_reload=1; need_harness_restart=1
+    # Identical unit (bytes, 644, root:root): no rewrite, no daemon-reload,
+    # no harness restart. The user/group/sudoers hygiene above and below runs
+    # either way.
+    if config_unchanged "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service 644 root:root; then
+        applied="$applied harness-unit=unchanged"
+    else
+        install -m 644 -o root -g root "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service
+        applied="$applied harness-unit"; need_daemon_reload=1; need_harness_restart=1
+    fi
+fi
+
+# vendor-cli / vendor-runtime — see vendor_install. No harness restart: the
+# harness execs the CLI through its wrapper per turn, and the agent's
+# vendor-CLI check reads the PATH on each reconcile.
+if [ -f "$WORK/files/vendor-cli" ] || [ -f "$WORK/files/vendor-runtime" ]; then
+    vendor_apply "$WORK/files" || exit $?
 fi
 
 [ -n "$applied" ] || { echo "noo-apply: signed bundle contained nothing to apply" >&2; exit 65; }
@@ -1378,8 +1847,7 @@ fi
 # agent binary (if this bundle carried one) is installed — see
 # agent_secret_files. The owner is the unit's User= (provision --local falls
 # back to root on a host with no noo-agent user).
-ASF_OWNER="$(sed -n 's/^User=//p' /etc/systemd/system/noo-node-agent.service 2>/dev/null | tail -1)"
-{ [ -n "$ASF_OWNER" ] && id -u "$ASF_OWNER" >/dev/null 2>&1; } || ASF_OWNER=root
+ASF_OWNER="$(asf_owner)"
 agent_secret_files /etc/noo-node-agent.env /etc/noo/agent-secrets /usr/local/bin/noo-node-agent \
     "$ASF_OWNER" /etc/noo-node-agent.env.container-backup || exit $?
 if [ "$ASF_CHANGED" = 1 ]; then need_restart=1; fi
@@ -1480,3 +1948,5 @@ companion_restart() {
 case " $applied " in
     *" agent-binary "*) companion_restart ;;
 esac
+# Last line of the apply, so the fetcher's tail of this log always carries it.
+[ -z "$binary_shas" ] || echo "binary-sha:$binary_shas"

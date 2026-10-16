@@ -8,6 +8,7 @@
 
 pub mod lock_fetch;
 pub mod pins;
+pub mod pop;
 pub mod resolve;
 
 use std::path::Path;
@@ -46,6 +47,20 @@ pub struct Prepared {
     pub verified: VerifiedLock,
     pub fetched: Fetched,
     pub pulled: usize,
+    /// The proxy root the images were pulled from (`None` = the registry).
+    pub pulled_from: Option<String>,
+    /// Which host and credential the lock and images came through.
+    pub via: String,
+}
+
+/// The lock client for the verbs that pull, with the credentials the route
+/// selector needs (`lock_fetch::Route`): the vendor token when the store
+/// holds one, and only then nothing else; otherwise the entitlement
+/// credential for anchors that name a `pull` root.
+pub fn installed_client() -> Result<lock_fetch::Client, String> {
+    let cred = lock_fetch::installed_credential()?;
+    let proxy = if cred.is_some() { None } else { lock_fetch::installed_proxy_auth()? };
+    Ok(lock_fetch::Client::new(cred).with_proxy(proxy))
 }
 
 /// Where and against what one or more add-ons are resolved.
@@ -56,7 +71,6 @@ pub struct Ctx<'a> {
     pub stack_lock: Option<&'a str>,
     pub allow_downgrade: bool,
     pub client: &'a lock_fetch::Client,
-    pub cred: Option<&'a Credential>,
 }
 
 /// Steps 1-7 for one add-on against `ctx.tag`: anchor, fetch, verify, stack
@@ -72,12 +86,23 @@ pub fn prepare(ctx: &Ctx, addon: &str, docker: &mut dyn Docker) -> Result<Prepar
         pinned: pinned.as_deref(),
         allow_downgrade: ctx.allow_downgrade,
     };
+    let route = ctx.client.route(&anchor).map_err(Refusal::Route)?;
     let (verified, fetched) = resolve::fetch_and_check(ctx.client, &anchor, &want)?;
-    let pulled = resolve::pull_images(docker, &verified, ctx.cred)?;
-    Ok(Prepared { addon: addon.to_string(), verified, fetched, pulled })
+    let mut cred = || -> Result<Option<Credential>, String> {
+        ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))
+    };
+    let pulled = resolve::pull_images(docker, &verified, &route, &mut cred)?;
+    Ok(Prepared {
+        addon: addon.to_string(),
+        verified,
+        fetched,
+        pulled,
+        pulled_from: route.pulled_from(),
+        via: ctx.client.describe(&route),
+    })
 }
 
 /// Step 8 for a prepared add-on.
 pub fn commit(root: &Path, p: &Prepared, tag: &str) -> Result<pins::Pin, Refusal> {
-    resolve::record(root, &p.addon, &p.verified, &p.fetched, tag)
+    resolve::record(root, &p.addon, &p.verified, &p.fetched, tag, p.pulled_from.clone())
 }

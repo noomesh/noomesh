@@ -92,3 +92,30 @@ def test_host_telemetry_kind_is_registered_in_all_three() -> None:
     assert "host-telemetry" in _shell_list("scripts/noo-apply.sh", "KNOWN_KINDS")
     assert "host-telemetry" in _shell_list("scripts/sign-bundle.sh", "KNOWN")
     assert "host-telemetry" in _rust_list()
+
+
+VENDOR_KINDS = ["vendor-cli", "vendor-cli-manifest", "vendor-runtime", "vendor-runtime-manifest"]
+
+
+def test_vendor_kinds_are_registered_in_all_three() -> None:
+    """i83 E1e: the controller stages a harness kind's vendor CLI (and its
+    runtime) and the bundle carries it with a manifest each; a list missing
+    one makes the whole bundle refuse on that side."""
+    apply = _shell_list("scripts/noo-apply.sh", "KNOWN_KINDS")
+    sign = _shell_list("scripts/sign-bundle.sh", "KNOWN")
+    rust = _rust_list()
+    for kind in VENDOR_KINDS:
+        assert kind in apply, f"noo-apply.sh KNOWN_KINDS lacks {kind}"
+        assert kind in sign, f"sign-bundle.sh KNOWN lacks {kind}"
+        assert kind in rust, f"node_fetch.rs KNOWN_KINDS lacks {kind}"
+
+
+def test_vendor_manifests_are_text_kinds_in_both_appliers() -> None:
+    """The manifests are parsed line by line; a CR or NUL must be refused."""
+    shell = _shell_list("scripts/noo-apply.sh", "TEXT_KINDS")
+    text = (REPO / "noo-cli/src/commands/node_fetch.rs").read_text()
+    m = re.search(r"const TEXT_KINDS: &\[&str\] = &\[(.*?)\];", text, re.S)
+    assert m
+    rust = re.findall(r'"([^"]+)"', m.group(1))
+    for kind in ("vendor-cli-manifest", "vendor-runtime-manifest"):
+        assert kind in shell and kind in rust, kind

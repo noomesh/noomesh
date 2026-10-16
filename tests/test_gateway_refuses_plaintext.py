@@ -57,14 +57,6 @@ PLAIN_URL = re.compile(r"""["'`]http://""" + SERVICE + r"""(?=[:/"'`])""")
 
 # (relative path, literal that must still be present) -> why it is still plain.
 ALLOW: dict[tuple[str, str], str] = {
-    ("gateway-rust/src/tools.rs", "http://sandbox:9000"):
-        "the sandbox executor's compose door — deferred by the operator",
-    ("src/noomesh/config.py", "http://sandbox:9000"):
-        "the same sandbox door, in the settings field's description string",
-    ("gateway-rust/src/stt_client.rs", "http://noo-whisper:8000"):
-        "voice (whisper STT) — deferred by the operator",
-    ("gateway-rust/src/tts_client.rs", "http://noo-piper:8000"):
-        "voice (piper TTS) — deferred by the operator",
     ("noo-cli/src/onboard/steps.rs", "http://gateway:"):
         "not a dial: `starts_with(\"http://gateway:\")` is the REWRITE that upgrades a stale "
         "CONTROLLER_URL to https during enrollment",

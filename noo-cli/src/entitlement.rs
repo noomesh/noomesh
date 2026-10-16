@@ -59,6 +59,21 @@ pub struct Entitlement {
     /// no add-on key and no add-on registry; the licence does.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub addons: BTreeMap<String, TrustAnchor>,
+    /// The controller key this licence is bound to (RFC 7800 `cnf`): the
+    /// public half of the key `noo security entitlement pubkey` prints. The
+    /// vendor's add-on registry proxy asks the controller to sign a nonce
+    /// with it before it hands out a pull token, so a copied token is no
+    /// use on another controller. Absent = no binding (every token issued
+    /// before the field). Optional and additive, like `addons`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
+}
+
+/// RFC 7800 style confirmation key: `{"ed25519": "<64 hex public key>"}`.
+/// Other members a later issuer adds are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cnf {
+    pub ed25519: String,
 }
 
 impl Entitlement {
@@ -72,6 +87,10 @@ impl Entitlement {
     /// The trust anchor this licence names for `addon`, if any.
     pub fn addon_anchor(&self, addon: &str) -> Option<&TrustAnchor> {
         self.addons.get(addon)
+    }
+    /// The bound controller key (hex), if the licence carries one.
+    pub fn controller_key(&self) -> Option<&str> {
+        self.cnf.as_ref().map(|c| c.ed25519.trim())
     }
 }
 
@@ -98,6 +117,12 @@ pub fn validate_addons(addons: &BTreeMap<String, TrustAnchor>) -> Result<(), Str
                 anchor.registry
             ));
         }
+        if let Some(p) = &anchor.pull {
+            if !valid_registry_root(p.trim()) {
+                return Err(format!("add-on trust block for {name}: pull {p:?} is not a registry root (host/path)"));
+            }
+            anchor.check_pull().map_err(|e| format!("add-on trust block for {name}: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -121,6 +146,7 @@ pub fn parse_addon_flag(v: &str) -> Result<(String, TrustAnchor), String> {
     let anchor = TrustAnchor {
         keys: keys.split(',').map(str::trim).filter(|k| !k.is_empty()).map(String::from).collect(),
         registry: registry.trim().to_string(),
+        pull: None,
     };
     if name.is_empty() {
         return Err(bad());
@@ -145,6 +171,33 @@ pub fn check_issue_addons(features: &[String], addons: &BTreeMap<String, TrustAn
         return Err(format!("feature {f} has no --addon block naming its signing key and registry"));
     }
     Ok(())
+}
+
+/// Issuer `--bind-key <hex>`: the controller public key `noo security
+/// entitlement pubkey` printed on the customer's controller.
+#[cfg(any(test, has_entitlement_signer))]
+pub fn parse_bind_key(v: &str) -> Result<Cnf, String> {
+    let hex = v.trim().to_ascii_lowercase();
+    pubkey_from_hex(&hex).map_err(|e| format!("--bind-key: {e}"))?;
+    Ok(Cnf { ed25519: hex })
+}
+
+/// Issuer `--pull-host <host>`: every anchor gains `pull` = the same path
+/// as its registry on `host` (a host swap, nothing else).
+#[cfg(any(test, has_entitlement_signer))]
+pub fn apply_pull_host(addons: &mut BTreeMap<String, TrustAnchor>, host: &str) -> Result<(), String> {
+    let host = host.trim();
+    if host.is_empty() || host.contains('/') || host.contains("://") || host.contains(':') || host.chars().any(char::is_whitespace) {
+        return Err(format!("--pull-host {host:?}: expected a bare host name (addons.noomesh.ai)"));
+    }
+    if addons.is_empty() {
+        return Err("--pull-host needs at least one --addon block to apply to".into());
+    }
+    for anchor in addons.values_mut() {
+        let path = anchor.registry.trim().split_once('/').map(|(_, p)| p.to_string()).unwrap_or_default();
+        anchor.pull = Some(format!("{host}/{path}"));
+    }
+    validate_addons(addons)
 }
 
 fn hex_bytes(hex: &str) -> Result<[u8; 32], String> {
@@ -200,6 +253,9 @@ pub fn verify_with(token: &str, key: &VerifyingKey) -> Result<Entitlement, Strin
         return Err(format!("unsupported entitlement version {}", ent.v));
     }
     validate_addons(&ent.addons)?;
+    if let Some(c) = &ent.cnf {
+        pubkey_from_hex(&c.ed25519).map_err(|e| format!("cnf.ed25519: {e}"))?;
+    }
     Ok(ent)
 }
 
@@ -273,7 +329,7 @@ mod tests {
     }
 
     fn ent() -> Entitlement {
-        Entitlement { v: 1, sub: "acme".into(), tier: TIER_INTELLIGENT.into(), features: vec!["trellion_intel".into()], iat: 1_700_000_000, exp: 0, id: "t-1".into(), bound: None, max_nodes: None, terms: None, addons: BTreeMap::new() }
+        Entitlement { v: 1, sub: "acme".into(), tier: TIER_INTELLIGENT.into(), features: vec!["trellion_intel".into()], iat: 1_700_000_000, exp: 0, id: "t-1".into(), bound: None, max_nodes: None, terms: None, addons: BTreeMap::new(), cnf: None }
     }
 
     #[test]
@@ -312,7 +368,7 @@ mod tests {
     }
 
     fn with_addons() -> Entitlement {
-        let a = TrustAnchor { keys: vec![key_hex(7), key_hex(8)], registry: "ghcr.io/example/intel".into() };
+        let a = TrustAnchor { keys: vec![key_hex(7), key_hex(8)], registry: "ghcr.io/example/intel".into(), pull: None };
         Entitlement { addons: BTreeMap::from([("trellion_intel".to_string(), a)]), ..ent() }
     }
 
@@ -381,7 +437,7 @@ mod tests {
         let (k1, k2) = (key_hex(7), key_hex(8));
         let (name, a) = parse_addon_flag(&format!("trellion_intel=ghcr.io/example/intel:{k1},{k2}")).unwrap();
         assert_eq!(name, "trellion_intel");
-        assert_eq!(a, TrustAnchor { keys: vec![k1.clone(), k2], registry: "ghcr.io/example/intel".into() });
+        assert_eq!(a, TrustAnchor { keys: vec![k1.clone(), k2], registry: "ghcr.io/example/intel".into(), pull: None });
         for bad in ["trellion_intel", "=ghcr.io/x/y:aa", &format!("x=ghcr.io/x/y:{k1},zz"), &format!("x=ghcr.io:{k1}"), "x=ghcr.io/x/y:"] {
             assert!(parse_addon_flag(bad).is_err(), "{bad} must be refused");
         }
@@ -415,5 +471,77 @@ mod tests {
         assert_eq!(pubkey_from_hex(&hex).unwrap(), sk.verifying_key());
         assert!(pubkey_from_hex(PUBKEY_HEX).is_ok());
         assert!(pubkey_from_hex("zz").is_err());
+    }
+
+    #[test]
+    fn cnf_round_trips_and_is_omitted_when_absent() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let bound = Entitlement { cnf: Some(Cnf { ed25519: key_hex(11) }), ..ent() };
+        let back = verify_with(&sign(&bound, &sk), &sk.verifying_key()).unwrap();
+        assert_eq!(back, bound);
+        assert_eq!(back.controller_key(), Some(key_hex(11).as_str()));
+        assert!(serde_json::to_string(&bound).unwrap().contains(r#""cnf":{"ed25519":""#));
+        assert!(!serde_json::to_string(&ent()).unwrap().contains("cnf"), "absent cnf must not serialise");
+        assert_eq!(verify_with(&sign(&ent(), &sk), &sk.verifying_key()).unwrap().controller_key(), None);
+    }
+
+    #[test]
+    fn cnf_members_beside_ed25519_are_ignored_and_a_bad_key_refuses() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let k = key_hex(11);
+        let base = r#"{"v":1,"sub":"a","tier":"t","features":[],"iat":1,"exp":0,"id":"ent-1","#;
+        let ok = format!(r#"{base}"cnf":{{"ed25519":"{k}","jkt":"x"}}}}"#);
+        assert_eq!(verify_with(&sign_raw(ok.as_bytes(), &sk), &sk.verifying_key()).unwrap().controller_key(), Some(k.as_str()));
+        for (cnf, want) in [
+            (r#""cnf":{"ed25519":"zz"}"#, "cnf.ed25519"),
+            (r#""cnf":{"rsa":"x"}"#, "payload is not an entitlement"),
+            (r#""cnf":"abc""#, "payload is not an entitlement"),
+        ] {
+            let p = format!("{base}{cnf}}}");
+            let e = verify_with(&sign_raw(p.as_bytes(), &sk), &sk.verifying_key()).unwrap_err();
+            assert!(e.contains(want), "{cnf}: {e}");
+        }
+    }
+
+    #[test]
+    fn pull_round_trips_and_must_be_a_host_swap_of_registry() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let mut e = with_addons();
+        e.addons.get_mut("trellion_intel").unwrap().pull = Some("addons.noomesh.ai/example/intel".into());
+        let back = verify_with(&sign(&e, &sk), &sk.verifying_key()).unwrap();
+        let a = back.addon_anchor("trellion_intel").unwrap();
+        assert_eq!(a.pull.as_deref(), Some("addons.noomesh.ai/example/intel"));
+        assert_eq!(a.location(), "addons.noomesh.ai/example/intel");
+        assert_eq!(a.registry, "ghcr.io/example/intel", "registry stays the trust root");
+        assert!(!serde_json::to_string(&with_addons()).unwrap().contains("pull"), "absent pull must not serialise");
+        let k = key_hex(7);
+        for (pull, want) in [
+            ("addons.noomesh.ai/example/other", "same path as registry"),
+            ("addons.noomesh.ai/example", "same path as registry"),
+            ("https://addons.noomesh.ai/example/intel", "not a registry root"),
+            ("addons.noomesh.ai/example/intel@sha256:00", "not a registry root"),
+        ] {
+            let p = format!(
+                r#"{{"v":1,"sub":"a","tier":"t","features":["evolve"],"iat":1,"exp":0,"id":"t","addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/example/intel","pull":"{pull}"}}}}}}"#
+            );
+            let err = verify_with(&sign_raw(p.as_bytes(), &sk), &sk.verifying_key()).unwrap_err();
+            assert!(err.contains(want), "{pull}: {err}");
+        }
+    }
+
+    #[test]
+    fn issuer_bind_key_and_pull_host() {
+        let c = parse_bind_key(&key_hex(11).to_ascii_uppercase()).unwrap();
+        assert_eq!(c.ed25519, key_hex(11), "stored lowercase");
+        assert!(parse_bind_key("zz").unwrap_err().contains("--bind-key"));
+        let (name, a) = parse_addon_flag(&format!("evolve=ghcr.io/personifai/evolve:{}", key_hex(7))).unwrap();
+        let mut blocks = BTreeMap::from([(name, a)]);
+        apply_pull_host(&mut blocks, "addons.noomesh.ai").unwrap();
+        assert_eq!(blocks["evolve"].pull.as_deref(), Some("addons.noomesh.ai/personifai/evolve"));
+        assert_eq!(blocks["evolve"].registry, "ghcr.io/personifai/evolve");
+        for bad in ["", "https://addons.noomesh.ai", "addons.noomesh.ai/x", "host:443"] {
+            assert!(apply_pull_host(&mut blocks.clone(), bad).is_err(), "{bad:?}");
+        }
+        assert!(apply_pull_host(&mut BTreeMap::new(), "addons.noomesh.ai").is_err(), "nothing to apply to");
     }
 }

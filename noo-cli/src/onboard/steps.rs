@@ -2742,6 +2742,20 @@ pub(crate) const SVC_LIST: &[&str] = &[
     // mounts it. Issued everywhere for the same reason `evolve` is: the
     // day a standby is wanted, its leaf is already on the primary.
     "postgres-standby",
+    // The sandbox executor's door (mTLS doors phase 1, i77): uvicorn serves
+    // this leaf with `--ssl-cert-reqs 2`, so the gateway, the worker and
+    // trellion reach it only with a cluster-CA client certificate. A new
+    // name, so `noo upgrade --stack` issues it on its own before the roll
+    // (upgrade.rs reconcile_service_certs). sandbox-extra replicas answer
+    // to the `sandbox` alias and mount this same leaf.
+    "sandbox",
+    // The voice add-on's doors (mTLS doors phase 2, i77): uvicorn in
+    // noo-whisper / noo-piper serves each leaf with `--ssl-cert-reqs 2`,
+    // and the gateway dials them with its own. Issued whether or not
+    // `addons.voice` is on, like `evolve`: a leaf is cheap, the add-on
+    // switched on later must not need the wizard re-run, and a missing
+    // bind source would be created root-owned by Docker on first start.
+    "whisper", "piper",
 ];
 /// Dialled from OTHER hosts by the controller's reachable names, so the leaf
 /// carries `noo-controller`, the LAN IP and the tailnet name. `model-cache`
@@ -2793,6 +2807,15 @@ pub(crate) fn svc_extra_hostnames(svc: &str) -> Vec<String> {
         // remote nodes get the EXTERNALLY_REACHABLE names on top.
         "model-cache" => &["noo-model-cache"],
         "evolve" => &["noo-evolve"],
+        // Callers dial the `sandbox` alias (the extras carry it too); the
+        // container and replica service names ride along so a probe by
+        // either still verifies.
+        "sandbox" => &["noo-sandbox", "sandbox-extra"],
+        // The gateway's default voice URLs dial the container names
+        // (https://noo-whisper:8000, https://noo-piper:8000); the compose
+        // service name rides in as the leaf's CN SAN.
+        "whisper" => &["noo-whisper"],
+        "piper" => &["noo-piper"],
         _ => &[],
     };
     v.iter().map(|s| s.to_string()).collect()

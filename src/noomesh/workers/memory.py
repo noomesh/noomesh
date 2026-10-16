@@ -79,6 +79,53 @@ async def _resolve_org_teams(store: Any, user_id: "str | None") -> "tuple[str | 
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# Context injection reads these lines into the system prompt of the NEXT
+# turn. They used to be bare `content` strings: an old user message such as
+# "what can you tell me about trading" arrived looking exactly like a
+# request, and the search is trigram similarity, so it ranks a question by
+# its WORDING ("tell me about ...") rather than its topic. gemma-4 12B on
+# mcmini answered that old question instead of the one asked (2026-10-16).
+# Every line now says when it was said and by whom; the loop's own tool-call
+# records and the message being answered are dropped.
+MEMORY_OVERFETCH = 3
+MEMORY_FETCH_CAP = 30
+MEMORY_SKIP_TYPES = frozenset({"tool_call", "tool_result", "tool", "system"})
+_SPEAKER = {"user": "the user said", "assistant": "you replied"}
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def format_memory_lines(results: list, query: str, top_k: int) -> list[str]:
+    """One labelled line per remembered message, at most ``top_k``.
+
+    Drops tool-call/tool-result records (the loop's own searches, which
+    otherwise come back and steer the next search) and any row whose text
+    is the query itself (the message being answered is stored before the
+    search runs, so it is always the best match).
+    """
+    from datetime import datetime, timezone
+
+    asked = _norm(query)
+    lines: list[str] = []
+    for entry, _score in results:
+        kind = (entry.get("type") or "").lower()
+        content = (entry.get("content") or "").strip()
+        if not content or kind in MEMORY_SKIP_TYPES or _norm(content) == asked:
+            continue
+        ts = entry.get("created_at") or 0
+        try:
+            when = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d") if ts else "earlier"
+        except (TypeError, ValueError, OSError):
+            when = "earlier"
+        who = _SPEAKER.get(kind, "noted")
+        lines.append(f"- ({when}, {who}) {content[:500]}")
+        if len(lines) >= top_k:
+            break
+    return lines
+
+
 # NOTE: HTTP memory routes are native Rust (gateway-rust/src/routes/
 # memory.rs), but the Rust coordinator uses the worker.memory.search /
 # worker.memory.cross_channel NATS subjects for context injection
@@ -118,16 +165,17 @@ async def _memory_search(request: dict) -> Any:
         # user's org and their personal/team/org-shared conversations.
         org, teams = await _resolve_org_teams(conversation_store, user_id)
         # search_text returns List[Tuple[entry_dict, score]] and applies the
-        # user/persona/org/team scope when those are supplied.
+        # user/persona/org/team scope when those are supplied. Over-fetch:
+        # format_memory_lines drops rows, and the caller still wants top_k.
         results = await conversation_store.search_text(
-            query, top_k=top_k, user_id=user_id, persona_id=persona_id, org=org, teams=teams
+            query,
+            top_k=min(int(top_k) * MEMORY_OVERFETCH, MEMORY_FETCH_CAP),
+            user_id=user_id,
+            persona_id=persona_id,
+            org=org,
+            teams=teams,
         )
-        if results:
-            return "\n".join(
-                (entry.get("content", "") or "")[:500]
-                for entry, _score in results[:top_k]
-            )
-        return ""
+        return "\n".join(format_memory_lines(results or [], query, int(top_k)))
     except Exception as e:
         return {"error": str(e)}
 

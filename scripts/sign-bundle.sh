@@ -52,7 +52,7 @@ esac
 [ -r "$CA_KEY" ] || { echo "sign-bundle: cannot read CA key at $CA_KEY" >&2; exit 66; }
 [ -t 1 ] && { echo "sign-bundle: refusing to write a tar to a terminal — redirect stdout" >&2; exit 64; }
 
-KNOWN="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key"
+KNOWN="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-runtime vendor-runtime-manifest"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

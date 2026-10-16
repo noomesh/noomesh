@@ -78,8 +78,9 @@ def test_memory_search_scopes_by_user(monkeypatch):
             {"params": {"query": "q", "top_k": 3, "user_id": "alice", "persona_id": "p1"}}
         )
     )
+    # Over-fetched: format_memory_lines drops tool rows and the query itself.
     assert store.search_text_calls == [
-        {"query": "q", "top_k": 3, "user_id": "alice", "persona_id": "p1"}
+        {"query": "q", "top_k": 3 * wp.MEMORY_OVERFETCH, "user_id": "alice", "persona_id": "p1"}
     ]
     assert "hello world" in out
 
@@ -107,7 +108,7 @@ def test_memory_search_result_shape_is_tuple_safe(monkeypatch):
     monkeypatch.setattr(wp, "_get_conversation_store", lambda: store)
     _sole(monkeypatch, "solo")
     out = _run(wp._memory_search({"params": {"query": "q"}}))
-    assert out == "hello world"
+    assert out == "- (earlier, noted) hello world"
 
 
 def test_cross_channel_scopes_by_user_and_excludes_current(monkeypatch):
@@ -201,3 +202,30 @@ def test_cross_channel_threads_org_and_teams(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_memory_lines_are_labelled_and_filtered():
+    """mcmini, 2026-10-16: asked about machine learning, gemma answered an
+    older "what can you tell me about trading" that arrived in the prompt as a
+    bare line, and its own "Tool: noo_rag_query ... trading" records came back
+    to steer the next search. Lines now carry date + speaker; tool rows and
+    the message being answered are dropped."""
+    day = 1792087167.0  # 2026-10-15T17:59:27Z
+    results = [
+        ({"type": "user", "content": "tell me about machien learning", "created_at": day}, 0.9),
+        ({"type": "user", "content": "what can you tell me about trading", "created_at": day}, 0.7),
+        ({"type": "tool_call", "content": "Tool: noo_rag_query\nArguments: {}", "created_at": day}, 0.6),
+        ({"type": "assistant", "content": "Trading is ...", "created_at": day}, 0.5),
+        ({"type": "user", "content": "", "created_at": day}, 0.4),
+        ({"type": "user", "content": "one more", "created_at": day}, 0.3),
+    ]
+    lines = wp.format_memory_lines(results, "Tell me about  MACHIEN learning", 2)
+    assert lines == [
+        "- (2026-10-15, the user said) what can you tell me about trading",
+        "- (2026-10-15, you replied) Trading is ...",
+    ]
+
+
+def test_memory_lines_tolerate_bad_timestamps():
+    lines = wp.format_memory_lines([({"type": "user", "content": "x", "created_at": "nope"}, 1.0)], "q", 5)
+    assert lines == ["- (earlier, the user said) x"]

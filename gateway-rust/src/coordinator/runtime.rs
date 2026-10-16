@@ -63,7 +63,9 @@ pub(crate) trait HarnessRuntime: Sync {
     async fn detect_model_from_prompt(&self, prompt: &str) -> Option<String>;
     async fn resolve_backend_for_model(&self, model: Option<&str>) -> Result<ResolvedBackend>;
     async fn resolve_backend_excluding(&self, model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend>;
-    /// A cloud model: single turn, no tools, provider API called natively.
+    /// A cloud model, single turn, no tools. NOT the loop's path: the loop
+    /// resolves a cloud model to a cloud backend and runs it with tools
+    /// (i83 phase C). Kept for the harness rail's `CloudRun` op.
     async fn run_cloud_completion(&self, prompt: &str, conversation_id: &str, channel: &str, model: &str) -> Result<CoordinatorResult>;
 
     // ── the session ────────────────────────────────────────────────────

@@ -439,7 +439,7 @@ async fn native_inference(
     let cache_key = crate::cache::RedisCache::llm_cache_key(
         "auto", &messages_for_cache, effective_uid.as_deref());
 
-    if let Some(redis) = &state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         if let Some(cached) = redis.get_llm_cache(&cache_key).await {
             tracing::debug!("inference_cache_hit");
             return (StatusCode::OK, Json(json!({
@@ -471,7 +471,7 @@ async fn native_inference(
         Ok(result) => {
             // Cache the response
             if !result.response.is_empty() {
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     redis.set_llm_cache(
                         &cache_key,
                         &json!({"content": result.response}),

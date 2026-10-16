@@ -117,7 +117,12 @@ fn valid_artifact_name(name: &str, required_ext: &str) -> bool {
         && !name.contains('\\')
         && !name.contains("..")
         && !name.starts_with('.')
-        && name.to_ascii_lowercase().ends_with(required_ext)
+        && {
+            let lower = name.to_ascii_lowercase();
+            // An image is a `.tar` or, since the controller compresses its
+            // exports, a `.tar.gz`. Only the image kind (`.tar`) widens.
+            lower.ends_with(required_ext) || (required_ext == ".tar" && lower.ends_with(".tar.gz"))
+        }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -484,6 +489,18 @@ pub(crate) fn image_tar_name(image: &str, arch: &str) -> String {
     format!("{}_{arch}.tar", image.replace(['/', ':'], "_"))
 }
 
+/// The compressed export's name: `image_tar_name` + ".gz" (twins: Go
+/// `ImageTarGzName`, noo-cli `image_tar_gz_name`).
+pub(crate) fn image_tar_gz_name(image: &str, arch: &str) -> String {
+    format!("{}.gz", image_tar_name(image, arch))
+}
+
+/// Whether the store holds this image for `arch` in either form (an older
+/// controller store holds the plain `.tar`).
+pub(crate) fn image_is_staged(dir: &Path, image: &str, arch: &str) -> bool {
+    dir.join(image_tar_gz_name(image, arch)).is_file() || dir.join(image_tar_name(image, arch)).is_file()
+}
+
 /// Docker's normalisation of a ref's NAME — twin of Go `normalizeName` and
 /// noo-cli `image_stage::normalize_name`; `tests/fixtures/own_image_cases.json`
 /// holds all three to one answer.
@@ -570,6 +587,8 @@ mod tests {
     fn tar_name_twin_matches_the_go_and_cli_convention() {
         assert_eq!(image_tar_name("pai-assistant/node-agent:latest", "amd64"), "pai-assistant_node-agent_latest_amd64.tar");
         assert_eq!(image_tar_name("ghcr.io/x/y:z", "arm64"), "ghcr.io_x_y_z_arm64.tar");
+        assert_eq!(image_tar_gz_name("ghcr.io/x/y:z", "arm64"), "ghcr.io_x_y_z_arm64.tar.gz");
+        assert_eq!(image_tar_gz_name("a:b", "amd64"), format!("{}.gz", image_tar_name("a:b", "amd64")));
     }
 
     #[test]
@@ -624,6 +643,9 @@ mod tests {
         let id = format!("sha256:{}", "Ab".repeat(32));
         std::fs::write(dir.join("x_amd64.tar.imageid"), format!("{id}\n")).unwrap();
         assert_eq!(read_image_id_sidecar(&dir, "x_amd64.tar"), Some(id.to_ascii_lowercase()));
+        // The sidecar of a compressed export is `<name>.tar.gz.imageid`.
+        std::fs::write(dir.join("x_amd64.tar.gz.imageid"), format!("{id}\n")).unwrap();
+        assert_eq!(read_image_id_sidecar(&dir, "x_amd64.tar.gz"), Some(id.to_ascii_lowercase()));
         std::fs::write(dir.join("bad_amd64.tar.imageid"), "not-an-id").unwrap();
         assert!(read_image_id_sidecar(&dir, "bad_amd64.tar").is_none());
         assert!(read_image_id_sidecar(&dir, "missing.tar").is_none());
@@ -662,16 +684,36 @@ mod tests {
     }
 
     #[test]
+    fn an_image_is_staged_in_either_form() {
+        let dir = std::env::temp_dir().join(format!("noo-art-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!image_is_staged(&dir, "a/b:c", "amd64"));
+        std::fs::write(dir.join(image_tar_name("a/b:c", "amd64")), b"x").unwrap();
+        assert!(image_is_staged(&dir, "a/b:c", "amd64"));
+        std::fs::remove_file(dir.join(image_tar_name("a/b:c", "amd64"))).unwrap();
+        std::fs::write(dir.join(image_tar_gz_name("a/b:c", "amd64")), b"x").unwrap();
+        assert!(image_is_staged(&dir, "a/b:c", "amd64"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn image_tar_names_follow_the_same_rules() {
         // The agent builds these with ImageTarName: '/'+':' → '_', arch
         // suffix, .tar — so accepted names are exactly that shape.
         for good in [
             "pai-assistant_node-agent_latest_amd64.tar",
             "ghcr.io_noomesh_llamacpp_v0.1.47_arm64.tar",
+            // The controller's compressed export (same stem + ".gz").
+            "pai-assistant_node-agent_latest_amd64.tar.gz",
+            "ghcr.io_noomesh_llamacpp_v0.1.47_arm64.TAR.GZ",
         ] {
             assert!(valid_artifact_name(good, ".tar"), "{good:?} must be accepted");
         }
-        for bad in ["a/b.tar", "..", "img.tar.gz", ".hidden.tar", "img.gguf"] {
+        // Only the image kind widens: a weight is never served as `.tar.gz`.
+        assert!(!valid_artifact_name("m.tar.gz", ".gguf"));
+        assert!(!valid_artifact_name("m.tar.gz", ".modelfile"));
+        for bad in ["a/b.tar", "..", ".hidden.tar", ".hidden.tar.gz", "a/b.tar.gz", "img.gguf", "img.gz", "img.tgz"] {
             assert!(!valid_artifact_name(bad, ".tar"), "{bad:?} must be rejected");
         }
     }

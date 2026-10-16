@@ -82,6 +82,11 @@ impl Consumer {
 }
 
 struct KeyInfo {
+    /// `noo_service_keys.expires_at`: set on the short-lived keys a node
+    /// harness mints for a foreign CLI (`mint_door_key`); `None` = no expiry.
+    /// Checked on the cached path too, so a key stops at its expiry, not up
+    /// to one cache TTL later.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
     consumer: String,
     scopes: Vec<String>,
     rpm_limit: Option<i64>,
@@ -168,7 +173,7 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
     if let Ok(guard) = cache().read() {
         if let Some(c) = guard.as_ref() {
             if c.loaded.elapsed() < TTL {
-                return c.map.get(&hash).map(|k| Consumer {
+                return c.map.get(&hash).filter(|k| live(k.expires_at, chrono::Utc::now())).map(|k| Consumer {
                     name: k.consumer.clone(),
                     scopes: k.scopes.clone(),
                     rpm_limit: k.rpm_limit,
@@ -187,18 +192,19 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
     // disabled account yields NULL rather than dropping the key entirely —
     // the key still authenticates as a machine key and is visibly unbound,
     // instead of vanishing and reading as "revoked".
-    let rows = sqlx::query_as::<_, (String, String, Value, Option<i64>, Option<String>, Option<Value>, Option<String>)>(
-        "SELECT k.key_hash, k.consumer, k.scopes, k.rpm_limit, u.username, u.scopes, u.role \
+    #[allow(clippy::type_complexity)]
+    let rows = sqlx::query_as::<_, (String, String, Value, Option<i64>, Option<String>, Option<Value>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT k.key_hash, k.consumer, k.scopes, k.rpm_limit, u.username, u.scopes, u.role, k.expires_at \
          FROM noo_service_keys k \
          LEFT JOIN noo_users u ON u.username = k.user_id AND u.disabled = false \
-         WHERE k.active = true",
+         WHERE k.active = true AND (k.expires_at IS NULL OR k.expires_at > now())",
     )
     .fetch_all(db)
     .await
     .ok()?;
 
     let mut map = HashMap::new();
-    for (key_hash, consumer, scopes_json, rpm_limit, user, user_scopes_json, user_role_str) in rows {
+    for (key_hash, consumer, scopes_json, rpm_limit, user, user_scopes_json, user_role_str, expires_at) in rows {
         let scopes = scopes_json
             .as_array()
             .map(|a| {
@@ -229,7 +235,7 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
         };
         map.insert(
             key_hash,
-            KeyInfo { consumer, scopes, rpm_limit, user, user_scopes, user_role },
+            KeyInfo { expires_at, consumer, scopes, rpm_limit, user, user_scopes, user_role },
         );
     }
 
@@ -264,6 +270,95 @@ async fn resolve_active(db: &PgPool, token: &str) -> Option<Consumer> {
     }
 
     found
+}
+
+/// Whether a key with this expiry is usable at `now`.
+fn live(expires_at: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    expires_at.is_none_or(|e| e > now)
+}
+
+/// Drop the resolved-key cache, so the next `resolve` reads the table: a
+/// revocation takes effect at once instead of up to one TTL later.
+pub fn invalidate_cache() {
+    if let Ok(mut guard) = cache().write() {
+        *guard = None;
+    }
+}
+
+/// The consumer-name prefix of a key minted for a node harness's foreign
+/// CLI. Only such rows are revoked by [`revoke_door_key`] and swept by
+/// [`mint_door_key`]; a person's own keys are never touched by either.
+pub const DOOR_KEY_CONSUMER_PREFIX: &str = "harness:";
+
+/// The consumer name of a door key: `harness:<node>:<first 8 of the
+/// conversation>`. It is also where the door's connection label comes from
+/// (`auth::connection_label`), so the CLI is a connection of its own,
+/// distinguishable from the person's other clients.
+pub fn door_key_consumer(node: &str, conversation_id: &str) -> String {
+    let conv: String = conversation_id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    format!("{DOOR_KEY_CONSUMER_PREFIX}{node}:{conv}")
+}
+
+/// A minted door key: the raw key (shown once), its row id, its expiry.
+pub struct DoorKey {
+    pub key: String,
+    pub id: uuid::Uuid,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Mint the short-lived user-door key a node harness hands its foreign CLI:
+/// an ordinary `noo_service_keys` row with scope `mcp`, bound to `user`,
+/// expiring after `ttl_secs`. Ordinary on purpose: `/mcp/user` admits it
+/// through the same `resolve` → `admit` path as any key the person minted
+/// for themselves, so the tier is the account's live role and every call is
+/// attributed to the person. Expired harness rows are deleted first, so the
+/// table does not grow by a row per loop.
+pub async fn mint_door_key(db: &PgPool, user: &str, consumer: &str, ttl_secs: u64) -> anyhow::Result<DoorKey> {
+    let _ = sqlx::query("DELETE FROM noo_service_keys WHERE consumer LIKE $1 AND expires_at IS NOT NULL AND expires_at < now()")
+        .bind(format!("{DOOR_KEY_CONSUMER_PREFIX}%"))
+        .execute(db)
+        .await;
+    let key = {
+        use base64::Engine;
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        format!("noo-sk-{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    };
+    let id = uuid::Uuid::new_v4();
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs.min(i64::MAX as u64) as i64);
+    sqlx::query(
+        "INSERT INTO noo_service_keys (id, consumer, key_hash, scopes, note, user_id, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(consumer)
+    .bind(sha256_hex(&key))
+    .bind(serde_json::json!(["mcp"]))
+    .bind("node harness: a foreign CLI's door key, expires with its turn")
+    .bind(user)
+    .bind(expires_at)
+    .execute(db)
+    .await?;
+    invalidate_cache();
+    Ok(DoorKey { key, id, expires_at })
+}
+
+/// Revoke a door key `mint_door_key` minted for `user`. Never touches a key
+/// that is not a harness key or not that person's. `true` = a row changed.
+pub async fn revoke_door_key(db: &PgPool, id: &str, user: &str) -> anyhow::Result<bool> {
+    let id = uuid::Uuid::parse_str(id)?;
+    let n = sqlx::query(
+        "UPDATE noo_service_keys SET active = false WHERE id = $1 AND user_id = $2 AND consumer LIKE $3 AND active = true",
+    )
+    .bind(id)
+    .bind(user)
+    .bind(format!("{DOOR_KEY_CONSUMER_PREFIX}%"))
+    .execute(db)
+    .await?
+    .rows_affected();
+    invalidate_cache();
+    Ok(n > 0)
 }
 
 /// Insert one audit/usage row into `noo_external_requests`. Designed to be
@@ -302,6 +397,28 @@ pub async fn record_external_request(
     .await;
     if let Err(e) = res {
         tracing::warn!("external audit insert failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod door_key_tests {
+    use super::*;
+
+    #[test]
+    fn an_expired_key_is_dead_and_an_unexpiring_one_lives() {
+        let now = chrono::Utc::now();
+        assert!(live(None, now));
+        assert!(live(Some(now + chrono::Duration::seconds(5)), now));
+        assert!(!live(Some(now), now));
+        assert!(!live(Some(now - chrono::Duration::seconds(1)), now));
+    }
+
+    #[test]
+    fn a_door_key_consumer_is_a_harness_name_and_yields_a_connection_label() {
+        let c = door_key_consumer("awolf", "3f2a9c10-aaaa-bbbb");
+        assert_eq!(c, "harness:awolf:3f2a9c10");
+        assert!(c.starts_with(DOOR_KEY_CONSUMER_PREFIX));
+        assert_eq!(crate::auth::connection_label(&c).as_deref(), Some("harness-awolf-3f2a9c10"));
     }
 }
 

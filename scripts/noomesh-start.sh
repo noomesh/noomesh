@@ -167,7 +167,7 @@ fi
 # OVERLAY (docker-compose.voice.yml via lib-compose.sh; an earlier change phase
 # D), so the containers survive `noo stack start` and a reboot. Provider selection
 # stays in NOO_STT_* / NOO_TTS_* (the gateway defaults to
-# http://noo-whisper:8000 and http://noo-piper:8000, wire format "openai" for
+# https://noo-whisper:8000 and https://noo-piper:8000 (mTLS), wire format "openai" for
 # both); this switch only decides whether the containers are deployed.
 #
 # `voice` is in the same map but is NOT in the gateway's add-on table: it
@@ -233,60 +233,13 @@ if [ "$DIST" = true ]; then
     echo "Distribution mode: ON"
     echo "  Images: ${NOO_IMAGE_PREFIX}/<service>:${NOO_IMAGE_TAG} (pull-only, no local build)"
 
-    # Digest pins. `noo upgrade --stack` fetches the
-    # release's signed stack-<tag>.lock, verifies it against the release key
-    # baked into the CLI, and writes it here as stack.lock. Every compose
-    # image ref carries `${NOO_IMAGE_DIGEST_<SVC>:-}`, so with the lock
-    # present docker pulls `<image>:<tag>@sha256:…` — the tag is a label,
-    # the digest is what runs. A lock for a DIFFERENT tag is ignored (and
-    # said so): never pin one tag's digests onto another.
-    if [ -f "stack.lock" ]; then
-        if grep -q "^# tag ${DIST_TAG}\$" stack.lock; then
-            while IFS= read -r line; do
-                case "$line" in \#*|"") continue ;; esac
-                img="${line%%@*}"; dig="${line#*@}"
-                # IMAGE rows only. The lock also carries provenance rows —
-                # `source:trellion@<git sha>` since #1108 — which are not
-                # images, and whose derived name (NOO_IMAGE_DIGEST_SOURCE:…)
-                # is not a valid shell identifier. `export` then fails, and
-                # under `set -e` that killed every start on stack v0.2.22:
-                # the first tag whose lock carried provenance could not boot.
-                #
-                # Testing the DIGEST is what states the intent — an image
-                # row is the one that carries a sha256 digest.
-                case "$dig" in sha256:*) : ;; *) continue ;; esac
-                var="NOO_IMAGE_DIGEST_$(printf '%s' "$img" | tr 'a-z-' 'A-Z_')"
-                # ...and testing the NAME is what makes it safe, because the
-                # digest test alone does not close the failure mode it was
-                # written for. `export` dies on any name that is not a shell
-                # identifier, and `tr` only folds case and hyphens: a colon,
-                # a dot or a slash survives it. So a row like
-                # `attestation:sbom@sha256:…`, a registry-qualified
-                # `ghcr.io/owner/gateway@sha256:…`, or a bare `sha256:x` with
-                # no `@` at all (img and dig are then the same string, and it
-                # passes the digest test) reproduces v0.2.22 exactly: every
-                # start dies under `set -e`.
-                #
-                # Today's eleven image names are all lowercase and hyphens,
-                # so none of that is live — which is precisely the position
-                # we were in before #1108 added a row nobody had anticipated.
-                # A name we cannot export is a row we do not understand, and
-                # the launcher's job is to start the stack, not to adjudicate
-                # lock formats. Skip it, say so, and keep booting.
-                case "$var" in
-                    ''|[!A-Z_]*|*[!A-Z0-9_]*)
-                        echo "noomesh-start: stack.lock row '''$line''' does not name an image variable — skipping" >&2
-                        continue
-                        ;;
-                esac
-                export "$var=@$dig"
-                _DIST_PINS+=("$var=@$dig")
-            done < stack.lock
-            ui_kv "Digests" "pinned from stack.lock $(ui_muted "(signed release stack-${DIST_TAG})")"
-        else
-            ui_kv "Digests" "stack.lock is for another tag — pulling ${DIST_TAG} by tag $(ui_muted "(noo upgrade --stack refreshes the lock)")"
-        fi
-    fi
+    # Digest pins from the signed stack.lock (lib-dist.sh dist_load_stack_lock;
+    # a lock for another tag is never applied).
+    dist_load_stack_lock "$DIST_TAG"
+    case "$_DIST_LOCK_STATE" in
+        loaded) ui_kv "Digests" "pinned from stack.lock $(ui_muted "(signed release stack-${DIST_TAG})")" ;;
+        other) ui_kv "Digests" "stack.lock is for another tag — pulling ${DIST_TAG} by tag $(ui_muted "(noo upgrade --stack refreshes the lock)")" ;;
+    esac
 
     # ── Promotion guardrails (2026-08-28 incident: a plain start silently
     # DOWNGRADED v0.1.91 → v0.1.75 because the yaml's pinned NOO_IMAGE_TAG
@@ -475,26 +428,11 @@ if [ -z "$_data_root" ]; then
 fi
 
 # ── redis/grafana data re-owned to 65532 (i64) ────────────────────────
-# Both now run as uid 65532 (`user: nonroot` / `user: grafana`, each the
-# image's own name for 65532: docker-compose.cluster.yml); before
-# i64 they ran as the DHI -dev images' root, so on an existing install the
-# files they wrote under <data root>/redis (appendonlydir, dump.rdb) and
-# <data root>/grafana (grafana.db, plugins, png, ...) are root-owned and the
-# new uid cannot write them. Re-own them once, through the same throwaway
-# container pattern as the ingest dir below (no sudo). Idempotent: the
-# `find -quit` probe makes a box already on 65532 a no-op, and a missing dir
-# (not this profile, fresh install before onboard) is skipped.
-if [ -n "$_data_root" ]; then
-    for _svc_dir in redis grafana; do
-        [ -d "$_data_root/$_svc_dir" ] || continue
-        if ! docker run --rm -v "$_data_root/$_svc_dir":/d alpine \
-                sh -c 'if [ -n "$(find /d \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then chown -R 65532:65532 /d; fi' \
-                2>/dev/null; then
-            echo "NOTE: could not re-own $_data_root/$_svc_dir to uid 65532; $_svc_dir runs as 65532 (i64) and \
-may fail with 'permission denied'. To fix: docker run --rm -v \"$_data_root/$_svc_dir\":/d alpine chown -R 65532:65532 /d" >&2
-        fi
-    done
-fi
+# Done immediately before `up`, after the running service is stopped, and
+# verified afterwards: reown_nonroot_dirs (lib-reown.sh). It used to run HERE,
+# minutes before `up`, while the old root container kept rewriting its files
+# through the pull — the 0.6.3 -> 0.6.4 redis crash loop on a root-owned
+# appendonlydir/appendonly.aof.manifest (2026-10-16).
 
 # ── HF_CACHE_DIR must be an HF_HOME, not a bare hub archive ───────────
 # HF_CACHE_DIR is bound to /root/.cache/huggingface for the vLLM-family
@@ -527,7 +465,11 @@ if [ -d "$_hf_dir" ] && [ ! -d "$_hf_dir/hub" ] &&    [ -n "$(find "$_hf_dir" -m
     ui_note "see docs/models/weight-cache.md"
 fi
 unset _hf_dir
-unset _data_root
+# _data_root stays set: the re-own (reown_nonroot_dirs, i64/i100) runs just
+# before each `up`, far below, and reads it. 0.6.4/0.6.5-rc.1 unset it HERE,
+# so both `if [ -n "$_data_root" ]` guards were false and the re-own never
+# ran (the rc.1 rehearsal: redis crash-looped on the seeded root-owned AOF
+# manifest). tests/test_launcher_reown_nonroot_dirs.py runs the real script.
 # The dist-tag RESOLUTION is authoritative — re-assert it after every env
 # source has loaded. The sops store can carry a STALE NOO_IMAGE_TAG (the
 # wizard encrypts the whole .env, pin included) and load_secrets exports
@@ -553,6 +495,8 @@ source "$SCRIPT_DIR/lib-created-guard.sh"
 # Refuse an `up` whose bind-mount sources are missing or the wrong type
 # (Docker would invent root-owned directories for them — 2026-09-29).
 source "$SCRIPT_DIR/lib-bind-sources.sh"
+# Hand redis/grafana data to uid 65532 right before `up` (i64), verified.
+source "$SCRIPT_DIR/lib-reown.sh"
 # An enabled system without its credentials is a gateway crash-loop once
 # `up` runs — refuse before pulling or recreating anything.
 check_system_credentials || exit 1
@@ -936,6 +880,15 @@ require_compose_v2 || exit 1
         noo_check_port_collisions || exit 1
     fi
 
+    # redis/grafana run as uid 65532 (i64): re-own their data NOW, with the old
+    # container stopped, and refuse the start if anything is still not 65532 (lib-reown.sh).
+    # Before the bind-source check, which stays the last thing before `up`
+    # and so sees the final ownership.
+    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046  # one service name per word
+        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
     # Every bind source of what this `up` starts must already exist, with
     # the right type — else refuse NOW, before anything is recreated
     # (lib-bind-sources.sh). $ACTIVE_SVCS is that set, minus the scaled-out
@@ -992,6 +945,14 @@ else
         echo "Profiles: $PROFILE_ARGS"
     fi
 
+    # redis/grafana re-owned (lib-reown.sh) before the bind-source check,
+    # which stays last before `up`. Only the named services: re-owning (and so stopping) one this start
+    # does not bring back up would leave it down.
+    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046
+        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
     check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")

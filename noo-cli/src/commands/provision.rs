@@ -283,16 +283,22 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     // --move-data: acknowledge that this bundle moves the
     // node's data root off the one it runs on. Moves nothing itself.
     let mut move_data = false;
+    // --stage-only: stage + poke, then return without waiting for the node
+    // to apply (`noo upgrade --nodes` stages every node this way and waits
+    // for them together). It removes ONLY the apply wait: `--wait` still
+    // governs the enrollment wait at step 1, exactly as it always has.
+    let mut stage_only = false;
     let mut it = args.iter().peekable();
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--local" => local = true,
             "--move-data" => move_data = true,
+            "--stage-only" => stage_only = true,
             "--harness" => {
                 let v = it.next().cloned().unwrap_or_default();
                 if !matches!(v.as_str(), "auto" | "manual" | "off") {
                     fail(g.json, ExitCode::Usage, "usage", "--harness must be auto, manual or off",
-                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
+                        Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
                 }
                 harness = Some(v);
             }
@@ -308,17 +314,17 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             // through to the Python CLI (which has no `provision`).
             t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unknown flag: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
             t if node.is_none() => node = Some(t.to_string()),
             t if tier.is_none() => tier = Some(t.to_string()),
             t => fail(g.json, ExitCode::Usage, "usage",
                 &format!("unexpected argument: {t}"),
-                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]")),
+                Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]")),
         }
     }
     let Some(node) = node else {
         fail(g.json, ExitCode::Usage, "usage", "node name required",
-            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--move-data]"));
+            Some("usage: noo cluster provision <node> [tier] [--harness auto|manual|off] [--wait [secs]] [--stage-only] [--move-data]"));
     };
 
     if !g.json && !ui::quiet() {
@@ -966,6 +972,74 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             None => nnote(&format!("no harness in this bundle: no gateway asset for {os}/{arch}")),
         }
     }
+    // ── the vendor CLI the harness placement needs (i83 E1e) ──────────
+    // A harness kind that runs a vendor CLI (Copilot CLI, Claude Code,
+    // Codex) needs it on the node's PATH, and the node never fetches it:
+    // `noo cluster vendor stage <kind>` fetched and verified it on this
+    // controller, and the bundle carries it. The desired kind is the
+    // harness placement's NOO_HARNESS_KIND, read from the same
+    // desired-config the node agent converges to. Not staged = the restage
+    // is refused: a restage never downloads, and a node placed on a CLI it
+    // does not have would only be refused by its agent.
+    if self_node {
+        // The controller's gateway runs turns in process; no node harness here.
+    } else if !super::cluster_vendor::applier_knows_vendor_kinds(darwin, &node_app_version) {
+        nnote(&format!(
+            "no vendor CLI in this bundle: {node} reports {node_app_version}, whose applier predates \
+             the vendor kinds. It carries the newer CLI; the next restage carries the vendor CLI."
+        ));
+    } else {
+        let desired = crate::http::get_json_opt(
+            g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(&node)), true, 10);
+        let kind = desired.as_ref().and_then(super::cluster_vendor::desired_harness_kind);
+        let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
+        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
+        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+        let table = crate::harness_kinds::shipped();
+        let wants_vendor = kind.as_deref().is_some_and(|k| {
+            table.kinds.iter().any(|r| r.kind == k && r.distribution.is_some())
+        });
+        if wants_vendor {
+            let Some((os, arch)) = crate::harness_kinds::normalize_platform(os, arch) else {
+                scrub(&work);
+                fail(g.json, ExitCode::Generic, "vendor_platform",
+                    &format!("{node}'s harness placement names {} but its platform {os}/{arch} is not one vendor CLIs are staged for",
+                        kind.as_deref().unwrap_or("?")), None);
+            };
+            let dir = super::cluster_vendor::vendor_cache_dir(&root);
+            match super::cluster_vendor::vendor_bundle_files(&table, kind.as_deref(), os, arch,
+                &|n| super::cluster_vendor::read_staged(&dir, n))
+            {
+                Ok(vf) => {
+                    let size: usize = vf.iter().filter(|(k, _)| !k.ends_with("-manifest")).map(|(_, b)| b.len()).sum();
+                    nnote(&format!("bundle carries the {} vendor CLI{} ({})",
+                        kind.as_deref().unwrap_or("?"),
+                        if vf.iter().any(|(k, _)| *k == "vendor-runtime") { " and its runtime" } else { "" },
+                        human_bytes(size)));
+                    files.extend(vf);
+                }
+                Err(e) => {
+                    scrub(&work);
+                    fail_guided(g, ExitCode::Generic, "vendor_not_staged", &e,
+                        &format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
+                        &[(&format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
+                           "fetch the pinned CLI (and runtime) on this controller and verify its sha256"),
+                          ("noo cluster vendor status", "what is staged and which nodes need it"),
+                          (&format!("noo cluster provision {node}"), "restage once it is staged")]);
+                }
+            }
+        }
+    }
+    // A binary the node's own last report proves it already runs is not
+    // carried again (bandwidth only: the applier skips identical bytes anyway).
+    // The proof is the node's `binary-sha:` statement; see `node_runs_asset`.
+    // The status read is one GET; unreachable or unparseable = carry everything.
+    {
+        let last = crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10);
+        for note in drop_proven_binaries(&mut files, last.as_ref(), darwin, self_node) {
+            nnote(&note);
+        }
+    }
     // ── the backend door leaves issued in 3b ──────────────────────────────
     // Same rail, same signature. A Mac whose applier predates the kinds
     // would refuse the WHOLE bundle on them (it has no self-updating shell
@@ -1063,10 +1137,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         // kind it does not know, and its fetcher cannot report. Stage an
         // applier-only bundle first — the one kind every applier accepts —
         // so the full bundle below is applied by the new applier.
-        let legacy = crate::http::get_json_opt(
-                g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
-            .map(|st| st.get("applied_at").map(|v| v.is_null()).unwrap_or(true))
-            .unwrap_or(true);
+        let legacy = node_never_reported_apply(g, &node);
         if legacy && !darwin {
             let apply = super::enroll::asset_apply();
             if !apply.is_empty() {
@@ -1083,6 +1154,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                     Err(e) => { scrub(&w2); fail(g.json, ExitCode::Generic, "encrypt_failed", &e, None); }
                 };
                 scrub(&w2);
+                let applier_sha = sha256_hex(&blob2);
                 if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob2) {
                     fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
                 }
@@ -1096,23 +1168,68 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                           ("journalctl -u noo-fetch -n 20", "on the node — TLS and connectivity errors live here"),
                           (&format!("noo cluster provision {node} --wait"), "re-stage once the poll reaches the controller")]);
                 }
-                nstep(&format!("{node} fetched the applier — giving it 30s to install before the full bundle"));
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // The new applier reports its own apply (that is the point of
+                // the handshake), so wait for THAT report instead of a fixed
+                // 30 s guess. A node whose report never arrives (a fetcher
+                // that cannot report, a gateway that lost the POST) is not
+                // stuck: after the cap we proceed exactly as the old fixed
+                // sleep did, and say so.
+                nstep(&format!("{node} fetched the applier — waiting for it to report the install before the full bundle"));
+                match wait_applier_reported(g, &node, &applier_sha, APPLIER_REPORT_CAP_SECS, APPLIER_REPORT_POLL_SECS) {
+                    Some(0) => nstep(&format!("{node} installed the applier (reported exit 0)")),
+                    Some(rc) => warn_line(&format!(
+                        "{node}: the applier-only bundle reported exit {rc} — staging the full bundle anyway; it will likely be refused the same way")),
+                    None => warn_line(&format!(
+                        "{node}: no apply report for the applier within {APPLIER_REPORT_CAP_SECS}s — proceeding with the full bundle without confirmation")),
+                }
             }
         }
+        // Compress BEFORE encrypting (AES output does not compress) — but only
+        // for a node whose fetcher reads gzip (bundle_gzip_gate).
+        let (to_encrypt, gzip_note) = match bundle_gzip_gate(&node_app_version) {
+            Err(why) => {
+                nstep(&format!("bundle not compressed: {why}"));
+                (bundle.clone(), None)
+            }
+            Ok(()) => match gzip_bundle(&bundle, &work) {
+                Ok(gz) => {
+                    let from = std::fs::metadata(&bundle).map(|m| m.len() as usize).unwrap_or(0);
+                    (gz, Some(format!(", gzip from {}", human_bytes(from))))
+                }
+                Err(e) => {
+                    warn_line(&format!("bundle not compressed: {e} — staging it uncompressed"));
+                    (bundle.clone(), None)
+                }
+            },
+        };
         nstep(&format!("encrypting the bundle to {node}'s birth cert"));
-        let blob = match encrypt_bundle_cms(&bundle, cert, &work) {
+        let blob = match encrypt_bundle_cms(&to_encrypt, cert, &work) {
             Ok(b) => b,
             Err(e) => { scrub(&work);
                 fail(g.json, ExitCode::Generic, "encrypt_failed", &e,
                     Some("is openssl installed on the controller?")); }
         };
         scrub(&work);
-        nstep(&format!("staging the encrypted bundle at the gateway ({})", human_bytes(blob.len())));
+        nstep(&format!("staging the encrypted bundle at the gateway ({}{})", human_bytes(blob.len()), gzip_note.as_deref().unwrap_or("")));
         if let Err(e) = post_bytes(g, &format!("/api/cluster/provision-bundle/{node}"), &blob) {
             fail(g.json, ExitCode::Generic, "stage_failed", &e, None);
         }
         let poked = poke_fetch(g, &node);
+        let staged_sha = sha256_hex(&blob);
+        if stage_only {
+            // Everything up to and including the poke is done; the caller
+            // (`noo upgrade --nodes`) waits for the apply, for every node at
+            // once. Nothing here has judged the node: "staged" is printed
+            // as exactly that, and the verdict is the caller's, from the
+            // node's own report.
+            nstep(&format!("{node} staged (sha {}) — not waiting for the apply (--stage-only)", &staged_sha[..12]));
+            if g.json {
+                println!("{}", serde_json::json!({
+                    "status": "staged", "node": node, "staged_sha": staged_sha, "poked": poked,
+                }));
+            }
+            return Ok(0);
+        }
 
         // Verification (2026-09-03): the node's fetcher REPORTS the applier's
         // exit code (POST /bootstrap/bundle/{node}/applied) and the status
@@ -1125,10 +1242,6 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         } else {
             format!("staged — waiting for {node} to pull, apply and report (up to 10 min; an idle node polls about every 5)")
         });
-        let staged_sha = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&blob))
-        };
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(600);
         let mut seen_fetch = false;
@@ -1138,34 +1251,20 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             if let Some(st) = crate::http::get_json_opt(
                 g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
             {
-                if !seen_fetch && st.get("fetched_at").and_then(|v| v.as_str()).is_some() {
-                    seen_fetch = true;
-                    poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
-                }
-                let reported_sha = st.get("applied_sha").and_then(|v| v.as_str()).unwrap_or("");
-                if reported_sha == staged_sha {
-                    let rc = st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    let msg = st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    outcome = Some((rc, msg));
-                    break;
+                match judge_bundle_status(&st, &staged_sha) {
+                    BundleVerdict::Applied { rc, msg } => {
+                        outcome = Some((rc, msg));
+                        break;
+                    }
+                    BundleVerdict::Fetched if !seen_fetch => {
+                        seen_fetch = true;
+                        poll = ui::Poll::start_under(&format!("{node} fetched the bundle — waiting for decrypt + apply"));
+                    }
+                    BundleVerdict::Fetched | BundleVerdict::Nothing => {}
                 }
             }
-            if legacy && seen_fetch && started.elapsed().as_secs() > 45 {
-                // No report will come from an old fetcher; fall back to
-                // "agent registered" and say the confirmation is missing.
-                if let Some(doc) = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10) {
-                    let found = doc.get("nodes").and_then(|n| n.as_array()).map(|arr| {
-                        arr.iter().any(|nd| {
-                            nd.get("id").and_then(|v| v.as_str())
-                                .or_else(|| nd.get("node_id").and_then(|v| v.as_str()))
-                                .or_else(|| nd.get("name").and_then(|v| v.as_str()))
-                                .is_some_and(|id| id.eq_ignore_ascii_case(&node))
-                                && nd.get("status").and_then(|v| v.as_str())
-                                    .is_some_and(|st| st == "online" || st == "busy")
-                        })
-                    }).unwrap_or(false);
-                    if found { break; }
-                }
+            if legacy_fallback_due(legacy, seen_fetch, started.elapsed().as_secs()) && node_is_online(g, &node) {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
@@ -1174,34 +1273,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         match outcome {
             Some((0, ref msg)) => {
                 nstep(&format!("{node} reported: applied (exit 0)"));
-                // The POSITIVE check for the bundle-verification lane, read
-                // off the APPLIER's own account of what it did rather than
-                // off a config file's contents. "I edited the file" was
-                // exactly the evidence that failed here before: the arm the
-                // runbook told operators to close in
-                // /etc/noo-node-agent.env never reached the applier at all.
-                if let Some(lane) = verification_lane(msg) {
-                    nnote(&lane);
-                }
-                record_signing_adoption(&node, msg);
-                if is_self {
-                    write_self_lane(&node, SelfLaneRecord::Rail);
-                }
-                // The controller runs hostd twice from ONE binary: worker mode
-                // (a root system unit, which the applier just restarted and
-                // verified) and controller mode (this operator's user unit,
-                // which a root applier cannot reach). Restart the second only
-                // once the applier reports the new binary installed AND
-                // proven — its `applied:` list names hostd-binary only after a
-                // fresh heartbeat — so a failed upgrade never touches it.
-                if self_node && applier_applied(msg, "hostd-binary") {
-                    refresh_controller_hostd(&root);
-                }
-                // Applied is not done: the node must now satisfy every
-                // invariant. Printed, not fatal — the bundle
-                // is on the node; what is left is named beside each row.
-                if !crate::commands::cluster_verify::verify_node_after_apply(g, node.as_ref()) {
-                    nnote(&format!("{node}: applied, and an invariant does not hold yet — `noo cluster verify {node}` re-checks"));
+                // One function for every caller (this verb and the combined
+                // wait of `noo upgrade --nodes`), so the post-apply steps
+                // cannot drift between them. The controller's own node has
+                // extra steps; every other node gets the common ones.
+                if self_node {
+                    after_self_applied(g, &node, msg);
+                } else {
+                    after_remote_applied(g, &node, msg);
                 }
             }
             Some((rc, msg)) => {
@@ -1816,6 +1895,74 @@ pub(crate) fn applier_applied(msg: &str, kind: &str) -> bool {
         return false;
     }
     msg[at + "applied:".len()..].split_whitespace().any(|k| k == kind)
+}
+
+/// The `<kind>=<sha256>` pairs after the LAST `binary-sha:` in an apply
+/// report message (Linux `noo-apply` prints it as its final line; a Mac's
+/// fetch appends it). Empty for an applier that predates the line.
+fn reported_binary_shas(msg: &str) -> Vec<(String, String)> {
+    let Some(at) = msg.rfind("binary-sha:") else { return Vec::new() };
+    msg[at + "binary-sha:".len()..].split_whitespace()
+        .filter_map(|t| t.split_once('='))
+        .filter(|(_, h)| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|(k, h)| (k.to_string(), h.to_ascii_lowercase()))
+        .collect()
+}
+
+/// Does the node's last apply report PROVE it runs exactly `asset_sha` as
+/// `kind`? `status` is `/api/cluster/provision-bundle/<node>/status`. All of:
+/// the report is about the bundle currently staged (`applied_sha` equals the
+/// staged `sha256`), it was an apply that succeeded (`apply_rc` 0), and the
+/// node itself stated `kind=<asset_sha>` in its `binary-sha:` line. Anything
+/// else — no status, no report yet, a refused apply, an applier that prints no
+/// such line, a different sha — is "not proven", and the caller carries the
+/// binary. Never decided from a version string.
+fn node_runs_asset(status: Option<&serde_json::Value>, kind: &str, asset_sha: &str) -> bool {
+    let Some(st) = status else { return false };
+    let staged = st["sha256"].as_str().unwrap_or("");
+    let applied = st["applied_sha"].as_str().unwrap_or("");
+    if staged.is_empty() || staged != applied || st["apply_rc"].as_i64() != Some(0) {
+        return false;
+    }
+    let msg = st["apply_msg"].as_str().unwrap_or("");
+    reported_binary_shas(msg).iter().any(|(k, h)| k == kind && h == &asset_sha.to_ascii_lowercase())
+}
+
+/// Remove from the bundle the binary kinds the node has proven it already
+/// runs; returns one printed note per omission. Never touches the applier,
+/// fetcher, env, unit, certificate or harness-env kinds. Held back on purpose:
+/// a Mac's `agent-binary` (its applier requires that payload for a full
+/// install) and, on the controller's own node, `hostd-binary` (the controller
+/// restarts its user-mode hostd only when this apply installs one).
+fn drop_proven_binaries(
+    files: &mut Vec<(&str, Vec<u8>)>,
+    status: Option<&serde_json::Value>,
+    darwin: bool,
+    self_node: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for kind in ["agent-binary", "hostd-binary", "cli-binary", "harness-binary"] {
+        if (darwin && kind == "agent-binary") || (self_node && kind == "hostd-binary") {
+            continue;
+        }
+        let Some(sha) = files.iter().find(|(k, _)| *k == kind).map(|(_, b)| sha256_hex(b)) else { continue };
+        if !node_runs_asset(status, kind, &sha) {
+            continue;
+        }
+        files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
+        notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
+    }
+    // The vendor CLI and its runtime go as ONE group, manifests included:
+    // the wrapper names both versions, so carrying one without the other
+    // would rewrite it against a half the node may have pruned.
+    let vendor: Vec<(&str, String)> = files.iter()
+        .filter(|(k, _)| matches!(*k, "vendor-cli" | "vendor-runtime"))
+        .map(|(k, b)| (*k, sha256_hex(b))).collect();
+    if !vendor.is_empty() && vendor.iter().all(|(k, sha)| node_runs_asset(status, k, sha)) {
+        files.retain(|(k, _)| !k.starts_with("vendor-"));
+        notes.push("vendor CLI: unchanged since last apply, not carried (the node reported running these exact bytes)".into());
+    }
+    notes
 }
 
 /// Restart the controller-mode hostd (a user unit on the same binary the
@@ -2829,6 +2976,58 @@ fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<
     std::fs::read(&out).map_err(|e| e.to_string())
 }
 
+/// The first CLI release whose fetcher (`noo-fetch.sh` on Linux, `noo node
+/// fetch` on macOS) unwraps a gzip-compressed bundle after decrypting it.
+/// A guard test pins it; read that test's comment before changing it.
+const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
+
+/// "noo-cli-v0.6.5+abc1234" -> (0, 6, 5); anything else -> None.
+fn parse_cli_version(app_version: &str) -> Option<(u32, u32, u32)> {
+    let rest = app_version.split("noo-cli-v").nth(1)?;
+    let nums: Vec<u32> = rest.split(['+', '-']).next()?.split('.').filter_map(|s| s.parse().ok()).collect();
+    let [maj, min, pat] = nums[..] else { return None };
+    Some((maj, min, pat))
+}
+
+/// May this node be sent a gzip-wrapped bundle? Ok(()) yes; Err(reason) no.
+///
+/// The FETCHER must decompress, and on Linux it runs before the applier can
+/// self-update, so the applier's trick does not help. An old fetcher handed
+/// gzip bytes passes them to `noo-apply`, which refuses "not a readable tar":
+/// a wrong YES bricks the apply. So an unknown or unparseable version is NO
+/// (the opposite default from `applier_knows_harness_kinds`).
+pub(crate) fn bundle_gzip_gate(app_version: &str) -> Result<(), String> {
+    let (a, b, c) = GZIP_BUNDLE_MIN_VERSION;
+    match parse_cli_version(app_version) {
+        None if app_version.is_empty() => Err("the node reports no CLI version, so its fetcher may predate gzip".into()),
+        None => Err(format!("the node's version {app_version:?} is unreadable, so its fetcher may predate gzip")),
+        Some(v) if v < GZIP_BUNDLE_MIN_VERSION =>
+            Err(format!("{app_version} predates the gzip-aware fetcher (needs >= {a}.{b}.{c})")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// gzip `bundle` (level 6, one member, no filename, mtime 0) into
+/// `work/bundle.tar.gz`. The signed tar inside is untouched; the node's
+/// fetcher restores it byte for byte. A failure is returned, never fatal:
+/// the caller stages the uncompressed tar and says so.
+pub(crate) fn gzip_bundle(bundle: &Path, work: &Path) -> Result<std::path::PathBuf, String> {
+    use std::io::{Read, Write};
+    let out = work.join("bundle.tar.gz");
+    let mut src = std::fs::File::open(bundle).map_err(|e| format!("gzip: cannot read the bundle ({e})"))?;
+    let dst = std::fs::File::create(&out).map_err(|e| format!("gzip: cannot write {} ({e})", out.display()))?;
+    let mut enc = flate2::GzBuilder::new().mtime(0)
+        .write(std::io::BufWriter::new(dst), flate2::Compression::new(6));
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("gzip: read failed ({e})"))?;
+        if n == 0 { break; }
+        enc.write_all(&buf[..n]).map_err(|e| format!("gzip: compress failed ({e})"))?;
+    }
+    enc.finish().and_then(|mut w| w.flush()).map_err(|e| format!("gzip: finish failed ({e})"))?;
+    Ok(out)
+}
+
 /// POST raw bytes to a gateway path (the encrypted bundle — too large and
 /// too binary for the JSON helpers). Same base-url/TLS posture as http.rs;
 /// bearer from the standard resolution.
@@ -3003,7 +3202,9 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
 fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
-    let agent = crate::http::agent(g, &base, 60);
+    // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
+    // (i83 E1e) is a few hundred MB, which a flat 60 s cut off below ~5 MB/s.
+    let agent = crate::http::agent(g, &base, 60 + (body.len() / 1_000_000) as u64);
     let mut req = agent.post(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
@@ -3179,14 +3380,18 @@ fn darwin_run_harness() -> String {
     super::env_quote::run_wrapper(
         "harness.env",
         "rendered into the provision bundle — sources the harness env (launchd has no EnvironmentFile) and execs the gateway binary's harness subcommand.",
-        r#"exec "$HOME/noomesh/bin/noo-gateway" harness"#,
+        // ~/noomesh/bin first: a staged vendor CLI's wrapper lives there
+        // (i83 E1e), and the driver hands the CLI this PATH.
+        "export PATH=\"$HOME/noomesh/bin:$PATH\"\nexec \"$HOME/noomesh/bin/noo-gateway\" harness",
     )
 }
 fn darwin_run_agent() -> String {
     super::env_quote::run_wrapper(
         "agent.env",
         "rendered into the provision bundle — sources the agent env (launchd has no EnvironmentFile) and execs the agent.",
-        r#"exec "$HOME/noomesh/bin/noo-node-agent""#,
+        // ~/noomesh/bin first: the agent's vendor-CLI check (cliOnPath)
+        // looks for a staged CLI's wrapper on its own PATH (i83 E1e).
+        "export PATH=\"$HOME/noomesh/bin:$PATH\"\nexec \"$HOME/noomesh/bin/noo-node-agent\"",
     )
 }
 
@@ -3209,22 +3414,49 @@ fn darwin_run_agent() -> String {
 /// from before the field ignores it and applies its 24h queued-age bound.
 pub(crate) const POKE_EXPIRE_AFTER_SEC: u64 = 600;
 
+/// How long a poke is retried while the gateway says it cannot take one yet
+/// (its Redis client reconnecting right after a stack roll — every poke of
+/// the 0.6.4 node phase failed that way for several minutes, so every node
+/// waited for its timer), and how often.
+pub(crate) const POKE_RETRY_WINDOW_SECS: u64 = 60;
+pub(crate) const POKE_RETRY_STEP_SECS: u64 = 10;
+
+/// Is this submit failure the gateway's "not yet" rather than a verdict?
+/// The gateway answers 503 with `{"error":"redis_reconnecting"}` while its
+/// Redis client reconnects (older gateways: a bare 500 naming Redis). Any
+/// other status is an answer (bad body, auth, unknown node) and is not
+/// retried. The text is what `post_json_try` hands back: the `detail` field
+/// when there is one, else `HTTP <status>: <body>`.
+pub(crate) fn poke_is_transient(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.starts_with("http 503") || lower.contains("redis")
+}
+
 pub(crate) fn poke_fetch(g: &Globals, node: &str) -> bool {
     let body = poke_fetch_body(node);
-    match crate::http::post_json_try(g, "/api/jobs/submit", &body, true, 10) {
-        Ok(v) if v.get("error").is_none() => {
-            nstep(&format!("poked {node} over the bus to fetch now (job {})",
-                v.get("job_id").or_else(|| v.get("id")).and_then(|j| j.as_str()).unwrap_or("queued")));
-            true
-        }
-        Ok(v) => {
-            nstep(&format!("poke not accepted ({}) — {node} fetches on its timer",
-                v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")));
-            false
-        }
-        Err(e) => {
-            nstep(&format!("poke failed ({e}) — {node} fetches on its timer"));
-            false
+    let started = std::time::Instant::now();
+    loop {
+        match crate::http::post_json_try(g, "/api/jobs/submit", &body, true, 10) {
+            Ok(v) if v.get("error").is_none() => {
+                nstep(&format!("poked {node} over the bus to fetch now (job {})",
+                    v.get("job_id").or_else(|| v.get("id")).and_then(|j| j.as_str()).unwrap_or("queued")));
+                return true;
+            }
+            Ok(v) => {
+                warn_line(&format!(
+                    "poke not accepted ({}) — {node} will only fetch on its own timer, up to about 5 minutes",
+                    v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown")));
+                return false;
+            }
+            Err(e) if poke_is_transient(&e) && started.elapsed().as_secs() + POKE_RETRY_STEP_SECS <= POKE_RETRY_WINDOW_SECS => {
+                nstep(&format!("poke not taken yet ({e}) — retrying in {POKE_RETRY_STEP_SECS}s"));
+                std::thread::sleep(std::time::Duration::from_secs(POKE_RETRY_STEP_SECS));
+            }
+            Err(e) => {
+                warn_line(&format!(
+                    "poke failed ({e}) — {node} will only fetch on its own timer, up to about 5 minutes"));
+                return false;
+            }
         }
     }
 }
@@ -3250,6 +3482,262 @@ pub(crate) fn is_live_enrollment(t: &serde_json::Value) -> bool {
     t.get("used_at").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
         && t.get("birth_cert").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
         && !t.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// What the status route says about the bundle CURRENTLY staged for a node.
+#[derive(Debug, PartialEq)]
+pub(crate) enum BundleVerdict {
+    /// The node's report names the staged sha: it applied (rc 0) or refused
+    /// (rc != 0, -1 when the report carried no code).
+    Applied { rc: i64, msg: String },
+    /// Fetched (`fetched_at` stamped for this staging) but no report for it yet.
+    Fetched,
+    /// Not fetched yet, or only an older bundle's report is on the row.
+    Nothing,
+}
+
+/// The one judgement of `/api/cluster/provision-bundle/<node>/status`,
+/// shared by `cluster provision` (one node) and the combined wait of
+/// `noo upgrade --nodes`. Success is `applied_sha == staged_sha`, then
+/// `apply_rc`; an `applied_sha` for any OTHER bundle is not evidence about
+/// this one. An empty `staged_sha` matches nothing (an empty reported sha
+/// must never equal an empty staged one).
+pub(crate) fn judge_bundle_status(st: &serde_json::Value, staged_sha: &str) -> BundleVerdict {
+    let reported = st.get("applied_sha").and_then(|v| v.as_str()).unwrap_or("");
+    if !staged_sha.is_empty() && reported == staged_sha {
+        return BundleVerdict::Applied {
+            rc: st.get("apply_rc").and_then(|v| v.as_i64()).unwrap_or(-1),
+            msg: st.get("apply_msg").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        };
+    }
+    if st.get("fetched_at").and_then(|v| v.as_str()).is_some() {
+        BundleVerdict::Fetched
+    } else {
+        BundleVerdict::Nothing
+    }
+}
+
+/// A node that had never reported an apply (old fetcher, cannot report)
+/// gets no report ever; once it fetched and 45 s passed, the caller may
+/// fall back to "the agent is online" (see `node_is_online`) and must say
+/// the confirmation is missing.
+pub(crate) fn legacy_fallback_due(legacy: bool, fetched: bool, elapsed_secs: u64) -> bool {
+    legacy && fetched && elapsed_secs > 45
+}
+
+/// Is `node` online/busy in the registry? False when the gateway does not
+/// answer or does not list it (the fallback then simply does not fire).
+pub(crate) fn node_is_online(g: &Globals, node: &str) -> bool {
+    let Some(doc) = crate::http::get_json_opt(g, "/api/cluster/nodes", true, 10) else { return false };
+    doc.get("nodes").and_then(|n| n.as_array()).map(|arr| {
+        arr.iter().any(|nd| {
+            nd.get("id").and_then(|v| v.as_str())
+                .or_else(|| nd.get("node_id").and_then(|v| v.as_str()))
+                .or_else(|| nd.get("name").and_then(|v| v.as_str()))
+                .is_some_and(|id| id.eq_ignore_ascii_case(node))
+                && nd.get("status").and_then(|v| v.as_str())
+                    .is_some_and(|st| st == "online" || st == "busy")
+        })
+    }).unwrap_or(false)
+}
+
+/// True when the node has never reported an apply (no `applied_at` on its
+/// status row, or no row / no answer). Read BEFORE a staging replaces the row.
+pub(crate) fn node_never_reported_apply(g: &Globals, node: &str) -> bool {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .map(|st| st.get("applied_at").map(|v| v.is_null()).unwrap_or(true))
+        .unwrap_or(true)
+}
+
+/// The sha256 of the ciphertext currently staged for `node`, from the
+/// status route; None when nothing is staged or the gateway does not answer.
+pub(crate) fn staged_sha_of(g: &Globals, node: &str) -> Option<String> {
+    crate::http::get_json_opt(g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        .and_then(|st| st.get("sha256").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+/// An indented warned line under a node's label (the poke and handshake
+/// notices; a plain step line reads as routine, these are not).
+fn warn_line(msg: &str) {
+    if !ui::quiet() {
+        println!("{}", ui::sub(&ui::status_line(Glyph::Warn, msg)));
+    }
+}
+
+/// Longest the applier-first handshake waits for the new applier's own apply
+/// report, and how often it looks.
+const APPLIER_REPORT_CAP_SECS: u64 = 60;
+const APPLIER_REPORT_POLL_SECS: u64 = 5;
+
+/// Poll the status route until it reports an apply of `applier_sha` (the
+/// applier-only bundle), returning its rc; None when the cap passes first.
+/// ABSENT report / unreachable gateway / old fetcher: None, never an error —
+/// the handshake then proceeds as the old fixed sleep did.
+fn wait_applier_reported(g: &Globals, node: &str, applier_sha: &str, cap_secs: u64, every_secs: u64) -> Option<i64> {
+    let start = std::time::Instant::now();
+    let mut poll = ui::Poll::start_under(&format!("waiting for {node}'s applier to report (up to {cap_secs}s)"));
+    while start.elapsed().as_secs() < cap_secs {
+        if let Some(st) = crate::http::get_json_opt(
+            g, &format!("/api/cluster/provision-bundle/{node}/status"), true, 10)
+        {
+            if let BundleVerdict::Applied { rc, .. } = judge_bundle_status(&st, applier_sha) {
+                drop(poll);
+                return Some(rc);
+            }
+        }
+        poll.tick(start.elapsed().as_secs());
+        std::thread::sleep(std::time::Duration::from_secs(every_secs));
+    }
+    drop(poll);
+    None
+}
+
+/// One node staged with `--stage-only`, waiting for its apply report.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingApply {
+    pub node: String,
+    /// sha256 of the staged ciphertext (the status route's `sha256`).
+    pub sha: String,
+    /// The node had never reported an apply before this staging (see the
+    /// legacy fallback in `cluster_provision`).
+    pub legacy: bool,
+}
+
+/// How one pending node ended.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ApplyEnd {
+    Applied { rc: i64, msg: String },
+    /// Legacy fetcher: fetched, cannot report, agent online. Not a failure,
+    /// and not confirmed either.
+    LegacyUnconfirmed,
+    /// No report for the staged sha within the budget; `fetched` says which
+    /// stage it died at.
+    NotReported { fetched: bool },
+}
+
+/// A fetch that has not happened this long after the staging was poked is
+/// on the node's own ~5-minute timer: say so once, early.
+pub(crate) const SLOW_TIMER_WARN_SECS: u64 = 150;
+
+/// Wait for EVERY pending node together: one poll of each node's status
+/// route per `every_secs`, `budget_secs` overall (measured from the call,
+/// i.e. from when the last node was staged), one `ui::Poll` for the group,
+/// and a progress line as each node reports. The judgement per node is
+/// `judge_bundle_status` + `legacy_fallback_due`, the same as the single
+/// node wait. An unreachable status route leaves a node unresolved for that
+/// round (it can still resolve in a later one); it is never counted done.
+/// Results come back in the order of `pending`.
+pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_secs: u64, every_secs: u64) -> Vec<(String, ApplyEnd)> {
+    let mut ends: Vec<Option<ApplyEnd>> = pending.iter().map(|_| None).collect();
+    let mut fetched = vec![false; pending.len()];
+    let mut slow_warned = vec![false; pending.len()];
+    let started = std::time::Instant::now();
+    let names: Vec<&str> = pending.iter().map(|p| p.node.as_str()).collect();
+    let mut poll = ui::Poll::start(&format!(
+        "waiting for {} node(s) to pull, apply and report (up to {}m): {}",
+        pending.len(), budget_secs / 60, names.join(", ")));
+    // Printing over a live spinner line would leave its tail behind.
+    let say = |line: String| {
+        if ui::stderr_is_tty() { ui::clear_line(); }
+        if !ui::quiet() { println!("{}", ui::sub(&line)); }
+    };
+    while started.elapsed().as_secs() < budget_secs && ends.iter().any(|e| e.is_none()) {
+        let elapsed = started.elapsed().as_secs();
+        for (i, p) in pending.iter().enumerate() {
+            if ends[i].is_some() { continue; }
+            let st = crate::http::get_json_opt(
+                g, &format!("/api/cluster/provision-bundle/{}/status", p.node), true, 10);
+            if let Some(st) = &st {
+                match judge_bundle_status(st, &p.sha) {
+                    BundleVerdict::Applied { rc, msg } => {
+                        say(if rc == 0 {
+                            ui::status_line(Glyph::Ok, &format!("{}: applied (exit 0)", p.node))
+                        } else {
+                            ui::status_line(Glyph::Err, &format!("{}: the applier refused the bundle (exit {rc})", p.node))
+                        });
+                        ends[i] = Some(ApplyEnd::Applied { rc, msg });
+                        continue;
+                    }
+                    BundleVerdict::Fetched if !fetched[i] => {
+                        fetched[i] = true;
+                        say(ui::status_line(Glyph::Step, &format!("{}: fetched the bundle — waiting for decrypt + apply", p.node)));
+                    }
+                    BundleVerdict::Fetched | BundleVerdict::Nothing => {}
+                }
+            }
+            if legacy_fallback_due(p.legacy, fetched[i], elapsed) && node_is_online(g, &p.node) {
+                say(ui::status_line(Glyph::Warn, &format!(
+                    "{}: applied without confirmation — this node's fetcher predates apply reports; the next restage confirms", p.node)));
+                ends[i] = Some(ApplyEnd::LegacyUnconfirmed);
+                continue;
+            }
+            if !fetched[i] && !slow_warned[i] && elapsed >= SLOW_TIMER_WARN_SECS {
+                slow_warned[i] = true;
+                say(ui::status_line(Glyph::Warn, &format!(
+                    "{}: not fetched after {SLOW_TIMER_WARN_SECS}s — the poke likely did not reach it; it is on its own 5-minute timer", p.node)));
+            }
+        }
+        if ends.iter().all(|e| e.is_some()) { break; }
+        poll.tick(started.elapsed().as_secs());
+        std::thread::sleep(std::time::Duration::from_secs(every_secs));
+    }
+    drop(poll);
+    pending.iter().zip(ends).zip(fetched).map(|((p, end), f)| {
+        (p.node.clone(), end.unwrap_or(ApplyEnd::NotReported { fetched: f }))
+    }).collect()
+}
+
+/// What `cluster provision` does after a node reports exit 0, for any node
+/// but the controller's own: the applier's verification lane note, the
+/// signing-key adoption marker, and the invariant check. Called by the single
+/// node verb and by the combined wait of `noo upgrade --nodes`.
+pub(crate) fn after_remote_applied(g: &Globals, node: &str, msg: &str) {
+    after_applied(g, node, msg, false);
+}
+
+/// `after_remote_applied` plus the steps only the controller's own node has:
+/// the self-agent lane record and the controller-mode hostd restart. The one
+/// place those run, whether the node was staged by `cluster provision <me>`
+/// or by the combined wait of `noo upgrade --nodes`.
+pub(crate) fn after_self_applied(g: &Globals, node: &str, msg: &str) {
+    after_applied(g, node, msg, true);
+}
+
+fn after_applied(g: &Globals, node: &str, msg: &str, self_steps: bool) {
+    // The POSITIVE check for the bundle-verification lane, read off the
+    // APPLIER's own account of what it did rather than off a config file's
+    // contents. "I edited the file" was exactly the evidence that failed
+    // here before: the arm the runbook told operators to close in
+    // /etc/noo-node-agent.env never reached the applier at all.
+    if let Some(lane) = verification_lane(msg) {
+        nnote(&lane);
+    }
+    record_signing_adoption(node, msg);
+    if self_steps {
+        // The lane is recorded only for the controller's own node, and only
+        // here, after the node reported exit 0.
+        if crate::role::is_self_node(node) && crate::role::detect().controller.is_some() {
+            write_self_lane(node, SelfLaneRecord::Rail);
+        }
+        // The controller runs hostd twice from ONE binary: worker mode
+        // (a root system unit, which the applier just restarted and
+        // verified) and controller mode (this operator's user unit, which a
+        // root applier cannot reach). Restart the second only once the
+        // applier reports the new binary installed AND proven — its
+        // `applied:` list names hostd-binary only after a fresh heartbeat —
+        // so a failed upgrade never touches it. An applier that did not
+        // name hostd-binary (old, or nothing to install) leaves it alone.
+        if applier_applied(msg, "hostd-binary") {
+            refresh_controller_hostd(&crate::envfile::repo_root());
+        }
+    }
+    // Applied is not done: the node must now satisfy every invariant.
+    // Printed, not fatal — the bundle is on the node; what is left is named
+    // beside each row.
+    if !crate::commands::cluster_verify::verify_node_after_apply(g, node) {
+        nnote(&format!("{node}: applied, and an invariant does not hold yet — `noo cluster verify {node}` re-checks"));
+    }
 }
 
 fn wait_bundle_fetched(g: &Globals, node: &str, secs: u64) -> bool {
@@ -3301,7 +3789,18 @@ pub(crate) fn release_var(key: &str) -> String {
 
 #[cfg(test)]
 mod poke_fetch_tests {
-    use super::{poke_fetch_body, POKE_EXPIRE_AFTER_SEC};
+    use super::{poke_fetch_body, poke_is_transient, POKE_EXPIRE_AFTER_SEC, POKE_RETRY_WINDOW_SECS, POKE_RETRY_STEP_SECS};
+
+    #[test]
+    fn only_the_gateways_not_yet_is_retried() {
+        assert!(poke_is_transient(r#"HTTP 503: {"error":"redis_reconnecting"}"#));
+        assert!(poke_is_transient("Redis not connected"), "an older gateway's bare 500 detail");
+        assert!(poke_is_transient("HTTP 500: Redis not connected"));
+        assert!(!poke_is_transient("HTTP 400: force_node unknown"));
+        assert!(!poke_is_transient("HTTP 401: operator key required"));
+        assert!(!poke_is_transient("connection refused (gateway down?)"), "a transport failure is the gateway wait's job");
+        const { assert!(POKE_RETRY_WINDOW_SECS >= POKE_RETRY_STEP_SECS && POKE_RETRY_WINDOW_SECS < 600) };
+    }
 
     #[test]
     fn the_poke_is_pinned_and_expires_inside_the_wait_it_serves() {
@@ -3453,6 +3952,55 @@ mod tests {
     // parse. host6 sat in that deadlock for a day (2026-09-19): every
     // restage refused with `unknown kind 'harness-binary'`, and the fix
     // for it shipped inside the CLI it was refusing.
+    #[test]
+    fn the_gzip_gate_opens_only_at_or_above_the_fetcher_that_reads_it() {
+        for v in ["noo-cli-v0.6.4", "noo-cli-v0.6.4+abc1234", "noo-cli-v0.5.99", "noo-cli-v0.0.1"] {
+            assert!(bundle_gzip_gate(v).is_err(), "gzip sent to {v}");
+        }
+        for v in ["noo-cli-v0.6.5", "noo-cli-v0.6.5+7b00c90", "noo-cli-v0.6.6", "noo-cli-v0.7.0", "noo-cli-v1.0.0"] {
+            assert!(bundle_gzip_gate(v).is_ok(), "gzip withheld from {v}");
+        }
+        // Unknown / unparseable: NO (a wrong yes bricks the apply).
+        for v in ["", "garbage", "0.6.9", "noo-cli-v0.6", "noo-cli-vx.y.z", "noo-cli-v0.6.9.1"] {
+            assert!(bundle_gzip_gate(v).is_err(), "gzip sent to unreadable {v:?}");
+        }
+    }
+
+    /// The gate names the FIRST release whose fetchers unwrap gzip. It is
+    /// pinned here so a later edit can never lower it (a lower value sends
+    /// gzip to a fetcher that hands it to `noo-apply`, which refuses it), and
+    /// never raise it without reason (a higher value just withholds the
+    /// saving from nodes that could take it). The feature was written at CLI
+    /// 0.6.4 and ships in the 0.6.5 cut; if that cut is skipped or renumbered,
+    /// confirm which release carries the gzip-aware `noo-fetch.sh` and
+    /// `node_fetch.rs`, set the constant to it, and update this pin.
+    #[test]
+    fn the_gzip_gate_is_pinned_to_the_release_that_ships_the_fetcher() {
+        assert_eq!(GZIP_BUNDLE_MIN_VERSION, (0, 6, 5), "see the doc comment on this test before changing either");
+        let me = env!("CARGO_PKG_VERSION");
+        let v: Vec<u32> = me.split(['.', '-', '+']).take(3).map(|s| s.parse().unwrap()).collect();
+        assert!((v[0], v[1], v[2]) >= (0, 6, 4), "this tree predates the feature it gates: {me}");
+    }
+
+    #[test]
+    fn gzip_bundle_is_one_member_gzip_that_inflates_to_the_input() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("noo-gzip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bundle.tar");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let gz = gzip_bundle(&src, &dir).unwrap();
+        let raw = std::fs::read(&gz).unwrap();
+        assert_eq!(&raw[..2], &[0x1f, 0x8b]);
+        assert_eq!(raw[3], 0, "no FNAME/FEXTRA/FCOMMENT header flags");
+        assert!(raw.len() < data.len() / 2, "level-6 gzip should shrink a repetitive input");
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut back).unwrap();
+        assert_eq!(back, data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_mac_older_than_the_harness_kinds_is_not_sent_them() {
         // The version host6 was actually stuck on.
@@ -4267,14 +4815,23 @@ mod self_node_rail_tests {
         let view = body.find("judge_gateway_self_view(").expect("the gateway's view checked");
         let stage = body.find("/api/cluster/provision-bundle/{node}\"), &blob)").expect("the stage");
         assert!(local < view && view < stage, "local facts, then the gateway's view, then the stage");
-        let lane = body.find("write_self_lane(&node, SelfLaneRecord::Rail)").expect("the lane record");
+        // The lane record lives in `after_applied`, reached from the applied
+        // arm only through `after_self_applied`.
+        assert!(!body.contains("write_self_lane("), "the lane is recorded by after_self_applied, not inline");
         let applied = body.find("reported: applied (exit 0)").expect("the applied arm");
-        assert!(applied < lane, "the lane is recorded only after the node reported exit 0");
+        let call = body.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
+        assert!(applied < call, "the self steps run only after the node reported exit 0");
+        let aa = &src[src.find("fn after_applied(").unwrap()..];
+        let aa = &aa[..aa.find("\n}\n").unwrap()];
+        let lane = aa.find("write_self_lane(node, SelfLaneRecord::Rail)").expect("the lane record");
+        let hostd = aa.find("refresh_controller_hostd(").expect("the hostd restart");
+        assert!(aa.find("if self_steps").unwrap() < lane && lane < hostd, "{aa}");
+        assert!(aa.contains(r#"applier_applied(msg, "hostd-binary")"#), "{aa}");
         let up = include_str!("upgrade.rs");
         let up = up.split("#[cfg(test)]").next().unwrap();
         let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
-        assert!(f.contains("provision_one(g, me, &[])"), "{f}");
+        assert!(f.contains(r#"provision_one(g, me, &["--stage-only"])"#), "{f}");
         assert!(!f.contains("--local"), "{f}");
     }
 
@@ -4498,5 +5055,230 @@ mod local_lane_tests {
         c.arg("PREP_INSECURE=1").arg("PREP_CA_SHA256=ab").arg("NOO_DATA_ROOT=/a b").arg("bash").arg("/tmp/p'q.sh");
         assert_eq!(command_line(&c),
             "'env' 'PREP_INSECURE=1' 'PREP_CA_SHA256=ab' 'NOO_DATA_ROOT=/a b' 'bash' '/tmp/p'\\''q.sh'");
+    }
+
+    // ── a binary the node proved it runs is not carried again ──────────
+
+    fn st(rc: i64, staged: &str, applied: &str, msg: &str) -> serde_json::Value {
+        serde_json::json!({ "sha256": staged, "applied_sha": applied, "apply_rc": rc, "apply_msg": msg })
+    }
+    fn report_with(kind: &str, sha: &str) -> String {
+        format!("noo-apply: x applied: agent-env {kind}=unchanged verified-by: signing-key ca-lane: retired binary-sha: {kind}={sha}")
+    }
+
+    #[test]
+    fn omission_needs_the_nodes_own_proof() {
+        let bytes = b"\x7fELFgateway".to_vec();
+        let sha = sha256_hex(&bytes);
+        let ok = st(0, "b1", "b1", &report_with("harness-binary", &sha));
+        // No status at all (never staged): carry.
+        assert!(!node_runs_asset(None, "harness-binary", &sha));
+        // An applier that prints no binary-sha line: carry.
+        assert!(!node_runs_asset(Some(&st(0, "b1", "b1", "applied: harness-binary")), "harness-binary", &sha));
+        // Proven: the report is about the staged bundle, rc 0, and states this sha.
+        assert!(node_runs_asset(Some(&ok), "harness-binary", &sha));
+        // The last apply was refused: carry.
+        assert!(!node_runs_asset(Some(&st(65, "b1", "b1", &report_with("harness-binary", &sha))), "harness-binary", &sha));
+        // The report belongs to an older bundle than the staged one: carry.
+        assert!(!node_runs_asset(Some(&st(0, "b2", "b1", &report_with("harness-binary", &sha))), "harness-binary", &sha));
+        // Nothing applied yet (null applied_sha): carry.
+        assert!(!node_runs_asset(Some(&serde_json::json!({"sha256": "b1", "applied_sha": null, "apply_rc": null, "apply_msg": null})), "harness-binary", &sha));
+        // The asset changed since the node's statement: carry.
+        assert!(!node_runs_asset(Some(&ok), "harness-binary", &sha256_hex(b"newer")));
+        // A statement about another kind proves nothing about this one.
+        assert!(!node_runs_asset(Some(&ok), "agent-binary", &sha));
+    }
+
+    #[test]
+    fn dropping_removes_only_proven_binary_kinds() {
+        let hb = b"harness-bytes".to_vec();
+        let cb = b"cli-bytes".to_vec();
+        let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
+            ("agent-env", b"E".to_vec()), ("agent-binary", b"agent".to_vec()), ("hostd-binary", b"hostd".to_vec()),
+            ("cli-binary", cb.clone()), ("cli-user", b"u".to_vec()), ("harness-binary", hb.clone()),
+            ("harness-env", b"H".to_vec()), ("applier", b"A".to_vec()), ("fetcher", b"F".to_vec()),
+            ("ca.crt", b"C".to_vec()), ("node.crt", b"N".to_vec()), ("node.key", b"K".to_vec()),
+        ] };
+        let msg = format!("applied: x binary-sha: harness-binary={} cli-binary={} agent-binary={} hostd-binary={}",
+            sha256_hex(&hb), sha256_hex(&cb), sha256_hex(b"agent"), sha256_hex(b"hostd"));
+        let status = st(0, "s", "s", &msg);
+        fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
+
+        let mut f = mk();
+        let notes = drop_proven_binaries(&mut f, Some(&status), false, false);
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(notes.iter().all(|n| n.contains("unchanged since last apply, not carried")));
+        assert_eq!(names(&f), ["agent-env", "harness-env", "applier", "fetcher", "ca.crt", "node.crt", "node.key"],
+            "env, unit, cert, applier and fetcher kinds are never omitted (cli-user leaves with its binary)");
+
+        // No state: everything rides.
+        let mut f = mk();
+        assert!(drop_proven_binaries(&mut f, None, false, false).is_empty());
+        assert_eq!(f.len(), 12);
+
+        // A Mac keeps agent-binary (its applier demands it); the controller's own node keeps hostd.
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&status), true, false);
+        assert!(names(&f).contains(&"agent-binary") && !names(&f).contains(&"hostd-binary"));
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&status), false, true);
+        assert!(names(&f).contains(&"hostd-binary") && !names(&f).contains(&"agent-binary"));
+
+        // One asset changed: only that one rides.
+        let mut f = mk();
+        f.iter_mut().find(|(k, _)| *k == "harness-binary").unwrap().1 = b"harness-v2".to_vec();
+        drop_proven_binaries(&mut f, Some(&status), false, false);
+        assert!(names(&f).contains(&"harness-binary") && !names(&f).contains(&"cli-binary"));
+    }
+
+    #[test]
+    fn mac_runners_put_noomesh_bin_first_on_path_for_staged_vendor_clis() {
+        for (script, exec) in [(darwin_run_agent(), "exec \"$HOME/noomesh/bin/noo-node-agent\""),
+                               (darwin_run_harness(), "exec \"$HOME/noomesh/bin/noo-gateway\" harness")] {
+            let path_at = script.find("export PATH=\"$HOME/noomesh/bin:$PATH\"\n").expect("PATH export");
+            let exec_at = script.find(exec).expect("exec line");
+            let env_at = script.find("set -a; . \"$ENV_FILE\"; set +a").expect("env sourced");
+            assert!(env_at < path_at && path_at < exec_at, "{script}");
+        }
+    }
+
+    #[test]
+    fn the_vendor_cli_and_runtime_drop_only_together_with_their_manifests() {
+        let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
+            ("agent-env", b"E".to_vec()), ("vendor-cli", b"cli".to_vec()), ("vendor-cli-manifest", b"{}".to_vec()),
+            ("vendor-runtime", b"rt".to_vec()), ("vendor-runtime-manifest", b"{}".to_vec()),
+        ] };
+        fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
+        let both = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={} vendor-runtime={}",
+            sha256_hex(b"cli"), sha256_hex(b"rt")));
+        let mut f = mk();
+        let notes = drop_proven_binaries(&mut f, Some(&both), false, false);
+        assert_eq!(names(&f), ["agent-env"], "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("vendor CLI: unchanged")));
+        // Only the CLI proven (the runtime moved): the whole group rides.
+        let half = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"cli")));
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&half), false, false);
+        assert_eq!(f.len(), 5);
+    }
+
+    #[test]
+    fn binary_sha_parsing_takes_only_well_formed_pairs_after_the_last_marker() {
+        let h = "a".repeat(64);
+        let got = reported_binary_shas(&format!("binary-sha: old={} later text binary-sha: agent-binary={h} bad=zz short={}", "b".repeat(64), "c".repeat(63)));
+        assert_eq!(got, vec![("agent-binary".to_string(), h)]);
+        assert!(reported_binary_shas("applied: agent-binary").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bundle_status_judgement_tests {
+    use super::{judge_bundle_status, legacy_fallback_due, BundleVerdict};
+    use serde_json::json;
+
+    const SHA: &str = "aaaa";
+
+    #[test]
+    fn applied_ok_is_rc_zero_with_the_appliers_message() {
+        let st = json!({"fetched_at":"t","applied_at":"t","applied_sha":SHA,"apply_rc":0,"apply_msg":"applied: agent-env"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 0, msg: "applied: agent-env".into() });
+    }
+
+    #[test]
+    fn applied_refused_carries_the_nonzero_rc() {
+        let st = json!({"fetched_at":"t","applied_sha":SHA,"apply_rc":76,"apply_msg":"unknown kind"});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: 76, msg: "unknown kind".into() });
+    }
+
+    #[test]
+    fn a_report_without_a_code_is_minus_one_not_success() {
+        let st = json!({"applied_sha":SHA});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Applied { rc: -1, msg: String::new() });
+    }
+
+    #[test]
+    fn fetched_but_not_applied_is_fetched() {
+        let st = json!({"fetched_at":"t","applied_sha":null,"apply_rc":null});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Fetched);
+    }
+
+    #[test]
+    fn an_older_bundles_report_is_not_evidence_about_this_one() {
+        let st = json!({"fetched_at":null,"applied_sha":"old","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Nothing);
+        let st = json!({"fetched_at":"t","applied_sha":"old","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, SHA), BundleVerdict::Fetched);
+    }
+
+    #[test]
+    fn nothing_reported_is_nothing() {
+        assert_eq!(judge_bundle_status(&json!({}), SHA), BundleVerdict::Nothing);
+        assert_eq!(judge_bundle_status(&json!({"fetched_at":null}), SHA), BundleVerdict::Nothing);
+    }
+
+    #[test]
+    fn an_empty_staged_sha_never_matches_an_empty_report() {
+        let st = json!({"applied_sha":"","apply_rc":0});
+        assert_eq!(judge_bundle_status(&st, ""), BundleVerdict::Nothing);
+    }
+
+    #[test]
+    fn the_legacy_fallback_needs_legacy_a_fetch_and_45_seconds() {
+        assert!(legacy_fallback_due(true, true, 46));
+        assert!(!legacy_fallback_due(true, true, 45));
+        assert!(!legacy_fallback_due(true, false, 600), "never fetched: no fallback");
+        assert!(!legacy_fallback_due(false, true, 600), "a node that reports is judged by its report");
+    }
+}
+
+#[cfg(test)]
+mod upgrade_stages_every_node_before_waiting_tests {
+    /// `noo upgrade --nodes` must stage+poke every node before it blocks on
+    /// any apply, and the self node (staged last) still comes after the
+    /// remote nodes have been staged.
+    #[test]
+    fn the_nodes_phase_stages_all_then_waits_once() {
+        let up = include_str!("upgrade.rs");
+        let up = up.split("#[cfg(test)]").next().unwrap();
+        let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
+        let me = f.rfind("upgrade_self_node(g, me, &mut failed, &mut pending)").expect("the self node is staged into the same pending list");
+        let wait = f.rfind("wait_and_settle_nodes(g, &pending").expect("the combined wait");
+        let mac = f.find("mac_leaves_pass(").expect("the mac pass");
+        assert!(stage < me && me < wait && wait < mac, "stage remotes, stage self node, one wait, then the Mac pass");
+        assert_eq!(f.matches("provision_one(g, n,").count(), 1, "no per-node full provision left in the loop");
+        assert_eq!(f.matches("wait_and_settle_nodes(g, &pending").count(), 2, "one wait for the nodes, one for a controller with no other node");
+        assert!(!f.contains("provision_one(g, me"), "the self node is staged by upgrade_self_node only");
+    }
+
+    /// The self node's post-apply steps have ONE function with two callers:
+    /// the single-node verb and the combined wait. Neither may grow its own
+    /// copy (the lane record or the hostd restart), or they drift.
+    #[test]
+    fn the_self_nodes_post_apply_steps_have_one_function_and_two_callers() {
+        let prov = include_str!("provision.rs");
+        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        let up = include_str!("upgrade.rs");
+        let up = up.split("#[cfg(test)]").next().unwrap();
+        let verb = &prov[prov.find("pub fn cluster_provision(").unwrap()..];
+        let verb = &verb[..verb.find("\n}\n").unwrap()];
+        assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
+        let settle = &up[up.find("fn settle_end(").unwrap()..];
+        let settle = &settle[..settle.find("\n}\n").unwrap()];
+        assert!(settle.contains("after_self_applied(g, n, &msg)"), "the combined wait");
+        for (name, body) in [("provision.rs", prov), ("upgrade.rs", up)] {
+            assert_eq!(body.matches("refresh_controller_hostd(").count(), if name == "provision.rs" { 2 } else { 0 },
+                "{name}: the hostd restart is called once (plus its definition), inside after_applied");
+            assert_eq!(body.matches("write_self_lane(").count(), if name == "provision.rs" { 3 } else { 0 },
+                "{name}: Rail lane written once in after_applied; the definition and the onboard lane are the others");
+        }
+    }
+
+    /// The combined wait polls every 5 s (one cheap SELECT per node).
+    #[test]
+    fn the_combined_wait_polls_every_five_seconds() {
+        let up = include_str!("upgrade.rs");
+        assert!(up.contains("const NODES_APPLY_POLL_SECS: u64 = 5;"));
     }
 }

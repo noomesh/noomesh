@@ -54,17 +54,45 @@ pub struct Pin {
     pub key_index: usize,
     /// sha256 (hex) of the cached lock bytes this pin was made from.
     pub lock_sha256: String,
+    /// The root the images were pulled from when it is not the signed
+    /// registry: the entitlement's `pull` root (the vendor's add-on registry
+    /// proxy). Docker records the pulled reference, and a digest reference
+    /// cannot be retagged onto another host, so compose must run
+    /// [`Pin::local_ref`]. Not signed content; absent = the registry, and a
+    /// CLI that predates it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulled_from: Option<String>,
 }
 
 impl Pin {
-    pub fn from_verified(v: &VerifiedLock, stack_tag: &str, lock_bytes: &[u8]) -> Pin {
+    pub fn from_verified(v: &VerifiedLock, stack_tag: &str, lock_bytes: &[u8], pulled_from: Option<String>) -> Pin {
         Pin {
             version: v.lock.version.clone(),
             stack: stack_tag.trim().to_string(),
             images: v.lock.images.clone(),
             key_index: v.key_index,
             lock_sha256: sha256_hex(lock_bytes),
+            pulled_from,
         }
+    }
+
+    /// A signed image ref (`images` value) as docker holds it on this
+    /// controller: the same ref with the host swapped to `pulled_from`'s
+    /// (the pull root is the registry's path on another host).
+    pub fn local_ref(&self, reference: &str) -> String {
+        let Some(host) = self.pulled_from.as_deref().and_then(|p| p.trim().split('/').next()).filter(|h| !h.is_empty()) else {
+            return reference.to_string();
+        };
+        match reference.split_once('/') {
+            Some((_, rest)) => format!("{host}/{rest}"),
+            None => reference.to_string(),
+        }
+    }
+
+    /// `images` as docker holds them ([`Pin::local_ref`]): what compose
+    /// runs and what the running-container check compares with.
+    pub fn local_images(&self) -> BTreeMap<String, String> {
+        self.images.iter().map(|(k, r)| (k.clone(), self.local_ref(r))).collect()
     }
 
     /// The first image's digest, short, for listings.
@@ -352,7 +380,25 @@ mod tests {
             images: BTreeMap::from([("evolve".into(), format!("ghcr.io/x/evolve@sha256:{}", "ab".repeat(32)))]),
             key_index: 0,
             lock_sha256: sha256_hex(b"{}"),
+            pulled_from: None,
         }
+    }
+
+    #[test]
+    fn pulled_from_round_trips_maps_refs_and_is_omitted_when_absent() {
+        let d = scratch("pf");
+        let via = Pin { pulled_from: Some("addons.noomesh.ai/x/evolve".into()), ..pin() };
+        set_pin(&d, "evolve", &via, b"{}", "sig").unwrap();
+        assert_eq!(read(&d).unwrap()["evolve"], via);
+        let r = via.images["evolve"].clone();
+        assert_eq!(via.local_ref(&r), format!("addons.noomesh.ai/x/evolve@sha256:{}", "ab".repeat(32)));
+        assert_eq!(via.local_images()["evolve"], via.local_ref(&r));
+        assert_eq!(pin().local_ref(&r), r, "no pulled_from: the signed ref itself");
+        assert!(!serde_json::to_string(&pin()).unwrap().contains("pulled_from"));
+        // A pins file written before the field still reads.
+        let old = r#"{"evolve":{"version":"1","stack":"v0.6.0","images":{},"key_index":0,"lock_sha256":"x"}}"#;
+        std::fs::write(pins_path(&d), old).unwrap();
+        assert_eq!(read(&d).unwrap()["evolve"].pulled_from, None);
     }
 
     #[test]

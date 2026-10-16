@@ -524,7 +524,7 @@ services:
       - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}
       # STT provider (generic layer — gateway-rust/src/stt_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
-      # the opt-in `whisper` compose service (http://noo-whisper:8000,
+      # the opt-in `whisper` compose service (https://noo-whisper:8000, mTLS,
       # wire format "openai"), so these stay empty for the default path.
       - NOO_STT_URL=${NOO_STT_URL:-}
       - NOO_STT_BACKEND=${NOO_STT_BACKEND:-}
@@ -532,7 +532,7 @@ services:
       - NOO_STT_API_KEY_ENV=${NOO_STT_API_KEY_ENV:-}
       # TTS provider (generic layer — gateway-rust/src/tts_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
-      # the opt-in `piper` compose service (http://noo-piper:8000, wire
+      # the opt-in `piper` compose service (https://noo-piper:8000, mTLS, wire
       # format "openai"), so these stay empty for the default path.
       - NOO_TTS_URL=${NOO_TTS_URL:-}
       - NOO_TTS_BACKEND=${NOO_TTS_BACKEND:-}
@@ -592,8 +592,9 @@ services:
       # configured" on every install. tests/test_loki_wiring_parity.py pins
       # the name to the reader.
       - NOO_LOKI_URL=${NOO_LOKI_URL:-https://loki:3100}
-      # Python sandbox — isolated code execution (internal Docker network)
-      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-http://sandbox:9000}
+      # Python sandbox — isolated code execution (internal Docker network),
+      # mTLS: the gateway presents its own leaf (tls::cluster_client).
+      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-https://sandbox:9000}
       # disk_watermark autonomy location. The gateway has no env_file, so
       # these must be listed explicitly or the .env values never reach the
       # container and the evaluator silently uses its built-in defaults
@@ -756,7 +757,7 @@ services:
     networks:
       - noo-cluster
       - noo-db
-      # python_exec: gateway → http://sandbox:9000/exec (see M-3)
+      # python_exec: gateway → https://sandbox:9000/exec over mTLS (see M-3)
       - noo-sandbox
       # browser actions: gateway → http://browser:9222 (see R35)
       - noo-browser
@@ -883,7 +884,7 @@ services:
       # docs/security/secrets.md "The audit key").
       - NOO_AUDIT_HMAC_KEY_FILE=${NOO_AUDIT_HMAC_KEY:+/run/secrets/noo_audit_hmac_key}
       - NOO_GATEWAY_URL=${NOO_TRELLION_GATEWAY_URL:-https://gateway:8080}
-      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-http://sandbox:9000}
+      - NOO_SANDBOX_URL=${NOO_SANDBOX_URL:-https://sandbox:9000}
       # Restated from the image ENV on purpose: the Dockerfile shipped these
       # under the retired PAI_ prefix for one stack release (v0.2.3) while
       # every reader was NOO_, so the core worker booted with surfaces=all
@@ -1471,7 +1472,16 @@ services:
   ollama:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    # A FIXED version, never :latest (2026-10-15: every roll re-pulled a
+    # moved `latest` from Docker Hub, 91.6 s, and nothing recorded which
+    # ollama ran). The signed stack lock carries an `ollama@sha256:` row
+    # resolved from THIS tag at release time
+    # (scripts/stack-lock-third-party.py), so a dist start pulls it by
+    # digest and skips it when unchanged. Bump the version here, in all
+    # three ollama services; the next stack release pins the new digest.
+    # Pulled from Docker Hub by the controller only (never staged for nodes:
+    # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
     profiles: ["ollama", "gpu-tier2"]
     # No external port — gateway reaches Ollama via Docker network (noo-cluster)
@@ -1503,7 +1513,7 @@ services:
   ollama-embed:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
     profiles: ["standalone"]
     # Publishes NOTHING. Every caller goes through stunnel-ollama-embed
@@ -1545,7 +1555,7 @@ services:
   # Enable: docs/operating/runbooks/embed-capacity.md.
   ollama-embed-cpu:
     logging: *default-logging
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
     profiles: ["embed-cpu"]
     # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (the
@@ -2432,7 +2442,7 @@ services:
 
   # Python sandbox — isolated code execution for python_exec tool
   # Hardened container: read-only rootfs, no capabilities, seccomp, resource limits.
-  # Gateway reaches sandbox via Docker network: http://sandbox:9000 on the
+  # Gateway reaches sandbox via Docker network: https://sandbox:9000 (mTLS) on the
   # dedicated `noo-sandbox` network (audit M-3 — this container must NOT sit
   # on `noo-cluster`, where it could read NATS monitoring :8222).
   sandbox:
@@ -2453,10 +2463,38 @@ services:
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-sandbox
     profiles: ["controller", "standalone"]
     entrypoint: []
-    command: ["python", "-m", "uvicorn", "noomesh.sandbox.app:app", "--host", "0.0.0.0", "--port", "9000"]
-    # No external port — only accessible via Docker network (noo-cluster)
+    # mTLS doors phase 1 (i77): uvicorn terminates TLS itself and REQUIRES a
+    # cluster-CA client certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED),
+    # the same native listener vLLM runs — no stunnel sidecar, because the
+    # server already speaks TLS and a sidecar would leave a plaintext hop
+    # inside the container. There is no plaintext port: a caller without a
+    # leaf is refused in the handshake, before any route runs.
+    command: &sandbox-command
+      - python
+      - -m
+      - uvicorn
+      - noomesh.sandbox.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9000"
+      - --ssl-certfile
+      - /tls/services/sandbox/service.crt
+      - --ssl-keyfile
+      - /tls/services/sandbox/service.key
+      - --ssl-ca-certs
+      - /tls/ca.crt
+      - --ssl-cert-reqs
+      - "2"
+    # No published port — reachable only on the noo-sandbox network.
     expose:
       - "9000"
+    # The CA and the sandbox's OWN leaf, read-only, under /tls — a path the
+    # per-call bwrap jail does not bind (src/noomesh/sandbox/app.py RO_PATHS),
+    # so code run by /exec cannot read the key.
+    volumes: &sandbox-tls-volumes
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/ca.crt:/tls/ca.crt:ro
+      - ${NOO_PKI_DIR:-./.pki-placeholder}/services/sandbox:/tls/services/sandbox:ro
     environment: &sandbox-env
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
@@ -2527,7 +2565,10 @@ services:
       # Use python urllib — sandbox image doesn't include curl. /health is
       # unhealthy when the configured isolation cannot run, so a sandbox
       # that would refuse every call shows up here, not in a tool error.
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9000/health',timeout=3).status==200 else 1)"]
+      # Over the door itself: the CA verifies the server (hostname
+      # `localhost` is in the leaf) and the container's own leaf is the
+      # client certificate the listener requires.
+      test: ["CMD", "python", "-c", "import ssl,sys,urllib.request; c=ssl.create_default_context(cafile='/tls/ca.crt'); c.load_cert_chain('/tls/services/sandbox/service.crt','/tls/services/sandbox/service.key'); sys.exit(0 if urllib.request.urlopen('https://localhost:9000/health',context=c,timeout=3).status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -2546,7 +2587,10 @@ services:
     pull_policy: never
     profiles: ["controller", "standalone"]
     entrypoint: []
-    command: ["python", "-m", "uvicorn", "noomesh.sandbox.app:app", "--host", "0.0.0.0", "--port", "9000"]
+    # The same mTLS listener and the same leaf: callers dial the `sandbox`
+    # alias, which the leaf carries.
+    command: *sandbox-command
+    volumes: *sandbox-tls-volumes
     deploy:
       replicas: ${NOO_SANDBOX_EXTRA:-0}
       resources: *sandbox-resources
@@ -2748,7 +2792,7 @@ networks:
     driver: bridge
     internal: true
   # Code-execution network (audit M-3) — carries exactly one link:
-  # gateway/trellion → sandbox:9000. The sandbox executes LLM-generated
+  # gateway/trellion → sandbox:9000 (mTLS). The sandbox executes LLM-generated
   # code, so it must not share a network with the bus (NATS monitoring
   # :8222 discloses full cluster topology; mTLS-gated since 38 N9) or with
   # any other service hostname.

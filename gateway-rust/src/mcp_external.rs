@@ -713,6 +713,9 @@ async fn handle(
         "tools/list" => {
             let mut tools = tools_list();
             if let Some(arr) = tools.as_array_mut() {
+                // The task tools (i83 E1d): in process, owner-scoped to
+                // this caller — see `mcp_user_tasks`.
+                arr.extend(crate::mcp_user_tasks::tool_list());
                 for t in crate::mcp_bridge::catalog_for(&state, Some(&caller.user)).await {
                     arr.push(t.mcp_tool());
                 }
@@ -741,7 +744,8 @@ async fn handle(
                     };
                 }
             }
-            if tool(name).is_none() {
+            let task_tool = crate::mcp_user_tasks::is_tool(name);
+            if !task_tool && tool(name).is_none() {
                 return rpc_error(req.id.clone(), -32602, &format!("unknown tool: {name}"));
             }
 
@@ -764,7 +768,12 @@ async fn handle(
             )
             .await;
 
-            match call_tool(&caller, session.as_deref(), name, args).await {
+            let outcome = if task_tool {
+                crate::mcp_user_tasks::call(&state, &caller.user, name, args).await
+            } else {
+                call_tool(&caller, session.as_deref(), name, args).await
+            };
+            match outcome {
                 // Content is the raw gateway JSON, serialised, with no prose
                 // formatting layered on top.
                 Ok(v) => env.result(

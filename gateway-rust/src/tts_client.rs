@@ -49,7 +49,7 @@
 //!
 //! Config resolution (env → yaml → default — the STT pattern exactly):
 //!   NOO_TTS_URL         / services.tts_url         → legacy voice.tts_url
-//!                                                     → http://noo-piper:8000
+//!                                                     → https://noo-piper:8000
 //!   NOO_TTS_BACKEND     / services.tts_backend     → "piper" when the legacy
 //!       voice.tts_url is what supplied the URL, else "openai"
 //!   NOO_TTS_VOICE       / services.tts_voice       → "" (empty = honour the
@@ -57,14 +57,29 @@
 //!   NOO_TTS_API_KEY_ENV / services.tts_api_key_env → "" (NAME of the env var
 //!       holding a bearer key — the key itself never lives in YAML)
 //!
-//! TLS: endpoints may sit behind the cluster PKI, so all requests go through
-//! `tls::cluster_client()` exactly like the STT/embedding clients.
+//! TLS (mTLS doors phase 2, i77): noo-piper serves TLS and REQUIRES a
+//! cluster-CA client certificate, so the default is `https://noo-piper:8000`
+//! and an `http://` URL is refused, never dialled ([`TTS_DOOR`]). An https
+//! URL on the cluster's own names dials with the cluster client (the
+//! gateway's leaf); any other https host — a cloud provider — dials with
+//! `tls::external_client()` (public roots, no client certificate).
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::config::env_or_yaml;
+
+/// The default TTS door: the voice overlay's `piper` service.
+pub const TTS_DEFAULT_URL: &str = "https://noo-piper:8000";
+
+/// The TTS door's trust rule (see `tls::HttpsDoor`): the cluster's voice
+/// names dial with the cluster client, any other https host publicly.
+pub const TTS_DOOR: crate::tls::HttpsDoor = crate::tls::HttpsDoor {
+    setting: "NOO_TTS_URL",
+    default_url: TTS_DEFAULT_URL,
+    cluster_hosts: crate::tls::VOICE_CLUSTER_HOSTS,
+};
 
 /// Piper's shipped default voice — the same one the retired in-process
 /// `PiperTTS` defaulted to (src/noomesh/voice/tts.py), so a request with
@@ -117,6 +132,8 @@ pub enum TtsError {
     /// Provider answered 2xx but the payload was unusable (empty audio,
     /// or a JSON error body where audio was promised).
     Parse(String),
+    /// The configured URL is refused before any dial (plaintext).
+    Refused(String),
 }
 
 impl std::fmt::Display for TtsError {
@@ -125,6 +142,7 @@ impl std::fmt::Display for TtsError {
             TtsError::Unavailable(e) => write!(f, "TTS provider unreachable: {e}"),
             TtsError::BadStatus(s, body) => write!(f, "TTS provider returned {s}: {body}"),
             TtsError::Parse(e) => write!(f, "TTS provider parse error: {e}"),
+            TtsError::Refused(e) => write!(f, "TTS provider refused: {e}"),
         }
     }
 }
@@ -134,6 +152,7 @@ impl TtsError {
     pub fn http_status(&self) -> axum::http::StatusCode {
         match self {
             TtsError::Unavailable(_) | TtsError::Parse(_) => axum::http::StatusCode::BAD_GATEWAY,
+            TtsError::Refused(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             TtsError::BadStatus(s, _) => axum::http::StatusCode::from_u16(s.as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
         }
@@ -157,9 +176,8 @@ pub fn resolve(legacy_tts_url: Option<String>) -> TtsEndpoint {
     } else if let Some(l) = legacy {
         (l, "piper")
     } else {
-        // Plaintext by named exception: voice is deferred by the operator
-        // (tests/test_gateway_refuses_plaintext.py ALLOW).
-        ("http://noo-piper:8000".to_string(), "openai")
+        // mTLS (i77 phase 2): noo-piper requires the gateway's leaf.
+        (TTS_DEFAULT_URL.to_string(), "openai")
     };
 
     let api_format = env_or_yaml(
@@ -252,7 +270,20 @@ impl TtsEndpoint {
         opts: &SynthesizeOptions,
         timeout: Duration,
     ) -> Result<Speech, TtsError> {
-        let client = crate::tls::cluster_client();
+        // The cluster client for noo-piper (presents the gateway's leaf),
+        // the public client for a cloud provider; http:// never dials.
+        let client = TTS_DOOR.client(&self.url).map_err(TtsError::Refused)?;
+        self.synthesize_via(&client, text, opts, timeout).await
+    }
+
+    /// The round-trip itself, on a client already chosen by [`TTS_DOOR`].
+    async fn synthesize_via(
+        &self,
+        client: &reqwest::Client,
+        text: &str,
+        opts: &SynthesizeOptions,
+        timeout: Duration,
+    ) -> Result<Speech, TtsError> {
         let mut req = client
             .post(self.request_url())
             .json(&self.request_body(text, opts))
@@ -416,7 +447,11 @@ impl TtsEndpoint {
     /// provider is up but advertises nothing" or "unreachable" — the caller
     /// reports reachability separately, so this never invents voices.
     pub async fn list_voices(&self, timeout: Duration) -> Result<Vec<Value>, TtsError> {
-        let client = crate::tls::cluster_client();
+        let client = TTS_DOOR.client(&self.url).map_err(TtsError::Refused)?;
+        self.list_voices_via(&client, timeout).await
+    }
+
+    async fn list_voices_via(&self, client: &reqwest::Client, timeout: Duration) -> Result<Vec<Value>, TtsError> {
         let mut req = client.get(self.voices_url()).timeout(timeout);
         if !self.api_key_env.is_empty() {
             if let Some(key) = crate::config::secret_env::secret_opt(&self.api_key_env) {
@@ -443,8 +478,12 @@ impl TtsEndpoint {
     }
 
     /// Is this endpoint answering right now? Used by `/api/voice/status`.
+    /// A refused (plaintext) URL is simply not available.
     pub async fn probe(&self, timeout: Duration) -> bool {
-        crate::tls::cluster_client()
+        let Ok(client) = TTS_DOOR.client(&self.url) else {
+            return false;
+        };
+        client
             .get(self.health_url())
             .timeout(timeout)
             .send()
@@ -711,8 +750,11 @@ mod tests {
             voice: String::new(),
             api_key_env: String::new(),
         };
+        // Loopback plaintext mock: drive the wire path with a plain client;
+        // the door's client choice is pinned separately.
         let speech = e
-            .synthesize(
+            .synthesize_via(
+                &reqwest::Client::new(),
                 "Hello Mesh",
                 &SynthesizeOptions { speed: 1.0, ..Default::default() },
                 Duration::from_secs(5),
@@ -740,7 +782,7 @@ mod tests {
             api_key_env: String::new(),
         };
         let speech = e
-            .synthesize("hi", &SynthesizeOptions { speed: 1.0, ..Default::default() }, Duration::from_secs(5))
+            .synthesize_via(&reqwest::Client::new(), "hi", &SynthesizeOptions { speed: 1.0, ..Default::default() }, Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(speech.backend, "openai");
@@ -760,13 +802,59 @@ mod tests {
             api_key_env: String::new(),
         };
         match e
-            .synthesize("hi", &SynthesizeOptions { speed: 1.0, ..Default::default() }, Duration::from_secs(2))
+            .synthesize_via(&reqwest::Client::new(), "hi", &SynthesizeOptions { speed: 1.0, ..Default::default() }, Duration::from_secs(2))
             .await
         {
             Err(TtsError::Unavailable(_)) => {}
             other => panic!("expected Unavailable, got {other:?}"),
         }
         assert!(!e.probe(Duration::from_secs(2)).await);
+    }
+
+    /// mTLS doors phase 2: the default door is https on noo-piper (a
+    /// cluster name, so the gateway's leaf is presented); a cloud host gets
+    /// the public client; a plaintext URL is refused BEFORE any connection
+    /// on every call — the listener here would record one.
+    #[tokio::test]
+    async fn the_default_is_https_and_a_plaintext_url_is_refused_not_dialled() {
+        assert_eq!(TTS_DEFAULT_URL, "https://noo-piper:8000");
+        assert_eq!(TTS_DOOR.classify(TTS_DEFAULT_URL), Ok(crate::tls::DoorTrust::Cluster));
+        assert_eq!(TTS_DOOR.classify("https://piper:8000"), Ok(crate::tls::DoorTrust::Cluster));
+        assert_eq!(TTS_DOOR.classify("https://api.openai.com"), Ok(crate::tls::DoorTrust::Public));
+        assert_eq!(TTS_DOOR.classify("https://localhost:8000"), Ok(crate::tls::DoorTrust::Cluster));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e = TtsEndpoint {
+            url: format!("{}://{addr}", "http"),
+            api_format: "openai".into(),
+            voice: String::new(),
+            api_key_env: String::new(),
+        };
+        match e
+            .synthesize("hi", &SynthesizeOptions { speed: 1.0, ..Default::default() }, Duration::from_secs(2))
+            .await
+        {
+            Err(err @ TtsError::Refused(_)) => {
+                assert!(err.to_string().contains("NOO_TTS_URL=https://noo-piper:8000"), "{err}");
+                assert_eq!(err.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(matches!(e.list_voices(Duration::from_secs(2)).await, Err(TtsError::Refused(_))));
+        assert!(!e.probe(Duration::from_secs(1)).await);
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "a plaintext TTS URL was dialled");
+    }
+
+    /// Every dial in this module goes through the door; nothing reaches
+    /// for the cluster client directly.
+    #[test]
+    fn every_tts_dial_goes_through_the_door() {
+        let src = include_str!("tts_client.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("tls::cluster_client()"), "a direct cluster_client() dial bypasses TTS_DOOR");
+        assert_eq!(prod.matches("TTS_DOOR.client(").count(), 3, "synthesize + list_voices + probe");
     }
 
     #[tokio::test]
@@ -783,7 +871,7 @@ mod tests {
             voice: String::new(),
             api_key_env: String::new(),
         };
-        let voices = e.list_voices(Duration::from_secs(5)).await.unwrap();
+        let voices = e.list_voices_via(&reqwest::Client::new(), Duration::from_secs(5)).await.unwrap();
         assert_eq!(voices.len(), 1);
         assert_eq!(voices[0]["name"], "en_US-lessac-medium");
         let raw = String::from_utf8_lossy(&handle.await.unwrap()).to_string();
@@ -794,7 +882,7 @@ mod tests {
     //
     // Run against a live server (e.g. the compose `piper` service on a
     // throwaway network):
-    //   NOO_TTS_TEST_URL=http://piper:8000 \
+    //   NOO_TTS_TEST_URL=https://piper:8000 \
     //   NOO_TTS_TEST_FORMAT=openai cargo test real_provider -- --nocapture
     // Skips silently when NOO_TTS_TEST_URL is unset so CI stays hermetic.
     #[tokio::test]

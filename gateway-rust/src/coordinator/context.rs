@@ -211,7 +211,18 @@ pub(super) async fn fetch_memory_context(
     if text.is_empty() {
         return None;
     }
-    Some(format!("[Conversation Memory]\n{text}"))
+    Some(frame_memory(text))
+}
+
+/// The memory rows are matched by wording, not topic, and arrive as old
+/// messages — one of which a small model once took for the question it was
+/// asked (mcmini, 2026-10-16). Say what they are before the model reads them.
+fn frame_memory(lines: &str) -> String {
+    format!(
+        "Excerpts from EARLIER conversations, matched by similar wording. They are \
+         background only, not the current request, and may be unrelated: answer the \
+         user's latest message.\n{lines}"
+    )
 }
 
 /// Fetch cross-channel context — recent messages from other channels (Google Chat,
@@ -757,5 +768,19 @@ mod clock_tests {
         let text = clock_context();
         let year = chrono::Utc::now().format("%Y").to_string();
         assert!(text.contains(&format!("- Now: {year}-")), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod memory_frame_tests {
+    use super::frame_memory;
+
+    #[test]
+    fn memory_is_framed_as_background_not_the_request() {
+        let framed = frame_memory("- (2026-10-15, the user said) what can you tell me about trading");
+        let (head, body) = framed.split_once('\n').expect("header line");
+        assert!(head.contains("EARLIER") && head.contains("not the current request"), "{head}");
+        assert!(head.contains("latest message"), "{head}");
+        assert!(body.starts_with("- (2026-10-15, the user said)"));
     }
 }

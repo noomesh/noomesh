@@ -60,10 +60,12 @@ pub(crate) fn uses_legacy_completion(url: &str) -> bool {
 /// The protocol actually put on the wire for this backend. Differs from
 /// `api_format` in exactly one case: a llama.cpp backend is spoken to as
 /// OpenAI ("openai") unless it has refused tools, in which case the
-/// prompt-flattening `/completion` shape ("llamacpp") is used.
+/// prompt-flattening `/completion` shape ("llamacpp") is used. A cloud
+/// Anthropic backend speaks the Messages API ("anthropic").
 pub(crate) fn wire_format(backend: &ResolvedBackend) -> &'static str {
     match backend.api_format.as_str() {
         "ollama" => "ollama",
+        "anthropic" => "anthropic",
         "llamacpp" if uses_legacy_completion(&backend.url) => "llamacpp",
         _ => "openai",
     }
@@ -260,11 +262,30 @@ pub(crate) fn model_hint(raw: Option<&str>) -> Option<&str> {
 }
 
 /// Check if a model name refers to a cloud-hosted model (Claude, GPT, Gemini).
-/// Cloud models are delegated to Python's cloud provider manager via NATS.
-pub(super) fn is_cloud_model(model: &str) -> bool {
+/// Such a model resolves to a cloud backend ([`cloud_backend`]).
+pub(crate) fn is_cloud_model(model: &str) -> bool {
     model.starts_with("claude-")
         || model.starts_with("gpt-")
         || model.starts_with("gemini-")
+}
+
+/// The backend a cloud model runs on: the provider's public endpoint, with
+/// `backend_type` `cloud-anthropic` / `cloud-openai` / `cloud-gemini` and
+/// `api_format` `anthropic` or `openai`.
+///
+/// The gate (`CLOUD_PROVIDERS_ENABLED`) is checked first and its refusal is
+/// the typed `CloudGateClosed`, unchanged, so the routes' 403 mapping
+/// (`cloud_gate_refusal`) still finds it; then the provider key, whose
+/// absence is the plain "ANTHROPIC_API_KEY not configured — cloud model
+/// unavailable" error.
+pub(crate) fn cloud_backend(model: &str) -> Result<ResolvedBackend> {
+    super::cloud::cloud_backend_with(model, super::cloud::cloud_gate(), super::cloud::env_key)
+}
+
+/// Is this a cloud-provider backend (public internet, provider auth, no
+/// node behind it)?
+pub(crate) fn is_cloud_backend(backend: &ResolvedBackend) -> bool {
+    backend.backend_type.starts_with("cloud-")
 }
 
 /// Detect a model reference from natural language in the user prompt.
@@ -837,6 +858,12 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
     // through an entry point that already normalised (the rail, dispatch,
     // `/api/external/*`). See [`model_hint`].
     let requested_model = model_hint(requested_model);
+    // A cloud model is served by its provider, not by a node: no placement,
+    // no node, and nothing to exclude — a failed provider is reported, never
+    // replaced by a node backend (see `send_llm_with_fallback`).
+    if let Some(m) = requested_model.filter(|m| is_cloud_model(m)) {
+        return cloud_backend(m).map(|b| (b, None));
+    }
     let config = &state.config;
     let preferred = &config.cluster.default_backend;
     let default_model = config.cluster.backends

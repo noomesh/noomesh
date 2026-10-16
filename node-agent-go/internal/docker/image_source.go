@@ -226,7 +226,6 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		return c.resolveLegacy(ctx, ref)
 	}
 	arch := runtime.GOARCH
-	tar := ImageTarName(ref, arch)
 	localID, present := imageLocalID(ctx, c, ref)
 
 	// A ref whose rail pull failed in transport recently is not retried
@@ -238,7 +237,7 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		return "", "", fmt.Errorf("%s: the last rail pull failed less than %s ago (%v); not retrying yet", ref, railRetryBackoff, berr)
 	}
 
-	m, merr := imageManifestFetch(ctx, tar)
+	m, _, merr := fetchImageManifest(ctx, ref, arch)
 	staged := merr == nil && m != nil
 
 	// 1. Present at an ID the controller vouches for: the manifest's
@@ -291,7 +290,7 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 		return imagesource.Local, localID, nil
 	}
 	// 4. Absent and not staged.
-	notStaged := &ImageNotStagedError{Ref: ref, Arch: arch, Tar: tar}
+	notStaged := &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 	if isOwnImage(ref) || registryFallbackPolicy() != RegistryFallbackPublic {
 		if merr != nil && !errors.Is(merr, ErrArtifactAbsent) {
 			return "", "", fmt.Errorf("%w (the controller's manifest route could not be asked: %v)", notStaged, merr)
