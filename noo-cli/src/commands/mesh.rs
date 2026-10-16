@@ -150,17 +150,20 @@ pub(crate) fn recreate_service(service: &str) -> Result<(), String> {
     if !script.is_file() {
         return Err(format!("{} not found: cannot recreate {service}", script.display()));
     }
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script).args(["--force", service]).current_dir(&root);
-    cmd.env("NOO_COLOR", "never");
-    if let Ok(exe) = std::env::current_exe() {
-        cmd.env("NOO_CLI_BIN", exe);
-    }
+    // The script's stdout goes to our stderr (see the doc comment); if the
+    // dup fails, it inherits ours.
     let stderr_copy = unsafe { libc::dup(2) };
-    if stderr_copy >= 0 {
-        cmd.stdout(unsafe { Stdio::from_raw_fd(stderr_copy) });
-    }
-    match cmd.status() {
+    let stdout = if stderr_copy >= 0 { unsafe { Stdio::from_raw_fd(stderr_copy) } } else { Stdio::inherit() };
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg("--force")
+        .arg(service)
+        .current_dir(&root)
+        .env("NOO_COLOR", "never")
+        .envs(std::env::current_exe().ok().map(|exe| ("NOO_CLI_BIN", exe)))
+        .stdout(stdout)
+        .status();
+    match status {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("noomesh-restart.sh --force {service} exited {}", s.code().unwrap_or(1))),
         Err(e) => Err(format!("could not run noomesh-restart.sh: {e}")),

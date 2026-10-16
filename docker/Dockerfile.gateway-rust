@@ -119,6 +119,7 @@ COPY tests/fixtures/redaction_corpus.json /tests/fixtures/redaction_corpus.json
 # The audit hash-v2 vectors, shared with the Python writer's tests the same
 # way (src/audit_integrity.rs include_str!s them).
 COPY tests/fixtures/audit_hash_v2_vectors.json /tests/fixtures/audit_hash_v2_vectors.json
+COPY tests/fixtures/audit_chain_vectors.json /tests/fixtures/audit_chain_vectors.json
 COPY tests/fixtures/kb_audience_isolation.json /tests/fixtures/kb_audience_isolation.json
 # The own-image rule's shared cases (routes/artifacts.rs tests include_str! it;
 # the node agent and noo-cli read the same file).

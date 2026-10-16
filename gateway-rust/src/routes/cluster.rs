@@ -2574,10 +2574,10 @@ pub(crate) async fn start_backend_core(
     if backend == "vllm" {
         start_body["gpu_count"] = json!(1);
     }
-    let env = std::env::var;
-    if let Some(image) = backend_image_ref(backend.as_str(), &|k| env(k).ok()) {
+    if let Some(image) = backend_image_ref(backend.as_str(), &|k: &str| std::env::var(k).ok()) {
         start_body["image"] = json!(image);
     }
+    let env = std::env::var;
     if backend == "vllm" {
         for (key, json_field) in [
             ("VLLM_TOOL_PARSER", "tool_parser"),
