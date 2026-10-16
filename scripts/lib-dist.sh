@@ -490,7 +490,17 @@ dist_load_stack_lock() {
     local line img dig var
     _DIST_LOCK_STATE=missing
     [ -f "stack.lock" ] || return 0
-    if ! grep -q "^# tag ${1}\$" stack.lock; then
+    # The tag binding is the line INSIDE the signed bytes (`# stack <tag>`,
+    # released from v0.6.6 on; `noo upgrade --stack` already refused a lock
+    # signed for another tag). When it is there it is the only header trusted:
+    # the unsigned `# tag` line the CLI also writes is read only for the
+    # locks of older releases, which never carried the signed one.
+    if grep -q '^# stack ' stack.lock; then
+        if ! grep -q "^# stack ${1}\$" stack.lock || grep '^# stack ' stack.lock | grep -qv "^# stack ${1}\$"; then
+            _DIST_LOCK_STATE=other
+            return 0
+        fi
+    elif ! grep -q "^# tag ${1}\$" stack.lock; then
         _DIST_LOCK_STATE=other
         return 0
     fi
@@ -589,6 +599,69 @@ dist_ref_is_stack_versioned() {
     return 1
 }
 
+# dist_third_party_row REF - the lock row family (NOO_IMAGE_DIGEST_<X> suffix
+# list) for a third-party runtime image the signed lock pins, by the REPOSITORY
+# name in the ref; empty for anything else. Mirrors THIRD_PARTY in
+# scripts/stack-lock-third-party.py (tests/test_third_party_image_lock.py
+# pins the two together). tei has two rows (GPU and cpu- tags).
+dist_third_party_row() {
+    local _r="${1%%@*}"
+    _r="${_r##*/}"
+    _r="${_r%%:*}"
+    case "$_r" in
+        redis) echo REDIS ;;
+        nats) echo NATS ;;
+        nginx) echo NGINX ;;
+        loki) echo LOKI ;;
+        prometheus) echo PROMETHEUS ;;
+        alertmanager) echo ALERTMANAGER ;;
+        grafana) echo GRAFANA ;;
+        node-exporter) echo NODE_EXPORTER ;;
+        text-embeddings-inference) echo "TEI TEI_CPU" ;;
+        vllm-openai) echo VLLM ;;
+        ollama) echo OLLAMA ;;
+    esac
+}
+
+# dist_assert_third_party_ref REF - a third-party runtime image compose is
+# about to pull must be the one the signed lock pins. With a pin loaded for
+# its row: the ref must carry a digest, and it must be one of the lock's pins
+# (a hand-set override such as VLLM_IMAGE=vllm/vllm-openai:v0.26 of a locked
+# repository is refused too: name its digest, or unset it). With no pin for the row (a lock of a release before the
+# third-party rows existed, or no lock): warn, never silent, and go on, so a
+# roll back to an older stack still starts.
+dist_assert_third_party_ref() {
+    local _ref="$1" _rows _row _p _dig _ok="" _pinned=""
+    _rows="$(dist_third_party_row "$_ref")"
+    [ -n "$_rows" ] || return 0
+    for _row in $_rows; do
+        for _p in "${_DIST_PINS[@]+"${_DIST_PINS[@]}"}"; do
+            [ "${_p%%=*}" = "NOO_IMAGE_DIGEST_${_row}" ] && _pinned=1
+        done
+    done
+    if [ -z "$_pinned" ]; then
+        echo "WARNING: $_ref is not pinned by stack.lock (a release before the lock carried third-party images?) - pulled by tag" >&2
+        return 0
+    fi
+    case "$_ref" in
+        *@sha256:*)
+            _dig="@${_ref#*@}"
+            for _p in "${_DIST_PINS[@]+"${_DIST_PINS[@]}"}"; do
+                [ "${_p#*=}" = "$_dig" ] && _ok=1
+            done
+            if [ -z "$_ok" ]; then
+                echo "ERROR: the pull would fetch $_ref - its digest is not in stack.lock for ${DIST_TAG:-this tag} (an override such as VLLM_IMAGE? name its digest, or unset it); refusing to pull an unpinned image" >&2
+                return 1
+            fi ;;
+        *)
+            # Compose renders the digest whenever the lock is loaded, so a
+            # digest-less ref here is an override of the locked repository.
+            echo "ERROR: the pull would fetch $_ref with no digest, but stack.lock pins it - refusing to pull by tag" >&2
+            return 1 ;;
+    esac
+    return 0
+}
+
 # dist_assert_pull_refs - refuse a pull whose first-party refs are not the
 # ones the up phase will run. `config --images` is what compose will PULL;
 # every STACK-VERSIONED ref under our image prefix must carry DIST_TAG, and
@@ -608,9 +681,9 @@ dist_ref_is_stack_versioned() {
 #
 # The runtime images' own registry (NOO_BASE_REGISTRY, default
 # `<prefix>/dhi`, the DHI mirrors) nests UNDER the image prefix. Nothing
-# there is a stack image, whatever its name or tag looks like, so a ref
-# under `${NOO_BASE_REGISTRY}/` is skipped by rule rather than by the
-# accident of `dhi/<name>` matching no lock pin.
+# there is a stack image, so a ref under `${NOO_BASE_REGISTRY}/` is not held
+# to the stack TAG; it is held to its signed DIGEST pin instead, like every
+# other third-party runtime image (dist_assert_third_party_ref).
 dist_assert_pull_refs() {
     local _imgs _ref _rest _name _tag _dig _ok _p
     local _rc=0
@@ -625,6 +698,10 @@ dist_assert_pull_refs() {
     local _base="${NOO_BASE_REGISTRY:-${NOO_IMAGE_PREFIX:-}/dhi}"
     _base="${_base%/}"
     while IFS= read -r _ref; do
+        # Third-party runtime images (redis, nats, loki, vllm, tei ...) sit
+        # outside the stack-versioned set, but the signed lock pins them by
+        # digest: held to their pins below, wherever their registry is.
+        dist_assert_third_party_ref "$_ref" || return 1
         case "$_ref" in "${NOO_IMAGE_PREFIX:-}"/*) : ;; *) continue ;; esac
         if [ -n "$_base" ] && [ "$_base" != "${NOO_IMAGE_PREFIX:-}" ]; then
             case "$_ref" in "$_base"/*) continue ;; esac

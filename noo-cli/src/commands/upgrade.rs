@@ -3752,12 +3752,61 @@ pub(crate) fn stack_lock_with(
     if !text.lines().any(|l| l.contains("@sha256:")) {
         return Err(("stack_lock_empty", format!("{name} names no images"), None));
     }
+    match lock_tag_binding(tag, &text) {
+        Ok(LockBinding::Bound) => {}
+        Ok(LockBinding::Legacy) => eprintln!("warning: {}", format!(
+            "{name} predates the signed `# stack <tag>` line: its tag is not bound by the signature (only releases before {LOCK_BINDS_TAG_FROM} are accepted this way)")),
+        Err(e) => return Err(e),
+    }
     Ok(Some(text))
+}
+
+/// The first stack release whose lock carries the signed `# stack <tag>` line
+/// (images-release.yml writes it into the bytes it signs). Locks of tags
+/// before it never had the line and are accepted without it, with a warning;
+/// from this tag on a lock without the line is refused.
+pub(crate) const LOCK_BINDS_TAG_FROM: &str = "v0.6.6";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockBinding {
+    /// The signed bytes name this very tag.
+    Bound,
+    /// A pre-binding release's lock: no line, accepted for old tags only.
+    Legacy,
+}
+
+/// Does the SIGNED lock text name the tag it was fetched for? A validly
+/// signed lock of another release served under this tag (a mirror replaying
+/// an older, possibly vulnerable, release) fails here. The tag is compared
+/// exactly (rc suffix included), after `stack-` / `v` normalisation.
+pub(crate) fn lock_tag_binding(tag: &str, text: &str) -> Result<LockBinding, StackLockErr> {
+    let want = norm_stack_tag(tag);
+    let named: Vec<String> = text.lines()
+        .filter_map(|l| l.trim().strip_prefix("# stack ").map(norm_stack_tag))
+        .collect();
+    if !named.is_empty() {
+        if named.iter().all(|t| *t == want) {
+            return Ok(LockBinding::Bound);
+        }
+        return Err(("stack_lock_tag_mismatch",
+            format!("stack-{want}.lock is signed for {} — a lock of another release served under this tag; refusing", named.join(", ")),
+            Some("the release channel replayed another release's lock; do not work around this")));
+    }
+    // No line: only a release cut before the binding existed may lack it.
+    let core = rc_core(&want);
+    if is_stack_version(&core) && stack_semver(&core) < stack_semver(LOCK_BINDS_TAG_FROM) {
+        return Ok(LockBinding::Legacy);
+    }
+    Err(("stack_lock_tag_unbound",
+        format!("stack-{want}.lock carries no signed `# stack <tag>` line (every release from {LOCK_BINDS_TAG_FROM} on has one, so {want} cannot be tied to its lock) — refusing"),
+        Some("the lock was not produced by the release workflow for this tag; do not work around this")))
 }
 
 /// Write verified lock text as `<root>/stack.lock` (header `# tag <tag>`)
 /// atomically: a temp file beside it, then a rename, so the launcher never
-/// reads a half-written lock. Returns the number of image rows pinned.
+/// reads a half-written lock. A lock from a release that signs `# stack <tag>`
+/// carries that line inside `text`; the launcher trusts it over the unsigned
+/// `# tag` header, which only a pre-binding lock is read by. Returns the number of image rows pinned.
 pub(crate) fn write_stack_lock_file(root: &std::path::Path, tag: &str, text: &str) -> std::io::Result<usize> {
     let dst = root.join("stack.lock");
     let tmp = root.join(".stack.lock.tmp");
@@ -5447,8 +5496,41 @@ mod keyless_tests {
         let why = super::no_lock_refusal("dist", "v9.9.9").expect("dist refuses");
         assert!(why.contains("Nothing was changed") && why.contains("stack-v9.9.9"));
         assert!(super::no_lock_refusal("", "v9.9.9").is_none(), "dev keeps the warning-only path");
-        let mut has = |_: &str, name: &str| Ok(if name.ends_with(".sig") { b"sig".to_vec() } else { b"gateway@sha256:aa\n".to_vec() });
+        let mut has = |_: &str, name: &str| Ok(if name.ends_with(".sig") { b"sig".to_vec() } else { b"# stack v9.9.9\ngateway@sha256:aa\n".to_vec() });
         assert!(super::stack_lock_with("v9.9.9", &mut has, &|_, _| Ok(0)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_lock_signed_for_another_tag_is_refused_and_a_legacy_one_warned() {
+        use super::{lock_tag_binding as b, LockBinding};
+        let row = "gateway@sha256:aa\n";
+        // bound: exact tag, with or without the stack- prefix
+        assert_eq!(b("v0.6.6", &format!("# stack v0.6.6\n{row}")).unwrap(), LockBinding::Bound);
+        assert_eq!(b("stack-v0.6.6-rc.1", &format!("# stack v0.6.6-rc.1\n{row}")).unwrap(), LockBinding::Bound);
+        // an older release's validly signed lock replayed under a newer tag
+        let e = b("v0.6.7", &format!("# stack v0.6.5\n{row}")).unwrap_err();
+        assert_eq!(e.0, "stack_lock_tag_mismatch");
+        assert!(e.1.contains("v0.6.5"), "{}", e.1);
+        // an rc's lock is not the final's
+        assert_eq!(b("v0.6.6", &format!("# stack v0.6.6-rc.1\n{row}")).unwrap_err().0, "stack_lock_tag_mismatch");
+        // no line: legacy for releases before the binding, refused from it on
+        assert_eq!(b("v0.6.5", row).unwrap(), LockBinding::Legacy);
+        assert_eq!(b("v0.6.5-rc.2", row).unwrap(), LockBinding::Legacy);
+        assert_eq!(b("v0.6.6", row).unwrap_err().0, "stack_lock_tag_unbound");
+        assert_eq!(b("v0.6.6-rc.1", row).unwrap_err().0, "stack_lock_tag_unbound");
+        assert_eq!(b("custom-build", row).unwrap_err().0, "stack_lock_tag_unbound");
+    }
+
+    #[test]
+    fn stack_lock_with_applies_the_tag_binding() {
+        fn serve(text: &'static str) -> Box<super::ReleaseFileFetch<'static>> {
+            Box::new(move |_: &str, name: &str| Ok(if name.ends_with(".sig") { b"sig".to_vec() } else { text.as_bytes().to_vec() }))
+        }
+        let mut replay = serve("# stack v0.6.5\ngateway@sha256:aa\n");
+        let e = super::stack_lock_with("v0.6.7", &mut *replay, &|_, _| Ok(0)).unwrap_err();
+        assert_eq!(e.0, "stack_lock_tag_mismatch");
+        let mut good = serve("# stack v0.6.7\ngateway@sha256:aa\n");
+        assert!(super::stack_lock_with("v0.6.7", &mut *good, &|_, _| Ok(0)).unwrap().is_some());
     }
 
     #[test]

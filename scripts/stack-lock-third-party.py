@@ -34,9 +34,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.cluster.yml"
 
-# lock row name -> (upstream repository as compose names it, override env var)
-THIRD_PARTY: dict[str, tuple[str, str]] = {
-    "ollama": ("ollama/ollama", "OLLAMA_IMAGE"),
+# The DHI mirror the compose file's `${NOO_BASE_REGISTRY:-...}` defaults to.
+DHI = "ghcr.io/noomesh/dhi"
+_BASE = "${NOO_BASE_REGISTRY:-" + DHI + "}"
+_VER = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+
+# lock row name -> how compose spells the image and where its digest resolves:
+#   compose  the literal text before `:<version>` in the compose `image:` line
+#   repo     the registry reference the tag is resolved against
+#   ver      regex of the version part (one repository can carry two rows)
+# An optional `${ANY_OVERRIDE:-...}` wrapper around the default is allowed
+# (OLLAMA_IMAGE, VLLM_IMAGE, NATS_IMAGE: an operator's own image wins).
+THIRD_PARTY: dict[str, dict[str, str]] = {
+    "ollama": {"compose": "ollama/ollama", "repo": "docker.io/ollama/ollama", "ver": _VER},
+    "nats": {"compose": "nats", "repo": "docker.io/library/nats", "ver": _VER},
+    "nginx": {"compose": "nginx", "repo": "docker.io/library/nginx", "ver": _VER},
+    "redis": {"compose": _BASE + "/redis", "repo": DHI + "/redis", "ver": _VER},
+    "loki": {"compose": _BASE + "/loki", "repo": DHI + "/loki", "ver": _VER},
+    "prometheus": {"compose": _BASE + "/prometheus", "repo": DHI + "/prometheus", "ver": _VER},
+    "alertmanager": {"compose": _BASE + "/alertmanager", "repo": DHI + "/alertmanager", "ver": _VER},
+    "grafana": {"compose": _BASE + "/grafana", "repo": DHI + "/grafana", "ver": _VER},
+    "node-exporter": {"compose": _BASE + "/node-exporter", "repo": DHI + "/node-exporter", "ver": _VER},
+    "tei": {"compose": "ghcr.io/huggingface/text-embeddings-inference",
+            "repo": "ghcr.io/huggingface/text-embeddings-inference", "ver": "(?!cpu-)" + _VER},
+    "tei-cpu": {"compose": "ghcr.io/huggingface/text-embeddings-inference",
+                "repo": "ghcr.io/huggingface/text-embeddings-inference", "ver": "cpu-" + _VER},
+    "vllm": {"compose": "vllm/vllm-openai", "repo": "docker.io/vllm/vllm-openai", "ver": "v[A-Za-z0-9._-]*"},
 }
 
 ATTEMPTS = 4
@@ -50,27 +73,33 @@ def digest_var(name: str) -> str:
     return "NOO_IMAGE_DIGEST_" + name.upper().replace("-", "_")
 
 
-def compose_version(name: str, text: str) -> str:
-    """The one version every compose service running `name` names."""
-    repo, override = THIRD_PARTY[name]
-    pat = re.compile(
-        r"^\s*image:\s*\$\{" + re.escape(override) + r":-" + re.escape(repo)
-        + r":([A-Za-z0-9._-]+)\$\{" + re.escape(digest_var(name)) + r":-\}\}\s*$",
+def _image_re(name: str, hook: bool) -> "re.Pattern[str]":
+    """An `image:` line running `name`: [${OVERRIDE:-]compose:ver<hook>[}]."""
+    e = THIRD_PARTY[name]
+    tail = (r"\$\{" + re.escape(digest_var(name)) + r":-(?:@sha256:[0-9a-f]{64})?\}") if hook else r""
+    return re.compile(
+        r"^\s*image:\s*(?:\$\{[A-Z][A-Z0-9_]*:-)?" + re.escape(e["compose"]) + r":(" + e["ver"] + r")"
+        + tail + (r"\}?\s*$" if hook else r""),
         re.M,
     )
-    found = set(pat.findall(text))
-    mentions = len(re.findall(r"^\s*image:.*\b" + re.escape(repo) + r"[:@]", text, re.M))
+
+
+def compose_version(name: str, text: str) -> str:
+    """The one version every compose service running `name` names."""
+    hook = digest_var(name)
+    found = set(_image_re(name, True).findall(text))
+    pinned = len(_image_re(name, True).findall(text))
+    mentions = len(_image_re(name, False).findall(text))
     if not found:
-        raise LockError(f"no compose service runs {repo} as "
-                        f"${{{override}:-{repo}:<version>${{{digest_var(name)}:-}}}}")
-    if mentions != len(pat.findall(text)):
-        raise LockError(f"{mentions} services name {repo} but only {len(pat.findall(text))} "
-                        f"carry the {digest_var(name)} pin: every one must")
+        raise LockError(f"no compose service runs {name} with a ${{{hook}:-}} digest hook "
+                        f"({THIRD_PARTY[name]['compose']}:<version>${{{hook}:-}})")
+    if mentions != pinned:
+        raise LockError(f"{mentions} services run {name} but only {pinned} carry the {hook} pin: every one must")
     if len(found) != 1:
-        raise LockError(f"compose names {repo} at several versions {sorted(found)}: one release, one version")
+        raise LockError(f"compose names {name} at several versions {sorted(found)}: one release, one version")
     version = found.pop()
     if version == "latest":
-        raise LockError(f"compose runs {repo}:latest: pin a version (a lock row for a moving tag pins nothing)")
+        raise LockError(f"compose runs {name}:latest: pin a version (a lock row for a moving tag pins nothing)")
     return version
 
 
@@ -97,12 +126,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("mode", choices=("rows", "check"))
     ap.add_argument("--out", type=Path, help="directory for the row files (rows)")
     ap.add_argument("--compose", type=Path, default=COMPOSE)
+    ap.add_argument("--only", action="append", choices=sorted(THIRD_PARTY), help="restrict to these rows (tests)")
     a = ap.parse_args(argv)
     text = a.compose.read_text()
     try:
-        for name, (repo, _) in sorted(THIRD_PARTY.items()):
+        for name, entry in sorted(THIRD_PARTY.items()):
+            if a.only and name not in a.only:
+                continue
             version = compose_version(name, text)
-            ref = f"docker.io/{repo}:{version}"
+            ref = f"{entry['repo']}:{version}"
             if a.mode == "check":
                 print(f"{name}: {ref}")
                 continue
