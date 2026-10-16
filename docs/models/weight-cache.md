@@ -143,13 +143,29 @@ When the node-agent is asked to start a backend:
   `<cache-url>/hf/models--<org>--<name>/` into the node's HF cache itself,
   in-process against the host path (15-minute budget). It reads `refs/main`
   and mirrors **only that one** snapshot, so the backend can start with
-  `HF_HUB_OFFLINE=1`. No helper container is involved: the agent has been a
-  host process since the fleet hardening, and until 2026-09-12 this step
-  still tried to run a throwaway container from the agent's own image, which
-  no rail delivers to a node — every node logged "helper create: No such
-  image" and fell back to a WAN download. On a miss the agent logs
-  `model-cache preseed miss` and lets the backend download from HuggingFace;
-  on a permission error it logs the directory the agent's user cannot write.
+  `HF_HUB_OFFLINE=1`. No helper container is involved: the agent is a host
+  process. **A placed node never downloads weights from the internet.** With
+  `NOO_MODEL_CACHE_URL` set, the backend always starts with
+  `HF_HUB_OFFLINE=1` and **without** `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`
+  (a node needs no Hugging Face credential). A model the store does not hold
+  (and the node's own HF cache has no snapshot of) is refused:
+  the start fails with `model_cache_miss: <backend> needs <model>, which is
+  not in the controller's model store`, the refusal reaches the controller in
+  the node's heartbeat, and `noo cluster verify` shows it. The fix is on the
+  controller: run the model once there, or
+  `HF_HOME=$HF_CACHE_DIR huggingface-cli download <model>`, then re-run
+  `noo cluster verify`. A permission error is logged with the directory the
+  agent's user cannot write. A node with no store configured (the
+  controller's own agent, a hand-run dev box) keeps the old behaviour:
+  online on a miss, the token passed through.
+- **Ollama registry tags** (`gemma4:12b`): the controller store carries GGUF
+  files, not ollama registry blobs, so a placed node **refuses** to
+  `ollama pull` a tag from `registry.ollama.ai`
+  (`ollama_registry_pull_refused`). Fetch the model as a GGUF onto the
+  controller (`noo models fetch <hf_repo> <file.gguf>`) and place the file
+  name, which the node imports from the store. A node that must pull a tag
+  accepts that explicitly with `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` in its
+  node-agent environment.
 
 `noo models recommended` prefers models that are already in the cache
 (`GET /api/models/cached`) precisely because they preseed over the LAN.
@@ -223,6 +239,17 @@ the node pulls the tar over mTLS, verifies it, and `docker load`s it. No
 registry credential is ever sent to a node, by design: a node without
 the staged image fails with a clear refusal rather than an `unauthorized`
 registry error.
+
+Third-party backend images (vLLM, ollama, TEI) are pinned the same way. The
+controller sends each node the digest-pinned ref from the release-signed
+`stack.lock` (`vllm/vllm-openai:v0.25.0@sha256:...`) in its start request. A
+node refuses `:latest` and untagged refs outright, and on a dist node
+refuses a ref with no digest: a controller too old to send one leaves the
+node on its versioned default, which a registry node refuses (with the
+controller roll that fixes it) and a `NOO_IMAGE_SOURCE=rail` node runs only
+if the controller staged that image (`noo cluster sync-images <node> -i
+<image>`), since the rail verifies the tar against the gateway's manifest.
+On a rail node the image never comes from a registry.
 
 ### What the controller stages
 

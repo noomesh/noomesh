@@ -13,6 +13,8 @@ import (
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/client"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
 // An ollama placement names a REGISTRY tag (`gemma4:12b`), and until
@@ -51,11 +53,15 @@ func (c *Client) OllamaHasModel(ctx context.Context, name string) (bool, error) 
 // Blocking: a multi-GB pull can take many minutes, so the caller runs it
 // off the reconcile tick.
 func (c *Client) OllamaPull(ctx context.Context, name string) (string, error) {
-	if c == nil || c.docker == nil {
-		return "", fmt.Errorf("Docker not available")
-	}
 	if !ollamaTagPattern.MatchString(name) {
 		return "", fmt.Errorf("model %q is not an ollama registry ref", name)
+	}
+	// Before anything else: a placed node takes models from the controller.
+	if err := preseed.OllamaRegistryPullAllowed(name); err != nil {
+		return "", err
+	}
+	if c == nil || c.docker == nil {
+		return "", fmt.Errorf("Docker not available")
 	}
 	if !c.isRunning(ctx, OllamaContainer) {
 		return "", fmt.Errorf("%s is not running", OllamaContainer)

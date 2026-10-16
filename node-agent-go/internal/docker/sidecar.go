@@ -57,7 +57,7 @@ const StunnelImageEnv = "STUNNEL_IMAGE"
 // kept for nodes on a release that predates it, reported on the heartbeat
 // (`stunnel_image`, internal/sidecarimage) and removed once every node
 // carries the published image.
-const stunnelFallbackImage = "alpine:3.20"
+const stunnelFallbackImage = "alpine:3.22"
 
 // stunnelSidecarScript is the sidecar's `sh -c` entrypoint. `command -v`
 // covers the built image (docker/Dockerfile.stunnel, stunnel on PATH); the
