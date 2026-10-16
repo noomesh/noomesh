@@ -330,6 +330,15 @@ pub async fn rotate(db: &sqlx::PgPool, cfg: &RotateConfig) -> Result<RotateOutco
                 continue; // never drop what was not verified
             }
         }
+        // The signed retention checkpoint goes in BEFORE the drop: it names the
+        // chained rows about to vanish and the hash that links the rows after
+        // them, so `noo security audit verify` reads the gap as retention. If it
+        // cannot be written nothing is dropped (the drop function refuses too).
+        if let Err(e) = crate::audit_chain::record_retention_checkpoint(db, y, m).await {
+            tracing::error!(error = %e, "audit_retention_checkpoint_failed");
+            out.errors.push(format!("{name}: exported but not dropped, no retention checkpoint: {e}"));
+            continue;
+        }
         match sqlx::query_scalar::<_, bool>("SELECT noo_drop_audit_partition($1, $2)")
             .bind(y)
             .bind(m as i32)

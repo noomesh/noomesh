@@ -278,6 +278,98 @@ pub(crate) async fn write_row(
     Ok(seq)
 }
 
+/// Retention step: record, signed and chained, that `year`-`month`'s partition
+/// is about to be dropped. Names the partition's chained seq range and the
+/// `chain_hash` of its last row; the verifier then reads that gap as retention
+/// and takes the named hash as the predecessor of the row after it.
+///
+/// `Ok(false)`: the partition holds no chained row, nothing to record.
+/// `Ok(true)`: a checkpoint for exactly this range is in place (written now, or
+/// by an earlier run). `Err`: none could be written (no audit key, no chain
+/// tail, database error) and the caller MUST NOT drop. Called by
+/// `audit_partition::rotate` after the export verifies and before the drop.
+pub(crate) async fn record_retention_checkpoint(db: &sqlx::PgPool, year: i32, month: u32) -> Result<bool, String> {
+    use chrono::TimeZone as _;
+    let Some(key) = crate::audit_integrity::current_key() else {
+        return Err("no NOO_AUDIT_HMAC_KEY: cannot sign the retention checkpoint".into());
+    };
+    let start = Utc
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .ok_or_else(|| format!("bad partition {year}-{month}"))?;
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let end = Utc.with_ymd_and_hms(ny, nm, 1, 0, 0, 0).single().ok_or_else(|| "bad partition end".to_string())?;
+    let e = |what: &str, err: sqlx::Error| format!("retention checkpoint {year}-{month:02}: {what}: {err}");
+
+    let mut tx = db.begin().await.map_err(|x| e("begin", x))?;
+    take_lock(&mut tx).await.map_err(|x| e("lock", x))?;
+    let span: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT min(chain_seq), max(chain_seq) FROM noo_security_audit \
+         WHERE \"timestamp\" >= $1 AND \"timestamp\" < $2 AND chain_seq IS NOT NULL",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|x| e("range", x))?;
+    let (Some(lo), Some(hi)) = span else { return Ok(false) };
+    let last: Option<String> = sqlx::query_scalar(
+        "SELECT chain_hash FROM noo_security_audit WHERE chain_seq = $1 \
+         AND \"timestamp\" >= $2 AND \"timestamp\" < $3",
+    )
+    .bind(hi)
+    .bind(start)
+    .bind(end)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|x| e("last row", x))?
+    .flatten();
+    let last = last.ok_or_else(|| format!("retention checkpoint {year}-{month:02}: row seq {hi} has no chain_hash"))?;
+    let resource = Retention { from: lo, through: hi, chain: last }.resource();
+    let have: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM noo_security_audit WHERE event_type = $1 AND resource = $2 LIMIT 1",
+    )
+    .bind(RETENTION_EVENT)
+    .bind(&resource)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|x| e("existing", x))?;
+    if have.is_some() {
+        return Ok(true);
+    }
+    let details = serde_json::json!({
+        "what": "this month's partition was exported and verified, and is being dropped; its chained rows \
+                 are accounted for by this row",
+    })
+    .to_string();
+    let details: String = sqlx::query_scalar("SELECT $1::jsonb::text")
+        .bind(&details)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|x| e("details", x))?;
+    let outcome = format!("{year}-{month:02}");
+    insert_in_tx(
+        &mut tx,
+        &key,
+        Some(&key),
+        &NewRow {
+            event_type: RETENTION_EVENT,
+            severity: "info",
+            actor: "audit-retention",
+            resource: &resource,
+            outcome: &outcome,
+            details: &details,
+            prev_hash: None,
+        },
+        false,
+    )
+    .await
+    .map_err(|x| e("insert", x))?;
+    tx.commit().await.map_err(|x| e("commit", x))?;
+    tracing::info!(year, month, seq_from = lo, seq_through = hi, "audit_retention_checkpoint_written");
+    Ok(true)
+}
+
 /// What boot did about the genesis row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenesisOutcome {
@@ -934,6 +1026,23 @@ mod tests {
         assert!(report.breaks.iter().any(|b| b.reason.starts_with("chain:")));
         let ok = crate::audit_integrity::verify_all(&chain(5), &keys());
         assert!(ok.breaks.is_empty(), "{:?}", ok.breaks);
+    }
+
+    /// The partition that held the key hand-over checkpoint (and the genesis
+    /// and hash-v2 marker) can be dropped: the whole verdict stays ok when only
+    /// current-key rows remain, a retention checkpoint accounts for the gap, and
+    /// no `audit_key_checkpoint` row is left.
+    #[test]
+    fn dropping_the_partition_with_the_key_checkpoint_does_not_fail_verify() {
+        let mut rows = chain(6);
+        let ck = Retention { from: 1, through: 3, chain: rows[2].chain_hash.clone().unwrap() };
+        let prev = rows.last().unwrap().chain_hash.clone().unwrap();
+        let ck_row = linked(7, &prev, RETENTION_EVENT, &ck.resource(), 2000);
+        rows.drain(0..3);
+        rows.push(ck_row);
+        let report = crate::audit_integrity::verify_all(&rows, &keys());
+        assert_eq!(report.verdict, "ok", "{:?} {:?}", report.breaks, report.problems);
+        assert_eq!(report.chain.retired_rows, 3);
     }
 
     #[test]
