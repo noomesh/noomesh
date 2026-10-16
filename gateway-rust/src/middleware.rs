@@ -279,6 +279,26 @@ fn signed_by_the_cluster(request: &Request) -> bool {
     else {
         return false;
     };
+    if crate::cluster_token_v2::is_v2(token) {
+        // The limiter runs before the body is read, so the signature is
+        // checked against the body hash the signer SENT; the auth middleware
+        // hashes the real body, so a lie here only costs the liar the
+        // exemption. The nonce is not spent here (auth spends it).
+        let Some(secret) = crate::config::secret_env::secret_opt("NOO_CLUSTER_SECRET") else { return false };
+        let node = request
+            .extensions()
+            .get::<Option<crate::node_identity::VerifiedPeer>>()
+            .and_then(|p| p.as_ref())
+            .map(|p| p.node.clone());
+        let sha = request
+            .headers()
+            .get(crate::cluster_token_v2::BODY_SHA_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let uri = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or_else(|| request.uri().path());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        return rate_exempt_v2(token, node.as_deref(), &secret, request.method().as_str(), uri, sha, now);
+    }
     if !looks_like_cluster_token(token) {
         return false;
     }
@@ -305,6 +325,17 @@ pub(crate) fn rate_exempt_with(token: &str, node_leaf: Option<&str>, fleet_secre
     let (Some(node), Some(secret)) = (node_leaf, fleet_secret) else { return false };
     // Verified under the secret given, so the actor field is the signed one.
     crate::auth::verify_cluster_token_inner(token, secret, now) && token.split(':').next() == Some(node)
+}
+
+/// [`rate_exempt_with`] for a v2 token: the signature must verify for this
+/// request (with the body hash the signer sent) and its actor must be the node
+/// the connection's certificate names.
+pub(crate) fn rate_exempt_v2(token: &str, node_leaf: Option<&str>, secret: &str, method: &str, uri: &str, body_sha: &str, now: u64) -> bool {
+    let Some(node) = node_leaf else { return false };
+    if body_sha.len() != 64 {
+        return false;
+    }
+    crate::cluster_token_v2::verify_signature(token, secret, method, uri, body_sha, now).is_some_and(|(actor, _)| actor == node)
 }
 
 /// `<actor>:<digits>:<hex>` — exactly two colons, a numeric timestamp and a
@@ -1830,6 +1861,19 @@ mod tests {
         assert!(!compose_peer_in("100.64.0.9", &nets, &gws), "a tailnet node");
         assert!(!compose_peer_in("127.0.0.1", &nets, &gws));
         assert!(!compose_peer_in("fd00::1", &nets, &gws));
+    }
+
+    /// A v2 token exempts only for the node whose certificate is on the
+    /// connection, and only for the request it was signed for.
+    #[test]
+    fn a_v2_token_is_exempt_only_for_its_own_node_and_request() {
+        let sha = crate::cluster_token_v2::body_sha_hex(b"{}");
+        let t = crate::cluster_token_v2::sign("fleet", "POST", "/api/cluster/nodes/host8/heartbeat", b"{}", "host8", 500, "00112233445566778899aabbccddeeff").unwrap();
+        assert!(rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500));
+        assert!(!rate_exempt_v2(&t, None, "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500), "no leaf");
+        assert!(!rate_exempt_v2(&t, Some("host3"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500), "another node's leaf");
+        assert!(!rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/logs", &sha, 500), "another path");
+        assert!(!rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", "", 500), "no body hash");
     }
 
     #[test]

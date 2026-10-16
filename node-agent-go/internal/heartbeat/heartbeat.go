@@ -717,8 +717,7 @@ func (r *Reporter) Run(ctx context.Context) {
 
 func (r *Reporter) setAuthHeader(req *http.Request) {
 	if r.cfg.ClusterSecret != "" {
-		token := auth.CreateClusterToken(r.cfg.NodeID, r.cfg.ClusterSecret)
-		req.Header.Set("Authorization", "Bearer "+token)
+		auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret)
 	}
 }
 
@@ -941,3 +940,8 @@ func servedCertNotAfter(certPath string) int64 {
 	})
 	return servedCertExpiry
 }
+
+// UsableHostIP returns ip when it is an address the controller could dial
+// (not loopback, unspecified, link-local or multicast), else "". The API
+// listener uses it to decide whether it knows where to bind.
+func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }

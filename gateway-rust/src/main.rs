@@ -66,6 +66,7 @@ mod task_budget;
 mod text;
 mod auth_refresh;
 mod cache;
+mod cluster_token_v2;
 mod cert_expiry;
 mod config;
 mod coordinator;

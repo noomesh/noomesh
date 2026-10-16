@@ -2962,8 +2962,8 @@ pub(crate) fn logs_last_seen_check(metrics: Option<&str>, nodes: &[(String, bool
 /// REFUSES it: a count names an add-on image older than the
 /// change, or one with no key, whose gateway calls are all failing.
 pub(crate) const GATEWAY_LEGACY_LANES: &[&str] =
-    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused"];
-pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert"];
+    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
+pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert", "cluster_hmac_v2"];
 /// Counted REFUSALS, not admissions: a `noo` CLI older than the
 /// break-glass removal signing with the controller secret. Every count is
 /// a binary somewhere that needs `noo upgrade --all`.
@@ -2977,7 +2977,7 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
 /// The node-side lanes, as each agent reports them in `legacy_lanes`.
-pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller"];
+pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller", "cluster_hmac_v1"];
 /// Below this window a zero is not yet retirement evidence
 /// ≥7 days, spanning a weekly heartbeat run).
 const LEGACY_LANE_EVIDENCE_SECS: i64 = 7 * 86_400;

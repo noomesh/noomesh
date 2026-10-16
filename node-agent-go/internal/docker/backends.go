@@ -1319,7 +1319,7 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 	}
 	if secret := nodeconfig.Load().ClusterSecret; secret != "" {
 		nodeID := os.Getenv("NODE_ID")
-		req.Header.Set("Authorization", "Bearer "+auth.CreateClusterToken(nodeID, secret))
+		auth.SetClusterAuth(req, nodeID, secret)
 	}
 	transport, err := nodeconfig.Load().HTTPTransport()
 	if err != nil {

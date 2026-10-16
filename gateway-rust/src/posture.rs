@@ -132,6 +132,18 @@ pub const POSTURE_CATALOG: &[PostureKey] = &[
         kind: PostureKind::Bridge { closed: "0", window_days: 60 },
         why: "lets a shared-secret token still buy inference, instead of a per-consumer key",
     },
+    // The v1 cluster token (HMAC over actor and time only) is a
+    // replayable bearer; v2 binds the request. Every verifier accepts both
+    // while the fleet rolls and counts v1 under the `cluster_hmac_v1` lane
+    // (`noo cluster verify` names the callers). "0" refuses v1 at the gateway
+    // door and, mirrored to the agent env, at each node. Unlike the other
+    // bridges this one is OPEN when unset, because every install's nodes sign
+    // v1 until they upgrade; it is closed deliberately, once, after the roll.
+    PostureKey {
+        key: "NOO_CLUSTER_TOKEN_V1",
+        kind: PostureKind::Bridge { closed: "0", window_days: 60 },
+        why: "keeps accepting the old replayable cluster token from nodes that have not upgraded",
+    },
     // `NOO_NATS_LEGACY_SHARED_CREDS` was a bridge here (the one R43 was about)
     // retired the shared bus user it bridged to: the server
     // no longer defines that user, so there is nothing left to hold open.
@@ -419,6 +431,11 @@ pub fn bridge_standing(
     // opening value. A row the gateway treats as closed — "", "no", a typo —
     // is not reported as a standing open bridge.
     if entry.key == "NOO_SELF_CALL_SHARED_SECRET" && !crate::auth::shared_secret_buys_inference(value) {
+        return None;
+    }
+    // The v1-token bridge is judged with the gateway's own reader too: any
+    // closing spelling ("false", "off", …) closes it.
+    if entry.key == "NOO_CLUSTER_TOKEN_V1" && !crate::cluster_token_v2::v1_allowed_value(value) {
         return None;
     }
     Some(BridgeStanding {

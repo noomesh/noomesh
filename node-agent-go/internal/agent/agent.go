@@ -203,6 +203,13 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	// API server
 	server := api.NewServer(cfg, docker, gpu, coll)
+	server.DetectBindIP = func() string {
+		ip := heartbeat.DetectHostIP(cfg)
+		if heartbeat.UsableHostIP(ip) == "" {
+			return ""
+		}
+		return ip
+	}
 
 	a = &Agent{
 		cfg:     cfg,
@@ -564,7 +571,7 @@ func (a *Agent) startLogShip(ctx context.Context) {
 		Client:        a.http,
 		Auth: func(req *http.Request) {
 			if a.cfg.ClusterSecret != "" {
-				req.Header.Set("Authorization", "Bearer "+auth.CreateClusterToken(a.cfg.NodeID, a.cfg.ClusterSecret))
+				auth.SetClusterAuth(req, a.cfg.NodeID, a.cfg.ClusterSecret)
 			}
 		},
 		StateDir: a.cfg.StateDir,
