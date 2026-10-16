@@ -686,7 +686,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/users`, `/disable`, `/propose`, `/proposals`; `/api/kb/grants`, `/rules`, `/teams`, `/teams/create`, `/teams/delete` | older short forms of some of the operations above |
 | GET, PUT | `/api/settings`, `/api/v1/settings`; GET `…/export`, `/api/v1/settings/preference` | the settings snapshot |
 | GET, POST | `/api/settings/flags`, `/api/settings/flags/set` | behavioural flags ([config.md](config.md#behavioural-flags)) |
-| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`). Reads are Operator+ and redact any credential-shaped key's value (`*_key`, `*token*`, `*secret*`, `*password*`; names ending `_env` or `_tokens` are exempt). A `PUT` (here and on `/api/settings`) that carries a non-empty string under a credential-shaped key at any depth is refused `422` with the remedy `noo security secrets set` |
+| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`). Reads are Operator+ and redact any credential-shaped key's value (`*_key`, `*token*`, `*secret*`, `*password*`; names ending `_env` or `_tokens` are exempt). A `PUT` (here and on `/api/settings`) that carries a non-empty string under a credential-shaped key at any depth is refused `422` with the remedy `noo security secrets rotate <NAME> --set-from-stdin` |
 | GET | `/api/v1/settings/browse` | browse the server's folders |
 | GET, POST, DELETE | `/api/v1/settings/user-dirs` | watched-folder management (adding a `writable` folder is admin-only) |
 | GET | `/api/v1/settings/restart-status` | restart-needed flag |

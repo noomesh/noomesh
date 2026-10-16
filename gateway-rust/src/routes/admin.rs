@@ -2660,7 +2660,7 @@ fn decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppError> {
             tracing::warn!(via = %via, "approval decision refused: not a person's credential");
             Err(AppError::Forbidden(format!(
                 "approval decisions are made by a person, not by an agent: this credential is {via}. \
-                 Decide in the dashboard, with `noo approval approve|deny <id>` after `noo auth login`, \
+                 Decide in the dashboard, with `noo approval approve <id>` (or `noo approval deny <id>`) after `noo auth login`, \
                  or from a linked chat channel"
             )))
         }

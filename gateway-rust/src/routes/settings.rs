@@ -439,7 +439,7 @@ pub(crate) fn redact_credentials(v: &Value) -> Value {
                 .map(|(k, val)| {
                     let redacted = match val {
                         Value::String(s) if !s.is_empty() && config_key_looks_like_credential(k) => {
-                            Value::String("[redacted: credential-shaped key; use `noo security secrets set`]".into())
+                            Value::String("[redacted: credential-shaped key; store it with `noo security secrets rotate <NAME> --set-from-stdin`]".into())
                         }
                         other => redact_credentials(other),
                     };
@@ -458,12 +458,12 @@ fn credential_write_refusal(paths: &[String]) -> Value {
         "error": format!(
             "refusing to store credential-shaped key(s) in noomesh.yaml: {}. A secret in the \
              config plane is plaintext on disk and bind-mounted into containers, and nothing \
-             reads secrets from it. Store it with `noo security secrets set <NAME>` (and, where a \
+             reads secrets from it. Store it with `noo security secrets rotate <NAME> --set-from-stdin` (and, where a \
              setting needs to point at it, put the variable NAME in a `*_env` key).",
             paths.join(", ")
         ),
         "keys": paths,
-        "remedy": "noo security secrets set",
+        "remedy": "noo security secrets rotate <NAME> --set-from-stdin",
     })
 }
 
@@ -2864,9 +2864,9 @@ mod credential_plane_tests {
     fn refusal_body_names_the_remedy_and_the_keys() {
         let b = credential_write_refusal(&["search.tavily_api_key".to_string()]);
         let msg = b["error"].as_str().unwrap();
-        assert!(msg.contains("noo security secrets set"), "{msg}");
+        assert!(msg.contains("noo security secrets rotate <NAME> --set-from-stdin"), "{msg}");
         assert!(msg.contains("search.tavily_api_key"), "{msg}");
-        assert_eq!(b["remedy"], "noo security secrets set");
+        assert_eq!(b["remedy"], "noo security secrets rotate <NAME> --set-from-stdin");
     }
 
     #[test]

@@ -3754,8 +3754,8 @@ pub(crate) fn stack_lock_with(
     }
     match lock_tag_binding(tag, &text) {
         Ok(LockBinding::Bound) => {}
-        Ok(LockBinding::Legacy) => eprintln!("warning: {}", format!(
-            "{name} predates the signed `# stack <tag>` line: its tag is not bound by the signature (only releases before {LOCK_BINDS_TAG_FROM} are accepted this way)")),
+        Ok(LockBinding::Legacy) => eprintln!(
+            "warning: {name} predates the signed `# stack <tag>` line: its tag is not bound by the signature (only releases before {LOCK_BINDS_TAG_FROM} are accepted this way)"),
         Err(e) => return Err(e),
     }
     Ok(Some(text))
@@ -3765,7 +3765,10 @@ pub(crate) fn stack_lock_with(
 /// (images-release.yml writes it into the bytes it signs). Locks of tags
 /// before it never had the line and are accepted without it, with a warning;
 /// from this tag on a lock without the line is refused.
-pub(crate) const LOCK_BINDS_TAG_FROM: &str = "v0.6.6";
+// The first stack release whose lock job signs the line. 0.6.6 was cut
+// before this change, so its lock has no `# stack` line and must keep
+// loading (with the warning) when an install moves from it.
+pub(crate) const LOCK_BINDS_TAG_FROM: &str = "v0.6.7";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LockBinding {
@@ -5516,8 +5519,11 @@ mod keyless_tests {
         // no line: legacy for releases before the binding, refused from it on
         assert_eq!(b("v0.6.5", row).unwrap(), LockBinding::Legacy);
         assert_eq!(b("v0.6.5-rc.2", row).unwrap(), LockBinding::Legacy);
-        assert_eq!(b("v0.6.6", row).unwrap_err().0, "stack_lock_tag_unbound");
-        assert_eq!(b("v0.6.6-rc.1", row).unwrap_err().0, "stack_lock_tag_unbound");
+        // 0.6.6 (and its rcs) shipped before the lock job signed the line
+        assert_eq!(b("v0.6.6", row).unwrap(), LockBinding::Legacy);
+        assert_eq!(b("stack-v0.6.6-rc.1", row).unwrap(), LockBinding::Legacy);
+        assert_eq!(b("v0.6.7", row).unwrap_err().0, "stack_lock_tag_unbound");
+        assert_eq!(b("v0.6.7-rc.1", row).unwrap_err().0, "stack_lock_tag_unbound");
         assert_eq!(b("custom-build", row).unwrap_err().0, "stack_lock_tag_unbound");
     }
 

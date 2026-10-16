@@ -931,6 +931,8 @@ pub async fn before_tool_call(
     //     takes the same path: `strict` refuses at once, `approval` queues a
     //     request nobody's chat can answer with a bare `y` and refuses on timeout;
     //     only an explicit `auto`/`disabled` runs it.
+    // The outer test keeps the High-only reasoning above next to its branch.
+    #[allow(clippy::collapsible_if)]
     if risk_level == security::RiskLevel::High {
         if security::requires_approval_block(risk_level, &mode) {
             if mode == "approval" {
@@ -2320,7 +2322,7 @@ mod csp_default_tests {
         assert!(DEFAULT_CSP.contains("connect-src 'self' ws: wss:"));
         assert!(!DEFAULT_CSP.contains("http://") && !DEFAULT_CSP.contains("https://"));
         assert!(!DEFAULT_CSP.contains("unsafe-eval"));
-        assert!(DEFAULT_CSP.chars().all(|c| c.is_ascii()), "must be a valid header value");
+        assert!(DEFAULT_CSP.is_ascii(), "must be a valid header value");
         assert!(axum::http::HeaderValue::from_str(DEFAULT_CSP).is_ok());
     }
 

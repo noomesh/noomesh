@@ -30,6 +30,19 @@ fn scratch(tag: &str) -> ScratchDir {
     ScratchDir::new(&format!("noo-cli-secloc-{tag}"))
 }
 
+/// A scratch install root: a private (0600) empty `.env` marks it as an
+/// install, so the scan reads it as one on every host. Without it the scan
+/// would answer "nothing to scan" in CI and scan the node's own surfaces on
+/// an enrolled box, and the finding set would depend on the machine.
+fn install_repo(tag: &str) -> ScratchDir {
+    use std::os::unix::fs::PermissionsExt;
+    let d = scratch(tag);
+    let env = d.join(".env");
+    std::fs::write(&env, "").expect("write .env");
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).expect("chmod .env");
+    d
+}
+
 /// Run the binary with an isolated environment: NOO_REPO_ROOT → empty
 /// scratch (no .env), NOO_PKI_DIR → `pki`, and the scanned secrets vars
 /// removed so the host environment can't leak into assertions.
@@ -59,6 +72,19 @@ fn run(pki: &PathBuf, repo: &PathBuf, args: &[&str]) -> Output {
         "NOO_TLS_CA",
         "NOO_GATEWAY_URL",
         "CONTROLLER_URL",
+        // Read by the scan's newer checks; a developer's shell must not
+        // decide them either.
+        "NOO_AUDIT_HMAC_KEY",
+        "NOO_CONTROLLER_SECRET",
+        "NOO_ADMIN_PASSWORD",
+        "NOO_CSP",
+        "NOO_MTLS_GATEWAY",
+        "NOO_SELF_CALL_SHARED_SECRET",
+        "NOO_NATS_ALLOW_ANONYMOUS",
+        "NOO_ALLOW_LOCAL_PYTHON_EXEC",
+        "NOO_SANDBOX_ISOLATION",
+        "NOO_NODE_AGENT_PRIVILEGED",
+        "NOO_EXEC_APPROVAL_MODE",
     ] {
         cmd.env_remove(var);
     }
@@ -83,7 +109,7 @@ fn is_urlsafe(s: &str) -> bool {
 /// `--quiet` keeps only the captured value (CLI_STYLE_GUIDE rev 2 §7).
 #[test]
 fn generate_secret_quiet_prints_only_the_secret() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["--quiet", "security", "generate-secret"]);
     assert!(out.status.success());
@@ -95,7 +121,7 @@ fn generate_secret_quiet_prints_only_the_secret() {
 
 #[test]
 fn generate_secret_default_is_token_urlsafe_32() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["security", "generate-secret"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
@@ -107,7 +133,7 @@ fn generate_secret_default_is_token_urlsafe_32() {
 
 #[test]
 fn generate_secret_respects_length_and_type() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["security", "generate-secret", "jwt", "--length", "16"]);
     assert!(out.status.success());
@@ -116,7 +142,7 @@ fn generate_secret_respects_length_and_type() {
 
 #[test]
 fn generate_secret_fernet_is_padded_44_chars() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["security", "generate-secret", "fernet"]);
     assert!(out.status.success());
@@ -129,7 +155,7 @@ fn generate_secret_fernet_is_padded_44_chars() {
 
 #[test]
 fn generate_secret_json_envelope() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["--json", "security", "generate-secret", "cluster"]);
     assert!(out.status.success());
@@ -142,7 +168,7 @@ fn generate_secret_json_envelope() {
 
 #[test]
 fn scan_reports_full_finding_set_on_bare_env() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki"); // empty → no ca.crt
     let out = run(&pki, &repo, &["--json", "security", "scan"]);
     // a CRITICAL finding IS a failure. This used to assert
@@ -152,7 +178,7 @@ fn scan_reports_full_finding_set_on_bare_env() {
     assert!(!out.status.success(), "a CRITICAL finding must fail the command");
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json stdout");
-    assert_eq!(v["criticals"], 1);
+    assert_eq!(v["criticals"], 2);
     let checks: Vec<&str> = v["issues"]
         .as_array()
         .unwrap()
@@ -168,8 +194,11 @@ fn scan_reports_full_finding_set_on_bare_env() {
         checks,
         vec![
             "JWT Secret",
+            "Audit Key",
             "Cluster Secret",
             "Node Agent Token",
+            "Controller Secret",
+            "mTLS Enforcement",
             "Redis Password",
             "TLS",
             "Grafana Password",
@@ -184,7 +213,7 @@ fn scan_reports_full_finding_set_on_bare_env() {
 /// would talk to it refuses instead of sending the bearer token.
 #[test]
 fn scan_flags_a_cleartext_remote_gateway_as_critical() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(
         &pki,
@@ -211,7 +240,7 @@ fn scan_flags_a_cleartext_remote_gateway_as_critical() {
 /// attached the stored credential to the request.
 #[test]
 fn a_cleartext_remote_gateway_is_refused_before_any_request() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(
         &pki,
@@ -226,13 +255,15 @@ fn a_cleartext_remote_gateway_is_refused_before_any_request() {
 
 #[test]
 fn scan_human_mode_lists_findings_and_flags_criticals_on_stderr() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["security", "scan"]);
     assert_eq!(out.status.code(), Some(1), "a CRITICAL finding must fail the command");
     let so = stdout(&out);
     // Boxed header (rev 2 §5), plain fallback `| Title |`.
-    assert!(so.lines().nth(1).unwrap_or_default().starts_with("| Security Scan"), "stdout: {so}");
+    // The first line names what was scanned; the box follows it.
+    assert!(so.lines().next().unwrap_or_default().starts_with("scanning "), "stdout: {so}");
+    assert!(so.lines().take(4).any(|l| l.starts_with("| Security Scan")), "stdout: {so}");
     assert!(so.contains("Default or unset — set NOO_JWT_SECRET"));
     // Plain-mode glyph fallback (`x`) + the state word on the finding's row
     // (CLI_STYLE_GUIDE §4: colour is never the only signal).
@@ -240,14 +271,14 @@ fn scan_human_mode_lists_findings_and_flags_criticals_on_stderr() {
     assert!(row.trim_start().starts_with("x ") && row.contains("critical"), "stdout: {so}");
     // The critical count is narration → stdout (rev 2). The exit code says
     // the same thing to a script, which is the R30 half.
-    assert!(so.contains("1 critical issue(s) found"), "stdout: {so}");
+    assert!(so.contains("2 critical issue(s) found"), "stdout: {so}");
 }
 
 /// Security finding end to end: the exit code is the verdict, and `--strict` widens
 /// it. Without this the scan could not gate a hook or a CI job at all.
 #[test]
 fn scan_exit_code_is_the_verdict_and_strict_widens_it() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
 
     // A bare env has a CRITICAL (the default JWT secret) → 1.
@@ -256,7 +287,7 @@ fn scan_exit_code_is_the_verdict_and_strict_widens_it() {
     // A full-marks host → 0 in BOTH modes. Without this half, `--strict`
     // would be a permanent red and nobody could gate on it. Same setup as
     // `scan_clean_env_reports_no_issues`.
-    let clean_repo = scratch("clean-repo");
+    let clean_repo = install_repo("clean-repo");
     let clean_pki = scratch("clean-pki");
     assert!(run(&clean_pki, &clean_repo, &["security", "pki", "init"]).status.success());
     let clean = |args: &[&str]| {
@@ -274,6 +305,10 @@ fn scan_exit_code_is_the_verdict_and_strict_widens_it() {
             // --strict half of this test measures the newest check rather
             // than the exit code.
             .env("GRAFANA_PASSWORD", "a-generated-value-not-a-word")
+        .env("NOO_AUDIT_HMAC_KEY", "a-generated-audit-key-value")
+        .env("NOO_CONTROLLER_SECRET", "a-generated-controller-secret")
+            .env("NOO_AUDIT_HMAC_KEY", "a-generated-audit-key-value")
+            .env("NOO_CONTROLLER_SECRET", "a-generated-controller-secret")
             // Same rule for the 2026-09-28 checks: the registry-login check
             // must read a scratch docker config, not the developer's real
             // ~/.docker/config.json. (No NATS_PASSWORD: retired.)
@@ -302,7 +337,7 @@ fn scan_exit_code_is_the_verdict_and_strict_widens_it() {
 
 #[test]
 fn scan_clean_env_reports_no_issues() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     // Give the scan a full-marks environment (CA present via pki init).
     let out = run(&pki, &repo, &["security", "pki", "init"]);
@@ -317,6 +352,8 @@ fn scan_clean_env_reports_no_issues() {
         .env("NOO_NODE_AGENT_TOKEN", "x")
         .env("NOO_TLS_CERT", "/tmp/cert.pem")
         .env("GRAFANA_PASSWORD", "a-generated-value-not-a-word")
+        .env("NOO_AUDIT_HMAC_KEY", "a-generated-audit-key-value")
+        .env("NOO_CONTROLLER_SECRET", "a-generated-controller-secret")
         // See scan_exit_code_is_the_verdict_and_strict_widens_it.
         .env_remove("NATS_USER")
         .env_remove("NATS_PASSWORD")
@@ -324,7 +361,10 @@ fn scan_clean_env_reports_no_issues() {
         .env("DOCKER_CONFIG", &repo);
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "stdout: {}", stdout(&out));
-    assert!(stdout(&out).contains("+ No security issues found"), "stdout: {}", stdout(&out));
+    // Clean, and honest about what it could not see: with no gateway to ask,
+    // the gateway-posture rows are NOT CHECKED rather than counted as fine.
+    assert!(stdout(&out).contains("No security issues found in what was checked"), "stdout: {}", stdout(&out));
+    assert!(stdout(&out).contains("NOT CHECKED: gateway posture"), "stdout: {}", stdout(&out));
 }
 
 /// a value published in this repository is not a secret. The scan
@@ -338,7 +378,7 @@ fn scan_clean_env_reports_no_issues() {
 /// are under test.
 #[test]
 fn scan_flags_a_published_grafana_placeholder_as_critical() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
 
     let scan = |grafana: &str| {
@@ -351,6 +391,8 @@ fn scan_flags_a_published_grafana_placeholder_as_critical() {
             .env("REDIS_PASSWORD", "x")
             .env("NOO_NODE_AGENT_TOKEN", "x")
             .env("NOO_TLS_CERT", "/tmp/cert.pem")
+            .env("NOO_AUDIT_HMAC_KEY", "a-generated-audit-key-value")
+            .env("NOO_CONTROLLER_SECRET", "a-generated-controller-secret")
             .env("GRAFANA_PASSWORD", grafana);
         let out = cmd.output().unwrap();
         // a CRITICAL finding now exits 1, so the status depends on
@@ -402,7 +444,7 @@ fn scan_flags_a_published_grafana_placeholder_as_critical() {
 /// old cert+key was kept.
 #[test]
 fn rotate_all_reissues_expiring_leaf_and_keeps_backup() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(
@@ -476,7 +518,7 @@ fn rotate_all_reissues_expiring_leaf_and_keeps_backup() {
 
 #[test]
 fn rotate_all_json_without_yes_is_refused() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(
@@ -510,7 +552,7 @@ fn rotate_all_json_without_yes_is_refused() {
 
 #[test]
 fn rotate_all_with_nothing_expiring_is_a_noop() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(&pki, &repo, &["security", "pki", "issue", "n1", "10.0.0.1"]) // 90d default
@@ -540,7 +582,7 @@ fn rotate_all_unknown_flag_is_a_usage_error() {
     // prints the command's own usage. It used to fall through to the
     // Python passthrough and complain about a missing `noo-py`, which was
     // never the operator's actual problem (2026-09-03).
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let mut cmd = Command::new(bin());
     cmd.args(["security", "pki", "rotate-all", "--bogus"])
@@ -560,7 +602,7 @@ fn rotate_all_unknown_flag_is_a_usage_error() {
 
 #[test]
 fn trust_ca_missing_file_exits_1_with_hint() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki"); // no ca.crt
     let out = run(&pki, &repo, &["security", "trust-ca"]);
     assert_eq!(out.status.code(), Some(1));
@@ -571,7 +613,7 @@ fn trust_ca_missing_file_exits_1_with_hint() {
 
 #[test]
 fn untrust_ca_json_without_yes_is_refused() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["--json", "security", "untrust-ca"]);
     assert_eq!(out.status.code(), Some(1));
@@ -582,7 +624,7 @@ fn untrust_ca_json_without_yes_is_refused() {
 fn untrust_ca_piped_stdin_without_yes_is_refused() {
     // Non-TTY stdin must error out instead of blocking (the no-hang
     // contract) — this test itself IS the non-TTY caller.
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     let out = run(&pki, &repo, &["security", "untrust-ca"]);
     assert_eq!(out.status.code(), Some(1));
@@ -595,7 +637,7 @@ fn untrust_ca_piped_stdin_without_yes_is_refused() {
 /// "rotated", exit 0, node keeps its old cert) was the self-soothing lie.
 #[test]
 fn rotate_all_without_delivery_rails_exits_nonzero() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(&pki, &repo, &["security", "pki", "issue", "n1", "10.0.0.1", "--days", "10"])
@@ -622,7 +664,7 @@ fn rotate_all_without_delivery_rails_exits_nonzero() {
 /// exit 0. That is a clean bill of health for a fleet nobody looked at.
 #[test]
 fn rotate_signing_key_refuses_to_report_a_rollout_it_could_not_enumerate() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
 
@@ -665,7 +707,7 @@ fn rotate_signing_key_refuses_to_report_a_rollout_it_could_not_enumerate() {
 /// is a registration operation, not a shredder, and this is a private key.
 #[test]
 fn forgetting_a_node_archives_its_key_material_instead_of_orphaning_it() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(&pki, &repo, &["security", "pki", "issue", "host8", "10.0.0.9"])
@@ -739,7 +781,7 @@ fn mock_once(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
 /// enumerates that directory can see it as a node again.
 #[test]
 fn a_successful_forget_moves_the_key_material_out_of_the_nodes_directory() {
-    let repo = scratch("repo");
+    let repo = install_repo("repo");
     let pki = scratch("pki");
     assert!(run(&pki, &repo, &["security", "pki", "init"]).status.success());
     assert!(run(&pki, &repo, &["security", "pki", "issue", "host8", "10.0.0.9"])

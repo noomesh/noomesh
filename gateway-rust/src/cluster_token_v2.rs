@@ -244,7 +244,7 @@ mod tests {
         assert!(ok(&t, "GET", "/x", b"", 1000 + 300));
         assert!(ok(&t, "GET", "/x", b"", 700));
         assert!(!ok(&t, "GET", "/x", b"", 1000 + 301));
-        assert!(verify_signature(&t, SECRET, "GET", "/x", &body_sha_hex(b""), 1000 - 0).is_some());
+        assert!(verify_signature(&t, SECRET, "GET", "/x", &body_sha_hex(b""), 1000).is_some());
         // ts 1000 vs now 699 is 301 s of skew the other way
         assert!(!ok(&t, "GET", "/x", b"", 699));
         let v1 = crate::routes::cluster::mint_cluster_token("host2", SECRET, 1000).unwrap();

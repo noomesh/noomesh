@@ -998,6 +998,11 @@ async fn heartbeat_actions() -> AppJson {
             {"name": "idle_threshold_sec", "type": "number", "label": "Idle threshold (seconds)", "default": 600},
             {"name": "dry_run", "type": "boolean", "label": "Dry run only (report what would be stopped)", "default": true},
         ]}}),
+        json!({"name": "audit_log_rotate", "description": "Archive expired security-audit months to JSONL, then drop them (signed checkpoint first)", "config_schema": {"fields": [
+            {"name": "retention_months", "type": "number", "label": "Keep this many months", "default": 12},
+            {"name": "archive_dir", "type": "string", "label": "Archive directory", "default": "/data/audit-archive"},
+            {"name": "dry_run", "type": "boolean", "label": "Dry run only (report what would be dropped)", "default": true},
+        ]}}),
         json!({"name": "knowledge_refresh", "description": "Refresh knowledge base from sources", "config_schema": {"fields": [
             {"name": "max_docs", "type": "number", "label": "Max docs to check", "default": 20},
             {"name": "timeout_per_doc", "type": "number", "label": "Timeout per doc (sec)", "default": 10},
