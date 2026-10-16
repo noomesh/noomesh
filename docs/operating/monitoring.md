@@ -301,6 +301,8 @@ it by hand: `curl --cacert ca.crt --cert services/prometheus/service.crt
 `noo cluster verify --controller` reports the `image family` row (each
 running redis/monitoring container's image comes from `NOO_BASE_REGISTRY`,
 default `ghcr.io/noomesh/dhi`, and runs as the uid its key is handed to),
+the `voice images` row (with `addons.voice` on, noo-whisper and noo-piper
+run as uid 65532, the uid their keys are handed to; "not checked" when off),
 the `monitoring web config` row
 (every mounted web-config is named by its command) and one `<name> at rest`
 row per data directory — loki, postgres, redis, nats, prometheus, grafana,

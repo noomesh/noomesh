@@ -889,6 +889,9 @@ require_compose_v2 || exit 1
         # shellcheck disable=SC2046  # one service name per word
         reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
     fi
+    # The voice add-on's cache volumes (i105): whisper/piper run as 65532.
+    # shellcheck disable=SC2046
+    reown_nonroot_volumes "${COMPOSE_PROJECT_NAME:-noomesh}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'whisper|piper' || true) || exit 1
     # Every bind source of what this `up` starts must already exist, with
     # the right type — else refuse NOW, before anything is recreated
     # (lib-bind-sources.sh). $ACTIVE_SVCS is that set, minus the scaled-out
@@ -953,6 +956,8 @@ else
         # shellcheck disable=SC2046
         reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
+    # shellcheck disable=SC2046
+    reown_nonroot_volumes "${COMPOSE_PROJECT_NAME:-noomesh}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'whisper|piper' || true) || exit 1
     check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
