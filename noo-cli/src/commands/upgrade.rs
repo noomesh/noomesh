@@ -3819,6 +3819,7 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
             };
             crate::addons::resolve::installed_anchor(addon)
                 .and_then(|a| crate::addons::resolve::fetch_and_check(&client, &a, &want))
+                .and_then(|(v, f)| crate::addons::resolve::require_bundle(&v, target).map(|()| (v, f)))
                 .err()
                 .map(|r| (addon.to_string(), r.why(addon)))
         })

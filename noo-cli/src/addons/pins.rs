@@ -258,14 +258,6 @@ pub fn addon_dir(root: &Path, addon: &str) -> PathBuf {
     root.join(ADDONS_DIR).join(addon)
 }
 
-/// The overlay an add-on whose lock predates bundles (`noo-addon-lock/1`)
-/// still runs from, when an earlier CLI left it in the slice:
-/// `<root>/docker-compose.<addon, kebab>.yml`. DEPRECATED: honoured for one
-/// release (0.6.4) with a warning, then removed.
-pub fn legacy_overlay(root: &Path, addon: &str) -> PathBuf {
-    root.join(format!("docker-compose.{}.yml", addon.replace('_', "-")))
-}
-
 /// The bytes of each named file in `<root>/addons/<addon>/` that exists and
 /// is a regular file (a symlink is not read). Missing names are simply
 /// absent; `addon_lock::verify_files` says which.
@@ -482,7 +474,6 @@ mod tests {
         let bad = BTreeMap::from([("../x".to_string(), b"".to_vec())]);
         assert!(materialise(&d, "evolve", &bad).is_err());
         assert!(!d.join("x").exists());
-        assert_eq!(legacy_overlay(&d, "trellion_intel"), d.join("docker-compose.trellion-intel.yml"));
     }
 
     #[test]

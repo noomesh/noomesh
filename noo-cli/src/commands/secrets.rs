@@ -375,10 +375,7 @@ fn addon_key_consequence(overlay: &str, d: &crate::addon_decl_parse::ParsedDecl)
 ///      the bytes hash to the `files` entry of the cached lock its pin names
 ///      (the signature was checked when the pin was written; `noo addons
 ///      verify` re-checks it);
-///   2. DEPRECATED (one release): the overlay an earlier CLI materialised at
-///      `<root>/docker-compose.<addon>.yml`, only while the bytes are exactly
-///      what that CLI recorded in `.noo-materialised`;
-///   3. a development install (no `NOO_IMAGE_TAG`): the add-on checkout's own
+///   2. a development install (no `NOO_IMAGE_TAG`): the add-on checkout's own
 ///      overlay, `${NOO_<ADDON>_PATH:-../noo-<addon>}/docker-compose.<addon>.yml`.
 pub(crate) fn trusted_addon_overlay(root: &std::path::Path, addon: &str) -> Option<(String, String)> {
     use crate::addons::pins;
@@ -394,14 +391,6 @@ pub(crate) fn trusted_addon_overlay(root: &std::path::Path, addon: &str) -> Opti
             return String::from_utf8(bytes).ok().map(|t| (label, t));
         }
         return None;
-    }
-    let legacy = pins::legacy_overlay(root, addon);
-    if let Ok(bytes) = std::fs::read(&legacy) {
-        let rel = legacy.file_name()?.to_str()?.to_string();
-        let recorded = crate::onboard::standalone::materialised_sha(root, &rel);
-        if recorded.as_deref() == Some(pins::sha256_hex(&bytes).as_str()) {
-            return String::from_utf8(bytes).ok().map(|t| (rel, t));
-        }
     }
     if crate::addons::current_tag(root).is_none() {
         let kebab = addon.replace('_', "-");
@@ -7451,8 +7440,7 @@ mod provision_tests {
     }
 
     /// The run-time reader trusts a bundled overlay only while it hashes to
-    /// the pinned lock, and a legacy slice overlay only while it is the bytes
-    /// the last materialise recorded. An edited file declares nothing.
+    /// the pinned lock. An edited file declares nothing.
     #[test]
     fn a_bundled_declaration_is_read_only_while_it_matches_its_signed_lock() {
         use crate::addons::{pins, resolve};
@@ -7483,17 +7471,9 @@ mod provision_tests {
         assert!(trusted_addon_overlay(&d, "trellion_intel").is_none());
         assert!(runtime_addon_rows_at(&d).is_empty());
 
-        // A legacy slice overlay counts only with the bytes the manifest recorded.
+        // A slice-root overlay an earlier CLI left behind declares nothing.
         std::fs::remove_dir_all(pins::addon_dir(&d, "trellion_intel")).unwrap();
-        let legacy = pins::legacy_overlay(&d, "evolve");
-        std::fs::write(&legacy, TEST_BUNDLED_DECLS[1].1).unwrap();
-        assert!(trusted_addon_overlay(&d, "evolve").is_none(), "no manifest records it");
-        let manifest = serde_json::json!({"version": 1, "cli": "0.6.3",
-            "files": {"docker-compose.evolve.yml": pins::sha256_hex(TEST_BUNDLED_DECLS[1].1.as_bytes())}});
-        std::fs::write(d.join(".noo-materialised"), manifest.to_string()).unwrap();
-        let (label, _) = trusted_addon_overlay(&d, "evolve").expect("the recorded legacy overlay");
-        assert_eq!(label, "docker-compose.evolve.yml");
-        std::fs::write(&legacy, format!("{}# edited\n", TEST_BUNDLED_DECLS[1].1)).unwrap();
+        std::fs::write(d.join("docker-compose.evolve.yml"), TEST_BUNDLED_DECLS[1].1).unwrap();
         assert!(trusted_addon_overlay(&d, "evolve").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }

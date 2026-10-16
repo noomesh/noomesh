@@ -672,12 +672,11 @@ fn compose_service_names(text: &str) -> Vec<String> {
 
 /// The services a licensed add-on's overlay ADDS (its `services:` keys that
 /// the base and this tree's overlays do not define) — lib-addons.sh
-/// `addon_own_services`, in Rust. Read from its bundled overlay, else the
-/// deprecated slice copy; empty when neither is there.
+/// `addon_own_services`, in Rust. Read from its bundled overlay;
+/// empty when it is not there.
 pub(crate) fn licensed_addon_services(root: &Path, addon: &str) -> Vec<String> {
     let bundled = crate::addons::pins::addon_dir(root, addon).join(crate::addon_lock::OVERLAY_FILE);
-    let legacy = crate::addons::pins::legacy_overlay(root, addon);
-    let Some(text) = std::fs::read_to_string(&bundled).ok().or_else(|| std::fs::read_to_string(&legacy).ok()) else {
+    let Ok(text) = std::fs::read_to_string(&bundled) else {
         return Vec::new();
     };
     let core: Vec<String> = ["docker-compose.cluster.yml", "docker-compose.trellion.yml", "docker-compose.voice.yml"]

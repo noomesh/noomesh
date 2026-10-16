@@ -88,6 +88,7 @@ pub fn prepare(ctx: &Ctx, addon: &str, docker: &mut dyn Docker) -> Result<Prepar
     };
     let route = ctx.client.route(&anchor).map_err(Refusal::Route)?;
     let (verified, fetched) = resolve::fetch_and_check(ctx.client, &anchor, &want)?;
+    resolve::require_bundle(&verified, ctx.tag)?;
     let mut cred = || -> Result<Option<Credential>, String> {
         ctx.client.docker_credential(&route).map_err(|e| format!("{}: {}", route.host(), e.summary()))
     };
