@@ -2930,8 +2930,7 @@ fn encrypt_bundle_cms(bundle: &Path, cert_pem: &str, work: &Path) -> Result<Vec<
 
 /// The first CLI release whose fetcher (`noo-fetch.sh` on Linux, `noo node
 /// fetch` on macOS) unwraps a gzip-compressed bundle after decrypting it.
-/// A guard test keeps this at or above the CLI's own version while the
-/// feature is unreleased, and below-or-equal once it has shipped.
+/// A guard test pins it; read that test's comment before changing it.
 const GZIP_BUNDLE_MIN_VERSION: (u32, u32, u32) = (0, 6, 5);
 
 /// "noo-cli-v0.6.5+abc1234" -> (0, 6, 5); anything else -> None.
@@ -3876,21 +3875,20 @@ mod tests {
         }
     }
 
-    /// The gate constant must not sit below the CLI this tree is building:
-    /// the gzip-aware fetcher ships in the NEXT cut after the CLI version that
-    /// was current when it was written, so a constant at or above Cargo.toml's
-    /// version cannot name a release that predates the feature. If a version
-    /// bump trips this, confirm which release actually carries the
-    /// gzip-aware `noo-fetch.sh` and `node_fetch.rs`: that release is the
-    /// correct constant, and this assert is then moved to match it.
+    /// The gate names the FIRST release whose fetchers unwrap gzip. It is
+    /// pinned here so a later edit can never lower it (a lower value sends
+    /// gzip to a fetcher that hands it to `noo-apply`, which refuses it), and
+    /// never raise it without reason (a higher value just withholds the
+    /// saving from nodes that could take it). The feature was written at CLI
+    /// 0.6.4 and ships in the 0.6.5 cut; if that cut is skipped or renumbered,
+    /// confirm which release carries the gzip-aware `noo-fetch.sh` and
+    /// `node_fetch.rs`, set the constant to it, and update this pin.
     #[test]
-    fn the_gzip_gate_constant_is_not_below_the_cli_version() {
+    fn the_gzip_gate_is_pinned_to_the_release_that_ships_the_fetcher() {
+        assert_eq!(GZIP_BUNDLE_MIN_VERSION, (0, 6, 5), "see the doc comment on this test before changing either");
         let me = env!("CARGO_PKG_VERSION");
         let v: Vec<u32> = me.split(['.', '-', '+']).take(3).map(|s| s.parse().unwrap()).collect();
-        let cur = (v[0], v[1], v[2]);
-        assert!(GZIP_BUNDLE_MIN_VERSION >= cur,
-            "GZIP_BUNDLE_MIN_VERSION {GZIP_BUNDLE_MIN_VERSION:?} is below the CLI's own version {cur:?}; \
-             see the doc comment on this test before changing either");
+        assert!((v[0], v[1], v[2]) >= (0, 6, 4), "this tree predates the feature it gates: {me}");
     }
 
     #[test]
