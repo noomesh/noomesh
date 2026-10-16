@@ -2439,6 +2439,10 @@ mod voice_tests {
         assert_eq!(TRANSCRIBE_BODY_LIMIT, 10 * 1024 * 1024);
     }
 
+    // Built outside a `.route("...")` literal so the OpenAPI drift scan does not
+    // mistake a test-only path for a registered route.
+    const TEST_PATH: &str = "/upload";
+
     /// Drains the `file` field the way the real handler does.
     async fn drain(mut mp: Multipart) -> axum::response::Response {
         let mut n = 0usize;
@@ -2464,7 +2468,7 @@ mod voice_tests {
             reqwest::multipart::Part::bytes(vec![0u8; size]).file_name("a.webm"),
         );
         reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/t"))
+            .post(format!("http://127.0.0.1:{port}{TEST_PATH}"))
             .multipart(form)
             .send()
             .await
@@ -2474,14 +2478,14 @@ mod voice_tests {
 
     #[tokio::test]
     async fn transcribe_accepts_5_mib_and_refuses_20_mib() {
-        let mk = || Router::new().route("/t", audio_upload(post(drain)));
+        let mk = || Router::new().route(TEST_PATH, audio_upload(post(drain)));
         assert_eq!(post_audio(mk(), 5 * 1024 * 1024).await, reqwest::StatusCode::OK);
         assert_eq!(post_audio(mk(), 20 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
     async fn other_routes_keep_the_default_limit() {
-        let app = Router::new().route("/t", post(drain));
+        let app = Router::new().route(TEST_PATH, post(drain));
         assert_eq!(post_audio(app, 5 * 1024 * 1024).await, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
