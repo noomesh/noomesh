@@ -1352,7 +1352,8 @@ async fn native_task_done(state: &AppState, call: &ToolCall, args: &Value) -> To
     };
     let failed = args.get("failed").and_then(|v| v.as_bool()).unwrap_or(false);
     let text = arg_str(args, &["result", "reason", "text"]).unwrap_or_default();
-    match crate::tasks::finish(&state.db, &task.id, !failed, &text).await {
+    // In the loop the task's own tool calls are on record: the evidence gate applies.
+    match crate::tasks::finish(&state.db, &task.id, !failed, &text, /* require_tool_use */ true).await {
         Ok(true) => {
             post_task_result(state, &task, &user, !failed, &text).await;
             ok_result(call, json!({"task_id": task.id, "state": if failed { "failed" } else { "done" }}).to_string())

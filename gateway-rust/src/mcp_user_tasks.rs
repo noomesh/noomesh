@@ -98,8 +98,7 @@ pub fn tool_list() -> Vec<Value> {
         json!({
             "name": DONE,
             "description": "Finish one of your tasks: record its result (or, with failed=true, why it failed) and post \
-                            it to the task's thread. A success claim from a task that called no tool is refused once, \
-                            as it is inside a task's own loop.",
+                            it to the task's thread.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -146,7 +145,7 @@ trait TaskStore {
     async fn get(&self, id: &str) -> anyhow::Result<Option<Task>>;
     async fn children(&self, id: &str) -> anyhow::Result<Vec<Task>>;
     async fn list(&self, owner: &str, limit: i64) -> anyhow::Result<Vec<Task>>;
-    async fn finish(&self, id: &str, ok: bool, text: &str) -> anyhow::Result<bool>;
+    async fn finish(&self, id: &str, ok: bool, text: &str, require_tool_use: bool) -> anyhow::Result<bool>;
 }
 
 struct Db<'a>(&'a sqlx::PgPool);
@@ -161,8 +160,8 @@ impl TaskStore for Db<'_> {
     async fn list(&self, owner: &str, limit: i64) -> anyhow::Result<Vec<Task>> {
         crate::tasks::list(self.0, Some(owner), None, limit).await
     }
-    async fn finish(&self, id: &str, ok: bool, text: &str) -> anyhow::Result<bool> {
-        crate::tasks::finish(self.0, id, ok, text).await
+    async fn finish(&self, id: &str, ok: bool, text: &str, require_tool_use: bool) -> anyhow::Result<bool> {
+        crate::tasks::finish(self.0, id, ok, text, require_tool_use).await
     }
 }
 
@@ -246,14 +245,17 @@ async fn wait<S: TaskStore>(store: &S, user: &str, args: &Map<String, Value>, po
 }
 
 /// Finish the caller's task through the same `tasks::finish` the loop's
-/// `noo_task_done` uses (the evidence gate included). Returns the task as it
+/// `noo_task_done` uses, minus the evidence gate (`require_tool_use: false`). Returns the task as it
 /// was and whether it succeeded, for the result post.
 async fn finish<S: TaskStore>(store: &S, user: &str, args: &Map<String, Value>) -> Result<(Task, bool, String), String> {
     let Some(id) = arg(args, "task_id") else { return Err("task_id is required".into()) };
     let task = owned(store, user, id).await?;
     let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
     let text = arg(args, "result").or_else(|| arg(args, "reason")).unwrap_or_default().to_string();
-    match store.finish(&task.id, !failed, &text).await {
+    // No evidence gate from the door: the caller is an external agent whose
+    // tool use happens outside the task's conversation, so "called no tool"
+    // would be read off a record that never holds its calls.
+    match store.finish(&task.id, !failed, &text, /* require_tool_use */ false).await {
         Ok(true) => Ok((task, !failed, text)),
         Ok(false) => Err(format!("task {} is already {}", task.id, task.state)),
         Err(e) => Err(format!("could not finish task: {e}")),
@@ -347,11 +349,16 @@ mod tests {
         async fn list(&self, owner: &str, _limit: i64) -> anyhow::Result<Vec<Task>> {
             Ok(self.tasks.lock().unwrap().iter().filter(|t| t.owner.as_deref() == Some(owner) && t.parent_id.is_none()).cloned().collect())
         }
-        async fn finish(&self, id: &str, ok: bool, text: &str) -> anyhow::Result<bool> {
+        async fn finish(&self, id: &str, ok: bool, text: &str, require_tool_use: bool) -> anyhow::Result<bool> {
             let mut tasks = self.tasks.lock().unwrap();
             let Some(t) = tasks.iter_mut().find(|t| t.id == id) else { return Ok(false) };
             if !live(&t.state) {
                 return Ok(false);
+            }
+            // The fake's tasks have recorded no tool calls, so the gate,
+            // when asked for, refuses a success claim as `tasks::finish` does.
+            if ok && require_tool_use {
+                anyhow::bail!("refused: this task has not called a single tool");
             }
             t.state = if ok { "done" } else { "failed" }.into();
             t.result = Some(text.into());
@@ -453,6 +460,24 @@ mod tests {
         let (_, ok, _) = finish(&store, "alice", &args(json!({"task_id": "mine-kid", "result": "no route", "failed": true}))).await.unwrap();
         assert!(!ok, "failed=true records a failure");
         assert!(finish(&store, "alice", &args(json!({"result": "x"}))).await.unwrap_err().contains("task_id"));
+    }
+
+    /// A door caller's tool use is outside the task's conversation, so done
+    /// from the door skips the evidence gate: a task with zero recorded tool
+    /// calls finishes on the FIRST call, its result unprefixed.
+    #[tokio::test]
+    async fn door_done_does_not_require_prior_tool_calls() {
+        let store = fixture();
+        let (_, ok, text) = finish(&store, "alice", &args(json!({"task_id": "mine", "result": "answer"}))).await.expect("first call succeeds");
+        assert!(ok);
+        assert_eq!(text, "answer");
+        let recorded = store.finished.lock().unwrap().clone();
+        assert_eq!(recorded, vec![("mine".to_string(), true, "answer".to_string())]);
+        assert!(!recorded[0].2.starts_with(crate::tasks::NO_TOOLS_MARK), "unprefixed");
+        assert_eq!(store.tasks.lock().unwrap().iter().find(|t| t.id == "mine").unwrap().result.as_deref(), Some("answer"));
+        // The loop's path still asks for the gate; the door's never does.
+        assert!(include_str!("tools.rs").contains("/* require_tool_use */ true"));
+        assert!(include_str!("mcp_user_tasks.rs").contains("/* require_tool_use */ false"));
     }
 
     /// Delegating under a parent needs it to be the caller's AND live; with
