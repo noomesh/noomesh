@@ -700,6 +700,167 @@ pub struct ToolCallContext {
     pub actor: String,
 }
 
+// ── Argument- and context-aware risk ─────────────────────────────────────
+//
+// `security::classify_tool_risk` is pure and answers conservatively for the tools
+// whose risk depends on WHERE they point: an outbound channel message is High
+// unless its destination is known-good, an agent message is High unless the target
+// is the caller's own or a lower tier. `effective_risk` supplies the context
+// (saved recipients, the chat that asked, user roles) and may only LOWER those
+// to Medium. Any lookup that fails leaves the conservative High.
+
+fn trimmed_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Is `channel`/`recipient` the chat that started this turn? Pure so it can be pinned.
+pub(crate) fn is_originating_chat(
+    channel: &str,
+    recipient: &str,
+    origin: Option<&crate::routes::communication::ApprovalTarget>,
+) -> bool {
+    origin.is_some_and(|t| t.channel == channel && t.recipient.trim() == recipient)
+}
+
+/// The channel chat that originated the current turn: the channel pipeline's task-local, or
+/// (for a turn handed to a node's harness, whose tools run in another task) the origin the
+/// dispatcher registered for the conversation.
+fn originating_chat() -> Option<crate::routes::communication::ApprovalTarget> {
+    crate::routes::communication::CHANNEL_APPROVAL_TARGET
+        .try_with(|t| t.clone())
+        .ok()
+        .flatten()
+        .or_else(|| {
+            let conv = crate::routes::communication::turn_principal().conversation_id;
+            if conv.is_empty() {
+                return None;
+            }
+            crate::routes::communication::origin_for(&conv).and_then(|o| o.channel)
+        })
+}
+
+/// Pure rule for an agent-to-agent message: may it stay Medium? Own agents and agents of
+/// an equal or lower tier, yes; a higher tier or an unknown role, no.
+pub(crate) fn agent_send_stays_medium(
+    sender: &str,
+    target: &str,
+    roles: &dyn Fn(&str) -> Option<crate::auth::Role>,
+) -> bool {
+    if crate::auth::owns_name(sender, target) {
+        return true;
+    }
+    match (roles(crate::auth::account_of(sender)), roles(crate::auth::account_of(target))) {
+        (Some(mine), Some(theirs)) => theirs <= mine,
+        _ => false,
+    }
+}
+
+async fn user_role(db: &sqlx::PgPool, username: &str) -> Option<crate::auth::Role> {
+    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    match role?.as_str() {
+        "admin" => Some(crate::auth::Role::Admin),
+        "operator" => Some(crate::auth::Role::Operator),
+        "user" => Some(crate::auth::Role::User),
+        _ => None,
+    }
+}
+
+/// The risk a call is gated and audited at: [`security::classify_tool_risk_scoped`], lowered
+/// to Medium for an outbound message whose destination is known-good.
+pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
+    let file_policy = crate::local_files::FilePolicy::from_config(&state.config);
+    let base = security::classify_tool_risk_scoped(&call.name, &call.arguments, Some(&file_policy));
+    if base < RiskLevel::High {
+        return base;
+    }
+    match call.name.as_str() {
+        "noo_channel_send" => {
+            let (Some(channel), Some(recipient)) =
+                (trimmed_arg(&call.arguments, "channel"), trimmed_arg(&call.arguments, "recipient"))
+            else {
+                return base;
+            };
+            if is_originating_chat(&channel, &recipient, originating_chat().as_ref()) {
+                return RiskLevel::Medium;
+            }
+            // Saved by a person (`created_by` is stamped only for a person's own write, the
+            // rule `task_guard` uses for "registered"); a recipient an agent saved does not count.
+            let saved: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM noo_channel_recipients \
+                 WHERE channel = $1 AND recipient_id = $2 AND created_by IS NOT NULL)",
+            )
+            .bind(&channel)
+            .bind(&recipient)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+            if saved { RiskLevel::Medium } else { base }
+        }
+        "noo_agent_send" | "noo_agent_message" => {
+            let (Some(sender), Some(to)) = (crate::mcp_bridge::current_caller(), trimmed_arg(&call.arguments, "to")) else {
+                return base;
+            };
+            // A thread post needs a seat in the thread (the tool checks it); a broadcast is refused
+            // by the tool. Neither names another principal's agent.
+            if to == "thread" && trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some() {
+                return RiskLevel::Medium;
+            }
+            if crate::auth::owns_name(&sender, &to) {
+                return RiskLevel::Medium;
+            }
+            let mine = user_role(&state.db, crate::auth::account_of(&sender)).await;
+            let theirs = user_role(&state.db, crate::auth::account_of(&to)).await;
+            let lookup = |who: &str| {
+                if who == crate::auth::account_of(&sender) { mine } else if who == crate::auth::account_of(&to) { theirs } else { None }
+            };
+            if agent_send_stays_medium(&sender, &to, &lookup) { RiskLevel::Medium } else { base }
+        }
+        _ => base,
+    }
+}
+
+/// One `noo_security_audit` row for a Medium or High tool execution decision (the writer
+/// is the HMAC-chained `audit_event`; with no audit key the row is refused and logged, as
+/// for every other event). `decision` is what the gate did: `allowed`, `approved`,
+/// `denied`, `timeout` or `blocked`. Low-risk calls are not audited here.
+pub(crate) async fn audit_tool_decision(
+    state: &AppState,
+    call: &ToolCall,
+    risk: RiskLevel,
+    decision: &str,
+    mode: &str,
+    request_id: &str,
+) {
+    if risk < RiskLevel::Medium {
+        return;
+    }
+    let turn = crate::routes::communication::turn_principal();
+    let actor = if turn.requester.is_empty() { "unattended".to_string() } else { turn.requester.clone() };
+    crate::routes::core::audit_event(
+        &state.db,
+        "tool_exec",
+        if decision == "allowed" || decision == "approved" { "info" } else { "warning" },
+        &actor,
+        &format!("tool:{}", call.name),
+        decision,
+        serde_json::json!({
+            "tool": call.name,
+            "risk": risk.to_string(),
+            "decision": decision,
+            "exec_approval_mode": mode,
+            "conversation_id": turn.conversation_id,
+            "channel": turn.channel,
+            "request_id": request_id,
+        }),
+    )
+    .await;
+}
+
 /// Pre-execution security checks for a tool call.
 ///
 /// 1. Input sanitization (path traversal, injection, length)
@@ -726,16 +887,20 @@ pub async fn before_tool_call(
     // 2. Risk classification — policy-scoped: writes inside the
     //    operator's writable roots are pre-authorized by config and
     //    classify Medium (no per-call approval), everything else as before.
-    let file_policy = crate::local_files::FilePolicy::from_config(&state.config);
-    let risk_level =
-        security::classify_tool_risk_scoped(&call.name, &call.arguments, Some(&file_policy));
+    let risk_level = effective_risk(state, call).await;
+    let mode = exec_approval_mode();
+    // What the gate did, for the audit row (Medium and High only).
+    let mut decision = "allowed";
 
     // 2b. ENFORCE the risk (H-I1). Previously risk was computed + audited but
     //     never gated execution, so high-risk tools (python_exec, skill_execute)
     //     ran ungated even under strict/approval mode. Now a HIGH-risk call is
-    //     denied unless exec-approval mode is auto/disabled.
+    //     denied unless exec-approval mode is auto/disabled. An unattended run
+    //     (heartbeat, autonomy, delegated child task) has no person to ask, and
+    //     takes the same path: `strict` refuses at once, `approval` queues a
+    //     request nobody's chat can answer with a bare `y` and refuses on timeout;
+    //     only an explicit `auto`/`disabled` runs it.
     if risk_level == security::RiskLevel::High {
-        let mode = exec_approval_mode();
         if security::requires_approval_block(risk_level, &mode) {
             if mode == "approval" {
                 // Approve-then-execute (operator requirement 2026-08-08:
@@ -748,8 +913,11 @@ pub async fn before_tool_call(
                 // outright — never asked anyone. Approved falls THROUGH
                 // to normal execution below.
                 match wait_for_exec_approval(state, call, risk_level).await {
-                    ExecApprovalOutcome::Approved => {}
+                    ExecApprovalOutcome::Approved => {
+                        decision = "approved";
+                    }
                     ExecApprovalOutcome::Denied { by, request_id } => {
+                        audit_tool_decision(state, call, risk_level, "denied", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalDenied {
                             tool: call.name.clone(),
                             by,
@@ -757,6 +925,7 @@ pub async fn before_tool_call(
                         });
                     }
                     ExecApprovalOutcome::TimedOut { request_id, secs } => {
+                        audit_tool_decision(state, call, risk_level, "timeout", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalTimeout {
                             tool: call.name.clone(),
                             request_id,
@@ -777,6 +946,7 @@ pub async fn before_tool_call(
                     serde_json::json!({ "risk": risk_level.to_string(), "mode": mode }),
                 )
                 .await;
+                audit_tool_decision(state, call, risk_level, "blocked", &mode, &request_id).await;
                 return Err(SecurityError::ApprovalRequired {
                     tool: call.name.clone(),
                     mode,
@@ -784,6 +954,7 @@ pub async fn before_tool_call(
             }
         }
     }
+    audit_tool_decision(state, call, risk_level, decision, &mode, &request_id).await;
 
     let ctx = ToolCallContext {
         tool_name: call.name.clone(),
@@ -1966,5 +2137,76 @@ eth0\t000014AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             security::RiskLevel::High,
             "approval"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tool_risk_context_tests {
+    use super::*;
+    use crate::auth::Role;
+    use crate::routes::communication::ApprovalTarget;
+
+    fn target(channel: &'static str, recipient: &str) -> ApprovalTarget {
+        ApprovalTarget { channel, recipient: recipient.into(), thread_id: None, chat_type: "DM".into() }
+    }
+
+    /// A send is Medium only to the chat that asked; anywhere else (or with no channel origin,
+    /// as a dashboard or unattended turn) the destination has to be a saved recipient.
+    #[test]
+    fn only_the_chat_that_asked_is_the_originating_chat() {
+        let t = target("telegram", "555");
+        assert!(is_originating_chat("telegram", "555", Some(&t)));
+        assert!(!is_originating_chat("telegram", "556", Some(&t)), "another chat on the same channel");
+        assert!(!is_originating_chat("google_chat", "555", Some(&t)), "same id, other channel");
+        assert!(!is_originating_chat("telegram", "555", None), "no channel origin: nothing is originating");
+    }
+
+    fn roles(table: &'static [(&'static str, Role)]) -> impl Fn(&str) -> Option<Role> {
+        move |who| table.iter().find(|(n, _)| *n == who).map(|(_, r)| *r)
+    }
+
+    #[test]
+    fn an_agent_message_to_a_higher_tier_owner_is_high() {
+        let r = roles(&[("ada", Role::User), ("olive", Role::Operator), ("root", Role::Admin), ("bob", Role::User)]);
+        assert!(agent_send_stays_medium("ada", "ada/laptop", &r), "own agent");
+        assert!(agent_send_stays_medium("ada", "bob", &r), "equal tier");
+        assert!(agent_send_stays_medium("root", "ada", &r), "lower tier");
+        assert!(!agent_send_stays_medium("ada", "olive", &r), "operator's agent, from a user");
+        assert!(!agent_send_stays_medium("ada", "root/web", &r), "admin's agent, from a user");
+        assert!(!agent_send_stays_medium("ada", "ghost", &r), "unknown owner fails toward the gate");
+        assert!(!agent_send_stays_medium("ghost", "bob", &r), "unknown sender fails toward the gate");
+    }
+
+    /// An unattended run (heartbeat, autonomy, delegated child task) has no person: a High call
+    /// is refused under strict, and under approval mode waits on a request no chat can answer
+    /// with a bare `y` (the row is unbound: NULL conversation) and is refused on timeout. It only
+    /// runs when the operator set auto/disabled. Pins the rule and that the wait does not
+    /// short-circuit to Approved for an empty principal.
+    #[test]
+    fn a_high_call_with_no_human_present_is_never_auto_run_under_a_gate() {
+        for mode in ["strict", "approval"] {
+            assert!(security::requires_approval_block(RiskLevel::High, mode), "{mode}");
+        }
+        assert!(!security::requires_approval_block(RiskLevel::High, "auto"), "auto is the operator's explicit opt-out");
+        let unattended = crate::routes::communication::TurnPrincipal::default();
+        assert!(unattended.requester.is_empty() && unattended.conversation_id.is_empty());
+        let src = include_str!("middleware.rs");
+        let a = src.find("async fn wait_for_exec_approval(").expect("fn");
+        let body = &src[a..a + 6000];
+        assert!(body.contains("NULLIF($6, '')"), "an unattended request is stored unbound, decidable only by id");
+        assert!(body.contains("ExecApprovalOutcome::TimedOut"), "and refused when nobody decides");
+    }
+
+    /// Every Medium or High decision is audited, High refusals included; Low is not.
+    #[test]
+    fn the_gate_audits_every_branch() {
+        let src = include_str!("middleware.rs");
+        let a = src.find("pub async fn before_tool_call(").expect("fn");
+        let end = src[a..].find("let ctx = ToolCallContext").expect("ctx") + a;
+        let body = &src[a..end];
+        for d in ["\"denied\"", "\"timeout\"", "\"blocked\"", "decision, &mode"] {
+            assert!(body.contains(&format!("audit_tool_decision(state, call, risk_level, {d}")) || body.contains(d), "{d}");
+        }
+        assert!(body.matches("audit_tool_decision(").count() >= 4);
     }
 }

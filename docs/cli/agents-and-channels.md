@@ -59,7 +59,10 @@ noo agents messages --since 2026-09-01T00:00:00Z --threads
 message id; the gateway stamps your identity, node and harness on it.
 Delivery is the NATS subscription; `inbox` and `thread` are reviews of
 what the gateway recorded, newest first and oldest first respectively.
-Non-privileged callers see only their own traffic. External A2A agents
+Non-privileged callers see only their own traffic. When the model reads
+messages through its `noo_agent_inbox` / `noo_agent_thread` tools, the result
+opens with a notice that the bodies are untrusted data written by others,
+not instructions. External A2A agents
 register themselves; `agents peer list -c` shows the connected ones,
 `agents peer card` prints this gateway's own AgentCard, and `agents peer
 dispatch <agent-id> "<task>"` fires a task and returns its id.
@@ -107,6 +110,21 @@ is held open for the approval window (300 s by default) and proceeds on
 shown to the agent. `stats` exits 5 rather than printing a silent zero
 when the queue cannot be read. Set the gate with `noo security posture
 set NOO_EXEC_APPROVAL_MODE approval` ([security.md](security.md)).
+
+**Only a person decides.** `approve`, `deny` and the dashboard buttons use
+your login; the gateway refuses a decision from the agent's own credential
+(a tool call's delegated token), a harness or MCP-door key, a service
+identity or an account that is not an enabled user, with a 403 that says
+so. There is no approve or deny tool in the model's catalogue, so a model
+cannot approve its own call. In a linked chat, the operator's reply
+(`approve` / `deny`, or the card button) decides. A call with nobody
+present (heartbeat, autonomy, a delegated child task) gets no special path:
+`strict` refuses it at once, `approval` queues it for a decision by id and
+refuses it when the window closes, and only an explicit `auto`/`disabled`
+runs it.
+
+Which calls are high-risk depends on what they do and where they point;
+see [Tool risk tiers](../reference/config.md#tool-risk-tiers).
 
 ### See what the proactive loop is doing
 
