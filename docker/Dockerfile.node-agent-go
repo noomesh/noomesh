@@ -82,7 +82,13 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s \
     CMD ["/usr/local/bin/noo-node-agent", "-healthcheck"]
 
-# Must run as root for system-level setup
+# Root ON PURPOSE. This image is the opt-in containerised agent lane (the
+# default agent is a host process under hostd): it talks to the host Docker
+# socket (group 999 is only a convenience for nvidia-smi users, the socket
+# itself is root:docker 660), writes the host-root bind mounts and reads the
+# 0600 node key. A fixed non-root uid needs the host socket gid and every
+# mount re-owned per host; that is the host-process lane's job, so this image
+# keeps root rather than ship a user that cannot start a backend.
 USER 0
 
 # Create /lib64 symlink — x86-64 glibc binaries (nvidia-smi) expect the linker
