@@ -1909,6 +1909,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // forever on a model that can't recover.
     let mut nudge_history: Vec<&'static str> = Vec::new();
 
+    let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
     for iteration in 1..=max_iterations {
         result.iterations = iteration;
         let iter_start = Instant::now();
@@ -2444,12 +2445,17 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             })).await;
 
             let tool_start = Instant::now();
-            let tool_result = crate::mcp_bridge::CONVERSATION
-                .scope(
-                    Some(conversation_id.to_string()),
-                    crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                )
-                .await;
+            let repeat = repeat_guard.check(call, iteration);
+            let repeated = repeat.is_some();
+            let tool_result = match repeat {
+                Some(r) => r,
+                None => crate::mcp_bridge::CONVERSATION
+                    .scope(
+                        Some(conversation_id.to_string()),
+                        crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
+                    )
+                    .await,
+            };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
             let output_preview: String = tool_result.output.chars().take(500).collect();
@@ -2474,12 +2480,17 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 },
             }));
 
-            // Record tool call for audit trail (fire-and-forget)
-            rt.record_tool_call(
-                conversation_id, &call.name,
-                &call.arguments, tool_result.success, &tool_result.output,
-                tool_result.error.as_deref(), tool_elapsed_ms,
-            ).await;
+            // Record tool call for audit trail (fire-and-forget). A repeat
+            // the guard refused never ran: nothing to audit, and recording it
+            // would put one more "Tool: ... trading" row in memory for the
+            // next search to find.
+            if !repeated {
+                rt.record_tool_call(
+                    conversation_id, &call.name,
+                    &call.arguments, tool_result.success, &tool_result.output,
+                    tool_result.error.as_deref(), tool_elapsed_ms,
+                ).await;
+            }
 
             // Implicit retrieval feedback for learning loops
             if tool_result.success {
@@ -2949,6 +2960,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // loop — see the empty-response return below.
     let mut llm_failure: Option<anyhow::Error> = None;
 
+    let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
     for iteration in 1..=max_iterations {
         result.iterations = iteration;
         let iter_start = Instant::now();
@@ -3191,12 +3203,17 @@ async fn run_inner_bound<R: HarnessRuntime>(
         for call in &mut tool_calls {
             tools::inject_coordinator_context(call, conversation_id, channel);
             let tool_start = Instant::now();
-            let tool_result = crate::mcp_bridge::CONVERSATION
-                .scope(
-                    Some(conversation_id.to_string()),
-                    crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
-                )
-                .await;
+            let repeat = repeat_guard.check(call, iteration);
+            let repeated = repeat.is_some();
+            let tool_result = match repeat {
+                Some(r) => r,
+                None => crate::mcp_bridge::CONVERSATION
+                    .scope(
+                        Some(conversation_id.to_string()),
+                        crate::mcp_bridge::CALLER.scope(user_id.map(str::to_string), rt.execute_tool(call)),
+                    )
+                    .await,
+            };
             let tool_elapsed_ms = tool_start.elapsed().as_millis() as u64;
 
             usage.total_tool_calls += 1;
@@ -3213,12 +3230,17 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 },
             }));
 
-            // Record tool call for audit trail (fire-and-forget)
-            rt.record_tool_call(
-                conversation_id, &call.name,
-                &call.arguments, tool_result.success, &tool_result.output,
-                tool_result.error.as_deref(), tool_elapsed_ms,
-            ).await;
+            // Record tool call for audit trail (fire-and-forget). A repeat
+            // the guard refused never ran: nothing to audit, and recording it
+            // would put one more "Tool: ... trading" row in memory for the
+            // next search to find.
+            if !repeated {
+                rt.record_tool_call(
+                    conversation_id, &call.name,
+                    &call.arguments, tool_result.success, &tool_result.output,
+                    tool_result.error.as_deref(), tool_elapsed_ms,
+                ).await;
+            }
 
             // Implicit retrieval feedback for learning loops
             if tool_result.success {
