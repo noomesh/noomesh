@@ -3650,6 +3650,8 @@ pub(crate) fn controller_checks(
         }
     }
 
+    out.extend(node_agent_privilege_check(posture));
+
     let active: Vec<&str> = keys["keys"].as_array().unwrap_or(&empty).iter()
         .filter(|k| k["active"].as_bool().unwrap_or(false))
         .filter_map(|k| k["consumer"].as_str()).collect();
@@ -3755,6 +3757,60 @@ pub(crate) fn erasure_archive_check(v: &Value) -> Check {
             "oldest archived erasure is {days} days old; copies are kept {window} days, then purged daily ({} row(s) held)",
             v["rows"].as_i64().unwrap_or(0)
         ),
+    )
+}
+
+/// `node-agent privilege` — the container's ACTUAL `HostConfig.Privileged`
+/// (added to `posture list --json` by the CLI, since the gateway has no docker
+/// access), against the desired posture. "At desired" has to mean the
+/// container, not the gateway's own env var. `None` when the posture JSON
+/// carries neither field (an older CLI or no such gate): nothing was seen, so
+/// no row is better than a green one.
+pub(crate) fn node_agent_privilege_check(posture: &Value) -> Option<Check> {
+    const NAME: &str = "node-agent privilege";
+    const KEY: &str = "NOO_NODE_AGENT_PRIVILEGED";
+    let gate = posture["posture"].as_array()?.iter().find(|g| g["key"] == KEY)?;
+    let desired = gate["db_value"].as_str();
+    let want_off = desired.is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
+    if let Some(why) = gate["actual_error"].as_str() {
+        return Some(warn(NAME, format!("not checked: {why}"), Some("noo security posture list".into())));
+    }
+    let actual = match gate["actual"].as_str() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return None,
+    };
+    Some(match (actual, want_off) {
+        (true, true) => fail(
+            NAME,
+            "the node-agent container is PRIVILEGED (docker inspect) but posture says false: the gate is not in effect",
+            "noo security posture set NOO_NODE_AGENT_PRIVILEGED false   # mirrors into .env and recreates the node-agent",
+        ),
+        (true, false) => warn(
+            NAME,
+            "the node-agent container is privileged (docker inspect); posture does not set it to false",
+            Some("noo security posture apply-profile hardened   # or: noo security posture set NOO_NODE_AGENT_PRIVILEGED false".into()),
+        ),
+        (false, true) => ok(NAME, "unprivileged, as posture says (docker inspect)"),
+        (false, false) => ok(NAME, "unprivileged (docker inspect)"),
+    })
+}
+
+/// `audit key` — is `NOO_AUDIT_HMAC_KEY` in this install's store? Read
+/// locally, so it answers even when the gateway cannot (it refuses to boot
+/// without the key, which would otherwise surface only as "gateway down").
+pub(crate) fn audit_key_check(present: bool, store_unreadable: Option<&str>) -> Check {
+    const NAME: &str = "audit key";
+    if let Some(why) = store_unreadable {
+        return warn(NAME, format!("not checked: the secret store could not be read ({why})"), Some("noo security secrets audit".into()));
+    }
+    if present {
+        return ok(NAME, "NOO_AUDIT_HMAC_KEY is set: audit rows are signed");
+    }
+    fail(
+        NAME,
+        "NOO_AUDIT_HMAC_KEY is not set: the gateway refuses to start and no security audit row can be written",
+        "noo upgrade --stack   # mints NOO_AUDIT_HMAC_KEY into the encrypted store when absent, then recreates the stack",
     )
 }
 
@@ -4462,6 +4518,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(crate::commands::secrets_delivery::shared_secrets_row());
         // The audit log signs with its own key and verifies across the
         // checkpoint that retired the NOO_JWT_SECRET derivation.
+        checks.push(audit_key_check(
+            !std::env::var("NOO_AUDIT_HMAC_KEY").unwrap_or_default().trim().is_empty(),
+            match crate::envfile::secret_store_state() {
+                crate::envfile::StoreState::Unreadable(e) => Some(e.to_string()),
+                _ => None,
+            }
+            .as_deref(),
+        ));
         let (_, audit_verdict, _) = self_json(g, &["security", "audit", "verify"]);
         checks.push(audit_log_check(&audit_verdict));
         // An erase keeps a copy 30 days; a purge that is not running shows as
@@ -6059,6 +6123,36 @@ mod tests {
         let c = controller_checks(&serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
             &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &safe, &Value::Null, None, None, None);
         assert_eq!(verdict(&c, "exposure"), Verdict::Ok);
+    }
+
+    /// The privileged flag is judged on the CONTAINER, not the gateway's env.
+    #[test]
+    fn node_agent_privilege_is_read_from_the_container() {
+        let gate = |actual: serde_json::Value, db: &str| serde_json::json!({"posture": [
+            {"key": "NOO_NODE_AGENT_PRIVILEGED", "running": db, "db_value": db, "actual": actual}]});
+        let v = |p: &serde_json::Value| node_agent_privilege_check(p).map(|c| c.verdict);
+        // The bug: posture says false, the gateway's env says false, the container is privileged.
+        assert_eq!(v(&gate(serde_json::json!("true"), "false")), Some(Verdict::Fail));
+        assert_eq!(v(&gate(serde_json::json!("false"), "false")), Some(Verdict::Ok));
+        assert_eq!(v(&gate(serde_json::json!("true"), "true")), Some(Verdict::Warn));
+        // Could not inspect: warned as not checked, never ok.
+        let unseen = serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false", "actual_error": "docker is not runnable"}]});
+        let c = node_agent_privilege_check(&unseen).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not checked"), "{}", c.detail);
+        // An older CLI's listing has no container fact: no row, not a green one.
+        assert!(v(&serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false"}]})).is_none());
+        assert!(v(&serde_json::json!({"posture": []})).is_none());
+    }
+
+    #[test]
+    fn the_audit_key_row_answers_locally() {
+        assert_eq!(audit_key_check(true, None).verdict, Verdict::Ok);
+        let f = audit_key_check(false, None);
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.remedy.unwrap().contains("noo upgrade --stack"));
+        // An unreadable store cannot say the key is missing OR present.
+        assert_eq!(audit_key_check(false, Some("sops not found")).verdict, Verdict::Warn);
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub mod container_files;
 pub mod offboard;
 pub mod provision;
 pub mod security_local;
+pub mod security_scan_node;
 pub mod skills;
 pub mod systems;
 pub mod test;

@@ -1520,6 +1520,31 @@ fn reconcile_audit_key(root: &std::path::Path) -> Result<AuditKeyStage, AuditKey
     .map_err(AuditKeyRefusal::Store)
 }
 
+/// Before `noo stack start|restart|rebuild` hands the stack to the launcher:
+/// make sure the encrypted store holds a NON-BLANK audit key, because the
+/// gateway refuses to boot without one. `noo upgrade --stack` already mints
+/// it (stage -1); this covers the other ways a gateway gets (re)created on an
+/// install that never had it (a restore, a `--skip-security` onboard, a store
+/// edited by hand), so the refusal never strands a working install.
+///
+/// `Ok(true)` = minted now, `Ok(false)` = nothing to do (present, or no
+/// encrypted store: the launcher's `require_audit_key` then explains).
+/// Never rotates an existing key.
+pub(crate) fn ensure_audit_key_for_launch(root: &std::path::Path) -> Result<bool, String> {
+    let sops = root.join("secrets/env.sops");
+    if !sops.is_file() {
+        return Ok(false);
+    }
+    audit_key_stage(
+        || {
+            crate::commands::secrets::SecretStore::load_sops(&sops)
+                .map(|s| matches!(s.state(AUDIT_KEY), crate::commands::secrets::State::Set))
+        },
+        || crate::commands::secrets::mint_unset(&[AUDIT_KEY], &sops).map(|_| ()),
+    )
+    .map(|stage| stage == AuditKeyStage::Minted)
+}
+
 /// Every consumer that must hold its own gateway key, as `(provision name,
 /// consumer)` (`cluster_verify::required_service_keys`: the worker always,
 /// each add-on that is on).
@@ -4573,6 +4598,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(out, Err(super::AuditKeyRefusal::NoStore));
         assert_eq!(env_after, env_before, ".env was written — the key must never go to plaintext");
+    }
+
+    /// The launch-time mint never writes plaintext: with no encrypted store it
+    /// does nothing and leaves `.env` as it was (the launcher's
+    /// `require_audit_key` then refuses with the remedy), and `run_script`
+    /// calls it for start, restart and rebuild before the launcher runs.
+    #[test]
+    fn the_launch_time_mint_never_writes_plaintext_and_runs_before_the_launcher() {
+        let root = std::env::temp_dir().join(format!("noo-audit-key-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let env_before = "NOO_SECRETS_BACKEND=env\n";
+        std::fs::write(root.join(".env"), env_before).unwrap();
+        let out = super::ensure_audit_key_for_launch(&root);
+        let env_after = std::fs::read_to_string(root.join(".env")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(out, Ok(false));
+        assert_eq!(env_after, env_before);
+        let mesh = include_str!("mesh.rs");
+        let mint = mesh.find("ensure_audit_key_for_launch(&root)").expect("run_script mints");
+        let spawn = mesh.find("Command::new(\"bash\")").expect("run_script spawns the launcher");
+        assert!(mint < spawn, "the mint must precede the launcher");
     }
 
     /// The stage runs inside `upgrade_stack` BEFORE anything moves — the

@@ -1341,7 +1341,11 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
     }
     // Reading posture takes an Operator-role login (`users_admin_read_guard`);
     // the WRITES below take the operator certificate + a bound token
-    let body = get_json(g, "/api/security/posture", true, TIMEOUT);
+    let mut body = get_json(g, "/api/security/posture", true, TIMEOUT);
+    // The gateway cannot see containers; this host can. Without this the
+    // node-agent row's "running" was the gateway's own env var, which no
+    // container ever read.
+    annotate_actual(&mut body, &node_agent_privileged_actual());
     if g.json {
         println!("{body}");
         return Ok(0);
@@ -1352,7 +1356,8 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
         println!("{}", ui::muted("no posture gates"));
         return Ok(0);
     }
-    let pending = gates.iter().filter(|g| g["pending_restart"].as_bool().unwrap_or(false)).count();
+    let drifted = |g: &Value| g["actual_drift"].as_bool().unwrap_or(false);
+    let pending = gates.iter().filter(|g| g["pending_restart"].as_bool().unwrap_or(false) || drifted(g)).count();
     // An OPEN bridge is the most perishable thing in the install: a
     // compatibility window someone is holding open on purpose and is expected
     // to shut. Printed among thirty gates it reads as one more row, which is
@@ -1419,19 +1424,31 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
         .iter()
         .map(|gate| {
             let pending = gate["pending_restart"].as_bool().unwrap_or(false);
+            let drift = drifted(gate);
+            let unseen = gate["actual_error"].is_string();
             vec![
-                ui::glyph_cell(if pending { Glyph::Warn } else { Glyph::Ok }),
+                ui::glyph_cell(if pending || drift || unseen { Glyph::Warn } else { Glyph::Ok }),
                 cell(&gate["key"]),
-                match &gate["running"] {
-                    Value::Null => ui::muted("unset"),
-                    v => cell(v),
+                // A gate whose truth lives in a container shows THE
+                // CONTAINER's state, or that it could not be read.
+                match (&gate["actual"], &gate["running"]) {
+                    (Value::String(a), _) => format!("{a} (container)"),
+                    _ if unseen => ui::muted("container not checked"),
+                    (_, Value::Null) => ui::muted("unset"),
+                    (_, v) => cell(v),
                 },
                 match &gate["db_value"] {
                     Value::Null => String::new(),
                     v => cell(v),
                 },
                 cell(&gate["source"]),
-                if pending { ui::warn("pending") } else { ui::muted("no") },
+                if drift {
+                    ui::warn("recreate node-agent")
+                } else if pending {
+                    ui::warn("pending")
+                } else {
+                    ui::muted("no")
+                },
             ]
         })
         .collect();
@@ -1466,10 +1483,21 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
 /// of three processes ignore it, and finding out from an outage — is the
 /// failure this list exists to prevent.
 ///
-/// EMPTY since an earlier release: its one entry, `NOO_NATS_LEGACY_SHARED_CREDS`,
-/// bridged to the shared bus user, and that user is retired. The mechanism
-/// stays — the next pre-DB gate needs it, and R43 is what happens without it.
-const POSTURE_KEYS_MIRRORED_TO_ENV: &[&str] = &[];
+/// `NOO_NODE_AGENT_PRIVILEGED` is the one entry, for a different reason: it is
+/// consumed by COMPOSE INTERPOLATION (`privileged: ${NOO_NODE_AGENT_PRIVILEGED}`
+/// in `docker-compose.cluster.yml`), which reads `.env` and nothing else. A DB
+/// row alone reached no reader at all — `apply-profile hardened` reported the
+/// node-agent unprivileged while its container kept `--privileged`. Its
+/// mirror is written as `true`/`false` (never dropped: an absent line means
+/// "compose's default"), and a change recreates the container
+/// ([`converge_node_agent`]).
+///
+/// The previous entry, `NOO_NATS_LEGACY_SHARED_CREDS`, bridged to the shared
+/// bus user, and that user is retired.
+const POSTURE_KEYS_MIRRORED_TO_ENV: &[&str] = &[NODE_AGENT_PRIVILEGED_KEY];
+
+/// The posture key whose truth is a container's `HostConfig.Privileged`.
+const NODE_AGENT_PRIVILEGED_KEY: &str = "NOO_NODE_AGENT_PRIVILEGED";
 
 fn truthy_posture_value(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
@@ -1507,7 +1535,13 @@ fn mirror_into_env(written: &[(String, String)]) -> Vec<Result<String, (String, 
     keys_to_mirror(written)
         .into_iter()
         .map(|(key, value)| {
-            match crate::envfile::set_env_flag(&key, truthy_posture_value(&value)) {
+            let on = truthy_posture_value(&value);
+            let wrote = if key == NODE_AGENT_PRIVILEGED_KEY {
+                crate::envfile::set_env_value(&key, Some(if on { "true" } else { "false" }))
+            } else {
+                crate::envfile::set_env_flag(&key, on)
+            };
+            match wrote {
                 Ok(()) => Ok(key),
                 Err(e) => Err((key.clone(), format!("could not mirror {key} into .env: {e}"))),
             }
@@ -1520,6 +1554,9 @@ fn mirror_into_env(written: &[(String, String)]) -> Vec<Result<String, (String, 
 fn print_mirror_outcome(results: &[Result<String, (String, String)>]) {
     for r in results {
         match r {
+            Ok(key) if key == NODE_AGENT_PRIVILEGED_KEY => ui::done(&format!(
+                "{key} mirrored into .env — compose reads it when the node-agent container is created"
+            )),
             Ok(key) => ui::done(&format!(
                 "{key} mirrored into .env — the workers and the node-agent read it before any DB exists"
             )),
@@ -1528,6 +1565,124 @@ fn print_mirror_outcome(results: &[Result<String, (String, String)>]) {
                 println!("{}", ui::note("the DB row IS set; the workers and node-agent read this one from .env, so set it there by hand"));
             }
         }
+    }
+}
+
+/// Parse `docker inspect -f '{{.HostConfig.Privileged}}'`. Pure so every arm
+/// (running, absent, docker failing, garbage) is pinned without docker.
+pub(crate) fn parse_privileged_inspect(success: bool, stdout: &str, stderr: &str, container: &str) -> Result<bool, String> {
+    if !success {
+        let why = stderr.trim();
+        return Err(if why.contains("No such") || why.contains("no such") {
+            format!("no {container} container on this host (the node-agent here is not compose-managed, or the stack is down)")
+        } else if why.is_empty() {
+            format!("docker inspect {container} failed with no message")
+        } else {
+            format!("docker inspect {container} failed: {why}")
+        });
+    }
+    match stdout.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("docker inspect {container} answered {other:?}, expected true or false")),
+    }
+}
+
+/// Is the node-agent container privileged RIGHT NOW (docker's own answer,
+/// not the posture row and not an env var). `Err` = could not be seen; a
+/// caller must say "not checked", never treat it as unprivileged.
+pub(crate) fn node_agent_privileged_actual() -> Result<bool, String> {
+    let container = crate::envfile::container("node-agent");
+    match std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.HostConfig.Privileged}}", &container])
+        .output()
+    {
+        Ok(o) => parse_privileged_inspect(
+            o.status.success(),
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+            &container,
+        ),
+        Err(e) => Err(format!("docker is not runnable: {e}")),
+    }
+}
+
+/// Does the container's actual state disagree with the desired posture value?
+/// `None` when either side is unknown (nothing to compare is not a match).
+pub(crate) fn privileged_drift(desired: Option<&str>, actual: Option<bool>) -> Option<bool> {
+    Some(truthy_posture_value(desired?) != actual?)
+}
+
+/// Add the node-agent's ACTUAL container state to a `posture list` body:
+/// `actual` ("true"/"false") or `actual_error`, and `actual_drift`. The
+/// gateway cannot inspect containers (it has no docker access by design), so
+/// this host-local fact is added here, where docker is. `actual` is the word
+/// "at desired" has to mean.
+fn annotate_actual(body: &mut Value, actual: &Result<bool, String>) {
+    let Some(gates) = body["posture"].as_array_mut() else { return };
+    for gate in gates.iter_mut().filter(|g| g["key"] == NODE_AGENT_PRIVILEGED_KEY) {
+        match actual {
+            Ok(a) => {
+                gate["actual"] = json!(a.to_string());
+                let desired = gate["db_value"].as_str().map(String::from);
+                gate["actual_drift"] = json!(privileged_drift(desired.as_deref(), Some(*a)).unwrap_or(false));
+            }
+            Err(why) => gate["actual_error"] = json!(why),
+        }
+    }
+}
+
+/// After the node-agent's posture value was written and mirrored: make the
+/// container match, by recreating it when it does not. `Ok(true)` = it was
+/// recreated and now matches, `Ok(false)` = already matched. `Err` = could not
+/// be seen, or the recreate did not take.
+fn converge_node_agent(desired_on: bool) -> Result<bool, String> {
+    let before = node_agent_privileged_actual()?;
+    if before == desired_on {
+        return Ok(false);
+    }
+    super::mesh::recreate_service("node-agent")?;
+    let after = node_agent_privileged_actual()?;
+    if after == desired_on {
+        Ok(true)
+    } else {
+        Err(format!(
+            "recreated the node-agent but docker still reports privileged={after} (wanted {desired_on}); is .env being read by the launcher?"
+        ))
+    }
+}
+
+/// Run [`converge_node_agent`] for a just-written posture and say what happened.
+/// `None` when the node-agent key was not part of this write (or its mirror
+/// failed, which has already been reported).
+fn converge_after_write(written: &[(String, String)], results: &[Result<String, (String, String)>]) -> Option<Value> {
+    let (_, value) = written.iter().find(|(k, _)| k == NODE_AGENT_PRIVILEGED_KEY)?;
+    if !results.iter().any(|r| matches!(r, Ok(k) if k == NODE_AGENT_PRIVILEGED_KEY)) {
+        return None;
+    }
+    let desired = truthy_posture_value(value);
+    Some(match converge_node_agent(desired) {
+        Ok(recreated) => json!({"desired_privileged": desired, "recreated": recreated, "matches": true}),
+        Err(e) => json!({"desired_privileged": desired, "recreated": false, "matches": false, "error": e}),
+    })
+}
+
+fn print_converge_outcome(outcome: &Option<Value>) {
+    let Some(o) = outcome else { return };
+    let want = o["desired_privileged"].as_bool().unwrap_or(false);
+    let state = if want { "privileged" } else { "unprivileged" };
+    if o["matches"].as_bool() == Some(true) {
+        if o["recreated"].as_bool() == Some(true) {
+            ui::done(&format!("node-agent container recreated: it is now {state} (docker inspect)"));
+        } else {
+            ui::done(&format!("node-agent container already {state} (docker inspect)"));
+        }
+    } else {
+        println!("{}", ui::status_line(Glyph::Warn, &format!(
+            "node-agent container NOT confirmed {state}: {}",
+            o["error"].as_str().unwrap_or("unknown")
+        )));
+        println!("{}", ui::note("the posture row and .env are set; apply them with: noo stack restart --force node-agent"));
     }
 }
 
@@ -1543,15 +1698,17 @@ pub fn security_posture_set(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     let needs_mirror = !keys_to_mirror(&written).is_empty();
     let results = mirror_into_env(&written);
     let mirrored = needs_mirror.then(|| results.iter().all(|r| r.is_ok()));
+    let node_agent = converge_after_write(&written, &results);
     if g.json {
         if let Some(ok) = mirrored {
-            println!("{}", json!({"posture": body, "env_mirrored": ok}));
+            println!("{}", json!({"posture": body, "env_mirrored": ok, "node_agent": node_agent}));
         } else {
             println!("{body}");
         }
     } else {
         ui::done(&format!("posture {key} = {value}"));
         print_mirror_outcome(&results);
+        print_converge_outcome(&node_agent);
         ui::warned("restart the gateway to apply");
         ui::guide(&[("noo stack restart gateway", "posture gates are read at start; the change is live after the restart")]);
     }
@@ -1600,6 +1757,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
         })
         .collect();
     let results = mirror_into_env(&written);
+    let node_agent = converge_after_write(&written, &results);
 
     if g.json {
         println!(
@@ -1610,6 +1768,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
                     Ok(k) => json!({"key": k, "ok": true}),
                     Err((k, msg)) => json!({"key": k, "ok": false, "error": msg}),
                 }).collect::<Vec<_>>(),
+                "node_agent": node_agent,
             })
         );
         return Ok(0);
@@ -1672,6 +1831,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
     }
 
     print_mirror_outcome(&results);
+    print_converge_outcome(&node_agent);
     ui::done(&format!("'{profile}' applied ({applied} key(s) written)"));
     ui::warned("restart the gateway to apply");
     ui::guide(&[
@@ -2806,6 +2966,48 @@ mod posture_mirror_tests {
         // Same rule, same answer, from the single-key command.
         let from_set = w(&[("NOO_EXAMPLE_PRE_DB_GATE", "1")]);
         assert_eq!(keys_to_mirror_from(MIRRORED, &from_set).len(), 1);
+    }
+
+    /// The node-agent gate was cosmetic: `POSTURE_KEYS_MIRRORED_TO_ENV` was
+    /// empty and only compose interpolation reads the key. It now reaches
+    /// `.env`, whoever wrote it.
+    #[test]
+    fn the_node_agent_gate_is_mirrored_for_compose() {
+        let from_profile = w(&[("NOO_NODE_AGENT_PRIVILEGED", "false"), ("NOO_EXEC_APPROVAL_MODE", "approval")]);
+        assert_eq!(keys_to_mirror(&from_profile), w(&[("NOO_NODE_AGENT_PRIVILEGED", "false")]));
+    }
+
+    #[test]
+    fn docker_inspect_answers_are_parsed_without_guessing() {
+        let p = |ok, out, err| parse_privileged_inspect(ok, out, err, "noo-node-agent");
+        assert_eq!(p(true, "true\n", ""), Ok(true));
+        assert_eq!(p(true, "false\n", ""), Ok(false));
+        assert!(p(false, "", "Error: No such object: noo-node-agent").unwrap_err().contains("no noo-node-agent container"));
+        assert!(p(false, "", "").unwrap_err().contains("failed with no message"));
+        assert!(p(true, "<no value>", "").is_err(), "garbage is not unprivileged");
+    }
+
+    /// "At desired" has to mean the container: a privileged container under a
+    /// `false` row is drift, an unreadable container is not a match.
+    #[test]
+    fn the_listing_reports_the_container_not_the_gateways_env() {
+        assert_eq!(privileged_drift(Some("false"), Some(true)), Some(true));
+        assert_eq!(privileged_drift(Some("false"), Some(false)), Some(false));
+        assert_eq!(privileged_drift(Some("true"), Some(true)), Some(false));
+        assert_eq!(privileged_drift(None, Some(true)), None);
+        assert_eq!(privileged_drift(Some("false"), None), None);
+        let mut body = json!({"posture": [
+            {"key": "NOO_NODE_AGENT_PRIVILEGED", "running": "false", "db_value": "false"},
+            {"key": "NOO_EXEC_APPROVAL_MODE", "running": "strict", "db_value": "strict"},
+        ]});
+        annotate_actual(&mut body, &Ok(true));
+        assert_eq!(body["posture"][0]["actual"], "true");
+        assert_eq!(body["posture"][0]["actual_drift"], true);
+        assert!(body["posture"][1]["actual"].is_null(), "only the container-backed gate is annotated");
+        let mut body = json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "running": "false", "db_value": "false"}]});
+        annotate_actual(&mut body, &Err("no container".into()));
+        assert_eq!(body["posture"][0]["actual_error"], "no container");
+        assert!(body["posture"][0]["actual"].is_null());
     }
 
     /// The retired bus bridge is no longer mirrored — a posture
