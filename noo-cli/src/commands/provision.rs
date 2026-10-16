@@ -1215,34 +1215,14 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         match outcome {
             Some((0, ref msg)) => {
                 nstep(&format!("{node} reported: applied (exit 0)"));
-                // The POSITIVE check for the bundle-verification lane, read
-                // off the APPLIER's own account of what it did rather than
-                // off a config file's contents. "I edited the file" was
-                // exactly the evidence that failed here before: the arm the
-                // runbook told operators to close in
-                // /etc/noo-node-agent.env never reached the applier at all.
-                if let Some(lane) = verification_lane(msg) {
-                    nnote(&lane);
-                }
-                record_signing_adoption(&node, msg);
-                if is_self {
-                    write_self_lane(&node, SelfLaneRecord::Rail);
-                }
-                // The controller runs hostd twice from ONE binary: worker mode
-                // (a root system unit, which the applier just restarted and
-                // verified) and controller mode (this operator's user unit,
-                // which a root applier cannot reach). Restart the second only
-                // once the applier reports the new binary installed AND
-                // proven — its `applied:` list names hostd-binary only after a
-                // fresh heartbeat — so a failed upgrade never touches it.
-                if self_node && applier_applied(msg, "hostd-binary") {
-                    refresh_controller_hostd(&root);
-                }
-                // Applied is not done: the node must now satisfy every
-                // invariant. Printed, not fatal — the bundle
-                // is on the node; what is left is named beside each row.
-                if !crate::commands::cluster_verify::verify_node_after_apply(g, node.as_ref()) {
-                    nnote(&format!("{node}: applied, and an invariant does not hold yet — `noo cluster verify {node}` re-checks"));
+                // One function for every caller (this verb and the combined
+                // wait of `noo upgrade --nodes`), so the post-apply steps
+                // cannot drift between them. The controller's own node has
+                // extra steps; every other node gets the common ones.
+                if self_node {
+                    after_self_applied(g, &node, msg);
+                } else {
+                    after_remote_applied(g, &node, msg);
                 }
             }
             Some((rc, msg)) => {
@@ -3634,16 +3614,53 @@ pub(crate) fn wait_nodes_applied(g: &Globals, pending: &[PendingApply], budget_s
     }).collect()
 }
 
-/// What `cluster provision` does after a node reports exit 0, for a node
-/// restaged by the combined wait: the applier's verification lane note, the
-/// signing-key adoption marker, and the invariant check. (The self node's
-/// extra steps — lane record, controller hostd restart — stay in
-/// `cluster_provision`, which the self node still runs in full.)
+/// What `cluster provision` does after a node reports exit 0, for any node
+/// but the controller's own: the applier's verification lane note, the
+/// signing-key adoption marker, and the invariant check. Called by the single
+/// node verb and by the combined wait of `noo upgrade --nodes`.
 pub(crate) fn after_remote_applied(g: &Globals, node: &str, msg: &str) {
+    after_applied(g, node, msg, false);
+}
+
+/// `after_remote_applied` plus the steps only the controller's own node has:
+/// the self-agent lane record and the controller-mode hostd restart. The one
+/// place those run, whether the node was staged by `cluster provision <me>`
+/// or by the combined wait of `noo upgrade --nodes`.
+pub(crate) fn after_self_applied(g: &Globals, node: &str, msg: &str) {
+    after_applied(g, node, msg, true);
+}
+
+fn after_applied(g: &Globals, node: &str, msg: &str, self_steps: bool) {
+    // The POSITIVE check for the bundle-verification lane, read off the
+    // APPLIER's own account of what it did rather than off a config file's
+    // contents. "I edited the file" was exactly the evidence that failed
+    // here before: the arm the runbook told operators to close in
+    // /etc/noo-node-agent.env never reached the applier at all.
     if let Some(lane) = verification_lane(msg) {
         nnote(&lane);
     }
     record_signing_adoption(node, msg);
+    if self_steps {
+        // The lane is recorded only for the controller's own node, and only
+        // here, after the node reported exit 0.
+        if crate::role::is_self_node(node) && crate::role::detect().controller.is_some() {
+            write_self_lane(node, SelfLaneRecord::Rail);
+        }
+        // The controller runs hostd twice from ONE binary: worker mode
+        // (a root system unit, which the applier just restarted and
+        // verified) and controller mode (this operator's user unit, which a
+        // root applier cannot reach). Restart the second only once the
+        // applier reports the new binary installed AND proven — its
+        // `applied:` list names hostd-binary only after a fresh heartbeat —
+        // so a failed upgrade never touches it. An applier that did not
+        // name hostd-binary (old, or nothing to install) leaves it alone.
+        if applier_applied(msg, "hostd-binary") {
+            refresh_controller_hostd(&crate::envfile::repo_root());
+        }
+    }
+    // Applied is not done: the node must now satisfy every invariant.
+    // Printed, not fatal — the bundle is on the node; what is left is named
+    // beside each row.
     if !crate::commands::cluster_verify::verify_node_after_apply(g, node) {
         nnote(&format!("{node}: applied, and an invariant does not hold yet — `noo cluster verify {node}` re-checks"));
     }
@@ -4724,14 +4741,23 @@ mod self_node_rail_tests {
         let view = body.find("judge_gateway_self_view(").expect("the gateway's view checked");
         let stage = body.find("/api/cluster/provision-bundle/{node}\"), &blob)").expect("the stage");
         assert!(local < view && view < stage, "local facts, then the gateway's view, then the stage");
-        let lane = body.find("write_self_lane(&node, SelfLaneRecord::Rail)").expect("the lane record");
+        // The lane record lives in `after_applied`, reached from the applied
+        // arm only through `after_self_applied`.
+        assert!(!body.contains("write_self_lane("), "the lane is recorded by after_self_applied, not inline");
         let applied = body.find("reported: applied (exit 0)").expect("the applied arm");
-        assert!(applied < lane, "the lane is recorded only after the node reported exit 0");
+        let call = body.find("after_self_applied(g, &node, msg)").expect("the self node's post-apply steps");
+        assert!(applied < call, "the self steps run only after the node reported exit 0");
+        let aa = &src[src.find("fn after_applied(").unwrap()..];
+        let aa = &aa[..aa.find("\n}\n").unwrap()];
+        let lane = aa.find("write_self_lane(node, SelfLaneRecord::Rail)").expect("the lane record");
+        let hostd = aa.find("refresh_controller_hostd(").expect("the hostd restart");
+        assert!(aa.find("if self_steps").unwrap() < lane && lane < hostd, "{aa}");
+        assert!(aa.contains(r#"applier_applied(msg, "hostd-binary")"#), "{aa}");
         let up = include_str!("upgrade.rs");
         let up = up.split("#[cfg(test)]").next().unwrap();
         let f = &up[up.find("fn upgrade_self_node(").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
-        assert!(f.contains("provision_one(g, me, &[])"), "{f}");
+        assert!(f.contains(r#"provision_one(g, me, &["--stage-only"])"#), "{f}");
         assert!(!f.contains("--local"), "{f}");
     }
 
@@ -5112,10 +5138,42 @@ mod upgrade_stages_every_node_before_waiting_tests {
         let f = &up[up.find("fn upgrade_nodes(").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         let stage = f.find(r#"provision_one(g, n, &["--stage-only"])"#).expect("remote nodes are staged with --stage-only");
-        let me = f.rfind("upgrade_self_node(g, &me, &mut failed)").expect("the self node");
-        let wait = f.find("wait_and_settle_nodes(g, &pending").expect("the combined wait");
+        let me = f.rfind("upgrade_self_node(g, me, &mut failed, &mut pending)").expect("the self node is staged into the same pending list");
+        let wait = f.rfind("wait_and_settle_nodes(g, &pending").expect("the combined wait");
         let mac = f.find("mac_leaves_pass(").expect("the mac pass");
-        assert!(stage < me && me < wait && wait < mac, "stage remotes, self node, one wait, then the Mac pass");
+        assert!(stage < me && me < wait && wait < mac, "stage remotes, stage self node, one wait, then the Mac pass");
         assert_eq!(f.matches("provision_one(g, n,").count(), 1, "no per-node full provision left in the loop");
+        assert_eq!(f.matches("wait_and_settle_nodes(g, &pending").count(), 2, "one wait for the nodes, one for a controller with no other node");
+        assert!(!f.contains("provision_one(g, me"), "the self node is staged by upgrade_self_node only");
+    }
+
+    /// The self node's post-apply steps have ONE function with two callers:
+    /// the single-node verb and the combined wait. Neither may grow its own
+    /// copy (the lane record or the hostd restart), or they drift.
+    #[test]
+    fn the_self_nodes_post_apply_steps_have_one_function_and_two_callers() {
+        let prov = include_str!("provision.rs");
+        let prov = prov.split("#[cfg(test)]").next().unwrap();
+        let up = include_str!("upgrade.rs");
+        let up = up.split("#[cfg(test)]").next().unwrap();
+        let verb = &prov[prov.find("pub fn cluster_provision(").unwrap()..];
+        let verb = &verb[..verb.find("\n}\n").unwrap()];
+        assert!(verb.contains("after_self_applied(g, &node, msg)"), "the single-node verb");
+        let settle = &up[up.find("fn settle_end(").unwrap()..];
+        let settle = &settle[..settle.find("\n}\n").unwrap()];
+        assert!(settle.contains("after_self_applied(g, n, &msg)"), "the combined wait");
+        for (name, body) in [("provision.rs", prov), ("upgrade.rs", up)] {
+            assert_eq!(body.matches("refresh_controller_hostd(").count(), if name == "provision.rs" { 2 } else { 0 },
+                "{name}: the hostd restart is called once (plus its definition), inside after_applied");
+            assert_eq!(body.matches("write_self_lane(").count(), if name == "provision.rs" { 3 } else { 0 },
+                "{name}: Rail lane written once in after_applied; the definition and the onboard lane are the others");
+        }
+    }
+
+    /// The combined wait polls every 5 s (one cheap SELECT per node).
+    #[test]
+    fn the_combined_wait_polls_every_five_seconds() {
+        let up = include_str!("upgrade.rs");
+        assert!(up.contains("const NODES_APPLY_POLL_SECS: u64 = 5;"));
     }
 }
