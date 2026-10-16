@@ -749,11 +749,13 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
 {
     let mut rc = 0;
     let mut failed_stage = "";
+    let mut roll_started: Option<i64> = None;
     // `--stack` alone is one unit of work; anything with `--nodes` has at
     // least Gateway · CLI Assets · Nodes, so every stage gets its phase.
     let phased = nodes;
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
+        roll_started = Some(crate::commands::cluster_verify::now_unix());
         rc = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
         if rc != 0 { failed_stage = "stack"; }
         else if !nodes {
@@ -769,6 +771,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
                     &format!("{why} within 180s after the stack roll"),
                     Some(remedy),
                 );
+                rc = 1;
+                failed_stage = "stack";
+            } else if !post_roll_restart_loops_clear(g, roll_started) {
                 rc = 1;
                 failed_stage = "stack";
             }
@@ -790,6 +795,11 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             );
             rc = 1;
             failed_stage = "nodes";
+        } else if !post_roll_restart_loops_clear(g, roll_started) {
+            // The node phase never starts on a stack whose core container
+            // restart-loops (0.6.4 redis AOF, 2026-10-16).
+            rc = 1;
+            failed_stage = "stack";
         } else if let Some(err) = gateway_older_than_bundle(force) {
             ui::close_failed(&err, Some("noo upgrade --stack"));
             rc = 1;
@@ -3736,6 +3746,41 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
             None
         }
         LockStageVerdict::Refuse(m) => Some(m),
+    }
+}
+
+/// Post-roll gate: no stack container may be restart-looping. A healthy
+/// `/health` is one instant; a redis that crashes on start reads "Up"
+/// between restarts, and on 2026-10-16 (0.6.3 -> 0.6.4, a root-owned
+/// `appendonly.aof.manifest`) it looped once a minute for three hours
+/// behind a passing gate while the gateway ran with no Redis. Judged by
+/// `cluster_verify::restart_loops` against the roll's start (it re-looks
+/// for up to a minute while a container has restarted but not yet looped).
+/// `None` (no roll this run): nothing to judge. A docker that cannot list
+/// the stack warns and does not block.
+fn post_roll_restart_loops_clear(g: &Globals, roll_started: Option<i64>) -> bool {
+    use crate::commands::cluster_verify::{now_unix, restart_loops as rl};
+    let Some(since) = roll_started else { return true };
+    let prefix = crate::envfile::container_prefix();
+    match rl::gate_loops(&rl::real_docker, &prefix, since, &now_unix, &mut |s| std::thread::sleep(Duration::from_secs(s))) {
+        Ok(v) if v.is_empty() => true,
+        Ok(v) => {
+            for l in &v {
+                eprintln!("{}", ui::status_line(Glyph::Err, &l.line()));
+            }
+            let svc = rl::service_of(&v[0].container, &prefix).to_string();
+            ui::close_failed(
+                &format!("{} stack container(s) restart-looping after the roll — the node phase does not start on a broken stack", v.len()),
+                Some(&format!("noo stack logs {svc}")),
+            );
+            false
+        }
+        Err(e) => {
+            if !g.json {
+                eprintln!("{}", ui::status_line(Glyph::Warn, &format!("restart loops not judged after the roll: {e}")));
+            }
+            true
+        }
     }
 }
 
