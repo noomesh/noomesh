@@ -514,7 +514,6 @@ async def _rag_ingest(request: dict) -> Any:
     except ingest_confine.IngestRefused as e:
         log.warning("rag_ingest_refused", reason=str(e)[:200])
         raise
-    content = target.value
     # An ingest never changes an existing document's audience; only a retag
     # does. Trellion merges a dedup hit's metadata over the
     # existing row (new keys win), so `roles` is NOT passed to rag.ingest:
