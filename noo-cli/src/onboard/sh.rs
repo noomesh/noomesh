@@ -1069,7 +1069,7 @@ mod compose_files_tests {
     }
 
     #[test]
-    fn a_legacy_slice_overlay_is_composed_only_without_a_bundle() {
+    fn a_root_slice_overlay_is_never_composed_without_a_bundle() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let t = scratch(true);
         let root = t.path();
@@ -1079,9 +1079,9 @@ mod compose_files_tests {
         let with_bundle = compose_files_in(args.0, args.1, &args.2, &args.3);
         assert!(with_bundle.last().unwrap().ends_with("/addons/evolve/docker-compose.yml"), "{with_bundle:?}");
         std::fs::remove_dir_all(root.join("addons")).unwrap();
-        let legacy = compose_files_in(args.0, args.1, &args.2, &args.3);
+        let without = compose_files_in(args.0, args.1, &args.2, &args.3);
         clear_env();
-        assert_eq!(names(&legacy).last().map(String::as_str), Some("docker-compose.evolve.yml"), "{legacy:?}");
+        assert_eq!(names(&without), ["docker-compose.cluster.yml", "docker-compose.override.yml"], "{without:?}");
     }
 
     #[test]
