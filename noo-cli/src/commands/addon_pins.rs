@@ -150,6 +150,24 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             }
         }
     }
+    // A new bundle may declare the add-on's own NATS principal (i70 residue):
+    // render it now, so the restart below presents a user the server knows.
+    // Best-effort — without it the add-on presents the worker for one release.
+    if !check && rows.iter().any(|r| r["changed"] == true) {
+        match crate::commands::nats_users::reconcile_addon_principals(g, &root) {
+            Ok(Some(out)) => {
+                let reloaded = crate::commands::nats_users::hup_nats();
+                if !g.json {
+                    ui::done(&format!("add-on NATS principals rendered ({} principals){}",
+                        out.users, if reloaded { "; noo-nats reloaded" } else { "" }));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => if !g.json {
+                ui::warned(&format!("an add-on's NATS principal was not rendered ({e}); run: noo cluster nats-users render"));
+            },
+        }
+    }
     if g.json {
         println!("{}", json!({"stack": tag, "check": check, "addons": rows}));
     } else if !check && rows.iter().any(|r| r["changed"] == true) {

@@ -873,10 +873,11 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         key: "NATS_WORKER_PASSWORD",
         class: Class::ExternalTool { tool: "noo cluster nats-creds rotate worker --restart" },
         gen_bytes: 0,
-        consequence: "the bus user shared by noo-worker, noo-trellion and noo-trellion-intel \
-                      — denied `tasks.>`, `$KV.>` and stream administration. All \
-                      three are controller containers, so this is shared-service and not \
-                      fleet-wide; the same digest caveat as NATS_GATEWAY_PASSWORD applies — \
+        consequence: "noo-worker's bus user — denied `tasks.>`, `$KV.>` and stream \
+                      administration, and every add-on subject whose add-on has a principal of \
+                      its own. noo-trellion and noo-trellion-intel still hold it for ONE release, \
+                      as the fallback when their own password is not in the store. The same \
+                      digest caveat as NATS_GATEWAY_PASSWORD applies — \
                       `noo cluster nats-creds rotate worker --restart` is the rotation, not this tool",
         consumers: &[
             "noo-nats",
@@ -886,6 +887,41 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
             "noo-worker-extra",
         ],
         required_when: Requirement::Always,
+    },
+    // The add-ons' OWN bus users (i70 residue): each subscribes on exactly
+    // the subjects its add-on serves and replies on its own prefix
+    // (noo-cli nats_users.rs ADDON_PRINCIPALS). Minted by the render that
+    // first renders the principal (`noo upgrade --stack`, `noo addons
+    // enable`, `noo cluster nats-users render`, onboarding).
+    SecretSpec {
+        key: "NATS_TRELLION_PASSWORD",
+        class: Class::ExternalTool { tool: "noo cluster nats-creds rotate trellion --restart" },
+        gen_bytes: 0,
+        consequence: "noo-trellion's own bus user `trellion`: subscribe on the knowledge pack's \
+                      subjects (worker.rag/memory/recall/api.snapshots, worker.autonomy.check_rag) \
+                      and publish only its replies on `_INBOX_gw.trellion.>`. The server verifies a \
+                      bcrypt DIGEST of it — `noo cluster nats-creds rotate trellion --restart` \
+                      re-renders and recreates; never change it by hand. Absent, noo-trellion \
+                      presents the worker principal (one release)",
+        consumers: &["noo-nats", "noo-trellion"],
+        // Optional: absent is the one-release fallback (the add-on presents
+        // the worker), which `cluster verify`'s `nats principals` row WARNs on.
+        required_when: Requirement::Optional,
+    },
+    SecretSpec {
+        key: "NATS_TRELLION_INTEL_PASSWORD",
+        class: Class::ExternalTool { tool: "noo cluster nats-creds rotate trellion_intel --restart" },
+        gen_bytes: 0,
+        consequence: "noo-trellion-intel's own bus user `trellion_intel`: subscribe on the \
+                      Intelligent tier's subjects (worker.graph/temporal/retrieval, \
+                      worker.api.heartbeat.run_ml) and publish only its replies on \
+                      `_INBOX_gw.trellion_intel.>`. Rendered once the add-on's signed bundle \
+                      declares the principal; the same digest caveat as NATS_GATEWAY_PASSWORD — \
+                      `noo cluster nats-creds rotate trellion_intel --restart`",
+        consumers: &["noo-nats", "noo-trellion-intel"],
+        // Optional: absent is the one-release fallback (the add-on presents
+        // the worker), which `cluster verify`'s `nats principals` row WARNs on.
+        required_when: Requirement::Optional,
     },
     // NATS_NODE_PASSWORD_<NODE> is deliberately NOT listed: there is one per
     // node, minted and delivered by `noo cluster nats-creds rotate <node>`
@@ -6688,6 +6724,8 @@ mod tests {
             // digest and HUPing the server is a dedicated tool's job.
             ("NATS_GATEWAY_PASSWORD", "external-tool", "refused"),
             ("NATS_WORKER_PASSWORD", "external-tool", "refused"),
+            ("NATS_TRELLION_PASSWORD", "external-tool", "refused"),
+            ("NATS_TRELLION_INTEL_PASSWORD", "external-tool", "refused"),
             ("NATS_NODE_PASSWORD", "external-tool", "refused"),
             ("ANTHROPIC_API_KEY", "provider-issued", "manual"),
             ("OPENAI_API_KEY", "provider-issued", "manual"),

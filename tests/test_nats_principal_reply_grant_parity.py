@@ -7,8 +7,8 @@
 replaces on every config reload, so a reply to a request delivered before a
 SIGHUP was refused (`Publish Violation` on `_INBOX_gw.…`). The fix is a
 static publish grant on the reply inbox — scoped per principal: the worker
-(and the add-ons that present it, noo-trellion / noo-trellion-intel) on
-`_INBOX_gw.worker.>`, each node on `_INBOX_gw.node.<token>.>`. Two crates,
+on `_INBOX_gw.worker.>`, each add-on on `_INBOX_gw.<name>.>` (trellion,
+trellion_intel), each node on `_INBOX_gw.node.<token>.>`. Two crates,
 no shared source: `noo-cli` renders the grants, `gateway-rust` picks the
 reply inboxes. If either moves alone the replies are refused again —
 silently, because NATS reports a refused publish asynchronously.
@@ -65,10 +65,30 @@ def test_the_gateway_connects_with_its_prefix():
     assert "crate::nats_credentials::INBOX_PREFIX" in (GW / "state.rs").read_text()
 
 
+def test_each_addon_reply_grant_is_its_gateway_inbox():
+    # i70 residue: noo-cli renders `_INBOX_gw.<name>.>` for each add-on
+    # principal; the gateway addresses that add-on's subjects to the same.
+    gw_inbox = _const(GRANTS, "GATEWAY_INBOX")
+    assert gw_inbox == _const(GW_CREDS, "INBOX_PREFIX")
+    names = re.findall(r'AddonPrincipal \{\s*name: "([a-z_]+)"', GRANTS.read_text())
+    assert names == ["trellion", "trellion_intel"], names
+    for name in names:
+        const = f"{name.upper()}_REPLY_PREFIX"
+        assert _const(GW_CREDS, const) == f"{gw_inbox}.{name}", (
+            f"{name} may publish replies on {gw_inbox}.{name}.> but the gateway's {const} differs"
+        )
+    assert "fn addon_reply_inbox" in GRANTS.read_text()
+    assert 'format!("{GATEWAY_INBOX}.{name}.>")' in GRANTS.read_text()
+
+
 def test_the_gateway_uses_the_scoped_inboxes():
     # The constants are only half of it: the requests must be the ones using them.
     wc = (GW / "worker_client.rs").read_text()
-    assert wc.count("WORKER_REPLY_PREFIX") >= 2, "request_with_timeout and request_stream"
+    assert wc.count("reply_prefix_for(subject)") >= 2, "request_with_timeout and request_stream"
+    assert "WORKER_REPLY_PREFIX" not in wc, "an add-on subject must not be addressed to the worker's prefix"
+    creds = GW_CREDS.read_text()
+    assert "crate::addons::is_trellion_subject(subject)" in creds
+    assert "crate::addons::is_trellion_intel_subject(subject)" in creds
     assert "nats.request(" not in wc and "nats.request_with_headers(" not in wc, (
         "a worker request on the gateway's default inbox loses its reply across a reload"
     )

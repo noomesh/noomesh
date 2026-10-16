@@ -920,6 +920,33 @@ fn rerender_nats_users_for_roll(g: &Globals, root: &std::path::Path) {
     }
 }
 
+/// Step 2.65 of `upgrade --stack` — see the call site. Best-effort: an add-on
+/// without its own principal presents the worker for one more release (the
+/// fallback), so a failure here warns with the verb and never stops the roll.
+fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
+    use crate::commands::nats_users as nu;
+    match nu::reconcile_addon_principals(g, root) {
+        Ok(None) => {}
+        Ok(Some(out)) => {
+            let reloaded = nu::hup_nats();
+            if !g.json {
+                ui::done(&format!(
+                    "add-on NATS principals rendered ({} principals{}){}",
+                    out.users,
+                    if out.minted.is_empty() { String::new() } else { format!("; minted {}", out.minted.join(", ")) },
+                    if reloaded { "; noo-nats reloaded" } else { "" }
+                ));
+            }
+        }
+        Err(e) => if !g.json {
+            ui::warned(&format!(
+                "could not give the add-ons their own NATS principals ({e}) — they present the worker \
+                 principal for this release; run: noo cluster nats-users render"
+            ));
+        },
+    }
+}
+
 fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
@@ -1270,6 +1297,11 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    mount sources). Best effort: a failure is printed with its
     //    `noo models pull` line and never aborts the roll.
     crate::commands::voice_models::stage_if_on(g);
+    // 2.66. Each declared add-on its own NATS principal (i70 residue). After
+    //    step 1 (this release's trellion overlay) and step 2 (the add-on
+    //    pins, so a licensed add-on's bundle is the one being rolled to),
+    //    before the launcher recreates the add-ons with their password.
+    reconcile_addon_nats_principals(g, &root);
 
     // 2.7. Stage the release's node images on the artifact rail, while the
     //    old gateway still serves: it is controller-only work (registry pull +

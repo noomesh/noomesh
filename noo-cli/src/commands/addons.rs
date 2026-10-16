@@ -486,6 +486,22 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
             Ok(e) => {
                 let p = e.config.clone();
                 enabled_report = Some(e);
+                // Its own NATS principal, when its overlay declares one (i70
+                // residue): mint + render + HUP. Best-effort — without it the
+                // add-on presents the worker for one release.
+                match crate::commands::nats_users::reconcile_addon_principals(g, &crate::envfile::repo_root()) {
+                    Ok(Some(out)) => {
+                        let reloaded = crate::commands::nats_users::hup_nats();
+                        if !g.json {
+                            crate::ui::done(&format!("{name}: its own NATS principal rendered ({} principals){}",
+                                out.users, if reloaded { "; noo-nats reloaded" } else { "" }));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => if !g.json {
+                        crate::ui::warned(&format!("{name}: its NATS principal was not rendered ({e}); run: noo cluster nats-users render"));
+                    },
+                }
                 p
             }
             Err(r) => fail(

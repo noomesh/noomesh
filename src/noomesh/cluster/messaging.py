@@ -33,14 +33,24 @@ except ImportError:
 
 # --- credentials ---------------------------------------
 
-#: This principal's own pair. One shared NATS user for the gateway, the
+#: The worker principal's pair. One shared NATS user for the gateway, the
 #: workers and every node makes subject permissions impossible: nothing on
 #: the wire tells the principals apart, so the single user can only be
-#: granted ``>``/``>``. noo-worker, noo-trellion and noo-trellion-intel all
-#: present ``worker``, which is denied ``tasks.>``, ``$KV.>`` and stream
-#: administration.
+#: granted ``>``/``>``. noo-worker presents ``worker``, which is denied
+#: ``tasks.>``, ``$KV.>`` and stream administration.
 WORKER_USER_VAR = "NATS_WORKER_USER"
 WORKER_PASSWORD_VAR = "NATS_WORKER_PASSWORD"
+#: An add-on's OWN principal (i70 residue): noo-trellion presents
+#: ``trellion``, noo-trellion-intel ``trellion_intel`` — each granted exactly
+#: the subjects it serves and its own reply prefix (noo-cli nats_users.rs
+#: ``ADDON_PRINCIPALS``). Set by the add-on's overlay only when the store
+#: holds the password; the user name is the add-on key.
+ADDON_USER_VAR = "NATS_ADDON_USER"
+ADDON_PASSWORD_VAR = "NATS_ADDON_PASSWORD"
+#: The add-ons that have a principal of their own, by the audience their
+#: container already declares (``NOO_BUS_AUDIENCE``, kebab-case).
+ADDON_PRINCIPALS = ("trellion", "trellion_intel")
+BUS_AUDIENCE_VAR = "NOO_BUS_AUDIENCE"
 #: The retired shared fleet pair. Nothing presents it any
 #: more and the server no longer defines it: it is named here ONLY so the
 #: refusal below can say, specifically, why a set ``NATS_USER`` is ignored.
@@ -50,8 +60,22 @@ ALLOW_ANONYMOUS_VAR = "NOO_NATS_ALLOW_ANONYMOUS"
 
 #: Per-client inbox prefix, so a permission rule can grant this principal
 #: only its own inbox. The default ``_INBOX.`` is shared by everyone and
-#: therefore cannot be scoped.
+#: therefore cannot be scoped. An add-on presenting its own principal uses
+#: ``_INBOX_<principal>`` instead (:func:`inbox_prefix_for`).
 INBOX_PREFIX = "_INBOX_worker"
+
+
+def inbox_prefix_for(cred: Optional[Dict[str, str]]) -> str:
+    """The client inbox prefix for the credential this process presents.
+
+    The worker principal's grant is ``_INBOX_worker.>``; an add-on
+    principal's is ``_INBOX_<name>.>`` (and nothing of the worker's), so the
+    prefix follows the principal — including the one-release fallback, where
+    an add-on presenting the worker uses the worker's.
+    """
+    if cred and cred.get("source") == "addon":
+        return f"_INBOX_{cred['user']}"
+    return INBOX_PREFIX
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -85,6 +109,42 @@ def resolve_nats_credentials(env: Optional[Dict[str, str]] = None) -> Optional[D
         from ..secret_env import secret_from
 
         return (secret_from(key, env.get) or "").strip()
+
+    # An add-on's own principal first — but only ITS own. trellion-intel
+    # `extends` the trellion service, so an intel bundle that predates its
+    # own principal inherits trellion's pair; presenting it would subscribe
+    # intel's subjects under trellion's grant (refused) and is not this
+    # container's credential anyway.
+    # The user is a literal in the overlay; the password FILE is there only
+    # when the store holds it — no password, not this principal.
+    audience = read(BUS_AUDIENCE_VAR).replace("-", "_")
+    addon_user = read(ADDON_USER_VAR)
+    addon_password = read(ADDON_PASSWORD_VAR) if addon_user else ""
+    if addon_user and addon_user == audience and addon_password:
+        return {"user": addon_user, "password": addon_password, "source": "addon"}
+    if addon_user and addon_user != audience:
+        logger.warning(
+            "nats_addon_principal_not_ours",
+            presented=addon_user,
+            audience=audience or None,
+            message=(f"{ADDON_USER_VAR}={addon_user} is another add-on's principal (this container's "
+                     f"audience is {audience or 'unset'}) — inherited from an overlay this add-on's "
+                     "bundle does not override yet. Presenting the worker principal instead; "
+                     "`noo addons upgrade <addon>` brings a bundle with its own."),
+        )
+    elif audience in ADDON_PRINCIPALS:
+        # ONE release: the store has no password for this add-on yet (an
+        # install that has not run `noo upgrade --stack` / `noo cluster
+        # nats-users render` since), so it rides the worker principal, which
+        # keeps this add-on's subjects until its own principal is rendered.
+        logger.warning(
+            "nats_addon_principal_fallback",
+            principal=audience,
+            message=(f"no {ADDON_PASSWORD_VAR} for this add-on: presenting the WORKER principal for one release. "
+                     f"`noo upgrade --stack` (or `noo cluster nats-users render`) mints "
+                     f"NATS_{audience.upper()}_PASSWORD and renders this add-on's own principal; "
+                     "then recreate this container. The fallback is removed in the next release."),
+        )
 
     user = read(WORKER_USER_VAR)
     if user:
@@ -211,7 +271,7 @@ class ClusterMessaging:
                     allow_reconnect=retry,
                     # Per-client inbox prefix so a permission rule can grant
                     # this principal only its own inbox.
-                    inbox_prefix=INBOX_PREFIX.encode(),
+                    inbox_prefix=inbox_prefix_for(_cred).encode(),
                     # Lifecycle callbacks. Without these a total bus outage
                     # was completely silent on the Python side — no log line
                     # marked the disconnect, and nothing re-asserted the
