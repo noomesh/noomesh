@@ -7469,7 +7469,7 @@ mod provision_tests {
         let f = crate::addons::lock_fetch::Fetched { lock: bytes, sig, files };
         let want = resolve::Want { addon: "trellion_intel", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
         let v = resolve::check(&f, &resolve::tests::anchor(), &want).unwrap();
-        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0").unwrap();
+        resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
 
         let rows = runtime_addon_rows_at(&d);
         assert_eq!(rows.len(), 1, "{:?}", rows.iter().map(|r| r.0).collect::<Vec<_>>());

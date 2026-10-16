@@ -596,3 +596,20 @@ def test_the_doc_has_a_row_and_a_switch_for_every_harness_kind():
     for needle in ("skipWebFetchPreflight", "not shipped", "code.claude.com/docs/en/env-vars", "COPILOT_OFFLINE", "cloud model"):
         assert needle in doc, f"docs/security/telemetry.md does not mention {needle!r}"
     assert "### Paid add-ons" in doc
+
+
+def test_the_doc_has_a_row_for_the_addon_registry_and_its_switch():
+    """Add-on pulls through the vendor's add-on registry (i91) are outbound
+    traffic to the vendor: the doc names the host, what the vendor keeps, and
+    the switch that keeps a controller off it (NOO_ADDON_REGISTRY_TOKEN)."""
+    doc = (ROOT / "docs/security/telemetry.md").read_text()
+    rows = [l for l in doc.splitlines() if l.startswith("| Add-on pulls |")]
+    assert len(rows) == 1, "telemetry.md needs exactly one 'Add-on pulls' row"
+    row = rows[0]
+    for needle in ("addons.noomesh.ai", "NOO_ADDON_REGISTRY_TOKEN", "30 days", "never an IP address"):
+        assert needle in row, f"the Add-on pulls row must name {needle!r}"
+    selector = (ROOT / "noo-cli/src/addons/lock_fetch.rs").read_text()
+    assert "vendor_token || anchor.pull.is_none()" in selector, (
+        "the route selector must keep NOO_ADDON_REGISTRY_TOKEN as the switch off the proxy"
+    )
+

@@ -68,13 +68,41 @@ pub struct Entitlement {
     /// the two never disagree about whether a token is valid.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub addons: std::collections::BTreeMap<String, AddonAnchor>,
+    /// The controller key the licence is bound to (RFC 7800 `cnf`), as the
+    /// CLI's `entitlement::Cnf`. The gateway does not use it; it holds it to
+    /// the CLI's shape rule so the two agree on validity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
+}
+
+/// `{"ed25519": "<64 hex public key>"}`, as the CLI's `entitlement::Cnf`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cnf {
+    pub ed25519: String,
 }
 
 /// One add-on's trust anchor, as the CLI's `addon_lock::TrustAnchor`.
+/// `pull` is where the controller pulls from (the vendor's registry proxy):
+/// `registry`'s path on another host.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddonAnchor {
     pub keys: Vec<String>,
     pub registry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull: Option<String>,
+}
+
+/// The CLI's `addon_lock::valid_registry_root`.
+fn valid_registry_root(r: &str) -> bool {
+    !r.is_empty()
+        && r.contains('/')
+        && !r.contains("://")
+        && !r.contains('@')
+        && !r.contains(':')
+        && !r.starts_with('/')
+        && !r.ends_with('/')
+        && !r.split('/').any(str::is_empty)
+        && !r.chars().any(char::is_whitespace)
 }
 
 /// The CLI's `entitlement::validate_addons`: every anchor names at least one
@@ -92,17 +120,22 @@ fn validate_addons(addons: &std::collections::BTreeMap<String, AddonAnchor>) -> 
             pubkey_from_hex(k).map_err(|e| format!("add-on trust block for {name}: key #{i} {e}"))?;
         }
         let r = a.registry.trim();
-        let root_ok = !r.is_empty()
-            && r.contains('/')
-            && !r.contains("://")
-            && !r.contains('@')
-            && !r.contains(':')
-            && !r.starts_with('/')
-            && !r.ends_with('/')
-            && !r.split('/').any(str::is_empty)
-            && !r.chars().any(char::is_whitespace);
-        if !root_ok {
+        if !valid_registry_root(r) {
             return Err(format!("add-on trust block for {name}: registry {:?} is not a registry root (host/path)", a.registry));
+        }
+        // The CLI's `TrustAnchor::check_pull`: a host swap, same path.
+        if let Some(p) = &a.pull {
+            let pt = p.trim();
+            if !valid_registry_root(pt) {
+                return Err(format!("add-on trust block for {name}: pull {p:?} is not a registry root (host/path)"));
+            }
+            let path = |x: &str| x.split_once('/').map(|(_, rest)| rest.to_string());
+            if path(pt) != path(r) {
+                return Err(format!(
+                    "add-on trust block for {name}: pull {pt:?} must name the same path as registry {:?} (only the host may differ)",
+                    a.registry
+                ));
+            }
         }
     }
     Ok(())
@@ -156,6 +189,9 @@ pub fn verify_with(token: &str, key: &VerifyingKey) -> Result<Entitlement, Strin
         return Err(format!("unsupported entitlement version {}", ent.v));
     }
     validate_addons(&ent.addons)?;
+    if let Some(c) = &ent.cnf {
+        pubkey_from_hex(&c.ed25519).map_err(|e| format!("cnf.ed25519: {e}"))?;
+    }
     Ok(ent)
 }
 
@@ -243,6 +279,7 @@ pub mod testing {
             max_nodes: None,
             terms: None,
             addons: Default::default(),
+            cnf: None,
         }
     }
 }
@@ -350,6 +387,40 @@ mod tests {
         ] {
             let err = verify_with(&sign(&block), &vk).unwrap_err();
             assert!(err.contains(want), "{block}: {err}");
+        }
+    }
+
+    /// The CLI's entitlement gained `cnf` and an anchor `pull` root (i91).
+    /// Both verify here; malformed ones refuse here exactly as in the CLI.
+    #[test]
+    fn cnf_and_pull_parse_and_hold_the_cli_rules() {
+        let vk = testing::key().verifying_key();
+        let k: String = testing::key().verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let sign = |extra: &str| {
+            let payload = format!(r#"{{"v":1,"sub":"a","tier":"t","features":["evolve"],"iat":1,"exp":0,"id":"t",{extra}}}"#);
+            let sig = ed25519_dalek::Signer::sign(&testing::key(), payload.as_bytes());
+            format!(
+                "{TOKEN_PREFIX}{}.{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            )
+        };
+        let ok = format!(
+            r#""cnf":{{"ed25519":"{k}"}},"addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/x/evolve","pull":"addons.noomesh.ai/x/evolve"}}}}"#
+        );
+        let e = verify_with(&sign(&ok), &vk).unwrap();
+        assert_eq!(e.cnf.as_ref().map(|c| c.ed25519.as_str()), Some(k.as_str()));
+        assert_eq!(e.addons["evolve"].pull.as_deref(), Some("addons.noomesh.ai/x/evolve"));
+        assert!(e.grants("evolve"));
+        let without = verify_with(&sign(r#""terms":"addon-1.0""#), &vk).unwrap();
+        assert!(without.cnf.is_none());
+        for (extra, want) in [
+            (r#""cnf":{"ed25519":"zz"}"#.to_string(), "cnf.ed25519"),
+            (format!(r#""addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/x/evolve","pull":"addons.noomesh.ai/x/other"}}}}"#), "same path as registry"),
+            (format!(r#""addons":{{"evolve":{{"keys":["{k}"],"registry":"ghcr.io/x/evolve","pull":"https://addons.noomesh.ai/x/evolve"}}}}"#), "not a registry root"),
+        ] {
+            let err = verify_with(&sign(&extra), &vk).unwrap_err();
+            assert!(err.contains(want), "{extra}: {err}");
         }
     }
 

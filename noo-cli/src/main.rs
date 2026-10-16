@@ -527,6 +527,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "entitlement", "install"], commands::entitlement_install),
     (&["security", "entitlement", "show"], commands::entitlement_show),
     (&["security", "entitlement", "verify"], commands::entitlement_verify),
+    (&["security", "entitlement", "pubkey"], commands::entitlement_pubkey),
     (&["security", "release-sign"], commands::release_sign),
     (&["security", "release-verify"], commands::release_verify),
     (&["security", "addon-lock", "sign"], commands::security_addon_lock_sign),

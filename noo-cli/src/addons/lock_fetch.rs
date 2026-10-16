@@ -32,6 +32,24 @@
 //! it takes the v1 pair and no files (the caller decides what a bundle-less
 //! add-on may do).
 //!
+//! WHERE and WITH WHAT ([`Route`]). One selector, explicit precedence, no
+//! fallback between paths:
+//!   1. `NOO_ADDON_REGISTRY_TOKEN` is in the store: Direct to the anchor's
+//!      `registry` with it. The vendor-fleet override; the proxy is never
+//!      contacted, whatever the entitlement's `pull` says.
+//!   2. Otherwise the anchor names `pull`: Proxy. The lock and the images are
+//!      fetched from `pull` (the same path on the vendor's add-on registry
+//!      proxy), and the credential at the proxy's realm is Basic
+//!      `<entitlement id>:<entitlement token>`, never a GHCR token. When the
+//!      entitlement is bound to this controller (`cnf`) the proxy asks for
+//!      proof of possession ([`super::pop`]): one `Noo-PoP` challenge, one
+//!      signed retry. docker then logs in with the proxy's short access
+//!      token as the password ([`Client::docker_credential`]), never the
+//!      entitlement or the controller key.
+//!   3. Otherwise: Direct to `registry`, anonymous.
+//! Trust does not move with the location: the lock is verified against the
+//! anchor's `registry`, and its image refs must sit under it.
+//!
 //! TLS is always on: the agent is https-only with the platform verifier, so
 //! a realm or a redirect that leaves https fails loud. The Authorization
 //! header is never carried across a redirect (`RedirectAuthHeaders::Never`):
@@ -94,6 +112,116 @@ pub fn split_root(root: &str) -> Option<(&str, &str)> {
     (!host.is_empty() && !path.is_empty()).then_some((host, path))
 }
 
+/// Where one add-on's lock and images come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// The anchor's `registry`, with the vendor token when one is stored.
+    Direct { root: String },
+    /// The anchor's `pull` root (the vendor's add-on registry proxy).
+    /// `registry` is kept to map signed refs onto `root`.
+    Proxy { root: String, registry: String },
+}
+
+impl Route {
+    /// The selector (module docs): vendor token wins; else `pull`; else
+    /// `registry`. A `pull` that is not a host swap of `registry` is refused.
+    pub fn select(anchor: &crate::addon_lock::TrustAnchor, vendor_token: bool) -> Result<Route, String> {
+        if vendor_token || anchor.pull.is_none() {
+            return Ok(Route::Direct { root: anchor.registry.trim().to_string() });
+        }
+        anchor.check_pull()?;
+        Ok(Route::Proxy { root: anchor.location().to_string(), registry: anchor.registry.trim().to_string() })
+    }
+
+    /// The root fetched from.
+    pub fn root(&self) -> &str {
+        match self {
+            Route::Direct { root } | Route::Proxy { root, .. } => root,
+        }
+    }
+
+    /// The registry host fetched from.
+    pub fn host(&self) -> &str {
+        self.root().split('/').next().unwrap_or_default()
+    }
+
+    /// What a pin records as `pulled_from`: the proxy root, else nothing
+    /// (the registry).
+    pub fn pulled_from(&self) -> Option<String> {
+        match self {
+            Route::Direct { .. } => None,
+            Route::Proxy { root, .. } => Some(root.clone()),
+        }
+    }
+
+    /// A signed image ref (under `registry`) as it is pulled on this route.
+    pub fn local_ref(&self, reference: &str) -> Option<String> {
+        match self {
+            Route::Direct { .. } => Some(reference.to_string()),
+            Route::Proxy { root, registry } => crate::addon_lock::relocate(reference, registry, root),
+        }
+    }
+}
+
+/// The proxy credential: the installed entitlement, and the controller key
+/// when the entitlement is bound to one. `Debug` prints neither secret.
+#[derive(Clone)]
+pub struct ProxyAuth {
+    pub ent_id: String,
+    pub entitlement: String,
+    pub key: Option<ed25519_dalek::SigningKey>,
+}
+
+impl std::fmt::Debug for ProxyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProxyAuth {{ ent_id: {:?}, entitlement: <redacted>, key: {} }}", self.ent_id,
+            if self.key.is_some() { "<held>" } else { "none" })
+    }
+}
+
+/// The proxy credential for this controller, when the installed entitlement
+/// names a `pull` root. `Ok(None)`: no entitlement, an invalid one (the
+/// anchor lookup reports that), or no `pull` anywhere. `Err`: the
+/// entitlement is bound (`cnf`) and this controller's key cannot be read or
+/// is not the bound one; every proxy pull would be refused, so say why now.
+pub fn installed_proxy_auth() -> Result<Option<ProxyAuth>, String> {
+    let Some(token) = crate::entitlement::installed_token_checked()? else { return Ok(None) };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let Ok(ent) = crate::entitlement::check(&token, now) else { return Ok(None) };
+    proxy_auth_for(&ent, &token, &super::pop::controller_key)
+}
+
+/// [`installed_proxy_auth`] over a verified entitlement, with the key source
+/// injected (tests).
+pub fn proxy_auth_for(
+    ent: &crate::entitlement::Entitlement,
+    token: &str,
+    key: &dyn Fn() -> Result<ed25519_dalek::SigningKey, String>,
+) -> Result<Option<ProxyAuth>, String> {
+    if !ent.addons.values().any(|a| a.pull.is_some()) {
+        return Ok(None);
+    }
+    let key = match ent.controller_key() {
+        None => None,
+        Some(bound) => {
+            let k = key()?;
+            let mine = super::pop::pubkey_hex(&k);
+            if !mine.eq_ignore_ascii_case(bound) {
+                return Err(format!(
+                    "entitlement {} is bound to controller key {}, and this controller's key is {} (it was issued for \
+                     another controller, or the cluster CA changed); send `noo security entitlement pubkey` to the vendor \
+                     for a reissue",
+                    ent.id,
+                    crate::entitlement::short_key_id(bound),
+                    crate::entitlement::short_key_id(&mine)
+                ));
+            }
+            Some(k)
+        }
+    };
+    Ok(Some(ProxyAuth { ent_id: ent.id.clone(), entitlement: token.trim().to_string(), key }))
+}
+
 /// The registry credential. `Debug` never prints the token.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
@@ -148,6 +276,17 @@ pub struct Fetched {
     pub files: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
+/// The credential the token exchange of the current fetch presents.
+#[derive(Clone, Default)]
+struct Auth {
+    basic: Option<Credential>,
+    /// The controller key, for a proxy that asks for proof of possession.
+    pop: Option<ed25519_dalek::SigningKey>,
+    /// The current fetch goes to the vendor's proxy (its refusals are
+    /// quoted: they name the entitlement and the reason, never a token).
+    proxy: bool,
+}
+
 /// An OCI registry client for add-on locks.
 pub struct Client {
     /// Manifest and token requests: no redirects at all.
@@ -156,22 +295,64 @@ pub struct Client {
     /// the Authorization header.
     blob_agent: ureq::Agent,
     scheme: &'static str,
+    /// The vendor token (`NOO_ADDON_REGISTRY_TOKEN`), Direct path only.
     cred: Option<Credential>,
+    /// The entitlement credential, Proxy path only.
+    proxy: Option<ProxyAuth>,
     /// The registry host of the current fetch: the token realm must be on it.
     host: std::cell::RefCell<String>,
+    auth: std::cell::RefCell<Auth>,
 }
 
 impl Client {
     /// The production client: https only, verified by the platform trust
     /// store, Authorization never forwarded on a redirect.
     pub fn new(cred: Option<Credential>) -> Self {
-        Client { agent: agent(true, 0), blob_agent: agent(true, 5), scheme: "https", cred, host: Default::default() }
+        Client { agent: agent(true, 0), blob_agent: agent(true, 5), scheme: "https", cred, proxy: None, host: Default::default(), auth: Default::default() }
     }
 
     /// Plain http on loopback, for the fake registry in tests only.
     #[cfg(test)]
     pub(crate) fn plain_http_for_tests(cred: Option<Credential>) -> Self {
-        Client { agent: agent(false, 0), blob_agent: agent(false, 5), scheme: "http", cred, host: Default::default() }
+        Client { agent: agent(false, 0), blob_agent: agent(false, 5), scheme: "http", cred, proxy: None, host: Default::default(), auth: Default::default() }
+    }
+
+    /// Add the proxy credential (used only on a Proxy route).
+    pub fn with_proxy(mut self, proxy: Option<ProxyAuth>) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// The route for `anchor` with this client's credentials.
+    pub fn route(&self, anchor: &crate::addon_lock::TrustAnchor) -> Result<Route, String> {
+        Route::select(anchor, self.cred.is_some())
+    }
+
+    /// The route in words, for the verbs that pull: which host and which
+    /// credential. Never a secret.
+    pub fn describe(&self, route: &Route) -> String {
+        match route {
+            Route::Direct { .. } if self.cred.is_some() => format!("via {} ({TOKEN_KEY})", route.host()),
+            Route::Direct { .. } => format!("via {} (anonymous)", route.host()),
+            Route::Proxy { .. } => match &self.proxy {
+                Some(p) => format!("via {} (entitlement {}{})", route.host(), p.ent_id,
+                    if p.key.is_some() { ", bound to this controller" } else { "" }),
+                None => format!("via {} (no entitlement credential)", route.host()),
+            },
+        }
+    }
+
+    /// Point the token exchange at `route`'s credential.
+    fn arm(&self, route: &Route) {
+        let a = match route {
+            Route::Direct { .. } => Auth { basic: self.cred.clone(), pop: None, proxy: false },
+            Route::Proxy { .. } => Auth {
+                basic: self.proxy.as_ref().map(|p| Credential { user: p.ent_id.clone(), token: p.entitlement.clone() }),
+                pop: self.proxy.as_ref().and_then(|p| p.key.clone()),
+                proxy: true,
+            },
+        };
+        *self.auth.borrow_mut() = a;
     }
 
     fn get(&self, url: &str, accept: Option<&str>, auth: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
@@ -187,12 +368,26 @@ impl Client {
         accept: Option<&str>,
         auth: Option<&str>,
     ) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
+        self.get_with(agent, url, accept, auth, &[])
+    }
+
+    fn get_with(
+        &self,
+        agent: &ureq::Agent,
+        url: &str,
+        accept: Option<&str>,
+        auth: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
         let mut req = agent.get(url).header("User-Agent", "noo-cli");
         if let Some(a) = accept {
             req = req.header("Accept", a);
         }
         if let Some(a) = auth {
             req = req.header("Authorization", a);
+        }
+        for (k, v) in extra {
+            req = req.header(*k, *v);
         }
         req.call().map_err(|e| FetchError::new(release_fetch::classify_transport(&e), format!("GET {url}: {e}")))
     }
@@ -247,12 +442,44 @@ impl Client {
             .filter(|(k, _)| k == "service" || k == "scope")
             .map(|(k, v)| format!("{k}={}", pct(v)))
             .collect();
-        let url = if query.is_empty() { realm } else { format!("{realm}?{}", query.join("&")) };
-        let basic = self.cred.as_ref().map(|c| format!("Basic {}", c.basic()));
-        let resp = self.get(&url, None, basic.as_deref())?;
+        let url = if query.is_empty() { realm.clone() } else { format!("{realm}?{}", query.join("&")) };
+        let auth = self.auth.borrow().clone();
+        let basic = auth.basic.as_ref().map(|c| format!("Basic {}", c.basic()));
+        let mut resp = self.get(&url, None, basic.as_deref())?;
+        // Proof of possession: one challenge, one signed retry.
+        if resp.status().as_u16() == 401 {
+            let nonce = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).and_then(super::pop::challenge_nonce);
+            if let Some(nonce) = nonce {
+                let (Some(key), Some(c)) = (auth.pop.as_ref(), auth.basic.as_ref()) else {
+                    return Err(FetchError::new(
+                        FetchClass::Auth,
+                        format!("{} asks for proof of possession, and the installed entitlement names no key of this controller", self.host.borrow()),
+                    ));
+                };
+                let service = params.iter().find(|(k, _)| k == "service").map(|(_, v)| v.clone()).unwrap_or_else(|| self.host.borrow().clone());
+                let sig = super::pop::sign(key, &service, &c.user, &nonce);
+                resp = self.get_with(&self.agent, &url, None, basic.as_deref(),
+                    &[(super::pop::NONCE_HEADER, &nonce), (super::pop::SIGNATURE_HEADER, &sig)])?;
+            }
+        }
         let status = resp.status().as_u16();
-        if let Some((class, _)) = release_fetch::classify_status(status, &|_| None, 0) {
-            return Err(FetchError::new(class, format!("token request → HTTP {status}")));
+        let hdr = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+        // The Direct path classifies exactly as it always has (status only).
+        let none = |_: &str| None;
+        let hdr_of: &dyn Fn(&str) -> Option<String> = if auth.proxy { &hdr } else { &none };
+        if let Some((class, retry)) = release_fetch::classify_status(status, hdr_of, 0) {
+            if !auth.proxy {
+                return Err(FetchError::new(class, format!("token request → HTTP {status}")));
+            }
+            // The proxy's refusal names the entitlement and the reason
+            // (expired, revoked, not granted, rate-limited); quote it.
+            let why = read_capped(resp, MAX_BLOB, "token response").ok().and_then(|b| registry_error_message(&b));
+            let mut e = FetchError::new(class, match why {
+                Some(m) => format!("token request → HTTP {status}: {m}"),
+                None => format!("token request → HTTP {status}"),
+            });
+            e.retry_after = retry;
+            return Err(e);
         }
         let body = read_capped(resp, MAX_BLOB, "token response")?;
         let v: serde_json::Value = serde_json::from_slice(&body)
@@ -265,8 +492,50 @@ impl Client {
             .ok_or_else(|| FetchError::new(FetchClass::Auth, "token response carries no token"))
     }
 
-    /// Fetch the lock artifact `<root>:stack-<stack_tag>`.
+    /// Fetch the lock artifact `<root>:stack-<stack_tag>` with the vendor
+    /// token (the Direct path). Production callers go through
+    /// [`Client::fetch_via`] with a selected [`Route`].
+    #[cfg(test)]
     pub fn fetch(&self, root: &str, stack_tag: &str) -> Result<Fetched, FetchError> {
+        self.arm(&Route::Direct { root: root.to_string() });
+        self.fetch_armed(root, stack_tag)
+    }
+
+    /// Fetch the lock artifact for `stack_tag` on `route`, with its credential.
+    pub fn fetch_via(&self, route: &Route, stack_tag: &str) -> Result<Fetched, FetchError> {
+        self.arm(route);
+        self.fetch_armed(route.root(), stack_tag)
+    }
+
+    /// The credential docker logs in with to pull `route`'s images: the
+    /// vendor token on the Direct path; on the Proxy path a fresh proxy
+    /// access token (short-lived, scoped to what the entitlement grants)
+    /// with the entitlement id as the user. The entitlement and the
+    /// controller key never reach docker.
+    pub fn docker_credential(&self, route: &Route) -> Result<Option<Credential>, FetchError> {
+        let Route::Proxy { .. } = route else { return Ok(self.cred.clone()) };
+        let Some(p) = &self.proxy else {
+            return Err(FetchError::new(FetchClass::Auth, format!("{} needs the installed entitlement, and none is usable", route.host())));
+        };
+        self.arm(route);
+        *self.host.borrow_mut() = route.host().to_string();
+        let url = format!("{}://{}/v2/", self.scheme, route.host());
+        let resp = self.get(&url, None, None)?;
+        let status = resp.status().as_u16();
+        if status != 401 {
+            return Err(FetchError::new(FetchClass::Other, format!("GET {url} → HTTP {status}, not a token challenge")));
+        }
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| FetchError::new(FetchClass::Auth, format!("GET {url} → HTTP 401 with no token challenge")))?;
+        let token = self.token(&challenge)?;
+        Ok(Some(Credential { user: p.ent_id.clone(), token }))
+    }
+
+    fn fetch_armed(&self, root: &str, stack_tag: &str) -> Result<Fetched, FetchError> {
         let Some((host, path)) = split_root(root) else {
             return Err(FetchError::new(FetchClass::Other, format!("registry root {root:?} is not host/path")));
         };
@@ -350,9 +619,22 @@ fn pct(s: &str) -> String {
         .collect()
 }
 
+/// The first `message` of a registry error body
+/// (`{"errors":[{"code","message","detail"}]}`).
+fn registry_error_message(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let m = v.pointer("/errors/0/message")?.as_str()?.trim();
+    (!m.is_empty()).then(|| m.chars().take(300).collect())
+}
+
 /// `Bearer realm="…",service="…",scope="…"` → its parameters, in order.
 pub(crate) fn parse_bearer_challenge(h: &str) -> Option<Vec<(String, String)>> {
     let rest = h.trim().strip_prefix("Bearer ").or_else(|| h.trim().strip_prefix("bearer "))?;
+    parse_auth_params(rest)
+}
+
+/// `k="v",k2=v2` → its parameters, in order (keys lowercased).
+pub(crate) fn parse_auth_params(rest: &str) -> Option<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut s = rest.trim();
     while !s.is_empty() {
@@ -501,6 +783,14 @@ pub(crate) mod fake {
     pub struct Seen {
         pub path: String,
         pub auth: Option<String>,
+        /// Every request header, name lowercased.
+        pub headers: Vec<(String, String)>,
+    }
+
+    impl Seen {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        }
     }
 
     /// path → (status, headers, body). `{base}` in a header value is
@@ -520,10 +810,32 @@ pub(crate) mod fake {
     /// Bearer <token>` is answered 401 with a challenge whose realm is this
     /// server's `/token` (which the routes must answer).
     pub fn serve_gated(routes: impl FnOnce(&str) -> Routes, bearer: Option<&'static str>) -> Server {
+        serve_fn(move |base| {
+            let routes = routes(base);
+            let realm = format!("{base}/token");
+            move |req: &Seen| {
+                let key = req.path.split('?').next().unwrap_or("").to_string();
+                let gated = bearer.is_some_and(|t| key.starts_with("/v2/") && req.auth.as_deref() != Some(&format!("Bearer {t}")));
+                if gated {
+                    let ch = format!("Bearer realm=\"{realm}\",service=\"reg\",scope=\"repository:example/intel:pull\"");
+                    (401, vec![("WWW-Authenticate".to_string(), ch)], Vec::new())
+                } else {
+                    routes.get(&key).cloned().unwrap_or((404, vec![], b"{\"errors\":[{\"code\":\"NOT_FOUND\"}]}".to_vec()))
+                }
+            }
+        })
+    }
+
+    type Answer = (u16, Vec<(String, String)>, Vec<u8>);
+
+    /// A loopback server answering each request with `make(base)`'s handler.
+    pub fn serve_fn<H>(make: impl FnOnce(&str) -> H) -> Server
+    where
+        H: Fn(&Seen) -> Answer + Send + 'static,
+    {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
-        let routes = routes(&base);
-        let realm = format!("{base}/token");
+        let handler = make(&base);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = seen.clone();
         std::thread::spawn(move || {
@@ -533,6 +845,7 @@ pub(crate) mod fake {
                 let mut first = String::new();
                 let _ = rd.read_line(&mut first);
                 let mut auth = None;
+                let mut headers = Vec::new();
                 loop {
                     let mut line = String::new();
                     if rd.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -542,18 +855,13 @@ pub(crate) mod fake {
                         if k.trim().eq_ignore_ascii_case("authorization") {
                             auth = Some(v.trim().to_string());
                         }
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
                     }
                 }
                 let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
-                s2.lock().unwrap().push(Seen { path: path.clone(), auth: auth.clone() });
-                let key = path.split('?').next().unwrap_or("").to_string();
-                let gated = bearer.is_some_and(|t| key.starts_with("/v2/") && auth.as_deref() != Some(&format!("Bearer {t}")));
-                let (status, hdrs, body) = if gated {
-                    let ch = format!("Bearer realm=\"{realm}\",service=\"reg\",scope=\"repository:example/intel:pull\"");
-                    (401, vec![("WWW-Authenticate".to_string(), ch)], Vec::new())
-                } else {
-                    routes.get(&key).cloned().unwrap_or((404, vec![], b"{\"errors\":[{\"code\":\"NOT_FOUND\"}]}".to_vec()))
-                };
+                let req = Seen { path, auth, headers };
+                s2.lock().unwrap().push(req.clone());
+                let (status, hdrs, body) = handler(&req);
                 let mut resp = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
                 for (k, v) in hdrs {
                     resp.push_str(&format!("{k}: {v}\r\n"));
@@ -564,6 +872,94 @@ pub(crate) mod fake {
             }
         });
         Server { base, seen }
+    }
+
+    /// The entitlement token the fake proxy accepts (with user `ent-1`).
+    pub const ENT_TOKEN: &str = "noo-ent1.fake-entitlement";
+    /// The access token it hands out.
+    pub const PROXY_TOKEN: &str = "proxy-access-token";
+    const SERVICE: &str = "addons.test";
+    const NONCE: &str = "N0NCE";
+
+    pub fn basic(user: &str, pass: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    }
+
+    fn reg_error(status: u16, code: &str, msg: &str) -> Answer {
+        (status, vec![], serde_json::json!({"errors": [{"code": code, "message": msg}]}).to_string().into_bytes())
+    }
+
+    /// A fake add-on registry proxy with the real contract
+    /// (personifAI/addon-registry-proxy README): `/v2/` challenges to its
+    /// `/token` realm; the realm takes Basic `ent-1:<ENT_TOKEN>`, grants only
+    /// `repository:example/intel:pull`, asks for proof of possession when
+    /// `pop` is set (nonce [`NONCE`], signature checked over
+    /// `noo-addon-pop/1\n<service>\n<ent>\n<nonce>`), and refuses with
+    /// `refuse` when set; it serves `stack-v0.6.0` and its blobs by digest to
+    /// [`PROXY_TOKEN`].
+    pub fn proxy(lock: Vec<u8>, sig: Vec<u8>, pop: Option<ed25519_dalek::VerifyingKey>, refuse: Option<&'static str>) -> Server {
+        use ed25519_dalek::Verifier as _;
+        serve_fn(move |base| {
+            let realm = format!("{base}/token");
+            let manifest = super::manifest_for(&lock, &sig);
+            let blob = |b: &[u8]| format!("/v2/example/intel/blobs/sha256:{}", super::hex(&<sha2::Sha256 as sha2::Digest>::digest(b)));
+            let blobs = [(blob(&lock), lock.clone()), (blob(&sig), sig.clone())];
+            move |req: &Seen| {
+                let (key, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
+                if key.starts_with("/v2/") {
+                    if req.auth.as_deref() != Some(&format!("Bearer {PROXY_TOKEN}")) {
+                        let scope = if key == "/v2/" { String::new() } else { ",scope=\"repository:example/intel:pull\"".into() };
+                        let ch = format!("Bearer realm=\"{realm}\",service=\"{SERVICE}\"{scope}");
+                        return (401, vec![("WWW-Authenticate".into(), ch)], Vec::new());
+                    }
+                    if key == "/v2/" {
+                        return (200, vec![], b"{}".to_vec());
+                    }
+                    if key == "/v2/example/intel/manifests/stack-v0.6.0" {
+                        return (200, vec![], manifest.clone().into_bytes());
+                    }
+                    return blobs.iter().find(|(p, _)| p == key).map(|(_, b)| (200, vec![], b.clone()))
+                        .unwrap_or_else(|| reg_error(404, "NOT_FOUND", "unknown"));
+                }
+                if key != "/token" {
+                    return reg_error(404, "NOT_FOUND", "unknown");
+                }
+                if let Some(msg) = refuse {
+                    return reg_error(403, "DENIED", msg);
+                }
+                if req.auth.as_deref() != Some(&format!("Basic {}", basic("ent-1", ENT_TOKEN))) {
+                    return reg_error(401, "UNAUTHORIZED", "credentials required");
+                }
+                for kv in query.split('&').filter(|kv| kv.starts_with("scope=")) {
+                    if kv != "scope=repository%3Aexample%2Fintel%3Apull" {
+                        return reg_error(403, "DENIED", "entitlement ent-1 does not grant that repository");
+                    }
+                }
+                if let Some(vk) = &pop {
+                    match (req.header("noo-pop-nonce"), req.header("noo-pop-signature")) {
+                        (Some(n), Some(sig_b64)) => {
+                            use base64::Engine as _;
+                            let ok = n == NONCE
+                                && base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .decode(sig_b64)
+                                    .ok()
+                                    .and_then(|raw| ed25519_dalek::Signature::from_slice(&raw).ok())
+                                    .is_some_and(|s| vk.verify(&super::super::pop::message(SERVICE, "ent-1", NONCE), &s).is_ok());
+                            if !ok {
+                                return reg_error(401, "UNAUTHORIZED", "proof-of-possession signature does not verify");
+                            }
+                        }
+                        _ => {
+                            let mut a = reg_error(401, "POP_REQUIRED", "proof of possession required");
+                            a.1.push(("WWW-Authenticate".into(), format!("Noo-PoP realm=\"{realm}\",nonce=\"{NONCE}\"")));
+                            return a;
+                        }
+                    }
+                }
+                (200, vec![], serde_json::json!({"token": PROXY_TOKEN, "access_token": PROXY_TOKEN, "expires_in": 600}).to_string().into_bytes())
+            }
+        })
     }
 }
 
@@ -804,6 +1200,60 @@ mod tests {
         assert_eq!(p[0], ("realm".into(), "https://ghcr.io/token".into()));
         assert_eq!(p[2], ("scope".into(), "repository:a/b:pull".into()));
         assert!(parse_bearer_challenge("Basic realm=\"x\"").is_none());
+    }
+
+    fn bound_ent(cnf: Option<String>, pull: bool) -> crate::entitlement::Entitlement {
+        let a = crate::addon_lock::TrustAnchor {
+            keys: vec!["ab".repeat(32)],
+            registry: "ghcr.io/x/evolve".into(),
+            pull: pull.then(|| "addons.noomesh.ai/x/evolve".to_string()),
+        };
+        crate::entitlement::Entitlement {
+            v: 1, sub: "acme".into(), tier: "intelligent".into(), features: vec!["evolve".into()], iat: 1, exp: 0,
+            id: "ent-1".into(), bound: None, max_nodes: None, terms: None,
+            addons: std::collections::BTreeMap::from([("evolve".to_string(), a)]),
+            cnf: cnf.map(|ed25519| crate::entitlement::Cnf { ed25519 }),
+        }
+    }
+
+    #[test]
+    fn proxy_auth_needs_a_pull_root_and_the_bound_key() {
+        let k = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let mine = super::super::pop::pubkey_hex(&k);
+        let give = || Ok(k.clone());
+        assert!(proxy_auth_for(&bound_ent(Some(mine.clone()), false), "T", &give).unwrap().is_none(), "no pull root: no proxy");
+        let p = proxy_auth_for(&bound_ent(None, true), "T", &|| Err("never read".into())).unwrap().unwrap();
+        assert!(p.key.is_none(), "an unbound entitlement never reads the controller key");
+        assert_eq!((p.ent_id.as_str(), p.entitlement.as_str()), ("ent-1", "T"));
+        let p = proxy_auth_for(&bound_ent(Some(mine.to_ascii_uppercase()), true), "T", &give).unwrap().unwrap();
+        assert!(p.key.is_some());
+        let other = super::super::pop::pubkey_hex(&ed25519_dalek::SigningKey::from_bytes(&[5; 32]));
+        let e = proxy_auth_for(&bound_ent(Some(other), true), "T", &give).unwrap_err();
+        assert!(e.contains("bound to controller key") && e.contains("noo security entitlement pubkey"), "{e}");
+        let e = proxy_auth_for(&bound_ent(Some(mine), true), "T", &|| Err("ca.key could not be read".into())).unwrap_err();
+        assert!(e.contains("ca.key"), "{e}");
+        assert!(format!("{p:?}").contains("entitlement: <redacted>"), "Debug hides the entitlement: {p:?}");
+    }
+
+    #[test]
+    fn docker_gets_the_proxy_token_never_the_entitlement() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let proxy = fake::proxy(b"L".to_vec(), b"S".to_vec(), Some(key.verifying_key()), None);
+        let host = proxy.base.trim_start_matches("http://").to_string();
+        let route = Route::Proxy { root: format!("{host}/example/intel"), registry: "ghcr.io/example/intel".into() };
+        let c = Client::plain_http_for_tests(None)
+            .with_proxy(Some(ProxyAuth { ent_id: "ent-1".into(), entitlement: fake::ENT_TOKEN.into(), key: Some(key) }));
+        let cred = c.docker_credential(&route).unwrap().unwrap();
+        assert_eq!(cred, Credential { user: "ent-1".into(), token: fake::PROXY_TOKEN.into() });
+        let seen = proxy.seen.lock().unwrap().clone();
+        assert_eq!(seen[0].path, "/v2/");
+        assert!(seen[1].path.starts_with("/token?service=addons.test") && !seen[1].path.contains("scope="), "{:?}", seen[1]);
+        assert_eq!(seen[1].header("noo-pop-nonce"), None, "first ask carries no proof");
+        assert_eq!(seen[2].header("noo-pop-nonce"), Some("N0NCE"));
+        assert!(seen[2].header("noo-pop-signature").is_some_and(|s| s.len() == 86), "{:?}", seen[2]);
+        // Without a proxy credential the Proxy route is refused, not tried anonymously.
+        let e = Client::plain_http_for_tests(None).docker_credential(&route).unwrap_err();
+        assert_eq!(e.class, FetchClass::Auth, "{e}");
     }
 
     #[test]
