@@ -299,14 +299,15 @@ mod tests {
         let since = NOW - 30;
         let looks = Cell::new(0);
         let logs: HashMap<&str, &str> = HashMap::from([("noo-redis", AOF)]);
+        let one = HashMap::from([("noo-redis", String::new())]);
+        let rest = fake(&one, &logs); // ps + logs; inspect is answered here
         let docker = |args: &[&str]| -> Result<(bool, String, String), String> {
             if args[0] == "inspect" {
                 looks.set(looks.get() + 1);
                 let n = if looks.get() == 1 { 1 } else { 4 };
                 return Ok((true, state(true, NOW - 2, n, false), String::new()));
             }
-            let one = HashMap::from([("noo-redis", String::new())]);
-            fake(&one, &logs)(args)
+            rest(args)
         };
         let clock = Cell::new(NOW);
         let mut slept = Vec::new();
