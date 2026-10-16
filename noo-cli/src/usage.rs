@@ -175,7 +175,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["recall", "stats"], "", "Show recall lifecycle statistics"),
     (&["recall", "lifecycle-stats"], "", "Hidden: alias of `recall stats`"),
     (&["models", "cached"], "", "List models currently loaded on running node backends"),
-    (&["models", "pull"], "<model> [--backend <b>]", "Pull a model onto the gateway's Ollama (not a chosen node) with streamed progress; whisper:<size> / piper:<voice> stage a voice model on the controller"),
+    (&["models", "pull"], "<model> [--backend <b>]", "Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model"),
     (&["models", "fetch"], "<hf_repo> <file.gguf> [--revision <rev>] [--force]", "Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified)"),
     (&["stack", "status"], "", "Show stack container status (from docker ps)"),
     (&["stack", "logs"], "[<service>...] [--follow] [--tail <n>]", "Show container logs for one service or compose logs for many"),

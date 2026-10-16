@@ -334,7 +334,7 @@ fn fetch_blob(base: &str, token: Option<&str>, repo: &str, w: &Wanted, dir: &Pat
 pub(crate) fn stage(root: &Path, m: &VoiceModel, progress: bool) -> Result<Staged, String> {
     let repo = repo_of(m)?;
     let dir = staged_dir(root, m);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e} (the model store must be writable by you; see `noo models fetch`)", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e} (the model store, MODELS_DIR else <data root>/models, must be writable by you)", dir.display()))?;
     let base = models_fetch::hf_base();
     let token = models_fetch::hf_token();
     let wanted = select_files(m, &siblings(&base, token.as_deref(), &repo)?)?;
