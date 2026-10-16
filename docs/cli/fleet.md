@@ -175,6 +175,7 @@ noo cluster place gpu-2 harness qwen-7b.gguf  # point at that model's backend on
 ```sh
 noo cluster class list
 noo cluster class set chat-default node-1/vllm mac-1/ollama=gemma4:12b --degraded controller-1/ollama
+noo cluster class set chat-default node-1/vllm mac-1/ollama=gemma4:12b --pool
 noo cluster class unset chat-default
 ```
 
@@ -188,6 +189,15 @@ failed. With nothing declared, every served model is its own class and
 `chat-default` is the configured default model. `noo cluster verify
 --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
+
+`--pool` turns the list into peers instead of a failover order: each
+request goes to the healthy candidate with the fewest requests the
+gateway has open to it, then the lowest load, so one class spreads across
+several nodes instead of queueing on the first. Pool members may serve
+different models, because declaring the pool says they are
+interchangeable. Failover and `--degraded` still apply. A consumer that
+names a concrete model (`google/gemma-4-12B-…`) still reaches only the
+nodes serving it, so pinning stays available.
 
 Once the agent has started it, every turn whose model resolves to gpu-2
 runs there: the loop calls the model next door and reaches the cluster
@@ -450,7 +460,7 @@ agent may execute.
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
-| `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]...` | Declare a model class: candidates in failover order; --degraded ones answer last |
+| `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |

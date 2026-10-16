@@ -286,7 +286,13 @@ x-trellion-env: &trellion-env
   #. Override with NOO_TRELLION_LLM_URL to target
   # something other than the gateway.
   PAGEINDEX_LLM_URL: '${NOO_TRELLION_LLM_URL:-https://gateway:8080}'
-  PAGEINDEX_LLM_MODEL: '${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}'
+  # `default` = the gateway's chat-default class (2026-10-16), not one
+  # model's exact name: an exact name is served only where that model is
+  # placed, so every answer and extraction queued on one node while others
+  # sat idle. Declare chat-default as a pool (`noo cluster class set
+  # chat-default … --pool`) and trellion spreads with the rest of the mesh;
+  # set PAGEINDEX_LLM_MODEL to a model or class name to steer it instead.
+  PAGEINDEX_LLM_MODEL: '${PAGEINDEX_LLM_MODEL:-default}'
   # harrier / 1024: the default embedder and trellion's vector(1024) DDL.
   EMBEDDING_MODEL: '${EMBEDDING_MODEL:-harrier}'
   EMBEDDING_DIM: '${EMBEDDING_DIM:-1024}'
