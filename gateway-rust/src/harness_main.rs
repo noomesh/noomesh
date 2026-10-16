@@ -22,6 +22,10 @@
 //! | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type |
 //! | `NOO_HARNESS_MAX_TURNS` | concurrent turns (default 8) |
 //! | `NOO_HARNESS_KIND` | the loop: `noo` (default) runs ours; any other kind runs that vendor's headless CLI through [`crate::harness::driver`] |
+//!
+//! openapi-drift: not-gateway-routes — this is the harness entry point: it mounts nothing on the
+//! gateway's listener, and its tests stand up a fake NODE AGENT (`/harness/placement`) whose
+//! route is the agent's, not the gateway's (`scripts/check-openapi-drift.py`).
 
 use std::sync::Arc;
 use std::time::Duration;
