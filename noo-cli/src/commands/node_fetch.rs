@@ -518,6 +518,9 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         }
         ApplyBranch::Full => {}
     }
+    // The vendor CLI and runtime (i83 E1e) are judged before anything
+    // installs, like the Linux applier's vendor_check.
+    super::node_vendor::check(&payloads)?;
     // The user's tree, as the user, from the verified bytes.
     let inst = |kind: &str, dst: PathBuf, mode: u32| -> bool {
         payloads.get(kind).is_some_and(|b| user_write(&dst, b, mode).is_ok())
@@ -604,6 +607,20 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         }
     }
     let _ = inst("run-harness", base.join("run-harness.sh"), 0o700);
+    // The vendor CLI the harness placement needs (i83 E1e): unpacked under
+    // ~/noomesh/vendor, its wrapper at ~/noomesh/bin/<cli>, which
+    // run-agent.sh and run-harness.sh put on PATH. Staged by the
+    // controller; this node never fetches it.
+    let vendor_ok = match super::node_vendor::install(&payloads, base, "/usr/bin/tar", true, &|p, b, m| user_write(p, b, m)) {
+        Ok(done) => {
+            for (kind, unchanged, line) in done {
+                crate::ui::done(&format!("noo node fetch: {line}"));
+                note_binary(kind, unchanged, payloads.get(kind).map_or(&[][..], |b| b.as_slice()));
+            }
+            true
+        }
+        Err(e) => { crate::ui::warned(&format!("vendor CLI not installed: {e}")); false }
+    };
     // The harness env's secrets, judged by the installed gateway binary's
     // own marker — after both the env and the binary above.
     if let Err(e) = super::agent_secret_files::converge_harness(
@@ -730,7 +747,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
             ok
         }
     };
-    if !all_ok || !plist_ok {
+    if !all_ok || !plist_ok || !vendor_ok {
         return Err("bundle apply incomplete (a file was missing or unwritable)".into());
     }
     // No `chown -R` of ~/noomesh any more: everything above was written as
@@ -1084,7 +1101,13 @@ pub fn node_fetch(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 return Ok(0);
             }
         }
-        let mut resp = match agent.get(&format!("{url}/bootstrap/bundle/{node}")).call() {
+        // The bundle GET alone gets a long deadline: a bundle carrying a
+        // staged vendor CLI (i83 E1e) is a few hundred MB, which the agent's
+        // 60 s global timeout cut off on any link under ~5 MB/s.
+        let mut resp = match agent.get(&format!("{url}/bootstrap/bundle/{node}"))
+            .config().timeout_global(Some(std::time::Duration::from_secs(BUNDLE_FETCH_TIMEOUT_SECS))).build()
+            .call()
+        {
             Ok(r) => r,
             Err(e) => {
                 crate::ui::warned(&format!("noo node fetch: controller unreachable: {e}"));
@@ -1804,7 +1827,7 @@ fn manifest_kinds(manifest: &str) -> Vec<String> {
 const TEXT_KINDS: &[&str] = &[
     "agent-env", "harness-env", "nats-creds", "fleet-secrets", "host-telemetry", "teardown",
     "cli-user", "signing-pub", "ca.crt", "node.crt", "node.key", "agent-plist", "run-agent",
-    "harness-plist", "run-harness", "restart-backends",
+    "harness-plist", "run-harness", "restart-backends", "vendor-cli-manifest", "vendor-runtime-manifest",
 ];
 
 /// Where a ROOT apply keeps its trust anchors (`ca.crt`, `signing.pub`):
@@ -2378,6 +2401,9 @@ const KNOWN_KINDS: &[&str] = &[
     "svc-vllm.crt", "svc-vllm.key", "svc-llamacpp.crt", "svc-llamacpp.key",
     "svc-ollama.crt", "svc-ollama.key", "svc-tei.crt", "svc-tei.key",
     "svc-reranker.crt", "svc-reranker.key",
+    // The vendor CLI a harness kind runs, and the runtime it runs on, each
+    // with its manifest (i83 E1e; `cluster_vendor`).
+    "vendor-cli", "vendor-cli-manifest", "vendor-runtime", "vendor-runtime-manifest",
 ];
 
 /// The HTTPS agent for the poller: trusts ONLY the cluster CA pinned at
@@ -2538,6 +2564,9 @@ fn birth_proof(base: &Path, purpose: &str, node: &str, sha: &str) -> Result<Stri
     use base64::Engine as _;
     Ok(format!("{ts}.{}", base64::engine::general_purpose::STANDARD.encode(&sig)))
 }
+
+/// The deadline for the one bundle download (the other calls keep 60 s).
+const BUNDLE_FETCH_TIMEOUT_SECS: u64 = 900;
 
 fn pinned_agent(base: &Path) -> Result<ureq::Agent, String> {
     let anchor = base.join("pki/ca.crt");

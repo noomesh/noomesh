@@ -75,6 +75,51 @@ class SecurityPosture(BaseModel):
     audit_rows_written: int = 0
 
 
+class TaskRun(BaseModel):
+    """One task of a harness-compare run, under one harness kind."""
+    kind: str
+    task_set: str = "default"
+    task: str
+    task_id: str = ""
+    state: str = ""                  # the task's last state (done|failed|stopped|... or timeout)
+    loops: int = 0
+    wall_s: Optional[float] = None
+    result: str = ""                 # the task's result, or its error (truncated)
+    node: str = ""                   # where the gateway sent it
+    dispatched: bool = False         # a node harness took it (False = ran in process)
+    why: str = ""                    # the gateway's reason when it was not dispatched
+    children: int = 0                # delegated / fanned-out child tasks
+    tools: Optional[int] = None      # tool calls, when the gateway could tell
+    prompt_tokens: Optional[int] = None      # None = not reported, never 0-by-default
+    completion_tokens: Optional[int] = None
+    tokens_source: str = ""          # how the tokens were obtained (see harness_compare)
+    check: str = ""
+    passed: bool = False
+    skipped: bool = False            # the task does not apply to this kind
+    note: str = ""                   # why it failed (first line goes in the report)
+
+
+class KindRun(BaseModel):
+    """Placing one kind on the node and waiting for its harness."""
+    kind: str
+    placed: bool = False
+    ready: bool = False
+    ready_s: Optional[float] = None
+    error: str = ""
+
+
+class HarnessCompare(BaseModel):
+    """A harness-compare run: one task set per kind, on one node."""
+    node: str
+    kinds: list[str] = Field(default_factory=list)
+    original_kind: Optional[str] = None      # None = the node had no harness placement
+    restored: bool = False
+    restore_note: str = ""
+    kind_runs: list[KindRun] = Field(default_factory=list)
+    runs: list[TaskRun] = Field(default_factory=list)
+    token_method: str = ""
+
+
 class RunResult(BaseModel):
     """The full artifact of one evaluation run."""
     scenario: str
@@ -88,4 +133,5 @@ class RunResult(BaseModel):
     isolation_tests: list[IsolationTest] = Field(default_factory=list)
     replication: list[ReplEvent] = Field(default_factory=list)
     security: SecurityPosture = Field(default_factory=SecurityPosture)
+    harness_compare: Optional[HarnessCompare] = None
     notes: list[str] = Field(default_factory=list)

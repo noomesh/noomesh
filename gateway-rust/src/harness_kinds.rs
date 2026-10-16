@@ -40,6 +40,112 @@ pub struct HarnessKind {
     pub launch: Option<Launch>,
     /// Vendor telemetry switches the runner must launch it with.
     pub telemetry_off: BTreeMap<String, String>,
+    /// Where the controller stages the vendor CLI from (i83 E1e); `None` =
+    /// a manual install, or no CLI at all.
+    #[serde(default)]
+    pub distribution: Option<Distribution>,
+}
+
+/// noomesh platform facts (`linux`/`macos`, `x86_64`/`aarch64`) → the
+/// vendor's spelling inside a `source` URL template.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct Names {
+    #[serde(default)]
+    pub os: BTreeMap<String, String>,
+    #[serde(default)]
+    pub arch: BTreeMap<String, String>,
+}
+
+/// What shape a vendor ships its CLI in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum Format {
+    NpmTarball,
+    Tarball,
+    Binary,
+}
+
+/// How the artefact is unpacked on the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[allow(dead_code)]
+pub enum Unpack {
+    #[serde(rename = "tgz")]
+    Tgz,
+    #[serde(rename = "tar.xz")]
+    TarXz,
+    #[serde(rename = "zip")]
+    Zip,
+    #[serde(rename = "none")]
+    None,
+}
+
+/// A kind's staged vendor CLI: the controller fetches `source` (with
+/// `{version}`, `{os}`, `{arch}` filled in through `names`), verifies it
+/// against `sha256` (`any`, or keyed `<os>-<arch>`), and ships it to the
+/// node over the rail. `noo cluster vendor stage` is the fetch; the node
+/// never fetches.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct Distribution {
+    pub format: Format,
+    pub source: String,
+    #[serde(default)]
+    pub names: Option<Names>,
+    pub version: String,
+    pub sha256: BTreeMap<String, String>,
+    /// A `runtimes` entry the CLI runs on (`node`), or `None`.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// The path inside the unpacked tree to execute.
+    pub entry: String,
+    pub unpack: Unpack,
+}
+
+/// A runtime a staged CLI runs on, e.g. Node.js.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct Runtime {
+    pub version: String,
+    pub source: String,
+    #[serde(default)]
+    pub names: Option<Names>,
+    pub sha256: BTreeMap<String, String>,
+    pub unpack: Unpack,
+    pub bin_dir: String,
+}
+
+/// The URL to fetch an artefact from for `os`/`arch` and the sha256 it
+/// must hash to (lowercase). The noo CLI's `harness_kinds::artifact_url`
+/// is the same rule; this copy keeps the gateway's reading of the table
+/// typed and tested.
+#[allow(dead_code)]
+pub fn artifact_url(
+    source: &str,
+    names: Option<&Names>,
+    version: &str,
+    sha256: &BTreeMap<String, String>,
+    os: &str,
+    arch: &str,
+) -> Result<(String, String), String> {
+    let platform = format!("{os}-{arch}");
+    let sha = sha256
+        .get("any")
+        .or_else(|| sha256.get(&platform))
+        .ok_or_else(|| format!("no sha256 pin for {platform}"))?;
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("the sha256 pin for {platform} is not 64 hex characters"));
+    }
+    let (vos, varch) = match names {
+        Some(n) => (
+            n.os.get(os).cloned().ok_or_else(|| format!("names.os does not spell {os}"))?,
+            n.arch.get(arch).cloned().ok_or_else(|| format!("names.arch does not spell {arch}"))?,
+        ),
+        None => (os.to_string(), arch.to_string()),
+    };
+    let url = source.replace("{version}", version).replace("{os}", &vos).replace("{arch}", &varch);
+    Ok((url, sha.to_ascii_lowercase()))
 }
 
 /// How the driver (`harness::driver`) invokes a foreign CLI. A value
@@ -80,6 +186,10 @@ pub struct Launch {
 
 #[derive(Deserialize)]
 struct Table {
+    /// Runtimes a staged CLI may name (i83 E1e); optional.
+    #[serde(default)]
+    #[allow(dead_code)]
+    runtimes: BTreeMap<String, Runtime>,
     kinds: Vec<HarnessKind>,
 }
 
@@ -189,6 +299,78 @@ mod tests {
             }
             if let Some(rt) = d["runtime"].as_str() {
                 assert!(v["runtimes"][rt].is_object(), "{} needs runtime {rt}, not pinned", k["kind"]);
+            }
+        }
+    }
+
+    const FIXTURE: &str = r#"{
+      "runtimes": {"node": {"version": "22.11.0",
+        "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
+        "names": {"os": {"linux": "linux", "macos": "darwin"}, "arch": {"x86_64": "x64", "aarch64": "arm64"}},
+        "sha256": {"linux-x86_64": "1111111111111111111111111111111111111111111111111111111111111111",
+                   "macos-aarch64": "3333333333333333333333333333333333333333333333333333333333333333"},
+        "unpack": "tar.xz", "bin_dir": "bin"}},
+      "kinds": [
+        {"kind": "noo", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": null,
+         "lane": {}, "launch": null, "telemetry_off": {}},
+        {"kind": "copilot", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "copilot",
+         "lane": {}, "launch": null, "telemetry_off": {},
+         "distribution": {"format": "npm-tarball", "source": "https://registry.npmjs.org/@github/copilot/-/copilot-{version}.tgz",
+           "names": null, "version": "0.0.339",
+           "sha256": {"any": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+           "runtime": "node", "entry": "package/index.js", "unpack": "tgz"}},
+        {"kind": "codex", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "codex",
+         "lane": {}, "launch": null, "telemetry_off": {},
+         "distribution": {"format": "binary", "source": "https://example.invalid/{version}/codex-{arch}-{os}",
+           "names": {"os": {"linux": "unknown-linux-musl"}, "arch": {"x86_64": "x86_64"}}, "version": "0.46.0",
+           "sha256": {"linux-x86_64": "4444444444444444444444444444444444444444444444444444444444444444"},
+           "runtime": null, "entry": "codex", "unpack": "none"}},
+        {"kind": "manual", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "m",
+         "lane": {}, "launch": null, "telemetry_off": {}}
+      ]}"#;
+
+    #[test]
+    fn the_distribution_fixture_parses_every_variant() {
+        let t: Table = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let node = &t.runtimes["node"];
+        assert_eq!((node.unpack, node.bin_dir.as_str()), (Unpack::TarXz, "bin"));
+        let d = |k: &str| t.kinds.iter().find(|r| r.kind == k).unwrap().distribution.clone();
+        let cop = d("copilot").unwrap();
+        assert_eq!((cop.format, cop.unpack, cop.runtime.as_deref()), (Format::NpmTarball, Unpack::Tgz, Some("node")));
+        let cx = d("codex").unwrap();
+        assert_eq!((cx.format, cx.unpack, cx.runtime.as_deref()), (Format::Binary, Unpack::None, None));
+        assert!(d("manual").is_none(), "a cli with no distribution is a manual install");
+        assert!(d("noo").is_none());
+    }
+
+    #[test]
+    fn artifact_url_applies_names_and_pins() {
+        let t: Table = serde_json::from_str(FIXTURE).unwrap();
+        let node = &t.runtimes["node"];
+        let (u, s) = artifact_url(&node.source, node.names.as_ref(), &node.version, &node.sha256, "macos", "aarch64").unwrap();
+        assert_eq!(u, "https://nodejs.org/dist/v22.11.0/node-v22.11.0-darwin-arm64.tar.xz");
+        assert_eq!(s, "3".repeat(64));
+        assert!(artifact_url(&node.source, node.names.as_ref(), &node.version, &node.sha256, "linux", "aarch64").is_err());
+        let cop = t.kinds.iter().find(|r| r.kind == "copilot").unwrap().distribution.clone().unwrap();
+        let (u, s) = artifact_url(&cop.source, cop.names.as_ref(), &cop.version, &cop.sha256, "linux", "aarch64").unwrap();
+        assert_eq!(u, "https://registry.npmjs.org/@github/copilot/-/copilot-0.0.339.tgz");
+        assert_eq!(s, "a".repeat(64), "an any pin serves every platform, lowercased");
+        let cx = t.kinds.iter().find(|r| r.kind == "codex").unwrap().distribution.clone().unwrap();
+        let (u, _) = artifact_url(&cx.source, cx.names.as_ref(), &cx.version, &cx.sha256, "linux", "x86_64").unwrap();
+        assert_eq!(u, "https://example.invalid/0.46.0/codex-x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn the_shipped_table_parses_with_or_without_distributions() {
+        // The shipped file may or may not carry the E1e data yet; either way
+        // every declared distribution must parse into the typed shape.
+        let t: Table = serde_json::from_str(RAW).expect("parses");
+        for k in &t.kinds {
+            if let Some(d) = &k.distribution {
+                assert!(k.cli.is_some(), "{} has a distribution but no cli", k.kind);
+                if let Some(r) = &d.runtime {
+                    assert!(t.runtimes.contains_key(r), "{} names runtime {r}, which runtimes does not declare", k.kind);
+                }
             }
         }
     }

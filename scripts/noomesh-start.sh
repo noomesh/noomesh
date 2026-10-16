@@ -233,60 +233,13 @@ if [ "$DIST" = true ]; then
     echo "Distribution mode: ON"
     echo "  Images: ${NOO_IMAGE_PREFIX}/<service>:${NOO_IMAGE_TAG} (pull-only, no local build)"
 
-    # Digest pins. `noo upgrade --stack` fetches the
-    # release's signed stack-<tag>.lock, verifies it against the release key
-    # baked into the CLI, and writes it here as stack.lock. Every compose
-    # image ref carries `${NOO_IMAGE_DIGEST_<SVC>:-}`, so with the lock
-    # present docker pulls `<image>:<tag>@sha256:…` — the tag is a label,
-    # the digest is what runs. A lock for a DIFFERENT tag is ignored (and
-    # said so): never pin one tag's digests onto another.
-    if [ -f "stack.lock" ]; then
-        if grep -q "^# tag ${DIST_TAG}\$" stack.lock; then
-            while IFS= read -r line; do
-                case "$line" in \#*|"") continue ;; esac
-                img="${line%%@*}"; dig="${line#*@}"
-                # IMAGE rows only. The lock also carries provenance rows —
-                # `source:trellion@<git sha>` since #1108 — which are not
-                # images, and whose derived name (NOO_IMAGE_DIGEST_SOURCE:…)
-                # is not a valid shell identifier. `export` then fails, and
-                # under `set -e` that killed every start on stack v0.2.22:
-                # the first tag whose lock carried provenance could not boot.
-                #
-                # Testing the DIGEST is what states the intent — an image
-                # row is the one that carries a sha256 digest.
-                case "$dig" in sha256:*) : ;; *) continue ;; esac
-                var="NOO_IMAGE_DIGEST_$(printf '%s' "$img" | tr 'a-z-' 'A-Z_')"
-                # ...and testing the NAME is what makes it safe, because the
-                # digest test alone does not close the failure mode it was
-                # written for. `export` dies on any name that is not a shell
-                # identifier, and `tr` only folds case and hyphens: a colon,
-                # a dot or a slash survives it. So a row like
-                # `attestation:sbom@sha256:…`, a registry-qualified
-                # `ghcr.io/owner/gateway@sha256:…`, or a bare `sha256:x` with
-                # no `@` at all (img and dig are then the same string, and it
-                # passes the digest test) reproduces v0.2.22 exactly: every
-                # start dies under `set -e`.
-                #
-                # Today's eleven image names are all lowercase and hyphens,
-                # so none of that is live — which is precisely the position
-                # we were in before #1108 added a row nobody had anticipated.
-                # A name we cannot export is a row we do not understand, and
-                # the launcher's job is to start the stack, not to adjudicate
-                # lock formats. Skip it, say so, and keep booting.
-                case "$var" in
-                    ''|[!A-Z_]*|*[!A-Z0-9_]*)
-                        echo "noomesh-start: stack.lock row '''$line''' does not name an image variable — skipping" >&2
-                        continue
-                        ;;
-                esac
-                export "$var=@$dig"
-                _DIST_PINS+=("$var=@$dig")
-            done < stack.lock
-            ui_kv "Digests" "pinned from stack.lock $(ui_muted "(signed release stack-${DIST_TAG})")"
-        else
-            ui_kv "Digests" "stack.lock is for another tag — pulling ${DIST_TAG} by tag $(ui_muted "(noo upgrade --stack refreshes the lock)")"
-        fi
-    fi
+    # Digest pins from the signed stack.lock (lib-dist.sh dist_load_stack_lock;
+    # a lock for another tag is never applied).
+    dist_load_stack_lock "$DIST_TAG"
+    case "$_DIST_LOCK_STATE" in
+        loaded) ui_kv "Digests" "pinned from stack.lock $(ui_muted "(signed release stack-${DIST_TAG})")" ;;
+        other) ui_kv "Digests" "stack.lock is for another tag — pulling ${DIST_TAG} by tag $(ui_muted "(noo upgrade --stack refreshes the lock)")" ;;
+    esac
 
     # ── Promotion guardrails (2026-08-28 incident: a plain start silently
     # DOWNGRADED v0.1.91 → v0.1.75 because the yaml's pinned NOO_IMAGE_TAG
@@ -512,7 +465,11 @@ if [ -d "$_hf_dir" ] && [ ! -d "$_hf_dir/hub" ] &&    [ -n "$(find "$_hf_dir" -m
     ui_note "see docs/models/weight-cache.md"
 fi
 unset _hf_dir
-unset _data_root
+# _data_root stays set: the re-own (reown_nonroot_dirs, i64/i100) runs just
+# before each `up`, far below, and reads it. 0.6.4/0.6.5-rc.1 unset it HERE,
+# so both `if [ -n "$_data_root" ]` guards were false and the re-own never
+# ran (the rc.1 rehearsal: redis crash-looped on the seeded root-owned AOF
+# manifest). tests/test_launcher_reown_nonroot_dirs.py runs the real script.
 # The dist-tag RESOLUTION is authoritative — re-assert it after every env
 # source has loaded. The sops store can carry a STALE NOO_IMAGE_TAG (the
 # wizard encrypts the whole .env, pin included) and load_secrets exports

@@ -460,8 +460,8 @@ legacy_image_namespaces() { printf 'pai-assistant'; }
 # caller. Call it first if you want the dist values; this function is correct
 # either way.
 #
-# Digests: `noomesh-start.sh` is the only thing that loads `stack.lock` into
-# NOO_IMAGE_DIGEST_* vars, so a script that has not been through the launcher
+# Digests: only `dist_load_stack_lock` (start and restart) loads `stack.lock` into
+# NOO_IMAGE_DIGEST_* vars, so a script that has not been through one of them
 # resolves by TAG. That is the right trade for a disposable container — it is
 # a read-only consumer of a dump, not a fleet service — and it is stated here
 # rather than left to be discovered.
@@ -474,10 +474,86 @@ resolve_release_image() {
         "${NOO_IMAGE_PREFIX:-$(local_image_namespace)}" "$name" "${NOO_IMAGE_TAG:-latest}" "$digest"
 }
 
+_DIST_PINS=()
+# dist_load_stack_lock TAG - the ONE reader of ./stack.lock (the start
+# launcher and the restart both call it; a restart that skipped it recreated
+# every core container by TAG, no @sha256, on 0.6.5-rc.1). `noo upgrade
+# --stack` fetches the release's signed stack-<tag>.lock, verifies it against
+# the release key baked into the CLI, and writes it here as stack.lock. Every
+# compose image ref carries `${NOO_IMAGE_DIGEST_<SVC>:-}`, so with the lock
+# loaded docker runs `<image>:<tag>@sha256:...` - the tag is a label, the
+# digest is what runs. A lock for a DIFFERENT tag is never applied: one tag's
+# digests are never pinned onto another. Exports each pin, records it in
+# _DIST_PINS, and sets _DIST_LOCK_STATE to loaded | missing | other.
+_DIST_LOCK_STATE=missing
+dist_load_stack_lock() {
+    local line img dig var
+    _DIST_LOCK_STATE=missing
+    [ -f "stack.lock" ] || return 0
+    if ! grep -q "^# tag ${1}\$" stack.lock; then
+        _DIST_LOCK_STATE=other
+        return 0
+    fi
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        img="${line%%@*}"; dig="${line#*@}"
+        # IMAGE rows only. The lock also carries provenance rows —
+        # `source:trellion@<git sha>` since #1108 — which are not
+        # images, and whose derived name (NOO_IMAGE_DIGEST_SOURCE:…)
+        # is not a valid shell identifier. `export` then fails, and
+        # under `set -e` that killed every start on stack v0.2.22:
+        # the first tag whose lock carried provenance could not boot.
+        #
+        # Testing the DIGEST is what states the intent — an image
+        # row is the one that carries a sha256 digest.
+        case "$dig" in sha256:*) : ;; *) continue ;; esac
+        var="NOO_IMAGE_DIGEST_$(printf '%s' "$img" | tr 'a-z-' 'A-Z_')"
+        # ...and testing the NAME is what makes it safe, because the
+        # digest test alone does not close the failure mode it was
+        # written for. `export` dies on any name that is not a shell
+        # identifier, and `tr` only folds case and hyphens: a colon,
+        # a dot or a slash survives it. So a row like
+        # `attestation:sbom@sha256:…`, a registry-qualified
+        # `ghcr.io/owner/gateway@sha256:…`, or a bare `sha256:x` with
+        # no `@` at all (img and dig are then the same string, and it
+        # passes the digest test) reproduces v0.2.22 exactly: every
+        # start dies under `set -e`.
+        #
+        # Today's eleven image names are all lowercase and hyphens,
+        # so none of that is live — which is precisely the position
+        # we were in before #1108 added a row nobody had anticipated.
+        # A name we cannot export is a row we do not understand, and
+        # the launcher's job is to start the stack, not to adjudicate
+        # lock formats. Skip it, say so, and keep booting.
+        case "$var" in
+            ''|[!A-Z_]*|*[!A-Z0-9_]*)
+                echo "stack.lock row '''$line''' does not name an image variable — skipping" >&2
+                continue
+                ;;
+        esac
+        export "$var=@$dig"
+        _DIST_PINS+=("$var=@$dig")
+    done < stack.lock
+    _DIST_LOCK_STATE=loaded
+}
+
+# dist_require_lock TAG VERB - a recreate under distribution mode runs the
+# signed digests or nothing: refuse (exit status 1, saying why and the fix)
+# when ./stack.lock is missing or for another tag.
+dist_require_lock() {
+    case "$_DIST_LOCK_STATE" in
+        loaded) return 0 ;;
+        other) echo "ERROR: stack.lock is not for ${1} — refusing to $2 by tag (unpinned images)." >&2 ;;
+        *) echo "ERROR: no stack.lock for ${1} — refusing to $2 by tag (unpinned images)." >&2 ;;
+    esac
+    echo "       lay down the signed lock first: noo upgrade --stack --tag ${1}" >&2
+    return 1
+}
+
 # (Defined here, not in the launcher: the launcher's own guard tests read its
 # text for `docker compose` lines before the secrets check.)
 # The dist pins - NOO_IMAGE_TAG and the stack.lock digests - are resolved ONCE,
-# in the dist block below, which records every digest it exports in
+# by dist_load_stack_lock above, which records every digest it exports in
 # _DIST_PINS. Every later loader (load_secrets exports unconditionally,
 # load_config adds compose_env) can write the same names, and the pull and the
 # `up` after it must see the SAME values. `dist_reassert_pins` is the one place
@@ -485,7 +561,6 @@ resolve_release_image() {
 # (a digest is only ever the lock's, never another tag's) and re-exports the
 # recorded ones plus the tag. Called once, after the last loader and before the
 # pull.
-_DIST_PINS=()
 dist_reassert_pins() {
     [ -n "${DIST_TAG:-}" ] || return 0
     local _v _p

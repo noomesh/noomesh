@@ -3939,9 +3939,28 @@ pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
     }
 }
 
+/// When the `restart loops` row names `<prefix>-redis`, a failing `gateway
+/// redis` row is the gateway reporting the loop, and `noo stack restart
+/// gateway` cannot fix it: the 0.6.5-rc.1 rehearsal's seeded root-owned AOF
+/// manifest showed both rows failing with the remedy sending the operator to
+/// the one container that was fine. Repoint that remedy at redis.
+pub(crate) fn redis_remedy_follows_a_redis_loop(checks: &mut [Check], prefix: &str, data_root: &str) {
+    let looping = format!("{prefix}-redis is restart-looping");
+    if !checks.iter().any(|c| c.name == restart_loops::NAME && c.verdict == Verdict::Fail && c.detail.contains(&looping)) {
+        return;
+    }
+    let dir = format!("{}/redis", data_root.trim_end_matches('/'));
+    for c in checks.iter_mut().filter(|c| c.name == "gateway redis" && c.verdict == Verdict::Fail) {
+        c.remedy = Some(format!(
+            "noo stack logs redis (redis is restart-looping, see `restart loops`; for 'Permission denied' on its AOF/RDB files (i100): \
+             sudo chown -R 65532:65532 {dir}, then noo stack restart redis)"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod gateway_redis_tests {
-    use super::{gateway_redis_check, gateway_redis_state, Verdict};
+    use super::{gateway_redis_check, gateway_redis_state, redis_remedy_follows_a_redis_loop, restart_loops, Verdict};
     use serde_json::json;
 
     fn health(state: &str) -> serde_json::Value {
@@ -3964,6 +3983,41 @@ mod gateway_redis_tests {
             assert!(c.detail.starts_with(&format!("not connected ({state})")), "{}", c.detail);
             assert_eq!(c.remedy.as_deref(), Some("noo stack restart gateway"));
         }
+    }
+
+    #[test]
+    fn a_redis_restart_loop_repoints_the_gateway_redis_remedy_at_redis() {
+        let loop_row = |container: &str| {
+            restart_loops::row(
+                Ok(vec![restart_loops::Looping {
+                    container: container.into(),
+                    restarts: 7,
+                    last_error: Some("Fatal error: can't open the AOF manifest file appendonly.aof.manifest: Permission denied".into()),
+                }]),
+                "noo",
+            )
+        };
+        let mut checks = vec![gateway_redis_check(Some(&health("reconnecting"))), loop_row("noo-redis")];
+        redis_remedy_follows_a_redis_loop(&mut checks, "noo", "/var/lib/noo/");
+        let r = checks[0].remedy.as_deref().unwrap();
+        assert!(r.starts_with("noo stack logs redis"), "{r}");
+        assert!(r.contains("sudo chown -R 65532:65532 /var/lib/noo/redis"), "{r}");
+        assert!(!r.contains("restart gateway"), "{r}");
+        // The restart-loops row itself is untouched.
+        assert_eq!(checks[1].remedy.as_deref(), Some("noo stack logs redis"));
+
+        // Another container looping: the gateway remedy stands.
+        let mut checks = vec![gateway_redis_check(Some(&health("reconnecting"))), loop_row("noo-loki")];
+        redis_remedy_follows_a_redis_loop(&mut checks, "noo", "/var/lib/noo");
+        assert_eq!(checks[0].remedy.as_deref(), Some("noo stack restart gateway"));
+
+        // No loop: unchanged; a connected gateway row is never given a remedy.
+        let mut checks = vec![gateway_redis_check(Some(&health("reconnecting"))), restart_loops::row(Ok(vec![]), "noo")];
+        redis_remedy_follows_a_redis_loop(&mut checks, "noo", "/var/lib/noo");
+        assert_eq!(checks[0].remedy.as_deref(), Some("noo stack restart gateway"));
+        let mut checks = vec![gateway_redis_check(Some(&health("connected"))), loop_row("noo-redis")];
+        redis_remedy_follows_a_redis_loop(&mut checks, "noo", "/var/lib/noo");
+        assert_eq!(checks[0].remedy, None);
     }
 
     #[test]
@@ -4295,6 +4349,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // A container docker keeps restarting reads "Up" between restarts;
         // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
         checks.push(restart_loops::restart_loops_row());
+        // A gateway that cannot reach a crash-looping redis is redis's
+        // problem: point the `gateway redis` remedy at redis, not a gateway
+        // restart (0.6.5-rc.1 rehearsal).
+        redis_remedy_follows_a_redis_loop(
+            &mut checks,
+            &crate::envfile::container_prefix(),
+            &std::env::var("NOO_DATA_ROOT").ok().filter(|r| !r.is_empty())
+                .unwrap_or_else(|| crate::commands::data_root::DEFAULT_DATA_ROOT.into()),
+        );
         // Every container that bind-mounts noomesh.yaml still
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# Which harness is better on awolf? The same three tasks under each harness
+# kind, in turn. WHILE IT RUNS THIS CHANGES awolf's harness placement
+# (NOO_HARNESS_KIND), and puts the original back at the end, and on error.
+#
+# From the repository root:
+#   live:     PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-compare-awolf.yaml --gateway URL
+#             (operator credential in NOO_EVAL_TOKEN or --token)
+#   dry run:  PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-compare-awolf.yaml --fixture
+# Writes eval/reports/harness-compare-on-awolf.html and .json (git-ignored).
+#
+# check: contains:<text> (case-insensitive) | regex:<re> | nonempty | state:<state>
+# A task with `kinds: [...]` runs only under those kinds (the others show as skipped).
+name: Harness compare on awolf
+description: >
+  noo vs copilot vs claude-code on one node: a trivial reply, a question that
+  needs a mesh tool, and a two-step delegation. Pass rate, loops, wall time
+  and tokens per kind.
+harness_compare:
+  node: awolf
+  kinds: [noo, copilot, claude-code]
+  task_timeout_s: 600     # per task, unless the task sets timeout_s
+  poll_s: 5
+  settle_s: 20            # minimum wait after a kind change before trusting "running"
+  ready_timeout_s: 300    # a kind whose harness never reports running is recorded, not waited on
+  require_dispatch: true  # a task the controller ran in process fails: it measured the controller
+  # task_token_env: NOO_EVAL_TASK_TOKEN   # create tasks / read usage as this USER (optional)
+  task_sets:
+    - name: basics
+      tasks:
+        - name: reply-ok
+          objective: "Reply with the single word: ok"
+          loop_budget: 2
+          check: "regex:(?i)^\\W*ok\\W*$"
+          timeout_s: 180
+        - name: mesh-nodes
+          objective: >
+            Use your noomesh tools to list the nodes in this mesh, then finish
+            with a one-line answer that names every node.
+          loop_budget: 4
+          check: "contains:awolf"
+        - name: delegate
+          objective: >
+            Delegate a child task whose objective is "Reply with the single word: pong",
+            wait for it, then finish with the child's answer.
+          loop_budget: 6
+          check: "contains:pong"

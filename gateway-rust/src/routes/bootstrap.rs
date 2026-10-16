@@ -127,11 +127,15 @@ pub fn router() -> Router<Arc<AppState>> {
 /// node an operator watches most closely was again the one that could not
 /// fail.
 ///
-/// 256 MB is deliberately far above the largest bundle we ship rather than
-/// just above it: the next thing to join a bundle should not be a third
-/// outage. The body is buffered in memory, and the CLI stages one node at a
-/// time, so the ceiling is one bundle rather than the fleet.
-pub(crate) const MAX_RAIL_BODY: usize = 256 * 1024 * 1024;
+/// 256 MB was deliberately far above the largest bundle we shipped. Then the
+/// vendor CLIs joined (i83 E1e): a node whose harness placement names
+/// Copilot CLI, Claude Code or Codex carries that native binary, 100-250 MB
+/// per artefact and often already compressed, beside the ~82 MB it carried
+/// before — up to ~330 MB, past 256. 768 MB keeps twice that, and stays
+/// under Postgres's 1 GB limit on the bytea the bundle is stored in. The
+/// body is buffered in memory, and the CLI stages one node at a time, so
+/// the ceiling is one bundle rather than the fleet.
+pub(crate) const MAX_RAIL_BODY: usize = 768 * 1024 * 1024;
 
 // ═══════════════════════════════════════════════════════════════
 // Guards + shared helpers
