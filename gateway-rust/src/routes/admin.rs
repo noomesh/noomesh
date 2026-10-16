@@ -509,7 +509,7 @@ async fn logs_node_container(
 /// connections). Falls back to a basic healthy/unhealthy response if
 /// INFO parsing fails.
 pub(crate) async fn cache_stats(State(state): State<Arc<AppState>>) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"enabled": false, "reason": "Redis not connected"})),
     };
@@ -932,7 +932,7 @@ async fn list_jobs(
 /// `routes/kiosk.rs` can project this route's own answer instead of reading
 /// Redis a second time.
 pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) -> Value {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return json!({"jobs": [], "count": 0, "error": "Redis not connected"}),
     };
@@ -1035,7 +1035,7 @@ async fn job_history(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => {
             return Ok(Json(
@@ -1081,7 +1081,7 @@ async fn get_job(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Err(AppError::Internal("Redis not connected".into())),
     };
@@ -1139,7 +1139,7 @@ async fn cancel_job(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Err(AppError::Internal("Redis not connected".into())),
     };
@@ -1292,7 +1292,7 @@ async fn reprioritize_job(
         cluster.as_ref().map(|Extension(c)| c),
     )
     .map_err(AppError::Forbidden)?;
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Err(AppError::Internal("Redis not connected".into())),
     };
@@ -1379,7 +1379,7 @@ async fn scheduler_submit_task(
         return Ok(resp);
     }
 
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Err(AppError::Internal("Redis not connected".into())),
     };
@@ -1569,7 +1569,7 @@ async fn scheduler_submit_job(
         priority = p;
         knobs = k;
         // AFTER validation: a refused request is not charged to the quota.
-        let Some(redis) = &state.redis else {
+        let Some(redis) = state.redis.as_ref() else {
             return Err(redis_not_connected());
         };
         match redis
@@ -1599,7 +1599,7 @@ async fn scheduler_submit_job(
         return Ok(resp);
     }
 
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Err(redis_not_connected()),
     };
@@ -1817,7 +1817,7 @@ fn scheduler_running() -> (&'static str, Option<bool>, String) {
 pub(crate) async fn scheduler_status(
     State(state): State<Arc<AppState>>,
 ) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"error": "Redis not connected"})),
     };
@@ -1860,7 +1860,7 @@ pub(crate) async fn scheduler_status(
 async fn scheduler_pause(
     State(state): State<Arc<AppState>>,
 ) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"error": "Redis not connected"})),
     };
@@ -1879,7 +1879,7 @@ async fn scheduler_pause(
 async fn scheduler_resume(
     State(state): State<Arc<AppState>>,
 ) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"error": "Redis not connected"})),
     };
@@ -1900,7 +1900,7 @@ async fn scheduler_drain(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
 ) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"error": "Redis not connected"})),
     };
@@ -1925,7 +1925,7 @@ async fn scheduler_undrain(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
 ) -> AppJson {
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => return Json(json!({"error": "Redis not connected"})),
     };
@@ -2069,7 +2069,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
     // timeout_sec elapses (dispatched_at/node_id make it reaper-visible).
     let now = chrono::Utc::now().to_rfc3339();
     const TESTS_TIMEOUT_SEC: i64 = 3600;
-    if let Some(ref redis) = state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         let key = format!("{JOB_KEY_PREFIX}{job_id}");
         let payload = json!({"suite": suite}).to_string();
         let pairs = job_hash_pairs(&JobHashSpec {
@@ -2134,7 +2134,7 @@ async fn spawn_test_run(state: &Arc<AppState>, suite: &str) -> String {
 
         tracing::info!(job_id = %job_id_clone, status, "tests: finished");
 
-        if let Some(ref redis) = state_bg.redis {
+        if let Some(redis) = state_bg.redis.as_ref() {
             let done_at = chrono::Utc::now().to_rfc3339();
             let key = format!("{JOB_KEY_PREFIX}{job_id_clone}");
             let error = if status == "failed" { summary.as_str() } else { "" };
@@ -2178,7 +2178,7 @@ async fn security_violations(
     let mut stats = serde_json::Map::new();
     let mut total: i64 = 0;
 
-    if let Some(ref redis) = state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         // Counters written by the Rust request path (see
         // cache.rs::record_security_violation): the rate-limit middleware
         // bumps `rate_limit` on 429s and `before_tool_call` bumps the

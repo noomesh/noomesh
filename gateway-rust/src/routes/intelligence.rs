@@ -2314,8 +2314,8 @@ async fn autonomy_toggle_location(
 
 /// Write the global autonomy flag; 503 when the write did not happen.
 async fn set_autonomy_flag(state: &AppState, value: &str) -> Result<(), AppError> {
-    match state.redis {
-        Some(ref redis) => {
+    match state.redis.as_ref() {
+        Some(redis) => {
             if redis.set_string("noo:autonomy:enabled", value).await {
                 Ok(())
             } else {

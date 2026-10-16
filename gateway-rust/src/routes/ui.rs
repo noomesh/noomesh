@@ -558,7 +558,7 @@ async fn proactive_status(
     //
     // Note `Cache::get_string` returns Option<String> and cannot distinguish
     // an absent key from a Redis error, so the detail names both.
-    let (running, running_detail): (Option<bool>, String) = match state.redis {
+    let (running, running_detail): (Option<bool>, String) = match state.redis.as_ref() {
         None => (
             None,
             "unknown — Redis is not configured, and the proactive agent's \
@@ -566,7 +566,7 @@ async fn proactive_status(
              process has"
                 .to_string(),
         ),
-        Some(ref redis) => match redis.get_string("noo:proactive:status").await {
+        Some(redis) => match redis.get_string("noo:proactive:status").await {
             Some(v) if v == "running" => (
                 Some(true),
                 "noo:proactive:status == \"running\" (SET EX 30 by the Python \
@@ -1255,7 +1255,7 @@ async fn browser_status(
     // the module comment: this counter's only writer is the Rust
     // /sessions/start route, so it is a partial count, not "all live
     // browsers". Callers were free to read it as the latter.
-    let (active_sessions, sessions_source) = if let Some(ref redis) = state.redis {
+    let (active_sessions, sessions_source) = if let Some(redis) = state.redis.as_ref() {
         match redis.get_string("noo:browser:session_count").await {
             Some(s) => match s.parse::<u32>() {
                 Ok(n) => (Some(n), "redis"),
@@ -1469,7 +1469,7 @@ async fn browser_start(
     });
 
     // Store session in Redis for cross-process visibility
-    if let Some(ref redis) = state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         // Store individual session
         redis.set_string(
             &format!("noo:browser:session:{session_id}"),
@@ -1506,7 +1506,7 @@ async fn browser_stop(
     Path(session_id): Path<String>,
 ) -> AppResult {
     // Look up session from Redis
-    let session_data: Option<Value> = if let Some(ref redis) = state.redis {
+    let session_data: Option<Value> = if let Some(redis) = state.redis.as_ref() {
         redis.get_string(&format!("noo:browser:session:{session_id}")).await
             .and_then(|s| serde_json::from_str(&s).ok())
     } else {
@@ -1548,7 +1548,7 @@ async fn browser_stop(
     }
 
     // Remove session from Redis
-    if let Some(ref redis) = state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         redis.del_key(&format!("noo:browser:session:{session_id}")).await;
 
         // Update session list (remove this session)
@@ -1579,7 +1579,7 @@ async fn browser_sessions(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
     // Try to read sessions from Redis
-    let sessions: Vec<Value> = if let Some(ref redis) = state.redis {
+    let sessions: Vec<Value> = if let Some(redis) = state.redis.as_ref() {
         match redis.get_string("noo:browser:sessions").await {
             Some(data) => {
                 serde_json::from_str::<Vec<Value>>(&data).unwrap_or_default()
@@ -1642,7 +1642,7 @@ async fn browser_action(
         .unwrap_or("")
         .to_string();
     if session_id.is_empty() {
-        if let Some(ref redis) = state.redis {
+        if let Some(redis) = state.redis.as_ref() {
             let sessions: Vec<Value> = redis
                 .get_string("noo:browser:sessions")
                 .await
@@ -1680,8 +1680,8 @@ async fn browser_action(
 
     // Look up the session's container URL.
     let session_key = format!("noo:browser:session:{session_id}");
-    let session_data: Option<Value> = match state.redis {
-        Some(ref redis) => redis
+    let session_data: Option<Value> = match state.redis.as_ref() {
+        Some(redis) => redis
             .get_string(&session_key)
             .await
             .and_then(|s| serde_json::from_str(&s).ok()),
@@ -1783,7 +1783,7 @@ async fn browser_action(
     };
 
     // Touch last_action so idle bookkeeping reflects reality.
-    if let Some(ref redis) = state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         session_data["last_action"] = json!(chrono::Utc::now().timestamp() as f64);
         redis.set_string(&session_key, &session_data.to_string()).await;
     }

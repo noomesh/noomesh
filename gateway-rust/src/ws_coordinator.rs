@@ -174,7 +174,7 @@ async fn handle_chat(
                 let messages_for_cache = vec![json!({"role": "user", "content": chat_msg.prompt})];
                 let cache_key = crate::cache::RedisCache::llm_cache_key(
                     "auto", &messages_for_cache, uid.as_deref());
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     if let Some(cached) = redis.get_llm_cache(&cache_key).await {
                         tracing::debug!("llm_cache_hit");
                         if let Some(content) = cached.get("content").and_then(|c| c.as_str()) {
@@ -230,7 +230,7 @@ async fn handle_chat(
                     Ok(result) => {
                         // Cache the response
                         if !result.response.is_empty() {
-                            if let Some(redis) = &state.redis {
+                            if let Some(redis) = state.redis.as_ref() {
                                 redis
                                     .set_llm_cache(
                                         &cache_key,
