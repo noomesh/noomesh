@@ -186,8 +186,13 @@ list of `node/backend[=model]` candidates the gateway fails over across.
 restates a placement); `--degraded` candidates are the only ones allowed to
 answer with a different model, and only once every other candidate has
 failed. With nothing declared, every served model is its own class and
-`chat-default` is the configured default model. `noo cluster verify
---controller` has a `model classes` row for candidates that are neither
+`chat-default` is the configured default model. The `legacy lanes` row of
+`noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
+node by name, from the gateway's counters and from each agent's heartbeat)
+still signing the old, replayable cluster token instead of the request-bound
+v2; it reads 0 once every node has upgraded, and only then is it safe to set
+`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page). `noo cluster
+verify --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
 
 `--pool` turns the list into peers instead of a failover order: each
