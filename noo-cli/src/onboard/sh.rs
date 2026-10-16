@@ -171,6 +171,9 @@ fn bind_sources_refusal(ctx: &Ctx, args: &[&str]) -> Option<String> {
     let cfg: serde_json::Value = serde_json::Deserializer::from_str(&out).into_iter().next()?.ok()?;
     let data_root = ctx.read_env("NOO_DATA_ROOT");
     let root = if data_root.is_empty() { crate::commands::data_root::DEFAULT_DATA_ROOT.to_string() } else { data_root };
+    // No systemd = no hostd to create the host spool: make it here, as the
+    // user, rather than refuse (and rather than let Docker make it root-owned).
+    crate::commands::bind_sources::ensure_hostd_spool(&cfg, &services, no_deps, crate::commands::bind_sources::systemd_present());
     let findings = crate::commands::bind_sources::check(&cfg, &services, no_deps, Some(&root));
     (!findings.is_empty()).then(|| crate::commands::bind_sources::refusal(&findings))
 }
