@@ -128,6 +128,18 @@ impl RemoteRuntime {
         .map(|_| ())
     }
 
+    /// `budget_check`: the token switch, asked of the gateway — a runner on
+    /// a node never reads the database.
+    pub async fn budget_check(&self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+        let v = self.call(HarnessOp::BudgetCheck { task_id: task_id.to_string() }).await?;
+        serde_json::from_value(v).map_err(|e| anyhow!("harness rail: budget_check: {e}"))
+    }
+
+    /// `task_ask`: a loop's question to its owner.
+    pub async fn task_ask(&self, task_id: &str, question: &str) -> Result<()> {
+        self.call(HarnessOp::TaskAsk { task_id: task_id.to_string(), question: question.to_string() }).await.map(|_| ())
+    }
+
     /// One rail call. Non-2xx and non-JSON answers are errors; the body's
     /// `error` field, when the gateway sent one, is the message.
     pub async fn call(&self, op: HarnessOp) -> Result<Value> {
@@ -183,6 +195,22 @@ impl super::runtime::TaskRuntime for RemoteRuntime {
             self.token = t.to_string();
         }
         Self::field(&v, "state")
+    }
+
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+        RemoteRuntime::budget_check(self, task_id).await
+    }
+
+    async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()> {
+        self.call(HarnessOp::TaskUsage {
+            task_id: task_id.to_string(),
+            prompt_tokens: result.usage.prompt_tokens as u64,
+            completion_tokens: result.usage.completion_tokens as u64,
+            model: result.model.clone(),
+            backend: result.backend.clone(),
+        })
+        .await
+        .map(|_| ())
     }
 }
 

@@ -225,7 +225,7 @@ request object beside `op`.
 | `temporal_extract` | temporal extraction (`user_message`, `assistant_response`) |
 | `maybe_summary` | regenerate the running summary if due (`backend`, `turn`) |
 | `operator_alert` | raise an operator alert (`kind`, `target`, `cooldown_secs`, `message`); only `inference.backend_failover` is allowed, and the gateway writes the channel text itself |
-| `usage` | report the tokens a foreign loop's model calls used (`prompt_tokens`, `completion_tokens`, `total_tokens`, `calls`, `model`, `kind`, `task_id` optional), as the wire translator counted them; recorded in `noo_token_usage` as the token's user on the token's node, with source `harness`, backend `harness:<kind>` and the `harness_kind` column; `kind` must be a kind in `config/harness-kinds.json` |
+| `usage` | report the tokens a foreign loop's model calls used (`prompt_tokens`, `completion_tokens`, `total_tokens`, `calls`, `model`, `kind`, `task_id` optional), as the wire translator counted them; recorded in `noo_token_usage` as the token's user on the token's node, with source `harness`, backend `harness:<kind>` and the `harness_kind` column; `kind` must be a kind in `config/harness-kinds.json`. With a `task_id` that is this token's task, the row carries the task id and the tokens are added to the task's `tokens_spent` before the reply (which then carries `tokens_spent`) |
 
 **A task's loops**
 
@@ -233,6 +233,9 @@ request object beside `op`.
 |---|---|
 | `task_checkpoint` | record a loop boundary (`task_id`, `loops`, `note`, `exhausted`); replies `state` and a fresh `token` that replaces the old one |
 | `task_done` | a foreign CLI's verdict on its task (`task_id`, `result`, `failed`): what `noo_task_done` is for a native loop. The task must be this token's (403 otherwise). As for `noo_task_done` from the user door, there is no tool-use evidence gate (the CLI's tools ran on the node, outside noomesh's record); the result is recorded as given and posted to the task's thread; replies `state` |
+| `budget_check` | the token switch, asked BEFORE a loop starts and never during one (`task_id`): replies `proceed`, `reason`, `remaining_task`, `remaining_allowance`, `state` and, once after the owner answered a question, `clarification` (`question`, `answer`) for the next loop's prompt. On `proceed: false` the runner stops; the gateway has already parked the task (`budget_state` `exhausted` or `awaiting_clarification`) and posted the reason to its thread. The task must be this token's (403 otherwise) |
+| `task_usage` | a native loop's tokens, run on a node (`task_id`, `prompt_tokens`, `completion_tokens`, `model`, `backend`): recorded in `noo_token_usage` with source `task`, the task id, the token's user and node and the backend that served it, and added to the task's `tokens_spent`; replies `tokens_spent`. A `cloud-*` or `harness:*` backend is refused (400): cloud models run on the controller, and a foreign loop reports with `usage` |
+| `task_ask` | a loop's question to its owner (`task_id`, `question`): recorded and posted to the task's thread. The loop is not interrupted; at the next `budget_check` the task parks `awaiting_clarification` and waits for the owner's answer, which starts a new loop |
 
 **A foreign CLI's way back in**
 
@@ -411,7 +414,10 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
 6. Read the verdict. A task prompt asks for a last line
    `NOO_RESULT: <summary>` when the objective is achieved or
    `NOO_FAILED: <reason>` when it cannot be; either one becomes `task_done`.
-   Neither means more loops. A non-zero exit is a failed loop, its stderr
+   `NOO_QUESTION: <question>` when it cannot go on without the owner
+   becomes `task_ask`. None of them means more loops. Before each run the
+   driver asks `budget_check`; a `proceed: false` ends the task's runner
+   (the task is parked, not failed). A non-zero exit is a failed loop, its stderr
    tail the note; three in a row end the task, as for the native loop.
 7. Save the prompt and the answer (`session_save`), report the translator's
    token counts (`usage`), `task_checkpoint` (exhausted when the loop reached the

@@ -35,6 +35,7 @@ NATIVE = {
     "noo_rag_query", "noo_memory_search", "noo_inference",
     "noo_channel_send", "noo_tool_search", "web_search", "python_tool",
     "noo_agent_message", "noo_agent_inbox", "noo_agent_ack", "noo_task_done",
+    "noo_task_ask",
     "noo_task_delegate", "noo_task_status", "noo_task_wait",
 }
 

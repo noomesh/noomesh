@@ -143,6 +143,127 @@ pub fn usage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// The period words the gateway accepts for `usage me` and allowances.
+pub(crate) fn valid_period(p: &str) -> bool {
+    matches!(p, "day" | "week" | "month")
+}
+
+/// One column of `usage me`: label, prompt, completion, total, requests, cost.
+fn column_row(label: &str, c: &serde_json::Value) -> Vec<String> {
+    let cost = c["cost_usd"].as_f64().unwrap_or(0.0);
+    let unpriced = c["unpriced_tokens"].as_i64().unwrap_or(0);
+    vec![
+        label.to_string(),
+        c["prompt_tokens"].as_i64().unwrap_or(0).to_string(),
+        c["completion_tokens"].as_i64().unwrap_or(0).to_string(),
+        c["total_tokens"].as_i64().unwrap_or(0).to_string(),
+        c["requests"].as_i64().unwrap_or(0).to_string(),
+        if cost == 0.0 && unpriced > 0 { "-".to_string() } else { format!("${cost:.4}") },
+    ]
+}
+
+/// The report's columns as table rows: node, cloud, then one per harness
+/// kind — each its own row, never summed into another (pure, for tests).
+pub(crate) fn me_rows(body: &serde_json::Value) -> Vec<Vec<String>> {
+    let mut rows = vec![column_row("node", &body["node"]), column_row("cloud", &body["cloud"])];
+    if let Some(h) = body["harness"].as_array() {
+        for k in h {
+            rows.push(column_row(&format!("harness:{}", k["kind"].as_str().unwrap_or("?")), k));
+        }
+    }
+    rows
+}
+
+/// `noo usage me [--period day|week|month] [--user <u>]` — GET /api/usage/me.
+pub fn usage_me(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut period: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--period" | "-p" => period = Some(iter.next().ok_or(Unhandled)?.clone()),
+            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
+            _ => return Err(Unhandled),
+        }
+    }
+    if let Some(p) = &period {
+        if !valid_period(p) {
+            fail(g.json, ExitCode::Usage, "usage", &format!("invalid --period '{p}' (expected day|week|month)"), None);
+        }
+    }
+    let mut path = "/api/usage/me".to_string();
+    let mut sep = '?';
+    if let Some(p) = &period {
+        path.push_str(&format!("{sep}period={p}"));
+        sep = '&';
+    }
+    if let Some(u) = &user {
+        path.push_str(&format!("{sep}user={}", super::urlencode(u)));
+    }
+    let body = get_json(g, &path, true, 10);
+    if g.json {
+        println!("{body}");
+        return Ok(super::json_exit(&body));
+    }
+    let who = body["user"].as_str().unwrap_or("?");
+    let period = body["period"].as_str().unwrap_or("month");
+    println!("{}", ui::header("usage", Some(&format!("{who} · this {period}"))));
+    println!("{}", ui::section("tokens by where they ran"));
+    print!(
+        "{}",
+        ui::table(
+            &[Col::left("ran on"), Col::right("prompt"), Col::right("completion"), Col::right("total"), Col::right("reqs"), Col::right("cost")],
+            &me_rows(&body)
+        )
+    );
+    println!("  {}", ui::muted(&format!("spent {} tokens in all", body["spent"].as_i64().unwrap_or(0))));
+    println!("{}", ui::section("allowance"));
+    match body["allowance"].as_object() {
+        Some(a) => println!(
+            "  {} of {} tokens this {} — {} left",
+            a.get("spent").and_then(|v| v.as_i64()).unwrap_or(0),
+            a.get("limit").and_then(|v| v.as_i64()).unwrap_or(0),
+            a.get("period").and_then(|v| v.as_str()).unwrap_or("month"),
+            a.get("remaining").and_then(|v| v.as_i64()).unwrap_or(0)
+        ),
+        None => println!("  {}", ui::muted("none set — no standing cap")),
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod me_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Node, cloud and each harness kind are separate rows; nothing adds
+    /// them into one another.
+    #[test]
+    fn node_cloud_and_harness_are_separate_rows() {
+        let body = json!({
+            "node": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "requests": 2, "cost_usd": 0.0, "unpriced_tokens": 110},
+            "cloud": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "requests": 1, "cost_usd": 0.012, "unpriced_tokens": 0},
+            "harness": [{"kind": "copilot", "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "requests": 1, "cost_usd": 0.0, "unpriced_tokens": 10}],
+            "spent": 1320,
+        });
+        let rows = me_rows(&body);
+        let labels: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(labels, ["node", "cloud", "harness:copilot"]);
+        assert_eq!(rows[0][3], "110");
+        assert_eq!(rows[1][3], "1200");
+        assert_eq!(rows[1][5], "$0.0120");
+        assert_eq!(rows[0][5], "-", "unpriced is not $0");
+    }
+
+    #[test]
+    fn periods_are_day_week_month() {
+        for p in ["day", "week", "month"] {
+            assert!(valid_period(p));
+        }
+        assert!(!valid_period("year") && !valid_period("Month"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

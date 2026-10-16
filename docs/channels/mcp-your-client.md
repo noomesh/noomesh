@@ -199,12 +199,12 @@ Tool availability follows your account's role and scopes:
 
 ### Tasks
 
-Every account, from role `user` up, gets four task tools on the user door.
+Every account, from role `user` up, gets seven task tools on the user door.
 With them a client that has no loop of its own can hand the mesh an objective
 and follow it. That client might be your own Claude Code, or a CLI harness
 running a task it was given.
 
-- `noo_task_delegate {objective, parent_task_id?, role?, model?, loop_budget?}`
+- `noo_task_delegate {objective, parent_task_id?, role?, model?, loop_budget?, token_budget?}`
   opens a task for you and starts it. `parent_task_id` makes it a sub-task of
   one of your live tasks.
 - `noo_task_status {task_id?}` returns a task and its sub-tasks. With no id it
@@ -214,6 +214,14 @@ running a task it was given.
   it again.
 - `noo_task_done {task_id, result, failed?}` finishes the task and posts the
   result to its thread.
+- `noo_task_ask {task_id, question}` asks the task's owner a question the task
+  cannot go on without. The running loop finishes; then the task waits.
+- `noo_task_resubmit {task_id, token_budget?}` gives a task more tokens. A
+  task that ran out resumes from its checkpoint.
+- `noo_task_answer {task_id, text}` answers a task's question. A new loop
+  starts with the question and your answer.
+
+How token budgets work: [Token budgets](../operating/token-budgets.md).
 
 They act only on **your own** tasks, whatever your role: an admin's door
 cannot see anyone else's. Any other id answers `task not found`. Full

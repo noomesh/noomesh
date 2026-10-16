@@ -62,6 +62,7 @@ mod harness_kinds;
 mod harness;
 mod harness_main;
 mod tasks;
+mod task_budget;
 mod text;
 mod auth_refresh;
 mod cache;

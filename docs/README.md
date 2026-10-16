@@ -61,6 +61,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 |----------|-------------|
 | [operating/operator-manual.md](operating/operator-manual.md) | The controller stack day to day: what runs where, `noo stack` start/stop/rebuild/reset, profiles and add-ons, upgrades, backups, troubleshooting |
 | [operating/monitoring.md](operating/monitoring.md) | Prometheus scrapes, the gateway `/metrics` registry, node-agent and GPU exporters, alert rules, Grafana, Loki logs, health endpoints |
+| [operating/token-budgets.md](operating/token-budgets.md) | Token budgets on tasks and allowances per person: the switch between loops, resubmitting or answering a parked task, and node vs cloud spend |
 
 ### Runbooks
 

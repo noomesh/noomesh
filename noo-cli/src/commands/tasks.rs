@@ -5,7 +5,9 @@
 //!
 //! `create` starts a task as you, on the harness of the node holding its
 //! model or on the controller; `list`/`show` read; `stop` ends one at its
-//! next checkpoint. Progress and the result live in the task's
+//! next checkpoint. A task may carry a token budget (`--token-budget`):
+//! when it runs out the task parks between loops, and `resubmit` gives it
+//! more; a task that asked you a question waits for `answer`. Progress and the result live in the task's
 //! agent-message thread (`noo agents thread <id>`).
 
 use super::truncate;
@@ -17,11 +19,13 @@ pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut objective: Vec<String> = Vec::new();
     let mut model: Option<String> = None;
     let mut budget: Option<u64> = None;
+    let mut token_budget: Option<u64> = None;
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
         match tok.as_str() {
             "--model" | "-m" => model = Some(iter.next().ok_or(Unhandled)?.clone()),
             "--budget" | "-b" => budget = Some(iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?),
+            "--token-budget" | "-t" => token_budget = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).ok_or(Unhandled)?),
             t if t.starts_with('-') => return Err(Unhandled),
             t => objective.push(t.to_string()),
         }
@@ -36,6 +40,9 @@ pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     if let Some(b) = budget {
         body["loop_budget"] = serde_json::json!(b);
+    }
+    if let Some(t) = token_budget {
+        body["token_budget"] = serde_json::json!(t);
     }
     let resp = post_json(g, "/api/tasks", &body, true, 20);
     if g.json {
@@ -52,10 +59,11 @@ pub fn tasks_create(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // credentials are broken", which is where an operator landed
     // (2026-09-21).
     ui::done(&format!(
-        "task {} started {} ({} loops max)",
+        "task {} started {} ({} loops max{})",
         ui::muted(id),
         where_it_ran(node, resp["dispatched"].as_bool()),
-        t["loop_budget"].as_u64().unwrap_or(0)
+        t["loop_budget"].as_u64().unwrap_or(0),
+        t["token_budget"].as_i64().map(|b| format!(", {b} tokens max")).unwrap_or_default()
     ));
     if resp["dispatched"].as_bool() == Some(false) {
         if let Some(why) = resp["why"].as_str().filter(|w| !w.trim().is_empty()) {
@@ -130,7 +138,11 @@ pub fn tasks_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     _ => Glyph::Bullet,
                 }),
                 ui::muted(&truncate(t["id"].as_str().unwrap_or("?"), 8)),
-                if stale { format!("{} {}", ui::state(st), ui::warn("stale")) } else { ui::state(st) },
+                match (stale, t["budget_state"].as_str()) {
+                    (_, Some(b)) => format!("{} {}", ui::state(st), ui::warn(budget_label(b))),
+                    (true, None) => format!("{} {}", ui::state(st), ui::warn("stale")),
+                    (false, None) => ui::state(st),
+                },
                 format!("{}/{}", t["loops"].as_u64().unwrap_or(0), t["loop_budget"].as_u64().unwrap_or(0)),
                 truncate(t["owner"].as_str().unwrap_or("-"), 12),
                 truncate(t["node"].as_str().unwrap_or("-"), 12),
@@ -146,6 +158,24 @@ pub fn tasks_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         )
     );
     Ok(0)
+}
+
+/// A parked task's state, in a word or two.
+pub(crate) fn budget_label(state: &str) -> &'static str {
+    match state {
+        "exhausted" => "out of tokens",
+        "awaiting_clarification" => "asked you",
+        _ => "parked",
+    }
+}
+
+/// The "tokens" row: spent, of what, and what is left.
+pub(crate) fn tokens_line(t: &serde_json::Value) -> String {
+    let spent = t["tokens_spent"].as_i64().unwrap_or(0);
+    match t["token_budget"].as_i64() {
+        Some(b) => format!("{spent} of {b} ({} left)", t["remaining"].as_i64().unwrap_or((b - spent).max(0))),
+        None => format!("{spent} (no cap)"),
+    }
 }
 
 /// The "tools called" row: how many tools the task called and which. A
@@ -180,6 +210,17 @@ pub fn tasks_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("node", t["node"].as_str().unwrap_or(dash).to_string()),
         ("model", t["model"].as_str().unwrap_or("auto").to_string()),
         ("loops", format!("{} of {}", t["loops"].as_u64().unwrap_or(0), t["loop_budget"].as_u64().unwrap_or(0))),
+        ("tokens", tokens_line(t)),
+        ("allowance", match resp["allowance"].as_object() {
+            Some(a) => format!(
+                "{} of {} this {} ({} left)",
+                a.get("spent").and_then(|v| v.as_i64()).unwrap_or(0),
+                a.get("limit").and_then(|v| v.as_i64()).unwrap_or(0),
+                a.get("period").and_then(|v| v.as_str()).unwrap_or("month"),
+                a.get("remaining").and_then(|v| v.as_i64()).unwrap_or(0)
+            ),
+            None => "none".to_string(),
+        }),
         ("tools called", tools_line(&resp["tools"])),
         ("last checkpoint", t["last_checkpoint"].as_str().unwrap_or(dash).to_string()),
         ("thread", t["thread_id"].as_str().unwrap_or(dash).to_string()),
@@ -192,6 +233,20 @@ pub fn tasks_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if let Some(n) = t["last_note"].as_str().filter(|n| !n.is_empty()) {
         println!();
         println!("{} {}", ui::muted("last note:"), n);
+    }
+    let id = t["id"].as_str().unwrap_or(dash);
+    match t["budget_state"].as_str() {
+        Some("exhausted") => {
+            println!();
+            println!("{}", ui::warn("out of tokens: no more loops run until it is resubmitted"));
+            ui::guide(&[(&format!("noo tasks resubmit {id} --token-budget <n>"), "raise the budget and resume from the checkpoint")]);
+        }
+        Some("awaiting_clarification") => {
+            println!();
+            println!("{}", ui::warn("it asked you the question above and waits for your answer"));
+            ui::guide(&[(&format!("noo tasks answer {id} <text>"), "answer it; a new loop starts with your answer")]);
+        }
+        _ => {}
     }
     if let Some(r) = t["result"].as_str().filter(|r| !r.is_empty()) {
         println!();
@@ -236,6 +291,83 @@ pub fn tasks_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::status_line(Glyph::Warn, &format!("task {id} was not running")));
     }
     Ok(0)
+}
+
+pub fn tasks_resubmit(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut id: Option<String> = None;
+    let mut token_budget: Option<u64> = None;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--token-budget" | "-t" => token_budget = Some(iter.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0).ok_or(Unhandled)?),
+            t if t.starts_with('-') => return Err(Unhandled),
+            t if id.is_none() => id = Some(t.to_string()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let id = id.ok_or(Unhandled)?;
+    let mut body = serde_json::json!({});
+    if let Some(t) = token_budget {
+        body["token_budget"] = serde_json::json!(t);
+    }
+    let resp = post_json(g, &format!("/api/tasks/{}/resubmit", super::urlencode(&id)), &body, true, 20);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    let t = &resp["task"];
+    if resp["resumed"].as_bool() == Some(true) {
+        ui::done(&format!(
+            "task {} resumed {} — tokens {}",
+            ui::muted(&id),
+            where_it_ran(resp["node"].as_str().unwrap_or("?"), resp["dispatched"].as_bool()),
+            tokens_line(t)
+        ));
+    } else {
+        ui::done(&format!("task {} budget set — tokens {}", ui::muted(&id), tokens_line(t)));
+    }
+    ui::guide(&[(&format!("noo tasks show {id}"), "state, loops, tokens, last note")]);
+    Ok(0)
+}
+
+pub fn tasks_answer(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [id, rest @ ..] = args else { return Err(Unhandled) };
+    if id.starts_with('-') || rest.is_empty() {
+        return Err(Unhandled);
+    }
+    let text = rest.join(" ");
+    let resp = post_json(g, &format!("/api/tasks/{}/answer", super::urlencode(id)), &serde_json::json!({"text": text}), true, 20);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    ui::done(&format!(
+        "answered; task {} goes on {} with your answer",
+        ui::muted(id),
+        where_it_ran(resp["node"].as_str().unwrap_or("?"), resp["dispatched"].as_bool())
+    ));
+    ui::guide(&[(&format!("noo agents thread {}", resp["task"]["thread_id"].as_str().unwrap_or("?")), "its notes and result as they arrive")]);
+    Ok(0)
+}
+
+#[cfg(test)]
+mod budget_line_tests {
+    use super::{budget_label, tokens_line};
+    use serde_json::json;
+
+    #[test]
+    fn tokens_read_spent_of_cap_and_left() {
+        assert_eq!(tokens_line(&json!({"tokens_spent": 1200, "token_budget": 1000, "remaining": 0})), "1200 of 1000 (0 left)");
+        assert_eq!(tokens_line(&json!({"tokens_spent": 300, "token_budget": 1000, "remaining": 700})), "300 of 1000 (700 left)");
+        assert_eq!(tokens_line(&json!({"tokens_spent": 5})), "5 (no cap)");
+        assert_eq!(tokens_line(&json!({})), "0 (no cap)", "an older gateway sends no budget");
+    }
+
+    #[test]
+    fn parked_states_have_words() {
+        assert_eq!(budget_label("exhausted"), "out of tokens");
+        assert_eq!(budget_label("awaiting_clarification"), "asked you");
+    }
 }
 
 #[cfg(test)]

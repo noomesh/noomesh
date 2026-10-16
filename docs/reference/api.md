@@ -662,6 +662,8 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST, DELETE | `/api/v1/settings/user-dirs` | watched-folder management (adding a `writable` folder is admin-only) |
 | GET | `/api/v1/settings/restart-status` | restart-needed flag |
 | GET | `/api/usage/summary` | token usage by month / dimension — `group=node|model|backend|source|user|consumer|day` (`noo usage`). An operator report: Operator+ sees the install, a `user`-tier caller sees only its own consumption at every grain. The response echoes `scope` (null = the whole install) |
+| GET | `/api/usage/me` | one person's spend for the period (`period=day|week|month`, default the allowance's period, else `month`; Operator+ may name `user=`): `node`, `cloud` and `harness` (one entry per kind) as separate columns, each with `prompt_tokens`, `completion_tokens`, `total_tokens`, `requests`, `cost_usd`, `unpriced_tokens` and a breakdown (`by_node`, `by_provider`, `by_model`). A row is in exactly one column: backend `cloud-*` is cloud, a `harness_kind` (backend `harness:<kind>`) is that kind, anything else is node. `spent` is the one budget number across them; `allowance` is `{period, limit, spent, remaining}` or null (`noo usage me`). `cost_usd` prices tokens by the longest model-name prefix in the `NOO_MODEL_COST_USD_PER_MTOK` setting (a JSON object of prefix → USD per million tokens); reported, never enforced |
+| GET, PUT, DELETE | `/api/users/{username}/allowance` | a person's standing token allowance: `PUT {tokens, period?}` (`period` `day`, `week` or `month`, default `month`) sets it and `DELETE` removes it (Admin only, audited); `GET` returns `{user, allowance: {period, limit, spent, remaining} | null}` to an Admin or the person (`noo security user allowance`) |
 | GET / POST | `/api/mcp/servers` | the external MCP server registry (`noo mcp server list/add`); operator role |
 | GET / PUT / DELETE | `/api/mcp/servers/{id}` | one server: spec, audience, placements, discovered tools (`noo mcp server show/enable/disable/remove`) |
 | PUT / DELETE | `/api/mcp/servers/{id}/placements/{node}` | which registered node hosts or dials it (`noo mcp place/unplace`) |
@@ -704,10 +706,18 @@ agent-message thread.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/tasks` | `{objective, model?, loop_budget?}` — creates and starts a task for the caller (`noo tasks create`) |
+| POST | `/api/tasks` | `{objective, model?, loop_budget?, token_budget?}` — creates and starts a task for the caller (`noo tasks create`). `token_budget` caps the prompt + completion tokens its loops may spend; leave it out for no cap of its own |
 | GET | `/api/tasks` | the caller's tasks; operators see everyone's, or one person's with `user=`; `state=`, `limit=` |
-| GET | `/api/tasks/{id}` | state, loops, last note, result, and its children (sub-tasks a loop delegated with `noo_task_delegate`, or the roles a collaboration fanned out) |
+| GET | `/api/tasks/{id}` | state, loops, last note, result, `token_budget`, `tokens_spent`, `remaining` (null = no cap), `budget_state` (`exhausted`, `awaiting_clarification` or null), the owner's `allowance` when one is set, and its children (sub-tasks a loop delegated with `noo_task_delegate`, or the roles a collaboration fanned out) |
 | POST | `/api/tasks/{id}/stop` | stopped at the next checkpoint; the loops' tool calls stand |
+| POST | `/api/tasks/{id}/resubmit` | `{token_budget?}` — owner only. A task parked `exhausted` gets the new budget and resumes from its checkpoint (`resumed: true`); `409` when it would still be out of tokens (the reason says whether the task or the allowance is spent). On a running task it only changes the cap (`resumed: false`) (`noo tasks resubmit`) |
+| POST | `/api/tasks/{id}/ask` | `{question}` — owner only: records a question and posts it to the task's thread. The task parks `awaiting_clarification` at its next loop boundary. A loop asks with the `noo_task_ask` tool; a runner on a node with the `task_ask` rail op |
+| POST | `/api/tasks/{id}/answer` | `{text}` — owner only, for a task parked `awaiting_clarification`: posts the answer to the thread and starts a new loop whose prompt carries the question and the answer (`noo tasks answer`) |
+
+A task's **token budget** is checked between loops, never during one: a loop
+that crosses it finishes, and the task then parks (`checkpointed`, not
+failed) with the reason in its last note and its thread. See
+[Token budgets](../operating/token-budgets.md).
 
 A client with no loop of its own (a CLI harness, your own MCP client) reaches tasks through the user MCP door's task tools: see [MCP doors](#mcp-doors).
 
@@ -722,7 +732,7 @@ A client with no loop of its own (a CLI harness, your own MCP client) reaches ta
 | Listener | Path | Auth | Purpose |
 |---|---|---|---|
 | `:8080` | `POST /mcp/operator` | an `mcp:operator` service key bound to an account that holds the admin role (re-checked on every call) — mandatory, and the only credential (the shared `NOO_MCP_TOKEN` was retired on 2026-09-30; the plain-HTTP `/mcp` listener on 3100 was removed in stack-v0.2.41) | the operator door: the full tool manifest (`gateway-rust/mcp-tools-local.json`, 124 tools, plus any add-on fragment named by `NOO_MCP_EXTRA_MANIFEST`), for a machine acting as the operator |
-| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools) plus the four task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
+| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools) plus the seven task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
 
 Both speak streamable-HTTP JSON-RPC (`POST` only: `GET` and `DELETE` are
 `405`; a request body over 256 KiB is refused). Identity is re-resolved from
@@ -735,7 +745,7 @@ from `src/noomesh/mcp/tool_defs/` by `scripts/build-mcp-manifest.py` and
 embedded at compile time. Set-up:
 [channels/mcp-your-client.md](../channels/mcp-your-client.md).
 
-The user door also lists four **task tools** that are not manifest entries:
+The user door also lists seven **task tools** that are not manifest entries:
 they run in the gateway (`gateway-rust/src/mcp_user_tasks.rs`) rather than
 as a self-call, because the task they act on is named by id, and the door
 checks that it belongs to the key's account. Every account the door admits
@@ -746,10 +756,13 @@ audit row.
 
 | Tool | Arguments | Does |
 |---|---|---|
-| `noo_task_delegate` | `objective` (required), `parent_task_id?`, `role?`, `model?`, `loop_budget?` (1–500) | opens a task for the caller and starts it. With `parent_task_id` (one of the caller's live tasks) it is a sub-task on the parent's thread, capped like the in-loop tool (2 deep, 8 per parent). Without, a top-level task on a new thread. Leaving out `loop_budget` gives the default of the node it lands on, or the cluster's. Returns `task_id`, `thread_id`, `parent_id`, `node`, `dispatched`, `why` |
-| `noo_task_status` | `task_id?` | the task with its children (`state`, `loops`, `last_note`, `result`, `error`, `all_settled`); with no id, the caller's 20 most recent top-level tasks |
+| `noo_task_delegate` | `objective` (required), `parent_task_id?`, `role?`, `model?`, `loop_budget?` (1–500), `token_budget?` | opens a task for the caller and starts it. With `parent_task_id` (one of the caller's live tasks) it is a sub-task on the parent's thread, capped like the in-loop tool (2 deep, 8 per parent). Without, a top-level task on a new thread. Leaving out `loop_budget` gives the default of the node it lands on, or the cluster's. Returns `task_id`, `thread_id`, `parent_id`, `node`, `dispatched`, `why` |
+| `noo_task_status` | `task_id?` | the task with its children (`state`, `loops`, `last_note`, `result`, `error`, `token_budget`, `tokens_spent`, `remaining`, `budget_state`, `all_settled`); with no id, the caller's 20 most recent top-level tasks |
 | `noo_task_wait` | `task_id` (required), `seconds?` (1–25, default 25) | returns when the task settles, when one of its children settles, or at the deadline with the task as it stands (`state: running`, `timed_out: true`): call again. Never holds the request past 25 s (`ops::MAX_WAIT_SECS`) |
 | `noo_task_done` | `task_id`, `result` (required), `failed?` | records the result as the in-loop `noo_task_done` does and posts it to the task's thread. Done from the door does not require prior tool calls: the in-loop check that refuses a success claim from a task whose conversation called no tool is skipped, and the result is not prefixed, because a door caller's tool use happens outside that conversation |
+| `noo_task_ask` | `task_id`, `question` (required) | records the question and posts it to the task's thread; the task parks `awaiting_clarification` at its next loop boundary (the running loop is not interrupted). The same tool a task's own loop has |
+| `noo_task_resubmit` | `task_id` (required), `token_budget?` | as `POST /api/tasks/{id}/resubmit`: a task parked `exhausted` resumes with the new budget; a running one only gets the new cap. Returns the task with `resumed` |
+| `noo_task_answer` | `task_id`, `text` (required) | as `POST /api/tasks/{id}/answer`: answers the question of a task parked `awaiting_clarification` and starts a new loop with the question and the answer |
 
 ### Add-on token exchange (`routes/addon_token.rs`)
 

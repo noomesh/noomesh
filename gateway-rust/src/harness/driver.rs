@@ -26,6 +26,12 @@
 //! 5. usage is reported, the loop is checkpointed, the key revoked, the
 //!    translator stopped.
 //!
+//! Before each invocation the driver asks the gateway's token switch
+//! (`budget_check`, i83 G) whether another loop may start — never during
+//! one. A CLI that cannot go on without its owner ends with `NOO_QUESTION:`;
+//! the question goes over the rail (`task_ask`) and the task waits for the
+//! answer.
+//!
 //! Nothing streams mid-run in this cut: a turn gets one `content` event with
 //! the answer, then `harness_result` (sent by the caller).
 
@@ -50,6 +56,8 @@ pub const OUTPUT_CAP: usize = 256 * 1024;
 pub const RESULT_MARK: &str = "NOO_RESULT:";
 /// The line a CLI ends with when the objective cannot be achieved.
 pub const FAILED_MARK: &str = "NOO_FAILED:";
+/// The line a CLI ends with when it needs its owner to decide something.
+pub const QUESTION_MARK: &str = "NOO_QUESTION:";
 /// What goes in a CLI's provider-key variable: the loopback translator takes
 /// no key, but a CLI may refuse to start without one.
 pub const PLACEHOLDER_KEY: &str = "noo-loopback-no-key";
@@ -175,6 +183,10 @@ pub(crate) trait DriverRail {
     /// `session_save`, best effort.
     async fn save(&self, role: &str, content: &str);
     async fn report_usage(&self, usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>);
+    /// `budget_check`: the loop-boundary token switch.
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck>;
+    /// `task_ask`: the CLI's question to the task's owner.
+    async fn task_ask(&self, task_id: &str, question: &str) -> Result<()>;
 }
 
 impl DriverRail for RemoteRuntime {
@@ -208,6 +220,14 @@ impl DriverRail for RemoteRuntime {
         if let Err(e) = RemoteRuntime::report_usage(self, usage, model, kind, task_id).await {
             tracing::warn!(error = %e, kind, "harness driver: usage not reported");
         }
+    }
+
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+        RemoteRuntime::budget_check(self, task_id).await
+    }
+
+    async fn task_ask(&self, task_id: &str, question: &str) -> Result<()> {
+        RemoteRuntime::task_ask(self, task_id, question).await
     }
 }
 
@@ -585,10 +605,12 @@ fn resolve_program(prog: &str, path: Option<&str>) -> Option<PathBuf> {
 pub enum Verdict {
     Done(String),
     Failed(String),
+    /// The CLI needs its owner: the task waits for the answer.
+    Ask(String),
     Continue,
 }
 
-/// The LAST `NOO_RESULT:` / `NOO_FAILED:` line decides.
+/// The LAST `NOO_RESULT:` / `NOO_FAILED:` / `NOO_QUESTION:` line decides.
 pub fn verdict(stdout: &str) -> Verdict {
     for line in stdout.lines().rev() {
         let t = line.trim().trim_matches('`').trim();
@@ -597,6 +619,9 @@ pub fn verdict(stdout: &str) -> Verdict {
         }
         if let Some(r) = t.strip_prefix(FAILED_MARK) {
             return Verdict::Failed(r.trim().to_string());
+        }
+        if let Some(r) = t.strip_prefix(QUESTION_MARK).filter(|r| !r.trim().is_empty()) {
+            return Verdict::Ask(r.trim().to_string());
         }
     }
     Verdict::Continue
@@ -612,13 +637,13 @@ pub fn tail_lines(text: &str, n: usize) -> String {
 /// of what it printed.
 pub fn result_text(stdout: &str) -> String {
     match verdict(stdout) {
-        Verdict::Done(t) | Verdict::Failed(t) if !t.is_empty() => t,
+        Verdict::Done(t) | Verdict::Failed(t) | Verdict::Ask(t) if !t.is_empty() => t,
         _ => tail_lines(stdout, 20),
     }
 }
 
 /// One task loop's prompt.
-pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>) -> String {
+pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, clarification: Option<&crate::task_budget::Clarification>) -> String {
     let mut p = String::new();
     if let Some(role) = req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
         p.push_str(role.trim());
@@ -632,12 +657,20 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>) -> 
     if let Some(n) = last_note.filter(|n| !n.trim().is_empty()) {
         p.push_str(&format!("Where the previous loop left off:\n{}\n\n", n.trim()));
     }
+    if let Some(c) = clarification {
+        p.push_str(&format!(
+            "In an earlier loop you asked the owner:\n{}\nThe owner answered:\n{}\nTake the answer into account.\n\n",
+            c.question.trim(),
+            c.answer.as_deref().unwrap_or("").trim()
+        ));
+    }
     p.push_str(&format!(
         "Your working directory persists between loops of this task. noomesh's tools (knowledge base, memory, \
          agent messages to thread {thread}) are available as the MCP server `{MCP_SERVER_NAME}`.\n\
          When the objective is fully achieved, end your answer with one line:\n{RESULT_MARK} <one-line summary>\n\
          If it cannot be achieved, end with:\n{FAILED_MARK} <reason>\n\
-         If more work remains, end with neither; you will be run again.",
+         If you cannot go on without the owner deciding something, end with:\n{QUESTION_MARK} <one clear question>\n\
+         If more work remains, end with none of these; you will be run again.",
         thread = req.thread_id
     ));
     p
@@ -702,7 +735,20 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
         if loops >= req.loop_budget {
             return rail.checkpoint(&req.task_id, loops, Some("loop budget exhausted"), true).await;
         }
-        let prompt = task_prompt(req, loops + 1, last_note.as_deref());
+        // THE TOKEN SWITCH (i83 G): asked before the CLI runs, never while
+        // it does. A no parks the task on the gateway; the driver stops.
+        let check = match rail.budget_check(&req.task_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(task = %req.task_id, error = %e, "harness driver: budget check failed; stopping at the checkpoint");
+                return rail.checkpoint(&req.task_id, loops, Some(&format!("budget check failed: {e:#}")), false).await;
+            }
+        };
+        if !check.proceed {
+            tracing::info!(task = %req.task_id, reason = check.reason.as_deref().unwrap_or(""), "harness driver: budget switch says no more loops");
+            return Ok(check.state);
+        }
+        let prompt = task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref());
         let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
         loops += 1;
         let mut decided = false;
@@ -719,6 +765,13 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
                     Verdict::Failed(r) => {
                         decided = true;
                         rail.task_done(&req.task_id, &r, true).await?;
+                    }
+                    // The question parks the task at the next boundary:
+                    // this loop still checkpoints like any other.
+                    Verdict::Ask(q) => {
+                        if let Err(e) = rail.task_ask(&req.task_id, &q).await {
+                            tracing::warn!(task = %req.task_id, error = %e, "harness driver: question not recorded");
+                        }
                     }
                     Verdict::Continue => {}
                 }
@@ -856,16 +909,22 @@ mod tests {
         keys_revoked: Vec<String>,
         saved: Vec<(String, String)>,
         usage: Vec<(String, String, Option<String>)>,
+        checks: u32,
+        asked: Vec<String>,
     }
 
     struct FakeRail {
         calls: Mutex<Calls>,
         key_ttl_secs: i64,
+        /// The switch says no from this check on (1-based); `None` = always yes.
+        stop_at_check: Option<u32>,
+        /// A question parks the task: every check after one says no.
+        parks_on_ask: bool,
     }
 
     impl FakeRail {
         fn new() -> Self {
-            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900 }
+            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900, stop_at_check: None, parks_on_ask: true }
         }
     }
 
@@ -901,6 +960,21 @@ mod tests {
         }
         async fn report_usage(&self, _usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>) {
             self.calls.lock().unwrap().usage.push((model.to_string(), kind.to_string(), task_id.map(str::to_string)));
+        }
+        async fn budget_check(&mut self, _task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+            let mut c = self.calls.lock().unwrap();
+            c.checks += 1;
+            let no = self.stop_at_check.is_some_and(|n| c.checks >= n) || (self.parks_on_ask && !c.asked.is_empty());
+            Ok(crate::task_budget::BudgetCheck {
+                proceed: !no,
+                reason: no.then(|| "token budget exhausted".to_string()),
+                state: "checkpointed".into(),
+                ..Default::default()
+            })
+        }
+        async fn task_ask(&self, _task_id: &str, question: &str) -> Result<()> {
+            self.calls.lock().unwrap().asked.push(question.to_string());
+            Ok(())
         }
     }
 
@@ -993,6 +1067,78 @@ mod tests {
         assert!(note.contains("timed out"), "{note}");
         assert_eq!(c.keys_revoked.len(), 1, "a killed run still revokes its key");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED (i83 G): the token switch is asked before each CLI run, and a
+    /// no stops the task BEFORE the next run starts — the run in progress
+    /// was never interrupted, and its usage and checkpoint stand.
+    #[tokio::test]
+    async fn the_budget_switch_stops_the_task_between_runs_never_during_one() {
+        let root = scratch("budget");
+        let k = kind(&["sh", "-c", "echo working"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        rail.stop_at_check = Some(3);
+        let state = run_task_on(&ctx, &mut rail, &task("t-budget", 10)).await.unwrap();
+        assert_eq!(state, "checkpointed", "parked, not failed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.checks, 3, "one check per loop, and the third said no");
+        assert_eq!(c.keys_minted, 2, "the CLI ran twice: no run started after the no");
+        assert_eq!(c.checkpoints.len(), 2, "both runs finished and checkpointed");
+        assert!(c.checkpoints.iter().all(|cp| !cp.2), "nothing was failed for budget");
+        assert_eq!(c.usage.len(), 2, "both runs' tokens were reported");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED: in the driver's loop the check comes before the CLI runs, once.
+    #[test]
+    fn the_driver_checks_before_it_invokes() {
+        let src = include_str!("driver.rs");
+        let body = &src[src.find("async fn task_loops<").unwrap()..src.find("// ── a turn ──").unwrap()];
+        assert_eq!(body.matches("rail.budget_check(").count(), 1);
+        assert!(body.find("rail.budget_check(").unwrap() < body.find("invoke(ctx,").unwrap());
+        let invoke_fn = &src[src.find("async fn invoke<").unwrap()..src.find("// ── a task ──").unwrap()];
+        assert!(!invoke_fn.contains("budget_check"), "a run is never interrupted for budget");
+    }
+
+    /// A switch that says no before the first loop runs nothing at all.
+    #[tokio::test]
+    async fn an_exhausted_task_runs_no_cli() {
+        let root = scratch("budget0");
+        let k = kind(&["sh", "-c", "echo NOO_RESULT: ok"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        rail.stop_at_check = Some(1);
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-budget0", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!((c.keys_minted, c.checkpoints.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `NOO_QUESTION:` goes to the owner over the rail; the loop still
+    /// checkpoints, and the next boundary stops the task to wait.
+    #[tokio::test]
+    async fn a_cli_question_is_asked_and_the_task_waits() {
+        let root = scratch("ask");
+        let k = kind(&["sh", "-c", "echo looked; echo 'NOO_QUESTION: eu or us?'"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-ask", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.asked, vec!["eu or us?".to_string()]);
+        assert!(c.done.is_empty(), "a question is not a verdict");
+        assert_eq!(c.checkpoints, vec![(1, Some("eu or us?".to_string()), false)]);
+        assert_eq!(c.checks, 2, "the boundary after the question said no");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_answer_rides_the_next_prompt() {
+        let c = crate::task_budget::Clarification { question: "eu or us?".into(), answer: Some("eu".into()) };
+        let p = task_prompt(&task("t", 5), 2, Some("looked"), Some(&c));
+        assert!(p.contains("eu or us?") && p.contains("The owner answered:\neu") && p.contains(QUESTION_MARK));
+        assert_eq!(verdict("x\nNOO_QUESTION: which one?"), Verdict::Ask("which one?".into()));
+        assert_eq!(verdict("NOO_QUESTION:   "), Verdict::Continue, "an empty question is no question");
     }
 
     /// PINNED: what the CLI process actually sees carries none of the
