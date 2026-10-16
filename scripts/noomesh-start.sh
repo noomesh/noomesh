@@ -923,6 +923,15 @@ require_compose_v2 || exit 1
         noo_check_port_collisions || exit 1
     fi
 
+    # redis/grafana run as uid 65532 (i64): re-own their data NOW, with the old
+    # container stopped, and refuse the start if anything is still not 65532 (lib-reown.sh).
+    # Before the bind-source check, which stays the last thing before `up`
+    # and so sees the final ownership.
+    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046  # one service name per word
+        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
     # Every bind source of what this `up` starts must already exist, with
     # the right type — else refuse NOW, before anything is recreated
     # (lib-bind-sources.sh). $ACTIVE_SVCS is that set, minus the scaled-out
@@ -931,14 +940,6 @@ require_compose_v2 || exit 1
     [ -n "$AGENT_SCALE" ] && _bind_skip="--skip node-agent"
     # shellcheck disable=SC2086
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
-    # redis/grafana run as uid 65532 (i64): re-own their data NOW, after
-    # every other refusal above and with the old container stopped, and
-    # refuse the start if anything is still not 65532 (lib-reown.sh).
-    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
-    if [ -n "$_data_root" ]; then
-        # shellcheck disable=SC2046  # one service name per word
-        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
-    fi
     # Start all services with profile(s)
     # --force-recreate handles re-provisioning where stale containers may exist
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE
@@ -987,14 +988,15 @@ else
         echo "Profiles: $PROFILE_ARGS"
     fi
 
-    check_bind_sources "${SERVICES[@]}" || exit 1
-    # Only the named services: re-owning (and so stopping) one this start
+    # redis/grafana re-owned (lib-reown.sh) before the bind-source check,
+    # which stays last before `up`. Only the named services: re-owning (and so stopping) one this start
     # does not bring back up would leave it down.
     reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046
         reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
+    check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")
 fi

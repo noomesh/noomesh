@@ -123,21 +123,25 @@ def test_grafana_too_and_a_missing_dir_is_skipped(tmp_path: Path) -> None:
     assert "stop grafana" in log.read_text()
 
 
-def test_the_launcher_reowns_right_before_both_ups() -> None:
+def test_the_launcher_reowns_before_both_bind_checks_and_ups() -> None:
+    # The bind-source check stays the statement right before each `up`
+    # (test_launcher_bind_sources.py); the re-own runs just before that check.
     src = START.read_text()
     assert 'source "$SCRIPT_DIR/lib-reown.sh"' in src
     # the old top-of-script probe+chown is gone
     assert "-print -quit)\" ]; then chown" not in src
     full_check = src.index("check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1")
     full_up = src.index("up -d --force-recreate $BUILD_FLAG")
-    call = src.index("reown_nonroot_dirs", full_check)
-    assert full_check < call < full_up
+    call = src.rindex("reown_nonroot_dirs", 0, full_check)
+    assert src.index('ACTIVE_SVCS="$COMPOSE_OUT"') < call < full_check < full_up
+    assert "reown_nonroot_dirs" not in src[full_check:full_up]
     sub_check = src.index('check_bind_sources "${SERVICES[@]}" || exit 1')
     sub_up = src.index('up -d "${SERVICES[@]}"')
-    call2 = src.index("reown_nonroot_dirs", sub_check)
-    assert sub_check < call2 < sub_up
+    call2 = src.rindex("reown_nonroot_dirs", 0, sub_check)
+    assert full_up < call2 < sub_check < sub_up
+    assert "reown_nonroot_dirs" not in src[sub_check:sub_up]
     assert src.count("reown_nonroot_dirs \"$_data_root\"") == 2
-    assert src.count("|| exit 1", call, full_up) >= 1
+    assert "|| exit 1" in src[call:full_check]
 
 
 def test_the_lib_is_embedded_in_the_cli() -> None:
