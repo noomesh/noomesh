@@ -296,14 +296,19 @@ async fn authenticate_over_tls(
             ),
         ));
     };
-    if let Some(limit) = consumer.rpm_limit {
-        if let Some(redis) = redis {
-            if let Ok(crate::cache::RateResult::Limited { retry_after }) =
-                redis.check_consumer_quota(&consumer.name, limit).await
-            {
-                return Err(crate::auth::consumer_quota_exceeded(&consumer.name, retry_after));
-            }
-        }
+    // Metered per consumer even without a cap of its own (see
+    // `service_keys::door_rpm`); in-process when Redis is absent or erroring.
+    let limit = crate::service_keys::door_rpm(&consumer);
+    let over = match redis {
+        Some(redis) => match redis.check_consumer_quota(&consumer.name, limit).await {
+            Ok(crate::cache::RateResult::Limited { retry_after }) => Some(retry_after),
+            Ok(_) => None,
+            Err(_) => crate::service_keys::local_quota_exceeded(&consumer.name, limit),
+        },
+        None => crate::service_keys::local_quota_exceeded(&consumer.name, limit),
+    };
+    if let Some(retry_after) = over {
+        return Err(crate::auth::consumer_quota_exceeded(&consumer.name, retry_after));
     }
     operator_key_check(&consumer).map_err(|(code, msg)| {
         tracing::warn!(consumer = %consumer.name, %msg, "mcp_operator_key_refused");

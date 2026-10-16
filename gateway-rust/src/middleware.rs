@@ -1628,18 +1628,45 @@ mod refusal_storm_tests {
 /// no framing, no MIME sniffing, no referrer leakage, no ambient device
 /// permissions, and HSTS only when this process actually terminates TLS.
 ///
-/// The full `Content-Security-Policy` is OPT-IN (`NOO_CSP=1`, or a literal
-/// policy in `NOO_CSP`). The dashboard is a built artifact baked into the
-/// image, so a policy written blind here could silently break a pane that
-/// uses an inline script — and this is a local, network-fenced deployment
-/// where that trade is not worth making by default. Turn it on and check
-/// the console; `NOO_CSP=<policy>` overrides the built-in one.
+/// The built-in `Content-Security-Policy` is ON by default; `NOO_CSP=0`
+/// (or `off`/`false`) opts out, and `NOO_CSP=<policy>` replaces it. The policy
+/// was checked against the built console (`ui/apps/web`: one same-origin
+/// module bundle per entry, no inline `<script>` in `index.html` or
+/// `kiosk.html`, no `eval`, no third-party origin, no iframe — Grafana opens
+/// in its own tab — same-origin `fetch`/SSE plus the `/ws/*` sockets) and the
+/// gateway's one inline-script page (`/ui/basic`, hence `'unsafe-inline'` in
+/// `script-src`; inline `style=` attributes in the console need it in
+/// `style-src` too). `frame-ancestors 'none'` stays alongside
+/// `X-Frame-Options: DENY`.
+pub const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
+     style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
+     connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; \
+     frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+
+/// What `NOO_CSP` asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CspChoice<'a> {
+    /// No `Content-Security-Policy` header (explicit opt-out).
+    Off,
+    /// The built-in [`DEFAULT_CSP`].
+    Default,
+    /// An operator-supplied policy, sent as-is.
+    Custom(&'a str),
+}
+
+/// Pure so a test pins the default without touching the process environment:
+/// unset or empty is `Default` (a compose file passing an empty `NOO_CSP`
+/// must not silently switch the header off).
+pub fn csp_choice(env: Option<&str>) -> CspChoice<'_> {
+    match env.map(str::trim) {
+        None | Some("") | Some("1") | Some("true") | Some("on") => CspChoice::Default,
+        Some("0") | Some("off") | Some("false") | Some("none") => CspChoice::Off,
+        Some(policy) => CspChoice::Custom(policy),
+    }
+}
+
 pub async fn security_headers(request: Request, next: Next) -> Response {
     use axum::http::header::{HeaderName, HeaderValue};
-    const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
-         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
-         connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; \
-         frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
     let mut response = next.run(request).await;
     let h = response.headers_mut();
     let mut set = |name: HeaderName, value: HeaderValue| {
@@ -1656,19 +1683,25 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
     );
-    match std::env::var("NOO_CSP").ok().as_deref() {
-        None | Some("") | Some("0") | Some("off") => {}
-        Some("1") | Some("true") | Some("on") => set(
+    let csp_env = std::env::var("NOO_CSP").ok();
+    match csp_choice(csp_env.as_deref()) {
+        CspChoice::Off => {}
+        CspChoice::Default => set(
             HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static(DEFAULT_CSP),
         ),
-        Some(policy) => {
-            if let Ok(v) = HeaderValue::from_str(policy) {
-                set(HeaderName::from_static("content-security-policy"), v);
-            } else {
-                tracing::warn!("NOO_CSP is not a valid header value — no CSP sent");
+        CspChoice::Custom(policy) => match HeaderValue::from_str(policy) {
+            Ok(v) => set(HeaderName::from_static("content-security-policy"), v),
+            Err(_) => {
+                // A broken override must not become "no policy": fall back to
+                // the built-in one and say so.
+                tracing::warn!("NOO_CSP is not a valid header value — sending the built-in policy");
+                set(
+                    HeaderName::from_static("content-security-policy"),
+                    HeaderValue::from_static(DEFAULT_CSP),
+                );
             }
-        }
+        },
     }
     if std::env::var("NOO_TLS_CERT").ok().filter(|v| !v.is_empty()).is_some() {
         set(
@@ -2208,5 +2241,51 @@ mod tool_risk_context_tests {
             assert!(body.contains(&format!("audit_tool_decision(state, call, risk_level, {d}")) || body.contains(d), "{d}");
         }
         assert!(body.matches("audit_tool_decision(").count() >= 4);
+    }
+}
+
+#[cfg(test)]
+mod csp_default_tests {
+    use super::{csp_choice, CspChoice, DEFAULT_CSP};
+
+    #[test]
+    fn the_header_is_sent_with_no_env_at_all() {
+        assert_eq!(csp_choice(None), CspChoice::Default);
+        assert_eq!(csp_choice(Some("")), CspChoice::Default, "an empty NOO_CSP is not an opt-out");
+        assert_eq!(csp_choice(Some("1")), CspChoice::Default);
+    }
+
+    #[test]
+    fn only_an_explicit_off_removes_it() {
+        for v in ["0", "off", "false", "none"] {
+            assert_eq!(csp_choice(Some(v)), CspChoice::Off, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_literal_policy_replaces_the_built_in_one() {
+        assert_eq!(csp_choice(Some("default-src 'none'")), CspChoice::Custom("default-src 'none'"));
+    }
+
+    #[test]
+    fn the_built_in_policy_keeps_framing_closed_and_fits_the_console() {
+        assert!(DEFAULT_CSP.contains("frame-ancestors 'none'"));
+        assert!(DEFAULT_CSP.contains("default-src 'self'"));
+        assert!(DEFAULT_CSP.contains("object-src 'none'"));
+        // sockets and same-origin fetch; no third-party origin
+        assert!(DEFAULT_CSP.contains("connect-src 'self' ws: wss:"));
+        assert!(!DEFAULT_CSP.contains("http://") && !DEFAULT_CSP.contains("https://"));
+        assert!(!DEFAULT_CSP.contains("unsafe-eval"));
+        assert!(DEFAULT_CSP.chars().all(|c| c.is_ascii()), "must be a valid header value");
+        assert!(axum::http::HeaderValue::from_str(DEFAULT_CSP).is_ok());
+    }
+
+    /// The handler reads the choice, and the framing header stays alongside.
+    #[test]
+    fn security_headers_uses_the_choice_and_keeps_x_frame_options() {
+        let src = include_str!("middleware.rs");
+        let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("csp_choice(csp_env.as_deref())"));
+        assert!(body.contains("X_FRAME_OPTIONS"));
     }
 }

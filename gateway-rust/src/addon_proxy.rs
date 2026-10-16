@@ -472,6 +472,25 @@ pub fn manifests() -> Vec<AddonManifest> {
         .collect()
 }
 
+/// Is `path` a mounted, public GET route of some loaded add-on manifest
+/// (`{param}` segments match any single segment)? The tier gate asks this so
+/// narrowing a User's GETs to an allow-list does not close the add-ons' own
+/// read surface.
+pub fn is_mounted_get_route(path: &str) -> bool {
+    manifests_get_match(&manifests(), path)
+}
+
+fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').collect();
+    manifests.iter().flat_map(|m| m.routes.iter()).filter(|r| !r.internal && r.method == "GET").any(|r| {
+        std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| {
+            let p: Vec<&str> = pat.split('/').collect();
+            p.len() == segs.len()
+                && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+        })
+    })
+}
+
 // ── Mounting ─────────────────────────────────────────────────────────────
 
 /// Every non-internal route of one manifest.
@@ -1326,5 +1345,51 @@ pub(crate) mod tests {
         let params = HashMap::from([("item_id".to_string(), "not-a-uuid".to_string())]);
         let resp = serve(&m, &spec, params, None, None, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod user_read_route_tests {
+    use super::*;
+
+    fn manifest(routes: &[(&str, &str, bool)]) -> AddonManifest {
+        AddonManifest {
+            version: 1,
+            addon: "evolve".into(),
+            base_url_env: "NOO_EVOLVE_URL".into(),
+            base_url_default: "https://noo-evolve:8443".into(),
+            timeout_secs: 30,
+            routes: routes
+                .iter()
+                .map(|(m, p, internal)| RouteSpec {
+                    name: "r".into(),
+                    method: m.to_string(),
+                    path: p.to_string(),
+                    aliases: vec![],
+                    params: HashMap::new(),
+                    query: false,
+                    internal: *internal,
+                    timeout_secs: None,
+                    note: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_mounted_get_route_matches_with_params_and_nothing_else_does() {
+        let m = [manifest(&[
+            ("GET", "/api/evolve/status", false),
+            ("GET", "/api/evolve/runs/{id}", false),
+            ("POST", "/api/evolve/start", false),
+            ("GET", "/api/evolve/hidden", true),
+        ])];
+        assert!(manifests_get_match(&m, "/api/evolve/status"));
+        assert!(manifests_get_match(&m, "/api/evolve/runs/abc"));
+        assert!(!manifests_get_match(&m, "/api/evolve/runs/"), "an empty param segment is not a match");
+        assert!(!manifests_get_match(&m, "/api/evolve/runs/a/b"));
+        assert!(!manifests_get_match(&m, "/api/evolve/start"), "POST routes are not read routes");
+        assert!(!manifests_get_match(&m, "/api/evolve/hidden"), "internal routes are not mounted");
+        assert!(!manifests_get_match(&m, "/api/other"));
     }
 }

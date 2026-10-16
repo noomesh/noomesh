@@ -3015,8 +3015,14 @@ pub(crate) async fn models_pull(
 async fn desired_config_get(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
+    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Path(node_id): Path<String>,
 ) -> AppResult {
+    // A JWT caller below Operator is refused (a `read` account used to pass:
+    // the tier gate let every GET through and this handler assumed any
+    // non-node caller was an operator). A node carries ClusterNode and no
+    // RequesterCtx, so this does not touch the node path below.
+    super::operator_read_guard(&requester)?;
     // A node may read its OWN config and no other. the design
     //
     // Before this, the handler took node_id from the PATH and returned that
@@ -5278,6 +5284,17 @@ async fn notify_proposal(
     notified
 }
 
+/// Who a proposal is attributed to: the authenticated account (JWT `sub`,
+/// including the connection label), else the authenticated node, else
+/// `unknown`. Pure so a test pins that no request field can set it.
+fn proposer_of(actor: Option<&str>, node: Option<&str>) -> String {
+    actor
+        .or(node)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// POST /api/cluster/propose — Agent proposes adding a node.
 /// [ported from workers/cluster.py::_cluster_propose 2026-07-18]
 ///
@@ -5289,6 +5306,8 @@ async fn notify_proposal(
 /// noo_cluster_propose_node MCP tool + static/modules/proposals.js.
 async fn cluster_propose(
     State(state): State<Arc<AppState>>,
+    actor: Option<axum::Extension<crate::auth::AuthActor>>,
+    node: Option<axum::Extension<crate::auth::ClusterNode>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
@@ -5302,12 +5321,10 @@ async fn cluster_propose(
     };
     let role = get_trimmed("role");
     let reason = get_trimmed("reason");
-    let proposed_by = body.get("proposed_by")
-        .or_else(|| body.get("conversation_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("agent")
-        .to_string();
+    // Provenance comes from the verified credential, never the body: a
+    // `proposed_by` field the caller supplies is ignored (an operator-door
+    // agent could otherwise file a proposal "from" any account).
+    let proposed_by = proposer_of(actor.as_ref().map(|e| e.0 .0.as_str()), node.as_ref().map(|e| e.0 .0.as_str()));
 
     if host.is_empty() {
         return Err(AppError::BadRequest("host required".into()));
@@ -6340,5 +6357,30 @@ mod placement_role_tests {
         // Re-running is harmless.
         sqlx::raw_sql(mig.sql).execute(&db).await.expect("087 is idempotent");
         drop_db(&admin, db, "mrp_migrate_test").await;
+    }
+}
+
+#[cfg(test)]
+mod proposer_tests {
+    use super::proposer_of;
+
+    #[test]
+    fn provenance_is_the_verified_caller_never_a_request_field() {
+        assert_eq!(proposer_of(Some("alice/laptop"), Some("host3")), "alice/laptop");
+        assert_eq!(proposer_of(None, Some("host3")), "host3");
+        assert_eq!(proposer_of(None, None), "unknown");
+        assert_eq!(proposer_of(Some(""), None), "unknown");
+    }
+
+    #[test]
+    fn the_handler_does_not_read_proposed_by_from_the_body() {
+        let src = include_str!("cluster.rs");
+        let start = src.find("async fn cluster_propose(").unwrap();
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").unwrap();
+        let body = &rest[..end];
+        assert!(body.contains("proposer_of("));
+        assert!(!body.contains("body.get(\"proposed_by\")"), "caller-asserted provenance is back");
+        assert!(!body.contains("body.get(\"conversation_id\")"));
     }
 }

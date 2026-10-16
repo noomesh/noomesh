@@ -65,6 +65,7 @@ mod envfile;
 #[cfg(test)]
 mod hint_lint;
 mod host_access;
+mod password_policy;
 mod http;
 pub(crate) mod onboard;
 mod operator_cert;

@@ -25,8 +25,20 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 
 1. **A user JWT** (`Authorization: Bearer <token>`) from `POST /auth/token`.
    Role is derived from scopes: `admin` → Admin, `write` → Operator,
-   otherwise User. Operators may call anything; Users may `GET` (except
-   `/metrics`, `/api/metrics/query` and `/api/logs/*`, which are Operator+),
+   otherwise User. Operators may call anything. Users may `GET` only an
+   allow-list of the surfaces a person needs (conversations, memory, RAG and
+   graph reads, their jobs, agent mail, usage, the dashboard's cluster/scheduler
+   overview, the runbooks, `/ws/*`, add-on read routes); a route not on the list
+   is closed to a User until it is added on purpose, as for kiosk tokens.
+   Installation-wide reads are Operator+: `/metrics`, `/api/metrics/*`,
+   `/api/logs/*`, `/api/config*`, `/api/settings*` and `/api/v1/settings` (except
+   `user-dirs` and `preference`), `/api/security/*` (audit, violations, PKI, posture,
+   users, service keys; except the caller's own key), a node's
+   `desired-config` and the other fleet reads under `/api/cluster/`, snapshots and
+   the knowledge-base admin lists. The handlers behind the sensitive ones refuse a
+   User themselves as well (`403 operator role required`), so a mis-edited
+   allow-list cannot reopen them. `GET /api/coordinator/context` answers a User
+   without backend URLs or peer ids. Users also
    use the chat and query surface (`/api/inference*`, `/api/conversations`,
    `/api/voice/`, `/upload`, `POST /api/v1/rag/query`, `/api/memory/search`,
    `POST /api/v1/graph/entities/resolve`, `/tools/select`), file a
@@ -104,8 +116,24 @@ curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -X POST https:/
 ```
 
 A refresh token is set as a cookie; `POST /auth/refresh` (alias
-`/api/auth/refresh`) rotates it, `POST /auth/logout` revokes it,
-`GET /auth/me` returns the caller's identity and scopes. Lifetimes:
+`/api/auth/refresh`) rotates it, `POST /auth/logout` revokes it (a bearer-only
+logout, as the CLI makes, counts too) and ends the access token it was using,
+`GET /auth/me` returns the caller's identity and scopes (`401` for a disabled
+or deleted account, or a token issued before the account's session floor).
+
+**Ending sessions.** `disable`, `set-role`, `set-scopes`, `set-password`,
+`service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
+end the account's sessions immediately: every refresh token is revoked, open
+`/ws/*` sockets close (4401), the service-key cache is dropped, and a per-account
+"not before" time (Redis key `noo:auth:notbefore:<account>`, kept for one
+access-token lifetime) makes `require_any_auth` — and so the WebSocket handshake
+— refuse any access token issued before it, so a reconnect with the old JWT
+fails. If Redis is down the gateway applies the floors it holds in memory
+(never fewer), logs a warning, and does not refuse every request; keys not
+bound to the account are not touched by `disable`. Passwords set through
+`POST /api/security/users` and `PUT …/{username}/password` must be at least
+12 characters, not on the common list and not contain the username (`400`);
+existing passwords are not re-checked. Lifetimes:
 `NOO_TOKEN_EXPIRE_MINUTES` (15), `NOO_REFRESH_TOKEN_DAYS` (30). Failed
 logins are audited and lock the account after repeated failures.
 
@@ -319,7 +347,7 @@ receives flat JSON events, each with a `type`:
 | GET | `/api/cluster/backends`, `/api/cluster/gpu-metrics` | running backends; live GPU probe across nodes |
 | POST | `/api/cluster/backends/start`, `/stop`, `/clear-cooldowns` | backend lifecycle |
 | POST | `/api/cluster/suggest-placement` | hardware-fit recommendation |
-| POST | `/api/cluster/discover`, `/propose`, `/proposals` (the list), `/proposals/decide`; GET `/proposals/{id}` | node discovery and the propose/approve enrollment flow (`enroll_now` and `proposals/{id}/retry` were removed; re-enroll with a new bootstrap token) |
+| POST | `/api/cluster/discover`, `/propose` (`proposed_by` is the authenticated caller; a body field of that name is ignored), `/proposals` (the list), `/proposals/decide`; GET `/proposals/{id}` | node discovery and the propose/approve enrollment flow (`enroll_now` and `proposals/{id}/retry` were removed; re-enroll with a new bootstrap token) |
 | POST | `/api/cluster/nodes/{node_id}/logs` | a node pushes its log batch (Loki push shape, optional gzip); node credential only, `{node_id}` must be the caller; `node` label overwritten with the verified id. `204` accepted, `400`/`413` drop the batch, `429` + `Retry-After` over the per-node budget (`NOO_LOGS_INGEST_BYTES_PER_MIN`, `NOO_LOGS_INGEST_REQUESTS_PER_MIN`), `503` Loki unavailable |
 | POST | `/api/cluster/mint-join-key`, `/api/cluster/delete-tailscale-device` | tailnet join keys, device removal |
 | GET | `/api/cluster/replication-status` | Postgres replication view |
@@ -657,7 +685,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/users`, `/disable`, `/propose`, `/proposals`; `/api/kb/grants`, `/rules`, `/teams`, `/teams/create`, `/teams/delete` | older short forms of some of the operations above |
 | GET, PUT | `/api/settings`, `/api/v1/settings`; GET `…/export`, `/api/v1/settings/preference` | the settings snapshot |
 | GET, POST | `/api/settings/flags`, `/api/settings/flags/set` | behavioural flags ([config.md](config.md#behavioural-flags)) |
-| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`) |
+| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`). Reads are Operator+ and redact any credential-shaped key's value (`*_key`, `*token*`, `*secret*`, `*password*`; names ending `_env` or `_tokens` are exempt). A `PUT` (here and on `/api/settings`) that carries a non-empty string under a credential-shaped key at any depth is refused `422` with the remedy `noo security secrets set` |
 | GET | `/api/v1/settings/browse` | browse the server's folders |
 | GET, POST, DELETE | `/api/v1/settings/user-dirs` | watched-folder management (adding a `writable` folder is admin-only) |
 | GET | `/api/v1/settings/restart-status` | restart-needed flag |

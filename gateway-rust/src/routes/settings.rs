@@ -369,27 +369,134 @@ fn deep_merge(base: &mut Value, overlay: &Value) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Credential-shaped keys never live in noomesh.yaml
+// ═══════════════════════════════════════════════════════════════
+
+/// Whether a config KEY names a credential. Same needles and exclusions as
+/// the CLI's `looks_like_credential` (noo-cli `commands/secrets.rs`) so the
+/// two planes agree, applied to a yaml key (case-insensitive), plus the shapes
+/// a YAML tree has that an env file does not: `*_env` / `*_env_var` keys NAME
+/// the environment variable that holds a secret (`password_env:
+/// NOO_TRELLION_DB_PASSWORD`) and are the correct way to refer to one, and
+/// `*_tokens` is a count (`vllm_max_tokens`).
+pub(crate) fn config_key_looks_like_credential(key: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "PASSWORD", "SECRET", "TOKEN", "APIKEY", "API_KEY", "PASSPHRASE",
+        "PRIVATE_KEY", "CREDENTIAL", "AUTHTOKEN", "_KEY",
+    ];
+    const NOT_CREDENTIALS: &[&str] =
+        &["NOO_SECRETS_BACKEND", "SOPS_AGE_KEY_FILE", "NOO_TOKEN_TTL", "NOO_JWT_ALGORITHM"];
+    const CONFIG_SUFFIXES: &[&str] = &[
+        "_FILE", "_PATH", "_DIR", "_ENABLED", "_BACKEND", "_MODE", "_URL", "_HOST", "_PORT",
+        "_USER", "_NAME", "_TTL", "_ALGORITHM", "_TIMEOUT", "_LENGTH",
+        "_ENV", "_ENV_VAR", "_TOKENS",
+    ];
+    let k = key.to_ascii_uppercase();
+    if NOT_CREDENTIALS.contains(&k.as_str()) || CONFIG_SUFFIXES.iter().any(|s| k.ends_with(s)) {
+        return false;
+    }
+    NEEDLES.iter().any(|n| k.contains(n))
+}
+
+/// Dotted paths of every credential-shaped key in `v` that holds a non-empty
+/// string. Numbers, booleans, nulls, objects and empty strings are not
+/// secrets (a `token_ttl: 900` or an unset `api_key: ""` is configuration).
+pub(crate) fn credential_paths(v: &Value) -> Vec<String> {
+    fn walk(v: &Value, prefix: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, val) in m {
+                    let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    match val {
+                        Value::String(s) if !s.is_empty() && config_key_looks_like_credential(k) => {
+                            out.push(path)
+                        }
+                        _ => walk(val, &path, out),
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for (i, val) in a.iter().enumerate() {
+                    walk(val, &format!("{prefix}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, "", &mut out);
+    out
+}
+
+/// A copy of `v` with every credential-shaped string value replaced, so a
+/// reader of the config (any account with access) never receives one even if
+/// an operator once pasted it in. The key stays, so the caller sees THAT it
+/// is set and the remedy names where it belongs.
+pub(crate) fn redact_credentials(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, val)| {
+                    let redacted = match val {
+                        Value::String(s) if !s.is_empty() && config_key_looks_like_credential(k) => {
+                            Value::String("[redacted: credential-shaped key; use `noo security secrets set`]".into())
+                        }
+                        other => redact_credentials(other),
+                    };
+                    (k.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(redact_credentials).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The 422 body for a write that carries credential-shaped keys.
+fn credential_write_refusal(paths: &[String]) -> Value {
+    json!({
+        "error": format!(
+            "refusing to store credential-shaped key(s) in noomesh.yaml: {}. A secret in the \
+             config plane is plaintext on disk and bind-mounted into containers, and nothing \
+             reads secrets from it. Store it with `noo security secrets set <NAME>` (and, where a \
+             setting needs to point at it, put the variable NAME in a `*_env` key).",
+            paths.join(", ")
+        ),
+        "keys": paths,
+        "remedy": "noo security secrets set",
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Config section handlers
 // ═══════════════════════════════════════════════════════════════
 
 /// GET /api/config — Return full config as JSON (from cache).
 async fn config_get(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
 ) -> impl IntoResponse {
+    if let Err(e) = super::operator_read_guard(&requester) {
+        return e.into_response();
+    }
     let config = config_with_legacy_mirrors(&*state.config_yaml.read().await);
-    (StatusCode::OK, Json(config)).into_response()
+    (StatusCode::OK, Json(redact_credentials(&config))).into_response()
 }
 
 /// GET /api/config/{section} — Return a single config section (from cache).
 async fn config_get_section(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
     Path(section): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = super::operator_read_guard(&requester) {
+        return e.into_response();
+    }
     let config = state.config_yaml.read().await;
     let effective = effective_config_section(&config, &section);
 
     match config.get(&effective) {
-        Some(val) => (StatusCode::OK, Json(val.clone())).into_response(),
+        Some(val) => (StatusCode::OK, Json(redact_credentials(val))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("Section '{}' not found", section)})),
@@ -629,6 +736,21 @@ async fn config_update_section(
             cluster.is_some(),
         )
     });
+    // Third wall: no credential-shaped key with a value, at any depth.
+    let creds = credential_paths(&body);
+    if !creds.is_empty() && refusal.is_none() {
+        crate::routes::core::audit_event(
+            &state.db,
+            "config_update_refused",
+            "warning",
+            &actor_name(&actor),
+            &format!("config:{section}"),
+            "refused",
+            json!({ "section": section, "keys": creds, "reason": "credential-shaped key" }),
+        )
+        .await;
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(credential_write_refusal(&creds))).into_response();
+    }
     if let Some(reason) = refusal {
         crate::routes::core::audit_event(
             &state.db,
@@ -714,8 +836,12 @@ fn top_level_keys(body: &Value) -> Vec<String> {
 /// Now reads directly from the YAML config cache instead of delegating to Python.
 async fn settings_get(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
 ) -> impl IntoResponse {
-    let config = state.config_yaml.read().await.clone();
+    if let Err(e) = super::operator_read_guard(&requester) {
+        return e.into_response();
+    }
+    let config = redact_credentials(&*state.config_yaml.read().await);
     (StatusCode::OK, Json(config)).into_response()
 }
 
@@ -729,6 +855,10 @@ async fn settings_update(
     actor: Option<Extension<AuthActor>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    let creds = credential_paths(&body);
+    if !creds.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(credential_write_refusal(&creds))).into_response();
+    }
     // Deep-merge into the FRESH on-disk document under the config lock.
     let overlay = body.clone();
     if let Err((status, err_body)) = mutate_config(&state, move |doc| {
@@ -764,8 +894,12 @@ async fn settings_update(
 /// Returns the config as a YAML file attachment for backup/export.
 async fn settings_export(
     State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
 ) -> impl IntoResponse {
-    let config = state.config_yaml.read().await.clone();
+    if let Err(e) = super::operator_read_guard(&requester) {
+        return e.into_response();
+    }
+    let config = redact_credentials(&*state.config_yaml.read().await);
 
     // Convert JSON Value -> YAML string
     let yaml_val: serde_yaml::Value = match serde_json::from_value(
@@ -1559,7 +1693,11 @@ fn flag_truthy(raw: &str) -> bool {
 /// with the winning layer in `source` ("db" / "env" / "default"). A DB read
 /// failure degrades to env/default resolution (never errors), matching the
 /// Python handler.
-async fn settings_flags_list(State(state): State<Arc<AppState>>) -> AppJson {
+async fn settings_flags_list(
+    State(state): State<Arc<AppState>>,
+    requester: Option<Extension<crate::auth::RequesterCtx>>,
+) -> AppResult {
+    super::operator_read_guard(&requester)?;
     let mut db_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // Who last wrote each row, and when: `noo kiosk labels status` and the
     // verify row answer "who turned names on" from this, not from a log.
@@ -1619,7 +1757,7 @@ async fn settings_flags_list(State(state): State<Arc<AppState>>) -> AppJson {
             "source": source,
         }));
     }
-    Json(json!({ "flags": flags, "settings": string_settings }))
+    Ok(Json(json!({ "flags": flags, "settings": string_settings })))
 }
 
 /// Resolve one registered flag: DB row → env (unless `db_only`) → default,
@@ -2691,5 +2829,80 @@ mod tests {
         // An ordinary flag keeps its env layer.
         let cloud = super::FLAG_REGISTRY.iter().find(|f| f.key == "CLOUD_PROVIDERS_ENABLED").unwrap();
         assert_eq!(super::flag_resolution(cloud, None, Some("1")), (true, "env"));
+    }
+}
+
+#[cfg(test)]
+mod credential_plane_tests {
+    use super::*;
+
+    #[test]
+    fn credential_shaped_keys_are_recognised_and_config_shaped_ones_are_not() {
+        for k in ["tavily_api_key", "api_key", "jwt_secret", "cluster_secret", "db_password", "bot_token", "private_key", "AUTH_TOKEN"] {
+            assert!(config_key_looks_like_credential(k), "{k}");
+        }
+        for k in ["vllm_max_tokens", "password_env", "ddl_password_env", "key_file", "token_ttl", "api_key_env", "search_url", "model", "enabled"] {
+            assert!(!config_key_looks_like_credential(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn only_non_empty_strings_under_a_credential_key_count_at_any_depth() {
+        let body = json!({
+            "search": {"tavily_api_key": "tvly-abc", "max_tokens": 4096, "api_key": ""},
+            "db": {"password_env": "NOO_DB_PASSWORD", "nested": [{"bot_token": "123:abc"}]},
+            "token_ttl": 900,
+            "ok": true,
+        });
+        let mut got = credential_paths(&body);
+        got.sort();
+        assert_eq!(got, vec!["db.nested[0].bot_token", "search.tavily_api_key"]);
+        assert!(credential_paths(&json!({"search": {"provider": "tavily"}})).is_empty());
+    }
+
+    #[test]
+    fn refusal_body_names_the_remedy_and_the_keys() {
+        let b = credential_write_refusal(&["search.tavily_api_key".to_string()]);
+        let msg = b["error"].as_str().unwrap();
+        assert!(msg.contains("noo security secrets set"), "{msg}");
+        assert!(msg.contains("search.tavily_api_key"), "{msg}");
+        assert_eq!(b["remedy"], "noo security secrets set");
+    }
+
+    #[test]
+    fn redaction_hides_values_keeps_keys_and_leaves_the_rest() {
+        let cfg = json!({
+            "security": {"jwt_secret": "hunter2hunter2", "cluster_secret": "s3cr3t", "mode": "strict"},
+            "search": {"tavily_api_key": "tvly-abc", "password_env": "NOO_X", "max_tokens": 10},
+            "list": [{"bot_token": "123:abc", "name": "n"}],
+        });
+        let out = redact_credentials(&cfg);
+        let text = out.to_string();
+        for leaked in ["hunter2hunter2", "s3cr3t", "tvly-abc", "123:abc"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        assert!(out["security"]["jwt_secret"].as_str().unwrap().contains("redacted"));
+        assert_eq!(out["security"]["mode"], "strict");
+        assert_eq!(out["search"]["password_env"], "NOO_X");
+        assert_eq!(out["search"]["max_tokens"], 10);
+        assert_eq!(out["list"][0]["name"], "n");
+        // The placeholder itself is a credential-shaped write, so a GET->PUT
+        // round trip is refused rather than persisting the placeholder.
+        assert!(!credential_paths(&out).is_empty());
+    }
+
+    /// The PUT handlers answer 422 BEFORE the file is touched.
+    #[test]
+    fn the_write_handlers_refuse_before_mutating() {
+        let src = include_str!("settings.rs");
+        for sig in ["async fn config_update_section(", "async fn settings_update("] {
+            let start = src.find(sig).unwrap();
+            let rest = &src[start..];
+            let end = rest[sig.len()..].find("\nasync fn ").map(|i| i + sig.len()).unwrap();
+            let body = &rest[..end];
+            let refuse = body.find("StatusCode::UNPROCESSABLE_ENTITY").unwrap_or_else(|| panic!("{sig}: no 422"));
+            let mutate = body.find("mutate_config(").unwrap();
+            assert!(refuse < mutate, "{sig}: must refuse before mutate_config");
+        }
     }
 }
