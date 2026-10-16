@@ -261,7 +261,16 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 		landed.Store(true) // the first pull "loads" the image
 		return nil, ErrArtifactAbsent
 	}
-	t.Cleanup(func() { imageLocalID, imageManifestFetch = pl, pm })
+	var removed []string
+	var rmu sync.Mutex
+	pr := removeContainerFn
+	removeContainerFn = func(_ context.Context, _ *Client, name string) error {
+		rmu.Lock()
+		removed = append(removed, name)
+		rmu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { imageLocalID, imageManifestFetch, removeContainerFn = pl, pm, pr })
 
 	type out struct {
 		res *PullImageArtifactResult
@@ -269,7 +278,7 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 	}
 	results := make(chan out, 2)
 	pull := func() {
-		r, err := (&Client{}).PullImageArtifact(context.Background(), "race:1", "", "")
+		r, err := (&Client{}).PullImageArtifact(context.Background(), "race:1", "", "noo-old")
 		results <- out{r, err}
 	}
 	go pull()
@@ -283,11 +292,17 @@ func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
 		switch {
 		case o.err == nil && o.res.Status == "up_to_date":
 			upToDate++
+			if o.res.Removed != "noo-old" {
+				t.Fatalf("the waiter must still remove the old container, Removed=%q", o.res.Removed)
+			}
 		case IsImageNotStaged(o.err):
 			refused++
 		default:
 			t.Fatalf("unexpected result %+v %v", o.res, o.err)
 		}
+	}
+	if len(removed) != 1 || removed[0] != "noo-old" {
+		t.Fatalf("daemon removals %v, want [noo-old]", removed)
 	}
 	if upToDate != 1 || refused != 1 || atomic.LoadInt32(&manifestCalls) != 2 {
 		t.Fatalf("upToDate=%d refused=%d manifestCalls=%d, want 1 1 2 (one pull asks for the .tar.gz then the .tar name)", upToDate, refused, manifestCalls)
