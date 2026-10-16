@@ -1539,13 +1539,25 @@ async fn self_node_identity(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
 /// is about the CURRENTLY staged blob), not an authentication one, and it
 /// was never doing the job the auth bypass left vacant.
 ///
-/// Known gap, deliberate: the first-phase "applier-only" bundle
-/// (`provision.rs` stages it before the full one) and a failed apply on a
-/// never-provisioned host both run without the secret, so those reports now
-/// 401. `provision --wait` gates the applier phase on `fetched_at`, not on
-/// this report, so the phase still completes; a failed FIRST apply degrades
-/// to a timeout with no message instead of a message. Recorded in the R4
-/// notes rather than papered over with an unauthenticated fallback.
+/// **The credential is the node's own birth key, and only that.** The fleet
+/// HMAC is one secret every node holds, so `<node>:<ts>:<hmac>` proves "some
+/// node" and its `<node>` field is a claim. Since #111 the controller trusts
+/// this report's `binary-sha:` line to leave binaries out of the NEXT bundle,
+/// so an HMAC-only report would let any node withhold updates from any other
+/// by posting a forged "applied" for it. The report is therefore recorded
+/// only with a verified `X-Noo-Birth-Proof` over this node and this sha
+/// (`ProofStatus::Signed`), whatever the bearer says. Both fetchers
+/// (`scripts/noo-fetch.sh`, `noo node fetch`) send it whenever they hold the
+/// birth key; the first-phase "applier-only" bundle and a failed apply on a
+/// never-provisioned host hold it too, so no legitimate poster is shut out.
+/// A node whose fetcher predates the proof gets a 403 naming the fix.
+///
+/// No internal (controller-secret) poster exists: the controller's own node
+/// applies through the same fetcher and signs with its birth cert like any
+/// other node (`self_birth_cert`), and no other gateway/worker/CLI code posts
+/// here (`noo cluster provision` only READS `/status`). So the old
+/// "internal callers are accepted" arm is gone; an internal caller can still
+/// post, but only with a proof, like everyone else.
 async fn bundle_apply_report(
     State(state): State<Arc<AppState>>,
     Path(node): Path<String>,
@@ -1559,24 +1571,17 @@ async fn bundle_apply_report(
     // Belt and braces on top of `node_route_allowed`'s `{self}` match: that
     // check only runs when `controller_secret()` is set, and an operator
     // JWT reaching here must still not be able to forge a node's report.
-    let cluster_proved = match cluster.as_ref().map(|Extension(c)| c) {
-        Some(c) if c.0 == node => true,
-        Some(c) if c.is_internal() => true,
-        Some(c) => {
+    // The bearer no longer PROVES anything on this route (the birth-key
+    // proof below is the only credential); this check just keeps a bearer
+    // naming another node from being waved through as "close enough".
+    if let Some(Extension(c)) = cluster.as_ref() {
+        if !c.is_internal() && c.0 != node {
             return Err(AppError::Forbidden(format!(
                 "node '{}' may not report an apply for '{node}'",
                 c.0
-            )))
+            )));
         }
-        // No fleet credential. That is not automatically a forgery: it is the
-        // shape of the two legitimate cases the R4 notes recorded — the
-        // first-phase APPLIER-ONLY bundle, staged before the node has any
-        // secret, and a failed apply on a never-provisioned host (noo-apply
-        // exit 78). Both of those DO hold the birth key, so the proof below is
-        // what closes the gap rather than papering it over with an
-        // unauthenticated fallback.
-        None => false,
-    };
+    }
     let sha = body.get("sha").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
     let rc = body.get("rc").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
     let msg: String = body.get("msg").and_then(|v| v.as_str()).unwrap_or("").chars().take(2000).collect();
@@ -1588,10 +1593,8 @@ async fn bundle_apply_report(
         Some(s) if s != sha => return Err(AppError::BadRequest("sha does not match the staged bundle".into())),
         _ => {}
     }
-    // A birth-key proof is accepted INSTEAD of the fleet credential, and is
-    // checked even when the fleet credential is present: a proof that is
-    // present and wrong is a refusal in every mode (check_birth_proof), so a
-    // node cannot launder a bad proof past the HMAC rail.
+    // A proof that is present and wrong is a refusal in every mode
+    // (check_birth_proof), whatever the bearer says.
     let status = if headers.contains_key(BIRTH_PROOF_HEADER) {
         check_birth_proof(&state.db, &headers, crate::birth_proof::Purpose::Apply, &node, &sha)
             .await?;
@@ -1599,27 +1602,25 @@ async fn bundle_apply_report(
     } else {
         ProofStatus::Unsigned(crate::birth_proof::ProofError::Missing)
     };
-    let proved_by = match apply_report_decision(cluster_proved, &status) {
+    let proved_by = match apply_report_decision(&status) {
         Ok(by) => by,
         Err(()) => {
-            // Neither credential. What the operator
-            // needs is where to look, and that is the NODE: a Mac that cannot
-            // build the proof now says why in its own journal rather than
-            // posting unsigned and leaving the gateway to describe a symptom
-            // it cannot explain.
+            // No proof. What the operator needs is where to look, and that
+            // is the NODE: a Mac that cannot build the proof says why in its
+            // own journal rather than posting unsigned.
             tracing::warn!(
                 node = %node,
-                "bundle_apply_report_refused — no fleet credential and no birth-key proof. \
-                 On a Mac, `log show --predicate 'process == \"noo\"'` (or the fetch \
-                 daemon's stderr) carries the reason it could not sign"
+                "bundle_apply_report_refused — no birth-key proof (a fleet bearer alone is not \
+                 accepted). On a Mac, `log show --predicate 'process == \"noo\"'` (or the \
+                 fetch daemon's stderr) carries the reason it could not sign"
             );
             return Err(AppError::Forbidden(format!(
-                "the bundle apply report from '{node}' carried no credential: sign it with \
-                 NOO_CLUSTER_SECRET as node '<name>:<ts>:<hmac>', or with this node's birth \
-                 key as X-Noo-Birth-Proof: <ts>.<base64 sig> over \
-                 \"noo-bundle-apply:<node>:<sha>:<ts>\". A node that HAS a birth key and \
-                 still sends nothing failed to sign locally — the reason is in that node's \
-                 own log, not here"
+                "the bundle apply report from '{node}' carried no birth-key proof: this \
+                 node's fetcher must sign the report with its birth key (X-Noo-Birth-Proof: \
+                 <ts>.<base64 sig> over \"noo-bundle-apply:<node>:<sha>:<ts>\"); restage it \
+                 with `noo cluster provision {node} --wait` to install the current fetcher. \
+                 A node that HAS a birth key and still sends nothing failed to sign locally: \
+                 the reason is in that node's own log, not here"
             )));
         }
     };
@@ -1699,8 +1700,8 @@ pub enum ProofStatus {
     /// A birth-key proof verified against the birth cert recorded for this
     /// node.
     Signed,
-    /// No proof was offered. Whether that is enough is the route's decision:
-    /// on the apply report it is, only with the fleet credential.
+    /// No proof was offered. On the apply report that is never enough: the
+    /// fleet bearer does not substitute for it.
     Unsigned(crate::birth_proof::ProofError),
 }
 
@@ -1727,14 +1728,16 @@ async fn check_birth_proof(
 /// The apply report's credential decision, as a pure function.
 ///
 /// Extracted so the one rule that matters can be tested without a database:
-/// **"no credential at all" is never acceptable on this route.** The apply
-/// report accepts a birth-key proof or the fleet HMAC, and a request carrying
-/// neither is the hole #95 closed.
-pub fn apply_report_decision(cluster_proved: bool, proof: &ProofStatus) -> Result<&'static str, ()> {
-    match (cluster_proved, proof) {
-        (_, ProofStatus::Signed) => Ok("birth-key"),
-        (true, ProofStatus::Unsigned(_)) => Ok("cluster-secret"),
-        (false, ProofStatus::Unsigned(_)) => Err(()),
+/// **only a verified birth-key proof records an apply report.** The fleet
+/// HMAC is shared by every node, so it cannot say WHICH node is reporting,
+/// and the controller acts on the report (it omits binaries the node says it
+/// already has). A request carrying neither, or only the bearer, is refused.
+/// A present-and-wrong proof never reaches here: `check_birth_proof` has
+/// already returned 403.
+pub fn apply_report_decision(proof: &ProofStatus) -> Result<&'static str, ()> {
+    match proof {
+        ProofStatus::Signed => Ok("birth-key"),
+        ProofStatus::Unsigned(_) => Err(()),
     }
 }
 
@@ -2268,28 +2271,30 @@ mod tests {
         assert!(enroll_url("https://100.64.0.1:8080").is_ok());
     }
 
-    /// The apply report's rule, pinned: **"no credential at all" is never
-    /// acceptable on this route.** It accepts a birth-key proof or the fleet
-    /// HMAC; a request carrying neither is the hole #95 closed.
+    /// The apply report's rule, pinned: **only a verified birth-key proof
+    /// records it.** The fleet HMAC (one secret on every node) never
+    /// substitutes, and "no credential at all" stays refused (#95).
     #[test]
-    fn a_credentialless_apply_report_is_refused() {
+    fn only_a_birth_key_proof_records_an_apply_report() {
         use crate::birth_proof::ProofError;
-        let unsigned = ProofStatus::Unsigned(ProofError::Missing);
+        // Signed: recorded, attributed to the birth key.
+        assert_eq!(apply_report_decision(&ProofStatus::Signed), Ok("birth-key"));
+        // HMAC-only or nothing at all both arrive as Unsigned(Missing): the
+        // bearer is not an input to the decision any more. REFUSED.
+        assert_eq!(apply_report_decision(&ProofStatus::Unsigned(ProofError::Missing)), Err(()));
+        // And refused for every reason an unsigned report can carry.
+        assert_eq!(apply_report_decision(&ProofStatus::Unsigned(ProofError::NoBirthCert)), Err(()));
+    }
 
-        // Signed: recorded, and attributed to the birth key, with or without
-        // the fleet secret.
-        assert_eq!(apply_report_decision(false, &ProofStatus::Signed), Ok("birth-key"));
-        assert_eq!(apply_report_decision(true, &ProofStatus::Signed), Ok("birth-key"));
-        // Fleet HMAC and no proof: the ordinary Linux node. Recorded.
-        assert_eq!(apply_report_decision(true, &unsigned), Ok("cluster-secret"));
-        // Neither. REFUSED — this is the one that must not drift.
-        assert_eq!(apply_report_decision(false, &unsigned), Err(()));
-        // And refused for every reason the window covers, not just Missing:
-        // a node with no recorded birth cert is equally uncredentialed here.
-        assert_eq!(
-            apply_report_decision(false, &ProofStatus::Unsigned(ProofError::NoBirthCert)),
-            Err(())
-        );
+    /// A present-and-wrong proof is a 403 in `check_birth_proof` before the
+    /// decision is reached; pin that the decision has no path that would
+    /// turn a non-`Signed` status into an accept.
+    #[test]
+    fn the_apply_decision_has_no_accept_anyway_branch() {
+        let src = include_str!("bootstrap.rs");
+        let a = src.find("pub fn apply_report_decision").expect("decision fn");
+        let body = &src[a..a + 300];
+        assert!(!body.contains("cluster"), "the fleet bearer must not feed the apply decision");
     }
 
     /// i67: the controller's own node's birth cert is the host file, and

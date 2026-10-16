@@ -2167,13 +2167,13 @@ pub const PUBLIC_GET_PATH_PREFIXES: &[&str] = &["/bootstrap/bundle/"];
 /// | route | who it is for |
 /// |---|---|
 /// | `POST …/fetched` | the node's signed receipt — the only thing that stamps `fetched_at` |
-/// | `POST …/applied` | the apply report, which now takes EITHER the fleet HMAC or a birth proof |
+/// | `POST …/applied` | the apply report, recorded only with a verified birth-key proof (the fleet bearer alone is refused) |
 ///
 /// `…/applied` is here for the two legitimate 401s #95 recorded and accepted:
 /// the first-phase applier-only bundle, and a failed apply on a
 /// never-provisioned host. Both run before the node has a fleet secret and both
-/// hold the birth key. The handler still refuses when neither credential is
-/// present, so the hole #95 closed stays closed.
+/// hold the birth key. The handler refuses everything but a verified proof, so
+/// the hole #95 closed stays closed.
 ///
 /// The middleware steps aside for these ONLY when the request carries no
 /// bearer at all — there is then nothing for it to check. A request that does
