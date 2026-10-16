@@ -255,6 +255,129 @@ pub(crate) fn image_family_row() -> Check {
     }
 }
 
+// ── the voice add-on's images (i105) ─────────────────────────────────
+
+/// The "voice images" row.
+///
+/// `ghcr.io/noomesh/whisper` and `piper` ran as uid 0 through v0.6.4 (no
+/// USER line), so the mTLS leaves their doors gained (#125) went to a root
+/// reader. Both Dockerfiles now end `USER nonroot` (65532) and their keys
+/// are handed to that uid (`pki::SERVICE_KEY_READERS`). Not in the image
+/// family row: they are built from this tree, not pulled through
+/// `NOO_BASE_REGISTRY`. Voice is an overlay add-on, so with it off the row
+/// says "not checked"; with it on, each door's LIVE uid (the same BusyBox-safe
+/// reader as above) must be the uid its key is handed to, non-zero, and able
+/// to read the key.
+pub(crate) const VOICE_NAME: &str = "voice images";
+
+/// The voice doors, by compose service name.
+pub(crate) const VOICE_SERVICES: [&str; 2] = ["whisper", "piper"];
+
+/// What the box says about one voice container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VoiceUid {
+    /// No such container (not composed yet on this box).
+    Missing,
+    /// Created but not running: no live uid to read.
+    Stopped,
+    /// Running, as this uid.
+    Live(u32),
+    /// Running, but its uid could not be read (why).
+    Unreadable(String),
+}
+
+/// Judge the row. `key_readable` answers "can `uid` read this service's
+/// key" (`None` when the key is absent: nothing mounted to judge).
+pub(crate) fn voice_images_check(voice_on: bool, doors: &[(&'static str, VoiceUid)], key_readable: &dyn Fn(&str, u32) -> Option<bool>) -> Check {
+    if !voice_on {
+        return ok(VOICE_NAME, "voice off — not checked");
+    }
+    let mut problems: Vec<String> = Vec::new();
+    let mut unjudged: Vec<String> = Vec::new();
+    let mut root = 0usize;
+    let mut unreadable_key = 0usize;
+    for (svc, state) in doors {
+        let want = expected_uid(svc);
+        let want_s = want.map_or_else(|| "?".to_string(), |u| u.to_string());
+        let uid = match state {
+            VoiceUid::Live(u) => *u,
+            VoiceUid::Missing => {
+                unjudged.push(format!("{svc} has no container"));
+                continue;
+            }
+            VoiceUid::Stopped => {
+                unjudged.push(format!("{svc} is not running"));
+                continue;
+            }
+            VoiceUid::Unreadable(e) => {
+                unjudged.push(format!("{svc} is running but its live uid could not be read ({e})"));
+                continue;
+            }
+        };
+        if uid == 0 {
+            root += 1;
+            problems.push(format!(
+                "{svc} runs as root: an image from before i105 (the voice images run as nonroot, and its key is handed to uid {want_s})"));
+            continue;
+        }
+        if let Some(w) = want {
+            if uid != w {
+                problems.push(format!("{svc} runs as uid {uid}, but its key is handed to uid {w}"));
+                continue;
+            }
+        }
+        if key_readable(svc, uid) == Some(false) {
+            unreadable_key += 1;
+            problems.push(format!("{svc} (uid {uid}) cannot read services/{svc}/service.key"));
+        }
+    }
+    if !problems.is_empty() {
+        let remedy = if unreadable_key == problems.len() {
+            "noo security pki fix-modes   # re-hands each key to its reader; then: noo stack restart --force whisper piper"
+        } else if root == problems.len() {
+            "noo upgrade --stack   # pulls the non-root whisper/piper images and recreates both"
+        } else {
+            "noo upgrade --stack   # the shipped images and key modes; then: noo cluster verify --controller"
+        };
+        return fail(VOICE_NAME, problems.join("; "), remedy);
+    }
+    if !unjudged.is_empty() {
+        return warn(VOICE_NAME, format!("voice is on; not judged: {}", unjudged.join("; ")), Some("noo stack status".into()));
+    }
+    ok(VOICE_NAME, "whisper and piper run as non-root uid 65532, the uid their keys are handed to, and can read them")
+}
+
+/// Each voice container's state on the live box.
+fn inspect_voice() -> Vec<(&'static str, VoiceUid)> {
+    let prefix = crate::envfile::container_prefix();
+    VOICE_SERVICES
+        .iter()
+        .map(|svc| {
+            let name = format!("{prefix}-{svc}");
+            let state = match docker_text(&["inspect", "--format", "{{.State.Running}}", &name]) {
+                Err(_) => VoiceUid::Missing,
+                Ok(t) if t.trim() != "true" => VoiceUid::Stopped,
+                Ok(_) => match live_uid_via(&docker_text, &name) {
+                    Ok(u) => VoiceUid::Live(u),
+                    Err(e) => VoiceUid::Unreadable(e),
+                },
+            };
+            (*svc, state)
+        })
+        .collect()
+}
+
+/// The row, from the live box. `voice_on` is the `addons.voice` switch.
+pub(crate) fn voice_images_row(voice_on: bool) -> Check {
+    if !voice_on {
+        return voice_images_check(false, &[], &|_, _| None);
+    }
+    let pki = crate::pki::pki_dir();
+    voice_images_check(true, &inspect_voice(), &|svc, uid| {
+        crate::pki::readable_by_uid(&pki.join("services").join(svc).join("service.key"), uid)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +642,104 @@ mod tests {
         let mut want: Vec<String> = RUNTIME_SERVICES.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(found, want);
+    }
+
+    // ── voice images (i105) ──
+
+    fn voice(w: VoiceUid, p: VoiceUid) -> Vec<(&'static str, VoiceUid)> {
+        vec![("whisper", w), ("piper", p)]
+    }
+
+    #[test]
+    fn voice_off_is_not_checked() {
+        let c = voice_images_check(false, &voice(VoiceUid::Live(0), VoiceUid::Live(0)), &|_, _| Some(false));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "voice off — not checked");
+        assert_eq!(c.name, "voice images");
+    }
+
+    #[test]
+    fn the_voice_keys_are_handed_to_65532() {
+        assert_eq!(expected_uid("whisper"), Some(65532));
+        assert_eq!(expected_uid("piper"), Some(65532));
+        assert_eq!(VOICE_SERVICES, ["whisper", "piper"]);
+    }
+
+    #[test]
+    fn both_doors_as_nonroot_pass() {
+        let c = voice_images_check(true, &voice(VoiceUid::Live(65532), VoiceUid::Live(65532)), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("65532"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_pre_i105_root_image_fails_naming_the_door() {
+        // What v0.6.4's images measured: uid=0.
+        let c = voice_images_check(true, &voice(VoiceUid::Live(65532), VoiceUid::Live(0)), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("piper runs as root"), "{}", c.detail);
+        assert!(!c.detail.contains("whisper"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().starts_with("noo upgrade --stack"), "{:?}", c.remedy);
+    }
+
+    #[test]
+    fn root_wins_over_an_unreadable_key_check() {
+        // A root process reads anything: the uid is the finding, not the key.
+        let c = voice_images_check(true, &voice(VoiceUid::Live(0), VoiceUid::Live(0)), &|_, _| Some(false));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("whisper runs as root") && c.detail.contains("piper runs as root"), "{}", c.detail);
+        assert!(!c.detail.contains("cannot read"), "{}", c.detail);
+    }
+
+    #[test]
+    fn another_uid_fails() {
+        let c = voice_images_check(true, &voice(VoiceUid::Live(1000), VoiceUid::Live(65532)), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("whisper runs as uid 1000, but its key is handed to uid 65532"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_key_the_uid_cannot_read_fails_with_fix_modes() {
+        let c = voice_images_check(true, &voice(VoiceUid::Live(65532), VoiceUid::Live(65532)), &|svc, _| Some(svc != "whisper"));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("whisper (uid 65532) cannot read services/whisper/service.key"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().starts_with("noo security pki fix-modes"), "{:?}", c.remedy);
+    }
+
+    #[test]
+    fn an_absent_key_is_not_a_failure() {
+        let c = voice_images_check(true, &voice(VoiceUid::Live(65532), VoiceUid::Live(65532)), &|_, _| None);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+    }
+
+    #[test]
+    fn voice_on_but_not_running_is_a_warning_not_a_pass() {
+        for (w, p, want) in [
+            (VoiceUid::Missing, VoiceUid::Live(65532), "whisper has no container"),
+            (VoiceUid::Live(65532), VoiceUid::Stopped, "piper is not running"),
+            (VoiceUid::Unreadable("docker exec id -u failed: x".into()), VoiceUid::Live(65532), "whisper is running but its live uid could not be read"),
+        ] {
+            let c = voice_images_check(true, &voice(w, p), &|_, _| Some(true));
+            assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+            assert!(c.detail.contains(want), "{}", c.detail);
+        }
+    }
+
+    #[test]
+    fn a_root_door_fails_even_when_the_other_is_unjudged() {
+        let c = voice_images_check(true, &voice(VoiceUid::Stopped, VoiceUid::Live(0)), &|_, _| Some(true));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+    }
+
+    #[test]
+    fn the_voice_live_uid_reader_is_the_busybox_safe_one() {
+        // `docker exec id -u` first; `docker top` only when exec fails.
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let docker = |a: &[&str]| -> Result<String, String> {
+            calls.borrow_mut().push(a.join(" "));
+            Ok("65532\n".into())
+        };
+        assert_eq!(live_uid_via(&docker, "noo-piper"), Ok(65532));
+        assert_eq!(*calls.borrow(), vec!["exec noo-piper id -u".to_string()]);
     }
 }

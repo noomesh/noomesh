@@ -47,6 +47,21 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
 WORKDIR /app
 COPY docker/whisper_server.py /app/whisper_server.py
 
+# Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
+# rest of the stack runs as. Everything this server WRITES at run time is
+# under HF_HOME (/models: huggingface_hub's hub/ cache and its .locks, where
+# faster-whisper downloads the model) plus one tempfile per request in /tmp
+# (already 1777). /models is chowned BEFORE the VOLUME line (changes after it
+# are discarded), so a fresh `whisper-models` volume is copied up from the
+# image owned by 65532; a volume an older root whisper filled is re-owned by
+# the launcher before `up` (scripts/lib-reown.sh, reown_nonroot_volumes).
+# The service key is handed to this uid (noo-cli pki.rs SERVICE_KEY_READERS).
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
+        --shell /usr/sbin/nologin nonroot \
+    && mkdir -p /models \
+    && chown 65532:65532 /models
+
 # Model cache on a volume so pulls survive container recreation.
 ENV HF_HOME=/models \
     WHISPER_MODEL=base \
@@ -58,5 +73,7 @@ EXPOSE 8000
 # curl-less healthcheck (slim image): python stdlib probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+USER nonroot
 
 CMD ["uvicorn", "whisper_server:app", "--host", "0.0.0.0", "--port", "8000"]

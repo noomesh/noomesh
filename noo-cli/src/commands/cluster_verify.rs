@@ -4315,6 +4315,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let voice_overlay = if voice_on { std::fs::read_to_string(root.join("docker-compose.voice.yml")).ok() } else { None };
         let voice_probe = if voice_on { voice_live_probe() } else { None };
         checks.push(voice_listeners_check(voice_on, voice_overlay.as_deref(), voice_probe.as_ref()));
+        // ... and run as non-root uid 65532, the uid their keys are handed
+        // to (i105): the live uid, `docker exec id -u` first.
+        checks.push(image_family::voice_images_row(voice_on));
         // Every compose inference backend requires a client certificate at
         // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
