@@ -9,6 +9,7 @@ import { ApprovalCard } from './ApprovalCard';
 import { useCoordinator, type TurnStats, type ToolRun } from './useCoordinator';
 import { useBackendHealth } from './useBackendHealth';
 import { atTail } from './followTail';
+import { formatElapsed } from './toolElapsed';
 
 export interface ChatPaneProps {
   /** Whether the side panel is currently collapsed. */
@@ -104,7 +105,7 @@ function ToolChips({ tools }: { tools: ToolRun[] }) {
             </span>
             <span className="tool-name">{t.name}</span>
             {t.elapsedMs !== undefined && (
-              <span className="tool-ms">{(t.elapsedMs / 1000).toFixed(1)}s</span>
+              <span className="tool-ms">{formatElapsed(t.elapsedMs)}</span>
             )}
           </button>
           {shown === i && t.detail && <pre className="tool-detail">{t.detail}</pre>}
