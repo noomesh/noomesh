@@ -1978,7 +1978,7 @@ pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
 /// one line.
 pub const TOKEN_BUDGETS_REVISION: &str = "091_token_budgets";
 
-/// The model-class pool revision, the head. A constant so a renumber at
+/// The model-class pool revision. A constant so a renumber at
 /// rebase is one line.
 pub const MODEL_CLASS_POOL_REVISION: &str = "093_model_class_pool";
 
@@ -2748,11 +2748,11 @@ mod tests {
         assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind"), "usage::insert must write harness_kind");
     }
 
-    /// 093 is the head, on the kiosk seats, and adds the pool flag
-    /// `classes::save_class` writes.
+    /// 093 sits on the kiosk seats and adds the pool flag
+    /// `classes::save_class` writes. (094, the audit chain, sits on it.)
     #[test]
     fn model_class_pool_revision_is_the_head_and_adds_the_column() {
-        let m = MIGRATIONS.last().expect("chain");
+        let m = MIGRATIONS.iter().find(|m| m.revision == MODEL_CLASS_POOL_REVISION).expect("093 must be in the chain");
         assert_eq!(m.revision, MODEL_CLASS_POOL_REVISION);
         assert_eq!(m.revision, "093_model_class_pool");
         assert_eq!(m.down_revision, Some(KIOSK_SEATS_REVISION));
