@@ -289,3 +289,38 @@ def test_the_pro_profile_has_one_home() -> None:
             f"{path.name} still selects the pro profile: {hits} — evolve is composed "
             "by file (lib-compose.sh); the profile left its overlay in an earlier change"
         )
+
+
+def test_identity_is_a_gateway_feature_not_a_missing_overlay(install: Path) -> None:
+    """`identity` is a free gateway feature flag with no container and no
+    overlay (docs/getting-started/add-ons.md). The 0.6.3 -> 0.6.4 roll
+    (2026-10-15) printed "addons.identity is true but no overlay was found"
+    on every start because every non-core-overlay name counted as licensed."""
+    out = _run_helper("trellion=1\\nidentity=1", "addons_report_licensed", root=install)
+    assert "no overlay" not in out.stdout + out.stderr, out.stdout + out.stderr
+    assert out.stdout.strip() == "Add-on identity: ENABLED (gateway feature)", out.stdout
+    # unstated (the default) or off: nothing to say
+    for m in ("trellion=1", "trellion=1\\nidentity=0"):
+        out = _run_helper(m, "addons_report_licensed", root=install)
+        assert out.stdout.strip() == "" and out.stderr.strip() == "", (m, out.stdout, out.stderr)
+    # never a licensed name, so never composed, stopped or pin-checked
+    got = _run_helper("trellion=1\\nidentity=1", "addon_licensed_names", root=install)
+    assert "identity" not in got.stdout.split(), got.stdout
+    # the premise: a licensed add-on with no overlay still warns
+    out = _run_helper("trellion=1\\nnobundle_addon=1", "addons_report_licensed", root=install)
+    assert "addons.nobundle_addon is true but no overlay was found" in out.stdout, out.stdout
+
+
+def test_gateway_feature_addons_mirror_the_cli_rows() -> None:
+    """GATEWAY_FEATURE_ADDONS is exactly the CLI's ADDON_ROWS that are not
+    licensed and not a core overlay: a new feature-flag add-on declared in
+    the CLI without the launcher learning it would warn again."""
+    body = (SCRIPTS / "lib-addons.sh").read_text()
+    decl = lambda name: set(re.search(rf'^{name}="([^"]*)"', body, re.M).group(1).split())  # noqa: E731
+    rows = (SCRIPTS.parent / "noo-cli/src/commands/addons.rs").read_text()
+    table = rows[rows.index("pub const ADDON_ROWS"):rows.index("];", rows.index("pub const ADDON_ROWS"))]
+    parsed = re.findall(r'key:\s*"([a-z_]+)".*?licensed:\s*(None|Some)', table, re.S)
+    assert len(parsed) >= 4, f"parsed {parsed} from ADDON_ROWS: the read broke"
+    free = {k for k, lic in parsed if lic == "None"}
+    assert "identity" in free
+    assert decl("GATEWAY_FEATURE_ADDONS") == free - decl("CORE_OVERLAY_ADDONS")

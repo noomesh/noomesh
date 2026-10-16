@@ -1471,7 +1471,16 @@ services:
   ollama:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    # A FIXED version, never :latest (2026-10-15: every roll re-pulled a
+    # moved `latest` from Docker Hub, 91.6 s, and nothing recorded which
+    # ollama ran). The signed stack lock carries an `ollama@sha256:` row
+    # resolved from THIS tag at release time
+    # (scripts/stack-lock-third-party.py), so a dist start pulls it by
+    # digest and skips it when unchanged. Bump the version here, in all
+    # three ollama services; the next stack release pins the new digest.
+    # Pulled from Docker Hub by the controller only (never staged for nodes:
+    # noo-cli image_stage.rs THIRD_PARTY_LOCK_ROWS).
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama
     profiles: ["ollama", "gpu-tier2"]
     # No external port — gateway reaches Ollama via Docker network (noo-cluster)
@@ -1503,7 +1512,7 @@ services:
   ollama-embed:
     logging: *default-logging
     # H-N4: parameterized so it can be pinned to a verified version/digest.
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed
     profiles: ["standalone"]
     # Publishes NOTHING. Every caller goes through stunnel-ollama-embed
@@ -1545,7 +1554,7 @@ services:
   # Enable: docs/operating/runbooks/embed-capacity.md.
   ollama-embed-cpu:
     logging: *default-logging
-    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-ollama-embed-cpu
     profiles: ["embed-cpu"]
     # Publishes nothing; only stunnel-ollama-embed-cpu reaches it (the
