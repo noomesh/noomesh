@@ -1554,6 +1554,7 @@ mod catalogue_tests {
         let decl = Declarations {
             classes: vec![DeclaredClass {
                 name: "fast".into(),
+                pool: false,
                 candidates: vec![DeclaredCandidate { node_id: "host3".into(), backend: "vllm".into(), model: None, degraded: false }],
             }],
             aliases: vec![("quick".into(), "fast".into())],

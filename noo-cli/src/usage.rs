@@ -27,7 +27,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "unplace"], "<node> <backend> [--role chat|embed|rerank]", "Remove a placement (one role); a container is left running, the harness is stopped"),
         (&["cluster", "fit"], "<node> [--with <backend> <model> [--on cpu|gpu] [--role <role>] [--env KEY=VALUE]...]", "Show whether placements fit a node's GPU memory and RAM, with or without one more"),
         (&["cluster", "class", "list"], "", "Show the model classes consumers may send as `model`, with candidate placement and health"),
-        (&["cluster", "class", "set"], "<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]...", "Declare a model class: candidates in failover order; --degraded ones answer last"),
+        (&["cluster", "class", "set"], "<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]", "Declare a model class: failover order, or --pool to share the load; --degraded ones last"),
         (&["cluster", "class", "unset"], "<class>", "Forget a declared model class and its aliases; the derived class of its model takes over"),
         (&["cluster", "logs"], "[<node>] [<service>] [-b|--backend <backend>] [-n|--tail <n>]", "Tail logs for a noo-* container or host service (harness, agent) on one node or all"),
         (&["cluster", "restart-agent"], "<node>", "Ask the gateway to restart a node's node-agent"),

@@ -3361,9 +3361,9 @@ fn seed_export_placement(nid: &str, p: &serde_json::Value) -> serde_yaml::Value 
 }
 
 /// Model-class PUT body from a seed-file entry:
-/// `{aliases: [..], candidates: [{node, backend, model?, degraded?}]}`.
+/// `{aliases: [..], pool?: true, candidates: [{node, backend, model?, degraded?}]}`.
 /// `model` is sent only when given — absent means the placement's model —
-/// and `degraded` only when true.
+/// and `degraded` and `pool` only when true.
 fn seed_model_class_body(spec: &serde_json::Value) -> serde_json::Value {
     let empty = Vec::new();
     let candidates: Vec<serde_json::Value> = spec["candidates"]
@@ -3384,7 +3384,11 @@ fn seed_model_class_body(spec: &serde_json::Value) -> serde_json::Value {
         })
         .collect();
     let aliases: Vec<serde_json::Value> = spec["aliases"].as_array().cloned().unwrap_or_default();
-    serde_json::json!({"candidates": candidates, "aliases": aliases})
+    let mut body = serde_json::json!({"candidates": candidates, "aliases": aliases});
+    if spec["pool"].as_bool() == Some(true) {
+        body["pool"] = serde_json::json!(true);
+    }
+    body
 }
 
 /// Seed-file `model_classes` map from `GET /api/cluster/model-classes`:
@@ -3414,6 +3418,9 @@ fn seed_export_model_classes(classes: &serde_json::Value) -> serde_yaml::Mapping
         let aliases = aliases_of(name);
         if !aliases.is_empty() {
             spec.insert("aliases".into(), serde_yaml::Value::Sequence(aliases));
+        }
+        if c["pool"].as_bool() == Some(true) {
+            spec.insert("pool".into(), serde_yaml::Value::Bool(true));
         }
         let cands: Vec<serde_yaml::Value> = c["candidates"]
             .as_array()

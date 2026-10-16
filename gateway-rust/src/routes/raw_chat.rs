@@ -227,15 +227,27 @@ pub enum Outcome {
 
 /// Bounds the retry loop and refuses a retry once the client has been sent
 /// a byte: the body stream flips `streamed`, and `may_retry` reads it.
+///
+/// It also carries the winning candidate's in-flight ticket
+/// (`classes::InFlight`): the guard lives as long as the answer — the
+/// stream holds a clone until the client has read the last byte — so a
+/// pool counts the request as open for exactly that long.
 #[derive(Clone, Debug)]
 pub struct RetryGuard {
     streamed: Arc<AtomicBool>,
     max_attempts: usize,
+    ticket: Arc<std::sync::Mutex<Option<classes::InFlight>>>,
 }
 
 impl RetryGuard {
     pub fn new(max_attempts: usize) -> Self {
-        Self { streamed: Arc::new(AtomicBool::new(false)), max_attempts }
+        Self { streamed: Arc::new(AtomicBool::new(false)), max_attempts, ticket: Arc::default() }
+    }
+    /// Keep `ticket` open for as long as this guard (or a clone) lives.
+    pub fn hold(&self, ticket: classes::InFlight) {
+        if let Ok(mut t) = self.ticket.lock() {
+            *t = Some(ticket);
+        }
     }
     /// `tried` attempts have been made; may a next one happen?
     pub fn may_retry(&self, tried: usize) -> bool {
@@ -404,6 +416,8 @@ where
             break;
         }
         tried += 1;
+        // Open while this attempt runs; handed to the guard if it answers.
+        let ticket = classes::InFlight::open(&cand.url, &cand.backend);
         let (path, mut body) = build(cand);
         // A non-streaming call goes out as a stream so a stall is visible.
         let aggregate = !stream && can_aggregate(&path, &body);
@@ -433,6 +447,7 @@ where
             Ok(Err(e)) => format!("unreachable: {e}"),
             Ok(Ok(resp)) if resp.status().is_success() => {
                 if stream {
+                    guard.hold(ticket);
                     return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Stream(Box::new(resp)), guard });
                 }
                 if aggregate {

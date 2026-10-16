@@ -1754,14 +1754,29 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: MODEL_CLASS_POOL_REVISION,
+    down_revision: Some(KIOSK_SEATS_REVISION),
+    // A declared model class may be a POOL: its non-degraded candidates
+    // share the load (least in flight, then heartbeat load) instead of
+    // failing over in declared order (`coordinator::classes`). Written on
+    // every row of the class. Additive, NOT NULL DEFAULT false: every
+    // existing class keeps its failover order.
+    sql: r#"
+ALTER TABLE IF EXISTS noo_model_classes ADD COLUMN IF NOT EXISTS pool boolean NOT NULL DEFAULT false
+"#,
 }];
 
-/// The kiosk-seat revision (i77). The chain head.
+/// The kiosk-seat revision (i77).
 pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
 
 /// The token-budget revision (i83 G). A constant so a renumber at rebase is
 /// one line.
 pub const TOKEN_BUDGETS_REVISION: &str = "091_token_budgets";
+
+/// The model-class pool revision, the head. A constant so a renumber at
+/// rebase is one line.
+pub const MODEL_CLASS_POOL_REVISION: &str = "093_model_class_pool";
 
 /// The Alembic revision the baselines reproduce.
 ///
@@ -2522,6 +2537,19 @@ mod tests {
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text"));
         let writer = include_str!("usage.rs");
         assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind"), "usage::insert must write harness_kind");
+    }
+
+    /// 093 is the head, on the kiosk seats, and adds the pool flag
+    /// `classes::save_class` writes.
+    #[test]
+    fn model_class_pool_revision_is_the_head_and_adds_the_column() {
+        let m = MIGRATIONS.last().expect("chain");
+        assert_eq!(m.revision, MODEL_CLASS_POOL_REVISION);
+        assert_eq!(m.revision, "093_model_class_pool");
+        assert_eq!(m.down_revision, Some(KIOSK_SEATS_REVISION));
+        assert!(m.sql.contains("ADD COLUMN IF NOT EXISTS pool boolean NOT NULL DEFAULT false"));
+        let classes = include_str!("coordinator/classes.rs");
+        assert!(classes.contains("degraded, pool, updated_at"), "save_class must write pool");
     }
 
     /// 091 sits on 090 and adds what `task_budget` and `usage::insert` name.
