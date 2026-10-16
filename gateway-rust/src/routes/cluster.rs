@@ -3577,7 +3577,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
     }
     let index = art::read_staged_index(&dir);
     let image = art::placement_required_image(backend, body_image, &arch, index.release.as_ref(), &index.own_roots)?;
-    if dir.join(art::image_tar_name(&image, &arch)).is_file() {
+    if art::image_is_staged(&dir, &image, &arch) {
         return None;
     }
     tracing::warn!(node = %node_id, backend = %backend, image = %image, arch = %arch, "placement.image_not_staged");
