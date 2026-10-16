@@ -1020,6 +1020,69 @@ agent_secret_files() {
 }
 # END agent_secret_files
 
+# BEGIN asf_unchanged
+# asf_owner — the user that owns the agent's secret files: the unit's User=
+# (the unit this bundle carries when it carries one, else the installed one),
+# falling back to root on a host with no such user (provision --local).
+asf_owner() {
+    _ao="$(sed -n 's/^User=//p' "${WORK:-/nonexistent}/files/agent-unit" /etc/systemd/system/noo-node-agent.service 2>/dev/null | head -1)"
+    { [ -n "$_ao" ] && id -u "$_ao" >/dev/null 2>&1; } || _ao=root
+    printf '%s\n' "$_ao"
+}
+
+# asf_unchanged CANDIDATE ENV DIR BIN OWNER [KEYS] [MARKER] — would installing
+# CANDIDATE as ENV and then running agent_secret_files leave exactly what is on
+# disk now? Answered by running the REAL agent_secret_files on a copy of
+# CANDIDATE against a scratch secrets directory (so the normalisation, the
+# pointer shape, the quoting rules and the capability test cannot drift from
+# what the applier does), pointing its `KEY_FILE=` lines back at the real DIR,
+# then comparing: (a) the normalised env against ENV (bytes, 600 root:root) and
+# (b) every secret value it would write against the file at DIR/KEY (bytes,
+# 600, OWNER:its group). A pointer already aimed at DIR keeps whatever file is
+# there. Any difference, a missing file, a scratch run that fails, or an owner
+# that does not exist yet returns 1, and the caller installs exactly as it
+# always did. Nothing under the real DIR or ENV is touched.
+asf_unchanged() {
+    _au_cand="$1"; _au_env="$2"; _au_dir="$3"; _au_bin="$4"; _au_own="$5"
+    _au_keys="${6:-$AGENT_SECRET_KEYS}"; _au_marker="${7:-$AGENT_SECRET_CAPABILITY}"
+    [ -f "$_au_env" ] || return 1
+    id -u "$_au_own" >/dev/null 2>&1 || return 1
+    _au_grp="$(id -gn "$_au_own" 2>/dev/null || echo "$_au_own")"
+    _au_root="$(mktemp -d)" || return 1
+    _au_rc=1
+    if cp "$_au_cand" "$_au_root/env" && chmod 600 "$_au_root/env" \
+        && agent_secret_files "$_au_root/env" "$_au_root/s" "$_au_bin" "$_au_own" "" "$_au_keys" "$_au_marker" >/dev/null 2>&1 \
+        && sed "s|^\([A-Za-z0-9_]*_FILE\)=$_au_root/s/|\1=$_au_dir/|" "$_au_root/env" > "$_au_root/env.final" \
+        && config_unchanged "$_au_root/env.final" "$_au_env" 600 root:root; then
+        _au_rc=0
+        for _au_k in $_au_keys; do
+            if [ -f "$_au_root/s/$_au_k" ]; then
+                config_unchanged "$_au_root/s/$_au_k" "$_au_dir/$_au_k" 600 "$_au_own:$_au_grp" || _au_rc=1
+            elif grep -qE "^${_au_k}_FILE=$_au_dir/$_au_k\$" "$_au_root/env.final"; then
+                [ -f "$_au_dir/$_au_k" ] || _au_rc=1
+            else
+                [ ! -e "$_au_dir/$_au_k" ] || _au_rc=1
+            fi
+        done
+    fi
+    rm -rf "$_au_root"
+    return $_au_rc
+}
+
+# agent_env_same CANDIDATE INSTALLED / harness_env_same CANDIDATE INSTALLED —
+# the question every env-writing kind asks: is this already what the node holds
+# (as written, or as agent_secret_files leaves it)?
+agent_env_same() {
+    config_unchanged "$1" "$2" 600 root:root \
+        || asf_unchanged "$1" "$2" /etc/noo/agent-secrets /usr/local/bin/noo-node-agent "$(asf_owner)"
+}
+harness_env_same() {
+    config_unchanged "$1" "$2" 600 root:root \
+        || asf_unchanged "$1" "$2" /etc/noo/harness-secrets /usr/local/bin/noo-gateway noo-harness \
+            "$HARNESS_SECRET_KEYS" "$HARNESS_SECRET_CAPABILITY"
+}
+# END asf_unchanged
+
 # agent-env replaces /etc/noo-node-agent.env WHOLE, and the node's NATS pair
 # is not an agent-env key: it arrives only as `nats-creds`. A bundle that
 # carries agent-env WITHOUT nats-creds therefore used to drop the pair the
@@ -1067,7 +1130,7 @@ if [ -f "$WORK/files/agent-env" ]; then
     fi
     # STAGED_ENV is the FINAL content (payload plus any carried NATS pair),
     # so that is what is compared with the installed file.
-    if config_unchanged "$STAGED_ENV" /etc/noo-node-agent.env 600 root:root; then
+    if agent_env_same "$STAGED_ENV" /etc/noo-node-agent.env; then
         ae_state="agent-env=unchanged"
     else
         install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
@@ -1115,7 +1178,7 @@ if [ -f "$WORK/files/nats-creds" ]; then
     # fragment. The harness env below is judged the same way; the kind is
     # `unchanged` only when neither file needed rewriting.
     nc_changed=0
-    if ! config_unchanged "$TMPENV" "$AGENT_ENV" 600 root:root; then
+    if ! agent_env_same "$TMPENV" "$AGENT_ENV"; then
         install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
         nc_changed=1; need_restart=1
     fi
@@ -1132,7 +1195,7 @@ if [ -f "$WORK/files/nats-creds" ]; then
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$HARNESS_ENV" > "$TMPH" || true
         grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/nats-creds" >> "$TMPH"
         grep -qE '^NODE_ID=.+' "$TMPH" || { echo "noo-apply: harness env merge lost NODE_ID — aborting" >&2; rm -f "$TMPH"; exit 70; }
-        if ! config_unchanged "$TMPH" "$HARNESS_ENV" 600 root:root; then
+        if ! harness_env_same "$TMPH" "$HARNESS_ENV"; then
             install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
             nc_changed=1; need_harness_restart=1
         fi
@@ -1182,7 +1245,7 @@ if [ -f "$WORK/files/fleet-secrets" ]; then
     grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
     # Merged result vs the installed env, like nats-creds above.
     fs_unchanged=0
-    config_unchanged "$TMPENV" "$AGENT_ENV" 600 root:root && fs_unchanged=1
+    agent_env_same "$TMPENV" "$AGENT_ENV" && fs_unchanged=1
     if [ "$fs_unchanged" != 1 ]; then
         install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
         need_restart=1
@@ -1442,7 +1505,7 @@ if [ -f "$WORK/files/harness-env" ]; then
     fi
     # HE_FINAL is the FINAL content (payload, or payload plus the resolved
     # NATS pair); an identical installed env is left alone.
-    if config_unchanged "$HE_FINAL" "$HARNESS_ENV" 600 root:root; then
+    if harness_env_same "$HE_FINAL" "$HARNESS_ENV"; then
         applied="$applied harness-env=unchanged"
     else
         install -m 600 -o root -g root "$HE_FINAL" "$HARNESS_ENV"
@@ -1522,8 +1585,7 @@ fi
 # agent binary (if this bundle carried one) is installed — see
 # agent_secret_files. The owner is the unit's User= (provision --local falls
 # back to root on a host with no noo-agent user).
-ASF_OWNER="$(sed -n 's/^User=//p' /etc/systemd/system/noo-node-agent.service 2>/dev/null | tail -1)"
-{ [ -n "$ASF_OWNER" ] && id -u "$ASF_OWNER" >/dev/null 2>&1; } || ASF_OWNER=root
+ASF_OWNER="$(asf_owner)"
 agent_secret_files /etc/noo-node-agent.env /etc/noo/agent-secrets /usr/local/bin/noo-node-agent \
     "$ASF_OWNER" /etc/noo-node-agent.env.container-backup || exit $?
 if [ "$ASF_CHANGED" = 1 ]; then need_restart=1; fi

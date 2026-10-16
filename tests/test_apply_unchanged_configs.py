@@ -21,6 +21,7 @@ summary asserted. Not covered: a real node apply as root.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -31,6 +32,17 @@ REPO = Path(__file__).resolve().parents[1]
 APPLIER = (REPO / "scripts" / "noo-apply.sh").read_text()
 LINES = APPLIER.split("\n")
 NODE = "node1"
+
+
+@pytest.fixture(autouse=True)
+def _nothing_lands_in_the_repo_cwd():
+    """Every path handed to the applier must sit under the test's tmp dir: a
+    stub that misreads an argument once wrote `1/NOO_CLUSTER_SECRET` into the
+    working tree."""
+    before = set(os.listdir(REPO)) | set(os.listdir(os.getcwd()))
+    yield
+    after = set(os.listdir(REPO)) | set(os.listdir(os.getcwd()))
+    assert after == before, f"test left entries in the repo/cwd: {sorted(after - before)}"
 
 
 def lift(start: str, end: str) -> str:
@@ -70,37 +82,37 @@ R="$ROOT"
 OWNERS="$R/owners"; touch "$OWNERS"
 owner_of() { awk -v p="$1" '$1==p {o=$2} END {print o}' "$OWNERS"; }
 install() {
-    _m=""; _o=root; _g=root; _dir=0
+    t_m=""; t_o=root; t_g=root; t_d=0
     while [ $# -gt 0 ]; do case "$1" in
-        -m) _m="$2"; shift 2 ;; -o) _o="$2"; shift 2 ;; -g) _g="$2"; shift 2 ;; -d) _dir=1; shift ;; *) break ;; esac; done
-    if [ "$_dir" = 1 ]; then for _p in "$@"; do mkdir -p "$_p"; done; return 0; fi
-    cp "$1" "$2" && chmod "$_m" "$2" && echo "$2 $_o:$_g" >> "$OWNERS"
+        -m) t_m="$2"; shift 2 ;; -o) t_o="$2"; shift 2 ;; -g) t_g="$2"; shift 2 ;; -d) t_d=1; shift ;; *) break ;; esac; done
+    if [ "$t_d" = 1 ]; then for t_p in "$@"; do mkdir -p "$t_p"; done; return 0; fi
+    cp "$1" "$2" && chmod "$t_m" "$2" && echo "$2 $t_o:$t_g" >> "$OWNERS"
 }
 mv() {
-    for _l in "$@"; do :; done
-    if [ "$#" -ge 2 ]; then eval "_dst=\${$#}"; _src=""; for _a in "$@"; do case "$_a" in -*) ;; *) [ "$_a" = "$_dst" ] || _src="$_a" ;; esac; done
-        _own="$(owner_of "$_src")"; [ -z "$_own" ] || echo "$_dst $_own" >> "$OWNERS"; fi
+    if [ "$#" -ge 2 ]; then eval "t_dst=\${$#}"; t_src=""; for t_a in "$@"; do case "$t_a" in -*) ;; *) [ "$t_a" = "$t_dst" ] || t_src="$t_a" ;; esac; done
+        t_own="$(owner_of "$t_src")"; [ -z "$t_own" ] || echo "$t_dst $t_own" >> "$OWNERS"; fi
     command mv "$@"
 }
 stat() {
     if [ "$1" = -c ] && [ "$2" = '%a %U:%G' ]; then
-        _sm="$(command stat -c %a "$3")" || return 1
-        _so="$(owner_of "$3")"; [ -n "$_so" ] || _so="$(command stat -c %U:%G "$3")"
-        echo "$_sm $_so"
+        t_sm="$(command stat -c %a "$3")" || return 1
+        t_so="$(owner_of "$3")"; [ -n "$t_so" ] || t_so="$(command stat -c %U:%G "$3")"
+        echo "$t_sm $t_so"
     else command stat "$@"; fi
 }
 grant_traverse() { :; }
 grant_traverse_flush_missing() { :; }
 agent_env_secret() { sed -n "s/^$2=//p" "$1" | tail -1; }
 getent() { return 0; }
-id() { case "$*" in *-nG*) echo noo-agent ;; *) return 0 ;; esac; }
+id() { case "$*" in *-nG*) echo noo-agent ;; *-gn*) echo "${2}grp" ;; *-un*) echo root ;; *) return 0 ;; esac; }
+chown() { echo "$2 $1" >> "$OWNERS"; }
 useradd() { :; }
 gpasswd() { :; }
 '''
 
 
 def run(root: Path, kind: str, files: dict[str, bytes], *, preload: dict[str, bytes] | None = None,
-        tamper: str = "") -> dict[str, str]:
+        tamper: str = "", asf: bool = False) -> dict[str, str]:
     """One apply of KIND against the node tree in ROOT (persistent across calls)."""
     work = root / "work"
     if work.exists():
@@ -115,7 +127,17 @@ def run(root: Path, kind: str, files: dict[str, bytes], *, preload: dict[str, by
         p.chmod(0o600)
     pki = root / "pki"
     (pki / "nodes" / NODE).mkdir(parents=True, exist_ok=True)
-    body = BLOCKS[kind].replace("/etc/", f"{root}/etc/")
+    def paths(t: str) -> str:
+        return t.replace("/etc/", f"{root}/etc/").replace("/usr/local/bin", f"{root}/usr/local/bin")
+    body = paths(BLOCKS[kind])
+    # what the end of a real apply does: agent_secret_files over the env just written
+    tail = ""
+    if asf:
+        tail = paths('''ASF_OWNER="$(asf_owner)"
+agent_secret_files /etc/noo-node-agent.env /etc/noo/agent-secrets /usr/local/bin/noo-node-agent "$ASF_OWNER" /etc/noo-node-agent.env.container-backup || exit $?
+if [ "$ASF_CHANGED" = 1 ]; then need_restart=1; fi
+echo "asf_changed=$ASF_CHANGED"
+''')
     (root / "etc/systemd/system").mkdir(parents=True, exist_ok=True)
     (root / "etc/sudoers.d").mkdir(parents=True, exist_ok=True)
     script = f'''ROOT="{root}"
@@ -124,14 +146,17 @@ WORK="{work}"; PKI="{pki}"; NODE_ID="{NODE}"
 applied=""; need_restart=0; need_harness_restart=0; need_daemon_reload=0; fresh_unit=0
 {delimited("agent_env_nats_carry")}
 {delimited("config_unchanged")}
+{paths(delimited("agent_secret_files"))}
+{paths(delimited("asf_unchanged"))}
 {tamper.replace("@ROOT@", str(root))}
 {body}
+{tail}
 echo "applied=$applied"; echo "need_restart=$need_restart"
 echo "need_harness_restart=$need_harness_restart"; echo "need_daemon_reload=$need_daemon_reload"
 '''
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
-    keys = ("applied", "need_restart", "need_harness_restart", "need_daemon_reload")
+    keys = ("applied", "asf_changed", "need_restart", "need_harness_restart", "need_daemon_reload")
     return dict(l.split("=", 1) for l in r.stdout.splitlines() if l.split("=")[0] in keys and "=" in l)
 
 
@@ -332,3 +357,61 @@ def test_all_unchanged_bundle_succeeds_end_to_end(tmp_path: Path) -> None:
     assert summary and all(t.endswith("=unchanged") for t in summary)
     r = subprocess.run(["bash", "-c", f'applied=" {" ".join(summary)}"\n{line}\nexit 0'], capture_output=True)
     assert r.returncode == 0
+
+
+def test_secret_file_conversion_is_seen_through_two_secrets_applied_twice(tmp_path: Path) -> None:
+    """The env kinds survive agent_secret_files: with a capable agent binary the
+    installed env holds KEY_FILE pointers and the values live in files. A second
+    identical apply must compare the NORMALISED payload against that, report
+    `=unchanged`, set no flag, and leave the env and both secret files alone."""
+    binary = tmp_path / "usr/local/bin/noo-node-agent"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"\x7fELF noo-agent-reads-secret-files/1 \n")
+    payload = {"agent-env": (f"NODE_ID={NODE}\nTIER=x\nNOO_NODE_AGENT_TOKEN=tok-1\n"
+                             "NOO_CLUSTER_SECRET=sec-1\n").encode()}
+    first = run(tmp_path, "agent-env", payload, asf=True)
+    assert first["applied"].split() == ["agent-env"] and first["need_restart"] == "1"
+    assert first["asf_changed"] == "1"
+    env = tmp_path / "etc/noo-node-agent.env"
+    sdir = tmp_path / "etc/noo/agent-secrets"
+    assert f"NOO_NODE_AGENT_TOKEN_FILE={sdir}/NOO_NODE_AGENT_TOKEN" in env.read_text()
+    assert "tok-1" not in env.read_text()
+    assert (sdir / "NOO_CLUSTER_SECRET").read_text() == "sec-1"
+    marks = {p: p.stat().st_mtime_ns for p in (env, sdir / "NOO_NODE_AGENT_TOKEN", sdir / "NOO_CLUSTER_SECRET")}
+    second = run(tmp_path, "agent-env", payload, asf=True)
+    assert second["applied"].split() == ["agent-env=unchanged"]
+    assert flags(second) == ("0", "0", "0") and second["asf_changed"] == "0"
+    assert {p: p.stat().st_mtime_ns for p in marks} == marks
+    # a changed secret value is NOT unchanged, even though the env pointers are identical
+    changed = {"agent-env": payload["agent-env"].replace(b"sec-1", b"sec-2")}
+    third = run(tmp_path, "agent-env", changed, asf=True)
+    assert third["applied"].split() == ["agent-env"] and third["need_restart"] == "1"
+    assert (sdir / "NOO_CLUSTER_SECRET").read_text() == "sec-2"
+    # a missing secret file is not unchanged either
+    (sdir / "NOO_NODE_AGENT_TOKEN").unlink()
+    fourth = run(tmp_path, "agent-env", changed, asf=True)
+    assert fourth["applied"].split() == ["agent-env"] and fourth["need_restart"] == "1"
+    assert (sdir / "NOO_NODE_AGENT_TOKEN").read_text() == "tok-1"
+
+
+def test_merged_kinds_see_through_the_conversion_too(tmp_path: Path) -> None:
+    binary = tmp_path / "usr/local/bin/noo-node-agent"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"noo-agent-reads-secret-files/1\n")
+    pre = {"etc/noo-node-agent.env": f"NODE_ID={NODE}\n".encode()}
+    nats = {"nats-creds": f"NODE={NODE}\nNATS_NODE_USER=node-{NODE}\nNATS_NODE_PASSWORD=pw\n".encode()}
+    fleet = {"fleet-secrets": f"NODE={NODE}\nNOO_CLUSTER_SECRET=s3cret\nNOO_NODE_AGENT_TOKEN=t\n".encode()}
+    for kind, files in (("nats-creds", nats), ("fleet-secrets", fleet)):
+        first = run(tmp_path, kind, files, preload=pre if kind == "nats-creds" else None, asf=True)
+        assert first["applied"].split() == [kind] and first["need_restart"] == "1"
+        second = run(tmp_path, kind, files, asf=True)
+        assert second["applied"].split() == [f"{kind}=unchanged"], kind
+        assert flags(second) == ("0", "0", "0") and second["asf_changed"] == "0"
+
+
+def test_asf_unchanged_runs_the_real_agent_secret_files_so_they_cannot_drift() -> None:
+    wrapper = delimited("asf_unchanged")
+    assert 'agent_secret_files "$_au_root/env"' in wrapper
+    # provision --local lifts only this block; the comparison lives outside it
+    assert "asf_unchanged" not in delimited("agent_secret_files")
+    assert 'ASF_OWNER="$(asf_owner)"' in APPLIER
