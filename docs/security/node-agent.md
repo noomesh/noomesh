@@ -69,6 +69,46 @@ talk to the controller. A token signed with a shared key names its caller,
 but that name is a claim, so the token answers "is this the fleet?" and never
 "is this the controller?".
 
+**The HMAC is bound to the request (v2).** The original token signed only
+`<actor>:<time>`, so a copy of one `Authorization` header worked on any route,
+with any body, for five minutes. The current form signs
+
+```
+v2 \n METHOD \n path?query \n sha256(body) \n actor \n time \n nonce
+```
+
+and travels as `v2:<actor>:<time>:<nonce>:<signature>`, with a fresh 128-bit
+nonce per request. A verifier checks the signature against *the request in
+front of it*, so the same header cannot be moved to another path, method or
+body, and remembers every nonce it accepted for the five-minute window, so a
+captured request cannot be sent twice (the gateway keeps the set in Redis,
+falling back to its own memory; a node agent keeps it in memory, bounded, and
+refuses new tokens rather than admit unchecked if it ever fills). It applies
+in both directions: nodes sign their calls to the controller (registration,
+heartbeat, log shipping, desired-config, manifests, the apply report) and the
+agent verifies v2 from the peers and the controller that call it. A body over
+64 MiB (gateway) or 32 MiB (agent) is refused instead of admitted unbound.
+
+The old form is still accepted while the fleet rolls, and **every use is
+counted** under the `cluster_hmac_v1` lane (`noo cluster verify
+--controller`, row `legacy lanes`, names the callers; `cluster_hmac_v2` is the
+comparator). Roll the controller first (it must understand v2 before a node
+sends it), then the nodes. Once the row shows no v1 callers, close the door
+on the gateway with the posture bridge `NOO_CLUSTER_TOKEN_V1`:
+
+```
+noo security posture set NOO_CLUSTER_TOKEN_V1 0
+```
+
+(on a release that introduces the key, add `NOO_CLUSTER_TOKEN_V1` to
+`compose_env:` first and set it after the roll; a gate cannot be set before
+the release that defines it). A v1 token is then answered `401
+cluster_token_v1_refused` with the fix in the body. A node agent honours the
+same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), but the
+provisioned agent environment does not carry that key yet, so today the gateway
+is where the door closes; the agents keep counting v1 callers regardless. A node rolled
+*before* its controller can pin the old form with `NOO_CLUSTER_TOKEN_SIGN=v1`.
+
 One claimed name is refused outright: an HMAC whose actor is the `noo` CLI
 (`cli`, or `cli-` followed by a purpose) gets a `403` on every route, valid
 signature or not. No CLI calls a node with the shared secret — the CLI talks
@@ -103,6 +143,10 @@ Because the leaf decides, two callers need no bearer at all:
   reads it. A peer node's leaf, or this node's leaf from another host, is
   refused as before.
 
+`GET /tailnet/whois` answers "who is this tailnet IP" for any IP it is asked
+about, so it is the controller's alone: a peer node holding the fleet secret
+is refused (`403`).
+
 A request that carries a bearer is still judged by the bearer, so an older
 gateway or harness keeps working. Every use of the static token is counted
 (`noo cluster verify --controller`, row `legacy lanes`).
@@ -118,7 +162,16 @@ operator alert when a node registers without it.
 
 **The control API is mTLS-only, and an agent without its material does not
 start.** `:8081` (and `:8082` for the sensors instance) requires a
-cluster-CA client certificate at the handshake, always. There is no
+cluster-CA client certificate at the handshake, always. It also **listens only
+where it is reached**: on the address the controller dials this node on (`NODE_IP`
+as registered, else the source address of the route to the controller) and on
+loopback, not on every interface. A docker bridge, a second NIC or a public
+address no longer sees the port. `NODE_AGENT_BIND` overrides: `all` (or
+`0.0.0.0`) restores every interface, or a comma list of IPs binds exactly
+those; a hostname is refused at start with a message naming the setting. When
+no usable address is known the agent falls back to every interface and logs
+that it did, and a derived address that later changes (DHCP, tailscale coming
+up after the agent) is followed within a minute by a rebind. There is no
 plaintext listener and no weaker mode: with any of `NOO_TLS_CA`,
 `NOO_TLS_CERT`, `NOO_TLS_KEY` unset or unreadable the agent exits at
 startup with an error naming the missing file and the fix — `noo cluster
