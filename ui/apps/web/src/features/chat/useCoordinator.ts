@@ -384,6 +384,10 @@ export function useCoordinator() {
             break;
           }
           case 'error':
+            // Only a turn in flight owns the last bubble. An error with no turn
+            // running (an older gateway's "Token expired" before its 4401 close)
+            // was appended to a long-finished reply, once per token lifetime.
+            if (!busyRef.current) break;
             patchLast((l) => ({
               text: (l.text ? `${l.text}\n` : '') + `⚠ ${f.text ?? 'error'}`,
               streaming: false,

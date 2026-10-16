@@ -123,17 +123,25 @@ async fn handle_chat(
     });
 
     // The session ends when the token's `exp` passes or the account logs
-    // out: one `error` frame, then close 4401. The close is queued behind
-    // any turn still streaming, and the read loop below ends on the peer's
-    // close reply (or on the next failed keepalive if there is none).
+    // out: close 4401, reason in the close frame. No `error` frame — the
+    // console wrote it into the last reply on screen, one "Token expired"
+    // per 15 minutes in an idle tab. Expiry first lets a streaming turn
+    // finish (`TurnGate`); a logout closes at once. The read loop ends on
+    // the peer's close reply (or on the next failed keepalive).
+    let gate = Arc::new(crate::websocket::TurnGate::default());
     let guard_writer = writer.clone();
     let guard_sub = user_id.clone();
+    let guard_gate = gate.clone();
     let ends = state.alert_hub.subscribe_session_end();
     let exp = claims.exp;
     let guard_task = tokio::spawn(async move {
         let reason = crate::websocket::session_ended(exp, &guard_sub, ends).await;
+        if reason == "Logged out" {
+            guard_gate.end_now();
+        } else {
+            guard_gate.finish_then_end(crate::websocket::TURN_GRACE).await;
+        }
         tracing::info!(user_id = %guard_sub, reason, "ws_coordinator session ended");
-        let _ = guard_writer.send_event("error", json!(reason)).await;
         let _ = guard_writer.send_close(reason).await;
     });
 
@@ -150,6 +158,15 @@ async fn handle_chat(
                             .await;
                         continue;
                     }
+                };
+
+                // The session is closing (token expired, logout): start
+                // nothing; the console reconnects with a fresh token.
+                let Some(_turn) = gate.begin() else {
+                    let _ = writer
+                        .send_event("error", json!("Your session was renewing. Send that again."))
+                        .await;
+                    continue;
                 };
 
                 let conv_id = if chat_msg.conversation_id.is_empty() {
@@ -226,7 +243,18 @@ async fn handle_chat(
                     ),
                     ),
                 );
-                match run.await {
+                // A logout or an admin ending the account's sessions drops the
+                // turn here, tools and all; the guard sends the 4401 close and
+                // the loop ends on the peer's close reply. Expiry never
+                // revokes: it lets the turn finish (`TurnGate`).
+                let outcome = tokio::select! {
+                    r = run => r,
+                    _ = gate.revoked() => {
+                        tracing::info!(user_id = %user_id, conv_id = %conv_id, "ws_coordinator turn dropped: session revoked");
+                        continue;
+                    }
+                };
+                match outcome {
                     Ok(result) => {
                         // Cache the response
                         if !result.response.is_empty() {
