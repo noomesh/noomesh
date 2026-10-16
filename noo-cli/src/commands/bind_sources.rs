@@ -147,7 +147,7 @@ fn produce(source: &str, expects_file: bool, data_root: Option<&str>) -> String 
     // systemd never installs hostd, so it is simply absent there).
     if basename(source) == ".noo-host-spool" {
         return format!(
-            "noo onboard --only services installs noo-hostd, which owns this spool; without systemd there is no hostd — mkdir -p '{source}' (as you)"
+            "noo onboard --only services installs noo-hostd, which owns this spool; without systemd there is no hostd, and `noo onboard` creates '{source}' for you; otherwise mkdir -p it (as you)"
         );
     }
     // Onboard's storage step creates exactly [`directory_sources_under`]
@@ -398,6 +398,41 @@ fn unresolved_nats_vars(service: &Value, source: &str, target: &str) -> Vec<Stri
         _ => BTreeSet::new(),
     };
     refs.into_iter().filter(|v| !handed.contains(v)).collect()
+}
+
+/// This host runs systemd, so `noo onboard --only services` can install
+/// noo-hostd (which owns the host spool).
+pub fn systemd_present() -> bool {
+    Path::new("/run/systemd/system").is_dir()
+}
+
+/// Without systemd there is no hostd to create the host executor's spool, and
+/// Docker would create the bind source root-owned. Create each MISSING
+/// `.noo-host-spool` bind source here, as the invoking user, and return what
+/// was created. A no-op when systemd is present (hostd owns it) and for every
+/// other source (those keep their refusal).
+pub fn ensure_hostd_spool(cfg: &Value, services: &[String], no_deps: bool, systemd: bool) -> Vec<String> {
+    let mut made = Vec::new();
+    if systemd {
+        return made;
+    }
+    for svc in selected(cfg, services, no_deps) {
+        let vols = cfg["services"][&svc]["volumes"].as_array().cloned().unwrap_or_default();
+        for v in vols {
+            if v.get("type").and_then(Value::as_str) != Some("bind") {
+                continue;
+            }
+            let Some(source) = v.get("source").and_then(Value::as_str) else { continue };
+            let source = source.trim_end_matches('/');
+            if basename(source) != ".noo-host-spool" || Path::new(source).exists() || made.iter().any(|m| m == source) {
+                continue;
+            }
+            if std::fs::create_dir_all(source).is_ok() {
+                made.push(source.to_string());
+            }
+        }
+    }
+    made
 }
 
 /// The refusal text, header to footer. Empty when there is nothing to refuse.
@@ -727,5 +762,29 @@ mod tests {
         for d in ["/etc/nginx/conf.d", "/tls/services/nats", "/var/run/noo-spool", "/home/u/.noo/.noo-host-spool", "/", "/app/pki", "/tmp/.ui-index-unused"] {
             assert!(!looks_like_file(d), "{d}");
         }
+    }
+
+    #[test]
+    fn hostd_spool_is_created_only_without_systemd_and_only_that_source() {
+        let d = scratch("spool");
+        let spool = d.join(".noo-host-spool");
+        let other = d.join("configs");
+        let cfg = json!({"services": {"gateway": {"volumes": [
+            {"type": "bind", "source": spool.to_string_lossy(), "target": "/spool", "bind": {}},
+            {"type": "bind", "source": other.to_string_lossy(), "target": "/etc/cfg", "bind": {}}
+        ]}}});
+        let svcs: Vec<String> = Vec::new();
+        assert!(ensure_hostd_spool(&cfg, &svcs, false, true).is_empty());
+        assert!(!spool.exists());
+        let made = ensure_hostd_spool(&cfg, &svcs, false, false);
+        assert_eq!(made, vec![spool.to_string_lossy().to_string()]);
+        assert!(spool.is_dir());
+        assert!(!other.exists());
+        // The other missing source still refuses.
+        let findings = check(&cfg, &svcs, false, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].source, other.to_string_lossy());
+        // Idempotent.
+        assert!(ensure_hostd_spool(&cfg, &svcs, false, false).is_empty());
     }
 }

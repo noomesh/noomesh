@@ -231,14 +231,63 @@ pub fn db_stamp(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     eprintln!(
         "{}",
         ui::hint(&format!(
-            "docker exec -i {} psql -U noo -d noo -c \"UPDATE mesh.alembic_version_mesh SET version_num = '<rev>'\"",
-            crate::envfile::container("postgres")
+            "docker exec -i {} psql -U noo -d {} -c \"UPDATE mesh.alembic_version_mesh SET version_num = '<rev>'\"",
+            crate::envfile::container("postgres"),
+            resolve_db(&crate::envfile::container("postgres"))
         ))
     );
     Ok(2)
 }
 
 // ── noo db status ────────────────────────────────────────────────────────
+
+/// First non-empty `POSTGRES_DB` in a `.env`-style text (last assignment wins).
+fn dotenv_db(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|l| {
+        let l = l.trim();
+        let l = l.strip_prefix("export ").unwrap_or(l);
+        let v = l.strip_prefix("POSTGRES_DB=")?.trim().trim_matches('"').trim_matches('\'');
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// `POSTGRES_DB=<name>` out of `docker inspect --format '{{range .Config.Env}}…'` output.
+fn inspect_db(env_lines: &str) -> Option<String> {
+    env_lines.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("POSTGRES_DB=")?.trim();
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// Pure resolution order: process env, `.env`, the container's env, `noo`
+/// (the pre-0.6 database name). Fresh 0.6.x installs use `noomesh`.
+fn pick_db(process: Option<String>, dotenv: Option<&str>, inspected: Option<String>) -> String {
+    process
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| dotenv.and_then(dotenv_db))
+        .or(inspected)
+        .unwrap_or_else(|| "noo".to_string())
+}
+
+/// The database this install's postgres container serves, resolved once per command.
+fn resolve_db(container: &str) -> String {
+    let process = std::env::var("POSTGRES_DB").ok();
+    let dotenv = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok();
+    let inspected = if process.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false)
+        || dotenv.as_deref().and_then(dotenv_db).is_some()
+    {
+        None
+    } else {
+        Command::new("docker")
+            .args(["inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", container])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| inspect_db(&String::from_utf8_lossy(&o.stdout)))
+    };
+    pick_db(process, dotenv.as_deref(), inspected)
+}
 
 fn psql(container: &str, db: &str, sql: &str) -> Option<String> {
     let out = std::process::Command::new("docker")
@@ -305,6 +354,8 @@ pub fn db_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let pg = std::env::var("PGCONTAINER").unwrap_or_else(|_| crate::envfile::container("postgres"));
 
+    let dbname = resolve_db(&pg);
+
     let gw = std::process::Command::new("docker")
         .args(["ps", "--filter", "name=noo-gateway", "--format", "{{.Status}}"])
         .output()
@@ -321,8 +372,8 @@ pub fn db_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut fail = gw_bad;
     let mut stamps: Vec<ChainStamp> = Vec::new();
     for (name, table, schema) in chains {
-        let fresh = psql(&pg, "noo", &format!("SELECT version_num FROM {schema}.{table}"));
-        let legacy = psql(&pg, "noo", &format!("SELECT version_num FROM public.{table}"));
+        let fresh = psql(&pg, &dbname, &format!("SELECT version_num FROM {schema}.{table}"));
+        let legacy = psql(&pg, &dbname, &format!("SELECT version_num FROM public.{table}"));
         let row = chain_stamp(name, fresh, legacy, schema);
         if row.state == "err" {
             fail = true;
@@ -366,7 +417,7 @@ pub fn db_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// file-not-found.
 pub fn db_verify_plane(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let db = match args {
-        [] => "noo".to_string(),
+        [] => resolve_db(&crate::envfile::container("postgres")),
         [d] if !d.starts_with('-') => d.clone(),
         _ => return Err(Unhandled),
     };
@@ -394,6 +445,17 @@ pub fn db_verify_plane(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[test]
+    fn db_name_resolves_env_then_dotenv_then_container_then_noo() {
+        assert_eq!(pick_db(Some("noomesh".into()), Some("POSTGRES_DB=other\n"), Some("x".into())), "noomesh");
+        assert_eq!(pick_db(None, Some("A=1\nexport POSTGRES_DB=\"noomesh\"\n"), Some("x".into())), "noomesh");
+        assert_eq!(pick_db(Some("  ".into()), None, Some("noomesh".into())), "noomesh");
+        assert_eq!(pick_db(None, Some("POSTGRES_DB=\n"), None), "noo");
+        assert_eq!(pick_db(None, None, None), "noo");
+        assert_eq!(inspect_db("PATH=/bin\nPOSTGRES_DB=noo\nPOSTGRES_USER=noo\n").as_deref(), Some("noo"));
+        assert_eq!(inspect_db("PATH=/bin\n"), None);
+    }
 
     #[test]
     fn stamp_rows_resolve_fresh_then_legacy_and_flag_missing() {

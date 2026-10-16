@@ -313,7 +313,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 println!("{}", serde_json::json!({"status":"noop","version":current,"latest":version,"action":action.as_str()}));
             }
         } else if !g.json {
-            ui::done(&format!("no change: noo {current} is already current (use --version to force a specific build)"));
+            ui::done(&noop_message(&current, pin.is_some()));
         } else {
             println!("{}", serde_json::json!({"status":"noop","version":current,"action":action.as_str()}));
         }
@@ -1064,6 +1064,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             fail(g.json, ExitCode::Generic, "stack_lock_missing", &why,
                 Some("pick a published release: noo upgrade --check --stack"));
         }
+        warn_pulled_by_tag(g, &tag);
     }
     let addon_prep = addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade);
 
@@ -3396,17 +3397,37 @@ pub(crate) fn docker_registry_basic(registry: &str) -> Option<String> {
 
 
 /// Fetch + verify `stack-<tag>.lock` for the stack release: the verified
-/// text, or `None` when the release publishes no lock (said out loud; the
-/// pull is then by tag). A lock that fails verification is fatal: that is
+/// text, or `None` when the release publishes no lock (the caller says so,
+/// after any refusal; the pull is then by tag). A lock that fails verification is fatal: that is
 /// exactly the tamper this exists to catch.
 fn fetch_stack_lock(g: &Globals, tag: &str) -> Option<String> {
     match try_stack_lock(g, tag) {
         Ok(Some(text)) => Some(text),
         Ok(None) => {
-            if !g.json { ui::warned(&format!("stack-{tag} publishes no digest lock — images pulled by tag (locks start at v0.2.11)")); }
+            // The "pulled by tag" advisory is the caller's: a dist install
+            // refuses this roll, and a refusal pulls nothing.
             None
         }
         Err((code, msg, fix)) => fail(g.json, ExitCode::Generic, code, &msg, fix),
+    }
+}
+
+/// The "nothing to do" line for the CLI step. The `--version` hint is only
+/// offered when `--version` was not passed; when it was, say the pinned build
+/// is what is installed.
+pub(crate) fn noop_message(current: &str, pinned: bool) -> String {
+    if pinned {
+        format!("no change: noo {current} is already the requested version")
+    } else {
+        format!("no change: noo {current} is already current (use --version to force a specific build)")
+    }
+}
+
+/// The advisory for a release with no digest lock, printed only on a path
+/// that goes on to pull by tag (never after a refusal).
+fn warn_pulled_by_tag(g: &Globals, tag: &str) {
+    if !g.json {
+        ui::warned(&format!("stack-{tag} publishes no digest lock — images pulled by tag (locks start at v0.2.11)"));
     }
 }
 
@@ -4964,6 +4985,25 @@ mod keyless_tests {
         let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n}"));
         assert!(at("no_lock_refusal(&mode") < at("addon_preflight(g, &root, &tag"));
         assert!(body.contains("noo upgrade --check --stack"));
+    }
+
+    #[test]
+    fn noop_message_does_not_suggest_the_flag_already_passed() {
+        let unpinned = super::noop_message("0.6.4", false);
+        assert!(unpinned.contains("use --version"), "{unpinned}");
+        let pinned = super::noop_message("0.6.4", true);
+        assert!(!pinned.contains("--version") && pinned.contains("0.6.4"), "{pinned}");
+    }
+
+    #[test]
+    fn the_by_tag_advisory_is_printed_only_after_the_refusal_check() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let refusal = body.find("no_lock_refusal(&mode").unwrap();
+        let advisory = body.find("warn_pulled_by_tag(g, &tag)").unwrap();
+        assert!(refusal < advisory);
+        let fetch = &src[src.find("fn fetch_stack_lock(").unwrap()..src.find("pub(crate) fn noop_message").unwrap()];
+        assert!(!fetch.contains("images pulled by tag"), "fetch_stack_lock must stay silent");
     }
 
     #[test]
