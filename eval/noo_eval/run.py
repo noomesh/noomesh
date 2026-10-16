@@ -18,6 +18,13 @@ Live run options:
   --out PATH        report output path (default: eval/out/<scenario>.html)
   --body-only       emit Artifact-ready body (no <html>/<head>) instead of a full doc
   --json PATH       also dump the raw RunResult JSON
+  --fixture         harness-compare only: run against the built-in FAKE gateway
+                    (no cluster, no writes; every number is synthetic)
+
+A scenario with a ``harness_compare:`` block runs one task set under each
+harness kind on one node (see noo_eval.harness_compare). It CHANGES that
+node's harness placement while it runs and puts it back at the end. Its
+report gets a JSON twin next to the HTML (same path, ``.json``).
 """
 from __future__ import annotations
 
@@ -30,8 +37,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import collector, driver, identity, report
+from . import collector, driver, harness_compare, identity, report
 from .demo import build_demo
+from .harness_fake import FakeClock, FakeHarnessGateway
 from .faults import NodeKillInjector, schedule_faults
 from .scenario import Scenario
 from .schema import RunResult, SecurityPosture
@@ -61,8 +69,52 @@ def _resolve_verify(ca: str):
     return True
 
 
+async def _compare_run(args, scn: Scenario) -> RunResult:
+    """A harness-compare scenario: live against ``--gateway``, or against the
+    fake gateway with ``--fixture``."""
+    spec = scn.harness_compare
+    if args.fixture:
+        clock = FakeClock()
+        fake = FakeHarnessGateway(node=spec.node, clock=clock)
+        async with fake.client() as c:
+            hc = await harness_compare.run_compare(spec, c, clock=clock, sleep=clock.sleep)
+        return RunResult(scenario=f"SYNTHETIC fixture — {scn.name}", axes=["harness_kind"],
+                         started_at=args.started_at or "", gateway="fake gateway (--fixture)",
+                         harness_compare=hc,
+                         notes=["--fixture: canned answers from noo_eval/harness_fake.py; nothing was placed."])
+    token = args.token or os.getenv("NOO_EVAL_TOKEN", "")
+    verify = _resolve_verify(getattr(args, "ca", ""))
+    task_token = os.getenv(spec.task_token_env, "") if spec.task_token_env else ""
+    notes = []
+    if spec.task_token_env and not task_token:
+        notes.append(f"{spec.task_token_env} is unset: tasks and usage ran under the --token credential")
+
+    def client(tok: str) -> httpx.AsyncClient:
+        auth = {"Authorization": f"Bearer {tok}"} if tok else {}
+        return httpx.AsyncClient(base_url=args.gateway, headers=auth, timeout=30.0, verify=verify)
+
+    print(f"[noo-eval] {scn.name}: harness-compare on {spec.node} → {args.gateway} "
+          f"(this CHANGES {spec.node}'s harness placement while it runs, and restores it)")
+    async with client(token) as ops:
+        if task_token:
+            async with client(task_token) as tc:
+                hc = await harness_compare.run_compare(spec, ops, tc)
+        else:
+            hc = await harness_compare.run_compare(spec, ops)
+    return RunResult(scenario=scn.name, axes=["harness_kind"], started_at=args.started_at or "",
+                     gateway=args.gateway, harness_compare=hc, notes=notes)
+
+
 async def _live_run(args) -> RunResult:
     scn = Scenario.load(args.scenario)
+    if scn.harness_compare is not None:
+        if not args.fixture and not args.gateway:
+            raise SystemExit("noo_eval run: --gateway URL is required (or --fixture for a dry run)")
+        return await _compare_run(args, scn)
+    if args.fixture:
+        raise SystemExit("noo_eval run: --fixture applies to harness-compare scenarios only")
+    if not args.gateway:
+        raise SystemExit("noo_eval run: --gateway URL is required")
     token = args.token or os.getenv("NOO_EVAL_TOKEN", "")
     print(f"[noo-eval] {scn.name}: {scn.duration_s:.0f}s @ concurrency {scn.concurrency} → {args.gateway}")
 
@@ -155,7 +207,9 @@ def main(argv=None) -> int:
 
     pr = sub.add_parser("run", help="drive a live evaluation run")
     pr.add_argument("scenario")
-    pr.add_argument("--gateway", required=True)
+    pr.add_argument("--gateway", default="")
+    pr.add_argument("--fixture", action="store_true",
+                    help="harness-compare only: run against the built-in fake gateway (synthetic)")
     pr.add_argument("--prom", default="")
     pr.add_argument("--token", default="")
     pr.add_argument("--started-at", default="")
@@ -179,6 +233,9 @@ def main(argv=None) -> int:
 
     out = report.write_report(result, args.out, standalone=not getattr(args, "body_only", False))
     print(f"[noo-eval] report → {out}")
+    if result.harness_compare is not None:
+        twin = report.write_compare_json(result, Path(out).with_suffix(".json"))
+        print(f"[noo-eval] report json → {twin}")
     if getattr(args, "json", ""):
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(result.model_dump_json(indent=2))
