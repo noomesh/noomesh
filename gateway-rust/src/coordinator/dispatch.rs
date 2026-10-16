@@ -197,9 +197,8 @@ pub async fn harness_node_for(state: &AppState, model: Option<&str>) -> Option<S
 /// their credentials were wrong.
 pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Result<String, String> {
     let named = model.map(|m| format!("'{m}'")).unwrap_or_else(|| "the default model".into());
-    // A cloud model's turn runs where the provider keys are: here.
-    if let Some(m) = super::backend::model_hint(model).filter(|m| super::backend::is_cloud_model(m)) {
-        return Err(format!("'{m}' is a cloud model, served by its provider from the controller — nothing to dispatch"));
+    if let Some(why) = early_refusal(model, dispatch_enabled()) {
+        return Err(why);
     }
     let (backend, known_node) = super::backend::resolve_backend_and_node(state, model, &[]).await.map_err(|e| {
         format!("no backend resolved for {named}: {e}")
@@ -221,12 +220,13 @@ pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Re
             resolve_node_id(state, &host).await.map_err(|why| format!("{named} is served by {host}: {why}"))?
         }
     };
-    // The controller's own node runs turns in process by design (its bundle
-    // carries no harness). Say that, rather than "has no harness".
-    if is_controller_node(&node) {
-        return Err(format!(
-            "{named} is served by the controller's own node ('{node}'), which runs turns in process — nothing to dispatch"
-        ));
+    // The controller's own node is a node like any other (the controller box
+    // runs a node role beside the controller role), so it takes a harness
+    // like any other — but only one it has actually placed AND reports
+    // running. Without that, its gateway runs the turn in process, and the
+    // reason says which half is missing rather than "has no harness".
+    if let Err(why) = self_node_dispatchable(state, &node).await {
+        return Err(format!("{named} is served by the controller's own node ('{node}'), which runs turns in process — {why}"));
     }
     if !harness_effective(state, &node).await {
         return Err(format!(
@@ -236,8 +236,75 @@ pub async fn harness_node_explained(state: &AppState, model: Option<&str>) -> Re
     Ok(node)
 }
 
-/// Is `node` the controller's own node? Its bundle carries no harness and
-/// its gateway IS the harness, in process.
+/// The refusals that need no lookup, in order: a cloud model first (its
+/// turn runs where the provider keys are: here), then the brake — here and
+/// not only in `try_dispatch`, so a task (which asks
+/// [`harness_node_explained`] directly) honours it too. Pure, so the order
+/// is testable.
+fn early_refusal(model: Option<&str>, enabled: bool) -> Option<String> {
+    if let Some(m) = super::backend::model_hint(model).filter(|m| super::backend::is_cloud_model(m)) {
+        return Some(format!("'{m}' is a cloud model, served by its provider from the controller — nothing to dispatch"));
+    }
+    if !enabled {
+        return Some("NOO_HARNESS_DISPATCH=0 on the controller keeps every turn here — nothing is dispatched".into());
+    }
+    None
+}
+
+/// May a turn for `node` go to a harness on it, as far as the controller's
+/// own node is concerned? The ONE policy for the self node, consulted by
+/// [`harness_node_explained`] — which every dispatcher (chat turns via
+/// [`try_dispatch`], tasks via `tasks::start`) asks.
+///
+/// - `Ok(false)`: `node` is not the controller's own node; this rule says
+///   nothing and the ordinary harness check applies.
+/// - `Ok(true)`: it is, and it is dispatchable: a `harness` placement
+///   running on it (declared, or synthesised by `harness_policy: auto`) AND
+///   its agent's last heartbeat reports `host_services.harness.state ==
+///   "running"`.
+/// - `Err(why)`: it is, and the turn runs in process; `why` names which
+///   half is missing.
+pub async fn self_node_dispatchable(state: &AppState, node: &str) -> Result<bool, String> {
+    if !is_controller_node(node) {
+        return Ok(false);
+    }
+    let placed = harness_effective(state, node).await;
+    let record = if placed { node_record(state, node).await } else { None };
+    self_node_verdict(node, placed, record.as_ref()).map(|()| true)
+}
+
+/// The node's record as its agent last reported it (`mesh_nodes`).
+async fn node_record(state: &AppState, node: &str) -> Option<Value> {
+    let kv = state.js.get_key_value("mesh_nodes").await.ok()?;
+    let raw = kv.get(node).await.ok().flatten()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// What a node's agent reports its harness doing: the heartbeat's
+/// `host_services.harness.state` (`running`, `stopped`, `absent`, ...), as
+/// carried onto the node record. `None` = not reported.
+fn reported_harness_state(record: Option<&Value>) -> Option<&str> {
+    record?.get("host_services")?.get("harness")?.get("state")?.as_str().filter(|s| !s.is_empty())
+}
+
+/// The self-node rule, pure: `placed` is [`harness_effective`] for the
+/// node, `record` its heartbeat record.
+fn self_node_verdict(node: &str, placed: bool, record: Option<&Value>) -> Result<(), String> {
+    if !placed {
+        return Err(format!(
+            "no harness placed on the controller's node; place a harness on it to change that (`noo cluster place {node} harness auto`)"
+        ));
+    }
+    match reported_harness_state(record) {
+        Some("running") => Ok(()),
+        st => Err(format!(
+            "the controller's harness is placed but not running (host_services.harness: {}); see `noo cluster logs {node} harness`",
+            st.unwrap_or("not reported")
+        )),
+    }
+}
+
+/// Is `node` the controller's own node?
 ///
 /// It read `NOO_CONTROLLER_NODE_ID` / `NODE_ID` here while compose exports
 /// `NOO_CONTROLLER_HOSTNAME`, so the controller never recognised itself:
@@ -514,6 +581,59 @@ mod tests {
         // above is what keeps that safe.
         std::env::remove_var("NOO_HARNESS_DEFAULT_POLICY");
         assert_eq!(harness_default_policy(), "auto");
+    }
+
+    fn record(state: &str) -> Value {
+        json!({"id": "ctl", "status": "online", "host_services": {"harness": {"state": state, "runtime": "systemd"}}})
+    }
+
+    /// i83 D: the controller's own node with a running harness placement
+    /// and an agent reporting it running is dispatchable like any node.
+    #[test]
+    fn the_self_node_with_a_placed_running_harness_is_dispatchable() {
+        assert_eq!(self_node_verdict("ctl", true, Some(&record("running"))), Ok(()));
+    }
+
+    #[test]
+    fn the_self_node_placed_but_not_running_stays_in_process_and_says_so() {
+        for st in ["stopped", "absent"] {
+            let why = self_node_verdict("ctl", true, Some(&record(st))).unwrap_err();
+            assert!(why.contains("the controller's harness is placed but not running"), "{why}");
+            assert!(why.contains(&format!("host_services.harness: {st}")), "{why}");
+        }
+        // No heartbeat record, or one with no host_services: not reported
+        // is not running.
+        let why = self_node_verdict("ctl", true, None).unwrap_err();
+        assert!(why.contains("host_services.harness: not reported"), "{why}");
+        let bare = json!({"id": "ctl", "status": "online"});
+        assert!(self_node_verdict("ctl", true, Some(&bare)).is_err());
+        let blank = record("");
+        assert!(self_node_verdict("ctl", true, Some(&blank)).unwrap_err().contains("not reported"));
+    }
+
+    #[test]
+    fn the_self_node_with_no_placement_stays_in_process_and_says_so() {
+        // A running service with no placement still does not count: the
+        // placement is the operator's arming of dispatch.
+        let why = self_node_verdict("ctl", false, Some(&record("running"))).unwrap_err();
+        assert!(why.contains("no harness placed on the controller's node"), "{why}");
+        assert!(why.contains("place a harness on it to change that"), "{why}");
+        assert!(why.contains("noo cluster place ctl harness"), "{why}");
+    }
+
+    /// Cloud first, then the brake; a local model with the brake off has
+    /// no early refusal and goes on to the node checks (self node included).
+    #[test]
+    fn a_cloud_model_refuses_before_the_brake_and_the_brake_before_any_node() {
+        for enabled in [true, false] {
+            let why = early_refusal(Some("claude-sonnet-4"), enabled).expect("cloud stays here");
+            assert!(why.contains("is a cloud model"), "{why}");
+        }
+        let why = early_refusal(Some("gemma-4-12b"), false).expect("the brake");
+        assert!(why.contains("NOO_HARNESS_DISPATCH=0"), "{why}");
+        assert_eq!(early_refusal(Some("gemma-4-12b"), true), None);
+        assert_eq!(early_refusal(None, true), None);
+        assert!(early_refusal(None, false).is_some());
     }
 
     #[test]

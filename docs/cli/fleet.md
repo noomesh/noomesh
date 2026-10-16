@@ -197,6 +197,15 @@ No harness on a node, or one that does not answer, and the controller
 runs the turn as before. `NOO_HARNESS_DISPATCH=0` on the controller is
 the brake.
 
+The controller's own node is no exception. The controller box also runs a
+node agent for its own node (see
+[../security/node-agent.md](../security/node-agent.md)), so
+`noo cluster place <controller-node> harness auto` places a harness there
+like anywhere else, and a turn for a model served on that node goes to it
+once the agent reports the harness `running`. Until then, with no harness
+placed or one placed but not running, the controller runs those turns in
+process, and a task's `why` names which it was.
+
 The harness can also follow a node's chat backend on its own:
 
 ```sh
