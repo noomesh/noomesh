@@ -491,7 +491,7 @@ dist_load_stack_lock() {
     _DIST_LOCK_STATE=missing
     [ -f "stack.lock" ] || return 0
     # The tag binding is the line INSIDE the signed bytes (`# stack <tag>`,
-    # released from v0.6.6 on; `noo upgrade --stack` already refused a lock
+    # released from v0.6.7 on; `noo upgrade --stack` already refused a lock
     # signed for another tag). When it is there it is the only header trusted:
     # the unsigned `# tag` line the CLI also writes is read only for the
     # locks of older releases, which never carried the signed one.

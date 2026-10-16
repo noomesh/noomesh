@@ -2457,11 +2457,6 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
     cooldowns::is_cooled_down(&format!("{node_id}:{backend}"))
 }
 
-/// POST /api/cluster/backends/start — Start a backend on a node.
-///
-/// Native Rust: resolves node, sends POST to node-agent, polls health.
-/// No Python worker pool involvement.
-
 /// The image ref the controller tells a node to run for `backend`, or None
 /// (the node then uses its own versioned default, which a registry node
 /// refuses and a rail node takes only from the controller's staged tar).
@@ -2490,6 +2485,10 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
         .find(|v| !v.is_empty())
 }
 
+/// POST /api/cluster/backends/start — Start a backend on a node.
+///
+/// Native Rust: resolves node, sends POST to node-agent, polls health.
+/// No Python worker pool involvement.
 async fn backends_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BackendStartBody>,

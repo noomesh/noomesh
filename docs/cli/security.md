@@ -403,7 +403,7 @@ the lock. The layout both locks are published in is in
 | `noo security org list` | — | List orgs with member counts |
 | `noo security org create` | `<org_id> [--name <name>] [--description <text>]` | Create an org |
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
-| `noo security audit verify` | — | Verify every security audit row's hash and the hash chain (deleted or reordered rows) across the audit-key checkpoint (operator-only) |
+| `noo security audit verify` | — | Verify audit row hashes and the chain: deleted or reordered rows show (operator-only) |
 | `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
@@ -435,7 +435,7 @@ the lock. The layout both locks are published in is in
 | `noo security secrets remove` | `<key>... [--yes] [--dry-run] [--sops-file <path>]` | Remove unused keys from env.sops; refuses any key something reads, keeps a backup |
 | `noo security secrets rotate` | `<key>... [--all-generated] [--dry-run] [--yes] [--prompt] [--set-from-stdin] [--stdout] [--restart] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]` | Rotate secrets in env.sops, Postgres and the backup files atomically; confirms unless -y |
 | `noo security secrets reveal` | `<NAME> [--no-clipboard] [--stdout] [--sops-file <path>]` | Show one human-held secret once on this terminal and offer it to the clipboard |
-| `noo security scan` | `[--strict]` | Scan this host's posture (names the root it scanned; on an enrolled node scans the node's own surfaces); exits 1 on a CRITICAL finding, or on any finding with --strict |
+| `noo security scan` | `[--strict]` | Scan this install's or node's posture; exit 1 on a CRITICAL, or any finding with --strict |
 | `noo security pki rotate-all` | `[--warn-days <n>] [--new-days <n>] [--yes] [--reload \| --no-reload] [--no-deliver]` | Re-issue expiring certs, deliver to nodes, restart consumers; asks for confirmation (-y) |
 | `noo security pki rotate-ca` | `[--ca-days <n>] [--leaf-days <n>] [--yes] [--retire-old]` | Cross-signed CA rotation across every node; asks for confirmation (-y) |
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |

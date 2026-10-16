@@ -3528,7 +3528,7 @@ fn v1_refusal() -> Response {
     let body = axum::Json(serde_json::json!({
         "error": "v1 cluster tokens are refused (NOO_CLUSTER_TOKEN_V1=0): this node signs the old, replayable form",
         "code": "cluster_token_v1_refused",
-        "fix": "upgrade the node agent (`noo update`) so it signs v2, or set NOO_CLUSTER_TOKEN_V1=1 on the controller while the fleet rolls",
+        "fix": "upgrade the node agents (`noo upgrade --nodes`) so they sign v2, or set NOO_CLUSTER_TOKEN_V1=1 on the controller while the fleet rolls",
     }));
     (StatusCode::UNAUTHORIZED, body).into_response()
 }
@@ -4589,7 +4589,9 @@ mod tests {
         }
         let addon = claims_with(&["metrics", "temporal", "heartbeat"]);
         assert!(!scope_allows(&addon, &Method::GET, "/api/logs/query"), "no add-on scope reads logs");
-        assert!(scope_allows(&user, &Method::GET, "/api/logsomething"), "the prefix is a directory, not a stem");
+        // The logs gate is a directory prefix, not a stem. (A User tier no longer
+        // reads /api/logsomething for another reason: its GETs are an allow-list.)
+        assert!(!"/api/logsomething".starts_with(LOGS_READ_PREFIX), "the prefix is a directory, not a stem");
     }
 
     /// on the Grafana data-source routes `X-Grafana-User` is

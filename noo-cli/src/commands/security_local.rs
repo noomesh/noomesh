@@ -865,6 +865,16 @@ fn env_var(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
 
+/// What one scan mode yields: findings, the NOT CHECKED lines, what was
+/// read, the rows that do not apply on this host, and a store load problem.
+type ScanParts<'a> = (
+    Vec<Finding>,
+    Vec<String>,
+    Vec<String>,
+    Vec<&'a str>,
+    Option<crate::commands::secrets::StoreLoadError>,
+);
+
 /// `noo security scan` — local posture scan.
 ///
 /// this used to exit 0 no matter what it found, on "Python
@@ -899,13 +909,7 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mode = scan_mode(install_present(&root), enrolled);
     let root_line = scanned_line(&root, source, mode);
 
-    let (mut issues, not_checked, checked, not_applicable, store_problem): (
-        Vec<Finding>,
-        Vec<String>,
-        Vec<String>,
-        Vec<&str>,
-        Option<crate::commands::secrets::StoreLoadError>,
-    ) = match mode {
+    let (mut issues, not_checked, checked, not_applicable, store_problem): ScanParts = match mode {
         ScanMode::Nothing => {
             let why = format!(
                 "{root_line}: there is no noomesh install here and this host is not an enrolled node \
@@ -1143,11 +1147,23 @@ fn install_findings(
 
     // Gateway-side posture, read the way `cluster verify` reads it. Needs an
     // operator login; without one the rows below are NOT CHECKED, not fine.
-    let posture_body = get_posture(g);
+    // An untrusted transport is its own CRITICAL row below; asking that
+    // gateway anything would make the HTTP layer refuse the whole command
+    // (exit 3) before the scan could report the finding.
+    let transport_refused = crate::http::resolve_trust(&gateway_url).err();
+    let posture_body = if transport_refused.is_some() { None } else { get_posture(g) };
     let (exec_running, exec_desired, self_call_running) = match &posture_body {
         Some(b) => {
             checked.push("gateway posture (exec approval mode, shared-secret bridge)".into());
             posture_view(b)
+        }
+        None if transport_refused.is_some() => {
+            not_checked.push(
+                "gateway posture (exec approval mode, shared-secret bridge): not asked, the gateway's transport \
+                 is refused (see Gateway Transport)"
+                    .into(),
+            );
+            (None, None, false)
         }
         None => {
             not_checked.push(

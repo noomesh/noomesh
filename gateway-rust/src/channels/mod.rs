@@ -556,7 +556,11 @@ mod scoped_turn_tests {
             let run = code.find("coordinator::run(").unwrap_or_else(|| panic!("{name}: no coordinator::run"));
             let scoped = code.find("super::scoped_turn(").unwrap_or_else(|| panic!("{name}: no scoped_turn"));
             assert!(scoped < run, "{name}: coordinator::run must sit inside scoped_turn");
-            assert!(code.contains("is_shared_room("), "{name} must mark rooms");
+            // The room decision is `scoped_turn`'s (`is_shared_room` on the
+            // chat type the adapter normalised), so the pipeline must hand it
+            // the event's chat type rather than decide on its own.
+            let call = &code[scoped..(scoped + 120).min(code.len())];
+            assert!(call.contains("chat_type"), "{name} must pass the chat type to scoped_turn so rooms are marked");
         }
     }
 
