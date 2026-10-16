@@ -18316,6 +18316,29 @@
         }
       }
     },
+    "/api/security/audit/list": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get list",
+        "description": "[native] GET /api/security/audit/list",
+        "operationId": "security_audit_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/cluster/seat-enroll": {
       "post": {
         "tags": [
