@@ -1054,6 +1054,40 @@
           }
         }
       }
+    },
+    "/api/cluster/seat-enroll": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create seat enroll",
+        "description": "[native] POST /api/cluster/seat-enroll \u2014 redeem a seat token.",
+        "operationId": "seat_enroll",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

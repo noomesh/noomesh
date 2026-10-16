@@ -1944,7 +1944,7 @@ fn private_stage_dir_in(under: &Path, prefix: &str) -> Result<PathBuf, String> {
 /// name or pax header, a path outside that layout, a duplicate — refuses the
 /// whole bundle before anything is written. Parity with `noo-apply.sh`
 /// `bundle_tar_ok`.
-fn extract_bundle(tar: &[u8], stage: &Path) -> Result<(), String> {
+pub(crate) fn extract_bundle(tar: &[u8], stage: &Path) -> Result<(), String> {
     let members = tar_members(tar)?;
     let mut seen = std::collections::HashSet::new();
     for (name, kind, _, _) in &members {

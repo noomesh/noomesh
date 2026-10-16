@@ -1647,7 +1647,7 @@ pub fn cluster_reconcile_models(g: &Globals, args: &[String]) -> Result<i32, Unh
 // ════════════════════════════════════════════════════════════════════
 
 /// Parse a TTL like `1h`, `30m`, `24h`, `90s`, `1d`, or bare seconds.
-fn parse_ttl_seconds(s: &str) -> Option<i64> {
+pub(crate) fn parse_ttl_seconds(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;

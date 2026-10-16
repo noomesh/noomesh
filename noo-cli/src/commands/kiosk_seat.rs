@@ -1,0 +1,1638 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026 PersonifAI LLC
+
+//! Kiosk SEATS (proposal i77, followup i66): a kiosk display enrolled with
+//! the controller so its `noo` CLI and kiosk assets ride the artifact rail
+//! like a node's — and `noo upgrade --all` reaches it.
+//!
+//! # A seat is never a node
+//!
+//! A seat holds ONE credential: its own birth key, generated at
+//! `noo kiosk enroll <blob>` and recorded at the controller in `noo_seats` (a table
+//! no node query reads). It never holds the fleet secret, a NATS principal, a
+//! backend door leaf, the node-agent control API or a harness. Its bundle can
+//! carry only the kinds in [`SEAT_KINDS`] — the CLI, the four kiosk scripts,
+//! the four kiosk units and the signing anchor — and the seat applier writes
+//! only the paths in [`seat_targets`]; anything else refuses the WHOLE
+//! bundle before a byte is written.
+//!
+//! # The flow
+//!
+//! 1. controller: `noo kiosk seat-token <seat>` mints a one-time `role=seat`
+//!    token and prints `noo kiosk enroll noo-seat1.<blob>` (the blob carries
+//!    the controller URL, the token, the cluster CA pin and the fleet signing
+//!    PUBLIC key — the bundle trust anchor).
+//! 2. seat: `noo kiosk enroll <blob>` pins the CA, generates the birth key,
+//!    redeems the token at `/api/cluster/seat-enroll`, then asks for sudo
+//!    ONCE to install `/etc/noo-seat`, the root copy of the CLI the timer runs
+//!    (`/usr/local/libexec/noo-seat/noo`) and `noo-seat-sync.{service,timer}`.
+//!    Nothing after this needs sudo.
+//! 3. controller: `noo upgrade --nodes` / `--all` (or `--seats`) stages each
+//!    seat's bundle — signed with the fleet signing key exactly like a node
+//!    bundle, gzipped, CMS-encrypted to the seat's birth cert — then waits
+//!    for every seat together and prints a verify block per seat.
+//! 4. seat: `noo-seat-sync.timer` (root, every minute) runs
+//!    `noo kiosk seat-sync`: a signed heartbeat, a signed fetch, decrypt,
+//!    verify, apply inside the allow-list, restart `kiosk-serve` / reload the
+//!    display as needed, a signed apply report, and a closing heartbeat.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::output::{fail, ExitCode};
+use crate::ui::{self, Glyph};
+use crate::{Globals, Unhandled};
+
+/// The seat's root-owned home: birth key + cert, CA, signing anchor, config.
+pub(crate) const SEAT_DIR: &str = "/etc/noo-seat";
+/// Applier state (last applied sha, last console build) and staging.
+pub(crate) const SEAT_STATE_DIR: &str = "/var/lib/noo-seat";
+/// The root copy of `noo` the timer runs. Root-owned so a user-writable
+/// binary is never executed as root; replaced only from a verified bundle.
+pub(crate) const SEAT_APPLIER_BIN: &str = "/usr/local/libexec/noo-seat/noo";
+pub(crate) const SEAT_SYNC_SERVICE: &str = "/etc/systemd/system/noo-seat-sync.service";
+pub(crate) const SEAT_SYNC_TIMER: &str = "/etc/systemd/system/noo-seat-sync.timer";
+const BLOB_PREFIX: &str = "noo-seat1.";
+/// A seat bundle older than this is a replay (a node bundle's window).
+const SEAT_BUNDLE_MAX_AGE_SECS: i64 = 86_400;
+/// A seat heard from within this is online (the timer ticks every 60 s).
+pub(crate) const SEAT_HEARTBEAT_MAX_AGE_SECS: i64 = 180;
+
+/// Every kind a seat bundle may carry. Nothing a node bundle carries for its
+/// credentials (`agent-env`, `nats-creds`, `fleet-secrets`, `svc-*` leaves,
+/// `harness-*`, `hostd-binary`, `agent-binary`) is here, and the builder and
+/// the applier both refuse a kind that is not.
+pub(crate) const SEAT_KINDS: &[&str] = &[
+    "cli-binary",
+    "kiosk-launch",
+    "kiosk-cdp",
+    "kiosk-watchdog",
+    "kiosk-serve",
+    "unit-kiosk",
+    "unit-kiosk-serve",
+    "unit-kiosk-watchdog",
+    "unit-kiosk-watchdog-timer",
+    "signing-pub",
+    "seat-meta",
+];
+
+// ═══ the enrolment blob ═══════════════════════════════════════════════
+
+/// What `noo kiosk enroll <blob>` needs, in one paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeatBlob {
+    pub url: String,
+    pub token: String,
+    /// The cluster CA's DER sha256 (the pin for first contact).
+    pub ca: String,
+    pub seat: String,
+    /// The fleet signing PUBLIC key (PEM): what every seat bundle verifies
+    /// against. Rides the same out-of-band paste as the CA pin.
+    pub sigpub: String,
+}
+
+pub(crate) fn compose_seat_blob(b: &SeatBlob) -> String {
+    use base64::Engine as _;
+    let v = json!({"v": 1, "role": "seat", "url": b.url, "token": b.token, "ca": b.ca, "seat": b.seat, "sigpub": b.sigpub});
+    format!("{BLOB_PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string()))
+}
+
+/// Parse a seat blob. Refuses a node's `noo1.` blob and any blob whose claim
+/// is not `role: seat` — the two pastes are not interchangeable in either
+/// direction (`noo enroll` refuses this one).
+pub(crate) fn parse_seat_blob(s: &str) -> Result<SeatBlob, String> {
+    let s = s.trim();
+    if s.starts_with("noo1.") {
+        return Err("this is a NODE enrolment paste (`noo enroll noo1.…`); a seat enrols with \
+                    `noo kiosk enroll noo-seat1.…` from `noo kiosk seat-token <seat>` on the controller".into());
+    }
+    let b64 = s.strip_prefix(BLOB_PREFIX).ok_or("not a noo-seat1. enrolment blob")?.trim_end_matches('=');
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64)
+        .map_err(|e| format!("blob is not valid base64url: {e}"))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("blob is not valid JSON: {e}"))?;
+    if v["v"].as_i64() != Some(1) {
+        return Err(format!("blob version {} is newer than this CLI understands — run `noo upgrade` first", v["v"]));
+    }
+    if v["role"].as_str() != Some("seat") {
+        return Err("this blob does not carry the role=seat claim — refusing".into());
+    }
+    let field = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
+    let seat = field("seat").ok_or("blob is missing the seat name")?;
+    if !valid_seat_name(&seat) {
+        return Err(format!("blob seat name {seat:?} is not a valid name"));
+    }
+    let sigpub = field("sigpub").ok_or("blob is missing the fleet signing key")?;
+    if !sigpub.contains("BEGIN PUBLIC KEY") {
+        return Err("blob's signing key is not a PEM public key".into());
+    }
+    Ok(SeatBlob {
+        url: field("url").ok_or("blob is missing the controller url")?,
+        token: field("token").ok_or("blob is missing the token")?,
+        ca: field("ca").ok_or("blob is missing the cluster CA pin")?,
+        seat,
+        sigpub,
+    })
+}
+
+pub(crate) fn valid_seat_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+// ═══ seat configuration (written at enrol, root-owned) ════════════════
+
+/// `/etc/noo-seat/seat.json`. Root-owned and written once by the enrol step,
+/// so nothing the seat user can change decides where the root applier writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SeatConfig {
+    pub seat: String,
+    pub controller_url: String,
+    /// The account whose `noo` the seat keeps current.
+    pub cli_user: String,
+    pub cli_home: String,
+}
+
+impl SeatConfig {
+    /// `~/.local/bin/noo` for the seat user — the ONE path under a home
+    /// directory the applier writes, and it writes it AS that user.
+    pub(crate) fn cli_path(&self) -> PathBuf {
+        Path::new(&self.cli_home).join(".local/bin/noo")
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !valid_seat_name(&self.seat) {
+            return Err(format!("seat name {:?} is invalid", self.seat));
+        }
+        let user_ok = !self.cli_user.is_empty()
+            && self.cli_user.len() <= 32
+            && self.cli_user != "root"
+            && self.cli_user.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !user_ok {
+            return Err(format!("seat user {:?} is not a plain non-root account name", self.cli_user));
+        }
+        let home = Path::new(&self.cli_home);
+        if !home.is_absolute()
+            || self.cli_home == "/"
+            || home.components().any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+        {
+            return Err(format!("seat user home {:?} is not a plain absolute path", self.cli_home));
+        }
+        Ok(())
+    }
+}
+
+// ═══ the allow-list ═══════════════════════════════════════════════════
+
+const KIOSK_BIN: &str = "/usr/local/bin";
+const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// Where one kind lands on the seat. `Err` for any kind outside
+/// [`SEAT_KINDS`] — the applier refuses the whole bundle on it.
+pub(crate) fn seat_targets(kind: &str, cfg: &SeatConfig) -> Result<Vec<PathBuf>, String> {
+    let p = |s: String| PathBuf::from(s);
+    Ok(match kind {
+        // The user's CLI, and the root copy the timer runs: the same bytes.
+        "cli-binary" => vec![cfg.cli_path(), p(SEAT_APPLIER_BIN.into())],
+        "kiosk-launch" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-launch"))],
+        "kiosk-cdp" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-cdp"))],
+        "kiosk-watchdog" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-watchdog"))],
+        "kiosk-serve" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-serve"))],
+        "unit-kiosk" => vec![p(format!("{UNIT_DIR}/kiosk.service"))],
+        "unit-kiosk-serve" => vec![p(format!("{UNIT_DIR}/kiosk-serve.service"))],
+        "unit-kiosk-watchdog" => vec![p(format!("{UNIT_DIR}/kiosk-watchdog.service"))],
+        "unit-kiosk-watchdog-timer" => vec![p(format!("{UNIT_DIR}/kiosk-watchdog.timer"))],
+        "signing-pub" => vec![p(format!("{SEAT_DIR}/signing.pub"))],
+        // Read, never written.
+        "seat-meta" => vec![],
+        other => return Err(format!(
+            "REFUSED — kind '{other}' is not a seat kind; a seat bundle carries only {} (65)",
+            SEAT_KINDS.join(", ")
+        )),
+    })
+}
+
+/// The second guard: is `p` one of the exact paths a seat may write? Checked
+/// immediately before every write, independently of the kind mapping, so a
+/// mapping bug cannot widen the applier's reach.
+pub(crate) fn seat_path_allowed(p: &Path, cfg: &SeatConfig) -> bool {
+    if !p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return false;
+    }
+    let s = p.to_string_lossy();
+    let mut allowed: Vec<String> = vec![
+        cfg.cli_path().to_string_lossy().into_owned(),
+        SEAT_APPLIER_BIN.into(),
+        format!("{SEAT_DIR}/signing.pub"),
+    ];
+    for n in ["launch", "cdp", "watchdog", "serve"] {
+        allowed.push(format!("{KIOSK_BIN}/noo-kiosk-{n}"));
+    }
+    for u in ["kiosk.service", "kiosk-serve.service", "kiosk-watchdog.service", "kiosk-watchdog.timer"] {
+        allowed.push(format!("{UNIT_DIR}/{u}"));
+    }
+    allowed.iter().any(|a| a == s.as_ref())
+}
+
+/// The whole write plan for a bundle's kinds, or the refusal. Duplicate
+/// kinds and any target outside the allow-list refuse everything.
+pub(crate) fn plan_seat_apply(kinds: &[String], cfg: &SeatConfig) -> Result<Vec<(String, PathBuf)>, String> {
+    cfg.validate()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut plan = Vec::new();
+    for k in kinds {
+        if !seen.insert(k.clone()) {
+            return Err(format!("REFUSED — kind '{k}' appears twice (65)"));
+        }
+        for dst in seat_targets(k, cfg)? {
+            if !seat_path_allowed(&dst, cfg) {
+                return Err(format!("REFUSED — {} is outside the seat applier's allow-list (65)", dst.display()));
+            }
+            plan.push((k.clone(), dst));
+        }
+    }
+    Ok(plan)
+}
+
+// ═══ the bundle (controller side) ═════════════════════════════════════
+
+/// `#noo-seat-bundle 1` — a header no node applier accepts (`#noo-bundle 2`)
+/// and the seat applier requires, so a node bundle cannot be applied to a
+/// seat nor a seat bundle to a node.
+pub(crate) fn seat_manifest_header(seat: &str, issued: i64) -> String {
+    format!("#noo-seat-bundle 1\n#seat {seat}\n#issued {issued}\n")
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(b))
+}
+
+/// Build the signed seat bundle tar in `work`: `manifest` (sha256 per kind),
+/// `manifest.sig` (the CURRENT fleet signing key), `manifest.xsig.<n>` (each
+/// retained signing key, current first — so a seat still holding the key
+/// from before a rotation verifies, and then adopts the new `signing-pub`),
+/// `files/<kind>`. Refuses any kind outside [`SEAT_KINDS`]: this is where a
+/// node credential could otherwise slip into a seat bundle, so it is checked
+/// at the one door every seat bundle goes through.
+pub(crate) fn build_seat_bundle(
+    ca: &crate::pki::ClusterCa,
+    seat: &str,
+    files: &[(&str, Vec<u8>)],
+    work: &Path,
+) -> Result<PathBuf, String> {
+    for (kind, _) in files {
+        if !SEAT_KINDS.contains(kind) {
+            return Err(format!("a seat bundle may not carry '{kind}' (seat kinds: {})", SEAT_KINDS.join(", ")));
+        }
+    }
+    ca.ensure_signing_key()?;
+    let files_dir = work.join("files");
+    std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+    let mut manifest = seat_manifest_header(seat, now_unix());
+    for (kind, bytes) in files {
+        std::fs::write(files_dir.join(kind), bytes).map_err(|e| e.to_string())?;
+        manifest.push_str(&format!("{}  {kind}\n", sha256_hex(bytes)));
+    }
+    let manifest_path = work.join("manifest");
+    std::fs::write(&manifest_path, &manifest).map_err(|e| e.to_string())?;
+    let sign = |k: &Path, out: &str| -> bool {
+        Command::new("openssl")
+            .args(["dgst", "-sha256", "-sign"]).arg(k)
+            .arg("-out").arg(work.join(out))
+            .arg(&manifest_path)
+            .status().map(|s| s.success()).unwrap_or(false)
+    };
+    if !sign(&ca.signing_key_path(), "manifest.sig") {
+        return Err("openssl signing failed (is openssl installed?)".into());
+    }
+    let mut members: Vec<String> = vec!["manifest".into(), "manifest.sig".into()];
+    for (n, k) in ca.retained_signing_keys().iter().enumerate() {
+        let name = format!("manifest.xsig.{n}");
+        if !sign(k, &name) {
+            return Err(format!("openssl could not countersign with {}", k.display()));
+        }
+        members.push(name);
+    }
+    members.push("files".into());
+    let bundle = work.join("bundle.tar");
+    let ok = Command::new("tar").arg("-cf").arg(&bundle).arg("-C").arg(work).args(&members)
+        .status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return Err("tar failed".into());
+    }
+    Ok(bundle)
+}
+
+/// The kiosk parameters a seat reported (from its `/etc/default/kiosk`),
+/// which the units are rendered from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KioskParams {
+    pub user: String,
+    pub mode: super::kiosk::Mode,
+    pub vt: u8,
+}
+
+pub(crate) fn kiosk_params_from(hb: &Value) -> Option<KioskParams> {
+    let k = hb.get("kiosk")?;
+    let user = k.get("user")?.as_str()?.to_string();
+    if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return None;
+    }
+    let mode = match k.get("mode")?.as_str()? {
+        "dedicated" => super::kiosk::Mode::Dedicated,
+        "shared" => super::kiosk::Mode::Shared,
+        _ => return None,
+    };
+    let vt: u8 = k.get("vt").and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64().map(|n| n as u8)))
+        .filter(|v| (1..=63).contains(v))?;
+    Some(KioskParams { user, mode, vt })
+}
+
+/// Everything a seat bundle carries, as (kind, bytes). Pure: the CLI bytes,
+/// the signing anchor and the meta come in, so the contents are testable
+/// without a release asset. Units only when the seat has reported its kiosk
+/// parameters (a seat whose kiosk is not set up gets scripts and the CLI).
+pub(crate) fn seat_bundle_files(
+    cli: Vec<u8>,
+    kiosk: Option<&KioskParams>,
+    signing_pub: Vec<u8>,
+    meta: &Value,
+) -> Vec<(&'static str, Vec<u8>)> {
+    use super::kiosk as k;
+    let mut files: Vec<(&'static str, Vec<u8>)> = vec![
+        ("cli-binary", cli),
+        ("kiosk-launch", k::LAUNCH.as_bytes().to_vec()),
+        ("kiosk-cdp", k::CDP.as_bytes().to_vec()),
+        ("kiosk-watchdog", k::WATCHDOG.as_bytes().to_vec()),
+        ("kiosk-serve", k::SERVE.as_bytes().to_vec()),
+    ];
+    if let Some(p) = kiosk {
+        files.push(("unit-kiosk", k::render_kiosk_service(&p.user, p.mode, p.vt).into_bytes()));
+        files.push(("unit-kiosk-serve", k::render_serve_service(&p.user).into_bytes()));
+        files.push(("unit-kiosk-watchdog", k::render_watchdog_service().into_bytes()));
+        files.push(("unit-kiosk-watchdog-timer", k::render_watchdog_timer().as_bytes().to_vec()));
+    }
+    files.push(("signing-pub", signing_pub));
+    files.push(("seat-meta", meta.to_string().into_bytes()));
+    files
+}
+
+/// Stage one seat's bundle. Returns the staged sha256 (the status route's
+/// `sha256`, what the combined wait judges against).
+pub(crate) fn stage_seat(g: &Globals, seat: &Value) -> Result<String, String> {
+    let name = seat["seat_name"].as_str().ok_or("seat record has no name")?;
+    let cert = seat["birth_cert"].as_str().filter(|c| !c.is_empty()).ok_or("seat record has no birth cert")?;
+    let facts = &seat["facts"];
+    let os = facts["os"].as_str().unwrap_or("linux");
+    let arch = facts["arch"].as_str().unwrap_or("x86_64");
+    let asset = super::provision::cli_asset_for(os, arch)
+        .ok_or_else(|| format!("no CLI release asset for {os}/{arch}"))?;
+    let root = crate::envfile::repo_root();
+    let cli = super::provision::cached_release_asset(g, &root, &asset)?;
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    ca.ensure_signing_key()?;
+    let signing_pub = std::fs::read(ca.signing_pub_path()).map_err(|e| format!("signing.pub: {e}"))?;
+    let meta = json!({
+        "console_build": super::cluster_verify::controller_stack_tag(),
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "staged_at": now_unix(),
+    });
+    let kiosk = kiosk_params_from(&seat["heartbeat"]);
+    let files = seat_bundle_files(cli, kiosk.as_ref(), signing_pub, &meta);
+    let work = private_dir(&std::env::temp_dir(), "noo-seat-stage")?;
+    let r = (|| {
+        let refs: Vec<(&str, Vec<u8>)> = files.iter().map(|(k, b)| (*k, b.clone())).collect();
+        let bundle = build_seat_bundle(&ca, name, &refs, &work)?;
+        // Seats run a fetcher from this release or later: always gzip.
+        let gz = super::provision::gzip_bundle(&bundle, &work)?;
+        let blob = super::provision::encrypt_bundle_cms(&gz, cert, &work)?;
+        let sha = sha256_hex(&blob);
+        super::provision::post_bytes(g, &format!("/api/cluster/seats/{name}/bundle"), &blob)?;
+        Ok(sha)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    r
+}
+
+/// A fresh 0700 directory under `under` (never one that already existed).
+fn private_dir(under: &Path, prefix: &str) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = under.join(format!("{prefix}-{}-{nanos:x}-{}", std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::DirBuilder::new().mode(0o700).recursive(false).create(&dir)
+        .map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+// ═══ the bundle (seat side): verify ═══════════════════════════════════
+
+/// The seat twin of the node manifest shape check: header lines exactly as
+/// built, payload lines exactly `<64 hex><two spaces><kind>`.
+pub(crate) fn seat_manifest_shape_ok(m: &str) -> Result<(), String> {
+    let bad = || Err("REFUSED — the manifest has a line that is not a seat header or '<sha256>  <kind>' (65)".to_string());
+    if m.contains('\r') || m.contains('\0') {
+        return bad();
+    }
+    for line in m.lines() {
+        let ok = if line == "#noo-seat-bundle 1" {
+            true
+        } else if let Some(n) = line.strip_prefix("#seat ") {
+            valid_seat_name(n)
+        } else if let Some(t) = line.strip_prefix("#issued ") {
+            !t.is_empty() && t.len() <= 12 && t.bytes().all(|c| c.is_ascii_digit())
+        } else if line.len() > 66 && &line[64..66] == "  " {
+            let (sum, kind) = (&line[..64], &line[66..]);
+            sum.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                && kind.len() <= 64
+                && kind.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        } else {
+            false
+        };
+        if !ok {
+            return bad();
+        }
+    }
+    Ok(())
+}
+
+/// The header binding, judged AFTER the signature verifies: this seat, and
+/// signed recently.
+pub(crate) fn verify_seat_header(manifest: &str, seat: &str, now: i64) -> Result<(), String> {
+    let field = |name: &str| manifest.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string());
+    if !manifest.lines().any(|l| l == "#noo-seat-bundle 1") {
+        return Err("REFUSED — not a seat bundle (no #noo-seat-bundle 1 header); a node bundle is never applied to a seat (77)".into());
+    }
+    match field("#seat ") {
+        Some(s) if s == seat => {}
+        Some(s) => return Err(format!("REFUSED — this bundle is addressed to seat '{s}', this seat is '{seat}' (77)")),
+        None => return Err("REFUSED — the bundle names no seat (77)".into()),
+    }
+    let issued: i64 = field("#issued ").and_then(|v| v.parse().ok()).ok_or("REFUSED — no #issued stamp (77)")?;
+    let age = now - issued;
+    if age > SEAT_BUNDLE_MAX_AGE_SECS {
+        return Err(format!("REFUSED — signed {age}s ago, past the {SEAT_BUNDLE_MAX_AGE_SECS}s window: a replay (77)"));
+    }
+    if age < -300 {
+        return Err("REFUSED — the bundle claims to be signed in the future; a clock is wrong (77)".into());
+    }
+    Ok(())
+}
+
+/// The kinds the manifest names, in order.
+fn manifest_kinds(manifest: &str) -> Vec<(String, String)> {
+    manifest
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.len() > 66)
+        .map(|l| (l[..64].to_string(), l[66..].to_string()))
+        .collect()
+}
+
+/// Verify an extracted seat bundle in `stage` against the seat's signing
+/// anchor: signature (the current key, or a countersignature by it after a
+/// rotation), header, then every file's sha. Returns the plan.
+pub(crate) fn verify_seat_stage(
+    stage: &Path,
+    signing_pub: &Path,
+    cfg: &SeatConfig,
+    now: i64,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let manifest_path = stage.join("manifest");
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|_| "REFUSED — the bundle has no manifest (65)".to_string())?;
+    seat_manifest_shape_ok(&manifest)?;
+    let mut sigs = vec![stage.join("manifest.sig")];
+    for n in 0..100 {
+        let p = stage.join(format!("manifest.xsig.{n}"));
+        if !p.is_file() {
+            break;
+        }
+        sigs.push(p);
+    }
+    let verified = sigs.iter().filter(|s| s.is_file()).any(|sig| {
+        Command::new("openssl")
+            .args(["dgst", "-sha256", "-verify"]).arg(signing_pub)
+            .arg("-signature").arg(sig).arg(&manifest_path)
+            .output().map(|o| o.status.success()).unwrap_or(false)
+    });
+    if !verified {
+        return Err("REFUSED — the manifest signature does not verify against this seat's fleet signing key (77)".into());
+    }
+    verify_seat_header(&manifest, &cfg.seat, now)?;
+    let entries = manifest_kinds(&manifest);
+    for (sum, kind) in &entries {
+        let bytes = std::fs::read(stage.join("files").join(kind)).map_err(|_| format!("REFUSED — '{kind}' is in the manifest but not the bundle (65)"))?;
+        if &sha256_hex(&bytes) != sum {
+            return Err(format!("REFUSED — '{kind}' does not match its manifest sha (65)"));
+        }
+    }
+    let kinds: Vec<String> = entries.into_iter().map(|(_, k)| k).collect();
+    plan_seat_apply(&kinds, cfg)
+}
+
+/// `noo-kiosk-launch` carries one per-box line (`setup` rewrites BROWSER=
+/// when the box's browser is not `chromium`). Keep the installed line.
+pub(crate) fn carry_browser_line(new: &str, installed: Option<&str>) -> String {
+    let Some(old) = installed.and_then(|t| t.lines().find(|l| l.trim_start().starts_with("BROWSER=")).map(str::to_string)) else {
+        return new.to_string();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for l in new.lines() {
+        out.push(if l.trim_start().starts_with("BROWSER=") { old.clone() } else { l.to_string() });
+    }
+    let mut s = out.join("\n");
+    if new.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+// ═══ commands ═════════════════════════════════════════════════════════
+
+/// `noo kiosk seat-token <seat> [--ttl <1h|30m|secs>]` — on the controller.
+pub fn kiosk_seat_token(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut seat: Option<String> = None;
+    let mut ttl: Option<i64> = None;
+    let mut it = args.iter();
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "--ttl" => ttl = Some(super::cluster_provision::parse_ttl_seconds(it.next().ok_or(Unhandled)?).ok_or(Unhandled)?),
+            s if s.starts_with('-') => return Err(Unhandled),
+            s if seat.is_none() => seat = Some(s.to_string()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let Some(seat) = seat.filter(|s| valid_seat_name(s)) else {
+        fail(g.json, ExitCode::Usage, "usage", "a seat name is required ([a-zA-Z0-9._-], <= 64)",
+            Some("noo kiosk seat-token <seat-name> [--ttl 1h]"));
+    };
+    let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+    if let Err(e) = ca.ensure_signing_key() {
+        fail(g.json, ExitCode::Generic, "signing_key", &e, Some("noo security pki status"));
+    }
+    let sigpub = match std::fs::read_to_string(ca.signing_pub_path()) {
+        Ok(s) => s,
+        Err(e) => fail(g.json, ExitCode::Generic, "signing_key",
+            &format!("cannot read the fleet signing public key: {e}"), Some("noo security pki status")),
+    };
+    let mut body = json!({"seat_name": seat});
+    if let Some(t) = ttl {
+        body["ttl_seconds"] = json!(t);
+    }
+    let resp = match crate::http::post_json_try(g, "/api/cluster/seat-tokens", &body, true, 15) {
+        Ok(v) => v,
+        Err(e) => fail(g.json, ExitCode::Generic, "mint_failed", &e, None),
+    };
+    let blob = SeatBlob {
+        url: resp["controller_url"].as_str().unwrap_or_default().to_string(),
+        token: resp["token"].as_str().unwrap_or_default().to_string(),
+        ca: resp["ca_sha256"].as_str().unwrap_or_default().to_string(),
+        seat: seat.clone(),
+        sigpub,
+    };
+    if blob.url.is_empty() || blob.token.is_empty() || blob.ca.is_empty() {
+        fail(g.json, ExitCode::Generic, "mint_failed", "the gateway's answer lacks the url, token or CA pin", None);
+    }
+    let enroll = format!("noo kiosk enroll {}", compose_seat_blob(&blob));
+    if g.json {
+        println!("{}", json!({"id": resp["id"], "seat_name": seat, "role": "seat", "expires_at": resp["expires_at"], "enroll_command": enroll}));
+        return Ok(0);
+    }
+    println!("{}", ui::header("kiosk seat token", Some(&seat)));
+    println!("{}", ui::note("on the seat, as the account that runs `noo` (not root):"));
+    ui::value(&enroll);
+    println!("{}", ui::note(&format!(
+        "single-use; enrols a SEAT, never a node; expires {} — if the paste leaks, revoke it: \
+         POST /api/cluster/seat-tokens/{}/revoke",
+        resp["expires_at"].as_str().unwrap_or("?"), resp["id"].as_str().unwrap_or("?"))));
+    Ok(0)
+}
+
+/// What `/etc/default/kiosk` says about this display, when it is readable.
+fn read_kiosk_env(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|l| l.trim().split_once('='))
+        .filter(|(k, _)| k.starts_with("NOO_KIOSK_"))
+        .map(|(k, v)| (k.to_string(), v.trim().trim_matches('"').to_string()))
+        .collect()
+}
+
+fn kiosk_json(env: &BTreeMap<String, String>) -> Value {
+    let get = |k: &str| env.get(k).cloned().unwrap_or_default();
+    json!({
+        "user": get("NOO_KIOSK_USER"),
+        "mode": get("NOO_KIOSK_MODE"),
+        "vt": get("NOO_KIOSK_VT"),
+        "view": get("NOO_KIOSK_VIEW"),
+        "quality": get("NOO_KIOSK_QUALITY"),
+    })
+}
+
+/// The systemd units the enrol step installs. Root, oneshot, every minute.
+pub(crate) fn render_sync_service() -> String {
+    format!(
+        "# Written by `noo kiosk enroll <blob>`. The seat's rail: a signed heartbeat,\n\
+         # a signed fetch, and an apply that may write ONLY the seat user's\n\
+         # ~/.local/bin/noo, {applier}, /usr/local/bin/noo-kiosk-* and the\n\
+         # kiosk units. It holds no fleet credential and never will.\n\
+         [Unit]\n\
+         Description=noomesh kiosk seat sync (CLI + kiosk assets over the rail; seat-scoped)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={applier} kiosk seat-sync\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         TimeoutStartSec=15min\n",
+        applier = SEAT_APPLIER_BIN,
+    )
+}
+
+pub(crate) fn render_sync_timer() -> &'static str {
+    "# Written by `noo kiosk enroll <blob>`.\n\
+     [Unit]\n\
+     Description=noomesh kiosk seat sync, every minute\n\
+     \n\
+     [Timer]\n\
+     OnBootSec=45s\n\
+     OnUnitActiveSec=60s\n\
+     AccuracySec=5s\n\
+     \n\
+     [Install]\n\
+     WantedBy=timers.target\n"
+}
+
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The ONE root step of enrolment, as a script: printed in full before it
+/// runs, so the operator sees exactly what sudo is asked to do. `work` holds
+/// the files it installs (birth key + cert, CA, signing anchor, config,
+/// units); `exe` is this `noo`.
+pub(crate) fn seat_install_script(work: &Path, exe: &Path) -> String {
+    let w = |f: &str| shq(&work.join(f).to_string_lossy());
+    format!(
+        "set -eu\n\
+         install -d -m 0755 -o root -g root {dir}\n\
+         install -m 0600 -o root -g root {key} {dir}/birth.key\n\
+         install -m 0644 -o root -g root {crt} {dir}/birth.crt\n\
+         install -m 0644 -o root -g root {ca} {dir}/ca.crt\n\
+         install -m 0644 -o root -g root {sp} {dir}/signing.pub\n\
+         install -m 0644 -o root -g root {cfg} {dir}/seat.json\n\
+         install -d -m 0700 -o root -g root {state}\n\
+         install -D -m 0755 -o root -g root {exe} {applier}\n\
+         install -m 0644 -o root -g root {svc} {svc_dst}\n\
+         install -m 0644 -o root -g root {tmr} {tmr_dst}\n\
+         systemctl daemon-reload\n\
+         systemctl enable --now noo-seat-sync.timer\n",
+        dir = SEAT_DIR, state = SEAT_STATE_DIR, applier = SEAT_APPLIER_BIN,
+        key = w("birth.key"), crt = w("birth.crt"), ca = w("ca.crt"), sp = w("signing.pub"), cfg = w("seat.json"),
+        exe = shq(&exe.to_string_lossy()),
+        svc = w("noo-seat-sync.service"), svc_dst = SEAT_SYNC_SERVICE,
+        tmr = w("noo-seat-sync.timer"), tmr_dst = SEAT_SYNC_TIMER,
+    )
+}
+
+fn user_home(user: &str) -> Option<String> {
+    let out = Command::new("getent").args(["passwd", user]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().split(':').nth(5).map(str::to_string).filter(|h| !h.is_empty())
+}
+
+/// `noo kiosk enroll <noo-seat1.blob> [--controller <url>] [--dry-run] [-y]`
+pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut blob: Option<String> = None;
+    let mut controller: Option<String> = None;
+    let mut dry_run = false;
+    let mut it = args.iter();
+    while let Some(t) = it.next() {
+        match t.as_str() {
+            "--controller" => controller = Some(it.next().ok_or(Unhandled)?.trim_end_matches('/').to_string()),
+            "--dry-run" => dry_run = true,
+            "-y" | "--yes" => {}
+            s if s.starts_with('-') => return Err(Unhandled),
+            s if blob.is_none() => blob = Some(s.to_string()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let usage = "noo kiosk enroll noo-seat1.<blob> [--controller <https://…>]   (the blob comes from `noo kiosk seat-token <seat>` on the controller)";
+    let Some(blob) = blob else {
+        fail(g.json, ExitCode::Usage, "usage", "the seat enrolment blob is required", Some(usage));
+    };
+    let b = match parse_seat_blob(&blob) {
+        Ok(b) => b,
+        Err(e) => fail(g.json, ExitCode::Usage, "seat_blob", &e, Some(usage)),
+    };
+    if !cfg!(target_os = "linux") {
+        fail(g.json, ExitCode::Generic, "platform", "a kiosk seat is Linux-only (systemd)", None);
+    }
+    let me = std::env::var("USER").ok().filter(|u| !u.is_empty())
+        .or_else(|| Command::new("id").arg("-un").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or_default();
+    if me.is_empty() || me == "root" {
+        fail(g.json, ExitCode::Usage, "run_as_user",
+            "run `noo kiosk enroll <blob>` as the account whose `noo` this seat keeps current, not as root \
+             (it asks for sudo once, for the install step)", Some(usage));
+    }
+    let home = user_home(&me).or_else(|| std::env::var("HOME").ok()).unwrap_or_default();
+    let url = controller.clone().unwrap_or_else(|| b.url.clone());
+    let cfg = SeatConfig { seat: b.seat.clone(), controller_url: url.clone(), cli_user: me.clone(), cli_home: home };
+    if let Err(e) = cfg.validate() {
+        fail(g.json, ExitCode::Generic, "seat_config", &e, None);
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| cfg.cli_path());
+
+    println!("{}", ui::header("kiosk enroll", Some(&format!("seat {} → {url}", b.seat))));
+    // 1. the CA, by its pin
+    ui::step("fetching the cluster CA and checking it against the paste's pin");
+    let ca_pem = match super::enroll::fetch_ca_pem(&url, &b.ca) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "ca_pin", &e, None),
+    };
+    // 2. the birth keypair, in a private dir that is shredded on every exit
+    let work = match private_dir(&std::env::temp_dir(), "noo-seat-enroll") {
+        Ok(w) => w,
+        Err(e) => fail(g.json, ExitCode::Generic, "workdir", &e, None),
+    };
+    let cleanup = |w: &Path| {
+        let k = w.join("birth.key");
+        if let Ok(m) = std::fs::metadata(&k) {
+            let _ = std::fs::write(&k, vec![0u8; m.len() as usize]);
+        }
+        let _ = std::fs::remove_dir_all(w);
+    };
+    ui::step("generating the seat's birth keypair (RSA-4096)");
+    let ok = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "rsa:4096", "-nodes", "-days", "3650", "-subj"])
+        .arg(format!("/CN=noo-seat-{}", b.seat))
+        .arg("-keyout").arg(work.join("birth.key"))
+        .arg("-out").arg(work.join("birth.crt"))
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    let cert = std::fs::read_to_string(work.join("birth.crt")).unwrap_or_default();
+    if !ok || cert.is_empty() {
+        cleanup(&work);
+        fail(g.json, ExitCode::Generic, "birth_key", "openssl could not generate the birth keypair", Some("sudo apt install openssl"));
+    }
+    let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
+    let facts = json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "cli_user": cfg.cli_user,
+        "cli_path": cfg.cli_path(),
+        "kiosk": kiosk_json(&kiosk_env),
+    });
+    if dry_run {
+        cleanup(&work);
+        println!("{}", ui::note("dry run: would redeem the token, then run this once under sudo:"));
+        for l in seat_install_script(Path::new("<workdir>"), &exe).lines() {
+            println!("  {l}");
+        }
+        return Ok(0);
+    }
+    // 3. redeem
+    ui::step("redeeming the seat token");
+    let agent = match super::enroll::ca_agent(&ca_pem, 30) {
+        Ok(a) => a,
+        Err(e) => { cleanup(&work); fail(g.json, ExitCode::Generic, "ca_agent", &e, None) }
+    };
+    let body = json!({"token": b.token, "seat_name": b.seat, "birth_cert": cert, "facts": facts, "enroll_user": me});
+    let resp = agent.post(&format!("{url}/api/cluster/seat-enroll")).send_json(&body);
+    match resp {
+        Ok(mut r) if r.status().as_u16() == 200 => {
+            let _ = r.body_mut().read_to_string();
+        }
+        Ok(mut r) => {
+            let st = r.status().as_u16();
+            let text = r.body_mut().read_to_string().unwrap_or_default();
+            cleanup(&work);
+            fail(g.json, ExitCode::Generic, "seat_enroll", &format!("the controller refused the seat token (HTTP {st}): {}",
+                crate::http::detail_of(st, &text)), Some("mint a fresh one on the controller: noo kiosk seat-token <seat>"));
+        }
+        Err(e) => {
+            cleanup(&work);
+            fail(g.json, ExitCode::Generic, "seat_enroll", &format!("could not reach {url}: {e}"), None);
+        }
+    }
+    ui::done(&format!("enrolled as seat {} (no node credential was issued, and none can be)", b.seat));
+    // 4. the one root step
+    let writes = [
+        ("ca.crt", ca_pem.clone()),
+        ("signing.pub", b.sigpub.clone().into_bytes()),
+        ("seat.json", serde_json::to_vec_pretty(&cfg).unwrap_or_default()),
+        ("noo-seat-sync.service", render_sync_service().into_bytes()),
+        ("noo-seat-sync.timer", render_sync_timer().as_bytes().to_vec()),
+    ];
+    for (f, bytes) in writes {
+        if let Err(e) = std::fs::write(work.join(f), bytes) {
+            cleanup(&work);
+            fail(g.json, ExitCode::Generic, "workdir", &format!("{f}: {e}"), None);
+        }
+    }
+    let script = seat_install_script(&work, &exe);
+    println!();
+    println!("{}", ui::warn("one sudo, now, to install the seat's rail (nothing after this needs sudo):"));
+    for l in script.lines() {
+        println!("  {}", ui::muted(l));
+    }
+    let script_path = work.join("install.sh");
+    let _ = std::fs::write(&script_path, &script);
+    let st = Command::new("sudo").arg("sh").arg(&script_path).status();
+    cleanup(&work);
+    if !st.map(|s| s.success()).unwrap_or(false) {
+        fail(g.json, ExitCode::Generic, "install",
+            "the install step did not complete; the seat is enrolled at the controller but its timer is not installed",
+            Some("re-run `noo kiosk enroll <blob>` with a fresh token (`noo kiosk seat-token <seat>` on the controller)"));
+    }
+    if exe != cfg.cli_path() {
+        ui::warned(&format!(
+            "this `noo` runs from {}, but the seat keeps {} current — put that first on PATH (install.sh's default)",
+            exe.display(), cfg.cli_path().display()));
+    }
+    ui::done("seat rail installed: noo-seat-sync.timer runs every minute");
+    ui::guide(&[
+        ("noo upgrade --seats", "on the controller: stage this seat's bundle now (`--nodes`/`--all` include seats)"),
+        ("journalctl -u noo-seat-sync -n 30", "here: what the seat's last sync did"),
+    ]);
+    Ok(0)
+}
+
+// ═══ the seat's timer: `noo kiosk seat-sync` (root) ═══════════════════
+
+/// `<ts>.<base64 sig>` over `noo-seat-<tag>:<seat>:<sha>:<ts>` with the birth
+/// key — the gateway's `birth_proof::signed_message` for the seat purposes.
+pub(crate) fn seat_proof_message(tag: &str, seat: &str, sha: &str, ts: i64) -> String {
+    format!("noo-seat-{tag}:{seat}:{sha}:{ts}")
+}
+
+fn sign_proof(key: &Path, tag: &str, seat: &str, sha: &str) -> Result<String, String> {
+    let ts = now_unix();
+    let work = private_dir(&std::env::temp_dir(), "noo-seat-proof")?;
+    let msg = work.join("msg");
+    let sig = work.join("sig");
+    let r = (|| {
+        std::fs::write(&msg, seat_proof_message(tag, seat, sha, ts)).map_err(|e| e.to_string())?;
+        let out = Command::new("openssl").args(["dgst", "-sha256", "-sign"]).arg(key)
+            .arg("-out").arg(&sig).arg(&msg).output().map_err(|e| format!("openssl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("openssl could not sign with {}: {}", key.display(), String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let bytes = std::fs::read(&sig).map_err(|e| e.to_string())?;
+        use base64::Engine as _;
+        Ok(format!("{ts}.{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    r
+}
+
+fn sh_out(cmd: &mut Command) -> Option<String> {
+    let o = cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").output().ok()?;
+    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+fn unit_state(unit: &str) -> String {
+    sh_out(Command::new("systemctl").args(["is-active", unit])).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into())
+}
+
+fn unit_exists(unit: &str) -> bool {
+    Command::new("systemctl").args(["cat", unit]).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct SeatState {
+    last_applied_sha: Option<String>,
+    console_build: Option<String>,
+    display: Option<String>,
+}
+
+fn state_path() -> PathBuf {
+    Path::new(SEAT_STATE_DIR).join("state.json")
+}
+
+fn read_state() -> SeatState {
+    std::fs::read(state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn write_state(s: &SeatState) {
+    let _ = std::fs::create_dir_all(SEAT_STATE_DIR);
+    let _ = std::fs::write(state_path(), serde_json::to_vec_pretty(s).unwrap_or_default());
+}
+
+/// The heartbeat body. What `noo upgrade` and `noo cluster verify` judge.
+fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
+    let applier_sha = std::fs::read(SEAT_APPLIER_BIN).ok().map(|b| sha256_hex(&b));
+    let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
+    let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
+        .filter(|b| !b.is_empty() && b != "null");
+    let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
+    json!({
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
+        "kiosk_serve": unit_state("kiosk-serve.service"),
+        "kiosk_display": unit_state("kiosk.service"),
+        "console_build": console,
+        "kiosk": kiosk_json(&kiosk_env),
+        "last_applied_sha": state.last_applied_sha,
+        "display": state.display,
+        "ts": now_unix(),
+    })
+}
+
+/// Write one planned file. Root paths: a temp file in the same root-owned
+/// directory, then rename (atomic, and a running binary is replaced, not
+/// overwritten). The user's CLI: written AS the user (`runuser`), so the root
+/// applier never follows a link the user planted in their own home.
+fn install_file(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String> {
+    if !seat_path_allowed(dst, cfg) {
+        return Err(format!("REFUSED — {} is outside the seat applier's allow-list", dst.display()));
+    }
+    let mode = if dst.starts_with(UNIT_DIR) || dst.ends_with("signing.pub") { 0o644 } else { 0o755 };
+    if dst == cfg.cli_path() {
+        use std::io::Write as _;
+        let mut child = Command::new("runuser")
+            .args(["-u", &cfg.cli_user, "--", "install", "-D", "-m", "0755", "/dev/stdin"])
+            .arg(dst)
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .stdin(std::process::Stdio::piped())
+            .spawn().map_err(|e| format!("runuser: {e}"))?;
+        let mut sin = child.stdin.take().ok_or("runuser: no stdin")?;
+        sin.write_all(bytes).map_err(|e| format!("write {}: {e}", dst.display()))?;
+        drop(sin);
+        let st = child.wait().map_err(|e| e.to_string())?;
+        return if st.success() { Ok(()) } else { Err(format!("installing {} as {} exited {st}", dst.display(), cfg.cli_user)) };
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = dst.parent().ok_or("no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".{}.noo-seat-{}", dst.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.write_all(bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dst).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("rename onto {}: {e}", dst.display()) })
+}
+
+/// What changed, and what the applier did about it — the apply report's
+/// words, parsed back by the controller's verify block.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ApplyOutcome {
+    pub cli: &'static str,
+    pub scripts: usize,
+    pub units: usize,
+    pub serve: &'static str,
+    pub display: &'static str,
+    pub console: String,
+}
+
+impl ApplyOutcome {
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "seat-apply cli={} scripts={} units={} serve={} display={} console={}",
+            self.cli, self.scripts, self.units, self.serve, self.display,
+            if self.console.is_empty() { "-" } else { &self.console }
+        )
+    }
+}
+
+/// The display action an apply calls for: restart the session when its
+/// launcher, CDP helper or unit changed; else reload the page when the
+/// console build moved; else nothing.
+pub(crate) fn display_action(changed: &[String], console_moved: bool) -> &'static str {
+    if changed.iter().any(|k| matches!(k.as_str(), "kiosk-launch" | "kiosk-cdp" | "unit-kiosk")) {
+        "restart"
+    } else if console_moved {
+        "reload"
+    } else {
+        "unchanged"
+    }
+}
+
+/// Decrypt, unwrap, extract, verify and apply one blob. Returns the outcome.
+fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<ApplyOutcome, String> {
+    let stage = private_dir(Path::new(SEAT_STATE_DIR), "stage")?;
+    let r = (|| {
+        let enc = stage.join("bundle.der");
+        std::fs::write(&enc, blob).map_err(|e| e.to_string())?;
+        let tarp = stage.join("bundle.tar");
+        let out = Command::new("openssl")
+            .args(["smime", "-decrypt", "-binary", "-inform", "DER", "-inkey"])
+            .arg(Path::new(SEAT_DIR).join("birth.key"))
+            .arg("-in").arg(&enc).arg("-out").arg(&tarp)
+            .output().map_err(|e| format!("openssl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("decrypt failed — is this bundle for this seat's birth key? re-enrol if the key changed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let mut tar = std::fs::read(&tarp).map_err(|e| e.to_string())?;
+        if tar.starts_with(&[0x1f, 0x8b]) {
+            use std::io::Read as _;
+            let mut d = Vec::new();
+            flate2::read::GzDecoder::new(&tar[..]).read_to_end(&mut d).map_err(|e| format!("gunzip: {e}"))?;
+            tar = d;
+        }
+        let ex = stage.join("x");
+        std::fs::create_dir(&ex).map_err(|e| e.to_string())?;
+        super::node_fetch::extract_bundle(&tar, &ex)?;
+        let plan = verify_seat_stage(&ex, &Path::new(SEAT_DIR).join("signing.pub"), cfg, now_unix())?;
+        // Apply. Everything verified; any write failure stops here and is
+        // reported, with what was already written named in the message.
+        let mut changed: Vec<String> = Vec::new();
+        for (kind, dst) in &plan {
+            let mut bytes = std::fs::read(ex.join("files").join(kind)).map_err(|e| e.to_string())?;
+            if kind == "kiosk-launch" {
+                let installed = std::fs::read_to_string(dst).ok();
+                bytes = carry_browser_line(&String::from_utf8_lossy(&bytes), installed.as_deref()).into_bytes();
+            }
+            if std::fs::read(dst).ok().as_deref() == Some(&bytes[..]) {
+                continue;
+            }
+            install_file(dst, &bytes, cfg).map_err(|e| format!("{e} (already changed: {})", changed.join(",")))?;
+            if !changed.contains(kind) {
+                changed.push(kind.clone());
+            }
+        }
+        let meta: Value = std::fs::read(ex.join("files/seat-meta")).ok()
+            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+        let console = meta["console_build"].as_str().unwrap_or("").to_string();
+        let console_moved = !console.is_empty() && state.console_build.as_deref() != Some(console.as_str());
+        let units_changed = changed.iter().filter(|k| k.starts_with("unit-")).count();
+        if units_changed > 0 {
+            let _ = Command::new("systemctl").arg("daemon-reload").status();
+        }
+        let mut o = ApplyOutcome {
+            cli: if changed.iter().any(|k| k == "cli-binary") { "updated" } else { "unchanged" },
+            scripts: changed.iter().filter(|k| k.starts_with("kiosk-")).count(),
+            units: units_changed,
+            serve: "unchanged",
+            display: "unchanged",
+            console: console.clone(),
+        };
+        if changed.iter().any(|k| k == "kiosk-serve" || k == "unit-kiosk-serve") && unit_exists("kiosk-serve.service") {
+            o.serve = if Command::new("systemctl").args(["restart", "kiosk-serve.service"]).status().map(|s| s.success()).unwrap_or(false) {
+                "restarted"
+            } else {
+                "restart-failed"
+            };
+        }
+        if changed.iter().any(|k| k == "unit-kiosk-watchdog-timer") && unit_exists("kiosk-watchdog.timer") {
+            let _ = Command::new("systemctl").args(["restart", "kiosk-watchdog.timer"]).status();
+        }
+        o.display = match display_action(&changed, console_moved) {
+            "restart" if unit_exists("kiosk.service") => {
+                if Command::new("systemctl").args(["restart", "kiosk.service"]).status().map(|s| s.success()).unwrap_or(false) { "restarted" } else { "restart-failed" }
+            }
+            "reload" => {
+                if Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("reload").status().map(|s| s.success()).unwrap_or(false) { "reloaded" } else { "reload-failed" }
+            }
+            _ => "unchanged",
+        };
+        if !console.is_empty() {
+            state.console_build = Some(console);
+        }
+        state.display = Some(o.display.to_string());
+        Ok(o)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    r
+}
+
+/// `noo kiosk seat-sync` — the seat timer's one tick (root; hidden).
+pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    if !args.is_empty() {
+        return Err(Unhandled);
+    }
+    let say = |m: &str| eprintln!("noo-seat-sync: {m}");
+    let cfg: SeatConfig = match std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        Some(c) => c,
+        None => { say("no /etc/noo-seat/seat.json — this box is not an enrolled seat (`noo kiosk enroll <blob>`)"); return Ok(78); }
+    };
+    if let Err(e) = cfg.validate() {
+        say(&e);
+        return Ok(78);
+    }
+    let key = Path::new(SEAT_DIR).join("birth.key");
+    let ca = match std::fs::read(Path::new(SEAT_DIR).join("ca.crt")) {
+        Ok(c) => c,
+        Err(e) => { say(&format!("no CA anchor: {e}")); return Ok(78); }
+    };
+    let agent = match super::enroll::ca_agent(&ca, 900) {
+        Ok(a) => a,
+        Err(e) => { say(&e); return Ok(1); }
+    };
+    let base = cfg.controller_url.trim_end_matches('/').to_string();
+    let seat = cfg.seat.clone();
+    let mut state = read_state();
+    let post_signed = |path: &str, tag: &str, sha: &str, body: Vec<u8>| -> Result<u16, String> {
+        let proof = sign_proof(&key, tag, &seat, sha)?;
+        let r = agent.post(&format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .header("x-noo-birth-proof", &proof)
+            .send(&body[..]);
+        match r {
+            Ok(r) => Ok(r.status().as_u16()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let heartbeat = |state: &SeatState| {
+        let body = heartbeat_body(&cfg, state).to_string().into_bytes();
+        let sha = sha256_hex(&body);
+        match post_signed(&format!("/bootstrap/seat/{seat}/heartbeat"), "heartbeat", &sha, body) {
+            Ok(200) => {}
+            Ok(st) => say(&format!("heartbeat answered HTTP {st}")),
+            Err(e) => say(&format!("heartbeat: {e}")),
+        }
+    };
+    heartbeat(&state);
+    // Fetch (signed GET).
+    let proof = match sign_proof(&key, "get", &seat, "-") {
+        Ok(p) => p,
+        Err(e) => { say(&e); return Ok(1); }
+    };
+    let blob = match agent.get(&format!("{base}/bootstrap/seat/{seat}/bundle")).header("x-noo-birth-proof", &proof).call() {
+        Ok(mut r) if r.status().as_u16() == 200 => {
+            use std::io::Read as _;
+            let mut b = Vec::new();
+            if let Err(e) = r.body_mut().as_reader().read_to_end(&mut b) {
+                say(&format!("reading the bundle: {e}"));
+                return Ok(1);
+            }
+            b
+        }
+        Ok(r) if r.status().as_u16() == 404 => return Ok(0),
+        Ok(r) => { say(&format!("bundle fetch answered HTTP {}", r.status().as_u16())); return Ok(1); }
+        Err(e) => { say(&format!("bundle fetch: {e}")); return Ok(1); }
+    };
+    let sha = sha256_hex(&blob);
+    if state.last_applied_sha.as_deref() == Some(sha.as_str()) {
+        return Ok(0);
+    }
+    let _ = post_signed(&format!("/bootstrap/seat/{seat}/fetched"), "fetch", &sha, json!({"sha": sha}).to_string().into_bytes());
+    let (rc, msg) = match apply_blob(&blob, &cfg, &mut state) {
+        Ok(o) => (0, o.line()),
+        Err(e) => (65, e),
+    };
+    say(&format!("apply rc={rc}: {msg}"));
+    match post_signed(&format!("/bootstrap/seat/{seat}/applied"), "apply", &sha,
+        json!({"sha": sha, "rc": rc, "msg": msg}).to_string().into_bytes()) {
+        Ok(200) => {
+            // Recorded only once the controller has the report: a lost report
+            // means the next tick applies (idempotently) and reports again.
+            state.last_applied_sha = Some(sha);
+            write_state(&state);
+        }
+        Ok(st) => say(&format!("apply report answered HTTP {st}")),
+        Err(e) => say(&format!("apply report: {e}")),
+    }
+    heartbeat(&state);
+    Ok(if rc == 0 { 0 } else { 1 })
+}
+
+// ═══ the controller's view: upgrade + verify ══════════════════════════
+
+/// Every enrolled seat, or `None` when the gateway does not answer (an older
+/// gateway has no seat routes: that is "no seats", said once by the caller).
+pub(crate) fn list_seats(g: &Globals) -> Option<Vec<Value>> {
+    crate::http::get_json_opt(g, "/api/cluster/seats", true, 15)
+        .and_then(|d| d["seats"].as_array().cloned())
+}
+
+fn check(name: &'static str, verdict: super::cluster_verify::Verdict, detail: String, remedy: Option<String>) -> super::cluster_verify::Check {
+    super::cluster_verify::Check { name, verdict, detail, remedy }
+}
+
+fn norm_tag(t: &str) -> String {
+    let t = t.trim().split('+').next().unwrap_or("").trim_start_matches("stack-");
+    if t.is_empty() || t.starts_with('v') { t.to_string() } else { format!("v{t}") }
+}
+
+/// The token after `key=` in a `seat-apply …` report line.
+pub(crate) fn report_word<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
+    msg.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// One seat, judged: online, CLI current, kiosk-serve active, display on the
+/// controller's console build, last apply ok. Pure over the record (the
+/// `/api/cluster/seats` row or the `/status` answer), so every verdict is
+/// pinned by a test. Shared by `noo upgrade` and `noo cluster verify`.
+pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
+    use super::cluster_verify::Verdict;
+    let name = seat["seat_name"].as_str().or_else(|| seat["seat"].as_str()).unwrap_or("?");
+    let hb = &seat["heartbeat"];
+    let mut out = Vec::new();
+    let seen = seat["last_seen"].as_str().and_then(super::cluster_verify::parse_rfc3339_unix);
+    out.push(match seen {
+        Some(t) if now - t <= SEAT_HEARTBEAT_MAX_AGE_SECS => check("seat online", Verdict::Ok, format!("heard {}s ago", now - t), None),
+        Some(t) => check("seat online", Verdict::Fail, format!("last heard {}s ago — the seat's sync timer is not reaching the controller", now - t),
+            Some(format!("on {name}: systemctl status noo-seat-sync.timer"))),
+        None => check("seat online", Verdict::Fail, "never heard from since it enrolled".into(),
+            Some(format!("on {name}: journalctl -u noo-seat-sync -n 30"))),
+    });
+    let cli = hb["cli_version"].as_str().unwrap_or("");
+    let user_current = hb["user_cli_current"].as_bool().unwrap_or(false);
+    out.push(if cli.is_empty() {
+        check("seat cli", Verdict::Fail, "no CLI version reported".into(), Some("noo upgrade --seats".into()))
+    } else if cli != controller_cli {
+        check("seat cli", Verdict::Fail, format!("{cli}, controller {controller_cli}"), Some("noo upgrade --seats".into()))
+    } else if !user_current {
+        check("seat cli", Verdict::Warn, format!("{cli} (the seat's applier); the user's ~/.local/bin/noo differs"),
+            Some("noo upgrade --seats".into()))
+    } else {
+        check("seat cli", Verdict::Ok, format!("{cli} = controller"), None)
+    });
+    let serve = hb["kiosk_serve"].as_str().unwrap_or("unknown");
+    out.push(match serve {
+        "active" => check("kiosk-serve", Verdict::Ok, "active".into(), None),
+        "inactive" | "unknown" if hb["kiosk"]["user"].as_str().unwrap_or("").is_empty() =>
+            check("kiosk-serve", Verdict::Warn, "no kiosk set up on this seat".into(),
+                Some(format!("on {name}: noo kiosk setup --mode dedicated --url https://<controller>.<tailnet>.ts.net"))),
+        other => check("kiosk-serve", Verdict::Fail, other.to_string(), Some(format!("on {name}: journalctl -u kiosk-serve -n 50"))),
+    });
+    let build = hb["console_build"].as_str().unwrap_or("");
+    let display = report_word(seat["apply_msg"].as_str().unwrap_or(""), "display").unwrap_or("");
+    let quality = hb["kiosk"]["quality"].as_str().filter(|q| !q.is_empty()).map(|q| format!(", quality {q}")).unwrap_or_default();
+    out.push(if build.is_empty() {
+        check("display", Verdict::Warn, format!("console build not stated (the browser is not answering on CDP){quality}"),
+            Some(format!("on {name}: noo kiosk status")))
+    } else if norm_tag(build) != norm_tag(controller_tag) {
+        check("display", Verdict::Fail, format!("console {build}, controller {controller_tag}{quality}"),
+            Some(format!("on {name}: noo kiosk reload")))
+    } else {
+        check("display", Verdict::Ok, format!("console {build} = controller{}{quality}",
+            if display.is_empty() { String::new() } else { format!(" (last apply: display {display})") }), None)
+    });
+    let staged = seat["staged_sha"].as_str().or_else(|| seat["sha256"].as_str());
+    if let Some(staged) = staged {
+        let applied = seat["applied_sha"].as_str();
+        let rc = seat["apply_rc"].as_i64();
+        out.push(match (applied == Some(staged), rc) {
+            (true, Some(0)) => check("seat bundle", Verdict::Ok, "the staged bundle applied (exit 0)".into(), None),
+            (true, Some(rc)) => check("seat bundle", Verdict::Fail,
+                format!("the seat refused its bundle (exit {rc}): {}", seat["apply_msg"].as_str().unwrap_or("")),
+                Some("noo upgrade --seats".into())),
+            _ => check("seat bundle", Verdict::Warn, "staged, not applied yet".into(), Some(format!("on {name}: journalctl -u noo-seat-sync -n 30"))),
+        });
+    }
+    out
+}
+
+/// The seats stage of `noo upgrade` (after the nodes, or alone with
+/// `--seats`): stage every enrolled seat, wait for all of them together with
+/// the nodes' combined wait, then one verify block per seat. No enrolled
+/// seat: nothing is staged and nothing is printed beyond one line.
+pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
+    let Some(seats) = list_seats(g) else {
+        if !g.json { println!("{}", ui::note("seats: this gateway has no seat registry (an older stack) — skipped")); }
+        return 0;
+    };
+    if seats.is_empty() {
+        if !g.json { println!("{}", ui::note("seats: none enrolled (`noo kiosk seat-token <seat>` mints one)")); }
+        return 0;
+    }
+    if !g.json { println!("{}", ui::phase("Seats")); }
+    let mut pending: Vec<super::provision::PendingApply> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for s in &seats {
+        let name = s["seat_name"].as_str().unwrap_or("?").to_string();
+        println!();
+        println!("{}", ui::item(&format!("seat {name}")));
+        match stage_seat(g, s) {
+            Ok(sha) => {
+                println!("{}", ui::sub(&ui::status_line(Glyph::Ok, "staged (CLI + kiosk assets, signed, encrypted to the seat's birth cert)")));
+                pending.push(super::provision::PendingApply { node: name, sha, legacy: false });
+            }
+            Err(e) => {
+                println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("not staged: {e}"))));
+                failed.push(name);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        println!();
+        let ends = super::provision::wait_applied_via(g, &pending, 600, 5,
+            &|n| format!("/api/cluster/seats/{n}/status"), "seat");
+        let tag = super::cluster_verify::controller_stack_tag();
+        let mut rows = Vec::new();
+        for (n, end) in ends {
+            let ok_apply = matches!(end, super::provision::ApplyEnd::Applied { rc: 0, .. });
+            // The closing heartbeat follows the apply report by a second or
+            // two; give it a moment so the block judges the new state.
+            let mut st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
+            if ok_apply {
+                for _ in 0..12 {
+                    let fresh = st.as_ref().is_some_and(|s| s["heartbeat"]["cli_version"].as_str() == Some(env!("CARGO_PKG_VERSION"))
+                        && s["heartbeat"]["last_applied_sha"] == s["sha256"]);
+                    if fresh { break; }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    st = crate::http::get_json_opt(g, &format!("/api/cluster/seats/{n}/status"), true, 10);
+                }
+            }
+            let st = st.unwrap_or(Value::Null);
+            let checks = seat_checks(&st, env!("CARGO_PKG_VERSION"), &tag, now_unix());
+            let seat_ok = ok_apply && checks.iter().all(|c| c.verdict != super::cluster_verify::Verdict::Fail);
+            if !seat_ok { failed.push(n.clone()); }
+            if g.json {
+                rows.push(json!({"seat": n, "ok": seat_ok, "outcome": format!("{end:?}"),
+                    "checks": checks.iter().map(|c| json!({"name": c.name, "verdict": format!("{:?}", c.verdict), "detail": c.detail})).collect::<Vec<_>>()}));
+            } else {
+                println!();
+                println!("{}", ui::item(&format!("seat {n}")));
+                match &end {
+                    super::provision::ApplyEnd::Applied { rc: 0, .. } => {}
+                    super::provision::ApplyEnd::Applied { rc, msg } => println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                        &format!("the seat refused its bundle (exit {rc}): {}", msg.chars().take(300).collect::<String>())))),
+                    other => println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
+                }
+                for c in &checks {
+                    let glyph = match c.verdict {
+                        super::cluster_verify::Verdict::Ok => Glyph::Ok,
+                        super::cluster_verify::Verdict::Fail => Glyph::Err,
+                        _ => Glyph::Warn,
+                    };
+                    println!("{}", ui::sub(&ui::status_line(glyph, &format!("{}: {}", c.name, c.detail))));
+                }
+            }
+        }
+        if g.json { println!("{}", json!({"seats_apply": rows})); }
+    }
+    if failed.is_empty() {
+        if !g.json { ui::close_done(&format!("{} seat(s) current", seats.len())); }
+        0
+    } else {
+        if !g.json {
+            ui::close_failed(&format!("{} of {} seat(s) not current: {}", failed.len(), seats.len(), failed.join(", ")),
+                Some("noo upgrade --seats"));
+        }
+        1
+    }
+}
+
+// ═══ tests ════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> SeatConfig {
+        SeatConfig { seat: "lobby".into(), controller_url: "https://ctl.example.ts.net:8080".into(),
+            cli_user: "alex".into(), cli_home: "/home/alex".into() }
+    }
+
+    const SIGPUB: &str = "-----BEGIN PUBLIC KEY-----\nMHYw\n-----END PUBLIC KEY-----\n";
+
+    fn blob() -> SeatBlob {
+        SeatBlob { url: "https://ctl.example.ts.net:8080".into(), token: "noo-st-abc".into(), ca: "ab".repeat(32),
+            seat: "lobby".into(), sigpub: SIGPUB.into() }
+    }
+
+    #[test]
+    fn the_seat_blob_round_trips_and_carries_the_seat_claim() {
+        let s = compose_seat_blob(&blob());
+        assert!(s.starts_with("noo-seat1."));
+        assert_eq!(parse_seat_blob(&s).unwrap(), blob());
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim_start_matches("noo-seat1.")).unwrap();
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["role"], "seat");
+    }
+
+    #[test]
+    fn a_blob_without_the_seat_claim_or_a_node_blob_is_refused() {
+        use base64::Engine as _;
+        let enc = |v: Value| format!("noo-seat1.{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string()));
+        let base = json!({"v": 1, "url": "https://x", "token": "t", "ca": "c", "seat": "s", "sigpub": SIGPUB});
+        for role in [json!("node"), json!(null), json!("SEAT")] {
+            let mut v = base.clone();
+            v["role"] = role.clone();
+            assert!(parse_seat_blob(&enc(v)).is_err(), "role {role}");
+        }
+        assert!(parse_seat_blob("noo1.eyJ2IjoxfQ").unwrap_err().contains("NODE enrolment"));
+        let mut v = base.clone();
+        v["role"] = json!("seat");
+        v["seat"] = json!("../etc");
+        assert!(parse_seat_blob(&enc(v)).is_err());
+    }
+
+    #[test]
+    fn every_seat_kind_lands_inside_the_allow_list() {
+        let c = cfg();
+        let kinds: Vec<String> = SEAT_KINDS.iter().map(|k| k.to_string()).collect();
+        let plan = plan_seat_apply(&kinds, &c).expect("every seat kind plans");
+        for (_, dst) in &plan {
+            assert!(seat_path_allowed(dst, &c), "{}", dst.display());
+        }
+        let paths: Vec<String> = plan.iter().map(|(_, p)| p.to_string_lossy().into_owned()).collect();
+        assert!(paths.contains(&"/home/alex/.local/bin/noo".to_string()));
+        assert!(paths.contains(&SEAT_APPLIER_BIN.to_string()));
+        assert!(paths.contains(&"/usr/local/bin/noo-kiosk-serve".to_string()));
+        assert!(paths.contains(&"/etc/systemd/system/kiosk-serve.service".to_string()));
+    }
+
+    /// The applier's scope: node kinds and any path outside the list refuse
+    /// the whole bundle.
+    #[test]
+    fn the_seat_applier_refuses_anything_outside_its_allow_list() {
+        let c = cfg();
+        for kind in ["agent-env", "nats-creds", "fleet-secrets", "svc-gateway.crt", "svc-gateway.key", "agent-binary",
+                     "hostd-binary", "harness-binary", "harness-env", "signing-key", "node-cert", "teardown", "sudoers"] {
+            let kinds = vec!["cli-binary".to_string(), kind.to_string()];
+            let e = plan_seat_apply(&kinds, &c).unwrap_err();
+            assert!(e.contains("not a seat kind"), "{kind}: {e}");
+        }
+        assert!(plan_seat_apply(&["cli-binary".into(), "cli-binary".into()], &c).is_err(), "a duplicate kind refuses");
+        for p in [
+            "/etc/noo-node-agent.env", "/usr/local/bin/noo-node-agent", "/usr/local/bin/noo-hostd", "/usr/local/bin/noo",
+            "/etc/sudoers.d/noo", "/etc/noo/birth.key", "/etc/noo-seat/birth.key", "/etc/noo-seat/seat.json",
+            "/home/alex/.bashrc", "/home/other/.local/bin/noo", "/root/.local/bin/noo",
+            "/usr/local/bin/noo-kiosk-serve/../../sbin/x", "/usr/local/bin/../bin/noo-kiosk-serve",
+            "/etc/systemd/system/noo-node-agent.service", "/etc/systemd/system/noo-seat-sync.service",
+            "usr/local/bin/noo-kiosk-serve", "/etc/default/kiosk",
+        ] {
+            assert!(!seat_path_allowed(Path::new(p), &c), "{p} must be outside the seat allow-list");
+        }
+        // install_file re-checks at the write itself.
+        assert!(install_file(Path::new("/etc/sudoers.d/noo"), b"x", &c).unwrap_err().contains("allow-list"));
+    }
+
+    #[test]
+    fn a_seat_config_must_name_a_plain_user_and_home() {
+        let mut c = cfg();
+        assert!(c.validate().is_ok());
+        c.cli_user = "root".into();
+        assert!(c.validate().is_err(), "the seat CLI is never root's");
+        let mut c = cfg();
+        c.cli_home = "/home/alex/../root".into();
+        assert!(c.validate().is_err());
+        c.cli_home = "/".into();
+        assert!(c.validate().is_err());
+        c.cli_home = "home/alex".into();
+        assert!(c.validate().is_err());
+    }
+
+    /// Bundle contents: the seat kinds and nothing that is a node credential.
+    #[test]
+    fn a_seat_bundle_carries_no_node_credentials() {
+        let params = KioskParams { user: "alex".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 };
+        let files = seat_bundle_files(b"\x7fELF-cli".to_vec(), Some(&params), SIGPUB.as_bytes().to_vec(),
+            &json!({"console_build": "stack-v0.6.5", "cli_version": "0.6.5"}));
+        for (k, bytes) in &files {
+            assert!(SEAT_KINDS.contains(k), "{k} is not a seat kind");
+            let text = String::from_utf8_lossy(bytes);
+            for needle in ["NOO_CLUSTER_SECRET", "NOO_CONTROLLER_SECRET", "NATS_PASSWORD", "NATS_USER", "BEGIN PRIVATE KEY",
+                           "BEGIN RSA PRIVATE KEY", "BEGIN EC PRIVATE KEY", "NOO_NODE_ID", "noo-node-agent"] {
+                assert!(!text.contains(needle), "{k} carries {needle}");
+            }
+        }
+        let kinds: Vec<&str> = files.iter().map(|(k, _)| *k).collect();
+        assert!(kinds.contains(&"cli-binary") && kinds.contains(&"unit-kiosk-serve") && kinds.contains(&"signing-pub"));
+        // A seat that has not set up its kiosk gets no units.
+        let bare = seat_bundle_files(vec![1], None, vec![2], &json!({}));
+        assert!(!bare.iter().any(|(k, _)| k.starts_with("unit-")));
+    }
+
+    #[test]
+    fn the_builder_refuses_a_node_kind() {
+        let dir = private_dir(&std::env::temp_dir(), "noo-seat-test").unwrap();
+        let ca = crate::pki::ClusterCa::new(dir.join("pki"));
+        for kind in ["agent-env", "nats-creds", "svc-gateway.key", "fleet-secrets"] {
+            let e = build_seat_bundle(&ca, "lobby", &[("cli-binary", vec![1]), (kind, b"NOO_CLUSTER_SECRET=x".to_vec())], &dir.join("w")).unwrap_err();
+            assert!(e.contains("may not carry"), "{kind}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end on this host (openssl + tar): build, extract with the node
+    /// extractor, verify with the seat's anchor; a wrong seat, a tampered
+    /// file and a foreign key all refuse.
+    #[test]
+    fn a_built_seat_bundle_verifies_and_tampering_refuses() {
+        if Command::new("openssl").arg("version").output().is_err() {
+            eprintln!("openssl absent; skipping");
+            return;
+        }
+        let dir = private_dir(&std::env::temp_dir(), "noo-seat-e2e").unwrap();
+        let ca = crate::pki::ClusterCa::new(dir.join("pki"));
+        ca.ensure_signing_key().unwrap();
+        let files = seat_bundle_files(b"cli-bytes".to_vec(), None, std::fs::read(ca.signing_pub_path()).unwrap(),
+            &json!({"console_build": "stack-v0.6.5"}));
+        let refs: Vec<(&str, Vec<u8>)> = files.iter().map(|(k, b)| (*k, b.clone())).collect();
+        std::fs::create_dir_all(dir.join("w")).unwrap();
+        let tar = build_seat_bundle(&ca, "lobby", &refs, &dir.join("w")).expect("build");
+        let bytes = std::fs::read(&tar).unwrap();
+        let ex = dir.join("x");
+        std::fs::create_dir_all(&ex).unwrap();
+        super::super::node_fetch::extract_bundle(&bytes, &ex).expect("the node extractor's member rules hold");
+        let c = cfg();
+        let plan = verify_seat_stage(&ex, &ca.signing_pub_path(), &c, now_unix()).expect("verifies");
+        assert!(plan.iter().all(|(_, p)| seat_path_allowed(p, &c)));
+        let mut other = cfg();
+        other.seat = "hall".into();
+        assert!(verify_seat_stage(&ex, &ca.signing_pub_path(), &other, now_unix()).unwrap_err().contains("addressed to seat"));
+        assert!(verify_seat_stage(&ex, &ca.signing_pub_path(), &c, now_unix() + 2 * 86_400).unwrap_err().contains("replay"));
+        // A foreign key does not verify.
+        let foreign = crate::pki::ClusterCa::new(dir.join("pki2"));
+        foreign.ensure_signing_key().unwrap();
+        assert!(verify_seat_stage(&ex, &foreign.signing_pub_path(), &c, now_unix()).unwrap_err().contains("signature"));
+        // A tampered payload does not match its manifest sha.
+        std::fs::write(ex.join("files/cli-binary"), b"evil").unwrap();
+        assert!(verify_seat_stage(&ex, &ca.signing_pub_path(), &c, now_unix()).unwrap_err().contains("manifest sha"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_manifest_is_not_a_seat_manifest() {
+        let node = "#noo-bundle 2\n#node lobby\n#issued 1757000000\n";
+        assert!(seat_manifest_shape_ok(node).is_err());
+        assert!(verify_seat_header(node, "lobby", 1_757_000_000).unwrap_err().contains("not a seat bundle"));
+        assert!(seat_manifest_shape_ok(&seat_manifest_header("lobby", 1_757_000_000)).is_ok());
+    }
+
+    #[test]
+    fn the_browser_line_survives_an_update() {
+        let new = "#!/bin/sh\nBROWSER=\"${NOO_KIOSK_BROWSER:-chromium}\"\nexec x\n";
+        let old = "#!/bin/sh\nBROWSER=\"${NOO_KIOSK_BROWSER:-google-chrome-stable}\"\nexec old\n";
+        let out = carry_browser_line(new, Some(old));
+        assert!(out.contains("google-chrome-stable") && out.contains("exec x") && !out.contains("exec old"));
+        assert_eq!(carry_browser_line(new, None), new);
+    }
+
+    #[test]
+    fn the_display_reloads_only_when_it_has_to() {
+        assert_eq!(display_action(&["kiosk-launch".into()], false), "restart");
+        assert_eq!(display_action(&["unit-kiosk".into()], true), "restart");
+        assert_eq!(display_action(&["cli-binary".into(), "kiosk-serve".into()], true), "reload");
+        assert_eq!(display_action(&["cli-binary".into()], false), "unchanged");
+    }
+
+    #[test]
+    fn the_seat_proof_message_matches_the_gateway() {
+        assert_eq!(seat_proof_message("heartbeat", "lobby", "deadbeef", 1_757_000_000),
+            "noo-seat-heartbeat:lobby:deadbeef:1757000000");
+        assert_eq!(seat_proof_message("fetch", "lobby", "deadbeef", 1_757_000_000),
+            "noo-seat-fetch:lobby:deadbeef:1757000000");
+    }
+
+    #[test]
+    fn the_verify_block_judges_a_seat() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let t = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap();
+        let now = t + 10;
+        let good = json!({"seat_name": "lobby", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.5", "user_cli_current": true, "kiosk_serve": "active",
+                          "console_build": "stack-v0.6.5", "kiosk": {"user": "alex", "quality": "lean"}},
+            "staged_sha": "a", "applied_sha": "a", "apply_rc": 0,
+            "apply_msg": "seat-apply cli=updated scripts=0 units=0 serve=unchanged display=reloaded console=stack-v0.6.5"});
+        let c = seat_checks(&good, "0.6.5", "stack-v0.6.5", now);
+        assert!(c.iter().all(|c| c.verdict == Verdict::Ok), "{c:?}");
+        assert!(c.iter().any(|c| c.detail.contains("display reloaded")));
+        let mut old = good.clone();
+        old["heartbeat"]["cli_version"] = json!("0.5.56");
+        assert!(seat_checks(&old, "0.6.5", "stack-v0.6.5", now).iter().any(|c| c.name == "seat cli" && c.verdict == Verdict::Fail));
+        let mut down = good.clone();
+        down["heartbeat"]["kiosk_serve"] = json!("failed");
+        assert!(seat_checks(&down, "0.6.5", "stack-v0.6.5", now).iter().any(|c| c.name == "kiosk-serve" && c.verdict == Verdict::Fail));
+        assert!(seat_checks(&good, "0.6.5", "stack-v0.6.5", now + 600).iter().any(|c| c.name == "seat online" && c.verdict == Verdict::Fail));
+        assert!(seat_checks(&good, "0.6.5", "v0.6.6", now).iter().any(|c| c.name == "display" && c.verdict == Verdict::Fail));
+        assert_eq!(report_word(good["apply_msg"].as_str().unwrap(), "display"), Some("reloaded"));
+    }
+
+    #[test]
+    fn kiosk_params_come_from_the_heartbeat() {
+        let hb = json!({"kiosk": {"user": "alex", "mode": "dedicated", "vt": "1"}});
+        assert_eq!(kiosk_params_from(&hb), Some(KioskParams { user: "alex".into(), mode: super::super::kiosk::Mode::Dedicated, vt: 1 }));
+        assert_eq!(kiosk_params_from(&json!({"kiosk": {"user": "", "mode": "dedicated", "vt": "1"}})), None);
+        assert_eq!(kiosk_params_from(&json!({"kiosk": {"user": "a b", "mode": "dedicated", "vt": "1"}})), None);
+        assert_eq!(kiosk_params_from(&json!({"kiosk": {"user": "k", "mode": "weird", "vt": "1"}})), None);
+        assert_eq!(kiosk_params_from(&json!({})), None);
+    }
+
+    #[test]
+    fn the_install_script_is_the_one_root_step() {
+        let s = seat_install_script(Path::new("/tmp/w"), Path::new("/home/alex/.local/bin/noo"));
+        assert!(s.contains("install -m 0600 -o root -g root '/tmp/w/birth.key' /etc/noo-seat/birth.key"));
+        assert!(s.contains(SEAT_APPLIER_BIN));
+        assert!(s.contains("systemctl enable --now noo-seat-sync.timer"));
+        // Nothing node-shaped is installed by a seat's enrolment.
+        for n in ["noo-node-agent", "noo-hostd", "noo-apply", "noo-fetch", "sudoers", "/etc/noo/"] {
+            assert!(!s.contains(n), "{n}");
+        }
+        assert!(render_sync_service().contains("ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"));
+    }
+}

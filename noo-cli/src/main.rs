@@ -653,9 +653,12 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),
     (&["kiosk", "labels"], commands::kiosk_labels),
     (&["kiosk", "reload"], commands::kiosk_reload),
+    (&["kiosk", "seat-sync"], commands::kiosk_seat_sync),
+    (&["kiosk", "seat-token"], commands::kiosk_seat_token),
     (&["kiosk", "serve"], commands::kiosk_serve),
     (&["kiosk", "setup"], commands::kiosk_setup),
     (&["kiosk", "status"], commands::kiosk_status),
@@ -695,6 +698,8 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["autonomy", "locations"],
     &["ops"],
     &["kiosk", "serve"],
+    // The seat's timer runs it (noo-seat-sync.service, root); nobody types it.
+    &["kiosk", "seat-sync"],
     &["tools", "select"],
     // Aliases and retired verbs: they still work, but are not offered.
     &["recall", "lifecycle-stats"],

@@ -86,6 +86,22 @@ pub enum Purpose {
     Fetch,
     /// "I applied this bundle, with this result" — stamps `applied_at`.
     Apply,
+    // ── Kiosk SEATS (i77) ──
+    //
+    // A seat signs with its own birth key, recorded in `noo_seats` — never in
+    // `noo_bootstrap_tokens`, so no node route can find a seat's cert. The
+    // seat purposes ALSO sign a different message prefix (`noo-seat-…`, see
+    // [`signed_message`]): a seat proof is not a node proof even for a seat
+    // and a node that share a name, and a node proof is not a seat proof.
+    /// The seat collects its staged bundle (the GET itself is signed, over
+    /// no sha: the seat is fully enrolled before it ever fetches).
+    SeatGet,
+    /// The seat's receipt for the blob it collected.
+    SeatFetch,
+    /// The seat's apply report.
+    SeatApply,
+    /// The seat's heartbeat; the sha is that of the JSON body.
+    SeatHeartbeat,
 }
 
 impl Purpose {
@@ -93,7 +109,17 @@ impl Purpose {
         match self {
             Purpose::Fetch => "fetch",
             Purpose::Apply => "apply",
+            Purpose::SeatGet => "get",
+            Purpose::SeatFetch => "fetch",
+            Purpose::SeatApply => "apply",
+            Purpose::SeatHeartbeat => "heartbeat",
         }
+    }
+
+    /// The domain a proof belongs to: `noo-bundle` for a node, `noo-seat`
+    /// for a seat. Part of the signed bytes.
+    pub fn is_seat(self) -> bool {
+        matches!(self, Purpose::SeatGet | Purpose::SeatFetch | Purpose::SeatApply | Purpose::SeatHeartbeat)
     }
 }
 
@@ -157,7 +183,8 @@ impl ProofError {
 /// tested against the same string the gateway builds, rather than against a
 /// second copy of the format that is free to drift.
 pub fn signed_message(purpose: Purpose, node: &str, sha: &str, ts: i64) -> String {
-    format!("noo-bundle-{}:{}:{}:{}", purpose.tag(), node, sha, ts)
+    let domain = if purpose.is_seat() { "noo-seat" } else { "noo-bundle" };
+    format!("{domain}-{}:{}:{}:{}", purpose.tag(), node, sha, ts)
 }
 
 /// Split `<ts>.<base64 signature>`.
@@ -215,6 +242,15 @@ fn public_key(cert_pem: &str) -> Result<RsaPublicKey, ProofError> {
         .map_err(|e| ProofError::BadBirthCert(format!("SPKI: {e}")))?;
     RsaPublicKey::from_public_key_der(&spki)
         .map_err(|e| ProofError::BadBirthCert(format!("not an RSA public key: {e}")))
+}
+
+/// Is this PEM a birth certificate a proof could ever be checked against?
+/// A seat's enrolment refuses one that is not (i77): a seat recorded with an
+/// unusable cert could never sign anything, and the failure would surface
+/// minutes later as a refused heartbeat instead of at the enrolment that
+/// caused it.
+pub fn usable_birth_cert(cert_pem: &str) -> bool {
+    public_key(cert_pem).is_ok()
 }
 
 /// Verify a proof. `now` is passed in rather than read here so the freshness
@@ -479,5 +515,31 @@ mod tests {
             signed_message(Purpose::Apply, "host9", "deadbeef", 1_757_000_000),
             "noo-bundle-apply:host9:deadbeef:1757000000"
         );
+        // The seat domain (i77): a different prefix, so neither side's proof
+        // is ever the other's message. `noo kiosk seat-sync` builds these.
+        assert_eq!(
+            signed_message(Purpose::SeatHeartbeat, "lobby", "deadbeef", 1_757_000_000),
+            "noo-seat-heartbeat:lobby:deadbeef:1757000000"
+        );
+        assert_eq!(
+            signed_message(Purpose::SeatFetch, "lobby", "deadbeef", 1_757_000_000),
+            "noo-seat-fetch:lobby:deadbeef:1757000000"
+        );
+    }
+
+    /// A seat's proof never verifies as a node's, nor a node's as a seat's,
+    /// even under one name and one key: the domain is part of the signed
+    /// bytes. This is what makes a name collision between a seat and a node
+    /// worthless to either.
+    #[test]
+    fn seat_and_node_proofs_never_cross() {
+        let now = 1_757_000_000;
+        for (seat, node) in [(Purpose::SeatFetch, Purpose::Fetch), (Purpose::SeatApply, Purpose::Apply)] {
+            let sp = proof(KEY_A, seat, "lobby", SHA, now);
+            assert_eq!(verify(Some(&sp), node, "lobby", SHA, Some(CERT_A), now), Err(ProofError::BadSignature));
+            verify(Some(&sp), seat, "lobby", SHA, Some(CERT_A), now).expect("a seat proof verifies as the seat");
+            let np = proof(KEY_A, node, "lobby", SHA, now);
+            assert_eq!(verify(Some(&np), seat, "lobby", SHA, Some(CERT_A), now), Err(ProofError::BadSignature));
+        }
     }
 }

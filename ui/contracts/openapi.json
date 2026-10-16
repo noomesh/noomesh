@@ -18315,6 +18315,334 @@
           }
         }
       }
+    },
+    "/api/cluster/seat-enroll": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create seat enroll",
+        "description": "[native] POST /api/cluster/seat-enroll \u2014 redeem a seat token.",
+        "operationId": "seat_enroll",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seat-tokens": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get seat tokens",
+        "description": "[native] GET /api/cluster/seat-tokens \u2014 issuance metadata, never hashes.",
+        "operationId": "seat_tokens_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create seat tokens",
+        "description": "[native] POST /api/cluster/seat-tokens \u2014 mint a one-time seat enrolment token.",
+        "operationId": "seat_token_create",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seat-tokens/{id}/revoke": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create revoke",
+        "description": "[native] POST /api/cluster/seat-tokens/{id}/revoke \u2014 idempotent.",
+        "operationId": "seat_token_revoke",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seats": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get seats",
+        "description": "[native] GET /api/cluster/seats \u2014 every enrolled seat with its last heartbeat and the state of its staged bundle. What `noo upgrade` and `noo cluster verify` read, and the ONLY place either learns a seat exists.",
+        "operationId": "seats_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seats/{seat}/bundle": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create bundle",
+        "description": "[native] POST /api/cluster/seats/{seat}/bundle \u2014 stage a seat's bundle: CMS ciphertext to the seat's birth cert, built and signed by the controller's CLI. Upsert; the seat's sync timer collects it.",
+        "operationId": "seat_bundle_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/seats/{seat}/status": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get status",
+        "description": "[native] GET /api/cluster/seats/{seat}/status \u2014 the staged bundle and the seat's receipts, the same shape as a node's provision-bundle status so the CLI's combined wait judges both with one function.",
+        "operationId": "seat_bundle_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/seat/{seat}/applied": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create applied",
+        "description": "[native] POST /bootstrap/seat/{seat}/applied \u2014 `{sha, rc, msg}`, signed.",
+        "operationId": "seat_apply_report",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/seat/{seat}/bundle": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get bundle",
+        "description": "[native] GET /bootstrap/seat/{seat}/bundle \u2014 the seat collects its ciphertext. The GET is SIGNED (unlike a node's, which happens before the node holds anything): a seat is fully enrolled before it ever fetches.",
+        "operationId": "seat_bundle_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/seat/{seat}/fetched": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create fetched",
+        "description": "[native] POST /bootstrap/seat/{seat}/fetched \u2014 `{sha}`, signed. Stamps fetched_at.",
+        "operationId": "seat_fetch_receipt",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bootstrap/seat/{seat}/heartbeat": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create heartbeat",
+        "description": "[native] POST /bootstrap/seat/{seat}/heartbeat \u2014 the seat's state (CLI version, kiosk units, console build), signed over the sha256 of the exact body bytes so a captured proof cannot carry a different body.",
+        "operationId": "seat_heartbeat",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

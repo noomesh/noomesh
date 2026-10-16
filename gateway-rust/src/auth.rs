@@ -2182,8 +2182,19 @@ pub const PUBLIC_GET_PATH_PREFIXES: &[&str] = &["/bootstrap/bundle/"];
 ///
 /// Matched as `<prefix><one non-empty segment><suffix>` — never as a bare
 /// prefix, which would re-open every neighbour the way `/metrics` once did.
-pub const HANDLER_AUTHENTICATED_PATHS: &[(&str, &str)] =
-    &[("/bootstrap/bundle/", "/fetched"), ("/bootstrap/bundle/", "/applied")];
+pub const HANDLER_AUTHENTICATED_PATHS: &[(&str, &str)] = &[
+    ("/bootstrap/bundle/", "/fetched"),
+    ("/bootstrap/bundle/", "/applied"),
+    // Kiosk SEATS (i77): the seat's whole rail. A seat holds its birth key
+    // and nothing else — never a fleet secret, never a JWT — so these are the
+    // only routes it can call, and each handler (`routes/seats.rs`) refuses
+    // anything but a `noo-seat-*` proof that verifies against the cert in
+    // `noo_seats`. A node's proof, or a node's fleet token, buys nothing here.
+    ("/bootstrap/seat/", "/bundle"),
+    ("/bootstrap/seat/", "/fetched"),
+    ("/bootstrap/seat/", "/applied"),
+    ("/bootstrap/seat/", "/heartbeat"),
+];
 
 /// Paths that answer WITHOUT a credential, and answer MORE with one.
 ///
@@ -2204,6 +2215,32 @@ pub const CREDENTIAL_OPTIONAL_PATHS: &[&str] = &["/health"];
 /// Whether `path` answers anonymously but says more to a credential.
 pub fn is_credential_optional(path: &str) -> bool {
     CREDENTIAL_OPTIONAL_PATHS.contains(&path)
+}
+
+/// The middleware's first decision, as a pure function: does this request go
+/// to its handler WITHOUT the middleware checking a credential?
+///
+/// True for the public lists, and for the handler-authenticated and
+/// credential-optional paths when the caller presents no bearer at all (see
+/// those lists). Everything else needs a credential the middleware itself
+/// verifies — which is what a kiosk SEAT never holds: a seat has a birth key
+/// and nothing else, so a route that is not here is a 401 for it before any
+/// handler runs (`seat_cannot_reach_node_routes`).
+pub fn passes_without_bearer_check(path: &str, safe_method: bool, has_bearer: bool) -> bool {
+    PUBLIC_PATHS_EXACT.contains(&path)
+        || PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
+        || (safe_method && PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)))
+        // Not public: these carry a birth-key proof the HANDLER verifies,
+        // because the node holds no fleet credential yet — and ONLY when the
+        // caller presents nothing for this middleware to check. A request that
+        // DOES carry a bearer goes down the normal path, so the apply report's
+        // existing fleet-HMAC lane still attaches its ClusterNode extension and
+        // a bad token is still a 401 here rather than a maybe in the handler.
+        // See HANDLER_AUTHENTICATED_PATHS.
+        || (is_handler_authenticated(path) && !has_bearer)
+        // Anonymous is allowed and gets the smaller answer; a bearer is
+        // checked like anywhere else, so the handler knows who is asking.
+        || (is_credential_optional(path) && !has_bearer)
 }
 
 /// Whether `path` is one of [`HANDLER_AUTHENTICATED_PATHS`].
@@ -2295,6 +2332,13 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     // bundle can verify. Certificates are public by construction.
     "/bootstrap/ca.crt",
     "/api/cluster/bootstrap",
+    // Kiosk SEAT enrolment (i77): public for the reason the node redemption
+    // above is — the seat holds nothing yet. It authenticates FULLY in the
+    // handler on the single-use seat token in the body (`noo_seat_tokens`,
+    // its own table, so a node's bootstrap token never redeems here and a
+    // seat token never redeems at `/api/cluster/bootstrap`), uniform 403 on
+    // any failure. What it returns carries no credential of any kind.
+    "/api/cluster/seat-enroll",
     // External MCP door. NOT unauthenticated — it authenticates FULLY on its
     // own (`mcp_external::authenticate`): bearer required, must resolve to an
     // active `noo_service_keys` row, must carry the `mcp` scope, and must be
@@ -2905,21 +2949,7 @@ pub async fn require_any_auth(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    if PUBLIC_PATHS_EXACT.iter().any(|p| *p == path)
-        || PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
-        || (safe_method && PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)))
-        // Not public: these carry a birth-key proof the HANDLER verifies,
-        // because the node holds no fleet credential yet — and ONLY when the
-        // caller presents nothing for this middleware to check. A request that
-        // DOES carry a bearer goes down the normal path, so the apply report's
-        // existing fleet-HMAC lane still attaches its ClusterNode extension and
-        // a bad token is still a 401 here rather than a maybe in the handler.
-        // See HANDLER_AUTHENTICATED_PATHS.
-        || (is_handler_authenticated(&path) && bearer_token(&request).is_none())
-        // Anonymous is allowed and gets the smaller answer; a bearer is
-        // checked like anywhere else, so the handler knows who is asking.
-        || (is_credential_optional(&path) && bearer_token(&request).is_none())
-    {
+    if passes_without_bearer_check(&path, safe_method, bearer_token(&request).is_some()) {
         return Ok(next.run(request).await);
     }
 
@@ -4433,12 +4463,97 @@ mod tests {
                 !PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p)),
                 "{path} must not be public for every method"
             );
-            // The GET prefix covers this path, but only for safe methods —
-            // these are POSTs.
-            assert!(
-                PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p)),
-                "{path} sits under the read-only bundle prefix"
-            );
+            // The node routes sit under the read-only bundle prefix, which
+            // covers only safe methods — these are POSTs. The seat routes sit
+            // under no public prefix at all: the seat's GET is signed too.
+            let under_get_prefix = PUBLIC_GET_PATH_PREFIXES.iter().any(|p| path.starts_with(p));
+            assert_eq!(under_get_prefix, *prefix == "/bootstrap/bundle/", "{path}");
+        }
+    }
+
+    /// The seat exemption (i77) is the same shape as the node one: exact
+    /// `<prefix><one segment><suffix>` routes, never a neighbourhood.
+    #[test]
+    fn the_seat_proof_exemption_is_four_routes_not_a_prefix() {
+        for suffix in ["/bundle", "/fetched", "/applied", "/heartbeat"] {
+            assert!(is_handler_authenticated(&format!("/bootstrap/seat/lobby{suffix}")), "{suffix}");
+        }
+        for path in [
+            "/bootstrap/seat/lobby",
+            "/bootstrap/seat//bundle",
+            "/bootstrap/seat/a/b/bundle",
+            "/bootstrap/seat/lobby/bundlex",
+            "/bootstrap/seat/lobby/status",
+            "/bootstrap/seats/lobby/bundle",
+            "/api/cluster/seats/lobby/bundle",
+            "/api/cluster/seats",
+        ] {
+            assert!(!is_handler_authenticated(path), "{path} must not be exempt");
+        }
+    }
+
+    /// i77's hard rule, as the middleware sees it: a kiosk SEAT holds a birth
+    /// key and nothing else — no fleet secret, no controller secret, no JWT,
+    /// no service key. So every route a seat can reach is a route that admits
+    /// a request carrying NO bearer. This walks every node-only route (the
+    /// `NODE_ROUTES` allow-list, with `{self}` and `*` filled in as the seat's
+    /// own name) and the operator's seat surface, and asserts each one is a
+    /// 401 for a bearer-less caller — except the two node birth-proof routes,
+    /// whose handlers verify against `noo_bootstrap_tokens` (where no seat's
+    /// cert is ever written) over a `noo-bundle-*` message (which no seat
+    /// signs; `birth_proof::seat_and_node_proofs_never_cross`). The seat's own
+    /// four routes are the only other bearer-less doors, and they accept only
+    /// `noo-seat-*` proofs. The NATS half of the rule is
+    /// `nats_users::tests::seat_has_no_bus_principal` (noo-cli).
+    #[test]
+    fn seat_cannot_reach_node_routes() {
+        let seat = "lobby";
+        let fill = |pattern: &str| pattern.replace("{self}", seat).replace('*', "x");
+        let mut checked = 0;
+        for (method, pattern) in NODE_ROUTES {
+            let path = fill(pattern);
+            let safe = matches!(*method, "GET" | "HEAD" | "OPTIONS");
+            let admitted = passes_without_bearer_check(&path, safe, false);
+            if *pattern == "/bootstrap/bundle/{self}/applied" {
+                // Handler-authenticated: it verifies a NODE birth proof
+                // against the node table, which a seat cannot produce.
+                assert!(admitted, "the node apply report stays reachable for a node's birth proof");
+                assert!(!path.starts_with("/bootstrap/seat/"));
+                continue;
+            }
+            assert!(!admitted, "{method} {path} is a node route a credential-less seat must not reach");
+            checked += 1;
+        }
+        assert!(checked >= 20, "the walk must cover the node allow-list, not an empty slice ({checked})");
+        // The other node pull-lane writes and the node bundle GET.
+        for path in ["/bootstrap/bundle/lobby/fetched", "/bootstrap/bundle/lobby/applied"] {
+            assert!(is_handler_authenticated(path));
+        }
+        // Node control surfaces that are not on the allow-list at all.
+        for (method, path) in [
+            ("POST", "/api/cluster/nodes/register"),
+            ("POST", "/api/cluster/provision-bundle/lobby"),
+            ("GET", "/api/cluster/provision-bundle/lobby/status"),
+            ("GET", "/api/cluster/nodes/lobby/desired-config"),
+            ("POST", "/api/cluster/mint-join-key"),
+            ("POST", "/api/security/bootstrap-tokens"),
+            ("GET", "/api/security/fleet-secrets"),
+            ("POST", "/api/harness/turn"),
+            ("GET", "/api/cluster/seats"),
+            ("POST", "/api/cluster/seats/lobby/bundle"),
+            ("GET", "/api/cluster/seats/lobby/status"),
+            ("POST", "/api/cluster/seat-tokens"),
+        ] {
+            let safe = method == "GET";
+            assert!(!passes_without_bearer_check(path, safe, false), "{method} {path}");
+        }
+        // And a seat's own doors are not node doors: a node's fleet token on
+        // them is a Node-kind caller, which `node_route_allowed` refuses.
+        for suffix in ["/bundle", "/fetched", "/applied", "/heartbeat"] {
+            let path = format!("/bootstrap/seat/{seat}{suffix}");
+            for m in ["GET", "POST"] {
+                assert!(!node_route_allowed(m, &path, seat), "{m} {path} must not be a node route");
+            }
         }
     }
 
