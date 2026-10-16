@@ -55,6 +55,16 @@ DOC_RE = re.compile(
 SIMPLE_ROUTE_RE = re.compile(r'\.route\(\s*"([^"]+)"')
 NEST_RE = re.compile(r"\.nest\(\s*\"")
 
+# Same per-file opt-out as scripts/check-openapi-drift.py: a file carrying
+# this marker in its module doc builds a router that is not mounted on the
+# gateway's listener, so its routes are not part of the spec.
+NOT_GATEWAY_ROUTES_MARKER = "openapi-drift: not-gateway-routes"
+MARKER_WINDOW = 4000
+
+
+def declares_not_gateway_routes(text: str) -> bool:
+    return NOT_GATEWAY_ROUTES_MARKER in text[:MARKER_WINDOW]
+
 
 def route_calls(text: str):
     """Yield (path, argument-source) for every `.route("…", …)`, balancing
@@ -102,6 +112,8 @@ def scan() -> tuple[dict[str, list[tuple[str, str]]], dict[str, str]]:
 
     for f in sorted(RUST_SRC.rglob("*.rs")):
         text = f.read_text(encoding="utf-8", errors="ignore")
+        if declares_not_gateway_routes(text):
+            continue
         if NEST_RE.search(text):
             nested.append(str(f.relative_to(ROOT)))
         simple.update(m.group(1) for m in SIMPLE_ROUTE_RE.finditer(text) if m.group(1).startswith("/"))
