@@ -194,9 +194,15 @@ def test_the_fetch_report_bearer_follows_the_pointer(tmp_path: Path) -> None:
     body = m.group(0).replace("_env=/etc/noo-node-agent.env", f"_env={tmp_path}/env")
     (tmp_path / "s").write_text("cluster-abc")
     (tmp_path / "env").write_text(f"NODE_ID=host3\nNOO_CLUSTER_SECRET_FILE={tmp_path}/s\n")
-    p = subprocess.run(["/bin/sh", "-c", f"NODE=host3\n{body}\nnode_bearer"], capture_output=True, text=True)
+    p = subprocess.run(["/bin/sh", "-c", f"NODE=host3\n{body}\nnode_bearer POST /x ''"], capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
-    assert p.stdout.startswith("host3:"), p.stdout
+    # The secret came from the FILE the env points at: the v2 signature only
+    # verifies under "cluster-abc" (a wrong or empty secret would not).
+    kind, node, ts, nonce, sig = p.stdout.split(":")
+    assert (kind, node) == ("v2", "host3"), p.stdout
+    import hashlib, hmac
+    msg = "\n".join(["v2", "POST", "/x", hashlib.sha256(b"").hexdigest(), "host3", ts, nonce]).encode()
+    assert sig == hmac.new(b"cluster-abc", msg, hashlib.sha256).hexdigest(), p.stdout
 
 
 @pytest.mark.parametrize("capable", [True, False])

@@ -86,4 +86,4 @@ def test_the_agent_hands_the_shipper_the_heartbeats_transport_and_bearer() -> No
     agent = _code_only((ROOT / "node-agent-go/internal/agent/agent.go").read_text())
     block = agent.split("func (a *Agent) startLogShip", 1)[1].split("\n}\n", 1)[0]
     assert "Client:        a.http," in block or "Client: a.http," in block, "the shipper is not using the agent's mTLS client"
-    assert "auth.CreateClusterToken(a.cfg.NodeID, a.cfg.ClusterSecret)" in block, "the shipper is not sending the heartbeat's cluster token"
+    assert "auth.SetClusterAuth(req, a.cfg.NodeID, a.cfg.ClusterSecret)" in block, "the shipper is not sending the heartbeat's cluster token"
