@@ -2,21 +2,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Pin a vendor CLI (or the runtime one needs) by version AND sha256.
+"""Pin a vendor CLI by version AND sha256.
 
-    vendor-pin.py <kind|runtime:NAME> <version> [--dl-dir DIR]
-    vendor-pin.py --check [<kind|runtime:NAME> ...] [--dl-dir DIR]
+    vendor-pin.py <kind> <version> [--dl-dir DIR]
+    vendor-pin.py --check [<kind> ...] [--dl-dir DIR]
 
 The controller stages each foreign harness kind's vendor CLI to the nodes
 (the node never touches the internet), so what it stages is pinned in
-config/harness-kinds.json: per kind a `distribution` block, per runtime a
-`runtimes.<name>` block, each with a version and a sha256 per platform the
-fleet has (linux-x86_64, linux-aarch64, macos-aarch64), or one `any` digest
+config/harness-kinds.json: per kind a `distribution` block with a version
+and a sha256 per platform the fleet has (linux-x86_64, linux-aarch64,
+macos-aarch64), or one `any` digest
 for a platform-independent artefact (an npm tarball).
 
 Pin mode resolves the block's `source` URL template for every platform,
 DOWNLOADS each artefact, computes its sha256, cross-checks it against the
-checksums the vendor publishes (nodejs.org SHASUMS256.txt, a GitHub release
+checksums the vendor publishes (a GitHub release
 SHA256SUMS file, Claude Code's release manifest.json, the npm registry's
 dist.integrity), and rewrites the block in config/harness-kinds.json AND its
 byte-equal copy node-agent-go/internal/reconcile/harness_kinds.json. The
@@ -78,13 +78,6 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 # Seeds for a block that is not in the file yet. Field order is the order
 # written. `version`/`sha256` are filled by the pin.
 RECIPES: dict[str, dict] = {
-    "runtime:node": {
-        "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
-        "names": {"os": {"linux": "linux", "macos": "darwin"},
-                  "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "unpack": "tar.xz",
-        "bin_dir": "bin",
-    },
     # Native single-file executable per platform (Bun-compiled); the npm
     # package is only a loader for per-platform optional dependencies.
     "claude-code": {
@@ -92,7 +85,6 @@ RECIPES: dict[str, dict] = {
         "source": "https://downloads.claude.ai/claude-code-releases/{version}/{os}-{arch}/claude",
         "names": {"os": {"linux": "linux", "macos": "darwin"},
                   "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "runtime": None,
         "entry": "claude",
         "unpack": "none",
     },
@@ -102,7 +94,6 @@ RECIPES: dict[str, dict] = {
         "source": "https://github.com/github/copilot-cli/releases/download/v{version}/copilot-{os}-{arch}.tar.gz",
         "names": {"os": {"linux": "linux", "macos": "darwin"},
                   "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "runtime": None,
         "entry": "copilot",
         "unpack": "tgz",
     },
@@ -112,7 +103,6 @@ RECIPES: dict[str, dict] = {
         "source": "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package-{arch}-{os}.tar.gz",
         "names": {"os": {"linux": "unknown-linux-musl", "macos": "apple-darwin"},
                   "arch": {"x86_64": "x86_64", "aarch64": "aarch64"}},
-        "runtime": None,
         "entry": "bin/codex",
         "unpack": "tgz",
     },
@@ -123,7 +113,6 @@ RECIPES: dict[str, dict] = {
 # `claude-manifest` is manifest.json's platforms.<os>-<arch>.checksum. Any
 # registry.npmjs.org tarball is cross-checked against dist.integrity.
 CROSSCHECK: dict[str, tuple[str, str]] = {
-    "runtime:node": ("sums", "https://nodejs.org/dist/v{version}/SHASUMS256.txt"),
     "copilot": ("sums", "https://github.com/github/copilot-cli/releases/download/v{version}/SHA256SUMS.txt"),
     "codex": ("sums", "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package_SHA256SUMS"),
     "claude-code": ("claude-manifest", "https://downloads.claude.ai/claude-code-releases/{version}/manifest.json"),
@@ -289,14 +278,6 @@ def _dump(doc: dict) -> str:
 
 def _find(doc: dict, name: str) -> tuple[dict | None, dict | None]:
     """(the block, the kind row) for name; refuse an unknown name."""
-    if name.startswith("runtime:"):
-        rt = name.split(":", 1)[1]
-        block = (doc.get("runtimes") or {}).get(rt)
-        if block is None and name not in RECIPES:
-            raise Refused(f"unknown runtime {rt!r} (known: "
-                          + ", ".join(sorted({k for k in RECIPES if k.startswith('runtime:')}
-                                             | {f'runtime:{r}' for r in doc.get('runtimes') or {}})) + ")")
-        return block, None
     for k in doc["kinds"]:
         if k["kind"] == name:
             if k.get("cli") is None:
@@ -305,9 +286,8 @@ def _find(doc: dict, name: str) -> tuple[dict | None, dict | None]:
     raise Refused(f"unknown kind {name!r} (known: {', '.join(k['kind'] for k in doc['kinds'])})")
 
 
-def _ordered(block: dict, runtime: bool) -> dict:
-    order = (["version", "source", "names", "sha256", "unpack", "bin_dir"] if runtime else
-             ["format", "source", "names", "version", "sha256", "runtime", "entry", "unpack"])
+def _ordered(block: dict) -> dict:
+    order = ["format", "source", "names", "version", "sha256", "entry", "unpack"]
     out = {k: block[k] for k in order if k in block}
     out.update({k: v for k, v in block.items() if k not in out})
     return out
@@ -325,19 +305,7 @@ def pin(name: str, version: str, dl: Path) -> None:
     print(f"pinning {name} {version}")
     block["version"] = version
     block["sha256"] = _resolve(name, version, block, dl)
-    runtime = row is None
-    block = _ordered(block, runtime)
-    if runtime:
-        rts = dict(doc.get("runtimes") or {})
-        rts[name.split(":", 1)[1]] = block
-        rebuilt = {}
-        for k, v in doc.items():
-            if k == "kinds" and "runtimes" not in doc:
-                rebuilt["runtimes"] = rts
-            rebuilt[k] = rts if k == "runtimes" else v
-        doc = rebuilt
-    else:
-        row["distribution"] = block
+    row["distribution"] = _ordered(block)
     # Every kind carries the key: `noo` (no CLI) null, a foreign kind not
     # pinned yet null until it is.
     for k in doc["kinds"]:
@@ -354,8 +322,7 @@ def pin(name: str, version: str, dl: Path) -> None:
 def check(names: list[str], dl: Path) -> int:
     doc, _ = _load()
     if not names:
-        names = [f"runtime:{r}" for r in doc.get("runtimes") or {}]
-        names += [k["kind"] for k in doc["kinds"] if k.get("distribution")]
+        names = [k["kind"] for k in doc["kinds"] if k.get("distribution")]
     bad = 0
     for name in names:
         try:

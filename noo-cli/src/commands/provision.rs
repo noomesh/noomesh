@@ -1012,9 +1012,8 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             {
                 Ok(vf) => {
                     let size: usize = vf.iter().filter(|(k, _)| !k.ends_with("-manifest")).map(|(_, b)| b.len()).sum();
-                    nnote(&format!("bundle carries the {} vendor CLI{} ({})",
+                    nnote(&format!("bundle carries the {} vendor CLI ({})",
                         kind.as_deref().unwrap_or("?"),
-                        if vf.iter().any(|(k, _)| *k == "vendor-runtime") { " and its runtime" } else { "" },
                         human_bytes(size)));
                     files.extend(vf);
                 }
@@ -1952,11 +1951,9 @@ fn drop_proven_binaries(
         files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
         notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
     }
-    // The vendor CLI and its runtime go as ONE group, manifests included:
-    // the wrapper names both versions, so carrying one without the other
-    // would rewrite it against a half the node may have pruned.
+    // The vendor CLI goes with its manifest.
     let vendor: Vec<(&str, String)> = files.iter()
-        .filter(|(k, _)| matches!(*k, "vendor-cli" | "vendor-runtime"))
+        .filter(|(k, _)| *k == "vendor-cli")
         .map(|(k, b)| (*k, sha256_hex(b))).collect();
     if !vendor.is_empty() && vendor.iter().all(|(k, sha)| node_runs_asset(status, k, sha)) {
         files.retain(|(k, _)| !k.starts_with("vendor-"));
@@ -5143,23 +5140,21 @@ mod local_lane_tests {
     }
 
     #[test]
-    fn the_vendor_cli_and_runtime_drop_only_together_with_their_manifests() {
+    fn the_vendor_cli_drops_only_with_its_manifest() {
         let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
             ("agent-env", b"E".to_vec()), ("vendor-cli", b"cli".to_vec()), ("vendor-cli-manifest", b"{}".to_vec()),
-            ("vendor-runtime", b"rt".to_vec()), ("vendor-runtime-manifest", b"{}".to_vec()),
         ] };
         fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
-        let both = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={} vendor-runtime={}",
-            sha256_hex(b"cli"), sha256_hex(b"rt")));
+        let proven = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={}", sha256_hex(b"cli")));
         let mut f = mk();
-        let notes = drop_proven_binaries(&mut f, Some(&both), false, false);
+        let notes = drop_proven_binaries(&mut f, Some(&proven), false, false);
         assert_eq!(names(&f), ["agent-env"], "{notes:?}");
         assert!(notes.iter().any(|n| n.starts_with("vendor CLI: unchanged")));
-        // Only the CLI proven (the runtime moved): the whole group rides.
-        let half = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"cli")));
+        // A CLI the node did not report running: the group rides.
+        let other = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"other")));
         let mut f = mk();
-        drop_proven_binaries(&mut f, Some(&half), false, false);
-        assert_eq!(f.len(), 5);
+        drop_proven_binaries(&mut f, Some(&other), false, false);
+        assert_eq!(f.len(), 3);
     }
 
     #[test]

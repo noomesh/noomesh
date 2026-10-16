@@ -41,9 +41,7 @@ binary itself: in its signed bundle, from the controller.
 1. **Pin.** A kind's `distribution` in `config/harness-kinds.json` says
    where the vendor publishes the CLI (a URL template filled in from the
    node's platform), its version, and the sha256 each artefact must hash
-   to. A CLI that runs on a runtime (Node.js) names it, and the table's
-   `runtimes` pins that the same way. Changing a pin is a reviewed change
-   to that file.
+   to. Changing a pin is a reviewed change to that file.
 2. **Stage.** `noo cluster vendor stage <kind>` (or `--all`) fetches every
    artefact the fleet's platforms need, on the controller, and refuses one
    whose sha256 is not the pinned one, naming the URL and both digests and
@@ -51,7 +49,7 @@ binary itself: in its signed bundle, from the controller.
    `noo cluster vendor status` lists what is staged and which nodes need
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)
-   puts the staged CLI, and its runtime, in the bundle of every node whose
+   puts the staged CLI in the bundle of every node whose
    harness placement names that kind. If it is not staged, the restage for
    that node is refused with the `noo cluster vendor stage` command to run:
    a restage never downloads.

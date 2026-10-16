@@ -518,7 +518,7 @@ pub(crate) fn darwin_apply(blob: &[u8], base: &Path, user: &str, me: &str, as_ro
         }
         ApplyBranch::Full => {}
     }
-    // The vendor CLI and runtime (i83 E1e) are judged before anything
+    // The vendor CLI (i83 E1e) is judged before anything
     // installs, like the Linux applier's vendor_check.
     super::node_vendor::check(&payloads)?;
     // The user's tree, as the user, from the verified bytes.
@@ -1827,7 +1827,7 @@ fn manifest_kinds(manifest: &str) -> Vec<String> {
 const TEXT_KINDS: &[&str] = &[
     "agent-env", "harness-env", "nats-creds", "fleet-secrets", "host-telemetry", "teardown",
     "cli-user", "signing-pub", "ca.crt", "node.crt", "node.key", "agent-plist", "run-agent",
-    "harness-plist", "run-harness", "restart-backends", "vendor-cli-manifest", "vendor-runtime-manifest",
+    "harness-plist", "run-harness", "restart-backends", "vendor-cli-manifest",
 ];
 
 /// Where a ROOT apply keeps its trust anchors (`ca.crt`, `signing.pub`):
@@ -2401,9 +2401,9 @@ const KNOWN_KINDS: &[&str] = &[
     "svc-vllm.crt", "svc-vllm.key", "svc-llamacpp.crt", "svc-llamacpp.key",
     "svc-ollama.crt", "svc-ollama.key", "svc-tei.crt", "svc-tei.key",
     "svc-reranker.crt", "svc-reranker.key",
-    // The vendor CLI a harness kind runs, and the runtime it runs on, each
-    // with its manifest (i83 E1e; `cluster_vendor`).
-    "vendor-cli", "vendor-cli-manifest", "vendor-runtime", "vendor-runtime-manifest",
+    // The vendor CLI a harness kind runs, with its manifest (i83 E1e;
+    // `cluster_vendor`).
+    "vendor-cli", "vendor-cli-manifest",
 ];
 
 /// The HTTPS agent for the poller: trusts ONLY the cluster CA pinned at

@@ -7,8 +7,7 @@
 //!
 //! A harness kind whose `cli` the node must have (Copilot CLI, Claude Code,
 //! Codex) carries a `distribution` in `config/harness-kinds.json`: where the
-//! vendor publishes it, the version, and the sha256 it must hash to. When it
-//! runs on a runtime (Node.js), the table's `runtimes` pins that too. The
+//! vendor publishes it, the version, and the sha256 it must hash to. The
 //! flow, start to end:
 //!
 //! 1. the pin lands in the table (reviewed like any change);
@@ -16,7 +15,7 @@
 //!    platforms need ON THE CONTROLLER, refuses anything whose sha256 is not
 //!    the pinned one, and keeps it in the controller's asset cache;
 //! 3. `noo cluster provision <node>` puts it in the node's signed bundle as
-//!    `vendor-cli` (+ `vendor-runtime`) beside a manifest, when the node's
+//!    `vendor-cli` beside a manifest, when the node's
 //!    harness placement names that kind; never downloading during a restage;
 //! 4. the node's applier verifies the sha256 again, unpacks it under
 //!    `/opt/noo/vendor` (`~/noomesh/vendor` on a Mac) and writes a wrapper
@@ -55,19 +54,11 @@ pub(crate) fn cache_file_name(name: &str, version: &str, platform: Option<(&str,
     }
 }
 
-/// Is this artefact the CLI or the runtime it runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Role {
-    Cli,
-    Runtime,
-}
-
 /// One artefact a kind needs on one platform.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Need {
-    pub role: Role,
     pub kind: String,
-    /// The CLI name (`copilot`) or the runtime name (`node`).
+    /// The CLI name (`copilot`).
     pub name: String,
     pub version: String,
     pub url: String,
@@ -101,10 +92,9 @@ fn safe_entry(s: &str) -> bool {
         && s.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
-/// What `kind` needs on `os`/`arch`: its CLI artefact and, when the
-/// distribution names one, its runtime. `Ok(None)` for a kind with no
+/// What `kind` needs on `os`/`arch`: its CLI artefact. `Ok(None)` for a kind with no
 /// distribution (no CLI, or a manual install). Refused: an unknown kind,
-/// a platform with no pin, a runtime the table does not declare, a value
+/// a platform with no pin, a value
 /// the applier would refuse.
 pub(crate) fn needs_for(table: &Table, kind: &str, os: &str, arch: &str) -> Result<Option<Vec<Need>>, String> {
     let row = table.kinds.iter().find(|k| k.kind == kind).ok_or_else(|| {
@@ -113,7 +103,7 @@ pub(crate) fn needs_for(table: &Table, kind: &str, os: &str, arch: &str) -> Resu
     })?;
     let Some(dist) = row.distribution.as_ref() else { return Ok(None) };
     let cli = row.cli.as_deref().ok_or_else(|| format!("'{kind}' has a distribution but no cli"))?;
-    if !safe_name(cli) || cli == "node" {
+    if !safe_name(cli) {
         return Err(format!("'{kind}': cli {cli:?} is not a name the applier installs"));
     }
     if !safe_version(&dist.version) {
@@ -127,8 +117,7 @@ pub(crate) fn needs_for(table: &Table, kind: &str, os: &str, arch: &str) -> Resu
     }
     let (url, sha) = artifact_url(dist, os, arch).map_err(|e| format!("'{kind}' {cli} {}: {e}", dist.version))?;
     let any = dist.is_any();
-    let mut out = vec![Need {
-        role: Role::Cli,
+    Ok(Some(vec![Need {
         kind: kind.to_string(),
         name: cli.to_string(),
         version: dist.version.clone(),
@@ -137,28 +126,7 @@ pub(crate) fn needs_for(table: &Table, kind: &str, os: &str, arch: &str) -> Resu
         unpack: dist.unpack,
         file: cache_file_name(cli, &dist.version, (!any).then_some((os, arch)), dist.unpack),
         any,
-    }];
-    if let Some(rt_name) = dist.runtime.as_deref() {
-        let rt = table.runtimes.get(rt_name)
-            .ok_or_else(|| format!("'{kind}' runs on runtime '{rt_name}', which `runtimes` does not declare"))?;
-        if !safe_name(rt_name) || !safe_version(&rt.version) || !safe_entry(&rt.bin_dir) {
-            return Err(format!("runtime '{rt_name}': a name, version or bin_dir the applier would refuse"));
-        }
-        let (url, sha) = artifact_url(rt, os, arch).map_err(|e| format!("runtime {rt_name} {}: {e}", rt.version))?;
-        let any = rt.is_any();
-        out.push(Need {
-            role: Role::Runtime,
-            kind: kind.to_string(),
-            name: rt_name.to_string(),
-            version: rt.version.clone(),
-            url,
-            sha256: sha,
-            unpack: rt.unpack,
-            file: cache_file_name(rt_name, &rt.version, (!any).then_some((os, arch)), rt.unpack),
-            any,
-        });
-    }
-    Ok(Some(out))
+    }]))
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -203,8 +171,7 @@ pub(crate) fn desired_harness_kind(desired: &Value) -> Option<String> {
     )
 }
 
-/// The manifest that rides beside a `vendor-cli` / `vendor-runtime`
-/// payload. One key per line, every value a plain string or `null`: the
+/// The manifest that rides beside a `vendor-cli` payload. One key per line, every value a plain string or `null`: the
 /// Linux applier reads it with `sed`, so the layout is part of the contract
 /// (`scripts/noo-apply.sh`, vendor_install).
 pub(crate) fn manifest_text(fields: &[(&str, Option<&str>)]) -> String {
@@ -254,7 +221,6 @@ pub(crate) fn vendor_bundle_files(
     let table_row = table.kinds.iter().find(|k| k.kind == kind).and_then(|k| k.distribution.as_ref());
     let dist = table_row.expect("needs_for found a distribution");
     let cli = &needs[0];
-    let rt = needs.get(1);
     let mut files: Vec<(&'static str, Vec<u8>)> = Vec::new();
     files.push(("vendor-cli", staged(cli).unwrap_or_default()));
     files.push((
@@ -267,27 +233,9 @@ pub(crate) fn vendor_bundle_files(
             ("format", Some(dist.format.as_str())),
             ("unpack", Some(cli.unpack.as_str())),
             ("entry", Some(&dist.entry)),
-            ("runtime", rt.map(|r| r.name.as_str())),
-            ("runtime_version", rt.map(|r| r.version.as_str())),
         ])
         .into_bytes(),
     ));
-    if let Some(r) = rt {
-        let bin_dir = table.runtimes.get(&r.name).map(|x| x.bin_dir.as_str()).unwrap_or("bin");
-        files.push(("vendor-runtime", staged(r).unwrap_or_default()));
-        files.push((
-            "vendor-runtime-manifest",
-            manifest_text(&[
-                ("kind", Some("runtime")),
-                ("name", Some(&r.name)),
-                ("version", Some(&r.version)),
-                ("sha256", Some(&r.sha256)),
-                ("unpack", Some(r.unpack.as_str())),
-                ("bin_dir", Some(bin_dir)),
-            ])
-            .into_bytes(),
-        ));
-    }
     Ok(files)
 }
 
@@ -303,40 +251,16 @@ pub(crate) fn applier_knows_vendor_kinds(darwin: bool, app_version: &str) -> boo
 
 // ── the wrapper ───────────────────────────────────────────────────────────
 
-/// A runtime the wrapper puts first on PATH: its name, version, bin_dir.
-pub(crate) struct WrapperRuntime<'a> {
-    pub name: &'a str,
-    pub version: &'a str,
-    pub bin_dir: &'a str,
-}
-
 /// The wrapper written at `<bin>/<cli>`: `vendor_root` is `/opt/noo/vendor`
-/// on Linux and `<home>/noomesh/vendor` on a Mac. With a runtime, its
-/// bin_dir goes first on PATH (a CLI may spawn `node` itself) and a `.js`
-/// entry is run by the runtime's own executable; otherwise the entry is
-/// executed directly. The Linux applier writes the same text
+/// on Linux and `<home>/noomesh/vendor` on a Mac. It executes the entry
+/// directly. The Linux applier writes the same text
 /// (`scripts/noo-apply.sh` vendor_wrapper; tests/test_vendor_apply_block.py
 /// holds the two equal).
-pub(crate) fn wrapper_script(vendor_root: &str, name: &str, version: &str, entry: &str, rt: Option<&WrapperRuntime>) -> String {
+pub(crate) fn wrapper_script(vendor_root: &str, name: &str, version: &str, entry: &str) -> String {
     let target = format!("{vendor_root}/{name}/{version}/{entry}");
-    let mut s = String::from("#!/bin/sh\n");
-    match rt {
-        Some(r) => {
-            let rbin = format!("{vendor_root}/{}/{}/{}", r.name, r.version, r.bin_dir);
-            s.push_str(&format!("# noomesh vendor wrapper: {name} {version} on {} {}, staged by the controller; do not edit\n", r.name, r.version));
-            s.push_str(&format!("PATH=\"{rbin}:$PATH\"\nexport PATH\n"));
-            if [".js", ".mjs", ".cjs"].iter().any(|x| entry.ends_with(x)) {
-                s.push_str(&format!("exec \"{rbin}/{}\" \"{target}\" \"$@\"\n", r.name));
-            } else {
-                s.push_str(&format!("exec \"{target}\" \"$@\"\n"));
-            }
-        }
-        None => {
-            s.push_str(&format!("# noomesh vendor wrapper: {name} {version}, staged by the controller; do not edit\n"));
-            s.push_str(&format!("exec \"{target}\" \"$@\"\n"));
-        }
-    }
-    s
+    format!(
+        "#!/bin/sh\n# noomesh vendor wrapper: {name} {version}, staged by the controller; do not edit\nexec \"{target}\" \"$@\"\n"
+    )
 }
 
 // ── the verbs ─────────────────────────────────────────────────────────────
@@ -457,7 +381,7 @@ pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandl
             };
             for n in needs {
                 if !seen.insert(n.file.clone()) {
-                    continue; // an `any` artefact, or a runtime two kinds share: once
+                    continue; // an `any` artefact two kinds share: once
                 }
                 let platform = if n.any { "any".to_string() } else { format!("{os}-{arch}") };
                 let path = dir.join(&n.file);
@@ -658,27 +582,27 @@ mod tests {
 
     #[test]
     fn cache_paths_are_name_version_platform_ext_and_any_once() {
-        assert_eq!(cache_file_name("node", "22.11.0", Some(("linux", "x86_64")), Unpack::TarXz), "node-22.11.0-linux-x86_64.tar.xz");
+        assert_eq!(cache_file_name("claude", "2.0.1", Some(("linux", "x86_64")), Unpack::Zip), "claude-2.0.1-linux-x86_64.zip");
         assert_eq!(cache_file_name("copilot", "0.0.339", None, Unpack::Tgz), "copilot-0.0.339-any.tgz");
         assert_eq!(cache_file_name("codex", "0.46.0", Some(("macos", "aarch64")), Unpack::None), "codex-0.46.0-macos-aarch64.bin");
         let t = t();
         let a = needs_for(&t, "copilot", "linux", "x86_64").unwrap().unwrap();
         let b = needs_for(&t, "copilot", "macos", "aarch64").unwrap().unwrap();
         assert_eq!(a[0].file, b[0].file, "an any artefact is one file for every platform");
-        assert_ne!(a[1].file, b[1].file, "the runtime is per platform");
-        assert_eq!(a[1].file, "node-22.11.0-linux-x86_64.tar.xz");
+        let c = needs_for(&t, "codex", "linux", "x86_64").unwrap().unwrap();
+        let d = needs_for(&t, "codex", "macos", "aarch64").unwrap().unwrap();
+        assert_ne!(c[0].file, d[0].file, "a per-platform artefact is one file per platform");
     }
 
     #[test]
     fn needs_follow_the_table() {
         let t = t();
         let n = needs_for(&t, "copilot", "linux", "aarch64").unwrap().unwrap();
-        assert_eq!(n.len(), 2);
-        assert_eq!((n[0].role, n[0].name.as_str()), (Role::Cli, "copilot"));
-        assert_eq!((n[1].role, n[1].name.as_str(), n[1].version.as_str()), (Role::Runtime, "node", "22.11.0"));
-        assert_eq!(n[1].url, "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-arm64.tar.xz");
+        assert_eq!(n.len(), 1, "a kind needs one artefact");
+        assert_eq!((n[0].name.as_str(), n[0].version.as_str()), ("copilot", "0.0.339"));
         let c = needs_for(&t, "codex", "linux", "x86_64").unwrap().unwrap();
-        assert_eq!(c.len(), 1, "a binary with no runtime is one artefact");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].url, "https://example.invalid/codex/0.46.0/codex-x86_64-unknown-linux-musl");
         assert!(needs_for(&t, "noo", "linux", "x86_64").unwrap().is_none());
         assert!(needs_for(&t, "manual", "linux", "x86_64").unwrap().is_none(), "manual install stages nothing");
         assert!(needs_for(&t, "codex", "linux", "aarch64").unwrap_err().contains("no sha256 pin"));
@@ -738,32 +662,27 @@ mod tests {
     }
 
     #[test]
-    fn bundle_carries_cli_runtime_and_both_manifests() {
+    fn bundle_carries_the_cli_and_its_manifest() {
         let f = vendor_bundle_files(&t(), Some("copilot"), "linux", "x86_64", &all_staged).unwrap();
         let kinds: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
-        assert_eq!(kinds, ["vendor-cli", "vendor-cli-manifest", "vendor-runtime", "vendor-runtime-manifest"]);
+        assert_eq!(kinds, ["vendor-cli", "vendor-cli-manifest"]);
         assert_eq!(f[0].1, b"bytes-of-copilot-0.0.339-any.tgz");
-        assert_eq!(f[2].1, b"bytes-of-node-22.11.0-linux-x86_64.tar.xz");
         let m: Value = serde_json::from_slice(&f[1].1).unwrap();
         assert_eq!(m, json!({"kind": "copilot", "name": "copilot", "version": "0.0.339", "sha256": "a".repeat(64),
-            "format": "npm-tarball", "unpack": "tgz", "entry": "package/index.js", "runtime": "node", "runtime_version": "22.11.0"}));
-        let r: Value = serde_json::from_slice(&f[3].1).unwrap();
-        assert_eq!(r, json!({"kind": "runtime", "name": "node", "version": "22.11.0", "sha256": "1".repeat(64),
-            "unpack": "tar.xz", "bin_dir": "bin"}));
+            "format": "npm-tarball", "unpack": "tgz", "entry": "package/index.js"}));
         // One key per line: the Linux applier's sed reads this layout.
         let text = String::from_utf8(f[1].1.clone()).unwrap();
-        assert!(text.lines().any(|l| l == "  \"entry\": \"package/index.js\","), "{text}");
-        assert!(text.lines().any(|l| l == "  \"runtime_version\": \"22.11.0\""), "{text}");
+        assert!(text.lines().any(|l| l == "  \"entry\": \"package/index.js\""), "{text}");
+        assert!(text.lines().any(|l| l == "  \"unpack\": \"tgz\","), "{text}");
     }
 
     #[test]
-    fn a_binary_kind_carries_no_runtime_and_a_null_runtime() {
+    fn a_binary_kind_carries_its_manifest_too() {
         let f = vendor_bundle_files(&t(), Some("codex"), "macos", "aarch64", &all_staged).unwrap();
         assert_eq!(f.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["vendor-cli", "vendor-cli-manifest"]);
         let m: Value = serde_json::from_slice(&f[1].1).unwrap();
-        assert!(m["runtime"].is_null() && m["runtime_version"].is_null());
         assert_eq!(m["format"], "binary");
-        assert!(String::from_utf8(f[1].1.clone()).unwrap().contains("  \"runtime\": null,\n"));
+        assert_eq!(m["unpack"], "none");
     }
 
     #[test]
@@ -775,32 +694,17 @@ mod tests {
 
     #[test]
     fn an_unstaged_artefact_refuses_the_restage_and_names_the_stage_command() {
-        let only_cli = |n: &Need| (n.name != "node").then(|| b"x".to_vec());
-        let e = vendor_bundle_files(&t(), Some("copilot"), "linux", "x86_64", &only_cli).unwrap_err();
-        assert!(e.contains("run `noo cluster vendor stage copilot` first") && e.contains("node 22.11.0"), "{e}");
-        assert!(!e.contains("copilot 0.0.339 +"), "only the missing one is named: {e}");
+        let none = |_: &Need| None;
+        let e = vendor_bundle_files(&t(), Some("copilot"), "linux", "x86_64", &none).unwrap_err();
+        assert!(e.contains("run `noo cluster vendor stage copilot` first") && e.contains("copilot 0.0.339"), "{e}");
         let e = vendor_bundle_files(&t(), Some("codex"), "linux", "aarch64", &all_staged).unwrap_err();
         assert!(e.contains("cannot be staged for linux/aarch64"), "{e}");
     }
 
     #[test]
-    fn wrapper_with_a_runtime_puts_it_first_and_runs_the_js_entry_with_it() {
-        let rt = WrapperRuntime { name: "node", version: "22.11.0", bin_dir: "bin" };
-        let w = wrapper_script("/opt/noo/vendor", "copilot", "0.0.339", "package/index.js", Some(&rt));
-        assert_eq!(w, "#!/bin/sh\n\
-# noomesh vendor wrapper: copilot 0.0.339 on node 22.11.0, staged by the controller; do not edit\n\
-PATH=\"/opt/noo/vendor/node/22.11.0/bin:$PATH\"\n\
-export PATH\n\
-exec \"/opt/noo/vendor/node/22.11.0/bin/node\" \"/opt/noo/vendor/copilot/0.0.339/package/index.js\" \"$@\"\n");
-        // A non-JS entry on a runtime: PATH still first, the entry runs itself.
-        let w = wrapper_script("/Users/u/noomesh/vendor", "claude", "2.0.1", "package/bin/claude", Some(&rt));
-        assert!(w.contains("PATH=\"/Users/u/noomesh/vendor/node/22.11.0/bin:$PATH\"\n"));
-        assert!(w.ends_with("exec \"/Users/u/noomesh/vendor/claude/2.0.1/package/bin/claude\" \"$@\"\n"), "{w}");
-    }
-
     #[test]
     fn wrapper_for_a_binary_execs_it_directly() {
-        let w = wrapper_script("/opt/noo/vendor", "codex", "0.46.0", "codex", None);
+        let w = wrapper_script("/opt/noo/vendor", "codex", "0.46.0", "codex");
         assert_eq!(w, "#!/bin/sh\n# noomesh vendor wrapper: codex 0.46.0, staged by the controller; do not edit\nexec \"/opt/noo/vendor/codex/0.46.0/codex\" \"$@\"\n");
         assert!(!w.contains("PATH="));
     }
@@ -840,8 +744,8 @@ exec \"/opt/noo/vendor/node/22.11.0/bin/node\" \"/opt/noo/vendor/copilot/0.0.339
     #[test]
     fn a_node_line_says_ready_or_what_is_missing() {
         let t = t();
-        let (c, ok) = node_need_cell(&t, Some("copilot"), Some(("linux", "x86_64")), &|n: &Need| n.name == "copilot");
-        assert!(!ok && c.contains("Pending (not staged: node 22.11.0)"), "{c}");
+        let (c, ok) = node_need_cell(&t, Some("copilot"), Some(("linux", "x86_64")), &|_: &Need| false);
+        assert!(!ok && c.contains("Pending (not staged: copilot 0.0.339)"), "{c}");
         let (c, ok) = node_need_cell(&t, Some("copilot"), Some(("linux", "x86_64")), &|_: &Need| true);
         assert!(ok && c.ends_with("Ready"), "{c}");
         assert!(node_need_cell(&t, None, None, &|_: &Need| true).1);

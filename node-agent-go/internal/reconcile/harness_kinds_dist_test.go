@@ -38,7 +38,6 @@ func TestEveryForeignKindHasAPinnedDistribution(t *testing.T) {
 			Version string            `json:"version"`
 			SHA256  map[string]string `json:"sha256"`
 			Entry   string            `json:"entry"`
-			Runtime *string           `json:"runtime"`
 		}
 		if err := json.Unmarshal(k.Distribution, &d); err != nil {
 			t.Errorf("%s distribution: %v", k.Kind, err)
@@ -56,15 +55,6 @@ func TestEveryForeignKindHasAPinnedDistribution(t *testing.T) {
 				if !hex64.MatchString(d.SHA256[p]) {
 					t.Errorf("%s: sha256[%s] = %q, want 64 hex", k.Kind, p, d.SHA256[p])
 				}
-			}
-		}
-		if d.Runtime != nil {
-			var doc struct {
-				Runtimes map[string]json.RawMessage `json:"runtimes"`
-			}
-			_ = json.Unmarshal(harnessKindsJSON, &doc)
-			if _, ok := doc.Runtimes[*d.Runtime]; !ok {
-				t.Errorf("%s needs runtime %q, which the table does not pin", k.Kind, *d.Runtime)
 			}
 		}
 	}
