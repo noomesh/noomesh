@@ -31,3 +31,12 @@ def test_no_gzip_directive_or_content_encoding_in_the_model_cache_conf():
 
 def test_the_images_location_exists():
     assert "location /images/" in _code(CONFS[1])
+
+
+def test_the_model_cache_never_disables_byte_ranges():
+    """The node resumes an interrupted verified fetch with ``Range: bytes=N-``
+    (preseed.FetchOneVerified). nginx serves static files with ranges by
+    default; ``max_ranges 0`` would silently turn every resume into a full
+    re-download (the node falls back on a 200, so nothing would fail loudly)."""
+    for conf in CONFS:
+        assert not re.search(r"^\s*max_ranges\s+0\b", _code(conf), re.M), f"{conf.name}: max_ranges 0 disables resume"
