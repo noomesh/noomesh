@@ -5,11 +5,13 @@ package docker
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/distribution/reference"
@@ -74,13 +76,40 @@ func isOwnImageWith(ref string, roots []string) bool {
 // index.json BEFORE it is loaded and refuses an archive that holds more than
 // one image, or tags anything other than ref. An untagged archive (saved by
 // ID) is fine — finishLoad tags it.
+//
+// A staged `.tar.gz` is read through compress/gzip. Whether the file is
+// gzip is decided by BOTH its name and its magic bytes (1f 8b): a mismatch
+// either way (a `.tar.gz` that is not gzip, a `.tar` that is) is a loud
+// verification error naming the mismatch rather than a confusing tar error.
+// The raw file, not the inflated stream, is what `docker load` is given.
 func checkTarManifest(path, ref string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open staged tar: %w", err)
 	}
 	defer f.Close()
-	return checkTarManifestReader(f, ref)
+	var magic [2]byte
+	n, _ := io.ReadFull(f, magic[:])
+	isGz := n == 2 && magic[0] == 0x1f && magic[1] == 0x8b
+	namedGz := strings.HasSuffix(path, ".gz")
+	if namedGz != isGz {
+		if namedGz {
+			return fmt.Errorf("%s is named .gz but is not gzip data (mislabeled export)", filepath.Base(path))
+		}
+		return fmt.Errorf("%s is gzip data but is not named .gz (mislabeled export)", filepath.Base(path))
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("read staged tar: %w", err)
+	}
+	if !isGz {
+		return checkTarManifestReader(f, ref)
+	}
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("read staged gzip: %w", err)
+	}
+	defer zr.Close()
+	return checkTarManifestReader(zr, ref)
 }
 
 func checkTarManifestReader(r io.Reader, ref string) error {
