@@ -2241,7 +2241,7 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     "/",            // dashboard root HTML shell
     // `/metrics` is NOT here (2026-09-25 B). It was public
     // because the scraper had no credential the gateway checked; with
-    // `NOO_MTLS_GATEWAY` on (onboard sets it) the gateway reads the
+    // mTLS enforced (the default; `NOO_MTLS_GATEWAY=false` opts out) the gateway reads the
     // scraper's service leaf, so the scrape authenticates by certificate and
     // everyone else by an Operator-or-Admin login — see METRICS_READ_PATHS.
     "/dashboard",   // alias for /

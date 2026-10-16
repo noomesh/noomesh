@@ -200,7 +200,7 @@ pub fn admit_registration(sub: &str, role: Role, conn: ConnCert<'_>, registratio
     let Some(operator) = conn.operator else {
         return Err(
             "present the operator client certificate you are registering (no operator leaf on this \
-             connection — the gateway reads client certificates only with NOO_MTLS_GATEWAY on)"
+             connection — the gateway reads client certificates unless NOO_MTLS_GATEWAY=false switched mTLS off)"
                 .into(),
         );
     };
