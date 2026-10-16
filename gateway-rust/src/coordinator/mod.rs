@@ -32,6 +32,7 @@ mod context;
 mod dispatch;
 mod rail;
 mod remote;
+mod repeat_guard;
 mod runtime;
 mod session;
 mod summary;
