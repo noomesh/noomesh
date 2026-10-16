@@ -388,4 +388,29 @@ describe('useCoordinator', () => {
     expect(last(result.current.messages).streaming).toBeFalsy();
     expect(result.current.status).toBe('closed');
   });
+
+  it('an error with no turn in flight does not touch the finished reply', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+    fire('onMessage', { type: 'content', text: 'answer' });
+    fire('onMessage', { type: 'done' });
+
+    // An older gateway sent this before every 4401 close, one per token lifetime.
+    fire('onMessage', { type: 'error', text: 'Token expired' });
+    fire('onMessage', { type: 'error', text: 'Token expired' });
+    expect(last(result.current.messages)).toMatchObject({ text: 'answer' });
+    expect(last(result.current.messages).error).toBeFalsy();
+  });
+
+  it('an error during a turn still lands in that turn', () => {
+    const { result } = renderHook(() => useCoordinator());
+    fire('onOpen', {});
+    H.sock.readyState = 1;
+    act(() => result.current.send('q'));
+    fire('onMessage', { type: 'error', text: 'backend down' });
+    expect(last(result.current.messages)).toMatchObject({ text: '⚠ backend down', error: true });
+    expect(result.current.canSend).toBe(true);
+  });
 });
