@@ -1,0 +1,24 @@
+{
+  "key": "audit-chain-vector-key",
+  "note": "chain_hash = HMAC-SHA256(key, 'noo-audit-chain-v1\\nseq=<n>\\nprev=<len>:<prev>\\nentry=<len>:<entry_hash>'); shared by gateway-rust/src/audit_chain.rs and src/noomesh/gateway/audit_log.py",
+  "cases": [
+    {
+      "seq": 1,
+      "prev": "",
+      "entry_hash": "v2:1111111111111111111111111111111111111111111111111111111111111111",
+      "chain_hash": "770eff41472ab663121c3aa6b5b0dd6df0817897cafe39e1a2e0a29bb9b4b802"
+    },
+    {
+      "seq": 2,
+      "prev": "770eff41472ab663121c3aa6b5b0dd6df0817897cafe39e1a2e0a29bb9b4b802",
+      "entry_hash": "v2:2222222222222222222222222222222222222222222222222222222222222222",
+      "chain_hash": "a66b284ee6d10134b286e37904663719d7a725af3dd1cfa4f2c8fa42605bd23b"
+    },
+    {
+      "seq": 3,
+      "prev": "a66b284ee6d10134b286e37904663719d7a725af3dd1cfa4f2c8fa42605bd23b",
+      "entry_hash": "v2:3333333333333333333333333333333333333333333333333333333333333333",
+      "chain_hash": "be658dea90359e8fff4830edc735a78b0b9b44d541e2e72bd58cb0be7a8dde32"
+    }
+  ]
+}

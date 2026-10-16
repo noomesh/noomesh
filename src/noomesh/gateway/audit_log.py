@@ -146,6 +146,39 @@ def audit_row_hash_v2(*, key: Optional[bytes] = None, **fields: Any) -> str:
     return _V2_PREFIX + hmac.new(k, canonical_v2(**fields), hashlib.sha256).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# The hash chain (deletion evidence)
+# ---------------------------------------------------------------------------
+# Every row is also LINKED to the one before it: `chain_seq` (gapless) and
+# `chain_hash` = HMAC(audit key, domain | seq | previous chain_hash | this
+# row's entry_hash). Delete or reorder a middle row and the link breaks,
+# which the per-row hash cannot show. All four writers (the gateway and the
+# Python containers) take the SAME transaction-scoped advisory lock, read the
+# newest chained row, choose a time no earlier than its, sign, insert and
+# commit, so concurrent writers cannot fork the chain. The application role is
+# INSERT-only (migration 092), so a row cannot be sealed after the fact: the
+# link is made at insert or not at all.
+#
+# A writer that finds NO chained row yet (the gateway has not written the
+# genesis row) inserts an unchained row; the genesis' keyed digest covers it.
+#
+# ⚠️ Mirror of gateway-rust/src/audit_chain.rs (`chain_hash`, `CHAIN_LOCK_KEY`),
+# pinned by tests/fixtures/audit_chain_vectors.json.
+CHAIN_LOCK_KEY = 0x6E6F6F5F61756474  # ASCII "noo_audt"
+_CHAIN_DOMAIN = "noo-audit-chain-v1"
+RETENTION_EVENT = "audit_retention_checkpoint"
+
+
+def chain_hash(*, key: bytes, seq: int, prev: str, entry_hash: str) -> str:
+    """Hex HMAC-SHA256 of one link; length-prefixed like the row form."""
+    canonical = (
+        f"{_CHAIN_DOMAIN}\nseq={int(seq)}\n"
+        f"prev={len(prev.encode('utf-8'))}:{prev}\n"
+        f"entry={len(entry_hash.encode('utf-8'))}:{entry_hash}"
+    )
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _refuse_unsigned(event: "AuditEvent", exc: AuditKeyMissing) -> None:
     # error, every time: an audit row that was not recorded is not a debug line.
     logger.error("audit_write_refused_no_key", error=str(exc),
@@ -177,9 +210,30 @@ class AuditEvent:
 
 _INSERT_SQL = (
     "INSERT INTO noo_security_audit "
+    "(id, timestamp, event_type, severity, actor, resource, outcome, details, request_id, "
+    "entry_hash, chain_seq, chain_hash) "
+    "VALUES (:id, :ts, :et, :sev, :actor, :resource, :outcome, :details, :rid, :eh, :seq, :ch)"
+)
+
+# Only for a database that has not run migration 092 yet (a worker that starts
+# before the gateway has migrated): the row is recorded unchained, never lost.
+_INSERT_UNCHAINED_SQL = (
+    "INSERT INTO noo_security_audit "
     "(id, timestamp, event_type, severity, actor, resource, outcome, details, request_id, entry_hash) "
     "VALUES (:id, :ts, :et, :sev, :actor, :resource, :outcome, :details, :rid, :eh)"
 )
+
+_LOCK_SQL = "SELECT pg_advisory_xact_lock(:k)"
+_TAIL_SQL = (
+    "SELECT chain_seq, chain_hash, timestamp FROM noo_security_audit "
+    "WHERE chain_seq IS NOT NULL ORDER BY chain_seq DESC LIMIT 1"
+)
+
+
+def _no_chain_columns(exc: BaseException) -> bool:
+    """Is this the error of a database without migration 092's columns?"""
+    msg = str(exc)
+    return "chain_seq" in msg and "does not exist" in msg
 
 
 def _canonical_details_sql():
@@ -195,17 +249,31 @@ def _details_json(event: "AuditEvent") -> str:
     return json.dumps(event.details)
 
 
-def _signed_params(event: "AuditEvent", key: bytes, details: str) -> dict:
-    """The insert's parameters, signed v2. `ts` is the datetime bound to the
-    column, so the hashed microseconds are the stored ones; `details` is
-    Postgres's own text for the value (`_canonical_details_sql`)."""
+def _signed_params(event: "AuditEvent", key: bytes, details: str, tail=None) -> dict:
+    """The insert's parameters, signed v2 and, given the newest chained row
+    `tail` = (chain_seq, chain_hash, timestamp), linked after it. `ts` is the
+    datetime bound to the column, so the hashed microseconds are the stored
+    ones; `details` is Postgres's own text for the value
+    (`_canonical_details_sql`). With a tail the time is never earlier than the
+    tail's, which keeps a monthly partition's seq range contiguous."""
     ts = datetime.fromtimestamp(event.timestamp, tz=timezone.utc)
+    if tail is not None:
+        tail_ts = tail[2]
+        if tail_ts.tzinfo is None:
+            tail_ts = tail_ts.replace(tzinfo=timezone.utc)
+        tail_ts = tail_ts.astimezone(timezone.utc)
+        if ts < tail_ts:
+            ts = tail_ts
     row_id = str(uuid.uuid4())
     entry_hash = audit_row_hash_v2(
         key=key, id=row_id, timestamp_us=stored_micros(ts), event_type=event.event_type,
         severity=event.severity, actor=event.actor, resource=event.resource,
         outcome=event.outcome, request_id=event.request_id, details=details, prev_hash=None,
     )
+    seq = chain = None
+    if tail is not None:
+        seq = int(tail[0]) + 1
+        chain = chain_hash(key=key, seq=seq, prev=tail[1], entry_hash=entry_hash)
     return {
         "id": row_id,
         "ts": ts,
@@ -217,6 +285,8 @@ def _signed_params(event: "AuditEvent", key: bytes, details: str) -> dict:
         "details": details,
         "rid": event.request_id,
         "eh": entry_hash,
+        "seq": seq,
+        "ch": chain,
     }
 
 
@@ -298,7 +368,7 @@ class AuditLogger:
                 pass
 
     def _write_db(self, event: AuditEvent) -> None:
-        """Insert audit row into PostgreSQL, signed with hash v2."""
+        """Insert audit row into PostgreSQL, signed with hash v2 and linked into the chain."""
         from sqlalchemy import text
 
         try:
@@ -308,7 +378,20 @@ class AuditLogger:
             return
         with self._db_engine.connect() as conn:
             details = conn.execute(_canonical_details_sql(), {"d": _details_json(event)}).scalar_one()
-            conn.execute(text(_INSERT_SQL), _signed_params(event, key, details))
+            sql = _INSERT_SQL
+            try:
+                # Held until commit: the next writer reads the tail only after this row is in.
+                conn.execute(text(_LOCK_SQL), {"k": CHAIN_LOCK_KEY})
+                tail = conn.execute(text(_TAIL_SQL)).first()
+            except Exception as exc:
+                if not _no_chain_columns(exc):
+                    raise
+                conn.rollback()
+                tail, sql = None, _INSERT_UNCHAINED_SQL
+            params = _signed_params(event, key, details, tail)
+            if sql is _INSERT_UNCHAINED_SQL:
+                params = {k: v for k, v in params.items() if k not in ("seq", "ch")}
+            conn.execute(text(sql), params)
             conn.commit()
 
     async def _write_db_async(self, event: AuditEvent) -> None:
@@ -328,7 +411,19 @@ class AuditLogger:
             async with self._async_engine.connect() as conn:
                 details = (await conn.execute(
                     _canonical_details_sql(), {"d": _details_json(event)})).scalar_one()
-                await conn.execute(text(_INSERT_SQL), _signed_params(event, key, details))
+                sql = _INSERT_SQL
+                try:
+                    await conn.execute(text(_LOCK_SQL), {"k": CHAIN_LOCK_KEY})
+                    tail = (await conn.execute(text(_TAIL_SQL))).first()
+                except Exception as exc:
+                    if not _no_chain_columns(exc):
+                        raise
+                    await conn.rollback()
+                    tail, sql = None, _INSERT_UNCHAINED_SQL
+                params = _signed_params(event, key, details, tail)
+                if sql is _INSERT_UNCHAINED_SQL:
+                    params = {k: v for k, v in params.items() if k not in ("seq", "ch")}
+                await conn.execute(text(sql), params)
                 await conn.commit()
         except Exception as exc:
             # See _write_db: a lost audit row is a warning, not a debug line.

@@ -1266,7 +1266,7 @@ mod tests {
 /// scratch database (a pgvector container); without it the test says so and
 /// passes, so CI without a database is not red for the wrong reason — but
 /// a run WITH the variable asserts every step, including that migration
-/// the chain head (`093_model_class_pool`, over `092_kiosk_seats`) is what stamped the schema.
+/// the chain head is what stamped the schema.
 #[cfg(test)]
 mod db_tests {
     use super::*;
@@ -1285,7 +1285,7 @@ mod db_tests {
         crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
         crate::mesh_migrate::apply(&admin).await.expect("migrations");
         let rev = crate::mesh_migrate::current_revision(&admin).await.expect("revision").expect("stamped");
-        assert_eq!(rev, crate::mesh_migrate::MODEL_CLASS_POOL_REVISION, "the head revision is the model-class pool migration");
+        assert_eq!(Some(rev.as_str()), crate::mesh_migrate::MIGRATIONS.last().map(|m| m.revision), "the head revision stamped the schema");
         // A fresh pool: the migrator resets search_path on the connection it used.
         let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect scratch db");
 

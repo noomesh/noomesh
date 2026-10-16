@@ -294,6 +294,9 @@ pub struct AuditRow {
     pub details: Option<String>,
     pub prev_hash: Option<String>,
     pub entry_hash: Option<String>,
+    /// Position in the hash chain (`audit_chain`); NULL for a row written before it.
+    pub chain_seq: Option<i64>,
+    pub chain_hash: Option<String>,
 }
 
 impl AuditRow {
@@ -361,7 +364,7 @@ impl AuditRow {
         (0..=ROLL_WINDOW_SECS).contains(&(self.ts_us.div_euclid(1_000_000) - checkpoint_at))
     }
 
-    fn signed_by(&self, key: &[u8]) -> bool {
+    pub(crate) fn signed_by(&self, key: &[u8]) -> bool {
         let Some(stored) = self.entry_hash.as_deref() else { return false };
         let expected = self.hash_under(key);
         // Constant-time: the comparison is against attacker-editable data.
@@ -502,6 +505,9 @@ pub struct Report {
     pub v1_roll_window: Vec<RollWindowWriter>,
     /// Row-level failures, each naming the row.
     pub breaks: Vec<Break>,
+    /// The hash chain over the rows: deletion and reordering evidence
+    /// (`audit_chain`). Its breaks are also in `breaks`, prefixed `chain:`.
+    pub chain: crate::audit_chain::ChainReport,
     /// Table-level failures (no key, no checkpoint).
     pub problems: Vec<String>,
     pub warnings: Vec<String>,
@@ -762,6 +768,16 @@ pub fn verify_rows(rows: &[AuditRow], keys: &Keys) -> Report {
     r
 }
 
+/// [`verify_rows`] plus the hash chain ([`crate::audit_chain::verify`]): the
+/// whole verdict `GET /api/security/audit/verify` serves. Kept apart so the
+/// per-row rules stay testable on rows that carry no chain.
+pub fn verify_all(rows: &[AuditRow], keys: &Keys) -> Report {
+    let mut r = verify_rows(rows, keys);
+    crate::audit_chain::verify(rows, keys.current.as_deref(), &mut r);
+    r.verdict = if r.breaks.is_empty() && r.problems.is_empty() { "ok" } else { "fail" }.into();
+    r
+}
+
 // ── Database side ────────────────────────────────────────────────────────────
 
 type RowTuple = (
@@ -775,6 +791,8 @@ type RowTuple = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<i64>,
     Option<String>,
 );
 
@@ -792,13 +810,16 @@ fn to_row(t: RowTuple) -> AuditRow {
         entry_hash: t.8,
         details: t.9,
         prev_hash: t.10,
+        chain_seq: t.11,
+        chain_hash: t.12,
     }
 }
 
 /// `details::text` is Postgres's jsonb rendering — the text the v2 writer
 /// hashed, because it asked Postgres for exactly that before signing.
 const SELECT_ROWS: &str = "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, \
-     outcome, request_id, entry_hash, details::text, prev_hash FROM noo_security_audit";
+     outcome, request_id, entry_hash, details::text, prev_hash, chain_seq, chain_hash \
+     FROM noo_security_audit";
 
 /// Read the whole table and judge it with the keys this process holds.
 pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
@@ -806,7 +827,7 @@ pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
         .fetch_all(db)
         .await?;
     let rows: Vec<AuditRow> = rows.into_iter().map(to_row).collect();
-    Ok(verify_rows(&rows, &Keys { current: current_key(), retired: retired_key() }))
+    Ok(verify_all(&rows, &Keys { current: current_key(), retired: retired_key() }))
 }
 
 /// What boot did about the checkpoint — logged, and returned for the tests.
@@ -1072,6 +1093,8 @@ mod tests {
             details: Some(r#"{"source_ip": "10.0.0.7"}"#.into()),
             prev_hash: None,
             entry_hash: None,
+            chain_seq: None,
+            chain_hash: None,
         };
         r.entry_hash = Some(r.hash_under(key)); // no hash yet → the v1 form
         r

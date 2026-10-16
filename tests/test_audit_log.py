@@ -37,7 +37,7 @@ class _FakeSyncConn:
     def __exit__(self, *a):
         return False
 
-    def execute(self, _stmt, params):
+    def execute(self, _stmt, params=None):
         return _record(self.sink, _stmt, params)
 
     def commit(self):
@@ -51,12 +51,17 @@ class _Result:
     def scalar_one(self):
         return self._value
 
+    def first(self):
+        return None  # no chained row yet
+
 
 def _record(sink, stmt, params):
     """Record the INSERT's params; answer the writer's jsonb-text question
     (`CAST(:d AS jsonb)::text`) with the text unchanged."""
     if "AS jsonb)::text" in str(stmt):
         return _Result(params["d"])
+    if str(stmt).lstrip().upper().startswith("SELECT"):
+        return _Result(None)  # the chain lock and the tail read
     sink.append(params)
     return _Result(None)
 
@@ -79,7 +84,7 @@ class _FakeAsyncConn:
     async def __aexit__(self, *a):
         return False
 
-    async def execute(self, _stmt, params):
+    async def execute(self, _stmt, params=None):
         return _record(self.sink, _stmt, params)
 
     async def commit(self):

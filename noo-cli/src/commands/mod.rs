@@ -172,7 +172,7 @@ pub use rag::{
     rag_status, rag_unhold,
 };
 pub use security::{
-    security_audit_verify,
+    security_audit_list, security_audit_verify,
     security_org_create, security_org_list, security_posture_apply_profile,
     security_posture_list, security_posture_set, security_service_key_issue,
     security_service_key_list, security_service_key_provision, security_service_key_retire,

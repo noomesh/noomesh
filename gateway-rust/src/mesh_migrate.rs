@@ -59,6 +59,64 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
+/// The statements that make `noo_security_audit` INSERT/SELECT-only for the
+/// application role: REVOKE UPDATE, DELETE and TRUNCATE on the parent and on
+/// every partition (a partition is its own relation with its own ACL, and
+/// default privileges hand the app role full DML on each new one).
+///
+/// A macro, not a const, so revision 092 (a `&'static str`, which `concat!`
+/// builds) and the boot-time re-assertion ([`enforce_audit_append_only`]) share ONE
+/// text. The re-assertion exists because `role_provision::grant_runtime_access`
+/// and `system_provision` re-issue `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL
+/// TABLES` on every migration run, which would otherwise undo the revoke the
+/// next time the gateway boots.
+///
+/// Guarded by pg_roles like every other grant here: a role-less fixture DB
+/// (schema-only replays) has no app role to restrict and must still migrate.
+macro_rules! audit_append_only_sql {
+    () => {
+        r#"
+DO $audit_append_only$
+DECLARE
+    r record;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        FOR r IN
+            SELECT c.oid::regclass AS rel
+              FROM pg_class c
+             WHERE (c.relname = 'noo_security_audit' AND c.relkind = 'p')
+                OR c.oid IN (SELECT i.inhrelid
+                               FROM pg_inherits i
+                               JOIN pg_class p ON p.oid = i.inhparent
+                              WHERE p.relname = 'noo_security_audit' AND p.relkind = 'p')
+        LOOP
+            EXECUTE format('REVOKE UPDATE, DELETE, TRUNCATE ON %s FROM noo_app', r.rel);
+        END LOOP;
+    END IF;
+END
+$audit_append_only$;
+"#
+    };
+}
+
+/// [`audit_append_only_sql`] as a string, for the boot-time re-assertion.
+pub const AUDIT_APPEND_ONLY_SQL: &str = audit_append_only_sql!();
+
+/// The audit hash chain and the append-only grant. See the entry in
+/// [`MIGRATIONS`].
+pub const AUDIT_CHAIN_REVISION: &str = "094_audit_chain_append_only";
+
+/// Re-assert that the application role cannot UPDATE or DELETE an audit row.
+/// Runs at the end of [`apply`], after every step that re-grants DML on all
+/// tables. Idempotent; a no-op where `noo_app` does not exist.
+pub async fn enforce_audit_append_only(db: &PgPool) -> Result<(), String> {
+    sqlx::raw_sql(AUDIT_APPEND_ONLY_SQL)
+        .execute(db)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("could not restrict the application role on noo_security_audit: {e}"))
+}
+
 /// Revisions authored AFTER the cut-over. Everything up to and including
 /// [`BASELINE_REVISION`] is covered by the baseline, not by entries here.
 /// New schema changes are appended here as SQL from now on.
@@ -1765,6 +1823,152 @@ END $$;
     sql: r#"
 ALTER TABLE IF EXISTS noo_model_classes ADD COLUMN IF NOT EXISTS pool boolean NOT NULL DEFAULT false
 "#,
+}, Migration {
+    revision: AUDIT_CHAIN_REVISION,
+    down_revision: Some(MODEL_CLASS_POOL_REVISION),
+    // Audit log: deletion evidence and an INSERT-only application role.
+    //
+    // 1. TWO COLUMNS for a hash chain over the rows. `chain_seq` is a
+    //    gapless counter; `chain_hash` = HMAC(audit key, domain, seq, the
+    //    previous row's chain_hash, this row's entry_hash)
+    //    (`audit_chain.rs`). A deleted or reordered middle row breaks it,
+    //    which the per-row `entry_hash` could not show. Both nullable: every
+    //    existing row stays as written (they are covered by ONE signed digest
+    //    in the genesis row the gateway appends at boot, since only the
+    //    gateway holds the key and a migration does not). The index serves
+    //    the writers' "newest chained row" read.
+    //
+    // 2. The application role loses UPDATE, DELETE and TRUNCATE on the table
+    //    and its partitions (see `audit_append_only_sql`). It keeps INSERT and
+    //    SELECT. The owner (`noo`, which runs migrations) is unchanged.
+    //
+    // 3. `noo_ensure_audit_partition` (036) revokes the same on each
+    //    partition it creates, because default privileges would otherwise
+    //    grant the app role full DML on the NEW partition directly.
+    //
+    // 4. `noo_drop_audit_partition` (047) refuses to drop a partition whose
+    //    chained rows have no `audit_retention_checkpoint` row naming exactly
+    //    their seq range. The checkpoint is a signed row the retention job
+    //    writes first; the verifier then reads the gap as retention, not
+    //    tampering. (The function cannot check the signature; the verifier
+    //    does. It stops a retention job that does not write one, and an old
+    //    worker image, from dropping history silently.)
+    sql: concat!(r#"
+ALTER TABLE noo_security_audit ADD COLUMN IF NOT EXISTS chain_seq bigint;
+ALTER TABLE noo_security_audit ADD COLUMN IF NOT EXISTS chain_hash text;
+CREATE INDEX IF NOT EXISTS noo_security_audit_chain_seq_idx
+    ON noo_security_audit (chain_seq DESC) WHERE chain_seq IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION noo_ensure_audit_partition(p_year int, p_month int)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = mesh, public, pg_catalog
+AS $fn$
+DECLARE
+    v_name  text;
+    v_start date;
+    v_end   date;
+BEGIN
+    IF p_year < 2000 OR p_year > 2999 THEN
+        RAISE EXCEPTION 'year out of range: %', p_year;
+    END IF;
+    IF p_month < 1 OR p_month > 12 THEN
+        RAISE EXCEPTION 'month out of range: %', p_month;
+    END IF;
+
+    v_name  := format('noo_security_audit_%s_%s',
+                      to_char(p_year, 'FM0000'), to_char(p_month, 'FM00'));
+    v_start := make_date(p_year, p_month, 1);
+    v_end   := (v_start + interval '1 month')::date;
+
+    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = v_name) THEN
+        RETURN false;
+    END IF;
+
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF noo_security_audit '
+        'FOR VALUES FROM (%L) TO (%L)', v_name, v_start, v_end);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        EXECUTE format('REVOKE UPDATE, DELETE, TRUNCATE ON %I FROM noo_app', v_name);
+    END IF;
+    RETURN true;
+END;
+$fn$;
+
+REVOKE ALL ON FUNCTION noo_ensure_audit_partition(int, int) FROM PUBLIC;
+DO $grant$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT EXECUTE ON FUNCTION noo_ensure_audit_partition(int, int) TO noo_app;
+    END IF;
+END $grant$;
+
+CREATE OR REPLACE FUNCTION noo_drop_audit_partition(p_year int, p_month int)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = mesh, public, pg_catalog
+AS $body$
+DECLARE
+    v_name  text;
+    v_start date;
+    v_end   date;
+    v_min   bigint;
+    v_max   bigint;
+BEGIN
+    IF p_year < 2000 OR p_year > 2999 THEN
+        RAISE EXCEPTION 'year out of range: %', p_year;
+    END IF;
+    IF p_month < 1 OR p_month > 12 THEN
+        RAISE EXCEPTION 'month out of range: %', p_month;
+    END IF;
+    IF make_date(p_year, p_month, 1)
+       >= date_trunc('month', now())::date THEN
+        RAISE EXCEPTION
+            'refusing to drop current or future audit partition %-%',
+            p_year, p_month;
+    END IF;
+
+    v_name  := format('noo_security_audit_%s_%s',
+                      to_char(p_year, 'FM0000'), to_char(p_month, 'FM00'));
+    v_start := make_date(p_year, p_month, 1);
+    v_end   := (v_start + interval '1 month')::date;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = v_name AND relkind = 'r') THEN
+        RETURN false;
+    END IF;
+
+    SELECT min(chain_seq), max(chain_seq) INTO v_min, v_max
+      FROM noo_security_audit
+     WHERE "timestamp" >= v_start AND "timestamp" < v_end AND chain_seq IS NOT NULL;
+    IF v_min IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM noo_security_audit
+         WHERE event_type = 'audit_retention_checkpoint'
+           AND chain_seq IS NOT NULL
+           AND resource LIKE format('audit-retention:from:%s;through:%s;%%', v_min, v_max)
+    ) THEN
+        RAISE EXCEPTION '%', format(
+            'refusing to drop audit partition %s-%s: its chained rows (seq %s..%s) have no '
+            'audit_retention_checkpoint row. Run the retention job from a current worker '
+            'image (it writes the signed checkpoint before it drops); dropping without one '
+            'would read as deleted history in the audit verify',
+            p_year, p_month, v_min, v_max);
+    END IF;
+
+    EXECUTE format('ALTER TABLE noo_security_audit DETACH PARTITION %I', v_name);
+    EXECUTE format('DROP TABLE %I', v_name);
+    RETURN true;
+END;
+$body$;
+
+REVOKE ALL ON FUNCTION noo_drop_audit_partition(int, int) FROM PUBLIC;
+DO $grant$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT EXECUTE ON FUNCTION noo_drop_audit_partition(int, int) TO noo_app;
+    END IF;
+END $grant$;
+"#, audit_append_only_sql!()),
 }];
 
 /// The kiosk-seat revision (i77).
@@ -2199,6 +2403,11 @@ pub async fn apply(db: &PgPool) -> Result<(), String> {
     // correct at birth and that pass deletes.
     crate::system_provision::run(db).await?;
 
+    // LAST: role_provision and system_provision above re-grant UPDATE and
+    // DELETE on every table to the application role on every run, so the
+    // audit log's INSERT-only restriction is re-asserted after them.
+    enforce_audit_append_only(db).await?;
+
     tracing::info!(
         baseline_created = created,
         applied = pending.len(),
@@ -2565,6 +2774,42 @@ mod tests {
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_token_allowances"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text"));
         assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
+    }
+
+    /// 092 adds the chain columns and makes the app role INSERT-only, and the
+    /// boot-time re-assertion runs the SAME text (the blanket re-grants that run
+    /// on every migration pass would otherwise undo it).
+    #[test]
+    fn audit_chain_revision_adds_columns_and_revokes_dml_from_the_app_role() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == AUDIT_CHAIN_REVISION).expect("094 must be in the chain");
+        assert_eq!(m.down_revision, Some(MODEL_CLASS_POOL_REVISION));
+        for needle in [
+            "ADD COLUMN IF NOT EXISTS chain_seq bigint",
+            "ADD COLUMN IF NOT EXISTS chain_hash text",
+            "REVOKE UPDATE, DELETE, TRUNCATE ON %s FROM noo_app",
+            // new partitions: default privileges would grant the app role DML on them
+            "REVOKE UPDATE, DELETE, TRUNCATE ON %I FROM noo_app",
+            "audit_retention_checkpoint",
+        ] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
+        assert!(m.sql.contains(AUDIT_APPEND_ONLY_SQL), "the migration and the boot re-assertion share one text");
+        assert!(AUDIT_APPEND_ONLY_SQL.contains("rolname = 'noo_app'"), "role-less fixture databases must still migrate");
+        assert!(!AUDIT_APPEND_ONLY_SQL.contains("GRANT"), "it only takes privileges away");
+        // The drop function's checkpoint pattern is the one audit_chain writes.
+        let r = crate::audit_chain::Retention { from: 3, through: 9, chain: "x".into() };
+        assert!(r.resource().starts_with("audit-retention:from:3;through:9;"));
+        assert!(m.sql.contains("'audit-retention:from:%s;through:%s;%%'"));
+    }
+
+    /// `apply` re-asserts the restriction AFTER the steps that re-grant DML.
+    #[test]
+    fn apply_reasserts_append_only_after_the_regrants() {
+        let src = include_str!("mesh_migrate.rs");
+        let body = &src[src.find("pub async fn apply(db: &PgPool)").expect("apply")..];
+        let grant = body.find("crate::system_provision::run(db)").expect("system_provision");
+        let enforce = body.find("enforce_audit_append_only(db)").expect("enforce");
+        assert!(enforce > grant, "the revoke must run after every blanket GRANT");
     }
 
     /// Post-cut-over revisions only. Anything up to BASELINE_REVISION is the
