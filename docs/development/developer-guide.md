@@ -461,8 +461,7 @@ python3 -I scripts/vendor-pin.py --check          # re-verify every pin, writes 
 It fills the block's `source` template for each platform, downloads every
 artefact (hash only: it never unpacks or runs one), cross-checks the digest
 against what the vendor publishes (the GitHub
-release `SHA256SUMS` file, Claude Code's release `manifest.json`, the npm
-registry's `dist.integrity`), and rewrites both `config/harness-kinds.json`
+release `SHA256SUMS` file, Claude Code's release `manifest.json`), and rewrites both `config/harness-kinds.json`
 and its byte-equal copy `node-agent-go/internal/reconcile/harness_kinds.json`.
 It refuses an unknown kind, a missing artefact, and a cross-check mismatch,
 printing both digests. `--dl-dir DIR` keeps the downloads. If a vendor
