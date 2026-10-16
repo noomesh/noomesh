@@ -57,6 +57,7 @@ mod commands;
 mod credentials;
 mod entitlement;
 mod entitlement_terms;
+mod harness_kinds;
 mod registry;
 mod release_fetch;
 mod release_sig;
@@ -319,6 +320,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // nodes over the pull rail; the group stub after it catches near-misses.
     (&["cluster", "host-telemetry", "apply"], commands::cluster_host_telemetry_apply),
     (&["cluster", "host-telemetry"], commands::cluster_host_telemetry_usage),
+    // The controller stages vendor CLIs for harness kinds (i83 E1e); the
+    // node never fetches them. Group stub after the subactions.
+    (&["cluster", "vendor", "stage"], commands::cluster_vendor_stage),
+    (&["cluster", "vendor", "status"], commands::cluster_vendor_status),
+    (&["cluster", "vendor"], commands::cluster_vendor_usage),
     // Move ONE node's agent out of its container. The node is
     // a required positional rather than a --host-process flag on
     // upgrade-agents, so "the whole fleet" is not expressible.

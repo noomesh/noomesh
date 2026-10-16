@@ -23,6 +23,8 @@ pub mod bundle;
 pub mod cluster;
 pub mod cluster_provision;
 pub mod cluster_host_telemetry;
+pub mod cluster_vendor;
+pub mod node_vendor;
 pub mod cluster_push_secrets;
 pub mod cluster_verify;
 pub mod image_stage;
@@ -188,6 +190,7 @@ pub use secrets_remove::secrets_remove;
 pub use secrets_reveal::secrets_reveal;
 // ── Fleet secret convergence (WP-FS): the missing push half of a rotation.
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
+pub use cluster_vendor::{cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_verify::cluster_verify;
 pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset};

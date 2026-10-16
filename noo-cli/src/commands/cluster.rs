@@ -3688,14 +3688,10 @@ fn running_cell(backend: &str, model: Option<&str>, native: bool) -> String {
 }
 
 /// The harness kinds a `--kind` may name: config/harness-kinds.json, the
-/// table the gateway and the node agent are built with too.
-const HARNESS_KINDS_JSON: &str = include_str!("../../../config/harness-kinds.json");
-
+/// table the gateway and the node agent are built with too
+/// (`crate::harness_kinds`).
 fn harness_kind_names() -> Vec<String> {
-    let v: serde_json::Value = serde_json::from_str(HARNESS_KINDS_JSON).unwrap_or(serde_json::Value::Null);
-    v["kinds"].as_array().map(|ks| {
-        ks.iter().filter_map(|k| k["kind"].as_str().map(str::to_string)).collect()
-    }).unwrap_or_default()
+    crate::harness_kinds::names()
 }
 
 #[cfg(test)]

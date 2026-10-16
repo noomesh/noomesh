@@ -972,6 +972,64 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             None => nnote(&format!("no harness in this bundle: no gateway asset for {os}/{arch}")),
         }
     }
+    // ── the vendor CLI the harness placement needs (i83 E1e) ──────────
+    // A harness kind that runs a vendor CLI (Copilot CLI, Claude Code,
+    // Codex) needs it on the node's PATH, and the node never fetches it:
+    // `noo cluster vendor stage <kind>` fetched and verified it on this
+    // controller, and the bundle carries it. The desired kind is the
+    // harness placement's NOO_HARNESS_KIND, read from the same
+    // desired-config the node agent converges to. Not staged = the restage
+    // is refused: a restage never downloads, and a node placed on a CLI it
+    // does not have would only be refused by its agent.
+    if self_node {
+        // The controller's gateway runs turns in process; no node harness here.
+    } else if !super::cluster_vendor::applier_knows_vendor_kinds(darwin, &node_app_version) {
+        nnote(&format!(
+            "no vendor CLI in this bundle: {node} reports {node_app_version}, whose applier predates \
+             the vendor kinds. It carries the newer CLI; the next restage carries the vendor CLI."
+        ));
+    } else {
+        let desired = crate::http::get_json_opt(
+            g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(&node)), true, 10);
+        let kind = desired.as_ref().and_then(super::cluster_vendor::desired_harness_kind);
+        let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
+        let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
+        let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+        let table = crate::harness_kinds::shipped();
+        let wants_vendor = kind.as_deref().is_some_and(|k| {
+            table.kinds.iter().any(|r| r.kind == k && r.distribution.is_some())
+        });
+        if wants_vendor {
+            let Some((os, arch)) = crate::harness_kinds::normalize_platform(os, arch) else {
+                scrub(&work);
+                fail(g.json, ExitCode::Generic, "vendor_platform",
+                    &format!("{node}'s harness placement names {} but its platform {os}/{arch} is not one vendor CLIs are staged for",
+                        kind.as_deref().unwrap_or("?")), None);
+            };
+            let dir = super::cluster_vendor::vendor_cache_dir(&root);
+            match super::cluster_vendor::vendor_bundle_files(&table, kind.as_deref(), os, arch,
+                &|n| super::cluster_vendor::read_staged(&dir, n))
+            {
+                Ok(vf) => {
+                    let size: usize = vf.iter().filter(|(k, _)| !k.ends_with("-manifest")).map(|(_, b)| b.len()).sum();
+                    nnote(&format!("bundle carries the {} vendor CLI{} ({})",
+                        kind.as_deref().unwrap_or("?"),
+                        if vf.iter().any(|(k, _)| *k == "vendor-runtime") { " and its runtime" } else { "" },
+                        human_bytes(size)));
+                    files.extend(vf);
+                }
+                Err(e) => {
+                    scrub(&work);
+                    fail_guided(g, ExitCode::Generic, "vendor_not_staged", &e,
+                        &format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
+                        &[(&format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
+                           "fetch the pinned CLI (and runtime) on this controller and verify its sha256"),
+                          ("noo cluster vendor status", "what is staged and which nodes need it"),
+                          (&format!("noo cluster provision {node}"), "restage once it is staged")]);
+                }
+            }
+        }
+    }
     // A binary the node's own last report proves it already runs is not
     // carried again (bandwidth only: the applier skips identical bytes anyway).
     // The proof is the node's `binary-sha:` statement; see `node_runs_asset`.
@@ -1893,6 +1951,16 @@ fn drop_proven_binaries(
         }
         files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
         notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
+    }
+    // The vendor CLI and its runtime go as ONE group, manifests included:
+    // the wrapper names both versions, so carrying one without the other
+    // would rewrite it against a half the node may have pruned.
+    let vendor: Vec<(&str, String)> = files.iter()
+        .filter(|(k, _)| matches!(*k, "vendor-cli" | "vendor-runtime"))
+        .map(|(k, b)| (*k, sha256_hex(b))).collect();
+    if !vendor.is_empty() && vendor.iter().all(|(k, sha)| node_runs_asset(status, k, sha)) {
+        files.retain(|(k, _)| !k.starts_with("vendor-"));
+        notes.push("vendor CLI: unchanged since last apply, not carried (the node reported running these exact bytes)".into());
     }
     notes
 }
@@ -3134,7 +3202,9 @@ pub(crate) fn put_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<serde_js
 fn post_bytes(g: &Globals, path: &str, body: &[u8]) -> Result<(), String> {
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
-    let agent = crate::http::agent(g, &base, 60);
+    // 60 s plus a second per MB: a bundle carrying a staged vendor CLI
+    // (i83 E1e) is a few hundred MB, which a flat 60 s cut off below ~5 MB/s.
+    let agent = crate::http::agent(g, &base, 60 + (body.len() / 1_000_000) as u64);
     let mut req = agent.post(&url).header("content-type", "application/octet-stream");
     if let Some(b) = crate::auth::bearer(g) {
         req = req.header("Authorization", &b);
@@ -3310,14 +3380,18 @@ fn darwin_run_harness() -> String {
     super::env_quote::run_wrapper(
         "harness.env",
         "rendered into the provision bundle — sources the harness env (launchd has no EnvironmentFile) and execs the gateway binary's harness subcommand.",
-        r#"exec "$HOME/noomesh/bin/noo-gateway" harness"#,
+        // ~/noomesh/bin first: a staged vendor CLI's wrapper lives there
+        // (i83 E1e), and the driver hands the CLI this PATH.
+        "export PATH=\"$HOME/noomesh/bin:$PATH\"\nexec \"$HOME/noomesh/bin/noo-gateway\" harness",
     )
 }
 fn darwin_run_agent() -> String {
     super::env_quote::run_wrapper(
         "agent.env",
         "rendered into the provision bundle — sources the agent env (launchd has no EnvironmentFile) and execs the agent.",
-        r#"exec "$HOME/noomesh/bin/noo-node-agent""#,
+        // ~/noomesh/bin first: the agent's vendor-CLI check (cliOnPath)
+        // looks for a staged CLI's wrapper on its own PATH (i83 E1e).
+        "export PATH=\"$HOME/noomesh/bin:$PATH\"\nexec \"$HOME/noomesh/bin/noo-node-agent\"",
     )
 }
 
@@ -5055,6 +5129,37 @@ mod local_lane_tests {
         f.iter_mut().find(|(k, _)| *k == "harness-binary").unwrap().1 = b"harness-v2".to_vec();
         drop_proven_binaries(&mut f, Some(&status), false, false);
         assert!(names(&f).contains(&"harness-binary") && !names(&f).contains(&"cli-binary"));
+    }
+
+    #[test]
+    fn mac_runners_put_noomesh_bin_first_on_path_for_staged_vendor_clis() {
+        for (script, exec) in [(darwin_run_agent(), "exec \"$HOME/noomesh/bin/noo-node-agent\""),
+                               (darwin_run_harness(), "exec \"$HOME/noomesh/bin/noo-gateway\" harness")] {
+            let path_at = script.find("export PATH=\"$HOME/noomesh/bin:$PATH\"\n").expect("PATH export");
+            let exec_at = script.find(exec).expect("exec line");
+            let env_at = script.find("set -a; . \"$ENV_FILE\"; set +a").expect("env sourced");
+            assert!(env_at < path_at && path_at < exec_at, "{script}");
+        }
+    }
+
+    #[test]
+    fn the_vendor_cli_and_runtime_drop_only_together_with_their_manifests() {
+        let mk = || -> Vec<(&'static str, Vec<u8>)> { vec![
+            ("agent-env", b"E".to_vec()), ("vendor-cli", b"cli".to_vec()), ("vendor-cli-manifest", b"{}".to_vec()),
+            ("vendor-runtime", b"rt".to_vec()), ("vendor-runtime-manifest", b"{}".to_vec()),
+        ] };
+        fn names<'a>(f: &[(&'a str, Vec<u8>)]) -> Vec<&'a str> { f.iter().map(|(k, _)| *k).collect() }
+        let both = st(0, "s", "s", &format!("applied: vendor-cli=unchanged binary-sha: vendor-cli={} vendor-runtime={}",
+            sha256_hex(b"cli"), sha256_hex(b"rt")));
+        let mut f = mk();
+        let notes = drop_proven_binaries(&mut f, Some(&both), false, false);
+        assert_eq!(names(&f), ["agent-env"], "{notes:?}");
+        assert!(notes.iter().any(|n| n.starts_with("vendor CLI: unchanged")));
+        // Only the CLI proven (the runtime moved): the whole group rides.
+        let half = st(0, "s", "s", &format!("applied: x binary-sha: vendor-cli={}", sha256_hex(b"cli")));
+        let mut f = mk();
+        drop_proven_binaries(&mut f, Some(&half), false, false);
+        assert_eq!(f.len(), 5);
     }
 
     #[test]
