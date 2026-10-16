@@ -127,7 +127,15 @@ def test_the_token_goes_with_the_nodes_leaf(tmp_path: Path) -> None:
     assert argv[argv.index("--key") + 1] == str(key), argv
     assert _has_bearer(argv), argv
     bearer = next(a for a in argv if a.lower().startswith("authorization: bearer "))
-    assert re.fullmatch(r"authorization: Bearer worker-1:\d+:[0-9a-f]{64}", bearer), bearer
+    assert re.fullmatch(r"authorization: Bearer v2:worker-1:\d+:[0-9a-f]{32}:[0-9a-f]{64}", bearer), bearer
+    # ...and it is bound to THIS report: the method, the path and the exact
+    # body curl sends (-d), under the fleet secret.
+    import hashlib, hmac
+    _, node, ts, nonce, sig = bearer.split("Bearer ", 1)[1].split(":")
+    body = argv[argv.index("-d") + 1]
+    msg = "\n".join(["v2", "POST", "/bootstrap/bundle/worker-1/applied", hashlib.sha256(body.encode()).hexdigest(), "worker-1", ts, nonce]).encode()
+    assert sig == hmac.new(b"fleet-secret", msg, hashlib.sha256).hexdigest(), bearer
+    assert f"x-noo-content-sha256: {hashlib.sha256(body.encode()).hexdigest()}" in argv, argv
     assert "x-noo-birth-proof: 1700000000.c2lnbmF0dXJl" in argv, argv
     assert argv[-1] == "https://ctl.example:8080/bootstrap/bundle/worker-1/applied", argv
 
