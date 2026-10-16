@@ -11,8 +11,7 @@
 //! of a row is ignored. `distribution` is optional: a kind with a `cli` and
 //! no `distribution` is a manual install.
 //!
-//! A pin is `sha256` keyed `any` (one artefact for every platform, an npm
-//! tarball) or keyed by noomesh's own platform facts, `<os>-<arch>` with os
+//! A pin is `sha256` keyed `any` (one artefact for every platform) or keyed by noomesh's own platform facts, `<os>-<arch>` with os
 //! `linux`/`macos` and arch `x86_64`/`aarch64`. `names` maps those facts to
 //! the vendor's own spelling inside the `source` URL template, which may use
 //! `{version}`, `{os}` and `{arch}`.
@@ -45,8 +44,6 @@ pub struct Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Format {
-    /// An npm package tarball (`package/…`).
-    NpmTarball,
     /// An archive holding the CLI.
     Tarball,
     /// A single executable.
@@ -85,7 +82,6 @@ impl Unpack {
 impl Format {
     pub fn as_str(self) -> &'static str {
         match self {
-            Format::NpmTarball => "npm-tarball",
             Format::Tarball => "tarball",
             Format::Binary => "binary",
         }
@@ -210,11 +206,11 @@ pub(crate) const FIXTURE: &str = r#"{
   "kinds": [
     { "kind": "noo", "cli": null, "title": "x", "extra": [1, 2] },
     { "kind": "copilot", "cli": "copilot",
-      "distribution": { "format": "npm-tarball",
-                        "source": "https://registry.npmjs.org/@github/copilot/-/copilot-{version}.tgz",
+      "distribution": { "format": "tarball",
+                        "source": "https://example.invalid/copilot/{version}/copilot.tgz",
                         "names": null, "version": "0.0.339",
                         "sha256": {"any": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
-                        "entry": "package/index.js", "unpack": "tgz" } },
+                        "entry": "bin/copilot", "unpack": "tgz" } },
     { "kind": "codex", "cli": "codex",
       "distribution": { "format": "binary",
                         "source": "https://example.invalid/codex/{version}/codex-{arch}-{os}",
@@ -247,7 +243,7 @@ mod tests {
         let t = parse(FIXTURE).unwrap();
         let by = |k: &str| t.kinds.iter().find(|r| r.kind == k).unwrap().clone();
         let cop = by("copilot").distribution.unwrap();
-        assert_eq!((cop.format, cop.unpack), (Format::NpmTarball, Unpack::Tgz));
+        assert_eq!((cop.format, cop.unpack), (Format::Tarball, Unpack::Tgz));
         assert!(cop.names.is_none() && cop.is_any());
         let cx = by("codex").distribution.unwrap();
         assert_eq!((cx.format, cx.unpack), (Format::Binary, Unpack::None));
@@ -294,7 +290,7 @@ mod tests {
         for os in OSES {
             for arch in ARCHES {
                 let (u, s) = artifact_url(&cop, os, arch).unwrap();
-                assert_eq!(u, "https://registry.npmjs.org/@github/copilot/-/copilot-0.0.339.tgz");
+                assert_eq!(u, "https://example.invalid/copilot/0.0.339/copilot.tgz");
                 assert_eq!(s, "a".repeat(64));
             }
         }

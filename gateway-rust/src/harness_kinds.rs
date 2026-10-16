@@ -62,7 +62,6 @@ pub struct Names {
 #[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum Format {
-    NpmTarball,
     Tarball,
     Binary,
 }
@@ -305,10 +304,10 @@ mod tests {
          "lane": {}, "launch": null, "telemetry_off": {}},
         {"kind": "copilot", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "copilot",
          "lane": {}, "launch": null, "telemetry_off": {},
-         "distribution": {"format": "npm-tarball", "source": "https://registry.npmjs.org/@github/copilot/-/copilot-{version}.tgz",
+         "distribution": {"format": "tarball", "source": "https://example.invalid/copilot/{version}/copilot.tgz",
            "names": null, "version": "0.0.339",
            "sha256": {"any": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
-           "entry": "package/index.js", "unpack": "tgz"}},
+           "entry": "bin/copilot", "unpack": "tgz"}},
         {"kind": "codex", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "codex",
          "lane": {}, "launch": null, "telemetry_off": {},
          "distribution": {"format": "binary", "source": "https://example.invalid/{version}/codex-{arch}-{os}",
@@ -324,7 +323,7 @@ mod tests {
         let t: Table = serde_json::from_str(FIXTURE).expect("fixture parses");
         let d = |k: &str| t.kinds.iter().find(|r| r.kind == k).unwrap().distribution.clone();
         let cop = d("copilot").unwrap();
-        assert_eq!((cop.format, cop.unpack), (Format::NpmTarball, Unpack::Tgz));
+        assert_eq!((cop.format, cop.unpack), (Format::Tarball, Unpack::Tgz));
         let cx = d("codex").unwrap();
         assert_eq!((cx.format, cx.unpack), (Format::Binary, Unpack::None));
         assert!(d("manual").is_none(), "a cli with no distribution is a manual install");
@@ -336,7 +335,7 @@ mod tests {
         let t: Table = serde_json::from_str(FIXTURE).unwrap();
         let cop = t.kinds.iter().find(|r| r.kind == "copilot").unwrap().distribution.clone().unwrap();
         let (u, s) = artifact_url(&cop.source, cop.names.as_ref(), &cop.version, &cop.sha256, "linux", "aarch64").unwrap();
-        assert_eq!(u, "https://registry.npmjs.org/@github/copilot/-/copilot-0.0.339.tgz");
+        assert_eq!(u, "https://example.invalid/copilot/0.0.339/copilot.tgz");
         assert_eq!(s, "a".repeat(64), "an any pin serves every platform, lowercased");
         let cx = t.kinds.iter().find(|r| r.kind == "codex").unwrap().distribution.clone().unwrap();
         let (u, _) = artifact_url(&cx.source, cx.names.as_ref(), &cx.version, &cx.sha256, "linux", "x86_64").unwrap();

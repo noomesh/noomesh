@@ -221,22 +221,22 @@ pub(crate) fn vendor_bundle_files(
     let table_row = table.kinds.iter().find(|k| k.kind == kind).and_then(|k| k.distribution.as_ref());
     let dist = table_row.expect("needs_for found a distribution");
     let cli = &needs[0];
-    let mut files: Vec<(&'static str, Vec<u8>)> = Vec::new();
-    files.push(("vendor-cli", staged(cli).unwrap_or_default()));
-    files.push((
-        "vendor-cli-manifest",
-        manifest_text(&[
-            ("kind", Some(kind)),
-            ("name", Some(&cli.name)),
-            ("version", Some(&cli.version)),
-            ("sha256", Some(&cli.sha256)),
-            ("format", Some(dist.format.as_str())),
-            ("unpack", Some(cli.unpack.as_str())),
-            ("entry", Some(&dist.entry)),
-        ])
-        .into_bytes(),
-    ));
-    Ok(files)
+    Ok(vec![
+        ("vendor-cli", staged(cli).unwrap_or_default()),
+        (
+            "vendor-cli-manifest",
+            manifest_text(&[
+                ("kind", Some(kind)),
+                ("name", Some(&cli.name)),
+                ("version", Some(&cli.version)),
+                ("sha256", Some(&cli.sha256)),
+                ("format", Some(dist.format.as_str())),
+                ("unpack", Some(cli.unpack.as_str())),
+                ("entry", Some(&dist.entry)),
+            ])
+            .into_bytes(),
+        ),
+    ])
 }
 
 /// The Mac applier learned the vendor kinds in this release; an older Mac
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn values_the_applier_would_interpolate_are_held_to_a_charset() {
-        let bad = FIXTURE.replace("package/index.js", "../../etc/passwd");
+        let bad = FIXTURE.replace("bin/copilot", "../../etc/passwd");
         assert!(needs_for(&parse(&bad).unwrap(), "copilot", "linux", "x86_64").unwrap_err().contains("entry"));
         let bad = FIXTURE.replace("\"0.0.339\"", "\"1.0;rm\"");
         assert!(needs_for(&parse(&bad).unwrap(), "copilot", "linux", "x86_64").unwrap_err().contains("version"));
@@ -669,10 +669,10 @@ mod tests {
         assert_eq!(f[0].1, b"bytes-of-copilot-0.0.339-any.tgz");
         let m: Value = serde_json::from_slice(&f[1].1).unwrap();
         assert_eq!(m, json!({"kind": "copilot", "name": "copilot", "version": "0.0.339", "sha256": "a".repeat(64),
-            "format": "npm-tarball", "unpack": "tgz", "entry": "package/index.js"}));
+            "format": "tarball", "unpack": "tgz", "entry": "bin/copilot"}));
         // One key per line: the Linux applier's sed reads this layout.
         let text = String::from_utf8(f[1].1.clone()).unwrap();
-        assert!(text.lines().any(|l| l == "  \"entry\": \"package/index.js\""), "{text}");
+        assert!(text.lines().any(|l| l == "  \"entry\": \"bin/copilot\""), "{text}");
         assert!(text.lines().any(|l| l == "  \"unpack\": \"tgz\","), "{text}");
     }
 
@@ -701,7 +701,6 @@ mod tests {
         assert!(e.contains("cannot be staged for linux/aarch64"), "{e}");
     }
 
-    #[test]
     #[test]
     fn wrapper_for_a_binary_execs_it_directly() {
         let w = wrapper_script("/opt/noo/vendor", "codex", "0.46.0", "codex");

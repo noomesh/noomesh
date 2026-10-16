@@ -32,7 +32,7 @@ OSES, ARCHES = {"linux", "macos"}, {"x86_64", "aarch64"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
-FORMATS = {"npm-tarball", "tarball", "binary"}
+FORMATS = {"tarball", "binary"}
 UNPACKS = {"tgz", "zip", "none"}
 
 
@@ -106,8 +106,6 @@ def test_every_kind_declares_its_distribution(row):
     _check_names(where, d["names"])
     per_platform = _check_sha(where, d["sha256"])
     _check_source(where, d["source"], per_platform)
-    if d["format"] == "npm-tarball":
-        assert not per_platform and d["unpack"] == "tgz", f"{where}: an npm tarball is one `any` .tgz"
     if d["format"] == "binary":
         assert d["unpack"] == "none", f"{where}: a binary is not unpacked"
         assert "/" not in d["entry"], f"{where}: a binary's entry is its file name"
