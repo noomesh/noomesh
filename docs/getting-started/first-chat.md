@@ -68,6 +68,30 @@ you joined one). A browser warns until it trusts the install's own CA:
 [trust-the-cluster-ca.md](trust-the-cluster-ca.md). Sign in with the admin
 account the wizard created. Grafana is at `https://localhost:3000`.
 
+## Voice in the console
+
+With the voice add-on on (`noo addons enable voice`, see
+[add-ons.md](add-ons.md)), the console's chat gains two controls:
+
+- **A microphone** next to the message box. Click it (or press `Alt+M`),
+  speak, click again to stop. The words land in the message box for you to
+  edit; nothing is sent until you press send. `Esc` or the ✕ cancels a
+  recording. One recording is capped at two minutes.
+- **A speaker** under each reply. Click it to hear the reply; click again to
+  stop. One reply plays at a time. Pick the voice from the account menu
+  (your name at the bottom of the sidebar) -> **Read-aloud voice**; the
+  choice is kept per account in that browser.
+
+The controls are hidden while voice is off. If the add-on is on but its
+speech-to-text or text-to-speech service is not answering, the matching
+control shows greyed out with a tooltip saying which; `noo voice status`
+gives the detail.
+
+The browser only grants the microphone to a secure page, so use the
+console over `https://` (the default, on `localhost` or your tailnet name).
+On a phone the browser asks for microphone permission the first time; if
+you refused it, allow it again in the browser's site settings.
+
 ## The two things people hit first
 
 - **The model is still loading.** Right after the first start, or after a
