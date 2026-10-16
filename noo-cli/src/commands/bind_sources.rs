@@ -147,7 +147,7 @@ fn produce(source: &str, expects_file: bool, data_root: Option<&str>) -> String 
     // systemd never installs hostd, so it is simply absent there).
     if basename(source) == ".noo-host-spool" {
         return format!(
-            "noo onboard --only services installs noo-hostd, which owns this spool; without systemd there is no hostd, and `noo onboard` creates '{source}' for you; otherwise mkdir -p it (as you)"
+            "with systemd, noo-hostd owns this spool: noo onboard --only services installs it; without systemd every start (noo onboard, noo stack start, noo upgrade --stack) creates it as you, so reaching this means that failed: mkdir -p '{source}' (as you)"
         );
     }
     // Onboard's storage step creates exactly [`directory_sources_under`]
@@ -483,12 +483,33 @@ pub fn run(args: &[String]) -> Result<i32, ()> {
             return Ok(65);
         }
     };
-    let findings = check_except(&cfg, &services, no_deps, &skip, data_root.as_deref());
-    if findings.is_empty() {
-        return Ok(0);
+    let (code, text) = launch_check(&cfg, &services, no_deps, &skip, data_root.as_deref(), systemd_present());
+    eprint!("{text}");
+    Ok(code)
+}
+
+/// The launch check over a parsed config: exit code and what to print.
+/// Without systemd there is no hostd, so the host spool is created here
+/// first, as the user (i76c: the dist launcher reaches only this path, and
+/// a fresh onboard in dind refused on the spool until someone ran mkdir).
+fn launch_check(
+    cfg: &Value,
+    services: &[String],
+    no_deps: bool,
+    skip: &[String],
+    data_root: Option<&str>,
+    systemd: bool,
+) -> (i32, String) {
+    let mut text = String::new();
+    for made in ensure_hostd_spool(cfg, services, no_deps, systemd) {
+        text.push_str(&format!("created the host executor spool {made} (no systemd, so no noo-hostd to own it)\n"));
     }
-    eprint!("{}", refusal(&findings));
-    Ok(EXIT_REFUSED)
+    let findings = check_except(cfg, services, no_deps, skip, data_root);
+    if findings.is_empty() {
+        return (0, text);
+    }
+    text.push_str(&refusal(&findings));
+    (EXIT_REFUSED, text)
 }
 
 #[cfg(test)]
@@ -786,5 +807,30 @@ mod tests {
         assert_eq!(findings[0].source, other.to_string_lossy());
         // Idempotent.
         assert!(ensure_hostd_spool(&cfg, &svcs, false, false).is_empty());
+    }
+
+    #[test]
+    fn launch_check_creates_the_spool_without_systemd_and_refuses_with_it() {
+        // The dist launcher's path (lib-bind-sources.sh -> `run`): no
+        // systemd, a fresh tree, the spool missing -> created, not refused.
+        let d = scratch("launch-spool");
+        let spool = d.join(".noo-host-spool");
+        let cfg = json!({"services": {"gateway": {"volumes": [
+            {"type": "bind", "source": spool.to_string_lossy(), "target": "/spool", "bind": {}}
+        ]}}});
+        let root = d.to_string_lossy().to_string();
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), false);
+        assert_eq!(code, 0, "{text}");
+        assert!(spool.is_dir());
+        assert!(text.contains("created the host executor spool"), "{text}");
+        // Present now: silent.
+        assert_eq!(launch_check(&cfg, &[], false, &[], Some(&root), false), (0, String::new()));
+        // With systemd it is hostd's: not created, refused, and the text
+        // says who owns it.
+        std::fs::remove_dir(&spool).unwrap();
+        let (code, text) = launch_check(&cfg, &[], false, &[], Some(&root), true);
+        assert_eq!(code, EXIT_REFUSED);
+        assert!(!spool.exists());
+        assert!(text.contains("noo-hostd owns this spool"), "{text}");
     }
 }

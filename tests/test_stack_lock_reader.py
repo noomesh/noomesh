@@ -22,7 +22,8 @@ import subprocess
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "noomesh-start.sh"
+# The one reader (dist_load_stack_lock), shared by start and restart.
+SCRIPT = ROOT / "scripts" / "lib-dist.sh"
 
 
 def _digest_loop() -> str:
@@ -36,7 +37,7 @@ def _digest_loop() -> str:
     """
     src = SCRIPT.read_text()
     end = src.index("done < stack.lock") + len("done < stack.lock")
-    start = src.rindex("while IFS= read -r line; do", 0, end)
+    start = src.rindex("    while IFS= read -r line; do", 0, end)
     block = src[start:end]
     assert "NOO_IMAGE_DIGEST_" in block, "extracted the wrong block from the launcher"
     return block

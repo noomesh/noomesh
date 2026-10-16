@@ -65,7 +65,21 @@ apply_dist_mode "."
 # x-noo-secrets-floor does not read. `secrets rotate` runs this script too.
 if [ "${DIST_MODE:-0}" = 1 ]; then
     require_secrets_floor "." "$NOO_IMAGE_TAG" || exit 1
+    # The signed digests, exactly as noomesh-start.sh loads them (one reader,
+    # lib-dist.sh). Without this `restart --force` recreated every core
+    # container by TAG - `gateway:v0.6.5-rc.1`, `ollama/ollama:0.40.5`, no
+    # @sha256 (0.6.5-rc.1 rehearsal). dist_reassert_pins drops any stale
+    # NOO_IMAGE_DIGEST_* load_secrets exported above.
+    DIST_TAG="$NOO_IMAGE_TAG"
+    dist_load_stack_lock "$DIST_TAG"
+    dist_reassert_pins
 fi
+# A recreate under distribution mode runs the lock's digests or refuses; a
+# plain `compose restart` keeps the containers' images and needs no lock.
+restart_require_lock() {
+    [ "${DIST_MODE:-0}" = 1 ] || return 0
+    dist_require_lock "$DIST_TAG" "recreate"
+}
 # Licensed add-ons run only their signed, local pins for this tag (see
 # lib-dist.sh require_addon_pins); restart never pulls one either.
 require_addon_pins || exit 1
@@ -244,6 +258,7 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
             AGENT_SCALE="--scale node-agent=0"
             ACTIVE_SVCS="$(printf '%s\n' "$ACTIVE_SVCS" | grep -vx node-agent)"
         fi
+        restart_require_lock || exit 1
         # shellcheck disable=SC2086
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
         docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE
@@ -289,6 +304,7 @@ else
     if [ "$FORCE_RECREATE" = true ]; then
         # --no-deps: "restart THESE" must not recreate half the stack via
         # depends_on; --no-build: a restart never compiles anything.
+        restart_require_lock || exit 1
         check_bind_sources --no-deps "${SERVICES[@]}" || exit 1
         docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --no-deps --force-recreate "${SERVICES[@]}" || RESTART_RC=$?
         if [ "$RESTART_RC" -eq 0 ]; then
