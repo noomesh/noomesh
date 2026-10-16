@@ -6411,6 +6411,10 @@ mod tests {
                 // derived rows.
                 // A node's own bus principal, delivered over the rail; a
                 // controller store that runs no node-agent never holds it.
+                // The add-ons' own bus passwords (i70 residue): absent is the
+                // one-release fallback, which `nats principals` WARNs on.
+                "NATS_TRELLION_PASSWORD",
+                "NATS_TRELLION_INTEL_PASSWORD",
                 "NATS_NODE_PASSWORD",
                 "ANTHROPIC_API_KEY",
                 // The other two cloud providers (rows added 2026-09-29; the
