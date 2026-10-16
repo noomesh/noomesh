@@ -103,6 +103,32 @@ impl RemoteRuntime {
         self
     }
 
+    /// Report what a foreign loop's model calls used (i83 E1b): the wire
+    /// translator's totals, posted as the `usage` op. The gateway records
+    /// them as this token's user on this token's node; `kind` is the
+    /// harness kind (`copilot`, `claude-code`, ...). An error is the
+    /// caller's to log — the turn's answer does not depend on it.
+    #[allow(dead_code)] // the foreign-loop driver (E1c) is the caller
+    pub async fn report_usage(
+        &self,
+        totals: &crate::harness::translator::UsageTotals,
+        model: &str,
+        kind: &str,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        self.call(HarnessOp::Usage {
+            prompt_tokens: totals.prompt_tokens,
+            completion_tokens: totals.completion_tokens,
+            total_tokens: totals.total_tokens,
+            calls: totals.calls,
+            model: model.to_string(),
+            kind: kind.to_string(),
+            task_id: task_id.map(str::to_string),
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// One rail call. Non-2xx and non-JSON answers are errors; the body's
     /// `error` field, when the gateway sent one, is the message.
     pub async fn call(&self, op: HarnessOp) -> Result<Value> {

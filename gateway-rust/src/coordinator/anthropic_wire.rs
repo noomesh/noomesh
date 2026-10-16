@@ -299,6 +299,11 @@ pub(crate) fn parse_response(body: &Value) -> Value {
 pub(crate) struct SseTranslator {
     tool_index_by_block: HashMap<u64, usize>,
     next_tool: usize,
+    /// `message_start` reported input tokens. When it did not (a stream
+    /// that only knows its usage at the end, like the harness's wire
+    /// translator), `message_delta`'s `input_tokens` is the count; when it
+    /// did, `message_delta`'s is the same number again and is not added.
+    saw_input: bool,
 }
 
 impl SseTranslator {
@@ -318,6 +323,7 @@ impl SseTranslator {
                     .iter()
                     .filter_map(|k| u.get(*k).and_then(|v| v.as_u64()))
                     .sum::<u64>();
+                self.saw_input = input > 0;
                 Ok(Some(json!({
                     "choices": [],
                     "usage": {"prompt_tokens": input, "completion_tokens": 0, "total_tokens": input},
@@ -378,9 +384,14 @@ impl SseTranslator {
                 }
                 chunk.insert("choices".into(), json!([choice]));
                 if let Some(out) = event.pointer("/usage/output_tokens").and_then(|v| v.as_u64()) {
+                    let input = if self.saw_input {
+                        0
+                    } else {
+                        event.pointer("/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    };
                     chunk.insert(
                         "usage".into(),
-                        json!({"prompt_tokens": 0, "completion_tokens": out, "total_tokens": out}),
+                        json!({"prompt_tokens": input, "completion_tokens": out, "total_tokens": input + out}),
                     );
                 }
                 Ok(Some(Value::Object(chunk)))
@@ -404,6 +415,413 @@ pub(crate) fn usage_tokens(u: &Value) -> (u64, u64, u64) {
     let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
     let total = get("total_tokens").unwrap_or(prompt + completion);
     (prompt, completion, total)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// The reverse direction (i83 E1b): Anthropic in, OpenAI to the backend
+// ═══════════════════════════════════════════════════════════════
+//
+// The node harness's wire translator serves `/v1/messages` to a foreign
+// CLI (Claude Code) in front of a backend that speaks OpenAI chat. The
+// three items below are the inverse of the three above:
+//
+// - [`request_body_from_anthropic`]: a `/v1/messages` body -> an OpenAI
+//   chat-completions body (system -> leading system message, `tool_use`
+//   -> `tool_calls`, `tool_result` -> `role:"tool"` messages).
+// - [`response_to_anthropic`]: an OpenAI assistant message + finish reason
+//   + usage -> a Messages response body.
+// - [`OpenAiToAnthropicSse`]: OpenAI SSE chunks -> the Anthropic event
+//   sequence (`message_start`, `content_block_*`, `message_delta`,
+//   `message_stop`).
+
+/// The text of an Anthropic `content` (a string, or the `text` of its
+/// text blocks) — for `system` and `tool_result` content.
+fn anthropic_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("text") == "text")
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// An Anthropic image block -> an OpenAI `image_url` content part.
+fn image_part(block: &Value) -> Option<Value> {
+    let src = block.get("source")?;
+    let url = match src.get("type").and_then(|t| t.as_str()) {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            src.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/png"),
+            src.get("data").and_then(|d| d.as_str())?
+        ),
+        Some("url") => src.get("url").and_then(|u| u.as_str())?.to_string(),
+        _ => return None,
+    };
+    Some(json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+/// Anthropic `tool_choice` -> OpenAI `tool_choice`.
+fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
+    match tc.get("type").and_then(|t| t.as_str())? {
+        "auto" => Some(json!("auto")),
+        "any" => Some(json!("required")),
+        "none" => Some(json!("none")),
+        "tool" => {
+            let name = tc.get("name").and_then(|n| n.as_str())?;
+            Some(json!({"type": "function", "function": {"name": name}}))
+        }
+        _ => None,
+    }
+}
+
+/// A `/v1/messages` request body -> an OpenAI chat-completions body.
+///
+/// - `system` (string or text blocks) becomes the leading system message.
+/// - A user turn's `tool_result` blocks become `role:"tool"` messages,
+///   emitted BEFORE the turn's own text: OpenAI wants the results right
+///   after the assistant message that asked for them.
+/// - An assistant turn's `tool_use` blocks become `tool_calls` (input
+///   serialised as the `arguments` string); `thinking` blocks are dropped
+///   (they carry a signature only Anthropic can check).
+/// - `tools` become function schemas; a tool with no `input_schema` (an
+///   Anthropic server tool) has no OpenAI equivalent and is dropped.
+/// - `max_tokens`, `temperature`, `top_p`, `stop_sequences`, `stream` and
+///   `tool_choice` carry over; `metadata`, `thinking` and the rest do not.
+pub(crate) fn request_body_from_anthropic(body: &Value) -> Value {
+    let mut messages: Vec<Value> = Vec::new();
+    let system = anthropic_text(body.get("system"));
+    if !system.trim().is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    for m in body.get("messages").and_then(|m| m.as_array()).map(Vec::as_slice).unwrap_or(&[]) {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let blocks: Vec<Value> = match m.get("content") {
+            Some(Value::String(s)) => vec![json!({"type": "text", "text": s})],
+            Some(Value::Array(b)) => b.clone(),
+            _ => Vec::new(),
+        };
+        if role == "assistant" {
+            let mut text = String::new();
+            let mut calls = Vec::new();
+            for b in &blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => text.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                    Some("tool_use") => calls.push(json!({
+                        "id": b.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "type": "function",
+                        "function": {
+                            "name": b.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "arguments": b.get("input").cloned().unwrap_or_else(|| json!({})).to_string(),
+                        },
+                    })),
+                    _ => {}
+                }
+            }
+            let mut msg = json!({"role": "assistant", "content": text});
+            if !calls.is_empty() {
+                msg["tool_calls"] = Value::Array(calls);
+            }
+            messages.push(msg);
+            continue;
+        }
+        // A user turn: tool results first, then whatever the person said.
+        let mut parts: Vec<Value> = Vec::new();
+        for b in &blocks {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("tool_result") => {
+                    let mut content = anthropic_text(b.get("content"));
+                    if b.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+                        content = format!("Error: {content}");
+                    }
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": b.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or(""),
+                        "content": content,
+                    }));
+                }
+                Some("text") => {
+                    let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if !t.is_empty() {
+                        parts.push(json!({"type": "text", "text": t}));
+                    }
+                }
+                Some("image") => parts.extend(image_part(b)),
+                _ => {}
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        let content = if parts.iter().all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text")) {
+            Value::String(
+                parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"),
+            )
+        } else {
+            Value::Array(parts)
+        };
+        messages.push(json!({"role": "user", "content": content}));
+    }
+
+    let mut out = json!({
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "messages": messages,
+        "stream": body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+    });
+    for (from, to) in [("max_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")] {
+        if let Some(v) = body.get(from).filter(|v| !v.is_null()) {
+            out[to] = v.clone();
+        }
+    }
+    let tools: Vec<Value> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name").and_then(|n| n.as_str()).filter(|n| !n.is_empty())?;
+            let schema = t.get("input_schema").filter(|s| s.is_object())?;
+            Some(json!({"type": "function", "function": {
+                "name": name,
+                "description": t.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "parameters": schema,
+            }}))
+        })
+        .collect();
+    if !tools.is_empty() {
+        out["tools"] = Value::Array(tools);
+        if let Some(tc) = body.get("tool_choice").and_then(tool_choice_to_openai) {
+            out["tool_choice"] = tc;
+        }
+    }
+    out
+}
+
+/// OpenAI `finish_reason` -> Anthropic `stop_reason`. A turn that produced
+/// tool calls is `tool_use` whatever the backend said (Ollama reports
+/// `stop` on a tool-call turn).
+pub(crate) fn stop_reason(finish_reason: Option<&str>, had_tool_calls: bool) -> &'static str {
+    if had_tool_calls {
+        return "tool_use";
+    }
+    match finish_reason {
+        Some("tool_calls") | Some("function_call") => "tool_use",
+        Some("length") => "max_tokens",
+        Some("content_filter") => "refusal",
+        _ => "end_turn",
+    }
+}
+
+/// A fresh Anthropic-shaped message id.
+fn message_id() -> String {
+    format!("msg_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// An OpenAI assistant message (`choices[0].message`), its finish reason
+/// and the reply's usage (prompt, completion) -> a `/v1/messages` response.
+pub(crate) fn response_to_anthropic(message: &Value, finish_reason: Option<&str>, usage: (u64, u64), model: &str) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    let text = content_text(message);
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    let calls = message.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    for (i, tc) in calls.iter().enumerate() {
+        let func = tc.get("function").unwrap_or(tc);
+        let id = tc
+            .get("id")
+            .and_then(|i| i.as_str())
+            .filter(|i| !i.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("toolu_{i}"));
+        content.push(json!({
+            "type": "tool_use",
+            "id": id,
+            "name": func.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+            "input": arguments_object(func.get("arguments")),
+        }));
+    }
+    json!({
+        "id": message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason(finish_reason, !calls.is_empty()),
+        "stop_sequence": null,
+        "usage": {"input_tokens": usage.0, "output_tokens": usage.1},
+    })
+}
+
+/// Which content block is open in an [`OpenAiToAnthropicSse`] stream.
+#[derive(Clone, Copy, PartialEq)]
+enum OpenBlock {
+    Text(u64),
+    Tool(u64),
+}
+
+/// Translates OpenAI chat-completion chunks into Anthropic SSE events —
+/// the inverse of [`SseTranslator`].
+///
+/// OpenAI streams text and tool-call deltas against one message and puts
+/// usage on a trailing chunk; Anthropic numbers content blocks, opens and
+/// closes each one, and puts the stop reason and usage on `message_delta`.
+/// Feed every chunk to [`on_chunk`](Self::on_chunk) and call
+/// [`finish`](Self::finish) once at the end; each returns the events to
+/// write, as `(event name, data)`.
+pub(crate) struct OpenAiToAnthropicSse {
+    model: String,
+    started: bool,
+    open: Option<OpenBlock>,
+    next_block: u64,
+    /// OpenAI tool-call index -> Anthropic block index.
+    tool_blocks: HashMap<u64, u64>,
+    finish_reason: Option<String>,
+    usage: (u64, u64),
+}
+
+impl OpenAiToAnthropicSse {
+    pub(crate) fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            started: false,
+            open: None,
+            next_block: 0,
+            tool_blocks: HashMap::new(),
+            finish_reason: None,
+            usage: (0, 0),
+        }
+    }
+
+    fn start(&mut self, out: &mut Vec<(String, Value)>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        out.push((
+            "message_start".into(),
+            json!({"type": "message_start", "message": {
+                "id": message_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": self.model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                // OpenAI reports usage only at the end; message_delta
+                // carries the real counts, input tokens included.
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }}),
+        ));
+    }
+
+    fn close(&mut self, out: &mut Vec<(String, Value)>) {
+        if let Some(OpenBlock::Text(i) | OpenBlock::Tool(i)) = self.open.take() {
+            out.push(("content_block_stop".into(), json!({"type": "content_block_stop", "index": i})));
+        }
+    }
+
+    /// One OpenAI chunk -> the Anthropic events it implies.
+    pub(crate) fn on_chunk(&mut self, chunk: &Value) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        self.start(&mut out);
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            let (p, c, _) = usage_tokens(u);
+            self.usage = (p, c);
+        }
+        let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+            return out;
+        };
+        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+        if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|t| !t.is_empty()) {
+            let index = match self.open {
+                Some(OpenBlock::Text(i)) => i,
+                _ => {
+                    self.close(&mut out);
+                    let i = self.next_block;
+                    self.next_block += 1;
+                    self.open = Some(OpenBlock::Text(i));
+                    out.push((
+                        "content_block_start".into(),
+                        json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}),
+                    ));
+                    i
+                }
+            };
+            out.push((
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": t}}),
+            ));
+        }
+        for tc in delta.get("tool_calls").and_then(|t| t.as_array()).map(Vec::as_slice).unwrap_or(&[]) {
+            let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let func = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+            let block = match self.tool_blocks.get(&ti).copied() {
+                Some(b) => b,
+                None => {
+                    self.close(&mut out);
+                    let b = self.next_block;
+                    self.next_block += 1;
+                    self.tool_blocks.insert(ti, b);
+                    self.open = Some(OpenBlock::Tool(b));
+                    let id = tc
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .filter(|i| !i.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("toolu_{ti}"));
+                    out.push((
+                        "content_block_start".into(),
+                        json!({"type": "content_block_start", "index": b, "content_block": {
+                            "type": "tool_use",
+                            "id": id,
+                            "name": func.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                            "input": {},
+                        }}),
+                    ));
+                    b
+                }
+            };
+            // Arguments arrive as a JSON string in fragments, or (Ollama,
+            // converted upstream) whole; either way they are partial JSON.
+            let part = match func.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v @ Value::Object(_)) => v.to_string(),
+                _ => String::new(),
+            };
+            if !part.is_empty() {
+                out.push((
+                    "content_block_delta".into(),
+                    json!({"type": "content_block_delta", "index": block, "delta": {"type": "input_json_delta", "partial_json": part}}),
+                ));
+            }
+        }
+        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            self.finish_reason = Some(fr.to_string());
+        }
+        out
+    }
+
+    /// The closing events: the open block's stop, `message_delta` with the
+    /// stop reason and usage, `message_stop`.
+    pub(crate) fn finish(&mut self) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        self.start(&mut out);
+        self.close(&mut out);
+        let sr = stop_reason(self.finish_reason.as_deref(), !self.tool_blocks.is_empty());
+        out.push((
+            "message_delta".into(),
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": sr, "stop_sequence": null},
+                   "usage": {"input_tokens": self.usage.0, "output_tokens": self.usage.1}}),
+        ));
+        out.push(("message_stop".into(), json!({"type": "message_stop"})));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -562,8 +980,145 @@ pub(crate) mod tests {
         assert_eq!(chunks[4]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"], "{\"query\": ");
         assert_eq!(chunks[6]["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(chunks[6]["usage"]["completion_tokens"], 42);
+        // The real API repeats input_tokens on message_delta: not added twice.
+        let mut t2 = SseTranslator::new();
+        t2.translate(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 50}}})).unwrap();
+        let d = t2.translate(&json!({"type": "message_delta", "delta": {}, "usage": {"input_tokens": 50, "output_tokens": 3}})).unwrap().unwrap();
+        assert_eq!(d["usage"]["prompt_tokens"], 0);
         // The stream's own error event is an error, not silence.
         let e = t.translate(&json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}));
         assert!(e.unwrap_err().contains("Overloaded"));
+    }
+
+    // ── the reverse direction (E1b) ──────────────────────────
+
+    #[test]
+    fn an_anthropic_request_becomes_an_openai_body_with_tool_results_first() {
+        let body = json!({
+            "model": "claude-sonnet-x",
+            "max_tokens": 1024,
+            "system": [{"type": "text", "text": "Be brief."}],
+            "stop_sequences": ["END"],
+            "tool_choice": {"type": "any"},
+            "tools": [
+                {"name": "read_file", "description": "read", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ],
+            "messages": [
+                {"role": "user", "content": "open a.txt"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hm", "signature": "sig"},
+                    {"type": "text", "text": "Reading."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.txt"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "hello"}]},
+                    {"type": "text", "text": "now summarise"},
+                ]},
+            ],
+            "stream": true,
+        });
+        let out = request_body_from_anthropic(&body);
+        assert_eq!(out["model"], "claude-sonnet-x");
+        assert_eq!(out["max_tokens"], 1024);
+        assert_eq!(out["stop"], json!(["END"]));
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["tool_choice"], "required");
+        assert_eq!(out["tools"].as_array().unwrap().len(), 1, "the server tool has no OpenAI form");
+        assert_eq!(out["tools"][0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+        let m = out["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 5, "{m:#?}");
+        assert_eq!(m[0], json!({"role": "system", "content": "Be brief."}));
+        assert_eq!(m[1], json!({"role": "user", "content": "open a.txt"}));
+        assert_eq!(m[2]["content"], "Reading.", "thinking dropped");
+        let tc = &m[2]["tool_calls"][0];
+        assert_eq!((tc["id"].as_str(), tc["function"]["name"].as_str()), (Some("toolu_1"), Some("read_file")));
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"path": "a.txt"}));
+        assert_eq!(m[3], json!({"role": "tool", "tool_call_id": "toolu_1", "content": "hello"}));
+        assert_eq!(m[4], json!({"role": "user", "content": "now summarise"}));
+    }
+
+    #[test]
+    fn an_openai_message_becomes_an_anthropic_response() {
+        let msg = json!({"role": "assistant", "content": "Let me look.", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b\"}"}},
+        ]});
+        let r = response_to_anthropic(&msg, Some("stop"), (12, 4), "qwen");
+        assert_eq!(r["type"], "message");
+        assert_eq!(r["role"], "assistant");
+        assert_eq!(r["model"], "qwen");
+        assert!(r["id"].as_str().unwrap().starts_with("msg_"));
+        assert_eq!(r["content"][0], json!({"type": "text", "text": "Let me look."}));
+        assert_eq!(r["content"][1], json!({"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "b"}}));
+        assert_eq!(r["stop_reason"], "tool_use", "tool calls win over the backend's `stop`");
+        assert_eq!(r["usage"], json!({"input_tokens": 12, "output_tokens": 4}));
+        let plain = response_to_anthropic(&json!({"role": "assistant", "content": "done"}), Some("length"), (1, 1), "m");
+        assert_eq!(plain["stop_reason"], "max_tokens");
+        assert_eq!(plain["content"].as_array().unwrap().len(), 1);
+    }
+
+    /// Round trip: the Anthropic events this produces, fed back through the
+    /// phase-C `SseTranslator`, give the same text, tool call and usage.
+    #[test]
+    fn openai_chunks_become_a_valid_anthropic_event_sequence() {
+        let chunks = [
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "Let me "}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "check."}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_9", "type": "function", "function": {"name": "web_search", "arguments": ""}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"query\":"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"noo\"}"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 42, "total_tokens": 92}}),
+        ];
+        let mut t = OpenAiToAnthropicSse::new("qwen");
+        let mut events: Vec<(String, Value)> = chunks.iter().flat_map(|c| t.on_chunk(c)).collect();
+        events.extend(t.finish());
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
+                "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
+                "message_delta", "message_stop",
+            ],
+        );
+        for (name, data) in &events {
+            assert_eq!(data["type"], name.as_str(), "the event name is the data's type");
+        }
+        assert_eq!(events[5].1["index"], 1, "the tool block follows the text block");
+        assert_eq!(events[5].1["content_block"]["id"], "call_9");
+        assert_eq!(events[9].1["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events[9].1["usage"], json!({"input_tokens": 50, "output_tokens": 42}));
+
+        // Back through phase C's translator: the loop would see the same turn.
+        let mut back = SseTranslator::new();
+        let mut text = String::new();
+        let mut args = String::new();
+        let mut usage = (0, 0);
+        for (_, data) in &events {
+            if let Some(c) = back.translate(data).unwrap() {
+                if let Some(s) = c.pointer("/choices/0/delta/content").and_then(|s| s.as_str()) {
+                    text.push_str(s);
+                }
+                if let Some(a) = c.pointer("/choices/0/delta/tool_calls/0/function/arguments").and_then(|s| s.as_str()) {
+                    args.push_str(a);
+                }
+                if let Some(u) = c.get("usage") {
+                    let (p, o, _) = usage_tokens(u);
+                    usage = (usage.0 + p, usage.1 + o);
+                }
+            }
+        }
+        assert_eq!(text, "Let me check.");
+        assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({"query": "noo"}));
+        assert_eq!(usage, (50, 42));
+
+        // An empty stream still opens and closes a message.
+        let mut empty = OpenAiToAnthropicSse::new("m");
+        let names: Vec<String> = empty.finish().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["message_start", "message_delta", "message_stop"]);
     }
 }

@@ -24,7 +24,7 @@
 //! in degraded mode (no context injection but still functional).
 
 mod agent_loop;
-mod anthropic_wire;
+pub(crate) mod anthropic_wire;
 mod backend;
 pub mod classes;
 mod cloud;

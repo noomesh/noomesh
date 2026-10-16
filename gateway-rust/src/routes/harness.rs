@@ -248,6 +248,31 @@ async fn harness_call(
             };
             json!({"state": after, "token": token})
         }
+        HarnessOp::Usage { prompt_tokens, completion_tokens, total_tokens, calls, model, kind, task_id } => {
+            // A foreign loop's model calls, counted by the harness's wire
+            // translator. Charged to the token's user on the token's node —
+            // the body names neither — and the kind must be a declared one.
+            if !crate::harness_kinds::names().contains(&kind.as_str()) {
+                return Err(AppError::BadRequest(format!("harness rail: unknown harness kind {kind:?}")).into());
+            }
+            let model = if model.trim().is_empty() { "unknown".to_string() } else { model };
+            tracing::info!(
+                node = %turn.node, user, conversation = conv, kind = %kind, model = %model,
+                task = task_id.as_deref().unwrap_or(""), calls, prompt_tokens, completion_tokens, total_tokens,
+                "harness_usage"
+            );
+            let clamp = |n: u64| n.min(i32::MAX as u64) as u32;
+            crate::usage::record_harness(
+                state.db.clone(),
+                turn.node.clone(),
+                model,
+                kind,
+                user.to_string(),
+                clamp(prompt_tokens),
+                clamp(completion_tokens),
+            );
+            json!({})
+        }
         HarnessOp::OperatorAlert { kind, target, cooldown_secs, message } => {
             // A harness may raise the alert kinds the loop raises, nothing else.
             if kind != "inference.backend_failover" {

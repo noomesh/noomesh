@@ -1615,6 +1615,23 @@ BEGIN
     END IF;
 END $$
 "#,
+}, Migration {
+    revision: "089_usage_harness_kind",
+    down_revision: Some("088_placement_target_usage"),
+    // i83 E1b: a foreign loop on a node harness (Copilot CLI, Claude Code)
+    // makes its model calls through the harness's wire translator, which
+    // counts them; the `usage` rail op records the totals here as the
+    // turn's user on the harness's node. `harness_kind` names the loop
+    // (`config/harness-kinds.json`): NULL for every row any other writer
+    // makes, so nothing existing changes meaning.
+    //
+    // Raw rows only. The monthly rollup keeps its key; a harness row's
+    // `backend` is `harness:<kind>`, so `group=backend` still separates
+    // the kinds after retention. Adding the column on the partitioned
+    // parent adds it to every partition; nullable, no default, no rewrite.
+    sql: r#"
+ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text;
+"#,
 }];
 
 /// The Alembic revision the baselines reproduce.
@@ -2366,6 +2383,16 @@ mod tests {
             "must rewrite the derive trigger — a bare column DEFAULT shadows \
              it and silently files every user's conversation under 'default'"
         );
+    }
+
+    /// 089 sits on 088 and adds the column `usage::insert` writes.
+    #[test]
+    fn usage_harness_kind_revision_adds_the_column_the_writer_names() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == "089_usage_harness_kind").expect("089 must be in the chain");
+        assert_eq!(m.down_revision, Some("088_placement_target_usage"));
+        assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS harness_kind text"));
+        let writer = include_str!("usage.rs");
+        assert!(writer.contains("prompt_tokens, completion_tokens, harness_kind)"), "usage::insert must write harness_kind");
     }
 
     /// Post-cut-over revisions only. Anything up to BASELINE_REVISION is the

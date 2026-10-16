@@ -70,6 +70,20 @@ pub enum HarnessOp {
     OperatorAlert { kind: String, target: String, cooldown_secs: i64, message: String },
     // a task's loops
     TaskCheckpoint { task_id: String, loops: u32, #[serde(default)] note: Option<String>, #[serde(default)] exhausted: bool },
+    // metering
+    /// The tokens a foreign loop's model calls used, as the harness's wire
+    /// translator counted them (i83 E1b). Recorded on the gateway as the
+    /// token's user, on the token's node; `kind` is the harness kind.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        calls: u32,
+        model: String,
+        kind: String,
+        #[serde(default)]
+        task_id: Option<String>,
+    },
 }
 
 impl HarnessOp {
@@ -110,6 +124,7 @@ impl HarnessOp {
         "maybe_summary",
         "operator_alert",
         "task_checkpoint",
+        "usage",
     ];
 
     /// The op's wire name, for audit rows and logs.
@@ -149,6 +164,7 @@ impl HarnessOp {
             HarnessOp::MaybeSummary { .. } => "maybe_summary",
             HarnessOp::OperatorAlert { .. } => "operator_alert",
             HarnessOp::TaskCheckpoint { .. } => "task_checkpoint",
+            HarnessOp::Usage { .. } => "usage",
         }
     }
 }
@@ -166,6 +182,7 @@ mod tests {
             HarnessOp::ResolveBackend { model: None, exclude_urls: vec![] },
             HarnessOp::ExecuteTool { call: ToolCall { id: "1".into(), name: "web_search".into(), arguments: json!({"query": "x"}) } },
             HarnessOp::MaybeSummary { backend: ResolvedBackend { url: "u".into(), model: "m".into(), backend_type: "vllm".into(), api_format: "openai".into() }, turn: 4 },
+            HarnessOp::Usage { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, calls: 3, model: "qwen".into(), kind: "copilot".into(), task_id: Some("t1".into()) },
         ];
         for op in ops {
             let wire = serde_json::to_value(&op).unwrap();
@@ -215,6 +232,7 @@ mod tests {
             HarnessOp::MaybeSummary { backend, turn: 0 },
             HarnessOp::OperatorAlert { kind: String::new(), target: String::new(), cooldown_secs: 0, message: String::new() },
             HarnessOp::TaskCheckpoint { task_id: String::new(), loops: 0, note: None, exhausted: false },
+            HarnessOp::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, calls: 0, model: String::new(), kind: String::new(), task_id: None },
         ]
     }
 
@@ -239,6 +257,21 @@ mod tests {
         for needle in ["harness.run.", "harness.task.", "harness.ready.", "harness.turn.", "/api/harness/call", "harness_result"] {
             assert!(doc.contains(needle), "docs/reference/harness-protocol.md does not mention {needle}");
         }
+    }
+
+    /// The `usage` op's wire form: what a foreign runner posts, with
+    /// `task_id` optional.
+    #[test]
+    fn the_usage_op_reads_its_documented_wire_form() {
+        let op: HarnessOp = serde_json::from_value(json!({
+            "op": "usage", "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            "calls": 2, "model": "qwen", "kind": "claude-code",
+        }))
+        .unwrap();
+        assert_eq!(
+            op,
+            HarnessOp::Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, calls: 2, model: "qwen".into(), kind: "claude-code".into(), task_id: None }
+        );
     }
 
     #[test]
