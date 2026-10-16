@@ -404,6 +404,12 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // evolve: python:3.12-slim with no USER line (root); the overlay's
     // entrypoint stages the key to /tmp as that uid before libpq reads it.
     ("evolve", KeyReader::ContainerRoot),
+    // docker/Dockerfile.sandbox ends `USER nonroot`: 65532, measured with
+    // `docker run --rm --entrypoint id` on the published sandbox image.
+    // uvicorn reads the key itself (`--ssl-keyfile`). Mounted under /tls,
+    // which is not in the sandbox's bwrap RO_PATHS, so code run by /exec
+    // never sees it.
+    ("sandbox", KeyReader::ContainerUid(65532)),
     // A warm standby's replication client identity.
     // No container on THIS box mounts it: the operator's CLI reads it, and
     // `scripts/bootstrap-standby.sh join` stages a 0600 copy owned by the
@@ -2400,6 +2406,39 @@ mod key_mode_tests {
         assert_eq!(readable_by_uid(&key, 65532), Some(true), "noo-worker (nonroot) can start");
     }
 
+    /// The sandbox door (mTLS doors phase 1): its own SERVICE leaf, onboarded
+    /// and upgrade-issued like every SVC_LIST name, serving `sandbox` (the
+    /// alias the gateway, the worker and trellion dial, which the
+    /// sandbox-extra replicas carry too) and `localhost` (the container's own
+    /// healthcheck). The key is handed to the image's nonroot uid, which is
+    /// what uvicorn reads it as.
+    #[test]
+    fn the_sandbox_is_issued_its_own_server_leaf() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        assert!(crate::onboard::steps::SVC_LIST.contains(&"sandbox"), "onboard and upgrade --stack would never issue it");
+        let (extra, ips) = crate::onboard::steps::service_cert_sans("sandbox", "Pop-Host", "10.0.0.1", "pop.ts.net");
+        assert!(ips.is_empty(), "the sandbox is compose-network only: no LAN IP in its leaf: {ips:?}");
+        let (crt, key) = ca.issue_service_cert("sandbox", &extra, &ips, 90).unwrap();
+        let data = std::fs::read(&crt).unwrap();
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&data).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        let orgs: Vec<&str> = cert.subject().iter_organization().filter_map(|a| a.as_str().ok()).collect();
+        assert_eq!(orgs, vec!["Mesh Cluster Service"], "a service leaf names no node and no controller");
+        assert!(cert.extended_key_usage().unwrap().expect("EKU").value.server_auth, "uvicorn serves it");
+        let dns: Vec<String> = cert.subject_alternative_name().unwrap().unwrap().value.general_names.iter()
+            .filter_map(|g| if let x509_parser::extensions::GeneralName::DNSName(d) = g { Some(d.to_string()) } else { None })
+            .collect();
+        for name in ["sandbox", "localhost", "noo-sandbox", "sandbox-extra"] {
+            assert!(dns.contains(&name.to_string()), "{name} missing: {dns:?}");
+        }
+        for controller_name in ["gateway", "noo-controller", "Pop-Host", "pop.ts.net"] {
+            assert!(!dns.contains(&controller_name.to_string()), "the sandbox claims {controller_name}: {dns:?}");
+        }
+        assert_eq!(ca.key_reader(&key), KeyReader::ContainerUid(65532));
+        assert_eq!(readable_by_uid(&key, 65532), Some(true), "noo-sandbox (nonroot) can start");
+    }
+
     /// The mode table, file by file: who reads it decides the bits.
     #[test]
     fn the_reader_of_each_key_follows_its_path() {
@@ -2414,6 +2453,7 @@ mod key_mode_tests {
         assert_eq!(r("services/grafana/service.key"), KeyReader::ContainerUid(65532), "compose user: 65532 (i64)");
         assert_eq!(r("services/nats/service.key"), KeyReader::ContainerRoot);
         assert_eq!(r("services/loki/service.key"), KeyReader::ContainerUid(65532));
+        assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.sandbox USER nonroot");
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
         assert_eq!(r("stray.key"), KeyReader::Unknown);

@@ -954,13 +954,30 @@ async fn execute_native(state: &AppState, call: &ToolCall) -> Option<ToolResult>
 /// is unconditional in both launchers, so "no sandbox" is a deployment
 /// bug, not a mode. There is NO local-subprocess fallback by design:
 /// arbitrary code runs in noo-sandbox or not at all.
-fn sandbox_url() -> String {
-    std::env::var("NOO_SANDBOX_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        // Plaintext by named exception: the sandbox door is deferred by the
-        // operator (tests/test_gateway_refuses_plaintext.py ALLOW).
-        .unwrap_or_else(|| "http://sandbox:9000".to_string())
+///
+/// mTLS doors phase 1 (i77): the sandbox serves TLS and requires a
+/// cluster-CA client certificate, so the URL is `https://` and a plaintext
+/// override is REFUSED (`Err`) with the fix named, never dialled — a
+/// stale `http://sandbox:9000` in `.env` must fail loudly, not fall back.
+fn sandbox_url() -> Result<String, String> {
+    resolve_sandbox_url(std::env::var("NOO_SANDBOX_URL").ok().as_deref())
+}
+
+const SANDBOX_DEFAULT_URL: &str = "https://sandbox:9000";
+
+fn resolve_sandbox_url(env: Option<&str>) -> Result<String, String> {
+    let url = env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(SANDBOX_DEFAULT_URL)
+        .to_string();
+    if !url.to_ascii_lowercase().starts_with("https://") {
+        return Err(format!(
+            "NOO_SANDBOX_URL={url} is not https — the sandbox serves mTLS only; \
+             set NOO_SANDBOX_URL={SANDBOX_DEFAULT_URL} (or unset it) and recreate the gateway"
+        ));
+    }
+    Ok(url)
 }
 
 /// `python_tool` — POST straight to the sandbox `/exec`. Port of
@@ -981,16 +998,24 @@ async fn native_python_exec(call: &ToolCall, args: &Value) -> ToolResult {
     // offered one and the sandbox ignores it on the wire.
     let body = json!({ "code": code, "timeout": timeout_secs });
 
-    let url = format!("{}/exec", sandbox_url().trim_end_matches('/'));
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs_f64(timeout_secs + 5.0))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return err_result(call, format!("sandbox client: {e}")),
+    let base = match sandbox_url() {
+        Ok(u) => u,
+        Err(e) => return err_result(call, e),
     };
+    let url = format!("{}/exec", base.trim_end_matches('/'));
+    // The cluster client: trusts the cluster CA only and presents this
+    // gateway's leaf, which the sandbox listener requires
+    // (`--ssl-cert-reqs 2`). The per-request timeout overrides the shared
+    // client's backend default — a call may legitimately run 300s.
+    let client = crate::tls::cluster_client();
 
-    match client.post(&url).json(&body).send().await {
+    match client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs_f64(timeout_secs + 5.0))
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let payload: Value = resp.json().await.unwrap_or(json!({}));
             let output = payload
@@ -1948,6 +1973,28 @@ fn strip_quote_tokens(v: &mut Value) {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+
+    /// mTLS doors phase 1: the sandbox door is https by default, and a
+    /// plaintext override is refused with the fix named, never dialled.
+    #[test]
+    fn the_sandbox_door_is_https_and_refuses_a_plaintext_override() {
+        assert_eq!(resolve_sandbox_url(None).unwrap(), "https://sandbox:9000");
+        assert_eq!(resolve_sandbox_url(Some("  ")).unwrap(), "https://sandbox:9000");
+        assert_eq!(resolve_sandbox_url(Some("https://sandbox:9443")).unwrap(), "https://sandbox:9443");
+        let e = resolve_sandbox_url(Some(&format!("{}://sandbox:9000", "http"))).unwrap_err();
+        assert!(e.contains("not https") && e.contains("NOO_SANDBOX_URL=https://sandbox:9000"), "{e}");
+        assert!(resolve_sandbox_url(Some("sandbox:9000")).is_err(), "a bare host is not a scheme");
+    }
+
+    /// The dial goes through the cluster client (CA + this gateway's leaf),
+    /// never a fresh default client that would present no certificate.
+    #[test]
+    fn python_exec_dials_the_sandbox_with_the_cluster_client() {
+        let src = include_str!("tools.rs");
+        let body = src.split("async fn native_python_exec(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("crate::tls::cluster_client()"), "python_exec must present the gateway leaf");
+        assert!(!body.contains("reqwest::Client::builder()"), "a default client presents no client certificate");
+    }
 
     #[test]
     fn a_task_result_carries_the_tools_it_called_as_evidence() {

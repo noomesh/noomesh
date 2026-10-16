@@ -53,6 +53,7 @@ def test_sandbox_path_used_when_configured_not_subprocess():
     def fake_post(url, **kwargs):
         calls["url"] = url
         calls["json"] = kwargs.get("json")
+        calls["kwargs"] = kwargs
         return _Resp()
 
     # If code ran in-process instead of the sandbox, this marker would appear.
@@ -63,18 +64,52 @@ def test_sandbox_path_used_when_configured_not_subprocess():
     pt.httpx.post = fake_post
     pt.subprocess.run = fail_subprocess
     try:
-        out = _run_python({"code": "print('x')"}, "http://sandbox:9000")
+        out = _run_python({"code": "print('x')"}, "https://sandbox:9000")
     finally:
         pt.httpx.post, pt.subprocess.run = orig_post, orig_run
 
     assert out == "sandboxed-ok"
-    assert calls["url"] == "http://sandbox:9000/exec"
+    assert calls["url"] == "https://sandbox:9000/exec"
     assert calls["json"]["code"] == "print('x')"
+    # The cluster TLS context rides every call: CA verify + the caller's leaf.
+    assert "verify" in calls["kwargs"] and "cert" in calls["kwargs"]
+
+
+def test_sandbox_client_presents_the_cluster_leaf(tmp_path, monkeypatch):
+    for name in ("ca.crt", "leaf.crt", "leaf.key"):
+        (tmp_path / name).write_text("x")
+    monkeypatch.setenv("NOO_TLS_CA", str(tmp_path / "ca.crt"))
+    monkeypatch.setenv("NOO_TLS_CERT", str(tmp_path / "leaf.crt"))
+    monkeypatch.setenv("NOO_TLS_KEY", str(tmp_path / "leaf.key"))
+    import ssl
+
+    monkeypatch.setattr(ssl, "create_default_context", lambda cafile=None: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    kw = pt.sandbox_tls_kwargs()
+    assert kw["cert"] == (str(tmp_path / "leaf.crt"), str(tmp_path / "leaf.key"))
+    assert isinstance(kw["verify"], ssl.SSLContext)
+    assert kw["verify"].verify_mode == ssl.CERT_REQUIRED and kw["verify"].check_hostname
+
+
+def test_plaintext_sandbox_url_is_refused_not_dialled():
+    _clear_optin()
+
+    def no_dial(*a, **k):
+        raise AssertionError("a plaintext sandbox URL must not be dialled")
+
+    orig_post = pt.httpx.post
+    pt.httpx.post = no_dial
+    try:
+        out = _run_python({"code": "print('x')"}, "http" + "://sandbox:9000")
+    finally:
+        pt.httpx.post = orig_post
+    assert "not https" in out and "https://sandbox:9000" in out
 
 
 if __name__ == "__main__":
     failures = 0
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    # Fixture-taking tests (tmp_path, monkeypatch) run under pytest only.
+    tests = [v for k, v in sorted(globals().items())
+             if k.startswith("test_") and callable(v) and not v.__code__.co_argcount]
     for t in tests:
         try:
             t()
