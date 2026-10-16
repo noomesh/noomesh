@@ -164,6 +164,35 @@ mod tests {
         }
     }
 
+    /// The pinned vendor artefacts (`distribution`, `runtimes`) ride in the
+    /// same file. `HarnessKind` has no field for them yet and serde ignores
+    /// unknown fields (no `deny_unknown_fields`), so the typed table still
+    /// parses; this looks at the raw JSON so a foreign kind cannot ship
+    /// without the artefact the controller stages for it.
+    #[test]
+    fn foreign_kinds_carry_a_pinned_distribution() {
+        let _ = all(); // the typed parse tolerates the new fields
+        let v: serde_json::Value = serde_json::from_str(RAW).unwrap();
+        let hex64 = |s: &serde_json::Value| s.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        for k in v["kinds"].as_array().unwrap() {
+            let d = k.get("distribution").unwrap_or_else(|| panic!("{} has no distribution key", k["kind"]));
+            if k["cli"].is_null() {
+                assert!(d.is_null(), "{} has no CLI, so no distribution", k["kind"]);
+                continue;
+            }
+            assert!(d.is_object(), "{} launches a CLI but has no distribution", k["kind"]);
+            assert!(d["version"].as_str().is_some_and(|s| !s.is_empty()), "{} distribution.version", k["kind"]);
+            let sha = d["sha256"].as_object().unwrap_or_else(|| panic!("{} distribution.sha256", k["kind"]));
+            let keys: Vec<&str> = if sha.contains_key("any") { vec!["any"] } else { vec!["linux-x86_64", "linux-aarch64", "macos-aarch64"] };
+            for p in keys {
+                assert!(sha.get(p).is_some_and(hex64), "{} sha256[{p}]", k["kind"]);
+            }
+            if let Some(rt) = d["runtime"].as_str() {
+                assert!(v["runtimes"][rt].is_object(), "{} needs runtime {rt}, not pinned", k["kind"]);
+            }
+        }
+    }
+
     #[test]
     fn the_validation_message_lists_the_table() {
         assert_eq!(names().join(", "), "noo, claude-code, copilot, codex");

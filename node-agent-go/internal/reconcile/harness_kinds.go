@@ -40,6 +40,11 @@ type harnessKind struct {
 	// Launch is how the driver invokes the CLI; the driver parses it.
 	Launch       json.RawMessage   `json:"launch"`
 	TelemetryOff map[string]string `json:"telemetry_off"`
+	// Distribution is the vendor artefact the controller stages for the
+	// CLI, pinned by version and sha256 (scripts/vendor-pin.py); null for
+	// `noo`. Parse-only here: the applier installs it, the agent never
+	// fetches anything.
+	Distribution json.RawMessage `json:"distribution"`
 }
 
 var (

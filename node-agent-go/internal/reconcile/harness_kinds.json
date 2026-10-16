@@ -1,5 +1,28 @@
 {
-  "_comment": "The harness kinds a harness placement may name in NOO_HARNESS_KIND, declared ONCE. The gateway (gateway-rust/src/harness_kinds.rs) validates placements against it, the node agent embeds a byte-equal copy (node-agent-go/internal/reconcile/harness_kinds.json, held equal by TestHarnessKindsTableMatchesTheShippedFile) for wire compatibility, runner and vendor-CLI presence, lane and telemetry switches, and the noo CLI checks --kind against it. kind: the NOO_HARNESS_KIND value. wire: the API the harness speaks. wires: the node chat backend types that serve it (empty = no node backend serves it yet). runner: the executable the applier installs beside the agent; ONE runner serves every kind, the gateway binary in harness mode (`noo-gateway harness`), which for a foreign kind launches the vendor's headless CLI and fronts the node's model with a loopback wire translator (null = no runner ships yet; the node agent refuses the kind). cli: the vendor executable that must be on PATH on the node for a foreign kind (null for `noo`); the node agent refuses the kind while it is absent. lane: env vars the runner sets to keep the CLI one-shot and inside its lane (no auto-update, no interactive prompt, no vendor login flow), merged after any placement value; only variables verified in vendor documentation are listed, empty when none are. launch: how the driver invokes the CLI (null for `noo`): command is the argv with {prompt} filled in, model_url_env and model_env name the variables that point the CLI at the loopback translator and name its model, mcp says how the CLI takes an MCP server. A value starting `unverified:` is documented-but-unconfirmed or undocumented and is for the driver (i83 phase E1c) to settle. telemetry_off: the vendor telemetry switches the runner must launch it with, merged after any placement value (docs/security/telemetry.md, Agent harnesses); every kind has an entry, empty when there is nothing to switch off or none is declared yet. Optional launch fields the driver (gateway-rust/src/harness/driver.rs) reads: model_url_suffix (appended to the translator's base URL), api_key_env (filled with a placeholder; the loopback translator takes no key), model_alias_envs (more model-naming variables, all set to the pinned model) and home_env (the CLI's config directory, pointed inside the task's own HOME); launch.mcp `config-file` means the driver writes the MCP config and passes its path as {mcp_config} in command.",
+  "_comment": "The harness kinds a harness placement may name in NOO_HARNESS_KIND, declared ONCE. The gateway (gateway-rust/src/harness_kinds.rs) validates placements against it, the node agent embeds a byte-equal copy (node-agent-go/internal/reconcile/harness_kinds.json, held equal by TestHarnessKindsTableMatchesTheShippedFile) for wire compatibility, runner and vendor-CLI presence, lane and telemetry switches, and the noo CLI checks --kind against it. kind: the NOO_HARNESS_KIND value. wire: the API the harness speaks. wires: the node chat backend types that serve it (empty = no node backend serves it yet). runner: the executable the applier installs beside the agent; ONE runner serves every kind, the gateway binary in harness mode (`noo-gateway harness`), which for a foreign kind launches the vendor's headless CLI and fronts the node's model with a loopback wire translator (null = no runner ships yet; the node agent refuses the kind). cli: the vendor executable that must be on PATH on the node for a foreign kind (null for `noo`); the node agent refuses the kind while it is absent. lane: env vars the runner sets to keep the CLI one-shot and inside its lane (no auto-update, no interactive prompt, no vendor login flow), merged after any placement value; only variables verified in vendor documentation are listed, empty when none are. launch: how the driver invokes the CLI (null for `noo`): command is the argv with {prompt} filled in, model_url_env and model_env name the variables that point the CLI at the loopback translator and name its model, mcp says how the CLI takes an MCP server. A value starting `unverified:` is documented-but-unconfirmed or undocumented and is for the driver (i83 phase E1c) to settle. telemetry_off: the vendor telemetry switches the runner must launch it with, merged after any placement value (docs/security/telemetry.md, Agent harnesses); every kind has an entry, empty when there is nothing to switch off or none is declared yet. Optional launch fields the driver (gateway-rust/src/harness/driver.rs) reads: model_url_suffix (appended to the translator's base URL), api_key_env (filled with a placeholder; the loopback translator takes no key), model_alias_envs (more model-naming variables, all set to the pinned model) and home_env (the CLI's config directory, pointed inside the task's own HOME); launch.mcp `config-file` means the driver writes the MCP config and passes its path as {mcp_config} in command. distribution: the vendor artefact the controller stages to the node for the CLI (null for `noo`; the node never downloads it), pinned by version AND sha256 and written only by scripts/vendor-pin.py (docs/development/developer-guide.md, Pinning a vendor CLI): format npm-tarball|tarball|binary, source a URL template filled with {version} {os} {arch} through names (null = noomesh's own names), sha256 keyed `any` for one platform-independent artefact or by the fleet's <os>-<arch> facts (linux-x86_64, linux-aarch64, macos-aarch64), runtime the runtimes entry it needs (null = native), entry the path inside the unpacked tree to execute, unpack tgz|tar.xz|zip|none. runtimes: interpreters a distribution may name, pinned the same way, with bin_dir the directory of executables inside the unpacked tree.",
+  "runtimes": {
+    "node": {
+      "version": "22.23.3",
+      "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
+      "names": {
+        "os": {
+          "linux": "linux",
+          "macos": "darwin"
+        },
+        "arch": {
+          "x86_64": "x64",
+          "aarch64": "arm64"
+        }
+      },
+      "sha256": {
+        "linux-x86_64": "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de",
+        "linux-aarch64": "a44aeb94849a299b22df10b9e622ec2f605c2183501bc40590705131de7c740f",
+        "macos-aarch64": "72d5d8832b41c9d9646197af614ffd751406ea4d215060eb91b98864e1919a3e"
+      },
+      "unpack": "tar.xz",
+      "bin_dir": "bin"
+    }
+  },
   "kinds": [
     {
       "kind": "noo",
@@ -16,7 +39,8 @@
       "cli": null,
       "lane": {},
       "launch": null,
-      "telemetry_off": {}
+      "telemetry_off": {},
+      "distribution": null
     },
     {
       "kind": "claude-code",
@@ -74,6 +98,29 @@
         "DISABLE_UPDATES": "1",
         "DO_NOT_TRACK": "1",
         "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1"
+      },
+      "distribution": {
+        "format": "binary",
+        "source": "https://downloads.claude.ai/claude-code-releases/{version}/{os}-{arch}/claude",
+        "names": {
+          "os": {
+            "linux": "linux",
+            "macos": "darwin"
+          },
+          "arch": {
+            "x86_64": "x64",
+            "aarch64": "arm64"
+          }
+        },
+        "version": "2.1.292",
+        "sha256": {
+          "linux-x86_64": "a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e2c942a4ec93b3",
+          "linux-aarch64": "24caa9e6ff13bf227049a2626f1c816fc895023050f0ec3b12dbf14d897367e0",
+          "macos-aarch64": "97a01e5bc74a199e67189435d0331ea3a24eac2e07db4b76d9148c5b0386138f"
+        },
+        "runtime": null,
+        "entry": "claude",
+        "unpack": "none"
       }
     },
     {
@@ -116,6 +163,29 @@
       },
       "telemetry_off": {
         "COPILOT_OFFLINE": "true"
+      },
+      "distribution": {
+        "format": "tarball",
+        "source": "https://github.com/github/copilot-cli/releases/download/v{version}/copilot-{os}-{arch}.tar.gz",
+        "names": {
+          "os": {
+            "linux": "linux",
+            "macos": "darwin"
+          },
+          "arch": {
+            "x86_64": "x64",
+            "aarch64": "arm64"
+          }
+        },
+        "version": "1.0.98",
+        "sha256": {
+          "linux-x86_64": "87ddb4b3f98462b7cb13c0a6857c68ee410ec9673e2e5f64ee5bedad45825b05",
+          "linux-aarch64": "a7509dcac0e5f22886788ba4c1e2f8b9b07367e84714e42b9e7cee4d8f9fa5f2",
+          "macos-aarch64": "a87018a0194789313c979906e45e8874699fee50549ea11d0be7bdde88b6b3c8"
+        },
+        "runtime": null,
+        "entry": "copilot",
+        "unpack": "tgz"
       }
     },
     {
@@ -136,7 +206,30 @@
         "model_env": "unverified:config.toml model",
         "mcp": "config-file:{CODEX_HOME}/config.toml [mcp_servers.<name>]"
       },
-      "telemetry_off": {}
+      "telemetry_off": {},
+      "distribution": {
+        "format": "tarball",
+        "source": "https://github.com/openai/codex/releases/download/rust-v{version}/codex-package-{arch}-{os}.tar.gz",
+        "names": {
+          "os": {
+            "linux": "unknown-linux-musl",
+            "macos": "apple-darwin"
+          },
+          "arch": {
+            "x86_64": "x86_64",
+            "aarch64": "aarch64"
+          }
+        },
+        "version": "0.163.0",
+        "sha256": {
+          "linux-x86_64": "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182",
+          "linux-aarch64": "9d8ecf2d19d3e184877983902d6c85de48b3888dcb72c382a8a0c975845927fb",
+          "macos-aarch64": "b0344fc2e41f15e0071147e5869008047b8ff4bf2c4a8897975d3bae3f103b34"
+        },
+        "runtime": null,
+        "entry": "bin/codex",
+        "unpack": "tgz"
+      }
     }
   ]
 }
