@@ -18,7 +18,7 @@ door, and nothing is placed on a node. See
 | `noo` (default) | noomesh's own loop (`noo-gateway harness`) | **Runs today** | vLLM, llama.cpp, Ollama, AirLLM | None: no phone-home code |
 | `claude-code` | Anthropic's Claude Code CLI | Runs once the vendor CLI (`claude`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (the harness translates Anthropic's Messages API to the node's wire) | Switched off by a fixed set of variables, see [Telemetry](#telemetry) |
 | `copilot` | GitHub's Copilot CLI | Runs once the vendor CLI (`copilot`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (OpenAI's wire) | Offline mode only, see [Telemetry](#telemetry) |
-| `codex` | OpenAI's Codex CLI | Accepted, then **refused**: its wire is not served by any node backend yet | None yet (it speaks OpenAI's Responses API, which no node backend serves) | No switches declared yet, see [Telemetry](#telemetry) |
+| `codex` | OpenAI's Codex CLI | Runs once the vendor CLI (`codex`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (the harness translates OpenAI's Responses API to the node's wire) | Switched off in the `config.toml` the harness writes for each run, see [Telemetry](#telemetry) |
 
 The kinds, the chat backends each can use, the vendor CLI each needs
 (`cli`), how it is launched and its vendor telemetry switches are declared
@@ -31,8 +31,7 @@ headless CLI and fronts the node's model with a loopback wire translator, so
 `runner` is `noo-gateway` for all four kinds and what differs per kind is
 the vendor CLI that must be on the node. The controller stages that CLI and
 ships it to the node over the rail (next section); until the node has it, a
-placement of that kind is refused. `codex` stays refused by data: its
-Responses API wire has no translator yet.
+placement of that kind is refused.
 
 ## Vendor CLIs are staged by the controller
 
@@ -102,8 +101,8 @@ this order, and reports the first problem as the placement's refusal:
 
 1. **Wire compatibility.** The kind must speak the wire of the node's
    running chat backend. For example, `claude-code` on a node whose chat
-   backend is vLLM is refused with the backends that would do; `codex`,
-   whose wire no node backend serves yet, is refused saying so.
+   backend is vLLM is refused with the backends that would do. A kind whose
+   wire no node backend serves (none today) is refused saying so.
 2. **Known kind.** Anything not in `config/harness-kinds.json` (`noo`,
    `claude-code`, `copilot`, `codex`) is refused.
 3. **Runner shipped.** A kind with no runner in the table (none today) is
@@ -111,7 +110,7 @@ this order, and reports the first problem as the placement's refusal:
 4. **Runner installed.** Every kind's runner is `noo-gateway`; it is refused
    with "its runner ... is not installed on this node" when the binary is not
    where the node's installer puts it.
-5. **Vendor CLI installed.** A foreign kind (`claude-code`, `copilot`) whose
+5. **Vendor CLI installed.** A foreign kind (`claude-code`, `copilot`, `codex`) whose
    `cli` is not on the node's PATH is refused with "its runner is present
    but the \"claude\" command is not installed on this node". Stage it and
    restage the node (see above).

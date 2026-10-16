@@ -2,7 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 //! The foreign-CLI driver: a vendor's headless CLI (Copilot CLI, Claude
-//! Code) as the node's task executor.
+//! Code, Codex CLI) as the node's task executor.
 //!
 //! `noo-gateway harness` stays the runner for every kind: it holds the bus,
 //! acks, takes the concurrency permit, publishes `harness_result` and
@@ -16,7 +16,11 @@
 //! 3. the CLI runs in the task's own workspace, with a HOME of its own, an
 //!    environment built from NOTHING (no bus pair, no node-agent bearer, no
 //!    turn token), the kind's `lane` and `telemetry_off` merged last, and an
-//!    MCP config naming `{NOO_GATEWAY_URL}/mcp/user` with the door key;
+//!    MCP config naming `{NOO_GATEWAY_URL}/mcp/user` with the door key
+//!    (`launch.mcp`: `config-file`, a `{"mcpServers": ...}` JSON file; or
+//!    `config-file:codex-toml`, Codex's whole `$CODEX_HOME/config.toml`,
+//!    which also carries the model provider, since Codex takes its base URL
+//!    from no variable);
 //! 4. its verdict (`NOO_RESULT:` / `NOO_FAILED:` on the last such line) is
 //!    the task's `noo_task_done`, carried by the rail op `task_done`;
 //! 5. usage is reported, the loop is checkpointed, the key revoked, the
@@ -52,8 +56,16 @@ pub const PLACEHOLDER_KEY: &str = "noo-loopback-no-key";
 /// The MCP server name the CLI sees noomesh's tools under. The kind table's
 /// tool allowlists (`mcp__noomesh`, `--allow-tool=noomesh`) name it too.
 pub const MCP_SERVER_NAME: &str = "noomesh";
-/// The `launch.mcp` value this driver implements.
+/// The `launch.mcp` value for a CLI that reads a `{"mcpServers": ...}`
+/// file named on its command line (`{mcp_config}`).
 pub const MCP_CONFIG_FILE: &str = "config-file";
+/// The `launch.mcp` value for Codex CLI: the driver writes the whole
+/// `config.toml` in the CLI's home (`launch.home_env`), with the loopback
+/// translator as the model provider and the user door as an MCP server.
+pub const MCP_CODEX_TOML: &str = "config-file:codex-toml";
+/// The model provider id the Codex config names (`openai`, `ollama` and
+/// `lmstudio` are Codex's reserved ids).
+pub const CODEX_PROVIDER: &str = "noomesh";
 
 /// Everything a driven invocation needs that does not change per task.
 #[derive(Debug, Clone)]
@@ -122,11 +134,19 @@ pub fn validate_kind(kind: &HarnessKind) -> Result<Launch> {
     if let Some(v) = fields.iter().find(|v| v.starts_with("unverified:")) {
         bail!("kind {}: its launch recipe is not verified yet ({v})", kind.kind);
     }
-    if launch.mcp != MCP_CONFIG_FILE {
-        bail!("kind {}: MCP wiring {:?} is not one this driver implements ({MCP_CONFIG_FILE:?})", kind.kind, launch.mcp);
-    }
-    if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
-        bail!("kind {}: launch names no model variables", kind.kind);
+    match launch.mcp.as_str() {
+        MCP_CONFIG_FILE => {
+            if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
+                bail!("kind {}: launch names no model variables", kind.kind);
+            }
+        }
+        // The config file carries the model; a home is where it goes.
+        MCP_CODEX_TOML => {
+            if launch.home_env.as_deref().is_none_or(|h| h.trim().is_empty()) {
+                bail!("kind {}: {MCP_CODEX_TOML} needs launch.home_env, the directory its config.toml goes in", kind.kind);
+            }
+        }
+        other => bail!("kind {}: MCP wiring {other:?} is not one this driver implements ({MCP_CONFIG_FILE:?}, {MCP_CODEX_TOML:?})", kind.kind),
     }
     Ok(launch)
 }
@@ -238,20 +258,36 @@ impl Workspace {
         self.root.join("noomesh-mcp.json")
     }
 
+    /// The CLI's own config/state directory (`launch.home_env`), inside HOME.
+    pub fn cli_home(&self, cli: &str) -> PathBuf {
+        self.home.join(format!(".{cli}"))
+    }
+
+    /// Where `config-file:codex-toml` writes: `$CODEX_HOME/config.toml`.
+    pub fn codex_config_path(&self, cli: &str) -> PathBuf {
+        self.cli_home(cli).join("config.toml")
+    }
+
+    /// The config a kind's `launch.mcp` asks for, written 0600; its path is
+    /// `{mcp_config}` in the command. Removed after each run.
+    pub fn write_cli_config(&self, ctx: &DriverCtx, translator_url: &str, key: &str) -> Result<PathBuf> {
+        if ctx.launch.mcp != MCP_CODEX_TOML {
+            return self.write_mcp_config(&ctx.gateway, key);
+        }
+        let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
+        let base = format!("{}{}", translator_url.trim_end_matches('/'), ctx.launch.model_url_suffix);
+        let path = self.codex_config_path(cli);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        write_private(&path, codex_config(&base, &ctx.pinned.model, &ctx.gateway, key).as_bytes())?;
+        Ok(path)
+    }
+
     /// Write the MCP config naming the user door, readable by this user only.
     pub fn write_mcp_config(&self, gateway: &str, key: &str) -> Result<PathBuf> {
-        use std::io::Write;
         let path = self.mcp_path();
-        let _ = std::fs::remove_file(&path);
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path).with_context(|| format!("writing {}", path.display()))?;
-        f.write_all(serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
+        write_private(&path, serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
         Ok(path)
     }
 
@@ -263,6 +299,85 @@ impl Workspace {
             tracing::warn!(path = %self.root.display(), error = %e, "harness driver: workspace not removed");
         }
     }
+}
+
+/// Write `bytes` to a fresh file at `path`, mode 0600 from creation.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+/// A TOML basic string. A JSON string literal is one: JSON's escapes
+/// (`\"`, `\\`, `\n`, `\uXXXX`, ...) are all TOML escapes.
+fn toml_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Codex CLI's `config.toml` for one run (`config-file:codex-toml`).
+///
+/// - The loopback translator is the model provider (`wire_api =
+///   "responses"`, the only wire Codex speaks); no `env_key`, so no API
+///   key is asked for, and no websocket transport, so every request is a
+///   stateless `POST /responses`.
+/// - The user door is the one MCP server, a streamable-HTTP server with the
+///   door key as its bearer: the key is in this 0600 file only, never in
+///   the CLI's environment.
+/// - No approvals (`never`: a headless run has nobody to ask) inside the
+///   `workspace-write` sandbox: the CLI writes its working directory, and
+///   anything outside it, or the network, fails instead of escalating.
+/// - Every vendor channel off (docs/security/telemetry.md): analytics,
+///   feedback, the OpenTelemetry exporters (metrics default to Statsig),
+///   the update check, saved history, hosted web search.
+pub fn codex_config(base_url: &str, model: &str, gateway: &str, key: &str) -> String {
+    let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
+    let bearer = format!("Bearer {key}");
+    format!(
+        "# Written by the noomesh harness for one run; removed when it ends.\n\
+         model = {model}\n\
+         model_provider = {provider}\n\
+         approval_policy = \"never\"\n\
+         sandbox_mode = \"workspace-write\"\n\
+         web_search = \"disabled\"\n\
+         check_for_update_on_startup = false\n\
+         \n\
+         [model_providers.{CODEX_PROVIDER}]\n\
+         name = {provider}\n\
+         base_url = {base}\n\
+         wire_api = \"responses\"\n\
+         \n\
+         [mcp_servers.{MCP_SERVER_NAME}]\n\
+         url = {mcp_url}\n\
+         http_headers = {{ Authorization = {bearer} }}\n\
+         \n\
+         [analytics]\n\
+         enabled = false\n\
+         \n\
+         [feedback]\n\
+         enabled = false\n\
+         \n\
+         [history]\n\
+         persistence = \"none\"\n\
+         \n\
+         [otel]\n\
+         exporter = \"none\"\n\
+         trace_exporter = \"none\"\n\
+         metrics_exporter = \"none\"\n",
+        model = toml_str(model),
+        provider = toml_str(CODEX_PROVIDER),
+        base = toml_str(base_url),
+        mcp_url = toml_str(&mcp_url),
+        bearer = toml_str(&bearer),
+    )
 }
 
 /// The MCP config a CLI loads: one HTTP server, the user door, the door key
@@ -301,8 +416,14 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
     env.insert("LANG".to_string(), ctx.lang.clone());
     env.insert("TMPDIR".to_string(), ws.tmp.display().to_string());
     env.insert("NO_COLOR".to_string(), "1".to_string());
-    env.insert(l.model_url_env.clone(), format!("{}{}", translator_url.trim_end_matches('/'), l.model_url_suffix));
-    env.insert(l.model_env.clone(), ctx.pinned.model.clone());
+    // Empty for a CLI that takes its model from the config the driver
+    // writes (`config-file:codex-toml`).
+    if !l.model_url_env.trim().is_empty() {
+        env.insert(l.model_url_env.clone(), format!("{}{}", translator_url.trim_end_matches('/'), l.model_url_suffix));
+    }
+    if !l.model_env.trim().is_empty() {
+        env.insert(l.model_env.clone(), ctx.pinned.model.clone());
+    }
     for alias in &l.model_alias_envs {
         env.insert(alias.clone(), ctx.pinned.model.clone());
     }
@@ -311,10 +432,13 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
     }
     if let Some(h) = l.home_env.as_deref().filter(|h| !h.is_empty()) {
         let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
-        env.insert(h.to_string(), ws.home.join(format!(".{cli}")).display().to_string());
+        env.insert(h.to_string(), ws.cli_home(cli).display().to_string());
     }
     if let Some(ca) = &ctx.ca_path {
         env.insert("NODE_EXTRA_CA_CERTS".to_string(), ca.clone());
+        if let Some(v) = l.ca_env.as_deref().filter(|v| !v.is_empty()) {
+            env.insert(v.to_string(), ca.clone());
+        }
     }
     for (k, v) in &ctx.kind.lane {
         env.insert(k.clone(), v.clone());
@@ -533,7 +657,7 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
         }
     };
     let run = async {
-        let mcp = ws.write_mcp_config(&ctx.gateway, &key.key)?;
+        let mcp = ws.write_cli_config(ctx, translator.base_url(), &key.key)?;
         let env = build_env(ctx, ws, translator.base_url());
         let argv = fill_command(&ctx.launch.command, prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
@@ -542,6 +666,7 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
+    let _ = std::fs::remove_file(ws.codex_config_path(ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind)));
     let usage = translator.usage();
     rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
     rail.door_key_revoke(&key.key_id).await;
@@ -981,15 +1106,17 @@ mod tests {
         assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
     }
 
-    /// The shipped table: Copilot and Claude Code are runnable, Codex is
-    /// refused until its recipe is verified, `noo` is never driven.
+    /// The shipped table: Copilot, Claude Code and Codex are runnable,
+    /// `noo` is never driven.
     #[test]
     fn the_shipped_foreign_kinds_validate() {
-        for name in ["copilot", "claude-code"] {
+        for name in ["copilot", "claude-code", "codex"] {
             let k = crate::harness_kinds::get(name).unwrap();
             let l = validate_kind(k).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(l.command.iter().any(|a| a.contains("{prompt}")), "{name}: no {{prompt}}");
-            assert!(l.command.iter().any(|a| a.contains("{mcp_config}")), "{name}: no {{mcp_config}}");
+            if l.mcp == MCP_CONFIG_FILE {
+                assert!(l.command.iter().any(|a| a.contains("{mcp_config}")), "{name}: no {{mcp_config}}");
+            }
             assert_eq!(l.command[0], k.cli.clone().unwrap(), "{name}");
             let ctx = DriverCtx::new("n", "https://g", k, pinned(), &|_| None).unwrap();
             let root = scratch(name);
@@ -1001,8 +1128,108 @@ mod tests {
             ws.finish();
             let _ = std::fs::remove_dir_all(root);
         }
-        assert!(validate_kind(crate::harness_kinds::get("codex").unwrap()).is_err());
         assert!(validate_kind(crate::harness_kinds::get("noo").unwrap()).is_err());
+
+        // Codex: headless, approval-free inside its sandbox, its home the
+        // task's own, the config the driver writes carrying the model.
+        let codex = crate::harness_kinds::get("codex").unwrap();
+        let l = validate_kind(codex).unwrap();
+        assert_eq!(l.mcp, MCP_CODEX_TOML);
+        assert_eq!(&l.command[..2], ["codex", "exec"]);
+        for flag in ["--skip-git-repo-check", "--ephemeral", "--sandbox"] {
+            assert!(l.command.iter().any(|a| a == flag), "codex: {flag}");
+        }
+        assert!(!l.command.iter().any(|a| a.contains("dangerously") || a == "--yolo" || a == "--full-auto"), "no blanket bypass: {:?}", l.command);
+        assert_eq!(l.home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(codex.wires, crate::harness_kinds::get("copilot").unwrap().wires, "every node backend, through the translator");
+    }
+
+    fn codex_kind(command: &[&str]) -> HarnessKind {
+        serde_json::from_value(json!({
+            "kind": "codex", "title": "t", "wire": "OpenAI's Responses API", "wires": ["llamacpp"],
+            "runner": "noo-gateway", "cli": "codex", "lane": {},
+            "launch": {"command": command, "model_url_env": "", "model_env": "", "mcp": MCP_CODEX_TOML,
+                       "model_url_suffix": "/v1", "home_env": "CODEX_HOME", "ca_env": "CODEX_CA_CERTIFICATE"},
+            "telemetry_off": {},
+        }))
+        .unwrap()
+    }
+
+    /// PINNED: `config-file:codex-toml` writes Codex's whole config in the
+    /// task's own CODEX_HOME, 0600: the translator as a Responses provider,
+    /// the pinned model, the user door with the door key, and every vendor
+    /// channel off. No model variable is set; the key is not in the env.
+    #[test]
+    fn the_codex_mode_writes_its_config_toml_in_the_task_home() {
+        let root = scratch("codex");
+        let k = codex_kind(&["codex", "exec", "{prompt}"]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-codex", false).unwrap();
+        let p = ws.write_cli_config(&ctx, "http://127.0.0.1:41234/", "noo-sk-door-1").unwrap();
+        assert_eq!(p, ws.home.join(".codex").join("config.toml"));
+        assert!(p.starts_with(&ws.home) && !p.starts_with(&ws.work), "inside the task HOME, outside the working directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        for line in [
+            "model = \"gemma-4\"",
+            "model_provider = \"noomesh\"",
+            "approval_policy = \"never\"",
+            "sandbox_mode = \"workspace-write\"",
+            "web_search = \"disabled\"",
+            "check_for_update_on_startup = false",
+            "[model_providers.noomesh]",
+            "base_url = \"http://127.0.0.1:41234/v1\"",
+            "wire_api = \"responses\"",
+            "[mcp_servers.noomesh]",
+            "url = \"https://gateway:8080/mcp/user\"",
+            "http_headers = { Authorization = \"Bearer noo-sk-door-1\" }",
+            "[analytics]",
+            "[feedback]",
+            "persistence = \"none\"",
+            "metrics_exporter = \"none\"",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line:?} in:\n{text}");
+        }
+        assert_eq!(text.matches("enabled = false").count(), 2, "analytics and feedback off");
+        assert!(!text.contains("env_key"), "the loopback provider asks for no key");
+
+        let env = build_env(&ctx, &ws, "http://127.0.0.1:41234/");
+        assert_eq!(env["CODEX_HOME"], ws.home.join(".codex").display().to_string(), "CODEX_HOME is the directory the config is in");
+        assert_eq!(env["CODEX_CA_CERTIFICATE"], "/etc/noo/pki/ca.crt");
+        assert!(!env.contains_key(""), "an empty model variable is not set");
+        assert!(env.values().all(|v| !v.contains("noo-sk-door")), "the door key is in the file only");
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A run in the codex mode sees its config while it runs; it is gone after.
+    #[tokio::test]
+    async fn a_codex_run_reads_its_config_and_the_file_is_removed_after() {
+        let root = scratch("codexrun");
+        let k = codex_kind(&["sh", "-c", "grep -c '^wire_api = \"responses\"$' \"$CODEX_HOME/config.toml\"; echo NOO_RESULT: ok"]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.keep_workdir = true;
+        let mut rail = FakeRail::new();
+        let state = run_task_on(&ctx, &mut rail, &task("t-codexrun", 1)).await.unwrap();
+        assert_eq!(state, "done");
+        let c = rail.calls.lock().unwrap();
+        assert!(c.saved[1].1.starts_with('1'), "the CLI read its provider block: {:?}", c.saved[1].1);
+        assert!(root.join("t-codexrun/home/.codex").is_dir());
+        assert!(!root.join("t-codexrun/home/.codex/config.toml").exists(), "the key file is removed when the run ends");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_codex_mode_without_a_home_is_refused() {
+        let mut k = codex_kind(&["codex", "exec", "{prompt}"]);
+        k.launch.as_mut().unwrap().home_env = None;
+        assert!(validate_kind(&k).unwrap_err().to_string().contains("home_env"));
+        k.launch.as_mut().unwrap().mcp = "config-file:yaml".into();
+        assert!(validate_kind(&k).is_err());
     }
 
     #[tokio::test]

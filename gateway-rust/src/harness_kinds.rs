@@ -157,13 +157,16 @@ pub struct Launch {
     /// argv; `{prompt}` and `{mcp_config}` (the MCP config file the driver
     /// writes) are filled in by the driver, inside any argument.
     pub command: Vec<String>,
-    /// The variable that points the CLI at the loopback translator.
+    /// The variable that points the CLI at the loopback translator (empty
+    /// when the config file the driver writes carries the URL).
     pub model_url_env: String,
-    /// The variable that names the CLI's model.
+    /// The variable that names the CLI's model (empty likewise).
     pub model_env: String,
     /// How the CLI takes an MCP server. `config-file`: the driver writes
     /// `{"mcpServers": {"noomesh": {...}}}` and passes its path as
-    /// `{mcp_config}` in `command`.
+    /// `{mcp_config}` in `command`. `config-file:codex-toml`: the driver
+    /// writes Codex's whole `config.toml` under `home_env` (model provider,
+    /// model, MCP server, approvals, sandbox, telemetry off).
     pub mcp: String,
     /// Appended to the translator's base URL (`/v1` for a CLI that appends
     /// `/chat/completions` to the URL it is given).
@@ -182,6 +185,11 @@ pub struct Launch {
     /// points it inside the task's own HOME.
     #[serde(default)]
     pub home_env: Option<String>,
+    /// A variable that names a CA bundle file for this CLI (beside
+    /// `NODE_EXTRA_CA_CERTS`, which every driven CLI gets); the driver sets
+    /// it to the cluster CA so the CLI can reach the user door.
+    #[serde(default)]
+    pub ca_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -262,6 +270,19 @@ mod tests {
             let l = k.launch.as_ref().unwrap_or_else(|| panic!("{} has no launch", k.kind));
             assert!(!l.command.is_empty(), "{} launch.command empty", k.kind);
             assert_eq!(l.command[0], cli, "{} launch.command[0] must be its cli", k.kind);
+        }
+    }
+
+    /// Every foreign kind runs on every node backend through the loopback
+    /// translator, and no shipped launch recipe is still `unverified:`.
+    #[test]
+    fn foreign_kinds_are_served_by_every_backend_and_verified() {
+        for k in all().iter().filter(|k| k.kind != "noo") {
+            assert_eq!(k.wires, ["vllm", "vllm-secondary", "llamacpp", "ollama", "airllm"], "{} wires", k.kind);
+            let l = k.launch.as_ref().unwrap();
+            let mut fields = vec![&l.model_url_env, &l.model_env, &l.mcp];
+            fields.extend(l.command.iter());
+            assert!(!fields.iter().any(|v| v.starts_with("unverified:")), "{} launch is unverified: {fields:?}", k.kind);
         }
     }
 

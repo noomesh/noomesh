@@ -3,9 +3,10 @@
 
 //! The loopback wire translator (i83 phase E1b).
 //!
-//! A harness of a foreign kind (`copilot`, `claude-code`) runs the vendor's
-//! CLI headless against the node's own model. The CLIs want OpenAI chat
-//! (Copilot) or Anthropic Messages (Claude Code); the node's backends speak
+//! A harness of a foreign kind (`copilot`, `claude-code`, `codex`) runs the
+//! vendor's CLI headless against the node's own model. The CLIs want OpenAI
+//! chat (Copilot), Anthropic Messages (Claude Code) or OpenAI's Responses
+//! API (Codex, phase E2); the node's backends speak
 //! OpenAI chat (vLLM, llama.cpp under `--jinja`, the node agent's proxy) or
 //! Ollama's `/api/chat`. One [`Translator`] per task or turn binds an
 //! ephemeral port on `127.0.0.1`, the CLI's base-URL variable is pointed at
@@ -16,6 +17,7 @@
 //! |---|---|---|
 //! | `POST /v1/chat/completions` | OpenAI chat | as-is (OpenAI wire), or `/api/chat` and back (Ollama) |
 //! | `POST /v1/messages` | Anthropic Messages | converted to OpenAI chat, the reply converted back |
+//! | `POST /v1/responses` | OpenAI Responses | converted to OpenAI chat, the reply converted back (`coordinator::responses_wire`) |
 //! | `GET /v1/models` | | nothing: the pinned model, as the one entry |
 //!
 //! openapi-drift: not-gateway-routes — this router is bound on a loopback
@@ -24,7 +26,7 @@
 //! the OpenAPI spec (`scripts/check-openapi-drift.py`, `scripts/gen-openapi.py`).
 //!
 //! Anything else is a 404 with a JSON error body. Streaming and
-//! non-streaming both work on both routes. A `model` the CLI names is
+//! non-streaming both work on every route. A `model` the CLI names is
 //! replaced with the pinned model (logged once): the harness is placed
 //! beside ONE model, and a CLI's default model name means nothing here.
 //!
@@ -47,9 +49,19 @@
 //! agent's bearer and backend hint through
 //! `coordinator::with_backend_hint_url`, exactly as the loop sends.
 //!
-//! Not served: the Responses API (Codex, a later phase), and llama.cpp's
-//! legacy `/completion` prompt path (a llama-server without `--jinja`
-//! cannot take a CLI's tool calls, so there is nothing to fall back to).
+//! **The Responses route is stateless.** Codex sends the whole conversation
+//! in `input` on every HTTP request (its request type has no
+//! `previous_response_id`; only its websocket transport chains responses,
+//! and that is off for a custom provider), so nothing is kept between
+//! calls, there is no `GET /v1/responses/{id}`, and a request that names a
+//! `previous_response_id` is refused with a 400 rather than answered
+//! without its history. Fields with no chat equivalent (`store`,
+//! `include`, `reasoning`, `prompt_cache_key`, `metadata`, ...) are dropped,
+//! and logged once.
+//!
+//! Not served: llama.cpp's legacy `/completion` prompt path (a llama-server
+//! without `--jinja` cannot take a CLI's tool calls, so there is nothing to
+//! fall back to).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,6 +80,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::coordinator::anthropic_wire::{self, OpenAiToAnthropicSse};
+use crate::coordinator::responses_wire::{self, ChatToResponsesSse, ToolNames};
 use crate::coordinator::ResolvedBackend;
 
 /// A CLI's request can carry a whole repository's worth of context.
@@ -99,6 +112,7 @@ struct Shared {
     usage: Mutex<UsageTotals>,
     logged_rewrite: AtomicBool,
     logged_no_usage: AtomicBool,
+    logged_dropped: AtomicBool,
 }
 
 impl Shared {
@@ -168,6 +182,7 @@ impl Translator {
             usage: Mutex::new(UsageTotals::default()),
             logged_rewrite: AtomicBool::new(false),
             logged_no_usage: AtomicBool::new(false),
+            logged_dropped: AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -224,6 +239,7 @@ fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .route("/v1/models", get(models))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -504,6 +520,61 @@ async fn messages(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
                         }
                         None => return Some((Ok(frame(t.finish())), None)),
                     }
+                }
+            });
+            sse_response(Body::from_stream(events))
+        }
+    }
+}
+
+/// `POST /v1/responses`: OpenAI Responses in, OpenAI chat to the
+/// backend, a Responses object (or event stream) out.
+async fn responses(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
+    let body = match parse_body(&bytes) {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    if body.get("previous_response_id").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty()) {
+        return error_reply(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "previous_response_id is not supported: the noomesh wire translator keeps no responses; send the whole conversation in input",
+        );
+    }
+    let dropped = responses_wire::dropped_fields(&body);
+    if !dropped.is_empty() && !sh.logged_dropped.swap(true, Ordering::Relaxed) {
+        tracing::info!(fields = %dropped.join(","), "translator: Responses fields with no chat equivalent are dropped");
+    }
+    let names = ToolNames::from_request(&body);
+    let chat = responses_wire::request_body_from_responses(&body);
+    let model = sh.upstream.model.clone();
+    match complete(&sh, chat).await {
+        Err((status, msg)) => upstream_error(status, &msg),
+        Ok(Reply::Whole(v)) => {
+            let choice = v.pointer("/choices/0").cloned().unwrap_or_else(|| json!({}));
+            let msg = choice.get("message").cloned().unwrap_or_else(|| json!({"role": "assistant", "content": ""}));
+            let usage = v.get("usage").filter(|u| u.is_object()).map(|u| {
+                let (p, c, _) = anthropic_wire::usage_tokens(u);
+                (p, c)
+            });
+            let fr = choice.get("finish_reason").and_then(|f| f.as_str());
+            Json(responses_wire::response_from_chat(&msg, fr, usage, &model, &names)).into_response()
+        }
+        Ok(Reply::Chunks(rx)) => {
+            let t = ChatToResponsesSse::new(&model, names);
+            let events = futures::stream::unfold(Some((rx, t)), |state| async move {
+                let (mut rx, mut t) = state?;
+                loop {
+                    let (ev, more) = match rx.recv().await {
+                        Some(Ok(v)) => (t.on_chunk(&v), true),
+                        Some(Err(e)) => (t.fail(&e), false),
+                        None => (t.finish(), false),
+                    };
+                    if ev.is_empty() && more {
+                        continue;
+                    }
+                    let frame = Bytes::from(responses_wire::sse_frames(&ev));
+                    return Some((Ok::<_, std::convert::Infallible>(frame), more.then_some((rx, t))));
                 }
             });
             sse_response(Body::from_stream(events))
@@ -1000,6 +1071,130 @@ mod tests {
         t.shutdown().await;
     }
 
+    /// (event name, data) pairs of a Responses SSE body.
+    fn responses_events(text: &str) -> Vec<(String, Value)> {
+        anthropic_events(text)
+    }
+
+    fn responses_tools() -> Value {
+        json!([
+            {"type": "function", "name": "read_file", "description": "read a file", "strict": false, "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            {"type": "web_search"},
+        ])
+    }
+
+    #[tokio::test]
+    async fn responses_round_trip_a_function_call_through_an_openai_backend() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let c = client();
+        let url = format!("{}/v1/responses", t.base_url());
+
+        // What Codex sends: developer instructions in input, store/include
+        // that chat has no use for, a hosted tool the node cannot run.
+        let first = json!({
+            "model": "gpt-5-codex", "store": false, "include": ["reasoning.encrypted_content"], "tool_choice": "auto", "parallel_tool_calls": false,
+            "tools": responses_tools(),
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "open a.txt"}]},
+            ],
+        });
+        let r: Value = c.post(&url).json(&first).send().await.unwrap().json().await.unwrap();
+        let up = m.last();
+        assert_eq!(up["model"], "qwen-pinned");
+        assert_eq!(up["messages"][0], json!({"role": "system", "content": "You are Codex."}));
+        assert_eq!(up["messages"][1], json!({"role": "user", "content": "open a.txt"}));
+        assert_eq!(up["tools"].as_array().unwrap().len(), 1, "web_search does not go upstream");
+        assert!(up.get("store").is_none() && up.get("include").is_none());
+        assert_eq!(r["object"], "response");
+        assert_eq!(r["status"], "completed");
+        let call = &r["output"][0];
+        assert_eq!((call["type"].as_str(), call["call_id"].as_str(), call["name"].as_str()), (Some("function_call"), Some("call_1"), Some("read_file")));
+        assert_eq!(call["arguments"], "{\"path\":\"a.txt\"}");
+        assert_eq!(r["usage"]["input_tokens"], 10);
+        assert_eq!(r["usage"]["output_tokens"], 5);
+        assert_eq!(r["usage"]["total_tokens"], 15);
+
+        // Codex runs the tool and sends the WHOLE conversation again.
+        let mut second = first.clone();
+        let input = second["input"].as_array_mut().unwrap();
+        input.push(call.clone());
+        input.push(json!({"type": "function_call_output", "call_id": "call_1", "output": "file body"}));
+        let r: Value = c.post(&url).json(&second).send().await.unwrap().json().await.unwrap();
+        let msgs = m.last()["messages"].as_array().unwrap().clone();
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[3], json!({"role": "tool", "tool_call_id": "call_1", "content": "file body"}));
+        assert_eq!(r["output"][0]["type"], "message");
+        assert_eq!(r["output"][0]["content"][0]["text"], "hello");
+
+        // previous_response_id: refused, nothing sent, nothing counted.
+        let seen = m.seen.lock().unwrap().len();
+        let resp = c.post(&url).json(&json!({"previous_response_id": "resp_x", "input": "go on"})).send().await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert!(body["error"]["message"].as_str().unwrap().contains("previous_response_id"), "{body}");
+        assert_eq!(m.seen.lock().unwrap().len(), seen);
+
+        let u = t.usage();
+        assert_eq!((u.calls, u.prompt_tokens, u.completion_tokens, u.total_tokens), (2, 20, 10, 30));
+        t.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn streamed_responses_are_a_valid_event_sequence_and_are_metered() {
+        let m = mock().await;
+        let t = Translator::start(backend(&m.url, "openai")).await.unwrap();
+        let c = client();
+        let url = format!("{}/v1/responses", t.base_url());
+
+        // Text.
+        let resp = c.post(&url).json(&json!({"model": "gpt-5-codex", "stream": true, "input": "hi"})).send().await.unwrap();
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let ev = responses_events(&resp.text().await.unwrap());
+        assert_eq!(m.last()["stream_options"]["include_usage"], true, "usage is asked for upstream");
+        let names: Vec<&str> = ev.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["response.created", "response.in_progress", "response.output_item.added", "response.content_part.added",
+             "response.output_text.delta", "response.output_text.delta", "response.output_text.done", "response.content_part.done",
+             "response.output_item.done", "response.completed"],
+        );
+        let text: String = ev.iter().filter(|(n, _)| n == "response.output_text.delta").filter_map(|(_, d)| d["delta"].as_str()).collect();
+        assert_eq!(text, "Hello");
+        let done = &ev.last().unwrap().1["response"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(done["usage"]["input_tokens"], 10);
+        assert_eq!(done["usage"]["output_tokens"], 5);
+
+        // A function call.
+        let resp = c.post(&url).json(&json!({"stream": true, "tools": responses_tools(), "input": [{"role": "user", "content": "open"}]})).send().await.unwrap();
+        let ev = responses_events(&resp.text().await.unwrap());
+        let added = ev.iter().find(|(n, _)| n == "response.output_item.added").unwrap();
+        assert_eq!(added.1["item"]["type"], "function_call");
+        let args: String = ev.iter().filter(|(n, _)| n == "response.function_call_arguments.delta").filter_map(|(_, d)| d["delta"].as_str()).collect();
+        assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({"path": "a.txt"}));
+        let item = &ev.iter().find(|(n, _)| n == "response.output_item.done").unwrap().1["item"];
+        assert_eq!((item["call_id"].as_str(), item["name"].as_str(), item["status"].as_str()), (Some("call_s"), Some("read_file"), Some("completed")));
+        assert_eq!(ev.last().unwrap().0, "response.completed");
+
+        // ...and over Ollama: NDJSON in, the same events out.
+        let o = Translator::start(backend(&m.url, "ollama")).await.unwrap();
+        let resp = c.post(format!("{}/v1/responses", o.base_url())).json(&json!({"stream": true, "tools": responses_tools(), "input": "open"})).send().await.unwrap();
+        let ev = responses_events(&resp.text().await.unwrap());
+        let item = &ev.iter().find(|(n, _)| n == "response.output_item.done").unwrap().1["item"];
+        assert_eq!((item["type"].as_str(), item["name"].as_str()), (Some("function_call"), Some("read_file")));
+        assert_eq!(serde_json::from_str::<Value>(item["arguments"].as_str().unwrap()).unwrap(), json!({"path": "a.txt"}));
+        assert_eq!(ev.last().unwrap().1["response"]["usage"]["input_tokens"], 7);
+        assert_eq!(o.usage().calls, 1);
+        o.shutdown().await;
+
+        let u = t.usage();
+        assert_eq!((u.calls, u.prompt_tokens, u.completion_tokens), (2, 20, 10));
+        t.shutdown().await;
+    }
+
     #[tokio::test]
     async fn models_lists_the_pinned_model_and_anything_else_is_a_json_404() {
         let m = mock().await;
@@ -1009,12 +1204,12 @@ mod tests {
         assert_eq!(r["data"].as_array().unwrap().len(), 1);
         assert_eq!(r["data"][0]["id"], "qwen-pinned");
 
-        let resp = c.post(format!("{}/v1/responses", t.base_url())).json(&json!({})).send().await.unwrap();
+        let resp = c.post(format!("{}/v1/completions", t.base_url())).json(&json!({})).send().await.unwrap();
         assert_eq!(resp.status(), 404);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "not_found_error");
-        assert!(body["error"]["message"].as_str().unwrap().contains("/v1/responses"));
+        assert!(body["error"]["message"].as_str().unwrap().contains("/v1/completions"));
 
         // Not JSON: a 400 in the same shape, and no call counted.
         let resp = c.post(format!("{}/v1/chat/completions", t.base_url())).body("nope").send().await.unwrap();
