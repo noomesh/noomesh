@@ -2630,6 +2630,36 @@ fn require_operator(
     }
 }
 
+/// An approval decision is a human's. The gate exists so a person decides every
+/// high-risk action; a model that could decide its own pending request would make
+/// the gate decoration. So the decision routes accept only a PERSON's credential
+/// (`task_guard::resolve_origin`): a worker-delegated token (the one a tool call
+/// carries back to this gateway), a harness token, an MCP-door key, a service
+/// identity or an account that is not an enabled user is refused with 403.
+/// Fails closed: if the account lookup fails the caller is not a person.
+/// Dashboard and `noo approval` use an ordinary login token, so they pass.
+async fn require_human_decider(
+    db: &sqlx::PgPool,
+    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
+) -> Result<(), AppError> {
+    decider_refusal(&crate::task_guard::resolve_origin(db, ctx).await)
+}
+
+/// The rule of [`require_human_decider`], pure so it can be pinned.
+fn decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppError> {
+    match origin {
+        crate::task_guard::Origin::Person { .. } => Ok(()),
+        crate::task_guard::Origin::Agent { via, .. } => {
+            tracing::warn!(via = %via, "approval decision refused: not a person's credential");
+            Err(AppError::Forbidden(format!(
+                "approval decisions are made by a person, not by an agent: this credential is {via}. \
+                 Decide in the dashboard, with `noo approval approve|deny <id>` after `noo auth login`, \
+                 or from a linked chat channel"
+            )))
+        }
+    }
+}
+
 /// POST /api/approval/{request_id}/approve — approve a pending request.
 ///
 /// SQL UPDATE noo_approval_requests SET status='approved' WHERE request_id=$1.
@@ -2640,6 +2670,7 @@ async fn approval_approve(
     body: Option<Json<Value>>,
 ) -> AppResult {
     let requester = require_operator(&ctx)?;
+    require_human_decider(&state.db, &ctx).await?;
     let approved_by = body
         .as_ref()
         .and_then(|b| b.get("approved_by"))
@@ -2688,6 +2719,7 @@ async fn approval_deny(
     body: Option<Json<Value>>,
 ) -> AppResult {
     let requester = require_operator(&ctx)?;
+    require_human_decider(&state.db, &ctx).await?;
     let reason = body
         .as_ref()
         .and_then(|b| b.get("reason"))
@@ -2844,6 +2876,7 @@ async fn approval_decide(
     body: Option<Json<Value>>,
 ) -> AppResult {
     let resolved_by = decide_actor(&ctx)?;
+    require_human_decider(&state.db, &ctx).await?;
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let (new_status, reason) = parse_decision(&body)?;
 
@@ -5454,5 +5487,71 @@ mod mesh_lifecycle_gate_tests {
         let ctx = ctx_role(Role::Admin, &["admin"]);
         let r = mesh_lifecycle_admin_guard(&ctx).expect("admin must pass");
         assert_eq!(r.sub, "alice", "the audit row needs the admin's name");
+    }
+}
+
+#[cfg(test)]
+mod approval_decider_tests {
+    use super::*;
+    use crate::auth::{Actor, RequesterCtx, Role};
+
+    fn ctx(sub: &str, harness: Option<&str>, act: bool) -> Option<axum::Extension<RequesterCtx>> {
+        Some(axum::Extension(RequesterCtx {
+            sub: sub.into(),
+            scopes: vec!["read".into(), "write".into(), "admin".into()],
+            role: Role::Admin,
+            harness: harness.map(String::from),
+            act: act.then(|| Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+        }))
+    }
+
+    /// A pool that never connects: the agent paths must refuse before any query,
+    /// and the person path must fail closed when the account lookup cannot run.
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool")
+    }
+
+    #[tokio::test]
+    async fn the_model_cannot_decide_its_own_approval() {
+        let db = dead_pool();
+        // worker-delegated token (what a tool call carries back), harness token,
+        // MCP-door key, service identity.
+        for c in [
+            ctx("alice", None, true),
+            ctx("alice", Some("worker:t1"), false),
+            ctx("alice", Some("node:host3"), false),
+            ctx("alice", Some("mcp-external:codex"), false),
+            ctx("svc:evolve", None, false),
+            None,
+        ] {
+            let r = require_human_decider(&db, &c).await;
+            match r {
+                Err(AppError::Forbidden(m)) => assert!(m.contains("by a person"), "{m}"),
+                other => panic!("expected 403 for {c:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_person_login_passes_and_an_unverifiable_one_fails_closed() {
+        // Pure rule: a person is accepted.
+        let person = crate::task_guard::Origin::Person { account: "olive".into(), role: Role::Operator };
+        assert!(decider_refusal(&person).is_ok(), "dashboard / CLI login must keep working");
+        // Account lookup impossible (DB down): not a person.
+        let r = require_human_decider(&dead_pool(), &ctx("olive", None, false)).await;
+        assert!(matches!(r, Err(AppError::Forbidden(_))), "fail closed");
+    }
+
+    #[test]
+    fn all_three_decision_routes_check_it() {
+        let src = include_str!("admin.rs");
+        for f in ["async fn approval_approve(", "async fn approval_deny(", "async fn approval_decide("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + 700];
+            assert!(body.contains("require_human_decider("), "{f} must refuse non-person credentials");
+        }
     }
 }

@@ -592,7 +592,7 @@ answers when it does not reply.
 | GET, POST | `/api/activities`; POST `…/{id}/progress`, `/link-task`, `/complete`; PUT `…/{id}/status` | agent activities |
 | GET | `/api/agent/loops` | managed loops |
 | GET, POST, DELETE | `/api/proactive/status`, `/rules`, `/history`, `/rules/{rule_id}` | the proactive loop |
-| GET, POST | `/api/approval/pending`, `/stats`; POST `…/{request_id}/approve`, `/deny`, `/decide` | exec-approval queue. `pending` is scoped to the requester for `user` tier (unbound rows stay operator-only) and echoes `scope`; `/stats` is four aggregate counts, global; approve/deny/decide need a named Operator+ |
+| GET, POST | `/api/approval/pending`, `/stats`; POST `…/{request_id}/approve`, `/deny`, `/decide` | exec-approval queue. `pending` is scoped to the requester for `user` tier (unbound rows stay operator-only) and echoes `scope`; `/stats` is four aggregate counts, global; approve/deny/decide need a named Operator+ **person** (an ordinary login: a worker-delegated tool token, harness or MCP-door key, service identity or non-user account gets 403) |
 | GET | `/api/exec-approval/status` | current mode |
 
 ## Agents, workflows, skills, tools (`routes/agents.rs`, `routes/peers.rs`, `routes/ui.rs`)

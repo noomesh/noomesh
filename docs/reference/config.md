@@ -225,8 +225,36 @@ For search that reliably runs, pick another provider:
 `watched_folders` — now requires an **Admin JWT** and refuses any
 cluster-token caller: each of those sections feeds a security decision
 (`FilePolicy`'s allowed and writable roots, the risk classifier's tool lists,
-the TLS material). `noo_config_set` of any of the five is classified HIGH, so
+the TLS material). `noo_config_set` of **any** section is classified HIGH, so
 the agent's own config tool gates under approval mode as well.
+
+#### Tool risk tiers
+
+Every tool call the model makes is classified before it runs
+(`security.rs`, `middleware.rs`). **High** calls are gated by
+`NOO_EXEC_APPROVAL_MODE`: `strict` (the default) refuses them, `approval`
+holds them for a person's decision, `auto`/`disabled` run them. **Medium**
+and **High** calls each write a `noo_security_audit` row (`tool_exec`: actor,
+tool, risk, decision, conversation id), signed like every other audit row;
+with no audit key the row is refused and logged, as elsewhere. Low-risk
+calls are not audited per call.
+
+| Tool | Tier |
+|---|---|
+| `noo_channel_send` | Medium to the chat that started the turn or to a recipient a person saved (in the dashboard, or `POST /api/channels/saved-recipients` with a login); **High** to any other destination |
+| `noo_agent_send` / `noo_agent_message` | Medium to your own agents or an account of equal or lower role (and thread posts); **High** to a higher-tier account, or when either role cannot be read |
+| `noo_rag_ingest` | Medium for `text` only; **High** with any `source`, path, URL, glob or directory |
+| `noo_heartbeat_create_task`, `noo_heartbeat_run_task` | **High** |
+| `noo_config_set` | **High**, every section |
+| `noo_local_files` write, `noo_skill_execute`, camera and microphone capture, unknown tools | **High** (a `local_files` write inside the operator's writable roots is Medium) |
+
+A recipient counts as saved only when a person created it; one an agent
+saved does not. Recipients saved before `created_by` was stamped count after
+a review (`noo heartbeat review-existing`).
+
+An exec-approval decision is never a tool: `noo_approval_approve` and
+`noo_approval_deny` are not in any manifest the model sees, and the decision
+routes refuse every credential that is not a person's own login.
 
 | Key | Env | Default | Purpose |
 |---|---|---|---|
