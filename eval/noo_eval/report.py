@@ -10,9 +10,11 @@ It is theme-aware (light/dark) via CSS custom properties.
 from __future__ import annotations
 
 import html
+import json
 from pathlib import Path
 
 from . import svg
+from .harness_compare import first_line, report_json, summarize
 from .metrics import Aggregates, aggregate
 from .schema import RunResult
 
@@ -93,7 +95,102 @@ def _fault_panel(run: RunResult, agg: Aggregates) -> str:
     return "<div class='faults'>" + "".join(cards) + "</div>"
 
 
+def _num(v, fmt="{:,}") -> str:
+    return "—" if v is None else fmt.format(v)
+
+
+def _compare_tables(run: RunResult) -> str:
+    """One table per task set, one row per harness kind — the point of i83 F."""
+    hc = run.harness_compare
+    rows = summarize(hc)
+    out = []
+    for s in dict.fromkeys(r["task_set"] for r in rows):
+        trs = []
+        for r in (x for x in rows if x["task_set"] == s):
+            tone = "ok" if r["total"] and r["passed"] == r["total"] else ("bad" if r["passed"] == 0 else "warn")
+            got, of = r["tokens_reported"].split("/")
+            tok_note = (f" <span class='muted'>({_esc(r['tokens_reported'])} reported)</span>"
+                        if r["prompt_tokens"] is not None and got != of else "")
+            fails = "<br>".join(_esc(f) for f in r["failures"]) or "<span class='muted'>none</span>"
+            skipped = f" <span class='muted'>(+{r['skipped']} skipped)</span>" if r["skipped"] else ""
+            trs.append(
+                f"<tr><td><b>{_esc(r['harness_kind'])}</b></td>"
+                f"<td class='{tone}'>{r['passed']}/{r['total']}{skipped}</td>"
+                f"<td>{_num(r['mean_loops'], '{:g}')}</td><td>{_num(r['mean_wall_s'], '{:.1f}')}</td>"
+                f"<td>{_num(r['prompt_tokens'])}{tok_note}</td><td>{_num(r['completion_tokens'])}</td>"
+                f"<td class='wrap-cell'>{fails}</td></tr>")
+        out.append(
+            f"<h3>Task set: {_esc(s)}</h3>"
+            "<table class='grid'><thead><tr><th>harness_kind</th><th>Passed</th><th>Mean loops</th>"
+            "<th>Mean wall s</th><th>Prompt tokens</th><th>Completion tokens</th><th>Failures</th>"
+            "</tr></thead><tbody>" + "".join(trs) + "</tbody></table>")
+    return "".join(out)
+
+
+def _compare_detail(run: RunResult) -> str:
+    trs = []
+    for r in run.harness_compare.runs:
+        verdict = ("<span class='pill ok'>pass</span>" if r.passed else
+                   "<span class='muted'>skipped</span>" if r.skipped else "<span class='pill bad'>fail</span>")
+        where = f"{_esc(r.node or '—')}" + ("" if r.dispatched or not r.task_id else " <span class='warn'>(in process)</span>")
+        trs.append(
+            f"<tr><td>{_esc(r.task)}</td><td>{_esc(r.kind)}</td><td>{verdict}</td><td>{_esc(r.state)}</td>"
+            f"<td>{_esc(r.check)}</td><td>{r.loops}</td><td>{_num(r.wall_s, '{:.1f}')}</td>"
+            f"<td>{_num(r.prompt_tokens)} / {_num(r.completion_tokens)}</td><td>{where}</td>"
+            f"<td class='muted wrap-cell'>{_esc(first_line(r.note) or first_line(r.result))}</td></tr>")
+    return ("<table class='grid'><thead><tr><th>Task</th><th>Kind</th><th>Verdict</th><th>State</th><th>Check</th>"
+            "<th>Loops</th><th>Wall s</th><th>Tokens p / c</th><th>Node</th><th>Note / result</th>"
+            "</tr></thead><tbody>" + "".join(trs) + "</tbody></table>")
+
+
+def _render_compare(run: RunResult) -> str:
+    hc = run.harness_compare
+    rows = summarize(hc)
+    totals: dict[str, list[int]] = {}
+    for r in rows:
+        t = totals.setdefault(r["harness_kind"], [0, 0])
+        t[0] += r["passed"]
+        t[1] += r["total"]
+    rate = {k: (p / n) for k, (p, n) in totals.items() if n}
+    top = max(rate.values(), default=None)
+    best = [k for k, v in rate.items() if v == top]     # a tie names every kind in it
+    kpis = [_kpi(str(len(hc.kinds)), "harness kinds"),
+            _kpi(str(len({(r.task_set, r.task) for r in hc.runs})), "tasks per kind")]
+    if best:
+        p, n = totals[best[0]]
+        kpis.append(_kpi(", ".join(best), f"best pass rate ({p}/{n})", "ok" if top else "bad"))
+    kpis.append(_kpi("yes" if hc.restored else "NO", "placement restored", "ok" if hc.restored else "bad"))
+    kind_lines = "".join(
+        f"<li><b>{_esc(k.kind)}</b>: " + (f"harness running {k.ready_s}s after placing" if k.ready else _esc(k.error))
+        + "</li>" for k in hc.kind_runs)
+    synthetic = "SYNTHETIC" in run.scenario.upper()
+    banner = ('<div class="synthetic-banner">SYNTHETIC FIXTURE — every value below came from the '
+              'fake gateway in noo_eval/harness_fake.py, to test the pipeline and the report. '
+              'It says nothing about any harness.</div>' if synthetic else "")
+    notes = [f"Node {hc.node}: original harness kind {hc.original_kind or '(no harness placement)'}; "
+             f"{hc.restore_note}.", hc.token_method, *run.notes]
+    return f"""
+<style>{_CSS}</style>
+<div class="wrap">
+{banner}
+<header>
+  <div class="eyebrow">harness compare</div>
+  <h1>{_esc(run.scenario)}</h1>
+  <div class="meta">node {_esc(hc.node)} &nbsp;·&nbsp; kinds {_esc(', '.join(hc.kinds))} &nbsp;·&nbsp; {_esc(run.gateway or 'cluster')} &nbsp;·&nbsp; {_esc(run.started_at)}</div>
+</header>
+<div class="kpis">{''.join(kpis)}</div>
+<section><h2>Which harness is better here</h2><p class='sub'>The same task set, run under each harness kind on one node in turn. Tokens are the harness:&lt;kind&gt; usage the run could attribute (— = not reported).</p>{_compare_tables(run)}</section>
+<section><h2>Placing each kind</h2><ul>{kind_lines}</ul></section>
+<section><h2>Every task run</h2>{_compare_detail(run)}</section>
+<section><h2>Notes</h2><ul>{''.join(f"<li>{_esc(n)}</li>" for n in notes if n)}</ul></section>
+<footer>Generated by <code>noo-eval</code> · schema v{_esc(__import__('noo_eval').__version__)} · self-contained (no external assets)</footer>
+</div>
+"""
+
+
 def _render(run: RunResult) -> str:
+    if run.harness_compare is not None:
+        return _render_compare(run)
     agg = aggregate(run)
     axes = " · ".join(_AXIS_LABEL.get(a, a) for a in run.axes)
 
@@ -216,6 +313,17 @@ def write_report(run: RunResult, path: str | Path, *, standalone: bool = True) -
     return p
 
 
+def write_compare_json(run: RunResult, path: str | Path) -> Path:
+    """The JSON twin of a harness-compare report: the summary table plus
+    every task run, for a script (or the next run) to read."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    doc = report_json(run.harness_compare, run.scenario)
+    doc.update({"gateway": run.gateway, "started_at": run.started_at, "notes": run.notes})
+    p.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    return p
+
+
 _CSS = """
 :root{--bg:#f7f7fb;--card:#fff;--ink:#1a1a2e;--muted:#6b7280;--grid:#e5e7eb;
 --accent:#4f46e5;--ok:#10b981;--warn:#f59e0b;--bad:#ef4444;
@@ -264,6 +372,8 @@ td.bad,.bad{color:var(--bad)}td.warn,.warn{color:var(--warn)}.muted{color:var(--
 footer{color:var(--muted);font-size:12px;text-align:center;margin-top:32px}
 code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;border-radius:5px;font-size:.9em}
 ul{margin:8px 0;padding-left:20px}li{margin:4px 0}
+h3{font-size:14px;margin:14px 0 2px;font-weight:600}
+table.grid td.wrap-cell{white-space:normal;min-width:220px}
 .synthetic-banner{background:color-mix(in srgb,var(--bad) 15%,var(--card));
 border:1px solid var(--bad);color:var(--bad);border-radius:10px;padding:12px 16px;
 margin-bottom:18px;font-size:13px;font-weight:600}

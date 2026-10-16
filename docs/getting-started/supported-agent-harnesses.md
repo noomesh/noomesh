@@ -124,6 +124,57 @@ and `noo cluster status` prints it as `<node> harness: <reason>`.
 The gateway also refuses an unknown kind when you place it, before the node
 is involved.
 
+## Compare kinds on a node
+
+Which kind does better on your node is a measurement, not an opinion: the
+eval harness in `eval/` runs the same task set under each kind, in turn, on
+one node, and reports a row per kind. A scenario with a `harness_compare:`
+block does it; `eval/scenarios/harness-compare-awolf.yaml` is the sample
+(three tasks: a one-word reply, a question that needs a mesh tool, and a
+two-step delegation, under `noo`, `copilot` and `claude-code`).
+
+**It changes the node's harness placement while it runs.** For each kind it
+sets `NOO_HARNESS_KIND` on the node's `harness` placement (keeping the rest
+of the placement's env), waits for the node to report the harness running
+on a fresh heartbeat, then runs each task through `POST /api/tasks` and
+polls it to the end. The original placement is put back at the end and when
+the run fails; if the put-back itself fails, the report says so and gives
+the command to restore the kind by hand. Run it when nobody else depends on
+that node's harness. Placements and the tasks are the only things it writes.
+
+From the repository root, with an operator credential in `NOO_EVAL_TOKEN`
+(placing is an operator action) and the eval harness's Python dependencies
+(`httpx`, `pydantic`, `pyyaml`):
+
+```sh
+PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-compare-awolf.yaml --gateway https://<controller>:8080
+PYTHONPATH=eval python3 -m noo_eval run eval/scenarios/harness-compare-awolf.yaml --fixture
+```
+
+The second is a dry run against a built-in fake gateway: no cluster, no
+writes, every number synthetic. It exists so CI can test the pipeline and
+the report.
+
+It writes `eval/reports/<scenario>.html` and a JSON twin beside it
+(`.json`): per task set, one row per `harness_kind` with tasks passed out of
+total, mean loops, mean wall seconds, prompt and completion tokens, and each
+failure's first line; then every task run (state, loops, the node that ran
+it, the check). A task the controller ran in process instead of the node's
+harness fails by default (`require_dispatch`), because it measured the
+controller and not the kind.
+
+A task's `check` is one of `contains:<text>` (case-insensitive),
+`regex:<pattern>`, `nonempty` or `state:<state>` (for example `state:done`).
+A task with `kinds: [...]` runs only under those kinds.
+
+Tokens come from `GET /api/usage/summary?group=backend`: the difference in
+the `harness:<kind>` row before and after each task. Usage rows carry no
+task id, so under an operator token the number is install-wide and counts
+any other traffic of the same kind at the same time; set `task_token_env`
+in the scenario to run the tasks as a user and read only that user's usage.
+The `noo` kind records no token usage for its loops today, so its token
+columns read "not reported" rather than 0.
+
 ## Telemetry
 
 The vendor switches each third-party harness must be launched with, the
