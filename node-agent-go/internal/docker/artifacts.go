@@ -42,6 +42,31 @@ func ImageTarName(ref, arch string) string {
 	return sanitized + "_" + arch + ".tar"
 }
 
+// ImageTarGzName is the compressed export's name: ImageTarName + ".gz". The
+// controller exports this; a node asks for it first and falls back to the
+// plain tar (an older controller store). MUST stay in lockstep with
+// `image_tar_gz_name` in noo-cli and the gateway.
+func ImageTarGzName(ref, arch string) string {
+	return ImageTarName(ref, arch) + ".gz"
+}
+
+// fetchImageManifest asks the manifest route for the compressed export
+// first, then the plain tar. Only "the controller has no such file"
+// (ErrArtifactAbsent) falls back; any other error (route down, auth,
+// timeout) is returned as is and is NOT retried under the other name — it is
+// about the route, not the name. Both absent returns ErrArtifactAbsent. The
+// name that answered is returned so the fetch uses it.
+func fetchImageManifest(ctx context.Context, ref, arch string) (m *artifactManifest, name string, err error) {
+	name = ImageTarGzName(ref, arch)
+	m, err = imageManifestFetch(ctx, name)
+	if err == nil || !errors.Is(err, ErrArtifactAbsent) {
+		return m, name, err
+	}
+	name = ImageTarName(ref, arch)
+	m, err = imageManifestFetch(ctx, name)
+	return m, name, err
+}
+
 // PullImageArtifactResult is the honest outcome of one pull.
 type PullImageArtifactResult struct {
 	Status  string `json:"status"` // "loaded" | "up_to_date"
@@ -84,7 +109,9 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		return nil, fmt.Errorf("NOO_MODEL_CACHE_URL is not set — no data plane to pull from")
 	}
 	arch := runtime.GOARCH
-	tarName := ImageTarName(ref, arch)
+	// Reported when the image is already current or not staged; the name that
+	// is actually fetched is whichever the manifest route answers for below.
+	tarName := ImageTarGzName(ref, arch)
 
 	if controllerImageID != "" {
 		if inspect, err := c.docker.ImageInspect(ctx, ref); err == nil && inspect.ID == controllerImageID {
@@ -92,10 +119,10 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		}
 	}
 
-	m, merr := imageManifestFetch(ctx, tarName)
+	m, tarName, merr := fetchImageManifest(ctx, ref, arch)
 	if merr != nil {
 		if errors.Is(merr, ErrArtifactAbsent) {
-			return nil, &ImageNotStagedError{Ref: ref, Arch: arch, Tar: tarName}
+			return nil, &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
 		}
 		return nil, fmt.Errorf(
 			"no artifact manifest for %s (the manifest route or its auth failed: %v) — an image is executable code, so nothing is pulled unverified",
@@ -126,6 +153,8 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	// image, tagged as nothing or as the ref asked for. A verified tar from
 	// a controller that names another image (say `alpine:latest`) would
 	// otherwise re-point that tag on this node as a side effect of loading.
+	// (A `.tar.gz` is read through gzip; Docker itself detects gzip on load,
+	// so the raw file is what ImageLoad gets below.)
 	if err := checkTarManifest(staged, ref); err != nil {
 		return nil, &ImageVerificationError{Ref: ref, Err: err}
 	}
@@ -181,12 +210,19 @@ type ImageNotStagedError struct {
 	Ref  string
 	Arch string
 	Tar  string
+	// AltTar is the second name tried (the plain tar an older controller
+	// store holds); empty when only Tar was asked for.
+	AltTar string
 }
 
 func (e *ImageNotStagedError) Error() string {
+	tried := e.Tar
+	if e.AltTar != "" {
+		tried = e.Tar + " or " + e.AltTar
+	}
 	return fmt.Sprintf(
 		"image %s not staged on the controller (no %s tar %s in its artifact store) — run `noo cluster sync-images %s -i %s` or `noo upgrade` on the controller",
-		e.Ref, e.Arch, e.Tar, nodeIDOrPlaceholder(), e.Ref)
+		e.Ref, e.Arch, tried, nodeIDOrPlaceholder(), e.Ref)
 }
 
 // IsImageNotStaged reports whether err is (or wraps) the not-staged refusal.
