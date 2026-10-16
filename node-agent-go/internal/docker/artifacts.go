@@ -75,11 +75,16 @@ var imageRefLocks sync.Map // ref -> *sync.Mutex
 // lockImageRef serialises pulls of one ref and returns the unlock. Different
 // refs do not contend. It is held across a pull (by design) and is NOT the
 // railFail mutex, which only ever guards a map lookup.
-func lockImageRef(ref string) func() {
+//
+// waited reports that another pull of the ref held the lock first.
+func lockImageRef(ref string) (unlock func(), waited bool) {
 	v, _ := imageRefLocks.LoadOrStore(ref, &sync.Mutex{})
 	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	if !mu.TryLock() {
+		waited = true
+		mu.Lock()
+	}
+	return mu.Unlock, waited
 }
 
 // PullImageArtifactResult is the honest outcome of one pull.
@@ -120,10 +125,20 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 		return nil, fmt.Errorf("invalid image ref %q", ref)
 	}
 	// One pull of a ref at a time: two writers on one staged .partial would
-	// corrupt it (a prefetch and a start path can overlap on one image). The
-	// second caller waits for the first, then runs its own pull (a re-fetch is
-	// LAN-cheap and FetchOneVerified verifies whatever it lands).
-	defer lockImageRef(ref)()
+	// corrupt it (a prefetch and a start path can overlap on one image).
+	unlock, waited := lockImageRef(ref)
+	defer unlock()
+	if waited {
+		// The pull we waited for has most likely just landed this ref:
+		// do not download the same multi-GB tar again back to back. Only
+		// after a wait: an uncontended caller asked for a pull on purpose
+		// (the local copy may be the stale one). When controllerImageID is
+		// given the local ID must match it, as in the check below; if the
+		// image is absent or differs, we fall through and pull as usual.
+		if id, ok := imageLocalID(ctx, c, ref); ok && (controllerImageID == "" || id == controllerImageID) {
+			return &PullImageArtifactResult{Status: "up_to_date", Image: ref, Tar: ImageTarGzName(ref, runtime.GOARCH), Arch: runtime.GOARCH}, nil
+		}
+	}
 	cacheURL := preseed.CacheURL()
 	if cacheURL == "" {
 		return nil, fmt.Errorf("NOO_MODEL_CACHE_URL is not set — no data plane to pull from")

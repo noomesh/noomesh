@@ -241,3 +241,55 @@ func TestPullImageArtifactSerialisesPerRef(t *testing.T) {
 		t.Fatalf("max in flight %d, want 2 (one per distinct ref)", got)
 	}
 }
+
+// A pull that waited on the per-ref lock finds the image local once the
+// first one lands and makes no manifest or fetch call of its own.
+func TestPullImageArtifactSecondCallerFindsItLocal(t *testing.T) {
+	pki := preseedtest.New(t)
+	pki.SetNodeEnv(t)
+	t.Setenv("NOO_MODEL_CACHE_URL", pki.Store(t, http.NotFoundHandler()).URL)
+	var landed atomic.Bool
+	var manifestCalls int32
+	release := make(chan struct{})
+	entered := make(chan struct{}, 4)
+	pl, pm := imageLocalID, imageManifestFetch
+	imageLocalID = func(context.Context, *Client, string) (string, bool) { return "sha256:new", landed.Load() }
+	imageManifestFetch = func(context.Context, string) (*artifactManifest, error) {
+		atomic.AddInt32(&manifestCalls, 1)
+		entered <- struct{}{}
+		<-release
+		landed.Store(true) // the first pull "loads" the image
+		return nil, ErrArtifactAbsent
+	}
+	t.Cleanup(func() { imageLocalID, imageManifestFetch = pl, pm })
+
+	type out struct {
+		res *PullImageArtifactResult
+		err error
+	}
+	results := make(chan out, 2)
+	pull := func() {
+		r, err := (&Client{}).PullImageArtifact(context.Background(), "race:1", "", "")
+		results <- out{r, err}
+	}
+	go pull()
+	<-entered
+	go pull()
+	time.Sleep(150 * time.Millisecond) // let the second reach the lock
+	close(release)
+	var upToDate, refused int
+	for i := 0; i < 2; i++ {
+		o := <-results
+		switch {
+		case o.err == nil && o.res.Status == "up_to_date":
+			upToDate++
+		case IsImageNotStaged(o.err):
+			refused++
+		default:
+			t.Fatalf("unexpected result %+v %v", o.res, o.err)
+		}
+	}
+	if upToDate != 1 || refused != 1 || atomic.LoadInt32(&manifestCalls) != 2 {
+		t.Fatalf("upToDate=%d refused=%d manifestCalls=%d, want 1 1 2 (one pull asks for the .tar.gz then the .tar name)", upToDate, refused, manifestCalls)
+	}
+}
