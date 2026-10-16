@@ -188,7 +188,7 @@ fn sops_path() -> PathBuf {
 pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     use crate::addons::resolve::Refusal as R;
     if r.is_auth() {
-        return crate::addons::resolve::TOKEN_FIX.to_string();
+        return r.auth_fix().to_string();
     }
     match r {
         R::NoEntitlement(_) => "noo security entitlement install <token>".into(),
@@ -218,18 +218,16 @@ impl EnableOps for Live<'_> {
             ));
         };
         let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
-        let cred = addons::lock_fetch::installed_credential().map_err(|e| Refusal {
+        let client = addons::installed_client().map_err(|e| Refusal {
             why: format!("{e}. Nothing was changed"),
             fix: "noo security secrets audit".into(),
         })?;
-        let client = addons::lock_fetch::Client::new(cred.clone());
         let ctx = addons::Ctx {
             root: &root,
             tag: &tag,
             stack_lock: stack_lock.as_deref(),
             allow_downgrade: false,
             client: &client,
-            cred: cred.as_ref(),
         };
         if !self.g.json {
             crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));
@@ -244,6 +242,9 @@ impl EnableOps for Live<'_> {
             }
             Err(r) => return Err(Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) }),
         };
+        if !self.g.json {
+            crate::ui::step(&format!("{addon}: lock verified, images pulled {}", prepared.via));
+        }
         let pin = addons::commit(&root, &prepared, &tag).map_err(|r| Refusal {
             why: format!("{}. The images are pulled; noomesh.yaml is unchanged", r.why(addon)),
             fix: pin_fix(addon, &r),
@@ -595,9 +596,9 @@ addons:
     fn pin_remedies_name_real_causes() {
         use crate::addons::resolve::Refusal as R;
         use crate::release_fetch::{FetchClass, FetchError};
-        let auth = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: FetchError::new(FetchClass::Auth, "x") };
+        let auth = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: Box::new(FetchError::new(FetchClass::Auth, "x")), via: None };
         assert_eq!(pin_fix("evolve", &auth), crate::addons::resolve::TOKEN_FIX);
-        let nf = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: FetchError::new(FetchClass::NotFound, "x") };
+        let nf = R::Fetch { reference: "r".into(), stack_tag: "v0.6.4".into(), err: Box::new(FetchError::new(FetchClass::NotFound, "x")), via: None };
         assert!(pin_fix("evolve", &nf).starts_with("noo addons upgrade evolve --check"));
         assert!(pin_fix("evolve", &R::NoEntitlement("none".into())).starts_with("noo security entitlement install"));
         let d = R::Downgrade { pinned: "2".into(), offered: "1".into() };

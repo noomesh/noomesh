@@ -143,6 +143,11 @@ PersonifAI or to any vendor.
 - Neither package downloads models or data at runtime, contains an analytics,
   crash-reporting or experiment-tracking client, or checks a licence or
   version online.
+- Pulling an add-on is the only contact with the vendor: when the licence names
+  a pull location, `noo addons enable|upgrade` and `noo upgrade --stack` fetch
+  the add-on's signed lock and images from the vendor's add-on registry
+  (`addons.noomesh.ai`) with the licence as the credential (row below). A
+  running add-on never checks its licence online.
 - The Intelligent tier image is built on the open ML image and inherits its
   Hugging Face switches. The self-tuning engines image has no Hugging Face
   library; its compose service sets the same two switches anyway.
@@ -421,6 +426,7 @@ setting you chose. None of it is a report about you or your machines.
 | Model catalog browsing | `huggingface.co` API, `ollama.com`, `registry.ollama.ai` | `noo models search`; `noo models list` / `recommended` / `ollama` with `--refresh` or an expired catalog cache |
 | Image pulls | `ghcr.io`, `dhi.io`, Docker Hub, `mcr.microsoft.com`, NVIDIA | `noo stack start`, `noo upgrade`, provisioning, building images |
 | Releases and install | `api.github.com`, `github.com`, `raw.githubusercontent.com` | `noo upgrade`, the installer, node bootstrap |
+| Add-on pulls | `addons.noomesh.ai` (the vendor's add-on registry) and `pkg-containers.githubusercontent.com` (large layers it redirects to) | `noo addons enable|upgrade`, and `noo upgrade --stack` with a licensed add-on on, when the licence names a pull location. The vendor sees the licence id, add-on, digest, bytes and status for 30 days, never an IP address. With `NOO_ADDON_REGISTRY_TOKEN` in the store the controller pulls from `ghcr.io` instead and never contacts it. |
 | Tailnet | Tailscale coordination (`controlplane.tailscale.com`) and DERP relays; `api.tailscale.com` | Always while `tailscaled` runs on a host: this is how the node reaches the controller, so it is function, not telemetry, and is not switched off. Tailscale's client *log upload* is a different thing and is switched off (see [Host software](#host-software)). noomesh calls `api.tailscale.com` itself only when it provisions or removes a node with your Tailscale OAuth credentials. |
 | Channels | Google Chat, Google Pub/Sub, Telegram APIs; Meta's WhatsApp Cloud API (`graph.facebook.com`, outbound sends only) | Only for a channel you have configured |
 | Cloud models | Anthropic, OpenAI, Google Gemini APIs | Only when `CLOUD_PROVIDERS_ENABLED` is on, a `claude-*`, `gpt-*` or `gemini-*` model is selected and its key is configured. The model runs the full agent loop, so each request carries the whole turn: the system prompt with retrieved context and memory, the conversation, the tool definitions and the tool results |

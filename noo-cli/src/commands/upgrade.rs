@@ -3632,10 +3632,10 @@ fn addons_on(g: &Globals, root: &std::path::Path) -> Vec<&'static str> {
     }
 }
 
-/// The registry credential, or a refusal: an unreadable store is never "no
-/// token".
-fn addon_credential(g: &Globals) -> Option<crate::addons::lock_fetch::Credential> {
-    match crate::addons::lock_fetch::installed_credential() {
+/// The add-on lock client with its credentials, or a refusal: an
+/// unreadable store is never "no token".
+fn addon_client(g: &Globals) -> crate::addons::lock_fetch::Client {
+    match crate::addons::installed_client() {
         Ok(c) => c,
         Err(e) => fail(g.json, ExitCode::Generic, "store_unreadable", &format!("{e}. Nothing was changed"),
             Some("noo security secrets audit")),
@@ -3645,7 +3645,7 @@ fn addon_credential(g: &Globals) -> Option<crate::addons::lock_fetch::Credential
 /// Remedy for an add-on that holds a stack roll.
 fn addon_hold_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> String {
     if r.is_auth() {
-        return crate::addons::resolve::TOKEN_FIX.to_string();
+        return r.auth_fix().to_string();
     }
     if crate::addons::resolve::is_not_published(r) {
         return format!("noo addons upgrade {addon} --check   # retry shortly; the vendor signs the lock minutes after a stack release");
@@ -3669,9 +3669,8 @@ fn addon_preflight(
     if on.is_empty() {
         return Vec::new();
     }
-    let cred = addon_credential(g);
-    let client = crate::addons::lock_fetch::Client::new(cred.clone());
-    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade, client: &client, cred: cred.as_ref() };
+    let client = addon_client(g);
+    let ctx = crate::addons::Ctx { root, tag, stack_lock, allow_downgrade, client: &client };
     let mut out = Vec::new();
     for addon in on {
         if !g.json { ui::step(&format!("{addon}: resolving its signed lock for {tag}")); }
@@ -3707,8 +3706,8 @@ fn commit_addon_pins(g: &Globals, root: &std::path::Path, tag: &str, prepared: &
     for p in prepared {
         match crate::addons::commit(root, p, tag) {
             Ok(pin) => if !g.json {
-                ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest)",
-                    p.addon, pin.version, pin.key_index, p.pulled));
+                ui::done(&format!("{} {} pinned for {tag} (add-on key #{}; {} image(s) pulled by digest {})",
+                    p.addon, pin.version, pin.key_index, p.pulled, p.via));
             },
             Err(r) => fail(g.json, ExitCode::Generic, "addon_pin_write_failed",
                 &format!("{} — stack.lock is already written for {tag}; the launcher refuses {} until it is pinned",
@@ -3729,7 +3728,7 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
         Ok(t) => t,
         Err((_, msg, _)) => return on.iter().map(|a| (a.to_string(), format!("the stack lock for {target} did not verify ({msg})"))).collect(),
     };
-    let client = crate::addons::lock_fetch::Client::new(addon_credential(g));
+    let client = addon_client(g);
     let pins = match crate::addons::pins::read(root) {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),

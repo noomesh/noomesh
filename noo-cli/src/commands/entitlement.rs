@@ -14,10 +14,11 @@ use crate::ui::{self, Glyph};
 use crate::{Globals, Unhandled};
 
 pub(super) const USAGE: &str = "Usage: noo security entitlement keygen [--out <file>]\n\
-       noo security entitlement issue --sub <customer> (--terms <version> | --no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--addon <name>=<registry>:<key>[,<key>]]... [--key <file>]\n\
+       noo security entitlement issue --sub <customer> (--terms <version> | --no-terms) [--tier intelligent] [--features a,b] [--days <n>] [--id <id>] [--addon <name>=<registry>:<key>[,<key>]]... [--pull-host <host>] [--bind-key <hex>] [--key <file>]\n\
        noo security entitlement install <token> [--enable] [--ci] [--accept-terms <version>]\n\
        noo security entitlement show\n\
-       noo security entitlement verify <token>";
+       noo security entitlement verify <token>\n\
+       noo security entitlement pubkey";
 
 pub(super) fn now() -> i64 {
     std::time::SystemTime::now()
@@ -56,6 +57,9 @@ fn print_ent(g: &Globals, ent: &Entitlement, verdict: &str, acceptance: Option<O
     if let Some(n) = ent.max_nodes {
         rows.push(("seats", format!("{n} nodes")));
     }
+    if let Some(k) = ent.controller_key() {
+        rows.push(("controller key", format!("{}  {}", entitlement::short_key_id(k), ui::muted("(`noo security entitlement pubkey` shows this controller's)"))));
+    }
     let valid = verdict.starts_with("valid");
     rows.push(("verdict", if valid { ui::ok(verdict) } else { ui::err(verdict) }));
     print!("{}", ui::kv(&rows));
@@ -81,7 +85,8 @@ pub(super) fn addon_signer_rows(ent: &Entitlement) -> Vec<(&str, String)> {
                 n => ui::muted(&format!("  (+{} older)", n - 1)),
             };
             let key0 = a.keys.first().map(|k| entitlement::short_key_id(k)).unwrap_or_else(|| ui::dash().to_string());
-            (name.as_str(), format!("{}  key #0 {key0}{older}", a.registry))
+            let pull = a.pull.as_deref().map(|p| ui::muted(&format!("  pulled via {p}"))).unwrap_or_default();
+            (name.as_str(), format!("{}  key #0 {key0}{older}{pull}", a.registry))
         })
         .collect()
 }
@@ -295,6 +300,53 @@ pub(crate) fn enable_unlocked<'a>(
     (enabled, failed)
 }
 
+/// `noo security entitlement pubkey`: this controller's add-on key, the
+/// 64-hex ed25519 public key the operator sends the vendor so the
+/// entitlement is bound to this controller (`cnf`, `issue --bind-key`).
+/// Derived from the cluster CA (`addons::pop`), so it is stable for the
+/// cluster's life and nothing new is stored. Prints only a public key.
+pub fn entitlement_pubkey(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    match args {
+        [] => {}
+        [h] if h == "--help" || h == "-h" => {
+            println!("{USAGE}");
+            return Ok(0);
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    }
+    let key = match crate::addons::pop::controller_key() {
+        Ok(k) => k,
+        Err(e) => fail(g.json, ExitCode::Generic, "controller_key_unreadable", &e, Some("noo security pki status")),
+    };
+    let hex = crate::addons::pop::pubkey_hex(&key);
+    // Whether the installed entitlement is bound, and to this key.
+    let bound = entitlement::installed_token().and_then(|t| entitlement::verify(&t).ok()).map(|e| e.controller_key().map(str::to_string));
+    if g.json {
+        println!("{}", serde_json::json!({
+            "public_key_hex": hex,
+            "derived_from": "cluster CA",
+            "installed_entitlement_bound": bound.as_ref().map(|b| b.is_some()),
+            "installed_entitlement_matches": bound.as_ref().and_then(|b| b.as_ref()).map(|b| b.eq_ignore_ascii_case(&hex)),
+        }));
+        return Ok(0);
+    }
+    // The key is the value a script captures: stdout, plain.
+    ui::value(&hex);
+    println!("{}", ui::note("this controller's add-on key (ed25519, derived from the cluster CA); send it to the vendor to bind the entitlement to this controller"));
+    match &bound {
+        Some(Some(b)) if b.eq_ignore_ascii_case(&hex) => println!("{}", ui::note("the installed entitlement is bound to this key")),
+        Some(Some(b)) => println!("{}", ui::note(&format!(
+            "the installed entitlement is bound to another key ({}): add-on pulls through the vendor's registry are refused until it is reissued for this one",
+            entitlement::short_key_id(b)))),
+        Some(None) => println!("{}", ui::note("the installed entitlement is not bound to a controller key")),
+        None => {}
+    }
+    Ok(0)
+}
+
 pub fn entitlement_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
         return Err(Unhandled);
@@ -367,7 +419,7 @@ mod tests {
 
     #[test]
     fn show_prints_terms_both_ways() {
-        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "intelligent".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default() };
+        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "intelligent".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default(), cnf: None };
         assert_eq!(terms_at_issue(&e), "none recorded (issued before terms)");
         e.terms = Some("addon-1.0".into());
         assert_eq!(terms_at_issue(&e), "addon-1.0");
@@ -375,9 +427,9 @@ mod tests {
 
     #[test]
     fn show_lists_addon_signers_by_registry_and_key_zero() {
-        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "t".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default() };
+        let mut e = Entitlement { v: 1, sub: "a".into(), tier: "t".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default(), cnf: None };
         assert!(super::addon_signer_rows(&e).is_empty());
-        e.addons.insert("evolve".into(), crate::addon_lock::TrustAnchor { keys: vec!["cd".repeat(32), "ef".repeat(32)], registry: "ghcr.io/example/evolve".into() });
+        e.addons.insert("evolve".into(), crate::addon_lock::TrustAnchor { keys: vec!["cd".repeat(32), "ef".repeat(32)], registry: "ghcr.io/example/evolve".into(), pull: None });
         let rows = super::addon_signer_rows(&e);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "evolve");
