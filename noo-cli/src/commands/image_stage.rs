@@ -132,6 +132,19 @@ pub(crate) fn image_tar_name(image: &str, arch: &str) -> String {
     format!("{}_{arch}.tar", image.replace(['/', ':'], "_"))
 }
 
+/// The compressed artifact's name: the tar name + ".gz" (twins: Go
+/// `ImageTarGzName`, the gateway's `image_tar_gz_name`). The controller now
+/// exports this; a node asks for it first and falls back to the plain tar.
+pub(crate) fn image_tar_gz_name(image: &str, arch: &str) -> String {
+    format!("{}.gz", image_tar_name(image, arch))
+}
+
+/// True when the store holds the image for `arch` in either form. An older
+/// controller store (plain `.tar`) is still a staged image.
+fn image_staged_in(dir: &Path, image: &str, arch: &str) -> bool {
+    dir.join(image_tar_gz_name(image, arch)).is_file() || dir.join(image_tar_name(image, arch)).is_file()
+}
+
 /// Where the tars live on this host (`IMAGES_DIR`, else `$NOO_DATA_ROOT/images`).
 pub(crate) fn images_store_dir() -> PathBuf {
     let v = |k: &str| std::env::var(k).unwrap_or_default();
@@ -393,37 +406,156 @@ fn resolve_platform(src: &str, arch: &str) -> Result<PlatformPick, String> {
     Ok(pick_platform(&v, arch))
 }
 
-/// `docker save` into the store under `tar`, tmp+rename (nginx and the
-/// gateway's digest cache must never see a half-written tar), with the
-/// `<tar>.imageid` sidecar. A tar whose sidecar already names `id` is kept.
+/// The first of `names` that is an executable file on PATH. ABSENT → None.
+fn on_path(names: &[&str]) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    names.iter().find_map(|n| {
+        std::env::split_paths(&path)
+            .map(|d| d.join(n))
+            .find(|p| p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false))
+            .map(|_| n.to_string())
+    })
+}
+
+/// `docker save <save_args> | pigz -1 (else gzip -1) > out`.
+///
+/// Level 1 on purpose: the controller's CPU time matters more than the last
+/// ~10% of size, and layers already shrink about 2:1 at level 1.
+///
+/// Both ends of the pipe are checked. This repo has been bitten by the
+/// pipe-to-tail pattern (`save | gzip && go-on` gates on the LAST command, so
+/// a failed `docker save` plus a happy gzip yields a valid-looking, truncated
+/// archive that is then staged as good); the two children are spawned
+/// directly and each exit status is read, which needs no `set -o pipefail`
+/// (dash, a common /bin/sh, only recently learned it).
+///
+/// Neither pigz nor gzip on PATH → an error, never an uncompressed export:
+/// nodes ask for `.tar.gz` first, so a plain tar would not be found by them.
+fn docker_save_gz(save_args: &[&str], out: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let out_s = out.display().to_string();
+        let mut args: Vec<&str> = vec!["save", "-o", &out_s];
+        args.extend_from_slice(save_args);
+        if let Some(r) = FAKE_DOCKER.with(|f| f.borrow_mut().as_mut().map(|h| h(&args))) {
+            return r.map(|_| ());
+        }
+    }
+    let gz = on_path(&["pigz", "gzip"]).ok_or("gzip is required on the controller (apt install gzip)")?;
+    let mut save = Command::new("docker");
+    save.arg("save").args(save_args);
+    pipe_gz(save, "docker save", &gz, out)
+}
+
+/// `producer | <gz> -1 > out`, with BOTH exit statuses checked.
+fn pipe_gz(mut producer: Command, what: &str, gz: &str, out: &Path) -> Result<(), String> {
+    use std::process::Stdio;
+    let file = std::fs::File::create(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let mut prod = producer.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{what}: {e}"))?;
+    let prod_out = prod.stdout.take().ok_or_else(|| format!("{what}: no stdout"))?;
+    let mut comp = match Command::new(gz).arg("-1").stdin(Stdio::from(prod_out)).stdout(Stdio::from(file)).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = prod.kill();
+            let _ = prod.wait();
+            return Err(format!("{gz}: {e}"));
+        }
+    };
+    let prod_res = prod.wait_with_output().map_err(|e| format!("{what}: {e}"))?;
+    let comp_res = comp.wait().map_err(|e| format!("{gz}: {e}"))?;
+    if !prod_res.status.success() {
+        return Err(format!("{what}: {}", String::from_utf8_lossy(&prod_res.stderr).trim()));
+    }
+    if !comp_res.success() {
+        return Err(format!("{gz} -1 failed ({comp_res})"));
+    }
+    Ok(())
+}
+
+/// Hard-link an existing `.tar.gz` export whose sidecar names `id` to
+/// `<tar>.exporting` (the caller finishes with sidecar + rename). False when
+/// there is none, or the link fails — then the caller exports normally.
+fn link_same_id_export(dir: &Path, tar: &str, id: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(data) = name.strip_suffix(".imageid") else { continue };
+        if data == tar || !data.ends_with(".tar.gz") || !dir.join(data).is_file() {
+            continue;
+        }
+        if std::fs::read_to_string(e.path()).unwrap_or_default().trim() != id {
+            continue;
+        }
+        let tmp = dir.join(format!("{tar}.exporting"));
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(dir.join(data), &tmp).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Export into the store under `tar` (a `.tar.gz` name), tmp+rename (nginx
+/// and the gateway's digest cache must never see a half-written file), with
+/// the `<tar>.imageid` sidecar. An export whose sidecar already names `id`
+/// is kept. Once a `.tar.gz` is in place the same stem's stale uncompressed
+/// `.tar` (+ sidecar) is removed: disk, and one name per image.
 fn save_tar(dir: &Path, tar: &str, save_args: &[&str], id: &str, g: &Globals) -> Result<(), String> {
     let path = dir.join(tar);
     let sidecar = dir.join(format!("{tar}.imageid"));
-    if !id.is_empty() && path.is_file() && std::fs::read_to_string(&sidecar).unwrap_or_default().trim() == id {
-        return Ok(());
+    let kept = !id.is_empty() && path.is_file() && std::fs::read_to_string(&sidecar).unwrap_or_default().trim() == id;
+    if kept && !g.json && !ui::quiet() {
+        println!("  {tar}: already staged (same image id)");
     }
-    if !g.json && !ui::quiet() {
-        println!("  exporting → {tar}");
+    if !kept {
+        // The file NAME embeds the release tag, so across releases the name
+        // above never exists yet even when the image bytes did not change.
+        // An export saved BY ID (no RepoTags inside; the node tags it on
+        // load) is identical for the same id whatever it is called: reuse
+        // the sibling by hard link instead of exporting again. A tar saved
+        // by TAG carries its tag in manifest.json, which the node refuses
+        // under another ref, so those are never reused.
+        let by_id = !id.is_empty() && save_args == [id];
+        let reused = by_id && link_same_id_export(dir, tar, id);
+        if reused {
+            if !g.json && !ui::quiet() {
+                println!("  {tar}: already staged (same image id)");
+            }
+        } else {
+            if !g.json && !ui::quiet() {
+                println!("  exporting → {tar}");
+            }
+            let tmp = dir.join(format!("{tar}.exporting"));
+            if let Err(e) = docker_save_gz(save_args, &tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            // World-readable before it is visible: newer Docker CLIs create the
+            // `-o` file 0600, and the model-cache's nginx (another uid) must read it.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).map_err(|e| format!("chmod {tar}: {e}"))?;
+            }
+        }
+        let tmp = dir.join(format!("{tar}.exporting"));
+        // The sidecar first: a reader that sees the new file sees its ID.
+        let side_tmp = dir.join(format!("{tar}.imageid.tmp"));
+        std::fs::write(&side_tmp, format!("{id}\n")).map_err(|e| e.to_string())?;
+        std::fs::rename(&side_tmp, &sidecar).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("finalize {tar}: {e}"))?;
     }
-    let tmp = dir.join(format!("{tar}.exporting"));
-    let tmp_s = tmp.display().to_string();
-    let mut args: Vec<&str> = vec!["save", "-o", &tmp_s];
-    args.extend_from_slice(save_args);
-    if let Err(e) = docker(&args) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    if let Some(stem) = tar.strip_suffix(".gz") {
+        let old = dir.join(stem);
+        if old.is_file() {
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.imageid")));
+            let _ = std::fs::remove_file(&old);
+            if !g.json && !ui::quiet() {
+                println!("  removed the stale uncompressed {stem} (superseded by {tar})");
+            }
+        }
     }
-    // World-readable before it is visible: newer Docker CLIs create the
-    // `-o` file 0600, and the model-cache's nginx (another uid) must read it.
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).map_err(|e| format!("chmod {tar}: {e}"))?;
-    }
-    // The sidecar first: a reader that sees the new tar sees its ID.
-    let side_tmp = dir.join(format!("{tar}.imageid.tmp"));
-    std::fs::write(&side_tmp, format!("{id}\n")).map_err(|e| e.to_string())?;
-    std::fs::rename(&side_tmp, &sidecar).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("finalize {tar}: {e}"))
+    Ok(())
 }
 
 fn now_unix() -> u64 {
@@ -450,7 +582,7 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
     let src = lock_digest.map(|d| format!("{repo}@{d}")).unwrap_or_else(|| image.to_string());
     let dir = images_store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let tar = image_tar_name(image, arch);
+    let tar = image_tar_gz_name(image, arch);
     let platform = format!("linux/{arch}");
 
     let image_id = if arch == host {
@@ -464,7 +596,14 @@ pub(crate) fn stage_image(g: &Globals, image: &str, arch: &str, lock_digest: Opt
         if lock_digest.is_some() {
             docker(&["tag", &src, image])?;
         }
-        save_tar(&dir, &tar, &[image], &id, g)?;
+        // Classic store: save BY ID so the export holds no RepoTags (the node
+        // tags it on load) and the same bytes can serve the next release.
+        // On the containerd store the id is an index digest, so keep the tag.
+        if containerd_store() {
+            save_tar(&dir, &tar, &[image], &id, g)?;
+        } else {
+            save_tar(&dir, &tar, &[id.as_str()], &id, g)?;
+        }
         id
     } else if containerd_store() {
         docker(&["pull", "-q", "--platform", &platform, &src]).map_err(|e| format!("{NO_VARIANT} {arch}? {e}"))?;
@@ -711,7 +850,7 @@ pub(crate) fn unstaged_for(placements: &Value, arch: &str) -> Vec<String> {
             let roots: Vec<&str> = idx.own_roots.iter().map(String::as_str).collect();
             placement_required_image(p["backend"].as_str().unwrap_or(""), p["image"].as_str(), arch, idx.release.as_ref(), &roots)
         })
-        .filter(|img| !dir.join(image_tar_name(img, arch)).is_file())
+        .filter(|img| !image_staged_in(&dir, img, arch))
         .collect();
     out.sort();
     out.dedup();
@@ -940,7 +1079,7 @@ mod tests {
         assert_eq!(calls.iter().filter(|c| c.starts_with("pull")).count(), 1, "no restore pull: {calls:?}");
         assert!(calls.iter().any(|c| c.starts_with("save -o") && c.ends_with(" sha256:armid")), "saved by ID: {calls:?}");
         assert_eq!(rec.image_id, "sha256:armid");
-        assert_eq!(rec.tar, image_tar_name(&format!("{REPO}:v1"), "arm64"));
+        assert_eq!(rec.tar, image_tar_gz_name(&format!("{REPO}:v1"), "arm64"));
         assert!(dir.join(&rec.tar).is_file() && dir.join(format!("{}.imageid", rec.tar)).is_file());
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(dir.join(&rec.tar)).unwrap().permissions().mode() & 0o777;
@@ -993,7 +1132,7 @@ mod tests {
         let tag_at = calls.iter().position(|c| c.starts_with("tag ")).expect("tagged");
         let inspect_at = calls.iter().position(|c| c.starts_with("image inspect")).unwrap();
         assert!(inspect_at < tag_at, "inspect before tag: {calls:?}");
-        assert!(calls.iter().any(|c| c.starts_with("save -o") && c.ends_with(&format!(" {REPO}:v1"))), "saved by tag: {calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("save -o") && c.ends_with(" sha256:hostid")), "saved by ID: {calls:?}");
         assert_eq!(rec.image_id, "sha256:hostid");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -1003,7 +1142,7 @@ mod tests {
     fn a_tar_already_staged_at_the_same_id_is_not_re_exported() {
         let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = store("same-id");
-        let tar = image_tar_name(&format!("{REPO}:v1"), "amd64");
+        let tar = image_tar_gz_name(&format!("{REPO}:v1"), "amd64");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(&tar), b"old").unwrap();
         std::fs::write(dir.join(format!("{tar}.imageid")), "sha256:hostid\n").unwrap();
@@ -1015,6 +1154,111 @@ mod tests {
         });
         stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("stage");
         assert!(d.calls.borrow().iter().all(|c| !c.starts_with("save")), "{:?}", d.calls.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE cause of "re-exported though nothing changed": the file name embeds
+    /// the release tag, so a new release never found its own sidecar. An
+    /// export of the same image id under the PREVIOUS release's name is
+    /// linked, not re-saved.
+    #[test]
+    fn the_same_image_id_under_the_previous_release_name_is_not_re_exported() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("prev-release");
+        let old = image_tar_gz_name(&format!("{REPO}:v1"), "amd64");
+        let new = image_tar_gz_name(&format!("{REPO}:v2"), "amd64");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&old), b"bytes").unwrap();
+        std::fs::write(dir.join(format!("{old}.imageid")), "sha256:hostid\n").unwrap();
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            l if l.starts_with("info") => Ok(String::new()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        let rec = stage_image(&g(), &format!("{REPO}:v2"), "amd64", Some(D), "lock").expect("stage");
+        assert!(d.calls.borrow().iter().all(|c| !c.starts_with("save")), "{:?}", d.calls.borrow());
+        assert_eq!(rec.tar, new);
+        assert_eq!(std::fs::read(dir.join(&new)).unwrap(), b"bytes");
+        assert_eq!(std::fs::read_to_string(dir.join(format!("{new}.imageid"))).unwrap().trim(), "sha256:hostid");
+        assert!(dir.join(&old).is_file(), "the previous release keeps its own name (rollback)");
+        // A DIFFERENT id is exported.
+        std::fs::write(dir.join(format!("{old}.imageid")), "sha256:other\n").unwrap();
+        let _ = std::fs::remove_file(dir.join(&new));
+        let _ = std::fs::remove_file(dir.join(format!("{new}.imageid")));
+        stage_image(&g(), &format!("{REPO}:v2"), "amd64", Some(D), "lock").expect("stage");
+        assert!(d.calls.borrow().iter().any(|c| c.starts_with("save")), "different id must export");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipe is only as honest as its first stage: a failing producer with
+    /// a happy gzip must be an ERROR (the pipe-to-tail trap), and a good one
+    /// must round-trip through gunzip.
+    #[test]
+    fn a_failing_producer_is_not_masked_by_a_successful_gzip() {
+        let Some(gz) = on_path(&["gzip"]) else { return };
+        let dir = std::env::temp_dir().join(format!("noo-pipegz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("o.gz");
+        let mut bad = Command::new("sh");
+        bad.args(["-c", "echo partial; echo boom >&2; exit 3"]);
+        let e = pipe_gz(bad, "fake save", &gz, &out).expect_err("must fail");
+        assert!(e.contains("boom"), "{e}");
+        let mut good = Command::new("sh");
+        good.args(["-c", "printf hello"]);
+        pipe_gz(good, "fake save", &gz, &out).expect("ok");
+        let back = Command::new(&gz).args(["-dc"]).arg(&out).output().unwrap();
+        assert_eq!(back.stdout, b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gz_name_is_the_tar_name_plus_gz() {
+        assert_eq!(image_tar_gz_name("ghcr.io/x/y:z", "arm64"), "ghcr.io_x_y_z_arm64.tar.gz");
+        for (i, a) in [("pai-assistant/node-agent:latest", "amd64"), ("noo-sandbox-base:latest", "arm64")] {
+            assert_eq!(image_tar_gz_name(i, a), format!("{}.gz", image_tar_name(i, a)));
+        }
+    }
+
+    /// An uncompressed tar left by an older controller does NOT count as the
+    /// gz export (nodes ask for `.tar.gz` first): it is re-exported, and the
+    /// stale plain tar and its sidecar are removed once the gz is in place.
+    #[test]
+    fn a_gz_export_replaces_a_stale_plain_tar() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = store("stale-plain");
+        let plain = image_tar_name(&format!("{REPO}:v1"), "amd64");
+        let gz = image_tar_gz_name(&format!("{REPO}:v1"), "amd64");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&plain), b"old").unwrap();
+        std::fs::write(dir.join(format!("{plain}.imageid")), "sha256:hostid\n").unwrap();
+        let d = daemon(move |l| match l {
+            l if l.starts_with("version") => Ok("amd64".into()),
+            l if l.starts_with("image inspect") => Ok("sha256:hostid amd64".into()),
+            l if l.starts_with("tag ") => Ok(String::new()),
+            other => Err(format!("unexpected: {other}")),
+        });
+        stage_image(&g(), &format!("{REPO}:v1"), "amd64", Some(D), "lock").expect("stage");
+        assert!(d.calls.borrow().iter().any(|c| c.starts_with("save")), "must re-export: {:?}", d.calls.borrow());
+        assert!(dir.join(&gz).is_file() && dir.join(format!("{gz}.imageid")).is_file());
+        assert!(!dir.join(&plain).exists() && !dir.join(format!("{plain}.imageid")).exists(), "stale plain tar must go");
+        assert!(image_staged_in(&dir, &format!("{REPO}:v1"), "amd64"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn either_form_counts_as_staged() {
+        let dir = std::env::temp_dir().join(format!("noo-staged-either-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!image_staged_in(&dir, "a/b:c", "arm64"));
+        std::fs::write(dir.join(image_tar_name("a/b:c", "arm64")), b"x").unwrap();
+        assert!(image_staged_in(&dir, "a/b:c", "arm64"));
+        let _ = std::fs::remove_file(dir.join(image_tar_name("a/b:c", "arm64")));
+        std::fs::write(dir.join(image_tar_gz_name("a/b:c", "arm64")), b"x").unwrap();
+        assert!(image_staged_in(&dir, "a/b:c", "arm64"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
