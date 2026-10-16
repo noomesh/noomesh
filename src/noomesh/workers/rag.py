@@ -33,7 +33,7 @@ from .kb import (
     _resolve_kb_roles,
     _writable_kb_roles,
 )
-from . import kb_ingest_roles, kb_trace
+from . import ingest_confine, kb_ingest_roles, kb_trace
 from . import walks as _walks
 from .registry import worker_handler
 
@@ -505,11 +505,16 @@ async def _rag_ingest(request: dict) -> Any:
             "ingest has no audience: refusing to store an untagged document"
         )
     metadata = dict(metadata or {})
-    if not source and not text:
-        raise ValueError("Provide 'source' or 'text'")
-
-    # PageIndexRAG.ingest() auto-detects whether input is a path or raw text
-    content = source if source else text
+    # Decide what this is BEFORE trellion sees it: PageIndexRAG.ingest opens
+    # any string that names an existing file, so a source outside the
+    # declared roots (or text that spells a path) must never reach it.
+    # Raises ValueError (the contract for a bad request) with the fix named.
+    try:
+        target = ingest_confine.classify(source, text)
+    except ingest_confine.IngestRefused as e:
+        log.warning("rag_ingest_refused", reason=str(e)[:200])
+        raise
+    content = target.value
     # An ingest never changes an existing document's audience; only a retag
     # does. Trellion merges a dedup hit's metadata over the
     # existing row (new keys win), so `roles` is NOT passed to rag.ingest:
@@ -524,8 +529,8 @@ async def _rag_ingest(request: dict) -> Any:
             raise RuntimeError("cannot read the database clock; refusing an ingest it cannot settle")
     else:
         metadata["roles"] = list(roles)
-    doc_id = await rag.ingest(
-        content, title=title, source_uri=source_uri, metadata=metadata,
+    doc_id = await _store_document(
+        rag, target, title=title, source_uri=source_uri, metadata=metadata,
     )
     outcome = (
         await kb_ingest_roles.settle_roles(store, str(doc_id), roles, started) if settle else "created"
@@ -548,6 +553,36 @@ async def _rag_ingest(request: dict) -> Any:
             message=f"'{title}' is already in the knowledge base; its audience is unchanged",
         )
     return out
+
+
+async def _store_document(rag: Any, target: Any, *, title: str, source_uri: Any, metadata: dict) -> Any:
+    """Hand a classified document to trellion by the explicit entry point.
+
+    Text goes to ``ingest_text`` and a vetted file to ``ingest_file``, so
+    trellion never has to guess (and cannot guess a path out of text). A
+    rag object without the explicit entry points (a test double) gets
+    ``ingest`` -- but never text that ``ingest`` would open as a file.
+    """
+    ingestor = getattr(rag, "ingestor", None)
+    if target.kind == "file":
+        from pathlib import Path
+        if ingestor is not None and hasattr(ingestor, "ingest_file"):
+            return await ingestor.ingest_file(
+                Path(target.value), title=title, source_uri=source_uri, metadata=metadata,
+            )
+    else:
+        if ingestor is not None and hasattr(ingestor, "ingest_text"):
+            return await ingestor.ingest_text(
+                text=target.value, title=title, source_uri=source_uri or "", metadata=metadata,
+            )
+        if ingest_confine.text_would_be_read_as_path(target.value):
+            raise ValueError(
+                "refusing text that names a file on the worker: this RAG backend "
+                "cannot store it without opening that file"
+            )
+    return await rag.ingest(
+        target.value, title=title, source_uri=source_uri, metadata=metadata,
+    )
 
 
 def _may_see_existing(requester: dict, allowed: Any) -> bool:

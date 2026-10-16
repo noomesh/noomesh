@@ -36,7 +36,11 @@ before it returns), prints `ingested <name>` and the bare `doc_id`
 with several files or a folder it is refused. A folder argument expands to
 the text files one level deep (`-r` descends); `--audience <role>[,<role>]`
 (`company`, `team:<name>`, `user:<name>`) sets who can read the result,
-and without it the document is tagged to you. Binary formats (PDF, …) have no upload
+and without it the document is tagged to you. `ingest` sends the file's
+text, so it never asks the server to read a path; a server-side `source`
+path (the `noo_rag_ingest` tool, the API) is limited to the directories an
+operator declared in `tools.allowed_paths` or a watched folder, and one
+file per call. Binary formats (PDF, …) have no upload
 route on this path — drop them in a watched folder instead (next
 recipe). `query` prints a header (`rag query  strategy hybrid · intent … ·
 N evidence pages`), the answer, a `verification` line with confidence and
