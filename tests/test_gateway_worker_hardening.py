@@ -35,7 +35,9 @@ import pytest
 from tests._compose_projection import full_projection
 
 ROOT = Path(__file__).resolve().parents[1]
-HARDENED = ("gateway", "worker", "worker-extra")
+# trellion-intel ships its compose from its own repository and extends
+# trellion, so it inherits both lines there.
+HARDENED = ("gateway", "worker", "worker-extra", "trellion")
 
 
 @pytest.fixture(scope="module")
