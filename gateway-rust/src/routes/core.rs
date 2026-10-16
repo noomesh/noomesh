@@ -251,7 +251,7 @@ async fn login_bucket_allows(
     subject: &str,
     limit: i64,
 ) -> bool {
-    if let Some(redis) = &state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         match redis
             .check_named_limit(ns, subject, limit, LOGIN_WINDOW_SECS)
             .await
@@ -321,7 +321,7 @@ const BOOTSTRAP_FAILURE_LIMIT: i64 = 5;
 /// for a previous attacker's failures beyond the threshold itself.
 async fn bootstrap_failures_remaining(state: &AppState, username: &str) -> bool {
     let key = username.trim().to_lowercase();
-    if let Some(redis) = &state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         match redis.get_string(&format!("noo:nl:login-fail:{key}")).await {
             Some(raw) => {
                 if let Ok(n) = raw.parse::<i64>() {
@@ -1716,17 +1716,28 @@ async fn health(
     deps.insert("nats".into(), json!({"healthy": nats_ok}));
     if !nats_ok { all_ok = false; }
 
-    // Check Redis (optional — absence is not degradation)
-    let redis_ok = if let Some(ref cache) = state.redis {
-        cache.is_healthy().await
-    } else {
-        true
+    // Check Redis. `state` is the word `noo cluster verify` ("gateway redis")
+    // and `noo upgrade`'s post-roll gate read: `connected`, `reconnecting`
+    // (a client exists and is redialling — the boot-time race that left the
+    // controller Redis-less for an hour on 2026-10-15 reported healthy here),
+    // or `unavailable` (no client could be built: a configuration error).
+    let (redis_ok, redis_state) = match state.redis.as_ref() {
+        Some(cache) => {
+            let ok = cache.is_healthy().await;
+            (ok, if ok { "connected" } else { "reconnecting" })
+        }
+        None => match state.redis.state() {
+            crate::cache::RedisState::Unavailable => (true, "unavailable"),
+            s => (false, s.as_str()),
+        },
     };
+    let redis_optional = redis_state == "unavailable";
     deps.insert("redis".into(), json!({
         "healthy": redis_ok,
-        "optional": state.redis.is_none(),
+        "optional": redis_optional,
+        "state": redis_state,
     }));
-    if !redis_ok && state.redis.is_some() { all_ok = false; }
+    if !redis_ok && !redis_optional { all_ok = false; }
 
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();

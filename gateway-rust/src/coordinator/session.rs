@@ -57,7 +57,7 @@ pub(crate) fn cache_trustworthy(owner: Option<&str>, me: &str) -> bool {
 /// Take (or renew) ownership. Best-effort: Redis down means single-process
 /// semantics, which is exactly today's behaviour.
 async fn claim_ownership(state: &AppState, conversation_id: &str) {
-    if let Some(redis) = &state.redis {
+    if let Some(redis) = state.redis.as_ref() {
         let key = format!("{OWNER_KEY_PREFIX}{conversation_id}");
         if redis.set_string(&key, instance_id()).await {
             let _ = redis.expire(&key, SESSION_CACHE_TTL_SECS as i64).await;
@@ -73,7 +73,7 @@ pub(super) async fn get_or_load_session(
 ) -> Session {
     // Ownership first: a cached copy is only ours to trust if no other
     // process has served this conversation since we cached it.
-    let owner = match &state.redis {
+    let owner = match state.redis.as_ref() {
         Some(redis) => redis.get_string(&format!("{OWNER_KEY_PREFIX}{conversation_id}")).await,
         None => None,
     };

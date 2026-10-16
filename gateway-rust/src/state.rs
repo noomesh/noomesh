@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use serde_json::Value;
 use tokio::sync::{broadcast, RwLock, mpsc};
-use crate::cache::RedisCache;
+use crate::cache::RedisSlot;
 use crate::config::AppConfig;
 use crate::mesh::gossip::GossipMesh;
 use crate::paths;
@@ -149,7 +149,9 @@ pub struct AppState {
     /// time for the `nats_isolation` preflight row.
     pub nats_cred_source: Option<&'static str>,
     pub js: async_nats::jetstream::Context,
-    pub redis: Option<RedisCache>,
+    /// Filled once the first Redis connection lands (boot or later);
+    /// `state.redis.as_ref()` is the `Option<&RedisCache>` every caller reads.
+    pub redis: RedisSlot,
     pub gossip: GossipMesh,
     pub collab_cache: CollabCache,
     /// Alert broadcast hub — WebSocket client registry + fanout channel.
@@ -520,7 +522,9 @@ impl AppState {
 
         ensure_kv_buckets(&js, true).await;
 
-        // Redis (optional — graceful degradation if unavailable)
+        // Redis (optional — graceful degradation if unavailable). Waits a
+        // bounded while for the first connection, then serves without it and
+        // fills `state.redis` from the background when Redis comes up.
         let redis = {
             let redis_url = crate::config::env_or_yaml(
                 "REDIS_URL",
@@ -528,16 +532,7 @@ impl AppState {
                 // Redis serves TLS only (`tls-port 6379`, `port 0`).
                 "rediss://redis:6379",
             );
-            match RedisCache::connect(&redis_url).await {
-                Ok(r) => {
-                    tracing::info!(url = %crate::redact::scrub_url_userinfo(&redis_url), "Redis connected");
-                    Some(r)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Redis unavailable — rate limiting and caching disabled");
-                    None
-                }
-            }
+            RedisSlot::connect(&redis_url, crate::cache::REDIS_BOOT_BUDGET).await
         };
 
         // Gossip mesh

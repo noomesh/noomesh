@@ -3780,6 +3780,80 @@ mod system_credentials_tests {
     }
 }
 
+/// `dependencies.redis.state` from an AUTHENTICATED `/health` body
+/// (`connected` / `reconnecting` / `unavailable`). `None` when the body is
+/// absent or lacks it: the gateway was unreachable, is older than the field,
+/// or answered the anonymous body (no credential).
+pub(crate) fn gateway_redis_state(health: Option<&Value>) -> Option<&str> {
+    health?["dependencies"]["redis"]["state"].as_str()
+}
+
+/// The `gateway redis` row. The gateway used to decide Redis ONCE at boot
+/// (5 s, no retry): if redis was not accepting connections yet it served
+/// without Redis until restarted, and `/api/jobs/*` answered "Redis not
+/// connected" on the controller for an hour after the 0.6.4 move
+/// (2026-10-15) while `/health` still said healthy. It now redials on its
+/// own; a row that stays `reconnecting` means redis is down or the gateway
+/// cannot reach it.
+pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway redis";
+    match gateway_redis_state(health) {
+        Some("connected") => ok(NAME, "connected"),
+        Some(state) => fail(
+            NAME,
+            format!(
+                "not connected ({state}) — /api/jobs, rate limiting and the response cache run degraded \
+                 (is the redis container up? `noo stack status`)"
+            ),
+            "noo stack restart gateway",
+        ),
+        None => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.redis.state \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gateway_redis_tests {
+    use super::{gateway_redis_check, gateway_redis_state, Verdict};
+    use serde_json::json;
+
+    fn health(state: &str) -> serde_json::Value {
+        json!({"status": "healthy", "dependencies": {"redis": {"healthy": state == "connected", "state": state}}})
+    }
+
+    #[test]
+    fn a_connected_gateway_passes() {
+        let c = gateway_redis_check(Some(&health("connected")));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.name, "gateway redis");
+        assert_eq!(c.detail, "connected");
+    }
+
+    #[test]
+    fn a_reconnecting_or_unavailable_gateway_fails_with_the_restart_remedy() {
+        for state in ["reconnecting", "unavailable"] {
+            let c = gateway_redis_check(Some(&health(state)));
+            assert_eq!(c.verdict, Verdict::Fail, "{state}");
+            assert!(c.detail.starts_with(&format!("not connected ({state})")), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("noo stack restart gateway"));
+        }
+    }
+
+    #[test]
+    fn no_state_is_a_warn_never_a_pass() {
+        // Unreachable, the anonymous body, and an older gateway's deps map.
+        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true, "optional": true}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            assert_eq!(gateway_redis_state(body.as_ref()), None);
+            assert_eq!(gateway_redis_check(body.as_ref()).verdict, Verdict::Warn);
+        }
+    }
+}
+
 /// The `(remedy, row name)` pairs a section prints under its table: every
 /// FAIL row's, and in the controller section every WARN row's too.
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
@@ -3992,6 +4066,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
         checks.push(model_classes_check(get_json_opt(g, "/api/cluster/model-classes", true, 15).as_ref()));
+        // The gateway's own Redis connection (authenticated /health: the
+        // anonymous body carries no dependency map).
+        checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));

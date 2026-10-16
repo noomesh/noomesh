@@ -764,10 +764,10 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             // and failed. With `--nodes` the Gateway phase below already
             // waits; without it, wait here, so "Stack now on" means serving.
             if phased && !g.json { println!("{}", ui::phase("Gateway")); }
-            if !wait_for_gateway(g, 180) {
+            if let Err((why, remedy)) = wait_for_gateway(g, 180) {
                 ui::close_failed(
-                    "the gateway did not report healthy within 180s after the stack roll",
-                    Some("noo stack status"),
+                    &format!("{why} within 180s after the stack roll"),
+                    Some(remedy),
                 );
                 rc = 1;
                 failed_stage = "stack";
@@ -783,10 +783,10 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
         // one Gateway phase covers both, with a longer budget after a roll.
         if !g.json { println!("{}", ui::phase("Gateway")); }
         let budget = if stack { 180 } else { 60 };
-        if !wait_for_gateway(g, budget) {
+        if let Err((why, remedy)) = wait_for_gateway(g, budget) {
             ui::close_failed(
-                &format!("the gateway did not report healthy within {budget}s{}", if stack { " after the stack roll" } else { " — is the stack running?" }),
-                Some("noo stack status"),
+                &format!("{why} within {budget}s{}", if stack { " after the stack roll" } else { " — is the stack running?" }),
+                Some(remedy),
             );
             rc = 1;
             failed_stage = "nodes";
@@ -3739,24 +3739,62 @@ fn lock_stage_blocker(g: &Globals, failed: &[String], force: bool) -> Option<Str
     }
 }
 
-/// Poll `/health` until the gateway answers, up to `secs`. Quiet on the
-/// first try (the common case), one line when it has to wait.
-fn wait_for_gateway(g: &Globals, secs: u64) -> bool {
+/// One `/health` reading for the post-roll gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GatewayGate {
+    /// No 2xx yet.
+    Down,
+    /// Serving, but its Redis connection is not up (the state word).
+    RedisPending(String),
+    Ready,
+}
+
+/// `anon_ok`: the anonymous `/health` answered 2xx. `authed`: the
+/// authenticated body, whose `dependencies.redis.state` says whether the
+/// gateway's Redis is up. A gateway that booted before redis accepted
+/// connections served WITHOUT Redis until restarted (0.6.4 controller,
+/// 2026-10-15: `/api/jobs/*` → "Redis not connected" for an hour), so the
+/// node phase must not start against it. No state at all (a gateway older
+/// than the field, or no credential to read it with) falls back to liveness
+/// — the gate this replaced.
+pub(crate) fn gateway_gate(anon_ok: bool, authed: Option<&serde_json::Value>) -> GatewayGate {
+    if !anon_ok {
+        return GatewayGate::Down;
+    }
+    match crate::commands::cluster_verify::gateway_redis_state(authed) {
+        None | Some("connected") => GatewayGate::Ready,
+        Some(other) => GatewayGate::RedisPending(other.to_string()),
+    }
+}
+
+/// Poll `/health` until the gateway answers AND reports its Redis connected,
+/// up to `secs`. Quiet on the first try (the common case), one line when it
+/// has to wait. `Err((what did not happen, remedy))` on timeout.
+fn wait_for_gateway(g: &Globals, secs: u64) -> Result<(), (String, &'static str)> {
     let start = std::time::Instant::now();
     let mut poll: Option<ui::Poll> = None;
     loop {
-        if crate::http::get_json_try(g, "/health", false, 5).is_ok() {
+        let anon_ok = crate::http::get_json_try(g, "/health", false, 5).is_ok();
+        let authed = if anon_ok { crate::http::get_json_opt(g, "/health", true, 5) } else { None };
+        let last = gateway_gate(anon_ok, authed.as_ref());
+        if last == GatewayGate::Ready {
             if !g.json {
                 match poll.take() {
                     Some(p) => p.done(&format!("gateway healthy after {}s", start.elapsed().as_secs())),
                     None => ui::done("gateway healthy"),
                 }
             }
-            return true;
+            return Ok(());
         }
         let elapsed = start.elapsed().as_secs();
         if elapsed >= secs {
-            return false;
+            return Err(match last {
+                GatewayGate::RedisPending(state) => (
+                    format!("the gateway answered but its Redis stayed {state}"),
+                    "noo stack restart gateway",
+                ),
+                _ => ("the gateway did not report healthy".to_string(), "noo stack status"),
+            });
         }
         if !g.json {
             // One live line on a TTY, one line per minute otherwise (§5).
@@ -3764,6 +3802,32 @@ fn wait_for_gateway(g: &Globals, secs: u64) -> bool {
             p.tick(elapsed);
         }
         std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod gateway_gate_tests {
+    use super::{gateway_gate, GatewayGate};
+    use serde_json::json;
+
+    #[test]
+    fn a_redis_less_gateway_holds_the_gate() {
+        let body = json!({"status": "degraded", "dependencies": {"redis": {"healthy": false, "state": "reconnecting"}}});
+        assert_eq!(gateway_gate(true, Some(&body)), GatewayGate::RedisPending("reconnecting".into()));
+    }
+
+    #[test]
+    fn connected_redis_opens_it_and_a_down_gateway_does_not() {
+        let body = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true, "state": "connected"}}});
+        assert_eq!(gateway_gate(true, Some(&body)), GatewayGate::Ready);
+        assert_eq!(gateway_gate(false, Some(&body)), GatewayGate::Down);
+    }
+
+    #[test]
+    fn no_state_falls_back_to_liveness() {
+        // An older gateway, or no credential (the anonymous body).
+        assert_eq!(gateway_gate(true, None), GatewayGate::Ready);
+        assert_eq!(gateway_gate(true, Some(&json!({"status": "healthy"}))), GatewayGate::Ready);
     }
 }
 

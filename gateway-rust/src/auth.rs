@@ -3266,7 +3266,7 @@ pub async fn require_any_auth(
                 return Err(StatusCode::UNAUTHORIZED);
             }
             if let Some(limit) = consumer.rpm_limit {
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     if let Ok(crate::cache::RateResult::Limited { retry_after }) =
                         redis.check_consumer_quota(&consumer.name, limit).await
                     {
@@ -3290,7 +3290,7 @@ pub async fn require_any_auth(
             // shared inference surface. Only named keys with an rpm_limit are
             // capped; internal callers (rpm_limit=None) are never throttled here.
             if let Some(limit) = consumer.rpm_limit {
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     if let Ok(crate::cache::RateResult::Limited { retry_after }) =
                         redis.check_consumer_quota(&consumer.name, limit).await
                     {

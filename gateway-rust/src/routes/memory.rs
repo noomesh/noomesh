@@ -1368,7 +1368,7 @@ async fn embed_start(State(state): State<Arc<AppState>>) -> AppResult {
 /// POST /api/memory/embed/stop
 /// Set embedding worker state to "stopped" via Redis flag.
 async fn embed_stop(State(state): State<Arc<AppState>>) -> AppResult {
-    match &state.redis {
+    match state.redis.as_ref() {
         Some(redis) => {
             redis.set_string(EMBED_STATE_KEY, "stopped").await;
             Ok(Json(json!({"status": "stopped"})))
@@ -1381,7 +1381,7 @@ async fn embed_stop(State(state): State<Arc<AppState>>) -> AppResult {
 /// Read embed state from Redis + embedding counts from SQL.
 async fn embed_status(State(state): State<Arc<AppState>>) -> AppResult {
     // Read state from Redis (default to "stopped" if unavailable)
-    let embed_state = match &state.redis {
+    let embed_state = match state.redis.as_ref() {
         Some(redis) => redis.get_string(EMBED_STATE_KEY).await.unwrap_or_else(|| "stopped".into()),
         None => "unknown".into(),
     };
@@ -1410,7 +1410,7 @@ async fn embed_status(State(state): State<Arc<AppState>>) -> AppResult {
 
     // What the last drain pass ended with ("complete", "stopped", or "stuck"
     // with the reason), so a stopped state is never unexplained.
-    let last: Option<Value> = match &state.redis {
+    let last: Option<Value> = match state.redis.as_ref() {
         Some(redis) => redis.get_string(EMBED_LAST_KEY).await.and_then(|s| serde_json::from_str(&s).ok()),
         None => None,
     };
