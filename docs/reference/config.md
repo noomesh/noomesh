@@ -587,7 +587,7 @@ Decide in this order:
    | Gate | Meaning |
    |---|---|
    | `NOO_EXEC_APPROVAL_MODE` | `auto` \| `approval` \| `strict` tool-execution gating |
-   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged — an opt-in compose profile the fleet does not deploy; every node runs the host binary as `noo-agent` in the `docker` group ([node-agent.md](../security/node-agent.md)) |
+   | `NOO_NODE_AGENT_PRIVILEGED` | whether the node-agent **container** runs privileged (mirrored into `.env` for compose, and the container is recreated on change; `posture list` reports the container's actual state) — an opt-in compose profile the fleet does not deploy; every node runs the host binary as `noo-agent` in the `docker` group ([node-agent.md](../security/node-agent.md)) |
    | `NOO_MCP_EXTERNAL_ENABLED` | opens the user MCP door (`/mcp/user`) |
    | `NOO_SELF_CALL_SHARED_SECRET` | a *bridge*, not a gate: closed by default (unset = closed); only `1` / `open` holds it open. While open, a shared-secret token still buys inference and every acceptance warns naming the caller; closed, callers must present their own `noo_service_keys` row. It does not retire `NOO_CONTROLLER_SECRET`, whose one remaining job is the gateway's boot guard |
 
