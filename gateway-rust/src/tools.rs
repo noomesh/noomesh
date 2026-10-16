@@ -1270,7 +1270,12 @@ async fn native_memory_search(state: &AppState, call: &ToolCall, args: &Value) -
     };
     let vec_str = crate::embedding_client::pgvector_literal(&embedding);
 
-    match crate::routes::memory::memory_search_rows(state, &query, &vec_str, None, top_k).await {
+    // The person the loop runs for (harness, dashboard, channel), as the
+    // HTTP route scopes a non-operator: their conversations plus unowned
+    // ones. With no caller bound (internal callers) the search stays global.
+    let caller = crate::mcp_bridge::current_caller();
+    let scope = caller.as_deref().map(crate::auth::account_of);
+    match crate::routes::memory::memory_search_rows(state, &query, &vec_str, scope, top_k).await {
         Ok(body) => ok_result(
             call,
             serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
