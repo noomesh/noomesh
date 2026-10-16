@@ -2461,6 +2461,35 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
 ///
 /// Native Rust: resolves node, sends POST to node-agent, polls health.
 /// No Python worker pool involvement.
+
+/// The image ref the controller tells a node to run for `backend`, or None
+/// (the node then uses its own versioned default, which a registry node
+/// refuses and a rail node takes only from the controller's staged tar).
+///
+/// Order: an operator override in this process's own environment
+/// (`VLLM_IMAGE` ...), else the compose-rendered `NOO_BACKEND_IMAGE_<X>`,
+/// which carries the digest-pinned ref from the signed stack lock
+/// (`tag@sha256:...`, docker-compose.cluster.yml). Blank values are absent.
+pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let (operator, locked) = match backend {
+        "vllm" => ("VLLM_IMAGE", "NOO_BACKEND_IMAGE_VLLM"),
+        "vllm-secondary" => ("VLLM2_IMAGE", "NOO_BACKEND_IMAGE_VLLM_SECONDARY"),
+        "ollama" => ("OLLAMA_IMAGE", "NOO_BACKEND_IMAGE_OLLAMA"),
+        // First-party / per-architecture images: the node derives its own
+        // release ref (prefix:tag, rail-staged); only an operator override
+        // is forwarded.
+        "llamacpp" => ("LLAMACPP_IMAGE", ""),
+        "embedding" => ("TEI_IMAGE", ""),
+        _ => return None,
+    };
+    [operator, locked]
+        .iter()
+        .filter(|k| !k.is_empty())
+        .filter_map(|k| get(k))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
 async fn backends_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BackendStartBody>,
@@ -2546,19 +2575,8 @@ pub(crate) async fn start_backend_core(
         start_body["gpu_count"] = json!(1);
     }
     let env = std::env::var;
-    if let Some((image_key, _)) = match backend.as_str() {
-        "vllm" => Some(("VLLM_IMAGE", "")),
-        "vllm-secondary" => Some(("VLLM2_IMAGE", "")),
-        "llamacpp" => Some(("LLAMACPP_IMAGE", "")),
-        "ollama" => Some(("OLLAMA_IMAGE", "")),
-        "embedding" => Some(("TEI_IMAGE", "")),
-        _ => None,
-    } {
-        if let Ok(v) = env(image_key) {
-            if !v.is_empty() {
-                start_body["image"] = json!(v);
-            }
-        }
+    if let Some(image) = backend_image_ref(backend.as_str(), &|k| env(k).ok()) {
+        start_body["image"] = json!(image);
     }
     if backend == "vllm" {
         for (key, json_field) in [
@@ -6382,5 +6400,46 @@ mod proposer_tests {
         assert!(body.contains("proposer_of("));
         assert!(!body.contains("body.get(\"proposed_by\")"), "caller-asserted provenance is back");
         assert!(!body.contains("body.get(\"conversation_id\")"));
+    }
+}
+
+#[cfg(test)]
+mod backend_image_ref_tests {
+    use super::backend_image_ref;
+    use std::collections::HashMap;
+
+    fn with(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| m.get(k).cloned()
+    }
+
+    const PINNED: &str = "vllm/vllm-openai:v0.25.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The controller sends the lock-pinned ref even when no operator override
+    /// is set (until now it sent one only when VLLM_IMAGE was in its env).
+    #[test]
+    fn the_locked_digest_ref_is_sent_without_an_operator_override() {
+        let get = with(&[("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &get).as_deref(), Some(PINNED));
+    }
+
+    #[test]
+    fn an_operator_override_wins_and_blank_values_are_absent() {
+        let get = with(&[("VLLM_IMAGE", "my/vllm:1@sha256:aa"), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &get).as_deref(), Some("my/vllm:1@sha256:aa"));
+        let blank = with(&[("VLLM_IMAGE", "  "), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &blank).as_deref(), Some(PINNED));
+        assert_eq!(backend_image_ref("vllm", &with(&[])), None);
+        assert_eq!(backend_image_ref("reranker", &get), None);
+    }
+
+    #[test]
+    fn each_node_backend_has_its_own_locked_variable() {
+        for (b, v) in [("vllm-secondary", "NOO_BACKEND_IMAGE_VLLM_SECONDARY"), ("ollama", "NOO_BACKEND_IMAGE_OLLAMA")] {
+            assert_eq!(backend_image_ref(b, &with(&[(v, "x/y:1@sha256:bb")])).as_deref(), Some("x/y:1@sha256:bb"), "{b}");
+        }
+        // llamacpp / embedding forward only an operator override
+        assert_eq!(backend_image_ref("llamacpp", &with(&[("LLAMACPP_IMAGE", "a/b:2")])).as_deref(), Some("a/b:2"));
+        assert_eq!(backend_image_ref("llamacpp", &with(&[("NOO_BACKEND_IMAGE_LLAMACPP", "a/b:2")])), None);
     }
 }

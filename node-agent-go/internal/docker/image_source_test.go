@@ -392,7 +392,7 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 		asked := recordEnsure(t)
 		t.Setenv("VLLM_IMAGE", "")
 		err := c.PullProfile("ollama")
-		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != "ollama/ollama:latest" {
+		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 || (*asked)[0] != "ollama/ollama:0.40.5" {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}
 	})
@@ -416,7 +416,7 @@ func TestStartPathsGoThroughEnsureImage(t *testing.T) {
 		asked := recordEnsure(t)
 		t.Setenv("NOO_IMAGE_PREFIX", "ghcr.io/noomesh")
 		t.Setenv("NOO_IMAGE_TAG", "v0.2.103")
-		err := c.StartBackendSDK("ollama", "", 0, StartOverrides{})
+		err := c.StartBackendSDK("ollama", "", 0, StartOverrides{Image: "ollama/ollama:0.40.5@sha256:" + strings.Repeat("a", 64)})
 		if !errors.Is(err, errSentinelEnsure) || len(*asked) != 1 {
 			t.Fatalf("err %v asked %v", err, *asked)
 		}

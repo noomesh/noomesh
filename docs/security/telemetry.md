@@ -428,8 +428,8 @@ setting you chose. None of it is a report about you or your machines.
 
 | Traffic | Destination | When |
 |---|---|---|
-| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, TEI, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper fetch their model or voice on first use. A model preseeded from the controller's model store (`HF_HUB_OFFLINE=1`) does not reach the Hub. |
-| Ollama model pulls | `registry.ollama.ai`, `ollama.com` | An Ollama placement or pull of a model that is not cached |
+| Model downloads | Hugging Face Hub (`huggingface.co`, its CDN) | A vLLM, TEI, AirLLM or `noo models` pull of a model that is not already cached. Whisper and Piper fetch their model or voice on first use. A placed node (one with `NOO_MODEL_CACHE_URL`) never reaches the Hub: its backends run `HF_HUB_OFFLINE=1` with no Hugging Face token, and a model missing from the controller's store is refused, not downloaded. Only the controller downloads. |
+| Ollama model pulls | `registry.ollama.ai`, `ollama.com` | An Ollama pull on the controller. A placed node refuses a registry tag (it imports GGUFs from the controller's store) unless `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` is set on that node |
 | Model catalog browsing | `huggingface.co` API, `ollama.com`, `registry.ollama.ai` | `noo models search`; `noo models list` / `recommended` / `ollama` with `--refresh` or an expired catalog cache |
 | Image pulls | `ghcr.io`, `dhi.io`, Docker Hub, `mcr.microsoft.com`, NVIDIA | `noo stack start`, `noo upgrade`, provisioning, building images |
 | Releases and install | `api.github.com`, `github.com`, `raw.githubusercontent.com` | `noo upgrade`, the installer, node bootstrap |
