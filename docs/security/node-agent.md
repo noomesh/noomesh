@@ -691,6 +691,115 @@ What this does and does not add:
 The agent has exactly one registry pull (`ImagePull`, in the fallback and
 the legacy mode) and no `ImageCreate`; a guard test keeps it that way.
 
+## Foreign CLIs run in a jail
+
+A foreign harness kind (`claude-code`, `copilot`, `codex`) runs a vendor
+CLI whose file tools act at the model's direction, so at the direction of
+whoever wrote the task. **Foreign CLIs run in a Landlock jail, and never
+without one.** The harness (`noo-gateway harness`) builds a Landlock
+ruleset before it starts the CLI, and the CLI's process applies it
+(`PR_SET_NO_NEW_PRIVS`, then `landlock_restrict_self`) between `fork` and
+`exec`. The ruleset handles every filesystem right the kernel's Landlock
+ABI knows, so anything not granted below is denied:
+
+| Access | Paths |
+|---|---|
+| read + execute | `/usr`, `/lib`, `/lib64`, `/lib32`, `/bin`, `/sbin`, `/opt/noo/vendor`, and the directory the CLI's executable resolves to |
+| read | `/proc`; the directories `/etc/ssl/certs`, `/etc/ca-certificates`, `/etc/ld.so.conf.d` |
+| read (one file each) | `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`, `/etc/localtime`, `/etc/ld.so.cache`, `/etc/ld.so.conf`, `/etc/host.conf`, `/etc/gai.conf`, the cluster CA file (`NOO_TLS_CA`, the file and never its directory), and the run's MCP config file |
+| read + write + ioctl | `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random` (not `/dev/tty`) |
+| everything | the task's working directory, its HOME and its TMPDIR |
+
+Paths that do not exist on the node are left out. Nothing else is
+reachable: not `/etc/noo/pki/nodes`, `/etc/noo-*.env`,
+`/etc/noo/harness-secrets`, the data root, `/run`, the docker socket,
+`/home` or `/root`. The jail refuses to start if any granted path is, or
+contains, one of those.
+
+- **Other processes.** `/proc` is readable because runtimes read
+  `/proc/self`. Landlock also scopes ptrace: a jailed process cannot pass a
+  ptrace read check against a process outside its own Landlock domain, and
+  `/proc/<pid>/environ`, `mem` and `fd/` are gated on that check. So the
+  CLI cannot read the harness's environment, which holds the node's bus
+  password and agent bearer, and it cannot read another task's CLI either.
+  The harness also makes itself non-dumpable when it starts, so no other
+  process of its user can read its `/proc` files, jailed or not.
+- **Network is not restricted.** The CLI must reach the loopback
+  translator, whose port is chosen per run, and the gateway's user door.
+- **Fail closed.** A kernel without Landlock (ABI v1 is the floor), with
+  Landlock disabled at boot, or with a seccomp filter that hides its
+  syscalls cannot run a foreign kind. Each task is checkpointed with the note
+  `harness jail unavailable: <why>; foreign CLIs never run unjailed`, and the
+  harness logs `harness_jail_refused`. At startup the harness logs
+  `harness jail: landlock ABI <n>`, or the refusal, once, so
+  `noo cluster logs <node> harness` shows it before any task runs.
+- **The unit.** `noo-harness.service` runs as user and group `noo-harness`,
+  in no other group. It reads its own copy of the node's certificate and
+  key, `/etc/noo/pki/harness/node.{crt,key}` (`root:noo-harness`, 0640,
+  installed by the applier from the same bundle files as the agent's
+  pair). The agent's pair, env file and secret files are
+  `InaccessiblePaths=` for it. So even a CLI that escaped the jail runs
+  with a uid and gid that cannot read the agent's key material.
+- **macOS.** The CLI runs under `/usr/bin/sandbox-exec` with a profile that
+  denies the whole of `~/noomesh` (pki, birth key, env files, secrets) and
+  the data root, names `~/noomesh/pki`, `~/noomesh/secrets`,
+  `~/noomesh/harness-secrets` and both env files in a deny of their own,
+  then re-allows the CLI's own `~/noomesh/vendor` and `~/noomesh/bin`, the
+  CA file, and the task's directories. No `sandbox-exec` means a refusal,
+  the same as on Linux.
+- **Other processes on a Mac.** macOS has no Landlock, and the harness and
+  the agent run as the same user as the CLI, so a plain process could read
+  their arguments and environment with `sysctl(KERN_PROCARGS2)` (what
+  `ps -E` uses) and their details with `proc_pidinfo`. The profile closes
+  both: `(deny process-info*)` then `(allow process-info* (target self))`,
+  and `(deny sysctl-read (sysctl-name "kern.procargs2") (sysctl-name
+  "kern.procargs"))`. Apple does not document the profile language; these
+  forms are the ones Apple's own WebKit WebContent profile and Chromium's
+  profiles use, and the self-test below checks the result on each node.
+- **Secrets are files, never environment, on both systems.** A secret the
+  agent or the harness reads arrives as a `NAME_FILE` pointer, never as a
+  value in its environment: on Linux the applier rewrites
+  `/etc/noo-node-agent.env` and `/etc/noo-harness.env` (systemd
+  `EnvironmentFile=`), and on a Mac `noo node fetch` rewrites
+  `~/noomesh/agent.env` and `~/noomesh/harness.env` (sourced by
+  `run-agent.sh` and `run-harness.sh`). The keys are
+  `NOO_NODE_AGENT_TOKEN`, `NOO_CLUSTER_SECRET` and `NATS_NODE_PASSWORD`.
+  Each value goes to its own 0600 file: `~/noomesh/secrets/` for the agent
+  and `~/noomesh/harness-secrets/` for the harness on a Mac,
+  `/etc/noo/agent-secrets/` and `/etc/noo/harness-secrets/` on Linux. The
+  rewrite runs after every write to the env file, and only when the
+  installed binary carries the marker that says it reads files (an older
+  binary gets plain values back, so it never boots pointed at a file it
+  cannot read). So even a process that could read the agent's environment
+  would find only paths, and the jail denies those paths.
+- **The self-test.** A jail that is wrong on some node's kernel or OS
+  release must not be trusted on faith. When a harness for a foreign kind
+  starts (after it makes itself non-dumpable, before it takes any task or
+  turn), it proves the jail on this node. It creates a scratch workspace
+  under its task directory root (`NOO_HARNESS_WORKDIR`), plants a secret
+  file outside it (Linux: a fresh directory beside it that is not on the
+  allow-list; macOS: under `~/noomesh/secrets`), and starts an
+  ordinary unjailed process of its own user with a unique canary in its
+  environment. Then it runs `/bin/sh` through the same jail a CLI gets.
+  The shell must be able to read and write its workspace. It must NOT be
+  able to read the planted secret, the canary process's environment, the
+  harness's own environment (`/proc/<pid>/environ` on Linux, `ps -E` on
+  macOS), or the node's real secrets where they exist (`/etc/noo/pki`
+  including the harness's own key pair, the secret directories and the env
+  files on Linux; `~/noomesh/pki`, both secret directories and both env
+  files on a Mac). Each must-fail check is judged on what the shell
+  printed: the canary or secret text must be absent, so a nonzero exit is
+  not enough. If the same read also fails OUTSIDE the jail, the check
+  proves nothing, and the result lists it as unproved instead of passed.
+  On success the harness logs `harness jail self-test: ok (<os>,
+  <mechanism>)`, with what was proved and how long it took (well under a
+  second on a Linux node). On failure it logs
+  `harness_jail_selftest_failed: <what leaked>` and refuses every foreign
+  task and turn for the life of the process, with the same checkpoint note
+  as a missing jail. The verdict is kept until the harness restarts and
+  runs the test again. It is visible in the harness's log only: the
+  agent's heartbeat reports the harness service's state, not this verdict.
+
 ## The helper image
 
 Every host operation the agent performs — create the models dir, chown it,

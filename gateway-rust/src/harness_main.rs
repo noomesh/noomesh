@@ -107,6 +107,12 @@ pub fn check_harness_secrets(get: &dyn Fn(&str) -> Option<String>) -> Result<(),
 }
 
 pub async fn run() -> Result<()> {
+    // i119: the environment systemd loaded (bus password, agent bearer)
+    // stays out of /proc/<pid>/environ for every other process of this uid
+    // — above all a foreign CLI the driver started. Costs core dumps only.
+    if let Err(e) = crate::harness::jail::make_undumpable() {
+        tracing::warn!(error = %e, "harness: could not make the process non-dumpable");
+    }
     let node = env("NODE_ID")?;
     let gateway = env("NOO_GATEWAY_URL")?;
     let nats_url = env("NATS_URL")?;
@@ -156,6 +162,21 @@ pub async fn run() -> Result<()> {
         let ctx = crate::harness::driver::DriverCtx::from_env(&node, &gateway, &kind, pinned.clone())
             .map_err(|e| anyhow!("harness: kind {kind}: {e}"))?;
         tracing::info!(kind = %kind, cli = ?ctx.kind.cli, workdir = %ctx.workdir_root.display(), timeout_secs = ctx.timeout.as_secs(), "harness: driving a foreign CLI");
+        // Said once at start, before any task: a node that cannot jail the
+        // CLI checkpoints every task with the reason instead of running it.
+        match crate::harness::jail::probe() {
+            Ok(a) => tracing::info!("harness jail: {a}"),
+            Err(r) => tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note()),
+        }
+        // Then the jail is PROVED here, not trusted: a jailed shell must
+        // fail to read a planted secret, a sibling's and this process's
+        // environment, and the node's key dir. The verdict is kept for the
+        // process (`jail::gate`, the driver's probe): a failure refuses
+        // every foreign task and turn until the harness restarts.
+        match crate::harness::jail::self_test(&ctx.workdir_root).await {
+            Ok(r) => tracing::info!(elapsed_ms = r.elapsed.as_millis() as u64, proved = ?r.proved, unproved = ?r.unproved, "harness jail self-test: {r}"),
+            Err(r) => tracing::error!(event = "harness_jail_selftest_failed", reason = %r, "harness_jail_selftest_failed: {r}"),
+        }
         Some(Arc::new(ctx))
     };
     let subject = coordinator::harness_run_subject(&node);
@@ -485,6 +506,19 @@ mod tests {
         let watch = run.find("node_agent_auth::watch_own_agent(").expect("run() must watch its own agent");
         let turns = run.find("queue_subscribe(").expect("run() subscribes");
         assert!(watch < turns, "the watch must start before the first turn is taken");
+    }
+
+    /// The jail self-test runs after the process is made non-dumpable and
+    /// before the first task or turn can be taken.
+    #[test]
+    fn the_jail_self_test_runs_before_any_task_is_taken() {
+        let code = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness_main.rs")).unwrap();
+        let run = &code[code.find("pub async fn run()").expect("run()")..code.find("async fn run_turn").expect("run_turn")];
+        let dump = run.find("jail::make_undumpable()").expect("undumpable");
+        let test = run.find("jail::self_test(&ctx.workdir_root).await").expect("run() must self-test the jail");
+        let subs = run.find("queue_subscribe(").expect("run() subscribes");
+        assert!(dump < test && test < subs, "undumpable, then the self-test, then the subscriptions");
+        assert!(run.contains("harness_jail_selftest_failed: {r}") && run.contains("harness jail self-test: {r}"));
     }
 
     #[test]

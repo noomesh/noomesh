@@ -329,3 +329,42 @@ def test_a_config_refresh_keeps_the_harness_pair_through_its_pointer() -> None:
     blk = src[src.index('if [ -f "$WORK/files/harness-env" ]'):src.index('if [ -f "$WORK/files/harness-binary" ]')]
     assert 'agent_env_secret "$HARNESS_ENV" NATS_NODE_PASSWORD' in blk
     assert "grep -qE '^NATS_NODE_PASSWORD=.+' \"$HARNESS_ENV\"" not in blk
+
+
+# ── the macOS applier ─────────────────────────────────────
+#
+# On a Mac the harness and the agent run as the enrolling user, so a CLI the
+# harness starts shares their uid: what run-agent.sh / run-harness.sh source
+# is what such a process could try to read. The darwin applier
+# (noo-cli node_fetch.rs) must convert each env AFTER every write to it, so
+# what launchd's runner exports is pointers only. (The runner itself is
+# driven end to end by provision.rs `mac_runner_env_tests`.)
+
+DARWIN_FETCH = REPO / "noo-cli/src/commands/node_fetch.rs"
+
+
+def test_the_mac_applier_converts_the_harness_env_after_every_harness_write() -> None:
+    src = DARWIN_FETCH.read_text()
+    call = src.index("super::agent_secret_files::converge_harness(")
+    assert '&base.join("harness-secrets")' in src[call:call + 300], "harness secrets leave ~/noomesh/harness-secrets"
+    for earlier in ('inst("harness-env", base.join("harness.env")',
+                    'merge_nats_creds(&body, &base.join("harness.env")',
+                    'inst_bin("harness-binary", base.join("bin/noo-gateway")'):
+        assert src.index(earlier) < call, earlier
+    shipped = src[:src.index("\n#[cfg(test)]")]
+    assert shipped.count('base.join("harness.env")') == shipped[:call + 300].count('base.join("harness.env")'), \
+        "a harness.env write after the conversion would leave plain values"
+
+
+def test_the_mac_applier_converts_the_agent_env_after_every_agent_write() -> None:
+    src = DARWIN_FETCH.read_text()
+    full = src.index("let all_ok = all_ok && agent_secrets_to_files(base, user, as_root)")
+    for earlier in ('inst("agent-env", base.join("agent.env")',
+                    'merge_nats_creds(&body, &base.join("agent.env")',
+                    'inst_bin("agent-binary", base.join("bin/noo-node-agent")'):
+        assert src.index(earlier) < full, earlier
+    fleet = src.index('merge_fleet_secrets(&body, &base.join("agent.env"), me)?;')
+    assert src.index("agent_secrets_to_files(base, user, as_root)?;", fleet) - fleet < 120, \
+        "the fleet-secrets branch converts right after its merge"
+    fn = src.index("fn agent_secrets_to_files(")
+    assert 'base.join("secrets")' in src[fn:fn + 400]

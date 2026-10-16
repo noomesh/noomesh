@@ -952,6 +952,12 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                             vars.get("node_agent_port").cloned().unwrap_or_else(|| "8081".to_string())));
                         hvars.insert("noo_harness_max_turns", String::from("2"));
                         hvars.insert("harness_log", String::from("noo_gateway=info"));
+                        // The harness's own copy of the node pair (i119):
+                        // the applier installs it root:noo-harness 0640 on
+                        // Linux; a Mac runs both as one user, same files.
+                        let (hcert, hkey) = harness_tls_paths(darwin, &vars);
+                        hvars.insert("harness_tls_cert", hcert);
+                        hvars.insert("harness_tls_key", hkey);
                         let henv = render_env_template(&htmpl, &hvars)
                             .unwrap_or_else(|e| fail(g.json, ExitCode::Generic, "harness_env", &e, None));
                         nnote(&format!("bundle carries the harness ({asset}, {})", human_bytes(bytes.len())));
@@ -3955,6 +3961,21 @@ agent-binary applier fetcher agent-unit verified-by: signing-key ca-lane: retire
     }
 }
 
+/// Where the harness reads its TLS pair (`harness_tls_cert` /
+/// `harness_tls_key` in `noo-harness.env.tmpl`): its OWN copy on Linux
+/// (`scripts/noo-apply.sh`, harness-pair), the agent's files on a Mac.
+pub(crate) fn harness_tls_paths(darwin: bool, vars: &BTreeMap<&str, String>) -> (String, String) {
+    if darwin {
+        (vars.get("na_tls_cert").cloned().unwrap_or_default(), vars.get("na_tls_key").cloned().unwrap_or_default())
+    } else {
+        (HARNESS_TLS_CERT.to_string(), HARNESS_TLS_KEY.to_string())
+    }
+}
+
+/// The harness's own copy of the node pair on a Linux node.
+pub(crate) const HARNESS_TLS_CERT: &str = "/etc/noo/pki/harness/node.crt";
+pub(crate) const HARNESS_TLS_KEY: &str = "/etc/noo/pki/harness/node.key";
+
 #[cfg(test)]
 mod tests {
     // The controller must never stage a bundle the node's applier cannot
@@ -4329,9 +4350,12 @@ mod tests {
         v.insert("noo_harness_model_url", "V_model_url".into());
         v.insert("noo_harness_max_turns", "V_max_turns".into());
         v.insert("harness_log", "V_log".into());
+        let (hc, hk) = harness_tls_paths(false, &v);
+        v.insert("harness_tls_cert", hc);
+        v.insert("harness_tls_key", hk);
         let out = render_env_template(&tmpl, &v).unwrap();
         for line in ["NODE_ID=V_na_node_id", "NOO_GATEWAY_URL=V_controller_url", "NATS_URL=V_nats_url",
-                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=V_na_tls_cert", "NOO_TLS_KEY=V_na_tls_key",
+                     "NOO_TLS_CA=V_na_tls_ca", "NOO_TLS_CERT=/etc/noo/pki/harness/node.crt", "NOO_TLS_KEY=/etc/noo/pki/harness/node.key",
                      "NOO_HARNESS_MODEL_URL=V_model_url", "NOO_HARNESS_MAX_TURNS=V_max_turns", "RUST_LOG=V_log"] {
             assert!(out.contains(line), "harness env lacks {line}:\n{out}");
         }
@@ -4339,6 +4363,9 @@ mod tests {
         // leaves it empty on purpose, never absent.
         assert!(out.contains("NATS_NODE_USER=\n"), "{out}");
         assert!(!out.contains("default("), "a default survived into the rendered env: {out}");
+        // i119: never the agent's pair on Linux; the agent's files on a Mac.
+        assert!(!out.contains("/pki/nodes/"), "{out}");
+        assert_eq!(harness_tls_paths(true, &v), ("V_na_tls_cert".to_string(), "V_na_tls_key".to_string()));
     }
 
     /// The REAL template must render with the exact vars cluster_provision
@@ -5300,5 +5327,74 @@ mod upgrade_stages_every_node_before_waiting_tests {
     fn the_combined_wait_polls_every_five_seconds() {
         let up = include_str!("upgrade.rs");
         assert!(up.contains("const NODES_APPLY_POLL_SECS: u64 = 5;"));
+    }
+}
+
+/// What a same-uid process on a Mac could read: the environment the run
+/// scripts hand to the agent and the harness. After the applier's
+/// conversion it holds `NAME_FILE` pointers into `~/noomesh/…` (which the
+/// harness jail denies) and no secret value — proved by running the real
+/// runner with `env` in place of the binary.
+#[cfg(test)]
+mod mac_runner_env_tests {
+    use super::{darwin_run_agent, darwin_run_harness};
+    use crate::commands::agent_secret_files::{
+        converge, converge_harness, AGENT_SECRET_CAPABILITY, AGENT_SECRET_KEYS, HARNESS_SECRET_CAPABILITY,
+        HARNESS_SECRET_KEYS,
+    };
+
+    const VALUES: &[(&str, &str)] = &[
+        ("NOO_NODE_AGENT_TOKEN", "tok-mac-1234"),
+        ("NOO_CLUSTER_SECRET", "cluster-mac-5678"),
+        ("NATS_NODE_PASSWORD", "nats-mac-9012"),
+    ];
+
+    fn exported(script: &str, exec_line: &str, home: &std::path::Path) -> String {
+        let script = script.replace(exec_line, "exec /usr/bin/env");
+        assert!(script.contains("exec /usr/bin/env"), "the exec line moved: {script}");
+        let out = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn the_mac_runners_export_pointers_and_no_secret_value() {
+        let home = std::env::temp_dir().join(format!("noo-mac-runner-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let base = home.join("noomesh");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let mut env = String::from("NODE_ID=host6\nNATS_NODE_USER=node-host6\nNOO_TLS_KEY=\"$HOME/noomesh/pki/node.key\"\n");
+        for (k, v) in VALUES {
+            env.push_str(&format!("{k}={v}\n"));
+        }
+        std::fs::write(base.join("agent.env"), &env).unwrap();
+        std::fs::write(base.join("harness.env"), &env).unwrap();
+        std::fs::write(base.join("bin/noo-node-agent"), format!("\u{cf}bin {AGENT_SECRET_CAPABILITY} x")).unwrap();
+        std::fs::write(base.join("bin/noo-gateway"), format!("\u{cf}bin {HARNESS_SECRET_CAPABILITY} x")).unwrap();
+        assert!(converge(&base.join("agent.env"), &base.join("secrets"), &base.join("bin/noo-node-agent")).unwrap());
+        assert!(converge_harness(&base.join("harness.env"), &base.join("harness-secrets"), &base.join("bin/noo-gateway")).unwrap());
+        for (script, exec, keys, dir) in [
+            (darwin_run_agent(), "exec \"$HOME/noomesh/bin/noo-node-agent\"", AGENT_SECRET_KEYS, "secrets"),
+            (darwin_run_harness(), "exec \"$HOME/noomesh/bin/noo-gateway\" harness", HARNESS_SECRET_KEYS, "harness-secrets"),
+        ] {
+            let got = exported(&script, exec, &home);
+            for (k, v) in VALUES {
+                assert!(!got.contains(v), "{k}'s value is in the {dir} runner's environment:\n{got}");
+            }
+            for k in keys {
+                let want = format!("{k}_FILE={}", base.join(dir).join(k).display());
+                assert!(got.lines().any(|l| l == want), "{want} missing:\n{got}");
+                assert!(!got.lines().any(|l| l.starts_with(&format!("{k}="))), "{k} plain:\n{got}");
+            }
+            assert!(got.lines().any(|l| l == "NODE_ID=host6"));
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

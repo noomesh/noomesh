@@ -27,16 +27,20 @@ RestartSec=30
 # here, rendered by the controller like /etc/noo-node-agent.env.
 EnvironmentFile=-/etc/noo-harness.env
 # A dedicated user (an earlier change's reasoning, applied to a process that
-# executes a model's decisions): in group noo-agent so it can read the
-# node's certificate and key (0640 root:noo-agent under /etc/noo/pki), and
-# in NO other group — above all not `docker`, which is root on the host.
+# executes a model's decisions), in a group of its OWN and no other — not
+# noo-agent, not `docker` (root on the host). It was in noo-agent so it
+# could read the node's pair (0640 root:noo-agent, 2026-09-16); since i119
+# it reads its own copy, /etc/noo/pki/harness/node.{crt,key} (0640
+# root:noo-harness, installed by the applier from the same bundle files),
+# and the agent's pair, env and secret files are not even mounted for it.
 User=noo-harness
-Group=noo-agent
+Group=noo-harness
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/noo/pki
+InaccessiblePaths=-/etc/noo/pki/nodes -/etc/noo-node-agent.env -/etc/noo/agent-secrets
 # The caps the container used to carry.
 MemoryMax=1G
 CPUQuota=100%
