@@ -482,8 +482,8 @@ agent may execute.
 | `noo cluster restart-backends` | `<node> <noo-svc>... [-y\|--yes\|--force]` | Restart noo-* backend containers on a node via a rail-delivered bundle |
 | `noo cluster host-telemetry apply` | `[<node>...] [--all] [--include-controller] [-y\|--yes]` | Switch off tailscaled's log upload on nodes over the pull rail, one at a time |
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
-| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI (and runtime) on the controller, checked against its pin |
-| `noo cluster vendor status` | — | List staged vendor CLIs and runtimes per platform, and which nodes need which |
+| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
+| `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
 | `noo cluster vendor` | — | Print vendor subcommand usage (stage, status) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |

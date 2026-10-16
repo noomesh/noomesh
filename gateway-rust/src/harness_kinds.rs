@@ -73,8 +73,6 @@ pub enum Format {
 pub enum Unpack {
     #[serde(rename = "tgz")]
     Tgz,
-    #[serde(rename = "tar.xz")]
-    TarXz,
     #[serde(rename = "zip")]
     Zip,
     #[serde(rename = "none")]
@@ -95,25 +93,9 @@ pub struct Distribution {
     pub names: Option<Names>,
     pub version: String,
     pub sha256: BTreeMap<String, String>,
-    /// A `runtimes` entry the CLI runs on (`node`), or `None`.
-    #[serde(default)]
-    pub runtime: Option<String>,
     /// The path inside the unpacked tree to execute.
     pub entry: String,
     pub unpack: Unpack,
-}
-
-/// A runtime a staged CLI runs on, e.g. Node.js.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct Runtime {
-    pub version: String,
-    pub source: String,
-    #[serde(default)]
-    pub names: Option<Names>,
-    pub sha256: BTreeMap<String, String>,
-    pub unpack: Unpack,
-    pub bin_dir: String,
 }
 
 /// The URL to fetch an artefact from for `os`/`arch` and the sha256 it
@@ -194,10 +176,6 @@ pub struct Launch {
 
 #[derive(Deserialize)]
 struct Table {
-    /// Runtimes a staged CLI may name (i83 E1e); optional.
-    #[serde(default)]
-    #[allow(dead_code)]
-    runtimes: BTreeMap<String, Runtime>,
     kinds: Vec<HarnessKind>,
 }
 
@@ -295,7 +273,7 @@ mod tests {
         }
     }
 
-    /// The pinned vendor artefacts (`distribution`, `runtimes`) ride in the
+    /// The pinned vendor artefacts (`distribution`) rides in the
     /// same file. `HarnessKind` has no field for them yet and serde ignores
     /// unknown fields (no `deny_unknown_fields`), so the typed table still
     /// parses; this looks at the raw JSON so a foreign kind cannot ship
@@ -318,19 +296,10 @@ mod tests {
             for p in keys {
                 assert!(sha.get(p).is_some_and(hex64), "{} sha256[{p}]", k["kind"]);
             }
-            if let Some(rt) = d["runtime"].as_str() {
-                assert!(v["runtimes"][rt].is_object(), "{} needs runtime {rt}, not pinned", k["kind"]);
-            }
         }
     }
 
     const FIXTURE: &str = r#"{
-      "runtimes": {"node": {"version": "22.11.0",
-        "source": "https://nodejs.org/dist/v{version}/node-v{version}-{os}-{arch}.tar.xz",
-        "names": {"os": {"linux": "linux", "macos": "darwin"}, "arch": {"x86_64": "x64", "aarch64": "arm64"}},
-        "sha256": {"linux-x86_64": "1111111111111111111111111111111111111111111111111111111111111111",
-                   "macos-aarch64": "3333333333333333333333333333333333333333333333333333333333333333"},
-        "unpack": "tar.xz", "bin_dir": "bin"}},
       "kinds": [
         {"kind": "noo", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": null,
          "lane": {}, "launch": null, "telemetry_off": {}},
@@ -339,13 +308,13 @@ mod tests {
          "distribution": {"format": "npm-tarball", "source": "https://registry.npmjs.org/@github/copilot/-/copilot-{version}.tgz",
            "names": null, "version": "0.0.339",
            "sha256": {"any": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
-           "runtime": "node", "entry": "package/index.js", "unpack": "tgz"}},
+           "entry": "package/index.js", "unpack": "tgz"}},
         {"kind": "codex", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "codex",
          "lane": {}, "launch": null, "telemetry_off": {},
          "distribution": {"format": "binary", "source": "https://example.invalid/{version}/codex-{arch}-{os}",
            "names": {"os": {"linux": "unknown-linux-musl"}, "arch": {"x86_64": "x86_64"}}, "version": "0.46.0",
            "sha256": {"linux-x86_64": "4444444444444444444444444444444444444444444444444444444444444444"},
-           "runtime": null, "entry": "codex", "unpack": "none"}},
+           "entry": "codex", "unpack": "none"}},
         {"kind": "manual", "title": "t", "wire": "w", "wires": [], "runner": "noo-gateway", "cli": "m",
          "lane": {}, "launch": null, "telemetry_off": {}}
       ]}"#;
@@ -353,13 +322,11 @@ mod tests {
     #[test]
     fn the_distribution_fixture_parses_every_variant() {
         let t: Table = serde_json::from_str(FIXTURE).expect("fixture parses");
-        let node = &t.runtimes["node"];
-        assert_eq!((node.unpack, node.bin_dir.as_str()), (Unpack::TarXz, "bin"));
         let d = |k: &str| t.kinds.iter().find(|r| r.kind == k).unwrap().distribution.clone();
         let cop = d("copilot").unwrap();
-        assert_eq!((cop.format, cop.unpack, cop.runtime.as_deref()), (Format::NpmTarball, Unpack::Tgz, Some("node")));
+        assert_eq!((cop.format, cop.unpack), (Format::NpmTarball, Unpack::Tgz));
         let cx = d("codex").unwrap();
-        assert_eq!((cx.format, cx.unpack, cx.runtime.as_deref()), (Format::Binary, Unpack::None, None));
+        assert_eq!((cx.format, cx.unpack), (Format::Binary, Unpack::None));
         assert!(d("manual").is_none(), "a cli with no distribution is a manual install");
         assert!(d("noo").is_none());
     }
@@ -367,11 +334,6 @@ mod tests {
     #[test]
     fn artifact_url_applies_names_and_pins() {
         let t: Table = serde_json::from_str(FIXTURE).unwrap();
-        let node = &t.runtimes["node"];
-        let (u, s) = artifact_url(&node.source, node.names.as_ref(), &node.version, &node.sha256, "macos", "aarch64").unwrap();
-        assert_eq!(u, "https://nodejs.org/dist/v22.11.0/node-v22.11.0-darwin-arm64.tar.xz");
-        assert_eq!(s, "3".repeat(64));
-        assert!(artifact_url(&node.source, node.names.as_ref(), &node.version, &node.sha256, "linux", "aarch64").is_err());
         let cop = t.kinds.iter().find(|r| r.kind == "copilot").unwrap().distribution.clone().unwrap();
         let (u, s) = artifact_url(&cop.source, cop.names.as_ref(), &cop.version, &cop.sha256, "linux", "aarch64").unwrap();
         assert_eq!(u, "https://registry.npmjs.org/@github/copilot/-/copilot-0.0.339.tgz");
@@ -379,6 +341,7 @@ mod tests {
         let cx = t.kinds.iter().find(|r| r.kind == "codex").unwrap().distribution.clone().unwrap();
         let (u, _) = artifact_url(&cx.source, cx.names.as_ref(), &cx.version, &cx.sha256, "linux", "x86_64").unwrap();
         assert_eq!(u, "https://example.invalid/0.46.0/codex-x86_64-unknown-linux-musl");
+        assert!(artifact_url(&cx.source, cx.names.as_ref(), &cx.version, &cx.sha256, "linux", "aarch64").is_err(), "no pin for the platform");
     }
 
     #[test]
@@ -387,11 +350,8 @@ mod tests {
         // every declared distribution must parse into the typed shape.
         let t: Table = serde_json::from_str(RAW).expect("parses");
         for k in &t.kinds {
-            if let Some(d) = &k.distribution {
+            if k.distribution.is_some() {
                 assert!(k.cli.is_some(), "{} has a distribution but no cli", k.kind);
-                if let Some(r) = &d.runtime {
-                    assert!(t.runtimes.contains_key(r), "{} names runtime {r}, which runtimes does not declare", k.kind);
-                }
             }
         }
     }
