@@ -749,7 +749,7 @@ audit row.
 | `noo_task_delegate` | `objective` (required), `parent_task_id?`, `role?`, `model?`, `loop_budget?` (1–500) | opens a task for the caller and starts it. With `parent_task_id` (one of the caller's live tasks) it is a sub-task on the parent's thread, capped like the in-loop tool (2 deep, 8 per parent). Without, a top-level task on a new thread. Leaving out `loop_budget` gives the default of the node it lands on, or the cluster's. Returns `task_id`, `thread_id`, `parent_id`, `node`, `dispatched`, `why` |
 | `noo_task_status` | `task_id?` | the task with its children (`state`, `loops`, `last_note`, `result`, `error`, `all_settled`); with no id, the caller's 20 most recent top-level tasks |
 | `noo_task_wait` | `task_id` (required), `seconds?` (1–25, default 25) | returns when the task settles, when one of its children settles, or at the deadline with the task as it stands (`state: running`, `timed_out: true`): call again. Never holds the request past 25 s (`ops::MAX_WAIT_SECS`) |
-| `noo_task_done` | `task_id`, `result` (required), `failed?` | records the result exactly as the in-loop `noo_task_done` does (evidence gate included: a success claim from a task whose conversation called no tool is refused once) and posts it to the task's thread |
+| `noo_task_done` | `task_id`, `result` (required), `failed?` | records the result as the in-loop `noo_task_done` does and posts it to the task's thread. Done from the door does not require prior tool calls: the in-loop check that refuses a success claim from a task whose conversation called no tool is skipped, and the result is not prefixed, because a door caller's tool use happens outside that conversation |
 
 ### Add-on token exchange (`routes/addon_token.rs`)
 
