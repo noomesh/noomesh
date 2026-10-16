@@ -143,7 +143,7 @@ the fields below. Failure is a non-2xx status and, usually, a body
 
 | Status | When |
 |---|---|
-| 400 | an unresolvable backend, a failed cloud run, an alert kind outside the allowed set |
+| 400 | an unresolvable backend, a failed cloud run, an alert kind outside the allowed set, a `usage` report naming an undeclared harness kind |
 | 403 | not a node-harness token (even an admin token is refused); `task_checkpoint` for a task that is not this turn's; the closed cloud gate on `cloud_run`, whose body is the cloud-gate body (`code: cloud_providers_disabled`) |
 | 500 | a session write failed |
 
@@ -222,6 +222,7 @@ request object beside `op`.
 | `temporal_extract` | temporal extraction (`user_message`, `assistant_response`) |
 | `maybe_summary` | regenerate the running summary if due (`backend`, `turn`) |
 | `operator_alert` | raise an operator alert (`kind`, `target`, `cooldown_secs`, `message`); only `inference.backend_failover` is allowed, and the gateway writes the channel text itself |
+| `usage` | report the tokens a foreign loop's model calls used (`prompt_tokens`, `completion_tokens`, `total_tokens`, `calls`, `model`, `kind`, `task_id` optional), as the wire translator counted them; recorded in `noo_token_usage` as the token's user on the token's node, with source `harness`, backend `harness:<kind>` and the `harness_kind` column; `kind` must be a kind in `config/harness-kinds.json` |
 
 **A task's loops**
 
@@ -308,3 +309,37 @@ must not execute gated tools locally.
     `task_checkpoint` after each, and stop when the returned `state` is not
     `running` or `checkpointed` or the budget is reached.
 11. Never re-run a turn, and never publish on another node's subjects.
+
+### Wire translator
+
+A foreign loop is a vendor CLI, and the CLI speaks its vendor's wire, not
+the node backend's. The harness does not point the CLI at
+`NOO_HARNESS_MODEL_URL`. For each task or turn it starts a wire translator
+(`gateway-rust/src/harness/translator.rs`) and gives the CLI that
+translator's base URL, `http://127.0.0.1:<port>`, as the CLI's model base
+URL. The port is ephemeral and the translator stops when the task ends.
+
+| Route | The CLI sends | The translator sends to the endpoint |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI chat (Copilot CLI) | the same body on an OpenAI-wire backend (vLLM, llama.cpp, the node agent), or Ollama's `/api/chat` with the reply converted back |
+| `POST /v1/messages` | Anthropic Messages (Claude Code) | the request converted to OpenAI chat, with the reply converted back to a Messages response or a Messages event stream |
+| `GET /v1/models` | | nothing. The answer is one entry, the pinned model |
+
+Streaming and non-streaming both work on both routes. The translator
+replaces whatever model the CLI names with the pinned model. Any other path
+gets a 404 with a JSON error body. The Responses API (Codex) is not served
+yet.
+
+The translator counts every model call: the reply's usage, or, for a
+stream, its final usage chunk or Ollama's closing object. A reply without
+usage still counts as a call. When the task ends, the harness reports the
+totals with the `usage` operation, so the gateway meters a foreign loop's
+model calls the same way it meters its own.
+
+The listener is plain HTTP on loopback with no auth. That is acceptable
+because the translator is per-process and per-task, binds `127.0.0.1` on a
+port the kernel picked, and dies with the task. Anything that can reach it
+already runs on the node as a local user and can read the credentials the
+harness itself uses. The translator forwards only to the one pinned
+endpoint and holds no credential of its own. Its upstream calls use the
+cluster CA and the node agent's bearer, the same as the reference loop's.
