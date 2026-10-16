@@ -94,6 +94,9 @@ pub(crate) const SECRETS: &[(&str, &str)] = &[
 /// tests/test_onboard_storage_dirs_cover_compose.py fails when it does not.
 pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
     "noo-data", "redis", "nats", "ollama", "hf-cache", "models", "prometheus", "grafana", "loki", "postgres", "images",
+    // The voice add-on's read-only staged-model mounts (i105): created even
+    // when voice is off, so turning it on later never hits the bind check.
+    "models/voice/whisper", "models/voice/piper",
 ];
 
 /// The eleven step titles, in wizard order — the single source for both
