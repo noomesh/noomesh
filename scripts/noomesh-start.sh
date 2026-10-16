@@ -167,7 +167,7 @@ fi
 # OVERLAY (docker-compose.voice.yml via lib-compose.sh; an earlier change phase
 # D), so the containers survive `noo stack start` and a reboot. Provider selection
 # stays in NOO_STT_* / NOO_TTS_* (the gateway defaults to
-# http://noo-whisper:8000 and http://noo-piper:8000, wire format "openai" for
+# https://noo-whisper:8000 and https://noo-piper:8000 (mTLS), wire format "openai" for
 # both); this switch only decides whether the containers are deployed.
 #
 # `voice` is in the same map but is NOT in the gateway's add-on table: it
@@ -475,26 +475,11 @@ if [ -z "$_data_root" ]; then
 fi
 
 # ── redis/grafana data re-owned to 65532 (i64) ────────────────────────
-# Both now run as uid 65532 (`user: nonroot` / `user: grafana`, each the
-# image's own name for 65532: docker-compose.cluster.yml); before
-# i64 they ran as the DHI -dev images' root, so on an existing install the
-# files they wrote under <data root>/redis (appendonlydir, dump.rdb) and
-# <data root>/grafana (grafana.db, plugins, png, ...) are root-owned and the
-# new uid cannot write them. Re-own them once, through the same throwaway
-# container pattern as the ingest dir below (no sudo). Idempotent: the
-# `find -quit` probe makes a box already on 65532 a no-op, and a missing dir
-# (not this profile, fresh install before onboard) is skipped.
-if [ -n "$_data_root" ]; then
-    for _svc_dir in redis grafana; do
-        [ -d "$_data_root/$_svc_dir" ] || continue
-        if ! docker run --rm -v "$_data_root/$_svc_dir":/d alpine \
-                sh -c 'if [ -n "$(find /d \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then chown -R 65532:65532 /d; fi' \
-                2>/dev/null; then
-            echo "NOTE: could not re-own $_data_root/$_svc_dir to uid 65532; $_svc_dir runs as 65532 (i64) and \
-may fail with 'permission denied'. To fix: docker run --rm -v \"$_data_root/$_svc_dir\":/d alpine chown -R 65532:65532 /d" >&2
-        fi
-    done
-fi
+# Done immediately before `up`, after the running service is stopped, and
+# verified afterwards: reown_nonroot_dirs (lib-reown.sh). It used to run HERE,
+# minutes before `up`, while the old root container kept rewriting its files
+# through the pull — the 0.6.3 -> 0.6.4 redis crash loop on a root-owned
+# appendonlydir/appendonly.aof.manifest (2026-10-16).
 
 # ── HF_CACHE_DIR must be an HF_HOME, not a bare hub archive ───────────
 # HF_CACHE_DIR is bound to /root/.cache/huggingface for the vLLM-family
@@ -553,6 +538,8 @@ source "$SCRIPT_DIR/lib-created-guard.sh"
 # Refuse an `up` whose bind-mount sources are missing or the wrong type
 # (Docker would invent root-owned directories for them — 2026-09-29).
 source "$SCRIPT_DIR/lib-bind-sources.sh"
+# Hand redis/grafana data to uid 65532 right before `up` (i64), verified.
+source "$SCRIPT_DIR/lib-reown.sh"
 # An enabled system without its credentials is a gateway crash-loop once
 # `up` runs — refuse before pulling or recreating anything.
 check_system_credentials || exit 1
@@ -936,6 +923,15 @@ require_compose_v2 || exit 1
         noo_check_port_collisions || exit 1
     fi
 
+    # redis/grafana run as uid 65532 (i64): re-own their data NOW, with the old
+    # container stopped, and refuse the start if anything is still not 65532 (lib-reown.sh).
+    # Before the bind-source check, which stays the last thing before `up`
+    # and so sees the final ownership.
+    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046  # one service name per word
+        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
     # Every bind source of what this `up` starts must already exist, with
     # the right type — else refuse NOW, before anything is recreated
     # (lib-bind-sources.sh). $ACTIVE_SVCS is that set, minus the scaled-out
@@ -992,6 +988,14 @@ else
         echo "Profiles: $PROFILE_ARGS"
     fi
 
+    # redis/grafana re-owned (lib-reown.sh) before the bind-source check,
+    # which stays last before `up`. Only the named services: re-owning (and so stopping) one this start
+    # does not bring back up would leave it down.
+    reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
+    if [ -n "$_data_root" ]; then
+        # shellcheck disable=SC2046
+        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
+    fi
     check_bind_sources "${SERVICES[@]}" || exit 1
     docker compose $COMPOSE_FILES $PROFILE_ARGS up -d "${SERVICES[@]}"
     NOO_CREATED_GUARD_SERVICES="${SERVICES[*]}" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq "${SERVICES[@]}")

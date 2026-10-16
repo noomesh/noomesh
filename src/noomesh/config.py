@@ -127,7 +127,8 @@ class SandboxConfig(BaseModel):
     url: Optional[str] = Field(
         default=None,
         description="Python sandbox URL for isolated code execution. "
-                    "Set to 'http://sandbox:9000' when using Docker cluster (internal network). "
+                    "Set to 'https://sandbox:9000' when using Docker cluster (internal network; "
+                    "mTLS — the caller presents its cluster leaf). "
                     "None = local subprocess execution.",
     )
 

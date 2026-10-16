@@ -866,6 +866,31 @@ pub(crate) fn cert_consumers(name: &str, role: &str, local_hostname: &str) -> Ve
     }
 }
 
+/// Running replicas of a service that share its leaf but carry no
+/// `container_name` (compose names them `<project>-<service>-<n>`), so
+/// [`cert_consumers`]' fixed names never match them. Today: the
+/// `sandbox-extra` executors, which mount `services/sandbox` and would
+/// otherwise keep serving the old leaf after a rotation.
+pub(crate) fn replica_consumers(name: &str, running: &[String]) -> Vec<String> {
+    let svc = Path::new(name)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let replica = match svc.as_str() {
+        "sandbox" if name.starts_with("services/") => "-sandbox-extra-",
+        _ => return Vec::new(),
+    };
+    running
+        .iter()
+        .filter(|c| {
+            c.split_once(replica)
+                .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .cloned()
+        .collect()
+}
+
 fn local_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
@@ -2361,6 +2386,11 @@ pub fn pki_rotate_ca(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 to_restart.push(c);
             }
         }
+        for c in replica_consumers(&info.name, &running) {
+            if !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
     }
     to_restart.sort_by_key(|c| c.ends_with("-gateway"));
     for c in &to_restart {
@@ -3702,6 +3732,11 @@ pub fn pki_rotate_all(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             // probe all see this instance's real container names.
             let c = crate::envfile::instanced(&c);
             if running.contains(&c) && !to_restart.contains(&c) {
+                to_restart.push(c);
+            }
+        }
+        for c in replica_consumers(&r.name, &running) {
+            if !to_restart.contains(&c) {
                 to_restart.push(c);
             }
         }
@@ -5130,6 +5165,44 @@ none /mnt/c/deeper tmpfs rw 0 0
         assert!(cert_consumers("nodes/worker2/node.crt", "node", "host1").is_empty());
         assert!(cert_consumers("nodes/host1/node.crt", "node", "").is_empty());
         assert!(cert_consumers("ca.crt", "ca", "host1").is_empty());
+    }
+
+    /// A rotated sandbox leaf restarts the sandbox-extra replicas too: they
+    /// mount the same leaf, have no container_name, and would otherwise
+    /// keep serving the old one until it expired.
+    #[test]
+    fn a_sandbox_rotation_restarts_its_replicas() {
+        let running: Vec<String> = ["noo-sandbox", "noomesh-sandbox-extra-1", "noomesh-sandbox-extra-2", "noo-gateway", "x-sandbox-extra-", "noomesh-sandbox-extra-1b"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            cert_consumers("services/sandbox/service.crt", "service", "host1"),
+            vec!["noo-sandbox".to_string(), "noo-stunnel-sandbox".to_string()]
+        );
+        assert_eq!(
+            replica_consumers("services/sandbox/service.crt", &running),
+            vec!["noomesh-sandbox-extra-1".to_string(), "noomesh-sandbox-extra-2".to_string()]
+        );
+        assert!(replica_consumers("services/loki/service.crt", &running).is_empty());
+        assert!(replica_consumers("nodes/sandbox/node.crt", &running).is_empty());
+    }
+
+    /// A rotated voice leaf restarts its own door and nothing else: the
+    /// whisper leaf reloads noo-whisper, the piper leaf noo-piper (both
+    /// filtered against the running set by rotate-all, so voice off means
+    /// nothing to restart), and neither has replicas.
+    #[test]
+    fn a_voice_rotation_restarts_whisper_and_piper() {
+        assert_eq!(
+            cert_consumers("services/whisper/service.crt", "service", "host1"),
+            vec!["noo-whisper".to_string(), "noo-stunnel-whisper".to_string()]
+        );
+        assert_eq!(
+            cert_consumers("services/piper/service.crt", "service", "host1"),
+            vec!["noo-piper".to_string(), "noo-stunnel-piper".to_string()]
+        );
+        let running: Vec<String> = ["noo-whisper", "noo-piper", "noo-gateway"].iter().map(|s| s.to_string()).collect();
+        assert!(replica_consumers("services/whisper/service.crt", &running).is_empty());
+        assert!(replica_consumers("services/piper/service.crt", &running).is_empty());
     }
 
     #[test]

@@ -80,6 +80,15 @@ CORE_ONLY_DEFERS="voice"
 # The add-ons whose overlay ships in this tree. Every other add-on's overlay
 # arrives in its own signed bundle (N6): addons/<name>/docker-compose.yml.
 CORE_OVERLAY_ADDONS="trellion voice"
+# Core add-ons that are a GATEWAY FEATURE FLAG and nothing else: no
+# container, no overlay, never a bundle (docs/getting-started/add-ons.md:
+# identity is free, `addons.identity (on)`). They are not licensed add-ons,
+# so nothing below looks for an overlay for them; addons_report_licensed
+# says "gateway feature" instead of the no-overlay warning it printed for
+# identity on every start (N6, 2026-10-15). Mirrors the CLI's ADDON_ROWS
+# rows that are neither licensed nor a core overlay
+# (tests/test_launcher_addon_profiles_parity.py holds the two equal).
+GATEWAY_FEATURE_ADDONS="identity"
 
 # addon_on NAME DEFAULT(0|1) — is this add-on switched on?
 #
@@ -138,8 +147,8 @@ addon_compose_overlay_args() {
     return 0
 }
 
-# addon_licensed_names — every add-on that is not a core overlay add-on and
-# that the map names or that has a bundle materialised, one per line, sorted
+# addon_licensed_names — every add-on that is not a core overlay add-on nor a
+# gateway feature flag (GATEWAY_FEATURE_ADDONS), and that the map names or that has a bundle materialised, one per line, sorted
 # (a stable compose order). Never a fixed list: core names no licensed add-on.
 addon_licensed_names() {
     _aln_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -150,6 +159,7 @@ addon_licensed_names() {
         done
     } | while read -r _aln_n; do
         case " $CORE_OVERLAY_ADDONS " in *" $_aln_n "*) continue ;; esac
+        case " $GATEWAY_FEATURE_ADDONS " in *" $_aln_n "*) continue ;; esac
         [ -n "$_aln_n" ] && printf '%s\n' "$_aln_n"
     done | sort -u
     return 0
@@ -258,10 +268,18 @@ warn_retired_env_keys() {
     return 0
 }
 
-# addons_report_licensed — one line per licensed add-on declared on, saying
+# addons_report_licensed — one line per gateway feature add-on declared on
+# ("gateway feature": it has no overlay to find), then one line per licensed
+# add-on declared on, saying
 # where its overlay comes from (or that none was found, in which case a dist
 # start refuses it in require_addon_pins and a dev start runs without it).
 addons_report_licensed() {
+    for _arl_n in $GATEWAY_FEATURE_ADDONS; do
+        # Only when DECLARED on: an unstated feature add-on is the gateway's
+        # default, and the launcher has no business restating it.
+        printf '%s\n' "$NOO_ADDON_MAP" | grep -qx "${_arl_n}=1" \
+            && echo "Add-on $_arl_n: ENABLED (gateway feature)"
+    done
     for _arl_n in $(addon_licensed_names); do
         addon_on "$_arl_n" 0 || continue
         _arl_o="$(addon_overlay "$_arl_n" 2>/dev/null)"

@@ -310,6 +310,10 @@ func (a *Agent) Run() error {
 	// DESIRED_STATE_CONFIG.md.
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.server.SetMCP(rec.MCP())
+	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
+		kind, env, ds, placed := rec.HarnessPlacementView()
+		return api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+	})
 
 	// 4b'. Node disk reclaim: the controller's ladder cannot reach this
 	// disk, so the agent queues the same ladder into its local hostd when

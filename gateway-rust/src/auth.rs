@@ -398,6 +398,9 @@ pub const HARNESS_NODE_PREFIX: &str = "node:";
 pub struct HarnessTurn {
     pub node: String,
     pub conversation_id: String,
+    /// The token's expiry (Unix seconds): nothing minted on the turn's
+    /// behalf (`door_key`) may outlive it.
+    pub exp: u64,
 }
 
 /// The harness rail's confinement, as a pure rule: a token whose
@@ -414,7 +417,7 @@ pub(crate) fn harness_turn_for(claims: &Claims, path: &str) -> Result<Option<Har
     if node.is_empty() || !path.starts_with(HARNESS_PATH_PREFIX) {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(Some(HarnessTurn { node: node.to_string(), conversation_id: conv }))
+    Ok(Some(HarnessTurn { node: node.to_string(), conversation_id: conv, exp: claims.exp as u64 }))
 }
 
 /// Mint the credential the gateway hands a node-hosted harness with a
@@ -3266,7 +3269,7 @@ pub async fn require_any_auth(
                 return Err(StatusCode::UNAUTHORIZED);
             }
             if let Some(limit) = consumer.rpm_limit {
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     if let Ok(crate::cache::RateResult::Limited { retry_after }) =
                         redis.check_consumer_quota(&consumer.name, limit).await
                     {
@@ -3290,7 +3293,7 @@ pub async fn require_any_auth(
             // shared inference surface. Only named keys with an rpm_limit are
             // capped; internal callers (rpm_limit=None) are never throttled here.
             if let Some(limit) = consumer.rpm_limit {
-                if let Some(redis) = &state.redis {
+                if let Some(redis) = state.redis.as_ref() {
                     if let Ok(crate::cache::RateResult::Limited { retry_after }) =
                         redis.check_consumer_quota(&consumer.name, limit).await
                     {

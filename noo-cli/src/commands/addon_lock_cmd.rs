@@ -200,7 +200,7 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
         Ok(s) => s,
         Err(e) => fail(g.json, ExitCode::Generic, "read_failed", &format!("{}: {e}", sig_path.display()), None),
     };
-    let anchor = TrustAnchor { keys, registry };
+    let anchor = TrustAnchor { keys, registry, pull: None };
     let v = match addon_lock::verify(&bytes, &sig, &anchor, &addon) {
         Ok(v) => v,
         Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_invalid", &e.to_string(),

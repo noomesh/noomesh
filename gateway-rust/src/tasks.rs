@@ -410,9 +410,16 @@ async fn set_state(db: &sqlx::PgPool, id: &str, state: &str, node: Option<&str>)
 /// [`evidence_verdict`]. A refusal comes back as an `Err` whose message is
 /// what the model reads as the tool result ("could not finish task: …");
 /// the task stays unfinished. Failure is never gated: owning up needs no proof.
-pub async fn finish(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result<bool> {
+///
+/// `require_tool_use` says whether that gate applies. The loop's own
+/// `noo_task_done` passes `true`: its tool calls are recorded in the task's
+/// conversation, so "called nothing" is a fact. The user door's passes
+/// `false`: its caller is an external agent whose tool use happens outside
+/// that conversation, so the gate would have nothing to look at
+/// (`mcp_user_tasks`).
+pub async fn finish(db: &sqlx::PgPool, id: &str, ok: bool, text: &str, require_tool_use: bool) -> Result<bool> {
     let mut text = text.to_string();
-    if ok {
+    if ok && require_tool_use {
         if let Some(task) = get(db, id).await? {
             if matches!(task.state.as_str(), "open" | "running" | "checkpointed") {
                 let looked = tools_used(db, &task.conversation_id).await;
@@ -585,7 +592,7 @@ pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
 pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&str>, exhausted: bool) -> Result<String> {
     let Some(task) = get(&state.db, id).await? else { return Err(anyhow!("task {id} not found")) };
     if exhausted && matches!(task.state.as_str(), "open" | "running" | "checkpointed") {
-        finish(&state.db, id, false, &format!("loop budget of {} exhausted", task.loop_budget)).await?;
+        finish(&state.db, id, false, &format!("loop budget of {} exhausted", task.loop_budget), true).await?;
     }
     let uuid = uuid::Uuid::parse_str(id)?;
     sqlx::query(
@@ -838,7 +845,7 @@ fn run_in_process(st: std::sync::Arc<AppState>, req: TaskRequest) -> std::pin::P
             Ok(Ok(final_state)) => tracing::info!(task = %req.task_id, state = %final_state, "task_finished"),
             Ok(Err(e)) => {
                 tracing::error!(task = %req.task_id, error = %e, "task_runner_failed");
-                let _ = finish(&st.db, &req.task_id, false, &format!("runner failed: {e}")).await;
+                let _ = finish(&st.db, &req.task_id, false, &format!("runner failed: {e}"), true).await;
             }
             Err(panic) => {
                 let what = panic
@@ -847,7 +854,7 @@ fn run_in_process(st: std::sync::Arc<AppState>, req: TaskRequest) -> std::pin::P
                     .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "unknown panic".into());
                 tracing::error!(task = %req.task_id, panic = %what, "task_runner_panicked");
-                let _ = finish(&st.db, &req.task_id, false, &format!("runner panicked: {}", crate::text::clip(&what, 500))).await;
+                let _ = finish(&st.db, &req.task_id, false, &format!("runner panicked: {}", crate::text::clip(&what, 500)), true).await;
             }
         }
     })

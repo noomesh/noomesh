@@ -91,11 +91,50 @@ pub struct AddonLock {
 }
 
 /// Whom to trust for one add-on: its signing keys (current first) and the
-/// registry root every image ref must sit under.
+/// registry root every image ref must sit under. `pull`, when the licence
+/// names one, is where the controller pulls from instead (the vendor's
+/// add-on registry proxy): the same path on another host. It never changes
+/// what is trusted: locks and image refs are still held to `registry`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustAnchor {
     pub keys: Vec<String>,
     pub registry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull: Option<String>,
+}
+
+impl TrustAnchor {
+    /// Where this add-on's lock and images are fetched from: `pull` when
+    /// the licence names one, else `registry`.
+    pub fn location(&self) -> &str {
+        self.pull.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or_else(|| self.registry.trim())
+    }
+
+    /// `Ok(())` when `pull` is absent or a pure host swap of `registry`
+    /// (same path, another host). Anything else would pull from a path the
+    /// lock was not signed for.
+    pub fn check_pull(&self) -> Result<(), String> {
+        let Some(p) = self.pull.as_deref().map(str::trim) else { return Ok(()) };
+        let path = |r: &str| r.split_once('/').map(|(_, p)| p.to_string());
+        match (path(p), path(self.registry.trim())) {
+            (Some(a), Some(b)) if a == b && !a.is_empty() => Ok(()),
+            _ => Err(format!(
+                "pull {p:?} must name the same path as registry {:?} (only the host may differ)",
+                self.registry
+            )),
+        }
+    }
+}
+
+/// `reference` (`<root>/<name>@sha256:…`, under `from`) re-rooted under
+/// `to`. `None` when it does not sit under `from`.
+pub fn relocate(reference: &str, from: &str, to: &str) -> Option<String> {
+    let (from, to) = (from.trim(), to.trim());
+    let rest = reference.strip_prefix(from)?;
+    if !(rest.starts_with('/') || rest.starts_with('@') || rest.starts_with(':')) {
+        return None;
+    }
+    Some(format!("{to}{rest}"))
 }
 
 /// A lock that passed [`verify`], with the index of the anchor key that
@@ -492,7 +531,7 @@ mod tests {
         assert!(valid_file_name("docker-compose.yml") && valid_file_name("routes.json"));
     }
     fn anchor() -> TrustAnchor {
-        TrustAnchor { keys: vec![pk(&seed())], registry: ROOT.into() }
+        TrustAnchor { keys: vec![pk(&seed())], registry: ROOT.into(), pull: None }
     }
     fn signed(l: &AddonLock) -> (Vec<u8>, String) {
         sign(l, &seed()).unwrap()
@@ -510,7 +549,7 @@ mod tests {
     #[test]
     fn an_older_anchor_key_still_verifies_and_reports_its_index() {
         let (bytes, sig) = signed(&lock());
-        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32)), pk(&seed())], registry: ROOT.into() };
+        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32)), pk(&seed())], registry: ROOT.into(), pull: None };
         assert_eq!(verify(&bytes, &sig, &a, "example_addon").unwrap().key_index, 1);
     }
 
@@ -527,9 +566,9 @@ mod tests {
     #[test]
     fn a_key_outside_the_anchor_is_refused() {
         let (bytes, sig) = signed(&lock());
-        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32))], registry: ROOT.into() };
+        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32))], registry: ROOT.into(), pull: None };
         assert!(matches!(verify(&bytes, &sig, &a, "example_addon"), Err(AddonLockError::BadSignature(_))));
-        let none = TrustAnchor { keys: vec![], registry: ROOT.into() };
+        let none = TrustAnchor { keys: vec![], registry: ROOT.into(), pull: None };
         assert_eq!(verify(&bytes, &sig, &none, "example_addon"), Err(AddonLockError::NoTrustedKeys));
     }
 
@@ -612,7 +651,7 @@ mod tests {
     fn a_bad_registry_root_is_refused_before_anything_else() {
         let (bytes, sig) = signed(&lock());
         for root in ["", "ghcr.io", "ghcr.io/example/", "https://ghcr.io/example", "ghcr.io/example:v1"] {
-            let a = TrustAnchor { keys: anchor().keys, registry: root.into() };
+            let a = TrustAnchor { keys: anchor().keys, registry: root.into(), pull: None };
             assert!(matches!(verify(&bytes, &sig, &a, "example_addon"), Err(AddonLockError::BadRegistryRoot(_))), "{root}");
         }
     }

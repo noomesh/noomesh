@@ -67,6 +67,8 @@ const STANDALONE_FILES: &[&str] = &[
     // Every launcher `compose up` is preceded by its bind-source check
     // (2026-09-29, grafana.pub made a directory by Docker).
     "scripts/lib-bind-sources.sh",
+    // The launcher re-owns redis/grafana data to 65532 right before `up`.
+    "scripts/lib-reown.sh",
     "scripts/lib-compose-lock.sh",
     "scripts/lib-addons.sh",
     // The retired-.env-key list: read by lib-addons.sh (the WARN) and by

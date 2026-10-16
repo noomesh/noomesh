@@ -82,11 +82,13 @@ class PythonExecutor(ToolExecutor):
 
     async def _execute_sandbox(self, code: str, **kwargs) -> ToolResult:
         """Route execution to the Docker sandbox container."""
-        url = self.sandbox_url.rstrip("/") + "/exec"
+        from ..tools.python_tool import sandbox_exec_url, sandbox_tls_kwargs
+
         timeout = float(kwargs.get("timeout", self.timeout))
         cwd = kwargs.get("cwd")
         try:
-            async with httpx.AsyncClient(timeout=timeout + 5) as client:
+            url = sandbox_exec_url(self.sandbox_url)
+            async with httpx.AsyncClient(timeout=timeout + 5, **sandbox_tls_kwargs()) as client:
                 resp = await client.post(
                     url,
                     json={"code": code, "timeout": timeout, "cwd": cwd},

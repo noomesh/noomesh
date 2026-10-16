@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -342,7 +343,8 @@ func (c *Client) FetchOne(ctx context.Context, fileURL, dest string) (bool, erro
 //
 //   - The hash is computed WHILE streaming (TeeReader), not in a second pass
 //     over a multi-GB file.
-//   - A mismatch removes the .partial and errors — the destination is never
+//   - A transport failure KEEPS the .partial; the next call hashes it and
+//     resumes with a Range request. A mismatch removes the .partial and errors — the destination is never
 //     replaced by unverified bytes, and a corrupt/tampered transfer cannot
 //     be told apart from a miss by the caller (both fail the preseed).
 //   - An ALREADY-PRESENT destination is re-hashed rather than size-trusted.
@@ -363,39 +365,106 @@ func (c *Client) FetchOneVerified(ctx context.Context, fileURL, dest, expectedSH
 		// Hash error or mismatch: fall through and re-download over it.
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
-	resp, err := c.do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("fetch %s: HTTP %d", fileURL, resp.StatusCode)
-	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return false, err
 	}
 	tmp := dest + ".partial"
-	f, err := os.Create(tmp)
+
+	// Resume. A transport failure keeps dest.partial (nobody but this
+	// function reads it), so the next call hashes the kept prefix and asks
+	// for the rest with a Range header. The server being OLD or ignoring
+	// ranges is fine: it answers 200 and we start over. The final digest
+	// covers the WHOLE file, so a corrupt or stale prefix can never land.
+	hasher := sha256.New()
+	var have int64
+	if fi, err := os.Stat(tmp); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		n, herr := hashInto(hasher, tmp)
+		if herr != nil {
+			os.Remove(tmp)
+			hasher.Reset()
+		} else {
+			have = n
+		}
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if have > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return false, err // partial kept
+	}
+	defer resp.Body.Close()
+
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	switch {
+	case resp.StatusCode == http.StatusPartialContent && have > 0:
+		start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
+		if !ok || start != have {
+			os.Remove(tmp)
+			return false, fmt.Errorf("fetch %s: 206 with Content-Range %q does not continue at byte %d; partial discarded", fileURL, resp.Header.Get("Content-Range"), have)
+		}
+		slog.Info("resuming verified fetch", "file", filepath.Base(dest), "from_mb", have>>20)
+		flags = os.O_WRONLY | os.O_APPEND
+	case resp.StatusCode == http.StatusOK:
+		if have > 0 {
+			slog.Info("server ignored the Range request; restarting the download", "file", filepath.Base(dest))
+		}
+		hasher.Reset()
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && have > 0:
+		// The partial is at least as long as the file: it cannot be a prefix of it.
+		os.Remove(tmp)
+		slog.Info("partial is longer than the file; restarting the download", "file", filepath.Base(dest))
+		return c.FetchOneVerified(ctx, fileURL, dest, want)
+	default:
+		return false, fmt.Errorf("fetch %s: HTTP %d", fileURL, resp.StatusCode) // partial kept
+	}
+
+	f, err := os.OpenFile(tmp, flags, 0o644)
 	if err != nil {
 		return false, err
 	}
-	hasher := sha256.New()
 	if _, err := io.Copy(f, io.TeeReader(resp.Body, hasher)); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		return false, err // transport failure: keep the partial for the next try
+	}
+	if err := f.Close(); err != nil {
 		return false, err
 	}
-	f.Close()
 	got := hex.EncodeToString(hasher.Sum(nil))
 	if got != want {
-		os.Remove(tmp)
+		os.Remove(tmp) // a corrupt partial must never be resumed
 		return false, fmt.Errorf("%w for %s: manifest says %s, bytes are %s", ErrDigestMismatch, fileURL, want, got)
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// hashInto streams path through h and returns its length.
+func hashInto(h io.Writer, path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return io.Copy(h, f)
+}
+
+// contentRangeStart parses the first byte of "bytes <start>-<end>/<total>".
+func contentRangeStart(v string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(v), "bytes ")
+	if !ok {
+		return 0, false
+	}
+	first, _, ok := strings.Cut(rest, "-")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+	return n, err == nil && n >= 0
 }
 
 // ErrDigestMismatch: the bytes arrived but do not hash to the manifest's

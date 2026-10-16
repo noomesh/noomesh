@@ -682,8 +682,8 @@ the same steps:
 3. check that the add-on name matches, that every image is under the root,
    that the stack tag is listed, that `base` matches the stack lock, and that
    the version is not a downgrade (allowed only with `--allow-downgrade`);
-4. pull every image by digest through a throwaway docker config holding the
-   store's `NOO_ADDON_REGISTRY_TOKEN`;
+4. pull every image by digest through a throwaway docker config (the
+   credential depends on the path, below);
 5. cache the lock under `addon-locks/` and write the pin to `addons.lock`,
    beside `stack.lock`;
 6. materialise the bundle files under `addons/<name>/`, replacing the
@@ -692,6 +692,35 @@ the same steps:
 A refusal at any step changes nothing. An add-on with no lock for the target
 stack holds the stack roll, and `noo upgrade --check --stack` says which
 add-on holds it.
+
+**Where the lock and images come from** (`lock_fetch::Route`, one selector, no
+fallback between paths; the chosen path is printed by every verb that pulls):
+
+1. `NOO_ADDON_REGISTRY_TOKEN` is in the store: **Direct** to the anchor's
+   `registry` (GHCR) with that token. This is the vendor-fleet override; the
+   entitlement's `pull` is ignored and the add-on registry proxy is never
+   contacted.
+2. Otherwise the anchor names `pull` (`addons.noomesh.ai/<same path as
+   registry>`): **Proxy**. The lock is fetched from `pull`, and the token realm
+   gets Basic `<entitlement id>:<entitlement token>` (never a GHCR token). When
+   the entitlement carries `cnf.ed25519` the proxy answers `401` with
+   `WWW-Authenticate: Noo-PoP realm=…,nonce=…`; the controller signs
+   `noo-addon-pop/1\n<service>\n<entitlement id>\n<nonce>` and retries once
+   with `Noo-PoP-Nonce` and `Noo-PoP-Signature`. Images are pulled as
+   `addons.noomesh.ai/<path>@sha256:…` (the signed digest, another host) with a
+   fresh short proxy token per image as docker's password; the entitlement and
+   the controller key never reach docker. The pin records `pulled_from`, and
+   `launch-pins` and `noo addons verify` use the pulled refs.
+3. Otherwise: Direct to `registry`, anonymous.
+
+Trust never moves with the location: the lock is verified against `registry`
+and every image ref in it must sit under `registry`. A `pull` that is not
+`registry`'s path on another host refuses the whole entitlement.
+
+The controller key is ed25519, derived one way from the cluster CA private key
+(`addons::pop`): stable for the cluster's life, nothing new stored. `noo
+security entitlement pubkey` prints its public half for the vendor's `issue
+--bind-key`; a re-created CA changes it and the entitlement is reissued.
 
 **At start.** The launcher never pulls an add-on and holds no registry
 credential. `scripts/lib-dist.sh` `require_addon_pins` asks

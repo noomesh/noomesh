@@ -309,6 +309,44 @@ report_post() {
     case "$REPORT_CODE" in 2??) return 0 ;; esac
     return 1
 }
+# ── gzip-wrapped bundles ─────────────────────────────────────
+#
+# A controller at noo-cli >= 0.6.5 gzips bundle.tar BEFORE encrypting it
+# (AES output does not compress, so it cannot be done after), and does so
+# only for a node that reports that version or newer. The signed tar inside
+# is byte-identical; noo-apply never sees the gzip. Detection is by the two
+# magic bytes 1f 8b, not by anything the controller said, so an uncompressed
+# bundle (an older controller) passes through untouched.
+#
+# gzip ABSENT or FAILED: the bundle cannot be read and nothing was applied.
+# That is reported as rc 69 (the applier's "required helper missing"
+# code, see its teardown/noo-deenroll refusal) with a readable reason in the
+# apply log, rather than handing gzip bytes to noo-apply to be refused as
+# "not a readable tar". The sha is recorded like any refused bundle, so the
+# journal is not re-flooded every tick: install gzip and re-stage.
+unwrap_gzip() {
+    _magic="$(head -c 2 "$TMP/bundle.tar" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "$_magic" = "1f8b" ] || return 0
+    if ! command -v gzip >/dev/null 2>&1; then
+        echo "noo-fetch: bundle is gzip-compressed but gzip is not installed on this node — install gzip, then re-stage" | tee "$TMP/apply.log" >&2
+        return 69
+    fi
+    if ! gzip -dc < "$TMP/bundle.tar" > "$TMP/bundle.tar.plain" 2>"$TMP/err"; then
+        echo "noo-fetch: gzip could not decompress the bundle ($(head -c 200 "$TMP/err" | tr '\n' ' ')) — re-stage" | tee "$TMP/apply.log" >&2
+        return 69
+    fi
+    mv "$TMP/bundle.tar.plain" "$TMP/bundle.tar"
+    echo "noo-fetch: bundle was gzip-compressed — decompressed"
+    return 0
+}
+if unwrap_gzip; then :; else
+    _grc=$?
+    printf '10\n' > "$EXPECT"; printf '0\n' > "$STATE"
+    printf '%s\n' "$SUM" > "$LAST"
+    report "$_grc"
+    exit "$_grc"
+fi
+
 echo "noo-fetch: applying via noo-apply"
 # `if` keeps `set -e` from killing this script on a non-zero applier exit
 # BEFORE the log is echoed and the outcome reported (that silence hid

@@ -22,3 +22,14 @@ func TestImageTarName(t *testing.T) {
 		}
 	}
 }
+
+func TestImageTarGzNameIsTheTarNamePlusGz(t *testing.T) {
+	if got := ImageTarGzName("ghcr.io/x/y:z", "arm64"); got != "ghcr.io_x_y_z_arm64.tar.gz" {
+		t.Errorf("ImageTarGzName = %q", got)
+	}
+	for _, ref := range []string{"pai-assistant/node-agent:latest", "noo-sandbox-base:latest"} {
+		if ImageTarGzName(ref, "amd64") != ImageTarName(ref, "amd64")+".gz" {
+			t.Errorf("%s: gz name is not tar name + .gz", ref)
+		}
+	}
+}

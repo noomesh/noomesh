@@ -117,7 +117,7 @@ pub async fn rate_limit(
     // the same fail-OPEN the Redis-ERROR path was fixed for in M-A1. Degrade to
     // the identical process-local cap instead, so "no Redis" tightens the
     // control rather than removing it.
-    let redis = match &state.redis {
+    let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => {
             return if fallback_allow(&ip) {
@@ -1895,7 +1895,7 @@ eth0\t000014AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
     fn no_redis_configured_still_hits_the_fallback_limiter() {
         let src = include_str!("middleware.rs");
         let start = src
-            .find("let redis = match &state.redis {")
+            .find("let redis = match state.redis.as_ref() {")
             .expect("the redis match moved — re-check this guard");
         let arm = &src[start..start + src[start..].find("};").expect("unterminated")];
         assert!(

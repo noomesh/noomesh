@@ -112,7 +112,7 @@ async fn coordinator_context(
     .unwrap_or(0);
 
     // Redis cache status
-    let redis_status = if state.redis.is_some() { "connected" } else { "unavailable" };
+    let redis_status = state.redis.state().as_str();
 
     // Tool schemas count
     let tool_count = state.tool_schemas.read().await.len();

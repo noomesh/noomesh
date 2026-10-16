@@ -645,6 +645,109 @@ mod loopback_verification_tests {
     }
 }
 
+/// Which client an https door is dialled with (mTLS doors phase 2, i77).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorTrust {
+    /// One of the cluster's own hostnames: [`cluster_client`] — the cluster
+    /// CA and this gateway's leaf, which the door's listener requires.
+    Cluster,
+    /// Any other host (a cloud provider): [`external_client`] — public
+    /// roots, NO client certificate. The cluster client could not verify a
+    /// public CA, and the gateway's leaf has no business leaving the cluster.
+    Public,
+}
+
+/// A configurable door the gateway dials whose default is a cluster
+/// service but whose URL an operator may point at a public provider — the
+/// voice doors (`NOO_STT_URL` → noo-whisper, `NOO_TTS_URL` → noo-piper).
+pub struct HttpsDoor {
+    /// What the operator sets, named in the refusal.
+    pub setting: &'static str,
+    /// The cluster default, named in the refusal as the fix.
+    pub default_url: &'static str,
+    /// Hostnames that are this cluster's: exact matches only, so a
+    /// look-alike (`noo-whisper.evil.com`) is a public host.
+    pub cluster_hosts: &'static [&'static str],
+}
+
+/// The cluster's own voice hostnames (the two leaves' SANs): an https
+/// `NOO_STT_URL` / `NOO_TTS_URL` on any of these dials with the cluster
+/// client; every other https host is a provider, dialled publicly.
+pub const VOICE_CLUSTER_HOSTS: &[&str] = &["noo-whisper", "whisper", "noo-piper", "piper", "localhost"];
+
+impl HttpsDoor {
+    /// `http://` is refused everywhere (the cluster door serves mTLS only,
+    /// and a cloud provider's key must not cross the wire in the clear); an
+    /// https URL on a cluster hostname is [`DoorTrust::Cluster`], any other
+    /// https host is [`DoorTrust::Public`].
+    pub fn classify(&self, url: &str) -> std::result::Result<DoorTrust, String> {
+        let url = url.trim();
+        let refuse = || {
+            format!(
+                "{}={url} is not https — the cluster's voice doors serve mTLS only and a provider \
+                 is dialled over TLS only; set {}={} (or an https provider URL), or unset it",
+                self.setting, self.setting, self.default_url
+            )
+        };
+        if !url.to_ascii_lowercase().starts_with("https://") {
+            return Err(refuse());
+        }
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("{}={url} is not a URL: {e}", self.setting))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| format!("{}={url} names no host", self.setting))?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if self.cluster_hosts.iter().any(|h| *h == host) {
+            Ok(DoorTrust::Cluster)
+        } else {
+            Ok(DoorTrust::Public)
+        }
+    }
+
+    /// The client to dial `url` with, or the refusal (never dialled).
+    pub fn client(&self, url: &str) -> std::result::Result<reqwest::Client, String> {
+        Ok(match self.classify(url)? {
+            DoorTrust::Cluster => cluster_client(),
+            DoorTrust::Public => external_client(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::{DoorTrust, HttpsDoor, VOICE_CLUSTER_HOSTS};
+
+    const D: HttpsDoor = HttpsDoor {
+        setting: "NOO_STT_URL",
+        default_url: "https://noo-whisper:8000",
+        cluster_hosts: VOICE_CLUSTER_HOSTS,
+    };
+
+    /// The URL classifier: http refused with the fix named; the cluster's
+    /// own names get the cluster client; every other https host the public one.
+    #[test]
+    fn the_door_classifier_picks_cluster_or_public_and_refuses_plaintext() {
+        assert_eq!(D.classify("https://noo-whisper:8000"), Ok(DoorTrust::Cluster));
+        assert_eq!(D.classify("HTTPS://Whisper:8000/"), Ok(DoorTrust::Cluster));
+        for host in ["noo-piper", "piper", "localhost", "LOCALHOST."] {
+            assert_eq!(D.classify(&format!("https://{host}:8000")), Ok(DoorTrust::Cluster), "{host}");
+        }
+        assert_eq!(D.classify("https://api.openai.com"), Ok(DoorTrust::Public));
+        assert_eq!(D.classify("https://speaches.example.net:8443/v1"), Ok(DoorTrust::Public));
+        // A look-alike is not a cluster name.
+        assert_eq!(D.classify("https://noo-whisper.evil.com"), Ok(DoorTrust::Public));
+        assert_eq!(D.classify("https://localhost.evil.com"), Ok(DoorTrust::Public));
+        assert_eq!(D.classify("https://whisper.noo-cluster"), Ok(DoorTrust::Public));
+        for plain in [format!("{}://noo-whisper:8000", "http"), format!("{}://api.openai.com", "http"), "noo-whisper:8000".into()] {
+            let e = D.classify(&plain).unwrap_err();
+            assert!(e.contains("not https") && e.contains("NOO_STT_URL=https://noo-whisper:8000"), "{e}");
+            assert!(D.client(&plain).is_err(), "{plain} must not get a client");
+        }
+        assert!(D.classify("https://").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_server_material, resolve_backend_timeout_secs, DEFAULT_BACKEND_TIMEOUT_SECS};

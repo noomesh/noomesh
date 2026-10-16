@@ -37,6 +37,7 @@ use std::process::Command;
 
 mod image_family;
 mod warmup;
+pub(crate) mod restart_loops;
 
 /// One invariant, judged.
 #[derive(Debug, Clone, PartialEq)]
@@ -2162,6 +2163,280 @@ pub(crate) fn loki_listener_check(config: Option<&str>, compose: Option<&str>) -
     ok("loki listener", "client certificate required from every caller; no published port")
 }
 
+/// The tokens of a compose `command:` as written, in either the block-list
+/// or the inline-array form: quotes, list dashes and brackets dropped.
+fn command_tokens(block: &str) -> Vec<String> {
+    block
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']')
+        .map(|t| t.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|t| !t.is_empty() && *t != "-")
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does this service block run uvicorn with a TLS listener that REQUIRES a
+/// client certificate (`--ssl-cert-reqs 2` = ssl.CERT_REQUIRED) and names
+/// a certificate, a key and the CA to verify callers against?
+fn uvicorn_requires_client_cert(block: &str) -> bool {
+    let toks = command_tokens(block);
+    let after = |flag: &str| toks.iter().position(|t| t == flag).and_then(|i| toks.get(i + 1)).map(String::as_str);
+    after("--ssl-cert-reqs") == Some("2")
+        && after("--ssl-certfile").is_some()
+        && after("--ssl-keyfile").is_some()
+        && after("--ssl-ca-certs").is_some()
+}
+
+/// What `sandbox_live_probe` saw from inside the gateway container, each
+/// as the probe script printed it: `refused: …`, `answered HTTP/1.1 …`,
+/// or `unreachable: …` (no TCP connection at all — the sandbox is down).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct SandboxProbe {
+    /// TLS with the cluster CA but NO client certificate.
+    pub no_cert: String,
+    /// TLS presenting the gateway's own leaf (NOO_TLS_CERT/KEY).
+    pub leaf: String,
+    /// Plain HTTP to the same port.
+    pub plain: String,
+}
+
+const SANDBOX_REMEDY_RESTART: &str = "noo stack restart --force sandbox";
+const SANDBOX_REMEDY_LEAF: &str = "noo security pki issue-service sandbox   # then: noo stack restart --force sandbox";
+
+/// The "sandbox listener" row (mTLS doors phase 1, i77). The sandbox runs
+/// model-written code, so its door must refuse a caller with no cluster
+/// leaf in the TLS handshake — not at a bearer, not at a route. Two
+/// halves: the compose file the stack runs from (uvicorn with
+/// `--ssl-cert-reqs 2` on `sandbox` and `sandbox-extra`, no published
+/// port), and a live probe from inside the gateway container — the one
+/// that really dials it — that a connection with no client certificate
+/// and a plaintext one get no HTTP answer while the gateway's own leaf
+/// does. `probe` is `None` when it could not run (container down, no
+/// python in the gateway image), which the row says rather than passing.
+pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&SandboxProbe>) -> Check {
+    const ROW: &str = "sandbox listener";
+    let Some(compose) = compose else {
+        return warn(ROW, "could not read docker-compose.cluster.yml from the running checkout", None);
+    };
+    let Some(block) = compose_service_block(compose, "sandbox") else {
+        return warn(ROW, "docker-compose.cluster.yml has no sandbox service", None);
+    };
+    let reshipped = "restore the shipped compose file (noo upgrade --stack re-materialises it), then: noo stack restart --force sandbox";
+    if !uvicorn_requires_client_cert(&block) {
+        return fail(
+            ROW,
+            "the sandbox's uvicorn does not run with --ssl-cert-reqs 2 and its leaf — any process on noo-sandbox could POST code to /exec",
+            reshipped,
+        );
+    }
+    if let Some(extra) = compose_service_block(compose, "sandbox-extra") {
+        if !(extra.contains("*sandbox-command") || uvicorn_requires_client_cert(&extra)) {
+            return fail(ROW, "sandbox-extra does not run the sandbox's mTLS listener (it answers to the same `sandbox` name)", reshipped);
+        }
+        if extra.lines().any(|l| l.trim() == "ports:") {
+            return fail(ROW, "sandbox-extra publishes a host port — the executor is noo-sandbox only", "remove the ports: block from sandbox-extra and recreate it");
+        }
+    }
+    if block.lines().any(|l| l.trim() == "ports:") {
+        return fail(
+            ROW,
+            "the sandbox service publishes a host port — the executor is reachable on noo-sandbox only by design",
+            "remove the ports: block from the sandbox service, then: noo stack restart --force sandbox",
+        );
+    }
+    let Some(p) = probe else {
+        return warn(
+            ROW,
+            "the compose listener requires a client certificate; not probed live (gateway or sandbox container not running)",
+            Some("noo stack status".into()),
+        );
+    };
+    let answered = |s: &str| s.starts_with("answered");
+    if p.no_cert.starts_with("unreachable") || p.leaf.starts_with("unreachable") {
+        return fail(ROW, format!("the gateway cannot reach sandbox:9000 ({})", p.leaf), SANDBOX_REMEDY_RESTART);
+    }
+    if answered(&p.no_cert) {
+        return fail(
+            ROW,
+            format!("a connection WITHOUT a client certificate was answered ({}) — the listener does not require one", p.no_cert),
+            SANDBOX_REMEDY_RESTART,
+        );
+    }
+    if answered(&p.plain) {
+        return fail(ROW, format!("a PLAINTEXT request was answered ({})", p.plain), SANDBOX_REMEDY_RESTART);
+    }
+    if !answered(&p.leaf) {
+        return fail(
+            ROW,
+            format!("the gateway's own leaf was refused ({}) — the sandbox's leaf or CA does not match the gateway's", p.leaf),
+            SANDBOX_REMEDY_LEAF,
+        );
+    }
+    ok(ROW, "client certificate required from every caller (none and plaintext refused, the gateway's leaf accepted); no published port")
+}
+
+/// Run on the gateway's own interpreter (its runtime image is DHI python,
+/// no shell): dial `sandbox:9000` three ways and print one JSON line. TCP
+/// is opened BEFORE TLS so a down sandbox reads `unreachable`, never as a
+/// refusal that would pass the row.
+const SANDBOX_PROBE_PY: &str = r#"import json,os,socket,ssl
+def dial(tls,cert):
+    try:
+        raw=socket.create_connection(('sandbox',9000),timeout=5)
+    except OSError as e:
+        return 'unreachable: %s'%e
+    try:
+        s=raw
+        if tls:
+            c=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA'])
+            if cert:
+                c.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY'])
+            s=c.wrap_socket(raw,server_hostname='sandbox')
+        s.sendall(b'GET /health HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n\r\n')
+        b=s.recv(64)
+        return 'answered '+b.split(b'\r\n')[0].decode('ascii','replace') if b.startswith(b'HTTP/') else 'refused: closed without an answer'
+    except (ssl.SSLError,OSError,KeyError) as e:
+        return 'refused: %s'%(e,)
+    finally:
+        raw.close()
+print(json.dumps({'no_cert':dial(True,False),'leaf':dial(True,True),'plain':dial(False,False)}))
+"#;
+
+fn sandbox_live_probe() -> Option<SandboxProbe> {
+    let gateway = crate::envfile::container("gateway");
+    let sandbox = crate::envfile::container("sandbox");
+    if !crate::commands::secrets::container_running(&gateway) || !crate::commands::secrets::container_running(&sandbox) {
+        return None;
+    }
+    let out = std::process::Command::new("docker")
+        .args(["exec", &gateway, "python", "-c", SANDBOX_PROBE_PY])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(text.lines().last()?.trim()).ok()
+}
+
+/// What `voice_live_probe` saw at each voice door, from inside the gateway
+/// container: the same three dials as the sandbox's ([`SandboxProbe`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct VoiceProbe {
+    pub whisper: SandboxProbe,
+    pub piper: SandboxProbe,
+}
+
+/// The voice doors: compose service name → the leaf it must serve.
+const VOICE_DOORS: [&str; 2] = ["whisper", "piper"];
+
+/// The "voice listeners" row (mTLS doors phase 2, i77). noo-whisper and
+/// noo-piper take audio and text from the gateway, so each door must
+/// refuse a caller with no cluster leaf in the TLS handshake. Voice is an
+/// overlay add-on: with `addons.voice` off the containers are never
+/// composed, and the row says so instead of failing. With it on, the same
+/// two halves as the sandbox row: the overlay file the launcher composes
+/// (uvicorn with `--ssl-cert-reqs 2` on both, no published port), and a
+/// live probe from inside the gateway — no cert and plaintext get no HTTP
+/// answer at either door, the gateway's own leaf does.
+pub(crate) fn voice_listeners_check(voice_on: bool, overlay: Option<&str>, probe: Option<&VoiceProbe>) -> Check {
+    const ROW: &str = "voice listeners";
+    if !voice_on {
+        return ok(ROW, "voice off — not checked");
+    }
+    let Some(overlay) = overlay else {
+        return warn(ROW, "voice is on but docker-compose.voice.yml could not be read from the running checkout", None);
+    };
+    let reshipped = "restore the shipped docker-compose.voice.yml (noo upgrade --stack re-materialises it), then: noo stack restart --force whisper piper";
+    for door in VOICE_DOORS {
+        let Some(block) = compose_service_block(overlay, door) else {
+            return fail(ROW, format!("docker-compose.voice.yml has no {door} service"), reshipped);
+        };
+        if !uvicorn_requires_client_cert(&block) {
+            return fail(
+                ROW,
+                format!("{door}'s uvicorn does not run with --ssl-cert-reqs 2 and its leaf — any container on noo-cluster could call it"),
+                reshipped,
+            );
+        }
+        if block.lines().any(|l| l.trim() == "ports:") {
+            return fail(
+                ROW,
+                format!("{door} publishes a host port — the voice doors are reachable on noo-cluster only by design"),
+                format!("remove the ports: block from {door} in docker-compose.voice.yml, then: noo stack restart --force {door}"),
+            );
+        }
+    }
+    let Some(p) = probe else {
+        return warn(
+            ROW,
+            "both listeners require a client certificate in compose; not probed live (gateway, whisper or piper container not running)",
+            Some("noo stack status".into()),
+        );
+    };
+    let answered = |s: &str| s.starts_with("answered");
+    for (door, d) in [("whisper", &p.whisper), ("piper", &p.piper)] {
+        let restart = format!("noo stack restart --force {door}");
+        if d.no_cert.starts_with("unreachable") || d.leaf.starts_with("unreachable") {
+            return fail(ROW, format!("the gateway cannot reach {door}:8000 ({})", d.leaf), restart);
+        }
+        if answered(&d.no_cert) {
+            return fail(
+                ROW,
+                format!("{door}: a connection WITHOUT a client certificate was answered ({}) — the listener does not require one", d.no_cert),
+                restart,
+            );
+        }
+        if answered(&d.plain) {
+            return fail(ROW, format!("{door}: a PLAINTEXT request was answered ({})", d.plain), restart);
+        }
+        if !answered(&d.leaf) {
+            return fail(
+                ROW,
+                format!("{door}: the gateway's own leaf was refused ({}) — {door}'s leaf or CA does not match the gateway's", d.leaf),
+                format!("noo security pki issue-service {door}   # then: noo stack restart --force {door}"),
+            );
+        }
+    }
+    ok(ROW, "whisper and piper require a client certificate from every caller (none and plaintext refused, the gateway's leaf accepted); no published port")
+}
+
+/// The sandbox probe's dial, run against both voice doors by their compose
+/// service names (each leaf carries its own). Same rules: TCP before TLS so
+/// a down door reads `unreachable`, never a passing refusal.
+const VOICE_PROBE_PY: &str = r#"import json,os,socket,ssl
+def dial(host,tls,cert):
+    try:
+        raw=socket.create_connection((host,8000),timeout=5)
+    except OSError as e:
+        return 'unreachable: %s'%e
+    try:
+        s=raw
+        if tls:
+            c=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA'])
+            if cert:
+                c.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY'])
+            s=c.wrap_socket(raw,server_hostname=host)
+        s.sendall(b'GET /health HTTP/1.1\r\nHost: '+host.encode()+b'\r\nConnection: close\r\n\r\n')
+        b=s.recv(64)
+        return 'answered '+b.split(b'\r\n')[0].decode('ascii','replace') if b.startswith(b'HTTP/') else 'refused: closed without an answer'
+    except (ssl.SSLError,OSError,KeyError) as e:
+        return 'refused: %s'%(e,)
+    finally:
+        raw.close()
+print(json.dumps({h:{'no_cert':dial(h,True,False),'leaf':dial(h,True,True),'plain':dial(h,False,False)} for h in ('whisper','piper')}))
+"#;
+
+fn voice_live_probe() -> Option<VoiceProbe> {
+    let gateway = crate::envfile::container("gateway");
+    let running = |c: &str| crate::commands::secrets::container_running(c);
+    if !running(&gateway) || !VOICE_DOORS.iter().all(|d| running(&crate::envfile::container(d))) {
+        return None;
+    }
+    let out = std::process::Command::new("docker")
+        .args(["exec", &gateway, "python", "-c", VOICE_PROBE_PY])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(text.lines().last()?.trim()).ok()
+}
+
 /// How each compose-run inference backend on the controller is fronted.
 /// `Native`: the server itself terminates TLS and must run with
 /// `--ssl-cert-reqs 2` (vLLM). `Stunnel(name)`: the server has no TLS
@@ -3628,6 +3903,80 @@ mod system_credentials_tests {
     }
 }
 
+/// `dependencies.redis.state` from an AUTHENTICATED `/health` body
+/// (`connected` / `reconnecting` / `unavailable`). `None` when the body is
+/// absent or lacks it: the gateway was unreachable, is older than the field,
+/// or answered the anonymous body (no credential).
+pub(crate) fn gateway_redis_state(health: Option<&Value>) -> Option<&str> {
+    health?["dependencies"]["redis"]["state"].as_str()
+}
+
+/// The `gateway redis` row. The gateway used to decide Redis ONCE at boot
+/// (5 s, no retry): if redis was not accepting connections yet it served
+/// without Redis until restarted, and `/api/jobs/*` answered "Redis not
+/// connected" on the controller for an hour after the 0.6.4 move
+/// (2026-10-15) while `/health` still said healthy. It now redials on its
+/// own; a row that stays `reconnecting` means redis is down or the gateway
+/// cannot reach it.
+pub(crate) fn gateway_redis_check(health: Option<&Value>) -> Check {
+    const NAME: &str = "gateway redis";
+    match gateway_redis_state(health) {
+        Some("connected") => ok(NAME, "connected"),
+        Some(state) => fail(
+            NAME,
+            format!(
+                "not connected ({state}) — /api/jobs, rate limiting and the response cache run degraded \
+                 (is the redis container up? `noo stack status`)"
+            ),
+            "noo stack restart gateway",
+        ),
+        None => warn(
+            NAME,
+            "not read: no authenticated /health answer with dependencies.redis.state \
+             (unreachable, no credential, or a gateway older than this CLI)",
+            Some("noo health".into()),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod gateway_redis_tests {
+    use super::{gateway_redis_check, gateway_redis_state, Verdict};
+    use serde_json::json;
+
+    fn health(state: &str) -> serde_json::Value {
+        json!({"status": "healthy", "dependencies": {"redis": {"healthy": state == "connected", "state": state}}})
+    }
+
+    #[test]
+    fn a_connected_gateway_passes() {
+        let c = gateway_redis_check(Some(&health("connected")));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.name, "gateway redis");
+        assert_eq!(c.detail, "connected");
+    }
+
+    #[test]
+    fn a_reconnecting_or_unavailable_gateway_fails_with_the_restart_remedy() {
+        for state in ["reconnecting", "unavailable"] {
+            let c = gateway_redis_check(Some(&health(state)));
+            assert_eq!(c.verdict, Verdict::Fail, "{state}");
+            assert!(c.detail.starts_with(&format!("not connected ({state})")), "{}", c.detail);
+            assert_eq!(c.remedy.as_deref(), Some("noo stack restart gateway"));
+        }
+    }
+
+    #[test]
+    fn no_state_is_a_warn_never_a_pass() {
+        // Unreachable, the anonymous body, and an older gateway's deps map.
+        let older = json!({"status": "healthy", "dependencies": {"redis": {"healthy": true, "optional": true}}});
+        for body in [None, Some(json!({"status": "healthy"})), Some(older)] {
+            assert_eq!(gateway_redis_state(body.as_ref()), None);
+            assert_eq!(gateway_redis_check(body.as_ref()).verdict, Verdict::Warn);
+        }
+    }
+}
+
 /// The `(remedy, row name)` pairs a section prints under its table: every
 /// FAIL row's, and in the controller section every WARN row's too.
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
@@ -3840,6 +4189,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
         checks.push(model_classes_check(get_json_opt(g, "/api/cluster/model-classes", true, 15).as_ref()));
+        // The gateway's own Redis connection (authenticated /health: the
+        // anonymous body carries no dependency map).
+        checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
         {
             let root = crate::envfile::repo_root();
             let store = crate::commands::secrets::SecretStore::load_sops(&root.join("secrets/env.sops"));
@@ -3884,6 +4236,17 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let loki_cfg = std::fs::read_to_string(root.join("monitoring/loki/loki-config-tls.yml")).ok();
         let compose = std::fs::read_to_string(root.join("docker-compose.cluster.yml")).ok();
         checks.push(loki_listener_check(loki_cfg.as_deref(), compose.as_deref()));
+        // The sandbox executor's door (mTLS doors phase 1): compose runs
+        // its uvicorn with a required client certificate, and the gateway
+        // container proves it live — no cert and plaintext refused, its own
+        // leaf accepted.
+        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_live_probe().as_ref()));
+        // The voice doors (mTLS doors phase 2): only when the overlay is
+        // composed; then the same static + live three-way proof per door.
+        let voice_on = addon_on("voice");
+        let voice_overlay = if voice_on { std::fs::read_to_string(root.join("docker-compose.voice.yml")).ok() } else { None };
+        let voice_probe = if voice_on { voice_live_probe() } else { None };
+        checks.push(voice_listeners_check(voice_on, voice_overlay.as_deref(), voice_probe.as_ref()));
         // Every compose inference backend requires a client certificate at
         // its door (vLLM --ssl-cert-reqs 2, stunnel verify = 2).
         checks.push(backend_listener_check(compose.as_deref(), &|name| {
@@ -3929,6 +4292,9 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).
         checks.push(image_family::image_family_row());
+        // A container docker keeps restarting reads "Up" between restarts;
+        // judge RestartCount + recency instead (0.6.4 redis AOF, 2026-10-16).
+        checks.push(restart_loops::restart_loops_row());
         // Every container that bind-mounts noomesh.yaml still
         // reads the host's file (the gateway checks only its own view).
         checks.extend(config_mount_row());
@@ -5853,6 +6219,155 @@ mod tests {
         // The block parser stops at the next service: grafana's ports are not loki's.
         assert!(compose_service_block(COMPOSE_OK, "loki").unwrap().contains("tls-config.yaml"));
         assert!(!compose_service_block(COMPOSE_OK, "loki").unwrap().contains("3000"));
+    }
+
+    const SANDBOX_COMPOSE_OK: &str = "services:\n  sandbox:\n    entrypoint: []\n    command: &sandbox-command\n      - python\n      - -m\n      - uvicorn\n      - noomesh.sandbox.app:app\n      - --port\n      - \"9000\"\n      - --ssl-certfile\n      - /tls/services/sandbox/service.crt\n      - --ssl-keyfile\n      - /tls/services/sandbox/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"9000\"\n  sandbox-extra:\n    command: *sandbox-command\n  postgres:\n    ports:\n      - \"5432:5432\"\n";
+
+    fn sandbox_probe(no_cert: &str, leaf: &str, plain: &str) -> SandboxProbe {
+        SandboxProbe { no_cert: no_cert.into(), leaf: leaf.into(), plain: plain.into() }
+    }
+
+    /// The sandbox row: OK only when compose requires a client certificate
+    /// AND the live probe saw no-cert and plaintext refused and the
+    /// gateway's leaf answered. Every other combination names its remedy.
+    #[test]
+    fn the_sandbox_listener_row_requires_a_client_cert_and_proves_it_live() {
+        let good = sandbox_probe("refused: [SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED]", "answered HTTP/1.1 200 OK", "refused: closed without an answer");
+        let c = sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "client certificate required from every caller (none and plaintext refused, the gateway's leaf accepted); no published port");
+
+        // Compose: optional (1) is not required (2); a plaintext command; a published port.
+        let optional = SANDBOX_COMPOSE_OK.replace("      - \"2\"\n", "      - \"1\"\n");
+        let c = sandbox_listener_check(Some(&optional), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("--ssl-cert-reqs 2"), "{}", c.detail);
+        let inline_plain = "services:\n  sandbox:\n    command: [\"python\", \"-m\", \"uvicorn\", \"noomesh.sandbox.app:app\", \"--port\", \"9000\"]\n";
+        assert_eq!(sandbox_listener_check(Some(inline_plain), Some(&good)).verdict, Verdict::Fail);
+        let published = SANDBOX_COMPOSE_OK.replace("    expose:\n", "    ports:\n      - \"9000:9000\"\n    expose:\n");
+        let c = sandbox_listener_check(Some(&published), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("publishes a host port"), "{}", c.detail);
+        let extra_plain = SANDBOX_COMPOSE_OK.replace("    command: *sandbox-command\n", "    command: [\"python\", \"-m\", \"uvicorn\", \"x\"]\n");
+        let c = sandbox_listener_check(Some(&extra_plain), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("sandbox-extra"), "{}", c.detail);
+
+        // Live: no-cert answered, plaintext answered, leaf refused, sandbox down.
+        let c = sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), Some(&sandbox_probe("answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK", "refused: x")));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("WITHOUT a client certificate"));
+        assert_eq!(c.remedy.as_deref(), Some("noo stack restart --force sandbox"));
+        let c = sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), Some(&sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK")));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("PLAINTEXT"));
+        let c = sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), Some(&sandbox_probe("refused: x", "refused: [SSL: CERTIFICATE_VERIFY_FAILED]", "refused: y")));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.remedy.unwrap().contains("issue-service sandbox"));
+        let c = sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), Some(&sandbox_probe("unreachable: [Errno -2]", "unreachable: [Errno -2]", "unreachable: [Errno -2]")));
+        assert_eq!(c.verdict, Verdict::Fail, "a down sandbox must not read as a refusal");
+
+        // Not probed / not readable: said, never passed.
+        assert_eq!(sandbox_listener_check(Some(SANDBOX_COMPOSE_OK), None).verdict, Verdict::Warn);
+        assert_eq!(sandbox_listener_check(None, Some(&good)).verdict, Verdict::Warn);
+    }
+
+    /// The shipped compose passes the static half (the row reads the same
+    /// file on the running controller), and the probe script's output
+    /// parses into the struct the row reads.
+    #[test]
+    fn the_shipped_compose_passes_the_sandbox_row_and_the_probe_output_parses() {
+        let compose = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.cluster.yml")).unwrap();
+        let good = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        let c = sandbox_listener_check(Some(&compose), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let parsed: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}"#).unwrap();
+        assert_eq!(parsed, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
+        assert!(SANDBOX_PROBE_PY.contains("('sandbox',9000)") && SANDBOX_PROBE_PY.contains("NOO_TLS_CERT"));
+        assert!(!SANDBOX_PROBE_PY.contains("CERT_NONE") && !SANDBOX_PROBE_PY.contains("check_hostname"));
+    }
+
+    fn voice_overlay_ok() -> String {
+        let door = |svc: &str| format!(
+            "  {svc}:\n    command:\n      - uvicorn\n      - {svc}_server:app\n      - --port\n      - \"8000\"\n      - --ssl-certfile\n      - /tls/services/{svc}/service.crt\n      - --ssl-keyfile\n      - /tls/services/{svc}/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"8000\"\n"
+        );
+        format!("services:\n{}{}", door("whisper"), door("piper"))
+    }
+
+    /// The voice row: off is said, never failed; on, OK only when both
+    /// doors require a client certificate in the overlay AND the live probe
+    /// saw no-cert and plaintext refused and the gateway's leaf answered at
+    /// each. Every other combination names the door and its remedy.
+    #[test]
+    fn the_voice_listeners_row_is_off_or_proves_both_doors_live() {
+        let good_door = sandbox_probe("refused: [SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED]", "answered HTTP/1.1 200 OK", "refused: closed without an answer");
+        let good = VoiceProbe { whisper: good_door.clone(), piper: good_door.clone() };
+        let overlay = voice_overlay_ok();
+
+        // Off: not composed, nothing to probe — said, not failed, whatever the inputs.
+        for (o, p) in [(None, None), (Some(overlay.as_str()), Some(&good))] {
+            let c = voice_listeners_check(false, o, p);
+            assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+            assert_eq!(c.detail, "voice off — not checked");
+        }
+
+        let c = voice_listeners_check(true, Some(&overlay), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert_eq!(c.detail, "whisper and piper require a client certificate from every caller (none and plaintext refused, the gateway's leaf accepted); no published port");
+
+        // Static half: piper optional (1), whisper plaintext, a published port, a missing door.
+        let optional = overlay.replacen("      - \"2\"\n", "      - \"1\"\n", 2).replacen("      - \"1\"\n", "      - \"2\"\n", 1);
+        let c = voice_listeners_check(true, Some(&optional), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("piper's uvicorn") && c.detail.contains("--ssl-cert-reqs 2"), "{}", c.detail);
+        let plain = overlay.replace("      - --ssl-certfile\n      - /tls/services/whisper/service.crt\n", "");
+        let c = voice_listeners_check(true, Some(&plain), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("whisper's uvicorn"), "{}", c.detail);
+        let published = overlay.replacen("    expose:\n", "    ports:\n      - \"8000:8000\"\n    expose:\n", 1);
+        let c = voice_listeners_check(true, Some(&published), Some(&good));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("whisper publishes a host port"), "{}", c.detail);
+        let no_piper = overlay.split("  piper:\n").next().unwrap().to_string();
+        assert_eq!(voice_listeners_check(true, Some(&no_piper), Some(&good)).verdict, Verdict::Fail);
+
+        // Live half, per door.
+        let with = |w: SandboxProbe, p: SandboxProbe| VoiceProbe { whisper: w, piper: p };
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(good_door.clone(), sandbox_probe("answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK", "refused: x"))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("piper: a connection WITHOUT a client certificate"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some("noo stack restart --force piper"));
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "answered HTTP/1.1 200 OK"), good_door.clone())));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.starts_with("whisper: a PLAINTEXT request"), "{}", c.detail);
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(good_door.clone(), sandbox_probe("refused: x", "refused: [SSL: CERTIFICATE_VERIFY_FAILED]", "refused: y"))));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.remedy.unwrap().contains("issue-service piper"));
+        let down = sandbox_probe("unreachable: [Errno -2]", "unreachable: [Errno -2]", "unreachable: [Errno -2]");
+        let c = voice_listeners_check(true, Some(&overlay), Some(&with(down, good_door.clone())));
+        assert_eq!(c.verdict, Verdict::Fail, "a down door must not read as a refusal");
+        assert!(c.detail.contains("cannot reach whisper:8000"), "{}", c.detail);
+
+        // On but not probed / not readable: said, never passed.
+        assert_eq!(voice_listeners_check(true, Some(&overlay), None).verdict, Verdict::Warn);
+        assert_eq!(voice_listeners_check(true, None, Some(&good)).verdict, Verdict::Warn);
+    }
+
+    /// The shipped overlay passes the static half (the row reads the same
+    /// file on the running controller), and the probe output parses.
+    #[test]
+    fn the_shipped_voice_overlay_passes_the_row_and_the_probe_output_parses() {
+        let overlay = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docker-compose.voice.yml")).unwrap();
+        let door = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        let good = VoiceProbe { whisper: door.clone(), piper: door.clone() };
+        let c = voice_listeners_check(true, Some(&overlay), Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        let parsed: VoiceProbe = serde_json::from_str(
+            r#"{"whisper": {"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}, "piper": {"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}}"#,
+        ).unwrap();
+        assert_eq!(parsed.whisper, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
+        assert!(VOICE_PROBE_PY.contains("('whisper','piper')") && VOICE_PROBE_PY.contains("NOO_TLS_CERT"));
+        assert!(!VOICE_PROBE_PY.contains("CERT_NONE") && !VOICE_PROBE_PY.contains("check_hostname"));
     }
 
     const NATS_TLS_CFG: &str = "jetstream {\n  store_dir: /data\n}\nhttps_port: 8222\ninclude users.conf\n\ntls {\n  cert_file: /tls/services/nats/service.crt\n  key_file: /tls/services/nats/service.key\n  ca_file: /tls/ca.crt\n  verify: true\n}\n";

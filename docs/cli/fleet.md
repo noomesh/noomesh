@@ -197,6 +197,15 @@ No harness on a node, or one that does not answer, and the controller
 runs the turn as before. `NOO_HARNESS_DISPATCH=0` on the controller is
 the brake.
 
+The controller's own node is no exception. The controller box also runs a
+node agent for its own node (see
+[../security/node-agent.md](../security/node-agent.md)), so
+`noo cluster place <controller-node> harness auto` places a harness there
+like anywhere else, and a turn for a model served on that node goes to it
+once the agent reports the harness `running`. Until then, with no harness
+placed or one placed but not running, the controller runs those turns in
+process, and a task's `why` names which it was.
+
 The harness can also follow a node's chat backend on its own:
 
 ```sh
@@ -216,12 +225,15 @@ request named, else the node's default (`noo cluster set-config <node>
 smaller number; the task record shows which applied.
 
 Which harness runs on a node is part of the placement: `--kind noo`
-(the default, this gateway's own loop), `claude-code` or `copilot`. The
+(the default, this gateway's own loop), `claude-code`, `copilot` or
+`codex` (declared in `config/harness-kinds.json`). The
 node agent checks the kind against the node's chat backend before
-starting anything — Claude Code needs Anthropic's wire, which Ollama
-serves and vLLM and llama.cpp do not; Copilot CLI and our loop speak
-OpenAI's, which all three serve — and refuses a foreign kind until its
-runner ships, so the placement reports compatibility at once.
+starting anything — Claude Code and Copilot CLI run on every node
+backend (the harness translates their wire to the node's), as does our own
+loop; Codex CLI needs OpenAI's Responses API, which has no translator yet —
+and refuses a foreign kind until its vendor CLI is installed on the node
+(the runner is the same `noo-gateway` for every kind), so the placement
+reports compatibility at once.
 
 A node can be born with its policy, so it is ready for a chat model
 before it has one: `noo cluster provision <node> --harness auto`, or
@@ -434,7 +446,7 @@ agent may execute.
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrolment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
-| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
+| `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
@@ -451,7 +463,7 @@ agent may execute.
 | `noo cluster add-companion` | `<node> [-p\|--platform <p>] [--hostname <host>] [--ip <ip>] [-s\|--sensors <a,b>] [-b\|--backends <a,b>] [--battery <n>] [-n\|--network <type>] [--npu-tops <n>] [--app-version <v>]` | Register a Tier-5 companion device with the gateway and send a first heartbeat |
 | `noo cluster add-monitor` | `<node> [--hostname <host>] [--ip <ip>] [-s\|--services <a,b>]` | Register a Tier-6 monitor node with the gateway and send an initial heartbeat |
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
-| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--move-data]` | Stage the signed bundle for a pull-enrolled node; --wait blocks until enrolled |
+| `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
 | `noo cluster auto-place` | `<model>... [-b\|--backend <backend>] [--apply]` | Plan placement of a set of models across the fleet; --apply starts them |
 | `noo cluster place-model` | `<model> [-b\|--backend <backend>] [--node <node>] [--apply]` | Pick the best node for a model by capability and cache; --apply starts it there |

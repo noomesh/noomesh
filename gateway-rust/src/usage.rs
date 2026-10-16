@@ -93,6 +93,53 @@ pub fn record(
     prompt_tokens: u32,
     completion_tokens: u32,
 ) {
+    spawn_record(db, node_id, backend, model, source, actor, None, prompt_tokens, completion_tokens);
+}
+
+/// The `source` of a row a node harness reported (the `usage` rail op).
+pub const HARNESS_SOURCE: &str = "harness";
+
+/// Record the tokens a foreign loop on a node harness used (i83 E1b), as
+/// its wire translator counted them and the `usage` rail op reported them.
+///
+/// The row: `node_id` = the token's node, `source` = [`HARNESS_SOURCE`],
+/// `backend` = `harness:<kind>` (so the monthly rollup, which has no
+/// `harness_kind` column, still tells kinds apart), the person from the
+/// token with consumer `harness`, and `harness_kind` = the kind (089).
+pub fn record_harness(
+    db: sqlx::PgPool,
+    node_id: String,
+    model: String,
+    kind: String,
+    username: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) {
+    spawn_record(
+        db,
+        Some(node_id),
+        format!("harness:{kind}"),
+        model,
+        HARNESS_SOURCE,
+        UsageActor::user(username, "harness"),
+        Some(kind),
+        prompt_tokens,
+        completion_tokens,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_record(
+    db: sqlx::PgPool,
+    node_id: Option<String>,
+    backend: String,
+    model: String,
+    source: &'static str,
+    actor: UsageActor,
+    harness_kind: Option<String>,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) {
     if prompt_tokens == 0 && completion_tokens == 0 {
         return;
     }
@@ -102,8 +149,17 @@ pub fn record(
             Some(host) => Some(resolve_node_id(&db, &host).await),
             None => None,
         };
-        match insert(&db, &node_id, &backend, &model, source, &actor,
-                     prompt_tokens, completion_tokens).await {
+        let row = Row {
+            node_id: &node_id,
+            backend: &backend,
+            model: &model,
+            source,
+            actor: &actor,
+            harness_kind: harness_kind.as_deref(),
+            prompt_tokens,
+            completion_tokens,
+        };
+        match insert(&db, &row).await {
             Ok(()) => {}
             // The month rolled over onto a partition nobody created yet:
             // ensure current + next month, then retry the insert ONCE.
@@ -121,8 +177,7 @@ pub fn record(
                         tracing::warn!(error = %e2, "usage_partition_ensure_failed");
                     }
                 }
-                if let Err(e2) = insert(&db, &node_id, &backend, &model, source,
-                                        &actor, prompt_tokens, completion_tokens).await {
+                if let Err(e2) = insert(&db, &row).await {
                     tracing::warn!(error = %e2, "usage_record_failed_after_heal");
                 }
             }
@@ -350,38 +405,43 @@ async fn resolve_node_id(db: &sqlx::PgPool, host: &str) -> String {
     resolved
 }
 
-/// The INSERT itself. Runtime API, not the `query!` macro — sqlx-drift only
-/// prepares macro queries, and this table postdates the offline cache.
-#[allow(clippy::too_many_arguments)]
-async fn insert(
-    db: &sqlx::PgPool,
-    node_id: &Option<String>,
-    backend: &str,
-    model: &str,
-    source: &str,
-    actor: &UsageActor,
+/// One row's columns, borrowed for the insert and its one retry.
+struct Row<'a> {
+    node_id: &'a Option<String>,
+    backend: &'a str,
+    model: &'a str,
+    source: &'a str,
+    actor: &'a UsageActor,
+    /// The harness kind, for a row a node harness reported (089); NULL
+    /// for every other writer.
+    harness_kind: Option<&'a str>,
     prompt_tokens: u32,
     completion_tokens: u32,
-) -> Result<(), sqlx::Error> {
+}
+
+/// The INSERT itself. Runtime API, not the `query!` macro — sqlx-drift only
+/// prepares macro queries, and this table postdates the offline cache.
+async fn insert(db: &sqlx::PgPool, row: &Row<'_>) -> Result<(), sqlx::Error> {
     // The name → uuid resolution happens IN the insert: one round trip, no
     // cache to go stale on a rename, and a name with no account yields NULL
     // rather than a made-up identity.
     sqlx::query(
         "INSERT INTO noo_token_usage
              (node_id, backend, model, source, user_uuid, consumer,
-              prompt_tokens, completion_tokens)
+              prompt_tokens, completion_tokens, harness_kind)
          VALUES ($1, $2, $3, $4,
                  (SELECT u.user_uuid FROM noo_users u WHERE u.username = $5),
-                 $6, $7, $8)",
+                 $6, $7, $8, $9)",
     )
-    .bind(node_id.as_deref())
-    .bind(backend)
-    .bind(model)
-    .bind(source)
-    .bind(actor.username.as_deref())
-    .bind(actor.consumer.as_deref())
-    .bind(prompt_tokens as i32)
-    .bind(completion_tokens as i32)
+    .bind(row.node_id.as_deref())
+    .bind(row.backend)
+    .bind(row.model)
+    .bind(row.source)
+    .bind(row.actor.username.as_deref())
+    .bind(row.actor.consumer.as_deref())
+    .bind(row.prompt_tokens as i32)
+    .bind(row.completion_tokens as i32)
+    .bind(row.harness_kind)
     .execute(db)
     .await
     .map(|_| ())

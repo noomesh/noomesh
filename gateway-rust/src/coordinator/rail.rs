@@ -70,9 +70,75 @@ pub enum HarnessOp {
     OperatorAlert { kind: String, target: String, cooldown_secs: i64, message: String },
     // a task's loops
     TaskCheckpoint { task_id: String, loops: u32, #[serde(default)] note: Option<String>, #[serde(default)] exhausted: bool },
+    // metering
+    /// The tokens a foreign loop's model calls used, as the harness's wire
+    /// translator counted them (i83 E1b). Recorded on the gateway as the
+    /// token's user, on the token's node; `kind` is the harness kind.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        calls: u32,
+        model: String,
+        kind: String,
+        #[serde(default)]
+        task_id: Option<String>,
+    },
+    /// A foreign CLI's verdict on its task (`harness::driver`): the
+    /// `noo_task_done` a native loop calls as a tool, for a loop the gateway
+    /// cannot see into.
+    TaskDone { task_id: String, result: String, #[serde(default)] failed: bool },
+    // a foreign CLI's way back in
+    /// Mint the short-lived user-door key a foreign CLI reaches noomesh's
+    /// tools with: bound to the token's person, expiring with the turn.
+    DoorKey,
+    DoorKeyRevoke { key_id: String },
 }
 
 impl HarnessOp {
+    /// Every wire name, in declaration order. Pinned to the `name()` match
+    /// by a test, and to `docs/reference/harness-protocol.md` by another.
+    pub const ALL_NAMES: &'static [&'static str] = &[
+        "config",
+        "catalogs",
+        "model_preference",
+        "detect_model",
+        "resolve_backend",
+        "cloud_run",
+        "session_load",
+        "session_save",
+        "session_metadata",
+        "turn_number",
+        "persona",
+        "cluster_awareness",
+        "rag",
+        "memory",
+        "cross_channel",
+        "video",
+        "companion",
+        "skills",
+        "runbook",
+        "temporal",
+        "running_summary",
+        "recall",
+        "tool_schemas",
+        "execute_tool",
+        "record_tool_call",
+        "retrieval_feedback",
+        "skill_usage",
+        "pre_hooks",
+        "post_hooks",
+        "shard",
+        "temporal_extract",
+        "maybe_summary",
+        "operator_alert",
+        "task_checkpoint",
+        "usage",
+        "task_done",
+        "door_key",
+        "door_key_revoke",
+    ];
+
     /// The op's wire name, for audit rows and logs.
     pub fn name(&self) -> &'static str {
         match self {
@@ -110,6 +176,10 @@ impl HarnessOp {
             HarnessOp::MaybeSummary { .. } => "maybe_summary",
             HarnessOp::OperatorAlert { .. } => "operator_alert",
             HarnessOp::TaskCheckpoint { .. } => "task_checkpoint",
+            HarnessOp::Usage { .. } => "usage",
+            HarnessOp::TaskDone { .. } => "task_done",
+            HarnessOp::DoorKey => "door_key",
+            HarnessOp::DoorKeyRevoke { .. } => "door_key_revoke",
         }
     }
 }
@@ -127,6 +197,10 @@ mod tests {
             HarnessOp::ResolveBackend { model: None, exclude_urls: vec![] },
             HarnessOp::ExecuteTool { call: ToolCall { id: "1".into(), name: "web_search".into(), arguments: json!({"query": "x"}) } },
             HarnessOp::MaybeSummary { backend: ResolvedBackend { url: "u".into(), model: "m".into(), backend_type: "vllm".into(), api_format: "openai".into() }, turn: 4 },
+            HarnessOp::Usage { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, calls: 3, model: "qwen".into(), kind: "copilot".into(), task_id: Some("t1".into()) },
+            HarnessOp::TaskDone { task_id: "t1".into(), result: "shipped".into(), failed: false },
+            HarnessOp::DoorKey,
+            HarnessOp::DoorKeyRevoke { key_id: "k1".into() },
         ];
         for op in ops {
             let wire = serde_json::to_value(&op).unwrap();
@@ -136,6 +210,89 @@ mod tests {
             let text = wire.to_string();
             assert!(!text.contains("conversation_id") && !text.contains("user_id"), "identity leaked into an op: {text}");
         }
+    }
+
+    /// One of every variant, so `ALL_NAMES` cannot silently lag the enum.
+    fn one_of_each() -> Vec<HarnessOp> {
+        let backend = ResolvedBackend { url: "u".into(), model: "m".into(), backend_type: "vllm".into(), api_format: "openai".into() };
+        vec![
+            HarnessOp::Config,
+            HarnessOp::Catalogs,
+            HarnessOp::ModelPreference,
+            HarnessOp::DetectModel { prompt: String::new() },
+            HarnessOp::ResolveBackend { model: None, exclude_urls: vec![] },
+            HarnessOp::CloudRun { prompt: String::new(), channel: String::new(), model: String::new() },
+            HarnessOp::SessionLoad { channel: String::new() },
+            HarnessOp::SessionSave { role: String::new(), content: String::new(), metadata: None },
+            HarnessOp::SessionMetadata { metadata: json!({}) },
+            HarnessOp::TurnNumber,
+            HarnessOp::Persona,
+            HarnessOp::ClusterAwareness,
+            HarnessOp::Rag { prompt: String::new() },
+            HarnessOp::Memory { prompt: String::new() },
+            HarnessOp::CrossChannel { prompt: String::new(), channel: String::new() },
+            HarnessOp::Video { prompt: String::new() },
+            HarnessOp::Companion,
+            HarnessOp::Skills { prompt: String::new(), preferred: vec![] },
+            HarnessOp::Runbook { prompt: String::new() },
+            HarnessOp::Temporal { timeout_ms: 0 },
+            HarnessOp::RunningSummary,
+            HarnessOp::Recall { query: String::new(), top_k: 0 },
+            HarnessOp::ToolSchemas,
+            HarnessOp::ExecuteTool { call: ToolCall { id: "1".into(), name: "t".into(), arguments: json!({}) } },
+            HarnessOp::RecordToolCall { tool_name: String::new(), arguments: json!({}), success: true, output: String::new(), error: None, elapsed_ms: 0 },
+            HarnessOp::RetrievalFeedback { tool_name: String::new(), success: true },
+            HarnessOp::SkillUsage { names: vec![] },
+            HarnessOp::PreHooks { prompt: String::new() },
+            HarnessOp::PostHooks { result: CoordinatorResult { response: String::new(), model: String::new(), backend: String::new(), node: None, iterations: 0, tool_calls: vec![], elapsed_secs: 0.0, usage: Default::default() } },
+            HarnessOp::Shard,
+            HarnessOp::TemporalExtract { user_message: String::new(), assistant_response: String::new() },
+            HarnessOp::MaybeSummary { backend, turn: 0 },
+            HarnessOp::OperatorAlert { kind: String::new(), target: String::new(), cooldown_secs: 0, message: String::new() },
+            HarnessOp::TaskCheckpoint { task_id: String::new(), loops: 0, note: None, exhausted: false },
+            HarnessOp::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, calls: 0, model: String::new(), kind: String::new(), task_id: None },
+            HarnessOp::TaskDone { task_id: String::new(), result: String::new(), failed: false },
+            HarnessOp::DoorKey,
+            HarnessOp::DoorKeyRevoke { key_id: String::new() },
+        ]
+    }
+
+    #[test]
+    fn all_names_is_exactly_the_set_of_wire_names() {
+        let live: Vec<&str> = one_of_each().iter().map(|o| o.name()).collect();
+        assert_eq!(live, HarnessOp::ALL_NAMES, "ALL_NAMES must list every variant, in order");
+        for (op, name) in one_of_each().iter().zip(HarnessOp::ALL_NAMES) {
+            assert_eq!(serde_json::to_value(op).unwrap()["op"], *name, "serde tag and name() disagree");
+        }
+    }
+
+    /// The protocol doc names every op as a backticked token, and the
+    /// subjects and route a foreign runner has to know.
+    #[test]
+    fn the_protocol_doc_lists_every_op() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/reference/harness-protocol.md");
+        let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for name in HarnessOp::ALL_NAMES {
+            assert!(doc.contains(&format!("`{name}`")), "docs/reference/harness-protocol.md does not list the op `{name}`");
+        }
+        for needle in ["harness.run.", "harness.task.", "harness.ready.", "harness.turn.", "/api/harness/call", "harness_result"] {
+            assert!(doc.contains(needle), "docs/reference/harness-protocol.md does not mention {needle}");
+        }
+    }
+
+    /// The `usage` op's wire form: what a foreign runner posts, with
+    /// `task_id` optional.
+    #[test]
+    fn the_usage_op_reads_its_documented_wire_form() {
+        let op: HarnessOp = serde_json::from_value(json!({
+            "op": "usage", "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            "calls": 2, "model": "qwen", "kind": "claude-code",
+        }))
+        .unwrap();
+        assert_eq!(
+            op,
+            HarnessOp::Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, calls: 2, model: "qwen".into(), kind: "claude-code".into(), task_id: None }
+        );
     }
 
     #[test]

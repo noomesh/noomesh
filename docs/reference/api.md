@@ -709,6 +709,8 @@ agent-message thread.
 | GET | `/api/tasks/{id}` | state, loops, last note, result, and its children (sub-tasks a loop delegated with `noo_task_delegate`, or the roles a collaboration fanned out) |
 | POST | `/api/tasks/{id}/stop` | stopped at the next checkpoint; the loops' tool calls stand |
 
+A client with no loop of its own (a CLI harness, your own MCP client) reaches tasks through the user MCP door's task tools: see [MCP doors](#mcp-doors).
+
 ## Harness rail (`routes/harness.rs`)
 
 | Method | Path | Notes |
@@ -720,7 +722,7 @@ agent-message thread.
 | Listener | Path | Auth | Purpose |
 |---|---|---|---|
 | `:8080` | `POST /mcp/operator` | an `mcp:operator` service key bound to an account that holds the admin role (re-checked on every call) — mandatory, and the only credential (the shared `NOO_MCP_TOKEN` was retired on 2026-09-30; the plain-HTTP `/mcp` listener on 3100 was removed in stack-v0.2.41) | the operator door: the full tool manifest (`gateway-rust/mcp-tools-local.json`, 124 tools, plus any add-on fragment named by `NOO_MCP_EXTRA_MANIFEST`), for a machine acting as the operator |
-| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
+| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools) plus the four task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
 
 Both speak streamable-HTTP JSON-RPC (`POST` only: `GET` and `DELETE` are
 `405`; a request body over 256 KiB is refused). Identity is re-resolved from
@@ -732,6 +734,22 @@ also includes every tool in the user manifest. Both files are generated
 from `src/noomesh/mcp/tool_defs/` by `scripts/build-mcp-manifest.py` and
 embedded at compile time. Set-up:
 [channels/mcp-your-client.md](../channels/mcp-your-client.md).
+
+The user door also lists four **task tools** that are not manifest entries:
+they run in the gateway (`gateway-rust/src/mcp_user_tasks.rs`) rather than
+as a self-call, because the task they act on is named by id, and the door
+checks that it belongs to the key's account. Every account the door admits
+(User and above) gets them, and an Admin is still limited to their own tasks
+(operator reach is the operator door's). Any other task, existing or not,
+answers `task not found`. Each call writes the door's usual `mcp_tool_call`
+audit row.
+
+| Tool | Arguments | Does |
+|---|---|---|
+| `noo_task_delegate` | `objective` (required), `parent_task_id?`, `role?`, `model?`, `loop_budget?` (1–500) | opens a task for the caller and starts it. With `parent_task_id` (one of the caller's live tasks) it is a sub-task on the parent's thread, capped like the in-loop tool (2 deep, 8 per parent). Without, a top-level task on a new thread. Leaving out `loop_budget` gives the default of the node it lands on, or the cluster's. Returns `task_id`, `thread_id`, `parent_id`, `node`, `dispatched`, `why` |
+| `noo_task_status` | `task_id?` | the task with its children (`state`, `loops`, `last_note`, `result`, `error`, `all_settled`); with no id, the caller's 20 most recent top-level tasks |
+| `noo_task_wait` | `task_id` (required), `seconds?` (1–25, default 25) | returns when the task settles, when one of its children settles, or at the deadline with the task as it stands (`state: running`, `timed_out: true`): call again. Never holds the request past 25 s (`ops::MAX_WAIT_SECS`) |
+| `noo_task_done` | `task_id`, `result` (required), `failed?` | records the result as the in-loop `noo_task_done` does and posts it to the task's thread. Done from the door does not require prior tool calls: the in-loop check that refuses a success claim from a task whose conversation called no tool is skipped, and the result is not prefixed, because a door caller's tool use happens outside that conversation |
 
 ### Add-on token exchange (`routes/addon_token.rs`)
 

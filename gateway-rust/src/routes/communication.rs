@@ -1972,18 +1972,10 @@ async fn voice_status(
     // whisper assumption.
     let stt = stt_endpoint(&state).await;
     let tts = tts_endpoint(&state).await;
-    let client = crate::tls::cluster_client();
-
     let probe_timeout = std::time::Duration::from_secs(3);
-    let stt_probe = async {
-        client
-            .get(stt.health_url())
-            .timeout(probe_timeout)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    };
+    // Through the STT door: the cluster client for noo-whisper, the public
+    // one for a cloud provider, nothing for a refused http:// URL.
+    let stt_probe = stt.probe(probe_timeout);
     // The voice inventory doubles as the TTS liveness signal's detail: it is
     // what tells us WHICH backends this provider actually serves.
     let (stt_available, tts_available, tts_voices) = tokio::join!(

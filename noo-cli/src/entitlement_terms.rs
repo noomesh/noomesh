@@ -181,6 +181,7 @@ mod tests {
             v: 1, sub: "acme".into(), tier: "intelligent".into(), features: vec!["evolve".into()],
             iat: 1, exp: 0, id: "ent-1".into(), bound: None, max_nodes: None, terms: Some("addon-1.0".into()),
             addons: Default::default(),
+            cnf: None,
         }
     }
 

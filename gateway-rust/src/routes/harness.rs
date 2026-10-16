@@ -100,6 +100,11 @@ async fn harness_call(
         HarnessOp::ModelPreference => json!({"model": rt.user_model_preference(user).await}),
         HarnessOp::DetectModel { prompt } => json!({"model": rt.detect_model_from_prompt(&prompt).await}),
         HarnessOp::ResolveBackend { model, exclude_urls } => {
+            // A node harness has no provider keys: cloud models run on the
+            // controller (dispatch keeps those turns in process).
+            if let Some(m) = model.as_deref().filter(|m| crate::coordinator::is_cloud_model(m)) {
+                return Err(AppError::BadRequest(format!("'{m}' is a cloud model; cloud models run on the controller, not on a node harness")).into());
+            }
             let backend = rt.resolve_backend_excluding(model.as_deref(), &exclude_urls).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
             json!({"backend": backend})
         }
@@ -243,6 +248,69 @@ async fn harness_call(
             };
             json!({"state": after, "token": token})
         }
+        HarnessOp::Usage { prompt_tokens, completion_tokens, total_tokens, calls, model, kind, task_id } => {
+            // A foreign loop's model calls, counted by the harness's wire
+            // translator. Charged to the token's user on the token's node —
+            // the body names neither — and the kind must be a declared one.
+            if !crate::harness_kinds::names().contains(&kind.as_str()) {
+                return Err(AppError::BadRequest(format!("harness rail: unknown harness kind {kind:?}")).into());
+            }
+            let model = if model.trim().is_empty() { "unknown".to_string() } else { model };
+            tracing::info!(
+                node = %turn.node, user, conversation = conv, kind = %kind, model = %model,
+                task = task_id.as_deref().unwrap_or(""), calls, prompt_tokens, completion_tokens, total_tokens,
+                "harness_usage"
+            );
+            let clamp = |n: u64| n.min(i32::MAX as u64) as u32;
+            crate::usage::record_harness(
+                state.db.clone(),
+                turn.node.clone(),
+                model,
+                kind,
+                user.to_string(),
+                clamp(prompt_tokens),
+                clamp(completion_tokens),
+            );
+            json!({})
+        }
+        HarnessOp::TaskDone { task_id, result, failed } => {
+            // The same ownership rule as the checkpoint: this token's
+            // conversation, this token's person.
+            let task = crate::tasks::get(&state.db, &task_id).await.map_err(|e| AppError::Internal(e.to_string()))?;
+            let Some(task) = task.filter(|t| t.conversation_id == conv && t.owner.as_deref() == Some(user)) else {
+                return Err(AppError::Forbidden("harness rail: that task is not this turn's".into()).into());
+            };
+            // The door's rule (`noo_task_done` from /mcp/user): no evidence
+            // gate — the CLI's tools ran on the node, outside the record —
+            // and the same unprefixed result, posted the same way.
+            let changed = crate::tasks::finish(&state.db, &task.id, !failed, &result, /* require_tool_use */ false)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            if changed {
+                crate::tools::post_task_result(&state, &task, user, !failed, &result).await;
+            }
+            let after = crate::tasks::get(&state.db, &task.id).await.map_err(|e| AppError::Internal(e.to_string()))?.map(|t| t.state).unwrap_or_else(|| "failed".into());
+            json!({"state": after, "changed": changed})
+        }
+        HarnessOp::DoorKey => {
+            // The person must still hold an active account: a disabled one
+            // gets no key (the door would refuse it anyway, but say so here).
+            if crate::coordinator::role_of(&state, user).await.is_none() {
+                return Err(AppError::Forbidden("harness rail: no active account to mint a door key for".into()).into());
+            }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let Some(ttl) = door_key_ttl(turn.exp, now, crate::coordinator::turn_deadline().as_secs()) else {
+                return Err(AppError::Forbidden("harness rail: the turn's token has expired".into()).into());
+            };
+            let consumer = crate::service_keys::door_key_consumer(&turn.node, conv);
+            let k = crate::service_keys::mint_door_key(&state.db, user, &consumer, ttl).await.map_err(|e| AppError::Internal(e.to_string()))?;
+            tracing::info!(r#as = user, node = %turn.node, conversation = conv, key_id = %k.id, ttl, "harness_door_key_minted");
+            json!({"key": k.key, "key_id": k.id.to_string(), "expires_at": k.expires_at.to_rfc3339()})
+        }
+        HarnessOp::DoorKeyRevoke { key_id } => {
+            let revoked = crate::service_keys::revoke_door_key(&state.db, &key_id, user).await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+            json!({"revoked": revoked})
+        }
         HarnessOp::OperatorAlert { kind, target, cooldown_secs, message } => {
             // A harness may raise the alert kinds the loop raises, nothing else.
             if kind != "inference.backend_failover" {
@@ -265,9 +333,31 @@ async fn harness_call(
     Ok(Json(body))
 }
 
+/// How long a door key may live: until the turn's token expires, and never
+/// longer than one turn deadline. `None` when the token is already past its
+/// expiry (nothing to mint for).
+pub(crate) fn door_key_ttl(token_exp: u64, now: u64, deadline_secs: u64) -> Option<u64> {
+    let remaining = token_exp.checked_sub(now).filter(|r| *r > 0)?;
+    Some(remaining.min(deadline_secs.max(1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PINNED: a door key never outlives the token it was minted under, and
+    /// never lives longer than one turn deadline.
+    #[test]
+    fn a_door_key_never_outlives_the_turn() {
+        assert_eq!(door_key_ttl(1_000 + 960, 1_000, 900), Some(900), "capped at the deadline");
+        assert_eq!(door_key_ttl(1_000 + 120, 1_000, 900), Some(120), "capped at the token");
+        assert_eq!(door_key_ttl(1_000, 1_000, 900), None, "an expiring token mints nothing");
+        assert_eq!(door_key_ttl(999, 1_000, 900), None, "an expired token mints nothing");
+        for exp in [1_001u64, 1_500, 5_000, u64::MAX] {
+            let ttl = door_key_ttl(exp, 1_000, 900).unwrap();
+            assert!(ttl <= 900 && 1_000 + ttl <= exp, "{exp}: {ttl}");
+        }
+    }
 
     /// The closed cloud gate on the rail is 403 with the shared body; any
     /// other cloud failure stays the 400 it always was.

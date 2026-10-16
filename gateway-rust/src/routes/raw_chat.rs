@@ -263,6 +263,17 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>) -> Result<
         .await
         .map_err(|e| RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("class table unavailable: {e}")))?;
     if table.classes.is_empty() {
+        // The raw proxy forwards to cluster backends only; a cloud model
+        // runs through the agent loop (`/api/inference`), which holds the
+        // provider auth. Same 404 a cloud name got before cloud backends
+        // existed in the resolver.
+        if let Some(h) = coordinator::model_hint(hint).filter(|h| coordinator::is_cloud_model(h)) {
+            return Err(RawChatError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("model '{h}' is a cloud model; this route serves cluster models only (cloud models run through /api/inference)"),
+            ));
+        }
         let backend = coordinator::resolve_backend_for_model(state, hint).await.map_err(|e| RawChatError::from_resolve(&e))?;
         let cand = classes::Candidate::synthetic(
             coordinator::node_from_backend_url(&backend.url).unwrap_or_else(|| "controller".into()),
