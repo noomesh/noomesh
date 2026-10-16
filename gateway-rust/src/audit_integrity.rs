@@ -146,6 +146,28 @@ pub fn key_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
     lookup(KEY_ENV).filter(|k| !k.is_empty()).map(String::into_bytes)
 }
 
+/// A gateway with no audit key does not serve: every security audit row
+/// would be refused (nothing is written unsigned), so a login failure, an
+/// exec denial, a posture change and an erase would all go unrecorded while
+/// the product reported healthy. Same standard as `auth::LEGACY_REFUSAL`.
+pub const MISSING_KEY_REFUSAL: &str =
+    "NOO_AUDIT_HMAC_KEY is not set. Without it every security audit row is refused — logins, exec \
+     denials, posture changes and erases would go unrecorded — so the gateway refuses to start. \
+     Mint it: `noo upgrade --stack` (mints it into the encrypted store when absent, then recreates \
+     the stack), or `noo security secrets rotate NOO_AUDIT_HMAC_KEY` and `noo stack restart --force`. \
+     Existing audit rows stay verifiable: the first boot with the key writes the checkpoint that \
+     hands the chain over.";
+
+/// The boot refusal, given a secret lookup. `None` = a key is present.
+pub fn boot_refusal_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<&'static str> {
+    key_from(lookup).is_none().then_some(MISSING_KEY_REFUSAL)
+}
+
+/// The boot refusal for this process's environment (env or `_FILE`).
+pub fn boot_refusal() -> Option<&'static str> {
+    boot_refusal_from(&|name| crate::config::secret_env::secret_opt(name))
+}
+
 /// The RETIRED derivation, for verifying rows written before the checkpoint.
 /// Never a signing source for an ordinary row.
 pub fn retired_key_from(jwt_secret: &str) -> Vec<u8> {
@@ -1011,6 +1033,20 @@ pub(crate) async fn ensure_hash_v2_marker_with(
 
 #[cfg(test)]
 mod tests {
+
+    /// A gateway with no audit key refuses to boot (it used to serve with
+    /// every audit row refused). `key_from` has no test-build arm, so this
+    /// exercises the real decision.
+    #[test]
+    fn a_missing_or_blank_audit_key_is_a_boot_refusal() {
+        for lookup in [None, Some(String::new())] {
+            let l = lookup.clone();
+            let r = boot_refusal_from(&move |_| l.clone());
+            let msg = r.expect("no key must refuse");
+            assert!(msg.contains("NOO_AUDIT_HMAC_KEY") && msg.contains("noo upgrade --stack"), "{msg}");
+        }
+        assert!(boot_refusal_from(&|_| Some("k".into())).is_none());
+    }
     use super::*;
 
     const NEW: &[u8] = b"a-dedicated-audit-key-32-bytes!!";

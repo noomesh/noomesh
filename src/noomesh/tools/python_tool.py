@@ -17,10 +17,39 @@ from ..validation import ToolInputValidator, ValidationError
 logger = structlog.get_logger(__name__)
 
 
+def _inside_the_stack() -> bool:
+    """True in a container or under the sanctioned launcher: the deployed stack.
+
+    The in-process hatch is a source-checkout development tool. Inside the
+    stack it would run model-written code with the worker's credentials and
+    network, so no env value opens it there. This narrows the hatch instead
+    of removing it: a developer running from a checkout is unaffected.
+
+    Why a refusal and not a posture gate: posture is gateway-side state and the
+    Python worker has no gateway lookup at tool-call time; and a gate cannot be
+    set before the release that introduces it, so an install carrying the env
+    var today would keep the hole until a second roll. A refusal closes it on
+    the roll itself.
+    """
+    return (
+        os.path.exists("/.dockerenv")
+        or os.path.exists("/run/.containerenv")
+        or os.getenv("NOO_LAUNCHED", "").strip() == "1"
+    )
+
+
 def _local_exec_allowed() -> bool:
     """In-process python_exec is arbitrary RCE on the host, so it's OFF unless an
-    operator explicitly opts in (dev only). The safe path is the sandbox."""
-    return os.getenv("NOO_ALLOW_LOCAL_PYTHON_EXEC", "").strip().lower() in ("1", "true", "yes")
+    operator explicitly opts in (dev only, outside the stack). The safe path is
+    the sandbox."""
+    opted_in = os.getenv("NOO_ALLOW_LOCAL_PYTHON_EXEC", "").strip().lower() in ("1", "true", "yes")
+    if opted_in and _inside_the_stack():
+        logger.error(
+            "python_exec.local_exec_refused_in_stack",
+            note="NOO_ALLOW_LOCAL_PYTHON_EXEC is ignored inside the deployed stack; unset it",
+        )
+        return False
+    return opted_in
 
 
 def build_python_tool(sandbox_url: Optional[str] = None) -> ToolSpec:
@@ -82,8 +111,9 @@ def _run_python(args: Dict, sandbox_url: Optional[str]) -> str:
         return (
             "Error: python_exec is disabled — no sandbox is configured. "
             "Set NOO_SANDBOX_URL to run code in the isolated sandbox, or set "
-            "NOO_ALLOW_LOCAL_PYTHON_EXEC=1 to explicitly permit (unsafe) "
-            "in-process execution."
+            "NOO_ALLOW_LOCAL_PYTHON_EXEC=1 to permit (unsafe) in-process "
+            "execution from a source checkout — it is refused inside the "
+            "deployed stack (container or launcher)."
         )
 
     logger.warning(

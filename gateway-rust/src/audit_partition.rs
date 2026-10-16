@@ -13,10 +13,16 @@
 //! in production (Rust gateway owns the port). This Rust version
 //! restores the behavior.
 //!
-//! Future work (Tier 3 followup): port `export_partition` and
-//! `drop_partition` to a heartbeat task once the heartbeat loop is
-//! soaked. Today the Python `audit_archive.py` exporter remains as the
-//! reference implementation (Tier 4 — live library marker).
+//! Retention runs here too. The Python `audit_archive.rotate` was only ever
+//! reachable from a scheduler that does not run in production, so no
+//! partition was ever exported or dropped. [`action_audit_log_rotate`] is the
+//! Rust-native `audit_log_rotate` heartbeat action (seeded weekly by
+//! [`seed_rotation_task`]): for each partition older than the retention
+//! window it EXPORTS the rows to a JSONL file on the persistent `/data`
+//! volume, verifies the file against the row count, and only then drops the
+//! partition through the `noo_drop_audit_partition` definer function (which
+//! itself refuses the current and future months). An export that cannot be
+//! verified drops nothing.
 
 use chrono::Datelike;
 
@@ -121,8 +127,353 @@ pub(crate) async fn ensure_for_heal(db: &sqlx::PgPool) {
     }
 }
 
+// ─── retention ───────────────────────────────────────────────────────────
+
+/// Months of audit history kept in Postgres when the task names none.
+pub const DEFAULT_RETENTION_MONTHS: u32 = 12;
+
+/// Where expired partitions are exported. `/data` is the persistent
+/// `noo-data` volume; a file written anywhere else in the container would die
+/// with it, and the partition it replaced would be gone for good.
+pub const DEFAULT_ARCHIVE_DIR: &str = "/data/audit-archive";
+
+/// The heartbeat task id and action name.
+pub const ROTATION_ACTION: &str = "audit_log_rotate";
+
+/// `noo_security_audit_YYYY_MM` -> (year, month). Strict: anything else is
+/// not ours to drop.
+pub(crate) fn parse_partition_name(name: &str) -> Option<(i32, u32)> {
+    let rest = name.strip_prefix("noo_security_audit_")?;
+    let (y, m) = rest.split_once('_')?;
+    if y.len() != 4 || m.len() != 2 || !y.bytes().all(|b| b.is_ascii_digit()) || !m.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (y, m): (i32, u32) = (y.parse().ok()?, m.parse().ok()?);
+    ((2000..=2999).contains(&y) && (1..=12).contains(&m)).then_some((y, m))
+}
+
+pub(crate) fn partition_name(year: i32, month: u32) -> String {
+    format!("noo_security_audit_{year:04}_{month:02}")
+}
+
+/// (year, month) that is `n` months before `(year, month)`.
+pub(crate) fn months_before(year: i32, month: u32, n: u32) -> (i32, u32) {
+    let total = i64::from(year) * 12 + i64::from(month) - 1 - i64::from(n);
+    ((total.div_euclid(12)) as i32, (total.rem_euclid(12) + 1) as u32)
+}
+
+/// The partitions strictly older than the retention window, oldest first.
+/// With `retention_months = 12` in October 2026 the cutoff is October 2025:
+/// September 2025 and earlier expire; October 2025 is still kept.
+pub(crate) fn expired_partitions(parts: &[(i32, u32)], now: (i32, u32), retention_months: u32) -> Vec<(i32, u32)> {
+    let cutoff = months_before(now.0, now.1, retention_months);
+    let mut out: Vec<(i32, u32)> = parts.iter().copied().filter(|p| *p < cutoff).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The archive directory must be on the persistent volume (or `/tmp` for a
+/// test) and lexically clean. `None` = acceptable.
+pub(crate) fn archive_dir_problem(dir: &str) -> Option<String> {
+    if dir.contains("..") {
+        return Some(format!("archive_dir must not contain '..' (got {dir})"));
+    }
+    let ok = dir == "/data" || dir.starts_with("/data/") || dir == "/tmp" || dir.starts_with("/tmp/");
+    (!ok).then(|| {
+        format!("archive_dir must be under /data/ (the persistent volume) so the exported file outlives the container (got {dir})")
+    })
+}
+
+/// What one rotation did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RotateOutcome {
+    pub expired: Vec<String>,
+    pub exported: Vec<String>,
+    pub dropped: Vec<String>,
+    /// Expired partitions KEPT because nothing can archive them (backend).
+    pub retained: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+pub struct RotateConfig {
+    pub retention_months: u32,
+    pub archive_dir: String,
+    pub backend: String,
+    pub dry_run: bool,
+}
+
+impl RotateConfig {
+    /// From the task's JSON config. Bad values are errors, not defaults.
+    pub fn from_json(config: &serde_json::Value) -> Result<Self, String> {
+        let retention_months = match config.get("retention_months") {
+            None | Some(serde_json::Value::Null) => DEFAULT_RETENTION_MONTHS,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=120).contains(n))
+                .ok_or_else(|| format!("audit_log_rotate: retention_months must be 1..=120, got {v}"))? as u32,
+        };
+        let archive_dir = config
+            .get("archive_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_ARCHIVE_DIR)
+            .to_string();
+        if let Some(why) = archive_dir_problem(&archive_dir) {
+            return Err(format!("audit_log_rotate: {why}"));
+        }
+        let backend = config.get("backend").and_then(|v| v.as_str()).unwrap_or("local_dir").to_string();
+        // Default TRUE like every other destructive retention action; the
+        // seeded task opts in with `dry_run: false`.
+        let dry_run = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+        Ok(Self { retention_months, archive_dir, backend, dry_run })
+    }
+}
+
+/// Export one month's rows to `<dir>/noo_security_audit_YYYY_MM.jsonl`, one
+/// `to_jsonb(row)` per line (EVERY column, `entry_hash` and `prev_hash`
+/// included, so the archive can still be verified against the key). Returns
+/// the final path and row count. Written to a temp file, counted twice (the
+/// query's own count, and the lines read back from disk) and renamed only if
+/// all three agree; a mismatch deletes the temp file and is an error.
+async fn export_partition(db: &sqlx::PgPool, year: i32, month: u32, dir: &std::path::Path) -> Result<(std::path::PathBuf, u64), String> {
+    use futures::TryStreamExt as _;
+    use std::io::{BufRead as _, Write as _};
+
+    let name = partition_name(year, month);
+    // `name` is built from validated integers, never from input.
+    let count_sql = format!("SELECT count(*) FROM noo_security_audit t WHERE t.tableoid = '{name}'::regclass");
+    let expected: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+        .fetch_one(db)
+        .await
+        .map_err(|e| format!("{name}: count failed: {e}"))?;
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!("{name}.jsonl.tmp"));
+    let fin = dir.join(format!("{name}.jsonl"));
+    let rows_sql = format!(
+        "SELECT to_jsonb(t)::text FROM noo_security_audit t WHERE t.tableoid = '{name}'::regclass ORDER BY t.timestamp, t.id"
+    );
+    let result: Result<u64, String> = async {
+        let file = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(file);
+        let mut n: u64 = 0;
+        let mut stream = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(rows_sql)).fetch(db);
+        while let Some(line) = stream.try_next().await.map_err(|e| format!("{name}: read failed: {e}"))? {
+            writeln!(w, "{line}").map_err(|e| format!("write {}: {e}", tmp.display()))?;
+            n += 1;
+        }
+        w.flush().map_err(|e| format!("flush {}: {e}", tmp.display()))?;
+        w.get_ref().sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(w);
+        let on_disk = std::io::BufReader::new(std::fs::File::open(&tmp).map_err(|e| format!("reopen {}: {e}", tmp.display()))?)
+            .lines()
+            .count() as u64;
+        if on_disk != n || i64::try_from(n).ok() != Some(expected) {
+            return Err(format!(
+                "{name}: export does not verify (query counted {expected}, streamed {n}, file holds {on_disk}) — nothing dropped"
+            ));
+        }
+        Ok(n)
+    }
+    .await;
+    match result {
+        Ok(n) => {
+            std::fs::rename(&tmp, &fin).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), fin.display()))?;
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok((fin, n))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Export-then-drop every partition older than the retention window.
+pub async fn rotate(db: &sqlx::PgPool, cfg: &RotateConfig) -> Result<RotateOutcome, String> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_class p ON p.oid = i.inhparent \
+         WHERE p.relname = 'noo_security_audit'",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("audit_log_rotate: cannot list partitions: {e}"))?;
+    let parts: Vec<(i32, u32)> = names.iter().filter_map(|n| parse_partition_name(n)).collect();
+    let now = chrono::Utc::now();
+    let expired = expired_partitions(&parts, (now.year(), now.month()), cfg.retention_months);
+
+    let expired_names: Vec<String> = expired.iter().map(|(y, m)| partition_name(*y, *m)).collect();
+    let mut out = RotateOutcome { expired: expired_names.clone(), ..Default::default() };
+    for (&(y, m), name) in expired.iter().zip(expired_names) {
+        // Nothing can archive it: KEEP it. Dropping audit history because
+        // no archive is configured is the failure this rotation exists to
+        // avoid; the caller raises so the gap is visible.
+        if cfg.backend != "local_dir" {
+            out.retained.push(name);
+            continue;
+        }
+        if cfg.dry_run {
+            continue;
+        }
+        match export_partition(db, y, m, std::path::Path::new(&cfg.archive_dir)).await {
+            Ok((path, rows)) => {
+                tracing::info!(partition = %name, rows, path = %path.display(), "audit_partition_exported");
+                out.exported.push(name.clone());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "audit_partition_export_failed");
+                out.errors.push(e);
+                continue; // never drop what was not verified
+            }
+        }
+        match sqlx::query_scalar::<_, bool>("SELECT noo_drop_audit_partition($1, $2)")
+            .bind(y)
+            .bind(m as i32)
+            .fetch_one(db)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(partition = %name, "audit_partition_dropped");
+                out.dropped.push(name);
+            }
+            Ok(false) => {} // already gone
+            Err(e) => out.errors.push(format!("{name}: exported but the drop failed: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// The `audit_log_rotate` heartbeat action. RAISES on any failure or on an
+/// expired partition it could not archive: "no silent success" — a retention
+/// job that quietly does nothing is how the table grew unbounded.
+pub async fn action_audit_log_rotate(state: &AppState, config: &serde_json::Value) -> Result<String, String> {
+    let cfg = RotateConfig::from_json(config)?;
+    // Rollover duty first, as the Python original did: inserts need targets.
+    ensure_current_and_next(state).await;
+    let out = rotate(&state.db, &cfg).await?;
+    let summary = format!(
+        "Audit retention ({} months, {}, archive {}): {} expired, {} exported, {} dropped",
+        cfg.retention_months,
+        if cfg.dry_run { "DRY RUN" } else { "applied" },
+        cfg.archive_dir,
+        out.expired.len(),
+        out.exported.len(),
+        out.dropped.len()
+    );
+    if !out.errors.is_empty() {
+        return Err(format!("{summary}; {} FAILED: {}", out.errors.len(), out.errors.join(" | ")));
+    }
+    if !out.retained.is_empty() {
+        return Err(format!(
+            "{summary}; {} expired partition(s) KEPT because backend '{}' cannot archive them here \
+             (only local_dir does): {}. Set backend to local_dir, or archive them yourself",
+            out.retained.len(),
+            cfg.backend,
+            out.retained.join(", ")
+        ));
+    }
+    if cfg.dry_run && !out.expired.is_empty() {
+        return Ok(format!("{summary}. Would export then drop: {}. Set `dry_run: false` to apply.", out.expired.join(", ")));
+    }
+    Ok(summary)
+}
+
+/// Seed the weekly rotation task once, when absent. A system task, enabled,
+/// applying: the retention the docs state must not depend on an operator
+/// remembering to create it. An operator who disables it stays disabled
+/// (`ON CONFLICT DO NOTHING`); deleting the row re-creates it at next boot.
+pub async fn seed_rotation_task(db: &sqlx::PgPool) {
+    let r = sqlx::query(
+        "INSERT INTO noo_heartbeat_tasks (id, name, schedule, action, config, enabled, created_by) \
+         VALUES ($1, 'Audit log retention (weekly, 12 months)', '0 4 * * 0', \
+                 $1, '{\"dry_run\": false, \"retention_months\": 12}'::jsonb, true, 'system') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(ROTATION_ACTION)
+    .execute(db)
+    .await;
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "audit_rotation_task_seed_failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
+    #[test]
+    fn partition_names_parse_strictly() {
+        assert_eq!(parse_partition_name("noo_security_audit_2025_09"), Some((2025, 9)));
+        for bad in [
+            "noo_security_audit",
+            "noo_security_audit_2025_9",
+            "noo_security_audit_25_09",
+            "noo_security_audit_2025_13",
+            "noo_security_audit_2025_00",
+            "noo_security_audit_2025_09_x",
+            "noo_security_audit_default",
+            "noo_security_audit_backup_01",
+            "noo_security_audit_20a5_09",
+        ] {
+            assert_eq!(parse_partition_name(bad), None, "{bad}");
+        }
+        assert_eq!(partition_name(2025, 9), "noo_security_audit_2025_09");
+    }
+
+    /// Retention boundary. October 2026 with 12 months keeps October 2025 and
+    /// expires September 2025 and older — never the current or a future month.
+    #[test]
+    fn only_partitions_older_than_the_window_expire() {
+        assert_eq!(months_before(2026, 10, 12), (2025, 10));
+        assert_eq!(months_before(2026, 1, 1), (2025, 12));
+        assert_eq!(months_before(2026, 3, 15), (2024, 12));
+        let parts = [(2025, 8), (2025, 9), (2025, 10), (2026, 10), (2026, 11), (2024, 1)];
+        assert_eq!(expired_partitions(&parts, (2026, 10), 12), vec![(2024, 1), (2025, 8), (2025, 9)]);
+        assert!(expired_partitions(&[(2026, 10), (2026, 11)], (2026, 10), 1).is_empty());
+    }
+
+    /// The export must land on the persistent volume: a file in the
+    /// container's own filesystem dies with it, after the partition is gone.
+    #[test]
+    fn the_archive_dir_must_be_on_the_data_volume() {
+        assert!(archive_dir_problem("/data/audit-archive").is_none());
+        assert!(archive_dir_problem("/data").is_none());
+        for bad in ["./audit-archive", "audit-archive", "/app/audit", "/data/../etc", "/dataX/x", "/"] {
+            assert!(archive_dir_problem(bad).is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn config_defaults_are_a_dry_run_on_the_data_volume_with_twelve_months() {
+        let c = RotateConfig::from_json(&serde_json::json!({})).unwrap();
+        assert!(c.dry_run && c.retention_months == 12 && c.archive_dir == DEFAULT_ARCHIVE_DIR && c.backend == "local_dir");
+        let c = RotateConfig::from_json(&serde_json::json!({"dry_run": false, "retention_months": 6})).unwrap();
+        assert!(!c.dry_run && c.retention_months == 6);
+        assert!(RotateConfig::from_json(&serde_json::json!({"retention_months": 0})).is_err());
+        assert!(RotateConfig::from_json(&serde_json::json!({"retention_months": "12"})).is_err());
+        assert!(RotateConfig::from_json(&serde_json::json!({"archive_dir": "/app/x"})).is_err());
+    }
+
+    /// Retention RUNS in production: the action is Rust-native (the Python
+    /// scheduler it used to need never runs), seeded weekly at boot, and
+    /// called from the native dispatcher. On origin/dev it was a
+    /// Python-delegated action with no task row.
+    #[test]
+    fn retention_is_scheduled_and_dispatched_natively() {
+        assert_eq!(
+            crate::heartbeat_actions::action_path(ROTATION_ACTION),
+            crate::heartbeat_actions::ActionPath::RustNative
+        );
+        let dispatch = include_str!("heartbeat_actions.rs");
+        assert!(dispatch.contains("\"audit_log_rotate\" => crate::audit_partition::action_audit_log_rotate"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("audit_partition::seed_rotation_task"), "boot must seed the task");
+    }
     /// The startup hook must work on a FRESH install, where the mesh schema
     /// — tables and functions alike — lives in `mesh` rather than `public`.
     ///
