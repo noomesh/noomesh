@@ -35,7 +35,11 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.cluster.yml"
 
 # The DHI mirror the compose file's `${NOO_BASE_REGISTRY:-...}` defaults to.
-DHI = "ghcr.io/noomesh/dhi"
+# Read from the compose default itself, so the namespace has one home.
+_m = re.search(r"\$\{NOO_BASE_REGISTRY:-([^}]+)\}", COMPOSE.read_text())
+if not _m:
+    raise SystemExit("docker-compose.cluster.yml has no ${NOO_BASE_REGISTRY:-<default>} reference")
+DHI = _m.group(1)
 _BASE = "${NOO_BASE_REGISTRY:-" + DHI + "}"
 _VER = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 
