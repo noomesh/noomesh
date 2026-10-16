@@ -1520,15 +1520,16 @@ pub(crate) fn service_key_grants_check(keys: &Value, required: &[(String, String
 
 /// Can Prometheus scrape this controller's `/metrics`? Since an earlier release
 /// the page answers an Operator/Admin login or the scraper's service leaf,
-/// and the gateway sees that leaf only with `NOO_MTLS_GATEWAY` on. Either
+/// and the gateway sees that leaf only while mTLS is enforced (the default;
+/// `NOO_MTLS_GATEWAY=false` in `.env` is the explicit opt-out). Either
 /// missing means empty dashboards, never a public page — so say which.
 /// A warning, not a failure: a controller may run no Prometheus at all.
 pub(crate) fn metrics_scrape_check(mtls: Option<bool>, missing_leaves: &[&str]) -> Check {
     if mtls != Some(true) {
         return warn(
             "metrics scrape",
-            "the gateway does not read client certificates (NOO_MTLS_GATEWAY is not on), so Prometheus cannot scrape /metrics",
-            Some("set NOO_MTLS_GATEWAY=true in .env and recreate the gateway (noo stack restart --force)".into()),
+            "mTLS enforcement is switched off (NOO_MTLS_GATEWAY=false in .env): the gateway does not read client certificates, so Prometheus cannot scrape /metrics, and a node can present a fleet token naming another node",
+            Some("remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway (noo stack restart --force)".into()),
         );
     }
     if let Some(first) = missing_leaves.first() {
@@ -3377,10 +3378,23 @@ pub(crate) fn logs_access_check(anonymous: Option<u16>) -> Check {
     }
 }
 
-/// `NOO_MTLS_GATEWAY` as the controller's `.env` sets it; None when unreadable.
+/// Is mTLS enforced, per the controller's `.env`? None when `.env` is
+/// unreadable. Enforcement is the DEFAULT: an unset, empty or unrecognised
+/// value is on (the gateway also needs a CA, which a controller always has);
+/// only an explicit `false/0/no/off` is off.
 fn controller_mtls_on() -> Option<bool> {
-    let v = dotenv_value("NOO_MTLS_GATEWAY")?;
-    Some(matches!(v.trim().trim_matches('"').to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    let text = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok()?;
+    Some(mtls_on_in_dotenv(&text))
+}
+
+fn mtls_on_in_dotenv(text: &str) -> bool {
+    let v = text
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("NOO_MTLS_GATEWAY="))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase())
+        .unwrap_or_default();
+    !matches!(v.as_str(), "0" | "false" | "no" | "off")
 }
 
 /// One key from the controller's `.env` (last assignment wins, as compose
@@ -5937,11 +5951,25 @@ mod tests {
         assert_eq!(metrics_scrape_check(Some(true), &[]).verdict, Verdict::Ok);
         let no_mtls = metrics_scrape_check(Some(false), &[]);
         assert_eq!(no_mtls.verdict, Verdict::Warn);
-        assert!(no_mtls.remedy.unwrap().contains("NOO_MTLS_GATEWAY"));
+        assert!(no_mtls.remedy.unwrap().contains("NOO_MTLS_GATEWAY=false"));
         let no_leaf = metrics_scrape_check(Some(true), &["alertmanager"]);
         assert_eq!(no_leaf.verdict, Verdict::Warn);
         assert!(no_leaf.remedy.unwrap().contains("issue-service alertmanager"));
         assert_eq!(metrics_scrape_check(None, &[]).verdict, Verdict::Warn);
+    }
+
+    /// Enforcement is the default: only an explicit off in `.env` is off.
+    #[test]
+    fn mtls_is_on_unless_the_dotenv_says_off() {
+        for on in ["", "FOO=1\n", "NOO_MTLS_GATEWAY=\n", "NOO_MTLS_GATEWAY=true\n", "NOO_MTLS_GATEWAY=maybe\n",
+                   "NOO_MTLS_GATEWAY=false\nNOO_MTLS_GATEWAY=true\n"] {
+            assert!(mtls_on_in_dotenv(on), "{on:?}");
+        }
+        for off in ["NOO_MTLS_GATEWAY=false\n", "NOO_MTLS_GATEWAY=\"off\"\n", "NOO_MTLS_GATEWAY=0", "A=1\n NOO_MTLS_GATEWAY=No\n"] {
+            assert!(!mtls_on_in_dotenv(off), "{off:?}");
+        }
+        let w = metrics_scrape_check(Some(false), &[]);
+        assert!(w.remedy.unwrap().contains("remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway"));
     }
 
     /// Every leaf this row checks is one onboard issues — otherwise the row
