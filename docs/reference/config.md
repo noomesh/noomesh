@@ -266,7 +266,14 @@ content is ingested only on request.
 (`smart` \| `all`), `max_selected`, `min_score`, `selection_scoring`
 (`jaccard` \| `bm25`), `always_include`, and `allowed_paths` — the read
 allow-list for the native `local_files` tool (merged with watched-folder
-mounts and the workspace by the gateway).
+mounts and the workspace by the gateway). It is also the list of
+directories a `source` path given to `rag/ingest` or the `noo_rag_ingest`
+tool may name: the worker resolves the path (symlinks followed) and
+refuses anything outside these directories, the watched-folder staging
+area, and anything under the service's own secrets, PKI, config or home
+(`/run/secrets`, `/app`, `/tls`, `/etc`, `/proc`, `/sys`, `/root`) even if
+such a directory is listed here. To allow another directory, add it to
+`allowed_paths` and restart; or send the content as `text`.
 
 ### `memory`
 
