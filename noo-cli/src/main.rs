@@ -497,6 +497,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "org", "list"], commands::security_org_list),
     (&["security", "org", "create"], commands::security_org_create),
     (&["security", "audit", "verify"], commands::security_audit_verify),
+    (&["security", "audit", "list"], commands::security_audit_list),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),

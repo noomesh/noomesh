@@ -352,7 +352,7 @@ fn looks_like_cluster_token(token: &str) -> bool {
 
 /// The real socket peer IP, injected by `into_make_service_with_connect_info`.
 /// This is the one value a remote client cannot forge.
-fn peer_ip(request: &Request) -> Option<String> {
+pub(crate) fn peer_ip(request: &Request) -> Option<String> {
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -685,7 +685,7 @@ pub(crate) fn forwarded_client(xff: &str) -> Option<String> {
 /// attacker-controlled and ignored in favor of the socket peer IP. Falling
 /// back to the peer keeps each direct client (MCP hub, node-agents, executor
 /// sidecar) in its own bucket rather than a shared "unknown" one.
-fn client_ip(request: &Request, peer: Option<&str>) -> String {
+pub(crate) fn client_ip(request: &Request, peer: Option<&str>) -> String {
     if let Some(p) = peer {
         if is_trusted_proxy(p) {
             if let Some(client) = request

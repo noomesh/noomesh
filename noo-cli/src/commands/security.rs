@@ -1297,6 +1297,39 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
             }),
         ])
     );
+    // The hash chain: deletion and reordering evidence. Said plainly when it
+    // could not be judged; "not checked" is never shown as ok.
+    let chain = &body["chain"];
+    if chain["checked"].as_bool() == Some(true) {
+        let head = match chain["head"]["seq"].as_i64() {
+            Some(seq) => format!(
+                "seq {seq} {}",
+                ui::muted(&format!("hash {}", chain["head"]["chain_hash"].as_str().unwrap_or("?")))
+            ),
+            None => ui::muted("none"),
+        };
+        print!(
+            "{}",
+            ui::kv(&[
+                ("chain", format!(
+                    "{} chained, {} before the chain {}",
+                    chain["chained_rows"].as_u64().unwrap_or(0),
+                    chain["unchained_rows"].as_u64().unwrap_or(0),
+                    ui::muted(&format!("({} removed by retention)", chain["retired_rows"].as_u64().unwrap_or(0)))
+                )),
+                ("chain head", head),
+            ])
+        );
+        println!("{}", ui::muted("record the chain head somewhere the database owner cannot write: it is what shows the newest rows were not cut off"));
+    } else {
+        println!(
+            "{}",
+            ui::status_line(
+                Glyph::Warn,
+                &format!("chain not checked: {}", chain["note"].as_str().unwrap_or("the gateway did not report a chain section (older gateway?)"))
+            )
+        );
+    }
     let empty = Vec::new();
     let breaks = body["breaks"].as_array().unwrap_or(&empty);
     if !breaks.is_empty() {
@@ -1330,6 +1363,83 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
         println!("{}", ui::status_line(Glyph::Ok, "every hashed row verifies under the key of its epoch"));
         Ok(0)
     }
+}
+
+// ── security audit list ─────────────────────────────────────────────────────
+
+/// `noo security audit list` — GET /api/security/audit/list.
+///
+/// Reads the security audit log (Operator and above), newest first. Filters are
+/// applied by the gateway; `--cursor` continues from a previous page's
+/// `next_cursor`. Reading is itself recorded as an `audit_log_read` row.
+pub fn security_audit_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut query: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        let key = match tok.as_str() {
+            "--since" => "since",
+            "--event" | "--event-type" => "event_type",
+            "--actor" => "actor",
+            "--limit" | "-n" => "limit",
+            "--cursor" => "cursor",
+            _ => return Err(Unhandled),
+        };
+        let v = iter.next().ok_or(Unhandled)?;
+        if key == "limit" && v.parse::<u32>().is_err() {
+            return Err(Unhandled);
+        }
+        query.push(format!("{key}={}", super::urlencode(v)));
+    }
+    let path = if query.is_empty() {
+        "/api/security/audit/list".to_string()
+    } else {
+        format!("/api/security/audit/list?{}", query.join("&"))
+    };
+    let body = get_json(g, &path, true, 30);
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let empty = Vec::new();
+    let events = body["events"].as_array().unwrap_or(&empty);
+    if events.is_empty() {
+        println!("{}", ui::muted("no audit rows match"));
+        return Ok(0);
+    }
+    println!("{}", ui::header("security audit", Some(&format!("{} rows, newest first", events.len()))));
+    let rows: Vec<Vec<String>> = events
+        .iter()
+        .map(|e| {
+            let glyph = match e["severity"].as_str().unwrap_or("info") {
+                "critical" | "error" => Glyph::Err,
+                "warning" => Glyph::Warn,
+                _ => Glyph::Bullet,
+            };
+            let ip = e["details"]["source_ip"].as_str().unwrap_or("");
+            vec![
+                ui::glyph_cell(glyph),
+                ui::muted(e["timestamp"].as_str().unwrap_or("")),
+                cell(&e["event_type"]),
+                cell(&e["actor"]),
+                cell(&e["resource"]),
+                cell(&e["outcome"]),
+                ui::muted(ip),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        ui::table(
+            &[Col::left(""), Col::left("at"), Col::left("event"), Col::left("actor"), Col::left("resource"), Col::left("outcome"), Col::left("from")],
+            &rows,
+        )
+    );
+    if let Some(next) = body["next_cursor"].as_str() {
+        println!();
+        ui::guide(&[("noo security audit list --cursor <next>", &format!("more rows; cursor {next}"))]);
+    }
+    println!("{}", ui::muted("--json shows each row's details (source_ip, conversation_id) and chain position"));
+    Ok(0)
 }
 
 // ── security posture ────────────────────────────────────────────────────────

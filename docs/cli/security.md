@@ -403,7 +403,8 @@ the lock. The layout both locks are published in is in
 | `noo security org list` | — | List orgs with member counts |
 | `noo security org create` | `<org_id> [--name <name>] [--description <text>]` | Create an org |
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
-| `noo security audit verify` | — | Verify every security audit row's hash across the audit-key checkpoint (operator-only) |
+| `noo security audit verify` | — | Verify every security audit row's hash and the hash chain (deleted or reordered rows) across the audit-key checkpoint (operator-only) |
+| `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
 | `noo security posture apply-profile` | `<profile> [--include-bridges]` | Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply |

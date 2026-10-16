@@ -57,6 +57,7 @@ pub mod users;
 pub(crate) mod erase_kb;
 mod recall;
 mod walks;
+mod audit_read;
 pub mod ops;
 mod websocket;
 
@@ -293,6 +294,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(settings::router())
         .merge(intelligence::router())
         .merge(admin::router())
+        .merge(audit_read::router())
         .merge(monitoring::router())
         .merge(grafana_ds::router())
         .merge(users::router())
@@ -362,6 +364,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Outside auth: the Grafana session route never answers a bare 403
         // — it says why and which tiers open Grafana.
         .layer(axum_mw::from_fn(crate::auth::explain_grafana_refusal))
+        // The caller's address (same trusted-proxy rule as the rate limiter),
+        // bound for the handler so every audit row records where it came from.
+        .layer(axum_mw::from_fn(crate::audit_context::origin_layer))
         .layer(axum_mw::from_fn_with_state(state.clone(), crate::middleware::rate_limit))
         .layer(axum_mw::from_fn_with_state(state.clone(), crate::middleware::request_logger))
         // Outermost so every response carries them, including 401s from the

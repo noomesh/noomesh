@@ -107,6 +107,8 @@ mod agent_activities;
 mod agent_meta_loop;
 mod audit_partition;
 mod audit_integrity;
+mod audit_chain;
+mod audit_context;
 mod autonomy_audit;
 mod autonomy_evaluators;
 mod held_column;
@@ -568,6 +570,9 @@ async fn main() -> Result<()> {
     // Then the hash-v2 marker: after it, a row hashed v1
     // (time not covered) fails verification. Once; idempotent.
     audit_integrity::ensure_hash_v2_marker(&state.db).await;
+    // Then the hash chain's first row: from here a deleted or reordered audit
+    // row fails `noo security audit verify`. Once; idempotent.
+    audit_chain::ensure_genesis(&state.db).await;
 
     // Log initial cluster snapshot (proof-of-wiring for cluster_manager.rs).
     // Same data is available to autonomy actions, heartbeat tasks, and
