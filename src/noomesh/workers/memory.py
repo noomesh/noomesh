@@ -30,6 +30,14 @@ from .registry import worker_handler
 log = structlog.get_logger(__name__)
 
 
+def _in_shared_room(request: dict) -> bool:
+    """The SIGNED principal carries the gateway's shared-room scope."""
+    from .kb import SHARED_ROOM_SCOPE
+
+    principal = bus_principal.of(request)
+    return principal is not None and principal.has_scope(SHARED_ROOM_SCOPE)
+
+
 async def _resolve_org_teams(store: Any, user_id: "str | None") -> "tuple[str | None, list[str] | None]":
     """Resolve the tenant scope for a username (PR5): their org
     (``noo_users.org_id``) and their ``team:*`` role grants. Both feed the
@@ -150,6 +158,11 @@ async def _memory_search(request: dict) -> Any:
         # Tenancy comes from the SIGNED principal, not the payload. For a
         # user principal the two cannot disagree — the worker pool refused
         # the message if they did.
+        if _in_shared_room(request):
+            # A group chat or shared space: personal conversation history is
+            # never drawn into a reply the whole room reads.
+            log.info("memory_read_refused_shared_room")
+            return ""
         user_id = bus_principal.tenant_of(request, params)
         persona_id = params.get("persona_id") or request.get("persona_id") or None
         # Without a user_id the store would skip the scope join and return
@@ -198,6 +211,11 @@ async def _memory_cross_channel(request: dict) -> Any:
         params = request.get("params", request)
         exclude = params.get("exclude_channel", request.get("exclude_channel", ""))
         top_k = params.get("top_k", request.get("top_k", 3))
+        if _in_shared_room(request):
+            # A group chat or shared space: personal conversation history is
+            # never drawn into a reply the whole room reads.
+            log.info("memory_read_refused_shared_room")
+            return {"success": True, "data": {"messages": []}}
         user_id = bus_principal.tenant_of(request, params)
         # Resolve, then fail closed (see _memory_search): an unresolved
         # user_id would list every user's conversations across channels.

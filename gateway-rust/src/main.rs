@@ -35,6 +35,11 @@
 //! changes what `noomesh.yaml` parses — while others are genuinely orphaned
 //! helpers. the design carries the triaged list; when it is empty this line
 //! comes off and the gate starts catching new rot.
+// The channel turn wraps its future in the principal and shared-room scopes;
+// the in-process task runner nests those again, and the layout of that async
+// block passes the default query depth (128).
+#![recursion_limit = "256"]
+
 #![allow(unknown_lints)]
 #![allow(dead_code)]
 // Doc-comment formatting across ~55 sites (list indentation and lazy

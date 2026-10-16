@@ -1254,6 +1254,12 @@ async fn native_memory_search(state: &AppState, call: &ToolCall, args: &Value) -
         None => return err_result(call, "query required".into()),
     };
     let top_k = args.get("top_k").and_then(|v| v.as_i64()).unwrap_or(5).clamp(1, 50);
+    // A group chat or shared space: personal conversation memory is never
+    // drawn into a reply the whole room reads (the worker's memory handlers
+    // refuse the same way on the signed shared-room scope).
+    if crate::coordinator::in_shared_room() {
+        return ok_result(call, "Memory search is not available in a group chat or shared space: the reply would show your own conversations to everyone here. Ask in a private chat.".into());
+    }
 
     let truncated: String = query.chars().take(1500).collect();
     // Mesh, not the static endpoint — this call site kept embed_one() when
