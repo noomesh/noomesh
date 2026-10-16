@@ -22,7 +22,7 @@
 library/rust:1-bookworm                                        scripts/cargo-docker.sh (ci.yml rust-gateway, noo-cli, standalone-smoke)
 library/python:3.12-slim                                       Dockerfile (ci.yml build)
 library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b  docker/Dockerfile.whisper, docker/Dockerfile.piper
-library/alpine:3.19                                            docker/Dockerfile.stunnel
+library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8  docker/Dockerfile.stunnel
 library/alpine:3.22                                            docker/Dockerfile.node-agent-prebuilt, docker/Dockerfile.node-agent-go (gcompat stage)
 library/alpine:latest                                          workspace-reclaim steps (`docker run alpine`, before checkout; local image first)
 nvidia/cuda:12.2.0-base-ubuntu22.04                            docker/Dockerfile.nvidia-exporter
