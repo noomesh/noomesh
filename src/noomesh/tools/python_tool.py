@@ -114,15 +114,39 @@ def _run_python(args: Dict, sandbox_url: Optional[str]) -> str:
     return "\n\n".join(output)
 
 
+def sandbox_exec_url(sandbox_url: str) -> str:
+    """`<sandbox_url>/exec`, refusing anything but https.
+
+    mTLS doors phase 1 (i77): the sandbox listener requires a cluster-CA
+    client certificate, so a plaintext URL (a stale `.env` override) can
+    only fail — say why instead of dialling it."""
+    if not sandbox_url.strip().lower().startswith("https://"):
+        raise ValueError(
+            f"NOO_SANDBOX_URL={sandbox_url} is not https — the sandbox serves mTLS only; "
+            "set it to https://sandbox:9000 or unset it"
+        )
+    return sandbox_url.rstrip("/") + "/exec"
+
+
+def sandbox_tls_kwargs() -> dict:
+    """The cluster CA to verify the sandbox with and this process's own
+    leaf to present (NOO_TLS_CA / NOO_TLS_CERT / NOO_TLS_KEY), for httpx."""
+    from .._providers.http_context import default_http_context
+
+    ctx = default_http_context()
+    return {"verify": ctx.verify, "cert": ctx.cert}
+
+
 def _run_via_sandbox(
     sandbox_url: str, code: str, timeout: float, cwd: Optional[str]
 ) -> str:
-    url = sandbox_url.rstrip("/") + "/exec"
     try:
+        url = sandbox_exec_url(sandbox_url)
         response = httpx.post(
             url,
             json={"code": code, "timeout": timeout, "cwd": cwd},
             timeout=timeout + 5,
+            **sandbox_tls_kwargs(),
         )
         response.raise_for_status()
         payload = response.json()

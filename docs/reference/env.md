@@ -167,7 +167,7 @@ override. Everything else below is env-only.
 | `NOO_TOOL_TIMEOUT_SECS` | `120` | tool execution timeout (RAG queries can take 30–60 s) |
 | `NOO_BACKEND_TIMEOUT_SECS` | `300` | whole-request bound on every gateway → node-agent / backend call, so on a non-streaming completion it caps the entire generation. Raise it on CPU-only boxes, where a 12B model can outrun 300 s and the caller sees `502 backend_unreachable` — and raise the node's `NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS` with it, because the lower of the two is the one that fires |
 | `NOO_SESSION_CACHE_MAX_COUNT` | `1000` | coordinator session cache size |
-| `NOO_SANDBOX_URL` | — | the airgapped executor for `python_exec` (also `sandbox.url`) |
+| `NOO_SANDBOX_URL` | `https://sandbox:9000` | the airgapped executor for `python_exec` (also `sandbox.url`). mTLS only: the sandbox requires a cluster-CA client certificate, and an `http://` value is refused, never dialled (`noo cluster verify --controller` → `sandbox listener`) |
 | `NOO_SANDBOX_ISOLATION` | `bwrap` | per-call isolation inside the sandbox container: `bwrap` (own root, PID space, no network per call) or `process` (container isolation only, chosen by name — the executor refuses to run code rather than fall back). `/health` reports the active mode |
 | `NOO_SANDBOX_APPARMOR` | `docker-default` | AppArmor profile for the sandbox container; `unconfined` on hosts whose AppArmor blocks unprivileged user namespaces (Ubuntu 24.04+), where Bubblewrap otherwise fails with "No permissions to create new namespace" |
 | `NOO_SANDBOX_EXEC_MEM_MB` | `384` | per-call data-segment limit (`RLIMIT_DATA`) inside the sandbox; CPU is capped at the call's timeout |

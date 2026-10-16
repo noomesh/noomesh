@@ -342,7 +342,7 @@ x-trellion-env: &trellion-env
   NOO_HOST_SPOOL_DIR: '/var/run/noo-spool'
   RETRIEVAL_TRACKER_PATH: '/data/retrieval_tracker.json'
   RETRIEVAL_BANDIT_PATH: '/data/retrieval_bandit.json'
-  NOO_SANDBOX_URL: '${NOO_SANDBOX_URL:-http://sandbox:9000}'
+  NOO_SANDBOX_URL: '${NOO_SANDBOX_URL:-https://sandbox:9000}'
   NOO_SKILLS_HOST_DIR: '${NOO_SKILLS_HOST_DIR:-${PWD:-}/skills}'
   NOO_ARTIFACT_DIR: '${NOO_ARTIFACT_DIR:-}'
 
