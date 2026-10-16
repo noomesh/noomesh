@@ -495,6 +495,24 @@ note_binary_sha() {
 }
 # END binary_unchanged
 
+# BEGIN config_unchanged
+# config_unchanged PAYLOAD INSTALLED MODE OWNER:GROUP — the non-binary twin of
+# binary_unchanged: true only when INSTALLED exists, is readable, has the same
+# bytes as PAYLOAD, AND already carries the mode and owner:group the install
+# would give it. A missing file (first install), an unreadable one, a stat
+# that fails, or ANY difference in bytes, mode or owner returns false, so the
+# caller INSTALLS exactly as before: the skip path needs positive proof of
+# identity. A skipped kind sets no restart/reload flag and reports
+# `<kind>=unchanged`, a token the controller's whole-token applier_applied
+# lookup does not read as "installed".
+config_unchanged() {
+    [ -f "$2" ] || return 1
+    cmp -s "$1" "$2" 2>/dev/null || return 1
+    _cu_have="$(stat -c '%a %U:%G' "$2" 2>/dev/null)" || return 1
+    [ "$_cu_have" = "$3 $4" ]
+}
+# END config_unchanged
+
 for _k in $TEXT_KINDS; do
     [ -f "$WORK/files/$_k" ] && { text_payload_ok "$WORK/files/$_k" "$_k" || exit 65; }
 done
@@ -598,14 +616,28 @@ fresh_unit=0
 # certs — root:noo-agent, group-readable
 # ca.crt is a PUBLIC certificate: 644 so an unprivileged `noo upgrade` can
 # pin the controller mirror to it (2026-09-03); the keys stay 640.
-[ -f "$WORK/files/ca.crt" ]   && { install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1; }
+if [ -f "$WORK/files/ca.crt" ]; then
+    if config_unchanged "$WORK/files/ca.crt" "$PKI/ca.crt" 644 root:noo-agent; then
+        applied="$applied ca.crt=unchanged"
+    else
+        install -m 644 -o root -g noo-agent "$WORK/files/ca.crt"   "$PKI/ca.crt"; chmod 755 /etc/noo "$PKI" 2>/dev/null || true; applied="$applied ca.crt"; need_restart=1
+    fi
+fi
 # signing-pub — the fleet code-signing PUBLIC key (§3f R26). A public key:
 # 644, same as ca.crt. Installing it is what moves this node off the
 # CA-signed compatibility lane, so it is applied on the same pass that
 # verified it, and no agent restart is needed — only noo-apply reads it.
 [ -f "$WORK/files/signing-pub" ] && { install -m 644 -o root -g noo-agent "$WORK/files/signing-pub" "$PKI/signing.pub"; applied="$applied signing-pub"; }
-[ -f "$WORK/files/node.crt" ] && { install -m 640 -o root -g noo-agent "$WORK/files/node.crt" "$PKI/nodes/$NODE_ID/node.crt"; applied="$applied node.crt"; need_restart=1; }
-[ -f "$WORK/files/node.key" ] && { install -m 640 -o root -g noo-agent "$WORK/files/node.key" "$PKI/nodes/$NODE_ID/node.key"; applied="$applied node.key"; need_restart=1; }
+# node.crt / node.key: an identical file (bytes, 640, root:noo-agent) is left
+# alone and does not bounce the agent.
+for _nk in node.crt node.key; do
+    [ -f "$WORK/files/$_nk" ] || continue
+    if config_unchanged "$WORK/files/$_nk" "$PKI/nodes/$NODE_ID/$_nk" 640 root:noo-agent; then
+        applied="$applied $_nk=unchanged"
+    else
+        install -m 640 -o root -g noo-agent "$WORK/files/$_nk" "$PKI/nodes/$NODE_ID/$_nk"; applied="$applied $_nk"; need_restart=1
+    fi
+done
 
 # svc-<x>.crt / svc-<x>.key — this node's backend door leaves (an earlier change
 # A). Every backend the agent starts serves through a door that requires a
@@ -631,6 +663,18 @@ for _svc in vllm llamacpp ollama tei reranker; do
     _c="$WORK/files/svc-$_svc.crt"; _k="$WORK/files/svc-$_svc.key"
     [ -f "$_c" ] || [ -f "$_k" ] || continue
     [ -f "$_c" ] && [ -f "$_k" ] || { echo "noo-apply: svc-$_svc carries half a leaf (cert and key travel together) — refusing" >&2; exit 65; }
+    # Identical to what is installed (bytes, key 600 / cert 644, root:root):
+    # nothing to install, so no .next file is written and no rename happens.
+    # The CA/key verification below is for what we are ABOUT TO INSTALL; an
+    # unchanged file was verified when it was installed and is already
+    # trusted, so it is not re-judged here. Any difference (or a missing or
+    # unreadable file) falls through to verify + install as before.
+    _d="$PKI/services/$_svc"
+    if config_unchanged "$_k" "$_d/service.key" 600 root:root \
+        && config_unchanged "$_c" "$_d/service.crt" 644 root:root; then
+        applied="$applied svc-$_svc=unchanged"
+        continue
+    fi
     openssl verify -CAfile "$PKI/ca.crt" "$_c" >/dev/null 2>&1 \
         || { echo "noo-apply: svc-$_svc.crt does not verify against $PKI/ca.crt — refusing" >&2; exit 65; }
     # Compared as text, and each side must be non-empty: two failed
@@ -1021,7 +1065,14 @@ if [ -f "$WORK/files/agent-env" ]; then
         agent_env_carry_nats_pair "$STAGED_ENV" /etc/noo-node-agent.env \
             "$(grep -E '^NODE_ID=' "$WORK/files/agent-env" | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
     fi
-    install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
+    # STAGED_ENV is the FINAL content (payload plus any carried NATS pair),
+    # so that is what is compared with the installed file.
+    if config_unchanged "$STAGED_ENV" /etc/noo-node-agent.env 600 root:root; then
+        ae_state="agent-env=unchanged"
+    else
+        install -m 600 -o root -g root "$STAGED_ENV" /etc/noo-node-agent.env
+        ae_state="agent-env"; need_restart=1
+    fi
     rm -f "$STAGED_ENV"
     # The roots the controller declared for this node: reachable by the
     # agent's user, or the agent reports the drive as missing.
@@ -1030,7 +1081,7 @@ if [ -f "$WORK/files/agent-env" ]; then
         [ -n "$_v" ] && grant_traverse noo-agent "$_v"
     done
     grant_traverse_flush_missing
-    applied="$applied agent-env"; need_restart=1
+    applied="$applied $ae_state"
 fi
 
 # nats-creds — the node's OWN NATS credential. Applied AFTER
@@ -1060,9 +1111,15 @@ if [ -f "$WORK/files/nats-creds" ]; then
     # Never leave the agent without its identity: the NODE_ID line that
     # agent-env is refused for lacking must survive this rewrite too.
     grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
-    install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+    # The MERGED result is compared with the installed env, not the
+    # fragment. The harness env below is judged the same way; the kind is
+    # `unchanged` only when neither file needed rewriting.
+    nc_changed=0
+    if ! config_unchanged "$TMPENV" "$AGENT_ENV" 600 root:root; then
+        install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+        nc_changed=1; need_restart=1
+    fi
     rm -f "$TMPENV"
-    applied="$applied nats-creds"; need_restart=1
     # The harness is the same principal on the bus: the same
     # pair, merged the same way, into its own env — when it already has one
     # on disk. A node with no installed harness env has no harness YET; if
@@ -1075,10 +1132,13 @@ if [ -f "$WORK/files/nats-creds" ]; then
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$HARNESS_ENV" > "$TMPH" || true
         grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/nats-creds" >> "$TMPH"
         grep -qE '^NODE_ID=.+' "$TMPH" || { echo "noo-apply: harness env merge lost NODE_ID — aborting" >&2; rm -f "$TMPH"; exit 70; }
-        install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
+        if ! config_unchanged "$TMPH" "$HARNESS_ENV" 600 root:root; then
+            install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"
+            nc_changed=1; need_harness_restart=1
+        fi
         rm -f "$TMPH"
-        need_harness_restart=1
     fi
+    if [ "$nc_changed" = 1 ]; then applied="$applied nats-creds"; else applied="$applied nats-creds=unchanged"; fi
 fi
 
 # fleet-secrets — the FLEET-WIDE credentials every node holds.
@@ -1120,9 +1180,18 @@ if [ -f "$WORK/files/fleet-secrets" ]; then
     grep -vE "^($carried)=" "$AGENT_ENV" > "$TMPENV" || true
     grep -E "^($FS_KEYS)=" "$WORK/files/fleet-secrets" >> "$TMPENV"
     grep -qE '^NODE_ID=.+' "$TMPENV" || { echo "noo-apply: merge lost NODE_ID — aborting" >&2; rm -f "$TMPENV"; exit 70; }
-    install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+    # Merged result vs the installed env, like nats-creds above.
+    fs_unchanged=0
+    config_unchanged "$TMPENV" "$AGENT_ENV" 600 root:root && fs_unchanged=1
+    if [ "$fs_unchanged" != 1 ]; then
+        install -m 600 -o root -g root "$TMPENV" "$AGENT_ENV"
+        need_restart=1
+    fi
     rm -f "$TMPENV"
-    applied="$applied fleet-secrets"; need_restart=1
+    applied="$applied fleet-secrets"
+    # (the line above keeps its shape: tests/test_fleet_secret_declarations.py
+    # lifts the merge up to it.) Unchanged is reported as its own token.
+    [ "$fs_unchanged" != 1 ] || applied="${applied% fleet-secrets} fleet-secrets=unchanged"
 fi
 
 # agent-binary — staged then atomically moved, never written in place
@@ -1303,8 +1372,14 @@ if [ -f "$WORK/files/agent-unit" ]; then
     grep -q '^\[Service\]' "$WORK/files/agent-unit" \
         || { echo "noo-apply: agent-unit has no [Service] section" >&2; exit 65; }
     [ -f /etc/systemd/system/noo-node-agent.service ] || fresh_unit=1
-    install -m 644 -o root -g root "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service
-    applied="$applied agent-unit"; need_daemon_reload=1; need_restart=1
+    # Identical unit (bytes, 644, root:root): no rewrite, no daemon-reload,
+    # no restart. A first install (no file) is never "unchanged".
+    if config_unchanged "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service 644 root:root; then
+        applied="$applied agent-unit=unchanged"
+    else
+        install -m 644 -o root -g root "$WORK/files/agent-unit" /etc/systemd/system/noo-node-agent.service
+        applied="$applied agent-unit"; need_daemon_reload=1; need_restart=1
+    fi
 fi
 
 # ── the harness: the loop beside this node's model, delivered
@@ -1337,8 +1412,9 @@ if [ -f "$WORK/files/harness-env" ]; then
     grep -qE '^NODE_ID=.+' "$WORK/files/harness-env" \
         || { echo "noo-apply: harness-env lacks NODE_ID — refusing a config that boots an anonymous harness" >&2; exit 65; }
     HARNESS_ENV=/etc/noo-harness.env
+    TMPH=""
     if grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/harness-env"; then
-        install -m 600 -o root -g root "$WORK/files/harness-env" "$HARNESS_ENV"
+        HE_FINAL="$WORK/files/harness-env"
     else
         NATS_SRC=""
         if [ -f "$WORK/files/nats-creds" ] && grep -qE '^NATS_NODE_PASSWORD=.+' "$WORK/files/nats-creds"; then
@@ -1361,10 +1437,18 @@ if [ -f "$WORK/files/harness-env" ]; then
         TMPH="$(mktemp)"; chmod 600 "$TMPH"
         grep -vE '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$WORK/files/harness-env" > "$TMPH"
         [ -n "$NATS_SRC" ] && grep -E '^(NATS_NODE_USER|NATS_NODE_PASSWORD)=' "$NATS_SRC" >> "$TMPH"
-        install -m 600 -o root -g root "$TMPH" "$HARNESS_ENV"; rm -f "$TMPH"
+        HE_FINAL="$TMPH"
         unset NATS_SRC
     fi
-    applied="$applied harness-env"; need_harness_restart=1
+    # HE_FINAL is the FINAL content (payload, or payload plus the resolved
+    # NATS pair); an identical installed env is left alone.
+    if config_unchanged "$HE_FINAL" "$HARNESS_ENV" 600 root:root; then
+        applied="$applied harness-env=unchanged"
+    else
+        install -m 600 -o root -g root "$HE_FINAL" "$HARNESS_ENV"
+        applied="$applied harness-env"; need_harness_restart=1
+    fi
+    [ -z "$TMPH" ] || rm -f "$TMPH"
 fi
 
 # harness-binary — the gateway binary (the harness is its subcommand);
@@ -1418,11 +1502,18 @@ if [ -f "$WORK/files/harness-unit" ]; then
     if id -nG noo-harness | tr ' ' '\n' | grep -qx docker; then
         gpasswd -d noo-harness docker >/dev/null
     fi
-    install -m 644 -o root -g root "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service
     # Retire the grant that could never be used. Left behind it would be a
     # standing NOPASSWD root rule for a path nothing takes.
     rm -f /etc/sudoers.d/noo-harness-lifecycle /etc/sudoers.d/noo-harness-lifecycle.next
-    applied="$applied harness-unit"; need_daemon_reload=1; need_harness_restart=1
+    # Identical unit (bytes, 644, root:root): no rewrite, no daemon-reload,
+    # no harness restart. The user/group/sudoers hygiene above and below runs
+    # either way.
+    if config_unchanged "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service 644 root:root; then
+        applied="$applied harness-unit=unchanged"
+    else
+        install -m 644 -o root -g root "$WORK/files/harness-unit" /etc/systemd/system/noo-harness.service
+        applied="$applied harness-unit"; need_daemon_reload=1; need_harness_restart=1
+    fi
 fi
 
 [ -n "$applied" ] || { echo "noo-apply: signed bundle contained nothing to apply" >&2; exit 65; }
