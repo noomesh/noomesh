@@ -54,6 +54,9 @@ FILE_BACKED_SECRETS: tuple[str, ...] = (
     "REDIS_PASSWORD",
     "NOO_GATEWAY_KEY",
     "NATS_WORKER_PASSWORD",
+    # An add-on's OWN NATS password (noo-trellion, noo-trellion-intel), read
+    # by cluster/messaging.py beside NATS_ADDON_USER.
+    "NATS_ADDON_PASSWORD",
     "NOO_APP_DB_PASSWORD",
     "NOO_EVOLVE_DB_PASSWORD",
     "NOO_TRELLION_DB_PASSWORD",

@@ -61,6 +61,14 @@ x-noo-addon:
   why: >-
     the knowledge pack's extraction and retrieval call the gateway's chat and
     embeddings, and its counters post to the gateway's metrics door.
+  # This add-on's OWN NATS principal (i70 residue). The name is the add-on
+  # key; declaring it here is what makes `noo cluster nats-users render`
+  # (and `noo upgrade --stack`, `noo addons enable`) render a `trellion`
+  # user that subscribes on exactly trellion's subjects and replies on
+  # `_INBOX_gw.trellion.>` — and take those subjects off the worker's grant
+  # (noo-cli nats_users.rs ADDON_PRINCIPALS). The password is
+  # NATS_TRELLION_PASSWORD, delivered below as /run/secrets/nats_addon_password.
+  nats_principal: trellion
 
 x-default-logging: &default-logging
   driver: json-file
@@ -192,7 +200,13 @@ x-trellion-env: &trellion-env
   REDIS_URL: '${REDIS_URL:-rediss://redis:6379}'
   REDIS_PASSWORD_FILE: '${REDIS_PASSWORD:+/run/secrets/redis_password}'
   NATS_URL: '${NATS_URL:-tls://nats:4222}'
-  # This process's OWN bus principal (see the worker service above).
+  # The WORKER principal — the FALLBACK, for one release (i70 residue). Each
+  # add-on now presents its own principal (NATS_ADDON_USER, set on the
+  # service below, not in this shared anchor); the worker pair stays here
+  # only so an install whose store does not hold the add-on's password yet,
+  # or a trellion-intel bundle that predates its own principal, still gets
+  # on the bus. The add-on logs `nats_addon_principal_fallback` at WARNING
+  # whenever it presents this. Removed in the release after.
   NATS_WORKER_USER: '${NATS_WORKER_USER:-}'
   NATS_WORKER_PASSWORD_FILE: '${NATS_WORKER_PASSWORD:+/run/secrets/nats_worker_password}'
   NOO_NATS_ALLOW_ANONYMOUS: '${NOO_NATS_ALLOW_ANONYMOUS:-}'
@@ -355,6 +369,9 @@ x-trellion-env: &trellion-env
 secrets:
   noo_svc_key_trellion:
     environment: NOO_SVC_KEY_TRELLION
+  # trellion's own NATS password (x-noo-addon.nats_principal above).
+  nats_trellion_password:
+    environment: NATS_TRELLION_PASSWORD
   pgpass_trellion:
     environment: NOO_PGPASS_TRELLION
 
@@ -403,6 +420,17 @@ services:
       # worker_pool verifies each worker.* message's `trellion` MAC with it.
       NOO_BUS_KEY_FILE: '${NOO_BUS_KEY_TRELLION:+/run/secrets/noo_bus_key}'
       NOO_BUS_AUDIENCE: trellion
+      # trellion's OWN NATS principal (i70 residue). The user is a literal
+      # (an env value may name a secret only as a `_FILE` pointer); the pool
+      # presents it only when the password file is there, i.e. when the
+      # store holds NATS_TRELLION_PASSWORD. Here and not in the shared
+      # anchor, like the two keys above: trellion-intel `extends` this
+      # service and replaces both with its own (its bundle's overlay). An
+      # intel bundle that predates that inherits these, and the worker pool
+      # refuses to present a principal that is not its own audience
+      # (cluster/messaging.py) — it falls back to the worker pair instead.
+      NATS_ADDON_USER: trellion
+      NATS_ADDON_PASSWORD_FILE: '${NATS_TRELLION_PASSWORD:+/run/secrets/nats_addon_password}'
     # Every secret the anchor points at, as a FILE owned by the image's user
     # (DHI `nonroot`, 65532 — measured on the stack-v0.2.80 image) and 0400:
     # libpq refuses a pgpass with group/other bits. trellion-intel `extends`
@@ -411,7 +439,11 @@ services:
     # with its own key's source — see docker-compose.trellion-intel.yml.
     secrets:
       - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      # The worker's NATS password: the one-release fallback (see the anchor).
       - { source: nats_worker_password, target: nats_worker_password, uid: "65532", gid: "65532", mode: 0400 }
+      # trellion's OWN NATS password. trellion-intel re-sources this target
+      # from its own password, like noo_gateway_key and noo_bus_key.
+      - { source: nats_trellion_password, target: nats_addon_password, uid: "65532", gid: "65532", mode: 0400 }
       # This container's own bus-principal key; intel
       # re-sources the target from its own key, like noo_gateway_key.
       - { source: noo_bus_key_trellion, target: noo_bus_key, uid: "65532", gid: "65532", mode: 0400 }

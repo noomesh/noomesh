@@ -3500,7 +3500,14 @@ pub(crate) fn retired_bridge_sites(env_value: Option<&str>, posture: &Value) -> 
 /// under the current compose NATS refuses that file), or when the retired
 /// bridge is still set ON anywhere. A retired bridge left at a closed value
 /// changes nothing and is a WARN with the cleanup.
-pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(String, String)]) -> Check {
+///
+/// `declared_addons` is `nats_users::declared_addon_principals`: an add-on
+/// whose overlay declares a principal the file does not render is the
+/// one-release fallback (it presents the worker) — a WARN naming the render;
+/// one the file renders but no overlay declares is a FAIL: its subjects are
+/// off the worker's grant while its container presents the worker, so
+/// nothing may serve them.
+pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(String, String)], declared_addons: &[&str]) -> Check {
     let Some(conf) = users_conf else {
         return warn("nats principals", "could not read monitoring/nats/users.conf from the running checkout", None);
     };
@@ -3563,8 +3570,43 @@ pub(crate) fn nats_principals_check(users_conf: Option<&str>, bridge_sites: &[(S
             Some(cleanup(&all, false)),
         );
     }
+    let rendered = crate::commands::nats_users::addon_users_in_conf(conf);
+    let orphaned: Vec<&str> = rendered.iter().copied().filter(|a| !declared_addons.contains(a)).collect();
+    if !orphaned.is_empty() {
+        return fail(
+            "nats principals",
+            format!(
+                "users.conf renders {} but no overlay on this install declares it (x-noo-addon.nats_principal) — \
+                 its subjects are off the worker's grant while its container presents the worker, so nothing may serve them",
+                orphaned.join(", ")
+            ),
+            "noo cluster nats-users render   # renders only the declared add-on principals, then HUPs noo-nats",
+        );
+    }
     let principals = conf.lines().filter(|l| l.trim().starts_with("user:")).count();
-    ok("nats principals", format!("{principals} per-principal user(s), each a bcrypt digest; no shared user, no bridge"))
+    let nodes = crate::commands::nats_users::node_users_in_conf(conf).len();
+    let mut named: Vec<&str> = ["gateway", "worker"].into_iter().filter(|u| conf.contains(&format!("user: \"{u}\""))).collect();
+    named.extend(rendered.iter().copied());
+    let pending: Vec<&str> = declared_addons.iter().copied().filter(|a| !rendered.contains(a)).collect();
+    let detail = format!(
+        "{principals} per-principal user(s) ({}{}{nodes} node(s)), each a bcrypt digest; no shared user, no bridge; \
+         add-on subjects off the worker's grant: {}",
+        named.join(", "),
+        if named.is_empty() { "" } else { ", " },
+        if rendered.is_empty() { "none".to_string() } else { rendered.join(", ") },
+    );
+    if !pending.is_empty() {
+        return warn(
+            "nats principals",
+            format!(
+                "{detail} — {} present(s) the WORKER principal (the one-release fallback): its overlay declares its own \
+                 principal but users.conf does not render it yet",
+                pending.join(", ")
+            ),
+            Some("noo cluster nats-users render   # mints the add-on's password, renders it, HUPs noo-nats; then: noo stack restart --force".into()),
+        );
+    }
+    ok("nats principals", detail)
 }
 
 /// Judge the posture, key and doctor outputs. Pure over the JSON so the
@@ -4365,6 +4407,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(nats_principals_check(
             users_conf.as_deref(),
             &retired_bridge_sites(dotenv_value(RETIRED_NATS_BRIDGE).as_deref(), &posture),
+            &crate::commands::nats_users::declared_addon_principals(&root),
         ));
         // Postgres is TLS-only with a required cluster-CA client certificate
         // (2026-09-28): the shipped policy, and a live refusal of a client
@@ -5649,12 +5692,12 @@ mod tests {
             Principal { user: "gateway".into(), hash: "$2b$11$g".into(), role: Role::Gateway },
             Principal { user: "node-host3".into(), hash: "$2b$11$a".into(), role: Role::Node },
         ]);
-        let c = nats_principals_check(Some(&clean), &[]);
+        let c = nats_principals_check(Some(&clean), &[], &[]);
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         assert!(c.detail.starts_with("2 per-principal"), "{}", c.detail);
 
         let legacy = format!("{clean}      {{\n        user: $NATS_USER\n        password: $NATS_PASSWORD\n      }}\n");
-        let c = nats_principals_check(Some(&legacy), &[]);
+        let c = nats_principals_check(Some(&legacy), &[], &[]);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("$NATS_USER, $NATS_PASSWORD"), "{}", c.detail);
         assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster nats-users render"), "{:?}", c.remedy);
@@ -5664,26 +5707,54 @@ mod tests {
         let posture = serde_json::json!({"posture": [], "retired": [{"key": RETIRED_NATS_BRIDGE, "value": "1"}]});
         let sites = retired_bridge_sites(Some("0"), &posture);
         assert_eq!(sites.len(), 2, "{sites:?}");
-        let c = nats_principals_check(Some(&clean), &sites);
+        let c = nats_principals_check(Some(&clean), &sites, &[]);
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("the posture DB (=1)") && !c.detail.contains(".env"), "{}", c.detail);
         // Every remedy is a `noo` verb, never SQL (2026-10-02: the WARN's
         // remedy was `docker exec noo-postgres psql … DELETE`).
         let r = c.remedy.clone().unwrap_or_default();
         assert!(r.starts_with("noo security posture set NOO_NATS_LEGACY_SHARED_CREDS 0") && !r.contains("psql"), "{r}");
-        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(Some("0"), &serde_json::json!({})));
+        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(Some("0"), &serde_json::json!({})), &[]);
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         assert!(c.detail.contains(".env (=0)"), "{}", c.detail);
         assert_eq!(c.remedy.as_deref(), Some("remove the NOO_NATS_LEGACY_SHARED_CREDS line from .env"));
         // host8: a closed row in the DB only — the gateway deletes it at boot.
         let db_closed = serde_json::json!({"posture": [], "retired": [{"key": RETIRED_NATS_BRIDGE, "value": "0"}]});
-        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(None, &db_closed));
+        let c = nats_principals_check(Some(&clean), &retired_bridge_sites(None, &db_closed), &[]);
         assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
         let r = c.remedy.unwrap_or_default();
         assert!(r.starts_with("noo stack restart gateway") && !r.contains("psql"), "{r}");
         assert!(retired_bridge_sites(None, &serde_json::json!({"posture": []})).is_empty());
         assert!(retired_bridge_sites(Some("  "), &serde_json::json!({"retired": [{"key": "OTHER", "value": "1"}]})).is_empty());
-        assert_eq!(nats_principals_check(None, &[]).verdict, Verdict::Warn);
+        assert_eq!(nats_principals_check(None, &[], &[]).verdict, Verdict::Warn);
+    }
+
+    /// i70 residue: the row counts and names the add-on principals, warns on
+    /// the one-release fallback and fails on a principal nothing presents.
+    #[test]
+    fn the_nats_principals_row_names_each_addon_principal() {
+        use crate::commands::nats_users::{render_users_conf, Principal, Role};
+        let p = |u: &str, r: Role| Principal { user: u.into(), hash: "$2b$11$x".into(), role: r };
+        let both = render_users_conf(&[
+            p("gateway", Role::Gateway), p("worker", Role::Worker), p("trellion", Role::Addon),
+            p("trellion_intel", Role::Addon), p("node-host3", Role::Node),
+        ]);
+        let c = nats_principals_check(Some(&both), &[], &["trellion", "trellion_intel"]);
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.starts_with("5 per-principal user(s) (gateway, worker, trellion, trellion_intel, 1 node(s))"), "{}", c.detail);
+        assert!(c.detail.ends_with("add-on subjects off the worker's grant: trellion, trellion_intel"), "{}", c.detail);
+
+        // Declared but not rendered: the fallback, a WARN naming the render.
+        let only_t = render_users_conf(&[p("gateway", Role::Gateway), p("worker", Role::Worker), p("trellion", Role::Addon)]);
+        let c = nats_principals_check(Some(&only_t), &[], &["trellion", "trellion_intel"]);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("trellion_intel present(s) the WORKER principal"), "{}", c.detail);
+        assert!(c.remedy.unwrap_or_default().starts_with("noo cluster nats-users render"));
+
+        // Rendered but undeclared: nothing serves its subjects.
+        let c = nats_principals_check(Some(&both), &[], &["trellion"]);
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("renders trellion_intel"), "{}", c.detail);
     }
 
     #[test]
