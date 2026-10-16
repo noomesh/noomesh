@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -67,6 +68,20 @@ func fetchImageManifest(ctx context.Context, ref, arch string) (m *artifactManif
 	return m, name, err
 }
 
+// imageRefLocks holds one mutex per image ref being pulled. Entries are
+// never removed: a node has a handful of refs and a mutex is 8 bytes.
+var imageRefLocks sync.Map // ref -> *sync.Mutex
+
+// lockImageRef serialises pulls of one ref and returns the unlock. Different
+// refs do not contend. It is held across a pull (by design) and is NOT the
+// railFail mutex, which only ever guards a map lookup.
+func lockImageRef(ref string) func() {
+	v, _ := imageRefLocks.LoadOrStore(ref, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // PullImageArtifactResult is the honest outcome of one pull.
 type PullImageArtifactResult struct {
 	Status  string `json:"status"` // "loaded" | "up_to_date"
@@ -104,6 +119,11 @@ func (c *Client) PullImageArtifact(ctx context.Context, ref, controllerImageID, 
 	if ref == "" || strings.ContainsAny(ref, " \t\n") {
 		return nil, fmt.Errorf("invalid image ref %q", ref)
 	}
+	// One pull of a ref at a time: two writers on one staged .partial would
+	// corrupt it (a prefetch and a start path can overlap on one image). The
+	// second caller waits for the first, then runs its own pull (a re-fetch is
+	// LAN-cheap and FetchOneVerified verifies whatever it lands).
+	defer lockImageRef(ref)()
 	cacheURL := preseed.CacheURL()
 	if cacheURL == "" {
 		return nil, fmt.Errorf("NOO_MODEL_CACHE_URL is not set — no data plane to pull from")
