@@ -71,6 +71,18 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
         }
     }
 
+    // The gateway refuses to boot without its audit key. Mint it into the
+    // encrypted store when absent, BEFORE the launcher can recreate the
+    // gateway; a store that cannot be read is left to the launcher, which
+    // fails closed on it with its own explanation.
+    if ["start", "restart", "rebuild"].iter().any(|verb| name == format!("noomesh-{verb}.sh")) {
+        match super::upgrade::ensure_audit_key_for_launch(&root) {
+            Ok(true) => eprintln!("minted NOO_AUDIT_HMAC_KEY into the encrypted store (the gateway will not start without the audit log's signing key)"),
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: could not check NOO_AUDIT_HMAC_KEY in the encrypted store: {e}"),
+        }
+    }
+
     let mut cmd = Command::new("bash");
     cmd.arg(&script).args(args).current_dir(&root);
     // The launcher's lib-ui.sh mirrors the CLI palette; hand it the
@@ -125,6 +137,33 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
             &format!("failed to run {name}: {e}"),
             None,
         ),
+    }
+}
+
+/// Recreate ONE compose service (`noomesh-restart.sh --force <service>`) so
+/// it re-reads `.env` / the store. For callers that must keep their own
+/// stdout clean (posture commands under `--json`): the script's stdout goes to
+/// our stderr. `Err` carries the exit status.
+pub(crate) fn recreate_service(service: &str) -> Result<(), String> {
+    let root = repo_root();
+    let script = root.join("scripts/noomesh-restart.sh");
+    if !script.is_file() {
+        return Err(format!("{} not found: cannot recreate {service}", script.display()));
+    }
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script).args(["--force", service]).current_dir(&root);
+    cmd.env("NOO_COLOR", "never");
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("NOO_CLI_BIN", exe);
+    }
+    let stderr_copy = unsafe { libc::dup(2) };
+    if stderr_copy >= 0 {
+        cmd.stdout(unsafe { Stdio::from_raw_fd(stderr_copy) });
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("noomesh-restart.sh --force {service} exited {}", s.code().unwrap_or(1))),
+        Err(e) => Err(format!("could not run noomesh-restart.sh: {e}")),
     }
 }
 

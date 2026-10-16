@@ -241,6 +241,82 @@ pub(crate) struct ScanInputs {
     /// `Some(why)` when the repo `.env` holds a secret-class value
     /// (`plaintext_env::AtRest::plaintext_problem`) — names only.
     pub env_plaintext_secrets: Option<String>,
+    /// The posture-class checks (audit key, mTLS, hatches, gateway gates).
+    /// `Default` is "nothing to report", so a fixture that does not care
+    /// about them stays quiet; `security_scan` fills every field it could
+    /// actually see and lists what it could not in `not_checked`.
+    pub posture: PostureInputs,
+}
+
+/// What the scan saw of the install's POSTURE, as opposed to its secrets.
+/// Every field is "no finding" at its default; an `Option` is `None` when the
+/// thing was not seen (the scan then says so — see [`not_checked_line`]).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PostureInputs {
+    /// `NOO_CONTROLLER_SECRET` as this host resolves it; `None` = not read.
+    pub controller_secret: Option<String>,
+    /// `NOO_ADMIN_PASSWORD` when set (never printed).
+    pub admin_password: Option<String>,
+    /// `NOO_AUDIT_HMAC_KEY` is absent or blank in the store/env.
+    pub audit_key_missing: bool,
+    /// Why mTLS enforcement is not on, from [`mtls_off_reason`]. `None` = on.
+    pub mtls_off: Option<String>,
+    /// Raw `NOO_CSP` (`None` = unset).
+    pub csp_raw: Option<String>,
+    /// Env-only hatches that are set (names from [`ENV_HATCHES`]).
+    pub env_hatches: Vec<String>,
+    /// The gateway's RUNNING `NOO_EXEC_APPROVAL_MODE` (`None` = unset =
+    /// the code default, `strict`) and the DB row (desired), when the
+    /// gateway answered.
+    pub exec_approval_running: Option<String>,
+    pub exec_approval_desired: Option<String>,
+    /// Raw `NOO_SANDBOX_ISOLATION`.
+    pub sandbox_isolation: Option<String>,
+    /// `docker inspect` of the node-agent container: is it privileged NOW.
+    pub node_agent_privileged: Option<bool>,
+}
+
+/// An escape hatch that exists ONLY as an environment variable: no posture
+/// row governs it, and setting it removes a layer. (name, what it removes,
+/// remedy). `NOO_SELF_CALL_SHARED_SECRET` is also a posture bridge; the scan
+/// reads both the env and the gateway's running value.
+pub(crate) const ENV_HATCHES: &[(&str, &str, &str)] = &[
+    (
+        "NOO_SELF_CALL_SHARED_SECRET",
+        "a shared-secret token buys inference instead of a per-consumer key",
+        "unset it (and `noo security posture set NOO_SELF_CALL_SHARED_SECRET 0`), then `noo stack restart --force`",
+    ),
+    (
+        "NOO_NATS_ALLOW_ANONYMOUS",
+        "bus clients may connect without a per-principal credential",
+        "remove it from .env / compose_env and recreate the services (`noo stack restart --force`)",
+    ),
+    (
+        "NOO_ALLOW_LOCAL_PYTHON_EXEC",
+        "the Python worker runs python_exec in-process with no sandbox",
+        "remove it from the environment; it is refused outside a dev profile",
+    ),
+];
+
+/// Is an env-style flag value "on"?
+pub(crate) fn flag_is_on(v: &str) -> bool {
+    matches!(v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "open")
+}
+
+/// Why mTLS enforcement is NOT on, or `None` when it is. The gateway's own
+/// rule (`tls::mtls_mode_of`): `false/0/no/off` is an explicit opt-out;
+/// unset/empty/anything else is ON when a usable CA exists and OFF without
+/// one. `raw` is the value as the gateway's environment carries it, so the
+/// default flip in the gateway needs no change here — only the EFFECTIVE
+/// result is judged, never the env literal alone.
+pub(crate) fn mtls_off_reason(raw: Option<&str>, ca_usable: bool) -> Option<String> {
+    let v = raw.unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+    match v.as_str() {
+        "0" | "false" | "no" | "off" => Some(format!("NOO_MTLS_GATEWAY={v} switches client-certificate enforcement off")),
+        "1" | "true" | "yes" | "on" => None, // on (a missing CA is the gateway's own boot refusal)
+        _ if ca_usable => None,
+        _ => Some("no cluster CA exists, so there is nothing to verify client certificates against".into()),
+    }
 }
 
 /// Values that are published somewhere in this repository, its docs, or the
@@ -266,7 +342,7 @@ pub(crate) fn is_published_placeholder(v: &str) -> bool {
     PUBLISHED_PLACEHOLDERS.iter().any(|p| *p == v)
 }
 
-type Finding = (&'static str, &'static str, String); // (severity, check, detail)
+pub(crate) type Finding = (&'static str, &'static str, String); // (severity, check, detail)
 
 /// The check list from `security_cli.py::security_scan`, finding-for-finding
 /// (same wording, same severities). Returns findings in insertion order;
@@ -297,7 +373,7 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
 
     if store_readable {
         // JWT secret
-        if i.jwt_secret.is_empty() || i.jwt_secret == "dev-secret-change-in-production" {
+        if i.jwt_secret.is_empty() || is_published_placeholder(&i.jwt_secret) {
             issues.push(("CRITICAL", "JWT Secret", "Default or unset — set NOO_JWT_SECRET".into()));
         }
 
@@ -306,6 +382,12 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
         // Cluster secret
         if i.cluster_secret.is_empty() {
             issues.push(("HIGH", "Cluster Secret", "Empty — set NOO_CLUSTER_SECRET".into()));
+        } else if is_published_placeholder(&i.cluster_secret) {
+            issues.push((
+                "CRITICAL",
+                "Cluster Secret",
+                "A published placeholder, not a secret — every node's credential is forgeable; rotate it: noo security secrets rotate NOO_CLUSTER_SECRET".into(),
+            ));
         }
 
         // Redis password
@@ -320,6 +402,115 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
         if i.node_agent_token.is_empty() {
             issues.push(("HIGH", "Node Agent Token", "Unset — set NOO_NODE_AGENT_TOKEN".into()));
         }
+
+        // Controller secret: the gateway refuses to boot without it, and a
+        // published placeholder is no better than none.
+        match i.posture.controller_secret.as_deref() {
+            Some("") => issues.push((
+                "HIGH",
+                "Controller Secret",
+                "Empty — the gateway refuses to start without NOO_CONTROLLER_SECRET; mint it: noo security secrets rotate NOO_CONTROLLER_SECRET".into(),
+            )),
+            Some(v) if is_published_placeholder(v) => issues.push((
+                "CRITICAL",
+                "Controller Secret",
+                "A published placeholder, not a secret — whoever knows it is the operator; rotate it: noo security secrets rotate NOO_CONTROLLER_SECRET".into(),
+            )),
+            _ => {}
+        }
+
+        // Bootstrap admin password (only a fallback until the first admin
+        // row exists, but a published word there is a login).
+        if let Some(pw) = i.posture.admin_password.as_deref().filter(|p| !p.trim().is_empty()) {
+            if is_published_placeholder(pw) {
+                issues.push((
+                    "CRITICAL",
+                    "Admin Password",
+                    "NOO_ADMIN_PASSWORD is a published placeholder — reset it: noo security admin-password reset".into(),
+                ));
+            } else if pw.trim().chars().count() < 12 {
+                issues.push((
+                    "HIGH",
+                    "Admin Password",
+                    "NOO_ADMIN_PASSWORD is shorter than 12 characters — reset it: noo security admin-password reset".into(),
+                ));
+            }
+        }
+
+        // The audit log's signing key.
+        if i.posture.audit_key_missing {
+            issues.push((
+                "CRITICAL",
+                "Audit Key",
+                "NOO_AUDIT_HMAC_KEY is not set: the gateway refuses to start, and no security audit row can be written — mint it: noo upgrade --stack (or noo stack restart, which mints it into the encrypted store)".into(),
+            ));
+        }
+    }
+
+    // mTLS enforcement, judged on its EFFECTIVE value (env or .env, plus
+    // whether a CA exists), not on the literal alone.
+    if let Some(why) = &i.posture.mtls_off {
+        issues.push((
+            "HIGH",
+            "mTLS Enforcement",
+            format!("not enforced: {why} — a node can present a fleet token naming another node; remove NOO_MTLS_GATEWAY=false from .env and recreate the gateway (noo stack restart --force)"),
+        ));
+    }
+
+    // CSP: opt-in by default (the dashboard is a prebuilt artifact), so only
+    // an EXPLICIT off is a finding — somebody turned it off.
+    if let Some(v) = i.posture.csp_raw.as_deref() {
+        if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no") {
+            issues.push((
+                "MEDIUM",
+                "CSP",
+                format!("NOO_CSP={} turns the Content-Security-Policy off — remove it or set NOO_CSP=1, then recreate the gateway", v.trim()),
+            ));
+        }
+    }
+
+    // Env-only hatches.
+    for name in &i.posture.env_hatches {
+        let (what, fix) = ENV_HATCHES
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, w, f)| (*w, *f))
+            .unwrap_or(("a security layer is removed", "unset it"));
+        issues.push(("HIGH", "Escape Hatch", format!("{name} is set: {what} — {fix}")));
+    }
+
+    // Exec approval. `auto` removes the human from HIGH-risk calls.
+    let bad_mode = |m: &str| !matches!(m.trim().to_ascii_lowercase().as_str(), "strict" | "approval");
+    if let Some(m) = i.posture.exec_approval_running.as_deref().filter(|m| bad_mode(m)) {
+        issues.push((
+            "HIGH",
+            "Exec Approval",
+            format!("the gateway is RUNNING exec approval mode '{m}': HIGH-risk tool calls proceed without a human — noo security posture set NOO_EXEC_APPROVAL_MODE strict, then noo stack restart gateway"),
+        ));
+    } else if let Some(m) = i.posture.exec_approval_desired.as_deref().filter(|m| bad_mode(m)) {
+        issues.push((
+            "MEDIUM",
+            "Exec Approval",
+            format!("posture is set to '{m}' (takes effect at the next gateway restart) — noo security posture set NOO_EXEC_APPROVAL_MODE strict"),
+        ));
+    }
+
+    // Sandbox isolation downgrade.
+    if i.posture.sandbox_isolation.as_deref().map(|v| v.trim().eq_ignore_ascii_case("process")) == Some(true) {
+        issues.push((
+            "MEDIUM",
+            "Sandbox Isolation",
+            "NOO_SANDBOX_ISOLATION=process: per-call isolation is dropped to the container alone (bwrap is the default) — remove the override and recreate the sandbox".into(),
+        ));
+    }
+
+    // The node-agent container, as docker reports it.
+    if i.posture.node_agent_privileged == Some(true) {
+        issues.push((
+            "HIGH",
+            "Node Agent Privileged",
+            "the node-agent container is running --privileged (docker inspect) — noo security posture set NOO_NODE_AGENT_PRIVILEGED false (this recreates the node-agent; a GPU node may need the device reservation instead)".into(),
+        ));
     }
 
     // The RETIRED shared NATS credential. Every principal has
@@ -699,7 +890,237 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
-    let env_path = crate::envfile::repo_root().join(".env");
+    // WHAT is being scanned comes first, in the output and in the JSON. The
+    // root is chosen by a ranking (envfile::repo_root_source); an operator
+    // who is told only "JWT unset" cannot tell a bad install from a scan
+    // pointed at the wrong directory.
+    let (root, source) = crate::envfile::repo_root_source();
+    let enrolled = Path::new(crate::envfile::ENROLLED_CONTROLLER_URL).exists();
+    let mode = scan_mode(install_present(&root), enrolled);
+    let root_line = scanned_line(&root, source, mode);
+
+    let (mut issues, not_checked, checked, not_applicable, store_problem): (
+        Vec<Finding>,
+        Vec<String>,
+        Vec<String>,
+        Vec<&str>,
+        Option<crate::commands::secrets::StoreLoadError>,
+    ) = match mode {
+        ScanMode::Nothing => {
+            let why = format!(
+                "{root_line}: there is no noomesh install here and this host is not an enrolled node \
+                 (no {}), so there is nothing to scan — a verdict would describe an install that does not exist",
+                crate::envfile::ENROLLED_CONTROLLER_URL
+            );
+            if g.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "scanned": scanned_json(&root, source, mode),
+                        "issues": [], "criticals": 0, "strict": strict, "ok": false,
+                        "store_problem": null, "not_checked": [why],
+                    })
+                );
+            } else {
+                println!("{}", ui::muted(&root_line));
+                println!("{}", ui::status_line(Glyph::Err, &why));
+                ui::guide(&[("noo onboard", "set up an install here, or enrol this host as a node")]);
+            }
+            return Ok(1);
+        }
+        ScanMode::Node => {
+            let report = super::security_scan_node::node_report(&super::security_scan_node::gather_node_facts());
+            (
+                report.findings,
+                report.not_checked,
+                report.checked,
+                super::security_scan_node::NOT_APPLICABLE_ON_A_NODE.to_vec(),
+                None,
+            )
+        }
+        ScanMode::Install => {
+            let (findings, nc, ck, sp) = install_findings(g, &root);
+            (findings, nc, ck, Vec::new(), sp)
+        }
+    };
+    issues.sort_by_key(|(sev, _, _)| severity_rank(sev)); // stable, Python parity
+
+    if g.json {
+        let items: Vec<serde_json::Value> = issues
+            .iter()
+            .map(|(sev, check, detail)| {
+                serde_json::json!({ "severity": sev, "check": check, "detail": detail })
+            })
+            .collect();
+        let criticals = issues.iter().filter(|(s, _, _)| *s == "CRITICAL").count();
+        println!(
+            "{}",
+            serde_json::json!({
+                "scanned": scanned_json(&root, source, mode),
+                "issues": items,
+                "criticals": criticals,
+                "strict": strict,
+                "ok": scan_exit(&issues, strict) == 0,
+                // A gate reading this must know when the credential checks
+                // did not run at all (null = the store was read or absent).
+                "store_problem": store_problem.as_ref().map(|e| e.kind()),
+                // What could not be seen: never to be read as a pass.
+                "not_checked": not_checked,
+                "checked": checked,
+                "not_applicable": not_applicable,
+            })
+        );
+        return Ok(scan_exit(&issues, strict));
+    }
+
+    println!("{}", ui::muted(&root_line));
+    let print_unseen = || {
+        if !checked.is_empty() {
+            println!("{}", ui::muted(&format!("checked: {}", checked.join("; "))));
+        }
+        for n in &not_checked {
+            println!("{}", ui::status_line(Glyph::Warn, &not_checked_line(n)));
+        }
+        if !not_applicable.is_empty() {
+            println!("{}", ui::muted(&format!("not applicable on a node: {}", not_applicable.join(", "))));
+        }
+    };
+
+    if issues.is_empty() {
+        print_unseen();
+        // "no issues" is a statement about what was seen; with unseen
+        // surfaces it must not read as the whole picture.
+        let msg = if not_checked.is_empty() {
+            "no security issues found".to_string()
+        } else {
+            format!("no security issues found in what was checked ({} surface(s) NOT checked, above)", not_checked.len())
+        };
+        println!("{}", ui::status_line(if not_checked.is_empty() { Glyph::Ok } else { Glyph::Warn }, &msg));
+        return Ok(0);
+    }
+
+    let criticals = issues.iter().filter(|(s, _, _)| *s == "CRITICAL").count();
+    println!("{}", ui::header("security scan", Some(&format!("{} findings · {criticals} critical", issues.len()))));
+    println!("{}", ui::section("findings"));
+    let rows: Vec<Vec<String>> = issues
+        .iter()
+        .map(|(sev, check, detail)| {
+            let (glyph, word) = match *sev {
+                "CRITICAL" => (Glyph::Err, ui::err("critical")),
+                "HIGH" | "MEDIUM" | "WARNING" => (Glyph::Warn, ui::warn(&sev.to_ascii_lowercase())),
+                _ => (Glyph::Bullet, ui::muted(&sev.to_ascii_lowercase())),
+            };
+            vec![ui::glyph_cell(glyph), word, check.to_string(), detail.to_string()]
+        })
+        .collect();
+    print!("{}", ui::table(&[Col::left(""), Col::left("severity"), Col::left("check"), Col::left("detail")], &rows));
+    print_unseen();
+    if criticals > 0 {
+        println!("{}", ui::status_line(Glyph::Err, &format!("{criticals} critical issue(s) found")));
+        ui::guide(&[("noo security scan --json", "machine-readable findings for a ticket or a CI gate")]);
+    } else if strict {
+        println!("{}", ui::status_line(Glyph::Warn, &format!("{} finding(s); --strict fails on any of them", issues.len())));
+    }
+    Ok(scan_exit(&issues, strict))
+}
+
+/// What the scan is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    /// A controller / standalone install: files, store, gateway.
+    Install,
+    /// An enrolled node with no install of its own: the node's surfaces.
+    Node,
+    /// Neither. Nothing to scan.
+    Nothing,
+}
+
+/// The decision. An enrolled node with no install is a NODE even though a
+/// `~/.noo` directory name resolves; an install wins whenever one exists
+/// (a controller is enrolled with itself and has both).
+pub(crate) fn scan_mode(install_present: bool, enrolled: bool) -> ScanMode {
+    match (install_present, enrolled) {
+        (true, _) => ScanMode::Install,
+        (false, true) => ScanMode::Node,
+        (false, false) => ScanMode::Nothing,
+    }
+}
+
+/// Does `root` hold a noomesh install, or does this process carry the
+/// install's secrets in its environment?
+fn install_present(root: &Path) -> bool {
+    root.join("docker-compose.cluster.yml").exists()
+        || root.join(".env").exists()
+        || root.join("secrets/env.sops").exists()
+        || !env_var("NOO_JWT_SECRET").is_empty()
+}
+
+/// The first line of the output: what was scanned and how it was chosen.
+pub(crate) fn scanned_line(root: &Path, source: crate::envfile::RootSource, mode: ScanMode) -> String {
+    match mode {
+        ScanMode::Node => format!(
+            "scanning this host as an enrolled node (controller url in {}); no install at {} (root chosen by {})",
+            crate::envfile::ENROLLED_CONTROLLER_URL,
+            root.display(),
+            source.describe()
+        ),
+        _ => format!("scanning {} (chosen by {})", root.display(), source.describe()),
+    }
+}
+
+fn scanned_json(root: &Path, source: crate::envfile::RootSource, mode: ScanMode) -> serde_json::Value {
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "chosen_by": source.label(),
+        "mode": match mode { ScanMode::Install => "install", ScanMode::Node => "node", ScanMode::Nothing => "nothing" },
+    })
+}
+
+/// One "could not see this" line.
+fn not_checked_line(what: &str) -> String {
+    format!("NOT CHECKED: {what}")
+}
+
+/// A flag env var that is on: the process env, else the install's `.env`.
+fn env_or_dotenv(root: &Path, key: &str) -> Option<String> {
+    let v = env_var(key);
+    if !v.is_empty() {
+        return Some(v);
+    }
+    let text = std::fs::read_to_string(root.join(".env")).ok()?;
+    let prefix = format!("{key}=");
+    text.lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+}
+
+/// Read `posture list`'s JSON for the two rows the scan judges.
+/// `(exec running, exec desired, shared-secret bridge running)`.
+pub(crate) fn posture_view(body: &serde_json::Value) -> (Option<String>, Option<String>, bool) {
+    let empty = Vec::new();
+    let gates = body["posture"].as_array().unwrap_or(&empty);
+    let row = |k: &str| gates.iter().find(|g| g["key"] == k);
+    let exec = row("NOO_EXEC_APPROVAL_MODE");
+    (
+        exec.and_then(|g| g["running"].as_str()).map(String::from),
+        exec.and_then(|g| g["db_value"].as_str()).map(String::from),
+        row("NOO_SELF_CALL_SHARED_SECRET")
+            .and_then(|g| g["running"].as_str())
+            .is_some_and(flag_is_on),
+    )
+}
+
+/// The controller / standalone install scan: gather every input, judge it,
+/// and report what could not be seen. `(findings, not checked, checked,
+/// store problem)`.
+fn install_findings(
+    g: &Globals,
+    root: &Path,
+) -> (Vec<Finding>, Vec<String>, Vec<String>, Option<crate::commands::secrets::StoreLoadError>) {
+    let mut not_checked: Vec<String> = Vec::new();
+    let mut checked: Vec<String> = Vec::new();
+    let env_path = root.join(".env");
     let (env_mode, env_on_ntfs) = match std::fs::metadata(&env_path) {
         Ok(md) => {
             use std::os::unix::fs::MetadataExt as _;
@@ -719,6 +1140,53 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         crate::envfile::StoreState::Unreadable(e) => Some(e),
         _ => None,
     };
+
+    // Gateway-side posture, read the way `cluster verify` reads it. Needs an
+    // operator login; without one the rows below are NOT CHECKED, not fine.
+    let posture_body = get_posture(g);
+    let (exec_running, exec_desired, self_call_running) = match &posture_body {
+        Some(b) => {
+            checked.push("gateway posture (exec approval mode, shared-secret bridge)".into());
+            posture_view(b)
+        }
+        None => {
+            not_checked.push(
+                "gateway posture (exec approval mode, shared-secret bridge): the gateway did not answer or no \
+                 operator login is stored — noo auth login, then re-run"
+                    .into(),
+            );
+            (None, None, false)
+        }
+    };
+
+    // The node-agent container, as docker reports it.
+    let privileged = if root.join("docker-compose.cluster.yml").exists() {
+        match super::security::node_agent_privileged_actual() {
+            Ok(p) => {
+                checked.push("node-agent container privilege (docker inspect)".into());
+                Some(p)
+            }
+            Err(why) => {
+                not_checked.push(format!("node-agent container privilege: {why}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut hatches: Vec<String> = ENV_HATCHES
+        .iter()
+        .filter(|(n, _, _)| *n != "NOO_SELF_CALL_SHARED_SECRET")
+        .filter(|(n, _, _)| env_or_dotenv(root, n).is_some_and(|v| flag_is_on(&v)))
+        .map(|(n, _, _)| n.to_string())
+        .collect();
+    if env_or_dotenv(root, "NOO_SELF_CALL_SHARED_SECRET").is_some_and(|v| flag_is_on(&v)) || self_call_running {
+        hatches.insert(0, "NOO_SELF_CALL_SHARED_SECRET".to_string());
+    }
+    let ca_usable = pki_dir().join("ca.crt").exists();
+    let mtls_raw = env_or_dotenv(root, "NOO_MTLS_GATEWAY");
+
     let inputs = ScanInputs {
         jwt_secret: env_var("NOO_JWT_SECRET"),
         cluster_secret: env_var("NOO_CLUSTER_SECRET"),
@@ -727,12 +1195,12 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         env_mode,
         env_on_ntfs,
         tls_cert: env_var("NOO_TLS_CERT"),
-        pki_ca_exists: pki_dir().join("ca.crt").exists(),
+        pki_ca_exists: ca_usable,
         gateway_url: gateway_url.clone(),
         gateway_trust: crate::http::resolve_trust(&gateway_url),
         grafana_password: env_var("GRAFANA_PASSWORD"),
         lingering_passphrase_files: crate::commands::secrets_reveal::lingering_plaintext(|rel| {
-            crate::envfile::repo_root().join(rel).exists()
+            root.join(rel).exists()
         })
         .into_iter()
         .map(String::from)
@@ -757,7 +1225,7 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .filter(|k| !env_var(k).trim().is_empty())
             .map(|k| k.to_string())
             .collect(),
-        runtime_residue: runtime_residue_files(&crate::envfile::repo_root()),
+        runtime_residue: runtime_residue_files(root),
         // The shared-NATS names have their own finding ("Retired NATS
         // Credential", which also names the stale node-side lines); keep
         // them out of the generic one so a key is reported once.
@@ -767,62 +1235,26 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             .filter(|(k, _)| !env_var(k).trim().is_empty())
             .map(|(k, _)| (*k).to_string())
             .collect(),
-        env_plaintext_secrets: crate::commands::plaintext_env::AtRest::read(&crate::envfile::repo_root())
-            .plaintext_problem(),
+        env_plaintext_secrets: crate::commands::plaintext_env::AtRest::read(root).plaintext_problem(),
+        posture: PostureInputs {
+            controller_secret: Some(env_var("NOO_CONTROLLER_SECRET")),
+            admin_password: Some(env_var("NOO_ADMIN_PASSWORD")).filter(|p| !p.is_empty()),
+            audit_key_missing: env_var("NOO_AUDIT_HMAC_KEY").trim().is_empty(),
+            mtls_off: mtls_off_reason(mtls_raw.as_deref(), ca_usable),
+            csp_raw: env_or_dotenv(root, "NOO_CSP"),
+            env_hatches: hatches,
+            exec_approval_running: exec_running,
+            exec_approval_desired: exec_desired,
+            sandbox_isolation: env_or_dotenv(root, "NOO_SANDBOX_ISOLATION"),
+            node_agent_privileged: privileged,
+        },
     };
-    let mut issues = scan_findings(&inputs);
-    issues.sort_by_key(|(sev, _, _)| severity_rank(sev)); // stable, Python parity
+    (scan_findings(&inputs), not_checked, checked, store_problem)
+}
 
-    if g.json {
-        let items: Vec<serde_json::Value> = issues
-            .iter()
-            .map(|(sev, check, detail)| {
-                serde_json::json!({ "severity": sev, "check": check, "detail": detail })
-            })
-            .collect();
-        let criticals = issues.iter().filter(|(s, _, _)| *s == "CRITICAL").count();
-        println!(
-            "{}",
-            serde_json::json!({
-                "issues": items,
-                "criticals": criticals,
-                "strict": strict,
-                "ok": scan_exit(&issues, strict) == 0,
-                // A gate reading this must know when the credential checks
-                // did not run at all (null = the store was read or absent).
-                "store_problem": store_problem.as_ref().map(|e| e.kind()),
-            })
-        );
-        return Ok(scan_exit(&issues, strict));
-    }
-
-    if issues.is_empty() {
-        println!("{}", ui::status_line(Glyph::Ok, "no security issues found"));
-        return Ok(0);
-    }
-
-    let criticals = issues.iter().filter(|(s, _, _)| *s == "CRITICAL").count();
-    println!("{}", ui::header("security scan", Some(&format!("{} findings · {criticals} critical", issues.len()))));
-    println!("{}", ui::section("findings"));
-    let rows: Vec<Vec<String>> = issues
-        .iter()
-        .map(|(sev, check, detail)| {
-            let (glyph, word) = match *sev {
-                "CRITICAL" => (Glyph::Err, ui::err("critical")),
-                "HIGH" | "MEDIUM" | "WARNING" => (Glyph::Warn, ui::warn(&sev.to_ascii_lowercase())),
-                _ => (Glyph::Bullet, ui::muted(&sev.to_ascii_lowercase())),
-            };
-            vec![ui::glyph_cell(glyph), word, check.to_string(), detail.to_string()]
-        })
-        .collect();
-    print!("{}", ui::table(&[Col::left(""), Col::left("severity"), Col::left("check"), Col::left("detail")], &rows));
-    if criticals > 0 {
-        println!("{}", ui::status_line(Glyph::Err, &format!("{criticals} critical issue(s) found")));
-        ui::guide(&[("noo security scan --json", "machine-readable findings for a ticket or a CI gate")]);
-    } else if strict {
-        println!("{}", ui::status_line(Glyph::Warn, &format!("{} finding(s); --strict fails on any of them", issues.len())));
-    }
-    Ok(scan_exit(&issues, strict))
+/// The gateway's posture list, or `None` when it could not be read.
+fn get_posture(g: &Globals) -> Option<serde_json::Value> {
+    crate::http::get_json_opt(g, "/api/security/posture", true, 5)
 }
 
 /// The verdict. Kept apart from the printing so it can be tested without a
@@ -4695,6 +5127,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            posture: PostureInputs::default(),
         }
     }
 
@@ -4990,6 +5423,148 @@ mod tests {
         assert!(scan_findings(&clean_inputs()).iter().all(|(_, c, _)| *c != "Secrets At Rest"));
     }
 
+    fn posture_with(f: impl FnOnce(&mut PostureInputs)) -> Vec<Finding> {
+        let mut i = clean_inputs();
+        f(&mut i.posture);
+        scan_findings(&i)
+    }
+
+    fn has(f: &[Finding], sev: &str, check: &str) -> bool {
+        f.iter().any(|(s, c, _)| *s == sev && *c == check)
+    }
+
+    /// A clean fixture stays clean: the new checks fire only on a cause.
+    #[test]
+    fn the_posture_checks_are_quiet_on_a_good_install() {
+        assert!(scan_findings(&clean_inputs()).is_empty());
+        let f = posture_with(|p| {
+            p.controller_secret = Some("a-real-generated-secret".into());
+            p.admin_password = Some("correct-horse-battery-staple".into());
+            p.exec_approval_running = Some("strict".into());
+            p.exec_approval_desired = Some("approval".into());
+            p.csp_raw = Some("1".into());
+            p.sandbox_isolation = Some("bwrap".into());
+            p.node_agent_privileged = Some(false);
+        });
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn a_missing_audit_key_is_critical() {
+        let f = posture_with(|p| p.audit_key_missing = true);
+        assert!(has(&f, "CRITICAL", "Audit Key"), "{f:?}");
+        let (_, _, detail) = f.iter().find(|(_, c, _)| *c == "Audit Key").unwrap();
+        assert!(detail.contains("noo upgrade --stack"), "{detail}");
+    }
+
+    #[test]
+    fn published_placeholders_are_caught_for_every_secret() {
+        let mut i = clean_inputs();
+        i.jwt_secret = "Changeme".into();
+        i.cluster_secret = "secret".into();
+        i.posture.controller_secret = Some("password".into());
+        i.posture.admin_password = Some("admin".into());
+        let f = scan_findings(&i);
+        for c in ["JWT Secret", "Cluster Secret", "Controller Secret", "Admin Password"] {
+            assert!(has(&f, "CRITICAL", c), "{c}: {f:?}");
+        }
+        // An empty controller secret is HIGH (the gateway refuses to boot), and
+        // a short admin password is HIGH without echoing the value.
+        let f = posture_with(|p| {
+            p.controller_secret = Some(String::new());
+            p.admin_password = Some("short1".into());
+        });
+        assert!(has(&f, "HIGH", "Controller Secret") && has(&f, "HIGH", "Admin Password"), "{f:?}");
+        assert!(f.iter().all(|(_, _, d)| !d.contains("short1")));
+    }
+
+    /// The mTLS verdict is the EFFECTIVE value, mirroring the gateway's own
+    /// rule, so the default flipping to on changes nothing here.
+    #[test]
+    fn mtls_is_judged_on_its_effective_value_not_the_literal() {
+        for off in ["false", "0", "No", "OFF", "\"false\""] {
+            assert!(mtls_off_reason(Some(off), true).is_some(), "{off}");
+        }
+        for on in [None, Some(""), Some("true"), Some("1"), Some("maybe")] {
+            assert!(mtls_off_reason(on, true).is_none(), "{on:?}");
+        }
+        // Unset with no CA: nothing to verify against, so NOT enforcing.
+        assert!(mtls_off_reason(None, false).unwrap().contains("no cluster CA"));
+        assert!(mtls_off_reason(Some("true"), false).is_none());
+        let f = posture_with(|p| p.mtls_off = mtls_off_reason(Some("false"), true));
+        assert!(has(&f, "HIGH", "mTLS Enforcement"), "{f:?}");
+    }
+
+    #[test]
+    fn csp_is_flagged_only_when_explicitly_off() {
+        for off in ["0", "off", "false"] {
+            assert!(has(&posture_with(|p| p.csp_raw = Some(off.into())), "MEDIUM", "CSP"), "{off}");
+        }
+        for fine in [None, Some("1"), Some("default-src 'self'")] {
+            let f = posture_with(|p| p.csp_raw = fine.map(String::from));
+            assert!(!has(&f, "MEDIUM", "CSP"), "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn env_only_hatches_are_high_and_name_the_remedy() {
+        let f = posture_with(|p| p.env_hatches = ENV_HATCHES.iter().map(|(n, _, _)| n.to_string()).collect());
+        assert_eq!(f.iter().filter(|(s, c, _)| *s == "HIGH" && *c == "Escape Hatch").count(), 3, "{f:?}");
+        for (n, _, fix) in ENV_HATCHES {
+            assert!(f.iter().any(|(_, _, d)| d.contains(n) && d.contains(fix)), "{n}");
+        }
+        assert!(flag_is_on(" TRUE ") && flag_is_on("1") && flag_is_on("\"yes\"") && !flag_is_on("0") && !flag_is_on(""));
+    }
+
+    #[test]
+    fn exec_approval_other_than_strict_or_approval_is_high_and_pending_is_medium() {
+        let f = posture_with(|p| p.exec_approval_running = Some("auto".into()));
+        assert!(has(&f, "HIGH", "Exec Approval"), "{f:?}");
+        let f = posture_with(|p| {
+            p.exec_approval_running = Some("strict".into());
+            p.exec_approval_desired = Some("auto".into());
+        });
+        assert!(has(&f, "MEDIUM", "Exec Approval") && !has(&f, "HIGH", "Exec Approval"), "{f:?}");
+        // unset running = the code default (strict): nothing to report
+        assert!(posture_with(|p| p.exec_approval_running = None).is_empty());
+    }
+
+    #[test]
+    fn process_isolation_and_a_privileged_node_agent_are_findings() {
+        let f = posture_with(|p| {
+            p.sandbox_isolation = Some("process".into());
+            p.node_agent_privileged = Some(true);
+        });
+        assert!(has(&f, "MEDIUM", "Sandbox Isolation") && has(&f, "HIGH", "Node Agent Privileged"), "{f:?}");
+        // Not seen (None) is NOT a pass and NOT a finding: the caller lists it.
+        assert!(posture_with(|p| p.node_agent_privileged = None).is_empty());
+    }
+
+    #[test]
+    fn posture_view_reads_the_running_and_desired_rows() {
+        let body = serde_json::json!({"posture": [
+            {"key": "NOO_EXEC_APPROVAL_MODE", "running": "strict", "db_value": "approval"},
+            {"key": "NOO_SELF_CALL_SHARED_SECRET", "running": "1", "db_value": "1"},
+        ]});
+        assert_eq!(posture_view(&body), (Some("strict".into()), Some("approval".into()), true));
+        assert_eq!(posture_view(&serde_json::json!({})), (None, None, false));
+    }
+
+    /// Which root, how it was chosen, and whether it is a node — the first
+    /// line of every scan.
+    #[test]
+    fn the_scan_names_its_root_and_its_mode() {
+        assert_eq!(scan_mode(true, false), ScanMode::Install);
+        assert_eq!(scan_mode(true, true), ScanMode::Install, "a controller is enrolled with itself");
+        assert_eq!(scan_mode(false, true), ScanMode::Node);
+        assert_eq!(scan_mode(false, false), ScanMode::Nothing);
+        let line = scanned_line(Path::new("/home/u/.noo"), crate::envfile::RootSource::Derived, ScanMode::Install);
+        assert!(line.starts_with("scanning /home/u/.noo (chosen by ") && line.contains("derived"), "{line}");
+        let line = scanned_line(Path::new("/home/u/.noo"), crate::envfile::RootSource::Derived, ScanMode::Node);
+        assert!(line.contains("enrolled node") && line.contains("no install at /home/u/.noo"), "{line}");
+        assert_eq!(scanned_json(Path::new("/x"), crate::envfile::RootSource::Declared, ScanMode::Node)["mode"], "node");
+    }
+
     #[test]
     fn scan_full_check_list_and_severity_sort() {
         // Everything unset/missing → all 8 checks fire; sorted stably by
@@ -5015,6 +5590,7 @@ mod tests {
             runtime_residue: Vec::new(),
             retired_store_keys: Vec::new(),
             env_plaintext_secrets: None,
+            posture: PostureInputs::default(),
         };
         let mut f = scan_findings(&i);
         f.sort_by_key(|(sev, _, _)| severity_rank(sev));
