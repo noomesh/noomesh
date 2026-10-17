@@ -4201,13 +4201,20 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // Kiosk SEATS (i77): their own registry, joined here explicitly — a
         // seat never appears in /api/cluster/nodes, so nothing above judged
         // it. Fleet-wide only (a named-node verify is about those nodes).
-        // An older gateway without the registry, or no seat enrolled, adds
-        // nothing.
+        // An older gateway without the registry adds nothing; a registry
+        // with no seat says so (the 0.6.6-rc.1 rehearsal read silence as
+        // "seats not checked").
         if nodes.is_empty() {
-            let seats = crate::commands::kiosk_seat::list_seats(g).unwrap_or_default();
+            let listed = crate::commands::kiosk_seat::list_seats(g);
+            let seats = listed.clone().unwrap_or_default();
             let mut seat_json = Vec::new();
-            if !seats.is_empty() && !g.json {
-                println!("{}", ui::section(&format!("Seats ({})", seats.len())));
+            if !g.json {
+                if let Some((heading, empty_line)) = seats_heading(listed.as_ref().map(Vec::len)) {
+                    println!("{}", ui::section(&heading));
+                    if let Some(line) = empty_line {
+                        println!("{}", ui::note(line));
+                    }
+                }
             }
             for s in &seats {
                 let name = s["seat_name"].as_str().unwrap_or("?");
@@ -4608,8 +4615,29 @@ pub(crate) fn heard_since(n: &Value, since: i64) -> bool {
     n["last_heartbeat"].as_str().and_then(parse_rfc3339_unix).is_some_and(|t| t >= since)
 }
 
+/// The human Seats section header, by what the seat registry returned:
+/// `None` (an older gateway without one) prints nothing; an empty registry
+/// prints the section with one line naming the verb that enrols a seat.
+pub(crate) fn seats_heading(count: Option<usize>) -> Option<(String, Option<&'static str>)> {
+    let n = count?;
+    Some((format!("Seats ({n})"), (n == 0).then_some(NO_SEATS_LINE)))
+}
+
+pub(crate) const NO_SEATS_LINE: &str = "no seats enrolled (noo kiosk seat-token <seat> mints one)";
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seats_section_prints_when_no_seat_is_enrolled() {
+        let (heading, line) = super::seats_heading(Some(0)).expect("an empty registry must still print the section");
+        assert_eq!(heading, "Seats (0)");
+        assert_eq!(line, Some("no seats enrolled (noo kiosk seat-token <seat> mints one)"));
+        let (heading, line) = super::seats_heading(Some(2)).unwrap();
+        assert_eq!(heading, "Seats (2)");
+        assert_eq!(line, None, "enrolled seats render their own rows");
+        assert_eq!(super::seats_heading(None), None, "an older gateway without the registry stays silent");
+    }
+
     /// The `model classes` row: declared candidates must be
     /// placed or available; unplaced → WARN naming class + node with the
     /// placement that fixes it; a class with nothing routable → FAIL.

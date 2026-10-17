@@ -315,6 +315,11 @@ jobs:
         else
           pip install -e ".[dev,web,cache,db]"
         fi
+        # tests/test_whisper_server_decode.py runs the REAL faster-whisper
+        # decode_audio against the PyAV the whisper image pins — read from
+        # the Dockerfile so the test and the image cannot drift. A floating
+        # av (19.0.1) broke STT silently in stack 0.6.5.
+        pip install $(grep -oE '\b(faster-whisper|av|requests|python-multipart)==[0-9][0-9.]*' docker/Dockerfile.whisper)
     - name: Lint with ruff
       run: ruff check src/
 

@@ -220,14 +220,14 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     // `tier: intelligent` with an empty feature list unlocked nothing.
     let unlocks = crate::commands::addons::addons_granted_by(&ent.features);
     let unlock_names: Vec<&str> = unlocks.iter().map(|r| r.key).collect();
-    let (enabled, failed) = if enable {
+    let (enabled, failed, principals) = if enable {
         enable_unlocked(
             &crate::commands::addons::config_path(),
             &unlock_names,
             &mut crate::commands::addon_enable::Live { g, force: false },
         )
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), crate::commands::addon_enable::PrincipalStep::Unchanged)
     };
 
     if g.json {
@@ -237,6 +237,7 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
             "enabled": enabled.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             "enable": enabled.iter().map(|(k, e)| crate::commands::addon_enable::report_json(k, e)).collect::<Vec<_>>(),
             "failed": failed.iter().map(|(k, r)| serde_json::json!({"addon": k, "error": r.why, "fix": r.fix})).collect::<Vec<_>>(),
+            "nats_principals": crate::commands::addon_enable::principals_json(&principals),
             "restart_required": !enabled.is_empty(),
         }));
     } else {
@@ -251,6 +252,7 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
             for (k, e) in &enabled {
                 crate::commands::addon_enable::report(k, e);
             }
+            crate::commands::addon_enable::report_principals(&principals);
             for (k, r) in &failed {
                 ui::failed(
                     &format!("{k} not enabled: {} — noomesh.yaml is unchanged for it; the licence IS installed", r.why),
@@ -284,6 +286,11 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 /// declared on over credentials nobody minted (the stack-v0.2.80 rehearsal:
 /// the next restart crash-looped the gateway). One add-on's refusal does not
 /// stop the next.
+///
+/// Then, once, after every switch: the add-on NATS principals (mint, render,
+/// HUP), exactly as `noo addons enable` and `noo upgrade --stack` do. Before
+/// this the fresh-install path skipped it and intel ran on the worker
+/// fallback until the next `upgrade --stack` (0.6.6-rc.1 rehearsal).
 pub(crate) fn enable_unlocked<'a>(
     config: &std::path::Path,
     names: &[&'a str],
@@ -297,7 +304,12 @@ pub(crate) fn enable_unlocked<'a>(
             Err(r) => failed.push((name.to_string(), r)),
         }
     }
-    (enabled, failed)
+    let principals = if enabled.is_empty() {
+        crate::commands::addon_enable::PrincipalStep::Unchanged
+    } else {
+        ops.reconcile_principals()
+    };
+    (enabled, failed, principals)
 }
 
 /// `noo security entitlement pubkey`: this controller's add-on key, the
@@ -389,7 +401,7 @@ mod enable_tests {
     fn install_enable_mints_credentials_and_the_key_before_flipping() {
         let p = scratch("ent-enable");
         let mut ops = Fake { declares_key: true, ..Default::default() };
-        let (enabled, failed) = enable_unlocked(&p, &["evolve"], &mut ops);
+        let (enabled, failed, _) = enable_unlocked(&p, &["evolve"], &mut ops);
         assert!(failed.is_empty(), "{failed:?}");
         let (_, e) = &enabled[0];
         assert!(
@@ -398,14 +410,49 @@ mod enable_tests {
             ops.calls
         );
         assert!(matches!(e.key, KeyStep::Issued { .. }), "no service key was provisioned: {:?}", ops.calls);
-        assert_eq!(ops.calls, ["pin:evolve", "plan:evolve", "mint:evolve", "issue:evolve"]);
+        assert_eq!(ops.calls, ["pin:evolve", "plan:evolve", "mint:evolve", "issue:evolve", "principals"]);
+    }
+
+    /// `entitlement install --enable` gives the add-on its own NATS
+    /// principal (mint + render + HUP) like `noo addons enable` — once,
+    /// AFTER the switch is written (the render reads what is declared on).
+    /// The 0.6.6-rc.1 rehearsal: fresh install, intel stayed on the worker
+    /// fallback until the next `noo upgrade --stack`.
+    #[test]
+    fn install_enable_renders_the_addon_nats_principals_after_the_switch() {
+        let p = scratch("ent-principals");
+        let mut ops = Fake { config: Some(p.clone()), ..Default::default() };
+        let (enabled, failed, principals) = enable_unlocked(&p, &["evolve", "trellion-intel"], &mut ops);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(enabled.len(), 2);
+        assert_eq!(
+            ops.calls.iter().filter(|c| *c == "principals").count(), 1,
+            "reconcile must run exactly once, after every add-on: {:?}", ops.calls
+        );
+        assert_eq!(ops.calls.last().map(String::as_str), Some("principals"), "{:?}", ops.calls);
+        assert!(
+            ops.declared_at_reconcile.iter().any(|a| a == "evolve")
+                && ops.declared_at_reconcile.iter().any(|a| a == "trellion-intel"),
+            "reconcile ran before the switches were written: saw {:?}", ops.declared_at_reconcile
+        );
+        assert!(matches!(principals, crate::commands::addon_enable::PrincipalStep::Rendered { .. }));
+    }
+
+    /// Nothing enabled, nothing to render: a refusal does not touch the bus.
+    #[test]
+    fn install_enable_refusal_does_not_reconcile() {
+        let p = scratch("ent-refuse-principals");
+        let mut ops = Fake { declares_key: true, fail_mint: true, ..Default::default() };
+        let (_, _, principals) = enable_unlocked(&p, &["evolve"], &mut ops);
+        assert!(!ops.calls.iter().any(|c| c == "principals"), "{:?}", ops.calls);
+        assert_eq!(principals, crate::commands::addon_enable::PrincipalStep::Unchanged);
     }
 
     #[test]
     fn install_enable_refusal_leaves_the_flag_off_and_is_reported() {
         let p = scratch("ent-refuse");
         let mut ops = Fake { declares_key: true, fail_mint: true, ..Default::default() };
-        let (enabled, failed) = enable_unlocked(&p, &["evolve"], &mut ops);
+        let (enabled, failed, _) = enable_unlocked(&p, &["evolve"], &mut ops);
         assert!(enabled.is_empty());
         assert_eq!(failed.len(), 1);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), CONFIG);
