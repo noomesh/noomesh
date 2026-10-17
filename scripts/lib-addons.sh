@@ -173,9 +173,9 @@ addon_licensed_names() {
 #      written by `noo addons enable|upgrade` after verifying the add-on's
 #      signed lock (dist starts re-verify the bytes: lib-dist.sh
 #      require_addon_pins → `noo addons launch-pins`);
-#   3. DEPRECATED, one release (0.6.4): docker-compose.<name>.yml beside this
-#      launcher, which an earlier CLI shipped, for an add-on whose lock
-#      predates bundles. Warns.
+# With neither, nothing is echoed: the caller refuses an enabled add-on
+# naming `noo addons upgrade <name>`. (The root docker-compose.<name>.yml an
+# earlier CLI shipped is not looked for any more.)
 addon_overlay() {
     _ao_name="$1"
     _ao_kebab="$(printf '%s' "$_ao_name" | tr '_' '-')"
@@ -186,9 +186,6 @@ addon_overlay() {
         printf '%s' "$_ao_base/docker-compose.$_ao_kebab.yml"
     elif [ -f "$_ao_here/addons/$_ao_name/docker-compose.yml" ]; then
         printf '%s' "$_ao_here/addons/$_ao_name/docker-compose.yml"
-    elif [ -f "$_ao_here/docker-compose.$_ao_kebab.yml" ]; then
-        echo "WARN: add-on $_ao_name runs the deprecated overlay $_ao_here/docker-compose.$_ao_kebab.yml: its signed lock predates overlay bundles. This fallback is removed in the next release — the add-on's release must re-sign a bundle for this stack, then: noo addons upgrade $_ao_name" >&2
-        printf '%s' "$_ao_here/docker-compose.$_ao_kebab.yml"
     fi
     return 0
 }

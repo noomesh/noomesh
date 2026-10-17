@@ -232,7 +232,7 @@ pub(crate) struct Outcome {
 }
 
 /// Every segment of a repo-relative path, percent-encoded; `/` kept.
-fn enc_path(p: &str) -> String {
+pub(crate) fn enc_path(p: &str) -> String {
     p.split('/')
         .map(|seg| {
             let mut out = String::new();
@@ -259,7 +259,7 @@ pub(crate) fn resolve_url(base: &str, a: &FetchArgs) -> String {
 }
 
 /// `HF_ENDPOINT` (the variable huggingface_hub honours), else huggingface.co.
-fn hf_base() -> String {
+pub(crate) fn hf_base() -> String {
     let b = std::env::var("HF_ENDPOINT").unwrap_or_default();
     let b = b.trim().trim_end_matches('/');
     if b.is_empty() { "https://huggingface.co".into() } else { b.to_string() }
@@ -362,7 +362,7 @@ pub(crate) fn remote_meta(base: &str, token: Option<&str>, a: &FetchArgs) -> Res
 
 /// GET with redirects followed by hand: `Range` goes on every hop, the token
 /// only to the Hugging Face origin (a CDN location is pre-signed).
-fn get_following(base: &str, url: &str, token: Option<&str>, range_from: u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr> {
+pub(crate) fn get_following(base: &str, url: &str, token: Option<&str>, range_from: u64) -> Result<ureq::http::Response<ureq::Body>, FetchErr> {
     let ag = agent();
     let hf_origin = origin(base).to_string();
     let mut cur = url.to_string();
@@ -508,7 +508,7 @@ pub(crate) fn fetch_to_store(
 /// The controller's Hugging Face token: process env first (the override
 /// lane; startup already filled it from the store, fill-only-unset), then
 /// the encrypted store itself. Never printed, never on argv.
-fn hf_token() -> Option<String> {
+pub(crate) fn hf_token() -> Option<String> {
     for k in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
         if let Ok(v) = std::env::var(k) {
             if !v.trim().is_empty() {
@@ -529,7 +529,7 @@ fn hf_token() -> Option<String> {
 
 // ── Command ─────────────────────────────────────────────────────────────
 
-fn human(n: u64) -> String {
+pub(crate) fn human(n: u64) -> String {
     const G: f64 = 1024.0 * 1024.0 * 1024.0;
     if n as f64 >= G { format!("{:.2} GB", n as f64 / G) } else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
 }

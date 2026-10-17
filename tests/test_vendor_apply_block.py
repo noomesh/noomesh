@@ -33,9 +33,9 @@ def block() -> str:
     return m.group(1)
 
 
-def tgz(members: dict[str, bytes], mode: str = "w:gz", top_symlinks: dict[str, str] | None = None) -> bytes:
+def tgz(members: dict[str, bytes], top_symlinks: dict[str, str] | None = None) -> bytes:
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode=mode) as t:
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -54,9 +54,9 @@ def manifest(**kv: str | None) -> str:
 
 
 def cli_manifest(payload: bytes, name: str, version: str, entry: str, unpack: str = "tgz",
-                 fmt: str = "tarball", runtime: str | None = None, runtime_version: str | None = None) -> str:
+                 fmt: str = "tarball") -> str:
     return manifest(kind=name, name=name, version=version, sha256=hashlib.sha256(payload).hexdigest(),
-                    format=fmt, unpack=unpack, entry=entry, runtime=runtime, runtime_version=runtime_version)
+                    format=fmt, unpack=unpack, entry=entry)
 
 
 def stage(tmp: Path, files: dict[str, bytes | str]) -> Path:
@@ -136,52 +136,6 @@ def test_a_single_binary_unpack_none(tmp_path: Path) -> None:
     assert (tmp_path / "opt/noo/vendor/claude/2.0.0/claude").read_bytes() == ELF
 
 
-def test_a_runtime_is_flattened_put_first_on_path_and_runs_a_js_entry(tmp_path: Path) -> None:
-    fake_node = b'#!/bin/sh\necho "node-ran $*"\n'
-    rt = tgz({"node-v22.11.0-linux-x64/bin/node": fake_node, "node-v22.11.0-linux-x64/LICENSE": b"x"}, mode="w:xz")
-    cli = tgz({"package/index.js": b"console.log(1)\n"})
-    files = {
-        "vendor-runtime": rt,
-        "vendor-runtime-manifest": manifest(kind="runtime", name="node", version="22.11.0",
-                                            sha256=hashlib.sha256(rt).hexdigest(), unpack="tar.xz", bin_dir="bin"),
-        "vendor-cli": cli,
-        "vendor-cli-manifest": cli_manifest(cli, "copilot", "0.0.339", "package/index.js", fmt="npm-tarball",
-                                            runtime="node", runtime_version="22.11.0"),
-    }
-    r = run(tmp_path, stage(tmp_path, files))
-    assert r.returncode == 0, r.stderr
-    v = f"{tmp_path}/opt/noo/vendor"
-    assert (tmp_path / "opt/noo/vendor/node/22.11.0/bin/node").exists(), "the top-level directory is flattened"
-    wrapper = tmp_path / "usr/local/bin/copilot"
-    assert wrapper.read_text() == (
-        "#!/bin/sh\n"
-        "# noomesh vendor wrapper: copilot 0.0.339 on node 22.11.0, staged by the controller; do not edit\n"
-        f'PATH="{v}/node/22.11.0/bin:$PATH"\n'
-        "export PATH\n"
-        f'exec "{v}/node/22.11.0/bin/node" "{v}/copilot/0.0.339/package/index.js" "$@"\n'
-    )
-    out = subprocess.run([str(wrapper), "-p", "hi"], capture_output=True, text=True)
-    assert out.stdout.strip() == f"node-ran {v}/copilot/0.0.339/package/index.js -p hi"
-    assert "applied: vendor-runtime vendor-cli\n" in r.stdout
-    # The CLI alone later (runtime unchanged, not carried): it finds the runtime on disk.
-    cli2 = tgz({"package/index.js": b"console.log(2)\n"})
-    r = run(tmp_path, stage(tmp_path, {
-        "vendor-cli": cli2,
-        "vendor-cli-manifest": cli_manifest(cli2, "copilot", "0.0.340", "package/index.js", fmt="npm-tarball",
-                                            runtime="node", runtime_version="22.11.0")}))
-    assert r.returncode == 0, r.stderr
-    assert (tmp_path / "opt/noo/vendor/node/22.11.0").is_dir(), "a runtime a wrapper names is never pruned"
-
-
-def test_a_cli_whose_runtime_is_nowhere_is_refused(tmp_path: Path) -> None:
-    cli = tgz({"package/index.js": b"x"})
-    r = run(tmp_path, stage(tmp_path, {
-        "vendor-cli": cli,
-        "vendor-cli-manifest": cli_manifest(cli, "copilot", "1.0.0", "package/index.js", runtime="node",
-                                            runtime_version="9.9.9")}))
-    assert r.returncode == 65 and "neither this bundle nor this node carries" in r.stderr
-
-
 def test_a_payload_that_does_not_hash_to_its_manifest_is_refused_before_anything(tmp_path: Path) -> None:
     art = tgz({"copilot": ELF})
     d = stage(tmp_path, {"vendor-cli": art + b"tampered",
@@ -202,9 +156,8 @@ def test_values_that_would_escape_or_shadow_are_refused(tmp_path: Path) -> None:
         ({"entry": "../../etc/passwd"}, "entry is not a plain relative path"),
         ({"entry": "/usr/bin/id"}, "entry is not a plain relative path"),
         ({"name": "noo-gateway"}, "would shadow a noomesh binary"),
-        ({"name": "node"}, "may not be named node"),
         ({"version": "1.0;id"}, "is not a plain version"),
-        ({"unpack": "rar"}, "is not tgz, tar.xz, zip or none"),
+        ({"unpack": "rar"}, "is not tgz, zip or none"),
     ]:
         fields = json.loads(cli_manifest(art, "copilot", "1.0.0", "copilot"))
         fields.update(kw)

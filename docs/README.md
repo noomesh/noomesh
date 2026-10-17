@@ -39,6 +39,7 @@ reports the controller URL it resolved.
 | [getting-started/supported-hardware.md](getting-started/supported-hardware.md) | Tested and expected-to-work OS and hardware, what is not supported yet, node requirements, what fits where, the enrollment preflight, and a known Docker-repository issue on Pop!_OS |
 | [getting-started/supported-agent-harnesses.md](getting-started/supported-agent-harnesses.md) | Which agent loops can run on a node (`noo`, `claude-code`, `copilot`, `codex`), which run today, the chat backends each can use, what happens when a kind cannot run, and where their telemetry switches are listed |
 | [getting-started/trust-the-cluster-ca.md](getting-started/trust-the-cluster-ca.md) | Why the browser warns about the dashboard, the `ts.net` URL that needs no CA, and trusting the cluster CA in Chrome/Chromium, Firefox, macOS and Windows |
+| [getting-started/kiosk.md](getting-started/kiosk.md) | Kiosk displays: `noo kiosk setup`, enrolling the display as a seat (never a node) with `noo kiosk seat-token` + `noo kiosk enroll`, and how `noo upgrade --all` keeps its CLI and kiosk assets current |
 
 ## CLI
 
@@ -61,6 +62,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 |----------|-------------|
 | [operating/operator-manual.md](operating/operator-manual.md) | The controller stack day to day: what runs where, `noo stack` start/stop/rebuild/reset, profiles and add-ons, upgrades, backups, troubleshooting |
 | [operating/monitoring.md](operating/monitoring.md) | Prometheus scrapes, the gateway `/metrics` registry, node-agent and GPU exporters, alert rules, Grafana, Loki logs, health endpoints |
+| [operating/token-budgets.md](operating/token-budgets.md) | Token budgets on tasks and allowances per person: the switch between loops, resubmitting or answering a parked task, and node vs cloud spend |
 
 ### Runbooks
 

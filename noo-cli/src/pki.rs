@@ -411,11 +411,12 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // never sees it.
     ("sandbox", KeyReader::ContainerUid(65532)),
     // The voice add-on's doors: docker/Dockerfile.whisper and
-    // Dockerfile.piper (python:3.12-slim) have no USER line, so uvicorn runs
-    // as root — uid=0 measured with `docker run --rm --entrypoint id` on
-    // ghcr.io/noomesh/{whisper,piper}:v0.6.4. uvicorn reads the key itself.
-    ("whisper", KeyReader::ContainerRoot),
-    ("piper", KeyReader::ContainerRoot),
+    // Dockerfile.piper end `USER nonroot` (uid/gid 65532, i105; through
+    // v0.6.4 they had no USER line and ran as root). uvicorn reads the key
+    // itself (`--ssl-keyfile`). `noo cluster verify --controller` → `voice
+    // images` judges the live uid against this entry.
+    ("whisper", KeyReader::ContainerUid(65532)),
+    ("piper", KeyReader::ContainerUid(65532)),
     // A warm standby's replication client identity.
     // No container on THIS box mounts it: the operator's CLI reads it, and
     // `scripts/bootstrap-standby.sh join` stages a 0600 copy owned by the
@@ -2450,7 +2451,7 @@ mod key_mode_tests {
     /// container name the gateway dials (`noo-whisper` / `noo-piper`), the
     /// compose service name, and `localhost` (the healthcheck). Neither
     /// claims the other's names nor any controller name; the keys go to the
-    /// images' reader, root.
+    /// images' reader, `nonroot` (65532, i105), 0640.
     #[test]
     fn the_voice_doors_are_issued_their_own_server_leaves() {
         let ca = ClusterCa::new(scratch());
@@ -2475,7 +2476,9 @@ mod key_mode_tests {
             for wrong in [other.to_string(), format!("noo-{other}"), "gateway".into(), "noo-controller".into(), "Pop-Host".into(), "pop.ts.net".into()] {
                 assert!(!dns.contains(&wrong), "{svc} claims {wrong}: {dns:?}");
             }
-            assert_eq!(ca.key_reader(&key), KeyReader::ContainerRoot, "{svc}: uvicorn runs as root in the image");
+            assert_eq!(ca.key_reader(&key), KeyReader::ContainerUid(65532), "{svc}: uvicorn runs as nonroot (i105)");
+            assert_eq!(KeyReader::ContainerUid(65532).mode(), 0o640);
+            assert_eq!(readable_by_uid(&key, 65532), Some(true), "noo-{svc} (nonroot) can read its own key");
         }
     }
 
@@ -2494,8 +2497,8 @@ mod key_mode_tests {
         assert_eq!(r("services/nats/service.key"), KeyReader::ContainerRoot);
         assert_eq!(r("services/loki/service.key"), KeyReader::ContainerUid(65532));
         assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.sandbox USER nonroot");
-        assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerRoot, "Dockerfile.whisper has no USER (uid 0)");
-        assert_eq!(r("services/piper/service.key"), KeyReader::ContainerRoot, "Dockerfile.piper has no USER (uid 0)");
+        assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.whisper USER nonroot (i105)");
+        assert_eq!(r("services/piper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.piper USER nonroot (i105)");
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
         assert_eq!(r("stray.key"), KeyReader::Unknown);

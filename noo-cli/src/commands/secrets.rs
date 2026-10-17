@@ -375,10 +375,7 @@ fn addon_key_consequence(overlay: &str, d: &crate::addon_decl_parse::ParsedDecl)
 ///      the bytes hash to the `files` entry of the cached lock its pin names
 ///      (the signature was checked when the pin was written; `noo addons
 ///      verify` re-checks it);
-///   2. DEPRECATED (one release): the overlay an earlier CLI materialised at
-///      `<root>/docker-compose.<addon>.yml`, only while the bytes are exactly
-///      what that CLI recorded in `.noo-materialised`;
-///   3. a development install (no `NOO_IMAGE_TAG`): the add-on checkout's own
+///   2. a development install (no `NOO_IMAGE_TAG`): the add-on checkout's own
 ///      overlay, `${NOO_<ADDON>_PATH:-../noo-<addon>}/docker-compose.<addon>.yml`.
 pub(crate) fn trusted_addon_overlay(root: &std::path::Path, addon: &str) -> Option<(String, String)> {
     use crate::addons::pins;
@@ -394,14 +391,6 @@ pub(crate) fn trusted_addon_overlay(root: &std::path::Path, addon: &str) -> Opti
             return String::from_utf8(bytes).ok().map(|t| (label, t));
         }
         return None;
-    }
-    let legacy = pins::legacy_overlay(root, addon);
-    if let Ok(bytes) = std::fs::read(&legacy) {
-        let rel = legacy.file_name()?.to_str()?.to_string();
-        let recorded = crate::onboard::standalone::materialised_sha(root, &rel);
-        if recorded.as_deref() == Some(pins::sha256_hex(&bytes).as_str()) {
-            return String::from_utf8(bytes).ok().map(|t| (rel, t));
-        }
     }
     if crate::addons::current_tag(root).is_none() {
         let kebab = addon.replace('_', "-");
@@ -884,10 +873,11 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         key: "NATS_WORKER_PASSWORD",
         class: Class::ExternalTool { tool: "noo cluster nats-creds rotate worker --restart" },
         gen_bytes: 0,
-        consequence: "the bus user shared by noo-worker, noo-trellion and noo-trellion-intel \
-                      — denied `tasks.>`, `$KV.>` and stream administration. All \
-                      three are controller containers, so this is shared-service and not \
-                      fleet-wide; the same digest caveat as NATS_GATEWAY_PASSWORD applies — \
+        consequence: "noo-worker's bus user — denied `tasks.>`, `$KV.>` and stream \
+                      administration, and every add-on subject whose add-on has a principal of \
+                      its own. noo-trellion and noo-trellion-intel still hold it for ONE release, \
+                      as the fallback when their own password is not in the store. The same \
+                      digest caveat as NATS_GATEWAY_PASSWORD applies — \
                       `noo cluster nats-creds rotate worker --restart` is the rotation, not this tool",
         consumers: &[
             "noo-nats",
@@ -897,6 +887,41 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
             "noo-worker-extra",
         ],
         required_when: Requirement::Always,
+    },
+    // The add-ons' OWN bus users (i70 residue): each subscribes on exactly
+    // the subjects its add-on serves and replies on its own prefix
+    // (noo-cli nats_users.rs ADDON_PRINCIPALS). Minted by the render that
+    // first renders the principal (`noo upgrade --stack`, `noo addons
+    // enable`, `noo cluster nats-users render`, onboarding).
+    SecretSpec {
+        key: "NATS_TRELLION_PASSWORD",
+        class: Class::ExternalTool { tool: "noo cluster nats-creds rotate trellion --restart" },
+        gen_bytes: 0,
+        consequence: "noo-trellion's own bus user `trellion`: subscribe on the knowledge pack's \
+                      subjects (worker.rag/memory/recall/api.snapshots, worker.autonomy.check_rag) \
+                      and publish only its replies on `_INBOX_gw.trellion.>`. The server verifies a \
+                      bcrypt DIGEST of it — `noo cluster nats-creds rotate trellion --restart` \
+                      re-renders and recreates; never change it by hand. Absent, noo-trellion \
+                      presents the worker principal (one release)",
+        consumers: &["noo-nats", "noo-trellion"],
+        // Optional: absent is the one-release fallback (the add-on presents
+        // the worker), which `cluster verify`'s `nats principals` row WARNs on.
+        required_when: Requirement::Optional,
+    },
+    SecretSpec {
+        key: "NATS_TRELLION_INTEL_PASSWORD",
+        class: Class::ExternalTool { tool: "noo cluster nats-creds rotate trellion_intel --restart" },
+        gen_bytes: 0,
+        consequence: "noo-trellion-intel's own bus user `trellion_intel`: subscribe on the \
+                      Intelligent tier's subjects (worker.graph/temporal/retrieval, \
+                      worker.api.heartbeat.run_ml) and publish only its replies on \
+                      `_INBOX_gw.trellion_intel.>`. Rendered once the add-on's signed bundle \
+                      declares the principal; the same digest caveat as NATS_GATEWAY_PASSWORD — \
+                      `noo cluster nats-creds rotate trellion_intel --restart`",
+        consumers: &["noo-nats", "noo-trellion-intel"],
+        // Optional: absent is the one-release fallback (the add-on presents
+        // the worker), which `cluster verify`'s `nats principals` row WARNs on.
+        required_when: Requirement::Optional,
     },
     // NATS_NODE_PASSWORD_<NODE> is deliberately NOT listed: there is one per
     // node, minted and delivered by `noo cluster nats-creds rotate <node>`
@@ -6386,6 +6411,10 @@ mod tests {
                 // derived rows.
                 // A node's own bus principal, delivered over the rail; a
                 // controller store that runs no node-agent never holds it.
+                // The add-ons' own bus passwords (i70 residue): absent is the
+                // one-release fallback, which `nats principals` WARNs on.
+                "NATS_TRELLION_PASSWORD",
+                "NATS_TRELLION_INTEL_PASSWORD",
                 "NATS_NODE_PASSWORD",
                 "ANTHROPIC_API_KEY",
                 // The other two cloud providers (rows added 2026-09-29; the
@@ -6699,6 +6728,8 @@ mod tests {
             // digest and HUPing the server is a dedicated tool's job.
             ("NATS_GATEWAY_PASSWORD", "external-tool", "refused"),
             ("NATS_WORKER_PASSWORD", "external-tool", "refused"),
+            ("NATS_TRELLION_PASSWORD", "external-tool", "refused"),
+            ("NATS_TRELLION_INTEL_PASSWORD", "external-tool", "refused"),
             ("NATS_NODE_PASSWORD", "external-tool", "refused"),
             ("ANTHROPIC_API_KEY", "provider-issued", "manual"),
             ("OPENAI_API_KEY", "provider-issued", "manual"),
@@ -7451,8 +7482,7 @@ mod provision_tests {
     }
 
     /// The run-time reader trusts a bundled overlay only while it hashes to
-    /// the pinned lock, and a legacy slice overlay only while it is the bytes
-    /// the last materialise recorded. An edited file declares nothing.
+    /// the pinned lock. An edited file declares nothing.
     #[test]
     fn a_bundled_declaration_is_read_only_while_it_matches_its_signed_lock() {
         use crate::addons::{pins, resolve};
@@ -7483,17 +7513,9 @@ mod provision_tests {
         assert!(trusted_addon_overlay(&d, "trellion_intel").is_none());
         assert!(runtime_addon_rows_at(&d).is_empty());
 
-        // A legacy slice overlay counts only with the bytes the manifest recorded.
+        // A slice-root overlay an earlier CLI left behind declares nothing.
         std::fs::remove_dir_all(pins::addon_dir(&d, "trellion_intel")).unwrap();
-        let legacy = pins::legacy_overlay(&d, "evolve");
-        std::fs::write(&legacy, TEST_BUNDLED_DECLS[1].1).unwrap();
-        assert!(trusted_addon_overlay(&d, "evolve").is_none(), "no manifest records it");
-        let manifest = serde_json::json!({"version": 1, "cli": "0.6.3",
-            "files": {"docker-compose.evolve.yml": pins::sha256_hex(TEST_BUNDLED_DECLS[1].1.as_bytes())}});
-        std::fs::write(d.join(".noo-materialised"), manifest.to_string()).unwrap();
-        let (label, _) = trusted_addon_overlay(&d, "evolve").expect("the recorded legacy overlay");
-        assert_eq!(label, "docker-compose.evolve.yml");
-        std::fs::write(&legacy, format!("{}# edited\n", TEST_BUNDLED_DECLS[1].1)).unwrap();
+        std::fs::write(d.join("docker-compose.evolve.yml"), TEST_BUNDLED_DECLS[1].1).unwrap();
         assert!(trusted_addon_overlay(&d, "evolve").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }

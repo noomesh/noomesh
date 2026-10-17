@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"time"
 )
 
@@ -232,3 +234,19 @@ type pipe struct {
 }
 
 func newPipe() pipe { r, w := io.Pipe(); return pipe{r: r, w: w} }
+
+// A supervisor without the agent's mTLS client must not report: the report
+// carries the fleet bearer, and the default client has no node leaf.
+func TestReportRefusesWithoutTheAgentsClient(t *testing.T) {
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hit = true }))
+	defer srv.Close()
+	s := &Supervisor{cfg: &config.Config{ControllerURL: srv.URL, NodeID: "n1", ClusterSecret: "s"}}
+	err := s.report(context.Background(), "srv", nil)
+	if err == nil || !strings.Contains(err.Error(), "no controller client") {
+		t.Fatalf("want a no-controller-client error, got %v", err)
+	}
+	if hit {
+		t.Fatal("a request left without the node's client")
+	}
+}

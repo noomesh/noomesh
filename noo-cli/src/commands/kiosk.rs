@@ -40,10 +40,10 @@ use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-const LAUNCH: &str = include_str!("kiosk_assets/noo-kiosk-launch");
-const CDP: &str = include_str!("kiosk_assets/noo-kiosk-cdp");
-const WATCHDOG: &str = include_str!("kiosk_assets/noo-kiosk-watchdog");
-const SERVE: &str = include_str!("kiosk_assets/noo-kiosk-serve");
+pub(crate) const LAUNCH: &str = include_str!("kiosk_assets/noo-kiosk-launch");
+pub(crate) const CDP: &str = include_str!("kiosk_assets/noo-kiosk-cdp");
+pub(crate) const WATCHDOG: &str = include_str!("kiosk_assets/noo-kiosk-watchdog");
+pub(crate) const SERVE: &str = include_str!("kiosk_assets/noo-kiosk-serve");
 
 pub const ENV_FILE: &str = "/etc/default/kiosk";
 pub const STATE_DIR: &str = "/var/lib/kiosk";

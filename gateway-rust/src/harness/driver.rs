@@ -2,7 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 //! The foreign-CLI driver: a vendor's headless CLI (Copilot CLI, Claude
-//! Code) as the node's task executor.
+//! Code, Codex CLI) as the node's task executor.
 //!
 //! `noo-gateway harness` stays the runner for every kind: it holds the bus,
 //! acks, takes the concurrency permit, publishes `harness_result` and
@@ -16,11 +16,21 @@
 //! 3. the CLI runs in the task's own workspace, with a HOME of its own, an
 //!    environment built from NOTHING (no bus pair, no node-agent bearer, no
 //!    turn token), the kind's `lane` and `telemetry_off` merged last, and an
-//!    MCP config naming `{NOO_GATEWAY_URL}/mcp/user` with the door key;
+//!    MCP config naming `{NOO_GATEWAY_URL}/mcp/user` with the door key
+//!    (`launch.mcp`: `config-file`, a `{"mcpServers": ...}` JSON file; or
+//!    `config-file:codex-toml`, Codex's whole `$CODEX_HOME/config.toml`,
+//!    which also carries the model provider, since Codex takes its base URL
+//!    from no variable);
 //! 4. its verdict (`NOO_RESULT:` / `NOO_FAILED:` on the last such line) is
 //!    the task's `noo_task_done`, carried by the rail op `task_done`;
 //! 5. usage is reported, the loop is checkpointed, the key revoked, the
 //!    translator stopped.
+//!
+//! Before each invocation the driver asks the gateway's token switch
+//! (`budget_check`, i83 G) whether another loop may start — never during
+//! one. A CLI that cannot go on without its owner ends with `NOO_QUESTION:`;
+//! the question goes over the rail (`task_ask`) and the task waits for the
+//! answer.
 //!
 //! Nothing streams mid-run in this cut: a turn gets one `content` event with
 //! the answer, then `harness_result` (sent by the caller).
@@ -46,14 +56,35 @@ pub const OUTPUT_CAP: usize = 256 * 1024;
 pub const RESULT_MARK: &str = "NOO_RESULT:";
 /// The line a CLI ends with when the objective cannot be achieved.
 pub const FAILED_MARK: &str = "NOO_FAILED:";
+/// The line a CLI ends with when it needs its owner to decide something.
+pub const QUESTION_MARK: &str = "NOO_QUESTION:";
 /// What goes in a CLI's provider-key variable: the loopback translator takes
 /// no key, but a CLI may refuse to start without one.
 pub const PLACEHOLDER_KEY: &str = "noo-loopback-no-key";
 /// The MCP server name the CLI sees noomesh's tools under. The kind table's
 /// tool allowlists (`mcp__noomesh`, `--allow-tool=noomesh`) name it too.
 pub const MCP_SERVER_NAME: &str = "noomesh";
-/// The `launch.mcp` value this driver implements.
+/// The `launch.mcp` value for a CLI that reads a `{"mcpServers": ...}`
+/// file named on its command line (`{mcp_config}`).
 pub const MCP_CONFIG_FILE: &str = "config-file";
+/// The `launch.mcp` value for Codex CLI: the driver writes the whole
+/// `config.toml` in the CLI's home (`launch.home_env`), with the loopback
+/// translator as the model provider and the user door as an MCP server.
+pub const MCP_CODEX_TOML: &str = "config-file:codex-toml";
+/// The model provider id the Codex config names (`openai`, `ollama` and
+/// `lmstudio` are Codex's reserved ids).
+pub const CODEX_PROVIDER: &str = "noomesh";
+
+/// Whether a run gets noomesh's tools. Production always wires the user door
+/// ([`McpWiring::Door`]); `noo-gateway harness probe` runs a CLI with NO MCP
+/// server and no gateway at all ([`McpWiring::None`]): no door key is
+/// minted, no `mcpServers` file is written, and the command's
+/// `{mcp_config}` arguments (with the flag that takes each) are left out.
+#[derive(Debug, Clone, Copy)]
+pub enum McpWiring<'a> {
+    Door { gateway: &'a str, key: &'a str },
+    None,
+}
 
 /// Everything a driven invocation needs that does not change per task.
 #[derive(Debug, Clone)]
@@ -76,6 +107,10 @@ pub struct DriverCtx {
     /// harness's own environment.
     pub path: String,
     pub lang: String,
+    /// Whether a jail can be built here and, once the startup self-test
+    /// has run, whether it passed (i119, `jail::gate`); a refusal
+    /// checkpoints the task with the reason and the CLI never runs.
+    pub jail_probe: crate::harness::jail::Probe,
 }
 
 impl DriverCtx {
@@ -104,6 +139,7 @@ impl DriverCtx {
             ca_path: set("NOO_TLS_CA"),
             path: set("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
             lang: set("LANG").unwrap_or_else(|| "C.UTF-8".into()),
+            jail_probe: crate::harness::jail::gate,
         })
     }
 }
@@ -122,11 +158,19 @@ pub fn validate_kind(kind: &HarnessKind) -> Result<Launch> {
     if let Some(v) = fields.iter().find(|v| v.starts_with("unverified:")) {
         bail!("kind {}: its launch recipe is not verified yet ({v})", kind.kind);
     }
-    if launch.mcp != MCP_CONFIG_FILE {
-        bail!("kind {}: MCP wiring {:?} is not one this driver implements ({MCP_CONFIG_FILE:?})", kind.kind, launch.mcp);
-    }
-    if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
-        bail!("kind {}: launch names no model variables", kind.kind);
+    match launch.mcp.as_str() {
+        MCP_CONFIG_FILE => {
+            if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
+                bail!("kind {}: launch names no model variables", kind.kind);
+            }
+        }
+        // The config file carries the model; a home is where it goes.
+        MCP_CODEX_TOML => {
+            if launch.home_env.as_deref().is_none_or(|h| h.trim().is_empty()) {
+                bail!("kind {}: {MCP_CODEX_TOML} needs launch.home_env, the directory its config.toml goes in", kind.kind);
+            }
+        }
+        other => bail!("kind {}: MCP wiring {other:?} is not one this driver implements ({MCP_CONFIG_FILE:?}, {MCP_CODEX_TOML:?})", kind.kind),
     }
     Ok(launch)
 }
@@ -155,6 +199,10 @@ pub(crate) trait DriverRail {
     /// `session_save`, best effort.
     async fn save(&self, role: &str, content: &str);
     async fn report_usage(&self, usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>);
+    /// `budget_check`: the loop-boundary token switch.
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck>;
+    /// `task_ask`: the CLI's question to the task's owner.
+    async fn task_ask(&self, task_id: &str, question: &str) -> Result<()>;
 }
 
 impl DriverRail for RemoteRuntime {
@@ -188,6 +236,14 @@ impl DriverRail for RemoteRuntime {
         if let Err(e) = RemoteRuntime::report_usage(self, usage, model, kind, task_id).await {
             tracing::warn!(error = %e, kind, "harness driver: usage not reported");
         }
+    }
+
+    async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+        RemoteRuntime::budget_check(self, task_id).await
+    }
+
+    async fn task_ask(&self, task_id: &str, question: &str) -> Result<()> {
+        RemoteRuntime::task_ask(self, task_id, question).await
     }
 }
 
@@ -238,21 +294,67 @@ impl Workspace {
         self.root.join("noomesh-mcp.json")
     }
 
+    /// The CLI's own config/state directory (`launch.home_env`), inside HOME.
+    pub fn cli_home(&self, cli: &str) -> PathBuf {
+        self.home.join(format!(".{cli}"))
+    }
+
+    /// Where `config-file:codex-toml` writes: `$CODEX_HOME/config.toml`.
+    pub fn codex_config_path(&self, cli: &str) -> PathBuf {
+        self.cli_home(cli).join("config.toml")
+    }
+
+    /// The config a kind's `launch.mcp` asks for, written 0600; its path is
+    /// `{mcp_config}` in the command. Removed after each run.
+    pub fn write_cli_config(&self, ctx: &DriverCtx, translator_url: &str, key: &str) -> Result<PathBuf> {
+        self.write_cli_config_wired(ctx, translator_url, McpWiring::Door { gateway: &ctx.gateway, key })?
+            .ok_or_else(|| anyhow!("kind {}: no CLI config written", ctx.kind.kind))
+    }
+
+    /// [`write_cli_config`](Self::write_cli_config) for either wiring.
+    /// `None` = nothing to pass as `{mcp_config}` (a `config-file` kind run
+    /// without MCP); Codex always gets its `config.toml`, which carries the
+    /// model provider, with the `mcp_servers` table only under a door.
+    pub fn write_cli_config_wired(&self, ctx: &DriverCtx, translator_url: &str, wiring: McpWiring<'_>) -> Result<Option<PathBuf>> {
+        if ctx.launch.mcp != MCP_CODEX_TOML {
+            return match wiring {
+                McpWiring::Door { gateway, key } => self.write_mcp_config(gateway, key).map(Some),
+                McpWiring::None => Ok(None),
+            };
+        }
+        let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
+        let base = format!("{}{}", translator_url.trim_end_matches('/'), ctx.launch.model_url_suffix);
+        let path = self.codex_config_path(cli);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let door = match wiring {
+            McpWiring::Door { gateway, key } => Some((gateway, key)),
+            McpWiring::None => None,
+        };
+        write_private(&path, codex_config(&base, &ctx.pinned.model, door).as_bytes())?;
+        Ok(Some(path))
+    }
+
     /// Write the MCP config naming the user door, readable by this user only.
     pub fn write_mcp_config(&self, gateway: &str, key: &str) -> Result<PathBuf> {
-        use std::io::Write;
         let path = self.mcp_path();
-        let _ = std::fs::remove_file(&path);
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path).with_context(|| format!("writing {}", path.display()))?;
-        f.write_all(serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
+        write_private(&path, serde_json::to_string_pretty(&mcp_config(gateway, key))?.as_bytes())?;
         Ok(path)
+    }
+
+    /// The jail for one run in this workspace: work, HOME and TMP
+    /// read-write, the CLI config file and the cluster CA file read-only.
+    pub fn jail_spec(&self, ctx: &DriverCtx, cli_config: &Path) -> crate::harness::jail::JailSpec {
+        crate::harness::jail::JailSpec {
+            workspace: self.work.clone(),
+            home: self.home.clone(),
+            tmp: self.tmp.clone(),
+            ca_file: ctx.ca_path.as_deref().map(PathBuf::from),
+            // The Codex config is inside HOME already; the MCP file is not.
+            extra_ro: if cli_config.starts_with(&self.home) { Vec::new() } else { vec![cli_config.to_path_buf()] },
+            data_root: None,
+        }
     }
 
     /// Remove the workspace, unless it is kept for debugging.
@@ -263,6 +365,101 @@ impl Workspace {
             tracing::warn!(path = %self.root.display(), error = %e, "harness driver: workspace not removed");
         }
     }
+}
+
+/// Write `bytes` to a fresh file at `path`, mode 0600 from creation.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+/// A TOML basic string. A JSON string literal is one: JSON's escapes
+/// (`\"`, `\\`, `\n`, `\uXXXX`, ...) are all TOML escapes.
+fn toml_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Codex CLI's `config.toml` for one run (`config-file:codex-toml`).
+///
+/// - The loopback translator is the model provider (`wire_api =
+///   "responses"`, the only wire Codex speaks); no `env_key`, so no API
+///   key is asked for, and no websocket transport, so every request is a
+///   stateless `POST /responses`.
+/// - The user door is the one MCP server, a streamable-HTTP server with the
+///   door key as its bearer: the key is in this 0600 file only, never in
+///   the CLI's environment.
+/// - No approvals (`never`: a headless run has nobody to ask), and Codex's
+///   OWN sandbox off (`danger-full-access`): every foreign CLI already runs
+///   inside the harness's Landlock jail (harness/jail.rs), which confines
+///   writes to the task's workspace, HOME and TMP and refuses to start the
+///   CLI at all when it cannot jail. Codex's sandbox is bubblewrap, which
+///   needs to mount; a process inside a Landlock domain may not change its
+///   mounts, so the nested sandbox fails and Codex's shell tool silently
+///   does nothing (seen in `harness probe`, 2026-10-16). One jail, ours.
+/// - Every vendor channel off (docs/security/telemetry.md): analytics,
+///   feedback, the OpenTelemetry exporters (metrics default to Statsig),
+///   the update check, saved history, hosted web search.
+///
+/// `door` is the user door's `(gateway, key)`; `None` writes no
+/// `[mcp_servers]` table at all (`harness probe`'s no-MCP run).
+pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> String {
+    let mcp = match door {
+        Some((gateway, key)) => {
+            let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
+            let bearer = format!("Bearer {key}");
+            format!(
+                "[mcp_servers.{MCP_SERVER_NAME}]\n\
+                 url = {mcp_url}\n\
+                 http_headers = {{ Authorization = {bearer} }}\n\
+                 \n",
+                mcp_url = toml_str(&mcp_url),
+                bearer = toml_str(&bearer),
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "# Written by the noomesh harness for one run; removed when it ends.\n\
+         model = {model}\n\
+         model_provider = {provider}\n\
+         approval_policy = \"never\"\n\
+         sandbox_mode = \"danger-full-access\"\n\
+         web_search = \"disabled\"\n\
+         check_for_update_on_startup = false\n\
+         \n\
+         [model_providers.{CODEX_PROVIDER}]\n\
+         name = {provider}\n\
+         base_url = {base}\n\
+         wire_api = \"responses\"\n\
+         \n\
+         {mcp}\
+         [analytics]\n\
+         enabled = false\n\
+         \n\
+         [feedback]\n\
+         enabled = false\n\
+         \n\
+         [history]\n\
+         persistence = \"none\"\n\
+         \n\
+         [otel]\n\
+         exporter = \"none\"\n\
+         trace_exporter = \"none\"\n\
+         metrics_exporter = \"none\"\n",
+        model = toml_str(model),
+        provider = toml_str(CODEX_PROVIDER),
+        base = toml_str(base_url),
+    )
 }
 
 /// The MCP config a CLI loads: one HTTP server, the user door, the door key
@@ -301,8 +498,14 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
     env.insert("LANG".to_string(), ctx.lang.clone());
     env.insert("TMPDIR".to_string(), ws.tmp.display().to_string());
     env.insert("NO_COLOR".to_string(), "1".to_string());
-    env.insert(l.model_url_env.clone(), format!("{}{}", translator_url.trim_end_matches('/'), l.model_url_suffix));
-    env.insert(l.model_env.clone(), ctx.pinned.model.clone());
+    // Empty for a CLI that takes its model from the config the driver
+    // writes (`config-file:codex-toml`).
+    if !l.model_url_env.trim().is_empty() {
+        env.insert(l.model_url_env.clone(), format!("{}{}", translator_url.trim_end_matches('/'), l.model_url_suffix));
+    }
+    if !l.model_env.trim().is_empty() {
+        env.insert(l.model_env.clone(), ctx.pinned.model.clone());
+    }
     for alias in &l.model_alias_envs {
         env.insert(alias.clone(), ctx.pinned.model.clone());
     }
@@ -311,10 +514,13 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
     }
     if let Some(h) = l.home_env.as_deref().filter(|h| !h.is_empty()) {
         let cli = ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind);
-        env.insert(h.to_string(), ws.home.join(format!(".{cli}")).display().to_string());
+        env.insert(h.to_string(), ws.cli_home(cli).display().to_string());
     }
     if let Some(ca) = &ctx.ca_path {
         env.insert("NODE_EXTRA_CA_CERTS".to_string(), ca.clone());
+        if let Some(v) = l.ca_env.as_deref().filter(|v| !v.is_empty()) {
+            env.insert(v.to_string(), ca.clone());
+        }
     }
     for (k, v) in &ctx.kind.lane {
         env.insert(k.clone(), v.clone());
@@ -330,6 +536,25 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
 pub fn fill_command(command: &[String], prompt: &str, mcp_config: &Path) -> Vec<String> {
     let mcp = mcp_config.display().to_string();
     command.iter().map(|a| a.replace("{mcp_config}", &mcp).replace("{prompt}", prompt)).collect()
+}
+
+/// `launch.command` for a run with no MCP config ([`McpWiring::None`]): every
+/// argument naming `{mcp_config}` is dropped, with the flag before it when
+/// that flag takes it as its value (`--mcp-config {mcp_config}`); then
+/// `{prompt}` is filled in. A flag that only switches MCP behaviour
+/// (`--strict-mcp-config`) stays: strict with no config is no servers.
+pub fn fill_command_without_mcp(command: &[String], prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(command.len());
+    for a in command {
+        if a.contains("{mcp_config}") {
+            if !a.starts_with('-') && out.last().is_some_and(|p| p.starts_with('-') && !p.contains('=')) {
+                out.pop();
+            }
+            continue;
+        }
+        out.push(a.replace("{prompt}", prompt));
+    }
+    out
 }
 
 /// An invocation's limit: the configured timeout, cut to the door key's
@@ -396,11 +621,32 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> V
 /// Run `argv` in `cwd` with exactly `env`, stdin closed, output captured up
 /// to [`OUTPUT_CAP`], in a process group of its own that is killed whole at
 /// `timeout`.
-pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration) -> Result<RunOutput> {
+pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec) -> Result<RunOutput> {
+    spawn_cli_as(argv, env, cwd, timeout, jail, None).await
+}
+
+/// Who a CLI runs as when it is not the harness's own uid: the child
+/// switches to `gid` then `uid` before exec (std drops supplementary groups
+/// when it changes uid from root). Never uid 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// [`spawn_cli`], optionally as another user. The ONE place a CLI process
+/// is constructed: the production driver and `harness probe` both come
+/// through here, and so both run the CLI inside the jail. Order in the
+/// child (std's `do_exec`): setgid/setuid first, then the `pre_exec` hook
+/// that applies the jail, then exec — so the jail binds the dropped user.
+pub async fn spawn_cli_as(argv: &[String], env: &BTreeMap<String, String>, cwd: &Path, timeout: Duration, jail: &crate::harness::jail::JailSpec, run_as: Option<RunAs>) -> Result<RunOutput> {
     let (prog, args) = argv.split_first().ok_or_else(|| anyhow!("empty command"))?;
+    if run_as.is_some_and(|r| r.uid == 0) {
+        bail!("refusing to run a CLI as uid 0");
+    }
     // The program is looked up on the CLI's PATH, not the harness's.
     let resolved = resolve_program(prog, env.get("PATH").map(String::as_str)).unwrap_or_else(|| PathBuf::from(prog));
-    let mut cmd = tokio::process::Command::new(&resolved);
+    let mut cmd = crate::harness::jail::command(&resolved, jail).map_err(|r| anyhow!(r.note()))?;
     cmd.args(args)
         .env_clear()
         .envs(env)
@@ -411,6 +657,10 @@ pub async fn spawn_cli(argv: &[String], env: &BTreeMap<String, String>, cwd: &Pa
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(unix)]
+    if let Some(r) = run_as {
+        cmd.gid(r.gid).uid(r.uid);
+    }
     let started = Instant::now();
     let mut child = cmd.spawn().with_context(|| format!("starting {prog}"))?;
     let out = child.stdout.take().map(|s| tokio::spawn(read_capped(s, OUTPUT_CAP)));
@@ -461,10 +711,12 @@ fn resolve_program(prog: &str, path: Option<&str>) -> Option<PathBuf> {
 pub enum Verdict {
     Done(String),
     Failed(String),
+    /// The CLI needs its owner: the task waits for the answer.
+    Ask(String),
     Continue,
 }
 
-/// The LAST `NOO_RESULT:` / `NOO_FAILED:` line decides.
+/// The LAST `NOO_RESULT:` / `NOO_FAILED:` / `NOO_QUESTION:` line decides.
 pub fn verdict(stdout: &str) -> Verdict {
     for line in stdout.lines().rev() {
         let t = line.trim().trim_matches('`').trim();
@@ -473,6 +725,9 @@ pub fn verdict(stdout: &str) -> Verdict {
         }
         if let Some(r) = t.strip_prefix(FAILED_MARK) {
             return Verdict::Failed(r.trim().to_string());
+        }
+        if let Some(r) = t.strip_prefix(QUESTION_MARK).filter(|r| !r.trim().is_empty()) {
+            return Verdict::Ask(r.trim().to_string());
         }
     }
     Verdict::Continue
@@ -488,13 +743,13 @@ pub fn tail_lines(text: &str, n: usize) -> String {
 /// of what it printed.
 pub fn result_text(stdout: &str) -> String {
     match verdict(stdout) {
-        Verdict::Done(t) | Verdict::Failed(t) if !t.is_empty() => t,
+        Verdict::Done(t) | Verdict::Failed(t) | Verdict::Ask(t) if !t.is_empty() => t,
         _ => tail_lines(stdout, 20),
     }
 }
 
 /// One task loop's prompt.
-pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>) -> String {
+pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, clarification: Option<&crate::task_budget::Clarification>) -> String {
     let mut p = String::new();
     if let Some(role) = req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
         p.push_str(role.trim());
@@ -508,12 +763,20 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>) -> 
     if let Some(n) = last_note.filter(|n| !n.trim().is_empty()) {
         p.push_str(&format!("Where the previous loop left off:\n{}\n\n", n.trim()));
     }
+    if let Some(c) = clarification {
+        p.push_str(&format!(
+            "In an earlier loop you asked the owner:\n{}\nThe owner answered:\n{}\nTake the answer into account.\n\n",
+            c.question.trim(),
+            c.answer.as_deref().unwrap_or("").trim()
+        ));
+    }
     p.push_str(&format!(
         "Your working directory persists between loops of this task. noomesh's tools (knowledge base, memory, \
          agent messages to thread {thread}) are available as the MCP server `{MCP_SERVER_NAME}`.\n\
          When the objective is fully achieved, end your answer with one line:\n{RESULT_MARK} <one-line summary>\n\
          If it cannot be achieved, end with:\n{FAILED_MARK} <reason>\n\
-         If more work remains, end with neither; you will be run again.",
+         If you cannot go on without the owner deciding something, end with:\n{QUESTION_MARK} <one clear question>\n\
+         If more work remains, end with none of these; you will be run again.",
         thread = req.thread_id
     ));
     p
@@ -533,15 +796,16 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
         }
     };
     let run = async {
-        let mcp = ws.write_mcp_config(&ctx.gateway, &key.key)?;
+        let mcp = ws.write_cli_config(ctx, translator.base_url(), &key.key)?;
         let env = build_env(ctx, ws, translator.base_url());
         let argv = fill_command(&ctx.launch.command, prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
         tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
-        spawn_cli(&argv, &env, &ws.work, timeout).await
+        spawn_cli(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp)).await
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
+    let _ = std::fs::remove_file(ws.codex_config_path(ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind)));
     let usage = translator.usage();
     rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
     rail.door_key_revoke(&key.key_id).await;
@@ -563,6 +827,10 @@ pub async fn run_task(ctx: &DriverCtx, client: reqwest::Client, req: &TaskReques
 }
 
 pub(crate) async fn run_task_on<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequest) -> Result<String> {
+    if let Err(r) = (ctx.jail_probe)() {
+        tracing::error!(event = "harness_jail_refused", task = %req.task_id, reason = %r, "harness_jail_refused: {}", r.note());
+        return rail.checkpoint(&req.task_id, req.loops_done, Some(&r.note()), false).await;
+    }
     let ws = Workspace::create(&ctx.workdir_root, &req.task_id, ctx.keep_workdir)?;
     let out = task_loops(ctx, rail, req, &ws).await;
     ws.finish();
@@ -577,7 +845,20 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
         if loops >= req.loop_budget {
             return rail.checkpoint(&req.task_id, loops, Some("loop budget exhausted"), true).await;
         }
-        let prompt = task_prompt(req, loops + 1, last_note.as_deref());
+        // THE TOKEN SWITCH (i83 G): asked before the CLI runs, never while
+        // it does. A no parks the task on the gateway; the driver stops.
+        let check = match rail.budget_check(&req.task_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(task = %req.task_id, error = %e, "harness driver: budget check failed; stopping at the checkpoint");
+                return rail.checkpoint(&req.task_id, loops, Some(&format!("budget check failed: {e:#}")), false).await;
+            }
+        };
+        if !check.proceed {
+            tracing::info!(task = %req.task_id, reason = check.reason.as_deref().unwrap_or(""), "harness driver: budget switch says no more loops");
+            return Ok(check.state);
+        }
+        let prompt = task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref());
         let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
         loops += 1;
         let mut decided = false;
@@ -594,6 +875,13 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
                     Verdict::Failed(r) => {
                         decided = true;
                         rail.task_done(&req.task_id, &r, true).await?;
+                    }
+                    // The question parks the task at the next boundary:
+                    // this loop still checkpoints like any other.
+                    Verdict::Ask(q) => {
+                        if let Err(e) = rail.task_ask(&req.task_id, &q).await {
+                            tracing::warn!(task = %req.task_id, error = %e, "harness driver: question not recorded");
+                        }
                     }
                     Verdict::Continue => {}
                 }
@@ -629,6 +917,10 @@ pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnReques
 }
 
 pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
+    if let Err(r) = (ctx.jail_probe)() {
+        tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
+        bail!("{}", r.note());
+    }
     let id = format!("turn-{}", uuid::Uuid::new_v4().simple());
     let ws = Workspace::create(&ctx.workdir_root, &id, ctx.keep_workdir)?;
     let prompt = match req.role_prompt.as_deref().filter(|r| !r.trim().is_empty()) {
@@ -731,16 +1023,22 @@ mod tests {
         keys_revoked: Vec<String>,
         saved: Vec<(String, String)>,
         usage: Vec<(String, String, Option<String>)>,
+        checks: u32,
+        asked: Vec<String>,
     }
 
     struct FakeRail {
         calls: Mutex<Calls>,
         key_ttl_secs: i64,
+        /// The switch says no from this check on (1-based); `None` = always yes.
+        stop_at_check: Option<u32>,
+        /// A question parks the task: every check after one says no.
+        parks_on_ask: bool,
     }
 
     impl FakeRail {
         fn new() -> Self {
-            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900 }
+            Self { calls: Mutex::new(Calls::default()), key_ttl_secs: 900, stop_at_check: None, parks_on_ask: true }
         }
     }
 
@@ -776,6 +1074,21 @@ mod tests {
         }
         async fn report_usage(&self, _usage: &UsageTotals, model: &str, kind: &str, task_id: Option<&str>) {
             self.calls.lock().unwrap().usage.push((model.to_string(), kind.to_string(), task_id.map(str::to_string)));
+        }
+        async fn budget_check(&mut self, _task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
+            let mut c = self.calls.lock().unwrap();
+            c.checks += 1;
+            let no = self.stop_at_check.is_some_and(|n| c.checks >= n) || (self.parks_on_ask && !c.asked.is_empty());
+            Ok(crate::task_budget::BudgetCheck {
+                proceed: !no,
+                reason: no.then(|| "token budget exhausted".to_string()),
+                state: "checkpointed".into(),
+                ..Default::default()
+            })
+        }
+        async fn task_ask(&self, _task_id: &str, question: &str) -> Result<()> {
+            self.calls.lock().unwrap().asked.push(question.to_string());
+            Ok(())
         }
     }
 
@@ -867,6 +1180,138 @@ mod tests {
         let note = c.checkpoints[0].1.as_deref().unwrap();
         assert!(note.contains("timed out"), "{note}");
         assert_eq!(c.keys_revoked.len(), 1, "a killed run still revokes its key");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED (i83 G): the token switch is asked before each CLI run, and a
+    /// no stops the task BEFORE the next run starts — the run in progress
+    /// was never interrupted, and its usage and checkpoint stand.
+    #[tokio::test]
+    async fn the_budget_switch_stops_the_task_between_runs_never_during_one() {
+        let root = scratch("budget");
+        let k = kind(&["sh", "-c", "echo working"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        rail.stop_at_check = Some(3);
+        let state = run_task_on(&ctx, &mut rail, &task("t-budget", 10)).await.unwrap();
+        assert_eq!(state, "checkpointed", "parked, not failed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.checks, 3, "one check per loop, and the third said no");
+        assert_eq!(c.keys_minted, 2, "the CLI ran twice: no run started after the no");
+        assert_eq!(c.checkpoints.len(), 2, "both runs finished and checkpointed");
+        assert!(c.checkpoints.iter().all(|cp| !cp.2), "nothing was failed for budget");
+        assert_eq!(c.usage.len(), 2, "both runs' tokens were reported");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// PINNED: in the driver's loop the check comes before the CLI runs, once.
+    #[test]
+    fn the_driver_checks_before_it_invokes() {
+        let src = include_str!("driver.rs");
+        let body = &src[src.find("async fn task_loops<").unwrap()..src.find("// ── a turn ──").unwrap()];
+        assert_eq!(body.matches("rail.budget_check(").count(), 1);
+        assert!(body.find("rail.budget_check(").unwrap() < body.find("invoke(ctx,").unwrap());
+        let invoke_fn = &src[src.find("async fn invoke<").unwrap()..src.find("// ── a task ──").unwrap()];
+        assert!(!invoke_fn.contains("budget_check"), "a run is never interrupted for budget");
+    }
+
+    /// A switch that says no before the first loop runs nothing at all.
+    #[tokio::test]
+    async fn an_exhausted_task_runs_no_cli() {
+        let root = scratch("budget0");
+        let k = kind(&["sh", "-c", "echo NOO_RESULT: ok"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        rail.stop_at_check = Some(1);
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-budget0", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!((c.keys_minted, c.checkpoints.len()), (0, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `NOO_QUESTION:` goes to the owner over the rail; the loop still
+    /// checkpoints, and the next boundary stops the task to wait.
+    #[tokio::test]
+    async fn a_cli_question_is_asked_and_the_task_waits() {
+        let root = scratch("ask");
+        let k = kind(&["sh", "-c", "echo looked; echo 'NOO_QUESTION: eu or us?'"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-ask", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        assert_eq!(c.asked, vec!["eu or us?".to_string()]);
+        assert!(c.done.is_empty(), "a question is not a verdict");
+        assert_eq!(c.checkpoints, vec![(1, Some("eu or us?".to_string()), false)]);
+        assert_eq!(c.checks, 2, "the boundary after the question said no");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_answer_rides_the_next_prompt() {
+        let c = crate::task_budget::Clarification { question: "eu or us?".into(), answer: Some("eu".into()) };
+        let p = task_prompt(&task("t", 5), 2, Some("looked"), Some(&c));
+        assert!(p.contains("eu or us?") && p.contains("The owner answered:\neu") && p.contains(QUESTION_MARK));
+        assert_eq!(verdict("x\nNOO_QUESTION: which one?"), Verdict::Ask("which one?".into()));
+        assert_eq!(verdict("NOO_QUESTION:   "), Verdict::Continue, "an empty question is no question");
+    }
+
+    /// PINNED (i119): where no jail can be built, a foreign task checkpoints
+    /// with the reason and the CLI never starts — no key, no translator, no
+    /// process. A turn is an error with the same words.
+    #[tokio::test]
+    async fn a_refused_jail_checkpoints_and_never_spawns() {
+        let root = scratch("nojail");
+        let marker = root.join("ran");
+        let script = format!("touch {}; echo NOO_RESULT: ok", marker.display());
+        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.jail_probe = || Err(crate::harness::jail::Refusal("this kernel has no Landlock".into()));
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-nojail", 10)).await.unwrap(), "checkpointed");
+        {
+            let c = rail.calls.lock().unwrap();
+            let note = "harness jail unavailable: this kernel has no Landlock; foreign CLIs never run unjailed";
+            assert_eq!(c.checkpoints, vec![(0, Some(note.to_string()), false)], "checkpointed, not failed, not exhausted");
+            assert_eq!((c.keys_minted, c.checks, c.done.len(), c.saved.len()), (0, 0, 0, 0), "nothing ran");
+        }
+        assert!(!marker.exists(), "the CLI never started");
+        let turn = TurnRequest {
+            conversation_id: "c1".into(),
+            prompt: "hi".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: false,
+            token: TURN_TOKEN.into(),
+        };
+        let e = run_turn_on(&ctx, &rail, &turn).await.unwrap_err();
+        assert!(e.to_string().contains("foreign CLIs never run unjailed"), "{e}");
+        assert!(!marker.exists());
+        assert_eq!(rail.calls.lock().unwrap().keys_minted, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A failed startup self-test is the gate's answer for the process: the
+    /// task checkpoints with the leak named and the CLI never starts.
+    #[tokio::test]
+    async fn a_failed_jail_self_test_checkpoints_with_the_leak_named() {
+        let root = scratch("selftest-failed");
+        let marker = root.join("ran");
+        let script = format!("touch {}; echo NOO_RESULT: ok", marker.display());
+        let k = kind(&["sh", "-c", &script], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.jail_probe = || Err(crate::harness::jail::Refusal("jail self-test failed: the planted secret /tmp/p/node.key was readable inside the jail".into()));
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-selftest", 10)).await.unwrap(), "checkpointed");
+        let c = rail.calls.lock().unwrap();
+        let note = c.checkpoints[0].1.clone().unwrap();
+        assert!(note.contains("the planted secret /tmp/p/node.key was readable inside the jail") && note.contains("never run unjailed"), "{note}");
+        assert_eq!(c.keys_minted, 0);
+        assert!(!marker.exists(), "the CLI never started");
+        drop(c);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -981,15 +1426,17 @@ mod tests {
         assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
     }
 
-    /// The shipped table: Copilot and Claude Code are runnable, Codex is
-    /// refused until its recipe is verified, `noo` is never driven.
+    /// The shipped table: Copilot, Claude Code and Codex are runnable,
+    /// `noo` is never driven.
     #[test]
     fn the_shipped_foreign_kinds_validate() {
-        for name in ["copilot", "claude-code"] {
+        for name in ["copilot", "claude-code", "codex"] {
             let k = crate::harness_kinds::get(name).unwrap();
             let l = validate_kind(k).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(l.command.iter().any(|a| a.contains("{prompt}")), "{name}: no {{prompt}}");
-            assert!(l.command.iter().any(|a| a.contains("{mcp_config}")), "{name}: no {{mcp_config}}");
+            if l.mcp == MCP_CONFIG_FILE {
+                assert!(l.command.iter().any(|a| a.contains("{mcp_config}")), "{name}: no {{mcp_config}}");
+            }
             assert_eq!(l.command[0], k.cli.clone().unwrap(), "{name}");
             let ctx = DriverCtx::new("n", "https://g", k, pinned(), &|_| None).unwrap();
             let root = scratch(name);
@@ -1001,8 +1448,153 @@ mod tests {
             ws.finish();
             let _ = std::fs::remove_dir_all(root);
         }
-        assert!(validate_kind(crate::harness_kinds::get("codex").unwrap()).is_err());
         assert!(validate_kind(crate::harness_kinds::get("noo").unwrap()).is_err());
+
+        // Codex: headless, approval-free inside its sandbox, its home the
+        // task's own, the config the driver writes carrying the model.
+        let codex = crate::harness_kinds::get("codex").unwrap();
+        let l = validate_kind(codex).unwrap();
+        assert_eq!(l.mcp, MCP_CODEX_TOML);
+        assert_eq!(&l.command[..2], ["codex", "exec"]);
+        for flag in ["--skip-git-repo-check", "--ephemeral", "--sandbox"] {
+            assert!(l.command.iter().any(|a| a == flag), "codex: {flag}");
+        }
+        assert!(!l.command.iter().any(|a| a.contains("dangerously") || a == "--yolo" || a == "--full-auto"), "no blanket bypass: {:?}", l.command);
+        assert_eq!(l.home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(codex.wires, crate::harness_kinds::get("copilot").unwrap().wires, "every node backend, through the translator");
+    }
+
+    fn codex_kind(command: &[&str]) -> HarnessKind {
+        serde_json::from_value(json!({
+            "kind": "codex", "title": "t", "wire": "OpenAI's Responses API", "wires": ["llamacpp"],
+            "runner": "noo-gateway", "cli": "codex", "lane": {},
+            "launch": {"command": command, "model_url_env": "", "model_env": "", "mcp": MCP_CODEX_TOML,
+                       "model_url_suffix": "/v1", "home_env": "CODEX_HOME", "ca_env": "CODEX_CA_CERTIFICATE"},
+            "telemetry_off": {},
+        }))
+        .unwrap()
+    }
+
+    /// PINNED: `config-file:codex-toml` writes Codex's whole config in the
+    /// task's own CODEX_HOME, 0600: the translator as a Responses provider,
+    /// the pinned model, the user door with the door key, and every vendor
+    /// channel off. No model variable is set; the key is not in the env.
+    #[test]
+    fn the_codex_mode_writes_its_config_toml_in_the_task_home() {
+        let root = scratch("codex");
+        let k = codex_kind(&["codex", "exec", "{prompt}"]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-codex", false).unwrap();
+        let p = ws.write_cli_config(&ctx, "http://127.0.0.1:41234/", "noo-sk-door-1").unwrap();
+        assert_eq!(p, ws.home.join(".codex").join("config.toml"));
+        assert!(p.starts_with(&ws.home) && !p.starts_with(&ws.work), "inside the task HOME, outside the working directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        for line in [
+            "model = \"gemma-4\"",
+            "model_provider = \"noomesh\"",
+            "approval_policy = \"never\"",
+            "sandbox_mode = \"danger-full-access\"",
+            "web_search = \"disabled\"",
+            "check_for_update_on_startup = false",
+            "[model_providers.noomesh]",
+            "base_url = \"http://127.0.0.1:41234/v1\"",
+            "wire_api = \"responses\"",
+            "[mcp_servers.noomesh]",
+            "url = \"https://gateway:8080/mcp/user\"",
+            "http_headers = { Authorization = \"Bearer noo-sk-door-1\" }",
+            "[analytics]",
+            "[feedback]",
+            "persistence = \"none\"",
+            "metrics_exporter = \"none\"",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line:?} in:\n{text}");
+        }
+        assert_eq!(text.matches("enabled = false").count(), 2, "analytics and feedback off");
+        assert!(!text.contains("env_key"), "the loopback provider asks for no key");
+
+        let env = build_env(&ctx, &ws, "http://127.0.0.1:41234/");
+        assert_eq!(env["CODEX_HOME"], ws.home.join(".codex").display().to_string(), "CODEX_HOME is the directory the config is in");
+        assert_eq!(env["CODEX_CA_CERTIFICATE"], "/etc/noo/pki/ca.crt");
+        assert!(!env.contains_key(""), "an empty model variable is not set");
+        assert!(env.values().all(|v| !v.contains("noo-sk-door")), "the door key is in the file only");
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A run in the codex mode sees its config while it runs; it is gone after.
+    #[tokio::test]
+    async fn a_codex_run_reads_its_config_and_the_file_is_removed_after() {
+        let root = scratch("codexrun");
+        let k = codex_kind(&["sh", "-c", "grep -c '^wire_api = \"responses\"$' \"$CODEX_HOME/config.toml\"; echo NOO_RESULT: ok"]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.keep_workdir = true;
+        let mut rail = FakeRail::new();
+        let state = run_task_on(&ctx, &mut rail, &task("t-codexrun", 1)).await.unwrap();
+        assert_eq!(state, "done");
+        let c = rail.calls.lock().unwrap();
+        assert!(c.saved[1].1.starts_with('1'), "the CLI read its provider block: {:?}", c.saved[1].1);
+        assert!(root.join("t-codexrun/home/.codex").is_dir());
+        assert!(!root.join("t-codexrun/home/.codex/config.toml").exists(), "the key file is removed when the run ends");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn without_mcp_no_door_is_written_and_the_mcp_arguments_are_dropped() {
+        let root = scratch("nomcp");
+        // config-file kinds: nothing to write, the flag and its value go.
+        let k = kind(&["fake", "-p", "{prompt}", "--mcp-config", "{mcp_config}", "--strict-mcp-config", "--x=@{mcp_config}", "--allow"], &[], &[]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-nomcp", false).unwrap();
+        assert_eq!(ws.write_cli_config_wired(&ctx, "http://127.0.0.1:1", McpWiring::None).unwrap(), None);
+        assert!(!ws.mcp_path().exists());
+        assert_eq!(fill_command_without_mcp(&ctx.launch.command, "hi"), ["fake", "-p", "hi", "--strict-mcp-config", "--allow"]);
+        // The shipped rows lose exactly their MCP arguments.
+        let copilot = crate::harness_kinds::get("copilot").unwrap().launch.clone().unwrap();
+        let argv = fill_command_without_mcp(&copilot.command, "P");
+        assert!(!argv.iter().any(|a| a.contains("mcp_config") || a == "--additional-mcp-config"), "{argv:?}");
+        assert_eq!(argv.len(), copilot.command.len() - 2);
+        let claude = crate::harness_kinds::get("claude-code").unwrap().launch.clone().unwrap();
+        let argv = fill_command_without_mcp(&claude.command, "P");
+        assert!(!argv.iter().any(|a| a.contains("mcp_config") || a == "--mcp-config"), "{argv:?}");
+        assert_eq!(argv.len(), claude.command.len() - 2);
+        // The door path is unchanged.
+        let p = ws.write_cli_config(&ctx, "http://127.0.0.1:1", "noo-sk-door-9").unwrap();
+        assert_eq!(p, ws.mcp_path());
+        ws.finish();
+
+        // Codex: the provider still, the MCP table not.
+        let k = codex_kind(&["codex", "exec", "{prompt}"]);
+        let ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-nomcp-codex", false).unwrap();
+        let p = ws.write_cli_config_wired(&ctx, "http://127.0.0.1:41234", McpWiring::None).unwrap().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("base_url = \"http://127.0.0.1:41234/v1\"") && text.contains("[analytics]"), "{text}");
+        assert!(!text.contains("mcp_servers") && !text.contains("Bearer"), "{text}");
+        assert!(codex_config("b", "m", Some(("https://g", "k"))).contains("[mcp_servers.noomesh]"));
+        ws.finish();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cli_is_never_run_as_root() {
+        let env: BTreeMap<String, String> = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
+        let jail = crate::harness::jail::JailSpec { workspace: PathBuf::from("/nonexistent-ws"), home: PathBuf::from("/nonexistent-home"), tmp: PathBuf::from("/nonexistent-tmp"), ca_file: None, extra_ro: Vec::new(), data_root: None };
+        let err = spawn_cli_as(&["true".to_string()], &env, Path::new("/"), Duration::from_secs(5), &jail, Some(RunAs { uid: 0, gid: 0 })).await.unwrap_err();
+        assert!(err.to_string().contains("uid 0"), "{err}");
+    }
+
+    #[test]
+    fn a_codex_mode_without_a_home_is_refused() {
+        let mut k = codex_kind(&["codex", "exec", "{prompt}"]);
+        k.launch.as_mut().unwrap().home_env = None;
+        assert!(validate_kind(&k).unwrap_err().to_string().contains("home_env"));
+        k.launch.as_mut().unwrap().mcp = "config-file:yaml".into();
+        assert!(validate_kind(&k).is_err());
     }
 
     #[tokio::test]

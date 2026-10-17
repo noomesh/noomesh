@@ -359,6 +359,9 @@ func (r *Reconciler) Once(ctx context.Context) {
 	effective, envWarnings := effectivePlacements(desired.Placements)
 	r.surfaceEnvConflicts(envWarnings)
 	ollamaRows := runningOllama(desired.Placements)
+	// Fetch the images this tick will start, concurrently, before the
+	// ordered start loop below (which then finds them local).
+	r.prefetchImages(ctx, effective, running, specLabels, native)
 	for _, p := range effective {
 		if p.Backend == "harness" {
 			// Not a container: the host service, converged

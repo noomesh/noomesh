@@ -323,6 +323,93 @@ pub async fn session_ended(
     }
 }
 
+/// Keeps a token-expiry close from landing in the middle of a turn.
+///
+/// The chat socket authenticates once, with a 15-minute access token, and
+/// closes 4401 when it expires; the console refreshes and reconnects. Closing
+/// on the dot cut off a turn that was still streaming, and the `error` frame
+/// that preceded the close was written into whatever reply was last on
+/// screen: a tab left open collected one "Token expired" line every 15
+/// minutes (2026-10-16). Expiry now waits for the turn in flight, up to
+/// [`TURN_GRACE`], and refuses to start a new one. A logout, or an admin
+/// ending the account's sessions (`AlertHub::end_sessions`, same broadcast),
+/// does not wait: it refuses new turns and [`revoked`] fires, which the
+/// socket uses to drop the running turn — a disabled account does not get
+/// to finish a long one.
+///
+/// [`revoked`]: TurnGate::revoked
+#[derive(Default)]
+pub struct TurnGate {
+    /// (a turn is running, the session is ending, the session was revoked)
+    state: std::sync::Mutex<(bool, bool, bool)>,
+    idle: tokio::sync::Notify,
+    revoke: tokio::sync::Notify,
+}
+
+/// The longest an expired session waits for the turn in flight.
+pub const TURN_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Held for the length of one turn; dropping it ends the turn.
+pub struct TurnHeld<'a>(&'a TurnGate);
+
+impl Drop for TurnHeld<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner()).0 = false;
+        self.0.idle.notify_one();
+    }
+}
+
+impl TurnGate {
+    /// Start a turn. `None`: the session is ending, start nothing.
+    pub fn begin(&self) -> Option<TurnHeld<'_>> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.1 {
+            return None;
+        }
+        st.0 = true;
+        Some(TurnHeld(self))
+    }
+
+    /// Mark the session ending and wait (at most `max`) for the running
+    /// turn, if any, to finish.
+    pub async fn finish_then_end(&self, max: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            let notified = self.idle.notified();
+            {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.1 = true;
+                if !st.0 {
+                    return;
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// End the session now (a logout or an admin end): no new turns, and
+    /// [`TurnGate::revoked`] fires for the turn in flight.
+    pub fn end_now(&self) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.1 = true;
+            st.2 = true;
+        }
+        self.revoke.notify_waiters();
+    }
+
+    /// Resolves once [`TurnGate::end_now`] has run (never on expiry).
+    pub async fn revoked(&self) {
+        let notified = self.revoke.notified();
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).2 {
+            return;
+        }
+        notified.await;
+    }
+}
+
 pub async fn send_json(socket: &mut WebSocket, value: &Value) -> bool {
     let text = match serde_json::to_string(value) {
         Ok(t) => t,
@@ -410,6 +497,55 @@ mod session_tests {
         assert!(!fut.is_finished(), "bob's logout must not close alice's socket");
         tx.send("alice".to_string()).unwrap();
         assert_eq!(fut.await.unwrap(), "Logged out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_waits_for_the_turn_in_flight() {
+        let gate = std::sync::Arc::new(TurnGate::default());
+        let held = gate.begin().expect("a turn starts");
+        let g = gate.clone();
+        let ending = tokio::spawn(async move { g.finish_then_end(TURN_GRACE).await });
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(!ending.is_finished(), "the close must not cut a running turn off");
+        assert!(gate.begin().is_none(), "no new turn once the session is ending");
+        drop(held);
+        ending.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_with_no_turn_ends_at_once_and_a_stuck_turn_is_capped() {
+        let idle = TurnGate::default();
+        idle.finish_then_end(TURN_GRACE).await;
+        assert!(idle.begin().is_none());
+
+        let stuck = TurnGate::default();
+        let _held = stuck.begin().unwrap();
+        let t0 = tokio::time::Instant::now();
+        stuck.finish_then_end(TURN_GRACE).await;
+        assert_eq!(t0.elapsed(), TURN_GRACE);
+    }
+
+    #[tokio::test]
+    async fn a_logout_refuses_new_turns_and_revokes_the_running_one() {
+        let gate = std::sync::Arc::new(TurnGate::default());
+        let _held = gate.begin().unwrap();
+        let g = gate.clone();
+        let watcher = tokio::spawn(async move { g.revoked().await });
+        tokio::task::yield_now().await;
+        assert!(!watcher.is_finished());
+        gate.end_now();
+        watcher.await.unwrap();
+        assert!(gate.begin().is_none());
+        // Already revoked: resolves at once.
+        gate.revoked().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_never_revokes() {
+        let gate = TurnGate::default();
+        gate.finish_then_end(TURN_GRACE).await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), gate.revoked()).await;
+        assert!(r.is_err(), "expiry lets the turn finish; only a logout revokes");
     }
 
     #[test]

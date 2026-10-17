@@ -194,10 +194,12 @@ or have the person log in and run `noo security service-key self`
 ### `noo tasks` — Objectives the agent loops on until done
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo tasks create` | `<objective> [--model <m>] [--budget <loops>]` | Give the agent an objective to loop on until done (needs `noo auth login`) |
+| `noo tasks create` | `<objective> [--model <m>] [--budget <loops>] [-t\|--token-budget <tokens>]` | Give the agent an objective to loop on until done (needs `noo auth login`) |
 | `noo tasks list` | `[--state <s>] [--user <u>] [-n <limit>]` | List tasks: yours, or everyone's as an operator |
 | `noo tasks show` | `<id>` | One task: state, loops, last note, result |
 | `noo tasks stop` | `<id>` | Stop a task at its next checkpoint |
+| `noo tasks resubmit` | `<id> [-t\|--token-budget <tokens>]` | Give a task more tokens; one stopped out of tokens resumes from its checkpoint |
+| `noo tasks answer` | `<id> <text>...` | Answer the question a task asked you; a new loop starts with your answer |
 
 ### `noo workflow` — Workflow automation
 | Command | Arguments | What it does |

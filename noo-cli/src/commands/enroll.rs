@@ -81,6 +81,10 @@ struct EnrollCred {
 /// `noo cluster bootstrap-token create`. Accepts padded or
 /// unpadded encoding so a hand-relayed blob survives copy mangling.
 fn parse_blob(blob: &str) -> Result<EnrollCred, String> {
+    if blob.trim().starts_with("noo-seat1.") {
+        return Err("this is a kiosk SEAT enrolment paste — run it as `noo kiosk enroll noo-seat1.…`; \
+                    a seat never enrols as a node".into());
+    }
     let b64 = blob
         .strip_prefix("noo1.")
         .ok_or("not a noo1. credential blob")?
@@ -96,6 +100,14 @@ fn parse_blob(blob: &str) -> Result<EnrollCred, String> {
             "blob version {} is newer than this CLI understands — run `noo upgrade` first",
             v["v"]
         ));
+    }
+    // A node blob carries no role claim (or `node`). Anything else — a seat
+    // claim smuggled into a node-shaped blob — is refused: the node lane
+    // never redeems a token minted for something that is not a node.
+    if let Some(role) = v.get("role").filter(|r| !r.is_null()) {
+        if role.as_str() != Some("node") {
+            return Err(format!("this enrolment blob claims role {role}, not a node — refusing"));
+        }
     }
     let field = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
     Ok(EnrollCred {
@@ -138,7 +150,7 @@ fn first_contact_agent(timeout: u64) -> ureq::Agent {
 /// `pki::issue_gateway_cert` + the onboard Tailscale step), which are exactly
 /// the two spellings `noo cluster provision` can put in the blob URL, so a
 /// verifying agent works for both.
-fn ca_agent(ca_pem: &[u8], timeout: u64) -> Result<ureq::Agent, String> {
+pub(crate) fn ca_agent(ca_pem: &[u8], timeout: u64) -> Result<ureq::Agent, String> {
     let cert = ureq::tls::Certificate::from_pem(ca_pem)
         .map_err(|e| format!("the controller's CA is not a usable certificate: {e}"))?;
     let tls = ureq::tls::TlsConfig::builder()
@@ -469,6 +481,12 @@ pub fn enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--help" | "-h" => {
                 say(USAGE);
                 return Ok(0);
+            }
+            // A kiosk seat's paste is not a node's (i77): name the right verb
+            // instead of a usage error.
+            b if b.starts_with("noo-seat1.") => {
+                ui::failed(&parse_blob(b).err().unwrap_or_default(), Some("noo kiosk enroll noo-seat1.…"));
+                return Ok(2);
             }
             b if b.starts_with("noo1.") => match parse_blob(b) {
                 Ok(c) => cred = Some(c),
@@ -1554,7 +1572,7 @@ fn darwin_arm_daemon(home: &str, noo_url: &str, node: &str, data_root: Option<&s
 /// GET `<url>/bootstrap/ca.crt` at first contact and verify it against the
 /// enroll blob's DER-sha256 pin (finding #80: the pin makes first contact
 /// token-bound rather than blind TOFU). Returns the PEM.
-fn fetch_ca_pem(noo_url: &str, pin: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn fetch_ca_pem(noo_url: &str, pin: &str) -> Result<Vec<u8>, String> {
     if pin.trim().is_empty() {
         return Err(format!(
             "this enrollment carries no cluster-CA fingerprint, so there is nothing to verify \
@@ -1816,6 +1834,21 @@ mod tests {
         let blob = make_blob(serde_json::json!({"v":2,"url":"https://c:8080","token":"t"}));
         let err = parse_blob(&blob).unwrap_err();
         assert!(err.contains("noo upgrade"), "err was: {err}");
+    }
+
+    /// A seat's paste never enrols a node (i77), in either spelling: the
+    /// `noo-seat1.` blob, or a `noo1.` blob carrying a non-node role claim.
+    #[test]
+    fn a_seat_blob_is_refused_by_the_node_enrolment() {
+        let seat = crate::commands::kiosk_seat::compose_seat_blob(&crate::commands::kiosk_seat::SeatBlob {
+            url: "https://c:8080".into(), token: "noo-st-x".into(), ca: "ab".into(), seat: "lobby".into(),
+            sigpub: "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----\n".into(),
+        });
+        assert!(parse_blob(&seat).unwrap_err().contains("noo kiosk enroll"));
+        let smuggled = make_blob(serde_json::json!({"v":1,"url":"https://c:8080","token":"t","role":"seat"}));
+        assert!(parse_blob(&smuggled).unwrap_err().contains("not a node"));
+        let node = make_blob(serde_json::json!({"v":1,"url":"https://c:8080","token":"t","role":"node"}));
+        assert!(parse_blob(&node).is_ok());
     }
 
     #[test]

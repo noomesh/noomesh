@@ -551,7 +551,7 @@ mod tests {
         // `backend doors` is a warm-up row for its "no leaf yet" problems
         // only; its security faults are pinned in cluster_verify.rs
         // (`backend_doors_security_faults_never_soften`).
-        for name in ["postgres client cert", "loki listener", "sandbox listener", "voice listeners", "backend listener", "nats tls", "secrets not in env", "shared secrets",
+        for name in ["postgres client cert", "loki listener", "sandbox listener", "voice listeners", "voice images", "voice models", "backend listener", "nats tls", "secrets not in env", "shared secrets",
             "logs access", "pki key modes", "service keys", "posture"] {
             let row = Check { name, verdict: Verdict::Fail, detail: "wrong".into(), remedy: Some("fix".into()) };
             let c = judge(row.clone(), true, "noo-x", Some(&fresh), NOW);

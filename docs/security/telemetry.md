@@ -34,7 +34,7 @@ lists that traffic.
 | **Agent harnesses: `noo`** (`noo-gateway harness`, kind `noo`) | noomesh's own binary; no phone-home code. | Nothing to switch off. | n/a |
 | **Agent harnesses: Claude Code** (kind `claude-code`) | Anthropic's CLI. Usage metrics to Anthropic and third-party logging, error reports to a third-party error tracker, `/feedback` transcripts, session-quality surveys, background auto-updates and, on a first interactive launch, automatic registration of the official plugin marketplace. Its own docs: "Claude Code sends two kinds of operational telemetry: usage metrics and error reports." | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (auto-updates, telemetry, error reporting, `/feedback`, release notes), plus `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`, `DISABLE_FEEDBACK_COMMAND=1`, `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`, `DISABLE_UPDATES=1`, `DO_NOT_TRACK=1`, plus `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1`, which the first variable does not cover. See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `claude-code` in `config/harness-kinds.json` |
 | **Agent harnesses: Copilot CLI** (kind `copilot`) | GitHub's CLI. Talks to GitHub's servers and sends telemetry unless offline. | `COPILOT_OFFLINE=true` ("prevent Copilot CLI from contacting GitHub's servers"; "In offline mode, all telemetry is disabled and the CLI only communicates with your configured provider"). See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `copilot` in `config/harness-kinds.json` |
-| **Agent harnesses: Codex CLI** (kind `codex`) | OpenAI's CLI. No switches are declared for it yet, and no runner ships for it. | None declared yet. See [Agent harnesses](#agent-harnesses). | `telemetry_off` of kind `codex` in `config/harness-kinds.json` (empty) |
+| **Agent harnesses: Codex CLI** (kind `codex`) | OpenAI's CLI. Product analytics and OpenTelemetry metrics (exported to Statsig by default), `/feedback` uploads, an update check on startup, saved prompt history, and hosted web search. | No environment switches (`telemetry_off` is empty): the harness writes the CLI's whole `config.toml` for each run, with `analytics.enabled = false`, `feedback.enabled = false`, `otel.exporter`, `otel.trace_exporter` and `otel.metrics_exporter` all `"none"`, `check_for_update_on_startup = false`, `history.persistence = "none"` and `web_search = "disabled"`. See [Agent harnesses](#agent-harnesses). | `codex_config` in `gateway-rust/src/harness/driver.rs` (`launch.mcp` = `config-file:codex-toml`) |
 | **Prometheus, Alertmanager, node-exporter** | None. | — | — |
 | **NATS server** | None. It does not check for updates. | — | — |
 | **PostgreSQL** (pgvector), **Redis**, **nginx** (model cache), **stunnel** sidecars | None. | — | — |
@@ -82,9 +82,11 @@ turn reporting back on. A guard test fails if a kind has no entry, if a
 switch below goes missing, or if a foreign kind with no switches declared
 gets a runner.
 
-Codex CLI's switches are not declared yet: its `telemetry_off` entry is
-empty, so this page lists none for it, and the guard keeps it runner-less
-until they are.
+Codex CLI takes no environment switch for its reporting: its
+`telemetry_off` entry is empty, and its switches are keys of the
+`config.toml` the harness driver writes into the run's own `CODEX_HOME`
+before every invocation (`launch.mcp` = `config-file:codex-toml`). The
+guard checks that file's template carries every key in the table below.
 
 | Kind | Switch | What the vendor's documentation says |
 |---|---|---|
@@ -97,6 +99,11 @@ until they are.
 | `claude-code` | `DO_NOT_TRACK=1` | "Set to `1` to opt out of telemetry, with the same effect as `DISABLE_TELEMETRY`" ([env-vars](https://code.claude.com/docs/en/env-vars)) |
 | `claude-code` | `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1` | "Set to `1` to disable automatic registration of the official plugin marketplace. Claude Code reads the variable when it is about to register the marketplace, usually during a machine's first interactive launch." Anthropic's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` row says the official plugin marketplace auto-install "isn't covered" by it ([env-vars](https://code.claude.com/docs/en/env-vars)) |
 | `copilot` | `COPILOT_OFFLINE=true` | "Set `COPILOT_OFFLINE=true` to prevent Copilot CLI from contacting GitHub's servers." "In offline mode, all telemetry is disabled and the CLI only communicates with your configured provider." ([GitHub changelog, 2026-04-07](https://github.blog/changelog/2026-04-07-copilot-cli-now-supports-byok-and-local-models/); [BYOK guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models)) |
+| `codex` | `analytics.enabled = false` (config.toml) | "In Codex CLI, `analytics.enabled = false` disables this exporter, including custom OTLP exporters." ([config reference](https://learn.chatgpt.com/docs/config-file/config-reference)) |
+| `codex` | `otel.exporter`, `otel.trace_exporter`, `otel.metrics_exporter` = `"none"` (config.toml) | "Select the OpenTelemetry exporter"; `otel.metrics_exporter` takes `none`, `statsig`, `otlp-http` or `otlp-grpc` and "defaults to `statsig`". ([config reference](https://learn.chatgpt.com/docs/config-file/config-reference)) |
+| `codex` | `feedback.enabled = false` (config.toml) | `feedback.enabled`, boolean, default `true`. ([config reference](https://learn.chatgpt.com/docs/config-file/config-reference)) |
+| `codex` | `check_for_update_on_startup = false` (config.toml) | "Check for Codex updates on startup (set to false only when updates are centrally managed)." ([config reference](https://learn.chatgpt.com/docs/config-file/config-reference)) |
+| `codex` | `history.persistence = "none"`, `web_search = "disabled"` (config.toml) | `history.persistence`: `save-all` or `none`; `web_search`: `disabled`, `cached`, `indexed` or `live`, default `cached`. ([config reference](https://learn.chatgpt.com/docs/config-file/config-reference)) |
 
 What the switches do not cover, stated plainly:
 

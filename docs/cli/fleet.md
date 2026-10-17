@@ -175,6 +175,7 @@ noo cluster place gpu-2 harness qwen-7b.gguf  # point at that model's backend on
 ```sh
 noo cluster class list
 noo cluster class set chat-default node-1/vllm mac-1/ollama=gemma4:12b --degraded controller-1/ollama
+noo cluster class set chat-default node-1/vllm mac-1/ollama=gemma4:12b --pool
 noo cluster class unset chat-default
 ```
 
@@ -188,6 +189,15 @@ failed. With nothing declared, every served model is its own class and
 `chat-default` is the configured default model. `noo cluster verify
 --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
+
+`--pool` turns the list into peers instead of a failover order: each
+request goes to the healthy candidate with the fewest requests the
+gateway has open to it, then the lowest load, so one class spreads across
+several nodes instead of queueing on the first. Pool members may serve
+different models, because declaring the pool says they are
+interchangeable. Failover and `--degraded` still apply. A consumer that
+names a concrete model (`google/gemma-4-12B-…`) still reaches only the
+nodes serving it, so pinning stays available.
 
 Once the agent has started it, every turn whose model resolves to gpu-2
 runs there: the loop calls the model next door and reaches the cluster
@@ -450,7 +460,7 @@ agent may execute.
 | `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
-| `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]...` | Declare a model class: candidates in failover order; --degraded ones answer last |
+| `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
@@ -482,12 +492,12 @@ agent may execute.
 | `noo cluster restart-backends` | `<node> <noo-svc>... [-y\|--yes\|--force]` | Restart noo-* backend containers on a node via a rail-delivered bundle |
 | `noo cluster host-telemetry apply` | `[<node>...] [--all] [--include-controller] [-y\|--yes]` | Switch off tailscaled's log upload on nodes over the pull rail, one at a time |
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
-| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI (and runtime) on the controller, checked against its pin |
-| `noo cluster vendor status` | — | List staged vendor CLIs and runtimes per platform, and which nodes need which |
+| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
+| `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
 | `noo cluster vendor` | — | Print vendor subcommand usage (stage, status) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
-| `noo cluster nats-creds rotate` | `<node\|gateway\|worker>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; gateway/worker re-render + recreate |
+| `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
 | `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a published GGUF + Modelfile from the controller store into a node's ollama |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
 | `noo cluster clean` | `<node>\|all [--deep] [-y\|--yes]` | Remove this stack's containers on node(s) through their agents; --deep removes images too |
@@ -497,7 +507,7 @@ agent may execute.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo models cached` | — | List models currently loaded on running node backends |
-| `noo models pull` | `<model> [--backend <b>]` | Pull a model onto the gateway's Ollama (not a chosen node) with streamed progress |
+| `noo models pull` | `<model> [--backend <b>]` | Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model |
 | `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified) |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh]` | List popular models per backend from the HuggingFace catalog cache |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |

@@ -431,6 +431,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["tasks", "list"], commands::tasks_list),
     (&["tasks", "show"], commands::tasks_show),
     (&["tasks", "stop"], commands::tasks_stop),
+    (&["tasks", "resubmit"], commands::tasks_resubmit),
+    (&["tasks", "answer"], commands::tasks_answer),
     (&["agents", "peer", "dispatch"], commands::agents_peer_dispatch),
     (&["channels", "test"], commands::channels_test),
     (&["inference", "agent"], commands::inference_agent),
@@ -476,6 +478,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "admin-password", "reset"], commands::security_admin_password_reset),
     // Auth scopes, not the KB roles that `grant-role` handles — admin-only.
     (&["security", "user", "set-scopes"], commands::security_user_set_scopes),
+    (&["security", "user", "allowance"], commands::security_user_allowance),
     (&["security", "user", "set-org"], commands::security_user_set_org),
     (&["security", "user", "disable"], commands::security_user_disable),
     (&["security", "user", "enable"], commands::security_user_enable),
@@ -637,6 +640,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["auth", "status"], commands::auth_status),
     (&["auth", "logout"], commands::auth_logout),
     // ── Token-usage summary ── thin GET /api/usage/summary.
+    (&["usage", "me"], commands::usage_me),
     (&["usage"], commands::usage),
     // ── Self-update ── download+verify+swap the running binary; native
     // so it works on a box with NO repo (the standalone controller update path).
@@ -649,9 +653,12 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),
     (&["kiosk", "labels"], commands::kiosk_labels),
     (&["kiosk", "reload"], commands::kiosk_reload),
+    (&["kiosk", "seat-sync"], commands::kiosk_seat_sync),
+    (&["kiosk", "seat-token"], commands::kiosk_seat_token),
     (&["kiosk", "serve"], commands::kiosk_serve),
     (&["kiosk", "setup"], commands::kiosk_setup),
     (&["kiosk", "status"], commands::kiosk_status),
@@ -691,6 +698,8 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["autonomy", "locations"],
     &["ops"],
     &["kiosk", "serve"],
+    // The seat's timer runs it (noo-seat-sync.service, root); nobody types it.
+    &["kiosk", "seat-sync"],
     &["tools", "select"],
     // Aliases and retired verbs: they still work, but are not offered.
     &["recall", "lifecycle-stats"],

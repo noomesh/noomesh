@@ -6551,6 +6551,25 @@ pub fn security_posture(ctx: &mut Ctx) {
     }
 }
 
+/// The voice add-on's models (i105): when voice is on, the controller
+/// stages the configured whisper model and piper voice; the containers load
+/// them read-only and offline. A failure is a warning with its retry line.
+pub fn stage_voice_models(ctx: &mut Ctx) {
+    if ctx.state.mode == "worker" || !crate::commands::voice_models::voice_on() {
+        return;
+    }
+    if ctx.dry_run {
+        for m in crate::commands::voice_models::configured() {
+            ctx.dry(&format!("stage {} into {}", m.id(), crate::commands::voice_models::voice_root().display()));
+        }
+        return;
+    }
+    for r in crate::commands::voice_models::stage_configured(false) {
+        let l = crate::commands::voice_models::line(&r);
+        if r.is_ok() { ctx.success(&l) } else { ctx.warn(&l) }
+    }
+}
+
 pub fn addons(ctx: &mut Ctx) {
     if ctx.state.mode == "worker" {
         ctx.info("Worker mode — add-ons run on the controller. Skipping.");

@@ -672,12 +672,11 @@ fn compose_service_names(text: &str) -> Vec<String> {
 
 /// The services a licensed add-on's overlay ADDS (its `services:` keys that
 /// the base and this tree's overlays do not define) — lib-addons.sh
-/// `addon_own_services`, in Rust. Read from its bundled overlay, else the
-/// deprecated slice copy; empty when neither is there.
+/// `addon_own_services`, in Rust. Read from its bundled overlay;
+/// empty when it is not there.
 pub(crate) fn licensed_addon_services(root: &Path, addon: &str) -> Vec<String> {
     let bundled = crate::addons::pins::addon_dir(root, addon).join(crate::addon_lock::OVERLAY_FILE);
-    let legacy = crate::addons::pins::legacy_overlay(root, addon);
-    let Some(text) = std::fs::read_to_string(&bundled).ok().or_else(|| std::fs::read_to_string(&legacy).ok()) else {
+    let Ok(text) = std::fs::read_to_string(&bundled) else {
         return Vec::new();
     };
     let core: Vec<String> = ["docker-compose.cluster.yml", "docker-compose.trellion.yml", "docker-compose.voice.yml"]
@@ -1070,7 +1069,7 @@ mod compose_files_tests {
     }
 
     #[test]
-    fn a_legacy_slice_overlay_is_composed_only_without_a_bundle() {
+    fn a_root_slice_overlay_is_never_composed_without_a_bundle() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let t = scratch(true);
         let root = t.path();
@@ -1080,9 +1079,9 @@ mod compose_files_tests {
         let with_bundle = compose_files_in(args.0, args.1, &args.2, &args.3);
         assert!(with_bundle.last().unwrap().ends_with("/addons/evolve/docker-compose.yml"), "{with_bundle:?}");
         std::fs::remove_dir_all(root.join("addons")).unwrap();
-        let legacy = compose_files_in(args.0, args.1, &args.2, &args.3);
+        let without = compose_files_in(args.0, args.1, &args.2, &args.3);
         clear_env();
-        assert_eq!(names(&legacy).last().map(String::as_str), Some("docker-compose.evolve.yml"), "{legacy:?}");
+        assert_eq!(names(&without), ["docker-compose.cluster.yml", "docker-compose.override.yml"], "{without:?}");
     }
 
     #[test]

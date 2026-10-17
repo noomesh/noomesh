@@ -116,3 +116,74 @@ def test_the_anonymous_hatch_does_not_smuggle_the_shared_pair_in():
 def test_inbox_prefix_is_a_single_worker_scoped_token():
     assert INBOX_PREFIX == "_INBOX_worker"
     assert "." not in INBOX_PREFIX, "a dot would create a subject hierarchy"
+
+
+# ── an add-on's own principal (i70 residue) ──────────────────────────────
+
+from noomesh.cluster.messaging import (  # noqa: E402
+    ADDON_PASSWORD_VAR,
+    ADDON_USER_VAR,
+    BUS_AUDIENCE_VAR,
+    inbox_prefix_for,
+)
+
+_WORKER_PAIR = {WORKER_USER_VAR: "worker", WORKER_PASSWORD_VAR: "wk"}
+
+
+@pytest.mark.parametrize("audience, user", [("trellion", "trellion"), ("trellion-intel", "trellion_intel")])
+def test_an_addon_presents_its_own_principal(audience, user):
+    cred = resolve_nats_credentials({
+        **_WORKER_PAIR, BUS_AUDIENCE_VAR: audience, ADDON_USER_VAR: user, ADDON_PASSWORD_VAR: "own",
+    })
+    assert cred == {"user": user, "password": "own", "source": "addon"}
+    # Its client inbox is its own, not the worker's.
+    assert inbox_prefix_for(cred) == f"_INBOX_{user}"
+
+
+def test_an_addon_without_its_password_falls_back_to_the_worker_and_says_so():
+    # ONE release: the overlay sets NATS_ADDON_USER only when the store holds
+    # the add-on's password, so absent means "not migrated yet".
+    from structlog.testing import capture_logs
+
+    # The overlay's user is a literal; the password FILE is there only when
+    # the store holds it.
+    with capture_logs() as logs:
+        cred = resolve_nats_credentials({**_WORKER_PAIR, BUS_AUDIENCE_VAR: "trellion", ADDON_USER_VAR: "trellion"})
+    assert cred == {"user": "worker", "password": "wk", "source": "worker"}
+    assert inbox_prefix_for(cred) == INBOX_PREFIX
+    warned = [entry for entry in logs if entry["event"] == "nats_addon_principal_fallback"]
+    assert warned and warned[0]["log_level"] == "warning", logs
+    assert "NATS_TRELLION_PASSWORD" in warned[0]["message"]
+
+
+def test_an_inherited_principal_is_never_presented():
+    # trellion-intel `extends` trellion; a bundle that predates its own
+    # principal inherits trellion's pair. It must present the worker, not
+    # trellion (whose grant cannot subscribe intel's subjects anyway).
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        cred = resolve_nats_credentials({
+            **_WORKER_PAIR, BUS_AUDIENCE_VAR: "trellion-intel",
+            ADDON_USER_VAR: "trellion", ADDON_PASSWORD_VAR: "trellions",
+        })
+    assert cred["user"] == "worker" and cred["source"] == "worker"
+    assert any(entry["event"] == "nats_addon_principal_not_ours" for entry in logs), logs
+
+
+def test_the_core_worker_says_nothing_about_add_ons():
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        cred = resolve_nats_credentials({**_WORKER_PAIR, BUS_AUDIENCE_VAR: "worker"})
+    assert cred["source"] == "worker"
+    assert not [entry for entry in logs if entry["event"].startswith("nats_addon")], logs
+
+
+def test_the_addon_password_is_read_from_its_file(tmp_path):
+    f = tmp_path / "nats_addon_password"
+    f.write_text("from-file\n")
+    cred = resolve_nats_credentials({
+        BUS_AUDIENCE_VAR: "trellion", ADDON_USER_VAR: "trellion", ADDON_PASSWORD_VAR + "_FILE": str(f),
+    })
+    assert cred == {"user": "trellion", "password": "from-file", "source": "addon"}

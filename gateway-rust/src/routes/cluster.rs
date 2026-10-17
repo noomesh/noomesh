@@ -3851,6 +3851,7 @@ async fn model_classes_get(State(state): State<Arc<AppState>>) -> AppResult {
             json!({
                 "name": c.name,
                 "declared": c.declared,
+                "pool": c.pool,
                 "routable": c.routable_count(),
                 "healthy": c.healthy_count(),
                 "candidates": c.candidates,
@@ -3876,6 +3877,10 @@ pub(crate) struct ModelClassBody {
     pub candidates: Vec<ModelClassCandidateBody>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Peers sharing the load instead of a failover order
+    /// (`noo cluster class set … --pool`).
+    #[serde(default)]
+    pub pool: bool,
 }
 
 /// Validate a class declaration. Pure, so the rules are tested: a valid
@@ -3970,7 +3975,7 @@ pub(crate) fn validate_model_class(
             return Err(format!("alias '{a}' is listed twice"));
         }
     }
-    Ok(DeclaredClass { name, candidates })
+    Ok(DeclaredClass { name, candidates, pool: body.pool })
 }
 
 /// PUT /api/cluster/model-classes/{class} — declare (replace) a class:
@@ -5985,6 +5990,7 @@ mod model_class_tests {
         let body = ModelClassBody {
             candidates: vec![cand("host3", "vllm", None, false), cand("host6", "ollama", Some("gemma4:12b"), false), cand("host8", "ollama", None, true)],
             aliases: vec!["gemma4:12b-any".into()],
+            pool: false,
         };
         let d = validate_model_class("Chat-Default", &body, &["fast".into()], &[], NONE).expect("valid");
         assert_eq!(d.name, "chat-default", "stored lowercase");
@@ -5997,7 +6003,7 @@ mod model_class_tests {
 
     #[test]
     fn the_rules_refuse_what_they_say_they_refuse() {
-        let ok = |cands: Vec<ModelClassCandidateBody>, aliases: Vec<&str>| ModelClassBody { candidates: cands, aliases: aliases.into_iter().map(String::from).collect() };
+        let ok = |cands: Vec<ModelClassCandidateBody>, aliases: Vec<&str>| ModelClassBody { candidates: cands, aliases: aliases.into_iter().map(String::from).collect(), pool: false };
         let e = validate_model_class("chat-default", &ok(vec![], vec![]), &[], &[], NONE).unwrap_err();
         assert!(e.contains("at least one candidate"), "{e}");
         let e = validate_model_class("default", &ok(vec![cand("a", "vllm", None, false)], vec![]), &[], &[], NONE).unwrap_err();
@@ -6026,12 +6032,12 @@ mod model_class_tests {
     /// pin into whatever chat-default serves.
     #[test]
     fn an_alias_may_not_shadow_a_served_model() {
-        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["GEMMA4:26B:latest".into()] };
+        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["GEMMA4:26B:latest".into()], pool: false };
         let live: Vec<String> = vec!["gemma4:26b".into(), "google/gemma-4-12B-it-qat-w4a16-ct".into()];
         let e = validate_model_class("chat-default", &body, &live, &[], NONE).unwrap_err();
         assert!(e.contains("gemma4:26b") && e.contains("may not shadow"), "{e}");
         // A name no class carries is fine.
-        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["gemma4:12b-any".into()] };
+        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["gemma4:12b-any".into()], pool: false };
         assert!(validate_model_class("chat-default", &body, &live, &[], NONE).is_ok());
     }
 
@@ -6041,17 +6047,17 @@ mod model_class_tests {
     fn a_class_named_after_a_served_model_must_serve_it() {
         let live: Vec<String> = vec!["gemma4:26b".into(), "google/gemma-4-12B-it-qat-w4a16-ct".into()];
         // host3's vLLM serves the 12B, not the 26b the name promises.
-        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false), cand("host6", "ollama", None, true)], aliases: vec![] };
+        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false), cand("host6", "ollama", None, true)], aliases: vec![], pool: false };
         let e = validate_model_class("gemma4:26b", &body, &live, &[], &served_by).unwrap_err();
         assert!(e.contains("must serve it") && e.contains("gemma4:26b") && e.contains("host3/vllm"), "{e}");
         // The 26b-serving node first: fine, and the ordering is the point.
-        let body = ModelClassBody { candidates: vec![cand("host6", "ollama", None, false), cand("host3", "vllm", None, true)], aliases: vec![] };
+        let body = ModelClassBody { candidates: vec![cand("host6", "ollama", None, false), cand("host3", "vllm", None, true)], aliases: vec![], pool: false };
         assert!(validate_model_class("GEMMA4:26B", &body, &live, &[], &served_by).is_ok(), "case does not matter");
         // An explicit model on the first candidate counts as what it serves.
-        let body = ModelClassBody { candidates: vec![cand("ghost", "ollama", Some("gemma4:26b:latest"), false)], aliases: vec![] };
+        let body = ModelClassBody { candidates: vec![cand("ghost", "ollama", Some("gemma4:26b:latest"), false)], aliases: vec![], pool: false };
         assert!(validate_model_class("gemma4:26b", &body, &live, &[], &served_by).is_ok());
         // An unknown first candidate with no model named: refused, not guessed.
-        let body = ModelClassBody { candidates: vec![cand("ghost", "ollama", None, false)], aliases: vec![] };
+        let body = ModelClassBody { candidates: vec![cand("ghost", "ollama", None, false)], aliases: vec![], pool: false };
         let e = validate_model_class("gemma4:26b", &body, &live, &[], &served_by).unwrap_err();
         assert!(e.contains("cannot tell"), "{e}");
         // A class not named after a served model has no such rule.
@@ -6098,7 +6104,7 @@ mod model_class_tests {
     #[test]
     fn an_alias_owned_by_another_class_is_refused() {
         let owned = vec![("quick".to_string(), "fast".to_string())];
-        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["Quick".into()] };
+        let body = ModelClassBody { candidates: vec![cand("host3", "vllm", None, false)], aliases: vec!["Quick".into()], pool: false };
         let e = validate_model_class("chat-default", &body, &["fast".into()], &owned, NONE).unwrap_err();
         assert!(e.contains("belongs to class 'fast'"), "{e}");
         // The owner may restate its own alias.

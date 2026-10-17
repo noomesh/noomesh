@@ -486,6 +486,22 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
             Ok(e) => {
                 let p = e.config.clone();
                 enabled_report = Some(e);
+                // Its own NATS principal, when its overlay declares one (i70
+                // residue): mint + render + HUP. Best-effort — without it the
+                // add-on presents the worker for one release.
+                match crate::commands::nats_users::reconcile_addon_principals(g, &crate::envfile::repo_root()) {
+                    Ok(Some(out)) => {
+                        let reloaded = crate::commands::nats_users::hup_nats();
+                        if !g.json {
+                            crate::ui::done(&format!("{name}: its own NATS principal rendered ({} principals){}",
+                                out.users, if reloaded { "; noo-nats reloaded" } else { "" }));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => if !g.json {
+                        crate::ui::warned(&format!("{name}: its NATS principal was not rendered ({e}); run: noo cluster nats-users render"));
+                    },
+                }
                 p
             }
             Err(r) => fail(
@@ -506,6 +522,11 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // `unlicensed` is only ever Some under `--force`: the file now says yes
     // and the gateway will still refuse until a token is installed.
 
+    // Voice: the controller stages the whisper model and piper voice the
+    // containers will load read-only and offline (i105). After the flip, and
+    // never a refusal: a failed download is reported with its retry line.
+    let voice_staged = (on && name == "voice").then(|| crate::commands::voice_models::stage_configured(!g.json));
+
     if g.json {
         println!(
             "{}",
@@ -515,6 +536,10 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
                 "licensed_feature": r.licensed, "granted": unlicensed.is_none(),
                 "restart_required": true,
                 "enable": enabled_report.as_ref().map(|e| crate::commands::addon_enable::report_json(name, e)),
+                "voice_models": voice_staged.as_ref().map(|v| v.iter().map(|r| match r {
+                    Ok(s) => s.json(),
+                    Err((id, e)) => json!({"id": id, "error": e, "retry": format!("noo models pull {id}")}),
+                }).collect::<Vec<_>>()),
             })
         );
         return Ok(0);
@@ -529,6 +554,12 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
         ));
         if before == Some(on) {
             println!("{}", ui::note("it was already declared that way — nothing changed"));
+        }
+    }
+    for r in voice_staged.iter().flatten() {
+        match r {
+            Ok(_) => ui::done(&crate::commands::voice_models::line(r)),
+            Err(_) => ui::warned(&crate::commands::voice_models::line(r)),
         }
     }
     if let Some(f) = unlicensed {
@@ -732,8 +763,7 @@ compose_env:
     ///
     /// One-directional on purpose. Every gateway add-on must be offered
     /// here, because the gateway routes and refuses on it. The reverse is
-    /// allowed: `voice` is containers-only with no gateway surface, so it
-    /// has a row here and none there.
+    /// allowed for any add-on the gateway does not need to name.
     #[test]
     fn every_gateway_addon_is_offered_here() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();

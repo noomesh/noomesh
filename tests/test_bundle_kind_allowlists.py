@@ -94,12 +94,12 @@ def test_host_telemetry_kind_is_registered_in_all_three() -> None:
     assert "host-telemetry" in _rust_list()
 
 
-VENDOR_KINDS = ["vendor-cli", "vendor-cli-manifest", "vendor-runtime", "vendor-runtime-manifest"]
+VENDOR_KINDS = ["vendor-cli", "vendor-cli-manifest"]
 
 
 def test_vendor_kinds_are_registered_in_all_three() -> None:
-    """i83 E1e: the controller stages a harness kind's vendor CLI (and its
-    runtime) and the bundle carries it with a manifest each; a list missing
+    """i83 E1e: the controller stages a harness kind's vendor CLI and
+    the bundle carries it with a manifest; a list missing
     one makes the whole bundle refuse on that side."""
     apply = _shell_list("scripts/noo-apply.sh", "KNOWN_KINDS")
     sign = _shell_list("scripts/sign-bundle.sh", "KNOWN")
@@ -117,5 +117,5 @@ def test_vendor_manifests_are_text_kinds_in_both_appliers() -> None:
     m = re.search(r"const TEXT_KINDS: &\[&str\] = &\[(.*?)\];", text, re.S)
     assert m
     rust = re.findall(r'"([^"]+)"', m.group(1))
-    for kind in ("vendor-cli-manifest", "vendor-runtime-manifest"):
+    for kind in ("vendor-cli-manifest",):
         assert kind in shell and kind in rust, kind

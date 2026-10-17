@@ -147,7 +147,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
         | "noo_config_get" | "noo_memory_health"
         | "noo_device_battery" | "web_search"
         | "noo_agent_inbox" | "noo_agent_ack" | "noo_agent_thread" | "noo_task_done"
-        | "noo_task_status" | "noo_task_wait"
+        | "noo_task_ask" | "noo_task_status" | "noo_task_wait"
         | "noo_op_status" | "noo_op_list" => RiskLevel::Low,
 
         // Medium: side effects, external communication, inference

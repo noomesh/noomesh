@@ -51,6 +51,7 @@ pub mod heartbeat;
 pub mod inference;
 pub mod jobs;
 pub mod kiosk;
+pub mod kiosk_seat;
 pub mod logs;
 pub mod mcp;
 pub mod memory;
@@ -60,6 +61,7 @@ pub mod controller;
 pub mod migrate;
 pub mod models;
 pub mod models_fetch;
+pub mod voice_models;
 pub mod pki;
 pub mod plugins;
 pub mod proactive;
@@ -91,7 +93,7 @@ pub use agents::{
     agents_presence, agents_send, agents_thread,
 };
 pub use auth::{auth_login, auth_logout, auth_status};
-pub use tasks::{tasks_create, tasks_list, tasks_show, tasks_stop};
+pub use tasks::{tasks_answer, tasks_create, tasks_list, tasks_resubmit, tasks_show, tasks_stop};
 pub use approval::{approval_approve, approval_deny, approval_list, approval_stats, approval_status};
 pub use autonomy::{
     autonomy_audit, autonomy_decisions, autonomy_disable, autonomy_enable, autonomy_status,
@@ -183,7 +185,7 @@ pub use security::{
     security_user_links, security_user_list, security_user_list_roles, security_user_proposals,
     security_user_revoke_role, security_user_set_org, security_user_set_password,
     security_admin_password_reset,
-    security_user_set_scopes, security_user_unlink,
+    security_user_allowance, security_user_set_scopes, security_user_unlink,
 };
 pub use secrets::{secrets_audit, secrets_resync, secrets_rotate, secrets_tidy};
 pub use secrets_remove::secrets_remove;
@@ -206,7 +208,7 @@ pub use bundle::bundle_export;
 pub use provision::cluster_provision;
 pub use offboard::offboard;
 pub use upgrade::upgrade;
-pub use usage::usage;
+pub use usage::{usage, usage_me};
 
 /// `noo tui` — RETIRED 2026-08-16. Native so the answer needs no Python and
 /// a broken venv can't turn it into a traceback: the web dashboard
@@ -415,3 +417,4 @@ pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addons::{addons_disable, addons_enable, addons_list};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
+pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

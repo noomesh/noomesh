@@ -18,7 +18,7 @@ door, and nothing is placed on a node. See
 | `noo` (default) | noomesh's own loop (`noo-gateway harness`) | **Runs today** | vLLM, llama.cpp, Ollama, AirLLM | None: no phone-home code |
 | `claude-code` | Anthropic's Claude Code CLI | Runs once the vendor CLI (`claude`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (the harness translates Anthropic's Messages API to the node's wire) | Switched off by a fixed set of variables, see [Telemetry](#telemetry) |
 | `copilot` | GitHub's Copilot CLI | Runs once the vendor CLI (`copilot`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (OpenAI's wire) | Offline mode only, see [Telemetry](#telemetry) |
-| `codex` | OpenAI's Codex CLI | Accepted, then **refused**: its wire is not served by any node backend yet | None yet (it speaks OpenAI's Responses API, which no node backend serves) | No switches declared yet, see [Telemetry](#telemetry) |
+| `codex` | OpenAI's Codex CLI | Runs once the vendor CLI (`codex`) is installed on the node | vLLM, llama.cpp, Ollama, AirLLM (the harness translates OpenAI's Responses API to the node's wire) | Switched off in the `config.toml` the harness writes for each run, see [Telemetry](#telemetry) |
 
 The kinds, the chat backends each can use, the vendor CLI each needs
 (`cli`), how it is launched and its vendor telemetry switches are declared
@@ -31,8 +31,7 @@ headless CLI and fronts the node's model with a loopback wire translator, so
 `runner` is `noo-gateway` for all four kinds and what differs per kind is
 the vendor CLI that must be on the node. The controller stages that CLI and
 ships it to the node over the rail (next section); until the node has it, a
-placement of that kind is refused. `codex` stays refused by data: its
-Responses API wire has no translator yet.
+placement of that kind is refused.
 
 ## Vendor CLIs are staged by the controller
 
@@ -42,9 +41,7 @@ binary itself: in its signed bundle, from the controller.
 1. **Pin.** A kind's `distribution` in `config/harness-kinds.json` says
    where the vendor publishes the CLI (a URL template filled in from the
    node's platform), its version, and the sha256 each artefact must hash
-   to. A CLI that runs on a runtime (Node.js) names it, and the table's
-   `runtimes` pins that the same way. Changing a pin is a reviewed change
-   to that file.
+   to. Changing a pin is a reviewed change to that file.
 2. **Stage.** `noo cluster vendor stage <kind>` (or `--all`) fetches every
    artefact the fleet's platforms need, on the controller, and refuses one
    whose sha256 is not the pinned one, naming the URL and both digests and
@@ -52,7 +49,7 @@ binary itself: in its signed bundle, from the controller.
    `noo cluster vendor status` lists what is staged and which nodes need
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)
-   puts the staged CLI, and its runtime, in the bundle of every node whose
+   puts the staged CLI in the bundle of every node whose
    harness placement names that kind. If it is not staged, the restage for
    that node is refused with the `noo cluster vendor stage` command to run:
    a restage never downloads.
@@ -75,6 +72,20 @@ harness runs the CLI, and the harness reports the CLI's own error. A bundle
 that carries a vendor CLI is large (each artefact is 100-250 MB), so the
 first restage after a placement takes longer to stage and to fetch.
 
+### The CLI runs jailed
+
+The harness never runs a vendor CLI unconfined. On Linux the CLI runs in
+a Landlock jail: it can write only its task's working directory, HOME and
+TMPDIR, and read only the system trees a runtime needs, a short list of
+`/etc` files and the cluster CA file. It cannot read the node's keys, env
+files, secrets or data root, nor the harness's environment. The network is
+not restricted. A node whose kernel cannot provide Landlock (or a Mac
+without `sandbox-exec`) cannot run a foreign kind. Its tasks are
+checkpointed with `harness jail unavailable: …; foreign CLIs never run
+unjailed`, and the harness logs the reason at startup (`noo cluster logs
+<node> harness`). The exact allow-list is in
+[../security/node-agent.md](../security/node-agent.md#foreign-clis-run-in-a-jail).
+
 ## Place a harness
 
 ```sh
@@ -95,6 +106,60 @@ that harness only when one is placed there and the node's agent reports it
 running. Without one, the controller runs the turn in process, as it
 always has, and a task's `why` says which of the two is missing.
 
+## Probe a kind before placing it
+
+`noo-gateway harness probe` runs a kind's real vendor CLI once per test,
+exactly as the harness driver would run it for a task: the same launch
+recipe, the same environment built from nothing (the kind's `lane` and
+`telemetry_off` included), the same loopback wire translator, the same
+process group, timeout and output caps. It does not mint a door key or
+wire noomesh's MCP tools, and it never calls the gateway. Two tests:
+
+- `reply`: the CLI is asked to answer `NOO_RESULT: ok`. It passes when the
+  driver's verdict parser reads `ok`.
+- `file`: the CLI is asked to create `probe.txt` containing `noomesh` and
+  answer `NOO_RESULT: done`. It passes when the file is there with that
+  content and the verdict is `done`. This shows that the model drives the
+  CLI's own tool loop through the translator.
+
+There are two modes:
+
+- **Mock** (`--mock-model`): an in-process scripted model answers every
+  call. It tests the wire and the flags, and needs no model and no root.
+  For `file`, it calls whichever file-writing tool the CLI advertised and
+  records that tool's name and argument keys in the report.
+- **Real**: the node's own model. Settings come from `--model-url`,
+  `--model` and `--backend`. Without those flags it reads
+  `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL` and `NOO_HARNESS_BACKEND`.
+  When `/etc/noo-harness.env` is readable, the probe fills in every
+  variable that is not already set, the node certificate
+  (`NOO_TLS_CA`, `NOO_TLS_CERT`, `NOO_TLS_KEY`) and the node-agent bearer
+  included. The model calls then carry the same client identity the
+  harness presents. That file is root-only, so the real mode runs with
+  `sudo`. As root, the probe runs the CLI as `--run-as <user>` (default
+  `nobody`) and refuses to run it as uid 0.
+
+```sh
+# mock: the wire and the flags, as yourself
+noo-gateway harness probe --kind copilot --mock-model
+noo-gateway harness probe --kind claude-code --cli /opt/claude/claude --mock-model --json
+# real: the node's model, the CLI as an unprivileged user
+sudo noo-gateway harness probe --kind codex --run-as nobody --json
+```
+
+Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
+`--test reply|file|both` (default `both`), `--timeout <secs>` (default
+300), `--keep` (keep the workspace and print its path) and `--json`. For
+each test the report gives the CLI version, PASS or FAIL with the first
+concrete reason, the exit code, seconds, whether it timed out, every
+translator route the CLI hit (method, path, status), token usage, and the
+last 20 lines of stdout and stderr. The exit code is 0 only when every
+selected test passed.
+
+The probe changes no service, no placement and no file outside its
+workspace under the system temp directory. It removes that workspace when
+it finishes unless you pass `--keep`.
+
 ## What happens when a kind cannot run
 
 The node agent checks a harness placement before it starts anything, in
@@ -102,8 +167,8 @@ this order, and reports the first problem as the placement's refusal:
 
 1. **Wire compatibility.** The kind must speak the wire of the node's
    running chat backend. For example, `claude-code` on a node whose chat
-   backend is vLLM is refused with the backends that would do; `codex`,
-   whose wire no node backend serves yet, is refused saying so.
+   backend is vLLM is refused with the backends that would do. A kind whose
+   wire no node backend serves (none today) is refused saying so.
 2. **Known kind.** Anything not in `config/harness-kinds.json` (`noo`,
    `claude-code`, `copilot`, `codex`) is refused.
 3. **Runner shipped.** A kind with no runner in the table (none today) is
@@ -111,7 +176,7 @@ this order, and reports the first problem as the placement's refusal:
 4. **Runner installed.** Every kind's runner is `noo-gateway`; it is refused
    with "its runner ... is not installed on this node" when the binary is not
    where the node's installer puts it.
-5. **Vendor CLI installed.** A foreign kind (`claude-code`, `copilot`) whose
+5. **Vendor CLI installed.** A foreign kind (`claude-code`, `copilot`, `codex`) whose
    `cli` is not on the node's PATH is refused with "its runner is present
    but the \"claude\" command is not installed on this node". Stage it and
    restage the node (see above).

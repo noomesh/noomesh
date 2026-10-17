@@ -8,6 +8,15 @@
 //! (written by the `usage_rollup` heartbeat action, 049):
 //!
 //!   GET /api/usage/summary?window=month|all|YYYY-MM&group=node|model|backend|source|user|consumer|day
+//!   GET /api/usage/me?period=day|week|month[&user=]       (i83 G)
+//!   GET|PUT|DELETE /api/users/{username}/allowance          (i83 G)
+//!
+//! `me` is one person's spend for the period in THREE columns that are never
+//! summed into one another — node, cloud, and per harness kind — plus the
+//! allowance and what is left of it, and a `cost_usd` per column from the
+//! per-model price map (`usage::COST_SETTING`; reported, never enforced).
+//! The allowance is set by an Admin (`PUT`, `noo security user allowance`);
+//! a person may read their own.
 //!
 //! Defaults: window=month (the current calendar month), group=node. Rows are
 //! sums per group value, ordered by total tokens descending; a NULL node_id
@@ -44,12 +53,224 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::auth::{scoped_user, ClusterNode, RequesterCtx};
+use crate::auth::{scoped_user, ClusterNode, RequesterCtx, Role};
 use crate::routes::{AppError, AppResult};
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/usage/summary", get(usage_summary))
+    Router::new()
+        .route("/api/usage/summary", get(usage_summary))
+        .route("/api/usage/me", get(usage_me))
+        .route("/api/users/{username}/allowance", get(allowance_get).put(allowance_put).delete(allowance_delete))
+}
+
+// ─── one person's spend: node vs cloud vs harness (i83 G) ──────────────
+
+/// One grouped row of a person's period spend.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpendRow {
+    pub backend: String,
+    pub harness_kind: Option<String>,
+    pub node_id: Option<String>,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub requests: i64,
+}
+
+#[derive(Default)]
+struct Column {
+    prompt: i64,
+    completion: i64,
+    requests: i64,
+    cost_usd: f64,
+    unpriced_tokens: i64,
+    by: std::collections::BTreeMap<String, i64>,
+}
+
+impl Column {
+    fn add(&mut self, r: &SpendRow, key: &str, rate: Option<f64>) {
+        let total = r.prompt_tokens + r.completion_tokens;
+        self.prompt += r.prompt_tokens;
+        self.completion += r.completion_tokens;
+        self.requests += r.requests;
+        match rate {
+            Some(p) => self.cost_usd += total as f64 / 1_000_000.0 * p,
+            None => self.unpriced_tokens += total,
+        }
+        *self.by.entry(key.to_string()).or_default() += total;
+    }
+    fn json(&self, by_name: &str) -> Value {
+        json!({
+            "prompt_tokens": self.prompt,
+            "completion_tokens": self.completion,
+            "total_tokens": self.prompt + self.completion,
+            "requests": self.requests,
+            "cost_usd": (self.cost_usd * 10_000.0).round() / 10_000.0,
+            "unpriced_tokens": self.unpriced_tokens,
+            by_name: self.by.iter().map(|(k, v)| json!({"key": k, "total_tokens": v})).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Fold a person's rows into the report's columns. Pure, so the split is
+/// test-pinned: a row lands in exactly ONE of node / cloud / harness[kind]
+/// (`usage::side_of`), and no column's total includes another's.
+pub(crate) fn split_report(rows: &[SpendRow], prices: &[(String, f64)]) -> Value {
+    use crate::usage::{side_of, usd_per_mtok, Side};
+    let (mut node, mut cloud) = (Column::default(), Column::default());
+    let mut harness: std::collections::BTreeMap<String, Column> = Default::default();
+    for r in rows {
+        let rate = usd_per_mtok(&r.model, prices);
+        match side_of(&r.backend, r.harness_kind.as_deref()) {
+            Side::Node => node.add(r, r.node_id.as_deref().unwrap_or("(unknown)"), rate),
+            Side::Cloud => cloud.add(r, &r.backend, rate),
+            Side::Harness(kind) => harness.entry(kind).or_default().add(r, &r.model, rate),
+        }
+    }
+    let harness_json: Vec<Value> = harness
+        .iter()
+        .map(|(k, c)| {
+            let mut v = c.json("by_model");
+            v["kind"] = json!(k);
+            v
+        })
+        .collect();
+    let spent = node.prompt + node.completion + cloud.prompt + cloud.completion + harness.values().map(|c| c.prompt + c.completion).sum::<i64>();
+    json!({
+        "node": node.json("by_node"),
+        "cloud": cloud.json("by_provider"),
+        "harness": harness_json,
+        // The budget is ONE number across the columns; the columns are the accounting.
+        "spent": spent,
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct MeParams {
+    period: Option<String>,
+    user: Option<String>,
+}
+
+/// GET /api/usage/me — one person's spend this period: node, cloud and per-harness-kind columns (never merged), the allowance and what is left, and cost_usd per column.
+async fn usage_me(State(state): State<Arc<AppState>>, requester: Option<axum::Extension<RequesterCtx>>, Query(q): Query<MeParams>) -> AppResult {
+    let Some(axum::Extension(r)) = requester else {
+        return Err(AppError::Forbidden("usage/me belongs to a person: a user token is required".into()));
+    };
+    let me = crate::auth::account_of(&r.sub).to_string();
+    let who = match q.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) if u != me && r.role < Role::Operator => return Err(AppError::Forbidden(format!("'{me}' may only read their own usage"))),
+        Some(u) => u.to_string(),
+        None => me,
+    };
+    let allowance = crate::task_budget::allowance_use(&state.db, &who).await.map_err(|e| AppError::Internal(e.to_string()))?;
+    let period = q.period.clone().or_else(|| allowance.as_ref().map(|a| a.period.clone())).unwrap_or_else(|| "month".into());
+    if !crate::task_budget::PERIODS.contains(&period.as_str()) {
+        return Err(AppError::BadRequest(format!("invalid period '{period}' (expected day|week|month)")));
+    }
+    let rows = sqlx::query(
+        "SELECT backend, harness_kind, node_id, model,                 COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens,                 COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,                 COUNT(*)::bigint AS requests          FROM noo_token_usage          WHERE user_uuid = (SELECT u.user_uuid FROM noo_users u WHERE u.username = $1)            AND ts >= date_trunc($2, now())          GROUP BY 1, 2, 3, 4",
+    )
+    .bind(&who)
+    .bind(&period)
+    .fetch_all(&state.db)
+    .await?;
+    let rows: Vec<SpendRow> = rows
+        .iter()
+        .map(|r| SpendRow {
+            backend: r.try_get("backend").unwrap_or_default(),
+            harness_kind: r.try_get("harness_kind").ok().flatten(),
+            node_id: r.try_get("node_id").ok().flatten(),
+            model: r.try_get("model").unwrap_or_default(),
+            prompt_tokens: r.try_get("prompt_tokens").unwrap_or(0),
+            completion_tokens: r.try_get("completion_tokens").unwrap_or(0),
+            requests: r.try_get("requests").unwrap_or(0),
+        })
+        .collect();
+    let mut body = split_report(&rows, &crate::usage::cost_map());
+    body["user"] = json!(who);
+    body["period"] = json!(period);
+    body["allowance"] = match &allowance {
+        Some(a) => json!({"period": a.period, "limit": a.limit, "spent": a.spent, "remaining": a.remaining()}),
+        None => Value::Null,
+    };
+    Ok(Json(body))
+}
+
+// ─── the allowance: an operator's setting per person (i83 G) ────────────
+
+#[derive(Deserialize)]
+struct AllowanceReq {
+    tokens: i64,
+    #[serde(default)]
+    period: Option<String>,
+}
+
+fn is_admin(r: &Option<axum::Extension<RequesterCtx>>) -> Option<&RequesterCtx> {
+    r.as_ref().map(|axum::Extension(r)| r).filter(|r| r.role >= Role::Admin)
+}
+
+/// GET /api/users/{username}/allowance — a person's token allowance and its use this period (Admin, or the person).
+async fn allowance_get(State(state): State<Arc<AppState>>, requester: Option<axum::Extension<RequesterCtx>>, axum::extract::Path(username): axum::extract::Path<String>) -> AppResult {
+    let Some(axum::Extension(r)) = requester.as_ref() else {
+        return Err(AppError::Forbidden("a user token is required".into()));
+    };
+    if r.role < Role::Admin && crate::auth::account_of(&r.sub) != username {
+        return Err(AppError::Forbidden("an allowance is readable by an Admin or its own account".into()));
+    }
+    let a = crate::task_budget::allowance_use(&state.db, &username).await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({
+        "user": username,
+        "allowance": a.map(|a| json!({"period": a.period, "limit": a.limit, "spent": a.spent, "remaining": a.remaining()})),
+    })))
+}
+
+/// PUT /api/users/{username}/allowance — set a person's standing token allowance per period (Admin): body {tokens, period?=month}.
+async fn allowance_put(
+    State(state): State<Arc<AppState>>,
+    requester: Option<axum::Extension<RequesterCtx>>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(req): Json<AllowanceReq>,
+) -> AppResult {
+    let Some(by) = is_admin(&requester) else { return Err(AppError::Forbidden("setting an allowance is Admin-only".into())) };
+    let period = req.period.unwrap_or_else(|| "month".into());
+    if !crate::task_budget::PERIODS.contains(&period.as_str()) {
+        return Err(AppError::BadRequest(format!("invalid period '{period}' (expected day|week|month)")));
+    }
+    if req.tokens < 0 {
+        return Err(AppError::BadRequest("tokens must be zero or more".into()));
+    }
+    let n = sqlx::query(
+        "INSERT INTO noo_token_allowances (user_uuid, period, limit_tokens, updated_by, updated_at)          SELECT u.user_uuid, $2, $3, $4, now() FROM noo_users u WHERE u.username = $1          ON CONFLICT (user_uuid) DO UPDATE SET period = EXCLUDED.period, limit_tokens = EXCLUDED.limit_tokens,              updated_by = EXCLUDED.updated_by, updated_at = now()",
+    )
+    .bind(&username)
+    .bind(&period)
+    .bind(req.tokens)
+    .bind(&by.sub)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(AppError::NotFound(format!("no account named '{username}'")));
+    }
+    crate::routes::core::audit_event(&state.db, "token_allowance_set", "info", &by.sub, &username, "ok", json!({"period": period, "tokens": req.tokens})).await;
+    let a = crate::task_budget::allowance_use(&state.db, &username).await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({
+        "user": username,
+        "allowance": a.map(|a| json!({"period": a.period, "limit": a.limit, "spent": a.spent, "remaining": a.remaining()})),
+    })))
+}
+
+/// DELETE /api/users/{username}/allowance — remove a person's allowance: no standing cap (Admin).
+async fn allowance_delete(State(state): State<Arc<AppState>>, requester: Option<axum::Extension<RequesterCtx>>, axum::extract::Path(username): axum::extract::Path<String>) -> AppResult {
+    let Some(by) = is_admin(&requester) else { return Err(AppError::Forbidden("removing an allowance is Admin-only".into())) };
+    let n = sqlx::query("DELETE FROM noo_token_allowances WHERE user_uuid = (SELECT u.user_uuid FROM noo_users u WHERE u.username = $1)")
+        .bind(&username)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    crate::routes::core::audit_event(&state.db, "token_allowance_removed", "info", &by.sub, &username, if n > 0 { "ok" } else { "none" }, json!({})).await;
+    Ok(Json(json!({"user": username, "removed": n > 0})))
 }
 
 #[derive(Deserialize, Default)]
@@ -386,7 +607,47 @@ async fn usage_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_month, scope_predicates};
+    use super::{parse_month, scope_predicates, split_report, SpendRow};
+
+    fn row(backend: &str, kind: Option<&str>, node: Option<&str>, model: &str, p: i64, c: i64) -> SpendRow {
+        SpendRow { backend: backend.into(), harness_kind: kind.map(str::to_string), node_id: node.map(str::to_string), model: model.into(), prompt_tokens: p, completion_tokens: c, requests: 1 }
+    }
+
+    /// PINNED (i83 G): node, cloud and each harness kind are separate
+    /// columns; no column's total contains another's. Only `spent` — the
+    /// one budget number — adds them.
+    #[test]
+    fn node_cloud_and_harness_are_never_summed_together() {
+        let rows = vec![
+            row("vllm", None, Some("host3"), "gemma-4", 100, 10),
+            row("llamacpp", None, Some("host8"), "qwen", 50, 5),
+            row("cloud-anthropic", None, None, "claude-sonnet-5", 1000, 200),
+            row("cloud-openai", None, None, "gpt-4o", 300, 30),
+            row("harness:copilot", Some("copilot"), Some("host3"), "gemma-4", 7, 3),
+            row("harness:claude-code", Some("claude-code"), Some("host8"), "qwen", 20, 2),
+        ];
+        let prices = vec![("claude-".to_string(), 10.0)];
+        let r = split_report(&rows, &prices);
+        assert_eq!(r["node"]["total_tokens"], 165);
+        assert_eq!(r["cloud"]["total_tokens"], 1530);
+        let h = r["harness"].as_array().unwrap();
+        let kinds: Vec<(&str, i64)> = h.iter().map(|k| (k["kind"].as_str().unwrap(), k["total_tokens"].as_i64().unwrap())).collect();
+        assert_eq!(kinds, vec![("claude-code", 22), ("copilot", 10)]);
+        assert_eq!(r["spent"], 165 + 1530 + 32);
+        assert_eq!(r["cloud"]["by_provider"].as_array().unwrap().len(), 2);
+        assert_eq!(r["node"]["by_node"][0]["key"], "host3");
+        // The money column prices what it can, reports the rest as unpriced.
+        assert_eq!(r["cloud"]["cost_usd"], 0.012);
+        assert_eq!(r["cloud"]["unpriced_tokens"], 330);
+        assert_eq!(r["node"]["cost_usd"], 0.0);
+        // Moving a row's backend to cloud moves it, and only it.
+        let mut moved = rows.clone();
+        moved[0].backend = "cloud-gemini".into();
+        let r2 = split_report(&moved, &[]);
+        assert_eq!(r2["node"]["total_tokens"], 55);
+        assert_eq!(r2["cloud"]["total_tokens"], 1640);
+        assert_eq!(r2["spent"], r["spent"]);
+    }
 
     /// An unscoped caller must get the report it always
     /// got — an empty predicate, not a `TRUE` that changes the plan.

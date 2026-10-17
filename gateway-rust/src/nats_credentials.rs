@@ -57,9 +57,9 @@ pub const NODE_REMEDY: &str = "`noo cluster nats-creds rotate <node>` on the con
 /// because every principal uses it.
 pub const INBOX_PREFIX: &str = "_INBOX_gw";
 
-/// The reply inbox for a request the WORKER principal answers (noo-worker,
-/// noo-trellion, noo-trellion-intel all present it): every `worker.>`
-/// request leaves `worker_client` with a reply subject under this prefix.
+/// The reply inbox for a request the WORKER principal answers (noo-worker):
+/// every `worker.>` request that is not an add-on's leaves `worker_client`
+/// with a reply subject under this prefix ([`reply_prefix_for`]).
 ///
 /// Why a per-principal prefix at all (i69, i70): nats-server keeps the
 /// `allow_responses` "you may answer this one reply" entries in a
@@ -73,6 +73,32 @@ pub const INBOX_PREFIX: &str = "_INBOX_gw";
 /// noo-cli `nats_users.rs` `WORKER_REPLY_INBOX` must equal this + `.>`;
 /// tests/test_nats_principal_reply_grant_parity.py compares the two crates.
 pub const WORKER_REPLY_PREFIX: &str = "_INBOX_gw.worker";
+
+/// The reply inbox for a request an ADD-ON principal answers (i70 residue).
+/// noo-trellion presents `trellion` and noo-trellion-intel `trellion_intel`,
+/// each with a static publish grant on its own prefix + `.>` and nothing of
+/// the worker's. noo-cli `nats_users.rs` `addon_reply_inbox(<name>)` must
+/// equal each of these + `.>` (tests/test_nats_principal_reply_grant_parity.py).
+pub const TRELLION_REPLY_PREFIX: &str = "_INBOX_gw.trellion";
+pub const TRELLION_INTEL_REPLY_PREFIX: &str = "_INBOX_gw.trellion_intel";
+
+/// The reply prefix for a request on `subject`: the principal that SERVES
+/// it, by the same ownership predicates the degradation contract routes on
+/// (`addons::is_trellion_subject` / `is_trellion_intel_subject`, which the
+/// CLI's add-on grants mirror family for family).
+///
+/// An add-on that has no principal of its own yet (an older bundle, one
+/// release) presents the worker, whose grant then carries the add-on's
+/// prefix too (`perms_for`), so the reply is still statically granted.
+pub fn reply_prefix_for(subject: &str) -> &'static str {
+    if crate::addons::is_trellion_subject(subject) {
+        TRELLION_REPLY_PREFIX
+    } else if crate::addons::is_trellion_intel_subject(subject) {
+        TRELLION_INTEL_REPLY_PREFIX
+    } else {
+        WORKER_REPLY_PREFIX
+    }
+}
 
 /// The root of every NODE principal's reply inbox. A node's own prefix is
 /// `<root>.<token>` ([`node_reply_prefix`]), and its static grant is that
@@ -290,6 +316,23 @@ mod tests {
         assert!(resolve(env(&[(ALLOW_ANONYMOUS_VAR, "no")])).is_err());
     }
 
+    /// i70 residue: a request is answered on the prefix of the principal
+    /// that serves its subject — never the worker's for an add-on subject.
+    #[test]
+    fn each_subject_gets_its_servers_reply_prefix() {
+        for s in ["worker.rag.query", "worker.memory.search", "worker.recall.lifecycle",
+                  "worker.api.snapshots.consolidate", "worker.autonomy.check_rag"] {
+            assert_eq!(reply_prefix_for(s), TRELLION_REPLY_PREFIX, "{s}");
+        }
+        for s in ["worker.graph.recluster", "worker.temporal.extract", "worker.retrieval.feedback",
+                  "worker.api.heartbeat.run_ml", "worker.graph.console_piece"] {
+            assert_eq!(reply_prefix_for(s), TRELLION_INTEL_REPLY_PREFIX, "{s}");
+        }
+        for s in ["worker.tool.generic", "worker.api.heartbeat.run", "worker.api.coding.task"] {
+            assert_eq!(reply_prefix_for(s), WORKER_REPLY_PREFIX, "{s}");
+        }
+    }
+
     #[test]
     fn inbox_prefix_is_gateway_scoped() {
         assert_eq!(INBOX_PREFIX, "_INBOX_gw");
@@ -310,6 +353,8 @@ mod tests {
         assert_eq!(node_reply_prefix(""), "_INBOX_gw.node.unknown");
         let prefixes = [
             WORKER_REPLY_PREFIX.to_string(),
+            TRELLION_REPLY_PREFIX.to_string(),
+            TRELLION_INTEL_REPLY_PREFIX.to_string(),
             node_reply_prefix("host8"),
             node_reply_prefix("host9"),
             node_reply_prefix("worker"),
@@ -321,6 +366,8 @@ mod tests {
                 }
             }
         }
+        assert_eq!(TRELLION_REPLY_PREFIX, format!("{INBOX_PREFIX}.trellion"));
+        assert_eq!(TRELLION_INTEL_REPLY_PREFIX, format!("{INBOX_PREFIX}.trellion_intel"));
         // The node harness agrees on the token (its own inbox uses it).
         assert_eq!(crate::harness_main::inbox_prefix("a.b c"), format!("_INBOX_node_{}", subject_token("a.b c")));
     }

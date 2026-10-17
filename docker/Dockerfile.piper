@@ -39,10 +39,32 @@ FROM ${HUB_MIRROR}/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b04
 
 # piper-tts 1.6 (piper1-gpl) ships an abi3 manylinux wheel that bundles
 # espeak-ng and its phoneme data — no system packages needed.
-RUN pip install --no-cache-dir \
+#
+# EVERY package is pinned, transitive ones included, and installed with
+# --no-deps so nothing resolves at build time (Dockerfile.whisper: a
+# floating `av` broke STT silently in 0.6.5). tests/
+# test_voice_images_pinned.py refuses an unpinned line here.
+RUN pip install --no-cache-dir --no-deps \
         piper-tts==1.6.0 \
-        "fastapi>=0.115,<0.116" \
-        "uvicorn>=0.34,<0.35"
+        onnxruntime==1.31.0 \
+        pathvalidate==3.3.1 \
+        numpy==2.5.4 \
+        flatbuffers==25.12.19 \
+        protobuf==7.36.2 \
+        packaging==26.3 \
+        fastapi==0.115.14 \
+        starlette==0.46.2 \
+        pydantic==2.14.1 \
+        pydantic_core==2.50.1 \
+        annotated-types==0.8.0 \
+        typing-inspection==0.4.4 \
+        typing_extensions==4.16.0 \
+        anyio==4.15.1 \
+        idna==3.20 \
+        uvicorn==0.34.3 \
+        click==8.5.0 \
+        h11==0.16.0 \
+    && pip check
 
 # Vendor telemetry off (docs/security/telemetry.md), baked into the image so
 # a container started outside compose carries it too; compose sets the same.
@@ -50,18 +72,35 @@ ENV HF_HUB_DISABLE_TELEMETRY=1 \
     DO_NOT_TRACK=1
 
 WORKDIR /app
+COPY docker/voice_local.py /app/voice_local.py
 COPY docker/piper_server.py /app/piper_server.py
 
-# Voice cache on a volume so downloads survive container recreation.
+# Non-root (i105): uid/gid 65532 named `nonroot`, the DHI convention the
+# rest of the stack runs as. Nothing here writes a voice: the controller
+# stages them (`noo models pull piper:<voice>`, the CLI's voice_models.rs)
+# and compose mounts `<MODELS_DIR>/voice/piper` READ-ONLY at /voices; the
+# server loads `/voices/<voice>.onnx` and never calls piper's download_voice
+# (docker/voice_local.py), offline (HF_HUB_OFFLINE=1). Synthesis is in
+# memory. /voices is just the mount point, root-owned and read-only to
+# nonroot. The service key is handed to this uid (noo-cli pki.rs
+# SERVICE_KEY_READERS).
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/nonroot \
+        --shell /usr/sbin/nologin nonroot \
+    && mkdir -p /voices
+
 ENV PIPER_VOICE=en_US-lessac-medium \
     PIPER_VOICE_DIR=/voices \
-    PIPER_USE_CUDA=0
-VOLUME /voices
+    PIPER_USE_CUDA=0 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000
 
 # curl-less healthcheck (slim image): python stdlib probe.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+USER nonroot
 
 CMD ["uvicorn", "piper_server:app", "--host", "0.0.0.0", "--port", "8000"]

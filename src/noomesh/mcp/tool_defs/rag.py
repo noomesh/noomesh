@@ -71,8 +71,12 @@ class PaiRagIngest(ToolDef):
     # Operation-backed route (docs.ingest): a few seconds' wait, then an op handle.
     timeout_secs: ClassVar[int] = 60
 
-    source: Optional[str] = Field(default=None, description="File path, URL, glob, or directory to ingest")
-    text: Optional[str] = Field(default=None, description="Raw text to ingest directly")
+    source: Optional[str] = Field(default=None, description="ONE file already on the server, inside a directory an operator "
+                    "allowed (tools.allowed_paths or a watched folder); symlinks are "
+                    "followed and the service's own secrets/config are never allowed. "
+                    "URLs, directories and globs are refused: to ingest a web page or "
+                    "pasted content, send it as `text`.")
+    text: Optional[str] = Field(default=None, description="Raw text to ingest directly (stored as text, never read as a path)")
     title: Optional[str] = Field(default=None, description="Document title")
     roles: Optional[List[str]] = Field(
         default=None,

@@ -20,8 +20,9 @@
 //!
 //! ## How it works
 //!
-//! `NOO_MTLS_GATEWAY` makes the gateway verify a presented client
-//! certificate against the cluster CA (see `tls.rs`; verification is
+//! The gateway verifies a presented client certificate against the
+//! cluster CA by default whenever `NOO_TLS_CA` exists (`NOO_MTLS_GATEWAY=false`
+//! opts out; see `tls.rs`; verification is
 //! optional, so callers without one — the dashboard, the CLI, the MCP
 //! doors — are unaffected). This module wraps the TLS acceptor so that,
 //! once the handshake completes, the verified peer's identity is attached
@@ -33,9 +34,10 @@
 //!
 //! ## Blast radius
 //!
-//! The wrapper is installed ONLY when `NOO_MTLS_GATEWAY` is on. With it
-//! off — the default — the serving path is exactly what it was, because
-//! a bug in an acceptor takes down every request rather than one route.
+//! The acceptor is always installed (the CA is mandatory), but a peer
+//! certificate is only requested while mTLS is on, which is the default.
+//! With `NOO_MTLS_GATEWAY=false` the listener asks for no certificate and no
+//! `VerifiedPeer` is ever attached.
 
 use std::io;
 use std::pin::Pin;

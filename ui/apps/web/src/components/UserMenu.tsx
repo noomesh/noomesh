@@ -5,6 +5,8 @@ import { useState } from 'react';
 import { useAuth } from '@metis/core';
 import { useTheme } from '@/lib/useTheme';
 import { McpKeyDialog } from '@/features/account/McpKeyDialog';
+import { VoiceDialog } from '@/features/chat/voice/VoiceDialog';
+import { useVoiceControls } from '@/features/chat/voice/useVoice';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -37,18 +39,30 @@ const SignOutIcon = () => (
   </svg>
 );
 
+const SpeakerIcon = () => (
+  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6">
+    <path d="M3.5 8v4h3l4 3.5v-11L6.5 8z" />
+    <path d="M13.5 7.5a3.5 3.5 0 0 1 0 5M15.5 5.5a6.5 6.5 0 0 1 0 9" />
+  </svg>
+);
+
 /** Bottom-of-sidebar account button. The avatar/name opens a menu holding the
  *  theme toggle and sign-out (which used to sit loose in the footer). */
 export function UserMenu() {
   const { user, isOperator, logout } = useAuth();
   const { dark, toggle } = useTheme();
   const [keyOpen, setKeyOpen] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  // Shares the chat's voice-status query; the picker shows only when
+  // read-aloud is on for this install.
+  const voice = useVoiceControls(false);
   const name = user?.username ?? 'guest';
   const role = isOperator ? ' · operator' : '';
 
   return (
     <>
     <McpKeyDialog open={keyOpen} onOpenChange={setKeyOpen} />
+    <VoiceDialog open={voiceOpen} onOpenChange={setVoiceOpen} />
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button className="user-trigger" aria-label="Account menu">
@@ -77,6 +91,12 @@ export function UserMenu() {
           {dark ? <SunIcon /> : <MoonIcon />}
           {dark ? 'Light mode' : 'Dark mode'}
         </DropdownMenuItem>
+        {voice.speaker !== 'hidden' && (
+          <DropdownMenuItem onSelect={() => setVoiceOpen(true)}>
+            <SpeakerIcon />
+            Read-aloud voice
+          </DropdownMenuItem>
+        )}
         {user && (
           <DropdownMenuItem onSelect={() => setKeyOpen(true)}>
             <KeyIcon />

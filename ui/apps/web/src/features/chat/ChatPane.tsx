@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ChatRail } from '@/components/ChatRail';
@@ -9,6 +9,10 @@ import { ApprovalCard } from './ApprovalCard';
 import { useCoordinator, type TurnStats, type ToolRun } from './useCoordinator';
 import { useBackendHealth } from './useBackendHealth';
 import { atTail } from './followTail';
+import { formatElapsed } from './toolElapsed';
+import { useVoiceControls } from './voice/useVoice';
+import { MicControl } from './voice/MicControl';
+import { SpeakButton } from './voice/SpeakButton';
 
 export interface ChatPaneProps {
   /** Whether the side panel is currently collapsed. */
@@ -104,7 +108,7 @@ function ToolChips({ tools }: { tools: ToolRun[] }) {
             </span>
             <span className="tool-name">{t.name}</span>
             {t.elapsedMs !== undefined && (
-              <span className="tool-ms">{(t.elapsedMs / 1000).toFixed(1)}s</span>
+              <span className="tool-ms">{formatElapsed(t.elapsedMs)}</span>
             )}
           </button>
           {shown === i && t.detail && <pre className="tool-detail">{t.detail}</pre>}
@@ -139,6 +143,16 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
   const health = useBackendHealth();
   const [draft, setDraft] = useState('');
   const [model, setModel] = useState('');
+  // Voice: hidden unless the gateway's voice providers answer; re-polled
+  // whenever the chat opens from its rail.
+  const voice = useVoiceControls(!collapsed);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // A transcript lands in the box for the user to edit and send — never sent.
+  const onTranscript = useCallback((text: string) => {
+    setDraft((d) => (d.trim() ? `${d.replace(/\s+$/, '')} ${text}` : text));
+    inputRef.current?.focus();
+  }, []);
   const listRef = useRef<HTMLDivElement>(null);
   // Whether the reader is following the tail. Starts true — a fresh pane is
   // at the bottom because it is also at the top.
@@ -299,6 +313,11 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
                 {m.streaming && <span className="cursor">▍</span>}
               </div>
               {m.stats && <StatsFooter stats={m.stats} />}
+              {voice.speaker !== 'hidden' && !m.streaming && !m.error && !!m.text.trim() && (
+                <div className="turn-actions">
+                  <SpeakButton id={`turn-${i}`} text={m.text} state={voice.speaker} reason={voice.speakerReason} />
+                </div>
+              )}
             </div>
           ),
         )}
@@ -307,17 +326,35 @@ export function ChatPane({ panelHidden, onTogglePanel, onToggleChat, collapsed }
       <form className="composer" onSubmit={onSubmit}>
         <div className="composer-row">
           <input
+            ref={inputRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="Message Noomesh…"
             aria-label="Message Noomesh"
           />
+          {voice.mic !== 'hidden' && (
+            <MicControl
+              state={voice.mic}
+              reason={voice.micReason}
+              onTranscript={onTranscript}
+              onError={setVoiceError}
+            />
+          )}
           <Button type="submit" size="icon" aria-label="Send" disabled={!sendable}>
             <svg viewBox="0 0 20 20" fill="currentColor">
               <path d="M3 10l14-6-6 14-2-6z" />
             </svg>
           </Button>
         </div>
+
+        {voiceError && voice.mic !== 'hidden' && (
+          <div className="composer-status err voice-err" role="alert">
+            {voiceError}
+            <button type="button" className="voice-err-x" onClick={() => setVoiceError(null)} aria-label="Dismiss">
+              ×
+            </button>
+          </div>
+        )}
 
         {activity && (
           <div

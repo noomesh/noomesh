@@ -40,7 +40,7 @@ const TAG_PREFIX: &str = "noo-cli-v";
 /// The release installer, served by the controller mirror as `install.sh`.
 const INSTALLER: &str = include_str!("../../install.sh");
 const UPGRADE_USAGE: &str =
-    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
+    "usage: noo upgrade [--check] [--version X.Y.Z] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag vX.Y.Z] [--controller] [--allow-unsigned] [--skip-gateway-key-check] [--allow-downgrade] [--channel public|rollback|custom [--release-repo <owner/repo> --image-prefix <registry/path> [--base-registry <registry/path>]]] [--yes]";
 
 /// THE release repo, for every caller. `NOO_CLI_REPO` overrides the default.
 ///
@@ -95,6 +95,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut pin: Option<String> = None;
     let mut stack = false;
     let mut nodes = false;
+    // Kiosk seats (i77): `--nodes`/`--all` include them ("the fleet");
+    // `--seats` alone restages only the seats; `--no-seats` leaves them out.
+    let mut seats_only = false;
+    let mut no_seats = false;
     let mut stage2 = false;
     let mut tag_override: Option<String> = None;
     let mut allow_unsigned = std::env::var("NOO_ALLOW_UNSIGNED").map(|v| v == "1").unwrap_or(false);
@@ -118,6 +122,8 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--stack" => stack = true,
             "--controller" => return upgrade_controller(g),
             "--nodes" => nodes = true,
+            "--seats" => seats_only = true,
+            "--no-seats" => no_seats = true,
             "--all" => { stack = true; nodes = true; }
             "--stage2" => stage2 = true,
             "--allow-unsigned" => allow_unsigned = true,
@@ -170,6 +176,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     }
 
+    if seats_only && no_seats {
+        fail(g.json, ExitCode::Usage, "usage", "--seats and --no-seats contradict each other", Some(UPGRADE_USAGE));
+    }
+    let seats = seats_only || (nodes && !no_seats);
     if allow_downgrade && !stack {
         fail(g.json, ExitCode::Usage, "usage", "--allow-downgrade applies to the stack roll only (--stack or --all)",
             Some(UPGRADE_USAGE));
@@ -181,7 +191,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // The fresh binary corrects what an older one could not know about
         // (the parent of a self-update is the previous release).
         super::channel::migrate_legacy_base_registry(g, false);
-        return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+        return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
     }
 
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -325,10 +335,10 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 println!("{}", ui::note(&format!("installed tab completion: {}", p.display())));
             }
         }
-        if stack || nodes {
+        if stack || nodes || seats {
             // No swap happened — this process IS the current build, so its
             // paired tag and assets are already the right ones.
-            return run_fleet_stages(g, stack, nodes, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
+            return run_fleet_stages(g, stack, nodes, seats, tag_override.as_deref(), force, skip_gw_key_check, allow_downgrade);
         }
         return Ok(0);
     }
@@ -475,7 +485,7 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     }
 
-    if stack || nodes {
+    if stack || nodes || seats {
         // The running process is still the OLD build — its baked stack tag
         // and embedded assets are stale. Re-exec the binary we just
         // installed so the fleet stages use the NEW release's pairing.
@@ -486,6 +496,8 @@ pub fn upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             cmd.arg("upgrade").arg("--stage2");
             if stack { cmd.arg("--stack"); }
             if nodes { cmd.arg("--nodes"); }
+            if seats_only { cmd.arg("--seats"); }
+            if no_seats { cmd.arg("--no-seats"); }
             if let Some(t) = &tag_override { cmd.arg("--tag").arg(t); }
             if skip_gw_key_check { cmd.arg("--skip-gateway-key-check"); }
             if allow_downgrade { cmd.arg("--allow-downgrade"); }
@@ -744,21 +756,33 @@ fn version_less_than(a: &str, b: &str) -> bool {
 
 /// Run the requested fleet stages from a binary whose paired tag/assets are
 /// current (either freshly re-exec'd, or already-current with no swap).
-fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
     -> Result<i32, Unhandled>
 {
     let mut rc = 0;
     let mut failed_stage = "";
     let mut roll_started: Option<i64> = None;
+    // The node-image staging started inside upgrade_stack (overlapping the
+    // launcher). It is joined AFTER the gateway health wait below, so the
+    // 20-40 s wait overlaps the last exports; every path that leaves this
+    // function with it still live joins it first (StageRun also joins on drop).
+    let mut staging: Option<crate::commands::image_stage::StageRun> = None;
     // `--stack` alone is one unit of work; anything with `--nodes` has at
     // least Gateway · CLI Assets · Nodes, so every stage gets its phase.
-    let phased = nodes;
+    let phased = nodes || seats;
     if stack {
         if phased && !g.json { println!("{}", ui::phase("Stack")); }
         roll_started = Some(crate::commands::cluster_verify::now_unix());
-        rc = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
-        if rc != 0 { failed_stage = "stack"; }
-        else if !nodes {
+        let (stack_rc, run) = upgrade_stack(g, tag_override, force, skip_gw_key_check, allow_downgrade)?;
+        rc = stack_rc;
+        staging = run;
+        if rc != 0 {
+            // upgrade_stack joins on its failure paths, so this is normally
+            // None; a live run is joined here rather than dropped.
+            if let Some(st) = staging.take() { st.finish(g); }
+            failed_stage = "stack";
+        }
+        else if !nodes && !seats {
             // The roll returns the moment compose is up; the gateway reports
             // healthy 20-40 s later. `noo upgrade --stack` used to return
             // inside that window, so the very next command — `noo cluster
@@ -766,7 +790,9 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             // and failed. With `--nodes` the Gateway phase below already
             // waits; without it, wait here, so "Stack now on" means serving.
             if phased && !g.json { println!("{}", ui::phase("Gateway")); }
-            if let Err((why, remedy)) = wait_for_gateway(g, 180) {
+            let waited = wait_for_gateway(g, 180);
+            if let Some(st) = staging.take() { st.finish(g); }
+            if let Err((why, remedy)) = waited {
                 ui::close_failed(
                     &format!("{why} within 180s after the stack roll"),
                     Some(remedy),
@@ -779,7 +805,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             }
         }
     }
-    if nodes && rc == 0 {
+    if (nodes || seats) && rc == 0 {
         // The stack stage just recreated the gateway; it reports healthy
         // ~20-40 s later. Running the nodes stage the same instant hit
         // "cannot reach gateway: unexpected end of file" (host8,
@@ -788,7 +814,12 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
         // one Gateway phase covers both, with a longer budget after a roll.
         if !g.json { println!("{}", ui::phase("Gateway")); }
         let budget = if stack { 180 } else { 60 };
-        if let Err((why, remedy)) = wait_for_gateway(g, budget) {
+        let waited = wait_for_gateway(g, budget);
+        // Joined whether or not the gateway came up, and BEFORE the stage
+        // record (lock_stage_failures) is read below: it is written when the
+        // staging pass ends.
+        if let Some(st) = staging.take() { st.finish(g); }
+        if let Err((why, remedy)) = waited {
             ui::close_failed(
                 &format!("{why} within {budget}s{}", if stack { " after the stack roll" } else { " — is the stack running?" }),
                 Some(remedy),
@@ -804,19 +835,31 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
             ui::close_failed(&err, Some("noo upgrade --stack"));
             rc = 1;
             failed_stage = "nodes";
-        } else if let Some(err) = lock_stage_blocker(
+        } else if let Some(err) = if !nodes { None } else { lock_stage_blocker(
             g,
             &crate::commands::image_stage::lock_stage_failures(&crate::commands::provision::release_var("NOO_IMAGE_TAG")),
             force,
-        ) {
+        ) } {
             // Nodes on the rail pull their images from the controller's
             // store; rolling them on top of a failed stage strands them.
             ui::close_failed(&err, Some("noo cluster stage-images --lock"));
             rc = 1;
             failed_stage = "nodes";
         } else {
-            rc = upgrade_nodes(g)?;
-            if rc != 0 { failed_stage = "nodes"; }
+            if nodes {
+                rc = upgrade_nodes(g)?;
+                if rc != 0 { failed_stage = "nodes"; }
+            }
+            // Kiosk seats AFTER the nodes (i77), whatever the nodes did: a
+            // node that failed to apply is no reason to leave a display on
+            // the old CLI. With no seat enrolled this stages nothing.
+            if seats {
+                let seats_rc = crate::commands::kiosk_seat::upgrade_seats(g);
+                if seats_rc != 0 && rc == 0 {
+                    rc = seats_rc;
+                    failed_stage = "seats";
+                }
+            }
         }
     }
     if rc != 0 && !g.json {
@@ -826,7 +869,7 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, tag_override: Option<
         // in seconds. Pointing at `noo stack start` (the old hint) dropped
         // the operator out of the flow and skipped the nodes stage.
         let mut resume = String::from("noo upgrade");
-        resume.push_str(if stack && nodes { " --all" } else if stack { " --stack" } else { " --nodes" });
+        resume.push_str(if stack && nodes { " --all" } else if nodes { " --nodes" } else if stack && seats { " --stack --seats" } else if seats { " --seats" } else { " --stack" });
         if let Some(t) = tag_override { resume.push_str(&format!(" --tag {t}")); }
         ui::close_failed(&format!("upgrade stopped at the {failed_stage} stage — fix the cause above, then resume"), Some(&resume));
         eprintln!("{}", ui::note("stages are idempotent — the CLI stays current, the stack re-pulls on the moved pin, nodes restage"));
@@ -877,7 +920,36 @@ fn rerender_nats_users_for_roll(g: &Globals, root: &std::path::Path) {
     }
 }
 
-fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool) -> Result<i32, Unhandled> {
+/// Step 2.65 of `upgrade --stack` — see the call site. Best-effort: an add-on
+/// without its own principal presents the worker for one more release (the
+/// fallback), so a failure here warns with the verb and never stops the roll.
+fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
+    use crate::commands::nats_users as nu;
+    match nu::reconcile_addon_principals(g, root) {
+        Ok(None) => {}
+        Ok(Some(out)) => {
+            let reloaded = nu::hup_nats();
+            if !g.json {
+                ui::done(&format!(
+                    "add-on NATS principals rendered ({} principals{}){}",
+                    out.users,
+                    if out.minted.is_empty() { String::new() } else { format!("; minted {}", out.minted.join(", ")) },
+                    if reloaded { "; noo-nats reloaded" } else { "" }
+                ));
+            }
+        }
+        Err(e) => if !g.json {
+            ui::warned(&format!(
+                "could not give the add-ons their own NATS principals ({e}) — they present the worker \
+                 principal for this release; run: noo cluster nats-users render"
+            ));
+        },
+    }
+}
+
+fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
+    -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
+{
     // repo_root() ranks a python-venv-derived root above the standalone
     // home, so a STALE clone (e.g. ~/pai-assistant left from an early
     // manual attempt) shadowed a healthy ~/.noo and --stack refused a
@@ -1219,6 +1291,30 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    before the launcher: its bind-source check refuses a missing
     //    source, and Docker would otherwise create it as root.
     sync_gateway_pki_view(g);
+    // 2.65. The voice add-on's models, while voice is on (i105): the
+    //    containers mount them read-only and run offline, so the controller
+    //    stages them here, before the launcher (whose bind check needs the
+    //    mount sources). Best effort: a failure is printed with its
+    //    `noo models pull` line and never aborts the roll.
+    crate::commands::voice_models::stage_if_on(g);
+    // 2.66. Each declared add-on its own NATS principal (i70 residue). After
+    //    step 1 (this release's trellion overlay) and step 2 (the add-on
+    //    pins, so a licensed add-on's bundle is the one being rolled to),
+    //    before the launcher recreates the add-ons with their password.
+    reconcile_addon_nats_principals(g, &root);
+
+    // 2.7. Stage the release's node images on the artifact rail, while the
+    //    old gateway still serves: it is controller-only work (registry pull +
+    //    docker save) and used to sit AFTER the roll, ahead of the nodes
+    //    phase. It uses the lock bytes verified above for `tag` (not .env,
+    //    which still names the running release). Best-effort: a failure
+    //    warns per image and is recorded for the nodes stage's
+    //    lock_stage_blocker; it never aborts the roll. The prune below keeps
+    //    `tag`, so it cannot delete what was just staged.
+    //    It runs on a thread OVERLAPPING the launcher's compose pull/recreate
+    //    and the caller's gateway health wait; it is handed back to
+    //    run_fleet_stages to join. The failure paths below join it here.
+    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag);
 
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
@@ -1241,6 +1337,11 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         std::thread::sleep(Duration::from_secs(5));
         status = launch();
     }
+    // On success the live run is returned to the caller, which joins it after
+    // the gateway health wait (nothing here depends on it). The two failure
+    // arms below join it themselves: a detached thread could be killed
+    // mid-export by the process exit, and fail() exits.
+    let mut staging = Some(staging);
     match status {
         Ok(s) if s.success() => {
             // The process's idea of NOO_IMAGE_TAG is now STALE, and the
@@ -1345,20 +1446,22 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                     }
                 }
             }
-            // Stage the release's node images on the artifact rail (pulled
-            // by lock digest with THIS controller's registry login, exported
-            // for every fleet architecture). Nodes pull images only from
-            // there and hold no registry credential.
-            // Best-effort: never taints the roll, names the retry.
-            crate::commands::image_stage::stage_after_roll(g, &root, &tag);
-            Ok(0)
+            // Node images were staged BEFORE the launcher (see the call above
+            // it): nothing the roll does changes what the signed lock says, so
+            // there is no second pass here. The run is joined by the caller.
+            Ok((0, staging.take()))
         }
         Ok(s) => {
             ui::close_failed(&format!("launcher exited with {} twice; the pin IS moved to {tag}", s.code().unwrap_or(-1)), Some("noo stack logs"));
-            Ok(1)
+            if let Some(st) = staging.take() { st.finish(g); }
+            Ok((1, None))
         }
-        Err(e) => fail(g.json, ExitCode::Generic, "launch_failed",
-            &format!("could not run the launcher: {e}"), None),
+        Err(e) => {
+            // fail() exits the process: join first.
+            if let Some(st) = staging.take() { st.finish(g); }
+            fail(g.json, ExitCode::Generic, "launch_failed",
+            &format!("could not run the launcher: {e}"), None)
+        }
     }
 }
 
@@ -2714,6 +2817,26 @@ fn asset_platforms(toks: &[serde_json::Value], own_os: &str, own_arch: &str) -> 
     v
 }
 
+/// Does a `/bootstrap/cli/<name>.sha256` answer (`<hex>  <name>`) say the
+/// gateway already holds `name` with exactly `sha`? The hash must match;
+/// size or presence alone never counts. The gateway verified the hash
+/// against the bytes when it stored them.
+fn cli_asset_sha_line_matches(body: &str, name: &str, sha: &str) -> bool {
+    let mut it = body.split_whitespace();
+    matches!((it.next(), it.next(), it.next()), (Some(h), Some(n), None) if n == name && h.eq_ignore_ascii_case(sha))
+}
+
+/// True only when the gateway positively says it holds `name` at `sha`.
+/// ABSENT route (an older gateway), 404 (never uploaded), a different hash,
+/// or any transport error all answer false, and the caller uploads as it
+/// always did.
+fn gateway_holds_cli_asset(g: &Globals, name: &str, sha: &str) -> bool {
+    match crate::http::get_raw_opt(g, &format!("/bootstrap/cli/{name}.sha256"), false, 10) {
+        Some((200, body)) => cli_asset_sha_line_matches(&body, name, sha),
+        _ => false,
+    }
+}
+
 /// For every platform in the fleet (plus the always-staged set above): fetch
 /// the CLI asset of THIS version into the controller's cache (if missing)
 /// and upload it to the gateway.
@@ -2776,6 +2899,9 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             Err(e) => ui::warned(&format!("{name}: not fetched ({e}) — bundles carry no harness or helper for that platform until a re-run fetches it")),
         }
     }
+    // Assets the gateway already holds at the same sha256: not re-sent, and
+    // said so below (a skip is never counted as an upload).
+    let mut already_held: Vec<String> = Vec::new();
     // The signed manifest rides along: without it a node treats this mirror
     // as an old controller and goes to GitHub instead.
     let m = crate::release_sig::MANIFEST;
@@ -2789,6 +2915,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             },
         };
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&bytes)) };
+        if gateway_holds_cli_asset(g, &name, &sha) {
+            already_held.push(name.clone());
+            continue;
+        }
         if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/{name}?sha256={sha}&version={version}"), &bytes) {
             ui::warned(&format!("{name}: upload failed ({e})"));
@@ -2799,7 +2929,9 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     {
         let bytes = INSTALLER.as_bytes();
         let sha = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(bytes)) };
-        if let Err(e) = crate::commands::provision::put_bytes(
+        if gateway_holds_cli_asset(g, "install.sh", &sha) {
+            already_held.push("install.sh".to_string());
+        } else if let Err(e) = crate::commands::provision::put_bytes(
             g, &format!("/api/cluster/cli-asset/install.sh?sha256={sha}&version={version}"), bytes) {
             ui::warned(&format!("install.sh: upload failed ({e}) — new nodes fall back to the GitHub installer line"));
         }
@@ -2826,6 +2958,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(&bytes))
         };
+        if gateway_holds_cli_asset(g, &asset, &sha) {
+            already_held.push(asset.clone());
+            continue;
+        }
         match crate::commands::provision::put_bytes(
             g,
             &format!("/api/cluster/cli-asset/{asset}?sha256={sha}&version={version}"),
@@ -2840,6 +2976,10 @@ fn upload_cli_assets(g: &Globals, toks: &[serde_json::Value]) {
     if !uploaded.is_empty() {
         ui::done(&format!("{} CLI asset(s) uploaded to the controller ({version})", uploaded.len()));
         println!("{}", ui::note(&uploaded.join(", ")));
+    }
+    if !already_held.is_empty() {
+        ui::done(&format!("{} CLI asset(s) already on the gateway (sha256 matches, not re-uploaded)", already_held.len()));
+        println!("{}", ui::note(&already_held.join(", ")));
     }
 }
 
@@ -3741,6 +3881,7 @@ fn addon_holds(g: &Globals, root: &std::path::Path, target: &str) -> Vec<(String
             };
             crate::addons::resolve::installed_anchor(addon)
                 .and_then(|a| crate::addons::resolve::fetch_and_check(&client, &a, &want))
+                .and_then(|(v, f)| crate::addons::resolve::require_bundle(&v, target).map(|()| (v, f)))
                 .err()
                 .map(|r| (addon.to_string(), r.why(addon)))
         })
@@ -4333,6 +4474,71 @@ mod tests {
         for later in ["migrate_retired_yaml_gates(", "standalone::materialize(", "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
             assert!(mint < at(later), "enabled systems' credentials must be minted before `{later}`");
         }
+    }
+
+    /// Node images are staged on a thread started from the verified lock
+    /// BEFORE the launcher (overlapping it), after the last refusal that could
+    /// abort the roll. `upgrade_stack` joins it only on its two failure paths
+    /// and otherwise HANDS IT BACK; `run_fleet_stages` joins it after the
+    /// gateway health wait (both branches) and before the stage record is read.
+    #[test]
+    fn upgrade_stack_stages_node_images_before_the_launcher_tests() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
+        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
+        let spawn = at("image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag)");
+        assert!(at("fetch_stack_lock(g, &tag)") < spawn, "stage from a lock that has been fetched and verified");
+        for before in ["addon_preflight(", "reconcile_audit_key(&root)", "write_stack_lock(g, &tag", "NOO_IMAGE_TAG\", &tag", "sync_gateway_pki_view(g)"] {
+            assert!(at(before) < spawn, "`{before}` can abort or shape the roll and must run before staging");
+        }
+        let launcher = at("let mut status = launch();");
+        assert!(spawn < launcher, "staging must start before the launcher runs, to overlap it");
+        // Inside upgrade_stack only the two failure paths join (launcher
+        // failure; spawn error, whose fail() exits the process), each after the launcher.
+        assert_eq!(body.matches("st.finish(g)").count(), 2, "join only on launcher failure and spawn error");
+        assert!(launcher < at("st.finish(g)"), "joined after the launcher returns");
+        let success = &body[at("Ok(s) if s.success() => {")..at("Ok(s) => {")];
+        assert!(!success.contains("finish("), "the success arm hands the run back, it does not join");
+        assert!(success.contains("Ok((0, staging.take()))"), "the live run is returned to the caller on success");
+        assert!(!body.contains("stage_after_roll") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
+
+        // The caller joins after the gateway health wait, before the blocker read.
+        let src = include_str!("upgrade.rs");
+        let f = &src[src.find("fn run_fleet_stages(").expect("run_fleet_stages")..];
+        let f = &f[..f.find("\n/// Normalize a stack tag").expect("end of run_fleet_stages")];
+        let waits: Vec<usize> = f.match_indices("wait_for_gateway(g, ").map(|(i, _)| i).collect();
+        let joins: Vec<usize> = f.match_indices("st.finish(g)").map(|(i, _)| i).collect();
+        assert_eq!(waits.len(), 2, "stack-only and stack+nodes branches each wait for the gateway");
+        for w in &waits {
+            let j = joins.iter().find(|j| **j > *w).unwrap_or_else(|| panic!("no join after the gateway wait at {w}"));
+            let next_branch = f[*w..].find("if let Err((why, remedy))").expect("wait verdict");
+            assert!(*j < w + next_branch, "the join sits between the wait and its verdict");
+        }
+        let join_nodes = *joins.iter().find(|j| **j > waits[1]).unwrap();
+        assert!(join_nodes < f.find("lock_stage_failures(").expect("blocker read"), "joined before lock_stage_failures is read");
+        assert!(join_nodes < f.find("gateway_older_than_bundle(").expect("bundle gate"), "joined before the nodes-phase gates");
+    }
+
+    #[test]
+    fn an_asset_is_skipped_only_when_the_gateway_names_the_same_hash() {
+        use super::cli_asset_sha_line_matches as m;
+        let h = "a".repeat(64);
+        assert!(m(&format!("{h}  noo-x86_64-unknown-linux-gnu\n"), "noo-x86_64-unknown-linux-gnu", &h));
+        assert!(m(&format!("{}  install.sh\n", h.to_uppercase()), "install.sh", &h));
+        let other = "b".repeat(64);
+        assert!(!m(&format!("{other}  install.sh\n"), "install.sh", &h), "a different hash uploads");
+        assert!(!m(&format!("{h}  other-name\n"), "install.sh", &h), "a line for another asset uploads");
+        assert!(!m("", "install.sh", &h) && !m("no such asset on this controller", "install.sh", &h));
+    }
+
+    /// Every upload in `upload_cli_assets` asks the gateway first.
+    #[test]
+    fn every_cli_asset_upload_checks_the_gateway_first() {
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upload_cli_assets(").expect("upload_cli_assets")..];
+        let body = &body[..body.find("\nfn ").expect("end")];
+        assert_eq!(body.matches("put_bytes(").count(), body.matches("gateway_holds_cli_asset(").count());
     }
 
     #[test]

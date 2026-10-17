@@ -16,9 +16,15 @@ caller never got the answer (i69, fixed for the worker). Nodes and the
 add-ons were left on `allow_responses` (i70); each principal now holds a
 static publish on its OWN reply prefix:
 
-- worker — and the add-ons, which present the worker principal
-  (noo-trellion, noo-trellion-intel): `_INBOX_gw.worker.>`
+- worker (noo-worker): `_INBOX_gw.worker.>`
+- each add-on its OWN principal (i70 residue): `trellion` on
+  `_INBOX_gw.trellion.>`, `trellion_intel` on `_INBOX_gw.trellion_intel.>`,
+  each subscribing on exactly the subjects it serves
 - node <id>: `_INBOX_gw.node.<token>.>`
+
+While an add-on has no principal of its own (the one-release fallback) it
+presents the worker, and the worker's grant keeps that add-on's subjects and
+reply prefix — the `fallback_server` cases.
 
 The control tests prove the reload in this harness really does wipe dynamic
 reply permission, so the main tests cannot pass merely because no reload
@@ -61,23 +67,54 @@ def _const(path: Path, name: str) -> str:
 
 
 WORKER_PREFIX = _const(GW_CREDS, "WORKER_REPLY_PREFIX")
+TRELLION_PREFIX = _const(GW_CREDS, "TRELLION_REPLY_PREFIX")
+INTEL_PREFIX = _const(GW_CREDS, "TRELLION_INTEL_REPLY_PREFIX")
 NODE_ROOT = _const(GW_CREDS, "NODE_REPLY_ROOT")
 GW_DEFAULT = _const(GW_CREDS, "INBOX_PREFIX")
+
+
+def _addon_principals() -> dict[str, list[str]]:
+    """ADDON_PRINCIPALS as noo-cli declares it: name -> subjects it serves."""
+    text = GRANTS.read_text()
+    out = {}
+    for m in re.finditer(r'AddonPrincipal \{\s*name: "([a-z_]+)",.*?subjects: &\[(.*?)\],', text, re.S):
+        out[m.group(1)] = re.findall(r'"([^"]+)"', m.group(2))
+    assert set(out) == {"trellion", "trellion_intel"}, out
+    return out
+
+
+ADDONS = _addon_principals()
+
+
+def _quoted(items) -> str:
+    return ", ".join(f'"{i}"' for i in items)
 
 
 def _node_prefix(node: str) -> str:
     return f"{NODE_ROOT}.{node}"  # the ids used here are already one token
 
 
-def _permissions(role: str, node_id: str = "") -> str:
-    """The Role::<role> block of perms_for, as nats-server config text."""
+def _permissions(role: str, node_id: str = "", addons_rendered=tuple(ADDONS)) -> str:
+    """The Role::<role> block of perms_for, as nats-server config text.
+
+    The format arguments perms_for computes are recomputed here from the
+    same ADDON_PRINCIPALS table: an add-on with its own principal takes its
+    subjects off the worker; one without leaves the worker its reply prefix.
+    """
     text = GRANTS.read_text()
     m = re.search(rf"Role::{role} => format!\((.*?)\n        \),", text, re.S)
     assert m, f"Role::{role} grant not found"
+    gw_inbox = _const(GRANTS, "GATEWAY_INBOX")
     subs = {
         "{RESPONSE_EXPIRES}": _const(GRANTS, "RESPONSE_EXPIRES"),
         "{WORKER_REPLY_INBOX}": _const(GRANTS, "WORKER_REPLY_INBOX"),
         "{NODE_REPLY_ROOT}": _const(GRANTS, "NODE_REPLY_ROOT"),
+        "{worker_addon_replies}": "".join(
+            f', "{gw_inbox}.{a}.>"' for a in ADDONS if a not in addons_rendered),
+        "{worker_sub_deny}": "".join(
+            f', "{subj}"' for a in ADDONS if a in addons_rendered for subj in ADDONS[a]),
+        "{addon_subjects}": _quoted(ADDONS.get(node_id, [])),
+        "{addon_reply}": f"{gw_inbox}.{node_id}.>",
         "{id}": node_id,
         "{tok}": node_id,
     }
@@ -105,12 +142,19 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _conf(port: int, filler_password: str) -> str:
+ADDON_PASSWORDS = {"trellion": "tp", "trellion_intel": "ip"}
+
+
+def _conf(port: int, filler_password: str, addons_rendered=tuple(ADDONS)) -> str:
     # `filler` exists only so a reload has an authorization change to apply,
     # as a provision's re-render does on a live box.
     nodes = "\n".join(
         f'      {{ user: "node-{n}", password: "{n}", permissions: {{\n{_permissions("Node", n)}\n      }} }}'
         for n in NODES
+    )
+    addons = "\n".join(
+        f'      {{ user: "{a}", password: "{ADDON_PASSWORDS[a]}", permissions: {{\n{_permissions("Addon", a)}\n      }} }}'
+        for a in addons_rendered
     )
     return f"""
 port: {port}
@@ -122,8 +166,9 @@ accounts {{
       {{ user: "other", password: "ot", permissions: {{ publish: {{ allow: [">"] }}, subscribe: {{ allow: [">"] }} }} }}
       {{ user: "filler", password: "{filler_password}" }}
       {{ user: "worker", password: "wk", permissions: {{
-{_permissions("Worker")}
+{_permissions("Worker", addons_rendered=addons_rendered)}
       }} }}
+{addons}
 {nodes}
     ]
   }}
@@ -131,11 +176,10 @@ accounts {{
 """
 
 
-@pytest.fixture
-def server(tmp_path):
+def _start(tmp_path, addons_rendered):
     port = _free_port()
     conf = tmp_path / "nats.conf"
-    conf.write_text(_conf(port, "f0"))
+    conf.write_text(_conf(port, "f0", addons_rendered))
     log = tmp_path / "nats.log"
     proc = subprocess.Popen([SERVER, "-c", str(conf), "-l", str(log)])
     deadline = time.monotonic() + 10
@@ -153,7 +197,7 @@ def server(tmp_path):
 
     def reload():
         reloads["n"] += 1
-        conf.write_text(_conf(port, f"f{reloads['n']}"))
+        conf.write_text(_conf(port, f"f{reloads['n']}", addons_rendered))
         proc.send_signal(signal.SIGHUP)
         end = time.monotonic() + 10
         while time.monotonic() < end:
@@ -162,16 +206,33 @@ def server(tmp_path):
             time.sleep(0.05)
         raise AssertionError(f"server did not reload authorization ({reloads['n']}):\n{log.read_text()}")
 
+    return port, reload, log, proc
+
+
+@pytest.fixture
+def server(tmp_path):
+    """Every add-on with its own principal — the target state."""
+    port, reload, log, proc = _start(tmp_path, tuple(ADDONS))
+    yield port, reload, log
+    proc.terminate()
+    proc.wait(timeout=10)
+
+
+@pytest.fixture
+def fallback_server(tmp_path):
+    """No add-on principal rendered: the one-release fallback, where
+    noo-trellion / noo-trellion-intel present the worker."""
+    port, reload, log, proc = _start(tmp_path, ())
     yield port, reload, log
     proc.terminate()
     proc.wait(timeout=10)
 
 
 # (responder user, password, its own inbox prefix, subject it answers)
-WORKER = ("worker", "wk", "_INBOX_worker", "worker.rag.query")
-# An add-on request: trellion-intel answers `worker.graph.*` presenting the
-# worker principal (docker-compose.trellion.yml NATS_WORKER_USER).
-ADDON = ("worker", "wk", "_INBOX_worker", "worker.graph.recluster")
+WORKER = ("worker", "wk", "_INBOX_worker", "worker.tool.generic")
+# The add-ons on their OWN principals (i70 residue).
+TRELLION = ("trellion", "tp", "_INBOX_trellion", "worker.rag.query")
+INTEL = ("trellion_intel", "ip", "_INBOX_trellion_intel", "worker.graph.recluster")
 NODE8 = ("node-host8", "host8", "_INBOX_node_host8", "harness.run.host8")
 NODE9_TASK = ("node-host9", "host9", "_INBOX_node_host9", "harness.task.host9")
 
@@ -229,7 +290,8 @@ def _violations(errors):
     "responder, prefix",
     [
         pytest.param(WORKER, WORKER_PREFIX, id="worker"),
-        pytest.param(ADDON, WORKER_PREFIX, id="addon-trellion-intel"),
+        pytest.param(TRELLION, TRELLION_PREFIX, id="addon-trellion"),
+        pytest.param(INTEL, INTEL_PREFIX, id="addon-trellion-intel"),
         pytest.param(NODE8, _node_prefix("host8"), id="node-harness-run"),
         pytest.param(NODE9_TASK, _node_prefix("host9"), id="node-harness-task"),
     ],
@@ -271,6 +333,14 @@ async def test_control_a_node_has_no_grant_on_the_gateway_default_inbox(server):
         pytest.param("node-host8", "host8", GW_DEFAULT + ".x", id="node-into-gateway-default"),
         pytest.param("worker", "wk", _node_prefix("host8") + ".x", id="worker-into-node"),
         pytest.param("worker", "wk", GW_DEFAULT + ".x", id="worker-into-gateway-default"),
+        pytest.param("worker", "wk", TRELLION_PREFIX + ".x", id="worker-into-trellion"),
+        pytest.param("trellion", "tp", WORKER_PREFIX + ".x", id="trellion-into-worker"),
+        pytest.param("trellion", "tp", INTEL_PREFIX + ".x", id="trellion-into-intel"),
+        pytest.param("trellion", "tp", GW_DEFAULT + ".x", id="trellion-into-gateway-default"),
+        pytest.param("trellion", "tp", _node_prefix("host8") + ".x", id="trellion-into-node"),
+        pytest.param("trellion_intel", "ip", TRELLION_PREFIX + ".x", id="intel-into-trellion"),
+        pytest.param("trellion_intel", "ip", WORKER_PREFIX + ".x", id="intel-into-worker"),
+        pytest.param("trellion", "tp", "worker.tool.generic", id="trellion-publishes-a-worker-subject"),
     ],
 )
 async def test_no_principal_may_publish_on_another_ones_prefix(server, user, pw, target):
@@ -308,6 +378,8 @@ async def test_and_each_may_publish_on_its_own(server):
         ("worker", "wk", WORKER_PREFIX + ".x"),
         ("node-host8", "host8", _node_prefix("host8") + ".x"),
         ("node-host9", "host9", _node_prefix("host9") + ".x"),
+        ("trellion", "tp", TRELLION_PREFIX + ".x"),
+        ("trellion_intel", "ip", INTEL_PREFIX + ".x"),
     ]:
         errors: list[str] = []
 
@@ -329,3 +401,71 @@ async def test_and_each_may_publish_on_its_own(server):
         await nc.close()
         await gw.close()
         assert got == [b"ok"], f"{user} could not publish on its own prefix {target}: {errors}"
+
+
+async def _subscribe_errors(port, user, pw, inbox, subject):
+    errors: list[str] = []
+
+    async def on_err(e):
+        errors.append(str(e))
+
+    nc = await nats.connect(f"nats://127.0.0.1:{port}", user=user, password=pw,
+                            inbox_prefix=inbox.encode(), error_cb=on_err, allow_reconnect=False)
+    async def ignore(_msg):
+        pass
+
+    await nc.subscribe(subject, queue="q", cb=ignore)
+    await nc.flush()
+    await asyncio.sleep(0.3)  # the violation arrives asynchronously
+    await nc.close()
+    return errors
+
+
+@pytest.mark.parametrize(
+    "user, pw, inbox, subject",
+    [
+        # The worker's grant no longer covers an add-on's subjects.
+        pytest.param("worker", "wk", "_INBOX_worker", "worker.rag.query", id="worker-cannot-serve-trellion"),
+        pytest.param("worker", "wk", "_INBOX_worker", "worker.graph.recluster", id="worker-cannot-serve-intel"),
+        # An add-on serves its own subjects and nothing else.
+        pytest.param("trellion", "tp", "_INBOX_trellion", "worker.graph.recluster", id="trellion-cannot-serve-intel"),
+        pytest.param("trellion", "tp", "_INBOX_trellion", "worker.tool.generic", id="trellion-cannot-serve-core"),
+        pytest.param("trellion_intel", "ip", "_INBOX_trellion_intel", "worker.rag.query", id="intel-cannot-serve-trellion"),
+        pytest.param("trellion", "tp", "_INBOX_trellion", "agent.msg.direct.x", id="trellion-holds-no-agent-inbox"),
+    ],
+)
+async def test_each_principal_serves_only_its_own_subjects(server, user, pw, inbox, subject):
+    port, _reload, _log = server
+    errors = await _subscribe_errors(port, user, pw, inbox, subject)
+    assert _violations(errors), f"{user} was allowed to subscribe {subject}: {errors}"
+
+
+async def test_and_each_may_serve_its_own(server):
+    port, _reload, _log = server
+    for user, pw, inbox, subject in [
+        ("worker", "wk", "_INBOX_worker", "worker.tool.generic"),
+        ("trellion", "tp", "_INBOX_trellion", "worker.rag.query"),
+        ("trellion", "tp", "_INBOX_trellion", "worker.autonomy.check_rag"),
+        ("trellion_intel", "ip", "_INBOX_trellion_intel", "worker.graph.recluster"),
+        ("trellion_intel", "ip", "_INBOX_trellion_intel", "worker.api.heartbeat.run_ml"),
+    ]:
+        errors = await _subscribe_errors(port, user, pw, inbox, subject)
+        assert not _violations(errors), f"{user} could not subscribe {subject}: {errors}"
+
+
+@pytest.mark.parametrize(
+    "subject, prefix",
+    [
+        pytest.param("worker.rag.query", TRELLION_PREFIX, id="trellion-subject"),
+        pytest.param("worker.graph.recluster", INTEL_PREFIX, id="intel-subject"),
+    ],
+)
+async def test_fallback_an_addon_on_the_worker_principal_still_survives_a_reload(fallback_server, subject, prefix):
+    # One release: an add-on without its own principal presents the worker,
+    # and the gateway already addresses the add-on's prefix — so the worker
+    # keeps the add-on's subjects AND its reply prefix until it has one.
+    port, reload, _log = fallback_server
+    responder = ("worker", "wk", "_INBOX_worker", subject)
+    reply, errors = await _round_trip(port, reload, responder, "gateway", "gw", prefix)
+    assert reply == b"answer", f"the fallback lost the add-on's answer; errors: {errors}"
+    assert not _violations(errors), errors
