@@ -65,7 +65,9 @@ pub(crate) const CONTROLLER_ONLY: &[&str] = &[
 /// the release prefix does not carry them, and staging a multi-GB ollama
 /// for every architecture would slow every roll. A node that needs one is
 /// staged by name (`noo cluster sync-images <node> -i <image>`).
-pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &["ollama"];
+pub(crate) const THIRD_PARTY_LOCK_ROWS: &[&str] = &[
+    "ollama", "nats", "nginx", "redis", "loki", "prometheus", "alertmanager", "grafana", "node-exporter", "tei", "tei-cpu", "vllm",
+];
 
 /// Error prefix for "this image is not published for that architecture" —
 /// a skip, not a failure (llama.cpp on ARM uses the upstream image).

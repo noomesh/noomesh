@@ -59,6 +59,20 @@ pub fn router() -> Router<Arc<AppState>> {
 // returns the Rust coordinator's state: resolved backend, active
 // session info, config, and gossip mesh peer count.
 
+/// The backend block without `url` or free-text `error` (which carries
+/// upstream URLs). Pure, so a test pins what a non-operator never sees.
+pub(crate) fn strip_backend_topology(backend: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(m) = backend.as_object() {
+        for k in ["model", "backend_type", "api_format", "status"] {
+            if let Some(v) = m.get(k) {
+                out.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// GET /api/coordinator/context — return the Rust coordinator's current state.
 ///
 /// Reports backend resolution status, active configuration, gossip mesh
@@ -66,7 +80,13 @@ pub fn router() -> Router<Arc<AppState>> {
 /// get_context() which returned similar data from its in-process state.
 async fn coordinator_context(
     State(state): State<Arc<AppState>>,
+    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
 ) -> AppResult {
+    // Backend URLs, error text and gossip peer ids are installation topology
+    // (internal hostnames the egress floor otherwise hides). Operators see
+    // them; a `User` account (and the user-door `noo_conversation_context`
+    // tool that calls this route as one) gets the status without them.
+    let operator = super::operator_read_guard(&requester).is_ok();
     // Attempt backend resolution (non-blocking, reports current state)
     let backend_info = match crate::coordinator::resolve_backend(&state).await {
         Ok(b) => json!({
@@ -116,6 +136,12 @@ async fn coordinator_context(
 
     // Tool schemas count
     let tool_count = state.tool_schemas.read().await.len();
+
+    let (backend_info, peer_summaries) = if operator {
+        (backend_info, peer_summaries)
+    } else {
+        (strip_backend_topology(&backend_info), Vec::new())
+    };
 
     Ok(Json(json!({
         "status": "running",
@@ -477,5 +503,27 @@ mod tests {
             device_action_url("https://phone-1:8081/", "location"),
             "https://phone-1:8081/api/device/location"
         );
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::strip_backend_topology;
+    use serde_json::json;
+
+    #[test]
+    fn a_non_operator_context_carries_no_backend_url_or_error_text() {
+        let full = json!({
+            "url": "https://host7.internal:8000/v1", "model": "gemma", "backend_type": "vllm",
+            "api_format": "openai", "status": "resolved",
+        });
+        let out = strip_backend_topology(&full);
+        assert!(out.get("url").is_none());
+        assert_eq!(out["model"], "gemma");
+        assert_eq!(out["status"], "resolved");
+        let failed = json!({"status": "unavailable", "error": "connect to https://host7.internal:8000 refused"});
+        let out = strip_backend_topology(&failed);
+        assert_eq!(out, json!({"status": "unavailable"}));
+        assert!(!out.to_string().contains("host7"));
     }
 }

@@ -277,6 +277,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         out.push(c);
     }
 
+    // 6e. Shared GPU: the node yielded (or was held off) its GPU for work
+    //     outside noomesh. A warn by design, never a failure.
+    out.extend(gpu_contention_check(n));
+
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
@@ -325,6 +329,38 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out
+}
+
+/// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
+/// (internal/gpuyield). A node that gave its GPU to other work (VR, model
+/// development, a voice stack) is working as designed: yielded and held are
+/// WARNs, never FAILs. No row from an agent that does not report it.
+pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
+    let gb = |k: &str| gc[k].as_f64().unwrap_or(0.0) / 1024.0;
+    let paused: Vec<&str> = gc["paused_backends"].as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let paused = if paused.is_empty() { "GPU backends".to_string() } else { paused.join(", ") };
+    let method = gc["method"].as_str().unwrap_or("?");
+    let state = gc["state"].as_str().unwrap_or("?");
+    if method == "not-measured" && state != "held" && state != "yielded" {
+        return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
+    }
+    let off = if gc["policy"].as_str() == Some("off") { " (yield off)" } else { "" };
+    Some(match state {
+        "free" => ok("gpu", format!("free{off}")),
+        "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
+        "yielded" => warn("gpu",
+            format!("yielded: {paused} paused (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            None),
+        "held" => warn("gpu",
+            format!("held by operator{}: {paused} paused",
+                gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
+            Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
+        other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
+    })
 }
 
 /// The `image sources` row: which images the agent started containers from
@@ -1429,6 +1465,77 @@ pub(crate) fn model_classes_check(classes: Option<&Value>) -> Check {
     }
     let total: usize = declared.iter().map(|c| c["candidates"].as_array().map(|a| a.len()).unwrap_or(0)).sum();
     ok("model classes", format!("{} declared class(es), {total} candidate(s) all placed or available", declared.len()))
+}
+
+/// The `default chat` row: where an unpinned request (`default`, `auto`, no
+/// model) goes right now — chat-default's live candidates in routing order
+/// (the gateway's `routing_order`), and who is left out. `x` when none; `!`
+/// when every candidate is CPU-only, when one node carries all of it (no
+/// fallback), or when only excluded nodes (thermal critical, quarantined)
+/// are left.
+pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
+    const NAME: &str = "default chat";
+    let Some(body) = classes else {
+        return warn(NAME, "not read", Some("noo cluster class list".into()));
+    };
+    let empty = Vec::new();
+    let Some(cd) = body["classes"].as_array().unwrap_or(&empty).iter().find(|c| c["name"].as_str() == Some("chat-default")) else {
+        return fail(NAME, "no live chat node: an unpinned chat request gets 503", "noo cluster status");
+    };
+    let mode = if cd["declared"].as_bool() == Some(true) { "declared" } else { "dynamic" };
+    // An older gateway sends no routing_order: its candidates, routable ones.
+    let order: Vec<Value> = match cd["routing_order"].as_array() {
+        Some(o) => o.clone(),
+        None => cd["candidates"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|c| c["status"].as_str() != Some("unplaced"))
+            .cloned()
+            .collect(),
+    };
+    if order.is_empty() {
+        return fail(NAME, format!("chat-default ({mode}) has no live candidate: an unpinned chat request gets 503"), "noo cluster class list");
+    }
+    let listed: Vec<String> = order
+        .iter()
+        .map(|c| {
+            let base = format!(
+                "{}/{}={}",
+                c["node_id"].as_str().unwrap_or("?"),
+                c["backend"].as_str().unwrap_or("?"),
+                c["model"].as_str().unwrap_or("?")
+            );
+            match c["reason"].as_str() {
+                Some(r) => format!("{base} ({r})"),
+                None => base,
+            }
+        })
+        .collect();
+    let skipped: Vec<String> = cd["skipped"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|s| format!("{}/{}: {}", s["node_id"].as_str().unwrap_or("?"), s["backend"].as_str().unwrap_or("?"), s["reason"].as_str().unwrap_or("?")))
+        .collect();
+    let mut detail = format!("{mode}: {}", listed.join(" > "));
+    if !skipped.is_empty() {
+        detail.push_str(&format!("; skipped {}", skipped.join(", ")));
+    }
+    let is_gpu = |c: &Value| c["gpu"].as_bool().unwrap_or(false) || c["backend"].as_str().is_some_and(|b| b.starts_with("vllm"));
+    let mut nodes: Vec<&str> = order.iter().filter_map(|c| c["node_id"].as_str()).collect();
+    nodes.sort();
+    nodes.dedup();
+    if cd["last_resort"].as_bool() == Some(true) {
+        return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
+    }
+    if !order.iter().any(is_gpu) {
+        return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
+    }
+    if nodes.len() == 1 {
+        return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
+    }
+    ok(NAME, detail)
 }
 
 /// Run this binary with `words` and `--json`; the parsed stdout and the exit
@@ -2962,8 +3069,8 @@ pub(crate) fn logs_last_seen_check(metrics: Option<&str>, nodes: &[(String, bool
 /// REFUSES it: a count names an add-on image older than the
 /// change, or one with no key, whose gateway calls are all failing.
 pub(crate) const GATEWAY_LEGACY_LANES: &[&str] =
-    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused"];
-pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert"];
+    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
+pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert", "cluster_hmac_v2"];
 /// Counted REFUSALS, not admissions: a `noo` CLI older than the
 /// break-glass removal signing with the controller secret. Every count is
 /// a binary somewhere that needs `noo upgrade --all`.
@@ -2977,7 +3084,7 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
 /// The node-side lanes, as each agent reports them in `legacy_lanes`.
-pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller"];
+pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller", "cluster_hmac_v1"];
 /// Below this window a zero is not yet retirement evidence
 /// ≥7 days, spanning a weekly heartbeat run).
 const LEGACY_LANE_EVIDENCE_SECS: i64 = 7 * 86_400;
@@ -3650,6 +3757,8 @@ pub(crate) fn controller_checks(
         }
     }
 
+    out.extend(node_agent_privilege_check(posture));
+
     let active: Vec<&str> = keys["keys"].as_array().unwrap_or(&empty).iter()
         .filter(|k| k["active"].as_bool().unwrap_or(false))
         .filter_map(|k| k["consumer"].as_str()).collect();
@@ -3755,6 +3864,60 @@ pub(crate) fn erasure_archive_check(v: &Value) -> Check {
             "oldest archived erasure is {days} days old; copies are kept {window} days, then purged daily ({} row(s) held)",
             v["rows"].as_i64().unwrap_or(0)
         ),
+    )
+}
+
+/// `node-agent privilege` — the container's ACTUAL `HostConfig.Privileged`
+/// (added to `posture list --json` by the CLI, since the gateway has no docker
+/// access), against the desired posture. "At desired" has to mean the
+/// container, not the gateway's own env var. `None` when the posture JSON
+/// carries neither field (an older CLI or no such gate): nothing was seen, so
+/// no row is better than a green one.
+pub(crate) fn node_agent_privilege_check(posture: &Value) -> Option<Check> {
+    const NAME: &str = "node-agent privilege";
+    const KEY: &str = "NOO_NODE_AGENT_PRIVILEGED";
+    let gate = posture["posture"].as_array()?.iter().find(|g| g["key"] == KEY)?;
+    let desired = gate["db_value"].as_str();
+    let want_off = desired.is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
+    if let Some(why) = gate["actual_error"].as_str() {
+        return Some(warn(NAME, format!("not checked: {why}"), Some("noo security posture list".into())));
+    }
+    let actual = match gate["actual"].as_str() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return None,
+    };
+    Some(match (actual, want_off) {
+        (true, true) => fail(
+            NAME,
+            "the node-agent container is PRIVILEGED (docker inspect) but posture says false: the gate is not in effect",
+            "noo security posture set NOO_NODE_AGENT_PRIVILEGED false   # mirrors into .env and recreates the node-agent",
+        ),
+        (true, false) => warn(
+            NAME,
+            "the node-agent container is privileged (docker inspect); posture does not set it to false",
+            Some("noo security posture apply-profile hardened   # or: noo security posture set NOO_NODE_AGENT_PRIVILEGED false".into()),
+        ),
+        (false, true) => ok(NAME, "unprivileged, as posture says (docker inspect)"),
+        (false, false) => ok(NAME, "unprivileged (docker inspect)"),
+    })
+}
+
+/// `audit key` — is `NOO_AUDIT_HMAC_KEY` in this install's store? Read
+/// locally, so it answers even when the gateway cannot (it refuses to boot
+/// without the key, which would otherwise surface only as "gateway down").
+pub(crate) fn audit_key_check(present: bool, store_unreadable: Option<&str>) -> Check {
+    const NAME: &str = "audit key";
+    if let Some(why) = store_unreadable {
+        return warn(NAME, format!("not checked: the secret store could not be read ({why})"), Some("noo security secrets audit".into()));
+    }
+    if present {
+        return ok(NAME, "NOO_AUDIT_HMAC_KEY is set: audit rows are signed");
+    }
+    fail(
+        NAME,
+        "NOO_AUDIT_HMAC_KEY is not set: the gateway refuses to start and no security audit row can be written",
+        "noo upgrade --stack   # mints NOO_AUDIT_HMAC_KEY into the encrypted store when absent, then recreates the stack",
     )
 }
 
@@ -4330,7 +4493,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // Every declared model-class candidate is placed or available
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
-        checks.push(model_classes_check(get_json_opt(g, "/api/cluster/model-classes", true, 15).as_ref()));
+        let model_classes = get_json_opt(g, "/api/cluster/model-classes", true, 15);
+        checks.push(model_classes_check(model_classes.as_ref()));
+        // Where an unpinned chat goes: chat-default's live candidates.
+        checks.push(default_chat_check(model_classes.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
@@ -4462,6 +4628,14 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(crate::commands::secrets_delivery::shared_secrets_row());
         // The audit log signs with its own key and verifies across the
         // checkpoint that retired the NOO_JWT_SECRET derivation.
+        checks.push(audit_key_check(
+            !std::env::var("NOO_AUDIT_HMAC_KEY").unwrap_or_default().trim().is_empty(),
+            match crate::envfile::secret_store_state() {
+                crate::envfile::StoreState::Unreadable(e) => Some(e.to_string()),
+                _ => None,
+            }
+            .as_deref(),
+        ));
         let (_, audit_verdict, _) = self_json(g, &["security", "audit", "verify"]);
         checks.push(audit_log_check(&audit_verdict));
         // An erase keeps a copy 30 days; a purge that is not running shows as
@@ -4679,6 +4853,42 @@ mod tests {
         assert_eq!(c.verdict, super::Verdict::Ok);
         assert!(c.detail.contains("1 derived"), "{}", c.detail);
         assert_eq!(model_classes_check(None).verdict, super::Verdict::Warn);
+    }
+
+    /// The `default chat` row lists the live candidates in routing order,
+    /// warns on CPU-only or a single node, and fails on none.
+    #[test]
+    fn default_chat_row_lists_candidates_and_flags_cpu_only_single_node_or_none() {
+        use super::default_chat_check;
+        let two = serde_json::json!({"classes": [{"name": "chat-default", "declared": false, "dynamic": true,
+            "routing_order": [
+                {"node_id": "mcmini", "backend": "ollama", "model": "gemma4:12b", "gpu": true, "reason": "rank=gpu,params=12,load=0.40"},
+                {"node_id": "pop-os", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
+            ],
+            "skipped": [{"node_id": "awolf", "backend": "vllm", "reason": "thermal critical"}]}]});
+        let c = default_chat_check(Some(&two));
+        assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("dynamic: mcmini/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > pop-os/"), "{}", c.detail);
+        assert!(c.detail.contains("skipped awolf/vllm: thermal critical"), "{}", c.detail);
+
+        let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "pop-os", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
+        let c = default_chat_check(Some(&cpu));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("only CPU"), "{}", c.detail);
+
+        let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "awolf", "backend": "ollama", "model": "m", "gpu": true}]}]});
+        let c = default_chat_check(Some(&one));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("one node"), "{}", c.detail);
+
+        let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
+        assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []}))).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(None).verdict, super::Verdict::Warn);
     }
 
     use super::*;
@@ -6059,6 +6269,36 @@ mod tests {
         let c = controller_checks(&serde_json::json!({"posture": [{"key": "K", "running": "1", "db_value": "1"}]}),
             &serde_json::json!({"keys": []}), &[], (0, &Value::Null), &safe, &Value::Null, None, None, None);
         assert_eq!(verdict(&c, "exposure"), Verdict::Ok);
+    }
+
+    /// The privileged flag is judged on the CONTAINER, not the gateway's env.
+    #[test]
+    fn node_agent_privilege_is_read_from_the_container() {
+        let gate = |actual: serde_json::Value, db: &str| serde_json::json!({"posture": [
+            {"key": "NOO_NODE_AGENT_PRIVILEGED", "running": db, "db_value": db, "actual": actual}]});
+        let v = |p: &serde_json::Value| node_agent_privilege_check(p).map(|c| c.verdict);
+        // The bug: posture says false, the gateway's env says false, the container is privileged.
+        assert_eq!(v(&gate(serde_json::json!("true"), "false")), Some(Verdict::Fail));
+        assert_eq!(v(&gate(serde_json::json!("false"), "false")), Some(Verdict::Ok));
+        assert_eq!(v(&gate(serde_json::json!("true"), "true")), Some(Verdict::Warn));
+        // Could not inspect: warned as not checked, never ok.
+        let unseen = serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false", "actual_error": "docker is not runnable"}]});
+        let c = node_agent_privilege_check(&unseen).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("not checked"), "{}", c.detail);
+        // An older CLI's listing has no container fact: no row, not a green one.
+        assert!(v(&serde_json::json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "db_value": "false"}]})).is_none());
+        assert!(v(&serde_json::json!({"posture": []})).is_none());
+    }
+
+    #[test]
+    fn the_audit_key_row_answers_locally() {
+        assert_eq!(audit_key_check(true, None).verdict, Verdict::Ok);
+        let f = audit_key_check(false, None);
+        assert_eq!(f.verdict, Verdict::Fail);
+        assert!(f.remedy.unwrap().contains("noo upgrade --stack"));
+        // An unreadable store cannot say the key is missing OR present.
+        assert_eq!(audit_key_check(false, Some("sops not found")).verdict, Verdict::Warn);
     }
 
     #[test]
@@ -7968,5 +8208,57 @@ mod self_agent_lane_tests {
         let c = self_agent_lane_check("pop-os", &[], Some(&p), Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_contention_tests {
+    use super::*;
+
+    fn node(gc: Value) -> Value {
+        serde_json::json!({"id": "host3", "gpu_contention": gc})
+    }
+
+    #[test]
+    fn free_is_ok() {
+        let c = gpu_contention_check(&node(serde_json::json!({"state": "free", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.name, "gpu");
+        assert_eq!(c.detail, "free");
+    }
+
+    #[test]
+    fn yielded_is_a_warn_naming_the_paused_backend_and_foreign_use() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 11468, "method": "memory-accounting", "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "by design: never a failure");
+        assert!(c.detail.starts_with("yielded: vllm paused (foreign 11.2 GB"), "{}", c.detail);
+        assert!(c.remedy.is_none());
+    }
+
+    #[test]
+    fn held_is_a_warn_with_the_release_command() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "held by operator (voice): vllm paused");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+    }
+
+    #[test]
+    fn not_measured_is_ok_and_absent_is_no_row() {
+        let c = gpu_contention_check(&node(serde_json::json!({"state": "free", "method": "not-measured"}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("not measured"));
+        assert!(gpu_contention_check(&serde_json::json!({"id": "host9"})).is_none());
+    }
+
+    #[test]
+    fn node_checks_carry_the_gpu_row() {
+        let n = serde_json::json!({"id": "host3", "status": "online",
+            "gpu_contention": {"state": "yielded", "foreign_mb": 2048, "method": "nvidia-smi", "paused_backends": ["vllm"]}});
+        let rows = node_checks(&n, "v0.6.2", "0.6.2", 0, None);
+        let gpu = rows.iter().find(|c| c.name == "gpu").expect("a gpu row");
+        assert_eq!(gpu.verdict, Verdict::Warn);
     }
 }

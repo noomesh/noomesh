@@ -26,6 +26,7 @@ pub mod cluster_host_telemetry;
 pub mod cluster_vendor;
 pub mod node_vendor;
 pub mod cluster_push_secrets;
+pub mod cluster_gpu;
 pub mod cluster_verify;
 pub mod image_stage;
 pub mod cluster_class;
@@ -77,6 +78,7 @@ pub mod container_files;
 pub mod offboard;
 pub mod provision;
 pub mod security_local;
+pub mod security_scan_node;
 pub mod skills;
 pub mod systems;
 pub mod test;
@@ -171,7 +173,7 @@ pub use rag::{
     rag_status, rag_unhold,
 };
 pub use security::{
-    security_audit_verify,
+    security_audit_list, security_audit_verify,
     security_org_create, security_org_list, security_posture_apply_profile,
     security_posture_list, security_posture_set, security_service_key_issue,
     security_service_key_list, security_service_key_provision, security_service_key_retire,
@@ -194,6 +196,7 @@ pub use secrets_reveal::secrets_reveal;
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
 pub use cluster_vendor::{cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
+pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
 pub use cluster_verify::cluster_verify;
 pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset};
 pub use security_local::{

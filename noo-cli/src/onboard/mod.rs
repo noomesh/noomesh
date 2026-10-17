@@ -215,6 +215,32 @@ pub(crate) struct State {
     pub port_offset: u32,
 }
 
+/// What a `--skip-*` flag left UNAPPLIED, for the closing summary. A skipped
+/// section is not a clean install: "setup complete" over a run that never
+/// created the PKI, minted the service keys or applied the posture profile is
+/// the silent success this wizard exists to avoid. One line per skip, naming
+/// what is forgone and the command that does it later.
+pub(crate) fn not_applied_lines(skip: &Skip) -> Vec<String> {
+    let mut lines = Vec::new();
+    if skip.security {
+        lines.push(
+            "NOT applied (--skip-security): secret minting and the encrypted store (JWT, cluster, controller, \
+             audit, database, bus), the admin account, and the cluster PKI with enrollment (TLS, mTLS). The gateway \
+             will not start without TLS material and the audit key — run: noo onboard --only secrets, then noo onboard --only enrollment"
+                .to_string(),
+        );
+    }
+    if skip.services {
+        lines.push(
+            "NOT applied (--skip-services): starting the stack, the per-service keys, and the hardened posture \
+             profile (exec approval, unprivileged node-agent). Until applied, gates sit at code defaults — run: \
+             noo stack start, then noo security service-key provision <name> and noo security posture apply-profile hardened"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 impl State {
     fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!("Mode: {}", self.mode), format!("Tier: {}", self.tier)];
@@ -1328,6 +1354,9 @@ fn print_final_summary(ctx: &Ctx) {
     for line in aligned_kv(&ctx.state.summary_lines()) {
         ctx.raw(&format!("    {line}"));
     }
+    for line in not_applied_lines(&ctx.skip) {
+        ctx.warn(&line);
+    }
     let addons = steps::addons_summary(ctx);
     if !addons.is_empty() {
         ctx.raw("");
@@ -1521,6 +1550,20 @@ mod outcome_tests {
 #[cfg(test)]
 mod summary_tests {
     use super::State;
+
+    /// A skipped security or services section is reported in the closing
+    /// summary with what it forgoes and the command that applies it.
+    #[test]
+    fn skips_are_listed_as_not_applied_with_the_remedy() {
+        use super::{not_applied_lines, Skip};
+        assert!(not_applied_lines(&Skip::default()).is_empty());
+        let l = not_applied_lines(&Skip { security: true, ..Default::default() });
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains("--skip-security") && l[0].contains("PKI") && l[0].contains("noo onboard --only enrollment"), "{l:?}");
+        let l = not_applied_lines(&Skip { services: true, ..Default::default() });
+        assert!(l[0].contains("service keys") && l[0].contains("posture") && l[0].contains("apply-profile hardened"), "{l:?}");
+        assert_eq!(not_applied_lines(&Skip { security: true, services: true, ..Default::default() }).len(), 2);
+    }
 
     /// `--skip-model` (or declining the model step): services ran, nothing
     /// was pulled here. The summary must say so with a next step, not stay

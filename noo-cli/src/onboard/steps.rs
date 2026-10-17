@@ -5476,37 +5476,9 @@ fn reset_grafana_password(ctx: &mut Ctx) {
     }
 }
 
-/// Why a password is refused, or None. The admin login faces whatever
-/// interface the cluster plane binds to — on a LAN or VPS install that is the
-/// network — behind a 10/min/user + 20/min/IP limit, ≈14k guesses a day.
-/// An 8-character floor with no blocklist loses that race to a dictionary;
-/// 12 characters and the top of the list do not.
-fn weak_password(pw: &str, username: &str) -> Option<&'static str> {
-    const FLOOR: usize = 12;
-    // The shapes a dictionary tries first: the most-used passwords, plus the
-    // product's own words. Matched case-insensitively against the whole
-    // password, so `Password123!` is refused as surely as `password123`.
-    const COMMON: &[&str] = &[
-        "password", "password1", "password12", "password123", "password1234", "password123!",
-        "123456789012", "1234567890123", "qwertyuiop12", "qwerty123456", "letmein12345",
-        "iloveyou1234", "welcome12345", "welcome123!", "admin1234567", "administrator",
-        "changeme1234", "changemenow!", "trustno1trustno1", "sunshine1234", "princess1234",
-        "football1234", "baseball1234", "dragon123456", "monkey123456", "master123456",
-        "abc123456789", "abcd12345678", "111111111111", "000000000000", "123123123123",
-        "noomesh12345", "noomeshadmin", "noo-controller", "controller12",
-    ];
-    if pw.chars().count() < FLOOR {
-        return Some("Password must be at least 12 characters (this login faces the network).");
-    }
-    let lower = pw.to_lowercase();
-    if COMMON.contains(&lower.as_str()) {
-        return Some("That password is on every attacker's first list — choose another.");
-    }
-    if !username.is_empty() && lower.contains(&username.to_lowercase()) {
-        return Some("Password must not contain the username.");
-    }
-    None
-}
+// The password rule lives in `crate::password_policy` (shared with the
+// `noo security user` verbs and, byte-for-byte, the gateway).
+use crate::password_policy::weak_password;
 
 // ── Step 6: First Model ──────────────────────────────────────────────────
 
@@ -5745,12 +5717,13 @@ pub fn first_model(ctx: &mut Ctx) {
         start_vllm(ctx, &model_name);
     } else {
         pull_ollama(ctx, &model_name);
-        // Standalone serves chat from the embed container; trellion needs the
-        // MODEL name as well as the URL, or ollama answers 404 to its
-        // /v1/chat/completions and every RAG answer fails (2026-09-07).
-        if ctx.repo_root.join(".noo-standalone").exists() {
-            ctx.update_env("PAGEINDEX_LLM_MODEL", &model_name);
-        }
+        // No PAGEINDEX_LLM_MODEL here any more. It was written on standalone
+        // when trellion dialled ollama directly and needed an exact name
+        // (2026-09-07); trellion now asks the gateway (2026-09-09), where
+        // `default` means every live chat node. An exact name written by
+        // onboarding pinned every RAG answer to the one model chosen at
+        // install (2026-10-17). The model still lands in the yaml as the
+        // local backend's placement hint (`update_yaml_config`).
     }
 }
 

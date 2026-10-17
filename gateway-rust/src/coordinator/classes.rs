@@ -20,10 +20,38 @@
 //!   true`, and only a degraded candidate may answer with a different
 //!   model than the class's first one.
 //! * **Derived** when nothing is declared: one class per distinct served
-//!   model, holding only that model's candidates; `chat-default` is the
-//!   configured default model's candidates. So an undeclared fleet never
-//!   silently answers a request with a different model than the one at
-//!   position 0 — it fails over across NODES, not across models.
+//!   model, holding only that model's candidates — a request that NAMES a
+//!   model is answered by that model or refused, and fails over across
+//!   NODES, never across models.
+//!
+//! ## `chat-default` is the whole mesh (operator rule, 2026-10-17)
+//!
+//! An unpinned request (`model` absent, `default`, `auto`, blank) means
+//! "any live chat-capable node", chosen per request. Undeclared,
+//! `chat-default` is **dynamic**: every running chat-role candidate on
+//! every node, whatever model it serves, ranked by [`rank_key`]. Nodes are
+//! multipurpose and come and go — a busy, hot, stalled or offline node
+//! drops down or out of the ranking on its own and climbs back the same
+//! way; nothing is pinned to one model or one node. The yaml's
+//! `cluster.backends.<x>.model` is a PLACEMENT hint (what onboarding put on
+//! the local backend), never a routing pin: it does not narrow the default.
+//!
+//! Only three things narrow an unpinned request: a concrete model name
+//! (its derived class), an explicit node (`node` / `X-Noo-Node`, see
+//! [`select`]), or a DECLARED `chat-default` (`noo cluster class set
+//! chat-default …`), which stays authoritative because it is an explicit
+//! operator choice. `noo cluster class list` says which one is live:
+//! `dynamic (all live chat nodes)` or `declared`.
+//!
+//! The dynamic ranking, lowest first ([`rank_key`]): degraded, unhealthy
+//! (stale heartbeat, unreachable, quarantined), stalled in the last
+//! [`STALL_DEMOTION`] (5 min), thermal `serious`/`critical`, GPU shared
+//! with a foreign workload (`gpu_contention.state: shared`; a lane listed in
+//! `gpu_contention.paused_backends` is not a candidate at all), engine (vLLM,
+//! then a GPU runtime, then CPU), larger model first (parameter estimate,
+//! [`quality_of`]), fewest requests in flight from this gateway, heartbeat
+//! load. A quarantined node and a thermal-`critical` node are EXCLUDED
+//! (`skipped`) unless nothing else is left, and then used with a warning.
 //!
 //! A declared class may be a **pool** (`noo cluster class set … --pool`):
 //! its non-degraded candidates are peers, not a failover order. Each
@@ -70,6 +98,15 @@ pub const HEARTBEAT_INTERVAL_SECS: f64 = 30.0;
 
 /// Backend types that can serve chat (the same set the legacy resolver scans).
 const INFERENCE_TYPES: [&str; 4] = ["vllm", "vllm-secondary", "ollama", "llamacpp"];
+
+/// How long a candidate that stalled (connected, then produced nothing in
+/// time) or timed out sorts after every candidate that did not. Five
+/// minutes: long enough that a wedged engine or a node busy with something
+/// else (a GPU in a VR session, a model build) stops taking every new
+/// request in its first 30 s window, short enough that it rejoins on its
+/// own once it recovers. Process-wide, written by the raw chat failover
+/// loop and the agent loop's `send_llm_with_fallback`.
+pub const STALL_DEMOTION: Duration = Duration::from_secs(300);
 
 // ── declarations ─────────────────────────────────────────────────────────
 
@@ -141,6 +178,20 @@ pub struct NodeFacts {
     pub heartbeat_age_secs: Option<f64>,
     /// `false` only when the reachability probe RECORDED a failure.
     pub inbound_ok: bool,
+    /// The heartbeat's `thermal_state` (`nominal|fair|serious|critical`).
+    pub thermal: Option<String>,
+    /// `status: quarantined` (the auto-quarantine evaluator's verdict).
+    pub quarantined: bool,
+    /// `status: offline`.
+    pub offline: bool,
+    /// `(model, size_bytes)` from the heartbeat's `model_stats`.
+    pub model_sizes: Vec<(String, u64)>,
+    /// `gpu_contention.state == "shared"`: something else on the node (a
+    /// game, a model build) is using the GPU. Absent = free.
+    pub gpu_shared: bool,
+    /// `gpu_contention.paused_backends`: lanes the node yielded; never
+    /// candidates while listed.
+    pub paused_backends: Vec<String>,
 }
 
 /// One row of `noo_backend_placements` as the table needs it:
@@ -185,8 +236,23 @@ pub struct Candidate {
     pub url: String,
     #[serde(skip)]
     tier: Option<i64>,
+    /// `vram_gb > 0` or unified memory on the node.
+    pub gpu: bool,
+    /// Parameter estimate in billions ([`quality_of`]); `None` = unknown.
+    pub params_b: Option<f64>,
+    /// The node's `thermal_state`, when it reports one.
+    pub thermal: Option<String>,
+    pub quarantined: bool,
+    /// The node reports its GPU shared with a foreign workload.
+    pub gpu_shared: bool,
+    /// The class this candidate was selected through, as logs print it
+    /// (`chat-default(dynamic)`); set by [`select`].
     #[serde(skip)]
-    gpu: bool,
+    pub class_label: String,
+    /// Why it ranks where it does (`rank=gpu,params=12,load=0.20`); set by
+    /// [`select`] for the logs.
+    #[serde(skip)]
+    pub rank: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -196,6 +262,9 @@ pub struct Class {
     pub candidates: Vec<Candidate>,
     /// A declared pool: candidates are picked by in-flight requests and load.
     pub pool: bool,
+    /// The undeclared `chat-default`: every live chat candidate on every
+    /// node, ranked by [`rank_key`].
+    pub dynamic: bool,
 }
 
 impl Candidate {
@@ -217,6 +286,24 @@ impl Candidate {
             url,
             tier: None,
             gpu: false,
+            params_b: None,
+            thermal: None,
+            quarantined: false,
+            gpu_shared: false,
+            class_label: String::new(),
+            rank: String::new(),
+        }
+    }
+
+    /// Thermal `critical` or quarantined: out of a dynamic default or a pool
+    /// unless nothing else is left. The reason, for the logs.
+    pub fn exclusion(&self) -> Option<String> {
+        if self.quarantined {
+            Some("quarantined".into())
+        } else if self.thermal.as_deref() == Some("critical") {
+            Some("thermal critical".into())
+        } else {
+            None
         }
     }
 }
@@ -235,6 +322,14 @@ pub struct ClassTable {
     pub classes: Vec<Class>,
     /// `(alias, class)`, built-ins first.
     pub aliases: Vec<(String, String)>,
+    /// The dynamic pool of every live chat candidate, kept even when
+    /// `chat-default` is declared: a node pin with no model selects from it.
+    #[serde(skip)]
+    pub all_chat: Option<Class>,
+    /// Every node with a heartbeat record, chat-capable or not — so a node
+    /// pin can tell "no such node" (422) from "serves no chat" (409).
+    #[serde(skip)]
+    pub nodes: Vec<String>,
 }
 
 impl ClassTable {
@@ -292,7 +387,94 @@ pub fn order_key(c: &Candidate) -> (u8, u8, usize, i64) {
     )
 }
 
+/// The dynamic default's routing order, lowest first: non-degraded,
+/// healthy, not stalled in the last [`STALL_DEMOTION`], not thermally
+/// `serious`/`critical`, GPU not shared with a foreign workload
+/// (`gpu_contention.state: shared`), engine (vLLM < GPU runtime < CPU), the larger
+/// model (`-params`, tenths of a billion), fewest requests in flight from
+/// this gateway, heartbeat load, position. A function so the ORDER is what
+/// gets tested.
+pub fn rank_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, u8, i64, usize, i64, usize) {
+    (
+        if c.degraded { 1 } else { 0 },
+        if c.healthy { 0 } else { 1 },
+        if stalled { 1 } else { 0 },
+        thermal_rank(c.thermal.as_deref()),
+        if c.gpu_shared { 1 } else { 0 },
+        engine_rank(&c.backend, c.gpu),
+        -((c.params_b.unwrap_or(0.0) * 10.0) as i64),
+        in_flight,
+        (c.load * 100.0) as i64,
+        c.position,
+    )
+}
+
+/// `serious` and `critical` sort after every cooler candidate.
+fn thermal_rank(t: Option<&str>) -> u8 {
+    match t {
+        Some("serious") | Some("critical") => 1,
+        _ => 0,
+    }
+}
+
+/// A candidate's model size in billions of parameters — the quality key of
+/// the dynamic default. From the name first (`gemma4:12b`, `gemma4:e2b-it-qat`,
+/// `google/gemma-4-12B-it-qat-w4a16-ct`: [`crate::placement_fit::params_b`];
+/// a vLLM lane reports no sizes, so its HF name is the only source), then
+/// the node's measured `model_stats[].size_bytes`, then the known-weights
+/// table, both converted at [`crate::placement_fit::GB_PER_BILLION_PARAMS`].
+pub fn quality_of(n: &NodeFacts, model: &str) -> Option<f64> {
+    if let Some(p) = crate::placement_fit::params_b(model) {
+        return Some(p);
+    }
+    let gb_to_b = |gb: f64| gb / crate::placement_fit::GB_PER_BILLION_PARAMS;
+    if let Some((_, b)) = n.model_sizes.iter().find(|(m, b)| *b > 0 && same_model(m, model)) {
+        return Some(gb_to_b(*b as f64 / 1e9));
+    }
+    crate::placement_fit::KNOWN_WEIGHTS_GB.iter().find(|(m, _)| same_model(m, model)).map(|(_, g)| gb_to_b(*g))
+}
+
+/// `rank=gpu,params=12,load=0.20` — why a candidate sits where it does.
+pub fn rank_reason(c: &Candidate, in_flight: usize, stalled: bool) -> String {
+    let engine = match engine_rank(&c.backend, c.gpu) {
+        0 => "vllm",
+        1 => "gpu",
+        _ => "cpu",
+    };
+    let mut out = format!("rank={engine}");
+    match c.params_b {
+        Some(p) => out.push_str(&format!(",params={}", (p * 10.0).round() / 10.0)),
+        None => out.push_str(",params=?"),
+    }
+    out.push_str(&format!(",load={:.2}", c.load));
+    if in_flight > 0 {
+        out.push_str(&format!(",in_flight={in_flight}"));
+    }
+    if stalled {
+        out.push_str(",stalled");
+    }
+    if let Some(t) = c.thermal.as_deref().filter(|t| thermal_rank(Some(t)) > 0) {
+        out.push_str(&format!(",thermal={t}"));
+    }
+    if c.gpu_shared {
+        out.push_str(",gpu_shared");
+    }
+    if !c.healthy {
+        out.push_str(&format!(",unhealthy={}", c.health));
+    }
+    if c.degraded {
+        out.push_str(",degraded");
+    }
+    out
+}
+
 fn health_of(n: &NodeFacts) -> (bool, String) {
+    if n.quarantined {
+        return (false, "quarantined".into());
+    }
+    if n.offline {
+        return (false, "status offline".into());
+    }
     match n.heartbeat_age_secs {
         None => return (false, "no heartbeat timestamp".into()),
         Some(age) if age > 2.0 * HEARTBEAT_INTERVAL_SECS => {
@@ -331,21 +513,20 @@ fn candidate(n: &NodeFacts, backend: &str, model: &str, position: usize, degrade
         url: url_for(n, backend),
         tier: n.tier,
         gpu: n.gpu,
+        params_b: quality_of(n, model),
+        thermal: n.thermal.clone(),
+        quarantined: n.quarantined,
+        gpu_shared: n.gpu_shared,
+        class_label: String::new(),
+        rank: String::new(),
     }
 }
 
 /// Build the class table from facts.
 ///
-/// `default_model` is `cluster.backends.<default_backend>.model`;
-/// `preferred_backend` is `cluster.default_backend`. Both only matter for
-/// the derived `chat-default`.
-pub fn build_table(
-    nodes: &[NodeFacts],
-    placements: &[PlacementRow],
-    decl: &Declarations,
-    default_model: &str,
-    preferred_backend: &str,
-) -> ClassTable {
+/// No configured default model takes part: an undeclared `chat-default` is
+/// the dynamic pool of every served chat candidate (see the module doc).
+pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Declarations) -> ClassTable {
     // Every served chat model, as the heartbeats report it.
     let mut served: Vec<Candidate> = Vec::new();
     for n in nodes {
@@ -353,12 +534,26 @@ pub fn build_table(
             if !INFERENCE_TYPES.contains(&bt.as_str()) || m.is_empty() {
                 continue;
             }
-            if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) {
+            if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) || n.paused_backends.iter().any(|b| b == bt) {
                 continue;
             }
             served.push(candidate(n, bt, m, 0, false, CandidateStatus::Placed));
         }
     }
+
+    // The dynamic default: every served chat candidate, whatever its model,
+    // positions in static rank order (in-flight and stalls are live and
+    // applied per request by `rank`).
+    let all_chat: Option<Class> = if served.is_empty() {
+        None
+    } else {
+        let mut cands = served.clone();
+        cands.sort_by_key(|c| rank_key(c, 0, false));
+        for (i, c) in cands.iter_mut().enumerate() {
+            c.position = i;
+        }
+        Some(Class { name: CHAT_DEFAULT.into(), declared: false, candidates: cands, pool: false, dynamic: true })
+    };
 
     // Derived: one class per distinct model, candidates in derive order.
     let mut groups: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
@@ -374,22 +569,8 @@ pub fn build_table(
         for (i, c) in cands.iter_mut().enumerate() {
             c.position = i;
         }
-        classes.push(Class { name: spelling[&key].clone(), declared: false, candidates: cands, pool: false });
+        classes.push(Class { name: spelling[&key].clone(), declared: false, candidates: cands, pool: false, dynamic: false });
     }
-
-    // Derived chat-default: the default model's group, else the group the
-    // legacy sort would have landed on (preferred type, then derive key) —
-    // still ONE model's candidates.
-    let derived_default: Option<Class> = classes
-        .iter()
-        .find(|c| same_model(&c.name, default_model))
-        .or_else(|| {
-            classes.iter().min_by_key(|c| {
-                let first = &c.candidates[0];
-                (if first.backend == preferred_backend { 0 } else { 1 }, derive_key(first))
-            })
-        })
-        .map(|c| Class { name: CHAT_DEFAULT.into(), declared: false, candidates: c.candidates.clone(), pool: false });
 
     // Declared classes override a derived class of the same name.
     for d in &decl.classes {
@@ -433,7 +614,7 @@ pub fn build_table(
             }
             cands.push(c);
         }
-        let class = Class { name: d.name.clone(), declared: true, candidates: cands, pool: d.pool };
+        let class = Class { name: d.name.clone(), declared: true, candidates: cands, pool: d.pool, dynamic: false };
         // Declared names are stored lowercase; a derived class keeps the
         // heartbeat's spelling (`google/gemma-4-12B-…`). Same model, one
         // class — the declaration replaces the derived one.
@@ -444,7 +625,7 @@ pub fn build_table(
         }
     }
     if !classes.iter().any(|c| c.name == CHAT_DEFAULT) {
-        if let Some(d) = derived_default {
+        if let Some(d) = all_chat.clone() {
             classes.insert(0, d);
         }
     } else {
@@ -461,7 +642,10 @@ pub fn build_table(
             aliases.push((a.clone(), c.clone()));
         }
     }
-    ClassTable { classes, aliases }
+    let mut node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    node_ids.sort();
+    node_ids.dedup();
+    ClassTable { classes, aliases, all_chat, nodes: node_ids }
 }
 
 /// The class a `model` hint names, if any. `hint` has been through
@@ -499,38 +683,293 @@ pub fn valid_model(model: &str) -> Result<(), String> {
 /// already failed this request. `exclude` holds `(url, backend)` pairs:
 /// every backend on a node is dialled at the same node-agent address
 /// (`https://<ip>:8081`), so a URL alone would take a node's ollama out
-/// with its vLLM.
+/// with its vLLM. A dynamic default or a pool leaves out quarantined and
+/// thermal-`critical` candidates unless nothing else is left ([`rank`]).
 pub fn ordered<'a>(class: &'a Class, exclude: &[(String, String)]) -> Vec<&'a Candidate> {
-    ordered_by(class, exclude, &|c| in_flight(&c.url, &c.backend))
+    let ex = |c: &Candidate| exclude.iter().any(|(u, b)| u == &c.url && b == &c.backend);
+    rank(class, &ex, &|c| in_flight(&c.url, &c.backend), &|c| recently_stalled(&c.url, &c.backend)).order
 }
 
-/// [`ordered`] with the in-flight count supplied, so a pool's order is
-/// tested without the process-wide registry.
+/// [`ordered`] with the in-flight count supplied and no stall memory, so a
+/// pool's order is tested without the process-wide registries.
 pub fn ordered_by<'a>(class: &'a Class, exclude: &[(String, String)], busy: &dyn Fn(&Candidate) -> usize) -> Vec<&'a Candidate> {
-    let mut out: Vec<&Candidate> = class
+    let ex = |c: &Candidate| exclude.iter().any(|(u, b)| u == &c.url && b == &c.backend);
+    rank(class, &ex, busy, &|_| false).order
+}
+
+/// A class's routable candidates, ranked.
+#[derive(Debug, Default)]
+pub struct Ranked<'a> {
+    /// The routing order.
+    pub order: Vec<&'a Candidate>,
+    /// Left out of a dynamic default or a pool (quarantined, thermal
+    /// critical) with the reason. When nothing else was left they are in
+    /// `order` instead and `last_resort` is true.
+    pub skipped: Vec<(&'a Candidate, String)>,
+    pub last_resort: bool,
+}
+
+/// Rank a class: drop unplaced and `exclude`d candidates; a dynamic default
+/// or a pool sets quarantined / thermal-critical ones aside unless nothing
+/// else is left; then sort — the dynamic default by [`rank_key`], a pool by
+/// [`pool_key`], any other class by [`order_key`] (declared position).
+pub fn rank<'a>(
+    class: &'a Class,
+    exclude: &dyn Fn(&Candidate) -> bool,
+    busy: &dyn Fn(&Candidate) -> usize,
+    stalled: &dyn Fn(&Candidate) -> bool,
+) -> Ranked<'a> {
+    let routable: Vec<&Candidate> = class
         .candidates
         .iter()
         .filter(|c| c.status != CandidateStatus::Unplaced)
-        .filter(|c| !exclude.iter().any(|(u, b)| u == &c.url && b == &c.backend))
+        .filter(|c| !exclude(c))
         .collect();
-    if class.pool {
-        out.sort_by_key(|c| pool_key(c, busy(c)));
+    let mut out = Ranked::default();
+    if class.dynamic || class.pool {
+        let (mut eligible, set_aside): (Vec<&Candidate>, Vec<&Candidate>) =
+            routable.into_iter().partition(|c| c.exclusion().is_none());
+        if eligible.is_empty() && !set_aside.is_empty() {
+            out.last_resort = true;
+            eligible = set_aside;
+        } else {
+            out.skipped = set_aside.into_iter().map(|c| (c, c.exclusion().unwrap_or_default())).collect();
+        }
+        if class.dynamic {
+            eligible.sort_by_key(|c| rank_key(c, busy(c), stalled(c)));
+        } else {
+            eligible.sort_by_key(|c| pool_key(c, busy(c), stalled(c)));
+        }
+        out.order = eligible;
     } else {
-        out.sort_by_key(|c| order_key(c));
+        let mut v = routable;
+        v.sort_by_key(|c| order_key(c));
+        out.order = v;
     }
     out
 }
 
-/// A pool's routing order, lowest first: non-degraded, healthy, fewest
-/// requests in flight from this gateway, heartbeat load, declared position.
-pub fn pool_key(c: &Candidate, in_flight: usize) -> (u8, u8, usize, i64, usize) {
+/// A pool's routing order, lowest first: non-degraded, healthy, not
+/// recently stalled, not thermally hot, GPU not shared, fewest requests in flight from this
+/// gateway, heartbeat load, declared position. No engine or model-size key:
+/// declaring a pool says its peers are interchangeable, and a size key
+/// would send every request to the biggest peer and never spread.
+pub fn pool_key(c: &Candidate, in_flight: usize, stalled: bool) -> (u8, u8, u8, u8, u8, usize, i64, usize) {
     (
         if c.degraded { 1 } else { 0 },
         if c.healthy { 0 } else { 1 },
+        if stalled { 1 } else { 0 },
+        thermal_rank(c.thermal.as_deref()),
+        if c.gpu_shared { 1 } else { 0 },
         in_flight,
         (c.load * 100.0) as i64,
         c.position,
     )
+}
+
+// ── selection (one function for raw chat and the agent loop) ────────────
+
+/// The candidates a request goes to, in order, with what the logs need.
+#[derive(Clone, Debug)]
+pub struct Selection {
+    /// The class name a consumer sees (`chat-default`, a model, a class).
+    pub class: String,
+    /// The same for the logs: `chat-default(dynamic)` / `chat-default(declared)`.
+    pub label: String,
+    /// In routing order; each carries `class_label` and `rank`.
+    pub candidates: Vec<Candidate>,
+    /// `node/backend: reason` for every candidate left out or demoted.
+    pub skipped: Vec<String>,
+    pub last_resort: bool,
+}
+
+/// Why a request has no candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    /// The hint names no class, alias or served model (404).
+    UnknownModel(String),
+    /// The pinned node has no heartbeat record (422).
+    UnknownNode(String),
+    /// The pinned node is there and serves no chat model (422, the same
+    /// status `/api/inference` gives a node pin with no chat backend).
+    NodeServesNoChat(String),
+    /// The pinned node serves chat, but not the named model (409).
+    NodeCannotServe(String),
+    /// The class exists and nothing in it is routable (503).
+    NoCandidates(String),
+}
+
+impl Refusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Refusal::UnknownModel(m)
+            | Refusal::UnknownNode(m)
+            | Refusal::NodeServesNoChat(m)
+            | Refusal::NodeCannotServe(m)
+            | Refusal::NoCandidates(m) => m,
+        }
+    }
+}
+
+/// How the logs name a class.
+pub fn class_label(class: &Class) -> String {
+    if class.name == CHAT_DEFAULT {
+        if class.dynamic {
+            format!("{CHAT_DEFAULT}(dynamic)")
+        } else {
+            format!("{CHAT_DEFAULT}(declared)")
+        }
+    } else {
+        class.name.clone()
+    }
+}
+
+/// [`select_with`] on the live in-flight and stall registries.
+pub fn select(table: &ClassTable, hint: Option<&str>, node: Option<&str>, exclude: &dyn Fn(&Candidate) -> bool) -> Result<Selection, Refusal> {
+    select_with(table, hint, node, exclude, &|c| in_flight(&c.url, &c.backend), &|c| recently_stalled(&c.url, &c.backend))
+}
+
+/// Resolve a request to its ordered candidates: the class the hint names
+/// (absent → `chat-default`), narrowed to `node` when one is pinned. A node
+/// pin with no model selects from every live chat candidate on that node
+/// (the dynamic pool), even when `chat-default` is declared — the caller
+/// named where, and the declaration is about where NOT named. Pure but for
+/// the two live callbacks, so raw chat and the agent loop share it and a
+/// test drives it with facts.
+pub fn select_with(
+    table: &ClassTable,
+    hint: Option<&str>,
+    node: Option<&str>,
+    exclude: &dyn Fn(&Candidate) -> bool,
+    busy: &dyn Fn(&Candidate) -> usize,
+    stalled: &dyn Fn(&Candidate) -> bool,
+) -> Result<Selection, Refusal> {
+    let node = node.map(str::trim).filter(|n| !n.is_empty());
+    let named = resolve_hint(table, hint);
+    let base: &Class = match (named, node, hint) {
+        (_, Some(_), None) => match table.all_chat.as_ref() {
+            Some(c) => c,
+            None => return Err(node_refusal(table, node.unwrap_or_default(), None)),
+        },
+        (Some(c), _, _) => c,
+        (None, _, _) => {
+            if let Some(n) = node {
+                if !table.nodes.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                    return Err(node_refusal(table, n, hint));
+                }
+            }
+            return Err(Refusal::UnknownModel(format!(
+                "model '{}' is not a class, alias or served model; ids: {}",
+                hint.unwrap_or(CHAT_DEFAULT),
+                table.ids().join(", ")
+            )));
+        }
+    };
+    let filtered: Class;
+    let class: &Class = match node {
+        Some(n) => {
+            let cands: Vec<Candidate> = base.candidates.iter().filter(|c| c.node_id.eq_ignore_ascii_case(n)).cloned().collect();
+            if cands.iter().all(|c| c.status == CandidateStatus::Unplaced) {
+                return Err(node_refusal(table, n, hint));
+            }
+            filtered = Class { candidates: cands, ..base.clone() };
+            &filtered
+        }
+        None => base,
+    };
+    let label = class_label(class);
+    let ranked = rank(class, exclude, busy, stalled);
+    if ranked.order.is_empty() {
+        let declared = class.candidates.len();
+        return Err(Refusal::NoCandidates(if class.declared && declared > 0 {
+            format!(
+                "class '{}' has {declared} declared candidate(s) and none is placed or available: {}",
+                class.name,
+                class.candidates.iter().map(|c| format!("{}/{}={} ({})", c.node_id, c.backend, c.model, c.health)).collect::<Vec<_>>().join("; ")
+            )
+        } else {
+            format!("class '{}' has no candidates", class.name)
+        }));
+    }
+    let mut skipped: Vec<String> = ranked.skipped.iter().map(|(c, why)| format!("{}/{}: {why}", c.node_id, c.backend)).collect();
+    let mut candidates = Vec::with_capacity(ranked.order.len());
+    for c in &ranked.order {
+        let (b, st) = (busy(c), stalled(c));
+        let mut c = (*c).clone();
+        c.class_label = label.clone();
+        c.rank = rank_reason(&c, b, st);
+        if st {
+            skipped.push(format!("{}/{}: stalled in the last {}s (demoted)", c.node_id, c.backend, STALL_DEMOTION.as_secs()));
+        } else if !c.healthy {
+            skipped.push(format!("{}/{}: {} (demoted)", c.node_id, c.backend, c.health));
+        } else if thermal_rank(c.thermal.as_deref()) > 0 {
+            skipped.push(format!("{}/{}: thermal {} (demoted)", c.node_id, c.backend, c.thermal.as_deref().unwrap_or("?")));
+        } else if c.gpu_shared {
+            skipped.push(format!("{}/{}: GPU shared with another workload (demoted)", c.node_id, c.backend));
+        }
+        candidates.push(c);
+    }
+    Ok(Selection { class: class.name.clone(), label, candidates, skipped, last_resort: ranked.last_resort })
+}
+
+/// Why a pinned node cannot take this request: unknown (422), present
+/// without a chat backend (422), or without the named model (409).
+fn node_refusal(table: &ClassTable, node: &str, hint: Option<&str>) -> Refusal {
+    if !table.nodes.iter().any(|x| x.eq_ignore_ascii_case(node)) {
+        return Refusal::UnknownNode(format!("node '{node}' is not a node of this mesh (no heartbeat record)"));
+    }
+    let serves: Vec<String> = table
+        .all_chat
+        .iter()
+        .flat_map(|c| c.candidates.iter())
+        .filter(|c| c.node_id.eq_ignore_ascii_case(node))
+        .map(|c| format!("{}={}", c.backend, c.model))
+        .collect();
+    if serves.is_empty() {
+        return Refusal::NodeServesNoChat(format!("node '{node}' serves no chat model right now"));
+    }
+    Refusal::NodeCannotServe(format!(
+        "node '{node}' does not serve '{}'; it serves {}",
+        hint.unwrap_or(CHAT_DEFAULT),
+        serves.join(", ")
+    ))
+}
+
+// ── stall memory ─────────────────────────────────────────────────────────
+
+/// When each `(node-agent address, backend)` last stalled or timed out. The
+/// address is one per node (`https://<ip>:8081`), so this is per node and
+/// backend; both callers hold the address, not always the node id.
+static STALLS: OnceLock<Mutex<HashMap<(String, String), Instant>>> = OnceLock::new();
+
+fn stalls() -> &'static Mutex<HashMap<(String, String), Instant>> {
+    STALLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a stall/timeout failover of `(url, backend)`: the candidate sorts
+/// after every non-stalled one for [`STALL_DEMOTION`].
+pub fn note_stall(url: &str, backend: &str) {
+    if let Ok(mut m) = stalls().lock() {
+        let now = Instant::now();
+        m.retain(|_, at| !stall_expired(*at, now));
+        m.insert((url.to_string(), backend.to_string()), now);
+    }
+    tracing::warn!(url, backend, demotion_secs = STALL_DEMOTION.as_secs(), "backend_stall_noted");
+}
+
+/// Did `(url, backend)` stall within [`STALL_DEMOTION`]?
+pub fn recently_stalled(url: &str, backend: &str) -> bool {
+    let now = Instant::now();
+    stalls()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(url.to_string(), backend.to_string())).copied())
+        .is_some_and(|at| !stall_expired(at, now))
+}
+
+/// A stall noted at `at` no longer demotes at `now`.
+pub fn stall_expired(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) >= STALL_DEMOTION
 }
 
 // ── requests in flight ───────────────────────────────────────────────────
@@ -624,6 +1063,25 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         gpu: vram > 0.0 || unified,
         heartbeat_age_secs: last.map(|t| (now_unix - t).max(0.0)),
         inbound_ok: data.get("inbound").and_then(Value::as_str) != Some("failed"),
+        thermal: data.get("thermal_state").and_then(Value::as_str).map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()),
+        quarantined: data.get("status").and_then(Value::as_str) == Some("quarantined"),
+        offline: data.get("status").and_then(Value::as_str) == Some("offline"),
+        model_sizes: data
+            .get("model_stats")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("size_bytes")?.as_u64()?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Read defensively: an older agent sends no `gpu_contention` (= free).
+        gpu_shared: data.pointer("/gpu_contention/state").and_then(Value::as_str) == Some("shared"),
+        paused_backends: data
+            .pointer("/gpu_contention/paused_backends")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
         node_id,
     }
 }
@@ -730,13 +1188,30 @@ async fn declared_and_placements(state: &AppState) -> Result<(Declarations, Vec<
     }
 }
 
-/// The live table: KV facts + placements + declarations + config default.
+/// The live table: KV facts + placements + declarations.
 pub async fn load_table(state: &AppState) -> Result<ClassTable> {
     let (decl, placements) = declared_and_placements(state).await?;
     let nodes = kv_node_facts(state, &placements).await;
+    note_yaml_model_is_a_hint(state);
+    Ok(build_table(&nodes, &placements, &decl))
+}
+
+/// Existing installs carry `cluster.default_backend: ollama` and
+/// `cluster.backends.ollama.model: <tag>` from onboarding. That used to be
+/// the undeclared `chat-default`; it no longer narrows unpinned routing.
+/// Said once per process so an operator who reads the yaml knows.
+fn note_yaml_model_is_a_hint(state: &AppState) {
+    static ONCE: OnceLock<()> = OnceLock::new();
     let cfg = &state.config.cluster;
-    let default_model = cfg.backends.get(cfg.default_backend.as_str()).map(|b| b.model.clone()).unwrap_or_default();
-    Ok(build_table(&nodes, &placements, &decl, &default_model, &cfg.default_backend))
+    let Some(model) = cfg.backends.get(cfg.default_backend.as_str()).map(|b| b.model.clone()).filter(|m| !m.is_empty()) else { return };
+    ONCE.get_or_init(|| {
+        tracing::info!(
+            backend = %cfg.default_backend,
+            model = %model,
+            "cluster.backends.{}.model is a placement hint, not a routing pin: unpinned chat goes to every live chat node (chat-default dynamic); declare chat-default to narrow it",
+            cfg.default_backend
+        );
+    });
 }
 
 // ── storage ──────────────────────────────────────────────────────────────
@@ -872,6 +1347,7 @@ mod tests {
             gpu,
             heartbeat_age_secs: Some(5.0),
             inbound_ok: true,
+            ..Default::default()
         }
     }
 
@@ -900,20 +1376,26 @@ mod tests {
     // ── derived defaults ─────────────────────────────────────────────
 
     #[test]
-    fn nothing_declared_derives_one_class_per_model_with_same_model_candidates_only() {
-        let t = build_table(&fleet(), &placements(), &Declarations::default(), HF, "vllm");
+    fn nothing_declared_derives_one_class_per_model_and_a_dynamic_default_over_all_of_them() {
+        let t = build_table(&fleet(), &placements(), &Declarations::default());
         let ids = t.ids();
         assert!(ids.contains(&CHAT_DEFAULT.to_string()), "{ids:?}");
         assert!(ids.contains(&HF.to_string()) && ids.contains(&"gemma4:26b".to_string()) && ids.contains(&"gemma4:e2b-it-qat".to_string()), "{ids:?}");
         assert!(ids.contains(&"default".to_string()) && ids.contains(&"auto".to_string()));
-        // chat-default = the configured default model's candidates, nothing else.
+        // chat-default = every live chat candidate on every node, ranked:
+        // vLLM, then the GPU ollama (26B), then the CPU e2b.
         let d = t.class(CHAT_DEFAULT).expect("chat-default");
-        assert_eq!(names(&ordered(d, &[])), vec![format!("host3/vllm={HF}")]);
-        assert!(!d.declared);
-        // Every derived class holds exactly one model.
-        for c in &t.classes {
+        assert!(d.dynamic && !d.declared && !d.pool);
+        assert_eq!(names(&ordered(d, &[])), vec![
+            format!("host3/vllm={HF}"),
+            "host6/ollama=gemma4:26b".to_string(),
+            "host8/ollama=gemma4:e2b-it-qat".to_string(),
+        ]);
+        // Every MODEL class holds exactly one model — a concrete name narrows.
+        for c in t.classes.iter().filter(|c| c.name != CHAT_DEFAULT) {
             let models: std::collections::HashSet<String> = c.candidates.iter().map(|c| norm_model(&c.model)).collect();
             assert_eq!(models.len(), 1, "class {} mixes models: {models:?}", c.name);
+            assert!(!c.dynamic);
         }
         assert_eq!(t.classes.len(), 4, "{:?}", t.classes.iter().map(|c| &c.name).collect::<Vec<_>>());
     }
@@ -927,20 +1409,12 @@ mod tests {
             node("gpu-idle", "10.0.0.4", &[("ollama", "m")], &[], true, 2, 0.1),
             node("v", "10.0.0.5", &[("vllm", "m")], &[], true, 2, 0.99),
         ];
-        let t = build_table(&nodes, &[], &Declarations::default(), "m", "vllm");
+        let t = build_table(&nodes, &[], &Declarations::default());
         let c = t.class("m").unwrap();
         let order: Vec<&str> = ordered(c, &[]).iter().map(|c| c.node_id.as_str()).collect();
         assert_eq!(order, ["v", "gpu-idle", "gpu-busy", "gpu-idle-t3", "cpu"]);
     }
 
-    #[test]
-    fn an_unserved_default_model_still_yields_a_single_model_chat_default() {
-        let t = build_table(&fleet(), &placements(), &Declarations::default(), "Qwen/Qwen3-8B-AWQ", "vllm");
-        let d = t.class(CHAT_DEFAULT).unwrap();
-        let models: std::collections::HashSet<String> = d.candidates.iter().map(|c| norm_model(&c.model)).collect();
-        assert_eq!(models.len(), 1, "{models:?}");
-        assert_eq!(d.candidates[0].backend, "vllm", "the preferred type wins when the default is not served");
-    }
 
     #[test]
     fn an_ollama_with_a_chat_row_and_an_embed_row_stays_a_chat_target() {
@@ -959,7 +1433,7 @@ mod tests {
         n.non_chat = vec!["ollama".into()];
         let mut m = node("host9", "10.0.0.8", &[("ollama", "gemma3:1b")], &[], false, 4, 0.0);
         m.model_missing = vec!["ollama".into()];
-        let t = build_table(&[n, m], &[], &Declarations::default(), "", "vllm");
+        let t = build_table(&[n, m], &[], &Declarations::default());
         assert!(t.classes.is_empty(), "{:?}", t.classes);
     }
 
@@ -982,7 +1456,7 @@ mod tests {
 
     #[test]
     fn alias_resolves_to_class_to_ordered_candidates() {
-        let t = build_table(&fleet(), &placements(), &declared(), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &declared());
         let c = resolve_hint(&t, Some("gemma4:12b-any")).expect("alias resolves");
         assert_eq!(c.name, CHAT_DEFAULT);
         assert!(c.declared);
@@ -1011,7 +1485,7 @@ mod tests {
         // Both non-degraded nodes are unhealthy; the degraded one is fine.
         nodes[0].heartbeat_age_secs = Some(500.0);
         nodes[1].inbound_ok = false;
-        let t = build_table(&nodes, &placements(), &declared(), HF, "vllm");
+        let t = build_table(&nodes, &placements(), &declared());
         let c = t.class(CHAT_DEFAULT).unwrap();
         let order: Vec<&str> = ordered(c, &[]).iter().map(|c| c.node_id.as_str()).collect();
         assert_eq!(order, ["host3", "host6", "host8"]);
@@ -1020,7 +1494,7 @@ mod tests {
         // Healthy outranks declared position among the non-degraded.
         let mut nodes = fleet();
         nodes[0].heartbeat_age_secs = Some(500.0);
-        let t = build_table(&nodes, &placements(), &declared(), HF, "vllm");
+        let t = build_table(&nodes, &placements(), &declared());
         let order: Vec<&str> = ordered(t.class(CHAT_DEFAULT).unwrap(), &[]).iter().map(|c| c.node_id.as_str()).collect();
         assert_eq!(order, ["host6", "host3", "host8"]);
     }
@@ -1031,7 +1505,7 @@ mod tests {
             node("a", "10.0.0.1", &[("ollama", "gemma4:12b")], &[], true, 2, 0.1),
             node("b", "10.0.0.2", &[("ollama", "gemma4:12b")], &[], true, 2, 0.2),
         ];
-        let t = build_table(&nodes, &[], &Declarations::default(), "gemma4:12b", "vllm");
+        let t = build_table(&nodes, &[], &Declarations::default());
         let c = resolve_hint(&t, Some("gemma4:12b")).unwrap();
         let first = ordered(c, &[]);
         assert_eq!(first.len(), 2);
@@ -1047,7 +1521,7 @@ mod tests {
     #[test]
     fn exclusion_is_per_backend_not_per_node_address() {
         let nodes = vec![node("host3", "10.0.0.1", &[("vllm", "m"), ("ollama", "m")], &[], true, 1, 0.1)];
-        let t = build_table(&nodes, &[], &Declarations::default(), "m", "vllm");
+        let t = build_table(&nodes, &[], &Declarations::default());
         let c = t.class("m").unwrap();
         assert_eq!(ordered(c, &[]).len(), 2);
         let after = ordered(c, &[("https://10.0.0.1:8081".to_string(), "vllm".to_string())]);
@@ -1060,7 +1534,7 @@ mod tests {
     #[test]
     fn a_class_or_served_model_outranks_an_alias_of_the_same_name() {
         let decl = Declarations { classes: vec![], aliases: vec![("gemma4:26b".into(), CHAT_DEFAULT.into())] };
-        let t = build_table(&fleet(), &placements(), &decl, HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &decl);
         let c = resolve_hint(&t, Some("gemma4:26b")).unwrap();
         assert_eq!(c.name, "gemma4:26b");
         assert_eq!(c.candidates[0].model, "gemma4:26b");
@@ -1082,7 +1556,7 @@ mod tests {
             }],
             aliases: vec![],
         };
-        let t = build_table(&fleet(), &placements(), &decl, HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &decl);
         let matching: Vec<&Class> = t.classes.iter().filter(|c| same_model(&c.name, HF)).collect();
         assert_eq!(matching.len(), 1, "one class, not a derived and a declared one: {:?}", t.classes.iter().map(|c| &c.name).collect::<Vec<_>>());
         assert!(matching[0].declared);
@@ -1124,7 +1598,7 @@ mod tests {
 
     #[test]
     fn a_pool_sends_the_next_request_to_the_least_busy_peer() {
-        let t = build_table(&fleet(), &placements(), &pool_decl(true), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &pool_decl(true));
         assert!(t.class(CHAT_DEFAULT).unwrap().pool);
         // Idle: heartbeat load breaks the tie (host6 0.1 < host3 0.3).
         assert_eq!(order_with(&t, &[]), ["host6", "host3", "host8"]);
@@ -1138,20 +1612,20 @@ mod tests {
     fn a_pool_still_puts_an_unhealthy_peer_after_a_healthy_one() {
         let mut nodes = fleet();
         nodes[1].heartbeat_age_secs = Some(600.0); // host6 silent
-        let t = build_table(&nodes, &placements(), &pool_decl(true), HF, "vllm");
+        let t = build_table(&nodes, &placements(), &pool_decl(true));
         assert_eq!(order_with(&t, &[("host3", 9)]), ["host3", "host6", "host8"]);
     }
 
     #[test]
     fn a_class_that_is_not_a_pool_keeps_its_declared_order_under_load() {
-        let t = build_table(&fleet(), &placements(), &pool_decl(false), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &pool_decl(false));
         assert!(!t.class(CHAT_DEFAULT).unwrap().pool);
         assert_eq!(order_with(&t, &[("host3", 9)]), ["host3", "host6", "host8"]);
     }
 
     #[test]
     fn a_derived_class_is_never_a_pool() {
-        let t = build_table(&fleet(), &placements(), &Declarations::default(), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &Declarations::default());
         assert!(t.classes.iter().all(|c| !c.pool));
     }
 
@@ -1170,7 +1644,7 @@ mod tests {
 
     #[test]
     fn a_declared_model_is_carried_separately_from_the_resolved_one() {
-        let t = build_table(&fleet(), &placements(), &declared(), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &declared());
         let c = t.class(CHAT_DEFAULT).unwrap();
         assert_eq!(c.candidates[0].declared_model, None, "the placement's");
         assert_eq!(c.candidates[0].model, HF);
@@ -1193,7 +1667,7 @@ mod tests {
             }],
             aliases: vec![],
         };
-        let t = build_table(&fleet(), &placements(), &decl, HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &decl);
         let c = t.class("fast").unwrap();
         assert_eq!(c.candidates[0].status, CandidateStatus::Unplaced, "not pulled on host8");
         assert_eq!(c.candidates[1].status, CandidateStatus::Unplaced, "no such node");
@@ -1207,7 +1681,7 @@ mod tests {
 
     #[test]
     fn the_catalogue_names_classes_and_aliases_and_no_topology() {
-        let t = build_table(&fleet(), &placements(), &declared(), HF, "vllm");
+        let t = build_table(&fleet(), &placements(), &declared());
         let list = catalogue(&t);
         let ids: Vec<&str> = list.iter().filter_map(|v| v["id"].as_str()).collect();
         for want in [CHAT_DEFAULT, "default", "auto", "gemma4:12b-any", HF, "gemma4:26b"] {
@@ -1259,6 +1733,214 @@ mod tests {
         assert_eq!(f.heartbeat_age_secs, Some(10.0));
         assert!(!f.inbound_ok);
         assert_eq!(f.tier, Some(2));
+        // Absent on an older agent: nominal, not quarantined, GPU free.
+        assert_eq!(f.thermal, None);
+        assert!(!f.quarantined && !f.offline && !f.gpu_shared && f.paused_backends.is_empty());
+    }
+
+    // ── the dynamic default (operator rule 2026-10-17) ────────────────
+
+    /// The 2026-10-17 fleet: the controller pop-os serving `gemma4:e2b-it-qat`
+    /// from a CPU ollama (idle-looking load), mcmini an M4 (unified memory)
+    /// serving `gemma4:12b`, busier by heartbeat. Onboarding wrote
+    /// `ollama` + `gemma4:e2b-it-qat` into pop-os's yaml.
+    fn incident() -> Vec<NodeFacts> {
+        vec![
+            node("pop-os", "100.64.1.1", &[("ollama", "gemma4:e2b-it-qat")], &[], false, 1, 0.05),
+            node("mcmini", "100.64.1.2", &[("ollama", "gemma4:12b")], &[], true, 3, 0.4),
+        ]
+    }
+
+    fn first_node(sel: &Selection) -> &str {
+        sel.candidates[0].node_id.as_str()
+    }
+
+    fn idle(_: &Candidate) -> usize {
+        0
+    }
+
+    fn fresh(_: &Candidate) -> bool {
+        false
+    }
+
+    /// Reverting the dynamic default to a one-model derivation sends this to
+    /// pop-os (the only model group that matches the yaml, or the single
+    /// best group) and fails here.
+    #[test]
+    fn incident_mcmini_12b_gpu_beats_popos_e2b_cpu() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.class, CHAT_DEFAULT);
+        assert_eq!(sel.label, "chat-default(dynamic)");
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["mcmini", "pop-os"], "both nodes are candidates, the GPU 12B first");
+        assert_eq!(sel.candidates[0].rank, "rank=gpu,params=12,load=0.40");
+        assert_eq!(sel.candidates[1].rank, "rank=cpu,params=2,load=0.05");
+        // Even with a GPU on pop-os the bigger model wins (quality key).
+        let mut nodes = incident();
+        nodes[0].gpu = true;
+        let t = build_table(&nodes, &[], &Declarations::default());
+        assert_eq!(first_node(&select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        // The built-in aliases land on the same dynamic class.
+        let t = build_table(&incident(), &[], &Declarations::default());
+        for alias in BUILTIN_ALIASES {
+            assert_eq!(first_node(&select_with(&t, Some(alias), None, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        }
+    }
+
+    #[test]
+    fn thermal_critical_is_excluded_unless_it_is_the_only_one_left() {
+        let mut nodes = incident();
+        nodes[1].thermal = Some("critical".into());
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["pop-os"], "the critical node is out while another is left");
+        assert!(sel.skipped.iter().any(|s| s.starts_with("mcmini/ollama: thermal critical")), "{:?}", sel.skipped);
+        assert!(!sel.last_resort);
+        // pop-os already failed this request: mcmini is all that is left.
+        let sel = select_with(&t, None, None, &|c| c.node_id == "pop-os", &idle, &fresh).unwrap();
+        assert_eq!(first_node(&sel), "mcmini");
+        assert!(sel.last_resort);
+        // `serious` is a demotion, not an exclusion.
+        let mut nodes = incident();
+        nodes[1].thermal = Some("serious".into());
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let order: Vec<String> = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap().candidates.iter().map(|c| c.node_id.clone()).collect();
+        assert_eq!(order, ["pop-os", "mcmini"]);
+    }
+
+    #[test]
+    fn a_stalled_node_is_demoted_for_five_minutes_then_back() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        let mcmini_stalled = |c: &Candidate| c.node_id == "mcmini";
+        let sel = select_with(&t, None, None, &|_| false, &idle, &mcmini_stalled).unwrap();
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["pop-os", "mcmini"], "demoted, not dropped");
+        assert!(sel.candidates[1].rank.contains("stalled"));
+        assert!(sel.skipped.iter().any(|s| s.starts_with("mcmini/ollama: stalled")), "{:?}", sel.skipped);
+        // The memory itself: 5 minutes from the stall, then gone.
+        let at = Instant::now();
+        assert_eq!(STALL_DEMOTION, Duration::from_secs(300));
+        assert!(!stall_expired(at, at + Duration::from_secs(299)));
+        assert!(stall_expired(at, at + Duration::from_secs(300)));
+        // Through the process-wide registry, on an address no other test uses.
+        let mut nodes = incident();
+        nodes[1].ip = "192.0.2.201".into();
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let d = t.class(CHAT_DEFAULT).unwrap();
+        assert_eq!(ordered(d, &[])[0].node_id, "mcmini");
+        note_stall("https://192.0.2.201:8081", "ollama");
+        assert!(recently_stalled("https://192.0.2.201:8081", "ollama"));
+        assert!(!recently_stalled("https://192.0.2.201:8081", "vllm"), "per backend");
+        assert_eq!(ordered(d, &[])[0].node_id, "pop-os");
+    }
+
+    #[test]
+    fn a_quarantined_node_is_excluded_unless_it_is_the_only_one_left() {
+        let rec = |status: &str| {
+            serde_json::json!({
+                "id": "mcmini", "ip_address": "100.64.1.2", "status": status, "load": 0.1,
+                "capabilities": {"unified_memory": true},
+                "running_backends": {"ollama": "gemma4:12b"}, "last_heartbeat": 1000.0,
+            })
+        };
+        let q = node_facts_from_kv("mcmini", &rec("quarantined"), &[], 1001.0);
+        assert!(q.quarantined);
+        let mut nodes = incident();
+        nodes[1] = q;
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
+        assert!(sel.skipped.iter().any(|s| s == "mcmini/ollama: quarantined"), "{:?}", sel.skipped);
+        let only = build_table(&nodes[1..], &[], &Declarations::default());
+        let sel = select_with(&only, None, None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(first_node(&sel), "mcmini");
+        assert!(sel.last_resort);
+        assert!(!node_facts_from_kv("mcmini", &rec("online"), &[], 1001.0).quarantined);
+    }
+
+    #[test]
+    fn a_concrete_model_name_narrows_to_its_group() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        let sel = select_with(&t, Some("gemma4:e2b-it-qat"), None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.class, "gemma4:e2b-it-qat");
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
+        assert!(matches!(select_with(&t, Some("llama3.2:1b"), None, &|_| false, &idle, &fresh), Err(Refusal::UnknownModel(_))));
+        // A model class is not ranked by the dynamic key: it is that model or nothing.
+        assert!(!t.class("gemma4:12b").unwrap().dynamic);
+    }
+
+    #[test]
+    fn a_declared_chat_default_is_respected() {
+        let decl = Declarations {
+            classes: vec![DeclaredClass {
+                name: CHAT_DEFAULT.into(),
+                pool: false,
+                candidates: vec![DeclaredCandidate { node_id: "pop-os".into(), backend: "ollama".into(), model: None, degraded: false }],
+            }],
+            aliases: vec![],
+        };
+        let t = build_table(&incident(), &[], &decl);
+        let d = t.class(CHAT_DEFAULT).unwrap();
+        assert!(d.declared && !d.dynamic);
+        let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.label, "chat-default(declared)");
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"], "the operator's choice, not the ranking's");
+        // The dynamic pool is still there for a node pin.
+        assert_eq!(first_node(&select_with(&t, None, Some("mcmini"), &|_| false, &idle, &fresh).unwrap()), "mcmini");
+    }
+
+    #[test]
+    fn a_node_pin_filters_and_refuses_clearly() {
+        let mut nodes = incident();
+        let mut embedder = node("host2", "100.64.1.3", &[("ollama", "harrier")], &[], false, 2, 0.0);
+        embedder.non_chat = vec!["ollama".into()];
+        nodes.push(embedder);
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let sel = select_with(&t, None, Some("pop-os"), &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
+        assert_eq!(first_node(&select_with(&t, Some("default"), Some("POP-OS"), &|_| false, &idle, &fresh).unwrap()), "pop-os");
+        assert!(matches!(select_with(&t, None, Some("ghost"), &|_| false, &idle, &fresh), Err(Refusal::UnknownNode(_))));
+        assert!(matches!(select_with(&t, None, Some("host2"), &|_| false, &idle, &fresh), Err(Refusal::NodeServesNoChat(_))));
+        match select_with(&t, Some("gemma4:12b"), Some("pop-os"), &|_| false, &idle, &fresh) {
+            Err(Refusal::NodeCannotServe(m)) => assert!(m.contains("ollama=gemma4:e2b-it-qat"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // A pinned node that is thermal critical is still served: the caller named it.
+        let mut nodes = incident();
+        nodes[0].thermal = Some("critical".into());
+        let t = build_table(&nodes, &[], &Declarations::default());
+        assert_eq!(first_node(&select_with(&t, None, Some("pop-os"), &|_| false, &idle, &fresh).unwrap()), "pop-os");
+    }
+
+    #[test]
+    fn gpu_contention_shared_demotes_and_a_paused_lane_is_no_candidate() {
+        let rec = serde_json::json!({
+            "id": "mcmini", "ip_address": "100.64.1.2", "load": 0.1, "last_heartbeat": 1000.0,
+            "capabilities": {"unified_memory": true},
+            "running_backends": {"ollama": "gemma4:12b", "llamacpp": "gemma4:26b-a4b-it-qat"},
+            "gpu_contention": {"state": "shared", "foreign_mb": 4000, "paused_backends": ["llamacpp"]},
+            "thermal_state": "Serious",
+            "model_stats": [{"name": "mystery-model", "size_bytes": 7_200_000_000u64}],
+        });
+        let f = node_facts_from_kv("mcmini", &rec, &[], 1001.0);
+        assert!(f.gpu_shared);
+        assert_eq!(f.paused_backends, vec!["llamacpp"]);
+        assert_eq!(f.thermal.as_deref(), Some("serious"));
+        assert_eq!(f.model_sizes, vec![("mystery-model".to_string(), 7_200_000_000)]);
+        // size_bytes is the quality fallback when the name says nothing.
+        assert!(quality_of(&f, "mystery-model").is_some_and(|q| (q - 12.0).abs() < 1e-6), "{:?}", quality_of(&f, "mystery-model"));
+        let mut m = incident()[1].clone();
+        m.gpu_shared = true;
+        m.paused_backends = vec!["llamacpp".into()];
+        m.running.push(("llamacpp".into(), "gemma4:26b-a4b-it-qat".into()));
+        let mut gpu_pop = incident()[0].clone();
+        gpu_pop.gpu = true;
+        let t = build_table(&[gpu_pop, m], &[], &Declarations::default());
+        let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
+        let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}", c.node_id, c.backend)).collect();
+        assert_eq!(order, ["pop-os/ollama", "mcmini/ollama"], "shared GPU sorts after a free one; the paused lane is gone");
     }
 }
 
@@ -1266,7 +1948,7 @@ mod tests {
 /// scratch database (a pgvector container); without it the test says so and
 /// passes, so CI without a database is not red for the wrong reason — but
 /// a run WITH the variable asserts every step, including that migration
-/// the chain head (`093_model_class_pool`, over `092_kiosk_seats`) is what stamped the schema.
+/// the chain head is what stamped the schema.
 #[cfg(test)]
 mod db_tests {
     use super::*;
@@ -1285,7 +1967,7 @@ mod db_tests {
         crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
         crate::mesh_migrate::apply(&admin).await.expect("migrations");
         let rev = crate::mesh_migrate::current_revision(&admin).await.expect("revision").expect("stamped");
-        assert_eq!(rev, crate::mesh_migrate::MODEL_CLASS_POOL_REVISION, "the head revision is the model-class pool migration");
+        assert_eq!(Some(rev.as_str()), crate::mesh_migrate::MIGRATIONS.last().map(|m| m.revision), "the head revision stamped the schema");
         // A fresh pool: the migrator resets search_path on the connection it used.
         let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect scratch db");
 

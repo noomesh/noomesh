@@ -1026,18 +1026,44 @@ mod refresh_rotation_tests;
 /// from the browser. Idempotent.
 async fn auth_logout_handler(
     State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
     jar: CookieJar,
 ) -> Response {
+    // Whose session is this? The refresh cookie names the account (browser);
+    // a CLI logout has no cookie but presents the bearer it is giving up.
+    let mut account: Option<String> = None;
     if let Some(c) = jar.get(auth_refresh::REFRESH_COOKIE_NAME) {
         let raw = c.value().to_string();
         if let Ok(Some(rec)) = auth_refresh::lookup_token(&state.db, &raw).await {
             let _ = auth_refresh::revoke_token(&state.db, &rec.id).await;
             audit_auth(&state.db, "auth_logout", &rec.user_id, "ok", None).await;
-            // Every open browser socket for this account closes with 4401;
-            // a WebSocket authenticates only at its handshake.
-            let closed = state.alert_hub.end_sessions(&rec.user_id);
-            tracing::info!(user_id = %rec.user_id, sockets = closed, "auth_logout ended open sockets");
+            account = Some(rec.user_id);
         }
+    }
+    if account.is_none() {
+        let secret = jwt_secret();
+        if !crate::auth::jwt_secret_is_insecure(&secret) {
+            if let Some(Ok(claims)) = headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| verify_token(t, &secret))
+            {
+                audit_auth(&state.db, "auth_logout", crate::auth::account_of(&claims.sub), "ok", None).await;
+                account = Some(crate::auth::account_of(&claims.sub).to_string());
+            }
+        }
+    }
+    if let Some(account) = account {
+        // The not-before floor kills the bearer this person is logging out
+        // of (the access token used to live on for up to 15 minutes), the
+        // refresh chains are left to the cookie revoke above, and every open
+        // socket for the account closes with 4401 — a WebSocket
+        // authenticates only at its handshake, and the floor stops it
+        // reconnecting with the same JWT.
+        let raised = crate::session_floor::raise(&state, &account, crate::session_floor::Reason::Logout).await;
+        let closed = state.alert_hub.end_sessions(&account);
+        tracing::info!(user_id = %account, sockets = closed, floor_shared = raised.shared, "auth_logout ended open sockets");
     }
     let clear = auth_refresh::build_clear_cookie(is_secure());
     let jar = CookieJar::new().add(clear);
@@ -1090,6 +1116,13 @@ async fn auth_me(
         }
     };
 
+    // Same floor `require_any_auth` applies: a token issued before the
+    // account was disabled/demoted/logged out is not an identity.
+    if crate::session_floor::refuses(&state, &claims.sub, &token).await {
+        return (StatusCode::UNAUTHORIZED,
+            Json(json!({"detail": "Session ended"}))).into_response();
+    }
+
     // Look up user for full details (scopes may have changed since token was
     // issued). On lookup failure, say so — do not fall through to the
     // bootstrap credential, and do not report stale claims as current truth.
@@ -1120,13 +1153,11 @@ async fn auth_me(
                 Json(json!({"detail": "User is disabled"}))).into_response()
         }
         None => {
-            // User deleted after token issued — still return from token claims
-            Json(json!({
-                "username": claims.sub,
-                "disabled": false,
-                "scopes": claims.scopes,
-                "role": claims.resolved_role().as_str(),
-            })).into_response()
+            // The account no longer exists (deleted after the token was
+            // issued). The token's claims are not a live identity: answer
+            // 401 like the disabled branch instead of echoing them.
+            (StatusCode::UNAUTHORIZED,
+                Json(json!({"detail": "User no longer exists"}))).into_response()
         }
     }
 }
@@ -1388,6 +1419,10 @@ fn audit_severity(event_type: &str, outcome: &str) -> &'static str {
 /// General best-effort security-audit insert for privileged actions
 /// (config changes, deletions). Never blocks/fails the caller's request.
 /// `details` is serialized to the `details` jsonb column. (H-L1)
+///
+/// The row also records `source_ip` (the request's caller, same trusted-proxy
+/// rule as the login rows) and `conversation_id` (inside an agent turn) when
+/// known and not already in `details` — see `audit_context`.
 pub(crate) async fn audit_event(
     db: &sqlx::PgPool,
     event_type: &str,
@@ -1397,7 +1432,11 @@ pub(crate) async fn audit_event(
     outcome: &str,
     details: serde_json::Value,
 ) {
-    audit_insert(db, event_type, severity, actor, resource, outcome, &details.to_string()).await;
+    audit_insert(
+        db, event_type, severity, actor, resource, outcome,
+        &crate::audit_context::with_origin(details).to_string(),
+    )
+    .await;
 }
 
 /// [`audit_event`] for a read that must NOT happen unaudited (the admin
@@ -1421,7 +1460,11 @@ pub(crate) async fn audit_event_required(
         );
         return false;
     };
-    write_audit_row(db, &key, event_type, severity, actor, resource, outcome, &details.to_string(), None).await
+    write_audit_row(
+        db, &key, event_type, severity, actor, resource, outcome,
+        &crate::audit_context::with_origin(details).to_string(), None,
+    )
+    .await
 }
 
 /// The ONE writer for `noo_security_audit`, with the missing-partition heal.
@@ -1481,11 +1524,13 @@ async fn audit_insert(
 /// (`audit_integrity::ensure_checkpoint`, which signs its one row with a
 /// different key, and `ensure_hash_v2_marker`).
 ///
-/// Every column v2 covers is fixed HERE, before signing, and bound
-/// explicitly — none is left to a column default:
+/// Every column v2 covers is fixed before signing, and bound explicitly —
+/// none is left to a column default. `audit_chain::insert_in_tx` does it, under
+/// the chain lock, so the row is linked after the newest one:
 ///   - `id`: a v4 uuid, as Postgres renders `uuid::text`;
-///   - `timestamp`: now, truncated to MICROseconds, the precision
-///     `timestamptz` stores — the hashed value is the stored value;
+///   - `timestamp`: now (never earlier than the previous row's), truncated to
+///     MICROseconds, the precision `timestamptz` stores — the hashed value is
+///     the stored value;
 ///   - `details`: Postgres's own jsonb text for the value (`$1::jsonb::text`),
 ///     which is what `details::text` reads back; jsonb re-orders keys and
 ///     re-spaces, so hashing our serde text would not survive the store.
@@ -1516,39 +1561,50 @@ pub(crate) async fn write_audit_row(
             return false;
         }
     };
-    let ts = stored_now();
-    let id = uuid::Uuid::new_v4().to_string();
-    let entry_hash = crate::audit_integrity::row_hash_v2(
-        key,
-        &crate::audit_integrity::RowV2 {
-            id: &id,
-            ts_us: ts.timestamp_micros(),
-            event_type,
-            severity,
-            actor,
-            resource,
-            outcome,
-            request_id: None,
-            details: Some(&details),
-            prev_hash,
-        },
-    );
-    insert_signed_audit_row(
-        db, &id, ts, event_type, severity, actor, resource, outcome, &details, None, &entry_hash,
+    // The chain is always linked under the CURRENT audit key, even for the one
+    // row (the key hand-over) whose own hash is signed under the retired one.
+    let chain_key = crate::audit_integrity::current_key();
+    let row = crate::audit_chain::NewRow {
+        event_type,
+        severity,
+        actor,
+        resource,
+        outcome,
+        details: &details,
         prev_hash,
-    )
-    .await
+    };
+    // The id, the time and both hashes are fixed INSIDE the chain lock
+    // (`audit_chain::insert_in_tx`), so a row's time is never earlier than its
+    // predecessor's. A missing monthly partition is healed once, as before.
+    for attempt in 0..2 {
+        match crate::audit_chain::write_row(db, key, chain_key.as_deref(), &row).await {
+            Ok(_) => return true,
+            Err(e) if attempt == 0 && is_missing_partition(&e) => {
+                crate::audit_partition::ensure_for_heal(db).await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    event_type, actor, error = %e,
+                    "audit_write_lost: a security audit row was NOT recorded"
+                );
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// Now, as `timestamptz` will store it: whole microseconds.
-fn stored_now() -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn stored_now() -> chrono::DateTime<chrono::Utc> {
     let us = chrono::Utc::now().timestamp_micros();
     chrono::DateTime::from_timestamp_micros(us).expect("now is in range")
 }
 
 /// Insert one fully-formed, already-signed row, healing a missing partition
-/// once. Returns whether the row landed. Callers sign with
-/// [`write_audit_row`]; the proof harness also inserts v1 rows through here.
+/// once. Returns whether the row landed. Unchained. Production signs and links
+/// through [`write_audit_row`]; this is the test harness's way to plant a row of
+/// any shape (v1 hashes, rows from a writer that predates the chain).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_signed_audit_row(
     db: &sqlx::PgPool,
@@ -1613,7 +1669,7 @@ pub(crate) async fn insert_signed_audit_row(
 /// Matched on the message because Postgres reports it as check_violation
 /// (23514), the same SQLSTATE as an ordinary CHECK failure — which is not a
 /// thing to heal by creating a partition.
-fn is_missing_partition(e: &sqlx::Error) -> bool {
+pub(crate) fn is_missing_partition(e: &sqlx::Error) -> bool {
     e.to_string().contains("no partition of relation")
 }
 

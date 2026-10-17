@@ -279,6 +279,26 @@ fn signed_by_the_cluster(request: &Request) -> bool {
     else {
         return false;
     };
+    if crate::cluster_token_v2::is_v2(token) {
+        // The limiter runs before the body is read, so the signature is
+        // checked against the body hash the signer SENT; the auth middleware
+        // hashes the real body, so a lie here only costs the liar the
+        // exemption. The nonce is not spent here (auth spends it).
+        let Some(secret) = crate::config::secret_env::secret_opt("NOO_CLUSTER_SECRET") else { return false };
+        let node = request
+            .extensions()
+            .get::<Option<crate::node_identity::VerifiedPeer>>()
+            .and_then(|p| p.as_ref())
+            .map(|p| p.node.clone());
+        let sha = request
+            .headers()
+            .get(crate::cluster_token_v2::BODY_SHA_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let uri = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or_else(|| request.uri().path());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        return rate_exempt_v2(token, node.as_deref(), &secret, request.method().as_str(), uri, sha, now);
+    }
     if !looks_like_cluster_token(token) {
         return false;
     }
@@ -307,6 +327,17 @@ pub(crate) fn rate_exempt_with(token: &str, node_leaf: Option<&str>, fleet_secre
     crate::auth::verify_cluster_token_inner(token, secret, now) && token.split(':').next() == Some(node)
 }
 
+/// [`rate_exempt_with`] for a v2 token: the signature must verify for this
+/// request (with the body hash the signer sent) and its actor must be the node
+/// the connection's certificate names.
+pub(crate) fn rate_exempt_v2(token: &str, node_leaf: Option<&str>, secret: &str, method: &str, uri: &str, body_sha: &str, now: u64) -> bool {
+    let Some(node) = node_leaf else { return false };
+    if body_sha.len() != 64 {
+        return false;
+    }
+    crate::cluster_token_v2::verify_signature(token, secret, method, uri, body_sha, now).is_some_and(|(actor, _)| actor == node)
+}
+
 /// `<actor>:<digits>:<hex>` — exactly two colons, a numeric timestamp and a
 /// hex signature. Anything else is not a cluster token and is not verified.
 fn looks_like_cluster_token(token: &str) -> bool {
@@ -321,7 +352,7 @@ fn looks_like_cluster_token(token: &str) -> bool {
 
 /// The real socket peer IP, injected by `into_make_service_with_connect_info`.
 /// This is the one value a remote client cannot forge.
-fn peer_ip(request: &Request) -> Option<String> {
+pub(crate) fn peer_ip(request: &Request) -> Option<String> {
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -654,7 +685,7 @@ pub(crate) fn forwarded_client(xff: &str) -> Option<String> {
 /// attacker-controlled and ignored in favor of the socket peer IP. Falling
 /// back to the peer keeps each direct client (MCP hub, node-agents, executor
 /// sidecar) in its own bucket rather than a shared "unknown" one.
-fn client_ip(request: &Request, peer: Option<&str>) -> String {
+pub(crate) fn client_ip(request: &Request, peer: Option<&str>) -> String {
     if let Some(p) = peer {
         if is_trusted_proxy(p) {
             if let Some(client) = request
@@ -700,6 +731,167 @@ pub struct ToolCallContext {
     pub actor: String,
 }
 
+// ── Argument- and context-aware risk ─────────────────────────────────────
+//
+// `security::classify_tool_risk` is pure and answers conservatively for the tools
+// whose risk depends on WHERE they point: an outbound channel message is High
+// unless its destination is known-good, an agent message is High unless the target
+// is the caller's own or a lower tier. `effective_risk` supplies the context
+// (saved recipients, the chat that asked, user roles) and may only LOWER those
+// to Medium. Any lookup that fails leaves the conservative High.
+
+fn trimmed_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Is `channel`/`recipient` the chat that started this turn? Pure so it can be pinned.
+pub(crate) fn is_originating_chat(
+    channel: &str,
+    recipient: &str,
+    origin: Option<&crate::routes::communication::ApprovalTarget>,
+) -> bool {
+    origin.is_some_and(|t| t.channel == channel && t.recipient.trim() == recipient)
+}
+
+/// The channel chat that originated the current turn: the channel pipeline's task-local, or
+/// (for a turn handed to a node's harness, whose tools run in another task) the origin the
+/// dispatcher registered for the conversation.
+fn originating_chat() -> Option<crate::routes::communication::ApprovalTarget> {
+    crate::routes::communication::CHANNEL_APPROVAL_TARGET
+        .try_with(|t| t.clone())
+        .ok()
+        .flatten()
+        .or_else(|| {
+            let conv = crate::routes::communication::turn_principal().conversation_id;
+            if conv.is_empty() {
+                return None;
+            }
+            crate::routes::communication::origin_for(&conv).and_then(|o| o.channel)
+        })
+}
+
+/// Pure rule for an agent-to-agent message: may it stay Medium? Own agents and agents of
+/// an equal or lower tier, yes; a higher tier or an unknown role, no.
+pub(crate) fn agent_send_stays_medium(
+    sender: &str,
+    target: &str,
+    roles: &dyn Fn(&str) -> Option<crate::auth::Role>,
+) -> bool {
+    if crate::auth::owns_name(sender, target) {
+        return true;
+    }
+    match (roles(crate::auth::account_of(sender)), roles(crate::auth::account_of(target))) {
+        (Some(mine), Some(theirs)) => theirs <= mine,
+        _ => false,
+    }
+}
+
+async fn user_role(db: &sqlx::PgPool, username: &str) -> Option<crate::auth::Role> {
+    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
+        .bind(username)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    match role?.as_str() {
+        "admin" => Some(crate::auth::Role::Admin),
+        "operator" => Some(crate::auth::Role::Operator),
+        "user" => Some(crate::auth::Role::User),
+        _ => None,
+    }
+}
+
+/// The risk a call is gated and audited at: [`security::classify_tool_risk_scoped`], lowered
+/// to Medium for an outbound message whose destination is known-good.
+pub async fn effective_risk(state: &AppState, call: &ToolCall) -> RiskLevel {
+    let file_policy = crate::local_files::FilePolicy::from_config(&state.config);
+    let base = security::classify_tool_risk_scoped(&call.name, &call.arguments, Some(&file_policy));
+    if base < RiskLevel::High {
+        return base;
+    }
+    match call.name.as_str() {
+        "noo_channel_send" => {
+            let (Some(channel), Some(recipient)) =
+                (trimmed_arg(&call.arguments, "channel"), trimmed_arg(&call.arguments, "recipient"))
+            else {
+                return base;
+            };
+            if is_originating_chat(&channel, &recipient, originating_chat().as_ref()) {
+                return RiskLevel::Medium;
+            }
+            // Saved by a person (`created_by` is stamped only for a person's own write, the
+            // rule `task_guard` uses for "registered"); a recipient an agent saved does not count.
+            let saved: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM noo_channel_recipients \
+                 WHERE channel = $1 AND recipient_id = $2 AND created_by IS NOT NULL)",
+            )
+            .bind(&channel)
+            .bind(&recipient)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+            if saved { RiskLevel::Medium } else { base }
+        }
+        "noo_agent_send" | "noo_agent_message" => {
+            let (Some(sender), Some(to)) = (crate::mcp_bridge::current_caller(), trimmed_arg(&call.arguments, "to")) else {
+                return base;
+            };
+            // A thread post needs a seat in the thread (the tool checks it); a broadcast is refused
+            // by the tool. Neither names another principal's agent.
+            if to == "thread" && trimmed_arg(&call.arguments, "thread_id").or_else(|| trimmed_arg(&call.arguments, "thread")).is_some() {
+                return RiskLevel::Medium;
+            }
+            if crate::auth::owns_name(&sender, &to) {
+                return RiskLevel::Medium;
+            }
+            let mine = user_role(&state.db, crate::auth::account_of(&sender)).await;
+            let theirs = user_role(&state.db, crate::auth::account_of(&to)).await;
+            let lookup = |who: &str| {
+                if who == crate::auth::account_of(&sender) { mine } else if who == crate::auth::account_of(&to) { theirs } else { None }
+            };
+            if agent_send_stays_medium(&sender, &to, &lookup) { RiskLevel::Medium } else { base }
+        }
+        _ => base,
+    }
+}
+
+/// One `noo_security_audit` row for a Medium or High tool execution decision (the writer
+/// is the HMAC-chained `audit_event`; with no audit key the row is refused and logged, as
+/// for every other event). `decision` is what the gate did: `allowed`, `approved`,
+/// `denied`, `timeout` or `blocked`. Low-risk calls are not audited here.
+pub(crate) async fn audit_tool_decision(
+    state: &AppState,
+    call: &ToolCall,
+    risk: RiskLevel,
+    decision: &str,
+    mode: &str,
+    request_id: &str,
+) {
+    if risk < RiskLevel::Medium {
+        return;
+    }
+    let turn = crate::routes::communication::turn_principal();
+    let actor = if turn.requester.is_empty() { "unattended".to_string() } else { turn.requester.clone() };
+    crate::routes::core::audit_event(
+        &state.db,
+        "tool_exec",
+        if decision == "allowed" || decision == "approved" { "info" } else { "warning" },
+        &actor,
+        &format!("tool:{}", call.name),
+        decision,
+        serde_json::json!({
+            "tool": call.name,
+            "risk": risk.to_string(),
+            "decision": decision,
+            "exec_approval_mode": mode,
+            "conversation_id": turn.conversation_id,
+            "channel": turn.channel,
+            "request_id": request_id,
+        }),
+    )
+    .await;
+}
+
 /// Pre-execution security checks for a tool call.
 ///
 /// 1. Input sanitization (path traversal, injection, length)
@@ -726,16 +918,22 @@ pub async fn before_tool_call(
     // 2. Risk classification — policy-scoped: writes inside the
     //    operator's writable roots are pre-authorized by config and
     //    classify Medium (no per-call approval), everything else as before.
-    let file_policy = crate::local_files::FilePolicy::from_config(&state.config);
-    let risk_level =
-        security::classify_tool_risk_scoped(&call.name, &call.arguments, Some(&file_policy));
+    let risk_level = effective_risk(state, call).await;
+    let mode = exec_approval_mode();
+    // What the gate did, for the audit row (Medium and High only).
+    let mut decision = "allowed";
 
     // 2b. ENFORCE the risk (H-I1). Previously risk was computed + audited but
     //     never gated execution, so high-risk tools (python_exec, skill_execute)
     //     ran ungated even under strict/approval mode. Now a HIGH-risk call is
-    //     denied unless exec-approval mode is auto/disabled.
+    //     denied unless exec-approval mode is auto/disabled. An unattended run
+    //     (heartbeat, autonomy, delegated child task) has no person to ask, and
+    //     takes the same path: `strict` refuses at once, `approval` queues a
+    //     request nobody's chat can answer with a bare `y` and refuses on timeout;
+    //     only an explicit `auto`/`disabled` runs it.
+    // The outer test keeps the High-only reasoning above next to its branch.
+    #[allow(clippy::collapsible_if)]
     if risk_level == security::RiskLevel::High {
-        let mode = exec_approval_mode();
         if security::requires_approval_block(risk_level, &mode) {
             if mode == "approval" {
                 // Approve-then-execute (operator requirement 2026-08-08:
@@ -748,8 +946,11 @@ pub async fn before_tool_call(
                 // outright — never asked anyone. Approved falls THROUGH
                 // to normal execution below.
                 match wait_for_exec_approval(state, call, risk_level).await {
-                    ExecApprovalOutcome::Approved => {}
+                    ExecApprovalOutcome::Approved => {
+                        decision = "approved";
+                    }
                     ExecApprovalOutcome::Denied { by, request_id } => {
+                        audit_tool_decision(state, call, risk_level, "denied", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalDenied {
                             tool: call.name.clone(),
                             by,
@@ -757,6 +958,7 @@ pub async fn before_tool_call(
                         });
                     }
                     ExecApprovalOutcome::TimedOut { request_id, secs } => {
+                        audit_tool_decision(state, call, risk_level, "timeout", &mode, &request_id).await;
                         return Err(SecurityError::ApprovalTimeout {
                             tool: call.name.clone(),
                             request_id,
@@ -777,6 +979,7 @@ pub async fn before_tool_call(
                     serde_json::json!({ "risk": risk_level.to_string(), "mode": mode }),
                 )
                 .await;
+                audit_tool_decision(state, call, risk_level, "blocked", &mode, &request_id).await;
                 return Err(SecurityError::ApprovalRequired {
                     tool: call.name.clone(),
                     mode,
@@ -784,6 +987,7 @@ pub async fn before_tool_call(
             }
         }
     }
+    audit_tool_decision(state, call, risk_level, decision, &mode, &request_id).await;
 
     let ctx = ToolCallContext {
         tool_name: call.name.clone(),
@@ -1457,18 +1661,45 @@ mod refusal_storm_tests {
 /// no framing, no MIME sniffing, no referrer leakage, no ambient device
 /// permissions, and HSTS only when this process actually terminates TLS.
 ///
-/// The full `Content-Security-Policy` is OPT-IN (`NOO_CSP=1`, or a literal
-/// policy in `NOO_CSP`). The dashboard is a built artifact baked into the
-/// image, so a policy written blind here could silently break a pane that
-/// uses an inline script — and this is a local, network-fenced deployment
-/// where that trade is not worth making by default. Turn it on and check
-/// the console; `NOO_CSP=<policy>` overrides the built-in one.
+/// The built-in `Content-Security-Policy` is ON by default; `NOO_CSP=0`
+/// (or `off`/`false`) opts out, and `NOO_CSP=<policy>` replaces it. The policy
+/// was checked against the built console (`ui/apps/web`: one same-origin
+/// module bundle per entry, no inline `<script>` in `index.html` or
+/// `kiosk.html`, no `eval`, no third-party origin, no iframe — Grafana opens
+/// in its own tab — same-origin `fetch`/SSE plus the `/ws/*` sockets) and the
+/// gateway's one inline-script page (`/ui/basic`, hence `'unsafe-inline'` in
+/// `script-src`; inline `style=` attributes in the console need it in
+/// `style-src` too). `frame-ancestors 'none'` stays alongside
+/// `X-Frame-Options: DENY`.
+pub const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
+     style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
+     connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; \
+     frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+
+/// What `NOO_CSP` asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CspChoice<'a> {
+    /// No `Content-Security-Policy` header (explicit opt-out).
+    Off,
+    /// The built-in [`DEFAULT_CSP`].
+    Default,
+    /// An operator-supplied policy, sent as-is.
+    Custom(&'a str),
+}
+
+/// Pure so a test pins the default without touching the process environment:
+/// unset or empty is `Default` (a compose file passing an empty `NOO_CSP`
+/// must not silently switch the header off).
+pub fn csp_choice(env: Option<&str>) -> CspChoice<'_> {
+    match env.map(str::trim) {
+        None | Some("") | Some("1") | Some("true") | Some("on") => CspChoice::Default,
+        Some("0") | Some("off") | Some("false") | Some("none") => CspChoice::Off,
+        Some(policy) => CspChoice::Custom(policy),
+    }
+}
+
 pub async fn security_headers(request: Request, next: Next) -> Response {
     use axum::http::header::{HeaderName, HeaderValue};
-    const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
-         style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
-         connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; \
-         frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
     let mut response = next.run(request).await;
     let h = response.headers_mut();
     let mut set = |name: HeaderName, value: HeaderValue| {
@@ -1485,19 +1716,25 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
     );
-    match std::env::var("NOO_CSP").ok().as_deref() {
-        None | Some("") | Some("0") | Some("off") => {}
-        Some("1") | Some("true") | Some("on") => set(
+    let csp_env = std::env::var("NOO_CSP").ok();
+    match csp_choice(csp_env.as_deref()) {
+        CspChoice::Off => {}
+        CspChoice::Default => set(
             HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static(DEFAULT_CSP),
         ),
-        Some(policy) => {
-            if let Ok(v) = HeaderValue::from_str(policy) {
-                set(HeaderName::from_static("content-security-policy"), v);
-            } else {
-                tracing::warn!("NOO_CSP is not a valid header value — no CSP sent");
+        CspChoice::Custom(policy) => match HeaderValue::from_str(policy) {
+            Ok(v) => set(HeaderName::from_static("content-security-policy"), v),
+            Err(_) => {
+                // A broken override must not become "no policy": fall back to
+                // the built-in one and say so.
+                tracing::warn!("NOO_CSP is not a valid header value — sending the built-in policy");
+                set(
+                    HeaderName::from_static("content-security-policy"),
+                    HeaderValue::from_static(DEFAULT_CSP),
+                );
             }
-        }
+        },
     }
     if std::env::var("NOO_TLS_CERT").ok().filter(|v| !v.is_empty()).is_some() {
         set(
@@ -1626,6 +1863,19 @@ mod tests {
         assert!(!compose_peer_in("100.64.0.9", &nets, &gws), "a tailnet node");
         assert!(!compose_peer_in("127.0.0.1", &nets, &gws));
         assert!(!compose_peer_in("fd00::1", &nets, &gws));
+    }
+
+    /// A v2 token exempts only for the node whose certificate is on the
+    /// connection, and only for the request it was signed for.
+    #[test]
+    fn a_v2_token_is_exempt_only_for_its_own_node_and_request() {
+        let sha = crate::cluster_token_v2::body_sha_hex(b"{}");
+        let t = crate::cluster_token_v2::sign("fleet", "POST", "/api/cluster/nodes/host8/heartbeat", b"{}", "host8", 500, "00112233445566778899aabbccddeeff").unwrap();
+        assert!(rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500));
+        assert!(!rate_exempt_v2(&t, None, "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500), "no leaf");
+        assert!(!rate_exempt_v2(&t, Some("host3"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", &sha, 500), "another node's leaf");
+        assert!(!rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/logs", &sha, 500), "another path");
+        assert!(!rate_exempt_v2(&t, Some("host8"), "fleet", "POST", "/api/cluster/nodes/host8/heartbeat", "", 500), "no body hash");
     }
 
     #[test]
@@ -1966,5 +2216,122 @@ eth0\t000014AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
             security::RiskLevel::High,
             "approval"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tool_risk_context_tests {
+    use super::*;
+    use crate::auth::Role;
+    use crate::routes::communication::ApprovalTarget;
+
+    fn target(channel: &'static str, recipient: &str) -> ApprovalTarget {
+        ApprovalTarget { channel, recipient: recipient.into(), thread_id: None, chat_type: "DM".into() }
+    }
+
+    /// A send is Medium only to the chat that asked; anywhere else (or with no channel origin,
+    /// as a dashboard or unattended turn) the destination has to be a saved recipient.
+    #[test]
+    fn only_the_chat_that_asked_is_the_originating_chat() {
+        let t = target("telegram", "555");
+        assert!(is_originating_chat("telegram", "555", Some(&t)));
+        assert!(!is_originating_chat("telegram", "556", Some(&t)), "another chat on the same channel");
+        assert!(!is_originating_chat("google_chat", "555", Some(&t)), "same id, other channel");
+        assert!(!is_originating_chat("telegram", "555", None), "no channel origin: nothing is originating");
+    }
+
+    fn roles(table: &'static [(&'static str, Role)]) -> impl Fn(&str) -> Option<Role> {
+        move |who| table.iter().find(|(n, _)| *n == who).map(|(_, r)| *r)
+    }
+
+    #[test]
+    fn an_agent_message_to_a_higher_tier_owner_is_high() {
+        let r = roles(&[("ada", Role::User), ("olive", Role::Operator), ("root", Role::Admin), ("bob", Role::User)]);
+        assert!(agent_send_stays_medium("ada", "ada/laptop", &r), "own agent");
+        assert!(agent_send_stays_medium("ada", "bob", &r), "equal tier");
+        assert!(agent_send_stays_medium("root", "ada", &r), "lower tier");
+        assert!(!agent_send_stays_medium("ada", "olive", &r), "operator's agent, from a user");
+        assert!(!agent_send_stays_medium("ada", "root/web", &r), "admin's agent, from a user");
+        assert!(!agent_send_stays_medium("ada", "ghost", &r), "unknown owner fails toward the gate");
+        assert!(!agent_send_stays_medium("ghost", "bob", &r), "unknown sender fails toward the gate");
+    }
+
+    /// An unattended run (heartbeat, autonomy, delegated child task) has no person: a High call
+    /// is refused under strict, and under approval mode waits on a request no chat can answer
+    /// with a bare `y` (the row is unbound: NULL conversation) and is refused on timeout. It only
+    /// runs when the operator set auto/disabled. Pins the rule and that the wait does not
+    /// short-circuit to Approved for an empty principal.
+    #[test]
+    fn a_high_call_with_no_human_present_is_never_auto_run_under_a_gate() {
+        for mode in ["strict", "approval"] {
+            assert!(security::requires_approval_block(RiskLevel::High, mode), "{mode}");
+        }
+        assert!(!security::requires_approval_block(RiskLevel::High, "auto"), "auto is the operator's explicit opt-out");
+        let unattended = crate::routes::communication::TurnPrincipal::default();
+        assert!(unattended.requester.is_empty() && unattended.conversation_id.is_empty());
+        let src = include_str!("middleware.rs");
+        let a = src.find("async fn wait_for_exec_approval(").expect("fn");
+        let body = &src[a..a + 6000];
+        assert!(body.contains("NULLIF($6, '')"), "an unattended request is stored unbound, decidable only by id");
+        assert!(body.contains("ExecApprovalOutcome::TimedOut"), "and refused when nobody decides");
+    }
+
+    /// Every Medium or High decision is audited, High refusals included; Low is not.
+    #[test]
+    fn the_gate_audits_every_branch() {
+        let src = include_str!("middleware.rs");
+        let a = src.find("pub async fn before_tool_call(").expect("fn");
+        let end = src[a..].find("let ctx = ToolCallContext").expect("ctx") + a;
+        let body = &src[a..end];
+        for d in ["\"denied\"", "\"timeout\"", "\"blocked\"", "decision, &mode"] {
+            assert!(body.contains(&format!("audit_tool_decision(state, call, risk_level, {d}")) || body.contains(d), "{d}");
+        }
+        assert!(body.matches("audit_tool_decision(").count() >= 4);
+    }
+}
+
+#[cfg(test)]
+mod csp_default_tests {
+    use super::{csp_choice, CspChoice, DEFAULT_CSP};
+
+    #[test]
+    fn the_header_is_sent_with_no_env_at_all() {
+        assert_eq!(csp_choice(None), CspChoice::Default);
+        assert_eq!(csp_choice(Some("")), CspChoice::Default, "an empty NOO_CSP is not an opt-out");
+        assert_eq!(csp_choice(Some("1")), CspChoice::Default);
+    }
+
+    #[test]
+    fn only_an_explicit_off_removes_it() {
+        for v in ["0", "off", "false", "none"] {
+            assert_eq!(csp_choice(Some(v)), CspChoice::Off, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_literal_policy_replaces_the_built_in_one() {
+        assert_eq!(csp_choice(Some("default-src 'none'")), CspChoice::Custom("default-src 'none'"));
+    }
+
+    #[test]
+    fn the_built_in_policy_keeps_framing_closed_and_fits_the_console() {
+        assert!(DEFAULT_CSP.contains("frame-ancestors 'none'"));
+        assert!(DEFAULT_CSP.contains("default-src 'self'"));
+        assert!(DEFAULT_CSP.contains("object-src 'none'"));
+        // sockets and same-origin fetch; no third-party origin
+        assert!(DEFAULT_CSP.contains("connect-src 'self' ws: wss:"));
+        assert!(!DEFAULT_CSP.contains("http://") && !DEFAULT_CSP.contains("https://"));
+        assert!(!DEFAULT_CSP.contains("unsafe-eval"));
+        assert!(DEFAULT_CSP.is_ascii(), "must be a valid header value");
+        assert!(axum::http::HeaderValue::from_str(DEFAULT_CSP).is_ok());
+    }
+
+    /// The handler reads the choice, and the framing header stays alongside.
+    #[test]
+    fn security_headers_uses_the_choice_and_keeps_x_frame_options() {
+        let src = include_str!("middleware.rs");
+        let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("csp_choice(csp_env.as_deref())"));
+        assert!(body.contains("X_FRAME_OPTIONS"));
     }
 }

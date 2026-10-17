@@ -552,6 +552,48 @@ async fn resolve_backend_url(gossip_url: &str, node_id: &str, backend_type: &str
     String::new()
 }
 
+/// The unpinned choice from the class table, or `None` when the table has
+/// nothing routable (fall through to discovery / the static last resort).
+async fn unpinned_from_table(state: &AppState, exclude_urls: &[String]) -> Option<(ResolvedBackend, Option<String>)> {
+    let table = match super::classes::load_table(state).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "backend_resolve_class_table_unavailable");
+            return None;
+        }
+    };
+    let sel = pick_unpinned(&table, exclude_urls)?;
+    let best = sel.candidates.first()?;
+    if sel.last_resort {
+        tracing::warn!(class = %sel.label, node = %best.node_id, "backend_resolved_only_excluded_candidates_left");
+    }
+    tracing::info!(
+        class = %sel.label,
+        node = %best.node_id, backend = %best.backend, model = %best.model,
+        url = %best.url, rank = %best.rank,
+        candidates = sel.candidates.len(), skipped = ?sel.skipped,
+        source = "class_table",
+        "backend_resolved"
+    );
+    Some((
+        ResolvedBackend {
+            url: best.url.clone(),
+            model: best.model.clone(),
+            api_format: detect_api_format_for_url(&best.backend, Some(&best.url)),
+            backend_type: best.backend.clone(),
+        },
+        Some(best.node_id.clone()),
+    ))
+}
+
+/// The unpinned selection minus backends that already failed this request.
+/// `exclude_urls` holds `ResolvedBackend.url` values — the candidate's own
+/// `url` (node-agent address, or the controller-local docker URL) — so a
+/// failed node's every backend is out, as the KV scan always did.
+pub(crate) fn pick_unpinned(table: &super::classes::ClassTable, exclude_urls: &[String]) -> Option<super::classes::Selection> {
+    super::classes::select(table, None, None, &|c| exclude_urls.iter().any(|u| u == &c.url)).ok()
+}
+
 /// Resolve a backend using the mesh discovery chain.
 /// Resolve backend using config defaults (for coordinator brain).
 pub(super) async fn resolve_backend_excluding(state: &AppState, requested_model: Option<&str>, exclude_urls: &[String]) -> Result<ResolvedBackend> {
@@ -746,11 +788,12 @@ fn scale_checked_load(node_key: &str, load: f64) -> f64 {
 
 /// Resolve a backend, optionally targeting a specific model.
 ///
-/// Routing priority:
-///   1. Exact model match (if requested_model is Some)
-///   2. Config default model match
-///   3. Preferred backend type
-///   4. Lowest load (from heartbeat data)
+/// Routing:
+///   * no model: the class table's `chat-default` — every live chat node,
+///     ranked (`classes::rank_key`), or the declared list — exactly what
+///     unpinned raw chat picks;
+///   * a model: only the nodes serving it (`apply_pin`), then preferred
+///     backend type, then lowest load (from heartbeat data).
 ///
 /// Load-aware: a node at or above `LOAD_CEILING` (0.9 of one core's worth of
 /// load average per core) is deprioritized, not excluded.
@@ -871,8 +914,25 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         .map(|b| b.model.clone())
         .unwrap_or_default();
 
-    // The target model: explicit request > config default
-    let target_model = requested_model.unwrap_or(&default_model);
+    // Unpinned (heartbeat tasks, agent turns with no model and no saved
+    // preference): the SAME choice raw chat makes — the class table's
+    // `chat-default` (dynamic: every live chat node, ranked by quality,
+    // health, thermal, stalls, load; or the operator's declaration), so a
+    // task and a chat request agree on where "default" goes. The yaml's
+    // `cluster.backends.<x>.model` is not consulted: it is a placement
+    // hint, and ranking it first sent every unpinned turn to the
+    // controller's CPU e2b while a 12B GPU node idled (2026-10-17).
+    // Discovery and the static OLLAMA_URL below stay the last resorts.
+    if requested_model.is_none() {
+        if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+            return Ok(found);
+        }
+    }
+
+    // The target model: an explicit request only. The configured default
+    // model is no longer a sort key (see above); it remains the model of
+    // the static last resort.
+    let target_model = requested_model.unwrap_or("");
 
     // 1. NATS KV (authoritative — populated by real node heartbeats)
     let inference_types = ["vllm", "vllm-secondary", "ollama", "llamacpp"];
@@ -1598,5 +1658,59 @@ mod local_backend_url_tests {
         assert_eq!(local_backend_url("ollama", 11434), "https://noo-stunnel-ollama:11434");
         assert_eq!(local_backend_url("vllm", 8000), "https://noo-vllm:8000");
         assert_eq!(local_backend_url("vllm-secondary", 8000), "https://noo-vllm-secondary:8000");
+    }
+}
+
+/// Heartbeat tasks and agent turns with no model resolve where unpinned raw
+/// chat does (operator rule 2026-10-17).
+#[cfg(test)]
+mod unpinned_tests {
+    use super::super::classes::{build_table, select, Declarations, NodeFacts};
+    use super::pick_unpinned;
+
+    fn node(id: &str, ip: &str, backend: &str, model: &str, gpu: bool, load: f64) -> NodeFacts {
+        NodeFacts {
+            node_id: id.into(),
+            ip: ip.into(),
+            running: vec![(backend.into(), model.into())],
+            load,
+            gpu,
+            heartbeat_age_secs: Some(2.0),
+            inbound_ok: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_heartbeat_path_picks_the_same_node_as_raw_chat_for_an_unpinned_turn() {
+        // The 2026-10-17 fleet (addresses no other test notes a stall on).
+        let nodes = vec![
+            node("pop-os", "192.0.2.211", "ollama", "gemma4:e2b-it-qat", false, 0.05),
+            node("mcmini", "192.0.2.212", "ollama", "gemma4:12b", true, 0.4),
+        ];
+        let t = build_table(&nodes, &[], &Declarations::default());
+        let raw = select(&t, None, None, &|_| false).expect("raw chat selection");
+        let task = pick_unpinned(&t, &[]).expect("heartbeat selection");
+        assert_eq!(raw.candidates[0].node_id, "mcmini");
+        assert_eq!(task.candidates[0].node_id, raw.candidates[0].node_id);
+        assert_eq!(task.candidates[0].url, "https://192.0.2.212:8081");
+        // After mcmini failed this turn (its ResolvedBackend.url excluded),
+        // the turn fails over to the next node, never back to mcmini.
+        let next = pick_unpinned(&t, &["https://192.0.2.212:8081".to_string()]).expect("failover");
+        assert_eq!(next.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
+        assert!(pick_unpinned(&t, &["https://192.0.2.212:8081".into(), "https://192.0.2.211:8081".into()]).is_none(),
+            "nothing left: fall through to discovery / the static last resort");
+    }
+
+    /// The unpinned branch runs BEFORE the KV scan, and the configured
+    /// default model is not a sort key any more.
+    #[test]
+    fn the_resolver_delegates_unpinned_turns_to_the_class_table() {
+        let src = include_str!("backend.rs");
+        let body = src.split("pub(crate) async fn resolve_backend_and_node(").nth(1).expect("resolver");
+        let unpinned = body.find("unpinned_from_table(state, exclude_urls)").expect("delegation");
+        let scan = body.find("get_key_value(\"mesh_nodes\")").expect("kv scan");
+        assert!(unpinned < scan);
+        assert!(body.contains("let target_model = requested_model.unwrap_or(\"\");"), "no configured-default tier-0 key");
     }
 }

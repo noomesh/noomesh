@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
+	"github.com/noomesh/noomesh/node-agent-go/internal/preseed"
 )
 
 // Native probes locally-running backends over loopback.
@@ -459,6 +460,9 @@ func (n *Native) Pull(ctx context.Context, name string) (string, error) {
 	base, ok := n.Endpoint("ollama")
 	if !ok {
 		return "", fmt.Errorf("no native ollama lane on this host")
+	}
+	if err := preseed.OllamaRegistryPullAllowed(name); err != nil {
+		return "", err
 	}
 	if n.clientErr != nil {
 		return "", n.clientErr

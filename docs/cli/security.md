@@ -37,8 +37,12 @@ config root and how it was chosen, and a line for any config file whose
 transport keys were ignored because it lives in a checkout this box is not
 installed from. There is no unverified-TLS fallback: an unusable anchor, or a
 non-loopback `http://` gateway, exits 3 (`tls_untrusted`) instead. `logout`
-revokes the refresh token server-side and deletes the file; an
-already-issued access token stays valid until it expires (15 minutes).
+revokes the refresh token server-side, deletes the file, and ends the
+access token it was holding: the gateway keeps a per-account "not before"
+time, so a bearer issued before the logout is refused at once (a
+re-login gets a fresh one) and the account's open dashboard sockets close.
+The floor lives in Redis for one access-token lifetime; with no Redis it is
+held in the gateway's memory only and does not survive a restart.
 Scripts pass `--token` or `NOO_TOKEN`; the resolution order is in
 [README.md#contracts](README.md#contracts).
 
@@ -52,16 +56,26 @@ noo security user list
 noo security user link alice telegram 123456789 --name "Alice"
 ```
 
-`create` prompts for the password (eight characters minimum;
-`--password-stdin` for scripts) and prints `user 'alice' created with
+`create` prompts for the password (12 characters minimum, not a common
+password, not containing the username; the CLI and the gateway enforce the
+same rule on `create` and `set-password`, so `--password-stdin` is checked
+too, and existing accounts keep logging in; only a new or changed password
+is checked) and prints `user 'alice' created with
 scopes read, write` (`read` alone when `--scope` is omitted: new accounts are read-only, and `read` + `write` is the Operator tier). `team
 create` makes the team and its `team:ops` KB role; `grant-role` adds it
 (`alice KB roles: team:ops`; everyone already has `user:<name>`,
 `company` and `system`). `link` maps a channel identity (a Telegram chat
 id, a Google Chat `users/123`, a WhatsApp number) to the account so
 messages from that sender run as alice; `links alice` lists them.
-`set-scopes` **replaces** the scope set and is admin-only — scopes are
-baked into the JWT, so the user must log out and back in.
+`set-scopes` **replaces** the scope set and is admin-only. Scopes are baked
+into the JWT, so the change **ends every session of that account
+immediately** (its refresh tokens are revoked, open sockets close, and a
+token issued before the change is refused): the user logs in again and gets
+the new scopes. `disable`, `set-role` and `set-password` do the same, and
+`service-key revoke --disable-account` too. A disabled account's bound MCP
+keys stop within the key cache interval (5 s) and its refresh cookie is
+refused. `disable` does not revoke keys that are not bound to the account
+(machine keys issued with `service-key issue`); revoke those by name.
 
 <a id="graph-scope"></a>
 **The `graph` scope.** A plain `read` account is refused every
@@ -240,22 +254,62 @@ The gates are `NOO_EXEC_APPROVAL_MODE`, `NOO_NODE_AGENT_PRIVILEGED`,
 and `NOO_MCP_EXTERNAL_ENABLED`; `list` shows
 `gate | running | desired (db) | source | restart` and how many are pending
 a restart. (Tenant isolation is not among them — it is unconditional, not a
-gate.) The profiles are `hardened` (approval mode, unprivileged agents) and
+gate.) `NOO_NODE_AGENT_PRIVILEGED` is consumed by compose when the node-agent
+container is created, not by the gateway, so `set` and `apply-profile` mirror
+it into `.env` (as `true`/`false`) and **recreate the node-agent container**
+when it differs; `list` and `cluster verify` report the container's actual
+`HostConfig.Privileged` (`docker inspect`), so "at desired" means the
+container. On a host with no such container the row says "container not
+checked". The profiles are `hardened` (approval mode, unprivileged agents) and
 `dev` (the opposite); **both** leave the external MCP door closed —
 opening it is a decision about a specific person,
 never a side effect of a bundle. `set` and `apply-profile` are
 operator-only (your operator client certificate plus a token bound to it,
 never an app admin and never a shared secret) and take effect at the next
-gateway boot. `noo security scan` is the local complement: it
-checks secrets, plaintext residue under `secrets/`, retired shared NATS names (`NATS_USER`, `NATS_PASSWORD`) still set,
-inline registry logins in
-`~/.docker/config.json`, `.env` permissions, TLS, the PKI, and the
-**gateway transport** on this host, and prints findings by severity (exit 1
-on a CRITICAL, or on anything with `--strict`; `--json` for CI). A store
-that is present but cannot be decrypted — `sops` off `PATH`, no age key —
-is one HIGH finding that says so, not a CRITICAL "unset" per secret. A gateway URL the CLI could not verify — a non-loopback
-`http://` URL, or an `https://` one with no usable trust anchor — is
-reported as `CRITICAL / Gateway Transport`; `http://` to loopback is
+gateway boot. `noo security scan` is the local complement.
+
+**What it scanned.** The first line says which root it read and how that root
+was chosen (`$NOO_REPO_ROOT`, the standalone install home, the checkout you
+are standing in, or derived), and `--json` carries the same as `scanned`. On
+a host that is an **enrolled node** (it has `/etc/noo/controller-url`) and has
+no install of its own, it scans the node's real surfaces instead: the modes
+and ownership of everything under `/etc/noo/pki` (a world-readable key is
+CRITICAL), `/etc/noo-node-agent.env` (must be `0600` root), the birth key
+`/etc/noo/birth.key`, a stale legacy `NATS_USER`/`NATS_PASSWORD` in the
+agent's env file, and the node-agent unit (`User=` not root,
+`NoNewPrivileges=true`). The controller-only rows (JWT, cluster and
+controller secrets, Redis, TLS, Grafana, the audit key, mTLS, CSP, exec
+approval) are listed as "not applicable on a node", never as passed. With no
+install and no enrollment there is nothing to scan: it says so and exits 1.
+
+**Never "ok" for what it could not see.** Anything it could not read is
+printed as `NOT CHECKED` (and listed under `not_checked` in `--json`): the
+agent's env file is `0600 root`, so a non-root scan reports the file's mode
+but says its contents were not read; the gateway-side rows need an operator
+login (`noo auth login`); the node-agent container needs docker. "No issues
+found" then says how many surfaces were not checked.
+
+**What it checks on a controller.** Secrets (JWT, cluster, **controller**,
+node-agent token, Redis, Grafana, the bootstrap `NOO_ADMIN_PASSWORD`) for
+empty values and for the **published placeholders** (`changeme`, `admin`,
+`password`, `secret`, `test`, `example`, `dev-secret-change-in-production`);
+the **audit key** (`NOO_AUDIT_HMAC_KEY` missing is CRITICAL: the gateway
+refuses to start without it); **mTLS enforcement** judged on its effective
+value (explicitly off, or no cluster CA, is HIGH); an explicit `NOO_CSP=0`/`off`
+(MEDIUM; CSP is opt-in); the env-only hatches `NOO_SELF_CALL_SHARED_SECRET`,
+`NOO_NATS_ALLOW_ANONYMOUS` and `NOO_ALLOW_LOCAL_PYTHON_EXEC` (HIGH each);
+the gateway's running **exec approval mode** when it is neither `strict` nor
+`approval` (HIGH; a not-yet-restarted `auto` row is MEDIUM);
+`NOO_SANDBOX_ISOLATION=process` (MEDIUM, a downgrade from `bwrap`); the
+node-agent container actually running **privileged** (HIGH, from `docker
+inspect`); plaintext residue under `secrets/`; retired shared NATS names;
+inline registry logins in `~/.docker/config.json`; `.env` permissions; TLS;
+the PKI; and the **gateway transport**. Exit 1 on a CRITICAL, or on anything
+with `--strict`; `--json` for CI. A store that is present but cannot be
+decrypted — `sops` off `PATH`, no age key — is one HIGH finding that says so,
+not a CRITICAL "unset" per secret. A gateway URL the CLI could not verify — a
+non-loopback `http://` URL, or an `https://` one with no usable trust anchor —
+is reported as `CRITICAL / Gateway Transport`; `http://` to loopback is
 reported as `LOW`, because that is the local-development default.
 
 ### Sign and verify an add-on lock
@@ -349,7 +403,8 @@ the lock. The layout both locks are published in is in
 | `noo security org list` | — | List orgs with member counts |
 | `noo security org create` | `<org_id> [--name <name>] [--description <text>]` | Create an org |
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
-| `noo security audit verify` | — | Verify every security audit row's hash across the audit-key checkpoint (operator-only) |
+| `noo security audit verify` | — | Verify audit row hashes and the chain: deleted or reordered rows show (operator-only) |
+| `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
 | `noo security posture apply-profile` | `<profile> [--include-bridges]` | Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply |
@@ -380,7 +435,7 @@ the lock. The layout both locks are published in is in
 | `noo security secrets remove` | `<key>... [--yes] [--dry-run] [--sops-file <path>]` | Remove unused keys from env.sops; refuses any key something reads, keeps a backup |
 | `noo security secrets rotate` | `<key>... [--all-generated] [--dry-run] [--yes] [--prompt] [--set-from-stdin] [--stdout] [--restart] [--sops-file <path>] [--pg-container <c>] [--pg-db <db>] [--pg-superuser <user>]` | Rotate secrets in env.sops, Postgres and the backup files atomically; confirms unless -y |
 | `noo security secrets reveal` | `<NAME> [--no-clipboard] [--stdout] [--sops-file <path>]` | Show one human-held secret once on this terminal and offer it to the clipboard |
-| `noo security scan` | `[--strict]` | Scan this host's posture; exits 1 on a CRITICAL finding, or on any finding with --strict |
+| `noo security scan` | `[--strict]` | Scan this install's or node's posture; exit 1 on a CRITICAL, or any finding with --strict |
 | `noo security pki rotate-all` | `[--warn-days <n>] [--new-days <n>] [--yes] [--reload \| --no-reload] [--no-deliver]` | Re-issue expiring certs, deliver to nodes, restart consumers; asks for confirmation (-y) |
 | `noo security pki rotate-ca` | `[--ca-days <n>] [--leaf-days <n>] [--yes] [--retire-old]` | Cross-signed CA rotation across every node; asks for confirmation (-y) |
 | `noo security pki rotate-signing-key` | `[<node>] [--deliver-only] [--yes]` | Mint the fleet code-signing key and deliver its public half to every node (-y to confirm) |

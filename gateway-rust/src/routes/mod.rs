@@ -57,6 +57,7 @@ pub mod users;
 pub(crate) mod erase_kb;
 mod recall;
 mod walks;
+mod audit_read;
 pub mod ops;
 mod websocket;
 
@@ -180,6 +181,23 @@ impl From<sqlx::Error> for AppError {
 /// Result type alias for handlers that return JSON on success or AppError on failure.
 pub type AppResult = Result<Json<Value>, AppError>;
 
+/// Second lock behind the tier gate for GET handlers that return
+/// installation-wide data (audit views, config, fleet desired-config, PKI).
+/// `auth::USER_READ_PATHS` already keeps a `User`-tier token off these
+/// paths; this check holds if a path is ever added to that list by mistake or
+/// the handler is mounted somewhere else. `None` is a caller with no
+/// requester context (an internal call that passed the auth layer), the same
+/// reading `users_admin_read_guard` makes.
+pub(crate) fn operator_read_guard(
+    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
+) -> Result<(), AppError> {
+    match ctx {
+        None => Ok(()),
+        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(()),
+        Some(_) => Err(AppError::Forbidden("operator role required".into())),
+    }
+}
+
 /// Refuse a whole router when the trellion add-on is absent.
 ///
 /// Applied by `temporal` (6 routes) and `knowledge` (16). Both reach
@@ -276,6 +294,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(settings::router())
         .merge(intelligence::router())
         .merge(admin::router())
+        .merge(audit_read::router())
         .merge(monitoring::router())
         .merge(grafana_ds::router())
         .merge(users::router())
@@ -345,6 +364,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Outside auth: the Grafana session route never answers a bare 403
         // — it says why and which tiers open Grafana.
         .layer(axum_mw::from_fn(crate::auth::explain_grafana_refusal))
+        // The caller's address (same trusted-proxy rule as the rate limiter),
+        // bound for the handler so every audit row records where it came from.
+        .layer(axum_mw::from_fn(crate::audit_context::origin_layer))
         .layer(axum_mw::from_fn_with_state(state.clone(), crate::middleware::rate_limit))
         .layer(axum_mw::from_fn_with_state(state.clone(), crate::middleware::request_logger))
         // Outermost so every response carries them, including 401s from the
@@ -356,4 +378,70 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::middleware::panic_response))
 
         .with_state(state)
+}
+
+/// The second lock behind the tier gate: GET handlers that return
+/// installation-wide data refuse a `User` account themselves.
+#[cfg(test)]
+mod operator_read_guard_tests {
+    use super::operator_read_guard;
+    use crate::auth::{RequesterCtx, Role};
+    use axum::{http::StatusCode, response::IntoResponse, Extension};
+
+    fn ctx(role: Role) -> Option<Extension<RequesterCtx>> {
+        Some(Extension(RequesterCtx {
+            sub: "alice".into(),
+            scopes: vec!["read".into()],
+            role,
+            harness: None,
+            act: None,
+        }))
+    }
+
+    #[test]
+    fn a_user_is_forbidden_and_operators_admins_and_internal_callers_pass() {
+        let code = |c| match operator_read_guard(&c) {
+            Ok(()) => StatusCode::OK,
+            Err(e) => e.into_response().status(),
+        };
+        assert_eq!(code(ctx(Role::User)), StatusCode::FORBIDDEN);
+        assert_eq!(code(ctx(Role::Operator)), StatusCode::OK);
+        assert_eq!(code(ctx(Role::Admin)), StatusCode::OK);
+        assert_eq!(code(None), StatusCode::OK);
+    }
+
+    /// Each handler the audit named calls the guard BEFORE it reads anything.
+    #[test]
+    fn every_installation_wide_read_calls_the_guard_first() {
+        let admin = include_str!("admin.rs");
+        let cluster = include_str!("cluster.rs");
+        let settings = include_str!("settings.rs");
+        let other = include_str!("other.rs");
+        let cases: [(&str, &str, &str); 11] = [
+            (admin, "async fn security_audit_history(", "operator_read_guard(&ctx)"),
+            (admin, "async fn security_audit_stats(", "operator_read_guard(&ctx)"),
+            (admin, "async fn security_violations(", "operator_read_guard(&ctx)"),
+            (admin, "async fn security_pki_status(", "operator_read_guard(&ctx)"),
+            (cluster, "async fn desired_config_get(", "operator_read_guard(&requester)"),
+            (settings, "async fn config_get(", "operator_read_guard(&requester)"),
+            (settings, "async fn config_get_section(", "operator_read_guard(&requester)"),
+            (settings, "async fn settings_get(", "operator_read_guard(&requester)"),
+            (settings, "async fn settings_export(", "operator_read_guard(&requester)"),
+            (settings, "async fn settings_flags_list(", "operator_read_guard(&requester)"),
+            (other, "async fn coordinator_context(", "operator_read_guard(&requester)"),
+        ];
+        for (src, sig, call) in cases {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+            let rest = &src[start..];
+            let end = rest[sig.len()..].find("\nasync fn ").map(|i| i + sig.len()).unwrap_or(rest.len());
+            let body = &rest[..end];
+            let at = body.find(call).unwrap_or_else(|| panic!("{sig} does not call {call}"));
+            let first_read = ["state.db", "state.config_yaml", ".fetch_", "read_to_string", "state.redis", "resolve_backend"]
+                .iter()
+                .filter_map(|m| body.find(m))
+                .min()
+                .unwrap_or(usize::MAX);
+            assert!(at < first_read, "{sig}: the guard must come before the first read");
+        }
+    }
 }

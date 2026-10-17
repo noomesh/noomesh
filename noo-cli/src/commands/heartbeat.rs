@@ -1221,7 +1221,7 @@ pub(crate) const RUST_NATIVE_ACTIONS: &[&str] = &[
     "cluster_health", "cost_report", "security_audit", "memory_cleanup", "idle_scaledown",
     "agent_self_check", "disk_cleanup", "write_log", "database_backup", "cert_rotation_check",
     "cert_auto_rotate", "heartbeat_retention", "agent_messages_retention", "usage_rollup", "backup_knowledge", "graph_prune", "entity_cleanup",
-    "channel_keepalive", "model_cache_warm", "rag_reindex", "self_benchmark",
+    "channel_keepalive", "model_cache_warm", "rag_reindex", "self_benchmark", "audit_log_rotate",
 ];
 pub(crate) const RUST_LLM_ACTIONS: &[&str] = &[
     "research_report", "research_and_send", "custom_prompt", "daily_briefing", "chat_digest",

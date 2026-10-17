@@ -147,7 +147,7 @@ def test_every_dhi_image_is_in_the_declared_list():
 
 
 COMPOSE_FILES = sorted(ROOT.glob("docker-compose*.yml"))
-BASE_REF = re.compile(r"\$\{NOO_BASE_REGISTRY(?::?-([^}]*))?\}/(\S+)")
+BASE_REF = re.compile(r"\$\{NOO_BASE_REGISTRY(?::?-([^}]*))?\}/([^\s$]+)")
 
 
 def _base_refs() -> list[tuple[str, str | None, str]]:

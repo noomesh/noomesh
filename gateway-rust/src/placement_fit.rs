@@ -375,13 +375,18 @@ fn env_str(env: &Map<String, Value>, key: &str) -> Option<String> {
     })
 }
 
-/// Parameter count (billions) parsed from a tag like `gemma4:26b-a4b-it-qat`
-/// or `qwen3:8b`: the first `<n>b` token.
-fn params_b(model: &str) -> Option<f64> {
+/// Parameter count (billions) parsed from a model name: the first token
+/// (split on anything but letters, digits and `.`) of the form `<n>b`
+/// (`qwen3:8b`, `gemma4:26b-a4b-it-qat` → 26, `google/gemma-4-12B-it-qat-w4a16-ct`
+/// → 12) or Gemma's effective-size `e<n>b` (`gemma4:e2b-it-qat` → 2,
+/// `gemma-4-E4B-it` → 4). Also the quality key of the dynamic chat default
+/// (`coordinator::classes::quality_of`).
+pub(crate) fn params_b(model: &str) -> Option<f64> {
     for tok in model.to_lowercase().split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
         if let Some(n) = tok.strip_suffix('b') {
+            let n = n.strip_prefix('e').unwrap_or(n);
             if let Ok(v) = n.parse::<f64>() {
-                if v > 0.0 {
+                if v > 0.0 && v.is_finite() {
                     return Some(v);
                 }
             }
@@ -615,6 +620,20 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names the fleet serves, in every spelling the parser must read
+    /// (`e<N>b` was unreadable before, so a 2B model ranked as "unknown").
+    #[test]
+    fn params_parse_every_fleet_spelling() {
+        assert_eq!(params_b("gemma4:e2b-it-qat"), Some(2.0));
+        assert_eq!(params_b("google/gemma-4-12B-it-qat-w4a16-ct"), Some(12.0));
+        assert_eq!(params_b("gemma4:26b-a4b-it-qat"), Some(26.0), "total, not the a4b active count");
+        assert_eq!(params_b("gemma4:12b"), Some(12.0));
+        assert_eq!(params_b("google/gemma-4-E4B-it"), Some(4.0));
+        assert_eq!(params_b("qwen3:0.6b"), Some(0.6));
+        assert_eq!(params_b("harrier"), None);
+        assert_eq!(params_b("gemma4:latest"), None);
+    }
 
     const GEMMA: &str = "gemma4:26b-a4b-it-qat";
 

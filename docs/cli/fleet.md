@@ -186,8 +186,33 @@ list of `node/backend[=model]` candidates the gateway fails over across.
 restates a placement); `--degraded` candidates are the only ones allowed to
 answer with a different model, and only once every other candidate has
 failed. With nothing declared, every served model is its own class and
-`chat-default` is the configured default model. `noo cluster verify
---controller` has a `model classes` row for candidates that are neither
+`chat-default` is **dynamic**: every live chat node in the mesh, whatever
+model it serves, ranked per request — healthy before not, a node that
+stalled in the last 5 minutes after one that did not, thermal
+`serious`/`critical` after cooler, a GPU shared with another workload
+after a free one, vLLM then a GPU runtime then CPU, the larger model first,
+then fewest requests in flight and the lowest load. A quarantined or
+thermal-`critical` node is left out unless nothing else is. Nodes come and
+go: a busy, hot or offline node drops out and rejoins on its own. The
+yaml's `cluster.backends.<x>.model` (what onboarding put on the local
+backend) is a placement hint and does not narrow this. Declaring
+`chat-default` replaces the dynamic pool with your list; `class list`
+prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
+`noo cluster verify --controller` has a `default chat` row listing the live
+candidates in order (`!` when only CPU candidates or one node remain, `x`
+when none).
+
+To send one request to one node, name it: a `node` field in the body or an
+`X-Noo-Node` header on `/v1/chat/completions`,
+`/api/external/chat/completions` or `/api/inference`. An unknown node, or
+one serving no chat, is refused with 422; a node that does not serve the
+model you named, with 409. The `legacy lanes` row of
+`noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
+node by name, from the gateway's counters and from each agent's heartbeat)
+still signing the old, replayable cluster token instead of the request-bound
+v2; it reads 0 once every node has upgraded, and only then is it safe to set
+`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page). `noo cluster
+verify --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
 
 `--pool` turns the list into peers instead of a failover order: each
@@ -437,6 +462,84 @@ accepted and changes nothing.
 network, no filesystem, no shell) — the sanctioned way to add code an
 agent may execute.
 
+### Shared GPU nodes
+
+A node can be a person's machine as well as a mesh node: the same box plays
+VR, trains models, or runs a realtime voice stack. When something **outside
+noomesh** needs the GPU, the node agent does not stop. It stays online, gives
+the GPU back, says so, and takes it again on its own once the GPU is free.
+
+**What counts as foreign.** A GPU process is noomesh's when it runs in a
+container the agent manages (`noo-<backend>`); everything else (another
+compose stack, a game, a training script) is foreign. The agent only measures
+foreign work. It never signals, stops or reconfigures it.
+
+**How it measures.** Every 15 s it reads `nvidia-smi` (`memory.used`,
+`memory.total` and the compute processes). When the process IDs resolve, each
+one is matched to a managed container through its cgroup (method
+`nvidia-smi`). Under WSL2 the process rows read `[Not Found]`, so the agent
+falls back to accounting: foreign = memory used − the expected footprint of
+the GPU backends it is running (vLLM: `GPU_MEMORY_UTILIZATION` × total)
+(method `memory-accounting`). A Mac or a node without an NVIDIA GPU reports
+`not-measured` and never yields.
+
+**When it yields.** The GPU is under pressure when foreign use is above
+`NOO_GPU_YIELD_FOREIGN_MB`, or when what is left after foreign use is less
+than the placed GPU backends need. Once the pressure has lasted 60 s, the
+agent **stops** (does not remove) its GPU backend containers and marks them
+`paused: gpu_in_use_by_other`. The reconciler does not start a paused backend
+again. Once the GPU has stayed clear for `NOO_GPU_RESUME_AFTER_S`, the agent
+starts the same containers again. A short spike does not pause anything, and
+a relapse during the clear window starts the window over. A drained stack's
+idle residue (pai-voice leaves about 113 MiB) counts as free.
+
+**What routing sees.** The node keeps heartbeating, so it stays in the mesh.
+The paused backend is simply not running, so default chat goes to other
+nodes. When the backend resumes, the node rejoins.
+
+**Hand the GPU over on purpose.** With automatic yielding alone, whichever
+side starts first keeps the GPU, and a stack that refuses to start on a busy
+GPU never gets it. An operator hold settles that:
+
+```bash
+noo cluster gpu hold host3 --reason voice   # pauses host3's GPU backends now; no auto-resume
+pai-voice-gpu enable                        # on host3: the voice stack now finds the GPU free
+# ... later
+pai-voice-gpu disable                       # the voice stack drains and frees the GPU
+noo cluster gpu release host3               # back to automatic: vLLM resumes once the GPU stays free
+```
+
+`hold` and `release` are operator-only and audited (`node_gpu_hold`,
+`node_gpu_release`). A hold survives an agent restart. Nothing flows in the
+other direction: the other stack never calls noomesh.
+
+**Knobs** (operator overrides in `/etc/noo-node-agent.env`; restart the agent):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NOO_GPU_YIELD` | on | `off` never yields automatically (always run). An operator hold still works |
+| `NOO_GPU_YIELD_FOREIGN_MB` | `2048` | foreign GPU use above this is pressure |
+| `NOO_GPU_YIELD_AFTER_S` | `60` | how long pressure must last before the agent yields |
+| `NOO_GPU_RESUME_AFTER_S` | `120` | how long the GPU must stay clear before the agent resumes |
+
+**What the operator sees.** The heartbeat carries `gpu_contention`:
+
+```json
+{"state": "yielded", "foreign_mb": 11468, "total_mb": 16376, "free_mb": 4908,
+ "method": "memory-accounting", "since": "2026-10-17T12:00:00Z",
+ "paused_backends": ["vllm"], "need_mb": 14738,
+ "reason": "foreign GPU use 11.2 GB > 2.0 GB threshold", "policy": "auto"}
+```
+
+`state` is one of `free`, `shared` (foreign work beside running backends),
+`yielded` or `held`.
+
+- `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
+- `noo cluster verify host3` has a `gpu` row: `+ free`, or
+  `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
+  held are warnings, not failures, because the node is working as designed.
+- The console's node card shows "GPU in use by other work — vllm paused since …".
+
 ## Related guides
 
 - [../models/weight-cache.md](../models/weight-cache.md) — the LAN model-weight cache
@@ -465,6 +568,8 @@ agent may execute.
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
+| `noo cluster gpu hold` | `<node> [--reason <text>]` | Pause a node's GPU backends and keep them paused, to free its GPU (operator-only) |
+| `noo cluster gpu release` | `<node>` | End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only) |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
 | `noo cluster assign` | `<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low\|medium\|high\|<n>] [--dry-run] [--async]` | Pin a task to the least-loaded node and run it; --dry-run prints the choice only |

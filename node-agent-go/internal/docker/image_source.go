@@ -292,7 +292,7 @@ func (c *Client) resolveImage(ctx context.Context, ref string) (source, imageID 
 	}
 	// 4. Absent and not staged.
 	notStaged := &ImageNotStagedError{Ref: ref, Arch: arch, Tar: ImageTarGzName(ref, arch), AltTar: ImageTarName(ref, arch)}
-	if isOwnImage(ref) || registryFallbackPolicy() != RegistryFallbackPublic {
+	if isOwnImage(ref) || isRailOnly(ctx) || registryFallbackPolicy() != RegistryFallbackPublic {
 		if merr != nil && !errors.Is(merr, ErrArtifactAbsent) {
 			return "", "", fmt.Errorf("%w (the controller's manifest route could not be asked: %v)", notStaged, merr)
 		}
@@ -453,30 +453,27 @@ func (c *Client) PrefetchImages(ctx context.Context, refs []string, placements i
 }
 
 // BackendImageRef is the image StartBackend will use for backend, so the
-// reconciler can prefetch it. It mirrors the image choices at the top of
-// StartBackendSDK (CPU image on a node without NVIDIA, the controller's
-// override, ${VAR} substitution). It returns "" when it cannot tell (unknown
-// backend) or when StartBackendSDK would swap in a locally-built hardened
-// llama.cpp (present locally, so nothing to fetch). A wrong answer here only
-// costs a missed or wasted prefetch: the start path decides by itself.
+// reconciler can prefetch it. It calls the same chooseBackendImage as
+// StartBackendSDK (image_choice.go): CPU image on a node without NVIDIA, the
+// controller's override, ${VAR} substitution and the pinning policy. It
+// returns "" when it cannot tell (unknown backend), when the policy refuses
+// the ref (the start path reports why), or when StartBackendSDK would swap in
+// a locally-built hardened llama.cpp (present locally, so nothing to fetch).
+// A wrong answer here only costs a missed or wasted prefetch.
 func BackendImageRef(backend, override string) string {
 	spec, ok := backendSpecs[backend]
 	if !ok {
 		return ""
 	}
-	if spec.CPUImage != "" && !hasNvidiaGPU() {
-		spec.Image = spec.CPUImage
+	choice, err := chooseBackendImage(backend, spec, override)
+	if err != nil {
+		return "" // the start path refuses it with the explanation
 	}
-	if override != "" {
-		spec.Image = override
-	} else {
-		spec.Image = resolveEnv(spec.Image)
-	}
-	if backend == "llamacpp" && spec.Image == "ghcr.io/ggml-org/llama.cpp:server" {
+	if backend == "llamacpp" && choice.Ref == "ghcr.io/ggml-org/llama.cpp:server" {
 		// StartBackendSDK prefers a locally-present hardened build; if one
 		// is here the upstream image is not needed, and if none is, the
 		// start path pulls the upstream one itself.
 		return ""
 	}
-	return spec.Image
+	return choice.Ref
 }

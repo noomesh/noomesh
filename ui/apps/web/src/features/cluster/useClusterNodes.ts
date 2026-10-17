@@ -4,6 +4,7 @@
 import { useQuery, useMetisClient } from '@metis/core';
 import { relTime } from '@/lib/format';
 import type { ClusterNode } from './types';
+import { readGpuContention } from './gpuContention';
 
 export interface ClusterView {
   nodes: ClusterNode[];
@@ -37,6 +38,7 @@ export function useClusterNodes() {
         ramTotal: n.ram_gb ?? undefined,
         backends: n.backends ?? [],
         heartbeat: relTime(n.last_heartbeat),
+        gpuContention: readGpuContention(n),
       }));
 
       const vramGb = nodes.reduce((s, n) => s + (n.vramTotal ?? 0), 0);

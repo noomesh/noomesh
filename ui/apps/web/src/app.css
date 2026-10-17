@@ -1208,6 +1208,18 @@ body {
   text-overflow: ellipsis;
 }
 
+/* ---- shared-GPU contention line (node agent gpu_contention) ---- */
+.node .gpu-contention {
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.node .gpu-contention.paused {
+  color: var(--warn);
+}
+
 /* ---- node footer (backends + heartbeat) ---- */
 .node-foot {
   display: flex;

@@ -46,6 +46,9 @@ POSTURE_KEYS = (
     # one is open by DEFAULT, because accepting the shared secret is what
     # every install does today.
     "NOO_SELF_CALL_SHARED_SECRET",
+    # The v1 (replayable) cluster token bridge: open when unset, "0" refuses
+    # it. Mirrors posture.rs; the parity test pins them together.
+    "NOO_CLUSTER_TOKEN_V1",
     # Retired bridges (NOO_CLUSTER_LEGACY_FULL_ACCESS,
     # NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH, NOO_BUS_PRINCIPAL, and the retired
     # approval gate NOO_APPROVAL_BREAK_GLASS) are not here:

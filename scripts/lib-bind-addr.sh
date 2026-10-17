@@ -152,6 +152,21 @@ resolve_bind_addr() {
                 # it is the proxy whose X-Forwarded-For names the real caller.
                 # Only processes on this host connect from it; remote tailnet
                 # peers keep their own source address through the DNAT.
+                #
+                # Why not loopback alone (checked 2026-10-16, audit 05-network):
+                # the serve backend `noo` writes is `https://<this tailnet
+                # IP>:<port>` (noo-cli/src/tailnet_serve.rs `backend()`), not
+                # `127.0.0.1`, because in tailnet mode the gateway is published
+                # ONLY on that address. A host process connecting to a local
+                # address is sourced from that address, so tailscaled's hop
+                # arrives from the tailnet IP and loopback is never the source.
+                # Trusting loopback only would make every dashboard login look
+                # like it came from the bridge. The residual: any process on
+                # THIS host can also connect from that address and set
+                # X-Forwarded-For (it can pick its own rate-limit key and audit
+                # IP; it gains no credential). Closing that needs the gateway
+                # to be published on loopback as well and `serve` pointed at
+                # it, which is a deploy change, not a trust-list edit.
                 case ",${NOO_TRUSTED_PROXIES:-}," in
                     *",$ip,"*) ;;
                     *) export NOO_TRUSTED_PROXIES="${NOO_TRUSTED_PROXIES:+$NOO_TRUSTED_PROXIES,}$ip" ;;

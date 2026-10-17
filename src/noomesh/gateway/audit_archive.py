@@ -316,9 +316,69 @@ def _parquet_bytes(rows: list[dict[str, Any]]) -> bytes:
 # ── Drop ──────────────────────────────────────────────────────────────
 
 
+async def record_retention_checkpoint(engine: AsyncEngine, year: int, month: int) -> bool:
+    """Write the signed, chained ``audit_retention_checkpoint`` row that makes
+    dropping this month's partition read as retention, not as deleted rows.
+
+    It names the partition's chained seq range and the ``chain_hash`` of its
+    last row; the verifier uses that hash as the predecessor of the row after
+    the gap. Returns False when the partition holds no chained rows (nothing to
+    record), True when a checkpoint for exactly this range is in place. RAISES
+    when it cannot write one (no audit key, no chain tail, database error): the
+    caller must then not drop. Idempotent: a repeat run finds its own row.
+    """
+    from . import audit_log as al
+
+    key = al._audit_hmac_key()  # AuditKeyMissing -> no drop
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = datetime(year + (month == 12), (month % 12) + 1, 1, tzinfo=timezone.utc)
+    window = {"s": start, "e": end}
+    async with engine.connect() as conn:
+        await conn.execute(text(al._LOCK_SQL), {"k": al.CHAIN_LOCK_KEY})
+        span = (await conn.execute(text(
+            "SELECT min(chain_seq), max(chain_seq) FROM noo_security_audit "
+            "WHERE timestamp >= :s AND timestamp < :e AND chain_seq IS NOT NULL"), window)).first()
+        if span is None or span[0] is None:
+            await conn.rollback()
+            return False
+        lo, hi = int(span[0]), int(span[1])
+        last = (await conn.execute(text(
+            "SELECT chain_hash FROM noo_security_audit WHERE chain_seq = :h "
+            "AND timestamp >= :s AND timestamp < :e"), {"h": hi, **window})).first()
+        if last is None or not last[0]:
+            raise RuntimeError(f"audit partition {year:04d}-{month:02d}: row seq {hi} has no chain_hash")
+        resource = f"audit-retention:from:{lo};through:{hi};chain:{last[0]}"
+        have = (await conn.execute(text(
+            "SELECT 1 FROM noo_security_audit WHERE event_type = :et AND resource = :r LIMIT 1"),
+            {"et": al.RETENTION_EVENT, "r": resource})).first()
+        if have is not None:
+            await conn.rollback()
+            return True
+        tail = (await conn.execute(text(al._TAIL_SQL))).first()
+        if tail is None:
+            raise RuntimeError("audit chain has no tail row to link the retention checkpoint after")
+        event = al.AuditEvent(
+            event_type=al.RETENTION_EVENT, severity="info", actor="audit-retention",
+            resource=resource, outcome=f"{year:04d}-{month:02d}",
+            details={"what": "this month's partition is about to be dropped after export; "
+                             "its chained rows are accounted for by this row"},
+        )
+        details = (await conn.execute(al._canonical_details_sql(), {"d": al._details_json(event)})).scalar_one()
+        await conn.execute(text(al._INSERT_SQL), al._signed_params(event, key, details, tail))
+        await conn.commit()
+    logger.info("audit_archive.retention_checkpoint", partition=_partition_name(year, month), seq_from=lo, seq_through=hi)
+    return True
+
+
 async def drop_partition(engine: AsyncEngine, year: int, month: int) -> bool:
     """DETACH then DROP the partition. Returns True if dropped, False if
-    it didn't exist."""
+    it didn't exist.
+
+    A signed retention checkpoint is written FIRST (``record_retention_checkpoint``)
+    and a failure to write one stops the drop: dropped history must be
+    accounted for in the audit chain, or ``noo security audit verify`` reads it
+    as deleted rows. Migration 092's drop function refuses without one too."""
+    await record_retention_checkpoint(engine, year, month)
     # Delegates to ``public.noo_drop_audit_partition`` (revision 047), the
     # DROP twin of the SECURITY DEFINER that ``ensure_partition`` already
     # uses — and for the same reason: partition DDL needs the table's OWNER,

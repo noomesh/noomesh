@@ -173,6 +173,11 @@ const RUST_NATIVE_ACTIONS: &[&str] = &[
     // with NOTHING scheduling it, so the table grew unbounded.
     "heartbeat_retention",
     "agent_messages_retention",
+    // Export-then-drop for noo_security_audit partitions past the retention
+    // window. It lived only in Python, behind a scheduler that does not run
+    // in production, so no audit partition was ever rotated. SQL + a JSONL
+    // file write on /data, no ML. See audit_partition.rs.
+    "audit_log_rotate",
     // Retention for noo_token_usage: roll expired raw partitions into the
     // monthly table, then drop them. SQL only, no ML.
     "usage_rollup",
@@ -1942,7 +1947,9 @@ async fn run_llm_action_inner(
     // the STREAMING path turns into a virtual <think>. Through `run` the
     // report came back as reasoning-plus-answer, the quality gate rejected it
     // as a stub, and the operator got nothing (2026-09-27, weekly_research).
-    let cr = crate::coordinator::run_with_thinking(
+    let cr = crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         prompt,
         conversation_id,
@@ -1951,6 +1958,7 @@ async fn run_llm_action_inner(
         model_ref,
         Some(HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await?;
     crate::usage::record(
@@ -2017,7 +2025,9 @@ pub async fn research_corrective_retry(
          Begin immediately with `## Summary`. Write the actual headings and \
          paragraphs — do not describe yourself or the process."
     );
-    match crate::coordinator::run_with_thinking(
+    match crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run_with_thinking(
         state,
         &retry_prompt,
         // The `-retry` suffix makes this a SEPARATE conversation from the
@@ -2030,6 +2040,7 @@ pub async fn research_corrective_retry(
         None, // model (use default)
         Some(HEARTBEAT_CONVERSATION_OWNER),
         false,
+    ),
     )
     .await
     {
@@ -2197,6 +2208,7 @@ pub async fn run_rust_native_action(
         "heartbeat_retention" => action_heartbeat_retention(state, config).await.map(Into::into),
         "agent_messages_retention" => action_agent_messages_retention(state, config).await.map(Into::into),
         "usage_rollup" => action_usage_rollup(state, config).await.map(Into::into),
+        "audit_log_rotate" => crate::audit_partition::action_audit_log_rotate(state, config).await.map(Into::into),
         "channel_keepalive" => action_channel_keepalive(config).await.map(Into::into),
         "model_cache_warm" => action_model_cache_warm(state, config).await.map(Into::into),
         // Agent turns: only through `run_rust_native_task`, which puts them under the task's ceiling.
@@ -4626,7 +4638,9 @@ async fn action_self_benchmark(
         let start = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            crate::coordinator::run(
+            crate::bus_principal::with_principal(
+        crate::bus_principal::unattended_principal(crate::heartbeat_actions::HEARTBEAT_CONVERSATION_OWNER),
+        crate::coordinator::run(
                 state,
                 prompt,
                 &conversation_id,
@@ -4635,6 +4649,7 @@ async fn action_self_benchmark(
                 None,
                 Some(HEARTBEAT_CONVERSATION_OWNER),
             ),
+    ),
         )
         .await;
 

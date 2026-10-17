@@ -112,7 +112,8 @@ def _restart(tmp: Path, lock: str | None, *names: str) -> subprocess.CompletedPr
 
 
 def _lock(tag: str = TAG) -> str:
-    rows = "".join(f"{n}@sha256:{format(i, 'x') * 64}\n" for i, n in enumerate(_locked_names(), start=2))
+    # two hex digits per row, offset so no row can read as the stale store pin (64 x '1')
+    rows = "".join(f"{n}@sha256:{format(i + 0x20, '02x') * 32}\n" for i, n in enumerate(_locked_names(), start=2))
     return f"# tag {tag}\n{rows}source:trellion@{'a' * 40}\n"
 
 

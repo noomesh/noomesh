@@ -462,7 +462,7 @@ func (s *Supervisor) report(ctx context.Context, id string, tools []Tool) error 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if s.cfg.ClusterSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+auth.CreateClusterToken(s.cfg.NodeID, s.cfg.ClusterSecret))
+		auth.SetClusterAuth(req, s.cfg.NodeID, s.cfg.ClusterSecret)
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {

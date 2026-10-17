@@ -42,6 +42,13 @@ type Config struct {
 	// proxies sensor calls to the wrong process).
 	AgentPort int
 
+	// AgentBind is NODE_AGENT_BIND: where the control API listens. Empty =
+	// the address the controller reaches this node on (NODE_IP, else the
+	// source address of the route to the controller) plus loopback; `all`
+	// (or 0.0.0.0) = every interface; otherwise a comma list of IPs. See
+	// api.BindPlan.
+	AgentBind string
+
 	// Controller (gateway) connection
 	ControllerURL     string
 	HeartbeatInterval int // seconds
@@ -114,6 +121,7 @@ func Load() *Config {
 		NodeID:            envOr("NODE_ID", "auto"),
 		Tier:              envInt("NODE_TIER", 3),
 		AgentPort:         envInt("NODE_AGENT_PORT", 8081),
+		AgentBind:         strings.TrimSpace(os.Getenv("NODE_AGENT_BIND")),
 		GPUModel:          os.Getenv("GPU_MODEL"),
 		SelfNode:          envBool("NOO_SELF_NODE"),
 		VRAMGB:            envFloat("VRAM_GB", 0.0),

@@ -599,6 +599,21 @@ impl RedisCache {
         self.client.get::<Option<String>, _>(key).await.ok()?
     }
 
+    /// `SET key value EX ttl`; `true` only when Redis acknowledged it.
+    pub async fn set_string_ex(&self, key: &str, value: &str, ttl_secs: i64) -> bool {
+        self.client
+            .set::<(), _, _>(key, value.to_string(), Some(fred::types::Expiration::EX(ttl_secs)), None, false)
+            .await
+            .is_ok()
+    }
+
+    /// Get a string key, telling "absent" (`Ok(None)`) from "Redis failed"
+    /// (`Err`). [`get_string`] cannot: callers that must not treat an outage
+    /// as "no value" (the session not-before floor) use this one.
+    pub async fn get_string_checked(&self, key: &str) -> Result<Option<String>, String> {
+        self.client.get::<Option<String>, _>(key).await.map_err(|e| e.to_string())
+    }
+
     /// Delete a key.
     pub async fn del_key(&self, key: &str) -> bool {
         self.client.del::<i64, _>(key).await.unwrap_or(0) > 0
@@ -647,6 +662,25 @@ impl RedisCache {
             .await
             .map(|v| !v.is_null())
             .unwrap_or(false)
+    }
+
+    /// SET key 1 NX EX <ttl>, telling "already there" apart from "Redis
+    /// failed": `Some(true)` = newly claimed, `Some(false)` = it existed (a
+    /// replay), `None` = the command errored (the caller falls back to its
+    /// process-local set rather than treating an outage as either answer).
+    /// Used to spend a cluster-token v2 nonce.
+    pub async fn claim_once(&self, key: &str, ttl_secs: i64) -> Option<bool> {
+        self.client
+            .set::<fred::types::Value, _, _>(
+                key,
+                "1".to_string(),
+                Some(fred::types::Expiration::EX(ttl_secs)),
+                Some(fred::types::SetOptions::NX),
+                false,
+            )
+            .await
+            .ok()
+            .map(|v| !v.is_null())
     }
 
     /// Set TTL on a key. Returns true if the TTL was set successfully.

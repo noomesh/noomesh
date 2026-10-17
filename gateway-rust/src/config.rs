@@ -337,12 +337,27 @@ fn default_system_prompt() -> String {
 fn default_max_iterations() -> u32 { 10 }
 fn default_max_session_messages() -> u32 { 20 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub jwt_secret: String,
     #[serde(default)]
     pub cluster_secret: String,
+}
+
+/// Both fields are credentials (the JWT signing key and the fleet HMAC
+/// secret), and `AppConfig` derives `Debug`, so a derived impl here would
+/// print them from any `{:?}` of the config — a startup log, a panic message,
+/// a test failure. Printed as `<redacted>` (or `<empty>` when unset, which is
+/// useful to see and is not a secret).
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = |v: &str| if v.is_empty() { "<empty>" } else { "<redacted>" };
+        f.debug_struct("SecurityConfig")
+            .field("jwt_secret", &format_args!("{}", shown(&self.jwt_secret)))
+            .field("cluster_secret", &format_args!("{}", shown(&self.cluster_secret)))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -566,5 +581,26 @@ pub fn backend_port(backend_type: &str) -> Option<u16> {
         "ollama" => Some(11434),
         "llamacpp" => Some(8085),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod security_config_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_a_secret_value() {
+        let c = SecurityConfig { jwt_secret: "jwt-AAAA-do-not-print".into(), cluster_secret: "fleet-BBBB-do-not-print".into() };
+        let out = format!("{c:?} {:#?}", c);
+        assert!(!out.contains("AAAA") && !out.contains("BBBB"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(format!("{:?}", SecurityConfig::default()).contains("<empty>"));
+    }
+
+    #[test]
+    fn the_whole_config_debug_is_redacted_too() {
+        let mut cfg = AppConfig::default();
+        cfg.security.jwt_secret = "jwt-CCCC-do-not-print".into();
+        assert!(!format!("{cfg:?}").contains("CCCC"));
     }
 }

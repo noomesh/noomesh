@@ -84,6 +84,12 @@ addons`); `--dry-run` writes nothing and ends `dry run complete — nothing
 was changed`. In `--ci` mode, existing postgres/redis/nats data makes the
 wizard **refuse** (exit 2) rather than onboard on top of it.
 
+Two skips leave security work undone, and the closing summary lists what
+was not applied. `--skip-security` forgoes secret minting, the admin
+account and the PKI/mTLS enrollment. `--skip-services` forgoes the stack
+start, the service keys and the hardened posture profile. `noo security
+scan` reports what each left behind.
+
 ### Check the host after setup
 
 ```sh

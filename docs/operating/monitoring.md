@@ -468,11 +468,17 @@ every Grafana user reaches the gateway from Grafana's one address. The
 source dials Prometheus or Loki directly, or when either `grafana.ini`
 switch above is off.
 
-**The 15-minute bound.** Grafana's JWT auth is stateless: the token *is* the
-session, and it lasts `NOO_GRAFANA_SESSION_TTL` minutes (15 by default,
+**The 5-minute bound.** Grafana's JWT auth is stateless: the token *is* the
+session, and it lasts `NOO_GRAFANA_SESSION_TTL` minutes (5 by default,
 60 at most). No Grafana session outlives it — a disabled account's open tab
-dies at `expires_at` — and that is the same bound the console's own login
-token has. When the tab expires, Grafana sends it to its `/login`. On a tailnet
+dies at `expires_at`. It is shorter than the console's own 15-minute login
+token on purpose: the token travels in the URL (`?auth_token=`, Grafana's
+`url_login`), because a browser navigation cannot set the `X-JWT-Assertion`
+header and the console sends the person to Grafana's own origin, not through
+the gateway — so there is no proxy hop that could carry it in a header or a
+cookie instead. Five minutes is the shortest session that is still usable,
+and it bounds how long a token left in browser history, a `Referer` or an
+access log works. When the tab expires, Grafana sends it to its `/login`. On a tailnet
 controller that leads back to the console, which opens Grafana again with a
 fresh token. On a `local` controller Grafana shows its login-disabled page,
 and you click **Open Grafana** again. The token travels in the tab's URL

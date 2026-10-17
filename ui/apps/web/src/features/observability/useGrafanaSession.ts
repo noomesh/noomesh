@@ -47,7 +47,7 @@ export function sendTab(tab: TabHandle, url: string, open: (u: string) => TabHan
 /**
  * Mint a Grafana session for the account at this browser and open it. The
  * gateway re-reads the account (a disabled one is refused) and its LIVE
- * tier becomes the Grafana role; the token lives 15 minutes by default, and
+ * tier becomes the Grafana role; the token lives 5 minutes by default, and
  * when the tab expires the fix is to click again.
  */
 export function useGrafanaSession() {

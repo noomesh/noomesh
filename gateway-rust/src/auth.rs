@@ -788,14 +788,19 @@ pub fn cert_binding_holds(bound: Option<&Cnf>, presented: Option<&str>) -> bool 
 /// one audience the gateway's verifier will never accept.
 pub const GRAFANA_AUDIENCE: &str = "noo-grafana";
 
-/// Default Grafana session length in minutes, and the ceiling. Fifteen is
-/// the same bound the console's own login token has
-/// (`auth_refresh::default_access_minutes`): JWT auth in Grafana is
-/// stateless, so this is exactly how long a disabled account's outstanding
-/// tab keeps working. `NOO_GRAFANA_SESSION_TTL` (minutes) moves it, clamped
+/// Default Grafana session length in minutes, and the ceiling. Five, not the
+/// console login token's fifteen: this token travels in the URL
+/// (`?auth_token=`, Grafana's `url_login` — the only way a browser
+/// NAVIGATION can hand Grafana a credential, since it cannot set the
+/// `X-JWT-Assertion` header and the console opens Grafana's own origin
+/// directly, not through the gateway), so it lands in browser history,
+/// `Referer` and any proxy log on the way. JWT auth in Grafana is stateless,
+/// so the TTL is both the exposure of that URL and exactly how long a
+/// disabled account's outstanding tab keeps working. When the tab expires
+/// the fix is to click "Open Grafana" again. `NOO_GRAFANA_SESSION_TTL` (minutes) moves it, clamped
 /// to [1, 60].
 pub const GRAFANA_SESSION_TTL_ENV: &str = "NOO_GRAFANA_SESSION_TTL";
-pub const GRAFANA_SESSION_DEFAULT_MINUTES: u64 = 15;
+pub const GRAFANA_SESSION_DEFAULT_MINUTES: u64 = 5;
 pub const GRAFANA_SESSION_MAX_MINUTES: u64 = 60;
 
 /// The session TTL in seconds from the env value (minutes), clamped. An
@@ -2714,7 +2719,7 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return true;
+        return user_may_read(path);
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
@@ -2781,6 +2786,128 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return true;
     }
     control_scope_allows(scopes, method, path)
+}
+
+/// GET paths a `User`-tier token may read, exact match. Everything a person
+/// needs to chat, search, browse the graph, see their own history, and have
+/// the dashboard render. This is an ALLOW-LIST like the kiosk's
+/// ([`KIOSK_READ_PATHS`]): a route added next year is closed to a User until
+/// someone puts it here on purpose. Until 2026-10 the tier gate waved every
+/// GET through, which let a `read` account list the audit/violation/PKI
+/// views, every node's desired config and the whole `noomesh.yaml`.
+///
+/// Handlers that return installation-wide data ALSO guard themselves
+/// (`routes/admin.rs`, `routes/settings.rs`, `routes/cluster.rs`): the tier
+/// gate is the front door, the in-handler guard is the second lock.
+pub const USER_READ_PATHS: &[&str] = &[
+    "/health",
+    "/auth/me",
+    "/v1/models",
+    "/tools/list",
+    "/api/version",
+    "/api/events/stream",
+    // Dashboard overview sources. `desired-config`, `maintenance`,
+    // `model-classes`, `provision-bundle`, `proposals` are NOT here.
+    "/api/cluster/status",
+    "/api/cluster/nodes",
+    "/api/cluster/backends",
+    "/api/cluster/gpu-metrics",
+    "/api/cluster/replication-status",
+    "/api/scheduler/status",
+    "/api/models/cached",
+    "/api/ollama/models",
+    "/api/jobs",
+    "/api/jobs/history",
+    "/api/heartbeat/status",
+    "/api/heartbeat/tasks",
+    "/api/heartbeat/history",
+    "/api/heartbeat/actions",
+    "/api/heartbeat/artifacts",
+    "/api/autonomy/status",
+    "/api/autonomy/decisions",
+    "/api/alerts/clients",
+    "/api/approval/stats",
+    "/api/channels/status",
+    "/api/coordinator/context",
+    "/api/memory/health",
+    "/api/memory/status",
+    "/api/memory/storage-stats",
+    "/api/memory/embed/status",
+    "/api/memory/search",
+    "/api/v1/rag/status",
+    "/api/v1/settings/user-dirs",
+    "/api/v1/settings/preference",
+    "/api/docs/openapi",
+    "/api/docs/runbooks",
+    "/api/skills/list",
+    "/api/prompt-skills",
+    "/api/tags",
+    "/api/workflows",
+    "/api/usage/me",
+    "/api/usage/summary",
+    "/api/voice/status",
+    "/api/voice/voices",
+    "/api/agent/loops",
+    "/api/external/capabilities",
+    "/api/external/models",
+    "/api/external/usage",
+    "/api/activities",
+    "/api/tasks",
+    "/api/cloud-providers/status",
+    "/api/mcp/status",
+    "/api/security/service-keys/self",
+];
+
+/// GET prefixes a `User` may read (boundary-aware: see [`user_may_read`]).
+pub const USER_READ_PREFIXES: &[&str] = &[
+    "/ws/",
+    "/upload/",
+    "/api/conversations",
+    "/api/inference",
+    "/api/memory/relationships/",
+    "/api/memory/stats/",
+    "/api/v1/docs",
+    "/api/v1/graph/",
+    "/api/v1/recall/",
+    "/api/v1/video-memory/",
+    "/api/v1/walks",
+    "/api/v1/ops",
+    "/api/agents/messages",
+    "/api/agents/threads",
+    "/api/agents/presence",
+    "/api/agents/roles",
+    "/api/agents/peer/",
+    "/api/heartbeat/tasks/",
+    "/api/jobs/",
+    "/api/docs/runbooks/",
+    "/api/skills/",
+    "/api/prompt-skills/",
+    "/api/persona/",
+    "/api/temporal/",
+    "/api/proactive/",
+    "/api/tasks/",
+    "/api/activities/",
+    "/api/addons/",
+    "/api/artifacts/manifest/",
+    "/api/users/",
+    "/v1/models/",
+];
+
+/// Whether a `User`-tier token may GET `path`: the allow-list above, plus the
+/// GET routes of mounted add-on manifests (validated at load; they are the
+/// add-on's own surface and were reachable before this list existed).
+pub fn user_may_read(path: &str) -> bool {
+    USER_READ_PATHS.contains(&path)
+        || USER_READ_PREFIXES.iter().any(|p| {
+            // `/x/` prefixes match by starts_with; a bare `/x` entry matches
+            // `/x` and `/x/...` only (a directory, not a stem).
+            if p.ends_with('/') {
+                path.starts_with(p)
+            } else {
+                path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/'))
+            }
+        })
+        || crate::addon_proxy::is_mounted_get_route(path)
 }
 
 /// Metric READS: Operator and Admin only. The metrics describe the whole
@@ -3001,6 +3128,26 @@ pub async fn require_any_auth(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
+    // Cluster token v2: a fleet-secret HMAC bound to THIS request (method,
+    // path+query, body hash) with a single-use nonce. Verified here, before
+    // any other credential class, because the token is never a JWT or a key.
+    // What the doors below see is a freshly minted v1-shaped token for the
+    // verified actor, so the fleet door is one code path for both forms;
+    // `from_v2` records which form really arrived (v1 is counted, and refused
+    // once `NOO_CLUSTER_TOKEN_V1=0`). A malformed or failing v2 token is a 401.
+    let mut from_v2 = false;
+    let t = if crate::cluster_token_v2::is_v2(&t) {
+        match admit_cluster_token_v2(&state, &mut request, &t).await {
+            Ok(v1_shaped) => {
+                from_v2 = true;
+                v1_shaped
+            }
+            Err(status) => return Err(status),
+        }
+    } else {
+        t
+    };
+
     let secret = jwt_secret();
     // Fail CLOSED on the insecure default: if `NOO_JWT_SECRET` is unset (or
     // still the well-known "dev-secret-change-in-production" placeholder),
@@ -3010,6 +3157,15 @@ pub async fn require_any_auth(
     // authenticated infra, but the forgeable-token door is shut.
     if !jwt_secret_is_insecure(&secret) {
         if let Ok(claims) = verify_token(&t, &secret) {
+            // The per-account not-before floor: a still-valid access token of
+            // an account that was since disabled, demoted, re-passworded or
+            // logged out is refused HERE, on every bearer path — including the
+            // `/ws/*` handshake, so a socket closed with 4401 cannot simply
+            // reconnect with the same JWT. See `session_floor`.
+            if crate::session_floor::refuses(&state, &claims.sub, &t).await {
+                tracing::info!(target: "security", sub = %claims.sub, "token refused: issued before the account's session floor");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
             // Peer tokens (scopes=["peer"], sub="peer:{id}") are confined to the
             // peer surface (/ws/agent + /api/agents/peer/*). Without this a peer
             // token is effectively a full-access token: it would receive
@@ -3169,6 +3325,18 @@ pub async fn require_any_auth(
     if verify_cluster_token(&t) {
         let actor = cluster_token_subject(&t).unwrap_or_default();
         let peer = crate::legacy_lanes::PeerFacts::of(&request);
+        // Which wire form arrived. v2 is the comparator; v1 is the legacy
+        // lane, counted by caller, and refused once the gate is closed.
+        if from_v2 {
+            crate::legacy_lanes::observe(&state.metrics, &[crate::legacy_lanes::hmac_v2_use(&actor)], &peer).await;
+        } else {
+            let u = crate::legacy_lanes::hmac_v1_use(&actor, &path);
+            crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            if !crate::cluster_token_v2::v1_allowed() {
+                tracing::warn!(actor = %actor, path = %path, "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2");
+                return Ok(v1_refusal());
+            }
+        }
         // The fleet door refuses an add-on's actor too: the
         // same decision as the controller door's, and one door guarded would
         // leave the other open while reading as done.
@@ -3350,6 +3518,81 @@ pub async fn require_any_auth(
         return Ok(next.run(request).await);
     }
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// The answer to a v1 cluster token once `NOO_CLUSTER_TOKEN_V1=0`: a 401 whose
+/// body names the cause and the fix, so a node that missed its upgrade says
+/// why in its own log instead of looking like a bad secret.
+fn v1_refusal() -> Response {
+    use axum::response::IntoResponse;
+    let body = axum::Json(serde_json::json!({
+        "error": "v1 cluster tokens are refused (NOO_CLUSTER_TOKEN_V1=0): this node signs the old, replayable form",
+        "code": "cluster_token_v1_refused",
+        "fix": "upgrade the node agents (`noo upgrade --nodes`) so they sign v2, or set NOO_CLUSTER_TOKEN_V1=1 on the controller while the fleet rolls",
+    }));
+    (StatusCode::UNAUTHORIZED, body).into_response()
+}
+
+/// Verify a v2 cluster token against the request it arrived on and spend its
+/// nonce. On success returns a v1-shaped token for the verified actor (see
+/// the call site); every failure is a 401 and says nothing about which check
+/// failed. Fleet secret only: the controller secret admits nothing, so a v2
+/// token under it is simply invalid.
+///
+/// Buffers the body (bounded) to hash it and puts it back for the handler.
+async fn admit_cluster_token_v2(
+    state: &Arc<AppState>,
+    request: &mut Request,
+    presented: &str,
+) -> Result<String, StatusCode> {
+    // Header only: a `?token=` bearer cannot be bound to a URI that contains it.
+    let from_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|h| h == presented);
+    let Some(secret) = crate::config::secret_env::secret_opt("NOO_CLUSTER_SECRET") else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if !from_header {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Cheap refusals first (shape, window) so a flood of junk never buffers a body.
+    let Some(parsed) = crate::cluster_token_v2::parse(presented) else { return Err(StatusCode::UNAUTHORIZED) };
+    if now.abs_diff(parsed.ts) > crate::cluster_token_v2::WINDOW_SECS {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let req = std::mem::replace(request, Request::new(axum::body::Body::empty()));
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, crate::cluster_token_v2::MAX_SIGNED_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            *request = Request::from_parts(parts, axum::body::Body::empty());
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    };
+    let uri = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| parts.uri.path().to_string());
+    let verdict = crate::cluster_token_v2::verify_and_spend(
+        state.redis.as_ref(),
+        &secret,
+        presented,
+        parts.method.as_str(),
+        &uri,
+        &bytes,
+        now,
+    )
+    .await;
+    *request = Request::from_parts(parts, axum::body::Body::from(bytes));
+    let Some(actor) = verdict else {
+        tracing::warn!(path = %request.uri().path(), "cluster token v2 refused: bad signature, wrong request, or nonce already used (replay)");
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    crate::routes::cluster::mint_cluster_token(&actor, &secret, now).ok_or(StatusCode::UNAUTHORIZED)
 }
 
 /// Build a 429 for a consumer that has exceeded its per-minute quota.
@@ -3778,9 +4021,9 @@ mod tests {
     #[test]
     fn the_grafana_session_ttl_is_clamped() {
         use super::grafana_session_ttl_secs as f;
-        assert_eq!(f(None), 15 * 60);
-        assert_eq!(f(Some("junk")), 15 * 60);
-        assert_eq!(f(Some("5")), 5 * 60);
+        assert_eq!(f(None), 5 * 60);
+        assert_eq!(f(Some("junk")), 5 * 60);
+        assert_eq!(f(Some("15")), 15 * 60);
         assert_eq!(f(Some("0")), 60);
         assert_eq!(f(Some("600")), super::GRAFANA_SESSION_MAX_MINUTES * 60);
     }
@@ -4346,7 +4589,9 @@ mod tests {
         }
         let addon = claims_with(&["metrics", "temporal", "heartbeat"]);
         assert!(!scope_allows(&addon, &Method::GET, "/api/logs/query"), "no add-on scope reads logs");
-        assert!(scope_allows(&user, &Method::GET, "/api/logsomething"), "the prefix is a directory, not a stem");
+        // The logs gate is a directory prefix, not a stem. (A User tier no longer
+        // reads /api/logsomething for another reason: its GETs are an allow-list.)
+        assert!(!"/api/logsomething".starts_with(LOGS_READ_PREFIX), "the prefix is a directory, not a stem");
     }
 
     /// on the Grafana data-source routes `X-Grafana-User` is
@@ -5835,5 +6080,202 @@ mod old_cli_refusal_tests {
         assert!(out.contains("controller_shared_secret_refused") && out.contains("cli_shared_secret_refused")
             && out.contains("addon_shared_secret_refused"), "{out}");
         assert!(!out.contains("cluster_hmac_non_inference") && !out.contains("self_call_shared_secret"), "{out}");
+    }
+}
+
+/// The tier gate's GET default for a `User` is an allow-list (`USER_READ_PATHS`
+/// / `USER_READ_PREFIXES`), not "every GET". These tests pin both halves: the
+/// console still renders for a User, and the installation-wide reads that used
+/// to pass (audit views, violations, PKI, config, fleet desired-config) do not.
+#[cfg(test)]
+mod user_read_allowlist_tests {
+    use super::*;
+    use axum::http::Method;
+
+    fn tier(role: &str, scopes: &[&str]) -> Claims {
+        Claims {
+            sub: "alice".into(),
+            exp: 4102444800,
+            role: role.into(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            harness: None,
+            conv: None,
+            act: None,
+            cnf: None,
+        }
+    }
+
+    /// Every GET `ui/apps/web` makes for a signed-in person (typed client +
+    /// `apiGet` + raw fetches), minus the admin-only panes' sources (below).
+    /// If a console pane for a plain account stops rendering, a path is
+    /// missing from `USER_READ_PATHS` / `USER_READ_PREFIXES`.
+    const CONSOLE_GETS_FOR_A_USER: &[&str] = &[
+        "/health",
+        "/auth/me",
+        "/v1/models",
+        "/api/version",
+        "/api/events/stream",
+        "/api/cluster/status",
+        "/api/cluster/nodes",
+        "/api/cluster/backends",
+        "/api/cluster/gpu-metrics",
+        "/api/scheduler/status",
+        "/api/models/cached",
+        "/api/jobs",
+        "/api/jobs/history",
+        "/api/jobs/0f9c1d2e-0000-4000-8000-000000000001",
+        "/api/heartbeat/status",
+        "/api/heartbeat/tasks",
+        "/api/heartbeat/tasks/t1/artifacts",
+        "/api/autonomy/status",
+        "/api/autonomy/decisions",
+        "/api/alerts/clients",
+        "/api/approval/stats",
+        "/api/channels/status",
+        "/api/coordinator/context",
+        "/api/conversations",
+        "/api/conversations/with-preview",
+        "/api/conversations/c1",
+        "/api/conversations/stats/overview",
+        "/api/conversations/stats/tools",
+        "/api/memory/health",
+        "/api/memory/status",
+        "/api/memory/storage-stats",
+        "/api/memory/embed/status",
+        "/api/memory/search",
+        "/api/v1/rag/status",
+        "/api/v1/docs",
+        "/api/v1/docs/d1",
+        "/api/v1/graph/overview",
+        "/api/v1/graph/stats",
+        "/api/v1/graph/prune/staged",
+        "/api/v1/graph/entities",
+        "/api/v1/recall/status",
+        "/api/v1/walks",
+        "/api/v1/walks/settings",
+        "/api/v1/ops",
+        "/api/v1/ops/op1",
+        "/api/v1/settings/user-dirs",
+        "/api/docs/openapi",
+        "/api/docs/runbooks",
+        "/api/docs/runbooks/upgrade",
+        "/api/addons/trellion/console-piece",
+        "/api/usage/summary",
+        "/api/usage/me",
+        "/api/agents/messages",
+        "/api/security/service-keys/self",
+        "/ws/coordinator",
+        "/upload/f1",
+    ];
+
+    /// Reads that describe the installation, not the person. Closed to a
+    /// `User`; open to Operator and Admin.
+    const OPERATOR_ONLY_GETS: &[&str] = &[
+        "/api/security/audit-history",
+        "/api/security/audit/stats",
+        "/api/security/audit/verify",
+        "/api/security/violations",
+        "/api/security/pki/status",
+        "/api/security/posture",
+        "/api/security/users",
+        "/api/security/service-keys",
+        "/api/config",
+        "/api/config/search",
+        "/api/settings",
+        "/api/settings/export",
+        "/api/settings/flags",
+        "/api/v1/settings",
+        "/api/v1/settings/export",
+        "/api/v1/settings/browse",
+        "/api/v1/settings/restart-status",
+        "/api/cluster/nodes/host3/desired-config",
+        "/api/cluster/maintenance",
+        "/api/cluster/model-classes",
+        "/api/cluster/self-node",
+        "/api/cluster/proposals/p1",
+        "/api/cluster/provision-bundle/host3/status",
+        "/api/db/migrations",
+        "/api/snapshots",
+        "/api/kb/rules",
+        "/api/kb/grants",
+        "/api/agents/trust",
+        "/api/agents/keys/review",
+        "/api/channels/telegram/messages",
+        "/api/users",
+        "/api/mesh/status",
+        "/api/tools/registry/raw",
+        "/api/exec-approval/status",
+        "/api/v1/admin/walks",
+        "/api/an/invented/route/next/year",
+    ];
+
+    #[test]
+    fn the_console_still_renders_for_a_user() {
+        let user = tier("user", &["read"]);
+        for p in CONSOLE_GETS_FOR_A_USER {
+            assert!(scope_allows(&user, &Method::GET, p), "User must still GET {p}");
+        }
+    }
+
+    #[test]
+    fn a_user_cannot_read_installation_wide_data() {
+        let user = tier("user", &["read"]);
+        for p in OPERATOR_ONLY_GETS {
+            assert!(!scope_allows(&user, &Method::GET, p), "User must NOT GET {p}");
+            assert!(!scope_allows(&user, &Method::HEAD, p), "User must NOT HEAD {p}");
+        }
+    }
+
+    #[test]
+    fn operators_and_admins_read_all_of_it() {
+        let op = tier("operator", &["read", "write"]);
+        let admin = tier("admin", &["read", "write", "admin"]);
+        for p in OPERATOR_ONLY_GETS.iter().chain(CONSOLE_GETS_FOR_A_USER) {
+            assert!(scope_allows(&op, &Method::GET, p), "operator GET {p}");
+            assert!(scope_allows(&admin, &Method::GET, p), "admin GET {p}");
+        }
+    }
+
+    /// A route added next year is closed to a User until it is listed.
+    #[test]
+    fn an_unlisted_route_is_closed_to_a_user_by_default() {
+        let user = tier("user", &["read"]);
+        assert!(!user_may_read("/api/brand/new/route"));
+        assert!(!scope_allows(&user, &Method::GET, "/api/brand/new/route"));
+        // prefixes are directories, not stems
+        assert!(!user_may_read("/api/conversationsx"));
+        assert!(!user_may_read("/wsdl"));
+    }
+
+    /// The writes a User had before are untouched by the GET change.
+    #[test]
+    fn user_writes_are_unchanged() {
+        let user = tier("user", &["read"]);
+        assert!(scope_allows(&user, &Method::POST, "/api/inference"));
+        assert!(!scope_allows(&user, &Method::PUT, "/api/config/search"));
+    }
+
+    /// The allow-list entries all resolve: no entry names a prefix or path
+    /// that is not a clean absolute path (typo guard).
+    #[test]
+    fn allow_list_entries_are_absolute_paths() {
+        for p in USER_READ_PATHS.iter().chain(USER_READ_PREFIXES) {
+            assert!(p.starts_with('/'), "{p}");
+            assert!(!p.contains("//") && !p.contains(' '), "{p}");
+        }
+    }
+
+    /// The floor is checked on the JWT branch before any role, kiosk, peer or
+    /// harness handling, so it covers every bearer path and the `/ws/*`
+    /// handshake (which passes the same middleware).
+    #[test]
+    fn the_session_floor_is_checked_right_after_the_token_verifies() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let verify = body.find("if let Ok(claims) = verify_token(&t, &secret) {").expect("jwt branch");
+        let floor = body.find("crate::session_floor::refuses(&state, &claims.sub, &t)").expect("floor check");
+        let first_branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
+        assert!(verify < floor && floor < first_branch, "floor must precede every other use of the claims");
+        assert!(body[floor..first_branch].contains("StatusCode::UNAUTHORIZED"));
     }
 }

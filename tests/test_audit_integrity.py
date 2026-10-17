@@ -56,6 +56,9 @@ class _Result:
     def scalar_one(self):
         return self._value
 
+    def first(self):
+        return self._value
+
 
 class _RecordingEngine:
     """Stands in for a sync SQLAlchemy engine: records every statement.
@@ -283,3 +286,223 @@ if __name__ == "__main__":
     print("cross-lang vector (empty request_id):",
           audit_row_hash("auth_failure", "warning", "alice", "gateway", "bad_password", ""))
     print("all Python audit-integrity tests passed")
+
+
+# ---------------------------------------------------------------------------
+# The hash chain: shared vectors, the writer's link, the lock, retention.
+# ---------------------------------------------------------------------------
+
+def test_chain_vectors_match_the_rust_verifier():
+    # gateway-rust/src/audit_chain.rs::chain_hash_matches_the_shared_vectors
+    # asserts the SAME hex for the SAME inputs.
+    import json
+    import pathlib
+
+    from noomesh.gateway.audit_log import chain_hash
+
+    doc = json.loads((pathlib.Path(__file__).resolve().parent / "fixtures" / "audit_chain_vectors.json").read_text())
+    assert len(doc["cases"]) >= 3
+    for c in doc["cases"]:
+        assert chain_hash(key=doc["key"].encode(), seq=c["seq"], prev=c["prev"],
+                          entry_hash=c["entry_hash"]) == c["chain_hash"], c
+
+
+class _ChainEngine(_RecordingEngine):
+    """A recording engine whose chain tail is `tail` ((seq, hash, ts) or None)."""
+
+    def __init__(self, tail):
+        super().__init__()
+        self.tail = tail
+
+    def connect(self):
+        engine = self
+        inner = super().connect()
+
+        class _Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, stmt, params=None):
+                if "chain_seq, chain_hash, timestamp" in str(stmt):
+                    engine.executed.append((str(stmt), params))
+                    return _Result(engine.tail)
+                return inner.execute(stmt, params)
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                engine.rolled_back = True
+
+        return _Conn()
+
+
+def _log(engine, monkeypatch, ts=None):
+    from noomesh.gateway import audit_log
+
+    monkeypatch.setenv("NOO_AUDIT_HMAC_KEY", "test-audit-key-123")
+    kw = {} if ts is None else {"timestamp": ts}
+    audit_log.AuditLogger(db_engine=engine).log(
+        audit_log.AuditEvent(event_type="exec_denied", actor="alice", outcome="denied", **kw))
+
+
+def test_a_row_is_linked_after_the_newest_chained_row(monkeypatch):
+    from datetime import datetime, timezone
+
+    from noomesh.gateway import audit_log
+
+    tail_ts = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    engine = _ChainEngine((41, "ab" * 32, tail_ts))
+    _log(engine, monkeypatch, ts=tail_ts.timestamp() + 5)
+    [p] = engine.inserts
+    assert p["seq"] == 42
+    assert p["ch"] == audit_log.chain_hash(key=b"test-audit-key-123", seq=42, prev="ab" * 32, entry_hash=p["eh"])
+    # The lock is taken before the tail is read, in the same connection.
+    sqls = [s for s, _ in engine.executed]
+    lock = next(i for i, s in enumerate(sqls) if "pg_advisory_xact_lock" in s)
+    tail = next(i for i, s in enumerate(sqls) if "chain_seq, chain_hash, timestamp" in s)
+    ins = next(i for i, s in enumerate(sqls) if s.lstrip().upper().startswith("INSERT"))
+    assert lock < tail < ins
+    assert engine.executed[lock][1] == {"k": audit_log.CHAIN_LOCK_KEY}
+
+
+def test_a_row_is_never_timed_before_its_predecessor(monkeypatch):
+    from datetime import datetime, timezone
+
+    from noomesh.gateway import audit_log
+
+    tail_ts = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+    engine = _ChainEngine((7, "cd" * 32, tail_ts))
+    _log(engine, monkeypatch, ts=tail_ts.timestamp() - 3600)  # the event is older than the tail
+    [p] = engine.inserts
+    assert p["ts"] == tail_ts
+    assert p["eh"] == audit_log.audit_row_hash_v2(
+        id=p["id"], timestamp_us=audit_log.stored_micros(p["ts"]), event_type="exec_denied",
+        severity="info", actor="alice", resource="", outcome="denied", request_id=p["rid"],
+        details=p["details"], prev_hash=None)
+
+
+def test_before_the_chain_starts_the_row_is_written_unchained(monkeypatch):
+    engine = _ChainEngine(None)
+    _log(engine, monkeypatch)
+    [p] = engine.inserts
+    assert p["seq"] is None and p["ch"] is None
+
+
+def test_a_database_without_the_chain_columns_still_records_the_row(monkeypatch):
+    """A worker that starts before the gateway has run migration 092 must not
+    lose the audit row."""
+    from noomesh.gateway import audit_log
+
+    class _Old(_RecordingEngine):
+        def connect(self):
+            engine = self
+            inner = super().connect()
+
+            class _Conn:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def execute(self, stmt, params=None):
+                    if "chain_seq, chain_hash, timestamp" in str(stmt):
+                        raise RuntimeError('column "chain_seq" does not exist')
+                    return inner.execute(stmt, params)
+
+                def commit(self):
+                    pass
+
+                def rollback(self):
+                    pass
+
+            return _Conn()
+
+    engine = _Old()
+    monkeypatch.setenv("NOO_AUDIT_HMAC_KEY", "test-audit-key-123")
+    audit_log.AuditLogger(db_engine=engine).log(
+        audit_log.AuditEvent(event_type="exec_denied", actor="alice", outcome="denied"))
+    [p] = engine.inserts
+    assert "seq" not in p and "ch" not in p
+    assert any("chain_seq" not in s for s, _ in engine.executed if s.lstrip().upper().startswith("INSERT"))
+
+
+def test_retention_checkpoint_names_the_range_and_blocks_the_drop_without_a_key(monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+
+    import pytest
+
+    from noomesh.gateway import audit_archive as aa
+    from noomesh.gateway import audit_log
+
+    ts = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    executed = []
+
+    class _R:
+        def __init__(self, v):
+            self.v = v
+
+        def first(self):
+            return self.v
+
+        def scalar_one(self):
+            return self.v
+
+    class _Conn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, stmt, params=None):
+            sql = str(stmt)
+            executed.append((sql, params))
+            if "min(chain_seq)" in sql:
+                return _R((10, 20))
+            if "WHERE chain_seq = :h" in sql:
+                return _R(("ee" * 32,))
+            if "LIMIT 1" in sql and "event_type = :et" in sql:
+                return _R(None)
+            if "chain_seq, chain_hash, timestamp" in sql:
+                return _R((99, "ff" * 32, ts))
+            if "AS jsonb)::text" in sql:
+                return _R(params["d"])
+            return _R(None)
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class _Eng:
+        def connect(self):
+            return _Conn()
+
+    monkeypatch.setenv("NOO_AUDIT_HMAC_KEY", "test-audit-key-123")
+    assert asyncio.run(aa.record_retention_checkpoint(_Eng(), 2026, 9)) is True
+    [ins] = [p for s, p in executed if s.lstrip().upper().startswith("INSERT")]
+    assert ins["et"] == "audit_retention_checkpoint"
+    assert ins["resource"] == "audit-retention:from:10;through:20;chain:" + "ee" * 32
+    assert ins["seq"] == 100 and ins["ch"]
+    assert ins["ch"] == audit_log.chain_hash(key=b"test-audit-key-123", seq=100, prev="ff" * 32, entry_hash=ins["eh"])
+
+    # No key: it raises, so drop_partition never reaches the drop.
+    for v in ("NOO_AUDIT_HMAC_KEY", "NOO_AUDIT_HMAC_KEY_FILE", "NOO_SECRET_NOO_AUDIT_HMAC_KEY"):
+        monkeypatch.delenv(v, raising=False)
+    dropped = []
+
+    class _DropEng(_Eng):
+        def begin(self):
+            dropped.append(1)
+            raise AssertionError("must not reach the drop")
+
+    with pytest.raises(audit_log.AuditKeyMissing):
+        asyncio.run(aa.drop_partition(_DropEng(), 2026, 9))
+    assert dropped == []

@@ -45,30 +45,51 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 1
 fi
 
-# TLS: verified by default. NOO_BOOTSTRAP_INSECURE=1 disables verification —
-# understand that a man-in-the-middle could then substitute THEIR SSH key
-# and sudoers content. Prefer installing the cluster CA, or reach the
-# controller over its tailnet name (public ts.net certificate).
+# TLS: verified by default. NOO_BOOTSTRAP_INSECURE=1 is for a node that does
+# not yet trust the cluster CA (the controller's certificate chains to it).
+# The ONLY unverified request this script ever makes is the fetch of the CA
+# certificate itself (a public document); its DER sha256 is then checked
+# against the pin in the paste (NOO_CA_SHA256) and every later request —
+# the token POST, the prep script that runs as root — is verified against
+# THAT CA with --cacert. Nothing that carries the token or runs as root is
+# ever fetched with -k (tests/test_prep_tofu_is_pinned.py enforces it).
 CURL_OPTS="-fsS"
+BOOT_CA=""
 if [ "${NOO_BOOTSTRAP_INSECURE:-0}" = "1" ]; then
     # The fingerprint is REQUIRED here, not merely preferred (§3f R25).
     # Without it an unverified first contact is blind trust-on-first-use:
     # whoever answers becomes this node's certificate authority, and the
-    # sudoers content and tooling that follow come from them. "WARNING" is
+    # prep script and tooling that follow come from them. "WARNING" is
     # not a control; refusing is.
     if [ -z "${NOO_CA_SHA256:-}" ]; then
         echo "ERROR: NOO_BOOTSTRAP_INSECURE=1 without NOO_CA_SHA256." >&2
         echo "       There would be nothing to verify the cluster CA against, so a" >&2
-        echo "       man-in-the-middle could substitute their own anchor, SSH key and" >&2
-        echo "       sudoers content. Re-mint the enrollment paste on the controller" >&2
+        echo "       man-in-the-middle could substitute their own anchor and the" >&2
+        echo "       root prep script. Re-mint the enrollment paste on the controller" >&2
         echo "       (noo cluster provision <node>) — it always carries the pin." >&2
         exit 1
     fi
-    # Finding #80: the paste pins the CA fingerprint, so this window is
-    # no longer blind — a substituted CA hard-fails at anchor install.
-    echo "note: transport TLS unverified at first contact (expected) — the CA" >&2
-    echo "      anchor is VERIFIED against the token's fingerprint pin." >&2
-    CURL_OPTS="-fsSk"
+    if ! command -v openssl >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+        echo "ERROR: NOO_BOOTSTRAP_INSECURE=1 needs openssl and sha256sum to check the CA pin." >&2
+        exit 1
+    fi
+    BOOT_CA="$(mktemp)"
+    # shellcheck disable=SC2064 # expand now: the path is fixed
+    trap "rm -f '$BOOT_CA'" EXIT
+    if ! curl -fsSk "$NOO_URL/bootstrap/ca.crt" -o "$BOOT_CA" || ! grep -q "BEGIN CERTIFICATE" "$BOOT_CA"; then
+        echo "ERROR: could not fetch the cluster CA certificate from $NOO_URL/bootstrap/ca.crt." >&2
+        exit 1
+    fi
+    BOOT_FP="$(openssl x509 -in "$BOOT_CA" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    if [ "$BOOT_FP" != "$NOO_CA_SHA256" ]; then
+        echo "ERROR: cluster CA fingerprint MISMATCH (expected $NOO_CA_SHA256, got ${BOOT_FP:-none}) —" >&2
+        echo "       whatever answered is not this mesh's controller (or the paste is stale)." >&2
+        echo "       Nothing was sent: the token is NOT burned. Not proceeding." >&2
+        exit 1
+    fi
+    echo "note: the cluster CA was fetched before it was trusted and VERIFIED against the" >&2
+    echo "      paste's fingerprint pin; every request after this one is TLS-verified against it." >&2
+    CURL_OPTS="-fsS --cacert $BOOT_CA"
 fi
 
 # ── Foreign-mesh guard (second-controller hardening, 2026-08-19) ────────────

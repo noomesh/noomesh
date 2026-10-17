@@ -259,10 +259,17 @@ impl HarnessRuntime for InProcessRuntime<'_> {
     }
 
     async fn memory_context(&self, prompt: &str, user_id: Option<&str>) -> Option<String> {
+        // A shared room never gets one member's personal memory.
+        if super::in_shared_room() {
+            return None;
+        }
         super::context::fetch_memory_context(&self.state.nats, prompt, user_id).await
     }
 
     async fn cross_channel_context(&self, prompt: &str, channel: &str, user_id: Option<&str>) -> Option<String> {
+        if super::in_shared_room() {
+            return None;
+        }
         super::context::fetch_cross_channel_context(&self.state.nats, prompt, channel, user_id).await
     }
 
@@ -283,6 +290,10 @@ impl HarnessRuntime for InProcessRuntime<'_> {
     }
 
     async fn temporal_context(&self, user_id: Option<&str>, timeout: Duration) -> Option<String> {
+        // Per-user preferences and decisions: personal, so not in a shared room.
+        if super::in_shared_room() {
+            return None;
+        }
         crate::temporal_graph::fetch_temporal_context_timeout(&self.state.db, user_id, timeout).await
     }
 

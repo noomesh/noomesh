@@ -388,6 +388,7 @@ source "$SCRIPT_DIR/lib-secrets.sh"
 load_secrets || { echo "aborting: secrets load failed" >&2; exit 1; }
 require_core_secrets || exit 1
 require_bus_keys || exit 1
+require_audit_key || exit 1
 # NATS runs ONE config (monitoring/nats/nats-tls.conf, mTLS). The selector
 # that could pick a plaintext `nats.conf` is gone from compose, so a .env
 # that still sets NOO_NATS_CONFIG would be silently ignored — and a value

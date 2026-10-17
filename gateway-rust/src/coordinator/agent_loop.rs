@@ -1494,6 +1494,12 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
             }
             Err(e) => {
                 tracing::error!(error = %e, backend = %backend.url, attempt, "LLM connection failed");
+                if e.is_timeout() {
+                    // A timeout is a stall: demote this node for the next
+                    // unpinned turns too (`classes::STALL_DEMOTION`), the
+                    // same memory the raw chat failover writes.
+                    super::classes::note_stall(&backend.url, &backend.backend_type);
+                }
                 e.to_string()
             }
         };
@@ -1737,6 +1743,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
 
     // 2. Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, "dashboard").await;
+    super::context::strip_data_frames(&mut session.messages);
     let mut persona_prompt = rt.persona_prompt().await;
     persona_prompt.push_str(&rt.cluster_awareness().await);
     persona_prompt.push_str(&super::context::clock_context());
@@ -1860,13 +1867,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         extra_context.push_str(tagged);
     };
 
-    if let Some(ref c) = temporal_ctx { push_layer("", c); }
+    // Only the gateway's own text goes in the system message. Everything
+    // FETCHED (temporal facts, knowledge base, memory, other channels, video
+    // recall) is third-party-authored and travels as a delimited data block
+    // in the user's message instead - see `context::build_data_frame`.
     if let Some(ref c) = abc_ctx { push_layer("", c); }
     if let Some(ref c) = runbook_ctx { push_layer("", c); }
-    if let Some(ref c) = rag_ctx { push_layer("[Knowledge Base Context]", c); }
-    if let Some(ref c) = mem_ctx { push_layer("[Memory Context]", c); }
-    if let Some(ref c) = channel_ctx { push_layer("[Channel Context]", c); }
-    if let Some(ref c) = video_ctx { push_layer("", c); }
     if let Some(ref c) = skills_ctx { push_layer("", c); }
     if let Some(ref c) = companion_ctx { push_layer("", c); }
 
@@ -1883,6 +1889,20 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 *first = json!({"role": "system", "content": format!("{}{}", existing, deduped)});
             }
         }
+    }
+
+    let data_frame = attach_retrieved_data(
+        &mut session.messages,
+        &[
+            ("Known facts about the user", temporal_ctx.as_deref()),
+            ("Knowledge base", rag_ctx.as_deref()),
+            ("Memory", mem_ctx.as_deref()),
+            ("Other channels", channel_ctx.as_deref()),
+            ("Video recall", video_ctx.as_deref()),
+        ],
+    );
+    if let Some(f) = data_frame.as_deref() {
+        record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
 
     tracing::info!(
@@ -2684,6 +2704,11 @@ async fn dispatch_or_run_inner(
     role_prompt: Option<&str>,
     enable_thinking: bool,
 ) -> Result<CoordinatorResult> {
+    // A shared-room turn runs here: a node harness would build its context
+    // without the room flag.
+    if super::in_shared_room() {
+        return run_inner(&InProcessRuntime::new(state), prompt, conversation_id, channel, max_iterations, model, user_id, role_prompt, enable_thinking).await;
+    }
     if let Some(result) = super::dispatch::try_dispatch(
         state, &crate::websocket::NullSink, false, prompt, conversation_id, channel, max_iterations, model, user_id, role_prompt, enable_thinking,
     )
@@ -2816,6 +2841,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
 
     // Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, channel).await;
+    super::context::strip_data_frames(&mut session.messages);
     // A role REPLACES the persona rather than appending to it: the Python
     // implementation built a fresh agent per role whose system prompt was the
     // role spec alone, so appending would blend two personas and change the
@@ -2927,13 +2953,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
         }
         extra_context.push_str(tagged);
     };
-    if let Some(ref c) = temporal_ctx { push_layer("", c); }
+    // Only the gateway's own text goes in the system message. Everything
+    // FETCHED (temporal facts, knowledge base, memory, other channels, video
+    // recall) is third-party-authored and travels as a delimited data block
+    // in the user's message instead - see `context::build_data_frame`.
     if let Some(ref c) = abc_ctx { push_layer("", c); }
     if let Some(ref c) = runbook_ctx { push_layer("", c); }
-    if let Some(ref c) = rag_ctx { push_layer("[Knowledge Base Context]", c); }
-    if let Some(ref c) = mem_ctx { push_layer("[Memory Context]", c); }
-    if let Some(ref c) = channel_ctx { push_layer("[Channel Context]", c); }
-    if let Some(ref c) = video_ctx { push_layer("", c); }
     if let Some(ref c) = skills_ctx { push_layer("", c); }
     if let Some(ref c) = companion_ctx { push_layer("", c); }
 
@@ -2948,6 +2973,20 @@ async fn run_inner_bound<R: HarnessRuntime>(
                 *first = json!({"role": "system", "content": format!("{}{}", existing, deduped)});
             }
         }
+    }
+
+    let data_frame = attach_retrieved_data(
+        &mut session.messages,
+        &[
+            ("Known facts about the user", temporal_ctx.as_deref()),
+            ("Knowledge base", rag_ctx.as_deref()),
+            ("Memory", mem_ctx.as_deref()),
+            ("Other channels", channel_ctx.as_deref()),
+            ("Video recall", video_ctx.as_deref()),
+        ],
+    );
+    if let Some(f) = data_frame.as_deref() {
+        record_layer_chars(rt.metrics(), "retrieved_data_frame", f).await;
     }
 
     tracing::info!(

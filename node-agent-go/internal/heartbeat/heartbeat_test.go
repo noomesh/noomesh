@@ -816,3 +816,28 @@ func TestReporter_HeartbeatCarriesModelPresence(t *testing.T) {
 		t.Fatalf("model_presence.ollama = %#v", payload["model_presence"])
 	}
 }
+
+// The shared-GPU yield's report rides every beat as `gpu_contention`, so a
+// yielded node stays online and says why its GPU backend is gone.
+func TestReporter_HeartbeatCarriesGPUContention(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&payload)
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	rpt := newTestReporter(t, server.URL, nil)
+	rpt.SendHeartbeat()
+	if _, has := payload["gpu_contention"]; has {
+		t.Fatal("no yield wired: gpu_contention must be omitted, not faked")
+	}
+	rpt.SetGPUContention(func() any {
+		return map[string]any{"state": "yielded", "foreign_mb": 11468, "method": "memory-accounting", "paused_backends": []string{"vllm"}}
+	})
+	rpt.SendHeartbeat()
+	gc, ok := payload["gpu_contention"].(map[string]any)
+	if !ok || gc["state"] != "yielded" || gc["method"] != "memory-accounting" {
+		t.Fatalf("gpu_contention missing or wrong: %#v", payload["gpu_contention"])
+	}
+}

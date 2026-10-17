@@ -396,3 +396,26 @@ require_bus_keys() {
     fi
     return 0
 }
+
+# require_audit_key — refuse a start whose store lacks NOO_AUDIT_HMAC_KEY.
+# The gateway refuses to boot without it (every security audit row would be
+# refused), so catching it here replaces a crash-looping container with one
+# explained line. `noo stack start|restart|rebuild` mints it into the
+# encrypted store BEFORE this runs; what reaches here is an install with no
+# encrypted store (plaintext .env, or a half-install). Call AFTER load_secrets.
+require_audit_key() {
+    local val
+    val="$(printenv NOO_AUDIT_HMAC_KEY 2>/dev/null || true)"
+    if [ -z "$val" ] && [ -f .env ]; then
+        val="$(grep -E "^[[:space:]]*NOO_AUDIT_HMAC_KEY=" .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
+    fi
+    if [ -z "$val" ]; then
+        echo "FATAL: NOO_AUDIT_HMAC_KEY is not set." >&2
+        echo "       The gateway signs every security audit row with it and refuses to start without it" >&2
+        echo "       (logins, exec denials, posture changes and erases would go unrecorded)." >&2
+        echo "       Fix:  noo upgrade --stack   (mints it into the encrypted store, then starts)" >&2
+        echo "        or:  noo onboard --reconfigure --only secrets --secrets-backend sops" >&2
+        return 1
+    fi
+    return 0
+}
