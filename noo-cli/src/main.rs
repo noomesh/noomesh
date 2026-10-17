@@ -264,6 +264,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "logs"], commands::cluster_logs),
     (&["cluster", "restart-agent"], commands::cluster_restart_agent),
     (&["cluster", "maintenance"], commands::cluster_maintenance),
+    (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
+    (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
     (&["cluster", "up"], commands::cluster_up),
     // Batch 3: HTTP/local control + SSH provisioning-adjacent commands.
     (&["cluster", "init-secret"], commands::cluster_init_secret),

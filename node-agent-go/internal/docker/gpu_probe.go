@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 )
 
@@ -46,31 +47,7 @@ func (c *Client) GPUContainers(ctx context.Context) ([]GPUContainer, error) {
 		if hc == nil {
 			continue
 		}
-		// Explicit device reservation is a request. The nvidia RUNTIME alone
-		// is not: on a host whose daemon defaults to it, EVERY container
-		// carries Runtime=="nvidia" (found live on host8 — the buildx
-		// builder showed up and would have been restarted-then-faulted).
-		// The runtime's own activation contract is the NVIDIA_VISIBLE_DEVICES
-		// env: without it the runtime injects nothing, so a container that
-		// hasn't set it has not asked for a GPU.
-		wantsGPU := false
-		for _, dr := range hc.Resources.DeviceRequests {
-			for _, caps := range dr.Capabilities {
-				for _, cap := range caps {
-					if cap == "gpu" {
-						wantsGPU = true
-					}
-				}
-			}
-		}
-		if !wantsGPU && hc.Runtime == "nvidia" && res.Container.Config != nil {
-			for _, env := range res.Container.Config.Env {
-				if v, ok := strings.CutPrefix(env, "NVIDIA_VISIBLE_DEVICES="); ok && v != "" && v != "void" && v != "none" {
-					wantsGPU = true
-					break
-				}
-			}
-		}
+		wantsGPU := requestsGPU(res.Container.HostConfig, res.Container.Config)
 		if !wantsGPU {
 			continue
 		}
@@ -85,6 +62,36 @@ func (c *Client) GPUContainers(ctx context.Context) ([]GPUContainer, error) {
 		})
 	}
 	return out, nil
+}
+
+// requestsGPU reports whether a container's config asks for GPU access.
+func requestsGPU(hc *container.HostConfig, cfg *container.Config) bool {
+	// Explicit device reservation is a request. The nvidia RUNTIME alone
+	// is not: on a host whose daemon defaults to it, EVERY container
+	// carries Runtime=="nvidia" (found live on host8 — the buildx
+	// builder showed up and would have been restarted-then-faulted).
+	// The runtime's own activation contract is the NVIDIA_VISIBLE_DEVICES
+	// env: without it the runtime injects nothing, so a container that
+	// hasn't set it has not asked for a GPU.
+	wantsGPU := false
+	for _, dr := range hc.Resources.DeviceRequests {
+		for _, caps := range dr.Capabilities {
+			for _, cap := range caps {
+				if cap == "gpu" {
+					wantsGPU = true
+				}
+			}
+		}
+	}
+	if !wantsGPU && hc.Runtime == "nvidia" && cfg != nil {
+		for _, env := range cfg.Env {
+			if v, ok := strings.CutPrefix(env, "NVIDIA_VISIBLE_DEVICES="); ok && v != "" && v != "void" && v != "none" {
+				wantsGPU = true
+				break
+			}
+		}
+	}
+	return wantsGPU
 }
 
 // ExecProbe runs cmd inside a container and returns its exit code. It is a
@@ -125,5 +132,69 @@ func (c *Client) ExecProbe(ctx context.Context, containerID string, cmd []string
 // RestartContainer restarts a container by ID with the default stop timeout.
 func (c *Client) RestartContainer(ctx context.Context, containerID string) error {
 	_, err := c.docker.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{})
+	return err
+}
+
+// GPUBackend is one of this agent's backend containers that requests a GPU,
+// running OR stopped — the shared-GPU yield (internal/gpuyield) pauses and
+// resumes these and must still see them while they are stopped.
+type GPUBackend struct {
+	Backend string // "vllm", "llamacpp", ... (the noo-<backend> key)
+	ID      string // full container id (cgroup attribution matches on it)
+	Name    string
+	Running bool
+}
+
+// GPUBackendContainers lists the agent's own backend containers that request
+// a GPU, stopped ones included. Only containers the agent manages (the
+// `noo-<backend>` name convention backendKeyFromName enforces) are returned:
+// anything else on the host is foreign and is never touched.
+func (c *Client) GPUBackendContainers(ctx context.Context) ([]GPUBackend, error) {
+	if c == nil || c.docker == nil {
+		return nil, fmt.Errorf("docker unavailable")
+	}
+	containers, err := c.listContainers(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	var out []GPUBackend
+	for _, ctr := range containers {
+		if len(ctr.Names) == 0 {
+			continue
+		}
+		name := strings.TrimPrefix(ctr.Names[0], "/")
+		if !strings.HasPrefix(name, "noo-") || stunnelBackendKey(name) != "" {
+			continue
+		}
+		key := backendKeyFromName(name)
+		if key == "" {
+			continue
+		}
+		res, err := c.docker.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
+		if err != nil || res.Container.HostConfig == nil {
+			continue
+		}
+		if !requestsGPU(res.Container.HostConfig, res.Container.Config) {
+			continue
+		}
+		running := res.Container.State != nil && res.Container.State.Running
+		out = append(out, GPUBackend{Backend: key, ID: ctr.ID, Name: name, Running: running})
+	}
+	return out, nil
+}
+
+// StopContainerGraceful stops (never removes) a container, giving the
+// process timeoutS seconds to exit on SIGTERM. The container keeps its spec,
+// so StartContainer brings back exactly what ran. Restart policy
+// unless-stopped keeps an explicitly stopped container down across a
+// daemon restart.
+func (c *Client) StopContainerGraceful(ctx context.Context, id string, timeoutS int) error {
+	_, err := c.docker.ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: &timeoutS})
+	return err
+}
+
+// StartContainer starts an existing (stopped) container.
+func (c *Client) StartContainer(ctx context.Context, id string) error {
+	_, err := c.docker.ContainerStart(ctx, id, client.ContainerStartOptions{})
 	return err
 }

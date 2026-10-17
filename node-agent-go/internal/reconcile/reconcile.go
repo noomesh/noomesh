@@ -39,6 +39,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
+	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -93,9 +94,11 @@ type desiredConfig struct {
 
 // Reconciler pulls desired config and converges the node toward it.
 type Reconciler struct {
-	cfg    *config.Config
-	docker *dockerpkg.Client
-	client *http.Client
+	nudge     chan struct{}
+	nudgeOnce sync.Once
+	cfg       *config.Config
+	docker    *dockerpkg.Client
+	client    *http.Client
 	// onReclaimPolicy receives desired-config's disk_reclaim on every
 	// successful fetch (nil when the gateway sends none).
 	onReclaimPolicy func(*diskreclaim.Policy)
@@ -241,8 +244,25 @@ func (r *Reconciler) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			r.Once(ctx)
+		case <-r.nudgeCh():
+			r.Once(ctx)
 		}
 	}
+}
+
+// Nudge asks for a reconcile pass now instead of at the next tick (the GPU
+// yield, after resuming, so a placed backend it never started comes up).
+// Non-blocking; nudges coalesce.
+func (r *Reconciler) Nudge() {
+	select {
+	case r.nudgeCh() <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reconciler) nudgeCh() chan struct{} {
+	r.nudgeOnce.Do(func() { r.nudge = make(chan struct{}, 1) })
+	return r.nudge
 }
 
 // Once performs a single reconcile pass. Errors are logged, never fatal —
@@ -266,6 +286,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 		slog.Debug("reconcile.no_desired_state")
 		// Nothing is placed: nothing is held, tuned, or in conflict.
 		modelpresence.Retain(map[string]bool{})
+		gpuyield.PublishPlacements(nil)
 		backendrt.SetOllamaTuning(nil)
 		r.surfaceEnvConflicts(nil)
 		if r.mcp != nil {
@@ -359,6 +380,8 @@ func (r *Reconciler) Once(ctx context.Context) {
 	effective, envWarnings := effectivePlacements(desired.Placements)
 	r.surfaceEnvConflicts(envWarnings)
 	ollamaRows := runningOllama(desired.Placements)
+	// The shared-GPU yield sizes what the GPU backends need from these.
+	gpuyield.PublishPlacements(gpuPlacements(effective))
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop below (which then finds them local).
 	r.prefetchImages(ctx, effective, running, specLabels, native)
@@ -419,6 +442,15 @@ func (r *Reconciler) Once(ctx context.Context) {
 						backendrt.SetOllamaTuning(nil)
 					}
 				}
+				continue
+			}
+			// Paused for other work on the GPU (internal/gpuyield): the
+			// container is stopped ON PURPOSE. Starting it here would fight
+			// the yield every tick; the yield resumes it itself.
+			if gpuHeld(p) {
+				slog.Info("reconcile.backend_paused",
+					"backend", p.Backend, "paused", gpuyield.PauseReason,
+					"detail", "GPU in use by other work; not starting until the GPU frees (or `noo cluster gpu release`)")
 				continue
 			}
 			curModel, isRunning := running[p.Backend]
@@ -594,6 +626,23 @@ func (r *Reconciler) Once(ctx context.Context) {
 		}
 	}
 	modelpresence.Retain(keep)
+}
+
+// gpuHeld: the shared-GPU yield has this backend paused (or is about to),
+// so the reconciler must not start it.
+func gpuHeld(p placement) bool { return gpuyield.HoldsStart(p.Backend) }
+
+// gpuPlacements is what the shared-GPU yield needs to know of the
+// placements: the running ones, and how big they are.
+func gpuPlacements(ps []placement) []gpuyield.Placed {
+	var out []gpuyield.Placed
+	for _, p := range ps {
+		if p.DesiredState != "running" || p.Backend == "harness" {
+			continue
+		}
+		out = append(out, gpuyield.Placed{Backend: p.Backend, Target: p.Target, Env: p.Env, MemoryLimitBytes: p.MemoryLimitBytes})
+	}
+	return out
 }
 
 // ensureOllamaModel makes the ollama container hold the placement's model.

@@ -82,7 +82,13 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut deaf: Vec<(&str, &str)> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut harness_refusals: Vec<(String, String)> = Vec::new();
+    // Nodes whose GPU went to work outside noomesh (yielded or held): online,
+    // by design, and the reason their GPU backend is missing from `running`.
+    let mut gpu_notes: Vec<String> = Vec::new();
     for n in nodes {
+        if let Some(note) = super::cluster_gpu::gpu_status_note(n) {
+            gpu_notes.push(note);
+        }
         let id = n["id"].as_str().unwrap_or("?");
         let status = n["status"].as_str().unwrap_or("?");
         // The node's own report of its NATS connection. `?` means the node
@@ -191,6 +197,12 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!();
         for (id, reason) in &harness_refusals {
             println!("{}", ui::status_line(Glyph::Warn, &format!("{id} harness: {reason}")));
+        }
+    }
+    if !gpu_notes.is_empty() {
+        println!();
+        for note in &gpu_notes {
+            println!("{}", ui::status_line(Glyph::Warn, note));
         }
     }
     // A node can be HTTP-alive and bus-deaf at once; jobs dispatched to it
