@@ -56,7 +56,7 @@ def test_v1_chat_completions_routes_on_the_requested_model() -> None:
     helper = raw[raw.index("pub async fn chat_completions(") :]
     helper = helper[: helper.index("\n}\n")]
     assert re.search(r'model_hint\(body\.get\("model"\)', helper), "the shared path reads the body's model as the hint"
-    assert re.search(r"resolve_candidates\(state,\s*hint\.as_deref\(\)\)", helper), (
+    assert re.search(r"resolve_candidates\(state,\s*hint\.as_deref\(\),", helper), (
         "the shared path must hand its hint to the class resolver unchanged"
     )
     assert "coordinator::resolve_backend(&state)" not in handler

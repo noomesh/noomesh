@@ -547,7 +547,10 @@ services:
       - PAGEINDEX_EMBEDDING_BACKEND=${PAGEINDEX_EMBEDDING_BACKEND:-}
       - PAGEINDEX_EMBEDDING_MODEL=${PAGEINDEX_EMBEDDING_MODEL:-}
       - PAGEINDEX_LLM_URL=${PAGEINDEX_LLM_URL:-https://noo-vllm:8000}
-      - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}}
+      # `default` = the gateway's chat-default class: every live chat node,
+      # ranked per request (2026-10-17). An exact model name here pinned
+      # every caller of it to the nodes serving that one model.
+      - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-default}
       # STT provider (generic layer — gateway-rust/src/stt_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
       # the opt-in `whisper` compose service (https://noo-whisper:8000, mTLS,

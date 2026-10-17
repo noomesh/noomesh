@@ -186,7 +186,27 @@ list of `node/backend[=model]` candidates the gateway fails over across.
 restates a placement); `--degraded` candidates are the only ones allowed to
 answer with a different model, and only once every other candidate has
 failed. With nothing declared, every served model is its own class and
-`chat-default` is the configured default model. The `legacy lanes` row of
+`chat-default` is **dynamic**: every live chat node in the mesh, whatever
+model it serves, ranked per request — healthy before not, a node that
+stalled in the last 5 minutes after one that did not, thermal
+`serious`/`critical` after cooler, a GPU shared with another workload
+after a free one, vLLM then a GPU runtime then CPU, the larger model first,
+then fewest requests in flight and the lowest load. A quarantined or
+thermal-`critical` node is left out unless nothing else is. Nodes come and
+go: a busy, hot or offline node drops out and rejoins on its own. The
+yaml's `cluster.backends.<x>.model` (what onboarding put on the local
+backend) is a placement hint and does not narrow this. Declaring
+`chat-default` replaces the dynamic pool with your list; `class list`
+prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
+`noo cluster verify --controller` has a `default chat` row listing the live
+candidates in order (`!` when only CPU candidates or one node remain, `x`
+when none).
+
+To send one request to one node, name it: a `node` field in the body or an
+`X-Noo-Node` header on `/v1/chat/completions`,
+`/api/external/chat/completions` or `/api/inference`. An unknown node, or
+one serving no chat, is refused with 422; a node that does not serve the
+model you named, with 409. The `legacy lanes` row of
 `noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
 node by name, from the gateway's counters and from each agent's heartbeat)
 still signing the old, replayable cluster token instead of the request-bound

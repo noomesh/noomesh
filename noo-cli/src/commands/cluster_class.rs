@@ -14,7 +14,10 @@
 //! of queueing on the first (they may serve different models — declaring
 //! the pool says they are interchangeable).
 //! With nothing declared the gateway derives one class per
-//! served model — `list` shows those too, marked `derived`.
+//! served model — `list` shows those too, marked `derived`. An undeclared
+//! `chat-default` is `dynamic`: every live chat node, whatever its model,
+//! ranked per request (quality, health, thermal, stalls, load). Declaring
+//! `chat-default` replaces that with the operator's list.
 
 use crate::http::{delete_json, get_json, put_json};
 use crate::output::{fail, ExitCode};
@@ -80,11 +83,7 @@ pub fn cluster_class_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     let mut unplaced: Vec<(String, String, String, String)> = Vec::new();
     for c in classes {
         let name = c["name"].as_str().unwrap_or("?");
-        let source = match (c["declared"].as_bool().unwrap_or(false), c["pool"].as_bool().unwrap_or(false)) {
-            (true, true) => "declared, pool",
-            (true, false) => "declared",
-            _ => "derived",
-        };
+        let source = class_source(c);
         let cands = c["candidates"].as_array().unwrap_or(&empty);
         if cands.is_empty() {
             rows.push(vec![name.into(), source.into(), dash.into(), ui::muted("no candidates"), dash.into(), dash.into()]);
@@ -130,6 +129,7 @@ pub fn cluster_class_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
             &rows,
         )
     );
+    println!("{}", ui::muted(&chat_default_line(classes)));
     let aliases = body["aliases"].as_array().unwrap_or(&empty);
     if !aliases.is_empty() {
         println!("{}", ui::section("aliases"));
@@ -145,6 +145,35 @@ pub fn cluster_class_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
         ui::guide(&[("noo cluster place <node> <backend> <model>", "places the model; or pull it on the node and the heartbeat will list it")]);
     }
     Ok(0)
+}
+
+/// The `source` column: `dynamic (all live chat nodes)` for the undeclared
+/// chat-default, else declared / declared, pool / derived.
+pub(crate) fn class_source(c: &serde_json::Value) -> &'static str {
+    match (
+        c["declared"].as_bool().unwrap_or(false),
+        c["pool"].as_bool().unwrap_or(false),
+        c["dynamic"].as_bool().unwrap_or(false),
+    ) {
+        (true, true, _) => "declared, pool",
+        (true, false, _) => "declared",
+        (false, _, true) => "dynamic (all live chat nodes)",
+        _ => "derived",
+    }
+}
+
+/// What an unpinned request (`default`, `auto`, no model) goes to.
+pub(crate) fn chat_default_line(classes: &[serde_json::Value]) -> String {
+    match classes.iter().find(|c| c["name"].as_str() == Some("chat-default")) {
+        Some(c) if c["declared"].as_bool() == Some(true) => {
+            "chat-default: declared — unpinned chat goes only to the candidates above (noo cluster class unset chat-default for every live chat node)".into()
+        }
+        Some(c) if c["dynamic"].as_bool() == Some(true) => {
+            "chat-default: dynamic (all live chat nodes) — ranked per request by model size, health, thermal, stalls and load".into()
+        }
+        Some(_) => "chat-default: derived".into(),
+        None => "chat-default: no live chat node".into(),
+    }
 }
 
 /// `noo cluster class set <class> <node>/<backend>[=<model>]... [--degraded ...]... [--alias <name>]... [--pool]`
@@ -234,7 +263,20 @@ pub fn cluster_class_unset(g: &Globals, args: &[String]) -> Result<i32, Unhandle
 
 #[cfg(test)]
 mod tests {
-    use super::{alias_rows, parse_candidate, set_body};
+    use super::{alias_rows, chat_default_line, class_source, parse_candidate, set_body};
+
+    #[test]
+    fn chat_default_says_dynamic_or_declared() {
+        let dynamic = serde_json::json!({"name": "chat-default", "declared": false, "pool": false, "dynamic": true});
+        let declared = serde_json::json!({"name": "chat-default", "declared": true, "pool": false, "dynamic": false});
+        let model = serde_json::json!({"name": "gemma4:12b", "declared": false, "pool": false, "dynamic": false});
+        assert_eq!(class_source(&dynamic), "dynamic (all live chat nodes)");
+        assert_eq!(class_source(&declared), "declared");
+        assert_eq!(class_source(&model), "derived");
+        assert!(chat_default_line(&[dynamic, model.clone()]).starts_with("chat-default: dynamic (all live chat nodes)"));
+        assert!(chat_default_line(&[declared]).starts_with("chat-default: declared"));
+        assert_eq!(chat_default_line(&[model]), "chat-default: no live chat node");
+    }
 
     /// `noo cluster class list` printed `Default` / `Auto`; a consumer sends
     /// `default` / `auto`.

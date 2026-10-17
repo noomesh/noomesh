@@ -1494,6 +1494,12 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
             }
             Err(e) => {
                 tracing::error!(error = %e, backend = %backend.url, attempt, "LLM connection failed");
+                if e.is_timeout() {
+                    // A timeout is a stall: demote this node for the next
+                    // unpinned turns too (`classes::STALL_DEMOTION`), the
+                    // same memory the raw chat failover writes.
+                    super::classes::note_stall(&backend.url, &backend.backend_type);
+                }
                 e.to_string()
             }
         };

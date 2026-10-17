@@ -1467,6 +1467,77 @@ pub(crate) fn model_classes_check(classes: Option<&Value>) -> Check {
     ok("model classes", format!("{} declared class(es), {total} candidate(s) all placed or available", declared.len()))
 }
 
+/// The `default chat` row: where an unpinned request (`default`, `auto`, no
+/// model) goes right now — chat-default's live candidates in routing order
+/// (the gateway's `routing_order`), and who is left out. `x` when none; `!`
+/// when every candidate is CPU-only, when one node carries all of it (no
+/// fallback), or when only excluded nodes (thermal critical, quarantined)
+/// are left.
+pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
+    const NAME: &str = "default chat";
+    let Some(body) = classes else {
+        return warn(NAME, "not read", Some("noo cluster class list".into()));
+    };
+    let empty = Vec::new();
+    let Some(cd) = body["classes"].as_array().unwrap_or(&empty).iter().find(|c| c["name"].as_str() == Some("chat-default")) else {
+        return fail(NAME, "no live chat node: an unpinned chat request gets 503", "noo cluster status");
+    };
+    let mode = if cd["declared"].as_bool() == Some(true) { "declared" } else { "dynamic" };
+    // An older gateway sends no routing_order: its candidates, routable ones.
+    let order: Vec<Value> = match cd["routing_order"].as_array() {
+        Some(o) => o.clone(),
+        None => cd["candidates"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|c| c["status"].as_str() != Some("unplaced"))
+            .cloned()
+            .collect(),
+    };
+    if order.is_empty() {
+        return fail(NAME, format!("chat-default ({mode}) has no live candidate: an unpinned chat request gets 503"), "noo cluster class list");
+    }
+    let listed: Vec<String> = order
+        .iter()
+        .map(|c| {
+            let base = format!(
+                "{}/{}={}",
+                c["node_id"].as_str().unwrap_or("?"),
+                c["backend"].as_str().unwrap_or("?"),
+                c["model"].as_str().unwrap_or("?")
+            );
+            match c["reason"].as_str() {
+                Some(r) => format!("{base} ({r})"),
+                None => base,
+            }
+        })
+        .collect();
+    let skipped: Vec<String> = cd["skipped"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|s| format!("{}/{}: {}", s["node_id"].as_str().unwrap_or("?"), s["backend"].as_str().unwrap_or("?"), s["reason"].as_str().unwrap_or("?")))
+        .collect();
+    let mut detail = format!("{mode}: {}", listed.join(" > "));
+    if !skipped.is_empty() {
+        detail.push_str(&format!("; skipped {}", skipped.join(", ")));
+    }
+    let is_gpu = |c: &Value| c["gpu"].as_bool().unwrap_or(false) || c["backend"].as_str().is_some_and(|b| b.starts_with("vllm"));
+    let mut nodes: Vec<&str> = order.iter().filter_map(|c| c["node_id"].as_str()).collect();
+    nodes.sort();
+    nodes.dedup();
+    if cd["last_resort"].as_bool() == Some(true) {
+        return warn(NAME, format!("{detail} — only excluded nodes are left (thermal critical / quarantined)"), Some("noo cluster status".into()));
+    }
+    if !order.iter().any(is_gpu) {
+        return warn(NAME, format!("{detail} — only CPU candidates"), Some("noo cluster place <node> <backend> <model>".into()));
+    }
+    if nodes.len() == 1 {
+        return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
+    }
+    ok(NAME, detail)
+}
+
 /// Run this binary with `words` and `--json`; the parsed stdout and the exit
 /// code. One definition per check lives in the verb itself.
 fn self_json(g: &Globals, words: &[&str]) -> (i32, Value, String) {
@@ -4422,7 +4493,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // Every declared model-class candidate is placed or available
         // An unplaced one is skipped at routing, and a class
         // whose candidates are all unplaced answers nothing.
-        checks.push(model_classes_check(get_json_opt(g, "/api/cluster/model-classes", true, 15).as_ref()));
+        let model_classes = get_json_opt(g, "/api/cluster/model-classes", true, 15);
+        checks.push(model_classes_check(model_classes.as_ref()));
+        // Where an unpinned chat goes: chat-default's live candidates.
+        checks.push(default_chat_check(model_classes.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
@@ -4779,6 +4853,42 @@ mod tests {
         assert_eq!(c.verdict, super::Verdict::Ok);
         assert!(c.detail.contains("1 derived"), "{}", c.detail);
         assert_eq!(model_classes_check(None).verdict, super::Verdict::Warn);
+    }
+
+    /// The `default chat` row lists the live candidates in routing order,
+    /// warns on CPU-only or a single node, and fails on none.
+    #[test]
+    fn default_chat_row_lists_candidates_and_flags_cpu_only_single_node_or_none() {
+        use super::default_chat_check;
+        let two = serde_json::json!({"classes": [{"name": "chat-default", "declared": false, "dynamic": true,
+            "routing_order": [
+                {"node_id": "mcmini", "backend": "ollama", "model": "gemma4:12b", "gpu": true, "reason": "rank=gpu,params=12,load=0.40"},
+                {"node_id": "pop-os", "backend": "ollama", "model": "gemma4:e2b-it-qat", "gpu": false, "reason": "rank=cpu,params=2,load=0.05"},
+            ],
+            "skipped": [{"node_id": "awolf", "backend": "vllm", "reason": "thermal critical"}]}]});
+        let c = default_chat_check(Some(&two));
+        assert_eq!(c.verdict, super::Verdict::Ok, "{c:?}");
+        assert!(c.detail.starts_with("dynamic: mcmini/ollama=gemma4:12b (rank=gpu,params=12,load=0.40) > pop-os/"), "{}", c.detail);
+        assert!(c.detail.contains("skipped awolf/vllm: thermal critical"), "{}", c.detail);
+
+        let cpu = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "pop-os", "backend": "ollama", "model": "e2b", "gpu": false},
+            {"node_id": "pi", "backend": "llamacpp", "model": "x", "gpu": false}]}]});
+        let c = default_chat_check(Some(&cpu));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("only CPU"), "{}", c.detail);
+
+        let one = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true},
+            {"node_id": "awolf", "backend": "ollama", "model": "m", "gpu": true}]}]});
+        let c = default_chat_check(Some(&one));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("one node"), "{}", c.detail);
+
+        let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
+        assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(Some(&serde_json::json!({"classes": []}))).verdict, super::Verdict::Fail);
+        assert_eq!(default_chat_check(None).verdict, super::Verdict::Warn);
     }
 
     use super::*;
