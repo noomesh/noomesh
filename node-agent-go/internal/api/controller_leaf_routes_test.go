@@ -52,6 +52,8 @@ var gatewayCalledRoutes = append([]struct{ method, path string }{
 	{"GET", "/logs/noo-gateway"},
 	{"POST", "/api/mcp/x/call"},
 	{"POST", "/api/device/screenshot"},
+	{"POST", "/gpu/hold"},
+	{"POST", "/gpu/release"},
 }, workRoutes...)
 
 func TestGatewayRoutesAdmitTheControllerLeafWithoutABearer(t *testing.T) {

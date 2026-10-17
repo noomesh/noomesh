@@ -104,6 +104,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/nodes/{node_id}/restart-agent", post(restart_node_agent))
         .route("/api/cluster/nodes/{node_id}/pull", post(pull_node_artifact))
         .route("/api/cluster/nodes/{node_id}/clean", post(clean_node))
+        // Shared-GPU operator hold (node agent `internal/gpuyield`).
+        .route("/api/cluster/nodes/{node_id}/gpu/hold", post(gpu_hold))
+        .route("/api/cluster/nodes/{node_id}/gpu/release", post(gpu_release))
         // ── Native Rust [ported from workers/cluster.py 2026-07-18] ──
         .route("/api/cluster/mint-join-key", post(mint_join_key))
         .route("/api/cluster/delete-tailscale-device", post(delete_tailscale_device))
@@ -369,6 +372,13 @@ async fn node_heartbeat(
     // `backend doors` reads a door miss on a container still warming up as
     // `starting` only from this; an agent that omits it changes nothing.
     carry_reported(&mut data, &body, "backend_containers");
+    // Shared-GPU contention (node agent `internal/gpuyield`): whether work
+    // outside noomesh holds the GPU and which GPU backends are paused for
+    // it. The node stays online while yielded; this is the WHY behind its
+    // missing backend. Field names are a contract with the router and the
+    // CLI: {state, foreign_mb, total_mb, free_mb, method, since,
+    // paused_backends, need_mb, reason, policy}. An older agent omits it.
+    carry_reported(&mut data, &body, "gpu_contention");
     // Per placed backend: does its model server HOLD the placement's model
     // (`crate::model_presence`). Unlike the reports above this
     // is REPLACED every beat and dropped when the beat omits it: a stale
@@ -908,6 +918,7 @@ async fn node_register_body(
     carry_reported(&mut data, &body, "image_sources");
     carry_reported(&mut data, &body, "image_source_mode");
     carry_reported(&mut data, &body, "backend_containers");
+    carry_reported(&mut data, &body, "gpu_contention");
     carry_reported(&mut data, &body, "model_presence");
     carry_reported(&mut data, &body, "model_stats");
     // The agent admits the gateway's leaf with no bearer;
@@ -2103,6 +2114,83 @@ async fn clean_node(
             Err(AppError::Internal(format!("Failed to contact node agent: {e}")))
         }
     }
+}
+
+/// Operator hold on a node's GPU: pause its GPU backends now and keep them
+/// paused (no automatic resume) until a release. For handing the GPU to work
+/// outside noomesh that will not start while the GPU is occupied.
+///
+/// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?}`. Operator only; audited.
+async fn gpu_hold(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> AppResult {
+    let reason = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("reason").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect::<String>();
+    gpu_hold_op(&state, ctx, &node_id, "hold", json!({"reason": reason})).await
+}
+
+/// End an operator GPU hold: the node returns to the automatic shared-GPU
+/// policy and resumes its GPU backends once the GPU has stayed free.
+///
+/// POST /api/cluster/nodes/{node_id}/gpu/release. Operator only; audited.
+async fn gpu_release(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> AppResult {
+    gpu_hold_op(&state, ctx, &node_id, "release", json!({})).await
+}
+
+/// The operator gate for the GPU hold routes: role Operator or above.
+pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
+    match ctx {
+        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
+        _ => Err(AppError::Forbidden("operator role required to hold or release a node's GPU".into())),
+    }
+}
+
+async fn gpu_hold_op(
+    state: &AppState,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    node_id: &str,
+    op: &str,
+    payload: Value,
+) -> AppResult {
+    let actor = gpu_hold_actor(&ctx)?;
+    let agent_url = get_node_agent_url(state, node_id).await?;
+    let client = build_node_agent_client();
+    let mut req = client.post(format!("{agent_url}/gpu/{op}")).json(&payload);
+    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
+        req = req.header(&k, &v);
+    }
+    let outcome = req.send().await;
+    let (ok, result) = match outcome {
+        Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            (false, Err(AppError::Internal(format!("Node agent returned {status}: {body}"))))
+        }
+        Err(e) => (false, Err(AppError::Internal(format!("Failed to contact node agent: {e}")))),
+    };
+    tracing::info!(node_id = %node_id, op, ok, actor = %actor, "node_gpu_hold");
+    crate::routes::core::audit_event(
+        &state.db, &format!("node_gpu_{op}"), "info", &actor,
+        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
+        json!({"node": node_id, "op": op, "request": payload}),
+    ).await;
+    let mut out = result?;
+    out["node"] = json!(node_id);
+    Ok(Json(out))
 }
 
 /// GET /api/cluster/proposals/{id}
@@ -5541,6 +5629,50 @@ mod heartbeat_carry_tests {
         // `{}` (nothing running) replaces an older report.
         carry_reported(&mut data, &json!({"backend_containers": {}}), "backend_containers");
         assert_eq!(data["backend_containers"], json!({}));
+    }
+
+    /// `gpu_contention` rides the record from both writers,
+    /// so `noo cluster status`/`verify` and the router can see a node that
+    /// yielded its GPU to other work (and why its backend is gone).
+    #[test]
+    fn heartbeat_and_register_carry_gpu_contention() {
+        let src = include_str!("cluster.rs");
+        let body_of = |sig: &str| src.split(sig).nth(1).expect("the handler")
+            .split("\nasync fn ").next().unwrap().to_string();
+        assert!(body_of("async fn node_heartbeat(").contains("carry_reported(&mut data, &body, \"gpu_contention\")"),
+            "node_heartbeat does not carry gpu_contention");
+        assert!(body_of("async fn node_register_body(").contains("carry_reported(&mut data, &body, \"gpu_contention\")"),
+            "node_register_body does not carry gpu_contention");
+        let mut data = json!({"id": "host3"});
+        let beat = json!({"gpu_contention": {"state": "yielded", "foreign_mb": 11468, "total_mb": 16376,
+            "free_mb": 4908, "method": "memory-accounting", "since": "2026-10-17T12:00:00Z",
+            "paused_backends": ["vllm"]}});
+        carry_reported(&mut data, &beat, "gpu_contention");
+        assert_eq!(data["gpu_contention"]["state"], "yielded");
+        assert_eq!(data["gpu_contention"]["paused_backends"], json!(["vllm"]));
+        assert_eq!(data["gpu_contention"]["method"], "memory-accounting");
+        // Resumed: the next beat replaces it.
+        carry_reported(&mut data, &json!({"gpu_contention": {"state": "free", "paused_backends": []}}), "gpu_contention");
+        assert_eq!(data["gpu_contention"]["state"], "free");
+        // An older agent omits it: nothing synthesised.
+        let mut old = json!({"id": "host9"});
+        carry_reported(&mut old, &json!({"load": 0.1}), "gpu_contention");
+        assert!(old.get("gpu_contention").is_none());
+    }
+
+    /// The GPU hold routes are operator-only, and both are audited.
+    #[test]
+    fn gpu_hold_is_operator_only_and_audited() {
+        assert!(gpu_hold_actor(&None).is_err(), "no requester: refused");
+        // The code above the tests only: this test's own literals would
+        // otherwise satisfy every `contains` below.
+        let src = include_str!("cluster.rs").split("fn gpu_hold_is_operator_only_and_audited").next().unwrap();
+        let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
+            .split("\nasync fn ").next().unwrap();
+        assert!(op.contains("gpu_hold_actor(&ctx)?"), "the operator gate must run first");
+        assert!(op.contains("audit_event("), "hold/release must be audited");
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
     }
 
     /// `stunnel_image` rides the record from both

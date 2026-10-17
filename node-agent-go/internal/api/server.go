@@ -75,6 +75,10 @@ type Server struct {
 	// the controller treats as unknown, the same skew contract as
 	// `available`.
 	gpuWatch func() any
+	// gpuHold / gpuRelease drive the shared-GPU yield's operator hold
+	// (internal/gpuyield). nil = not wired; the routes then answer 503.
+	gpuHold    func(ctx context.Context, reason string) any
+	gpuRelease func() any
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
 
@@ -142,6 +146,12 @@ func (s *Server) SetBusStatus(f func() BusStatus) { s.busStatus = f }
 
 // SetGPUWatch installs the GPU watchdog state provider (GPU nodes only).
 func (s *Server) SetGPUWatch(f func() any) { s.gpuWatch = f }
+
+// SetGPUHold installs the shared-GPU hold/release operations
+// (`noo cluster gpu hold|release`, via the gateway).
+func (s *Server) SetGPUHold(hold func(ctx context.Context, reason string) any, release func() any) {
+	s.gpuHold, s.gpuRelease = hold, release
+}
 
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }
@@ -233,6 +243,8 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /pull", ctrlMW(http.HandlerFunc(s.handlePull)))
 	s.mux.Handle("POST /clean", ctrlMW(http.HandlerFunc(s.handleClean)))
 	s.mux.Handle("GET /gpu", ctrlMW(http.HandlerFunc(s.handleGPUMetrics)))
+	s.mux.Handle("POST /gpu/hold", ctrlMW(http.HandlerFunc(s.handleGPUHold)))
+	s.mux.Handle("POST /gpu/release", ctrlMW(http.HandlerFunc(s.handleGPURelease)))
 	// Tailnet identity plane: whois + dialback for tailnet-native
 	// enrollment — only meaningful on the controller's self-agent. Both are
 	// the controller's: whois answers "who is this tailnet IP" for any IP

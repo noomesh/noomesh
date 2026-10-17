@@ -277,6 +277,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         out.push(c);
     }
 
+    // 6e. Shared GPU: the node yielded (or was held off) its GPU for work
+    //     outside noomesh. A warn by design, never a failure.
+    out.extend(gpu_contention_check(n));
+
     // 6d. The log shipper (fleet logging phase 6), from the agent's own
     //     account in its heartbeat.
     out.push(log_shipper_check(id, &n["log_ship"], now_unix, hb_recent));
@@ -325,6 +329,38 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
         (Some(p), s) => out.push(ok("harness", format!("{} (policy {p})", if s.is_empty() { "-" } else { s }))),
     } }
     out
+}
+
+/// The `gpu` row, from the node agent's `gpu_contention` heartbeat report
+/// (internal/gpuyield). A node that gave its GPU to other work (VR, model
+/// development, a voice stack) is working as designed: yielded and held are
+/// WARNs, never FAILs. No row from an agent that does not report it.
+pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
+    let id = n["id"].as_str().unwrap_or("?");
+    let gc = n.get("gpu_contention").filter(|v| v.is_object())?;
+    let gb = |k: &str| gc[k].as_f64().unwrap_or(0.0) / 1024.0;
+    let paused: Vec<&str> = gc["paused_backends"].as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let paused = if paused.is_empty() { "GPU backends".to_string() } else { paused.join(", ") };
+    let method = gc["method"].as_str().unwrap_or("?");
+    let state = gc["state"].as_str().unwrap_or("?");
+    if method == "not-measured" && state != "held" && state != "yielded" {
+        return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
+    }
+    let off = if gc["policy"].as_str() == Some("off") { " (yield off)" } else { "" };
+    Some(match state {
+        "free" => ok("gpu", format!("free{off}")),
+        "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
+        "yielded" => warn("gpu",
+            format!("yielded: {paused} paused (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            None),
+        "held" => warn("gpu",
+            format!("held by operator{}: {paused} paused",
+                gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
+            Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
+        other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
+    })
 }
 
 /// The `image sources` row: which images the agent started containers from
@@ -8062,5 +8098,57 @@ mod self_agent_lane_tests {
         let c = self_agent_lane_check("pop-os", &[], Some(&p), Some("rail"), false);
         assert_eq!(c.verdict, Verdict::Fail);
         assert_eq!(c.remedy.as_deref(), Some("noo upgrade --stack"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_contention_tests {
+    use super::*;
+
+    fn node(gc: Value) -> Value {
+        serde_json::json!({"id": "host3", "gpu_contention": gc})
+    }
+
+    #[test]
+    fn free_is_ok() {
+        let c = gpu_contention_check(&node(serde_json::json!({"state": "free", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert_eq!(c.name, "gpu");
+        assert_eq!(c.detail, "free");
+    }
+
+    #[test]
+    fn yielded_is_a_warn_naming_the_paused_backend_and_foreign_use() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "foreign_mb": 11468, "method": "memory-accounting", "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn, "by design: never a failure");
+        assert!(c.detail.starts_with("yielded: vllm paused (foreign 11.2 GB"), "{}", c.detail);
+        assert!(c.remedy.is_none());
+    }
+
+    #[test]
+    fn held_is_a_warn_with_the_release_command() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.detail, "held by operator (voice): vllm paused");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+    }
+
+    #[test]
+    fn not_measured_is_ok_and_absent_is_no_row() {
+        let c = gpu_contention_check(&node(serde_json::json!({"state": "free", "method": "not-measured"}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.starts_with("not measured"));
+        assert!(gpu_contention_check(&serde_json::json!({"id": "host9"})).is_none());
+    }
+
+    #[test]
+    fn node_checks_carry_the_gpu_row() {
+        let n = serde_json::json!({"id": "host3", "status": "online",
+            "gpu_contention": {"state": "yielded", "foreign_mb": 2048, "method": "nvidia-smi", "paused_backends": ["vllm"]}});
+        let rows = node_checks(&n, "v0.6.2", "0.6.2", 0, None);
+        let gpu = rows.iter().find(|c| c.name == "gpu").expect("a gpu row");
+        assert_eq!(gpu.verdict, Verdict::Warn);
     }
 }

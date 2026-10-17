@@ -18666,6 +18666,74 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/gpu/hold": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create hold",
+        "description": "[native] Operator hold on a node's GPU: pause its GPU backends now and keep them paused (no automatic resume) until a release. For handing the GPU to work outside noomesh that will not start while the GPU is occupied.",
+        "operationId": "gpu_hold",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/gpu/release": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create release",
+        "description": "[native] End an operator GPU hold: the node returns to the automatic shared-GPU policy and resumes its GPU backends once the GPU has stayed free.",
+        "operationId": "gpu_release",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

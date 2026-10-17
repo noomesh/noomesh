@@ -3,6 +3,7 @@
 
 import { cn } from '@/lib/utils';
 import type { ClusterNode } from '@/features/cluster/types';
+import { gpuContentionLine } from '@/features/cluster/gpuContention';
 
 const fmt = (n: number | undefined, digits = 1) => (n == null ? '—' : n.toFixed(digits));
 
@@ -23,6 +24,8 @@ export function NodeCard({ node }: { node: ClusterNode }) {
       : node.ramTotal
         ? `${node.ramTotal} GB`
         : '—';
+  const gpuLine = gpuContentionLine(node.gpuContention);
+  const gpuPaused = node.gpuContention?.state === 'yielded' || node.gpuContention?.state === 'held';
 
   return (
     <div className={cn('node', node.status === 'offline' && 'off')}>
@@ -51,6 +54,8 @@ export function NodeCard({ node }: { node: ClusterNode }) {
           RAM <b>{ram}</b>
         </span>
       </div>
+
+      {gpuLine && <div className={cn('gpu-contention', gpuPaused && 'paused')}>{gpuLine}</div>}
 
       <div className="node-foot">
         <span className="backends">

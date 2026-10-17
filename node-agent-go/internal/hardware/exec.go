@@ -166,3 +166,11 @@ func round(val float64, places int) float64 {
 	shift := math.Pow(10, float64(places))
 	return math.Round(val*shift) / shift
 }
+
+// NvidiaSMI runs the resolved nvidia-smi with args under the probe deadline
+// (execTimeout). Exported for the shared-GPU yield's contention probe
+// (internal/gpuyield), which needs raw --query-gpu / --query-compute-apps
+// output; an error means "not measurable here", never "no contention".
+func NvidiaSMI(args ...string) (string, error) {
+	return execTimeout(nvidiaSmi(), args...)
+}

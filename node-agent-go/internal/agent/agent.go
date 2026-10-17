@@ -28,6 +28,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuwatch"
+	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/heartbeat"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostd"
@@ -287,7 +288,15 @@ func (a *Agent) Run() error {
 		})
 	}
 
-	// 4. Start heartbeat loop
+	// 4. Start heartbeat loop. The shared-GPU yield (4b'') is built first so
+	// its reporter is installed before the loop reads it.
+	gy := gpuyield.New(gpuyield.ConfigFromEnv(os.Getenv), gpuyield.NewSMIProbe(), a.docker, a.cfg.StateDir)
+	gpuyield.SetDefault(gy)
+	a.hb.SetGPUContention(func() any { return gy.Report() })
+	a.server.SetGPUHold(
+		func(ctx context.Context, reason string) any { return gy.Hold(ctx, reason) },
+		func() any { return gy.Release() },
+	)
 	go a.hb.Run(ctx)
 
 	// 4a. GPU watchdog — only where a GPU is actually detected.
@@ -325,6 +334,13 @@ func (a *Agent) Run() error {
 	// 4b'. Node disk reclaim: the controller's ladder cannot reach this
 	// disk, so the agent queues the same ladder into its local hostd when
 	// a disk crosses the watermark, under the controller's policy.
+	// 4b''. Shared GPU: yield the GPU to work outside noomesh and report
+	// it (`gpu_contention`). Runs on every node — where the GPU cannot be
+	// measured (macOS, no NVIDIA) it reports "not-measured" and never acts.
+	// (Constructed before the heartbeat loop starts — see 4.)
+	gy.OnResume(rec.Nudge)
+	go gy.Run(ctx)
+
 	reclaimer := diskreclaim.New(hostd.WorkerSpoolDir)
 	rec.SetDiskReclaimSink(reclaimer.SetPolicy)
 	a.server.SetDiskReclaim(func() any { return reclaimer.State() })

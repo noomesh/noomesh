@@ -26,6 +26,7 @@ pub mod cluster_host_telemetry;
 pub mod cluster_vendor;
 pub mod node_vendor;
 pub mod cluster_push_secrets;
+pub mod cluster_gpu;
 pub mod cluster_verify;
 pub mod image_stage;
 pub mod cluster_class;
@@ -195,6 +196,7 @@ pub use secrets_reveal::secrets_reveal;
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
 pub use cluster_vendor::{cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
+pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
 pub use cluster_verify::cluster_verify;
 pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset};
 pub use security_local::{
