@@ -271,6 +271,7 @@ async fn native_inference(
     actor: Option<Extension<crate::auth::AuthActor>>,
     cluster: Option<Extension<crate::auth::ClusterNode>>,
     consumer: Option<Extension<Consumer>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InferenceRequest>,
 ) -> impl IntoResponse {
     let conversation_id = req.conversation_id
@@ -306,7 +307,9 @@ async fn native_inference(
     // ("model": "host9") even when the tool schema says `node`. A model
     // string that exactly matches a live node id is unambiguous — real
     // model names look like "org/name" or "*.gguf" — so treat it as a pin.
-    let mut node_pin = req.node.clone();
+    // `X-Noo-Node` is the same pin as the body's `node` (the header wins),
+    // as on `/v1/chat/completions` and `/api/external/chat/completions`.
+    let mut node_pin = super::raw_chat::node_header(&headers).or_else(|| req.node.clone());
     let mut node_from_model = false;
     if node_pin.is_none() {
         if let Some(m) = req.model.as_deref() {
@@ -392,7 +395,9 @@ async fn native_inference(
         // Same class resolution and failover as `/v1/chat/completions`. This
         // is an operator surface (a user-door JWT opens it), so the error
         // carries the detail, not the general wording.
-        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor).await {
+        // A node pin never reaches here: `req.node` / `X-Noo-Node` took the
+        // node-pinned branch above.
+        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor, None).await {
             Ok(super::raw_chat::Outcome::Json { data, served }) => {
                 let text = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or("");
                 let (p, c) = crate::usage::usage_from_frame(&data).unwrap_or((0, 0));
@@ -888,6 +893,7 @@ async fn openai_chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(consumer): Extension<Consumer>,
     cluster: Option<Extension<crate::auth::ClusterNode>>,
+    headers: axum::http::HeaderMap,
     Json(mut body): Json<Value>,
 ) -> axum::response::Response {
     // Per-consumer scope gate: a key scoped only to e.g. "embeddings" must not
@@ -906,7 +912,7 @@ async fn openai_chat_completions(
         "v1",
     );
     let requested = body.get("model").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-    match super::raw_chat::chat_completions(&state, &mut body, "v1", usage_actor).await {
+    match super::raw_chat::chat_completions(&state, &mut body, "v1", usage_actor, super::raw_chat::node_header(&headers).as_deref()).await {
         Ok(super::raw_chat::Outcome::Stream { resp, served, usage, guard }) => {
             tracing::info!(model_requested = %requested, class = %served.class, model_actual = %served.model, backend = %served.backend_type, stream = true, "openai_chat_completions_proxy");
             super::raw_chat::stream_response(*resp, &served, usage, guard)
@@ -952,7 +958,7 @@ async fn v1_responses(
         "v1",
     );
     use super::raw_chat::{self, Outcome};
-    let (class, cands) = match raw_chat::resolve_candidates(&state, requested_model_hint(&body)).await {
+    let (class, cands) = match raw_chat::resolve_candidates(&state, requested_model_hint(&body), None).await {
         Ok(r) => r,
         Err(e) => return e.into_response("v1"),
     };
@@ -1559,7 +1565,7 @@ mod catalogue_tests {
             }],
             aliases: vec![("quick".into(), "fast".into())],
         };
-        build_table(&nodes, &[], &decl, "google/gemma-4-12B-it-qat-w4a16-ct", "vllm")
+        build_table(&nodes, &[], &decl)
     }
 
     /// `/v1/responses` proxies natively to EVERY directly-reached vLLM of the

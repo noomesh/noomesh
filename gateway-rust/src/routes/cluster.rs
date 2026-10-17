@@ -3959,13 +3959,40 @@ async fn model_classes_get(State(state): State<Arc<AppState>>) -> AppResult {
         .classes
         .iter()
         .map(|c| {
+            // The order a request would take right now (in-flight and stall
+            // memory included), and who is left out — `noo cluster verify`'s
+            // `default chat` row lists it.
+            let ranked = crate::coordinator::classes::rank(
+                c,
+                &|_| false,
+                &|x| crate::coordinator::classes::in_flight(&x.url, &x.backend),
+                &|x| crate::coordinator::classes::recently_stalled(&x.url, &x.backend),
+            );
+            let order: Vec<Value> = ranked
+                .order
+                .iter()
+                .map(|x| {
+                    let busy = crate::coordinator::classes::in_flight(&x.url, &x.backend);
+                    let stalled = crate::coordinator::classes::recently_stalled(&x.url, &x.backend);
+                    json!({
+                        "node_id": x.node_id, "backend": x.backend, "model": x.model,
+                        "gpu": x.gpu || x.backend.starts_with("vllm"),
+                        "reason": crate::coordinator::classes::rank_reason(x, busy, stalled),
+                    })
+                })
+                .collect();
+            let skipped: Vec<Value> = ranked.skipped.iter().map(|(x, why)| json!({"node_id": x.node_id, "backend": x.backend, "reason": why})).collect();
             json!({
                 "name": c.name,
                 "declared": c.declared,
                 "pool": c.pool,
+                "dynamic": c.dynamic,
                 "routable": c.routable_count(),
                 "healthy": c.healthy_count(),
                 "candidates": c.candidates,
+                "routing_order": order,
+                "skipped": skipped,
+                "last_resort": ranked.last_resort,
             })
         })
         .collect();
@@ -6239,7 +6266,7 @@ mod model_class_tests {
             running: vec![("vllm".into(), "HF".into()), ("ollama".into(), "gemma4:26b".into())],
             heartbeat_age_secs: Some(1.0), inbound_ok: true, gpu: true, ..Default::default()
         }];
-        let t = build_table(&nodes, &[], &Declarations::default(), "HF", "vllm");
+        let t = build_table(&nodes, &[], &Declarations::default());
         assert_eq!(served_model_in(&t, "host3", "vllm").as_deref(), Some("HF"));
         assert_eq!(served_model_in(&t, "host3", "ollama").as_deref(), Some("gemma4:26b"));
         assert_eq!(served_model_in(&t, "host3", "llamacpp"), None);

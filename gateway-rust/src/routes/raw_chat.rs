@@ -263,18 +263,20 @@ impl RetryGuard {
 
 // ── resolution ───────────────────────────────────────────────────────────
 
-/// The class a hint names and its routable candidates in order.
+/// The class a hint names and its routable candidates in order, narrowed to
+/// `node` when the caller pinned one (`node` body field / `X-Noo-Node`).
 ///
 /// With no class table at all (a fleet whose nodes report nothing — the
 /// one-box standalone whose only backend is the `ollama-embed` container,
 /// or a gateway whose KV is empty), the legacy resolver's static
 /// `OLLAMA_URL` last resort is wrapped as the single candidate of
 /// `chat-default`, so a standalone install keeps answering.
-pub async fn resolve_candidates(state: &AppState, hint: Option<&str>) -> Result<(String, Vec<Candidate>), RawChatError> {
+pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Option<&str>) -> Result<(String, Vec<Candidate>), RawChatError> {
     let table = classes::load_table(state)
         .await
         .map_err(|e| RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("class table unavailable: {e}")))?;
-    if table.classes.is_empty() {
+    let node = node.map(str::trim).filter(|n| !n.is_empty());
+    if table.classes.is_empty() && node.is_none() {
         // The raw proxy forwards to cluster backends only; a cloud model
         // runs through the agent loop (`/api/inference`), which holds the
         // provider auth. Same 404 a cloud name got before cloud backends
@@ -295,35 +297,38 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>) -> Result<
         );
         return Ok((classes::CHAT_DEFAULT.to_string(), vec![cand]));
     }
-    let Some(class) = classes::resolve_hint(&table, hint) else {
-        return Err(RawChatError::new(
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            format!(
-                "model '{}' is not a class, alias or served model; ids: {}",
-                hint.unwrap_or(classes::CHAT_DEFAULT),
-                table.ids().join(", ")
-            ),
-        ));
-    };
-    let cands: Vec<Candidate> = classes::ordered(class, &[]).into_iter().cloned().collect();
-    if cands.is_empty() {
-        let declared = class.candidates.len();
-        return Err(RawChatError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backend_unavailable",
-            if declared > 0 {
-                format!(
-                    "class '{}' has {declared} declared candidate(s) and none is placed or available: {}",
-                    class.name,
-                    class.candidates.iter().map(|c| format!("{}/{}={} ({})", c.node_id, c.backend, c.model, c.health)).collect::<Vec<_>>().join("; ")
-                )
-            } else {
-                format!("class '{}' has no candidates", class.name)
-            },
-        ));
+    let sel = classes::select(&table, hint, node, &|_| false).map_err(refusal_error)?;
+    log_selection(&sel, node);
+    Ok((sel.class, sel.candidates))
+}
+
+/// A selection refusal on the raw surfaces. A node pin is the caller's own
+/// input, so its refusal says what was wrong with it (the node name the
+/// caller sent, nothing about addresses).
+pub fn refusal_error(r: classes::Refusal) -> RawChatError {
+    use classes::Refusal::*;
+    match r {
+        UnknownModel(m) => RawChatError::new(StatusCode::NOT_FOUND, "model_not_found", m),
+        NoCandidates(m) => RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", m),
+        UnknownNode(m) => RawChatError { public: Some(m.clone()), ..RawChatError::new(StatusCode::UNPROCESSABLE_ENTITY, "node_not_found", m) },
+        NodeServesNoChat(m) => RawChatError { public: Some(m.clone()), ..RawChatError::new(StatusCode::UNPROCESSABLE_ENTITY, "node_serves_no_chat", m) },
+        // The public text names only what the caller sent; what the node
+        // DOES serve stays in the detail (operator-side, under the ref).
+        NodeCannotServe(m) => {
+            let public = m.split("; it serves").next().unwrap_or(&m).to_string();
+            RawChatError { public: Some(public), ..RawChatError::new(StatusCode::CONFLICT, "node_cannot_serve", m) }
+        }
     }
-    Ok((class.name.clone(), cands))
+}
+
+/// One line per request saying where it can go and why, and which nodes
+/// were left out or demoted (offline, thermal, stalled, quarantined).
+fn log_selection(sel: &classes::Selection, node: Option<&str>) {
+    let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}={} [{}]", c.node_id, c.backend, c.model, c.rank)).collect();
+    if sel.last_resort {
+        tracing::warn!(class = %sel.label, order = ?order, "raw_chat_only_excluded_candidates_left");
+    }
+    tracing::info!(class = %sel.label, node_pin = ?node, order = ?order, skipped = ?sel.skipped, "raw_chat_candidates");
 }
 
 // ── the loop ─────────────────────────────────────────────────────────────
@@ -492,6 +497,10 @@ where
             }
         };
         all_stalled &= stalled;
+        if stalled {
+            // Demote it for the next requests too, not only this one.
+            classes::note_stall(&cand.url, &cand.backend);
+        }
 
         tracing::error!(class, node = %cand.node_id, url = %cand.url, attempt = tried, failure = %failure, "raw_chat_candidate_failed");
         failed.push((cand.url.clone(), cand.backend.clone()));
@@ -561,8 +570,10 @@ where
         fallback: ok.index != 0,
         attempts: ok.attempts,
     };
+    let label = if cand.class_label.is_empty() { class } else { cand.class_label.as_str() };
     tracing::info!(
-        class, node = %cand.node_id, backend = %cand.backend, model = %cand.model,
+        class = %label, node = %cand.node_id, backend = %cand.backend, model = %cand.model,
+        rank = %cand.rank,
         attempt = ok.attempts, fallback = served.fallback, stream, source, "raw_chat_served"
     );
     // Rebuilt per attempt: usage is charged to the candidate that answered.
@@ -589,17 +600,25 @@ where
 /// surfaces make. `body["model"]` is rewritten per attempt to the
 /// candidate's concrete model; `stream_options.include_usage` is set on a
 /// streaming request so vLLM emits the usage frame.
+///
+/// `node_header` is the `X-Noo-Node` header; a `node` field in the body
+/// does the same (the header wins when both are sent). Either one narrows
+/// the request to that node: 422 when the node is unknown or serves no
+/// chat, 409 when it serves chat but not the named model. The field is removed before
+/// the body is forwarded.
 pub async fn chat_completions(
     state: &AppState,
     body: &mut Value,
     source: &'static str,
     actor: UsageActor,
+    node_header: Option<&str>,
 ) -> Result<Outcome, RawChatError> {
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
+    let node = node_pin(body, node_header)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
-    let (class, cands) = resolve_candidates(state, hint.as_deref()).await?;
+    let (class, cands) = resolve_candidates(state, hint.as_deref(), node.as_deref()).await?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -611,6 +630,26 @@ pub async fn chat_completions(
         ("/v1/chat/completions".to_string(), b)
     })
     .await
+}
+
+/// The header naming a node to pin a chat request to.
+pub const HEADER_NODE: &str = "x-noo-node";
+
+/// The `X-Noo-Node` header's value, if sent and non-blank.
+pub fn node_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers.get(HEADER_NODE).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// The node a request pins: the header, else the body's `node` (a string),
+/// which is taken out of the body either way — a backend must not see it.
+pub fn node_pin(body: &mut Value, header: Option<&str>) -> Result<Option<String>, RawChatError> {
+    let field = body.as_object_mut().and_then(|o| o.remove("node"));
+    let from_body = match field {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        Some(_) => return Err(RawChatError::bad_request("'node' must be a string naming a node")),
+    };
+    Ok(header.map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).or(from_body))
 }
 
 // ── rendering ────────────────────────────────────────────────────────────
@@ -672,6 +711,40 @@ pub fn stream_response(resp: reqwest::Response, served: &Served, usage: StreamUs
         .body(Body::from_stream(body))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build error").into_response());
     with_served_headers(r, served)
+}
+
+#[cfg(test)]
+mod node_pin_tests {
+    use super::*;
+
+    #[test]
+    fn the_node_pin_comes_from_the_header_or_the_body_and_never_reaches_the_backend() {
+        let mut body = json!({"model": "default", "node": "mcmini", "messages": []});
+        assert_eq!(node_pin(&mut body, None).unwrap().as_deref(), Some("mcmini"));
+        assert!(body.get("node").is_none(), "stripped before forwarding");
+        let mut body = json!({"node": "mcmini"});
+        assert_eq!(node_pin(&mut body, Some("pop-os")).unwrap().as_deref(), Some("pop-os"), "the header wins");
+        let mut body = json!({"node": "  "});
+        assert_eq!(node_pin(&mut body, None).unwrap(), None);
+        let mut body = json!({"node": 7});
+        assert_eq!(node_pin(&mut body, None).unwrap_err().status, StatusCode::BAD_REQUEST);
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(HEADER_NODE, HeaderValue::from_static(" mcmini "));
+        assert_eq!(node_header(&h).as_deref(), Some("mcmini"));
+    }
+
+    #[test]
+    fn node_refusals_are_422_and_409_and_do_not_list_what_the_node_serves() {
+        use classes::Refusal;
+        assert_eq!(refusal_error(Refusal::UnknownNode("node 'x' is not a node".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal_error(Refusal::NodeServesNoChat("node 'x' serves no chat".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
+        let e = refusal_error(Refusal::NodeCannotServe("node 'pop-os' does not serve 'gemma4:12b'; it serves ollama=gemma4:e2b-it-qat".into()));
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.public_message(), "node 'pop-os' does not serve 'gemma4:12b'");
+        assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
+        assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
+        assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 #[cfg(test)]

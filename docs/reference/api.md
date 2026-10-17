@@ -199,8 +199,20 @@ The `model` a consumer sends is a **class**, an **alias** or a concrete
 served model name; it is never a node. A class is an ordered list of
 `(node, backend, model)` candidates the operator declared (`noo cluster
 class set`), or — with nothing declared — one derived class per served
-model, where `chat-default` (aliases `default`, `auto`, and an absent
-`model`) is the configured default model's candidates. The gateway tries
+model. Undeclared, `chat-default` (aliases `default`, `auto`, and an
+absent `model`) is **dynamic**: every live chat node in the mesh, whatever
+it serves, ranked per request (healthy, not stalled in the last 5 min, not
+thermally hot, GPU not shared, vLLM/GPU before CPU, larger model, fewest
+in flight, load; quarantined and thermal-`critical` nodes only when
+nothing else is left). A declared `chat-default` is used as declared.
+
+To pin one request to one node, send `"node": "<id>"` in the body or an
+`X-Noo-Node: <id>` header (also on `/api/inference`). The candidates are
+then that node's only: `422` (`node_not_found` / `node_serves_no_chat`)
+when the node is unknown or serves no chat, `409` (`node_cannot_serve`)
+when it serves chat but not the `model` named.
+
+The gateway tries
 candidates in order (non-degraded before degraded, healthy before not,
 declared position, load): a candidate that cannot be connected to within
 5 s, that sends no response headers within 30 s on a streaming request,

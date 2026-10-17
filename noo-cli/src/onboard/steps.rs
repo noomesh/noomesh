@@ -5717,12 +5717,13 @@ pub fn first_model(ctx: &mut Ctx) {
         start_vllm(ctx, &model_name);
     } else {
         pull_ollama(ctx, &model_name);
-        // Standalone serves chat from the embed container; trellion needs the
-        // MODEL name as well as the URL, or ollama answers 404 to its
-        // /v1/chat/completions and every RAG answer fails (2026-09-07).
-        if ctx.repo_root.join(".noo-standalone").exists() {
-            ctx.update_env("PAGEINDEX_LLM_MODEL", &model_name);
-        }
+        // No PAGEINDEX_LLM_MODEL here any more. It was written on standalone
+        // when trellion dialled ollama directly and needed an exact name
+        // (2026-09-07); trellion now asks the gateway (2026-09-09), where
+        // `default` means every live chat node. An exact name written by
+        // onboarding pinned every RAG answer to the one model chosen at
+        // install (2026-10-17). The model still lands in the yaml as the
+        // local backend's placement hint (`update_yaml_config`).
     }
 }
 
