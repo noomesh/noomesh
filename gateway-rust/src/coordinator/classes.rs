@@ -25,6 +25,15 @@
 //!   silently answers a request with a different model than the one at
 //!   position 0 — it fails over across NODES, not across models.
 //!
+//! A declared class may be a **pool** (`noo cluster class set … --pool`):
+//! its non-degraded candidates are peers, not a failover order. Each
+//! request goes to the healthy one with the fewest requests this gateway
+//! has in flight to it, then the lowest heartbeat load, then position —
+//! so one class spreads across nodes instead of queueing on the first.
+//! Peers may serve different models (the operator declared them
+//! interchangeable); failover and `--degraded` work as in any class. A
+//! request that names a concrete model or node still goes exactly there.
+//!
 //! Resolution of a `model` hint: absent / `default` / `auto` → `chat-default`;
 //! an alias → its class; a class name → that class; a concrete model name →
 //! the derived class of that model (the same exact-match filter `apply_pin`
@@ -78,6 +87,9 @@ pub struct DeclaredCandidate {
 pub struct DeclaredClass {
     pub name: String,
     pub candidates: Vec<DeclaredCandidate>,
+    /// Non-degraded candidates share the load instead of failing over in
+    /// order (see the module doc).
+    pub pool: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -182,6 +194,8 @@ pub struct Class {
     pub name: String,
     pub declared: bool,
     pub candidates: Vec<Candidate>,
+    /// A declared pool: candidates are picked by in-flight requests and load.
+    pub pool: bool,
 }
 
 impl Candidate {
@@ -360,7 +374,7 @@ pub fn build_table(
         for (i, c) in cands.iter_mut().enumerate() {
             c.position = i;
         }
-        classes.push(Class { name: spelling[&key].clone(), declared: false, candidates: cands });
+        classes.push(Class { name: spelling[&key].clone(), declared: false, candidates: cands, pool: false });
     }
 
     // Derived chat-default: the default model's group, else the group the
@@ -375,7 +389,7 @@ pub fn build_table(
                 (if first.backend == preferred_backend { 0 } else { 1 }, derive_key(first))
             })
         })
-        .map(|c| Class { name: CHAT_DEFAULT.into(), declared: false, candidates: c.candidates.clone() });
+        .map(|c| Class { name: CHAT_DEFAULT.into(), declared: false, candidates: c.candidates.clone(), pool: false });
 
     // Declared classes override a derived class of the same name.
     for d in &decl.classes {
@@ -419,7 +433,7 @@ pub fn build_table(
             }
             cands.push(c);
         }
-        let class = Class { name: d.name.clone(), declared: true, candidates: cands };
+        let class = Class { name: d.name.clone(), declared: true, candidates: cands, pool: d.pool };
         // Declared names are stored lowercase; a derived class keeps the
         // heartbeat's spelling (`google/gemma-4-12B-…`). Same model, one
         // class — the declaration replaces the derived one.
@@ -487,14 +501,80 @@ pub fn valid_model(model: &str) -> Result<(), String> {
 /// (`https://<ip>:8081`), so a URL alone would take a node's ollama out
 /// with its vLLM.
 pub fn ordered<'a>(class: &'a Class, exclude: &[(String, String)]) -> Vec<&'a Candidate> {
+    ordered_by(class, exclude, &|c| in_flight(&c.url, &c.backend))
+}
+
+/// [`ordered`] with the in-flight count supplied, so a pool's order is
+/// tested without the process-wide registry.
+pub fn ordered_by<'a>(class: &'a Class, exclude: &[(String, String)], busy: &dyn Fn(&Candidate) -> usize) -> Vec<&'a Candidate> {
     let mut out: Vec<&Candidate> = class
         .candidates
         .iter()
         .filter(|c| c.status != CandidateStatus::Unplaced)
         .filter(|c| !exclude.iter().any(|(u, b)| u == &c.url && b == &c.backend))
         .collect();
-    out.sort_by_key(|c| order_key(c));
+    if class.pool {
+        out.sort_by_key(|c| pool_key(c, busy(c)));
+    } else {
+        out.sort_by_key(|c| order_key(c));
+    }
     out
+}
+
+/// A pool's routing order, lowest first: non-degraded, healthy, fewest
+/// requests in flight from this gateway, heartbeat load, declared position.
+pub fn pool_key(c: &Candidate, in_flight: usize) -> (u8, u8, usize, i64, usize) {
+    (
+        if c.degraded { 1 } else { 0 },
+        if c.healthy { 0 } else { 1 },
+        in_flight,
+        (c.load * 100.0) as i64,
+        c.position,
+    )
+}
+
+// ── requests in flight ───────────────────────────────────────────────────
+
+/// Requests this gateway has open to each `(url, backend)`. A pool reads it
+/// to pick the least busy peer; the heartbeat load alone is up to 30 s old
+/// and does not see a burst.
+static IN_FLIGHT: OnceLock<Mutex<HashMap<(String, String), usize>>> = OnceLock::new();
+
+fn in_flight_map() -> &'static Mutex<HashMap<(String, String), usize>> {
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Open requests to `(url, backend)` right now.
+pub fn in_flight(url: &str, backend: &str) -> usize {
+    in_flight_map().lock().map(|m| m.get(&(url.to_string(), backend.to_string())).copied().unwrap_or(0)).unwrap_or(0)
+}
+
+/// One open request; dropping it closes it. Held for the whole answer,
+/// including a stream the client is still reading.
+#[derive(Debug)]
+pub struct InFlight((String, String));
+
+impl InFlight {
+    pub fn open(url: &str, backend: &str) -> InFlight {
+        let key = (url.to_string(), backend.to_string());
+        if let Ok(mut m) = in_flight_map().lock() {
+            *m.entry(key.clone()).or_insert(0) += 1;
+        }
+        InFlight(key)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Ok(mut m) = in_flight_map().lock() {
+            if let Some(n) = m.get_mut(&self.0) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        }
+    }
 }
 
 // ── loaders ──────────────────────────────────────────────────────────────
@@ -671,20 +751,22 @@ pub async fn load_placements(db: &sqlx::PgPool) -> Result<Vec<PlacementRow>, sql
 }
 
 pub async fn load_declarations(db: &sqlx::PgPool) -> Result<Declarations, sqlx::Error> {
-    let rows: Vec<(String, i32, String, String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT class, position, node_id, backend, model, degraded FROM noo_model_classes ORDER BY class, position",
+    let rows: Vec<(String, i32, String, String, Option<String>, bool, bool)> = sqlx::query_as(
+        "SELECT class, position, node_id, backend, model, degraded, pool FROM noo_model_classes ORDER BY class, position",
     )
     .fetch_all(db)
     .await?;
     let mut classes: Vec<DeclaredClass> = Vec::new();
-    for (class, _pos, node_id, backend, model, degraded) in rows {
+    for (class, _pos, node_id, backend, model, degraded, pool) in rows {
         let c = match classes.iter_mut().find(|c| c.name == class) {
             Some(c) => c,
             None => {
-                classes.push(DeclaredClass { name: class.clone(), candidates: Vec::new() });
+                classes.push(DeclaredClass { name: class.clone(), candidates: Vec::new(), pool: false });
                 classes.last_mut().expect("just pushed")
             }
         };
+        // Written on every row of the class; any row saying pool means pool.
+        c.pool |= pool;
         c.candidates.push(DeclaredCandidate { node_id, backend, model, degraded });
     }
     let aliases: Vec<(String, String)> = sqlx::query_as("SELECT alias, class FROM noo_model_aliases ORDER BY alias")
@@ -700,10 +782,10 @@ pub async fn save_class(db: &sqlx::PgPool, class: &DeclaredClass, aliases: &[Str
     sqlx::query("DELETE FROM noo_model_classes WHERE class = $1").bind(&class.name).execute(&mut *tx).await?;
     for (i, c) in class.candidates.iter().enumerate() {
         sqlx::query(
-            "INSERT INTO noo_model_classes (class, position, node_id, backend, model, degraded, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+            "INSERT INTO noo_model_classes (class, position, node_id, backend, model, degraded, pool, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
              ON CONFLICT (class, node_id, backend) DO UPDATE SET position = EXCLUDED.position, \
-               model = EXCLUDED.model, degraded = EXCLUDED.degraded, updated_at = NOW()",
+               model = EXCLUDED.model, degraded = EXCLUDED.degraded, pool = EXCLUDED.pool, updated_at = NOW()",
         )
         .bind(&class.name)
         .bind(i as i32)
@@ -711,6 +793,7 @@ pub async fn save_class(db: &sqlx::PgPool, class: &DeclaredClass, aliases: &[Str
         .bind(&c.backend)
         .bind(&c.model)
         .bind(c.degraded)
+        .bind(class.pool)
         .execute(&mut *tx)
         .await?;
     }
@@ -886,6 +969,7 @@ mod tests {
         Declarations {
             classes: vec![DeclaredClass {
                 name: CHAT_DEFAULT.into(),
+                pool: false,
                 candidates: vec![
                     DeclaredCandidate { node_id: "host3".into(), backend: "vllm".into(), model: None, degraded: false },
                     DeclaredCandidate { node_id: "host6".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false },
@@ -990,6 +1074,7 @@ mod tests {
         let decl = Declarations {
             classes: vec![DeclaredClass {
                 name: HF.to_ascii_lowercase(),
+                pool: false,
                 candidates: vec![
                     DeclaredCandidate { node_id: "host3".into(), backend: "vllm".into(), model: None, degraded: false },
                     DeclaredCandidate { node_id: "host6".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: true },
@@ -1009,6 +1094,80 @@ mod tests {
         assert_eq!(ids.iter().filter(|i| same_model(i, HF)).count(), 1, "{ids:?}");
     }
 
+    // ── pools ────────────────────────────────────────────────────────
+
+    /// chat-default as a pool of host3's vLLM 12B and host6's ollama 12B,
+    /// with host8's e2b as a degraded last resort — the shape the operator
+    /// asked for on 2026-10-16 (awolf + mcmini sharing chat).
+    fn pool_decl(pool: bool) -> Declarations {
+        Declarations {
+            classes: vec![DeclaredClass {
+                name: CHAT_DEFAULT.into(),
+                pool,
+                candidates: vec![
+                    DeclaredCandidate { node_id: "host3".into(), backend: "vllm".into(), model: None, degraded: false },
+                    DeclaredCandidate { node_id: "host6".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false },
+                    DeclaredCandidate { node_id: "host8".into(), backend: "ollama".into(), model: None, degraded: true },
+                ],
+            }],
+            aliases: vec![],
+        }
+    }
+
+    fn order_with(t: &ClassTable, busy: &[(&str, usize)]) -> Vec<String> {
+        let c = t.class(CHAT_DEFAULT).unwrap();
+        ordered_by(c, &[], &|cand| busy.iter().find(|(n, _)| *n == cand.node_id).map(|(_, b)| *b).unwrap_or(0))
+            .iter()
+            .map(|c| c.node_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_pool_sends_the_next_request_to_the_least_busy_peer() {
+        let t = build_table(&fleet(), &placements(), &pool_decl(true), HF, "vllm");
+        assert!(t.class(CHAT_DEFAULT).unwrap().pool);
+        // Idle: heartbeat load breaks the tie (host6 0.1 < host3 0.3).
+        assert_eq!(order_with(&t, &[]), ["host6", "host3", "host8"]);
+        // host6 busy with two requests, host3 with one: host3 goes first.
+        assert_eq!(order_with(&t, &[("host6", 2), ("host3", 1)]), ["host3", "host6", "host8"]);
+        // The degraded candidate stays last however idle it is.
+        assert_eq!(order_with(&t, &[("host6", 5), ("host3", 5)]), ["host6", "host3", "host8"]);
+    }
+
+    #[test]
+    fn a_pool_still_puts_an_unhealthy_peer_after_a_healthy_one() {
+        let mut nodes = fleet();
+        nodes[1].heartbeat_age_secs = Some(600.0); // host6 silent
+        let t = build_table(&nodes, &placements(), &pool_decl(true), HF, "vllm");
+        assert_eq!(order_with(&t, &[("host3", 9)]), ["host3", "host6", "host8"]);
+    }
+
+    #[test]
+    fn a_class_that_is_not_a_pool_keeps_its_declared_order_under_load() {
+        let t = build_table(&fleet(), &placements(), &pool_decl(false), HF, "vllm");
+        assert!(!t.class(CHAT_DEFAULT).unwrap().pool);
+        assert_eq!(order_with(&t, &[("host3", 9)]), ["host3", "host6", "host8"]);
+    }
+
+    #[test]
+    fn a_derived_class_is_never_a_pool() {
+        let t = build_table(&fleet(), &placements(), &Declarations::default(), HF, "vllm");
+        assert!(t.classes.iter().all(|c| !c.pool));
+    }
+
+    #[test]
+    fn an_in_flight_ticket_counts_until_dropped() {
+        let (url, be) = ("https://192.0.2.77:8081", "pool-test-backend");
+        assert_eq!(in_flight(url, be), 0);
+        let a = InFlight::open(url, be);
+        let b = InFlight::open(url, be);
+        assert_eq!(in_flight(url, be), 2);
+        drop(a);
+        assert_eq!(in_flight(url, be), 1);
+        drop(b);
+        assert_eq!(in_flight(url, be), 0);
+    }
+
     #[test]
     fn a_declared_model_is_carried_separately_from_the_resolved_one() {
         let t = build_table(&fleet(), &placements(), &declared(), HF, "vllm");
@@ -1025,6 +1184,7 @@ mod tests {
         let decl = Declarations {
             classes: vec![DeclaredClass {
                 name: "fast".into(),
+                pool: false,
                 candidates: vec![
                     DeclaredCandidate { node_id: "host8".into(), backend: "ollama".into(), model: Some("qwen2.5:0.5b".into()), degraded: false },
                     DeclaredCandidate { node_id: "ghost".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false },
@@ -1106,7 +1266,7 @@ mod tests {
 /// scratch database (a pgvector container); without it the test says so and
 /// passes, so CI without a database is not red for the wrong reason — but
 /// a run WITH the variable asserts every step, including that migration
-/// the chain head (`092_kiosk_seats`, over `091_token_budgets`) is what stamped the schema.
+/// the chain head (`093_model_class_pool`, over `092_kiosk_seats`) is what stamped the schema.
 #[cfg(test)]
 mod db_tests {
     use super::*;
@@ -1125,7 +1285,7 @@ mod db_tests {
         crate::mesh_migrate::apply_baseline(&admin).await.expect("baseline");
         crate::mesh_migrate::apply(&admin).await.expect("migrations");
         let rev = crate::mesh_migrate::current_revision(&admin).await.expect("revision").expect("stamped");
-        assert_eq!(rev, crate::mesh_migrate::KIOSK_SEATS_REVISION, "the head revision is the kiosk-seats migration");
+        assert_eq!(rev, crate::mesh_migrate::MODEL_CLASS_POOL_REVISION, "the head revision is the model-class pool migration");
         // A fresh pool: the migrator resets search_path on the connection it used.
         let db = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect_with(opts).await.expect("connect scratch db");
 
@@ -1135,6 +1295,7 @@ mod db_tests {
 
         let class = DeclaredClass {
             name: CHAT_DEFAULT.into(),
+            pool: false,
             candidates: vec![
                 DeclaredCandidate { node_id: "host3".into(), backend: "vllm".into(), model: None, degraded: false },
                 DeclaredCandidate { node_id: "host6".into(), backend: "ollama".into(), model: Some("gemma4:12b".into()), degraded: false },
@@ -1147,7 +1308,7 @@ mod db_tests {
         assert_eq!(d.aliases, vec![("gemma4:12b-any".to_string(), CHAT_DEFAULT.to_string())]);
 
         // Replacing drops the candidates and aliases that are no longer named.
-        let shorter = DeclaredClass { name: CHAT_DEFAULT.into(), candidates: class.candidates[..1].to_vec() };
+        let shorter = DeclaredClass { name: CHAT_DEFAULT.into(), candidates: class.candidates[..1].to_vec(), pool: false };
         save_class(&db, &shorter, &[]).await.expect("replace");
         let d = load_declarations(&db).await.expect("load");
         assert_eq!(d.classes, vec![shorter]);

@@ -32,12 +32,56 @@ FROM ${HUB_MIRROR}/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b04
 # and VAD via onnxruntime — no system packages needed.
 # `requests` is imported by faster_whisper.utils but missing from its
 # declared deps at this pin — install it explicitly.
-RUN pip install --no-cache-dir \
+#
+# EVERY package is pinned, transitive ones included, and installed with
+# --no-deps so nothing resolves at build time. A floating dep is how STT
+# broke silently in stack 0.6.5: faster-whisper 1.1.1 declares `av>=11`,
+# the build resolved av 19.0.1, which dropped `metadata_errors` from
+# av.open() — and faster_whisper/audio.py decode_audio passes it, so every
+# transcription was a 422 (`open() got an unexpected keyword argument
+# 'metadata_errors'`). av 18.1.0 is the newest that still accepts it
+# (faster-whisper 1.2.1 passes it too, so a bump does not help).
+# tests/test_voice_images_pinned.py refuses an unpinned line here;
+# tests/test_whisper_server_decode.py runs the real decode_audio.
+# To move a pin: resolve in a throwaway python:3.12-slim, `pip freeze`,
+# replace the list below, and run both tests against that av.
+RUN pip install --no-cache-dir --no-deps \
         faster-whisper==1.1.1 \
-        "requests>=2.32,<3" \
-        "fastapi>=0.115,<0.116" \
-        "uvicorn>=0.34,<0.35" \
-        "python-multipart>=0.0.18,<0.1"
+        av==18.1.0 \
+        ctranslate2==4.8.3 \
+        onnxruntime==1.31.0 \
+        tokenizers==0.23.3 \
+        huggingface_hub==2.2.0 \
+        hf-xet==1.7.0 \
+        httpx2==2.13.1 \
+        httpcore2==2.13.1 \
+        truststore==0.10.5 \
+        numpy==2.5.4 \
+        flatbuffers==25.12.19 \
+        protobuf==7.36.2 \
+        filelock==4.2.0 \
+        fsspec==2026.9.0 \
+        packaging==26.3 \
+        PyYAML==6.0.3 \
+        tqdm==4.70.1 \
+        requests==2.34.2 \
+        certifi==2026.7.22 \
+        charset-normalizer==3.5.2 \
+        idna==3.20 \
+        urllib3==2.8.0 \
+        fastapi==0.115.14 \
+        starlette==0.46.2 \
+        pydantic==2.14.1 \
+        pydantic_core==2.50.1 \
+        annotated-types==0.8.0 \
+        typing-inspection==0.4.4 \
+        typing_extensions==4.16.0 \
+        anyio==4.15.1 \
+        uvicorn==0.34.3 \
+        click==8.5.0 \
+        h11==0.16.0 \
+        python-multipart==0.0.32 \
+    && pip check
 
 # Vendor telemetry off (docs/security/telemetry.md), baked into the image so
 # a container started outside compose carries it too; compose sets the same.

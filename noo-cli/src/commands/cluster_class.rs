@@ -8,8 +8,11 @@
 //!
 //! A class never restates a placement: `node/backend` with no `=model`
 //! means "whatever `noo cluster place` declared there". `--degraded`
-//! candidates are the only ones allowed to answer with a different model,
-//! and only after every other candidate has failed.
+//! candidates answer only after every other candidate has failed.
+//! `--pool` makes the non-degraded candidates peers: each request goes to
+//! the least busy healthy one, so the class spreads across nodes instead
+//! of queueing on the first (they may serve different models — declaring
+//! the pool says they are interchangeable).
 //! With nothing declared the gateway derives one class per
 //! served model — `list` shows those too, marked `derived`.
 
@@ -39,6 +42,7 @@ pub(crate) fn set_body(
     candidates: &[(String, String, Option<String>)],
     degraded: &[(String, String, Option<String>)],
     aliases: &[String],
+    pool: bool,
 ) -> serde_json::Value {
     let mut list = Vec::with_capacity(candidates.len() + degraded.len());
     for (deg, group) in [(false, candidates), (true, degraded)] {
@@ -50,7 +54,7 @@ pub(crate) fn set_body(
             list.push(c);
         }
     }
-    serde_json::json!({"candidates": list, "aliases": aliases})
+    serde_json::json!({"candidates": list, "aliases": aliases, "pool": pool})
 }
 
 /// `noo cluster class list`
@@ -76,7 +80,11 @@ pub fn cluster_class_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     let mut unplaced: Vec<(String, String, String, String)> = Vec::new();
     for c in classes {
         let name = c["name"].as_str().unwrap_or("?");
-        let source = if c["declared"].as_bool().unwrap_or(false) { "declared" } else { "derived" };
+        let source = match (c["declared"].as_bool().unwrap_or(false), c["pool"].as_bool().unwrap_or(false)) {
+            (true, true) => "declared, pool",
+            (true, false) => "declared",
+            _ => "derived",
+        };
         let cands = c["candidates"].as_array().unwrap_or(&empty);
         if cands.is_empty() {
             rows.push(vec![name.into(), source.into(), dash.into(), ui::muted("no candidates"), dash.into(), dash.into()]);
@@ -139,14 +147,16 @@ pub fn cluster_class_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     Ok(0)
 }
 
-/// `noo cluster class set <class> <node>/<backend>[=<model>]... [--degraded ...]... [--alias <name>]...`
+/// `noo cluster class set <class> <node>/<backend>[=<model>]... [--degraded ...]... [--alias <name>]... [--pool]`
 pub fn cluster_class_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut positional: Vec<String> = Vec::new();
     let mut degraded_words: Vec<String> = Vec::new();
     let mut aliases: Vec<String> = Vec::new();
+    let mut pool = false;
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
         match tok.as_str() {
+            "--pool" => pool = true,
             "--degraded" => degraded_words.push(iter.next().ok_or(Unhandled)?.clone()),
             "--alias" => aliases.push(iter.next().ok_or(Unhandled)?.clone()),
             t if t.starts_with('-') => return Err(Unhandled),
@@ -170,15 +180,16 @@ pub fn cluster_class_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     };
     let candidates = parse_all(words);
     let degraded = parse_all(&degraded_words);
-    let body = set_body(&candidates, &degraded, &aliases);
+    let body = set_body(&candidates, &degraded, &aliases, pool);
     let resp = put_json(g, &format!("/api/cluster/model-classes/{}", super::urlencode(class)), &body, true, 15);
     if g.json {
         println!("{resp}");
         return Ok(0);
     }
     ui::done(&format!(
-        "{class}: {} candidate(s){}{} declared — routing picks it up within 30 s",
+        "{class}: {} candidate(s){}{}{} declared — routing picks it up within 30 s",
         candidates.len(),
+        if pool { " sharing the load" } else { "" },
         if degraded.is_empty() { String::new() } else { format!(" + {} degraded", degraded.len()) },
         if aliases.is_empty() { String::new() } else { format!(", aliases {}", aliases.join(", ")) },
     ));
@@ -272,7 +283,7 @@ mod tests {
             parse_candidate("host6/ollama=gemma4:12b").unwrap(),
         ];
         let degraded = vec![parse_candidate("host8/ollama").unwrap()];
-        let body = set_body(&cands, &degraded, &["gemma4:12b-any".to_string()]);
+        let body = set_body(&cands, &degraded, &["gemma4:12b-any".to_string()], false);
         let list = body["candidates"].as_array().unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list[0]["node"], "host3");
@@ -283,5 +294,13 @@ mod tests {
         assert_eq!(list[2]["node"], "host8");
         assert_eq!(list[2]["degraded"], true);
         assert_eq!(body["aliases"][0], "gemma4:12b-any");
+        assert_eq!(body["pool"], false);
+    }
+
+    /// `--pool` reaches the PUT body; without it the class fails over in order.
+    #[test]
+    fn the_set_body_carries_the_pool_flag() {
+        let cands = vec![parse_candidate("host3/vllm").unwrap(), parse_candidate("host6/ollama=gemma4:12b").unwrap()];
+        assert_eq!(set_body(&cands, &[], &[], true)["pool"], true);
     }
 }

@@ -95,7 +95,7 @@ pub(crate) enum KeyStep {
 
 /// Per-add-on results of enabling several (`entitlement install --enable`):
 /// what was enabled, and what was refused with its fix.
-pub(crate) type EnableOutcomes<'a> = (Vec<(&'a str, Enabled)>, Vec<(String, Refusal)>);
+pub(crate) type EnableOutcomes<'a> = (Vec<(&'a str, Enabled)>, Vec<(String, Refusal)>, PrincipalStep);
 
 /// What step 0 did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +128,49 @@ pub(crate) trait EnableOps {
     fn plan_key(&mut self, addon: &str) -> Result<KeyPlan, Refusal>;
     fn mint_credentials(&mut self, addon: &str) -> Result<Vec<String>, Refusal>;
     fn issue_key(&mut self, addon: &str, plan: &KeyPlan) -> Result<(), Refusal>;
+    /// After the switch: give every declared add-on its own NATS principal
+    /// (mint + render users.conf + HUP noo-nats) — the reconcile `noo addons
+    /// enable` and `noo upgrade --stack` run. Without it a fresh install's
+    /// add-on presents the worker principal until the next `upgrade --stack`
+    /// (the 0.6.6-rc.1 rehearsal: `nats principals !`, empty
+    /// /run/secrets/nats_addon_password).
+    fn reconcile_principals(&mut self) -> PrincipalStep;
+}
+
+/// What the add-on NATS principal reconcile did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrincipalStep {
+    /// Every declared add-on principal was already rendered (or no users.conf yet).
+    Unchanged,
+    Rendered { users: usize, minted: Vec<String>, reloaded: bool },
+    /// Best-effort: the add-on falls back to the worker principal for now.
+    Failed(String),
+}
+
+/// Human line for a [`PrincipalStep`] — the same wording `upgrade --stack` prints.
+pub(crate) fn report_principals(step: &PrincipalStep) {
+    use crate::ui;
+    match step {
+        PrincipalStep::Unchanged => {}
+        PrincipalStep::Rendered { users, minted, reloaded } => ui::done(&format!(
+            "add-on NATS principals rendered ({users} principals{}){}",
+            if minted.is_empty() { String::new() } else { format!("; minted {}", minted.join(", ")) },
+            if *reloaded { "; noo-nats reloaded" } else { "" }
+        )),
+        PrincipalStep::Failed(e) => ui::warned(&format!(
+            "an add-on's NATS principal was not rendered ({e}) — it presents the worker principal \
+             until then; run: noo cluster nats-users render"
+        )),
+    }
+}
+
+pub(crate) fn principals_json(step: &PrincipalStep) -> serde_json::Value {
+    match step {
+        PrincipalStep::Unchanged => serde_json::json!({"rendered": false}),
+        PrincipalStep::Rendered { users, minted, reloaded } =>
+            serde_json::json!({"rendered": true, "principals": users, "minted": minted, "nats_reloaded": reloaded}),
+        PrincipalStep::Failed(e) => serde_json::json!({"rendered": false, "error": e}),
+    }
 }
 
 /// Is `addons.<name>` already declared true in `config`?
@@ -206,6 +249,14 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
 }
 
 impl EnableOps for Live<'_> {
+    fn reconcile_principals(&mut self) -> PrincipalStep {
+        use crate::commands::nats_users as nu;
+        match nu::reconcile_addon_principals(self.g, &crate::envfile::repo_root()) {
+            Ok(None) => PrincipalStep::Unchanged,
+            Ok(Some(out)) => PrincipalStep::Rendered { users: out.users, minted: out.minted, reloaded: nu::hup_nats() },
+            Err(e) => PrincipalStep::Failed(e),
+        }
+    }
     fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
         use crate::addons::{self, resolve::Refusal as R};
         if crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
@@ -444,11 +495,28 @@ pub(crate) mod tests {
         pub fail_issue: bool,
         pub fail_pin: bool,
         pub calls: Vec<String>,
+        /// When set, `reconcile_principals` records which add-ons this
+        /// config declared on AT THE TIME of the call (the render reads the
+        /// declared add-ons, so it must follow the switch).
+        pub config: Option<PathBuf>,
+        pub declared_at_reconcile: Vec<String>,
     }
 
     pub(crate) const CREDS: [&str; 2] = ["NOO_EVOLVE_DB_PASSWORD", "NOO_EVOLVE_DDL_PASSWORD"];
 
     impl EnableOps for Fake {
+        fn reconcile_principals(&mut self) -> PrincipalStep {
+            self.calls.push("principals".into());
+            if let Some(c) = &self.config {
+                let text = std::fs::read_to_string(c).unwrap_or_default();
+                self.declared_at_reconcile = crate::commands::addons::declared_in(&text)
+                    .into_iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(k, _)| k.to_string())
+                    .collect();
+            }
+            PrincipalStep::Rendered { users: 5, minted: vec!["NATS_TRELLION_INTEL_PASSWORD".into()], reloaded: true }
+        }
         fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
             self.calls.push(format!("pin:{addon}"));
             if self.fail_pin {

@@ -327,7 +327,7 @@ The agent does not read `noomesh.yaml`; `noo cluster provision` renders
 | `PGPASSFILE` | `/run/secrets/pgpass` when the store holds a role password | the pgpass file compose delivers (0400). The launcher derives its body — `noo` + `noo_app` for the gateway, `noo_app` for the worker (`derive_file_secrets`, `scripts/lib-secrets.sh`) |
 | `NOO_PGPASS_GATEWAY`, `NOO_PGPASS_WORKER` | derived | **launcher-process only** — the two pgpass bodies compose copies into the containers; never in `.env`, the store, or any container's environment |
 | `PAGEINDEX_EMBEDDING_URL`, `PAGEINDEX_EMBEDDING_BACKEND`, `PAGEINDEX_EMBEDDING_MODEL`, `EMBEDDING_DIM`, `EMBEDDING_MODEL` | — | embedding (same client rules as the gateway) |
-| `PAGEINDEX_LLM_URL`, `PAGEINDEX_LLM_MODEL` | — | the worker's direct LLM endpoint, and the model name trellion asks the gateway for (an exact-match routing hint: place that model on the node you want extraction to run on) |
+| `PAGEINDEX_LLM_URL`, `PAGEINDEX_LLM_MODEL` | — | the worker's direct LLM endpoint, and the model name trellion asks the gateway for: `default` (the chat-default class, which a `--pool` declaration spreads across nodes) unless set; a model name is an exact-match hint that pins trellion to the nodes serving it |
 | `NOO_EMBEDDING_BACKPRESSURE_THRESHOLD` | `5000` | pause ingest when the embed queue is deep |
 | `NOO_MIGRATIONS_ENVS` | — | which Alembic envs the migration step runs |
 | `NOO_CONFIG`, `NOO_SETTINGS_FILE` | — | config file path; settings snapshot path |
