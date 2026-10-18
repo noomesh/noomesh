@@ -33,6 +33,7 @@ mod addon_token;
 mod kiosk;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
+mod conversation_import;
 mod monitoring;
 mod grafana_ds;
 mod logs_ingest;

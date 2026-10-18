@@ -1121,6 +1121,9 @@ fn erase_targets(keep_account: bool, episodes_have_user_id: bool) -> Vec<EraseTa
         EraseTarget { label: "uploads", table: "noo_uploads", where_sql: "owner = $1" },
     ];
     if !keep_account {
+        // With keep_account, retain content-free source IDs so old publisher
+        // retries cannot undo the erasure. Import detects the removed copy.
+        t.push(EraseTarget { label: "conversation_sources", table: "noo_conversation_sources", where_sql: "user_id = $1" });
         t.push(EraseTarget { label: "account", table: "noo_users", where_sql: "username = $1" });
     }
     t

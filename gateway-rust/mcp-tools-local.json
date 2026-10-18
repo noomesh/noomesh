@@ -1546,6 +1546,39 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
+      "description": "Publish a source conversation entry, session ending or deletion to your\nown conversation memory. Infrastructure import: preserves original words,\nroles and source IDs; assistant dialogue is not verified action evidence.\nVersion 1 publications are idempotent and deletion prevents late replays.",
+      "had_custom_format": false,
+      "input_schema": {
+        "description": "Publish a source conversation entry, session ending or deletion to your\nown conversation memory. Infrastructure import: preserves original words,\nroles and source IDs; assistant dialogue is not verified action evidence.\nVersion 1 publications are idempotent and deletion prevents late replays.",
+        "properties": {
+          "publication": {
+            "additionalProperties": true,
+            "description": "Conversation publication v1 with publisher_id, event_id, conversation_id and operation (entry, session_end, delete).",
+            "title": "Publication",
+            "type": "object"
+          }
+        },
+        "required": [
+          "publication"
+        ],
+        "title": "ConversationPublish",
+        "type": "object"
+      },
+      "method": "POST",
+      "name": "noo_conversation_publish",
+      "path": "/api/conversations/import",
+      "risk_level": "medium",
+      "tags": [
+        "memory",
+        "conversation",
+        "external"
+      ],
+      "timeout_secs": 30
+    },
+    {
+      "aliases": {},
+      "auth": "cluster",
+      "body_field": "",
       "description": "Pure-traversal answer over a snapshot DAG \u2014 zero LLM cost.\n\nUse when you need a deterministic prerequisite/structure answer like\n'what should I learn before X?' from a topic-scoped snapshot.",
       "had_custom_format": false,
       "input_schema": {

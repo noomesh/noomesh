@@ -1969,6 +1969,25 @@ BEGIN
     END IF;
 END $grant$;
 "#, audit_append_only_sql!()),
+} , Migration {
+    revision: "095_conversation_sources",
+    down_revision: Some(AUDIT_CHAIN_REVISION),
+    sql: r#"
+CREATE TABLE noo_conversation_sources (
+    user_id text NOT NULL,
+    publisher_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    conversation_id uuid NOT NULL UNIQUE,
+    deleted boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY(user_id,publisher_id,source_id)
+);
+DO $$ BEGIN
+    IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='noo_app') THEN
+        GRANT SELECT,INSERT,UPDATE,DELETE ON noo_conversation_sources TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
 
 /// The kiosk-seat revision (i77).

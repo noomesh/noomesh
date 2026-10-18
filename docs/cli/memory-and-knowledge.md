@@ -364,3 +364,35 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo prompt-skills create` | `<name> [-f <file>] [-d <description>] [--tags <csv>] [-p <priority>]` | Create a prompt skill from a file or stdin content |
 | `noo prompt-skills evolve` | `[-o <observation>] [--skill <name>] [--role <role>] [--apply]` | Propose (or with --apply, write) an LLM-evolved prompt skill |
 <!-- END GENERATED -->
+
+## Conversation publication from add-ons
+
+`noo_conversation_publish` imports source dialogue through
+`POST /api/conversations/import`. This is a transcript-plane operation, not an
+inference request or knowledge-document ingestion. It requires a user-bound
+credential. The gateway resolves the account and organization from that token;
+the body cannot select another owner. Permission and labeling stay in Noomesh.
+Connection labels resolve to the same account for memory search/conversation
+reads; another account stays outside that scope.
+
+Publication v1 contains `publisher_id`, `event_id`, `conversation_id`, `version: 1`
+and `operation: entry | session_end | delete`. `entry` carries an immutable source
+entry UUID, `user`/`assistant` role, verbatim content, source timestamp, session ID,
+audio offsets, transcription source and voice. `session_end` carries the source
+session ID, `ended_at`, `end_reason` and transcription completeness. A `delete`
+contains no text. The API spec describes the fields and bounds.
+
+The gateway namespaces source IDs by authenticated account and publisher. A
+replayed entry cannot increase message counts or overwrite its words; altered
+content under an existing ID is a conflict. A delete removes the conversation
+projection and retains a minimal source tombstone that suppresses late retries.
+The acknowledgement echoes `event_id` and returns the destination conversation
+UUID plus `accepted`, `deleted` or `suppressed`. Acknowledgement means committed
+transcript storage; embedding/indexing happens asynchronously.
+
+Assistant entries remain `assistant_dialogue` with `verified_action: false`.
+Recall returns the source/conversation references and evidence label; an earlier
+assistant claim is not a successful tool execution. No persona/system prompt or
+privileged tool role is accepted through this interface. Add-ons should queue
+publication transactionally and use a current credential for the source user,
+without storing bearer tokens in transcript records or retry payloads.

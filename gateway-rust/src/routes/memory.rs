@@ -20,12 +20,19 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{holds_control_scope, scoped_user, ClusterNode, RequesterCtx, CONVERSATION_STATS_SCOPE};
+use crate::auth::{account_of, holds_control_scope, scoped_user, ClusterNode, RequesterCtx, CONVERSATION_STATS_SCOPE};
 use crate::auth::AuthActor;
 
 use crate::state::AppState;
 use super::{AppError, AppResult};
 use super::delegation::delegate_post;
+
+// Memory belongs to the person across connection labels. Apply the existing
+// tier clamp after resolving the credential through the platform account seam.
+fn memory_scope(requester: Option<&RequesterCtx>, cluster: Option<&ClusterNode>, requested: Option<&str>) -> Result<Option<String>,String> {
+    let caller=requester.cloned().map(|mut r| {r.sub=account_of(&r.sub).to_string();r});
+    scoped_user(caller.as_ref(),cluster,requested.map(account_of))
+}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -41,6 +48,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // endpoint. `with-preview` is kept because it is the name in the
         // contract the console builds against.
         .route("/api/conversations", get(conversations_with_preview))
+        .route("/api/conversations/import", post(super::conversation_import::receive))
         .route("/api/conversations/with-preview", get(conversations_with_preview))
         .route("/api/conversations/stats/tools", get(conv_stats_tools))
         .route("/api/conversations/stats/overview", get(conv_stats_overview))
@@ -257,7 +265,7 @@ async fn memory_search(
     cluster: Option<Extension<ClusterNode>>,
     Query(params): Query<SearchParams>,
 ) -> AppResult {
-    let scope = scoped_user(
+    let scope = memory_scope(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
         params.user_id.as_deref(),
@@ -305,9 +313,9 @@ pub(crate) async fn memory_search_rows(
 ) -> Result<Value, AppError> {
     // pgvector cosine similarity search on noo_entries
     let rows = if let Some(uid) = user_id {
-        sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<chrono::Utc>>, f64)>(
+        sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<chrono::Utc>>, f64, String, Option<Value>)>(
             "SELECT e.id::text, e.type, e.content, e.created_at, \
-                    1 - (e.embedding <=> CAST($1 AS vector)) AS score \
+                    1 - (e.embedding <=> CAST($1 AS vector)) AS score, e.conversation_id::text, e.metadata \
              FROM noo_entries e \
              JOIN noo_conversations c ON e.conversation_id = c.id \
              WHERE e.embedding IS NOT NULL \
@@ -321,9 +329,9 @@ pub(crate) async fn memory_search_rows(
         .fetch_all(&state.db)
         .await?
     } else {
-        sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<chrono::Utc>>, f64)>(
+        sqlx::query_as::<_, (String, String, String, Option<chrono::DateTime<chrono::Utc>>, f64, String, Option<Value>)>(
             "SELECT e.id::text, e.type, e.content, e.created_at, \
-                    1 - (e.embedding <=> CAST($1 AS vector)) AS score \
+                    1 - (e.embedding <=> CAST($1 AS vector)) AS score, e.conversation_id::text, e.metadata \
              FROM noo_entries e \
              WHERE e.embedding IS NOT NULL \
              ORDER BY e.embedding <=> CAST($1 AS vector) \
@@ -335,7 +343,7 @@ pub(crate) async fn memory_search_rows(
         .await?
     };
 
-    let results: Vec<Value> = rows.iter().map(|(id, typ, content, created_at, score)| {
+    let results: Vec<Value> = rows.iter().map(|(id, typ, content, created_at, score, conversation_id, metadata)| {
         let truncated = if content.chars().count() > 500 {
             format!("{}...", content.chars().take(500).collect::<String>())
         } else {
@@ -343,6 +351,10 @@ pub(crate) async fn memory_search_rows(
         };
         json!({
             "id": id,
+            "conversation_id": conversation_id,
+            "source": metadata.as_ref().and_then(|m|m.get("source")),
+            "evidence": metadata.as_ref().and_then(|m|m.get("evidence")),
+            "verified_action": metadata.as_ref().and_then(|m|m.get("verified_action")).and_then(Value::as_bool).unwrap_or(false),
             "type": typ,
             "content": truncated,
             "score": (score * 1000.0).round() / 1000.0,
@@ -645,7 +657,7 @@ async fn conversations_with_preview(
     cluster: Option<Extension<ClusterNode>>,
     Query(params): Query<ConversationListParams>,
 ) -> AppResult {
-    let scope = scoped_user(
+    let scope = memory_scope(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
         params.user_id.as_deref(),
@@ -1098,7 +1110,7 @@ async fn conv_detail(
 ) -> AppResult {
     // Scope comes from the ROW here: the id says nothing about who owns it,
     // so fetch first and compare.
-    let scope = scoped_user(
+    let scope = memory_scope(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
         None,
@@ -1202,7 +1214,7 @@ async fn conv_feedback(
     //
     // Same row-fetch-then-compare shape as `conv_detail`, including the 404
     // (not 403) so conversation ids cannot be enumerated by status code.
-    let scope = scoped_user(
+    let scope = memory_scope(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
         None,
@@ -1550,5 +1562,17 @@ mod stats_scope_tests {
         let op = who("alice", Role::Operator, &["write"]);
         assert_eq!(overview_scope(Some(&op), None, None), Ok(None));
         assert_eq!(overview_scope(Some(&op), None, Some("alice")), Ok(Some("alice".into())));
+    }
+}
+
+#[cfg(test)]
+mod publication_scope_tests {
+    use super::*;
+    #[test]
+    fn connection_labels_share_only_their_own_accounts_memory() {
+        let requester=RequesterCtx{sub:"alice/voice".into(),scopes:vec!["read".into()],role:crate::auth::Role::User,harness:None,act:None};
+        assert_eq!(memory_scope(Some(&requester),None,None).unwrap(),Some("alice".into()));
+        assert_eq!(memory_scope(Some(&requester),None,Some("alice/desktop")).unwrap(),Some("alice".into()));
+        assert!(memory_scope(Some(&requester),None,Some("bob/voice")).is_err());
     }
 }

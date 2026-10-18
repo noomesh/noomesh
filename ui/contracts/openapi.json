@@ -18734,6 +18734,49 @@
           }
         }
       }
+    },
+    "/api/conversations/import": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Publish source conversation dialogue",
+        "description": "User-bound transcript-plane import. The authenticated account determines ownership and organization. Version 1 accepts entry, session_end, or delete. Entry IDs are immutable and idempotent; deletion leaves a tombstone that suppresses late retries. Dialogue is not verified action evidence. Embedding/indexing is asynchronous.",
+        "operationId": "publish_source_conversation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "publication"
+                ],
+                "properties": {
+                  "publication": {
+                    "$ref": "#/components/schemas/SourceConversationPublication"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Committed publication receipt; echoes event_id and gives the destination conversation_id and accepted/deleted/suppressed status"
+          },
+          "400": {
+            "description": "Invalid publication"
+          },
+          "403": {
+            "description": "Missing or unavailable user-bound identity"
+          },
+          "409": {
+            "description": "Source identity or immutable entry conflict"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -18861,6 +18904,122 @@
           "expires_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "SourceConversationEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "session_id",
+          "role",
+          "content",
+          "created_at",
+          "start_ms",
+          "end_ms",
+          "source",
+          "voice"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "start_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "voice": {
+            "type": "string",
+            "maxLength": 128
+          }
+        }
+      },
+      "SourceConversationPublication": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "publisher_id",
+          "event_id",
+          "conversation_id",
+          "operation"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "publisher_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "entry",
+              "session_end",
+              "delete"
+            ]
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SourceConversationEntry"
+          },
+          "session_id": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_reason": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "transcription": {
+            "type": "string",
+            "maxLength": 128
           }
         }
       }
