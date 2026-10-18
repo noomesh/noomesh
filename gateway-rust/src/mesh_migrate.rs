@@ -2364,6 +2364,31 @@ BEGIN
     END IF;
 END $$;
 "#,
+}, Migration {
+    revision: CONVERSATION_SOURCES_REVISION,
+    down_revision: Some(PERSPECTIVES_REVISION),
+    // i608 (#169): the content-free source ledger for transcripts an add-on
+    // publishes through `noo_conversation_publish`. One row per (account,
+    // publisher, source id); `deleted` keeps a late replay of an erased or
+    // deleted source from coming back. Additive: a new table, which an older
+    // gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_conversation_sources (
+    user_id text NOT NULL,
+    publisher_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    conversation_id uuid NOT NULL UNIQUE,
+    deleted boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, publisher_id, source_id)
+);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2401,6 +2426,11 @@ pub const SEAT_DISPLAY_REVISION: &str = "113_seat_display";
 /// `perspective_id` on refresh rows, on seat display (113). A constant so a
 /// renumber at rebase is one line.
 pub const PERSPECTIVES_REVISION: &str = "114_perspectives";
+
+/// The conversation source ledger (i608, #169). 117: 114 is View-as (#829),
+/// 115 is #900 and 116 is i596 slice 2; it chains on whichever is the head
+/// when it lands. A constant so a renumber at rebase is one line.
+pub const CONVERSATION_SOURCES_REVISION: &str = "117_conversation_sources";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.

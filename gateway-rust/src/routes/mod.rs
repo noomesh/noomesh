@@ -43,6 +43,7 @@ mod kiosk;
 mod reservations;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
+mod conversation_import;
 mod monitoring;
 mod alert_intake;
 mod grafana_ds;
