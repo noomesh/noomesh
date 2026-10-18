@@ -2437,6 +2437,31 @@ CREATE TABLE IF NOT EXISTS noo_node_model_set_retry (
     updated_at timestamptz NOT NULL DEFAULT now()
 )
 "#,
+}, Migration {
+    revision: CONVERSATION_SOURCES_REVISION,
+    down_revision: Some(NODE_MODEL_SET_RETRY_REVISION),
+    // i608 (#169): the content-free source ledger for transcripts an add-on
+    // publishes through `noo_conversation_publish`. One row per (account,
+    // publisher, source id); `deleted` keeps a late replay of an erased or
+    // deleted source from coming back. Additive: a new table, which an older
+    // gateway ignores.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_conversation_sources (
+    user_id text NOT NULL,
+    publisher_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    conversation_id uuid NOT NULL UNIQUE,
+    deleted boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, publisher_id, source_id)
+);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'noo_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON noo_conversation_sources TO noo_app;
+    END IF;
+END $$;
+"#,
 }];
 
 /// Add-on feature settings and the super-admin flag (f99). A constant so a
@@ -2484,6 +2509,11 @@ pub const AGENT_MAILBOXES_REVISION: &str = "119_agent_mailboxes";
 /// The per-node model-set `retry now` epoch (i607b B3), on agent mailboxes
 /// (119). A constant so a renumber at rebase is one line.
 pub const NODE_MODEL_SET_RETRY_REVISION: &str = "120_node_model_set_retry";
+
+/// The conversation source ledger (i608, #169/#937), on the model-set retry
+/// epoch (120). Numbered at rebase against dev's real head; a migration that
+/// lands after it renumbers. A constant so a renumber at rebase is one line.
+pub const CONVERSATION_SOURCES_REVISION: &str = "121_conversation_sources";
 
 /// Creates the `pg_stat_statements` view the preloaded library feeds. A
 /// constant so a renumber at rebase is one line.
