@@ -375,6 +375,12 @@ the body cannot select another owner. Permission and labeling stay in Noomesh.
 Connection labels resolve to the same account for memory search/conversation
 reads; another account stays outside that scope.
 
+The import adapter delegates transcript storage to the gateway's existing
+conversation writer, sharing attribution, organization resolution and message
+counts with native chat. It does not call a Trellion worker or inference model.
+The conversation tables are currently provisioned by Trellion's migrations, so
+fresh installs still need that schema; this adds no new runtime service dependency.
+
 Publication v1 contains `publisher_id`, `event_id`, `conversation_id`, `version: 1`
 and `operation: entry | session_end | delete`. `entry` carries an immutable source
 entry UUID, `user`/`assistant` role, verbatim content, source timestamp, session ID,
