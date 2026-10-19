@@ -3103,6 +3103,9 @@ pub fn cluster_sync_model_files(g: &Globals, args: &[String]) -> Result<i32, Unh
             .map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
                     .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("gguf"))
+                    // A weight `noo models fetch ollama:<tag>` staged rides a
+                    // placement (the node imports it), not a push to every node.
+                    .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(crate::commands::ollama_stage::is_staged_name))
                     .collect()
             })
             .unwrap_or_default();

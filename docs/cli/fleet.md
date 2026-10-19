@@ -672,7 +672,7 @@ other direction: the other stack never calls noomesh.
 |---|---|---|
 | `noo models cached` | — | List models currently loaded on running node backends |
 | `noo models pull` | `<model> [--backend <b>]` | Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model |
-| `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified) |
+| `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face, or stage ollama:<tag> from the registry, into the store |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh]` | List popular models per backend from the HuggingFace catalog cache |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |
 | `noo models info` | `<model>` | Show detailed HuggingFace info for a model, including gating hints |
