@@ -95,6 +95,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/model-classes", get(model_classes_get))
         .route("/api/cluster/model-classes/{class}", put(model_class_put))
         .route("/api/cluster/model-classes/{class}", delete(model_class_delete))
+        .route("/api/cluster/model-aliases/{alias}", put(model_alias_put))
+        .route("/api/cluster/model-aliases/{alias}", delete(model_alias_delete))
         .route("/api/cluster/embedding-spaces", get(embedding_spaces_get))
         .route("/api/cluster/embedding-spaces/{space}", put(embedding_space_put))
         .route("/api/cluster/embedding-spaces/{space}", delete(embedding_space_delete))
@@ -4402,6 +4404,68 @@ async fn model_class_delete(
         json!({"class": class, "deleted": n}),
     ).await;
     Ok(Json(json!({"ok": true, "class": class, "deleted": n})))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelAliasBody {
+    class: String,
+}
+
+/// PUT /api/cluster/model-aliases/{alias} — point one alias (a purpose such
+/// as `knowledge`, or any other) at a class or a served model: `{class}`.
+/// That target is tried first and the mesh answers behind it (i145 phase D,
+/// `noo cluster prefer`). A target nothing serves is accepted with a note.
+async fn model_alias_put(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+    Json(body): Json<ModelAliasBody>,
+) -> AppResult {
+    use crate::coordinator::classes;
+    let alias = alias.trim().to_ascii_lowercase();
+    let class = body.class.trim().to_string();
+    classes::valid_name(&alias).map_err(AppError::BadRequest)?;
+    classes::valid_model(&class).map_err(AppError::BadRequest)?;
+    let table = classes::load_table(&state)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("model classes unavailable: {e}")))?;
+    if let Some(why) = classes::alias_refusal(&table, &alias, &class) {
+        return Err(AppError::Conflict(why));
+    }
+    classes::save_alias(&state.db, &alias, &class)
+        .await
+        .map_err(|e| AppError::Internal(format!("model alias write: {e}")))?;
+    let served = table.class(&class).is_some();
+    tracing::info!(alias = %alias, class = %class, served, "model_alias_declared");
+    crate::routes::core::audit_event(
+        &state.db, "model_alias_declared", "info", "gateway",
+        &format!("alias:{alias}"), "ok", json!({"alias": alias, "class": class, "served": served}),
+    ).await;
+    let mut out = json!({"ok": true, "alias": alias, "class": class, "served": served});
+    if !served {
+        out["note"] = json!(format!("nothing serves '{class}' right now: requests for '{alias}' go to any live chat node until something does"));
+    }
+    Ok(Json(out))
+}
+
+/// DELETE /api/cluster/model-aliases/{alias} — forget one alias. A purpose
+/// then means `chat-default` (the whole mesh) again.
+async fn model_alias_delete(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+) -> AppResult {
+    let alias = alias.trim().to_ascii_lowercase();
+    if !crate::coordinator::classes::delete_alias(&state.db, &alias)
+        .await
+        .map_err(|e| AppError::Internal(format!("model alias delete: {e}")))?
+    {
+        return Err(AppError::NotFound(format!("no declared alias '{alias}'")));
+    }
+    tracing::info!(alias = %alias, "model_alias_removed");
+    crate::routes::core::audit_event(
+        &state.db, "model_alias_removed", "info", "gateway",
+        &format!("alias:{alias}"), "ok", json!({"alias": alias}),
+    ).await;
+    Ok(Json(json!({"ok": true, "alias": alias})))
 }
 
 // ── embedding spaces (i145) ──────────────────────────────────────────

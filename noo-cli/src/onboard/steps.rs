@@ -520,6 +520,13 @@ fn offer_retired_env_keys(ctx: &mut Ctx) -> bool {
     for (k, note) in &set {
         ctx.raw(&format!("      {k} — {note}"));
     }
+    // i145: a model trellion was pointed at is a preference worth keeping.
+    // Say the exact command before the line goes, so the choice is carried
+    // into the DB instead of lost with the env value.
+    let (existing, _) = env::env_map(&ctx.env_path);
+    if let Some(cmd) = existing.get("PAGEINDEX_LLM_MODEL").and_then(|v| keep_llm_preference_hint(v)) {
+        ctx.info(&format!("To keep trellion preferring that model: {cmd}"));
+    }
     if ctx.dry_run {
         ctx.dry("offer to remove the retired .env keys (backup .env.bak_<ts> first)");
         return false;
@@ -540,6 +547,17 @@ fn offer_retired_env_keys(ctx: &mut Ctx) -> bool {
             false
         }
     }
+}
+
+/// The `noo cluster prefer` command that carries a retired
+/// `PAGEINDEX_LLM_MODEL` value into the DB, or None when it named no model
+/// (blank, `default`, the purpose itself).
+pub(crate) fn keep_llm_preference_hint(value: &str) -> Option<String> {
+    let v = value.trim().trim_matches('"').trim_matches('\'');
+    if v.is_empty() || ["default", "auto", "knowledge"].iter().any(|d| d.eq_ignore_ascii_case(v)) {
+        return None;
+    }
+    Some(format!("noo cluster prefer knowledge {v}"))
 }
 
 pub fn environment(ctx: &mut Ctx) {
@@ -7879,5 +7897,24 @@ mod dist_stack_lock_tests {
         let pin = body.find("if !pin_dist_stack_lock(ctx)").expect("the dist branch pins the lock");
         let launch = body.find("run_script_streamed(ctx, \"noomesh-start.sh\"").expect("the dist launch");
         assert!(pin < launch, "stack.lock must be verified and written before the launcher starts anything");
+    }
+}
+
+#[cfg(test)]
+mod llm_preference_hint_tests {
+    use super::keep_llm_preference_hint;
+
+    /// i145: a retired PAGEINDEX_LLM_MODEL that named a model becomes the
+    /// command that keeps it as trellion's preference; the defaults do not.
+    #[test]
+    fn a_named_model_becomes_a_prefer_command_and_defaults_do_not() {
+        assert_eq!(
+            keep_llm_preference_hint("google/gemma-4-12B-it-qat-w4a16-ct").as_deref(),
+            Some("noo cluster prefer knowledge google/gemma-4-12B-it-qat-w4a16-ct")
+        );
+        assert_eq!(keep_llm_preference_hint("\"gemma4:26b\"").as_deref(), Some("noo cluster prefer knowledge gemma4:26b"));
+        for none in ["", "default", "Default", "knowledge", " auto "] {
+            assert_eq!(keep_llm_preference_hint(none), None, "{none:?}");
+        }
     }
 }

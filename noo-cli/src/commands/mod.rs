@@ -202,7 +202,7 @@ pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
 pub use cluster_profile::cluster_profile;
 pub use cluster_verify::cluster_verify;
-pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset};
+pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset, cluster_prefer};
 pub use cluster_embedding_space::{cluster_embedding_space_list, cluster_embedding_space_set, cluster_embedding_space_unset};
 pub use security_local::{
     secrets_absorb_files,

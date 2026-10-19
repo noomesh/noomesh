@@ -1453,6 +1453,43 @@ pub async fn delete_class(db: &sqlx::PgPool, name: &str) -> Result<u64, sqlx::Er
     Ok(res.rows_affected())
 }
 
+/// Point one alias at a class (declared, or a served model's derived
+/// class): the purpose-preference write (i145 phase D,
+/// `noo cluster prefer`). Replaces whatever the alias pointed at.
+pub async fn save_alias(db: &sqlx::PgPool, alias: &str, class: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO noo_model_aliases (alias, class, updated_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (alias) DO UPDATE SET class = EXCLUDED.class, updated_at = NOW()",
+    )
+    .bind(alias)
+    .bind(class)
+    .execute(db)
+    .await?;
+    invalidate_cache();
+    Ok(())
+}
+
+/// Forget one alias. A purpose alias then means `chat-default` again.
+pub async fn delete_alias(db: &sqlx::PgPool, alias: &str) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM noo_model_aliases WHERE lower(alias) = lower($1)").bind(alias).execute(db).await?;
+    invalidate_cache();
+    Ok(res.rows_affected() > 0)
+}
+
+/// What an alias write may not do: shadow a class or served model by the
+/// same name (a request naming it must keep meaning it), or point at itself.
+/// `None` = allowed. A target nothing serves is allowed: it is a preference
+/// the mesh answers for until something serves it.
+pub fn alias_refusal(table: &ClassTable, alias: &str, class: &str) -> Option<String> {
+    if alias.eq_ignore_ascii_case(class) {
+        return Some(format!("'{alias}' cannot be an alias of itself"));
+    }
+    if table.class(alias).is_some() {
+        return Some(format!("'{alias}' is already a class or a served model; an alias by that name would hide it"));
+    }
+    None
+}
+
 // ── the public catalogue shape ───────────────────────────────────────────
 
 /// The OpenAI `/v1/models` list for a table: every class and alias as an id
@@ -2035,6 +2072,18 @@ mod tests {
         assert_eq!(first_node(&select_with(&t, Some("graph"), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
         // Purposes are declarable (the built-ins are not).
         assert!(valid_name("knowledge").is_ok());
+    }
+
+    /// i145 phase D: `noo cluster prefer` may point a purpose at a served
+    /// model or a class, but no alias may hide a class or model by its name.
+    #[test]
+    fn an_alias_may_not_shadow_a_class_or_served_model() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        assert_eq!(alias_refusal(&t, "knowledge", "gemma4:12b"), None);
+        assert_eq!(alias_refusal(&t, "knowledge", "not-served-yet"), None, "a preference the mesh answers for until served");
+        assert!(alias_refusal(&t, "gemma4:12b", CHAT_DEFAULT).is_some(), "a served model's name stays the model");
+        assert!(alias_refusal(&t, CHAT_DEFAULT, "gemma4:12b").is_some());
+        assert!(alias_refusal(&t, "x", "x").is_some());
     }
 
     #[test]

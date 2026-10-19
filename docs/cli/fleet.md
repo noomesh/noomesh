@@ -207,11 +207,13 @@ when none).
 trellion's answers and ingestion send `knowledge`, conversation
 extraction sends `graph`. `class list` shows them as `(purpose)` aliases.
 Undeclared, a purpose means `chat-default` (any live chat node) and is not
-a fallback. To prefer a model for one, give a class the purpose as an
-alias; the mesh still answers behind it when that class cannot:
+a fallback. To prefer a model for one, point the purpose at it; the mesh
+still answers behind it when that model cannot:
 
 ```sh
-noo cluster class set knowledge-big node-1/vllm --alias knowledge
+noo cluster prefer                          # every purpose and what it prefers
+noo cluster prefer knowledge gemma4:26b     # a served model (or a class) first
+noo cluster prefer knowledge --clear        # back to any live chat node
 ```
 
 To prefer one node for a request, name it: a `node` field in the body or an
@@ -614,6 +616,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
+| `noo cluster prefer` | `[<purpose> <model\|class> \| <purpose> --clear]` | Show or set which model a stack purpose (knowledge, graph) tries first |
 | `noo cluster embedding-space list` | — | Show each embedding space, its model and the nodes serving it |
 | `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
 | `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
