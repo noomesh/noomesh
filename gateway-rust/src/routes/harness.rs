@@ -94,7 +94,7 @@ async fn harness_call(
             "preferred_skills": rt.preferred_skills().await,
         }),
         HarnessOp::Catalogs => json!({
-            "skills": state.prompt_skills.list_all(),
+            "skills": state.prompt_skills.catalog_for_node(),
             "runbooks": state.runbooks,
         }),
         HarnessOp::ModelPreference => json!({"model": rt.user_model_preference(user).await}),
