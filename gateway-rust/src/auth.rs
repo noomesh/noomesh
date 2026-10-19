@@ -628,7 +628,20 @@ pub(crate) fn addon_consumer(claims: &Claims, is_inference_surface: bool) -> Opt
 /// the revocation of the key it came from, which is the property the short
 /// lifetime exists to deny.
 pub fn addon_token_scopes(key_scopes: &[String]) -> Vec<String> {
-    key_scopes.iter().filter(|s| s.as_str() != ADDON_SCOPE).cloned().collect()
+    addon_token_scopes_with(key_scopes, &crate::addon_proxy::declared_scopes())
+}
+
+/// A key holding a declared add-on scope (`<addon>:<word>`) gets `read` on the
+/// exchanged token: an add-on scope opens a GET route only together with
+/// `read`, and `read` is not a service-key scope, so without this the granted
+/// scope could never open anything. `read` is the User tier's own baseline.
+fn addon_token_scopes_with(key_scopes: &[String], declared: &[String]) -> Vec<String> {
+    let mut out: Vec<String> =
+        key_scopes.iter().filter(|s| s.as_str() != ADDON_SCOPE).cloned().collect();
+    if out.iter().any(|s| declared.contains(s)) && !out.iter().any(|s| s == "read") {
+        out.push("read".to_string());
+    }
+    out
 }
 
 /// The service-key scope that marks a **provisioning credential** for the
@@ -2748,6 +2761,11 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         // (addon_proxy), not waved through with the allow-list.
         return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, path);
     }
+    // A write the add-on's manifest opted in with `owner_scoped` (the add-on
+    // keeps every row to the forwarded account). Exact manifest match only.
+    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, path) {
+        return true;
+    }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
     }
@@ -3806,6 +3824,16 @@ mod tests {
     /// The door table is what makes a third consumer cheap. If the add-on
     /// path stopped resolving, the handler would be reachable by any
     /// credential the middleware happens to accept next.
+    #[test]
+    fn a_key_with_a_declared_addon_scope_exchanges_for_a_token_that_can_read_it() {
+        let declared = vec!["evolve:read_items".to_string()];
+        let key = vec!["addon".to_string(), "evolve:read_items".to_string()];
+        let t = super::addon_token_scopes_with(&key, &declared);
+        assert_eq!(t, vec!["evolve:read_items".to_string(), "read".to_string()]);
+        let plain = super::addon_token_scopes_with(&["addon".to_string(), "chat".to_string()], &declared);
+        assert_eq!(plain, vec!["chat".to_string()], "no add-on scope, no read");
+    }
+
     #[test]
     fn the_addon_path_is_an_exchange_door_and_only_for_post() {
         use axum::http::Method;

@@ -194,6 +194,12 @@ pub struct RouteSpec {
     /// requester holding `read` plus the scope, below `min_role`.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Opt-in for a `POST` at `min_role: "user"`: the add-on promises to read
+    /// and write only rows owned by the account the gateway forwards in
+    /// `x-noo-requester-sub`. The gateway does NOT check that promise. Without
+    /// it a `POST` is `operator` or `admin` (see "Who may call a route").
+    #[serde(default)]
+    pub owner_scoped: bool,
     /// Free text for whoever reads the manifest. Ignored by the code.
     #[serde(default)]
     pub note: Option<String>,
@@ -373,10 +379,23 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
                  (an unknown value is refused, never read as user)"
             ));
         };
-        if r.method == "POST" && role == crate::auth::Role::User {
+        if r.method == "POST" && role == crate::auth::Role::User && !r.owner_scoped {
             return Err(format!(
                 "{ctx}: a POST cannot be min_role \"user\" — writes are operator or admin, the \
-                 front door refuses a User's writes and a manifest does not widen that"
+                 front door refuses a User's writes and a manifest does not widen that. A route \
+                 whose add-on keeps every row to the calling account may declare \
+                 \"owner_scoped\": true (see \"Who may call a route\" in docs/development/addons.md)"
+            ));
+        }
+    }
+    if r.owner_scoped {
+        if r.method != "POST" || r.internal {
+            return Err(format!("{ctx}: owner_scoped applies to a public POST route only"));
+        }
+        if r.min_role.as_deref() != Some("user") {
+            return Err(format!(
+                "{ctx}: owner_scoped is the opt-in for min_role \"user\" on a POST; on any other \
+                 role it means nothing — remove it"
             ));
         }
     }
@@ -414,7 +433,7 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
         if let Some(p) = RESERVED_PREFIXES.iter().find(|p| path.starts_with(**p)) {
             return Err(format!("{ctx}: public path {path:?} is inside the gateway's own {p} namespace"));
         }
-        if r.method != "GET" {
+        if r.method != "GET" && !r.owner_scoped {
             let method = axum::http::Method::from_bytes(r.method.as_bytes()).expect("GET or POST");
             if user_tier_could_call(&method, path) {
                 return Err(format!(
@@ -590,6 +609,23 @@ pub fn manifests() -> Vec<AddonManifest> {
         .collect()
 }
 
+/// Every add-on scope (`<addon>:<word>`) a loaded manifest declares on some
+/// route, sorted and unique. This is what may be GRANTED to an account or a
+/// service key (`routes::users`): a scope no loaded add-on declares opens
+/// nothing, so granting it would be a typo that reads as a permission.
+pub fn declared_scopes() -> Vec<String> {
+    declared_scopes_of(&manifests())
+}
+
+pub fn declared_scopes_of(manifests: &[AddonManifest]) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = manifests
+        .iter()
+        .flat_map(|m| m.routes.iter())
+        .flat_map(|r| r.scopes.iter().cloned())
+        .collect();
+    set.into_iter().collect()
+}
+
 /// May a requester of `role` holding `scopes` GET `path` through a loaded
 /// add-on manifest? The tier gate asks this for a User-tier GET, so an
 /// add-on's read surface is scoped by its own `min_role`/`scopes` instead of
@@ -600,22 +636,47 @@ pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, path: &str
     get_allows(&manifests(), scopes, role, path)
 }
 
+/// May a requester of `role` holding `scopes` make a non-GET `method` call to
+/// `path` through a loaded `owner_scoped` route? The tier gate asks this for a
+/// User's write. False unless EVERY mounted route matching the method and path
+/// is `owner_scoped` and permits the role: a static route beside a `{param}`
+/// one that is not owner-scoped keeps the stricter reading.
+pub fn mounted_owner_scoped_allows(
+    method: &axum::http::Method,
+    scopes: &[String],
+    role: crate::auth::Role,
+    path: &str,
+) -> bool {
+    owner_scoped_allows(&manifests(), method, scopes, role, path)
+}
+
+fn owner_scoped_allows(
+    manifests: &[AddonManifest],
+    method: &axum::http::Method,
+    scopes: &[String],
+    role: crate::auth::Role,
+    path: &str,
+) -> bool {
+    let hits = matching_routes(manifests, method.as_str(), path);
+    !hits.is_empty() && hits.iter().all(|r| r.owner_scoped && r.permits(role, scopes))
+}
+
 fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    let hits = matching_get_routes(manifests, path);
+    let hits = matching_routes(manifests, "GET", path);
     !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
 }
 
 #[cfg(test)]
 fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
-    !matching_get_routes(manifests, path).is_empty()
+    !matching_routes(manifests, "GET", path).is_empty()
 }
 
-fn matching_get_routes<'a>(manifests: &'a [AddonManifest], path: &str) -> Vec<&'a RouteSpec> {
+fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
     let segs: Vec<&str> = path.split('/').collect();
     manifests
         .iter()
         .flat_map(|m| m.routes.iter())
-        .filter(|r| !r.internal && r.method == "GET")
+        .filter(|r| !r.internal && r.method == method)
         .filter(|r| {
             std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| {
                 let p: Vec<&str> = pat.split('/').collect();
@@ -724,6 +785,16 @@ async fn serve(
     body: Option<Value>,
     requester: Option<&crate::auth::RequesterCtx>,
 ) -> Response {
+    // An owner-scoped route is only safe because the add-on is handed the
+    // verified account. No requester means no account to hand over: refuse
+    // rather than forward a write the add-on cannot attribute.
+    if spec.owner_scoped && requester.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "detail": "this route acts for the signed-in account; no verified caller" })),
+        )
+            .into_response();
+    }
     // Permission first, before a param is parsed or anything is forwarded.
     if let Some(r) = requester {
         if !spec.permits(r.role, &r.scopes) {
@@ -1652,6 +1723,96 @@ mod permission_tests {
         v["routes"][3]["min_role"] = json!("user");
         let m: AddonManifest = serde_json::from_value(v).unwrap();
         assert!(validate(&m, "evolve").unwrap_err().contains("POST cannot be min_role"));
+    }
+
+    fn with_owner_route() -> AddonManifest {
+        let mut v = tests::sample_json();
+        v["routes"].as_array_mut().unwrap().push(json!({
+            "name": "sample_note", "method": "POST", "path": "/api/sample/notes",
+            "min_role": "user", "owner_scoped": true
+        }));
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        validate(&m, "evolve").expect("an owner_scoped user POST is accepted");
+        m
+    }
+
+    #[test]
+    fn owner_scoped_user_post_is_accepted_and_only_with_the_flag() {
+        with_owner_route();
+        // Without the flag: refused at load, and the error names the way out.
+        let mut v = tests::sample_json();
+        v["routes"][3]["min_role"] = json!("user");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        let e = validate(&m, "evolve").unwrap_err();
+        assert!(e.contains("POST cannot be min_role") && e.contains("owner_scoped"), "{e}");
+        // The flag means nothing on other shapes: refused, not ignored.
+        for (idx, role) in [(3usize, "operator"), (0, "user")] {
+            let mut v = tests::sample_json();
+            v["routes"][idx]["owner_scoped"] = json!(true);
+            v["routes"][idx]["min_role"] = json!(role);
+            let m: AddonManifest = serde_json::from_value(v).unwrap();
+            assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "route {idx}");
+        }
+    }
+
+    #[test]
+    fn the_tier_gate_admits_a_user_only_to_an_owner_scoped_post() {
+        let m = [with_owner_route()];
+        let post = axum::http::Method::POST;
+        let user = held(&["read"]);
+        assert!(owner_scoped_allows(&m, &post, &user, Role::User, "/api/sample/notes"));
+        // Operator-only POSTs are unchanged: a User is still refused.
+        assert!(!owner_scoped_allows(&m, &post, &user, Role::User, "/api/sample/run"));
+        assert!(!owner_scoped_allows(&m, &post, &user, Role::User, "/api/sample/rollback"));
+        assert!(!owner_scoped_allows(&m, &post, &user, Role::User, "/api/unmounted"));
+        // Method matters: the owner-scoped path is no GET route and no PUT route.
+        assert!(!owner_scoped_allows(&m, &axum::http::Method::PUT, &user, Role::User, "/api/sample/notes"));
+        assert!(!get_allows(&m, &user, Role::User, "/api/sample/notes"));
+    }
+
+    /// The add-on is handed the VERIFIED caller; the request to it is built
+    /// from nothing, so a header the client forged is never in it.
+    #[test]
+    fn a_forged_identity_header_is_replaced_by_the_verified_one() {
+        let h = caller_headers(Some(&ctx("alice", Role::User, &["read"])));
+        let all = |n: &str| h.iter().filter(|(k, _)| *k == n).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
+        // The client's `x-noo-requester-sub: root` has no way in: there is exactly
+        // one copy of each header and it is alice's.
+        assert_eq!(all(REQUESTER_SUB), ["alice"]);
+        assert_eq!(all(REQUESTER_ROLE), ["user"]);
+        assert_eq!(all(REQUESTER_SCOPES), ["read"]);
+        // forward() copies only caller_headers() onto a fresh request.
+        let src = include_str!("addon_proxy.rs");
+        let body = src.split("async fn forward(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(body.contains("for (name, value) in caller_headers(requester)"), "forward builds identity from the verified ctx");
+        assert!(!body.contains("HeaderMap") && !body.contains("headers()"), "forward must not pass client headers through");
+    }
+
+    #[tokio::test]
+    async fn an_owner_scoped_route_refuses_a_call_with_no_verified_caller() {
+        let m = with_owner_route();
+        let spec = m.route("sample_note").unwrap().clone();
+        let resp = serve(&m, &spec, HashMap::new(), None, Some(json!({})), None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn declared_scopes_are_the_manifest_scopes_sorted_and_unique() {
+        let m = [tests::sample()];
+        assert_eq!(declared_scopes_of(&m), vec!["evolve:read_items".to_string()]);
+        assert!(declared_scopes_of(&[]).is_empty());
+    }
+
+    /// An add-on scope is issuable only when declared, and holding it (with
+    /// `read`) opens that GET route and nothing else.
+    #[test]
+    fn a_granted_addon_scope_opens_its_route_and_nothing_else() {
+        let m = [tests::sample()];
+        let granted = held(&["read", "evolve:read_items"]);
+        assert!(get_allows(&m, &granted, Role::User, "/api/sample/items"));
+        assert!(!get_allows(&m, &granted, Role::User, "/api/sample/items/00000000-0000-0000-0000-000000000001"));
+        assert!(!get_allows(&m, &held(&["read"]), Role::User, "/api/sample/items"));
+        assert!(!owner_scoped_allows(&m, &axum::http::Method::POST, &granted, Role::User, "/api/sample/run"));
     }
 
     /// The shipped-shape fixture: every public route says who may call it.

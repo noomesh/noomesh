@@ -199,9 +199,10 @@ add-on when any of these fails:
 - routes the gateway calls by name (`CALLED_BY_NAME`: the console and CLI
   pieces and the gateway's own scheduled calls) are `internal`;
 - a public `POST` is one the front door already refuses a User-tier caller,
-  so a manifest cannot place a write where a User is admitted;
+  so a manifest cannot place a write where a User is admitted, unless the
+  route declares `"owner_scoped": true` (see "Who may call a route");
 - `min_role` is `user`, `operator` or `admin` (never anything else, never read
-  as `user`), a `POST` is not `user`, and `scopes` are `<name>:<word>` on a
+  as `user`), a `POST` is `user` only with `owner_scoped`, and `scopes` are `<name>:<word>` on a
   `GET`;
 - no public route collides with a core route.
 
@@ -228,9 +229,49 @@ Admins only. Before this field a manifest's `GET` routes were readable by any
 User-tier token; that is the one behaviour this narrows, and only for Users.
 Declare `"min_role": "user"` on a route a User should keep.
 
-Add-on scopes are checked against the scopes in the caller's token. Granting
-one to an account is a separate step the issuer must support for that word;
-until it does, `min_role` is the whole control.
+Add-on scopes are checked against the scopes in the caller's token. They are
+grantable: `noo security user set-scopes <user> --scope read --scope
+<addon>:<word>` (and `service-key issue --scopes <addon>:<word>`) accept a scope
+exactly when a loaded manifest declares it on some route, and refuse any other
+`<addon>:<word>` with the list of declared ones. The grant ends the account's
+sessions; the scope opens that add-on's `GET` route (with `read`) and nothing
+else.
+
+#### `owner_scoped`: a User's own writes
+
+The default is: declare it, or it is Operator. A `POST` cannot be
+`min_role: "user"`, because the front door refuses a User's writes.
+
+A route may opt out with `"owner_scoped": true`, and only a `POST` at
+`"min_role": "user"` may (the flag on any other shape is refused at load, not
+ignored). It means the add-on **promises to read and write only rows owned by
+the account the gateway forwards**, for example a person's own voice sessions,
+notes and tasks. The gateway does not check that promise; add the flag only to
+routes that keep it. What the gateway does:
+
+- the tier gate lets a User through to exactly that route (method and path), and
+  nothing else the add-on declares;
+- it forwards the verified caller on every request, in headers it **sets**
+  (the outbound request is built from nothing, so a copy a client sends is
+  never passed on): `X-Noo-Requester-Sub` (the account),
+  `X-Noo-Requester-Connection` (the session), `X-Noo-Requester-Role` (resolved
+  at validation, never re-derived from scopes), `X-Noo-Requester-Scopes`
+  (comma-separated), beside the gateway's bearer;
+- a call with no verified caller is refused (`401`) rather than forwarded, so
+  the add-on never has to guess whose row it is.
+
+The add-on must key every query and every write on `X-Noo-Requester-Sub`, take
+no owner from the body or path, and treat an absent header as the gateway
+itself, never as "anyone".
+
+```json
+{ "name": "voice_session_create", "method": "POST", "path": "/api/voice/sessions",
+  "min_role": "user", "owner_scoped": true, "timeout_secs": 30,
+  "note": "creates a session owned by the calling account" }
+```
+
+An add-on image that declares `owner_scoped` is refused whole by a gateway that
+predates the field, for the same reason; roll the gateway first.
 
 Rolling: the gateway rolls first. A gateway that predates `min_role` refuses an
 unknown manifest field outright (unknown keys fail the whole manifest), so an
