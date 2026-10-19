@@ -433,6 +433,30 @@ _secret_chown_files() {
         sh -c 'cd /d && while read -r u f; do chown "$u:$u" -- "$f" || exit 1; done < "$1"' sh "$m" >/dev/null
 }
 
+# _secret_form_conflicts <compose-file>... - overlays that still source a
+# top-level secret from `environment:` while extending a service or declaring
+# `read_only: true`. The stack's trellion service is read-only and compose
+# refuses an environment-sourced secret on a read-only service, which a service
+# that `extends` it inherits: such an overlay is a container compose will fail
+# to create halfway through `up`, after the rest of the stack was already
+# replaced. Static approximation (the base files are read-only themselves and
+# use `file:`); compose still refuses the exact case at create. Prints
+# "<file> <secret>" per conflict.
+_secret_form_conflicts() {
+    local f
+    for f in "$@"; do
+        awk -v file="$f" '
+            /^secrets:[[:space:]]*$/ { insec = 1; cur = ""; next }
+            insec && /^[^[:space:]#]/ { insec = 0 }
+            insec && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { cur = $1; sub(/:$/, "", cur); next }
+            insec && cur != "" && /^[[:space:]]+environment:/ { envsec[++n] = cur; next }
+            /^[[:space:]]+extends:/ { ext = 1 }
+            /^[[:space:]]+read_only:[[:space:]]*true/ { ro = 1 }
+            END { if (ext || ro) for (i = 1; i <= n; i++) print file, envsec[i] }
+        ' "$f"
+    done
+}
+
 # write_secret_files [compose-file] - write every `file:` secret the compose
 # files declare into secret_rundir, then export NOO_SECRET_RUNDIR for compose.
 #
@@ -459,6 +483,16 @@ write_secret_files() {
     # shellcheck disable=SC2046  # a file list, split on purpose
     plan="$(_secret_file_plan $(_secret_compose_files "$compose"))" || return 1
     [ -n "$plan" ] || return 0
+    bad="$(_secret_form_conflicts $(_secret_compose_files "$compose"))"
+    if [ -n "$bad" ]; then
+        echo "ERROR: an add-on overlay still sources a secret from 'environment:' but extends a read-only service:" >&2
+        printf '         %s\n' "$bad" >&2
+        echo "       The stack's trellion service is read_only, which compose refuses to give an environment-sourced" >&2
+        echo "       secret (and an overlay that extends it inherits that). Nothing was started or changed." >&2
+        echo "       Fix: update the add-on (noo addons upgrade), whose overlay uses 'file: \${NOO_SECRET_RUNDIR}/<name>'" >&2
+        echo "       with 'x-noo-source:'; or disable it (addons.<name>: false in noomesh.yaml) until it ships." >&2
+        return 1
+    fi
     bad="$(printf '%s\n' "$plan" | awk '$3 == "CONFLICT" || $3 == "NOSOURCE" { print $1 " (" $3 ")" }')"
     if [ -n "$bad" ]; then
         echo "ERROR: compose secret(s) the launcher cannot place: $bad" >&2

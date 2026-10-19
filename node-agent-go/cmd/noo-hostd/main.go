@@ -176,6 +176,7 @@ func newEngine(root, spool string) (*hostd.Engine, func(), error) {
 		Spool:          spool,
 		GatewayPort:    envOr("GATEWAY_PORT", "8080"),
 		Runner:         hostd.ExecRunner{},
+		RestoreOnBoot:  true,
 		HealthWake:     envDuration("NOO_HOSTD_HEALTH_WAKE", 15*time.Second),
 		HealthTimeout:  envDuration("NOO_HOSTD_HEALTH_TIMEOUT", 180*time.Second),
 		HealthInterval: envDuration("NOO_HOSTD_HEALTH_INTERVAL", 5*time.Second),

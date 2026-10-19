@@ -21,7 +21,8 @@
 //! Distroless containers have no `stat` binary, so `docker exec` cannot ask.
 //!
 //! When the socket is not a local unix socket (a tcp/ssh `DOCKER_HOST`, or no
-//! permission), the old `docker diff` still answers — but in parallel, under
+//! permission), the old `docker diff` (plus `.Mounts`, for bind-mounted secret
+//! files, which a diff never lists) still answers — but in parallel, under
 //! one shared deadline. Either way, a container the budget did not reach is
 //! [`Probe::Unchecked`], which the audit reports as "not checked", never as a
 //! pass.
@@ -157,6 +158,20 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
+/// Destinations of a container's mounts (`docker inspect`), empty when the
+/// inspect fails: the caller then falls back to what `docker diff` listed.
+fn mount_destinations(docker: &str, container: &str) -> Vec<String> {
+    Command::new(docker)
+        .args(["inspect", "-f", "{{range .Mounts}}{{println .Destination}}{{end}}", container])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// The fallback: `docker diff` for every container at once, each killed at
 /// `deadline`. A diff that fails is a container not here (the old
 /// behaviour); one still running at the deadline is Unchecked.
@@ -209,7 +224,17 @@ pub(crate) fn probe_via_diff(docker: &str, wanted: &BTreeMap<String, Vec<String>
             Some(_) => {
                 let text = reader.join().unwrap_or_default();
                 let added: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("A ")).collect();
-                Probe::Checked(paths.iter().filter(|p| added.contains(&p.as_str())).cloned().collect())
+                // A secret file the launcher bind-mounts from tmpfs (the
+                // `file:` delivery) is a MOUNT, not a layer change: `docker
+                // diff` never lists it. Its destination is in `.Mounts`.
+                let mounted = mount_destinations(docker, container);
+                Probe::Checked(
+                    paths
+                        .iter()
+                        .filter(|p| added.contains(&p.as_str()) || mounted.iter().any(|m| m == p.as_str()))
+                        .cloned()
+                        .collect(),
+                )
             }
         };
         out.insert(container.clone(), probe);
@@ -270,6 +295,26 @@ pub(crate) mod tests {
         let lines: String = added.iter().map(|a| format!("echo 'A {a}'\n")).collect();
         crate::test_exec::write_exec(&bin, format!("#!/bin/sh\n[ \"$1\" = diff ] || exit 1\nsleep {sleep}\n{lines}"), 0o755);
         bin
+    }
+
+    /// A bind-mounted secret file is in `.Mounts`, never in `docker diff`: the
+    /// fallback must not call it missing.
+    #[test]
+    fn the_diff_fallback_counts_a_bind_mounted_secret_as_present() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = scratch("mounts").join("docker");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncase \"$1\" in diff) echo 'A /tmp/x';; inspect) echo /run/secrets/redis_password;; *) exit 1;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = probe_via_diff(
+            bin.to_str().unwrap(),
+            &want("noo-redis", &["/run/secrets/redis_password", "/run/secrets/other"]),
+            Instant::now() + BUDGET,
+        );
+        assert_eq!(got["noo-redis"], Probe::Checked(vec!["/run/secrets/redis_password".to_string()]));
     }
 
     #[test]

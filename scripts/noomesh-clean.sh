@@ -161,6 +161,10 @@ done
 ui_step "Removing orphaned containers"
 docker compose $COMPOSE_FILES ps -a --format "{{.Names}}" | xargs -r docker rm -f 2>/dev/null
 
+# The RAM copies of the containers' secrets (lib-secrets.sh write_secret_files).
+# shellcheck source=lib-secrets.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-secrets.sh" 2>/dev/null && remove_secret_files || true
+
 # --- Always: prune build cache (biggest space saver, safe to do) ---
 echo ""
 ui_step "Pruning the Docker build cache"
