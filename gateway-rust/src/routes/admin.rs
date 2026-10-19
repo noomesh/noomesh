@@ -301,7 +301,6 @@ pub(crate) async fn all_node_agents(state: &AppState) -> Vec<(String, String, St
                             if !url.is_empty() { url.to_string() } else { continue; }
                         } else if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
                             if !ip.is_empty() {
-                                let proto = "https"; // node agents are mTLS-only
                                 crate::node_link::NodeLink::for_ip(ip).base().to_string()
                             } else { continue; }
                         } else {
