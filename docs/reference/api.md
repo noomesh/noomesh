@@ -125,11 +125,15 @@ or deleted account, or a token issued before the account's session floor).
 `service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
 end the account's sessions immediately: every refresh token is revoked, open
 `/ws/*` sockets close (4401), the service-key cache is dropped, and a per-account
-"not before" time (Redis key `noo:auth:notbefore:<account>`, kept for one
-access-token lifetime) makes `require_any_auth` — and so the WebSocket handshake
+"not before" time (Redis key `noo:auth:notbefore:<account>` plus the durable
+Postgres row in `noo_session_floors`, both kept for one access-token lifetime;
+the gateway loads the rows at boot) makes `require_any_auth` — and so the WebSocket handshake
 — refuse any access token issued before it, so a reconnect with the old JWT
-fails. If Redis is down the gateway applies the floors it holds in memory
-(never fewer), logs a warning, and does not refuse every request; keys not
+fails. The floor is read from Redis, then the gateway's memory, then Postgres
+(the highest wins), so a Redis outage or a restart does not forget one; if
+neither store can be read the gateway applies the floors it holds in memory
+(never fewer), logs a warning, and does not refuse every request.
+`noo security admin-password reset` raises the same row from the host. Keys not
 bound to the account are not touched by `disable`. Passwords set through
 `POST /api/security/users` and `PUT …/{username}/password` must be at least
 12 characters, not on the common list and not contain the username (`400`);
@@ -714,7 +718,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/security/kb-rules`; GET `/api/security/role-grants` | knowledge-base access rules and grants |
 | GET, POST | `/api/security/posture`; POST `/api/security/posture/profile` | posture gates — POST needs an operator client certificate plus a certificate-bound Admin token; an app login is refused however privileged |
 | GET, POST | `/api/security/service-keys`, `…/self`; GET `…/scopes`; POST `…/self/revoke`, `…/{consumer}/revoke`, `/revoke-and-disable`, `/rotate`, `/retire`, `/quota` | service keys (`retire` finishes a rotation by deactivating the superseded key once the new one has been seen) |
-| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key, checks the hash chain for deleted or reordered rows, and names what fails; Operator+. Its `chain` section reports `checked` (false with a `note` when it could not judge), the chained and pre-chain row counts, rows removed by retention, the `head` `{seq, chain_hash}` to record off-box, and the `first_break`) |
+| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key, checks the hash chain for deleted or reordered rows, and names what fails; Operator+. Its `chain` section reports `checked` (false with a `note` when it could not judge), the chained and pre-chain row counts, rows removed by retention, the `head` `{seq, chain_hash}`, an `export` section comparing that head with the signed heads the gateway appends every 15 minutes to `/data/audit-archive/chain-head.jsonl` (`checked`, `note`, `last_exported`, `regression`; a database head older than an exported one is a `problems` entry and verdict `fail`, no export yet is `checked: false`), and the `first_break`) |
 | GET | `/api/security/audit/list` | read the security audit log, newest first. **Operator+** (a lower tier gets `403`). Query: `since` (RFC 3339 time or a window `30m`/`24h`/`7d`/`2w`; anything else is `400`), `event_type` and `actor` (exact), `limit` (default 100, max 500), `cursor` (the previous page's `next_cursor`; a forged one is `400`). Answers `{events, count, next_cursor}`; an event has `id`, `timestamp`, `event_type`, `severity`, `actor`, `resource`, `outcome`, `request_id`, `details` (where `source_ip` and, inside an agent turn, `conversation_id` are recorded), `chain_seq`, `entry_hash`. Listing does not verify. Each read writes an `audit_log_read` row (after the read, so it does not list itself) (`noo security audit list`) |
 | GET, POST | `/api/users`, `/disable`, `/propose`, `/proposals`; `/api/kb/grants`, `/rules`, `/teams`, `/teams/create`, `/teams/delete` | older short forms of some of the operations above |
 | GET, PUT | `/api/settings`, `/api/v1/settings`; GET `…/export`, `/api/v1/settings/preference` | the settings snapshot |
