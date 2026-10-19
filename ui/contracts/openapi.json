@@ -19018,6 +19018,97 @@
           }
         ]
       }
+    },
+    "/api/tasks/stop": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create stop",
+        "description": "[native] Revoke background work: stop every unfinished task the caller owns that was created `via` an add-on. The owner, or that add-on's own delegated token, stops the caller's; an operator may name another person with `user`.",
+        "operationId": "tasks_stop_via",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/context": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create context",
+        "description": "[native] Context an add-on pushes into a running task: revisions are monotonic per task and a retry of the same revision is a no-op, picked up at the next loop boundary. Distinct from `answer`, which needs a pending question.",
+        "operationId": "tasks_context",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/events": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get events",
+        "description": "[native] The task's events after `after` (default: from the start), oldest first.",
+        "operationId": "tasks_events",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
