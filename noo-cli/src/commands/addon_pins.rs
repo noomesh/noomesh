@@ -605,7 +605,8 @@ mod tests {
         assert_eq!(root.as_deref(), Some(d.as_path()));
         assert_eq!(rest, ["v0.6.0", "trellion_intel"]);
         let lines = launch_lines(root.as_deref().unwrap(), &rest[0], &rest[1..], &|_| Ok(anchor()));
-        assert_eq!(lines[0], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
+        assert_eq!(lines[0], "verified trellion_intel 1.2.0 v0.6.0");
+        assert_eq!(lines[1], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
         // The cwd has no pins: reading it (the old behaviour) finds nothing.
         let from_cwd = launch_lines(&cwd, "v0.6.0", &rest[1..], &|_| Ok(anchor()));
         assert!(from_cwd[0].starts_with("refuse"), "{from_cwd:?}");

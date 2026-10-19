@@ -279,6 +279,9 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
     resp.body_mut().read_to_vec().map_err(|e| format!("{url}: {e}"))
 }
 
+/// Reads one file the lock names, relative to where the lock came from.
+type FileGetter = Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>;
+
 /// Read a lock the operator supplied: `<ref>` is the lock JSON (a path, or an
 /// `https://` URL), `<ref>.sig` its signature, and every bundle file the lock
 /// names sits in the same directory. Nothing here is trusted: the caller
@@ -289,7 +292,7 @@ pub fn fetch_supplied(reference: &str) -> Result<Fetched, String> {
     if r.starts_with("http://") {
         return Err("--lock over http:// is refused; use an https:// URL or a file path".into());
     }
-    let (lock, sig, mut get): (Vec<u8>, Vec<u8>, Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>) = if is_url {
+    let (lock, sig, mut get): (Vec<u8>, Vec<u8>, FileGetter) = if is_url {
         let base = r.rsplit_once('/').map(|(b, _)| b.to_string()).unwrap_or_default();
         (
             http_get(r)?,
