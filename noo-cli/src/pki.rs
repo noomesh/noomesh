@@ -295,7 +295,7 @@ impl ClusterCa {
 //     carries a node its key; the gateway only ever serves bundles) →
 //     0600;
 //   * a container process that is ROOT inside its container reads it
-//     (redis, nats, vllm, the stunnels, nginx…) → 0600 too: root on a
+//     (nats, vllm, nginx…) → 0600 too: root on a
 //     bind mount has CAP_DAC_OVERRIDE and reads an owner-only file, so
 //     nothing else needs to be able to;
 //   * a container process with a fixed non-root uid reads it (the
@@ -372,12 +372,16 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("vllm", KeyReader::ContainerRoot),
     // docker/Dockerfile.llamacpp: USER nonroot on a DHI base.
     ("llamacpp", KeyReader::ContainerUid(65532)),
-    // Read by the stunnel sidecar (alpine, ENTRYPOINT stunnel, no setuid): root.
-    ("ollama", KeyReader::ContainerRoot),
-    ("ollama-embed", KeyReader::ContainerRoot),
-    ("ollama-embed-cpu", KeyReader::ContainerRoot),
-    ("tei", KeyReader::ContainerRoot),
-    ("reranker", KeyReader::ContainerRoot),
+    // Read by the stunnel sidecar (docker/Dockerfile.stunnel ends `USER
+    // nonroot` = uid 65532, and compose pins `user: nonroot`; i132): uid 65532. The
+    // doors a NODE's agent starts (node-agent-go docker/sidecar.go) keep
+    // running as root with their own root-owned 0600 copy of the leaf under
+    // /etc/noo/pki, which is a different file from these.
+    ("ollama", KeyReader::ContainerUid(65532)),
+    ("ollama-embed", KeyReader::ContainerUid(65532)),
+    ("ollama-embed-cpu", KeyReader::ContainerUid(65532)),
+    ("tei", KeyReader::ContainerUid(65532)),
+    ("reranker", KeyReader::ContainerUid(65532)),
     // DHI runtime images: nonroot 65532.
     ("loki", KeyReader::ContainerUid(65532)),
     ("prometheus", KeyReader::ContainerUid(65532)),
@@ -393,8 +397,10 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     // live noo-worker (/proc/<pid>/status). noo-worker and worker-extra
     // share this one leaf through the compose anchor.
     ("worker", KeyReader::ContainerUid(65532)),
-    // docker/Dockerfile.nvidia-exporter: nvidia/cuda base, no USER: root.
-    ("nvidia-exporter", KeyReader::ContainerRoot),
+    // docker/Dockerfile.nvidia-exporter: nvidia/cuda base, `USER nonroot` (uid 65532) and
+    // compose `user: nonroot` (i132). NVML only needs the runtime's
+    // /dev/nvidia* nodes, which the NVIDIA container toolkit makes 0666.
+    ("nvidia-exporter", KeyReader::ContainerUid(65532)),
     // dhi.io/grafana:12-debian13-dev's image USER is 0; the compose service
     // runs it as `user: grafana`, the image's uid 65532 (i64). grafana-server reads
     // GF_SERVER_CERT_KEY itself, as that uid.
@@ -2500,6 +2506,10 @@ mod key_mode_tests {
         assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.whisper USER nonroot (i105)");
         assert_eq!(r("services/piper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.piper USER nonroot (i105)");
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
+        // The stunnel doors and the NVIDIA exporter run as 65532 (i132).
+        for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "tei", "reranker", "llamacpp", "nvidia-exporter"] {
+            assert_eq!(r(&format!("services/{door}/service.key")), KeyReader::ContainerUid(65532), "{door}: Dockerfile USER nonroot (65532) + compose user:");
+        }
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
         assert_eq!(r("stray.key"), KeyReader::Unknown);
         // A relative path resolves the same way.
