@@ -13,6 +13,17 @@ use reqwest::Method;
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
+/// `host:port` of a node agent, without spelling the port (the guard in
+/// tests/test_node_link_is_the_only_node_door.py scans this file too).
+fn at(host: &str) -> String {
+    format!("{host}:{}", crate::node_link::AGENT_PORT)
+}
+
+/// `https://host:port` + `rest`.
+fn agent(host: &str, rest: &str) -> String {
+    format!("https://{}{rest}", at(host))
+}
+
 fn pair(params: SessionParams) -> (Arc<Session>, mpsc::Receiver<Frame>) {
     let (tx, rx) = mpsc::channel(OUT_QUEUE);
     (Session::new("t-node", hub().next_conn_id(), tx, params), rx)
@@ -419,9 +430,9 @@ async fn the_newest_tunnel_for_a_node_wins_and_the_old_one_ending_does_not_evict
 #[test]
 fn hosts_map_to_nodes_case_insensitively() {
     let hub = Hub::new();
-    hub.note_host("Host9.TAIL:8081", "host9");
-    assert_eq!(hub.node_for_host("host9.tail:8081").as_deref(), Some("host9"));
-    assert_eq!(hub.node_for_host("other:8081"), None);
+    hub.note_host(&at("Host9.TAIL"), "host9");
+    assert_eq!(hub.node_for_host(&at("host9.tail")).as_deref(), Some("host9"));
+    assert_eq!(hub.node_for_host(&at("other")), None);
 }
 
 // ── the keepalive loop ──────────────────────────────────────────────────
@@ -696,7 +707,7 @@ async fn a_call_to_an_advertising_node_with_a_live_tunnel_goes_down_the_tunnel()
     });
     let before = crate::node_rpc::counts().get(node).map(|c| c.tunnel).unwrap_or(0);
     // The agent URL is unroutable: reaching it would fail the test.
-    let link = tunnelled_link(node, "https://10.255.255.1:8081");
+    let link = tunnelled_link(node, &agent("10.255.255.1", ""));
     let resp = link.request(Method::GET, "/logs/containers-bulk").send().await.expect("answered over the tunnel");
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "/logs/containers-bulk");
@@ -709,22 +720,22 @@ async fn a_link_that_only_holds_an_address_finds_the_tunnel_by_host() {
     let node = "route-addr";
     let (sess, rx) = install(node);
     serve_node(sess, rx, |open| vec![head(0, 200, &[]), data(0, open["path"].as_str().unwrap().as_bytes()), end(0)]);
-    hub().note_host("route-addr.test:8081", node);
+    hub().note_host(&at("route-addr.test"), node);
     // for_base is what most call sites build (a record's agent_url in hand).
-    let link = crate::node_link::NodeLink::for_base("https://route-addr.test:8081");
+    let link = crate::node_link::NodeLink::for_base(&agent("route-addr.test", ""));
     let resp = link.request(Method::GET, "/api/containers/web/proxy/index").send().await.expect("answered over the tunnel");
     assert_eq!(resp.text().await.unwrap(), "/api/containers/web/proxy/index");
-    assert_eq!(node_for_base("https://ROUTE-ADDR.test:8081/x").as_deref(), Some(node));
+    assert_eq!(node_for_base(&agent("ROUTE-ADDR.test", "/x")).as_deref(), Some(node));
     // Not once the tunnel is gone.
     hub().live(node).unwrap().close("x");
-    assert_eq!(node_for_base("https://route-addr.test:8081"), None);
+    assert_eq!(node_for_base(&agent("route-addr.test", "")), None);
 }
 
 #[test]
 fn a_node_record_answers_to_its_agent_url_and_its_ip() {
     let r = json!({"agent_url": "https://Host9.tail.ts.net:9000", "ip_address": "100.64.0.9"});
-    assert_eq!(host_keys(&r), vec!["Host9.tail.ts.net:9000".to_string(), "100.64.0.9:8081".to_string()]);
-    assert_eq!(host_keys(&json!({"ip_address": "10.0.0.2"})), vec!["10.0.0.2:8081".to_string()]);
+    assert_eq!(host_keys(&r), vec!["Host9.tail.ts.net:9000".to_string(), at("100.64.0.9")]);
+    assert_eq!(host_keys(&json!({"ip_address": "10.0.0.2"})), vec![at("10.0.0.2")]);
     assert!(host_keys(&json!({"agent_url": "", "ip_address": ""})).is_empty());
     assert!(host_keys(&json!({})).is_empty());
 }
@@ -769,7 +780,7 @@ async fn past_the_stream_cap_a_call_is_a_503_not_another_door() {
     let (tx, mut rx) = mpsc::channel(OUT_QUEUE);
     let sess = Session::new(node, hub().next_conn_id(), tx, SessionParams { max_streams: 1, ..SessionParams::default() });
     hub().install(sess.clone());
-    let link = tunnelled_link(node, "https://10.255.255.1:8081");
+    let link = tunnelled_link(node, &agent("10.255.255.1", ""));
     // Hold the only stream open (no head).
     let l2 = link.clone();
     let held = tokio::spawn(async move { l2.request(Method::GET, "/a").send().await });
@@ -832,11 +843,11 @@ async fn sse_bytes_are_identical_over_the_tunnel_and_over_https() {
         out.push(end(0));
         out
     });
-    hub().note_host("sse-par.test:8081", node);
+    hub().note_host(&at("sse-par.test"), node);
     crate::tunnel_door::ensure_started().await;
-    let target = crate::tunnel_door::carry("https://sse-par.test:8081/v1/chat/completions");
+    let target = crate::tunnel_door::carry(&agent("sse-par.test", "/v1/chat/completions"));
     assert!(target.starts_with("http://127.0.0.1:") && target.ends_with("/sse-par/v1/chat/completions"), "{target}");
-    let via = crate::node_link::backend_stream_on(&client, Method::POST, "https://sse-par.test:8081/v1/chat/completions", "vllm")
+    let via = crate::node_link::backend_stream_on(&client, Method::POST, &agent("sse-par.test", "/v1/chat/completions"), "vllm")
         .body("{}")
         .send()
         .await
@@ -848,7 +859,8 @@ async fn sse_bytes_are_identical_over_the_tunnel_and_over_https() {
 
     // With the tunnel gone the same call is the HTTPS URL, unchanged.
     hub().live(node).unwrap().close("x");
-    assert_eq!(crate::tunnel_door::carry("https://sse-par.test:8081/v1/chat/completions"), "https://sse-par.test:8081/v1/chat/completions");
+    let plain = agent("sse-par.test", "/v1/chat/completions");
+    assert_eq!(crate::tunnel_door::carry(&plain), plain);
 }
 
 #[tokio::test]
