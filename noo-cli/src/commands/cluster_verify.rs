@@ -3512,11 +3512,8 @@ fn controller_mtls_on() -> Option<bool> {
 }
 
 fn mtls_on_in_dotenv(text: &str) -> bool {
-    let v = text
-        .lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix("NOO_MTLS_GATEWAY="))
-        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase())
+    let v = crate::envfile::dotenv_last(text, "NOO_MTLS_GATEWAY")
+        .map(|v| v.to_ascii_lowercase())
         .unwrap_or_default();
     !matches!(v.as_str(), "0" | "false" | "no" | "off")
 }
@@ -3525,11 +3522,7 @@ fn mtls_on_in_dotenv(text: &str) -> bool {
 /// reads it); `None` when the file is unreadable OR the key is absent.
 fn dotenv_value(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok()?;
-    let prefix = format!("{key}=");
-    text.lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
-        .map(|v| v.trim().trim_matches('"').to_string())
+    crate::envfile::dotenv_last(&text, key)
 }
 
 /// The "nats tls" row: the bus runs ONE shipped config, which requires a
