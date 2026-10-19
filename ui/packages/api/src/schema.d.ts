@@ -10013,6 +10013,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/prompt-skills/proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get proposals
+         * @description [native] GET /api/prompt-skills/proposals?status=&limit= — pending first. Files a proposal for every runtime skill that has none on its current text (skills that predate this feature, or written while the table was unreachable).
+         */
+        get: operations["prompt_skills_proposals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prompt-skills/proposals/{id}/decide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create decide
+         * @description [native] POST /api/prompt-skills/proposals/{id}/decide — body `{decision: "promote"|"reject", reason?}`. A promoted skill is injected as instructions (system message, with core skills) while its text is the one decided on.
+         */
+        post: operations["prompt_skills_decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -22775,6 +22815,63 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    prompt_skills_proposals: {
+        parameters: {
+            query?: {
+                status?: "pending" | "promoted" | "rejected" | "superseded" | "withdrawn";
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    prompt_skills_decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    decision: "promote" | "reject";
+                    reason?: string;
+                };
+            };
+        };
         responses: {
             /** @description OK */
             200: {

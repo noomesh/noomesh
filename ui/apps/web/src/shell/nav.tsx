@@ -52,6 +52,8 @@ const CORE_NAV: NavSection[] = [
       // "Is the agent doing things I did not ask for, and is that loop even
       // alive?" — the same question Security answers for individual tool calls.
       { id: 'autonomy', label: 'Autonomy', status: 'live' },
+      // Which learned prompt skills may be injected: a person decides.
+      { id: 'skills', label: 'Skills', status: 'live' },
       { id: 'admin', label: 'Admin', status: 'live' },
     ],
   },
@@ -148,6 +150,12 @@ const CORE_ICONS: Record<string, ReactNode> = {
     <>
       <circle cx="10" cy="10" r="6" />
       <path d="M10 4v12M6 7c2.5 1.2 5.5 1.2 8 0M6 13c2.5-1.2 5.5-1.2 8 0" />
+    </>
+  ),
+  skills: (
+    <>
+      <path d="M5 3h8l3 3v11H5z" />
+      <path d="M8 10l1.6 1.6L13 8" />
     </>
   ),
   admin: (

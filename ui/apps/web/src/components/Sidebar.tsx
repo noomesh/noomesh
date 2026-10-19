@@ -28,7 +28,8 @@ export function Sidebar({ active, onSelect }: { active: string; onSelect: (id: s
   // scopes too). Note `admin` is a CORE tab since 2026-08-27, so this gate now
   // runs in the open-source build as well — a non-operator on an OSS install
   // sees 13 tabs, not 14.
-  const visible = (item: NavItem) => (item.id !== 'admin' && item.id !== 'model-prefs') || isOperator;
+  const OPERATOR_TABS = ['admin', 'model-prefs', 'skills'];
+  const visible = (item: NavItem) => !OPERATOR_TABS.includes(item.id) || isOperator;
 
   const renderBtn = (item: NavItem) => (
     <button
