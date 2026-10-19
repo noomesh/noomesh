@@ -321,10 +321,13 @@ nothing else:
   `N_CTX` `N_THREADS` `N_BATCH` `N_PARALLEL` `GPU_MEMORY_UTILIZATION`
   `TENSOR_PARALLEL_SIZE` `GPU_COUNT` `OLLAMA_MODEL` `OLLAMA_HOST`
   `OLLAMA_NUM_PARALLEL` `OLLAMA_KEEP_ALIVE` `OLLAMA_MAX_LOADED_MODELS`
-  `LOG_LEVEL` `RUST_LOG`
+  `OLLAMA_CONTEXT_LENGTH` `LOG_LEVEL` `RUST_LOG`
   (embed placements: `--env OLLAMA_NUM_PARALLEL=4` is the declared way to raise
-  an ollama embedder's concurrency; the context window is NOT a placement
-  setting, the gateway sends `options.num_ctx` on each embed request)
+  an ollama embedder's concurrency; an EMBEDDER's context window is not a
+  placement setting, the gateway sends `options.num_ctx` on each embed
+  request; `OLLAMA_CONTEXT_LENGTH` sets the daemon-wide default for CHAT
+  models, which a vendor CLI harness needs: e.g. `--env
+  OLLAMA_CONTEXT_LENGTH=32768`)
 - prefixes: `VLLM_` `LLAMA_ARG_` `TEI_` `RERANK_`
 
 Refused, by construction: `LD_*` and `PATH` (the dynamic loader reads them

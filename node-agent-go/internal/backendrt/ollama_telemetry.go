@@ -368,7 +368,7 @@ func (g *OllamaGuard) Report(running bool) map[string]any {
 
 // OllamaTuningKeys are the only placement env keys the guard writes into a
 // plist: the multi-model knobs a chat+embed ollama needs.
-var OllamaTuningKeys = []string{"OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_KEEP_ALIVE"}
+var OllamaTuningKeys = []string{"OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_KEEP_ALIVE", "OLLAMA_CONTEXT_LENGTH"}
 
 // tuning is Tuning() filtered to OllamaTuningKeys with non-empty values.
 func (g *OllamaGuard) tuning() map[string]string {
@@ -394,7 +394,7 @@ func (g *OllamaGuard) noteNoPlist() {
 	}
 	refusals.Record("placement_env", "ollama",
 		"this node's ollama is not a brew service (Ollama.app or a manual serve), so the agent cannot set its daemon env "+
-			"(OLLAMA_NUM_PARALLEL / OLLAMA_MAX_LOADED_MODELS / OLLAMA_KEEP_ALIVE); set them where it is launched")
+			"(OLLAMA_NUM_PARALLEL / OLLAMA_MAX_LOADED_MODELS / OLLAMA_KEEP_ALIVE / OLLAMA_CONTEXT_LENGTH); set them where it is launched")
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.warnedNoPlist {

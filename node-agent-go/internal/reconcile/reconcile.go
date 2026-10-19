@@ -903,6 +903,12 @@ var placementEnvExact = map[string]struct{}{
 	// ollama.
 	"OLLAMA_MODEL": {}, "OLLAMA_HOST": {}, "OLLAMA_NUM_PARALLEL": {},
 	"OLLAMA_KEEP_ALIVE": {}, "OLLAMA_MAX_LOADED_MODELS": {},
+	// The daemon-wide default context window for chat models. Embed
+	// requests send their own options.num_ctx, so raising it leaves an
+	// embedder sharing the same ollama alone. A vendor CLI harness needs it:
+	// Claude Code's system prompt overflows ollama's 4096 default and the
+	// model answers a truncated prompt (mcmini probe, 2026-10-19).
+	"OLLAMA_CONTEXT_LENGTH": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
 }
