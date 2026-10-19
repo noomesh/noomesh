@@ -342,7 +342,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let paused: Vec<&str> = gc["paused_backends"].as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let paused = if paused.is_empty() { "GPU backends".to_string() } else { paused.join(", ") };
+    let none_paused = paused.is_empty();
+    let paused = if none_paused { "GPU backends".to_string() } else { paused.join(", ") };
+    // "GPU backends paused" when none were is a false statement (rehearsal F4).
+    let paused_phrase = if none_paused { "no GPU backend paused".to_string() } else { format!("{paused} paused") };
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
     if method == "not-measured" && state != "held" && state != "yielded" {
@@ -353,10 +356,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
         "yielded" => warn("gpu",
-            format!("yielded: {paused} paused (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
         "held" => warn("gpu",
-            format!("held by operator{}: {paused} paused",
+            format!("held by operator{}: {paused_phrase}",
                 gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
             Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
@@ -4261,13 +4264,16 @@ mod gateway_redis_tests {
 }
 
 /// The `(remedy, row name)` pairs a section prints under its table: every
-/// FAIL row's, and in the controller section every WARN row's too.
+/// FAIL row's, and in the controller section every WARN row's too. In a
+/// node section only the held `gpu` WARN prints its remedy: `gpu release` is
+/// the one way out of an operator hold and was visible only in `--json`
+/// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
     let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
     for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && title == "controller"))
+        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu")))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
         match out.iter_mut().find(|(x, _)| *x == r) {
@@ -8265,6 +8271,20 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+    }
+
+    #[test]
+    fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
+        assert_eq!(c.detail, "held by operator: no GPU backend paused");
+        let checks = vec![c];
+        let r = remedies_to_print("host3", &checks);
+        assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");
+        assert!(r[0].0.starts_with("noo cluster gpu release host3"));
+        // other node warns stay remedy-less
+        let other = vec![warn("harness", "x", Some("noo cluster desired host3".into()))];
+        assert!(remedies_to_print("host3", &other).is_empty());
     }
 
     #[test]
