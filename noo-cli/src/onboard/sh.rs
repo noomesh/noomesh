@@ -258,7 +258,15 @@ pub(crate) fn file_secret_sources(compose: &str) -> Vec<String> {
     };
     secrets
         .values()
-        .filter_map(|v| v.get("environment").and_then(|e| e.as_str()).map(str::to_string))
+        // A secret is sourced from the env var compose reads (`environment:`)
+        // or, for the RAM-file form the read-only services need, the one the
+        // launcher writes the file from (`x-noo-source:`).
+        .filter_map(|v| {
+            v.get("environment")
+                .or_else(|| v.get("x-noo-source"))
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
         .collect()
 }
 
