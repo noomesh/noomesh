@@ -589,6 +589,9 @@ async fn main() -> Result<()> {
     // Then the hash chain's first row: from here a deleted or reordered audit
     // row fails `noo security audit verify`. Once; idempotent.
     audit_chain::ensure_genesis(&state.db).await;
+    // The durable session floors: a restart must not forget an account change.
+    let floors = session_floor::load_durable(&state.db).await;
+    tracing::info!(floors, "durable session floors loaded");
 
     // Log initial cluster snapshot (proof-of-wiring for cluster_manager.rs).
     // Same data is available to autonomy actions, heartbeat tasks, and
