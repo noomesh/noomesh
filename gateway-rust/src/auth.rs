@@ -3245,6 +3245,26 @@ pub async fn require_any_auth(
             // A worker-delegated token reaches the tool
             // routes and nothing else — the same shape as the harness rail.
             crate::worker_delegation::confine(&claims, request.method().as_str(), &path)?;
+            // An add-on delegated token (i143) reaches the task routes and
+            // nothing else, only while its add-on is registered with
+            // delegation on, and only while the account is enabled and no
+            // lower than the token's role. Handlers key their isolation on the
+            // extension: the add-on sees its own tasks for this person.
+            let mut addon_adt = false;
+            if let Some(addon) = crate::addon_delegation::addon_of(&claims) {
+                crate::addon_delegation::confine(&claims, request.method().as_str(), &path)?;
+                if !crate::addon_registry::get(addon).is_some_and(|e| e.delegates_tasks() && e.operator_enabled()) {
+                    tracing::warn!(sub = %claims.sub, addon, "add-on delegated token refused: the add-on does not delegate tasks (unregistered, undeclared or not enabled)");
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                let live = live_account_role(&state.db, &claims.sub).await;
+                if !rail_token_admitted(claims.resolved_role(), live) {
+                    tracing::warn!(sub = %claims.sub, addon, live = ?live, "add-on delegated token refused: account disabled, absent or below the token's role");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                request.extensions_mut().insert(crate::addon_delegation::AddonDelegation { addon: addon.to_string() });
+                addon_adt = true;
+            }
             if claims.scopes.iter().any(|s| s == "peer") {
                 let on_peer_surface = path.starts_with("/api/agents/peer")
                     || path.starts_with("/ws/agent");
@@ -3308,7 +3328,11 @@ pub async fn require_any_auth(
             // App-layer RBAC: User-tier callers see everything (GET) but can
             // only mutate the chat/query surface. Operator and above pass
             // (role claim or the legacy write/admin scopes — dual-accept).
-            if !scope_allows(&claims, request.method(), &path) {
+            // (An add-on delegated token is already confined to the task routes
+            // above, and those handlers isolate it to its own tasks: the tier
+            // gate, which keeps a User off task writes, is the person's own
+            // door, not this one.)
+            if !addon_adt && !scope_allows(&claims, request.method(), &path) {
                 return Err(StatusCode::FORBIDDEN);
             }
             // Attribute privileged actions (config/admin/delete) to the caller
@@ -5940,6 +5964,31 @@ mod harness_rail_tests {
         assert!(check < attach);
         assert!(body[check..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
         assert!(body[check..attach].contains("StatusCode::UNAUTHORIZED"));
+    }
+
+    /// An add-on delegated token is confined, must belong to an add-on that
+    /// delegates tasks, and is held to the account's live role, all before
+    /// the extension handlers key their isolation on is attached.
+    #[test]
+    fn the_addon_delegation_branch_confines_then_checks_the_registry_then_the_live_role() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let branch = body.find("crate::addon_delegation::addon_of(&claims)").expect("addon branch");
+        let confine = body[branch..].find("crate::addon_delegation::confine(").expect("confine") + branch;
+        let registry = body[branch..].find("crate::addon_registry::get(addon)").expect("registry") + branch;
+        let live = body[branch..].find("live_account_role(&state.db, &claims.sub)").expect("live check") + branch;
+        let attach = body[branch..].find("AddonDelegation { addon: addon.to_string() }").expect("attach") + branch;
+        assert!(confine < registry && registry < live && live < attach);
+        assert!(body[registry..live].contains("e.delegates_tasks() && e.operator_enabled()"));
+        assert!(body[registry..live].contains("StatusCode::FORBIDDEN"));
+        assert!(body[live..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
+        assert!(body[live..attach].contains("StatusCode::UNAUTHORIZED"));
+        // The branch is before the terminal peer / kiosk / add-on-consumer
+        // returns, so none of them can carry an ADT past it.
+        let peer = body.find("claims.scopes.iter().any(|s| s == \"peer\")").expect("peer branch");
+        assert!(attach < peer);
+        // The existing disabled-account check on any delegated token stays.
+        assert!(body.contains("claims.act.is_some() && !delegated_subject_enabled(&state.db, &claims.sub).await"));
     }
 
     #[test]

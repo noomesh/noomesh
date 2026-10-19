@@ -5,7 +5,8 @@
 //!
 //! `create` starts a task as you, on the harness of the node holding its
 //! model or on the controller; `list`/`show` read; `stop` ends one at its
-//! next checkpoint. A task may carry a token budget (`--token-budget`):
+//! next checkpoint (`stop --via addon:<name>` revokes an add-on's background
+//! work). A task may carry a token budget (`--token-budget`):
 //! when it runs out the task parks between loops, and `resubmit` gives it
 //! more; a task that asked you a question waits for `answer`. Progress and the result live in the task's
 //! agent-message thread (`noo agents thread <id>`).
@@ -279,6 +280,9 @@ pub fn tasks_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 }
 
 pub fn tasks_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    if args.iter().any(|a| a == "--via") {
+        return tasks_stop_via(g, args);
+    }
     let [id] = args else { return Err(Unhandled) };
     let resp = post_json(g, &format!("/api/tasks/{}/stop", super::urlencode(id)), &serde_json::json!({}), true, 10);
     if g.json {
@@ -289,6 +293,43 @@ pub fn tasks_stop(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::done(&format!("task {id} will stop at its next checkpoint"));
     } else {
         println!("{}", ui::status_line(Glyph::Warn, &format!("task {id} was not running")));
+    }
+    Ok(0)
+}
+
+/// `noo tasks stop --via addon:<name> [--user <u>]`: revoke an add-on's
+/// background work. Stops your unfinished tasks that add-on started; an
+/// operator names another person with `--user`.
+fn tasks_stop_via(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut via: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--via" => via = Some(iter.next().ok_or(Unhandled)?.clone()),
+            "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.clone()),
+            _ => return Err(Unhandled),
+        }
+    }
+    let via = via.filter(|v| v.strip_prefix("addon:").is_some_and(|n| !n.is_empty())).ok_or(Unhandled)?;
+    let mut body = serde_json::json!({ "via": via });
+    if let Some(u) = &user {
+        body["user"] = serde_json::json!(u);
+    }
+    let resp = post_json(g, "/api/tasks/stop", &body, true, 20);
+    if g.json {
+        println!("{resp}");
+        return Ok(0);
+    }
+    let ids: Vec<&str> = resp["stopped"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    let owner = resp["owner"].as_str().unwrap_or("you");
+    if ids.is_empty() {
+        println!("{}", ui::status_line(Glyph::Warn, &format!("no unfinished tasks from {via} for {owner}")));
+    } else {
+        ui::done(&format!("{} task(s) from {via} for {owner} will stop at their next checkpoint", ids.len()));
+        for id in &ids {
+            println!("  {}", ui::muted(id));
+        }
     }
     Ok(0)
 }

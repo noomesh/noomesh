@@ -1035,6 +1035,26 @@ async fn forward(
     for (name, value) in caller_headers(requester) {
         req = req.header(name, value);
     }
+    // The delegated task token (i143), only where the route opted in and the
+    // operator allowed it. The request is built from nothing, so a client's
+    // own `x-noo-delegation` can never ride along; this is the only place the
+    // header is set, and the token is never logged.
+    if let Some(r) = requester {
+        if let Some(entry) = crate::addon_registry::get(&manifest.addon) {
+            let route = path.split('?').next().unwrap_or(path);
+            if mints_delegation(Some(r), entry.route_receives_delegation(&spec.method, route), entry.operator_enabled()) {
+                match crate::addon_delegation::mint(r, &manifest.addon) {
+                    Some(token) => {
+                        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&token) {
+                            v.set_sensitive(true);
+                            req = req.header(crate::addon_delegation::HEADER, v);
+                        }
+                    }
+                    None => tracing::error!(addon = %manifest.addon, "add-on delegation: could not mint the delegated token (no NOO_JWT_SECRET on the gateway?); the add-on gets none and fails closed"),
+                }
+            }
+        }
+    }
     if let Some(b) = body {
         req = req.json(&b);
     }
@@ -1180,6 +1200,14 @@ fn caller_headers(requester: Option<&crate::auth::RequesterCtx>) -> Vec<(&'stati
     }
     out.retain(|(_, v)| reqwest::header::HeaderValue::from_str(v).is_ok());
     out
+}
+
+/// Does this proxied request carry a delegated task token? Only for an
+/// authenticated person whose own token is not itself delegated (no `act`, so a
+/// delegated token never mints another), on a route that declares
+/// `receives_delegation`, for an add-on the operator enabled.
+pub(crate) fn mints_delegation(requester: Option<&crate::auth::RequesterCtx>, route_receives: bool, operator_enabled: bool) -> bool {
+    route_receives && operator_enabled && requester.is_some_and(|r| r.act.is_none())
 }
 
 /// The container name an operator would `docker logs`. Kept alongside the
@@ -2069,6 +2097,34 @@ mod permission_tests {
         let body = src.split("async fn forward(").nth(1).unwrap().split("\n}\n").next().unwrap();
         assert!(body.contains("for (name, value) in caller_headers(requester)"), "forward builds identity from the verified ctx");
         assert!(!body.contains("HeaderMap") && !body.contains("headers()"), "forward must not pass client headers through");
+    }
+
+    /// A client-sent `x-noo-delegation` is dropped: the upstream request is
+    /// built from nothing, caller_headers never emits it, and the only place it
+    /// is set is the mint branch in `forward`.
+    #[test]
+    fn a_client_sent_delegation_header_is_never_forwarded() {
+        let h = caller_headers(Some(&super::tests::ctx("alice", Role::User, &["read"])));
+        assert!(!h.iter().any(|(n, _)| n.eq_ignore_ascii_case(crate::addon_delegation::HEADER)));
+        let src = include_str!("addon_proxy.rs");
+        let body = src.split("async fn forward(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert_eq!(body.matches("crate::addon_delegation::HEADER").count(), 1, "one place sets it");
+        let set = body.find("crate::addon_delegation::HEADER").unwrap();
+        let guard = body.find("mints_delegation(").unwrap();
+        assert!(guard < set, "set only behind the mint decision");
+        assert!(!body.contains("HeaderMap") && !body.contains("headers()"));
+    }
+
+    #[test]
+    fn a_token_is_minted_only_for_a_person_on_an_opted_in_route_of_an_enabled_addon() {
+        let person = super::tests::ctx("alice", Role::User, &["read"]);
+        assert!(mints_delegation(Some(&person), true, true));
+        assert!(!mints_delegation(Some(&person), false, true), "route did not opt in");
+        assert!(!mints_delegation(Some(&person), true, false), "operator has not enabled delegation");
+        assert!(!mints_delegation(None, true, true), "no person, no token");
+        let mut delegated = person.clone();
+        delegated.act = Some(crate::auth::Actor { sub: "addon:voice".into(), iss_user: None, task: None });
+        assert!(!mints_delegation(Some(&delegated), true, true), "a delegated token never mints another");
     }
 
     #[tokio::test]
