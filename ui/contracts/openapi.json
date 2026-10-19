@@ -18909,6 +18909,63 @@
           }
         }
       }
+    },
+    "/api/prompt-skills/proposals": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get proposals",
+        "description": "[native] GET /api/prompt-skills/proposals?status=&limit= \u2014 pending first. Files a proposal for every runtime skill that has none on its current text (skills that predate this feature, or written while the table was unreachable).",
+        "operationId": "prompt_skills_proposals",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/prompt-skills/proposals/{id}/decide": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create decide",
+        "description": "[native] POST /api/prompt-skills/proposals/{id}/decide \u2014 body `{decision: \"promote\"|\"reject\", reason?}`. A promoted skill is injected as instructions (system message, with core skills) while its text is the one decided on.",
+        "operationId": "prompt_skills_decide",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

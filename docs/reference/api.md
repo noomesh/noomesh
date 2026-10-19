@@ -685,6 +685,8 @@ answers when it does not reply.
 | GET, POST | `/api/prompt-skills`, `/api/prompt-skills/{name}` | prompt skills (POST creates an evolved skill) |
 | PUT | `/api/prompt-skills/{name}` | rewrite an evolved skill; a core skill is 400 `core skills are never mutated` |
 | POST | `/api/prompt-skills/{name}/retire`, `/api/prompt-skills/{name}/fitness` | retire an evolved skill; adjust its score |
+| GET | `/api/prompt-skills/proposals` | operator or admin: promotion proposals for runtime skills (`?status=`, `?limit=`); files one for any runtime skill that has none on its current text |
+| POST | `/api/prompt-skills/proposals/{id}/decide` | a person only (operator or admin login; agent, harness, MCP-door and service credentials get 403): body `{decision: "promote"\|"reject", reason?}`; 409 when the skill's text changed since the proposal |
 | POST | `/api/prompt-skills/evolve` | LLM-driven create/mutate, served by the evolve add-on (503 + refusal without it); proposal by default, `apply: true` writes |
 
 The four skill writes are also opened, and only they, by the add-on control scope `prompt_skills:write`.

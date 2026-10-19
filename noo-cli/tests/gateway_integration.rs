@@ -900,6 +900,23 @@ fn prompt_skills_create_posts_file_content() {
 }
 
 #[test]
+fn prompt_skills_decide_posts_the_decision_and_needs_exactly_one_verdict() {
+    let mock = Mock::start(200, "OK", "application/json", r#"{"id":7,"name":"my-skill","status":"promoted","decided_by":"olive","live":true}"#, 1);
+    let out = run(&["--gateway", &gw(mock.port), "prompt-skills", "decide", "7", "--promote", "--reason", "read it"], &[]);
+    let reqs = mock.requests();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(reqs[0].starts_with("POST /api/prompt-skills/proposals/7/decide "), "request was:\n{}", reqs[0]);
+    assert!(reqs[0].contains(r#""decision":"promote""#) && reqs[0].contains("read it"), "{}", reqs[0]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("promoted 'my-skill'"));
+    // Neither or both verdicts: a usage error before any request.
+    for extra in [&["7"][..], &["7", "--promote", "--reject"]] {
+        let mut argv = vec!["--gateway", "http://127.0.0.1:9", "prompt-skills", "decide"];
+        argv.extend_from_slice(extra);
+        assert_eq!(run(&argv, &[]).status.code(), Some(2));
+    }
+}
+
+#[test]
 fn prompt_skills_create_error_reply_exits_one() {
     let mock = Mock::start(200, "OK", "application/json", r#"{"error":"Failed to write skill file: denied"}"#, 1);
     let out = run(&["--gateway", &gw(mock.port), "prompt-skills", "create", "s", "--file", "/dev/null"], &[]);

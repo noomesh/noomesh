@@ -76,7 +76,7 @@ class PaiPromptSkillsGet(ToolDef):
 
 @register
 class PaiPromptSkillsCreate(ToolDef):
-    """Create a new prompt skill template."""
+    """Create a new prompt skill template. It is data until a person promotes it."""
 
     name: ClassVar[str] = "noo_prompt_skills_create"
     description: ClassVar[str] = __doc__
@@ -97,7 +97,7 @@ class PaiPromptSkillsCreate(ToolDef):
 
 @register
 class PaiPromptSkillsEvolve(ToolDef):
-    """Propose (or with apply=true, write) an LLM-evolved prompt skill from an observation."""
+    """Propose (or with apply=true, write) an LLM-evolved prompt skill from an observation. A written skill is data until a person promotes it."""
 
     name: ClassVar[str] = "noo_prompt_skills_evolve"
     description: ClassVar[str] = __doc__

@@ -170,7 +170,8 @@ pub use models::{
 pub use pki::{pki_fix_modes, pki_init, pki_issue, pki_issue_client, pki_issue_gateway, pki_issue_service, pki_issue_sso_key, pki_revoke_client, pki_rotate, pki_rotate_client, pki_status};
 pub use proactive::{proactive_history, proactive_rules, proactive_status};
 pub use prompt_skills::{
-    prompt_skills_create, prompt_skills_evolve, prompt_skills_info, prompt_skills_list,
+    prompt_skills_create, prompt_skills_decide, prompt_skills_evolve, prompt_skills_info, prompt_skills_list,
+    prompt_skills_proposals,
 };
 pub use rag::{
     rag_deduplicate, rag_doc, rag_docs, rag_held, rag_hold, rag_ingest, rag_purge, rag_query, rag_retag, rag_scan,

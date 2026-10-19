@@ -5429,6 +5429,9 @@ mod tests {
             (Method::POST, "/api/prompt-skills/my-skill/retire/extra"),
             (Method::PUT, "/api/prompt-skills/my-skill/retire"),
             (Method::POST, "/api/prompt-skills//retire"),
+            // Promotion is a person's decision: the writer's scope never opens it.
+            (Method::POST, "/api/prompt-skills/proposals/7/decide"),
+            (Method::GET, "/api/prompt-skills/proposals"),
             (Method::PUT, "/api/config/prompt_skills"),
             (Method::PUT, "/api/config/agent"),
             (Method::POST, "/api/temporal/adaptations"),

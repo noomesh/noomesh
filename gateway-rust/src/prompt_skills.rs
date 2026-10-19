@@ -30,6 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::RwLock;
 
 /// Directory names, relative to the project root.
 const CORE_DIR: &str = "prompts/skills/core";
@@ -47,6 +49,38 @@ pub const FITNESS_MAX: f64 = 10.0;
 /// Selection budget — mirrors PromptSkillSelector's defaults.
 const MAX_SKILLS: usize = 3;
 const MAX_TOTAL_CHARS: usize = 8000;
+
+/// How far a skill is trusted. Core skills are shipped and always instructions;
+/// this is the state of everything WRITTEN AT RUNTIME (the API, an agent's
+/// `noo_prompt_skills_create`, the evolve add-on).
+///
+/// * `Evolved`: the default, framed as DATA in the user's message.
+/// * `Promoted`: an operator reviewed this exact text and approved it; it
+///   travels in the system message beside core skills.
+/// * `Rejected`: an operator refused it; it is never injected.
+///
+/// The state is NEVER read from a skill file (a writer could otherwise promote
+/// itself with a front matter line): it comes from the decisions table, keyed
+/// by the skill's name AND the hash of the reviewed text ([`PromptSkill::review_hash`]),
+/// so a changed text is back to `Evolved` by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillTrust {
+    #[default]
+    Evolved,
+    Promoted,
+    Rejected,
+}
+
+impl SkillTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillTrust::Evolved => "evolved",
+            SkillTrust::Promoted => "promoted",
+            SkillTrust::Rejected => "rejected",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PromptSkill {
@@ -66,12 +100,31 @@ pub struct PromptSkill {
     pub parent_skill: Value,
     pub content: String,
     pub file_path: Option<String>,
+    /// Trust as the gateway resolved it when it shipped this skill to a
+    /// node-hosted loop ([`SkillRegistry::catalog_for_node`]). Never read from
+    /// a file; a gateway that predates the field sends none and the skill is
+    /// `Evolved` (framed), which is the safe direction.
+    #[serde(default)]
+    pub trust: SkillTrust,
     /// Runtime only — never persisted to frontmatter, same as Python.
     #[serde(skip, default)]
     pub usage_count: u64,
 }
 
 impl PromptSkill {
+    /// Hash of exactly what a reviewer approves: the name, description and body
+    /// (what [`PromptSkill::to_injection_text`] puts in a prompt). Scores,
+    /// fitness, tags and priority are not in it: they never reach the model as
+    /// text, and the evolve loop moves them constantly.
+    pub fn review_hash(&self) -> String {
+        let mut h = Sha256::new();
+        for part in [self.name.as_str(), self.description.as_str(), self.content.trim()] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        hex::encode(h.finalize())
+    }
+
     /// Format for injection into a system prompt. Byte-identical to
     /// `PromptSkill.to_injection_text`.
     pub fn to_injection_text(&self) -> String {
@@ -94,6 +147,7 @@ impl PromptSkill {
             "fitness": self.fitness,
             "generation": self.generation,
             "is_core": self.is_core,
+            "trust": if self.is_core { "core" } else { self.trust.as_str() },
         })
     }
 
@@ -123,6 +177,7 @@ impl PromptSkill {
             "usage_count": self.usage_count,
             "content": self.content,
             "file_path": self.file_path,
+            "trust": if self.is_core { "core" } else { self.trust.as_str() },
         })
     }
 
@@ -204,6 +259,9 @@ impl PromptSkill {
             parent_skill: m.get("parent_skill").cloned().unwrap_or(Value::Null),
             content: body,
             file_path: Some(path.to_string_lossy().to_string()),
+            // Whatever a file says, a skill read from disk is `Evolved` until
+            // the decisions table says otherwise.
+            trust: SkillTrust::Evolved,
             usage_count: 0,
         }
     }
@@ -254,6 +312,11 @@ pub struct SkillRegistry {
     skills: HashMap<String, PromptSkill>,
     /// Insertion order, so `list` is stable rather than hash-random.
     order: Vec<String>,
+    /// Operator decisions, `(name, review_hash) -> Promoted | Rejected`. Held
+    /// beside the skills (not in them) so a decision lands in the live
+    /// registry without rebuilding it. Empty until the gateway loads the table:
+    /// every runtime skill is then `Evolved`, i.e. framed.
+    decisions: RwLock<HashMap<(String, String), SkillTrust>>,
 }
 
 impl SkillRegistry {
@@ -306,6 +369,55 @@ impl SkillRegistry {
             self.order.push(skill.name.clone());
         }
         self.skills.insert(skill.name.clone(), skill);
+    }
+
+    /// Replace the decisions with the table's current promoted/rejected rows.
+    pub fn set_decisions(&self, rows: impl IntoIterator<Item = (String, String, SkillTrust)>) {
+        let map: HashMap<(String, String), SkillTrust> = rows
+            .into_iter()
+            .filter(|(_, _, t)| *t != SkillTrust::Evolved)
+            .map(|(n, h, t)| ((n, h), t))
+            .collect();
+        match self.decisions.write() {
+            Ok(mut g) => *g = map,
+            Err(p) => *p.into_inner() = map,
+        }
+    }
+
+    /// What this skill is right now. Core is not asked here (see
+    /// [`SkillRegistry::is_instruction`]). A decision applies only to the text
+    /// it was made on; with none on this text the skill's own field stands
+    /// (`Evolved` for everything scanned, whatever a file says).
+    pub fn effective_trust(&self, skill: &PromptSkill) -> SkillTrust {
+        let g = match self.decisions.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.get(&(skill.name.clone(), skill.review_hash())).copied().unwrap_or(skill.trust)
+    }
+
+    /// True when an operator refused this skill's text. Core is never rejected.
+    pub fn is_rejected(&self, skill: &PromptSkill) -> bool {
+        !skill.is_core && self.effective_trust(skill) == SkillTrust::Rejected
+    }
+
+    /// True when the skill travels as the operator's instructions: shipped, or
+    /// promoted on the text in hand.
+    pub fn is_instruction(&self, skill: &PromptSkill) -> bool {
+        skill.is_core || self.effective_trust(skill) == SkillTrust::Promoted
+    }
+
+    /// Every skill with its resolved trust, for a node-hosted loop that has no
+    /// decisions table of its own.
+    pub fn catalog_for_node(&self) -> Vec<PromptSkill> {
+        self.list_all()
+            .into_iter()
+            .map(|s| {
+                let mut c = s.clone();
+                c.trust = self.effective_trust(s);
+                c
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -406,7 +518,7 @@ pub fn select<'a>(
     // empty-message check — same as Python.
     if !force_skills.is_empty() {
         let forced: Vec<&PromptSkill> =
-            force_skills.iter().filter_map(|n| registry.get(n)).collect();
+            force_skills.iter().filter_map(|n| registry.get(n)).filter(|s| !registry.is_rejected(s)).collect();
         if !forced.is_empty() {
             return forced.into_iter().take(MAX_SKILLS).collect();
         }
@@ -421,6 +533,11 @@ pub fn select<'a>(
 
     let mut scored: Vec<(f64, &PromptSkill)> = Vec::new();
     for skill in registry.list_all() {
+        // A skill an operator rejected is not a candidate: it must not take a
+        // slot from one that can be used.
+        if registry.is_rejected(skill) {
+            continue;
+        }
         let mut score = 0.0f64;
 
         for kw in &skill.trigger_keywords {
@@ -648,6 +765,7 @@ mod tests {
             parent_skill: Value::Null,
             content: "body".into(),
             file_path: None,
+            trust: SkillTrust::Evolved,
             usage_count: 0,
         }
     }

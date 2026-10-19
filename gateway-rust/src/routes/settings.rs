@@ -72,6 +72,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/prompt-skills/{name}", put(prompt_skills_update))
         .route("/api/prompt-skills/{name}/retire", post(prompt_skills_retire))
         .route("/api/prompt-skills/{name}/fitness", post(prompt_skills_fitness))
+        // Promotion: a skill written at runtime is data until a PERSON promotes
+        // the reviewed text. `proposals` is a literal segment, so it wins over
+        // `{name}` (as `evolve` does).
+        .route("/api/prompt-skills/proposals", get(prompt_skills_proposals))
+        .route("/api/prompt-skills/proposals/{id}/decide", post(prompt_skills_decide))
 
         // ── Personas: NATS delegation (needs ML) ──
         // /api/v1/personas/{id}/lens REMOVED — same dead import as
@@ -2004,7 +2009,11 @@ async fn prompt_skills_evolve(
 ///
 /// Writes a markdown file with YAML frontmatter to the evolved/ directory.
 /// Accepts {name, description, content, tags, ...} in the request body.
-async fn prompt_skills_create(Json(body): Json<Value>) -> AppJson {
+async fn prompt_skills_create(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<crate::auth::RequesterCtx>>,
+    Json(body): Json<Value>,
+) -> AppJson {
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.is_empty() => n,
         _ => return Json(json!({"error": "Missing required field: name"})),
@@ -2057,10 +2066,16 @@ async fn prompt_skills_create(Json(body): Json<Value>) -> AppJson {
     match tokio::fs::write(&file_path, file_content.as_bytes()).await {
         Ok(_) => {
             tracing::info!(name = %name, path = %file_path.display(), "prompt_skill_created");
+            // Read back as the registry will, so the reviewed hash is of the
+            // text that gets injected.
+            let written = crate::prompt_skills::PromptSkill::from_markdown(&file_path, &file_content, false);
+            let proposal = open_skill_proposal(&state, &written, &ctx).await;
             Json(json!({
                 "status": "created",
                 "name": name,
                 "path": file_path.to_string_lossy(),
+                "trust": "evolved",
+                "proposal": proposal,
             }))
         }
         Err(e) => Json(json!({"error": format!("Failed to write skill file: {e}")})),
@@ -2087,20 +2102,172 @@ fn checked_skill_name(name: &str) -> Result<(), AppError> {
 /// Body `{content, description?, tags?, priority?, fitness?, generation?,
 /// parent_skill?, version?}`. A core skill is 400 `core skills are never
 /// mutated`; an unknown name is 404.
-async fn prompt_skills_update(Path(name): Path<String>, Json(body): Json<Value>) -> AppResult {
+async fn prompt_skills_update(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    ctx: Option<Extension<crate::auth::RequesterCtx>>,
+    Json(body): Json<Value>,
+) -> AppResult {
     checked_skill_name(&name)?;
     let root = crate::prompt_skills::find_root();
     let skill = crate::prompt_skills::update_skill(&root, &name, &body).map_err(store_error)?;
     tracing::info!(name = %name, "prompt_skill_updated");
-    Ok(Json(json!({"status": "updated", "name": name, "skill": skill.to_summary()})))
+    // A changed text is a new thing to review (and a promoted skill is no
+    // longer promoted on it); an unchanged one (a score move) finds its row.
+    let proposal = open_skill_proposal(&state, &skill, &ctx).await;
+    Ok(Json(json!({"status": "updated", "name": name, "skill": skill.to_summary(), "proposal": proposal})))
+}
+
+/// File (or find) the promotion proposal for a skill's current text. Never
+/// fails the write: the skill is already on disk and framed as data, which is
+/// the safe state, so a database error is REPORTED in the answer (and logged)
+/// and the next `proposals` listing files whatever is missing.
+async fn open_skill_proposal(
+    state: &AppState,
+    skill: &crate::prompt_skills::PromptSkill,
+    ctx: &Option<Extension<crate::auth::RequesterCtx>>,
+) -> Value {
+    use crate::repo::prompt_skill_proposals::{open_proposal, Opened};
+    let by = ctx.as_ref().map(|Extension(r)| r.sub.as_str()).filter(|s| !s.is_empty()).unwrap_or("unknown");
+    match open_proposal(&state.db, skill, by).await {
+        Ok(Opened::Pending(id)) => json!({"id": id, "status": "pending"}),
+        Ok(Opened::Decided(status)) => json!({"status": status}),
+        Err(e) => {
+            tracing::warn!(skill = %skill.name, error = %e, "prompt_skill_proposal_failed");
+            json!({"status": "not_filed", "error": format!(
+                "the skill was saved and stays data; the promotion proposal could not be filed ({e}); \
+                 `noo prompt-skills proposals` files it on its next run")})
+        }
+    }
+}
+
+/// Reload the registry's decisions from the table. Called at boot and after
+/// every decision. A failure leaves the previous decisions in place and says so.
+pub(crate) async fn refresh_skill_decisions(state: &AppState) -> Result<(), String> {
+    let rows = crate::repo::prompt_skill_proposals::load_decisions(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    state.prompt_skills.set_decisions(rows);
+    Ok(())
+}
+
+/// The operator-or-admin login that may read proposals and decide them.
+fn skill_reviewer(ctx: &Option<Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
+    match ctx {
+        Some(Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
+        _ => Err(AppError::Forbidden(
+            "prompt-skill proposals are for a logged-in operator or admin (`noo auth login`)".into(),
+        )),
+    }
+}
+
+/// Deciding is a PERSON's act: a worker-delegated token (what a tool call
+/// carries back), a harness token, an MCP-door key, a service identity or an
+/// account that is not an enabled user is refused, exactly as the exec-approval
+/// decisions refuse them (`task_guard::resolve_origin`, fail closed when the
+/// account cannot be looked up). Without this a model could promote the skill it
+/// just wrote.
+fn skill_decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppError> {
+    match origin {
+        crate::task_guard::Origin::Person { .. } => Ok(()),
+        crate::task_guard::Origin::Agent { via, .. } => Err(AppError::Forbidden(format!(
+            "a prompt skill is promoted by a person, not by an agent: this credential is {via}. \
+             Decide with `noo prompt-skills decide <id> --promote` (or `--reject`) after `noo auth login`"
+        ))),
+    }
+}
+
+/// GET /api/prompt-skills/proposals?status=&limit= — pending first. Files a
+/// proposal for every runtime skill that has none on its current text (skills
+/// that predate this feature, or written while the table was unreachable).
+async fn prompt_skills_proposals(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<Extension<crate::auth::RequesterCtx>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> AppResult {
+    skill_reviewer(&ctx)?;
+    let status = q.get("status").map(String::as_str).filter(|s| !s.is_empty());
+    if let Some(st) = status {
+        if !["pending", "promoted", "rejected", "superseded", "withdrawn"].contains(&st) {
+            return Err(AppError::BadRequest(format!("unknown status '{st}' (pending, promoted, rejected, superseded, withdrawn)")));
+        }
+    }
+    let limit = q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500);
+    for skill in scan_all_skills().iter().filter(|s| !s.is_core) {
+        if let Err(e) = crate::repo::prompt_skill_proposals::open_proposal(&state.db, skill, crate::repo::prompt_skill_proposals::SWEEP_ACTOR).await {
+            return Err(AppError::Internal(format!("could not read or file proposals: {e}")));
+        }
+    }
+    let rows = crate::repo::prompt_skill_proposals::list(&state.db, status, limit)
+        .await
+        .map_err(|e| AppError::Internal(format!("could not list proposals: {e}")))?;
+    let pending = rows.iter().filter(|r| r["status"] == "pending").count();
+    Ok(Json(json!({"proposals": rows, "count": rows.len(), "pending": pending})))
+}
+
+/// POST /api/prompt-skills/proposals/{id}/decide — body `{decision:
+/// "promote"|"reject", reason?}`. A promoted skill is injected as instructions
+/// (system message, with core skills) while its text is the one decided on.
+async fn prompt_skills_decide(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    ctx: Option<Extension<crate::auth::RequesterCtx>>,
+    Json(body): Json<Value>,
+) -> AppResult {
+    use crate::prompt_skills::SkillTrust;
+    use crate::repo::prompt_skill_proposals::{decide, DecideError};
+    let by = skill_reviewer(&ctx)?;
+    skill_decider_refusal(&crate::task_guard::resolve_origin(&state.db, &ctx).await)?;
+    let trust = match body.get("decision").and_then(Value::as_str) {
+        Some("promote") => SkillTrust::Promoted,
+        Some("reject") => SkillTrust::Rejected,
+        _ => return Err(AppError::BadRequest("decision must be \"promote\" or \"reject\"".into())),
+    };
+    let reason = body.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty());
+    let done = match decide(&state.db, id, trust, &by, reason).await {
+        Ok(d) => d,
+        Err(DecideError::NotFound) => return Err(AppError::NotFound(format!("proposal {id} not found"))),
+        Err(DecideError::Closed(st)) => {
+            return Err(AppError::Conflict(format!(
+                "proposal {id} is {st}: the skill's text changed (or it was retired) after it was filed; decide the newest one in `noo prompt-skills proposals`"
+            )))
+        }
+        Err(DecideError::Unchanged(st)) => return Err(AppError::Conflict(format!("proposal {id} is already {st}"))),
+        Err(DecideError::Db(e)) => return Err(AppError::Internal(format!("could not record the decision: {e}"))),
+    };
+    crate::routes::core::audit_event(
+        &state.db,
+        if trust == SkillTrust::Promoted { "prompt_skill_promoted" } else { "prompt_skill_rejected" },
+        "info",
+        &by,
+        &done.name,
+        "ok",
+        json!({"proposal_id": done.id, "content_sha": done.content_sha, "reason": reason}),
+    )
+    .await;
+    // The decision is in the table either way; if the live registry cannot be
+    // refreshed it keeps the previous decisions until the next refresh, and the
+    // answer says so rather than claiming it took effect.
+    let live = match refresh_skill_decisions(&state).await {
+        Ok(()) => json!(true),
+        Err(e) => {
+            tracing::error!(error = %e, "prompt_skill_decisions_refresh_failed");
+            json!(format!("recorded, but this gateway could not reload the decisions ({e}); it applies after a restart"))
+        }
+    };
+    Ok(Json(json!({"id": done.id, "name": done.name, "status": done.status, "decided_by": by, "live": live})))
 }
 
 /// POST /api/prompt-skills/{name}/retire — move an EVOLVED skill into
 /// `<its directory>/graveyard/`, out of selection and the listing.
-async fn prompt_skills_retire(Path(name): Path<String>) -> AppResult {
+async fn prompt_skills_retire(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> AppResult {
     checked_skill_name(&name)?;
     let root = crate::prompt_skills::find_root();
     let to = crate::prompt_skills::retire_skill(&root, &name).map_err(store_error)?;
+    // Nothing left to promote; a stale proposal would only mislead the reviewer.
+    if let Err(e) = crate::repo::prompt_skill_proposals::withdraw(&state.db, &name).await {
+        tracing::warn!(skill = %name, error = %e, "prompt_skill_proposal_withdraw_failed");
+    }
     tracing::info!(name = %name, path = %to.display(), "prompt_skill_retired");
     Ok(Json(json!({"status": "retired", "name": name, "path": to.to_string_lossy()})))
 }
@@ -2194,6 +2361,107 @@ mod tests {
             assert!(checked_skill_name(bad).is_err(), "{bad:?}");
         }
         assert!(checked_skill_name("code-review").is_ok());
+    }
+
+    fn skill_ctx(sub: &str, role: crate::auth::Role, harness: Option<&str>, act: bool) -> Option<Extension<crate::auth::RequesterCtx>> {
+        Some(Extension(crate::auth::RequesterCtx {
+            sub: sub.into(),
+            scopes: vec!["read".into(), "write".into(), "admin".into()],
+            role,
+            harness: harness.map(String::from),
+            act: act.then(|| crate::auth::Actor { sub: "svc:worker".into(), iss_user: None, task: Some("t1".into()) }),
+        }))
+    }
+
+    /// A model cannot promote the skill it just wrote: a worker-delegated
+    /// token, a harness token, an MCP-door key and a service identity are all
+    /// refused, the same set the exec-approval decisions refuse.
+    #[tokio::test]
+    async fn a_delegated_token_cannot_decide_a_skill_promotion() {
+        use crate::auth::Role;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/nothing")
+            .expect("lazy pool");
+        for c in [
+            skill_ctx("alice", Role::Admin, None, true),
+            skill_ctx("alice", Role::Admin, Some("worker:t1"), false),
+            skill_ctx("alice", Role::Admin, Some("node:host3"), false),
+            skill_ctx("alice", Role::Admin, Some("mcp-external:codex"), false),
+            skill_ctx("svc:evolve", Role::Admin, None, false),
+            None,
+        ] {
+            // The role gate may pass (an admin-scoped agent) or fail (no
+            // login); the person gate must refuse either way.
+            let origin = crate::task_guard::resolve_origin(&pool, &c).await;
+            match skill_decider_refusal(&origin) {
+                Err(AppError::Forbidden(m)) => assert!(m.contains("by a person"), "{m}"),
+                other => panic!("expected 403 for {c:?}, got {other:?}"),
+            }
+        }
+        // A plain login whose account cannot be verified (no database) fails closed.
+        let origin = crate::task_guard::resolve_origin(&pool, &skill_ctx("olive", Role::Operator, None, false)).await;
+        assert!(skill_decider_refusal(&origin).is_err(), "fail closed");
+        // A person passes the pure rule.
+        let person = crate::task_guard::Origin::Person { account: "olive".into(), role: Role::Operator };
+        assert!(skill_decider_refusal(&person).is_ok());
+    }
+
+    /// Reading and deciding need an operator or admin login; a plain user does not pass.
+    #[test]
+    fn skill_proposals_need_an_operator_login() {
+        use crate::auth::Role;
+        assert_eq!(skill_reviewer(&skill_ctx("olive", Role::Operator, None, false)).unwrap(), "olive");
+        assert!(skill_reviewer(&skill_ctx("olive", Role::Admin, None, false)).is_ok());
+        assert!(matches!(skill_reviewer(&skill_ctx("bob", Role::User, None, false)), Err(AppError::Forbidden(_))));
+        assert!(matches!(skill_reviewer(&None), Err(AppError::Forbidden(_))));
+    }
+
+    /// The wiring the pure rules cannot see: the decide route runs both gates
+    /// before it touches the table, the write routes file a proposal, the
+    /// fitness route does not, and a retire withdraws the open one.
+    #[test]
+    fn promotion_routes_are_wired_to_the_gates_and_the_proposal_queue() {
+        let src = include_str!("settings.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let body_of = |sig: &str| {
+            let at = code.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            let rest = &code[at..];
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        let decide = body_of("async fn prompt_skills_decide(");
+        let (gate, person, write) = (decide.find("skill_reviewer(").unwrap(), decide.find("skill_decider_refusal(").unwrap(), decide.find("decide(&state.db").unwrap());
+        assert!(gate < write && person < write, "both gates run before the decision is recorded");
+        assert!(body_of("async fn prompt_skills_proposals(").contains("skill_reviewer("), "listing is operator-only");
+        for f in ["async fn prompt_skills_create(", "async fn prompt_skills_update("] {
+            assert!(body_of(f).contains("open_skill_proposal("), "{f} must file a promotion proposal");
+        }
+        assert!(!body_of("async fn prompt_skills_fitness(").contains("open_skill_proposal("), "a score move is not a new text");
+        assert!(body_of("async fn prompt_skills_retire(").contains("withdraw("));
+        assert!(decide.contains("audit_event("), "every decision leaves an audit row");
+        assert!(decide.contains("refresh_skill_decisions("), "a decision takes effect in the live registry");
+    }
+
+    /// What a reviewer approves is name + description + body; a score move or a
+    /// tag change is not a new text, an edit of the words is.
+    #[test]
+    fn the_reviewed_hash_follows_the_words_and_nothing_else() {
+        let mk = |body: &str, fitness: f64| {
+            let mut s = crate::prompt_skills::PromptSkill::from_markdown(
+                std::path::Path::new("a.md"),
+                &format!("---\nname: a\ndescription: d\n---\n\n{body}\n"),
+                false,
+            );
+            s.fitness = fitness;
+            s.tags = vec![format!("t{fitness}")];
+            s
+        };
+        assert_eq!(mk("same", 1.0).review_hash(), mk("same", 9.0).review_hash());
+        assert_ne!(mk("same", 1.0).review_hash(), mk("edited", 1.0).review_hash());
+        let mut renamed = mk("same", 1.0);
+        renamed.description = "other".into();
+        assert_ne!(renamed.review_hash(), mk("same", 1.0).review_hash(), "the description is injected too");
     }
 
     /// PINNED: the approval gate cannot be switched off
