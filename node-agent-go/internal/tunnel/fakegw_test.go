@@ -108,6 +108,8 @@ type fakeGW struct {
 	// silent makes the server stop reading after the handshake, so pings go
 	// unanswered.
 	silent atomic.Bool
+	// bigFirst makes the first message an oversized one.
+	bigFirst atomic.Bool
 }
 
 type gwConn struct {
@@ -152,6 +154,12 @@ func (g *fakeGW) handle(w http.ResponseWriter, r *http.Request) {
 		g.pings.Add(1)
 		return c.WriteControl(websocket.PongMessage, []byte(m), time.Now().Add(time.Second))
 	})
+	if g.bigFirst.Load() {
+		_ = c.WriteMessage(websocket.TextMessage, make([]byte, 200<<10))
+		time.Sleep(100 * time.Millisecond)
+		c.Close()
+		return
+	}
 	nonce := base64.RawURLEncoding.EncodeToString(sha256Sum([]byte(time.Now().String())))
 	ts := time.Now().Unix()
 	node := g.nodeID

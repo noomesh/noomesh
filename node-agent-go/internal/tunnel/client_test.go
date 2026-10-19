@@ -436,3 +436,62 @@ func TestSSEBytesAreIdenticalOverTheTunnelAndOverHTTP(t *testing.T) {
 		t.Fatalf("stream did not end with [DONE]: %q", got[len(got)-40:])
 	}
 }
+
+func TestAWindowSmallerThanOneFrameIsRefused(t *testing.T) {
+	rg := newRig(t, echo, nil)
+	rg.gw.window = MaxData - 1
+	_, err := rg.client.session(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "window") {
+		t.Fatalf("a window below the maximum frame can never be satisfied; got %v", err)
+	}
+	if rg.client.Connected() {
+		t.Fatal("must not report connected")
+	}
+}
+
+func TestAnOversizedHandshakeMessageIsNotBuffered(t *testing.T) {
+	rg := newRig(t, echo, nil)
+	rg.gw.bigFirst.Store(true)
+	_, err := rg.client.session(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no challenge") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAnEmptyDataFrameResetsTheStreamWithoutSpawningAnything(t *testing.T) {
+	block := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-block })
+	t.Cleanup(func() { close(block) })
+	rg := newRig(t, h, nil)
+	gc, _ := rg.run(t)
+	gc.open(1, "POST", "/x", nil)
+	gc.write(FrameData, 1, nil)
+	_, _, ended := gc.collect(t, 1)
+	if !strings.HasPrefix(ended, "reset") || !strings.Contains(ended, "empty DATA") {
+		t.Fatalf("got %q", ended)
+	}
+}
+
+func TestAHostileCreditGrantCannotOverflowTheWindow(t *testing.T) {
+	w := newWindow(DefaultWindow)
+	for i := 0; i < 1000; i++ {
+		w.add(int(^uint32(0) >> 1)) // the largest a 32-bit int holds
+	}
+	w.add(-1)
+	w.mu.Lock()
+	avail := w.avail
+	w.mu.Unlock()
+	if avail != 2*DefaultWindow {
+		t.Fatalf("credit must clamp at twice the window, got %d", avail)
+	}
+	// And through the wire: an enormous grant on a live stream leaves it working.
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("fine")) })
+	rg := newRig(t, h, nil)
+	gc, _ := rg.run(t)
+	gc.open(1, "GET", "/x", nil)
+	gc.write(FrameCredit, 1, []byte{0xff, 0xff, 0xff, 0xff})
+	gc.write(FrameEnd, 1, nil)
+	if _, body, ended := gc.collect(t, 1); ended != "end" || string(body) != "fine" {
+		t.Fatalf("ended %q body %q", ended, body)
+	}
+}

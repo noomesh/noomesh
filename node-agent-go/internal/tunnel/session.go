@@ -216,7 +216,11 @@ func (s *session) dispatch(kind byte, id uint32, payload []byte) {
 			return
 		}
 		if st := s.get(id); st != nil {
-			st.send.add(int(binary.BigEndian.Uint32(payload)))
+			n := binary.BigEndian.Uint32(payload)
+			if uint64(n) > MaxWindow { // also keeps the conversion below inside a 32-bit int
+				n = MaxWindow
+			}
+			st.send.add(int(n))
 		}
 	case FrameReset:
 		if st := s.get(id); st != nil {

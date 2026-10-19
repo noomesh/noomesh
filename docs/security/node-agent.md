@@ -419,8 +419,12 @@ Rollback: `NOO_NODE_TUNNEL=0` on the gateway, or roll a node back.
 **Not in this slice:** turning `:8081` off (phase 3), Prometheus and other
 metrics scrapes, tailnet dialback, and discovery handing out `noo-node://<id>`
 instead of `https://<ip>:8081` (a caller that holds only an address still
-reaches the tunnel: the gateway maps a node's `agent_url` and
-`ip_address:8081` to its live tunnel).
+reaches the tunnel: the gateway maps the address it OBSERVED the tunnel
+connecting from, plus the agent port, to that node's live tunnel. Never an
+`agent_url` or `ip_address` a node reports, which any node could set to
+another node's address; an address a live node already holds is not shared,
+and a call to it stays on HTTPS. Behind NAT the observed address will not match
+the agent's, so those calls stay on HTTPS too).
 
 ---
 

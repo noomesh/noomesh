@@ -39,6 +39,10 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 
+/// How long the door waits for a node's response head: the stream idle
+/// default, so a cold model load keeps its old patience.
+pub const DOOR_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The header that carries the door secret.
 pub const DOOR_HEADER: &str = "x-noo-tunnel-door";
 use axum::response::{IntoResponse, Response};
@@ -141,7 +145,15 @@ pub fn test_secret() -> String {
 /// returned unchanged. The secret never appears in the URL.
 pub fn mark(req: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilder {
     match DOOR.get() {
-        Some(d) if url.starts_with(&format!("http://127.0.0.1:{}/", d.port)) => req.header(DOOR_HEADER, d.secret.as_str()),
+        Some(d) if url.starts_with(&format!("http://127.0.0.1:{}/", d.port)) => match HeaderValue::from_str(&d.secret) {
+            Ok(mut v) => {
+                // Sensitive: left out of Debug output and not forwarded as a
+                // credential by HTTP/2 header compression.
+                v.set_sensitive(true);
+                req.header(DOOR_HEADER, v)
+            }
+            Err(_) => req,
+        },
         _ => req,
     }
 }
@@ -202,12 +214,21 @@ async fn door(State(secret): State<Arc<String>>, req: axum::extract::Request) ->
         .collect();
     let stream = body.into_data_stream().map(|r| r.map_err(std::io::Error::other)).boxed();
     let treq = TunnelRequest { method: parts.method.as_str().to_string(), path: target, headers, body: TunnelBody::Stream(stream) };
-    match sess.request(treq, None).await {
+    // No total bound (a stream may run for minutes), but a node that never
+    // answers must not hold one of its stream places forever.
+    match sess.request_with(treq, None, Some(DOOR_HEAD_TIMEOUT)).await {
         Ok(resp) => {
             let mut b = Response::builder().status(resp.status);
             if let Some(h) = b.headers_mut() {
+                let redirect = (300..400).contains(&resp.status);
                 for (k, v) in &resp.headers {
                     if crate::tunnel::drop_response_header(k) {
+                        continue;
+                    }
+                    // The caller's client follows redirects and would carry
+                    // the door header to wherever a node points it. A node
+                    // answering a tunnel stream with a redirect gets none.
+                    if redirect && k.eq_ignore_ascii_case("location") {
                         continue;
                     }
                     if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {

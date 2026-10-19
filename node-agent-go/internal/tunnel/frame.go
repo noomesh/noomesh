@@ -129,11 +129,12 @@ var errWindowClosed = errors.New("stream closed")
 type window struct {
 	mu     sync.Mutex
 	avail  int
+	limit  int // credit never exceeds this; a hostile grant cannot overflow
 	wake   chan struct{}
 	closed bool
 }
 
-func newWindow(n int) *window { return &window{avail: n, wake: make(chan struct{})} }
+func newWindow(n int) *window { return &window{avail: n, limit: 2 * n, wake: make(chan struct{})} }
 
 // take waits until n bytes of credit are available and spends them.
 func (w *window) take(ctx context.Context, n int) error {
@@ -160,7 +161,11 @@ func (w *window) take(ctx context.Context, n int) error {
 
 func (w *window) add(n int) {
 	w.mu.Lock()
-	w.avail += n
+	if n < 0 || n > w.limit || w.avail > w.limit-n {
+		w.avail = w.limit
+	} else {
+		w.avail += n
+	}
 	close(w.wake)
 	w.wake = make(chan struct{})
 	w.mu.Unlock()
