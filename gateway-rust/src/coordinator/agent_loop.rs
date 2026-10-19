@@ -1832,7 +1832,11 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let mut session = rt.load_session(conversation_id, "dashboard").await;
     super::context::strip_data_frames(&mut session.messages);
     let mut persona_prompt = rt.persona_prompt().await;
-    persona_prompt.push_str(&rt.cluster_awareness().await);
+    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text.
+    let cluster_ctx = rt.cluster_awareness().await;
+    if !cluster_ctx.trim().is_empty() {
+        persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
+    }
     persona_prompt.push_str(&super::context::clock_context());
     session.set_system_prompt(&persona_prompt);
 
@@ -1984,6 +1988,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         &mut session.messages,
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
+            (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
             ("Knowledge base", rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
@@ -3012,7 +3017,11 @@ async fn run_inner_bound<R: HarnessRuntime>(
         Some(rp) => rp.to_string(),
         None => rt.persona_prompt().await,
     };
-    persona_prompt.push_str(&rt.cluster_awareness().await);
+    // Node-reported ids and backends are data (framed below); only the operator's guidance is system text.
+    let cluster_ctx = rt.cluster_awareness().await;
+    if !cluster_ctx.trim().is_empty() {
+        persona_prompt.push_str(super::context::CLUSTER_GUIDANCE);
+    }
     persona_prompt.push_str(&super::context::clock_context());
     session.set_system_prompt(&persona_prompt);
 
@@ -3142,6 +3151,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         &mut session.messages,
         &[
             ("Known facts about the user", temporal_ctx.as_deref()),
+            (super::context::CLUSTER_FRAME_LABEL, Some(cluster_ctx.as_str())),
             ("Knowledge base", rag_ctx.as_deref()),
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),

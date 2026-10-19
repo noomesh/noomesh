@@ -11,7 +11,10 @@ retrieved documents, graph facts, memory, other-channel messages, video
 recall, conversation summaries and recall (they are built from past
 messages), skills written at runtime (evolved, through the API, the
 `noo_prompt_skills_create` tool or the evolve add-on) and companion-device
-reports. The block is removed again before the session is cached.
+reports, and the live cluster listing (node ids and the backends each node
+reports: a node writes those strings, not the operator). Only the operator's
+static guidance about how to use `noo_cluster_status` stays in the system
+message, and it names no node. The block is removed again before the session is cached.
 
 Evolved skills are data for this reason: anyone with prompt-skill write
 access, an agent through `noo_prompt_skills_create`, or the evolve add-on can
