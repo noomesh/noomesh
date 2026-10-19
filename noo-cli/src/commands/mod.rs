@@ -64,6 +64,7 @@ pub mod controller;
 pub mod migrate;
 pub mod models;
 pub mod models_fetch;
+pub mod ollama_stage;
 pub mod voice_models;
 pub mod pki;
 pub mod plugins;
