@@ -2861,6 +2861,19 @@ mod tests {
         assert!(cluster.contains("harness_profile = CASE WHEN"), "the upsert must write harness_profile");
     }
 
+    /// i145: the embedding-space table is the chain head, sits on the
+    /// harness-profile revision, and is empty (the gateway seeds it at boot).
+    #[test]
+    fn embedding_spaces_revision_creates_the_table_and_seeds_nothing() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "097_embedding_spaces");
+        assert_eq!(m.down_revision, Some(HARNESS_PROFILE_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACES_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_embedding_spaces"));
+        assert!(!m.sql.contains("INSERT"), "a migration cannot read the fleet's embed model; the boot seed does");
+        assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
+    }
+
     /// The vendor-kinds revision sits on the audit chain and adds what
     /// `routes::cluster` reads and writes.
     #[test]
