@@ -445,6 +445,13 @@ services:
       # P1 entitlement). Verified offline by the gateway — absent/invalid
       # means the trellion-intel surfaces refuse "unlicensed".
       - NOO_ENTITLEMENT_FILE=${NOO_ENTITLEMENT:+/run/secrets/noo_entitlement}
+      # Add-on registry (gateway-rust/src/addon_registry.rs): the launcher's
+      # offline verdict on every composed add-on's signed lock
+      # (`name=version@stack,...`, `none`, or `dev` in a source checkout), and
+      # the stack this gateway was started for. Empty = a launcher from before
+      # the hand-off; the gateway then loads only the add-ons it already knew.
+      - NOO_ADDONS_VERIFIED=${NOO_ADDONS_VERIFIED:-}
+      - NOO_STACK_TAG=${NOO_IMAGE_TAG:-}
       # Agent-message review key: seals every
       # agent-to-agent body on the bus/in the table; operators review
       # through the gateway. Absent = plaintext (boot log says so).
