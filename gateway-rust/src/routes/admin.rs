@@ -276,7 +276,7 @@ fn local_agent_url() -> String {
     }
     // Node agents serve mTLS only (no plaintext listener exists).
     let proto = "https";
-    format!("{proto}://node-agent:8081")
+    format!("{proto}://node-agent:{}", crate::node_link::AGENT_PORT)
 }
 
 /// Collect all node entries from NATS KV mesh_nodes (excluding gateway).
@@ -302,7 +302,7 @@ pub(crate) async fn all_node_agents(state: &AppState) -> Vec<(String, String, St
                         } else if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
                             if !ip.is_empty() {
                                 let proto = "https"; // node agents are mTLS-only
-                                format!("{proto}://{ip}:8081")
+                                crate::node_link::NodeLink::for_ip(ip).base().to_string()
                             } else { continue; }
                         } else {
                             continue;
@@ -328,7 +328,6 @@ async fn logs_containers(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let client = super::cluster::build_node_agent_client();
     let mut results: Vec<Value> = Vec::new();
 
     let nodes = all_node_agents(&state).await;
@@ -338,10 +337,7 @@ async fn logs_containers(
             if let Some(ref filter) = params.node_id {
                 if nid != filter { continue; }
             }
-            let mut req = client.get(format!("{agent_url}/logs/containers"));
-            if let Some((ref k, ref v)) = crate::node_agent_auth::header_for(agent_url) {
-                req = req.header(k.as_str(), v.as_str());
-            }
+            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/logs/containers");
             match req.timeout(std::time::Duration::from_secs(10)).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(containers) = resp.json::<Vec<Value>>().await {
@@ -360,10 +356,7 @@ async fn logs_containers(
     } else if params.node_id.is_none() {
         // Fallback: try local node-agent directly
         let local = local_agent_url();
-        let mut req = client.get(format!("{local}/logs/containers"));
-        if let Some((ref k, ref v)) = crate::node_agent_auth::header_for_self(&local) {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/logs/containers");
         if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
             if resp.status().is_success() {
                 if let Ok(containers) = resp.json::<Vec<Value>>().await {
@@ -387,7 +380,6 @@ async fn logs_docker_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContainerQueryParams>,
 ) -> AppJson {
-    let client = super::cluster::build_node_agent_client();
     let mut results: Vec<Value> = Vec::new();
 
     let nodes = all_node_agents(&state).await;
@@ -397,10 +389,7 @@ async fn logs_docker_stats(
             if let Some(ref filter) = params.node_id {
                 if nid != filter { continue; }
             }
-            let mut req = client.get(format!("{agent_url}/stats/containers"));
-            if let Some((ref k, ref v)) = crate::node_agent_auth::header_for(agent_url) {
-                req = req.header(k.as_str(), v.as_str());
-            }
+            let req = crate::node_link::NodeLink::for_base(agent_url).request(reqwest::Method::GET, "/stats/containers");
             match req.timeout(std::time::Duration::from_secs(10)).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(containers) = resp.json::<Vec<Value>>().await {
@@ -419,10 +408,7 @@ async fn logs_docker_stats(
     } else if params.node_id.is_none() {
         // Fallback: try local node-agent directly
         let local = local_agent_url();
-        let mut req = client.get(format!("{local}/stats/containers"));
-        if let Some((ref k, ref v)) = crate::node_agent_auth::header_for_self(&local) {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        let req = crate::node_link::NodeLink::self_agent_at(local).request(reqwest::Method::GET, "/stats/containers");
         if let Ok(resp) = req.timeout(std::time::Duration::from_secs(10)).send().await {
             if resp.status().is_success() {
                 if let Ok(containers) = resp.json::<Vec<Value>>().await {
@@ -456,27 +442,21 @@ async fn logs_node_container(
     Path((node_id, container)): Path<(String, String)>,
     Query(params): Query<NodeContainerLogParams>,
 ) -> impl IntoResponse {
-    let agent_url = match super::cluster::get_node_agent_url(&state, &node_id).await {
-        Ok(url) => url,
+    let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
+        Ok(l) => l,
         Err(_) => {
             return (StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Node not found: {node_id}")}))).into_response();
         }
     };
 
-    let client = super::cluster::build_node_agent_client();
-    let auth = crate::node_agent_auth::header_for(&agent_url);
-
     let tail = params.tail.min(2000);
-    let mut url = format!("{agent_url}/logs/{container}?tail={tail}");
+    let mut path = format!("/logs/{container}?tail={tail}");
     if let Some(ref since) = params.since {
-        url.push_str(&format!("&since={}", urlencoding::encode(since)));
+        path.push_str(&format!("&since={}", urlencoding::encode(since)));
     }
 
-    let mut req = client.get(&url);
-    if let Some((ref k, ref v)) = auth {
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = link.request(reqwest::Method::GET, &path);
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -3283,16 +3263,11 @@ async fn node_log_lines(
     container: &str,
     tail: i64,
 ) -> Result<Vec<String>, String> {
-    let agent_url = super::cluster::get_node_agent_url(state, node_id)
+    let link = crate::node_link::NodeLink::for_node(state, node_id)
         .await
         .map_err(|_| "node-agent logs failed: HTTP 404".to_string())?;
-    let client = super::cluster::build_node_agent_client();
-    let auth = crate::node_agent_auth::header_for(&agent_url);
     let tail = tail.clamp(1, 2000);
-    let mut req = client.get(format!("{agent_url}/logs/{container}?tail={tail}"));
-    if let Some((ref k, ref v)) = auth {
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = link.request(reqwest::Method::GET, &format!("/logs/{container}?tail={tail}"));
     let resp = req
         .timeout(std::time::Duration::from_secs(30))
         .send()

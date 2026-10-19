@@ -65,16 +65,12 @@ impl Reach {
 
 /// Dial one node's agent the way the work does.
 pub async fn probe_node(state: &AppState, node_id: &str) -> Reach {
-    let Ok(base) = crate::routes::cluster::get_node_agent_url(state, node_id).await else {
+    let Ok(link) = crate::node_link::NodeLink::for_node(state, node_id).await else {
         return Reach::Unknown;
     };
-    let client = crate::routes::cluster::build_node_agent_client();
-    let mut req = client
-        .get(format!("{}/health", base.trim_end_matches('/')))
+    let req = link
+        .request(reqwest::Method::GET, "/health")
         .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&base) {
-        req = req.header(k, v);
-    }
     match req.send().await {
         Ok(r) if r.status().is_success() => Reach::Ok,
         // A 401/403 still proves the socket, the TLS handshake and the

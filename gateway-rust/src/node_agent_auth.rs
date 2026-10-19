@@ -278,6 +278,11 @@ pub(crate) async fn watch_own_agent(client: reqwest::Client, model_url: String) 
     });
 }
 
+/// One lock for every test that reads or writes the process-global map
+/// (here and in `node_link`): cargo runs tests in threads.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     if let Ok(mut m) = LEAF_ONLY.write() {
@@ -291,7 +296,7 @@ mod tests {
     use serde_json::json;
 
     // One lock: the map is process-global and cargo runs tests in threads.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_SERIAL as SERIAL;
 
     fn with_token<R>(f: impl FnOnce() -> R) -> R {
         // The bearer reads the environment; give it a value to send. No

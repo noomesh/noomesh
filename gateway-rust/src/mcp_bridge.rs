@@ -265,23 +265,19 @@ pub async fn call(state: &AppState, user: Option<&str>, server: &str, tool: &str
     if nodes.is_empty() {
         return Err(format!("'{server}' is not placed on any node"));
     }
-    let client = crate::routes::cluster::build_node_agent_client();
     let mut last_err = String::new();
     for node in &nodes {
-        let base = match crate::routes::cluster::get_node_agent_url(state, node).await {
-            Ok(u) => u,
+        let link = match crate::node_link::NodeLink::for_node(state, node).await {
+            Ok(l) => l,
             Err(e) => {
                 last_err = format!("{node}: {e}");
                 continue;
             }
         };
-        let mut req = client
-            .post(format!("{}/api/mcp/{}/call", base.trim_end_matches('/'), server))
+        let req = link
+            .request(reqwest::Method::POST, &format!("/api/mcp/{server}/call"))
             .json(&json!({ "tool": tool, "arguments": args }))
             .timeout(std::time::Duration::from_secs(130));
-        if let Some((k, v)) = crate::node_agent_auth::header_for(&base) {
-            req = req.header(k, v);
-        }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let body: Value = resp.json().await.unwrap_or(json!({}));

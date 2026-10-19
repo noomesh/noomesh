@@ -554,7 +554,7 @@ fn health_of(n: &NodeFacts) -> (bool, String) {
 
 fn url_for(n: &NodeFacts, backend: &str) -> String {
     if !n.ip.is_empty() {
-        format!("https://{}:8081", n.ip)
+        crate::node_link::NodeLink::for_ip(&n.ip).base().to_string()
     } else {
         let port = crate::config::backend_port(backend).unwrap_or(0);
         super::backend::local_backend_url(backend, port)
