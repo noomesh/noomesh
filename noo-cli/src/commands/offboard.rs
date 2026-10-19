@@ -52,6 +52,24 @@ pub(crate) fn stop_self_heal_daemons(remove_unit: bool) {
             let _ = std::fs::remove_file(unit);
         }
         quiet("systemctl", &["--user", "daemon-reload"]);
+        remove_secret_rundir();
+    }
+}
+
+/// The RAM directory the launcher writes the containers' secret files to
+/// (scripts/lib-secrets.sh `secret_rundir`: `NOO_SECRET_RUNDIR`, else
+/// `/run/noo/secrets` as root, else `/dev/shm/noo-secrets-<uid>`). Offboard and
+/// `stack clean --deep` leave no plaintext behind, even in RAM. Best effort: a
+/// directory that is not there, or not ours, is left alone.
+pub(crate) fn remove_secret_rundir() {
+    let euid = unsafe { libc::geteuid() };
+    let dir = match std::env::var("NOO_SECRET_RUNDIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ if euid == 0 => PathBuf::from("/run/noo/secrets"),
+        _ => PathBuf::from(format!("/dev/shm/noo-secrets-{euid}")),
+    };
+    if dir.is_dir() && !dir.is_symlink() {
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

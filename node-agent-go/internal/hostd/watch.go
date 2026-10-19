@@ -54,6 +54,10 @@ func (e *Engine) Run(ctx context.Context, poll, heartbeat time.Duration) error {
 		version.String(), e.Root, e.Spool, e.GatewayPort, SupportedOpsFor(e.Mode))
 
 	e.writeHeartbeat(started, heartbeat)
+	// Reboot path for the RAM-backed secret files (boot.go).
+	if e.RestoreOnBoot {
+		go e.BootRestore(ctx)
+	}
 	hbTicker := time.NewTicker(heartbeat)
 	defer hbTicker.Stop()
 	pollTicker := time.NewTicker(poll)

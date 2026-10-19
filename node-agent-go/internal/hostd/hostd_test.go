@@ -844,3 +844,41 @@ func TestBackupThatExitsZeroButNamesNoDumpIsAFailure(t *testing.T) {
 		t.Errorf("the failure must say why: %q", r.Stderr)
 	}
 }
+
+// The reboot path: tmpfs secret files are gone, dockerd could not start the
+// containers that bind them and does not retry, so the daemon rewrites the files
+// (load_secrets) and starts exactly the stopped containers that bind from the
+// directory. Worker mode and a populated directory do nothing.
+func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
+	e, fr := testEngine(t)
+	e.BootRestore(context.Background())
+	got := strings.Join(fr.joined(), "\n")
+	for _, want := range []string{"lib-secrets.sh", "secret_rundir", "load_secrets", "--filter status=created", "docker start", `grep -q "^$d/"`, "is populated; nothing to do"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("boot-restore script lacks %q:\n%s", want, got)
+		}
+	}
+	// the populated check comes BEFORE the write, and the start after it
+	if !(strings.Index(got, "populated") < strings.Index(got, "load_secrets >/dev/null") && strings.Index(got, "load_secrets >/dev/null") < strings.Index(got, "docker start")) {
+		t.Fatalf("wrong order:\n%s", got)
+	}
+	if strings.Contains(got, "up -d") || strings.Contains(got, "pull") || strings.Contains(got, "--force-recreate") {
+		t.Fatalf("boot-restore must not recreate or pull:\n%s", got)
+	}
+}
+
+func TestBootRestoreDoesNothingForAWorker(t *testing.T) {
+	e, fr := testEngine(t)
+	e.Mode = ModeWorker
+	e.BootRestore(context.Background())
+	if len(fr.calls) != 0 {
+		t.Fatalf("worker ran %v", fr.calls)
+	}
+}
+
+func TestTheDaemonRunsBootRestoreAtStart(t *testing.T) {
+	src, _ := os.ReadFile("../../cmd/noo-hostd/main.go")
+	if !strings.Contains(string(src), "RestoreOnBoot:  true") {
+		t.Fatal("noo-hostd main must enable RestoreOnBoot")
+	}
+}

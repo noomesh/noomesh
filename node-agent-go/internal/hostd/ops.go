@@ -47,6 +47,10 @@ type Engine struct {
 	GatewayPort string
 	Runner      Runner
 
+	// RestoreOnBoot runs BootRestore when Run starts (boot.go): set by the
+	// daemon's main, off in unit tests.
+	RestoreOnBoot bool
+
 	// Health-check tuning for `recreate`.
 	HealthWake     time.Duration
 	HealthTimeout  time.Duration

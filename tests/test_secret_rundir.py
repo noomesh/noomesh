@@ -368,3 +368,98 @@ def test_stop_removes_the_files_and_the_wizard_runs_the_loader_for_every_install
 def test_hostd_keeps_the_loaders_stderr() -> None:
     go = (ROOT / "node-agent-go/internal/hostd/exec.go").read_text()
     assert "load_secrets >/dev/null 2>&1" not in go, "the refusal reason (not tmpfs, chown failed) would be discarded"
+
+
+def _boot_script() -> str:
+    go = (ROOT / "node-agent-go/internal/hostd/boot.go").read_text()
+    m = re.search(r"const bootRestoreScript = `(.*?)`\n", go, re.S)
+    assert m, "bootRestoreScript not found"
+    return m.group(1).replace("%s", f"'{LIB}'")
+
+
+def _boot_run(box: Box, populated: bool) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run the hostd boot-restore script for real, with a fake docker that has
+    two stopped containers: one binding a secret file, one not."""
+    log = box.tmp / "docker.log"
+    docker = box.bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$DOCKER_LOG"\n'
+        'case "$1" in\n'
+        "  ps) printf 'aaa\\nbbb\\n' ;;\n"
+        '  inspect) case "$4" in aaa) echo "$NOO_SECRET_RUNDIR/noo_jwt_secret" ;; *) echo /srv/other ;; esac ;;\n'
+        "esac\n"
+    )
+    docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+    if populated:
+        box.rundir.mkdir(mode=0o700)
+        (box.rundir / "x").write_text("1")
+    r = box.run(f"bash -c {__import__('shlex').quote(_boot_script())}", extra={"DOCKER_LOG": str(log)})
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+@needs_shm
+def test_boot_restore_rewrites_the_files_then_starts_only_the_containers_that_bind_them(box: Box) -> None:
+    r, calls = _boot_run(box, populated=False)
+    assert r.returncode == 0, r.stderr
+    assert (box.rundir / "noo_jwt_secret").is_file(), "files must exist before any container is started"
+    starts = [c for c in calls if c.startswith("start")]
+    assert starts == ["start aaa"], calls
+    assert "started 1 container" in r.stdout
+
+
+@needs_shm
+def test_boot_restore_leaves_a_populated_directory_and_stopped_services_alone(box: Box) -> None:
+    r, calls = _boot_run(box, populated=True)
+    assert r.returncode == 0 and "nothing to do" in r.stdout, (r.stdout, r.stderr)
+    assert calls == [], "a hostd restart (files present) must not start anything"
+
+
+@needs_shm
+def test_boot_restore_failure_to_write_starts_nothing(box: Box) -> None:
+    box.log.write_text("")
+    r = box.run(
+        f"bash -c {__import__('shlex').quote(_boot_script())}",
+        extra={"FAKE_CHOWN_FAIL": "1", "DOCKER_LOG": str(box.tmp / "d.log")},
+    )
+    assert r.returncode == 1 and "could not write the secret files" in r.stderr
+    assert not (box.tmp / "d.log").exists()
+
+
+@needs_shm
+def test_an_addon_overlay_that_extends_a_read_only_service_with_environment_secrets_is_refused(tmp_path: Path) -> None:
+    b = Box(tmp_path)
+    (tmp_path / "docker-compose.trellion-intel.yml").write_text(
+        "services:\n  trellion-intel:\n    extends:\n      file: docker-compose.trellion.yml\n      service: trellion\n"
+        "secrets:\n  noo_svc_key_trellion_intel:\n    environment: NOO_SVC_KEY_TRELLION_INTEL\n"
+    )
+    try:
+        r = b.run("load_secrets >/dev/null")
+        assert r.returncode == 1, r.stderr
+        assert "noo_svc_key_trellion_intel" in r.stderr and "noo addons upgrade" in r.stderr and "Nothing was started" in r.stderr
+        assert not b.rundir.exists(), "refused before anything is written"
+    finally:
+        b.cleanup()
+
+
+@needs_shm
+def test_an_independent_addon_with_environment_secrets_is_not_refused(tmp_path: Path) -> None:
+    """noo-evolve does not extend trellion and is not read-only: its overlay's
+    environment: secrets still work and are still exported."""
+    b = Box(tmp_path)
+    (tmp_path / "docker-compose.evolve.yml").write_text(
+        "services:\n  noo-evolve:\n    image: x\nsecrets:\n  evolve_key:\n    environment: NOO_EVOLVE_KEY\n"
+    )
+    try:
+        r = b.run("load_secrets >/dev/null")
+        assert r.returncode == 0, r.stderr
+    finally:
+        b.cleanup()
+
+
+def test_the_intel_overlay_in_its_repo_uses_file_secrets() -> None:
+    p = Path.home() / "personifAI/trellion-intel/.worktrees/ro-rootfs/bundle/docker-compose.yml"
+    if not p.is_file():
+        pytest.skip("the trellion-intel checkout is not beside this one")
+    plan = subprocess.run(["bash", "-c", f". {LIB}; _secret_form_conflicts {p}"], capture_output=True, text=True).stdout
+    assert plan == "", plan

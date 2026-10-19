@@ -255,10 +255,40 @@ compose creates anything:
 * a secret the store does not hold is an **empty** file (compose needs the
   bind source to exist) and its `_FILE` pointer stays unset, so it reads as
   unset;
-* `noo stack stop` (the whole stack) deletes the files and the directory. A
-  reboot clears them too, and the next start writes them again. Until then a
-  container whose restart policy fires after a reboot cannot find its files:
-  run `noo stack start`.
+* `noo stack stop` (the whole stack), `noo stack clean --deep`, `noo offboard`
+  and the controller teardown script delete the files and the directory.
+
+### After a reboot
+
+The directory is RAM, so a reboot empties it, while dockerd starts every
+container whose restart policy says so as soon as it is up. A container whose
+bind source does not exist cannot be created for that start, and dockerd does
+not retry it (a restart policy governs a container that started and exited, not
+one that never could): it stays in `Created` until something starts it. Before
+the files moved to tmpfs the values lived in each container's layer and the
+stack simply came back, so noo-hostd, which a controller already runs at boot,
+restores that. When it starts and finds the secret directory missing or empty
+(`BootRestore`, `node-agent-go/internal/hostd/boot.go`) it:
+
+1. runs `load_secrets`, which decrypts `secrets/env.sops` with the age key
+   already on disk (`~/.config/sops/age/keys.txt`) and rewrites every file;
+2. `docker start`s exactly the stopped (`created`/`exited`) containers that
+   bind a file from that directory. It pulls, builds and recreates nothing, and
+   a container that does not bind a secret is never touched;
+3. retries for about two minutes while docker is not up yet, takes the same
+   compose lock as every other mutating step, and logs `BOOT-RESTORE gave up:
+   run noo stack start` if it cannot. If the directory is already populated (a
+   hostd restart, not a reboot) it does nothing, so a service an operator
+   stopped by hand stays stopped.
+
+What this relies on: noo-hostd must be running at boot, as the user who owns
+the age key. A controller installs it as a systemd **user** unit
+(`WantedBy=default.target`), which starts at boot only with linger on:
+`sudo loginctl enable-linger <user>` (`noo-hostd install` prints this line).
+Without linger the user manager, and so hostd, starts at first login, and the
+stack stays down until then or until `noo stack start`. A boot that cannot
+decrypt the store (age key missing) writes nothing and starts nothing, loudly,
+rather than starting services with empty credentials.
 
 If a launcher is older than the compose file (a stale checkout, an older
 `noo`), `NOO_SECRET_RUNDIR` is unset and compose binds a path that does not
@@ -266,6 +296,20 @@ exist: creating the container fails with `bind source path does not exist:
 /nonexistent/noo-secret-rundir-unset/<name>`. It never starts a service with
 no credentials. Run `noo upgrade --all`, which swaps the CLI (and with it the
 launcher and compose files) before the stack.
+
+**Add-on overlays ship before or with the stack change.** An overlay that
+`extends` the read-only trellion service (trellion-intel) must source its own
+secrets from `file:` + `x-noo-source:`, like the stack's. The launcher refuses
+a start, before touching anything, when an overlay still declares
+`environment:` secrets while extending a service (`_secret_form_conflicts`):
+the error names the overlay and the secret and says `noo addons upgrade` or
+`addons.<name>: false`. So the add-on's `file:` overlay ships **with or before** the stack that
+introduces `write_secret_files`, never after: a new stack with the old overlay
+is refused at launch (above); an old stack with the new overlay starts intel
+with no secret files (`bind source path does not exist`, only intel affected),
+so `noo upgrade --all` moves both in one step. An independent add-on that does not
+extend a read-only service (noo-evolve) keeps working with `environment:`
+secrets.
 
 **Database passwords travel as pgpass.** No DSN carries a password any more
 (`postgresql://noo_app@postgres:5432/noomesh?sslmode=…`). The gateway and the
