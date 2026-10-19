@@ -26,6 +26,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuwatch"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
@@ -53,6 +54,7 @@ type Agent struct {
 	hb     *heartbeat.Reporter
 	server *api.Server
 	mesh   *messaging.MeshResponder
+	ctrl   *ctrlrpc.Service
 	gossip *messaging.GossipAnnouncer
 
 	// native probes backends served outside Docker (darwin/Metal). nil off
@@ -370,6 +372,24 @@ func (a *Agent) Run() error {
 	return nil
 }
 
+// startControlBus wires the control-over-the-bus service. Never fatal.
+func (a *Agent) startControlBus(ctx context.Context) {
+	caPEM, err := os.ReadFile(a.cfg.TLSCA)
+	if a.cfg.TLSCA == "" || err != nil {
+		slog.Warn("control over the bus not enabled: the cluster CA (NOO_TLS_CA) is unreadable, so control envelopes cannot be verified; control stays on HTTPS",
+			"path", a.cfg.TLSCA, "error", err)
+		return
+	}
+	v, err := ctrlrpc.NewVerifier(a.cfg.NodeID, caPEM)
+	if err != nil {
+		slog.Warn("control over the bus not enabled; control stays on HTTPS", "error", err)
+		return
+	}
+	a.ctrl = ctrlrpc.NewService(a.nats, a.cfg.NodeID, v, a.server)
+	a.hb.SetNatsRPC(a.ctrl.Ready)
+	a.ctrl.Start(ctx)
+}
+
 func (a *Agent) startMessaging(ctx context.Context) {
 	// Connect no longer fails just because the bus is down: it returns a
 	// client that keeps retrying in the background and fires the reconnect
@@ -439,6 +459,14 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		slog.Error("job subscription failed", "error", err)
 	}
 	go a.jobs.EnsureBound(ctx)
+
+	// Control over the bus (followup i131 phase 1): answer the controller's
+	// small control calls on node.<id>.rpc.> through the same handlers the
+	// HTTPS API uses. Advertised (control_transports.nats_rpc) only while the
+	// server has accepted the subscription; with no CA to verify envelopes
+	// against, or an older controller NATS file that denies the subject, the
+	// node stays on HTTPS and says why in the log.
+	a.startControlBus(ctx)
 
 	// Start mesh responder
 	scheme := a.cfg.Scheme()

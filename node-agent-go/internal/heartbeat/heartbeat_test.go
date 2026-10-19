@@ -871,3 +871,22 @@ func TestReporter_HeartbeatCarriesGPUContention(t *testing.T) {
 		t.Fatalf("gpu_contention missing or wrong: %#v", payload["gpu_contention"])
 	}
 }
+
+// nats_rpc follows the probe the agent installs: false until control over the
+// bus is live, true while it is, false again when it is taken back.
+func TestControlTransportsFollowTheBusProbe(t *testing.T) {
+	r := &Reporter{}
+	if r.controlTransports()["nats_rpc"] {
+		t.Fatal("no probe installed: nats_rpc must be false (an old controller NATS file, or no CA)")
+	}
+	live := false
+	r.SetNatsRPC(func() bool { return live })
+	if r.controlTransports()["nats_rpc"] {
+		t.Fatal("probe says not live")
+	}
+	live = true
+	ct := r.controlTransports()
+	if !ct["nats_rpc"] || !ct["https_listener"] || ct["tunnel"] {
+		t.Fatalf("live probe: %v", ct)
+	}
+}

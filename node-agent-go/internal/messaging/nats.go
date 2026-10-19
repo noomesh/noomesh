@@ -115,6 +115,9 @@ type Client struct {
 	hookMu         sync.Mutex
 	reconnectHooks []func()
 
+	violMu     sync.Mutex
+	violations []Violation
+
 	stopOnce sync.Once
 	stop     chan struct{}
 }
@@ -264,6 +267,7 @@ func (c *Client) buildOptions() ([]nats.Option, error) {
 				subject = sub.Subject
 			}
 			slog.Error("nats async error", "node_id", c.nodeID, "subject", subject, "error", err)
+			c.noteViolation(err)
 		}),
 	}
 
@@ -774,3 +778,51 @@ func buildNATSTLS() (*tls.Config, error) {
 
 	return tlsCfg, nil
 }
+
+// Violation is one permission refusal the server reported. NATS reports a
+// refused SUBSCRIBE or PUBLISH asynchronously and the call that caused it
+// has already returned nil, so this record is the only evidence a grant is
+// missing.
+type Violation struct {
+	At  time.Time
+	Msg string
+}
+
+const maxViolations = 64
+
+// noteViolation records err when it is a permissions violation.
+func (c *Client) noteViolation(err error) {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "permissions violation") {
+		return
+	}
+	c.violMu.Lock()
+	defer c.violMu.Unlock()
+	c.violations = append(c.violations, Violation{At: time.Now(), Msg: err.Error()})
+	if len(c.violations) > maxViolations {
+		c.violations = c.violations[len(c.violations)-maxViolations:]
+	}
+}
+
+// ViolationsSince returns the permission refusals reported at or after
+// since whose text contains substr (empty = any).
+func (c *Client) ViolationsSince(since time.Time, substr string) []string {
+	c.violMu.Lock()
+	defer c.violMu.Unlock()
+	var out []string
+	for _, v := range c.violations {
+		if !v.At.Before(since) && strings.Contains(v.Msg, substr) {
+			out = append(out, v.Msg)
+		}
+	}
+	return out
+}
+
+// NoteViolationForTest feeds the recorder (tests of callers that cannot run a
+// server).
+func (c *Client) NoteViolationForTest(err error) { c.noteViolation(err) }
+
+// NodeReplyRoot is the root of the reply inboxes the gateway addresses a
+// node's replies to (`_INBOX_gw.node.<token>.<nuid>`). The node holds a
+// static publish grant on its own `<root>.<token>.>` (noo-cli nats_users.rs
+// NODE_REPLY_ROOT, gateway nats_credentials::NODE_REPLY_ROOT).
+const NodeReplyRoot = "_INBOX_gw.node"
