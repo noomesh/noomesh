@@ -1301,6 +1301,9 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
     let model = arg_str(args, &["model"]);
 
     let mut node_pin = arg_str(args, &["node"]);
+    // `node` is a preference: when it cannot answer, the mesh does and the
+    // result says so. `node_strict: true` keeps it on that node.
+    let strict = args.get("node_strict").and_then(Value::as_bool).unwrap_or(false);
     let mut node_from_model = false;
     if node_pin.is_none() {
         if let Some(m) = model.as_deref() {
@@ -1311,27 +1314,41 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
         }
     }
 
-    if let Some(node_id) = node_pin {
+    let mut unmet: Option<String> = None;
+    if let Some(node_id) = node_pin.as_deref() {
         use crate::routes::inference::{self as inf, NodeChat};
-        let (backend_type, model_name, base_url) = match inf::node_chat_backend(state, &node_id).await {
-            NodeChat::Serves(bt, m, url) => (bt, m, url),
-            // Same refusal as the HTTP route, before dispatch (i69a).
-            NodeChat::NoChat(msg) => return err_result(call, msg),
+        match inf::node_chat_backend(state, node_id).await {
             NodeChat::Unknown => return err_result(
                 call,
                 format!("node '{node_id}' not found or has no inference backend"),
             ),
-        };
-        let model_used = if node_from_model { model_name } else { model.unwrap_or(model_name) };
-        return match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt).await {
-            Ok(text) => ok_result(call, text),
-            Err(e) if inf::backend_cannot_chat(&e) => err_result(
-                call,
-                inf::no_chat_refusal(&node_id, &[(backend_type.clone(), model_used.clone())], &[]),
-            ),
-            Err(e) => err_result(call, e),
-        };
+            // Same refusal as the HTTP route, before dispatch (i69a).
+            NodeChat::NoChat(msg) if strict => return err_result(call, msg),
+            NodeChat::NoChat(msg) => unmet = Some(format!("node '{node_id}' could not answer ({msg})")),
+            NodeChat::Serves(backend_type, model_name, base_url) => {
+                let model_used = if node_from_model { model_name } else { model.clone().unwrap_or(model_name) };
+                match inf::chat_completion_on_node(&backend_type, &model_used, &base_url, &prompt).await {
+                    Ok(text) => return ok_result(call, text),
+                    Err(e) if strict && inf::backend_cannot_chat(&e) => return err_result(
+                        call,
+                        inf::no_chat_refusal(node_id, &[(backend_type.clone(), model_used.clone())], &[]),
+                    ),
+                    Err(e) if strict => return err_result(call, e),
+                    Err(e) => {
+                        if !inf::backend_cannot_chat(&e) {
+                            crate::coordinator::classes::note_stall(&base_url, &backend_type);
+                        }
+                        unmet = Some(format!("node '{node_id}' could not answer ({})", crate::text::clip(&e, 200)));
+                    }
+                }
+            }
+        }
+        if let Some(why) = &unmet {
+            tracing::warn!(node = %node_id, reason = %why, "inference_tool_node_preference_unmet_mesh_answers");
+        }
     }
+    // A node id sent as `model` is not a model.
+    let model = if node_from_model { None } else { model };
 
     // The Python ToolDef pinned max_iterations=1 and channel="tool_call" so
     // noo_inference is a single LLM turn, not a recursive agentic loop.
@@ -1341,7 +1358,11 @@ async fn native_inference_tool(state: &AppState, call: &ToolCall, args: &Value) 
         state, &prompt, &conversation_id, "tool_call", 1, model.as_deref(), None,
     ));
     match run.await {
-        Ok(result) => ok_result(call, result.response),
+        // The fallback is said, not silent: the caller asked for a node.
+        Ok(result) => match unmet {
+            Some(why) => ok_result(call, format!("[fallback: {why}; answered by the mesh]\n\n{}", result.response)),
+            None => ok_result(call, result.response),
+        },
         Err(e) => err_result(call, e.to_string()),
     }
 }

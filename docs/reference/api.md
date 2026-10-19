@@ -211,14 +211,23 @@ tried first, and behind it every other live chat node in that same
 ranking, so a request is answered (perhaps slower, perhaps by a smaller
 model) while any chat node is up. A model nothing serves right now — its
 node is off doing something else — is answered by `chat-default` instead
-of a `404`. `X-Noo-Served-Model` says what answered. Only a node pin is
-strict.
+of a `404`. `X-Noo-Served-Model` says what answered. Only a strict node
+pin (below) never falls back.
 
-To pin one request to one node, send `"node": "<id>"` in the body or an
-`X-Noo-Node: <id>` header (also on `/api/inference`). The candidates are
-then that node's only: `422` (`node_not_found` / `node_serves_no_chat`)
-when the node is unknown or serves no chat, `409` (`node_cannot_serve`)
-when it serves chat but not the `model` named.
+To prefer one node, send `"node": "<id>"` in the body or an
+`X-Noo-Node: <id>` header (also on `/api/inference` and the
+`noo_inference` tool). That node is tried first, then the class's other
+nodes, then the rest of the pool, and an answer from anywhere else says
+`fallback: true` (`/api/inference` also returns `requested_node` and
+`node_unavailable`). A name that is no node of this mesh is a `422`
+(`node_not_found`) either way: a typo does not become "any node".
+
+To keep a request on that node ALONE — locality, privacy, a liveness
+check — add `"node_strict": true` or `X-Noo-Node-Strict: 1` (`0`,
+`false`, `no`, `off` turn it off; any other value turns it on). A strict
+request never reaches another node: `422` (`node_serves_no_chat`) when
+the node serves no chat, `409` (`node_cannot_serve`) when it serves chat
+but not the `model` named, and a `504`/`502` when it cannot answer.
 
 The gateway tries
 candidates in order (non-degraded before degraded, healthy before not,
