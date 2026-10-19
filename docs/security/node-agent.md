@@ -291,6 +291,137 @@ roll a node back (it stops subscribing and stops advertising).
 
 ---
 
+## The node-held tunnel
+
+Streaming and bulk controller-to-node calls no longer need the node's inbound
+`:8081` listener either. A node dials the gateway **outbound**, over the same
+HTTPS listener every other node call uses, upgrades the connection to a
+WebSocket (`GET /api/node/tunnel`) and keeps it (followup i131, phase 2). The
+gateway opens one stream per call on it: inference SSE, the container proxy,
+logs, device blobs, and any other call the bus does not take. The node serves
+each stream **in-process through its existing route table**, so a handler does
+not know which way a request came; `TestSSEBytesAreIdenticalOverTheTunnelAndOverHTTP`
+(node) and `sse_bytes_are_identical_over_the_tunnel_and_over_https` (gateway)
+pin that the bytes of a canned SSE stream are identical both ways.
+
+### Trust model
+
+The node dials; the controller never dials in. Four independent checks, and
+the tunnel is not used until all hold:
+
+1. **The node refuses a server that is not the controller.** The TLS
+   handshake already verifies the gateway's certificate against the cluster CA;
+   the node additionally requires its organization to be `Mesh Cluster Gateway`
+   (`VerifyConnection`), so a service leaf or another node's leaf that chains to
+   the same CA cannot stand in. A gateway behind a reverse proxy that
+   re-terminates TLS with another certificate therefore never gets a tunnel:
+   the node logs `not the controller's` once and control stays on HTTPS.
+2. **The node cannot open a tunnel as another node.** The upgrade is an
+   ordinary authenticated request: a cluster token whose actor is a node
+   (`NODE_ROUTES`) **and** an mTLS leaf that names the same node. A token that
+   names a different node than the certificate is a `403` (`a node can open a
+   tunnel only as itself`). The node id comes from the certificate subject, never
+   from a message.
+3. **A short signed challenge, both ways.** After the upgrade the gateway sends
+   `{node, nonce, ts}` signed with its leaf; the node verifies the chain to the
+   cluster CA, the controller organization and the signature, and that the
+   challenge names *this* node. The node answers with the same nonce signed with
+   **its** leaf key; the gateway verifies it against the certificate the TLS
+   handshake presented (its thumbprint must match) and that the certificate names
+   the node. Nothing in either message can be replayed on another connection, and
+   a holder of the fleet secret without the node's private key cannot answer.
+4. **Newest tunnel per node wins.** A second tunnel from the same node closes
+   the first and aborts its streams.
+
+**The tunnel principal.** Every stream is opened by the gateway and stamped
+`principal: controller`. The node serves it through its own mux as if
+`ControllerOnly` had passed, but **only** for a stream that arrived on its own
+authenticated session. The authority is a value in the request's Go context
+(`auth.WithTunnelController`), set by the tunnel client and nothing else. It
+is never read from a header or any other property of a request: a request that
+arrives on `:8081` is built by `net/http` and has no such value, so no header
+a TCP caller writes can mint it (`TestATcpRequestCarryingTheTunnelPrincipalIsRefused`
+runs the real route table with `X-Noo-Tunnel-Principal` and variants). The
+tunnel client also drops `Authorization`, hop-by-hop headers and everything in
+the reserved `X-Noo-Tunnel-*` namespace from a stream's headers, and the gateway
+drops them on the way in. A stream cannot reach the harness-only route
+(`/harness/placement`): the tunnel principal is the controller, not the node's
+own harness.
+
+### Multiplexing and backpressure
+
+Our own framing over WebSocket binary messages (`type u8 | stream u32 | payload`:
+`OPEN`, `HEAD`, `DATA`, `END`, `CREDIT`, `RESET`); the spec is the package
+comment of `node-agent-go/internal/tunnel`. No `yamux` crate: it is not in
+`Cargo.lock`, and WebSocket already gives message boundaries, so the
+multiplexer is a few hundred lines that are tested end to end instead of a
+dependency that cannot be re-locked here. Each direction of each stream has a
+256 KiB window; a `DATA` frame costs `max(len, 1 KiB)` of it (tiny frames
+cannot outrun the window) and the receiver grants it back with `CREDIT` when
+the bytes reach the consumer. A response a slow reader is not pulling stops the
+node's handler after one window instead of filling a buffer. At most **64**
+streams per node; the 65th call is answered `503` (`tunnel_busy`,
+`Retry-After: 1`), not sent somewhere else. Keepalive: a ping every 15 s from
+each side, a peer silent (no frame, no pong) for 45 s is dropped.
+
+### How the gateway chooses
+
+`NodeLink` (frozen signatures) carries a call down the tunnel when the node's
+record says `control_transports.tunnel` **and** this gateway holds a live
+tunnel for it, and not otherwise:
+
+| Call | Takes |
+|---|---|
+| a small control op (`start`, `health`, ...) on a node with the bus | NATS, as before |
+| `NodeRequest::send` for anything else (container proxy, logs bodies, device blobs, pulls on a node without the bus) | the tunnel, else HTTPS :8081 |
+| `backend_stream` / `NodeLink::stream` (inference SSE) | the tunnel, else HTTPS :8081 |
+
+Streams that hold only a URL reach the tunnel through a loopback door inside
+the gateway (`tunnel_door.rs`): a listener on `127.0.0.1` that starts with the
+first tunnel, forwards **only** to a node that holds a live tunnel to this
+gateway, and requires a 256-bit secret in every path. It dials nothing. A
+gateway run with `HTTP_PROXY` set must also set `NO_PROXY=127.0.0.1`, or the
+client would send door requests to the proxy.
+
+### When the tunnel breaks
+
+| Situation | What happens |
+|---|---|
+| Old node (no `tunnel`) | HTTPS, as before |
+| Old gateway, new node | The dial gets `404`/`403`; the node logs **one** line (`not available from this controller`), stays on HTTPS and asks again every ~10 min |
+| Tunnel not up (reconnecting) | `control_transports.tunnel` is false from the next heartbeat; calls use HTTPS. Reconnect backoff is 1 s doubling to 60 s, jittered |
+| Tunnel drops mid-stream | In-flight streams end with a **distinct** error (`tunnel_lost: the tunnel to node X dropped (...)`, counted in `control_calls.tunnel_aborts`), never a clean end. Over the loopback door the response is cut without its terminating chunk. The node cancels the handlers (their contexts end) |
+| Drop before the response head, a read (`GET`/`HEAD`) | One retry over HTTPS, logged and counted (`fallbacks`) |
+| Drop before the response head, anything else | The node is reported unreachable (`tunnel-lost`); **never retried**: the node may have run it |
+| Inference stream cut before the head | A plain `502` (`x-noo-tunnel-error`), which the failover lane already treats as the backend being down: nothing was sent, so another node may be tried. After the head, tokens may have flowed and the stream is not restarted |
+| Caller stops reading | The gateway resets the stream; the node's handler is cancelled |
+
+`NOO_NODE_TUNNEL=0` on the gateway makes the endpoint answer `404` (as an
+older gateway does) and routes everything the old way; `NOO_AGENT_TUNNEL=off`
+on a node keeps that node from dialing. `GET /api/cluster/nodes` carries, per
+node, `control_calls.tunnel`, `tunnel_aborts`, `https_other` (streams still on
+HTTPS) and `tunnel_live`. `noo cluster verify` has a `streaming over tunnel`
+row: one stream round trip, **NOT CHECKED** (a warning, never ok) for a node
+that does not advertise a tunnel, **FAIL** for one that advertises it while the
+gateway holds none or gets no answer.
+
+### Roll order
+
+1. Upgrade the controller (gateway, CLI). Nothing changes: no node advertises a
+   tunnel. The endpoint is on `NODE_ROUTES`; an older gateway answers `403`.
+2. Upgrade the nodes (`noo upgrade --nodes`). A new node dials, completes the
+   challenge, and advertises `tunnel` on its next heartbeat. A node upgraded
+   before step 1 asks, is refused, logs once and retries every ten minutes.
+3. `noo cluster verify`: every node shows `streaming over tunnel` green.
+
+Rollback: `NOO_NODE_TUNNEL=0` on the gateway, or roll a node back.
+
+**Not in this slice:** turning `:8081` off (phase 3), Prometheus/metrics
+scrapes, tailnet dialback, and the container-proxy and device callers that
+still pin an agent URL by hand.
+
+---
+
 ## Declared host roots
 
 A node declares where its data lives in its own environment. The controller

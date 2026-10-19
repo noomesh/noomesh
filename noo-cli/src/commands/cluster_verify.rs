@@ -145,6 +145,48 @@ pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
     }
 }
 
+/// The `streaming over tunnel` row (i131 phase 2). The verdicts, in order:
+/// - the node does not advertise `control_transports.tunnel` (an older agent,
+///   or its tunnel is not connected right now): NOT CHECKED, never ok.
+///   Streaming calls use HTTPS :8081.
+/// - it advertises it and the gateway's stream round trip over the tunnel
+///   answered: ok, with the round trip time and the per-node counters of
+///   streams carried by each transport.
+/// - it advertises it and the round trip failed (including "the gateway holds
+///   no live tunnel for it"): FAIL. The node says it is connected and the
+///   gateway cannot use it.
+/// - it advertises it but no probe result reached us (an older gateway, or
+///   the probe call failed): NOT CHECKED.
+pub(crate) fn tunnel_row(id: &str, n: &Value) -> Check {
+    const NAME: &str = "streaming over tunnel";
+    let advertised = n["control_transports"]["tunnel"].as_bool();
+    let https_only = "streaming calls use HTTPS :8081 for this node";
+    match advertised {
+        None => warn(NAME, format!("NOT CHECKED — the agent does not report control_transports (older agent); {https_only}"),
+            Some(format!("noo cluster provision {id} --wait"))),
+        Some(false) => warn(NAME, format!("NOT CHECKED — the node does not advertise a tunnel (an older agent, or its tunnel is not connected); {https_only}"),
+            Some(format!("noo cluster logs {id}   # 'node tunnel' lines say why it is not connected"))),
+        Some(true) => {
+            let p = &n["tunnel_probe"];
+            match (p["checked"].as_bool(), p["ok"].as_bool()) {
+                (Some(true), Some(true)) => {
+                    let c = &n["control_calls"];
+                    let counts = if c.is_object() {
+                        format!("; since the gateway started: {} stream(s) over the tunnel, {} over HTTPS", c["tunnel"].as_u64().unwrap_or(0), c["https_other"].as_u64().unwrap_or(0))
+                    } else {
+                        String::new()
+                    };
+                    ok(NAME, format!("stream round trip over the tunnel in {} ms{counts}", p["rtt_ms"].as_u64().unwrap_or(0)))
+                }
+                (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the stream round trip failed").to_string(),
+                    format!("noo cluster logs {id}   # 'node tunnel' lines; the node reconnects on its own, and `NOO_AGENT_TUNNEL=off` or `NOO_NODE_TUNNEL=0` turns the tunnel off on purpose")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the tunnel probe (older gateway)")),
+                    None),
+            }
+        }
+    }
+}
+
 /// A heartbeat older than this is a node the controller is not hearing.
 pub(crate) const HEARTBEAT_MAX_AGE_SECS: i64 = 120;
 /// Right after `noo cluster provision <node> --wait`, a field the restarted
@@ -224,6 +266,7 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     // 2b. Control over the bus (i131): the small control calls ride NATS on a
     //     connection the node holds outbound instead of the :8081 listener.
     out.push(control_bus_row(id, n));
+    out.push(tunnel_row(id, n));
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
@@ -996,9 +1039,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
     } else {
         None
     };
+    // Streaming over the tunnel: the same shape. One stream round trip,
+    // run by the gateway, only for a node that says it holds a tunnel.
+    let tunnel_probe = if n["control_transports"]["tunnel"].as_bool() == Some(true) {
+        get_json_opt(g, &format!("/api/cluster/nodes/{}/tunnel-probe", crate::commands::urlencode(&id)), true, 15)
+    } else {
+        None
+    };
     if let Some(obj) = n.as_object_mut() {
         if let Some(p) = bus_probe {
             obj.insert("bus_control_probe".into(), p);
+        }
+        if let Some(p) = tunnel_probe {
+            obj.insert("tunnel_probe".into(), p);
         }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
@@ -5807,13 +5860,67 @@ mod tests {
         assert!(r.detail.contains("gateway's own bus"), "{}", r.detail);
     }
 
+    // ── streaming over tunnel (i131 phase 2) ──────────────────────────
+
+    fn tunnel_row_of(n: &Value, now: i64) -> Check {
+        node_checks(n, "v0.2.70", "0.5.57", now, Some(true)).into_iter().find(|c| c.name == "streaming over tunnel").expect("the row is always present")
+    }
+
+    #[test]
+    fn streaming_over_tunnel_is_not_checked_for_a_node_that_does_not_advertise_it() {
+        let now = 1_800_000_000;
+        // No field at all: an older agent.
+        let r = tunnel_row_of(&healthy(now), now);
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("HTTPS"), "{}", r.detail);
+        // Reports transports, tunnel false: the same, with the logs remedy.
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": false}));
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        assert!(r.remedy.as_deref().unwrap().contains("noo cluster logs"));
+        // Never ok for a node that did not advertise it, whatever a probe field says.
+        let mut n = n;
+        n["tunnel_probe"] = serde_json::json!({"checked": true, "ok": true, "rtt_ms": 3});
+        assert_eq!(tunnel_row_of(&n, now).verdict, Verdict::Warn, "a verdict from a probe nobody asked for is not a pass");
+    }
+
+    #[test]
+    fn streaming_over_tunnel_passes_only_on_a_stream_round_trip() {
+        let now = 1_800_000_000;
+        let adv = || with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": true}));
+        // Answered, with the counters.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": true, "rtt_ms": 9});
+        n["control_calls"] = serde_json::json!({"bus": 4, "https_control": 0, "https_other": 2, "fallbacks": 0, "tunnel": 31, "tunnel_aborts": 0});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("9 ms") && r.detail.contains("31 stream(s) over the tunnel, 2 over HTTPS"), "{}", r.detail);
+        // Claims a tunnel, the gateway holds none or it does not answer: FAIL.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": false, "detail": "the node advertises a tunnel but this gateway holds no live tunnel for it"});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.detail.contains("no live tunnel") && r.remedy.as_deref().unwrap().contains("noo cluster logs"));
+        // Claims it, no probe result reached us (older gateway, or the call failed): not a pass.
+        let r = tunnel_row_of(&adv(), now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // The gateway could not try (tunnels switched off there): NOT CHECKED with its reason.
+        let mut n = adv();
+        n["tunnel_probe"] = serde_json::json!({"advertised": true, "checked": false, "ok": false, "detail": "node tunnels are switched off on this gateway (NOO_NODE_TUNNEL)"});
+        let r = tunnel_row_of(&n, now);
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("NOO_NODE_TUNNEL"), "{}", r.detail);
+    }
+
     #[test]
     fn a_healthy_node_passes_every_invariant() {
         let now = 1_800_000_000;
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 21, "fifteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 22, "sixteen node invariants (the log shipper, peer identity, control over bus, streaming over tunnel, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to

@@ -700,6 +700,13 @@ drain_started, drained_at}`.
   HTTPS :8081; a node that advertises it and does not answer FAILS, with
   `noo cluster nats-users render` as the first remedy. See
   [Control over the bus](../security/node-agent.md#control-over-the-bus).
+- `noo cluster verify host3` has a `streaming over tunnel` row: one stream
+  round trip over the node's outbound tunnel, with the per-node counts of
+  streams carried by the tunnel and by HTTPS. It is a warning reading
+  `NOT CHECKED` (never ok) for a node that does not advertise a tunnel, which
+  keeps taking streaming calls over HTTPS :8081; a node that advertises one
+  while the gateway holds none, or gets no answer, FAILS. See
+  [The node-held tunnel](../security/node-agent.md#the-node-held-tunnel).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
   held are warnings, not failures, because the node is working as designed.
