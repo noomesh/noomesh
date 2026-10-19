@@ -117,6 +117,7 @@ mod agent_meta_loop;
 mod audit_partition;
 mod audit_integrity;
 mod audit_chain;
+mod audit_head_export;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -606,6 +607,8 @@ async fn main() -> Result<()> {
         "cluster_initial_snapshot"
     );
 
+    // The signed audit chain head, recorded outside the database.
+    audit_head_export::spawn(state.clone());
     ingest_loop::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 

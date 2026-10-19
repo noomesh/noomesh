@@ -41,10 +41,50 @@ revokes the refresh token server-side, deletes the file, and ends the
 access token it was holding: the gateway keeps a per-account "not before"
 time, so a bearer issued before the logout is refused at once (a
 re-login gets a fresh one) and the account's open dashboard sockets close.
-The floor lives in Redis for one access-token lifetime; with no Redis it is
-held in the gateway's memory only and does not survive a restart.
+The floor is kept for one access-token lifetime in three places, read in
+this order: Redis (shared by every gateway instance), the gateway's memory,
+and Postgres (`noo_session_floors`, the durable copy, loaded at boot). A
+Redis outage or a restart therefore no longer forgets an account change; with
+neither Redis nor Postgres readable the gateway applies the floors it holds in
+memory and logs a warning rather than refusing every request.
 Scripts pass `--token` or `NOO_TOKEN`; the resolution order is in
 [README.md#contracts](README.md#contracts).
+
+### Reset the admin password
+
+```sh
+noo security admin-password reset
+```
+
+Run on the controller. It writes the account through the database, so it
+works with the gateway down and needs no login. The same transaction ends the
+account's sessions: every refresh token is revoked and the durable
+"not before" floor (`noo_session_floors`) is raised, so a running gateway
+refuses the old access tokens within about five seconds (its Postgres
+re-read interval) and a stopped one honours the floor at its next start. The
+reset does not call the gateway, deliberately: it must work when the gateway
+cannot be reached or the password is lost.
+
+### Verify the audit log
+
+```sh
+noo security audit verify
+```
+
+Recomputes every row's hash, checks the hash chain for deleted or reordered
+rows, and compares the chain head with the **exported head**. Every 15
+minutes the gateway appends `{seq, chain_hash, time, mac}` (MAC under the
+audit key) to `/data/audit-archive/chain-head.jsonl` (opened append-only, mode
+0600, on the gateway's data volume, outside Postgres) and publishes it to the
+operator event stream (`events.ops.audit.chain_head`). If the database head is
+older than an exported head, or the same sequence carries another hash, the
+newest rows were truncated or history was rewritten: the verdict is `fail` and
+the exit code 1. If there is no export yet, or the file cannot be read, the
+head line says `NOT CHECKED` and why; it is never reported as intact. A line
+that fails its MAC fails the check and names the line; after a deliberate
+audit-key rotation, move the file aside and the export starts a new one.
+`chattr +a` on the file makes the kernel enforce append-only. Override the
+location with `NOO_AUDIT_HEAD_FILE`.
 
 ### Create a user and give them knowledge access
 
@@ -385,7 +425,7 @@ the lock. The layout both locks are published in is in
 | `noo security user unlink` | `<channel> <channel_user_id>` | Remove a channel identity link |
 | `noo security user links` | `<username>` | List the channel identities linked to a user |
 | `noo security user set-password` | `<username> [--password-stdin]` | Set a user's password (prompts unless --password-stdin) |
-| `noo security admin-password reset` | `[--stdout] [--yes]` | On the controller, no login needed: reset the admin account and show the new password once |
+| `noo security admin-password reset` | `[--stdout] [--yes]` | On the controller, no login: reset the admin, end its sessions, show the new password once |
 | `noo security user set-scopes` | `<username> --scope <scope>...` | Replace a user's auth scopes with the given set (admin-only) |
 | `noo security user allowance` | `<username> [-t\|--tokens <n>] [-p\|--period day\|week\|month] [--clear]` | Show, set or clear a user's standing token allowance per period (setting is admin-only) |
 | `noo security user set-org` | `<username> <org_id>` | Assign a user to an org |
@@ -403,7 +443,7 @@ the lock. The layout both locks are published in is in
 | `noo security org list` | — | List orgs with member counts |
 | `noo security org create` | `<org_id> [--name <name>] [--description <text>]` | Create an org |
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
-| `noo security audit verify` | — | Verify audit row hashes and the chain: deleted or reordered rows show (operator-only) |
+| `noo security audit verify` | — | Verify audit hashes, the chain, and its head against the exported head (operator-only) |
 | `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
