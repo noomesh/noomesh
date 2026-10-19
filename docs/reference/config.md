@@ -106,6 +106,39 @@ Types and defaults are what the Rust loader (`gateway-rust/src/config.rs`)
 and the Python models (`src/noomesh/config.py`) declare; the *Read by*
 column says which side actually consumes the key.
 
+### `addons` and `addon_delegation` — which add-ons run, and what they may do (gateway + launcher)
+
+`addons` is a map of add-on name to a boolean. The launcher composes each
+enabled add-on's overlay from it; the gateway's add-on registry
+(`gateway-rust/src/addon_registry.rs`) registers each enabled HTTP add-on at
+startup from the route manifest its image delivers. Both read the same file.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `addons.<name>` | bool | the add-on's own polarity (trellion and identity on, the rest off) | Switch the add-on on or off. A name the stack does not ship is off until you set it `true`; set it with `noo addons enable <name>`. |
+| `addon_delegation.<name>.tasks` | bool | `false` | Let the add-on create and steer a present person's tasks. Takes effect only if the add-on's manifest also declares `delegate: "tasks"`; both are required. |
+
+An enabled add-on is registered only if its signed lock was verified for this
+stack; one that is enabled with no verified lock is refused, with an error that
+names `noo addons upgrade <name>` (see
+[development/addons.md](../development/addons.md#registration)).
+
+`addon_delegation` is a separate section on purpose: `addons` stays a plain
+`name: bool` map that the launcher and older releases read, and a switch that
+widens what an add-on may do for a person is its own admin-only entry (writing it
+through `PUT /api/config/addon_delegation` needs an Admin login, never a cluster
+credential). It is not a posture row: delegation is off by default, so no install
+is stranded, and its keys are add-on names a fixed posture catalog cannot list.
+The gateway reads the file at startup, so restart the gateway after editing.
+
+```yaml
+addons:
+  yourthing: true
+addon_delegation:
+  yourthing:
+    tasks: true
+```
+
 ### `services` — endpoints (gateway + workers)
 
 Topology only — credentials stay in the secret store. Each key's env

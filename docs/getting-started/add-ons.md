@@ -115,6 +115,50 @@ In a non-interactive run, pass `--accept-terms <version>` naming the terms
 version the install prints. If `install` refuses a token,
 `noo security entitlement verify <token>` says why.
 
+## Enable a third-party add-on
+
+An add-on you did not get with the stack (a voice assistant from another
+vendor, say) is switched on the same way as a built-in one, and the gateway
+registers it at startup when three things hold: you turned it on, its image
+delivered its route manifest, and its signed lock was verified for your stack.
+
+```yaml
+addons:
+  yourthing: true
+```
+
+```bash
+noo addons upgrade yourthing        # fetch and verify its signed lock, pin its images
+noo stack restart --force           # the launcher re-verifies the lock, then starts the add-on
+noo health --json                   # "addons" reads enabled for it
+```
+
+The lock step needs the CLI to know the add-on: `noo addons upgrade` takes the
+add-ons in its own table today, so a vendor add-on becomes installable this way
+once a CLI release lists it. The gateway side described here does not depend on
+that.
+
+If you turn an add-on on and skip the lock step, nothing loads quietly:
+`noo health` reads `unhealthy` for it, none of its routes are mounted, and the
+gateway log says "has no verified lock for this stack ... Run `noo addons
+upgrade yourthing`". A lock verified for an older stack is refused the same
+way; run `noo addons upgrade` after `noo upgrade --stack`. Upgrading noomesh
+keeps the add-ons you already run working on the first start.
+
+An add-on that wants to create and steer a person's tasks for them (a voice
+assistant that starts work while you talk) must declare that in its manifest
+**and** be allowed by you. It is off until you add it, and the gateway reads it
+at startup:
+
+```yaml
+addon_delegation:
+  yourthing:
+    tasks: true
+```
+
+Setting `tasks: true` for an add-on that does not declare it does nothing, and
+the gateway log says so. The key is admin-only to change through the API.
+
 ## Build your own
 
 An add-on is anything that speaks one of the core's extension seams (an MCP

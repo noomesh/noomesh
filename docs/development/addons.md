@@ -11,7 +11,11 @@ an overlay the same way but is never in `ADDONS` and never reported by
 `/health`.
 
 This page is the contract. Follow it and your add-on plugs into the gateway
-without a single new line of gateway routing code.
+without a single new line of gateway routing code. An HTTP add-on does not even
+need a row in `ADDONS`: the gateway's runtime registry
+(`gateway-rust/src/addon_registry.rs`) registers any add-on the operator turns
+on, from the route manifest its image delivers, once its signed lock has been
+verified (see "Registration" in step 2a).
 
 ## The two layers
 
@@ -22,7 +26,7 @@ pretending otherwise would make both worse.
 
 | Layer | Where | What it decides |
 |---|---|---|
-| Declaration | `gateway-rust/src/addons.rs` — one `Addon` row | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
+| Declaration | `gateway-rust/src/addons.rs` — one `Addon` row (the add-ons that shipped with the stack); a third-party HTTP add-on is declared by the operator (`addons.<name>: true`) and registered at runtime | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
 | Transport (HTTP) | your repo's route manifest, delivered to `/opt/noo/addon-routes/<name>/routes.json` | Which paths the gateway proxies to it (validated and mounted at startup) |
 | Transport (NATS) | a subject prefix, matched in `worker_client.rs` | Which subjects it answers |
 
@@ -107,6 +111,11 @@ with a changelog as the coordination channel. Follow it.
 
 ## Step 1 — declare it
 
+An add-on that is not shipped with the stack needs no row: skip to step 2a,
+where the operator's `addons.<name>: true` and your manifest are the whole
+declaration. The row below is for add-ons the stack itself ships (it carries
+the polarity, licence feature and refusal text).
+
 One row in `ADDONS` (`gateway-rust/src/addons.rs`):
 
 ```rust
@@ -122,8 +131,10 @@ Addon {
 There is deliberately no `env` field: the switch is the `addons.<name>` key
 in `noomesh.yaml`, read by both the launcher (compose overlays) and the
 gateway (routing/refusals) from the same file. No per-add-on environment
-variable exists or is accepted. Set `routes_manifest: true` on the row if you
-serve HTTP routes through a manifest (step 2a).
+variable exists or is accepted. Set `routes_manifest: true` on the row only to
+make a missing manifest a loud refusal (the diagnostic for an image from before
+manifests shipped); the registry reads the manifest of every enabled add-on
+whether or not its row says so.
 
 `default_on` is the whole polarity decision. An open pack people expect to
 have (trellion) is opt-out; anything licensed is opt-in.
@@ -136,7 +147,43 @@ that is the reason this table exists rather than a scattering of env reads.
 
 Write your manifest in your own repo and ship it in your image. The gateway
 reads it at startup from `/opt/noo/addon-routes/<name>/routes.json` when your
-switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
+switch is on (`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch
+no gateway code.
+
+### Registration
+
+The gateway keeps a **runtime registry** of HTTP add-ons, built at startup. An
+add-on is registered when all three hold:
+
+1. the operator switched it on: `addons.<name>: true` in `noomesh.yaml`;
+2. its image delivered a manifest the gateway accepted (below);
+3. the launcher vouches for its signed lock: `noo addons enable|upgrade` verified
+   the lock against the add-on's key in the installed entitlement and checked
+   that it lists this stack (`supports_stack`), and `noo stack start|restart`
+   re-verified it offline and handed the gateway the verdict
+   (`NOO_ADDONS_VERIFIED`).
+
+An add-on that fails 2 or 3 is **refused, never silently skipped**: no routes,
+`/health` reads `addons.<name>: "unhealthy"`, and the log says why. A missing
+lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
+for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
+stack is refused the same way, naming both stacks.
+
+Names are lowercase letters, digits, `-` and `_`, starting with a letter (at
+most 32). A name with `-` reads its upstream override from the variable with `_`
+(`pai-voice` reads `NOO_PAI_VOICE_URL`; the host stays `noo-pai-voice`) and may
+declare scopes as `pai-voice:<word>`.
+
+The routes are mounted once, when the router is built at startup. A reload
+rebuilds the registry (what is registered, what is delegated), but an add-on that
+appears later gets its routes at the next start.
+
+**Upgrading.** An install that upgrades keeps its enabled add-ons working on the
+first boot: the new launcher already verified every composed licensed add-on's
+pin before the gateway started. If the gateway is started by an older launcher
+that does not report a verdict, it loads only the add-ons it already knew, as
+before, and logs that `noo upgrade` updates the launcher; it never extends that
+to a name it did not know.
 
 ```json
 {
@@ -173,6 +220,33 @@ switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
 
 Any other field is refused.
 
+Two **top-level** keys (beside `routes`, not inside a route) prepare an add-on
+to act for a present person through that person's own tasks:
+
+| Key | Meaning |
+|---|---|
+| `delegate` | `"tasks"` is the only value. Declares that the add-on asks to create and steer a present person's tasks. An unknown value refuses the manifest. |
+| `task_events` | `{"method": "POST", "path": "/..."}`: where the gateway POSTs task events for this add-on. Valid only with `delegate: "tasks"`; the method must be `POST`; the path is plain (no `{param}`) and must not equal or match **any public route** of the same manifest (aliases and `{param}` routes included), so it is never reachable through the front door. An `internal` route's path is allowed. |
+
+Declaring `delegate` grants nothing. The operator must also enable it for the
+add-on, in `noomesh.yaml`:
+
+```yaml
+addon_delegation:
+  yourthing:
+    tasks: true
+```
+
+The default is off, and each half alone is off: the registry's
+`operator_enabled()` is true only when the manifest declares `delegate: "tasks"`
+**and** `addon_delegation.<name>.tasks` is true. The `addon_delegation` section
+is admin-only to write through the config API (a gated section), and the
+gateway reads it at startup. Minting the delegated token and delivering task
+events are separate changes (noomesh-internal i143); this release parses,
+validates and exposes the keys. A gateway that predates them refuses a manifest
+that carries them (unknown keys fail the whole manifest), so ship them with a
+`supports_stack` that starts at the release that reads them.
+
 ### Delivering it
 
 Your overlay hands the file to the gateway read-only: a one-shot service from
@@ -204,6 +278,9 @@ add-on when any of these fails:
 - `min_role` is `user`, `operator` or `admin` (never anything else, never read
   as `user`), a `POST` is `user` only with `owner_scoped`, and `scopes` are `<name>:<word>` on a
   `GET`;
+- `delegate` is `"tasks"` or absent; `task_events` appears only with
+  `delegate`, is a `POST`, and names a path no public route of the manifest
+  covers;
 - no public route collides with a core route.
 
 ### Who may call a route
@@ -280,8 +357,8 @@ gateway with an older add-on image treats every route as `operator`.
 
 ### When it is missing or wrong
 
-Switched on, with no manifest or an invalid one: **none** of your routes are
-mounted, never a partial surface. The gateway logs the reason at startup,
+Switched on, with no manifest, an invalid one, or no verified lock for this
+stack: **none** of your routes are mounted, never a partial surface. The gateway logs the reason at startup,
 `/health` reports `addons.<name>: "unhealthy"`, and every internal call to
 you answers with the reason (an image from before manifests shipped with the
 add-on is named as the likely cause, with the fix). Switched off: nothing is
