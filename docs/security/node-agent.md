@@ -106,9 +106,12 @@ noo security posture set NOO_CLUSTER_TOKEN_V1 0
 `compose_env:` first and set it after the roll; a gate cannot be set before
 the release that defines it). A v1 token is then answered `401
 cluster_token_v1_refused` with the fix in the body. A node agent honours the
-same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), but the
-provisioned agent environment does not carry that key yet, so today the gateway
-is where the door closes; the agents keep counting v1 callers regardless. A node rolled
+same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), and
+`noo cluster provision` renders it from the controller's posture, so after
+`posture set` the next bundle (`noo upgrade --nodes`, or `noo cluster provision
+<node>`) closes the door on each node too; the agents keep counting v1 callers
+until then. The provision output says `NOT CHECKED` when it could not read the
+posture. A node rolled
 *before* its controller can pin the old form with `NOO_CLUSTER_TOKEN_SIGN=v1`.
 
 One claimed name is refused outright: an HMAC whose actor is the `noo` CLI
@@ -170,7 +173,7 @@ as registered, else the source address of the route to the controller) and on
 loopback, not on every interface. A docker bridge, a second NIC or a public
 address no longer sees the port. `NODE_AGENT_BIND` overrides: `all` (or
 `0.0.0.0`) restores every interface, or a comma list of IPs binds exactly
-those; a hostname is refused at start with a message naming the setting. When
+those; a hostname is refused at start with a message naming the setting. Set it for the fleet on the controller (`NODE_AGENT_BIND` in `.env` / `compose_env`): `noo cluster provision` renders it into each node's env with every bundle, and refuses an invalid value before staging anything. When
 no usable address is known the agent falls back to every interface and logs
 that it did, and a derived address that later changes (DHCP, tailscale coming
 up after the agent) is followed within a minute by a rebind. There is no
