@@ -1980,7 +1980,23 @@ END $grant$;
     sql: r#"
 ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS vendor_kinds text[] NOT NULL DEFAULT '{}'
 "#,
+}, Migration {
+    revision: HARNESS_PROFILE_REVISION,
+    down_revision: Some(NODE_VENDOR_KINDS_REVISION),
+    // The per-node harness profile OVERRIDES (`noo cluster profile <node>
+    // --set k=v`): any subset of the fields in config/harness-profiles.json,
+    // validated by `harness_profile::validate_overrides` on write. The
+    // resolved profile (override > measured > tier default) is computed on
+    // read, never stored. NOT NULL DEFAULT '{}': every existing row resolves
+    // to its tier defaults.
+    sql: r#"
+ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS harness_profile jsonb NOT NULL DEFAULT '{}'
+"#,
 }];
+
+/// The harness-profile revision. A constant so a renumber at rebase is one
+/// line.
+pub const HARNESS_PROFILE_REVISION: &str = "096_harness_profile";
 
 /// The node vendor-kinds revision. A constant so a renumber at rebase is
 /// one line.
@@ -2809,8 +2825,23 @@ mod tests {
         assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
     }
 
-    /// The vendor-kinds revision is the chain head, sits on the audit chain,
-    /// and adds what `routes::cluster` reads and writes.
+    /// The harness-profile revision is the chain head, sits on the
+    /// vendor-kinds revision, and adds what `routes::cluster` reads and
+    /// writes.
+    #[test]
+    fn harness_profile_revision_is_the_head_on_vendor_kinds_and_adds_the_column() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == HARNESS_PROFILE_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "096_harness_profile");
+        assert_eq!(m.down_revision, Some(NODE_VENDOR_KINDS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(HARNESS_PROFILE_REVISION), "the chain head");
+        assert!(m.sql.contains("ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS harness_profile jsonb NOT NULL DEFAULT '{}'"));
+        let cluster = include_str!("routes/cluster.rs");
+        assert!(cluster.contains("vendor_kinds, harness_profile"), "desired-config must read harness_profile");
+        assert!(cluster.contains("harness_profile = CASE WHEN"), "the upsert must write harness_profile");
+    }
+
+    /// The vendor-kinds revision sits on the audit chain and adds what
+    /// `routes::cluster` reads and writes.
     #[test]
     fn node_vendor_kinds_revision_sits_on_the_audit_chain_and_adds_the_column() {
         let m = MIGRATIONS.iter().find(|m| m.revision == NODE_VENDOR_KINDS_REVISION).expect("must be in the chain");

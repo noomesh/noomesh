@@ -37,6 +37,8 @@ an allow-list.
 | Place an external MCP server | `streamable_http` only — a URL the node dials out to. **A stdio server cannot be placed at all**; those are declared on the node |
 | Call a tool on a placed MCP server, read logs, read metrics, run inference, clean disk, restart the agent | Controller identity required — see [Who is the controller](#who-is-the-controller) |
 | Preseed a model weight from the controller's store | Only against a **digest the controller states in its artifact manifest** |
+| Benchmark the running chat model (`POST /bench`) | Controller identity required, one bench at a time, 600 s in all — see [Harness profile](#harness-profile) |
+| Set the node's harness profile (desired-config `harness_profile`) | Numbers and enums the agent applies to its own bounds; the env on the box still wins — see [Harness profile](#harness-profile) |
 
 ### The controller MAY NOT
 
@@ -733,6 +735,69 @@ controller. An agent that does not send `backend_containers` leaves the
 row exactly as it was.
 
 ---
+
+## Harness profile
+
+The controller resolves a per-node **harness profile** (a tier default,
+refined by a per-node override and by a measured model speed) and sends it in
+desired-config as `harness_profile`. The agent keeps the last good one: a
+fetch that fails, or a profile that does not parse, keeps it; a desired-config
+with no `harness_profile` clears it, and no profile is exactly the behaviour
+from before profiles. The agent applies four of its fields:
+
+- **`first_byte_secs`** is the inference proxy's wait for a backend's
+  response headers. Precedence: `NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS` on the
+  box (the operator's override, read once) > the profile > 290 s. It is
+  live: the proxy builds its transport per request, and each build reads the
+  bound in force, so a profile change applies to the next request with no
+  agent restart (a request already in flight keeps the bound it started
+  with). An unusable env value is not an override; the profile or the
+  default applies.
+- **`ollama_context`** is the default `OLLAMA_CONTEXT_LENGTH` for this node's
+  ollama when the ollama placement's env does not set the key; a placement
+  that sets it is never touched. On Linux it joins the container env before
+  the spec hash is taken, so a changed default recreates the container like
+  any placement env edit. On macOS it reaches a brew-managed ollama through
+  the plist tuning, and the guard rewrites the key and boots the job out and
+  back once, as for its other tuning keys (it never removes a key, so
+  clearing the profile leaves the last value in the plist).
+- **`foreign_kinds`** lists the foreign harness kinds this node offers. After
+  the kind checks above (wire, table, runner, vendor CLI), a foreign kind the
+  profile does not list is refused (`backend_start` / `harness`) with:
+  harness kind "claude-code": this node's profile (tier 3) does not offer it;
+  set it with noo cluster profile &lt;node&gt; --set foreign_kinds=… (the
+  node's id in place of &lt;node&gt;). `noo` is never refused by the profile,
+  and with no profile there is no new refusal.
+- The whole resolved object is passed to the node's own harness as `profile`
+  in `GET /harness/placement` (omitted when there is none); the harness reads
+  `stream_idle_secs`, `thinking` and `claude_prompt` from it. The profile
+  carries numbers, enums and kind names, never a secret, and the placement
+  env beside it keeps its secret-looking-key filter.
+
+`POST /bench` measures the running chat model for the measured
+`first_byte_secs`. It is a controller-only route (`ctrlMW`, the class of
+`/restart` and `/gpu/hold`; a peer node, a service leaf and the node's own
+harness are refused): a bench occupies the GPU, so it is a command. It
+benches the desired placement with role chat (409 when there is none, or its
+backend is not running; 409 while another bench runs), dialled exactly as the
+inference proxy dials it (same door, TLS and client certificate; the header
+wait is the bench budget, not the first-byte bound it measures):
+
+1. `load_secs`: time to the first token of a streamed one-token completion,
+   **as found**: a model already loaded gives a warm number, one that is not
+   gives its cold load.
+2. A deterministic ~8192-token prompt (one leading nonce line so a prefix
+   cache cannot answer it) streamed with `max_tokens` 64 and
+   `stream_options.include_usage`: `prefill_tps` = prompt tokens / time to
+   first token, `decode_tps` = tokens after the first / the time after it.
+   Token counts come from the backend's `usage`; without one the prompt is
+   counted at chars/4 and the completion by content chunks.
+
+The whole bench is bounded at 600 s (504 on expiry, 502 on a backend error).
+The answer is the heartbeat's `model_bench`
+(`{"model","backend","load_secs","prefill_tps","decode_tps","prompt_tokens","at"}`),
+kept in memory and sent beside `host_services` on every heartbeat after; it
+is absent until a bench has run on this agent process.
 
 ## When a node refuses
 

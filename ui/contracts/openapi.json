@@ -18757,6 +18757,40 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/bench": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create bench",
+        "description": "[native] Measure a node's chat model: the gateway asks the node agent's `POST /bench`, which loads the model, times a reference prefill and decode, keeps the result and reports it as `model_bench` on every heartbeat after. The answer is that `model_bench` object (`{model, backend, load_secs, prefill_tps, decode_tps, prompt_tokens, at}`); the node's resolved harness profile (`desired-config`) derives its `first_byte_secs` from it. Operator only; audited. Up to 900 s.",
+        "operationId": "node_bench",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

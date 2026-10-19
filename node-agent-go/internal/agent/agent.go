@@ -31,6 +31,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuwatch"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/heartbeat"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostd"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
@@ -332,9 +333,17 @@ func (a *Agent) Run() error {
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
 	a.harnessKind = rec.HarnessRunningKind
 	a.server.SetMCP(rec.MCP())
+	a.server.SetChatPlacement(func() (api.ChatPlacement, bool) {
+		b, m, ok := rec.ChatPlacement()
+		return api.ChatPlacement{Backend: b, Model: m}, ok
+	})
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
-		return api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		if prof := harnessprofile.Current(); prof != nil {
+			hp.Profile = prof.Raw
+		}
+		return hp
 	})
 
 	// 4b'. Node disk reclaim: the controller's ladder cannot reach this
@@ -442,6 +451,13 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	})
 	a.hb.SetDataMounts(a.docker.ManagedDataMounts)
 	a.hb.SetHostState(a.hostServices)
+	a.hb.SetModelBench(func() any {
+		// A nil *ModelBench must reach the heartbeat as a nil interface.
+		if b := a.server.LastBench(); b != nil {
+			return b
+		}
+		return nil
+	})
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL("ollama") })

@@ -77,6 +77,11 @@ type Reporter struct {
 	// nil = this agent build does not report it, and the key is omitted.
 	hostState func() map[string]any
 
+	// modelBench is the last POST /bench result (api.Server.LastBench),
+	// sent as `model_bench` beside host_services. nil provider, or a nil
+	// answer (no bench has run), omits the key: absent until a bench runs.
+	modelBench func() any
+
 	// hostdState reports the confined-root daemon's liveness and the op
 	// names it advertises. `noo-apply` already reads that heartbeat FILE on
 	// the node to decide whether a swap took; nothing carried it up, so the
@@ -238,6 +243,9 @@ func (r *Reporter) dataRoots() map[string]any {
 
 // SetHostState installs the host-service reporter (harness state, runtime).
 func (r *Reporter) SetHostState(f func() map[string]any) { r.hostState = f }
+
+// SetModelBench installs the last-bench reporter, sent as `model_bench`.
+func (r *Reporter) SetModelBench(f func() any) { r.modelBench = f }
 
 // SetHostdState installs the confined-root daemon reporter.
 func (r *Reporter) SetHostdState(f func() map[string]any) { r.hostdState = f }
@@ -556,6 +564,15 @@ func (r *Reporter) SendHeartbeat() {
 		}
 	}
 	clk.mark("host_services")
+
+	// The last measured model speed (POST /bench), beside host_services:
+	// the controller resolves a measured first_byte_secs from it. Omitted
+	// until a bench has run on this agent (kept in memory only).
+	if r.modelBench != nil {
+		if mb := r.modelBench(); mb != nil {
+			payload["model_bench"] = mb
+		}
+	}
 
 	// The confined-root daemon that performs privileged ops for this
 	// unprivileged agent. Omitted when unreported.

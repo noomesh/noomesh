@@ -429,6 +429,17 @@ A turn sends one `content` event with the answer, then `harness_result`.
 A kind whose `launch` still carries an `unverified:` value is refused at
 start.
 
+A kind may also declare `launch_slim`, with the same fields as `launch`.
+Only claude-code has one. The driver runs it instead of `launch` while the
+node's harness profile (`profile.claude_prompt` in the agent's
+`/harness/placement` answer) says `slim`. It reads the choice once per run
+and re-reads the placement every minute. `launch_slim.system_prompt_file`
+names a file in the task's HOME. Before the run, the driver writes its slim
+system prompt there (mode 0600) and passes the path as
+`{system_prompt_file}` in `command`. It removes the file after the run. A
+command that names `{system_prompt_file}` without declaring the file is
+refused at start, and so is a file name that is not a plain name.
+
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`
 arguments and no `[mcp_servers]` table. The probe uses either the node's

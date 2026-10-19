@@ -890,3 +890,40 @@ func TestControlTransportsFollowTheBusProbe(t *testing.T) {
 		t.Fatalf("live probe: %v", ct)
 	}
 }
+
+// model_bench rides every heartbeat beside host_services once a bench has
+// run, and is absent before (a nil answer, or no provider).
+func TestHeartbeatCarriesModelBenchOnlyOnceOneHasRun(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/cluster/nodes/test-node/heartbeat" {
+			payload = nil
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+		}
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+	rpt := newTestReporter(t, server.URL, nil)
+	rpt.SetHostState(func() map[string]any { return map[string]any{"harness": map[string]any{"state": "running"}} })
+
+	rpt.SendHeartbeat()
+	if _, ok := payload["model_bench"]; ok {
+		t.Fatalf("no provider: model_bench must be absent: %v", payload["model_bench"])
+	}
+	var bench any
+	rpt.SetModelBench(func() any { return bench })
+	rpt.SendHeartbeat()
+	if _, ok := payload["model_bench"]; ok {
+		t.Fatalf("no bench yet: model_bench must be absent")
+	}
+	bench = map[string]any{"model": "gemma4:12b", "backend": "ollama", "load_secs": 4.2, "prefill_tps": 210.5,
+		"decode_tps": 18.3, "prompt_tokens": 8192, "at": "2026-10-19T17:00:00Z"}
+	rpt.SendHeartbeat()
+	mb, ok := payload["model_bench"].(map[string]any)
+	if !ok || mb["model"] != "gemma4:12b" || mb["prefill_tps"] != 210.5 {
+		t.Fatalf("model_bench: %v", payload["model_bench"])
+	}
+	if _, ok := payload["host_services"]; !ok {
+		t.Error("host_services still sent beside it")
+	}
+}

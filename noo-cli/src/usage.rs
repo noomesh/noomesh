@@ -34,6 +34,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "maintenance"], "<node> on --reason <text> [--until <duration>] | <node> off | list", "Mute a known-down node's operator alerts (operator-only); the daily summary still lists it"),
         (&["cluster", "gpu", "hold"], "<node> [--reason <text>]", "Pause a node's GPU backends and keep them paused, to free its GPU (operator-only)"),
         (&["cluster", "gpu", "release"], "<node>", "End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only)"),
+        (&["cluster", "profile"], "<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]", "Show a node's harness profile with each value's source; set overrides; bench its model"),
         (&["cluster", "up"], "<backend> <model> [--node <node>] [--replicas <n>]", "Start a backend with a model via the imperative start route (prefer place)"),
         (&["cluster", "init-secret"], "", "Generate and print a fresh random cluster secret locally (no gateway call)"),
         (&["cluster", "assign"], "<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low|medium|high|<n>] [--dry-run] [--async]", "Pin a task to the least-loaded node and run it; --dry-run prints the choice only"),

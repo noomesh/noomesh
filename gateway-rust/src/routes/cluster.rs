@@ -109,6 +109,8 @@ pub fn router() -> Router<Arc<AppState>> {
         // Shared-GPU operator hold (node agent `internal/gpuyield`).
         .route("/api/cluster/nodes/{node_id}/gpu/hold", post(gpu_hold))
         .route("/api/cluster/nodes/{node_id}/gpu/release", post(gpu_release))
+        // Measure the node's chat model (harness profile: first_byte_secs).
+        .route("/api/cluster/nodes/{node_id}/bench", post(node_bench))
         // ── Native Rust [ported from workers/cluster.py 2026-07-18] ──
         .route("/api/cluster/mint-join-key", post(mint_join_key))
         .route("/api/cluster/delete-tailscale-device", post(delete_tailscale_device))
@@ -339,6 +341,12 @@ async fn node_heartbeat(
     // a new heartbeat field is dropped by default, and the row would have
     // read every node as "agent predates the shipper".
     carry_reported(&mut data, &body, "log_ship");
+    // The node's measured model speed (`POST /bench` on the agent,
+    // `noo cluster profile <node> --bench`): `{model, backend, load_secs,
+    // prefill_tps, decode_tps, prompt_tokens, at}`. Absent until a bench has
+    // run; the agent reports its last one on every beat after. desired-config
+    // resolves `harness_profile.first_byte_secs` from it.
+    carry_reported(&mut data, &body, "model_bench");
     // The agent's posture: whether its control API requires a client
     // certificate. A running agent on the mTLS-only build always says true;
     // an older build can say false, and `noo cluster verify` fails it.
@@ -921,6 +929,8 @@ async fn node_register_body(
     carry_reported(&mut data, &body, "data_roots");
     // And the legacy-lane counts.
     carry_reported(&mut data, &body, "legacy_lanes");
+    // And the last model bench (the harness profile's measured speed).
+    carry_reported(&mut data, &body, "model_bench");
     // Same for the sidecar image report and the backend
     // container start times + health.
     carry_reported(&mut data, &body, "stunnel_image");
@@ -2183,6 +2193,91 @@ async fn gpu_hold_op(
     Ok(Json(out))
 }
 
+/// How long the gateway waits on a node's bench: a cold load of a large
+/// model on a CPU worker plus a 30k-token prefill can take many minutes.
+const NODE_BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Measure a node's chat model: the gateway asks the node agent's
+/// `POST /bench`, which loads the model, times a reference prefill and
+/// decode, keeps the result and reports it as `model_bench` on every
+/// heartbeat after. The answer is that `model_bench` object (`{model,
+/// backend, load_secs, prefill_tps, decode_tps, prompt_tokens, at}`); the
+/// node's resolved harness profile (`desired-config`) derives its
+/// `first_byte_secs` from it. Operator only; audited. Up to 900 s.
+///
+/// POST /api/cluster/nodes/{node_id}/bench
+async fn node_bench(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let actor = match ctx {
+        Some(axum::Extension(ref r)) if r.role >= crate::auth::Role::Operator => r.sub.clone(),
+        _ => return AppError::Forbidden("operator role required to bench a node".into()).into_response(),
+    };
+    let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
+        Ok(l) => l,
+        Err(e) => return e.into_response(),
+    };
+    let started = std::time::Instant::now();
+    let outcome = link
+        .request(reqwest::Method::POST, "/bench")
+        .timeout(NODE_BENCH_TIMEOUT)
+        .send()
+        .await;
+    let (ok, response, detail) = match outcome {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(body) => {
+                let detail = body.clone();
+                (true, Json(body).into_response(), detail)
+            }
+            Err(e) => {
+                let body = json!({"error": format!("node agent {node_id} answered /bench with a body that is not JSON: {e}")});
+                (false, (axum::http::StatusCode::BAD_GATEWAY, Json(body.clone())).into_response(), body)
+            }
+        },
+        Ok(resp) => {
+            // The agent's own refusal (no chat model to bench, a bench
+            // already running, an older agent with no /bench), passed
+            // through with its status so the CLI can say which.
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let text = resp.text().await.unwrap_or_default();
+            let body = serde_json::from_str::<Value>(&text)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({"error": format!("node agent {node_id} returned {}: {}", status.as_u16(), text.trim())}));
+            (false, (status, Json(body.clone())).into_response(), body)
+        }
+        Err(e) => {
+            let body = json!({"error": format!("could not reach the node agent on {node_id} for /bench: {e}")});
+            (false, (axum::http::StatusCode::BAD_GATEWAY, Json(body.clone())).into_response(), body)
+        }
+    };
+    // Put the bench on the node record now, so the very next desired-config
+    // (the CLI's re-resolved profile, the agent's next poll) reads it; the
+    // agent reports it on every heartbeat after, which keeps it there.
+    if ok && crate::harness_profile::ModelBench::from_record(&json!({"model_bench": detail.clone()})).is_some() {
+        if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+            if let Ok(Some(entry)) = kv.get(&node_id).await {
+                if let Ok(mut record) = serde_json::from_slice::<Value>(&entry) {
+                    record["model_bench"] = detail.clone();
+                    let _ = kv.put(&node_id, serde_json::to_vec(&record).unwrap_or_default().into()).await;
+                }
+            }
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    tracing::info!(node_id = %node_id, ok, actor = %actor, secs, "node_bench");
+    crate::routes::core::audit_event(
+        &state.db, "node_bench", "info", &actor,
+        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
+        json!({"node": node_id, "secs": secs, "result": detail}),
+    ).await;
+    response
+}
+
 /// GET /api/cluster/proposals/{id}
 ///
 /// Single-proposal status + execution log, so a caller can poll an
@@ -3137,9 +3232,9 @@ async fn desired_config_get(
         }
     }
     #[allow(clippy::type_complexity)]
-    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>, Vec<String>)> =
+    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>, Vec<String>, Value)> =
         sqlx::query_as(
-            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds \
+            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile \
              FROM noo_node_config WHERE node_id = $1",
         )
         .bind(&node_id)
@@ -3222,8 +3317,38 @@ async fn desired_config_get(
     );
     let placement_json = apply_harness_policy(&harness_policy, placement_json);
 
+    // The harness profile, RESOLVED (`harness_profile::resolve`): per field
+    // override > measured > tier default. The tier is the one the node's
+    // live facts derive (as `collect_cluster_nodes` derives it), the
+    // measured speed the record's `model_bench`, applied only when it is of
+    // the model the node's chat backend runs now.
+    let harness_profile = {
+        let record: Value = match state.js.get_key_value("mesh_nodes").await {
+            Ok(kv) => match kv.get(&node_id).await {
+                Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
+                _ => json!({}),
+            },
+            Err(_) => json!({}),
+        };
+        let derived_tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(
+            record.get("capabilities").unwrap_or(&json!({})),
+        ))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+        let bench = crate::harness_profile::ModelBench::from_record(&record);
+        let running_chat = crate::harness_profile::running_chat_model(
+            &record,
+            &placement_json,
+            bench.as_ref().and_then(|b| b.backend.as_deref()),
+            bench.as_ref().map(|b| b.model.as_str()),
+        );
+        let overrides = node.as_ref().map(|n| n.12.clone()).unwrap_or_else(|| json!({}));
+        let resolved = crate::harness_profile::resolve(derived_tier, &overrides, bench.as_ref(), running_chat.as_deref());
+        serde_json::to_value(&resolved).unwrap_or(Value::Null)
+    };
+
     let node_json = match node {
-        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds)) => json!({
+        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile_overrides)) => json!({
             "node_id": node_id,
             "ip_address": ip,
             "ssh_user": user,
@@ -3241,6 +3366,10 @@ async fn desired_config_get(
             // The vendor CLIs this node's bundle carries besides its
             // harness placement's (`noo cluster vendor install`).
             "vendor_kinds": vendor_kinds,
+            // The STORED per-node harness profile overrides (`noo cluster
+            // profile <node> --set`), as written. What the node applies is
+            // the resolved `harness_profile` at the top level.
+            "harness_profile_overrides": harness_profile_overrides,
         }),
         None => json!(null),
     };
@@ -3249,6 +3378,12 @@ async fn desired_config_get(
         "node": node_json,
         "placements": placement_json,
         "mcp_servers": mcp_json,
+        // The resolved harness profile (config/harness-profiles.json):
+        // `{tier, first_byte_secs, stream_idle_secs, thinking,
+        // ollama_context, claude_prompt, foreign_kinds, sources, bench}`.
+        // The agent applies first_byte_secs, ollama_context and
+        // foreign_kinds, and hands the whole object to its harness.
+        "harness_profile": harness_profile,
         // The fleet's node disk-reclaim gate (disk_watermark location): the
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
@@ -3290,6 +3425,14 @@ struct NodeConfigBody {
     /// `[]` or `null` = none.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     vendor_kinds: Option<Option<Value>>,
+    /// The per-node harness profile overrides (`noo cluster profile <node>
+    /// --set k=v`): any subset of the fields in
+    /// config/harness-profiles.json, the whole object replaced. Omitted =
+    /// keep; `{}` or `null` = clear (the node resolves to its tier
+    /// defaults and measured speed). Validated by
+    /// `harness_profile::validate_overrides`.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    harness_profile: Option<Option<Value>>,
 }
 
 /// Judge a `vendor_kinds` value: kinds from the harness-kinds table that
@@ -3330,8 +3473,8 @@ where
 /// column/value arity is pinned by a test — the 2026-09-11 cut listed
 /// twelve columns and supplied eleven values, which no compiler sees.
 const NODE_CONFIG_UPSERT: &str =
-        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, $18, NOW()) \
+        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, $18, $20, NOW()) \
          ON CONFLICT (node_id) DO UPDATE SET \
            ip_address = COALESCE($2, noo_node_config.ip_address), \
            ssh_user   = COALESCE($3, noo_node_config.ssh_user), \
@@ -3346,6 +3489,7 @@ const NODE_CONFIG_UPSERT: &str =
            default_loop_budget = CASE WHEN $15 THEN $14 ELSE noo_node_config.default_loop_budget END, \
            usage_profile = CASE WHEN $17 THEN $16 ELSE noo_node_config.usage_profile END, \
            vendor_kinds = CASE WHEN $19 THEN $18 ELSE noo_node_config.vendor_kinds END, \
+           harness_profile = CASE WHEN $21 THEN $20 ELSE noo_node_config.harness_profile END, \
            updated_at = NOW()";
 /// PUT /api/cluster/nodes/{node_id}/config — upsert the node config row.
 /// COALESCE keeps existing values for fields omitted from the body.
@@ -3386,6 +3530,15 @@ async fn node_config_put(
         None => (Vec::new(), false),
         Some(v) => (validate_vendor_kinds(v.as_ref()).map_err(AppError::BadRequest)?, true),
     };
+    // Absent → keep ($20 `{}`, $21 false: an INSERT starts with none);
+    // `null`/`{}` → clear; an object → validated, then replaces the stored one.
+    let (profile_value, profile_set): (Value, bool) = match &body.harness_profile {
+        None => (json!({}), false),
+        Some(v) => (
+            crate::harness_profile::validate_overrides(v.as_ref().unwrap_or(&Value::Null)).map_err(AppError::BadRequest)?,
+            true,
+        ),
+    };
     let (policy_value, policy_set) = match &body.companion_policy {
         None => (None, false),
         Some(None) => (None, true),
@@ -3418,6 +3571,8 @@ async fn node_config_put(
     .bind(usage_set)
     .bind(vendor_value)
     .bind(vendor_set)
+    .bind(profile_value)
+    .bind(profile_set)
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Internal(format!("node_config upsert: {e}")))?;
@@ -5720,6 +5875,22 @@ mod heartbeat_carry_tests {
         assert!(op.contains("audit_event("), "hold/release must be audited");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
+    }
+
+    /// The bench route is operator-only, audited, one NodeLink call with its
+    /// own 900 s timeout, and the bench rides both record writers.
+    #[test]
+    fn node_bench_is_operator_only_audited_and_generous() {
+        assert_eq!(NODE_BENCH_TIMEOUT, std::time::Duration::from_secs(900));
+        let src = include_str!("cluster.rs").split("fn node_bench_is_operator_only_audited_and_generous").next().unwrap();
+        let h = src.split("async fn node_bench(").nth(1).expect("node_bench").split("\nasync fn ").next().unwrap();
+        assert!(h.contains("r.role >= crate::auth::Role::Operator"), "the operator gate");
+        assert!(h.contains(".request(reqwest::Method::POST, \"/bench\")"));
+        assert!(h.contains(".timeout(NODE_BENCH_TIMEOUT)"));
+        assert!(h.contains("audit_event("), "a bench must be audited");
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/bench\", post(node_bench))"));
+        assert_eq!(src.matches("carry_reported(&mut data, &body, \"model_bench\");").count(), 2, "heartbeat and registration");
+        assert!(src.contains("\"harness_profile\": harness_profile,"), "desired-config carries the resolved profile");
     }
 
     /// `stunnel_image` rides the record from both

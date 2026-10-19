@@ -29,6 +29,12 @@
 //! `/etc/noo-harness.env` when readable, filling only variables not already
 //! set — the model endpoint, `NOO_TLS_CA`/`NOO_TLS_CERT`/`NOO_TLS_KEY`, and
 //! the node-agent bearer — the same values the harness unit gets.
+//!
+//! `--prompt full|slim` picks the launch for a kind with a slim one
+//! (Claude Code): the full launch or `launch_slim`, so an operator can A/B
+//! the two on a node. Without the flag, real mode asks the node's agent for
+//! its harness profile (`claude_prompt`) and runs that; mock mode, or an
+//! agent with no profile, runs full.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,7 +43,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
-use super::driver::{self, build_env, fill_command_without_mcp, spawn_cli_as, DriverCtx, McpWiring, RunAs, RunOutput, Verdict, Workspace};
+use super::driver::{self, build_env, fill_command_without_mcp, spawn_cli_as, with_system_prompt, DriverCtx, McpWiring, RunAs, RunOutput, Verdict, Workspace};
+use super::profile::{resolve_claude_prompt, ClaudePrompt, HarnessProfile};
 use super::probe_mock::{MockCall, MockModel, Script, PROBE_FILE, PROBE_WORD};
 use super::translator::{RouteHit, Translator, UsageTotals};
 use crate::coordinator::{self, ResolvedBackend};
@@ -52,13 +59,15 @@ pub const FILE_PROMPT: &str = "Create a file named probe.txt in the current dire
 
 pub const USAGE: &str = "usage: noo-gateway harness probe --kind <copilot|claude-code|codex> [--cli <path>] [--mock-model]
        [--model-url <url>] [--model <name>] [--backend <vllm|llamacpp|ollama|openai>]
-       [--test <reply|file|both>] [--timeout <secs>] [--run-as <user>] [--keep] [--json]
+       [--test <reply|file|both>] [--prompt <full|slim>] [--timeout <secs>] [--run-as <user>] [--keep] [--json]
 
 Runs the kind's vendor CLI once per test, as the harness driver does, against the
 node's model (NOO_HARNESS_MODEL_URL/MODEL/BACKEND, else /etc/noo-harness.env) or,
 with --mock-model, a scripted in-process model. No MCP, no gateway, no service or
 placement change; the workspace is a temp dir, removed unless --keep. As root the
-CLI runs as --run-as (default nobody), never as uid 0. Exit 0 only if every test passed.";
+CLI runs as --run-as (default nobody), never as uid 0. --prompt picks Claude Code's full
+or slim launch (default: the node's harness profile in real mode, else full). Exit 0
+only if every test passed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +108,8 @@ pub struct ProbeArgs {
     pub model: Option<String>,
     pub backend: Option<String>,
     pub tests: Vec<ProbeTest>,
+    /// `--prompt`: `None` = the node's profile in real mode, else full.
+    pub prompt: Option<ClaudePrompt>,
     pub timeout: u64,
     pub run_as: Option<String>,
     pub keep: bool,
@@ -115,6 +126,7 @@ pub fn parse_args(args: &[String]) -> Result<ProbeArgs, String> {
         model: None,
         backend: None,
         tests: vec![ProbeTest::Reply, ProbeTest::File],
+        prompt: None,
         timeout: 300,
         run_as: None,
         keep: false,
@@ -156,6 +168,10 @@ pub fn parse_args(args: &[String]) -> Result<ProbeArgs, String> {
                     other => return Err(format!("--test must be reply, file or both, got {other:?}")),
                 }
             }
+            "--prompt" => {
+                let v = value("--prompt")?;
+                a.prompt = Some(ClaudePrompt::parse(&v).ok_or_else(|| format!("--prompt must be full or slim, got {v:?}"))?);
+            }
             "--timeout" => a.timeout = value("--timeout")?.parse().ok().filter(|s| *s > 0).ok_or("--timeout must be a positive number of seconds")?,
             "--run-as" => a.run_as = Some(value("--run-as")?),
             "--keep" => a.keep = true,
@@ -172,6 +188,9 @@ pub fn parse_args(args: &[String]) -> Result<ProbeArgs, String> {
     }
     if crate::harness_kinds::get(&a.kind).is_none() {
         return Err(format!("unknown kind {:?} (known: {})", a.kind, crate::harness_kinds::names().join(", ")));
+    }
+    if a.prompt == Some(ClaudePrompt::Slim) && crate::harness_kinds::get(&a.kind).is_some_and(|k| k.launch_slim.is_none()) {
+        return Err(format!("--prompt slim: kind {} has no slim launch (only claude-code has one)", a.kind));
     }
     if a.mock_model && (a.model_url.is_some() || a.backend.is_some()) {
         return Err("--mock-model serves its own model; drop --model-url/--backend".into());
@@ -303,6 +322,10 @@ pub struct Report {
     pub model: String,
     pub backend: String,
     pub model_url: String,
+    /// The launch variant run (`full`, or `slim` for a kind with one) and
+    /// where the choice came from (`flag`, `profile`, `default`).
+    pub prompt: ClaudePrompt,
+    pub prompt_source: &'static str,
     pub env_file: Option<String>,
     pub run_as: Option<RunAsUser>,
     pub tests: Vec<TestReport>,
@@ -371,6 +394,9 @@ pub struct Plan {
     pub env_file: Option<String>,
     /// The environment the driver context reads (PATH, LANG, NOO_TLS_CA).
     pub parent_env: BTreeMap<String, String>,
+    /// Which launch runs (only a kind with a `launch_slim` is affected), and why.
+    pub prompt: ClaudePrompt,
+    pub prompt_source: &'static str,
 }
 
 fn ctx_for(plan: &Plan, pinned: ResolvedBackend, base: &Path) -> Result<DriverCtx> {
@@ -378,7 +404,9 @@ fn ctx_for(plan: &Plan, pinned: ResolvedBackend, base: &Path) -> Result<DriverCt
     e.insert("NOO_HARNESS_WORKDIR".into(), base.display().to_string());
     e.insert("NOO_HARNESS_TURN_TIMEOUT_SECS".into(), plan.timeout.as_secs().to_string());
     // The gateway is never called: no MCP, no rail.
-    DriverCtx::new("probe", "http://127.0.0.1:9", &plan.kind, pinned, &|k| e.get(k).cloned())
+    let ctx = DriverCtx::new("probe", "http://127.0.0.1:9", &plan.kind, pinned, &|k| e.get(k).cloned())?;
+    ctx.prompt.set(plan.prompt);
+    Ok(ctx)
 }
 
 fn run_as_ids(plan: &Plan) -> Option<RunAs> {
@@ -429,22 +457,26 @@ async fn run_test(plan: &Plan, base: &Path, test: ProbeTest) -> Result<TestRepor
         (None, Some(m)) => ResolvedBackend { url: m.url().to_string(), model: MOCK_MODEL.into(), backend_type: "openai".into(), api_format: "openai".into() },
         (None, None) => unreachable!("a mock is started when there is no upstream"),
     };
-    let ctx = ctx_for(plan, pinned.clone(), base)?;
+    let full_ctx = ctx_for(plan, pinned.clone(), base)?;
+    // The launch the driver would run for this variant.
+    let (_, chosen) = full_ctx.run_ctx();
+    let ctx: &DriverCtx = &chosen;
     let translator = Translator::start_logged(pinned).await.context("starting the wire translator")?;
     let run = async {
-        let cli_config = ws.write_cli_config_wired(&ctx, translator.base_url(), McpWiring::None)?;
+        let cli_config = ws.write_cli_config_wired(ctx, translator.base_url(), McpWiring::None)?;
+        let system_prompt = ws.write_system_prompt(&ctx.launch)?;
         #[cfg(unix)]
         if let Some(u) = &plan.run_as {
             chown_tree(&ws.root, u)?;
         }
-        let env = build_env(&ctx, &ws, translator.base_url());
-        let mut argv = fill_command_without_mcp(&ctx.launch.command, test.prompt());
+        let env = build_env(ctx, &ws, translator.base_url());
+        let mut argv = fill_command_without_mcp(&with_system_prompt(&ctx.launch.command, system_prompt.as_deref()), test.prompt());
         argv[0] = plan.cli.display().to_string();
         tracing::info!(kind = %ctx.kind.kind, argv = ?argv, "probe: running the CLI");
         // The probe runs the CLI in the same jail the driver does: a probe
         // that passes unjailed would prove nothing about a real task.
         (ctx.jail_probe)().map_err(|r| anyhow!(r.note()))?;
-        let jail = ws.jail_spec(&ctx, cli_config.as_deref().unwrap_or(&ws.home));
+        let jail = ws.jail_spec(ctx, cli_config.as_deref().unwrap_or(&ws.home));
         spawn_cli_as(&argv, &env, &ws.work, ctx.timeout, &jail, run_as_ids(plan)).await
     }
     .await;
@@ -533,6 +565,8 @@ pub async fn run_plan(plan: &Plan) -> Result<Report> {
         model,
         backend,
         model_url,
+        prompt: if plan.kind.launch_slim.is_some() { plan.prompt } else { ClaudePrompt::Full },
+        prompt_source: plan.prompt_source,
         env_file: plan.env_file.clone(),
         run_as: plan.run_as.clone(),
         pass: !tests.is_empty() && tests.iter().all(|t| t.pass),
@@ -547,6 +581,7 @@ fn find_on_path(prog: &str, path: &str) -> Option<PathBuf> {
 fn print_human(r: &Report) {
     println!("harness probe: kind {} ({} model {} via {})", r.kind, r.mode, r.model, r.model_url);
     println!("  cli: {} — {}", r.cli, r.cli_version.as_deref().unwrap_or("version unknown"));
+    println!("  launch: {} ({})", r.prompt.name(), r.prompt_source);
     if let Some(u) = &r.run_as {
         println!("  run as: {} (uid {})", u.user, u.uid);
     }
@@ -654,7 +689,20 @@ async fn prepare_and_run(a: &ProbeArgs) -> Result<Report> {
         crate::node_agent_auth::watch_own_agent(crate::tls::cluster_client(), u.url.clone()).await;
     }
     let parent_env: BTreeMap<String, String> = ["PATH", "LANG", "NOO_TLS_CA"].iter().filter_map(|k| get(k).map(|v| (k.to_string(), v))).collect();
-    let plan = Plan { kind, cli, upstream, tests: a.tests.clone(), timeout: Duration::from_secs(a.timeout), run_as, keep: a.keep, env_file, parent_env };
+    // Without --prompt, real mode runs what the node's profile says; only
+    // asked of a node agent, and only for a kind with a slim launch.
+    let profile = match upstream.as_ref().filter(|u| a.prompt.is_none() && kind.launch_slim.is_some() && coordinator::is_node_agent_url(&u.url)) {
+        Some(u) => match crate::harness_main::fetch_placement(&crate::tls::cluster_client(), &u.url).await {
+            Ok(p) => p.as_ref().and_then(HarnessProfile::from_placement),
+            Err(e) => {
+                tracing::warn!(error = %e, "probe: could not read the node's harness profile; running the full launch");
+                None
+            }
+        },
+        None => None,
+    };
+    let (prompt, prompt_source) = resolve_claude_prompt(a.prompt, profile.as_ref());
+    let plan = Plan { kind, cli, upstream, tests: a.tests.clone(), timeout: Duration::from_secs(a.timeout), run_as, keep: a.keep, env_file, parent_env, prompt, prompt_source };
     run_plan(&plan).await
 }
 
@@ -690,6 +738,20 @@ mod tests {
             assert!(e.contains(why), "{bad:?}: {e}");
         }
         assert_eq!(parse_args(&args(&["--help"])).unwrap_err(), "", "help is not an error");
+    }
+
+    #[test]
+    fn the_prompt_flag_picks_full_or_slim_and_only_where_a_slim_launch_exists() {
+        assert_eq!(parse_args(&args(&["--kind", "claude-code"])).unwrap().prompt, None, "default: the profile, else full");
+        assert_eq!(parse_args(&args(&["--kind", "claude-code", "--prompt", "slim"])).unwrap().prompt, Some(ClaudePrompt::Slim));
+        assert_eq!(parse_args(&args(&["--kind=claude-code", "--prompt=full"])).unwrap().prompt, Some(ClaudePrompt::Full));
+        assert_eq!(parse_args(&args(&["--kind", "copilot", "--prompt", "full"])).unwrap().prompt, Some(ClaudePrompt::Full), "full is every kind's");
+        let e = parse_args(&args(&["--kind", "copilot", "--prompt", "slim"])).unwrap_err();
+        assert!(e.contains("no slim launch"), "{e}");
+        let e = parse_args(&args(&["--kind", "claude-code", "--prompt", "tiny"])).unwrap_err();
+        assert!(e.contains("--prompt must be full or slim"), "{e}");
+        assert!(parse_args(&args(&["--kind", "claude-code", "--prompt"])).unwrap_err().contains("needs a value"));
+        assert!(USAGE.contains("--prompt <full|slim>"));
     }
 
     #[test]
@@ -790,7 +852,30 @@ mod tests {
             keep,
             env_file: None,
             parent_env: [("PATH".to_string(), std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))].into_iter().collect(),
+            prompt: ClaudePrompt::Full,
+            prompt_source: "default",
         }
+    }
+
+    /// `--prompt slim` runs the kind's slim launch with its system prompt
+    /// file; full runs the launch. The report says which.
+    #[tokio::test]
+    async fn the_probe_runs_the_slim_launch_when_asked() {
+        let mut k = fake_kind(r#"echo "NOO_FAILED: the full launch ran""#);
+        let mut slim = k.launch.clone().unwrap();
+        slim.command = vec!["sh".into(), "-c".into(), r#"[ -s "$0" ] || exit 7; case "$1" in *probe.txt*) printf noomesh > probe.txt; echo "NOO_RESULT: done";; *) echo "NOO_RESULT: ok";; esac"#.into(), "{system_prompt_file}".into(), "{prompt}".into()];
+        slim.system_prompt_file = Some("noomesh-system-prompt.txt".into());
+        k.launch_slim = Some(slim);
+        let mut p = plan(k.clone(), false);
+        p.prompt = ClaudePrompt::Slim;
+        p.prompt_source = "flag";
+        let r = run_plan(&p).await.unwrap();
+        assert!(r.pass, "{r:#?}");
+        assert_eq!((r.prompt, r.prompt_source), (ClaudePrompt::Slim, "flag"));
+        let r = run_plan(&plan(k, false)).await.unwrap();
+        assert!(!r.pass && r.tests[0].verdict.as_deref() == Some("NOO_FAILED: the full launch ran"), "{r:#?}");
+        assert_eq!(r.prompt, ClaudePrompt::Full);
+        assert_eq!(serde_json::to_value(&r).unwrap()["prompt"], "full");
     }
 
     #[tokio::test]

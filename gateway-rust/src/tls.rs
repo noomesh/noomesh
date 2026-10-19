@@ -111,8 +111,7 @@ pub const DEFAULT_STREAM_IDLE_SECS: u64 = 300;
 /// also the budget for model load + prompt prefill. Raise it on a node whose
 /// prefill is slower than that.
 pub fn stream_idle() -> std::time::Duration {
-    static SECS: OnceLock<u64> = OnceLock::new();
-    let secs = *SECS.get_or_init(|| {
+    let secs = *STREAM_IDLE_SECS.get_or_init(|| {
         let raw = std::env::var(STREAM_IDLE_ENV).unwrap_or_default();
         match resolve_positive_secs(&raw, DEFAULT_STREAM_IDLE_SECS) {
             Ok(secs) => {
@@ -132,6 +131,33 @@ pub fn stream_idle() -> std::time::Duration {
         }
     });
     std::time::Duration::from_secs(secs)
+}
+
+/// The stream idle bound in force for this PROCESS: set once, on the first
+/// [`stream_idle`] read or by [`set_stream_idle_override`], whichever comes
+/// first, and never changed after (the stream clients bake it in).
+static STREAM_IDLE_SECS: OnceLock<u64> = OnceLock::new();
+
+/// Fix the stream idle bound for this process before anything reads it.
+///
+/// For `noo-gateway harness`: its node's harness profile carries
+/// `stream_idle_secs`, which applies when `NOO_BACKEND_STREAM_IDLE_SECS` is
+/// not set (process env > profile > [`DEFAULT_STREAM_IDLE_SECS`]). The
+/// harness calls this ONCE at start, after reading its placement and before
+/// it builds a stream client or starts a translator. Process-wide: every
+/// stream client this process builds, and every later [`stream_idle`] read,
+/// gets the value. Returns `false` (and changes nothing) when the bound was
+/// already fixed, i.e. something read it first; zero is refused likewise.
+pub fn set_stream_idle_override(idle: std::time::Duration) -> bool {
+    let secs = idle.as_secs();
+    if secs == 0 {
+        return false;
+    }
+    let set = STREAM_IDLE_SECS.set(secs).is_ok();
+    if set {
+        tracing::info!(seconds = secs, "stream idle timeout set from the harness profile");
+    }
+    set
 }
 
 /// The timeouts a client is built with. reqwest does not expose them on a
@@ -931,6 +957,25 @@ mod door_tests {
             assert!(D.client(&plain).is_err(), "{plain} must not get a client");
         }
         assert!(D.classify("https://").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stream_idle_override_tests {
+    use super::{set_stream_idle_override, stream_idle, DEFAULT_STREAM_IDLE_SECS};
+    use std::time::Duration;
+
+    /// The harness fixes the bound once; nothing changes it after, and zero
+    /// is never a bound. Process-wide, so this sets only the default value:
+    /// another test in this binary may have read it first.
+    #[test]
+    fn the_stream_idle_override_is_set_once_and_never_zero() {
+        assert!(!set_stream_idle_override(Duration::ZERO), "zero would disable the bound");
+        let _ = set_stream_idle_override(Duration::from_secs(DEFAULT_STREAM_IDLE_SECS));
+        let fixed = stream_idle();
+        assert!(fixed > Duration::ZERO);
+        assert!(!set_stream_idle_override(Duration::from_secs(1)), "already fixed: refused");
+        assert_eq!(stream_idle(), fixed, "never changed once fixed");
     }
 }
 
