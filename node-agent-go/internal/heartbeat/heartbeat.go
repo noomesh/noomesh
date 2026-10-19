@@ -289,6 +289,10 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 		// This agent admits the controller's leaf with no bearer. The gateway stops sending NOO_NODE_AGENT_TOKEN to this node
 		// only once it reads true here or on a heartbeat.
 		"controller_leaf_only": auth.ControllerLeafOnly(r.cfg),
+		// Which control transports this agent offers. Only the HTTPS
+		// listener exists today; the others are reserved for the
+		// node-initiated control plane. Absent = an older agent = listener only.
+		"control_transports": controlTransports(),
 		// The door leaves this node holds. The controller
 		// rebuilds the node record on registration; sending them here keeps
 		// the report from vanishing until the next beat.
@@ -572,6 +576,7 @@ func (r *Reporter) SendHeartbeat() {
 	// gateway drops NOO_NODE_AGENT_TOKEN for this node. An agent that omits
 	// it keeps receiving the bearer — both roll orders stay safe.
 	payload["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
+	payload["control_transports"] = controlTransports()
 
 	// The backend door leaves this node HOLDS under $NOO_PKI_DIR/services/
 	// per door service, the leaf's DNS SANs and NotAfter.
@@ -971,3 +976,10 @@ func servedCertNotAfter(certPath string) int64 {
 // (not loopback, unspecified, link-local or multicast), else "". The API
 // listener uses it to decide whether it knows where to bind.
 func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }
+
+// controlTransports reports how the controller can reach this agent. The
+// HTTPS listener is the only transport that exists; "nats_rpc" and "tunnel"
+// stay false until the node-initiated control plane ships.
+func controlTransports() map[string]bool {
+	return map[string]bool{"https_listener": true, "nats_rpc": false, "tunnel": false}
+}
