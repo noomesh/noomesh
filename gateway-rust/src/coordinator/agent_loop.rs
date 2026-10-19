@@ -1447,7 +1447,6 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
     enable_thinking: bool,
     until: Instant,
 ) -> Result<reqwest::Response> {
-    let client = crate::tls::cluster_client();
     for attempt in 1..=MAX_LLM_BACKEND_ATTEMPTS {
         // The whole call, streamed body included, ends with the turn — not
         // at the client's fixed backend timeout, which cut a slow answer
@@ -1464,7 +1463,13 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
                 None => continue,
             }
         }
-        let failure = match with_backend_hint(client.post(&url).json(&body).timeout(remaining), backend).send().await {
+        let req = if stream {
+            crate::node_link::backend_stream(reqwest::Method::POST, &url, &backend.backend_type)
+        } else {
+            crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
+        };
+        // The turn deadline, not the client's fixed backend timeout (#177).
+        let failure = match req.json(&body).timeout(remaining).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {

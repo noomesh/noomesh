@@ -248,14 +248,14 @@ async fn capability_router_status(
 
 // ── Device action (native Rust, HTTP proxy) ───────────────────────
 
-/// Build the node-agent URL for a companion device action.
+/// The node-agent path of a companion device action.
 ///
 /// The Go node-agent serves device sensors under `/api/device/{action}`
 /// (node-agent-go/internal/api/server.go), matching the legacy Python
 /// node_agent.py routes. This proxy used to call `/device/{action}`,
 /// which 404s on every agent — keep the prefix in sync with the agent.
-fn device_action_url(device_url: &str, action: &str) -> String {
-    format!("{}/api/device/{}", device_url.trim_end_matches('/'), action)
+fn device_action_path(action: &str) -> String {
+    format!("/api/device/{action}")
 }
 
 /// Proxy an action to a companion device.
@@ -276,8 +276,8 @@ async fn device_action(
         .unwrap_or("");
 
     // Look up device in NATS KV
-    let device_url = if !device_id.is_empty() {
-        super::cluster::get_node_agent_url(&state, device_id).await?
+    let device_link = if !device_id.is_empty() {
+        crate::node_link::NodeLink::for_node(&state, device_id).await?
     } else {
         // Find first companion device (tier >= 5) from NATS KV
         let mut found_url = None;
@@ -290,8 +290,8 @@ async fn device_action(
                         if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                             let tier = data.get("tier").and_then(|t| t.as_u64()).unwrap_or(0);
                             if tier >= 5 {
-                                if let Ok(url) = super::cluster::get_node_agent_url(&state, &key).await {
-                                    found_url = Some(url);
+                                if let Ok(link) = crate::node_link::NodeLink::for_node(&state, &key).await {
+                                    found_url = Some(link);
                                     break;
                                 }
                             }
@@ -304,12 +304,9 @@ async fn device_action(
     };
 
     // Proxy the action to the device
-    let url = device_action_url(&device_url, &action);
-    let client = super::cluster::build_node_agent_client();
-    let mut req = client.post(&url).json(&body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&url) {
-        req = req.header(&k, &v);
-    }
+    let req = device_link
+        .request(reqwest::Method::POST, &device_action_path(&action))
+        .json(&body);
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -461,7 +458,7 @@ async fn terminal_ollama_delete(
     let base_url = ollama_base_url();
     let url = format!("{}/api/delete", base_url.trim_end_matches('/'));
 
-    let client = super::cluster::build_node_agent_client();
+    let client = crate::tls::cluster_client();
 
     match client
         .delete(&url)
@@ -487,7 +484,8 @@ async fn terminal_ollama_delete(
 
 #[cfg(test)]
 mod tests {
-    use super::device_action_url;
+    use super::device_action_path;
+    use crate::node_link::NodeLink;
 
     /// Contract with the node-agent: device sensor routes live under
     /// /api/device/* (Go server.go, legacy Python node_agent.py). The
@@ -495,12 +493,12 @@ mod tests {
     #[test]
     fn device_action_url_uses_api_prefix() {
         assert_eq!(
-            device_action_url("https://phone-1:8081", "camera_capture"),
+            NodeLink::for_base("https://phone-1:8081").url(&device_action_path("camera_capture")),
             "https://phone-1:8081/api/device/camera_capture"
         );
         // Trailing slash on the agent URL must not double up.
         assert_eq!(
-            device_action_url("https://phone-1:8081/", "location"),
+            NodeLink::for_base("https://phone-1:8081/").url(&device_action_path("location")),
             "https://phone-1:8081/api/device/location"
         );
     }

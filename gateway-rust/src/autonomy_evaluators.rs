@@ -826,17 +826,13 @@ async fn eval_node_disks(state: &AppState, watermark: f64) -> bool {
 
     let mut any = false;
     for (node_id,) in nodes {
-        let Ok(agent_url) = crate::routes::cluster::get_node_agent_url(state, &node_id).await
+        let Ok(link) = crate::node_link::NodeLink::for_node(state, &node_id).await
         else {
             continue;
         };
-        let client = crate::routes::cluster::build_node_agent_client();
-        let mut req = client
-            .get(format!("{agent_url}/health"))
+        let req = link
+            .request(reqwest::Method::GET, "/health")
             .timeout(std::time::Duration::from_secs(10));
-        if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-            req = req.header(k, v);
-        }
         let Ok(resp) = req.send().await else { continue };
         let Ok(body) = resp.json::<serde_json::Value>().await else {
             continue;
@@ -2773,20 +2769,16 @@ async fn probe_backend_via_agent(
     node_id: &str,
     backend_type: &str,
 ) -> BackendProbe {
-    let agent_url = match crate::routes::cluster::get_node_agent_url(state, node_id).await {
-        Ok(u) => u,
+    let link = match crate::node_link::NodeLink::for_node(state, node_id).await {
+        Ok(l) => l,
         Err(_) => return BackendProbe::AgentUnreachable,
     };
-    let client = crate::routes::cluster::build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/v1/chat/completions"))
+    let req = link
+        .request(reqwest::Method::POST, "/v1/chat/completions")
         .header("X-Noo-Backend", backend_type)
         .header("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(10))
         .json(&json!({"model": ""}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(k, v);
-    }
 
     match req.send().await {
         Ok(resp) => {
@@ -2844,18 +2836,13 @@ pub async fn eval_gpu_health(state: &AppState) -> Result<bool, String> {
     let mut wedged: Vec<String> = Vec::new();
     let mut container_faults: Vec<String> = Vec::new();
     for (node_id, gpu_model) in claimants {
-        let Ok(agent_url) =
-            crate::routes::cluster::get_node_agent_url(state, &node_id).await
+        let Ok(link) = crate::node_link::NodeLink::for_node(state, &node_id).await
         else {
             continue; // no address on record — nothing to probe
         };
-        let client = crate::routes::cluster::build_node_agent_client();
-        let mut req = client
-            .get(format!("{agent_url}/gpu"))
+        let req = link
+            .request(reqwest::Method::GET, "/gpu")
             .timeout(std::time::Duration::from_secs(10));
-        if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-            req = req.header(k, v);
-        }
         let Ok(resp) = req.send().await else {
             continue; // agent unreachable → node_health's finding
         };

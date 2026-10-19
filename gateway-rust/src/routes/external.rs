@@ -440,7 +440,7 @@ pub(crate) async fn mesh_targets(
     let mut skipped_model_missing: Vec<String> = Vec::new();
     let mut out = Vec::with_capacity(peers.len());
     for peer in peers {
-        let Ok(agent_url) = crate::routes::cluster::get_node_agent_url(state, &peer.node_id).await
+        let Ok(link) = crate::node_link::NodeLink::for_node(state, &peer.node_id).await
         else {
             // A peer advertising the capability but with no reachable agent
             // is a real condition (agent restarting, URL not yet published)
@@ -476,12 +476,10 @@ pub(crate) async fn mesh_targets(
         }
         // Per agent: none for an agent that admits the
         // gateway's leaf alone, the legacy bearer for one that has not said.
-        let headers = crate::node_agent_auth::header_for(&agent_url)
-            .map(|(k, v)| vec![(k, v)])
-            .unwrap_or_default();
+        let headers = link.auth_headers();
         out.push(MeshTarget {
             node_id: peer.node_id,
-            url: format!("{}/{}", agent_url.trim_end_matches('/'), path.trim_start_matches('/')),
+            url: link.url(&format!("/{}", path.trim_start_matches('/'))),
             headers,
         });
     }
@@ -664,11 +662,14 @@ async fn classify_one(
     });
 
     for attempt in 0..2 {
-        let req = coordinator::with_backend_hint_url(
-            client.post(url).json(&body).timeout(Duration::from_secs(60)),
+        let req = crate::node_link::backend_request_on(
+            client,
+            reqwest::Method::POST,
             url,
             &backend.backend_type,
-        );
+        )
+        .json(&body)
+        .timeout(Duration::from_secs(60));
         let resp = req
             .send()
             .await

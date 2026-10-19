@@ -29,7 +29,7 @@ use sha2::{Sha256, Digest};
 
 use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
-use super::cluster::{get_node_agent_url, build_node_agent_client};
+use crate::node_link::NodeLink;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -1058,19 +1058,15 @@ async fn tools_node_tools(
     Path(node_id): Path<String>,
 ) -> AppResult {
     // Resolve node agent URL
-    let agent_url = match super::cluster::get_node_agent_url(&state, &node_id).await {
-        Ok(url) => url,
+    let link = match NodeLink::for_node(&state, &node_id).await {
+        Ok(l) => l,
         Err(_) => return Err(AppError::NotFound(format!("Node '{}' not found", node_id))),
     };
 
     // Proxy to node agent /tools endpoint
-    let client = super::cluster::build_node_agent_client();
-    let mut req = client
-        .get(format!("{agent_url}/tools"))
+    let req = link
+        .request(reqwest::Method::GET, "/tools")
         .timeout(std::time::Duration::from_secs(10));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -1166,22 +1162,14 @@ const UPSTREAM_AUTH_HEADER: &str = "X-Noo-Upstream-Authorization";
 /// proxies to the container's loopback-published port
 /// (`node-agent-go/internal/api/containers.go`). The container's port is
 /// bound on 127.0.0.1 only, so there is no `http://<node>:<port>` to dial.
-fn browser_proxy_base(agent_url: &str, container_name: &str) -> String {
-    format!(
-        "{}/api/containers/{container_name}/proxy",
-        agent_url.trim_end_matches('/')
-    )
+fn browser_proxy_path(container_name: &str) -> String {
+    format!("/api/containers/{container_name}/proxy")
 }
 
-/// Add the two credentials a proxied browser call carries: the agent's own
-/// (`agent_auth`) and the browser door's bearer (upstream header).
-fn browser_proxied(
-    mut req: reqwest::RequestBuilder,
-    agent_auth: &Option<(String, String)>,
-) -> reqwest::RequestBuilder {
-    if let Some((k, v)) = agent_auth {
-        req = req.header(k, v);
-    }
+/// Add the second credential a proxied browser call carries: the browser
+/// door's bearer (upstream header). The agent's own credential is already on
+/// the request, applied by the `NodeLink` it was built from.
+fn browser_proxied(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if let Some((_, bearer)) = browser_auth_header() {
         req = req.header(UPSTREAM_AUTH_HEADER, bearer);
     }
@@ -1200,12 +1188,12 @@ fn browser_proxied(
 fn default_browser_agent(configured: Option<String>) -> Result<String, AppError> {
     match configured.map(|u| u.trim().trim_end_matches('/').to_string()) {
         Some(u) if !u.is_empty() => Ok(u),
-        _ => Err(AppError::BadRequest(
+        _ => Err(AppError::BadRequest(format!(
             "a browser session needs a node: pass node_id (a node from `noo cluster status`), \
              or set NOO_DEFAULT_AGENT_URL to the agent that runs browsers. The gateway has no \
-             agent of its own at localhost:8081."
-                .into(),
-        )),
+             agent of its own at localhost:{}.",
+            crate::node_link::AGENT_PORT
+        ))),
     }
 }
 
@@ -1223,15 +1211,12 @@ fn default_browser_agent(configured: Option<String>) -> Result<String, AppError>
 async fn browser_agent(
     state: &AppState,
     node_id: &str,
-) -> Result<(String, Option<(String, String)>), AppError> {
+) -> Result<NodeLink, AppError> {
     if !node_id.is_empty() && node_id != "local" {
-        let url = get_node_agent_url(state, node_id).await?;
-        let auth = crate::node_agent_auth::header_for(&url);
-        return Ok((url, auth));
+        return NodeLink::for_node(state, node_id).await;
     }
     let url = default_browser_agent(std::env::var("NOO_DEFAULT_AGENT_URL").ok())?;
-    let auth = crate::node_agent_auth::header_for_self(&url);
-    Ok((url, auth))
+    Ok(NodeLink::self_agent_at(url))
 }
 
 /// GET /api/tools/browser/status — browser automation status.
@@ -1342,7 +1327,8 @@ async fn browser_start(
 
     // Resolve the node agent, and the credential it gets.
     let node_id = body.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
-    let (agent_url, agent_auth) = browser_agent(&state, node_id).await?;
+    let link = browser_agent(&state, node_id).await?;
+    let agent_url = link.base().to_string();
 
     const BROWSER_IMAGE: &str = "noo-browser:latest";
     const BROWSER_PORT: u16 = 9222;
@@ -1404,14 +1390,10 @@ async fn browser_start(
     );
 
     // POST to node-agent to start the container
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/api/containers/start"))
+    let req = link
+        .request(reqwest::Method::POST, "/api/containers/start")
         .json(&payload)
         .timeout(std::time::Duration::from_secs(60));
-    if let Some((k, v)) = &agent_auth {
-        req = req.header(k, v);
-    }
 
     let resp = req.send().await
         .map_err(|e| AppError::Internal(format!("Failed to start browser container: {e}")))?;
@@ -1426,19 +1408,17 @@ async fn browser_start(
 
     // The container is published on the node's loopback only; the gateway
     // reaches it through the node agent it already trusts.
-    let base_url = browser_proxy_base(&agent_url, &container_name);
+    let proxy_path = browser_proxy_path(&container_name);
+    let base_url = link.url(&proxy_path);
 
     // Wait for the container to become healthy (poll /status)
-    let health_client = crate::tls::cluster_client();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut healthy = false;
     while std::time::Instant::now() < deadline {
         let probe = browser_proxied(
-            health_client
-                .get(format!("{base_url}/status"))
+            link.request(reqwest::Method::GET, &format!("{proxy_path}/status"))
                 .timeout(std::time::Duration::from_secs(5)),
-            &agent_auth,
         );
         if probe
             .send().await
@@ -1527,17 +1507,13 @@ async fn browser_stop(
     // Resolve the agent that runs it. A session whose agent
     // can no longer be named is refused, and its record is kept, rather
     // than "stopped" against an address where nothing listens.
-    let (agent_url, agent_auth) = browser_agent(&state, node_id).await?;
+    let link = browser_agent(&state, node_id).await?;
 
     // POST to node-agent to stop the container
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/api/containers/stop"))
+    let req = link
+        .request(reqwest::Method::POST, "/api/containers/stop")
         .json(&json!({"container_name": container_name}))
         .timeout(std::time::Duration::from_secs(15));
-    if let Some((k, v)) = agent_auth {
-        req = req.header(&k, &v);
-    }
 
     if let Err(e) = req.send().await {
         tracing::warn!(
@@ -1701,8 +1677,8 @@ async fn browser_action(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| format!("noo-browser-{session_id}"));
-    let (agent_url, agent_auth) = browser_agent(&state, node_id).await?;
-    let base_url = browser_proxy_base(&agent_url, &container_name);
+    let link = browser_agent(&state, node_id).await?;
+    let proxy_path = browser_proxy_path(&container_name);
 
     // Map action → container endpoint + payload (BrowserTool's action_map).
     let (path, payload, is_get) = match action.as_str() {
@@ -1745,20 +1721,16 @@ async fn browser_action(
         }
     };
 
-    let client = crate::tls::cluster_client();
-    let with_auth = |req: reqwest::RequestBuilder| browser_proxied(req, &agent_auth);
     let result = if is_get {
-        with_auth(
-            client
-                .get(format!("{base_url}{path}"))
+        browser_proxied(
+            link.request(reqwest::Method::GET, &format!("{proxy_path}{path}"))
                 .timeout(std::time::Duration::from_secs(10)),
         )
         .send()
         .await
     } else {
-        with_auth(
-            client
-                .post(format!("{base_url}{path}"))
+        browser_proxied(
+            link.request(reqwest::Method::POST, &format!("{proxy_path}{path}"))
                 .json(&payload)
                 .timeout(std::time::Duration::from_secs(30)),
         )
@@ -1952,7 +1924,8 @@ mod browser_proxy_tests {
     #[test]
     fn session_url_is_the_agents_proxy_route() {
         assert_eq!(
-            super::browser_proxy_base("https://10.0.0.5:8081/", "noo-browser-ab12cd34"),
+            crate::node_link::NodeLink::for_base("https://10.0.0.5:8081/")
+                .url(&super::browser_proxy_path("noo-browser-ab12cd34")),
             "https://10.0.0.5:8081/api/containers/noo-browser-ab12cd34/proxy"
         );
     }

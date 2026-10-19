@@ -126,7 +126,7 @@ pub(crate) fn api_format_for(backend_type: &str, url: &str) -> String {
 /// the node-agent proxy case.
 fn detect_api_format_for_url(backend_type: &str, url: Option<&str>) -> String {
     if let Some(u) = url {
-        if u.contains(":8081") {
+        if crate::node_link::is_agent_url(u) {
             return "openai".to_string();
         }
     }
@@ -137,24 +137,20 @@ fn detect_api_format_for_url(backend_type: &str, url: Option<&str>) -> String {
     }
 }
 
-/// True when the backend URL is the node-agent proxy (port 8081).
+/// True when the backend URL is the node-agent proxy (the one definition is
+/// `node_link::is_agent_url`).
 /// Used at request sites to add the `X-Noo-Backend` hint header so
 /// node-agent picks the right local backend.
 pub(crate) fn is_node_agent_url(url: &str) -> bool {
-    url.contains(":8081")
+    crate::node_link::is_agent_url(url)
 }
 
 /// Add the `X-Noo-Backend: <type>` header when the request is going
 /// through the node-agent proxy. The header tells node-agent which
 /// local backend (vllm/llamacpp/ollama) to dispatch to. Non-node-agent
-/// URLs (controller-local backends) get no extra header.
-pub(super) fn with_backend_hint(req: reqwest::RequestBuilder, backend: &ResolvedBackend) -> reqwest::RequestBuilder {
-    with_backend_hint_url(req, &backend.url, &backend.backend_type)
-}
-
-/// URL-based variant of `with_backend_hint` for call sites that don't
-/// have a `ResolvedBackend` in scope (e.g., `routes/inference.rs` builds
-/// URLs directly from peer info). Pass empty backend_type for "no hint".
+/// URLs (controller-local backends) get no extra header. Pass empty
+/// backend_type for "no hint". Callers dial through
+/// `node_link::backend_request` / `backend_stream`, which call this.
 ///
 /// Also attaches the node-agent bearer token (NOO_NODE_AGENT_TOKEN or
 /// HMAC fallback) when the URL points at a node-agent — the new /v1/*
@@ -166,7 +162,7 @@ pub(crate) fn with_backend_hint_url(req: reqwest::RequestBuilder, url: &str, bac
         if !backend_type.is_empty() {
             req = req.header("X-Noo-Backend", backend_type);
         }
-        if let Some((name, value)) = crate::node_agent_auth::header_for(url) {
+        for (name, value) in crate::node_link::NodeLink::for_base(url).auth_headers() {
             req = req.header(name, value);
         }
     }
@@ -519,14 +515,12 @@ async fn resolve_backend_url(gossip_url: &str, node_id: &str, backend_type: &str
             if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                 if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
                     if !ip.is_empty() {
-                        // Node agents serve mTLS only (no plaintext listener exists).
-                        let proto = "https";
                         // Node-agent always on port 8081, regardless of
                         // which backend is being targeted. The
                         // X-Noo-Backend header tells node-agent which
                         // local backend to dispatch to.
                         let _hint = backend_type; // documents intent for the caller
-                        let resolved = format!("{proto}://{ip}:8081");
+                        let resolved = crate::node_link::NodeLink::for_ip(ip).base().to_string();
                         note_offer_mismatch(node_id, gossip_url, ip, &resolved);
                         return resolved;
                     }
@@ -622,7 +616,7 @@ struct Candidate {
 /// never excluded anything, so the retry re-resolved the same dead backend.
 fn is_excluded(exclude_urls: &[String], local_url: &str, node_ip: &str) -> bool {
     exclude_urls.iter().any(|u| {
-        u == local_url || (!node_ip.is_empty() && u == &format!("https://{node_ip}:8081"))
+        u == local_url || (!node_ip.is_empty() && u == crate::node_link::NodeLink::for_ip(node_ip).base())
     })
 }
 

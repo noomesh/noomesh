@@ -603,10 +603,8 @@ pub(crate) async fn openai_models(State(state): State<Arc<AppState>>) -> axum::r
         },
     };
     let url = format!("{}/v1/models", probe_url.trim_end_matches('/'));
-    let req = crate::coordinator::with_backend_hint_url(
-        crate::tls::cluster_client().get(&url).timeout(std::time::Duration::from_secs(5)),
-        &url, &backend_type,
-    );
+    let req = crate::node_link::backend_request(reqwest::Method::GET, &url, &backend_type)
+        .timeout(std::time::Duration::from_secs(5));
     let ready = match req.send().await {
         Ok(resp) => {
             crate::coordinator::warn_if_node_agent_outdated(resp.status(), &url);
@@ -660,16 +658,13 @@ pub(crate) async fn chat_completion_on_node(
         "temperature": 0.7,
     });
 
-    let client = crate::tls::cluster_client();
-
     // Add X-Noo-Backend hint for node-agent proxy URLs.
     // 240s: edge nodes are slow — host9 (gemma-4-E2B on a Pi) needs
     // ~40s for even one-word replies, so 60s failed any real prompt
     // with a misleading "backend unreachable" (reqwest timeout).
-    let req = crate::coordinator::with_backend_hint_url(
-        client.post(&url).json(&body).timeout(std::time::Duration::from_secs(240)),
-        &url, backend_type,
-    );
+    let req = crate::node_link::backend_request(reqwest::Method::POST, &url, backend_type)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(240));
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
@@ -793,7 +788,7 @@ pub(crate) async fn node_chat_backend(state: &AppState, node_id: &str) -> NodeCh
             }
         };
         match pick_chat_backend(id, rb, &non_chat) {
-            Ok((bt, m)) => return NodeChat::Serves(bt, m, format!("https://{ip}:8081")),
+            Ok((bt, m)) => return NodeChat::Serves(bt, m, crate::node_link::NodeLink::for_ip(ip).base().to_string()),
             Err(served) if !served.is_empty() => {
                 let roles = crate::repo::cluster::node_running_roles(&state.db, id).await.unwrap_or_default();
                 let msg = no_chat_refusal(id, &served, &roles);
@@ -853,7 +848,7 @@ async fn backend_node_agent_url(state: &AppState, backend_type: &str) -> Option<
             .map(|m| !m.is_empty()).unwrap_or(false);
         if !has { continue; }
 
-        let url = format!("https://{ip}:8081");
+        let url = crate::node_link::NodeLink::for_ip(ip).base().to_string();
         // Prefer the gossip-chosen node when the KV confirms it exists and
         // actually runs this backend; otherwise take the first that does.
         let id = data.get("id").and_then(|v| v.as_str()).unwrap_or(key.as_str());
@@ -880,10 +875,8 @@ async fn proxy_backend_health(
             json!({"error": format!("No {} backend available", backend_type)}).to_string()).into_response(),
     };
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let client = crate::tls::cluster_client();
-    let req = crate::coordinator::with_backend_hint_url(
-        client.get(&url).timeout(std::time::Duration::from_secs(5)), &url, backend_type,
-    );
+    let req = crate::node_link::backend_request(reqwest::Method::GET, &url, backend_type)
+        .timeout(std::time::Duration::from_secs(5));
     match req.send().await {
         Ok(resp) => {
             let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
@@ -1313,14 +1306,10 @@ async fn native_inference_stream(
         }),
     };
 
-    let client = crate::tls::cluster_client();
-
     // Stream the response from the backend as SSE.
     // Add X-Noo-Backend hint for node-agent proxy URLs.
-    let req = crate::coordinator::with_backend_hint_url(
-        client.post(&url).json(&body),
-        &url, &backend.backend_type,
-    );
+    let req = crate::node_link::backend_stream(reqwest::Method::POST, &url, &backend.backend_type)
+        .json(&body);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::info!(

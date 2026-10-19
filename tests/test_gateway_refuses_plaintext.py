@@ -229,10 +229,10 @@ def test_browser_session_is_reached_through_the_node_agent_not_a_plain_node_url(
     if this fails."""
     code = _code_only(UI_ROUTES, UI_ROUTES.read_text())
     assert 'format!("http://' not in code, "ui.rs builds a plaintext http:// URL again"
-    assert "{}/api/containers/{container_name}/proxy" in code, (
+    assert "/api/containers/{container_name}/proxy" in code, (
         "the browser session URL no longer goes via the agent's proxy route — the parse found no route"
     )
-    assert "browser_proxy_base(&agent_url" in code
+    assert "browser_proxy_path(&container_name)" in code and "link.url(&proxy_path)" in code
     agent = (ROOT / "node-agent-go/internal/docker/containers.go").read_text()
     assert "network.PortBinding{HostIP: managedPublishIP}" in agent, (
         "managed container ports are published without the loopback HostIP"

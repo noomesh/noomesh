@@ -81,9 +81,10 @@ def test_the_gateway_owns_disk_cleanup():
     assert re.search(r'^\s*"disk_cleanup",', native, re.M), "disk_cleanup left RUST_NATIVE — it would reach the worker, which refuses"
     body = src.split("async fn detect_container_logs", 1)[1].split("#[cfg(test)]", 1)[0]
     assert '"/cleanup/logs"' in body and '"/cleanup/images"' in src
-    # The credential is chosen per agent: none for an agent
-    # that admits the controller leaf alone, the legacy bearer otherwise.
-    assert "build_node_agent_client()" in body and "node_agent_auth::header_for(" in body
+    # The dial goes through NodeLink, which chooses the credential per agent:
+    # none for an agent that admits the controller leaf alone, the legacy
+    # bearer otherwise (`node_agent_auth::header_for`, called inside node_link.rs).
+    assert "NodeLink::for_base(" in body and "node_agent_auth::header_for(" not in body
     # A refused node is named, never folded into the count as zero.
     assert "NOT scanned" in body
 
