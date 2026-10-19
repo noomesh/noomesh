@@ -48,7 +48,6 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::audit_chain::HeadView;
 use crate::audit_integrity::{AuditRow, Report};
 use crate::state::AppState;
 
@@ -414,7 +413,7 @@ mod tests {
 
     fn report_with_db_head(seq: Option<i64>, hash: &str) -> Report {
         let mut r = Report::default();
-        r.chain.head = seq.map(|s| HeadView { seq: s, chain_hash: hash.into(), timestamp: "t".into() });
+        r.chain.head = seq.map(|s| crate::audit_chain::HeadView { seq: s, chain_hash: hash.into(), timestamp: "t".into() });
         r
     }
 

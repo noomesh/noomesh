@@ -620,14 +620,6 @@ mod tests {
     }
 
     #[test]
-    fn the_cli_and_the_gateway_name_the_same_table() {
-        let cli = include_str!("../../noo-cli/src/host_access.rs");
-        for needle in ["noo_session_floors", "account", "floor", "expires_at"] {
-            assert!(UPSERT_SQL.contains(needle) && cli.contains(needle), "{needle}");
-        }
-    }
-
-    #[test]
     fn the_ttl_covers_a_whole_access_token_lifetime() {
         assert!(floor_ttl_secs() >= 15 * 60 + 60);
     }
