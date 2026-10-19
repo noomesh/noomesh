@@ -498,17 +498,17 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
 
 /// Is this manifest acceptable for `addon`? `Err` names the first problem.
 pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
-    if m.version != 1 {
-        return Err(format!("version {} — this gateway reads version 1", m.version));
-    }
-    if m.addon != addon {
-        return Err(format!("it names add-on {:?}, but was delivered for {addon:?}", m.addon));
-    }
     if !crate::addon_registry::name_ok(addon) {
         return Err(format!(
             "{addon:?} is not a valid add-on name ({})",
             crate::addon_registry::NAME_RULE
         ));
+    }
+    if m.version != 1 {
+        return Err(format!("version {} — this gateway reads version 1", m.version));
+    }
+    if m.addon != addon {
+        return Err(format!("it names add-on {:?}, but was delivered for {addon:?}", m.addon));
     }
     check_upstream(m, addon)?;
     if m.timeout_secs == 0 || m.timeout_secs > MAX_TIMEOUT_SECS {
@@ -1870,6 +1870,8 @@ mod user_read_route_tests {
             base_url_env: "NOO_EVOLVE_URL".into(),
             base_url_default: "https://noo-evolve:8443".into(),
             timeout_secs: 30,
+            delegate: None,
+            task_events: None,
             routes: routes
                 .iter()
                 .map(|(m, p, internal)| RouteSpec {
@@ -1884,6 +1886,7 @@ mod user_read_route_tests {
                     min_role: None,
                     scopes: vec![],
                     owner_scoped: false,
+                    receives_delegation: false,
                     note: None,
                 })
                 .collect(),

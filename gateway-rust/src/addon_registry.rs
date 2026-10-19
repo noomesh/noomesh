@@ -759,8 +759,8 @@ mod tests {
     fn a_planted_file_for_a_nats_addon_is_never_read() {
         let dir = scratch("nats");
         plant(&dir, "trellion", &sample_json());
-        let snap = run(&dir, &[("trellion", true)], &[], &Reported::Dev, &|_| true);
-        assert!(snap.all().is_empty() && snap.refused.is_empty());
+        let snap = run(&dir, &[("trellion", true)], &[], &Reported::Dev, &|n| n == "trellion");
+        assert!(snap.all().is_empty() && snap.refused.is_empty(), "{:?}", snap.refused);
     }
 
     // ── delegation ───────────────────────────────────────────────────────
