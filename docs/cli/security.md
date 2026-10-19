@@ -119,6 +119,22 @@ keys stop within the key cache interval (5 s) and its refresh cookie is
 refused. `disable` does not revoke keys that are not bound to the account
 (machine keys issued with `service-key issue`); revoke those by name.
 
+<a id="addon-scopes"></a>
+**Add-on scopes.** A scope written `<addon>:<word>` (for example
+`evolve:read_items`) is accepted by `set-scopes`, `create` and
+`service-key issue --scopes` only when a loaded add-on's route manifest declares
+it on some route. Anything else is refused with the list of scopes the loaded
+add-ons do declare (or a note that none is loaded, e.g. the add-on is off), so
+a typo never reads as a permission. The check is made by the gateway, not the
+CLI, and applies to a proposal that carries scopes too. An add-on scope opens
+that add-on's `GET` route for an account that holds `read` plus the scope, and
+nothing else; it never opens a write. Granting one is admin-only like any scope
+change and ends the account's sessions, so it applies at the next login:
+`noo security user set-scopes alice --scope read --scope evolve:read_items`
+(the set is replaced). `noo security user list` shows them with the rest of the
+scopes. A service key carrying one (with `addon`, so it can exchange) gets a
+token that also holds `read`, which the route needs.
+
 <a id="graph-scope"></a>
 **The `graph` scope.** A plain `read` account is refused every
 `POST /api/v1/graph/*` (the intended boundary). An account that

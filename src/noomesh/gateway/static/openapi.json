@@ -18930,7 +18930,34 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "promoted",
+                "rejected",
+                "superseded",
+                "withdrawn"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        ]
       }
     },
     "/api/prompt-skills/proposals/{id}/decide": {
@@ -18942,12 +18969,26 @@
         "description": "[native] POST /api/prompt-skills/proposals/{id}/decide \u2014 body `{decision: \"promote\"|\"reject\", reason?}`. A promoted skill is injected as instructions (system message, with core skills) while its text is the one decided on.",
         "operationId": "prompt_skills_decide",
         "requestBody": {
-          "required": false,
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "additionalProperties": true
+                "required": [
+                  "decision"
+                ],
+                "properties": {
+                  "decision": {
+                    "type": "string",
+                    "enum": [
+                      "promote",
+                      "reject"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
               }
             }
           }
@@ -18964,7 +19005,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ]
       }
     }
   },

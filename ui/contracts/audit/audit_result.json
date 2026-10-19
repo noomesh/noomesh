@@ -163,6 +163,12 @@
   "/api/monitoring/grafana-session": [
    "apps/web/src/features/observability/useGrafanaSession.ts"
   ],
+  "/api/prompt-skills/proposals": [
+   "apps/web/src/features/skills/useSkillProposals.ts"
+  ],
+  "/api/prompt-skills/proposals/{id}/decide": [
+   "apps/web/src/features/skills/useSkillProposals.ts"
+  ],
   "/api/scheduler/drain/{node_id}": [
    "apps/web/src/features/jobs/useJobs.ts"
   ],
@@ -456,9 +462,6 @@
   "/api/proactive/status",
   "/api/prompt-skills",
   "/api/prompt-skills/evolve",
-  "/api/prompt-skills/proposals",
-  "/api/prompt-skills/proposals/{id}/decide",
-  "/api/prompt-skills/{name}",
   "/api/prompt-skills/{name}/fitness",
   "/api/prompt-skills/{name}/retire",
   "/api/security/audit-history",

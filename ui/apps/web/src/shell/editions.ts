@@ -48,6 +48,7 @@ export const CORE_TABS: readonly string[] = [
   'observability', // GPU metrics
   'usage', // token accounting; nobody else self-hosted shows it
   'security', // approval gates on agent actions — a genuine differentiator
+  'skills', // promote or reject learned prompt skills before they are injected
   'autonomy', // what it does when nobody asked; same safety class as approvals
   'admin', // users and behavioural flags (operator-gated in the sidebar)
   'docs', // in-app runbooks
