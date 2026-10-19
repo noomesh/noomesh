@@ -132,7 +132,9 @@ def test_the_trellion_overlay_delivers_its_own_principal_by_file():
     text = TRELLION_COMPOSE.read_text()
     doc = yaml.safe_load(text)
     assert doc["x-noo-addon"]["nats_principal"] == "trellion"
-    assert doc["secrets"]["nats_trellion_password"] == {"environment": "NATS_TRELLION_PASSWORD"}
+    src = doc["secrets"]["nats_trellion_password"]
+    assert src["x-noo-source"] == "NATS_TRELLION_PASSWORD"
+    assert src["file"].endswith("}/nats_trellion_password"), "a file: secret under the launcher's NOO_SECRET_RUNDIR (the service is read_only)"
     svc = doc["services"]["trellion"]
     env = svc["environment"]
     # A literal: an env value may name a secret only as a `_FILE` pointer.

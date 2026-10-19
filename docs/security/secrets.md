@@ -190,14 +190,17 @@ store key is `NOO_FILECRED_GOOGLE_CHAT_B64` and whose file is
 
 1. The launcher decrypts `secrets/env.sops` into its **own** process
    environment (`load_secrets`), as it always has.
-2. `docker-compose.cluster.yml` declares each secret at top level with
-   `environment: VAR` as its source — a variable of that process, not a file
-   on the host. An add-on overlay declares the secrets only it takes (its
-   own gateway key, its pgpass body) the same way; compose merges top-level
-   `secrets:` across files, and the launcher reads every
-   `docker-compose.*.yml` beside the base for their sources. At container create, compose copies the value into the
-   container as `/run/secrets/<name>`, mode `0400`, owned by the user the
-   image runs as.
+2. `load_secrets` then **writes each secret to a file on a tmpfs** (see
+   [Where the files live](#where-the-files-live) below). `docker-compose.cluster.yml`
+   declares each secret at top level as
+   `file: ${NOO_SECRET_RUNDIR}/<name>` with an `x-noo-source: VAR` naming the
+   launcher variable the file is written from (compose ignores `x-` keys; the
+   launcher reads them). An add-on overlay declares the secrets only it takes
+   (its own gateway key, its pgpass body) the same way; compose merges
+   top-level `secrets:` across files, and the launcher reads every
+   `docker-compose.*.yml` beside the base. Compose bind-mounts each file into
+   the consumer as `/run/secrets/<target>`, read-only, with the file's owner and
+   mode: `0400`, owned by the user the image runs as.
 3. The service's environment carries only a pointer:
    `NOO_JWT_SECRET_FILE=/run/secrets/noo_jwt_secret`, and the reader above
    follows it. Native consumers use their own spelling:
@@ -208,9 +211,61 @@ store key is `NOO_FILECRED_GOOGLE_CHAT_B64` and whose file is
    by the upstream Grafana image's `run.sh`, which the hardened image does not
    have — measured, it was silently ignored.)
 
-Nothing is written anywhere else: no host file to clean up, no tmpfs,
-nothing for `docker inspect` to print. The value exists in the launcher's
-process while it runs and in the one file inside each consumer.
+Nothing is written anywhere else. The value exists in the launcher's process
+while it runs, in one RAM-backed file per secret, and inside each consumer
+through a bind of that file: not in a container's environment, not in its
+writable layer (`docker diff` shows no secret), not on a disk.
+
+### Where the files live
+
+The gateway, the worker (and its replicas) and trellion run with a read-only
+root filesystem ([networks-and-containers.md](networks-and-containers.md)),
+and compose refuses to create an `environment:`-sourced secret in a read-only
+service (it would copy the value into the container's layer; `file` is the
+sole supported option). So the launcher (`write_secret_files` in
+`scripts/lib-secrets.sh`, called by `load_secrets`, which every launcher,
+noo-hostd and the onboarding wizard's compose wrapper run first) writes them:
+
+| Launched as | Directory |
+|---|---|
+| root (`sudo noo …`, a system-unit noo-hostd) | `/run/noo/secrets` |
+| the operator (an interactive `noo stack start`, a user-unit noo-hostd: the controller's normal case) | `/dev/shm/noo-secrets-<uid>` |
+| `NOO_SECRET_RUNDIR` set | that directory |
+
+`/run/user/<uid>` would be the usual home for an operator's runtime files and
+is deliberately not the default: it is unmounted at the last logout unless
+linger is on, and a container's restart policy re-resolves its bind sources, so
+a crashed service could not come back. `/dev/shm` lives until reboot.
+
+Each start rewrites every file (a temp name, then an atomic rename) before
+compose creates anything:
+
+* one file per secret, mode `0400`, owned by the uid its consumers run as. The
+  uid is read from the `uid:` on the service entries in the compose file; a
+  secret shared with a root-in-container service (the browser, the opt-in node
+  agent) is owned by the non-root consumer, and root reads it through the
+  default `CAP_DAC_OVERRIDE` (a test fails if such a service drops it); two
+  different non-root uids on one secret are refused at launch. As root the
+  launcher `chown`s; as the operator it runs a throwaway container
+  (`alpine`, no network, only `CAP_CHOWN`) over a bind of the directory, the
+  pattern `lib-reown.sh` uses, which sees file names and uids but never a value;
+* the directory is `0700`, owned by the launcher's user, not a symlink, and
+  must report `tmpfs` (or `ramfs`) for `stat -f -c %T`. Anything else is refused
+  with the reason and the remedy, and nothing is written;
+* a secret the store does not hold is an **empty** file (compose needs the
+  bind source to exist) and its `_FILE` pointer stays unset, so it reads as
+  unset;
+* `noo stack stop` (the whole stack) deletes the files and the directory. A
+  reboot clears them too, and the next start writes them again. Until then a
+  container whose restart policy fires after a reboot cannot find its files:
+  run `noo stack start`.
+
+If a launcher is older than the compose file (a stale checkout, an older
+`noo`), `NOO_SECRET_RUNDIR` is unset and compose binds a path that does not
+exist: creating the container fails with `bind source path does not exist:
+/nonexistent/noo-secret-rundir-unset/<name>`. It never starts a service with
+no credentials. Run `noo upgrade --all`, which swaps the CLI (and with it the
+launcher and compose files) before the stack.
 
 **Database passwords travel as pgpass.** No DSN carries a password any more
 (`postgresql://noo_app@postgres:5432/noomesh?sslmode=…`). The gateway and the
@@ -239,15 +294,14 @@ a rotated password does not touch them. The add-on roles `noo_evolve` and
 (see [Networks and containers](networks-and-containers.md)).
 
 **Optional secrets stay optional.** The launcher makes every source variable
-exist, empty when the store has no value (compose otherwise refuses to create
-the service). An empty value creates the container with **no** file, and each
-pointer is written `${NAME:+/run/secrets/…}`, so it is unset too — an unset
-optional secret reads as unset, not as a broken mount.
+exist, empty when the store has no value, and writes an empty file for it.
+Each pointer is written `${NAME:+/run/secrets/…}`, so it is unset too: an
+unset optional secret reads as unset, not as a broken mount.
 
-**A bare `docker compose up` fails loud.** Without the launcher no source
-variable is set, and compose refuses to create the services that take a
-secret: `environment variable "NOO_JWT_SECRET" required by secret … is not
-set`. Use `noo stack start`.
+**A bare `docker compose up` fails loud.** Without the launcher
+`NOO_SECRET_RUNDIR` is unset, the secret files do not exist, and compose
+refuses to create the services that take one (`bind source path does not
+exist: /nonexistent/noo-secret-rundir-unset/…`). Use `noo stack start`.
 
 **Images must read the files.** A gateway or worker image older than the
 readers would see neither the value nor the pointer and start with no
@@ -347,7 +401,8 @@ To see what a container holds, by name only:
 
 ```sh
 docker inspect noo-gateway --format '{{range .Config.Env}}{{index (split . "=") 0}}{{println}}{{end}}'
-docker diff noo-gateway | grep /run/secrets
+docker inspect noo-gateway --format '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Destination}}{{end}}{{end}}' | grep /run/secrets
+docker diff noo-gateway    # nothing under /run/secrets, /tmp/pki or any secret: the layer holds none
 ```
 
 **Fail loud.** A `NAME_FILE` that names a file which cannot be read, or
@@ -406,11 +461,14 @@ rotation tool knows about, prefer `noo security secrets rotate
 --set-from-stdin` below — it never writes plaintext to disk at all.
 
 A changed value reaches a container only on **recreate**, not restart:
-`noo stack restart --force <service>`. That holds for the files too: compose
-copies each `/run/secrets` file at create time, so `secrets rotate` (which
-writes the store and then runs `noomesh-restart.sh --force`, re-running
-`load_secrets` and `derive_file_secrets`) recreates the consumers and they
-get the new file — pgpass bodies included.
+`noo stack restart --force <service>`. Each start rewrites the secret files
+under a new inode and a running container keeps the one it was created with,
+so `secrets rotate` (which writes the store and then runs
+`noomesh-restart.sh --force`, re-running `load_secrets`, which rewrites the
+files) recreates the consumers and they get the new file, pgpass bodies
+included. (A container that is merely *restarted* re-resolves its bind path
+and picks up whatever the launcher last wrote, so avoid restarting a single
+consumer by hand between a store edit and the recreate.)
 
 **A plain `noo stack start <service>` does not apply a rotated secret.**
 Compose decides whether to recreate from the service's configuration, and a
@@ -422,12 +480,12 @@ place. Use `noo security secrets rotate` (it recreates the consumers) or
 Verify what a container actually received with `docker inspect`, not
 `docker exec … printenv` (the gateway image has no shell, so `printenv`
 produces nothing — which reads exactly like "unset"). For a file-delivered
-secret the environment shows only the `_FILE` pointer; `docker diff
-<container>` lists `/run/secrets/<name>` when the file is there:
+secret the environment shows only the `_FILE` pointer, and `.Mounts` lists
+`/run/secrets/<name>` as a bind of a file under the secret directory:
 
 ```sh
 docker inspect noo-gateway --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^NOO_JWT_SECRET'
-docker diff noo-gateway | grep /run/secrets
+docker inspect noo-gateway --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' | grep /run/secrets
 ```
 
 ## Audit the store
@@ -560,8 +618,8 @@ credential review interval something `security secrets audit` can check
 rather than a sentence in a document. The report names the containers that must be recreated
 (`--restart` runs the restart for you). That restart RECREATES the
 consumers (`noomesh-restart.sh --force`), which is what puts the new value
-into their `/run/secrets` file — compose copies a secret only at create
-time, so a plain `noo stack start` of a running service keeps the old file.
+into their `/run/secrets` file — a running container keeps the file it was
+created with, so a plain `noo stack start` of a running service keeps the old file.
 A provider key the store does not hold yet (a first search or Telegram key)
 is added the same way: `--set-from-stdin` writes it to the store, and the
 recreate delivers it.

@@ -91,6 +91,8 @@ x-trellion-env: &trellion-env
   # via markitdown loads it. The image bakes the same switch (deps-core); this
   # covers a container recreated before its image is rebuilt.
   ORT_DISABLE_TELEMETRY: '1'
+  # The rootfs is read-only; /app/src is compiled at image build.
+  PYTHONDONTWRITEBYTECODE: '1'
   # Surfaces: trellion serves ONLY the ML pack —
   # the core subjects moved to the always-on noo-worker. Overridable
   # (=all) as a one-release escape hatch if the split misbehaves.
@@ -361,19 +363,24 @@ x-trellion-env: &trellion-env
   NOO_ARTIFACT_DIR: '${NOO_ARTIFACT_DIR:-}'
 
 # The secrets only an add-on takes. Compose merges top-level `secrets:`
-# across `-f` files, so the shared ones (redis_password, noo_audit_hmac_key, …)
-# are the base file's entries, reused; these two are trellion's own. Sourced
-# from a variable of the LAUNCHER's environment, never a host file
-# (lib-secrets.sh derive_file_secrets exports every source, empty when the
-# store does not hold it, and derives NOO_PGPASS_TRELLION).
+# across `-f` files, so the shared ones (redis_password, noo_audit_hmac_key, ...)
+# are the base file's entries, reused; these are trellion's own. `file:` in
+# the launcher's tmpfs directory, exactly like the base file's (see the block
+# above its `secrets:`): this service is `read_only`, which refuses an
+# `environment:` source. `x-noo-source` names the launcher variable the file
+# is written from (lib-secrets.sh write_secret_files; derive_file_secrets
+# derives NOO_PGPASS_TRELLION).
 secrets:
   noo_svc_key_trellion:
-    environment: NOO_SVC_KEY_TRELLION
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_svc_key_trellion
+    x-noo-source: NOO_SVC_KEY_TRELLION
   # trellion's own NATS password (x-noo-addon.nats_principal above).
   nats_trellion_password:
-    environment: NATS_TRELLION_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_trellion_password
+    x-noo-source: NATS_TRELLION_PASSWORD
   pgpass_trellion:
-    environment: NOO_PGPASS_TRELLION
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/pgpass_trellion
+    x-noo-source: NOO_PGPASS_TRELLION
 
 services:
   trellion:
@@ -504,15 +511,29 @@ services:
       # rehearsal, defect #20). The launchers detect the missing checkout
       # and repoint DEST at a scratch path so the baked package survives.
       - ${TRELLION_SRC:-../trellion/src/trellion}:${TRELLION_SRC_DEST:-/opt/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/site-packages/trellion}:ro
-    # The gateway/worker hardening: no capabilities and no privilege gain.
-    # The image runs as nonroot, so nothing here needs a capability; this
-    # container parses untrusted documents, so a parser bug must not be able
-    # to regain one through a setuid binary. (noomesh.yaml, the override and
-    # the host spool stay writable: worker.settings writes them from here.)
+    # The gateway/worker hardening: no capabilities, no privilege gain, and a
+    # READ-ONLY root filesystem (i132). The image runs as nonroot, so nothing
+    # here needs a capability; this container parses untrusted documents, so a
+    # parser bug must not be able to regain one through a setuid binary, nor
+    # write a payload next to the code. (noomesh.yaml, the override, prompts/,
+    # /data and the host spool are mounts and stay writable: worker.settings
+    # writes them from here.) The write set was measured with `docker diff
+    # noo-trellion` on the live controller:
+    #   /tmp               tmpfs: the PKI/leaf key copy db/engine.py makes at
+    #                      /tmp/pki, document-conversion scratch, ffmpeg temp,
+    #                      `.ses` and the dist-mode `-unused` mount points
+    #   /home/nonroot      tmpfs: HOME. ~/.cache holds library caches, e.g. the
+    #                      onnxruntime device id (switched off above)
+    #   /app/src bytecode  compiled at image build + PYTHONDONTWRITEBYTECODE
+    # Model weights and the HF cache are in the noo-data volume, not here.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+      - /home/nonroot:size=256m,mode=0700,uid=65532,gid=65532
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
