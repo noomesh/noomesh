@@ -79,6 +79,7 @@ mod config_mount;
 mod dependency_watchdog;
 mod node_agent_auth;
 mod node_link;
+mod node_rpc;
 mod maintenance;
 mod node_reachability;
 mod model_presence;
