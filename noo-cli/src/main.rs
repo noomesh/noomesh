@@ -75,6 +75,8 @@ mod passthrough;
 mod pki;
 mod role;
 mod shell_completion;
+#[cfg(test)]
+mod test_exec;
 mod tailnet_serve;
 mod ui;
 mod usage;
