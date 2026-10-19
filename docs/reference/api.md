@@ -204,7 +204,15 @@ absent `model`) is **dynamic**: every live chat node in the mesh, whatever
 it serves, ranked per request (healthy, not stalled in the last 5 min, not
 thermally hot, GPU not shared, vLLM/GPU before CPU, larger model, fewest
 in flight, load; quarantined and thermal-`critical` nodes only when
-nothing else is left). A declared `chat-default` is used as declared.
+nothing else is left). A declared `chat-default` puts its candidates first.
+
+A `model` is a **preference**, not a selection: the class it names is
+tried first, and behind it every other live chat node in that same
+ranking, so a request is answered (perhaps slower, perhaps by a smaller
+model) while any chat node is up. A model nothing serves right now — its
+node is off doing something else — is answered by `chat-default` instead
+of a `404`. `X-Noo-Served-Model` says what answered. Only a node pin is
+strict.
 
 To pin one request to one node, send `"node": "<id>"` in the body or an
 `X-Noo-Node: <id>` header (also on `/api/inference`). The candidates are
@@ -219,9 +227,11 @@ declared position, load): a candidate that cannot be connected to within
 or that answers a `502`/`503`/`504` marking the backend itself as down,
 is skipped for the next one (at most three attempts, 300 s overall), and
 the operator is alerted (`inference.backend_failover`, 15 min cooldown).
-A different model answers **only** from a candidate the class declares
-`degraded: true`, and only once every other candidate has failed. A
-streaming answer is never retried once a byte has reached the client.
+The 30 s window only decides when to move on: the last candidate a
+request can still try gets the rest of the 300 s to start answering. A
+class's `degraded: true` candidates come after its others and before the
+rest of the mesh. A streaming answer is never retried once a byte has
+reached the client.
 
 Every chat answer says what served it:
 

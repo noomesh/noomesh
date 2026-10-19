@@ -33,7 +33,9 @@
 //! `include_usage`), the first chunk is required within
 //! [`FIRST_TOKEN_TIMEOUT`] and each later chunk within [`STREAM_IDLE_TIMEOUT`],
 //! and `chat_aggregate` folds the frames back into one `chat.completion`
-//! body; the caller still sees a non-streaming response and a long answer that
+//! body. Those windows only decide when to MOVE ON: the last candidate a
+//! request can still try is given the rest of [`OVERALL_DEADLINE`] to start
+//! answering, since cutting it off would turn a slow answer into none; the caller still sees a non-streaming response and a long answer that
 //! keeps producing tokens is never cut. A stall is a failover like any other
 //! and its failure text says so plainly and names the restart command.
 //! `n > 1` and non-chat paths (`/v1/responses` native) keep the old
@@ -433,7 +435,18 @@ where
         let url = format!("{}{}", cand.url.trim_end_matches('/'), path);
         let req = coordinator::with_backend_hint_url(client.post(&url).json(&body).timeout(remaining), &url, &cand.backend);
         let window_start = Instant::now();
-        let header_limit = if aggregate { timeouts.first_token } else { timeouts.header };
+        // The stall windows exist to move on to a better candidate. With
+        // nothing left to move on to, cutting this one off only turns a slow
+        // answer into none: the last candidate gets the rest of the
+        // deadline to start answering (a 12B on ollama prefilling a long
+        // prompt, or queued behind another request, takes longer than 30 s).
+        let last = !guard.may_retry(tried)
+            || !candidates[i + 1..].iter().any(|c| {
+                !(c.url == cand.url && c.backend == cand.backend) && !failed.iter().any(|(u, b)| u == &c.url && b == &c.backend)
+            });
+        let first_token = if last { remaining } else { timeouts.first_token };
+        let header = if last { remaining } else { timeouts.header };
+        let header_limit = if aggregate { first_token } else { header };
         let sent = if stream || aggregate {
             tokio::time::timeout(header_limit, req.send()).await
         } else {
@@ -443,11 +456,17 @@ where
         let failure = match sent {
             Err(_) if aggregate => {
                 stalled = true;
-                stall_text("no response", timeouts.first_token.as_secs(), cand)
+                stall_text("no response", first_token.as_secs(), cand)
             }
             Err(_) => {
                 stalled = true;
-                stall_text("no response headers", timeouts.header.as_secs(), cand)
+                stall_text("no response headers", header.as_secs(), cand)
+            }
+            // The request's own timeout (the deadline) can fire before the
+            // window does when the window IS the deadline: still a stall.
+            Ok(Err(e)) if e.is_timeout() => {
+                stalled = true;
+                stall_text("no response", header_limit.as_secs(), cand)
             }
             Ok(Err(e)) => format!("unreachable: {e}"),
             Ok(Ok(resp)) if resp.status().is_success() => {
@@ -456,12 +475,12 @@ where
                     return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Stream(Box::new(resp)), guard });
                 }
                 if aggregate {
-                    let first_wait = timeouts.first_token.saturating_sub(window_start.elapsed());
+                    let first_wait = first_token.saturating_sub(window_start.elapsed());
                     match chat_aggregate::read_aggregated(resp, first_wait, timeouts.idle, deadline).await {
                         Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
                         Err(ReadFailure::NoFirstChunk) => {
                             stalled = true;
-                            stall_text("no token", timeouts.first_token.as_secs(), cand)
+                            stall_text("no token", first_token.as_secs(), cand)
                         }
                         Err(ReadFailure::Idle) => {
                             stalled = true;
@@ -912,6 +931,8 @@ mod tests {
         Steady { frames: usize, gap: Duration },
         /// Two content frames, then silence.
         DiesMidAnswer,
+        /// Say nothing for `wait` (a long prefill, a queue), then answer.
+        LateStart { wait: Duration, text: &'static str },
     }
 
     struct FakeBackend {
@@ -997,6 +1018,14 @@ mod tests {
                             }
                             let _ = sock.write_all(b"0\r\n\r\n").await;
                         }
+                        Fake::LateStart { wait, text } => {
+                            tokio::time::sleep(wait).await;
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
                         Fake::DiesMidAnswer => {
                             let _ = sock.write_all(head.as_bytes()).await;
                             let _ = sock.write_all(&chunk(&delta("one "))).await;
@@ -1021,6 +1050,10 @@ mod tests {
     type Alerts = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn run(cands: &[Candidate], stream: bool, t: Timeouts) -> (Result<CoreSuccess, RawChatError>, Alerts) {
+        run_until(cands, stream, t, Duration::from_secs(20)).await
+    }
+
+    async fn run_until(cands: &[Candidate], stream: bool, t: Timeouts, within: Duration) -> (Result<CoreSuccess, RawChatError>, Alerts) {
         let alerts: Alerts = Arc::new(Mutex::new(Vec::new()));
         let sink = alerts.clone();
         let client = reqwest::Client::new();
@@ -1030,7 +1063,7 @@ mod tests {
             cands,
             stream,
             t,
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + within,
             |c| (CHAT_PATH.to_string(), json!({"model": c.model, "messages": [{"role":"user","content":"hi"}]})),
             move |url, detail| {
                 sink.lock().unwrap().push((url, detail));
@@ -1070,6 +1103,30 @@ mod tests {
             assert!(detail.contains("no token") || detail.contains("no response"), "{detail}");
             assert!(detail.contains("noo cluster restart-backends node-a noo-vllm"), "names the node and container: {detail}");
         }
+    }
+
+    /// 2026-10-19: every external chat to mcmini (the only live chat-default
+    /// candidate, a 12B on ollama) was cut at 30 s and answered 504, for
+    /// hours, although the node answered when given time. With nothing left
+    /// to fail over to, the window is the deadline.
+    #[tokio::test]
+    async fn the_last_candidate_is_given_the_deadline_not_the_stall_window() {
+        let slow = fake_backend(Fake::LateStart { wait: Duration::from_millis(700), text: "late but whole" }).await;
+        for stream in [false, true] {
+            let (r, alerts) = run(&[cand("mcmini", "ollama", "gemma4:12b", &slow.url)], stream, FAST).await;
+            let ok = r.unwrap_or_else(|e| panic!("stream={stream}: {}", e.detail));
+            if !stream {
+                let (_, data) = json_of(Ok(ok));
+                assert_eq!(data.pointer("/choices/0/message/content").and_then(Value::as_str), Some("late but whole"));
+            }
+            assert!(alerts.lock().unwrap().is_empty());
+        }
+        // Not the last: the same slow start still fails over at the window.
+        let spare = fake_backend(Fake::Answer("spare")).await;
+        let started = Instant::now();
+        let (r, _) = run(&[cand("a", "ollama", "m", &slow.url), cand("b", "ollama", "m", &spare.url)], false, FAST).await;
+        assert_eq!(json_of(r).0, 1);
+        assert!(started.elapsed() < Duration::from_millis(650), "moved on at the window");
     }
 
     #[tokio::test]
@@ -1120,12 +1177,14 @@ mod tests {
         let b = fake_backend(Fake::Silent).await;
         let cands = [cand("node-one", "vllm", "m", &a.url), cand("node-two", "ollama", "m", &b.url)];
         let started = Instant::now();
-        let (r, alerts) = run(&cands, false, FAST).await;
+        let (r, alerts) = run_until(&cands, false, FAST, Duration::from_secs(1)).await;
         let e = match r {
             Err(e) => e,
             Ok(_) => panic!("both candidates are wedged"),
         };
-        assert!(started.elapsed() < Duration::from_secs(5), "must not hang to the deadline");
+        // The last candidate is waited on to the deadline, never past it.
+        assert!(started.elapsed() >= Duration::from_millis(900), "the last candidate gets the rest of the deadline");
+        assert!(started.elapsed() < Duration::from_secs(5), "must not hang past the deadline");
         assert_eq!(e.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(e.kind, "backend_timeout");
         assert!(e.detail.contains("stalled"), "{}", e.detail);

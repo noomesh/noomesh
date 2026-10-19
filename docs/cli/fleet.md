@@ -181,11 +181,12 @@ noo cluster class unset chat-default
 
 A **model class** is a name a consumer sends as `model` on
 `/v1/chat/completions` or `/api/external/chat/completions`, and the ordered
-list of `node/backend[=model]` candidates the gateway fails over across.
+list of `node/backend[=model]` candidates the gateway tries first.
 `node/backend` with no `=model` means the placement's model (a class never
-restates a placement); `--degraded` candidates are the only ones allowed to
-answer with a different model, and only once every other candidate has
-failed. With nothing declared, every served model is its own class and
+restates a placement); `--degraded` candidates come after the others. A
+class is a preference, not a fence: when none of its candidates can
+answer, every other live chat node follows in the dynamic ranking below,
+and a model nothing serves is answered by `chat-default`. With nothing declared, every served model is its own class and
 `chat-default` is **dynamic**: every live chat node in the mesh, whatever
 model it serves, ranked per request — healthy before not, a node that
 stalled in the last 5 minutes after one that did not, thermal
@@ -196,7 +197,7 @@ thermal-`critical` node is left out unless nothing else is. Nodes come and
 go: a busy, hot or offline node drops out and rejoins on its own. The
 yaml's `cluster.backends.<x>.model` (what onboarding put on the local
 backend) is a placement hint and does not narrow this. Declaring
-`chat-default` replaces the dynamic pool with your list; `class list`
+`chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`

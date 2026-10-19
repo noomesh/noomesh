@@ -725,7 +725,7 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
     if all.iter().all(|c| c.excluded) {
         let who = all.iter().map(|c| format!("{}={}", c.node_id, c.backend_type)).collect::<Vec<_>>().join(" ");
         return Err(format!(
-            "every node serving '{pin}' failed this request ({who}); refusing to answer with a different model"
+            "every node serving '{pin}' failed this request ({who}) and no other node can answer"
         ));
     }
     all.retain(|c| !c.excluded);
@@ -1028,13 +1028,20 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         }
     }
 
-    // An explicit pin is a filter, not a preference: serve it or say who does.
-    // Only when the mesh reported backends at all - an empty list still falls
-    // through to discovery and the static last resort below, as before.
+    // A named model is a preference (operator rule 2026-10-19, see
+    // `classes`' "Preferences, not selections"): its own nodes first; when
+    // none of them can take this request (not served, or every one already
+    // failed it), any live chat node answers, as raw chat does. Only when
+    // the mesh reported backends at all - an empty list still falls through
+    // to discovery and the static last resort below, as before.
     if let (Some(pin), false) = (requested_model, candidates.is_empty()) {
-        apply_pin(&mut candidates, pin).map_err(|e| {
-            if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) }
-        })?;
+        if let Err(e) = apply_pin(&mut candidates, pin) {
+            if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+                tracing::warn!(requested_model = pin, reason = %e, node = ?found.1, model = %found.0.model, "backend_preference_unmet_mesh_answers");
+                return Ok(found);
+            }
+            return Err(if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) });
+        }
     } else {
         candidates.retain(|c| !c.excluded);
     }

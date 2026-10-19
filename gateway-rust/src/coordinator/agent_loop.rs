@@ -1370,6 +1370,20 @@ fn push_nudge_with_escalation(
 /// ignore the exclusion list and could re-offer a failed backend.
 pub(crate) const MAX_LLM_BACKEND_ATTEMPTS: usize = 3;
 
+/// Room left at the end of a turn to save the answer and the session.
+const TURN_SAVE_MARGIN: Duration = Duration::from_secs(45);
+
+/// When a turn that started at `start` stops calling the model: the turn
+/// deadline (where the controller stops relaying and the harness token
+/// expires) minus [`TURN_SAVE_MARGIN`]. Each model call is bounded by it
+/// too. 2026-10-17: a turn on mcmini ran four 5-minute model calls (the
+/// client's fixed timeout) past the 15-minute deadline; the answer, the
+/// user's message and the session metadata were all refused with 401 on
+/// the way back, so nothing of that conversation was saved.
+pub(crate) fn turn_cutoff(start: Instant) -> Instant {
+    start + super::turn_deadline().saturating_sub(TURN_SAVE_MARGIN)
+}
+
 /// Dedup window for the backend-failover alert, keyed per failed backend
 /// URL. A wedged backend fails on *every* request, so without a window
 /// this would alert per request. 15 minutes is long enough to stay quiet
@@ -1431,9 +1445,17 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
     tools: Option<&[Value]>,
     force_stream: bool,
     enable_thinking: bool,
+    until: Instant,
 ) -> Result<reqwest::Response> {
     let client = crate::tls::cluster_client();
     for attempt in 1..=MAX_LLM_BACKEND_ATTEMPTS {
+        // The whole call, streamed body included, ends with the turn — not
+        // at the client's fixed backend timeout, which cut a slow answer
+        // mid-stream and then let the loop start another call.
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("this turn reached its time limit before the model answered");
+        }
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
         let (url, body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
         if super::backend::is_cloud_backend(backend) {
@@ -1442,7 +1464,7 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
                 None => continue,
             }
         }
-        let failure = match with_backend_hint(client.post(&url).json(&body), backend).send().await {
+        let failure = match with_backend_hint(client.post(&url).json(&body).timeout(remaining), backend).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -1941,6 +1963,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     let mut nudge_history: Vec<&'static str> = Vec::new();
 
     let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
+    let turn_ends = turn_cutoff(Instant::now());
     for iteration in 1..=max_iterations {
         result.iterations = iteration;
         let iter_start = Instant::now();
@@ -1958,7 +1981,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let pre_send_url = backend.url.clone();
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), true, enable_thinking,
+            &session.messages, Some(&tool_schemas), true, enable_thinking, turn_ends,
         ).await {
             Ok(r) => {
                 if backend.url != pre_send_url {
@@ -2005,6 +2028,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let mut anthropic_sse = (super::backend::wire_format(&backend) == "anthropic")
             .then(super::anthropic_wire::SseTranslator::new);
         let mut stream_failed = false;
+        // The transport broke mid-stream (a timeout, a dropped connection):
+        // what arrived is all there will be.
+        let mut stream_broke: Option<String> = None;
 
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
@@ -2012,6 +2038,7 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(error = %e, "SSE stream error");
+                    stream_broke = Some(if e.is_timeout() { "the turn's time limit".to_string() } else { e.to_string() });
                     break;
                 }
             };
@@ -2223,6 +2250,24 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         }
 
         usage.total_latency_ms += iter_start.elapsed().as_millis() as u64;
+
+        // A broken stream is not an empty answer. Nudging it ("write the
+        // answer now") started another full-length call on a model that was
+        // still thinking when it was cut (2026-10-17: four 5-minute calls,
+        // each cut mid-thought, then a 401 on save). With no answer text,
+        // say what happened and end the turn; with some, keep it as the
+        // answer and run none of its tool calls, which may be cut too.
+        if let Some(why) = stream_broke {
+            if full_content.trim().is_empty() {
+                tracing::warn!(iteration, reasoning_chars = full_reasoning.chars().count(), reason = %why, "loop.stream_broke_before_answer");
+                let _ = writer.send_event("error", json!(format!(
+                    "The model's answer was cut off before it was written ({why}). Send it again, or ask for something shorter."
+                ))).await;
+                break;
+            }
+            tracing::warn!(iteration, chars = full_content.chars().count(), dropped_tool_calls = tool_calls_json.len(), reason = %why, "loop.stream_broke_partial_answer_kept");
+            tool_calls_json.clear();
+        }
 
         // Reconstruct the full message for session history
         let combined_content = if !full_reasoning.is_empty() && !full_content.is_empty() {
@@ -3021,6 +3066,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
     let mut llm_failure: Option<anyhow::Error> = None;
 
     let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
+    let turn_ends = turn_cutoff(Instant::now());
     for iteration in 1..=max_iterations {
         result.iterations = iteration;
         let iter_start = Instant::now();
@@ -3040,7 +3086,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         // AFTER the call — fallback may have switched api_format.
         let resp = match send_llm_with_fallback(
             rt, &mut backend, &mut failed_backend_urls, effective_model,
-            &session.messages, Some(&tool_schemas), false, enable_thinking,
+            &session.messages, Some(&tool_schemas), false, enable_thinking, turn_ends,
         ).await {
             Ok(r) => r,
             Err(e) => {
