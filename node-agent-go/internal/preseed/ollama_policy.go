@@ -14,16 +14,18 @@ const OllamaRegistryPullEnv = "NOO_ALLOW_OLLAMA_REGISTRY_PULL"
 
 // OllamaRegistryPullAllowed: a PLACED node (NOO_MODEL_CACHE_URL set) takes its
 // weights from the controller's store, never from the internet. The controller
-// store carries GGUF files (`noo models fetch`), which the node imports with
-// `import-model` from the rail; it does not carry ollama registry blobs, so a
-// bare registry tag cannot be delivered that way and is refused with the
-// remedy instead of quietly reaching registry.ollama.ai. The operator can
-// accept the exception per node with NOO_ALLOW_OLLAMA_REGISTRY_PULL=1.
+// stages an ollama registry tag into that store (`noo models fetch ollama:<tag>`:
+// it pulls the manifest and blobs, checks each against the digest the manifest
+// carries, and the node imports the staged pair like any other store model), so
+// a tag reaches a placed node that way. A tag the controller has not staged
+// cannot be delivered, and is refused with the remedy instead of quietly
+// reaching registry.ollama.ai. The operator can accept the exception per node
+// with NOO_ALLOW_OLLAMA_REGISTRY_PULL=1.
 func OllamaRegistryPullAllowed(name string) error {
 	if !Placed() || os.Getenv(OllamaRegistryPullEnv) == "1" {
 		return nil
 	}
-	return fmt.Errorf("ollama_registry_pull_refused: %s is an ollama registry tag, and a placed node takes models only from the controller's store, "+
-		"never from registry.ollama.ai. Put the model on the controller as a GGUF (`noo models fetch <hf_repo> <file.gguf>`) and place the file name "+
-		"(the node imports it from the store); or accept the exception on this node with %s=1 in its node-agent environment", name, OllamaRegistryPullEnv)
+	return fmt.Errorf("ollama_registry_pull_refused: %s is an ollama registry tag the controller's store does not hold (or could not be asked about), and a placed node takes models only from the controller's store, "+
+		"never from registry.ollama.ai. Stage it on the controller (`noo models fetch ollama:%s`; this node imports it from the store on its next reconcile), "+
+		"or put a GGUF there (`noo models fetch <hf_repo> <file.gguf>`) and place the file name; or accept the exception on this node with %s=1 in its node-agent environment", name, name, OllamaRegistryPullEnv)
 }
