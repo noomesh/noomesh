@@ -25,12 +25,24 @@
 
 /// The credential a process presents, plus which principal it is (for the
 /// log line — never the password).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NatsCredential {
     pub user: String,
     pub password: String,
     /// The principal role: `"gateway"` or `"node"`.
     pub source: &'static str,
+}
+
+/// By hand, never derived: `{:?}` on a credential (a `tracing` field, an
+/// `unwrap` panic message, an `assert_eq!` failure) must not print the password.
+impl std::fmt::Debug for NatsCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsCredential")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// The gateway's role-specific variable names.
@@ -193,6 +205,15 @@ pub fn resolve_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let c = NatsCredential { user: "gateway".into(), password: "hunter2-s3cret".into(), source: "gateway" };
+        let shown = format!("{c:?} {c:#?}");
+        assert!(!shown.contains("hunter2-s3cret"), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("gateway"), "{shown}");
+    }
+
     use std::collections::HashMap;
 
     /// Spelled out, not imported: the retired names must not come back as
