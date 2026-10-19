@@ -211,6 +211,10 @@ _addon_composed_names() {
 # render its unpinned sentinel) is refused here, by name. The exports are
 # recorded in _ADDON_PINS for dist_assert_addon_refs.
 #
+# Dist also exports NOO_ADDONS_VERIFIED, from the `verified <addon> <version>
+# <stack>` lines: `name=version@stack,...`, or `none`. Dev exports `dev`. The
+# gateway's add-on registry registers an add-on only when it is named there.
+#
 # Dev (not dist): each variable the composed overlays read is set to the dev
 # build's name, `${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE_TAG:-latest}`.
 #
@@ -222,7 +226,11 @@ _ADDON_PINS=()
 _DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
+    local _verified=() _pinned=() _legacy_cli=0 _p
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
+    # The registry verdict is set here and nowhere else: a value inherited from
+    # the shell or an .env line is dropped, like the image variables above.
+    unset NOO_ADDONS_VERIFIED
     _ADDON_PINS=()
     _args="$(addon_compose_overlay_args 2>/dev/null)"
     # shellcheck disable=SC2086
@@ -232,6 +240,10 @@ require_addon_pins() {
     # beyond the core overlays is on (a licensed add-on that is on always goes
     # to launch-pins, which refuses it when its bundle is missing).
     if [ -z "$_vars" ] && [ -z "$(printf '%s' "$_on" | tr ' ' '\n' | grep -vxE 'trellion|voice|' || true)" ]; then
+        # Nothing was composed that needs a lock. The gateway's add-on
+        # registry still wants the verdict: a dist launcher verified "none",
+        # a source checkout is "dev".
+        if [ "${DIST_MODE:-0}" = 1 ]; then export NOO_ADDONS_VERIFIED=none; else export NOO_ADDONS_VERIFIED=dev; fi
         return 0
     fi
     if [ "${DIST_MODE:-0}" != 1 ]; then
@@ -239,6 +251,8 @@ require_addon_pins() {
             _name="$(printf '%s' "${_v#NOO_ADDON_IMAGE_}" | tr 'A-Z_' 'a-z-')"
             export "${_v}=${NOO_IMAGE_PREFIX:-$(local_image_namespace)}/${_name}:${NOO_IMAGE_TAG:-latest}"
         done
+        # A source checkout builds its add-on images: there is no signed lock.
+        export NOO_ADDONS_VERIFIED=dev
         return 0
     fi
     local _tag="${DIST_TAG:-${NOO_IMAGE_TAG:-}}"
@@ -257,7 +271,15 @@ require_addon_pins() {
     fi
     while read -r _kind _addon _rest; do
         case "$_kind" in
+            verified)
+                # `verified <addon> <version> <stack>`: the signed lock verified
+                # offline and lists this stack. Handed to the gateway below.
+                case "$_rest" in
+                    *[!-A-Za-z0-9._+\ ]*|"") echo "REFUSING: noo addons launch-pins sent an unreadable verdict for ${_addon}: ${_rest}" >&2; fail=1 ;;
+                    *) _verified+=("${_addon}=${_rest%% *}@${_rest#* }") ;;
+                esac ;;
             pin)
+                _pinned+=("$_addon")
                 _var="${_rest%% *}"; _ref="${_rest#* }"
                 case "$_var" in NOO_ADDON_IMAGE_*) : ;; *)
                     echo "REFUSING: noo addons launch-pins named '${_var}' for ${_addon}, not an add-on image variable" >&2
@@ -286,6 +308,23 @@ require_addon_pins() {
 $_out
 PINS
     [ "$fail" = 0 ] || return 1
+    # The gateway's add-on registry reads this (gateway-rust/src/addon_registry.rs).
+    # A pin with no verdict beside it came from a noo binary older than this
+    # launcher: it verified, it just cannot say so. Leave the variable unset
+    # (the gateway then loads only the add-ons it already knew and says why)
+    # rather than report "none" and refuse a good add-on.
+    local _vstr
+    _vstr="$(IFS=,; printf '%s' "${_verified[*]-}")"
+    for _p in ${_pinned[@]+"${_pinned[@]}"}; do
+        case ",${_vstr}," in *",${_p}="*) : ;; *) _legacy_cli=1 ;; esac
+    done
+    if [ "$_legacy_cli" = 1 ]; then
+        echo "WARNING: this noo CLI does not report verified add-on locks; the gateway loads only the add-ons it already knew. Run: noo upgrade" >&2
+    elif [ -n "$_vstr" ]; then
+        export NOO_ADDONS_VERIFIED="$_vstr"
+    else
+        export NOO_ADDONS_VERIFIED=none
+    fi
     for _v in $_vars; do
         if [ -z "${!_v:-}" ]; then
             {

@@ -13,7 +13,11 @@
 //!   checks each pinned image is local, and compares running containers with
 //!   the pins.
 //! - `launch-pins <tag> [<name>…]` (hidden) is the launcher's reader: one
-//!   `pin <addon> <VAR> <ref>` or `refuse <addon> <why>` line per add-on.
+//!   `verified <addon> <version> <stack>` line then one
+//!   `pin <addon> <VAR> <ref>` line per image, or one
+//!   `refuse <addon> <why>` line, per add-on. The launcher hands the
+//!   `verified` lines to the gateway's add-on registry
+//!   (`NOO_ADDONS_VERIFIED`, gateway-rust/src/addon_registry.rs).
 //!
 //! Nothing here restarts anything: a new pin takes effect on the operator's
 //! next `noo stack restart --force`.
@@ -312,6 +316,11 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
         let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check(root, addon, tag, &a));
         match res {
             Ok(pin) => {
+                // The verdict the gateway's add-on registry reads
+                // (`NOO_ADDONS_VERIFIED`): this add-on's signed lock verified
+                // offline AND lists `tag`. Emitted before its `pin` lines so a
+                // launcher that stops at the first problem still saw it.
+                out.push(format!("verified {addon} {} {}", pin.version, pin.stack));
                 for (image, reference) in &pin.local_images() {
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
@@ -390,6 +399,9 @@ pub(crate) fn addon_image_env(
         let (kind, addon, rest) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let fix = format!("noo addons upgrade {addon}");
         match kind {
+            // Not an image: the registry verdict (`launch_lines`). The wizard
+            // composes the stack but starts no gateway of its own.
+            "verified" => {}
             "pin" => {
                 let (var, reference) = rest.split_once(' ').unwrap_or((rest, ""));
                 if present(reference) {
@@ -481,12 +493,14 @@ mod tests {
         let (d, reference) = pinned_root("launch");
         let names = vec!["trellion-intel".to_string(), "evolve".to_string(), "voice".to_string(), "trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|a| if a == "trellion_intel" { Ok(anchor()) } else { Err(resolve::Refusal::NoAnchor) });
-        assert_eq!(lines[0], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
-        assert!(lines[1].starts_with("refuse evolve the installed entitlement names no signing key"), "{lines:?}");
-        assert_eq!(lines.len(), 2, "voice is not licensed and a duplicate spelling is one add-on: {lines:?}");
+        assert_eq!(lines[0], "verified trellion_intel 1.2.0 v0.6.0", "the registry verdict leads: {lines:?}");
+        assert_eq!(lines[1], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
+        assert!(lines[2].starts_with("refuse evolve the installed entitlement names no signing key"), "{lines:?}");
+        assert_eq!(lines.len(), 3, "voice is not licensed and a duplicate spelling is one add-on: {lines:?}");
 
         let other_tag = launch_lines(&d, "v0.6.1", &names[..1], &|_| Ok(anchor()));
         assert!(other_tag[0].starts_with("refuse trellion_intel trellion_intel is pinned for stack v0.6.0"), "{other_tag:?}");
+        assert!(!other_tag.iter().any(|l| l.starts_with("verified")), "a refused add-on is never reported verified: {other_tag:?}");
     }
 
     /// Pulled through the proxy: compose runs, and verify compares with,
@@ -505,7 +519,7 @@ mod tests {
         let local = signed_ref.replacen("ghcr.io", "addons.noomesh.ai", 1);
         let names = vec!["trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(a.clone()));
-        assert_eq!(lines, [format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
+        assert_eq!(lines, ["verified trellion_intel 1.2.0 v0.6.0".to_string(), format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
         let running = vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: local.clone(), image_id: "sha256:x".into() }];
         let mut docker = FakeDocker { local: vec![local.clone()], ids: vec![(local.clone(), "sha256:x".into())], ..Default::default() };
         let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(a.clone()), &mut docker, &running);
