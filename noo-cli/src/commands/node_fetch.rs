@@ -2285,7 +2285,7 @@ fn root_exec_trustworthy(p: &Path) -> Result<(), String> {
 const AGENT_ENV_KEYS: &[&str] = &[
     "NODE_ID", "NODE_IP", "NODE_TIER", "GPU_MODEL", "CONTROLLER_URL", "NATS_URL",
     "NOO_NODE_AGENT_TOKEN", "NOO_CLUSTER_SECRET", "NOO_PKI_DIR", "NOO_TLS_CA", "NOO_TLS_CERT",
-    "NOO_TLS_KEY", "NOO_MTLS_NODES", "OLLAMA_URL", "NOO_SELF_NODE", "NOO_DATA_ROOT",
+    "NOO_TLS_KEY", "NOO_MTLS_NODES", "NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1", "OLLAMA_URL", "NOO_SELF_NODE", "NOO_DATA_ROOT",
     "HF_CACHE_DIR", "MODELS_DIR", "OLLAMA_DATA_DIR", "NOO_MODEL_CACHE_URL", "PATH",
     "NOO_FORCE_GPU", "NOO_OLLAMA_GPU_COUNT", "NOO_IMAGE_PREFIX", "NOO_IMAGE_TAG",
     "NODE_AGENT_PORT", "LOG_LEVEL", "DOCKER_HOST",
@@ -2348,6 +2348,12 @@ fn env_payload_ok(body: &str, kind: &str, keys: &[&str], inert: &[&str]) -> Resu
         }
         if k == "NOO_APPLY_ACCEPT_CA_SIGNED" && v != "0" {
             return refuse("NOO_APPLY_ACCEPT_CA_SIGNED may only say 0".into());
+        }
+        if k == "NOO_CLUSTER_TOKEN_V1" && !matches!(v, "" | "0" | "1") {
+            return refuse("NOO_CLUSTER_TOKEN_V1 may only say 0, 1 or nothing".into());
+        }
+        if k == "NODE_AGENT_BIND" && !(v == "all" || v.bytes().all(|c| c.is_ascii_hexdigit() || b":.,".contains(&c))) {
+            return refuse("NODE_AGENT_BIND may only be `all`, an address, or a comma list of addresses".into());
         }
     }
     Ok(())
@@ -2971,7 +2977,26 @@ mod env_shape_tests {
             rest = &tail[end..];
         }
         out.push_str(rest);
-        out
+        // The two cluster-trust keys have a shape of their own (pinned below).
+        out.replace("NOO_CLUSTER_TOKEN_V1=value", "NOO_CLUSTER_TOKEN_V1=0")
+            .replace("NODE_AGENT_BIND=value", "NODE_AGENT_BIND=10.0.0.5")
+    }
+
+    /// The Mac applier carries the bind and the v1 gate, pinned to the shapes
+    /// the controller renders (the shell applier is held to the same).
+    #[test]
+    fn the_cluster_trust_keys_are_carried_and_shape_checked() {
+        let agent = render("node-agent-go/deploy/noo-node-agent.env.tmpl");
+        for ok in ["NOO_CLUSTER_TOKEN_V1=1", "NOO_CLUSTER_TOKEN_V1=", "NODE_AGENT_BIND=all", "NODE_AGENT_BIND=100.64.0.7,fd7a::1", "NODE_AGENT_BIND="] {
+            env_payload_ok(&format!("{agent}{ok}\n"), "agent-env", AGENT_ENV_KEYS, AGENT_ENV_INERT_KEYS)
+                .unwrap_or_else(|e| panic!("{ok} refused: {e}"));
+        }
+        for bad in ["NOO_CLUSTER_TOKEN_V1=maybe", "NODE_AGENT_BIND=host3.local", "NODE_AGENT_BIND=*"] {
+            assert!(
+                env_payload_ok(&format!("{agent}{bad}\n"), "agent-env", AGENT_ENV_KEYS, AGENT_ENV_INERT_KEYS).is_err(),
+                "{bad} passed"
+            );
+        }
     }
 
     /// The floor: what the controller renders passes, Mac-quoted roots too.

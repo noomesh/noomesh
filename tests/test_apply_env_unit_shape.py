@@ -46,7 +46,10 @@ def render(tmpl: Path) -> str:
     {# #} comments and {% %} tags vanish (their bodies are kept)."""
     text = re.sub(r"\{#.*?#\}", "", tmpl.read_text(), flags=re.S)
     text = re.sub(r"\{%.*?%\}", "", text, flags=re.S)
-    return re.sub(r"\{\{.*?\}\}", "value", text)
+    text = re.sub(r"\{\{.*?\}\}", "value", text)
+    # The two cluster-trust keys have a shape of their own (the appliers pin it).
+    text = re.sub(r"^NOO_CLUSTER_TOKEN_V1=value$", "NOO_CLUSTER_TOKEN_V1=0", text, flags=re.M)
+    return re.sub(r"^NODE_AGENT_BIND=value$", "NODE_AGENT_BIND=10.0.0.5", text, flags=re.M)
 
 
 def template_keys(tmpl: Path) -> set[str]:
@@ -135,6 +138,37 @@ def test_an_env_payload_outside_its_shape_is_refused(tmp_path: Path, line: str, 
     r = env_ok(tmp_path, render(AGENT_TMPL) + line + "\n")
     assert r.returncode == 65, (line, r.stdout, r.stderr)
     assert why in r.stderr and "REFUSED agent-env" in r.stderr
+
+
+# ── the cluster-trust keys: carried, and pinned to their shape ──────────────
+
+def test_the_agent_env_carries_the_bind_and_the_v1_gate():
+    """NODE_AGENT_BIND and NOO_CLUSTER_TOKEN_V1 are rendered, allow-listed in
+    both appliers, and the Rust applier's (Mac) list agrees. Before they were
+    carried, a hand-added line was rewritten away by the next apply."""
+    for key in ("NODE_AGENT_BIND", "NOO_CLUSTER_TOKEN_V1"):
+        assert key in template_keys(AGENT_TMPL), key
+        assert key in shell_list("AGENT_ENV_KEYS"), key
+        assert key in rust_list("AGENT_ENV_KEYS"), key
+
+
+@pytest.mark.parametrize("line", [
+    "NOO_CLUSTER_TOKEN_V1=0", "NOO_CLUSTER_TOKEN_V1=1", "NOO_CLUSTER_TOKEN_V1=",
+    "NODE_AGENT_BIND=", "NODE_AGENT_BIND=all", "NODE_AGENT_BIND=100.64.0.7,fd7a::1",
+])
+def test_the_cluster_trust_values_the_controller_renders_pass(tmp_path: Path, line: str):
+    r = env_ok(tmp_path, render(AGENT_TMPL) + line + "\n")
+    assert r.returncode == 0, (line, r.stderr)
+
+
+@pytest.mark.parametrize("line", [
+    "NOO_CLUSTER_TOKEN_V1=maybe", "NOO_CLUSTER_TOKEN_V1=off",
+    "NODE_AGENT_BIND=host3.local", "NODE_AGENT_BIND=*", "NODE_AGENT_BIND=1.2.3.4;id",
+])
+def test_a_cluster_trust_value_outside_its_shape_is_refused(tmp_path: Path, line: str):
+    r = env_ok(tmp_path, render(AGENT_TMPL) + line + "\n")
+    assert r.returncode == 65, (line, r.stdout, r.stderr)
+    assert line.split("=")[0] in r.stderr
 
 
 def test_a_harness_env_cannot_borrow_agent_keys(tmp_path: Path):
