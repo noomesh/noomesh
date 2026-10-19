@@ -96,7 +96,7 @@ mcp = ["mcp[cli]>=1.2,<2"]
 # it every async DB call dies "requires that the Python 'greenlet' library is
 # installed" -- live 2026-10-06 on noo-worker: audit rows lost, heartbeat
 # scheduler uninitialised. tests/test_worker_image_dependency_set.py pins it.
-db = ["psycopg[binary]>=3.1", "sqlalchemy[asyncio]>=2.0", "alembic>=1.13", "pgvector>=0.3"]
+db = ["psycopg[binary]>=3.1", "sqlalchemy[asyncio]>=2.0", "alembic>=1.13", "pgvector>=0.5.1"]
 pgvector = ["noomesh[db]"]
 rag = ["noomesh[db]", "markitdown[all]>=0.1"]
 voice = [
