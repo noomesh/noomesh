@@ -147,6 +147,7 @@ the fields below. Failure is a non-2xx status and, usually, a body
 | Status | When |
 |---|---|
 | 400 | an unresolvable backend, a failed cloud run, an alert kind outside the allowed set, a `usage` report naming an undeclared harness kind |
+| 401 | the token expired, or its account is now disabled, absent, or holds a lower role than the token: the account is re-read on every call, cached at most 10 s, so disabling a person or lowering their role stops a running turn within that bound rather than at the token's expiry. A role raised mid-turn takes effect at the next mint (checkpoint renewal or the next dispatch) |
 | 403 | not a node-harness token (even an admin token is refused); `task_checkpoint` for a task that is not this turn's; the closed cloud gate on `cloud_run`, whose body is the cloud-gate body (`code: cloud_providers_disabled`) |
 | 500 | a session write failed |
 

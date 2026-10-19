@@ -973,22 +973,29 @@ pub fn mint_grafana_jwt_with(
 /// tokens going dead has to be small enough to describe in a sentence.
 const DELEGATED_SUBJECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-static DELEGATED_SUBJECTS: OnceLock<RwLock<HashMap<String, (bool, Instant)>>> = OnceLock::new();
+static DELEGATED_SUBJECTS: OnceLock<RwLock<HashMap<String, (Option<Role>, Instant)>>> = OnceLock::new();
 
 /// Is the subject of a DELEGATED token still an enabled account?
 ///
-/// Only exchanged tokens (the ones carrying `act`) are
-/// checked, and that narrowness is the design. An ordinary JWT is
-/// stateless by choice and stays that way; an exchanged one is minted on
-/// demand for an account somebody else controls, so "stop this agent" has
-/// to mean something before the token expires. Revoking the provisioning
-/// key stops the next mint; THIS is what makes the one already in flight
-/// stop working.
+/// Only exchanged tokens (the ones carrying `act`) and node-harness
+/// tokens are checked, and that narrowness is the design. An ordinary JWT
+/// is stateless by choice and stays that way; an exchanged one is minted
+/// on demand for an account somebody else controls, so "stop this agent"
+/// has to mean something before the token expires. Revoking the
+/// provisioning key stops the next mint; THIS is what makes the one
+/// already in flight stop working.
 ///
 /// One indexed lookup by username, cached for [`DELEGATED_SUBJECT_TTL`],
 /// and only on agent traffic. A missing account reads as disabled: an
 /// account erased out from under a live token must not keep working.
 pub async fn delegated_subject_enabled(db: &sqlx::PgPool, subject: &str) -> bool {
+    live_account_role(db, subject).await.is_some()
+}
+
+/// The account's role as the database holds it NOW, or `None` when it is
+/// disabled, absent, holds a role this build cannot read, or the database
+/// cannot answer. Shares [`delegated_subject_enabled`]'s cache and bound.
+pub async fn live_account_role(db: &sqlx::PgPool, subject: &str) -> Option<Role> {
     // A connection subject is checked against its OWNER: the account is
     // the row in `noo_users`, and disabling the person must stop every
     // connection they hold. Without this the lookup would search for
@@ -997,36 +1004,46 @@ pub async fn delegated_subject_enabled(db: &sqlx::PgPool, subject: &str) -> bool
     let subject = account_of(subject);
     let cache = DELEGATED_SUBJECTS.get_or_init(|| RwLock::new(HashMap::new()));
     if let Ok(map) = cache.read() {
-        if let Some((ok, at)) = map.get(subject) {
+        if let Some((live, at)) = map.get(subject) {
             if at.elapsed() < DELEGATED_SUBJECT_TTL {
-                return *ok;
+                return *live;
             }
         }
     }
-    let row: Result<Option<(bool,)>, _> =
-        sqlx::query_as("SELECT COALESCE(disabled, false) FROM noo_users WHERE username = $1")
+    let row: Result<Option<(bool, String)>, _> =
+        sqlx::query_as("SELECT COALESCE(disabled, false), role FROM noo_users WHERE username = $1")
             .bind(subject)
             .fetch_optional(db)
             .await;
-    let enabled = match row {
-        Ok(Some((disabled,))) => !disabled,
-        // No such account — fail closed.
-        Ok(None) => false,
+    let live = match row {
+        Ok(Some((false, role))) => role.parse::<Role>().ok(),
+        // Disabled, or no such account — fail closed.
+        Ok(_) => None,
         // A database that cannot answer must not be read as "enabled":
         // that would turn a DB blip into a window where a killed agent
         // works again. Not cached, so it re-asks on the next request.
         Err(e) => {
             tracing::warn!(subject = %subject, error = %e, "delegated subject check failed; refusing");
-            return false;
+            return None;
         }
     };
     if let Ok(mut map) = cache.write() {
         if map.len() > 10_000 {
             map.clear();
         }
-        map.insert(subject.to_string(), (enabled, Instant::now()));
+        map.insert(subject.to_string(), (live, Instant::now()));
     }
-    enabled
+    live
+}
+
+/// Does a node-harness token still speak for its account? Only while the
+/// account is enabled AND the token's role is no higher than the account's
+/// live role: a downgrade or a disable reaches a turn already running
+/// within [`DELEGATED_SUBJECT_TTL`], not at the token's exp (the turn
+/// deadline plus a minute). An upgrade is not propagated; it waits for the
+/// next mint (checkpoint renewal or the next dispatch).
+pub(crate) fn rail_token_admitted(token_role: Role, live: Option<Role>) -> bool {
+    live.is_some_and(|l| token_role <= l)
 }
 
 /// Which service-key scope, if any, opens a token-exchange route.
@@ -3177,6 +3194,14 @@ pub async fn require_any_auth(
             // for. It is a user token in every other respect; the rail's
             // handlers take the conversation from the claim, not the body.
             if let Some(turn) = harness_turn_for(&claims, &path)? {
+                // The account behind the turn is re-read on every rail
+                // call: disabling the person, or lowering their role,
+                // stops a turn already running (i143 decision 4).
+                let live = live_account_role(&state.db, &claims.sub).await;
+                if !rail_token_admitted(claims.resolved_role(), live) {
+                    tracing::warn!(sub = %claims.sub, node = %turn.node, live = ?live, "harness token refused: account disabled, absent or below the token's role");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
                 request.extensions_mut().insert(turn);
             }
             // A worker-delegated token reaches the tool
@@ -5813,6 +5838,30 @@ mod harness_rail_tests {
         assert_eq!(harness_turn_for(&claims(Some("node:host8"), None), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
         assert_eq!(harness_turn_for(&claims(Some("node:host8"), Some("")), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
         assert_eq!(harness_turn_for(&claims(Some("node:"), Some("c1")), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn a_harness_token_needs_an_enabled_account_at_or_above_its_role() {
+        assert!(rail_token_admitted(Role::User, Some(Role::User)));
+        assert!(rail_token_admitted(Role::User, Some(Role::Admin)), "an upgrade does not refuse; it waits for the next mint");
+        assert!(rail_token_admitted(Role::Operator, Some(Role::Operator)));
+        assert!(!rail_token_admitted(Role::Operator, Some(Role::User)), "a downgrade stops the running turn");
+        assert!(!rail_token_admitted(Role::Admin, Some(Role::Operator)));
+        assert!(!rail_token_admitted(Role::User, None), "disabled or absent");
+    }
+
+    /// The live-account check sits on the harness branch itself, before the
+    /// turn is attached: a turn the check refuses never reaches the rail.
+    #[test]
+    fn the_harness_branch_rechecks_the_live_account() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
+        let check = body[branch..].find("live_account_role(&state.db, &claims.sub)").expect("live check") + branch;
+        let attach = body[branch..].find("request.extensions_mut().insert(turn)").expect("attach") + branch;
+        assert!(check < attach);
+        assert!(body[check..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
+        assert!(body[check..attach].contains("StatusCode::UNAUTHORIZED"));
     }
 
     #[test]
