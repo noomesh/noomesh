@@ -1404,7 +1404,7 @@ jobs:
           || echo "::warning::ghcr.io login failed — the mirror check will fall back to Docker Hub"
         echo "HUB_PREFIX=$(python3 "$GITHUB_WORKSPACE/scripts/hub-mirror.py" dockerfile "$GITHUB_WORKSPACE/Dockerfile")" >> "$GITHUB_ENV"
 
-    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069   # v4.4.1
       if: needs.scope.outputs.code == 'true'
     # Exposes ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL to the shell so
     # `docker buildx build --cache-to type=gha` can reach the Actions cache.
@@ -1475,7 +1475,7 @@ jobs:
           echo "no DHI creds in secrets — anonymous pull" >&2
         fi
 
-    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f   # v3
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069   # v4.4.1
       if: needs.scope.outputs.llamacpp == 'true'
     - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124   # v3
       if: needs.scope.outputs.llamacpp == 'true'

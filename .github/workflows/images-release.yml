@@ -221,7 +221,7 @@ jobs:
         run: scripts/ci-free-disk.sh
       - name: Set up buildx   # docker/setup-buildx-action@v3
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
         uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
@@ -315,7 +315,7 @@ jobs:
         run: scripts/ci-free-disk.sh
       - name: Set up buildx   # docker/setup-buildx-action@v3
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
         uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
@@ -647,7 +647,7 @@ jobs:
         run: scripts/ci-free-disk.sh
       - name: Set up buildx   # docker/setup-buildx-action@v3
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
         uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
