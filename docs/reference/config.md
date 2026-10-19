@@ -139,6 +139,11 @@ addon_delegation:
     tasks: true
 ```
 
+`addon_trust.<name>` (`registry`, `keys`) holds the signing keys you trust for an
+add-on the stack does not ship; it is read by the CLI (`noo addons trust-key`,
+`untrust-key`) and is an admin-only config section like `addon_delegation`.
+`noo addons set <name> --delegate tasks|off` writes `addon_delegation.<name>.tasks`.
+
 ### `services` — endpoints (gateway + workers)
 
 Topology only — credentials stay in the secret store. Each key's env

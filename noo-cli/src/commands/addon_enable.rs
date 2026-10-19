@@ -221,6 +221,9 @@ pub(crate) struct Live<'a> {
     /// cannot be verified without the licence's trust anchor, so step 0 is
     /// skipped (said so); the launcher refuses the add-on until it is pinned.
     pub force: bool,
+    /// `--lock <path|https-url>`: a third-party add-on's signed lock handed
+    /// over by the operator. Ignored for an add-on the CLI ships.
+    pub lock: Option<String>,
 }
 
 fn sops_path() -> PathBuf {
@@ -235,6 +238,10 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
     }
     match r {
         R::NoEntitlement(_) => "noo security entitlement install <token>".into(),
+        R::Untrusted(_) | R::Lock(crate::addon_lock::AddonLockError::BadSignature(_)) if crate::addons::resolve::third_party(addon) => {
+            format!("noo addons trust-key {addon} <pubkey> --registry <root>")
+        }
+        R::Supplied(_) => format!("noo addons enable {addon} --lock <path|https-url>"),
         R::Store(_) => "noo security secrets audit".into(),
         R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),
         R::Downgrade { .. } => format!("noo addons upgrade {addon} --allow-downgrade"),
@@ -259,7 +266,8 @@ impl EnableOps for Live<'_> {
     }
     fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
         use crate::addons::{self, resolve::Refusal as R};
-        if crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
+        let third_party = crate::addons::resolve::third_party(addon);
+        if !third_party && crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
             return Ok(PinStep::NotLicensed);
         }
         let root = crate::envfile::repo_root();
@@ -269,10 +277,17 @@ impl EnableOps for Live<'_> {
             ));
         };
         let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
-        let client = addons::installed_client().map_err(|e| Refusal {
-            why: format!("{e}. Nothing was changed"),
-            fix: "noo security secrets audit".into(),
-        })?;
+        // A third-party registry is the OPERATOR's choice, not the vendor's: it
+        // gets no credential (the vendor token is never sent to it) and no
+        // entitlement proxy. Anonymous pulls only.
+        let client = if third_party {
+            addons::lock_fetch::Client::new(None)
+        } else {
+            addons::installed_client().map_err(|e| Refusal {
+                why: format!("{e}. Nothing was changed"),
+                fix: "noo security secrets audit".into(),
+            })?
+        };
         let ctx = addons::Ctx {
             root: &root,
             tag: &tag,
@@ -283,7 +298,20 @@ impl EnableOps for Live<'_> {
         if !self.g.json {
             crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));
         }
-        let prepared = match addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker::new(&root)) {
+        let outcome = if third_party {
+            let supplied = match self.lock.as_deref().map(addons::trust::fetch_supplied).transpose() {
+                Ok(s) => s,
+                Err(e) => {
+                    let r = R::Supplied(e);
+                    return Err(Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) });
+                }
+            };
+            addons::resolve::installed_anchor(addon)
+                .and_then(|a| addons::prepare_from(&ctx, addon, &a, supplied, &mut addons::resolve::LiveDocker::new(&root)))
+        } else {
+            addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker::new(&root))
+        };
+        let prepared = match outcome {
             Ok(p) => p,
             Err(r @ (R::NoEntitlement(_) | R::NoAnchor)) if self.force => {
                 return Ok(PinStep::Skipped(format!(

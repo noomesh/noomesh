@@ -333,9 +333,12 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
-| `noo addons enable` | `<name> [--force]` | Pin a licensed add-on's signed lock, mint its credentials and key, then declare it ON |
+| `noo addons enable` | `<name> [--force] [--lock <path\|https-url>]` | Pin an add-on's signed lock, mint its credentials and key, then declare it ON |
+| `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>]` | Trust a signing key for a third-party add-on's lock |
+| `noo addons untrust-key` | `<name> <pubkey>` | Stop trusting a signing key for a third-party add-on |
+| `noo addons set` | `<name> --delegate tasks\|off` | Let an add-on act on a person's tasks (needs its manifest to declare it too) |
 | `noo addons disable` | `<name>` | Declare an add-on OFF in noomesh.yaml; restart applies it |
-| `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade]` | Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin |
+| `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade] [--lock <path\|https-url>]` | Re-resolve add-ons' signed locks for this stack, pull by digest and re-pin |
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
 | `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 
