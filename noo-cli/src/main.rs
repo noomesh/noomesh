@@ -260,6 +260,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "class", "list"], commands::cluster_class_list),
     (&["cluster", "class", "set"], commands::cluster_class_set),
     (&["cluster", "class", "unset"], commands::cluster_class_unset),
+    (&["cluster", "prefer"], commands::cluster_prefer),
     (&["cluster", "embedding-space", "list"], commands::cluster_embedding_space_list),
     (&["cluster", "embedding-space", "set"], commands::cluster_embedding_space_set),
     (&["cluster", "embedding-space", "unset"], commands::cluster_embedding_space_unset),

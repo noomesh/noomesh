@@ -29,6 +29,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "class", "list"], "", "Show the model classes consumers may send as `model`, with candidate placement and health"),
         (&["cluster", "class", "set"], "<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]", "Declare a model class: failover order, or --pool to share the load; --degraded ones last"),
         (&["cluster", "class", "unset"], "<class>", "Forget a declared model class and its aliases; the derived class of its model takes over"),
+        (&["cluster", "prefer"], "[<purpose> <model|class> | <purpose> --clear]", "Show or set which model a stack purpose (knowledge, graph) tries first"),
         (&["cluster", "embedding-space", "list"], "", "Show each embedding space, its model and the nodes serving it"),
         (&["cluster", "embedding-space", "set"], "<space> <model> [--dims <n>]", "Declare an embedding space: a purpose bound to one embedding model"),
         (&["cluster", "embedding-space", "unset"], "<space>", "Forget an embedding space; the default (knowledge) cannot be removed"),
