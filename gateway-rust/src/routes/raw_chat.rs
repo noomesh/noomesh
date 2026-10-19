@@ -265,15 +265,17 @@ impl RetryGuard {
 
 // ── resolution ───────────────────────────────────────────────────────────
 
-/// The class a hint names and its routable candidates in order, narrowed to
-/// `node` when the caller pinned one (`node` body field / `X-Noo-Node`).
+/// The class a hint names and its routable candidates in order: the pinned
+/// `node`'s first when the caller named one (`node` body field /
+/// `X-Noo-Node`), then the mesh — or that node alone when `strict`
+/// (`node_strict` / `X-Noo-Node-Strict`), see `classes::select_with`.
 ///
 /// With no class table at all (a fleet whose nodes report nothing — the
 /// one-box standalone whose only backend is the `ollama-embed` container,
 /// or a gateway whose KV is empty), the legacy resolver's static
 /// `OLLAMA_URL` last resort is wrapped as the single candidate of
 /// `chat-default`, so a standalone install keeps answering.
-pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Option<&str>) -> Result<(String, Vec<Candidate>), RawChatError> {
+pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Option<&str>, strict: bool) -> Result<(String, Vec<Candidate>), RawChatError> {
     let table = classes::load_table(state)
         .await
         .map_err(|e| RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("class table unavailable: {e}")))?;
@@ -299,8 +301,8 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Opti
         );
         return Ok((classes::CHAT_DEFAULT.to_string(), vec![cand]));
     }
-    let sel = classes::select(&table, hint, node, &|_| false).map_err(refusal_error)?;
-    log_selection(&sel, node);
+    let sel = classes::select(&table, hint, node, strict, &|_| false).map_err(refusal_error)?;
+    log_selection(&sel, node, strict);
     Ok((sel.class, sel.candidates))
 }
 
@@ -325,12 +327,12 @@ pub fn refusal_error(r: classes::Refusal) -> RawChatError {
 
 /// One line per request saying where it can go and why, and which nodes
 /// were left out or demoted (offline, thermal, stalled, quarantined).
-fn log_selection(sel: &classes::Selection, node: Option<&str>) {
+fn log_selection(sel: &classes::Selection, node: Option<&str>, strict: bool) {
     let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}={} [{}]", c.node_id, c.backend, c.model, c.rank)).collect();
     if sel.last_resort {
         tracing::warn!(class = %sel.label, order = ?order, "raw_chat_only_excluded_candidates_left");
     }
-    tracing::info!(class = %sel.label, node_pin = ?node, order = ?order, skipped = ?sel.skipped, "raw_chat_candidates");
+    tracing::info!(class = %sel.label, node_pin = ?node, node_strict = strict, order = ?order, skipped = ?sel.skipped, "raw_chat_candidates");
 }
 
 // ── the loop ─────────────────────────────────────────────────────────────
@@ -629,24 +631,27 @@ where
 /// candidate's concrete model; `stream_options.include_usage` is set on a
 /// streaming request so vLLM emits the usage frame.
 ///
-/// `node_header` is the `X-Noo-Node` header; a `node` field in the body
-/// does the same (the header wins when both are sent). Either one narrows
-/// the request to that node: 422 when the node is unknown or serves no
-/// chat, 409 when it serves chat but not the named model. The field is removed before
-/// the body is forwarded.
+/// `pin` holds the `X-Noo-Node` / `X-Noo-Node-Strict` headers; `node` and
+/// `node_strict` fields in the body do the same (a header wins). A node is
+/// a preference: it is tried first, then the mesh, and the answer's
+/// `fallback` says when another node answered. Strict keeps the request on
+/// that node: 422 when it serves no chat, 409 when it serves chat but not
+/// the named model, and never another node. A name that is no node of this
+/// mesh is a 422 either way. Both fields are removed before the body is
+/// forwarded.
 pub async fn chat_completions(
     state: &AppState,
     body: &mut Value,
     source: &'static str,
     actor: UsageActor,
-    node_header: Option<&str>,
+    pin: &PinHeaders,
 ) -> Result<Outcome, RawChatError> {
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
-    let node = node_pin(body, node_header)?;
+    let pin = node_pin(body, pin)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
-    let (class, cands) = resolve_candidates(state, hint.as_deref(), node.as_deref()).await?;
+    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict).await?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -660,24 +665,65 @@ pub async fn chat_completions(
     .await
 }
 
-/// The header naming a node to pin a chat request to.
+/// The header naming the node a chat request prefers.
 pub const HEADER_NODE: &str = "x-noo-node";
+/// The header that makes that node the ONLY one (`1`/`true`/`yes`/`on`).
+pub const HEADER_NODE_STRICT: &str = "x-noo-node-strict";
+
+/// The two pin headers as sent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PinHeaders {
+    pub node: Option<String>,
+    /// `Some` when `X-Noo-Node-Strict` was sent.
+    pub strict: Option<bool>,
+}
+
+/// What a request pins once headers and body are read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodePin {
+    pub node: Option<String>,
+    pub strict: bool,
+}
 
 /// The `X-Noo-Node` header's value, if sent and non-blank.
 pub fn node_header(headers: &axum::http::HeaderMap) -> Option<String> {
     headers.get(HEADER_NODE).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
 }
 
-/// The node a request pins: the header, else the body's `node` (a string),
-/// which is taken out of the body either way — a backend must not see it.
-pub fn node_pin(body: &mut Value, header: Option<&str>) -> Result<Option<String>, RawChatError> {
-    let field = body.as_object_mut().and_then(|o| o.remove("node"));
+/// Both pin headers. An `X-Noo-Node-Strict` value that is not a yes/no
+/// word reads as yes: a caller who sent the header meant something by it,
+/// and the safe reading of a locality request is the strict one.
+pub fn pin_headers(headers: &axum::http::HeaderMap) -> PinHeaders {
+    let strict = headers.get(HEADER_NODE_STRICT).and_then(|v| v.to_str().ok()).map(|v| {
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    });
+    PinHeaders { node: node_header(headers), strict }
+}
+
+/// The node a request prefers (the header, else the body's `node`) and
+/// whether it is strict (the header, else the body's `node_strict`). Both
+/// fields are taken out of the body either way — a backend must not see
+/// them.
+pub fn node_pin(body: &mut Value, headers: &PinHeaders) -> Result<NodePin, RawChatError> {
+    let obj = body.as_object_mut();
+    let (field, strict_field) = match obj {
+        Some(o) => (o.remove("node"), o.remove("node_strict")),
+        None => (None, None),
+    };
     let from_body = match field {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
         Some(_) => return Err(RawChatError::bad_request("'node' must be a string naming a node")),
     };
-    Ok(header.map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).or(from_body))
+    let strict_body = match strict_field {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(_) => return Err(RawChatError::bad_request("'node_strict' must be true or false")),
+    };
+    Ok(NodePin {
+        node: headers.node.as_deref().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).or(from_body),
+        strict: headers.strict.or(strict_body).unwrap_or(false),
+    })
 }
 
 // ── rendering ────────────────────────────────────────────────────────────
@@ -747,18 +793,32 @@ mod node_pin_tests {
 
     #[test]
     fn the_node_pin_comes_from_the_header_or_the_body_and_never_reaches_the_backend() {
+        let none = PinHeaders::default();
+        let header = |n: &str| PinHeaders { node: Some(n.into()), strict: None };
         let mut body = json!({"model": "default", "node": "mcmini", "messages": []});
-        assert_eq!(node_pin(&mut body, None).unwrap().as_deref(), Some("mcmini"));
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: false }, "a preference by default");
         assert!(body.get("node").is_none(), "stripped before forwarding");
         let mut body = json!({"node": "mcmini"});
-        assert_eq!(node_pin(&mut body, Some("pop-os")).unwrap().as_deref(), Some("pop-os"), "the header wins");
+        assert_eq!(node_pin(&mut body, &header("pop-os")).unwrap().node.as_deref(), Some("pop-os"), "the header wins");
         let mut body = json!({"node": "  "});
-        assert_eq!(node_pin(&mut body, None).unwrap(), None);
+        assert_eq!(node_pin(&mut body, &none).unwrap().node, None);
         let mut body = json!({"node": 7});
-        assert_eq!(node_pin(&mut body, None).unwrap_err().status, StatusCode::BAD_REQUEST);
+        assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
+        // Strict: the body field, the header (which wins), both stripped.
+        let mut body = json!({"node": "mcmini", "node_strict": true});
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: true });
+        assert!(body.get("node_strict").is_none());
+        let mut body = json!({"node": "mcmini", "node_strict": true});
+        assert!(!node_pin(&mut body, &PinHeaders { node: None, strict: Some(false) }).unwrap().strict);
+        let mut body = json!({"node_strict": "yes"});
+        assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
         let mut h = axum::http::HeaderMap::new();
         h.insert(HEADER_NODE, HeaderValue::from_static(" mcmini "));
-        assert_eq!(node_header(&h).as_deref(), Some("mcmini"));
+        assert_eq!(pin_headers(&h), PinHeaders { node: Some("mcmini".into()), strict: None });
+        for (v, strict) in [("1", true), ("true", true), ("YES", true), ("on", true), ("anything", true), ("0", false), ("false", false), ("no", false), ("off", false)] {
+            h.insert(HEADER_NODE_STRICT, HeaderValue::from_str(v).unwrap());
+            assert_eq!(pin_headers(&h).strict, Some(strict), "{v}");
+        }
     }
 
     #[test]

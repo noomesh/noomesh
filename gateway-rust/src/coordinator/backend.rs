@@ -591,7 +591,7 @@ async fn unpinned_from_table(state: &AppState, exclude_urls: &[String]) -> Optio
 /// `url` (node-agent address, or the controller-local docker URL) — so a
 /// failed node's every backend is out, as the KV scan always did.
 pub(crate) fn pick_unpinned(table: &super::classes::ClassTable, exclude_urls: &[String]) -> Option<super::classes::Selection> {
-    super::classes::select(table, None, None, &|c| exclude_urls.iter().any(|u| u == &c.url)).ok()
+    super::classes::select(table, None, None, false, &|c| exclude_urls.iter().any(|u| u == &c.url)).ok()
 }
 
 /// Resolve a backend using the mesh discovery chain.
@@ -1696,7 +1696,7 @@ mod unpinned_tests {
             node("mcmini", "192.0.2.212", "ollama", "gemma4:12b", true, 0.4),
         ];
         let t = build_table(&nodes, &[], &Declarations::default());
-        let raw = select(&t, None, None, &|_| false).expect("raw chat selection");
+        let raw = select(&t, None, None, false, &|_| false).expect("raw chat selection");
         let task = pick_unpinned(&t, &[]).expect("heartbeat selection");
         assert_eq!(raw.candidates[0].node_id, "mcmini");
         assert_eq!(task.candidates[0].node_id, raw.candidates[0].node_id);

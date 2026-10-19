@@ -203,11 +203,15 @@ prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 candidates in order (`!` when only CPU candidates or one node remain, `x`
 when none).
 
-To send one request to one node, name it: a `node` field in the body or an
+To prefer one node for a request, name it: a `node` field in the body or an
 `X-Noo-Node` header on `/v1/chat/completions`,
-`/api/external/chat/completions` or `/api/inference`. An unknown node, or
-one serving no chat, is refused with 422; a node that does not serve the
-model you named, with 409. The `legacy lanes` row of
+`/api/external/chat/completions` or `/api/inference` (`noo inference run
+-n`). It is tried first; when it cannot answer, the pool does and the answer
+says `fallback: true`. A name that is no node of this mesh is refused with
+422. Add `node_strict: true` / `X-Noo-Node-Strict: 1` (`--strict-node`) to
+keep the request on that node alone: a node serving no chat is then refused
+with 422, one that does not serve the model you named with 409, and nothing
+ever goes elsewhere. The `legacy lanes` row of
 `noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
 node by name, from the gateway's counters and from each agent's heartbeat)
 still signing the old, replayable cluster token instead of the request-bound
@@ -342,7 +346,11 @@ noo jobs status <job-id> --wait
 noo jobs list --watch
 ```
 
-`inference run` posts to `/api/inference` and prints the response;
+`inference run` posts to `/api/inference` and prints the response.
+`-n <node>` names the node to try first: when it cannot answer, the pool
+does and the CLI says so (`! answered by <model> — <node> could not:
+…`). `--strict-node` keeps the prompt on that node alone and fails
+when it cannot answer — for locality or privacy, or a liveness check;
 `inference agent` runs the coordinator loop with tools (`--no-tools`
 disables them). A job that ends in any state other than `completed` exits
 1. `jobs scheduler` shows dispatch counters; `jobs pause`/`resume` stop and
@@ -635,7 +643,7 @@ other direction: the other stack never calls noomesh.
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-b <backend>] [-n <node>] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one direct model inference through the gateway and print the response |
+| `noo inference run` | `<prompt> [-m <model>] [-b <backend>] [-n <node> [--strict-node]] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one direct model inference through the gateway and print the response |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management
