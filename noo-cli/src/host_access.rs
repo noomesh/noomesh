@@ -143,7 +143,7 @@ pub(crate) fn login_with_ticket(g: &Globals, account: &str, purpose: &str) -> Re
 /// that leaves yesterday's bearer working is not a reset: it revokes every
 /// refresh token and writes the durable "not before" floor the gateway reads
 /// (`gateway-rust/src/session_floor.rs`, table `noo_session_floors`, migration
-/// 095). The floor is `now + 1` like an operator account change, and lives
+/// 095). The floor is in MILLISECONDS (`floor_ms`), `now + 1 ms` like an operator account change, and lives
 /// `floor_ttl_secs` (one access-token lifetime plus margin). A running gateway
 /// adopts it within its Postgres re-read interval (5 s); one that is down
 /// loads it at boot. This path deliberately does not call the gateway: the
@@ -168,10 +168,10 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str, floor_ttl_secs: 
          role = 'admin';\n\
          UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = {u} AND revoked_at IS NULL;\n\
          DO $floor$ BEGIN IF to_regclass('noo_session_floors') IS NOT NULL THEN \
-         INSERT INTO noo_session_floors (account, floor, expires_at) \
-         VALUES ({u}, extract(epoch FROM now())::bigint + 1, now() + interval '{floor_ttl_secs} seconds') \
+         INSERT INTO noo_session_floors (account, floor_ms, expires_at) \
+         VALUES ({u}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 1, now() + interval '{floor_ttl_secs} seconds') \
          ON CONFLICT (account) DO UPDATE SET \
-         floor = GREATEST(noo_session_floors.floor, EXCLUDED.floor), \
+         floor_ms = GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms), \
          expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at); \
          END IF; END $floor$;\n\
          COMMIT;\n"
@@ -246,9 +246,9 @@ mod tests {
         for needle in [
             "UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = 'admin'",
             "IF to_regclass('noo_session_floors') IS NOT NULL THEN",
-            "INSERT INTO noo_session_floors (account, floor, expires_at)",
-            "VALUES ('admin', extract(epoch FROM now())::bigint + 1, now() + interval '1200 seconds')",
-            "GREATEST(noo_session_floors.floor, EXCLUDED.floor)",
+            "INSERT INTO noo_session_floors (account, floor_ms, expires_at)",
+            "VALUES ('admin', (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 1, now() + interval '1200 seconds')",
+            "GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms)",
         ] {
             let at = sql.find(needle).unwrap_or_else(|| panic!("missing {needle}: {sql}"));
             assert!(begin < at && at < commit, "{needle} must sit inside the transaction");
@@ -266,11 +266,11 @@ mod tests {
     fn the_floor_table_matches_the_gateways_migration() {
         let mig = include_str!("../../gateway-rust/src/mesh_migrate.rs");
         let m = mig.split("revision: SESSION_FLOORS_REVISION").nth(1).expect("migration 095");
-        for col in ["noo_session_floors", "account", "floor", "expires_at"] {
+        for col in ["noo_session_floors", "account", "floor_ms", "expires_at"] {
             assert!(m.contains(col), "migration 095 lacks {col}");
         }
         let gw = include_str!("../../gateway-rust/src/session_floor.rs");
-        assert!(gw.contains("FROM noo_session_floors WHERE account = $1 AND expires_at > now()"));
+        assert!(gw.contains("floor_ms FROM noo_session_floors WHERE account = $1 AND expires_at > now()"));
         assert!(gw.contains("fn floor_ttl_secs() -> i64 {\n    crate::auth_refresh::default_access_minutes().max(15) * 60 + 300"));
     }
 

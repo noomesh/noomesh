@@ -125,11 +125,12 @@ or deleted account, or a token issued before the account's session floor).
 `service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
 end the account's sessions immediately: every refresh token is revoked, open
 `/ws/*` sockets close (4401), the service-key cache is dropped, and a per-account
-"not before" time (Redis key `noo:auth:notbefore:<account>` plus the durable
-Postgres row in `noo_session_floors`, both kept for one access-token lifetime;
+"not before" time (Redis key `noo:auth:notbefore_ms:<account>`, unix milliseconds, plus the
+durable Postgres row in `noo_session_floors.floor_ms`, both kept for one access-token lifetime;
 the gateway loads the rows at boot) makes `require_any_auth` — and so the WebSocket handshake
 — refuse any access token issued before it, so a reconnect with the old JWT
-fails. The floor is read from Redis, then the gateway's memory, then Postgres
+fails. A person's access token carries `iat_ms` (mint time in ms) beside `iat`;
+a token without it counts from the start of its `iat` second. The floor is read from Redis, then the gateway's memory, then Postgres
 (the highest wins), so a Redis outage or a restart does not forget one; if
 neither store can be read the gateway applies the floors it holds in memory
 (never fewer), logs a warning, and does not refuse every request.

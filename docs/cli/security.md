@@ -39,8 +39,9 @@ installed from. There is no unverified-TLS fallback: an unusable anchor, or a
 non-loopback `http://` gateway, exits 3 (`tls_untrusted`) instead. `logout`
 revokes the refresh token server-side, deletes the file, and ends the
 access token it was holding: the gateway keeps a per-account "not before"
-time, so a bearer issued before the logout is refused at once (a
-re-login gets a fresh one) and the account's open dashboard sockets close.
+time (kept in milliseconds, so a token minted in the same second as the
+logout is ordered against it correctly: one minted before is refused, a
+re-login's token minted after is accepted) and the account's open dashboard sockets close.
 The floor is kept for one access-token lifetime in three places, read in
 this order: Redis (shared by every gateway instance), the gateway's memory,
 and Postgres (`noo_session_floors`, the durable copy, loaded at boot). A
@@ -62,6 +63,7 @@ account's sessions: every refresh token is revoked and the durable
 "not before" floor (`noo_session_floors`) is raised, so a running gateway
 refuses the old access tokens within about five seconds (its Postgres
 re-read interval) and a stopped one honours the floor at its next start. The
+floor is stored in milliseconds (`floor_ms`). The
 reset does not call the gateway, deliberately: it must work when the gateway
 cannot be reached or the password is lost.
 
