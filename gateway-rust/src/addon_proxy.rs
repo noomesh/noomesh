@@ -237,6 +237,14 @@ pub struct RouteSpec {
     /// it a `POST` is `operator` or `admin` (see "Who may call a route").
     #[serde(default)]
     pub owner_scoped: bool,
+    /// This public route may be sent the add-on delegated task token
+    /// (noomesh-internal i143), so a manifest can keep the token off routes
+    /// that never need it (a GPU media route). Default false. Valid only when
+    /// the manifest declares top-level `delegate: "tasks"`, only on a public
+    /// route, and never on the `task_events` path. Declaring it grants
+    /// nothing by itself: see `AddonEntry::route_receives_delegation`.
+    #[serde(default)]
+    pub receives_delegation: bool,
     /// Free text for whoever reads the manifest. Ignored by the code.
     #[serde(default)]
     pub note: Option<String>,
@@ -559,6 +567,31 @@ fn check_delegation(m: &AddonManifest) -> Result<(), String> {
             ));
         }
     }
+    for r in m.routes.iter().filter(|r| r.receives_delegation) {
+        if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
+            return Err(format!(
+                "route {:?}: receives_delegation is valid only when the manifest declares \
+                 \"delegate\": \"{DELEGATE_TASKS}\" — add the delegate key or remove receives_delegation",
+                r.name
+            ));
+        }
+        if r.internal {
+            return Err(format!(
+                "route {:?}: receives_delegation applies to a public route; an internal route is \
+                 called by the gateway, which sends no delegated token",
+                r.name
+            ));
+        }
+        if let Some(ev) = m.task_events.as_ref() {
+            if std::iter::once(&r.path).chain(r.aliases.iter()).any(|p| *p == ev.path) {
+                return Err(format!(
+                    "route {:?}: receives_delegation is not allowed on the task_events path {:?} \
+                     (the gateway calls it, and it carries no delegated token)",
+                    r.name, ev.path
+                ));
+            }
+        }
+    }
     let Some(ev) = m.task_events.as_ref() else { return Ok(()) };
     if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
         return Err(format!(
@@ -775,7 +808,7 @@ fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
     !matching_routes(manifests, "GET", path).is_empty()
 }
 
-fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
+pub(crate) fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
     manifests
         .iter()
         .flat_map(|m| m.routes.iter())
@@ -1534,6 +1567,36 @@ pub(crate) mod tests {
             .expect("an internal route's path is not reachable through the front door");
         // A path no public route covers.
         check(delegating(|v| v["task_events"]["path"] = json!("/api/sample/items/abc/extra"))).expect("no route covers it");
+    }
+
+    #[test]
+    fn receives_delegation_is_valid_only_with_delegate_tasks_on_a_public_route() {
+        // Accepted: delegating manifest, public route.
+        check(delegating(|v| v["routes"][0]["receives_delegation"] = json!(true))).expect("accepted");
+        // Default false and explicit false are always fine, delegate or not.
+        let mut plain = sample_json();
+        plain["routes"][0]["receives_delegation"] = json!(false);
+        check(plain).expect("false needs no delegate");
+        // True without the manifest-level declaration is refused.
+        let mut v = sample_json();
+        v["routes"][0]["receives_delegation"] = json!(true);
+        let e = check(v).expect_err("refused");
+        assert!(e.contains("receives_delegation") && e.contains("delegate"), "{e}");
+        // On an internal route.
+        let e = check(delegating(|v| {
+            v["routes"][5]["receives_delegation"] = json!(true); // meta_loop_dispatch, internal
+        }))
+        .expect_err("refused");
+        assert!(e.contains("public route"), "{e}");
+        // On the task_events path (via a route that shares it).
+        let e = check(delegating(|v| {
+            v["task_events"]["path"] = json!("/api/sample/dispatch");
+            v["routes"][5]["receives_delegation"] = json!(true);
+        }))
+        .expect_err("refused");
+        assert!(e.contains("receives_delegation"), "{e}");
+        // Not a bool.
+        assert!(check(delegating(|v| v["routes"][0]["receives_delegation"] = json!("yes"))).is_err());
     }
 
     // ── add-on names beyond the compiled table ───────────────────────────

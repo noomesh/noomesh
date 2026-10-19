@@ -228,6 +228,16 @@ to act for a present person through that person's own tasks:
 | `delegate` | `"tasks"` is the only value. Declares that the add-on asks to create and steer a present person's tasks. An unknown value refuses the manifest. |
 | `task_events` | `{"method": "POST", "path": "/..."}`: where the gateway POSTs task events for this add-on. Valid only with `delegate: "tasks"`; the method must be `POST`; the path is plain (no `{param}`) and must not equal or match **any public route** of the same manifest (aliases and `{param}` routes included), so it is never reachable through the front door. An `internal` route's path is allowed. |
 
+A route-level boolean keeps the delegated token off routes that never need it
+(a GPU media route, say): `"receives_delegation": true` on a **public** route
+means the gateway may send that route the token. It defaults to false, is valid
+only when the manifest declares `delegate: "tasks"` (otherwise the manifest is
+refused), is refused on an `internal` route and on a route that shares the
+`task_events` path. The registry answers
+`route_receives_delegation(method, path)`, matching the way the proxy picks a
+route (aliases and `{param}` routes included; when several routes match, all must
+opt in). The token is minted only when that is true **and** `operator_enabled()`.
+
 Declaring `delegate` grants nothing. The operator must also enable it for the
 add-on, in `noomesh.yaml`:
 

@@ -281,6 +281,18 @@ impl AddonEntry {
         self.delegates_tasks() && self.delegate_enabled
     }
 
+    /// Would a request `method` `path` (a gateway path, as the proxy matches
+    /// it: `{param}` segments match any non-empty segment, aliases count) be
+    /// sent the delegated task token? True only when some public route matches
+    /// and EVERY matching route declares `receives_delegation` (the stricter
+    /// reading, like the tier gate). This is the route half only: the token is
+    /// minted when this AND [`AddonEntry::operator_enabled`] are both true.
+    /// In-memory, no allocation beyond a small Vec.
+    pub fn route_receives_delegation(&self, method: &str, path: &str) -> bool {
+        let hits = crate::addon_proxy::matching_routes(std::slice::from_ref(&self.manifest), method, path);
+        !hits.is_empty() && hits.iter().all(|r| r.receives_delegation)
+    }
+
     /// The manifest's `task_events` route, exactly as declared. Present only
     /// when the manifest also declared `delegate: "tasks"` (validation refuses
     /// it otherwise). It does NOT imply the operator enabled delegation:
@@ -778,6 +790,38 @@ mod tests {
         let snap = run(&dir, &[("pai-voice", true)], &[], &Reported::Dev, &|_| false);
         let e = snap.get("pai-voice").unwrap();
         assert!(e.delegates_tasks() && !e.operator_enabled());
+    }
+
+    #[test]
+    fn route_receives_delegation_truth_table() {
+        let dir = scratch("route-deleg");
+        let mut v = third_party("pai-voice");
+        v["delegate"] = json!("tasks");
+        v["routes"][0]["receives_delegation"] = json!(true); // GET /api/sample/status (+ alias)
+        v["routes"][2]["receives_delegation"] = json!(true); // GET /api/sample/items/{item_id}
+        plant(&dir, "pai-voice", &v);
+        let snap = run(&dir, &[("pai-voice", true)], &[], &Reported::Dev, &|_| false);
+        let e = snap.get("pai-voice").unwrap();
+        assert!(e.route_receives_delegation("GET", "/api/sample/status"));
+        assert!(e.route_receives_delegation("GET", "/api/sample-alt/status"), "an alias is the same route");
+        assert!(e.route_receives_delegation("GET", "/api/sample/items/abc"), "a {{param}} route matches");
+        assert!(!e.route_receives_delegation("GET", "/api/sample/items"), "declared without the flag: default false");
+        assert!(!e.route_receives_delegation("POST", "/api/sample/run"));
+        assert!(!e.route_receives_delegation("POST", "/api/sample/status"), "method must match");
+        assert!(!e.route_receives_delegation("GET", "/api/unknown"), "no route, no token");
+        assert!(!e.route_receives_delegation("GET", "/api/sample/dispatch"), "internal routes never match");
+        // The accessor is the route half only; the operator half is separate.
+        assert!(!e.operator_enabled());
+        // A static route beside a {param} one: every match must opt in.
+        let mut w = third_party("pai-voice");
+        w["delegate"] = json!("tasks");
+        w["routes"][1]["receives_delegation"] = json!(true); // GET /api/sample/items (static)
+        w["routes"][2]["receives_delegation"] = json!(false);
+        plant(&dir, "pai-voice", &w);
+        let snap = run(&dir, &[("pai-voice", true)], &[], &Reported::Dev, &|_| false);
+        let e = snap.get("pai-voice").unwrap();
+        assert!(e.route_receives_delegation("GET", "/api/sample/items"));
+        assert!(!e.route_receives_delegation("GET", "/api/sample/items/abc"));
     }
 
     #[test]
