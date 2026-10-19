@@ -54,6 +54,9 @@ def test_dockerfile_installs_from_the_hash_lock() -> None:
             assert "--no-deps" in part and re.search(r"-e \.(\s|$)", part), (
                 f"unlocked install in deps-core resolves from pyproject ranges: {part.strip()}"
             )
+            assert "--no-build-isolation" in part, (
+                f"the project's build backend resolves from PyPI unhashed (no --no-build-isolation): {part.strip()}"
+            )
             assert "[" not in part, f"extras in the unlocked project install: {part.strip()}"
 
 
@@ -205,3 +208,64 @@ def test_dependabot_watches_the_ml_lock() -> None:
     doc = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())
     dirs = {u["directory"] for u in doc["updates"] if u["package-ecosystem"] == "pip"}
     assert "/docker/ml-lock" in dirs and "/docker/core-lock" in dirs
+
+
+# ── build backends are hashed, in every lock whose image builds a local package ──
+
+PYPROJECT = ROOT / "pyproject.toml"
+BACKEND_IN = ROOT / "docker" / "core-lock" / "build-backends.in"
+
+
+def _build_system_requires() -> list[str]:
+    text = PYPROJECT.read_text()
+    m = re.search(r"^\[build-system\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    assert m, "pyproject.toml has no [build-system] table"
+    r = re.search(r"^requires\s*=\s*\[(.*?)\]", m.group(1), re.M | re.S)
+    assert r, "[build-system] has no requires"
+    return re.findall(r"[\"']([^\"']+)[\"']", r.group(1))
+
+
+def _lock_block(path: Path, name: str) -> str:
+    """The pin line plus its hashes for `name`, or ''."""
+    text = path.read_text().replace("\\\n", " ")
+    for l in text.splitlines():
+        if re.match(rf"^{re.escape(name)}==", l, re.I):
+            return l
+    return ""
+
+
+def test_the_core_lock_pins_and_hashes_the_projects_build_backend() -> None:
+    """deps-core builds the project --no-build-isolation, so pyproject's
+    [build-system] backend must be installed from the hashed lock. Without it
+    the build resolved setuptools from PyPI with no hash."""
+    requires = _build_system_requires()
+    assert requires, "pyproject.toml lost [build-system].requires"
+    for req in requires:
+        name = re.split(r"[<>=!~\[ ;]", req, 1)[0].lower().replace("_", "-")
+        line = _lock_block(LOCK, name)
+        assert line, f"build backend {name} (pyproject [build-system]) is not pinned in core-lock"
+        assert re.search(r"--hash=sha256:[0-9a-f]{64}", line), f"build backend {name} pinned without a hash"
+        assert name in BACKEND_IN.read_text().lower(), f"{name} missing from core-lock/build-backends.in (regen input)"
+
+
+def test_no_dockerfile_builds_a_local_package_with_an_isolated_backend() -> None:
+    """Every image that installs a local package (an editable `.`, a /tmp
+    context, a path) must pass --no-build-isolation; the shipped Dockerfiles
+    are the two layered ones. (The root Dockerfile is the deliberate unlocked
+    resolution gate for CI and is exempt.)"""
+    for df in (DOCKERFILE, DEPS_BASE):
+        text = df.read_text().replace("\\\n", " ")
+        for l in text.splitlines():
+            if not l.startswith("RUN ") or "pip install" not in l:
+                continue
+            for part in re.split(r"&&|;", l):
+                if "pip install" not in part or "-r /tmp/requirements" in part:
+                    continue
+                assert "--no-build-isolation" in part, f"{df.name}: isolated build resolves its backend unhashed: {part.strip()}"
+
+
+def test_the_backend_is_hashed_in_the_ml_lock_at_the_core_version() -> None:
+    ml, core = _pins(ML_LOCK), _pins(LOCK)
+    for req in _build_system_requires():
+        name = re.split(r"[<>=!~\[ ;]", req, 1)[0].lower().replace("_", "-")
+        assert name in ml and ml[name] == core.get(name), f"{name}: ml {ml.get(name)} vs core {core.get(name)}"
