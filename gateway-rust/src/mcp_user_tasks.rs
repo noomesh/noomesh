@@ -399,6 +399,7 @@ mod tests {
             tokens_spent: 0,
             budget_state: None,
             remaining: None,
+            created_via: None,
         }
     }
 

@@ -1545,6 +1545,7 @@ pub(crate) mod task_tree {
             parent,
             role: role.as_deref(),
             token_budget,
+            created_via: None,
         };
         let child = match crate::tasks::create_task(&state.db, new).await {
             Ok(c) => c,

@@ -114,6 +114,10 @@ pub struct Task {
     /// Computed on read: tokens left under `token_budget`; `None` = no cap.
     #[serde(default)]
     pub remaining: Option<i64>,
+    /// Who started it on the person's behalf: `addon:<name>` for a task an
+    /// add-on created with a delegated token (i143); `None` = created directly.
+    #[serde(default)]
+    pub created_via: Option<String>,
 }
 
 impl Task {
@@ -171,6 +175,7 @@ fn row_to_task(r: &sqlx::postgres::PgRow) -> Task {
         token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
         tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
         budget_state: r.try_get::<Option<String>, _>("budget_state").ok().flatten(),
+        created_via: r.try_get::<Option<String>, _>("created_via").ok().flatten(),
         remaining: crate::task_budget::remaining_task(crate::task_budget::TaskSpend {
             token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
             tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
@@ -218,7 +223,7 @@ pub fn is_stale(state: &str, last: Option<chrono::DateTime<chrono::Utc>>, loops_
 
 const SELECT: &str = "SELECT t.id, t.objective, u.username AS owner, t.node, t.state, t.conversation_id, t.thread_id, \
     t.channel, t.model, t.loops, t.loop_budget, t.last_checkpoint, t.last_note, t.result, t.error, t.created_at, t.updated_at, \
-    t.parent_id, t.role, t.budget_default, t.token_budget, t.tokens_spent, t.budget_state \
+    t.parent_id, t.role, t.budget_default, t.token_budget, t.tokens_spent, t.budget_state, t.created_via \
     FROM noo_tasks t LEFT JOIN noo_users u ON u.user_uuid = t.owner_uuid";
 
 /// How a task is created: who for, under which parent, in which thread.
@@ -234,6 +239,8 @@ pub struct NewTask<'a> {
     pub role: Option<&'a str>,
     /// The task's token cap (i83 G); `None` = no cap.
     pub token_budget: Option<i64>,
+    /// `addon:<name>` when an add-on creates it through a delegated token.
+    pub created_via: Option<&'a str>,
 }
 
 /// The most children one task may fan out or delegate, and how deep a
@@ -268,8 +275,8 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
     sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via) \
+         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(new.objective)
@@ -283,6 +290,7 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     .bind(new.role)
     .bind(budget_default)
     .bind(new.token_budget.filter(|b| *b > 0))
+    .bind(new.created_via)
     .execute(db)
     .await?;
     get(db, &id.to_string()).await?.ok_or_else(|| anyhow!("task vanished after insert"))
@@ -379,8 +387,8 @@ pub async fn settle_parent(db: &sqlx::PgPool, child: &Task) -> Result<()> {
     Ok(())
 }
 
-pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>, token_budget: Option<i64>) -> Result<Task> {
-    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None, token_budget }).await
+pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>, token_budget: Option<i64>, created_via: Option<&str>) -> Result<Task> {
+    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None, token_budget, created_via }).await
 }
 
 pub async fn get(db: &sqlx::PgPool, id: &str) -> Result<Option<Task>> {
@@ -400,6 +408,107 @@ pub async fn list(db: &sqlx::PgPool, owner: Option<&str>, state: Option<&str>, l
     .fetch_all(db)
     .await?;
     Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// `owner`'s tasks that were created `via` (`addon:<name>`), newest first.
+/// What an add-on's delegated token lists: never another account's, never a
+/// directly created task.
+pub async fn list_via(db: &sqlx::PgPool, owner: &str, via: &str, state: Option<&str>, limit: i64) -> Result<Vec<Task>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT} WHERE u.username = $1 AND t.created_via = $2 AND ($3::text IS NULL OR t.state = $3) \
+         AND t.parent_id IS NULL ORDER BY t.created_at DESC LIMIT $4"
+    )))
+    .bind(owner)
+    .bind(via)
+    .bind(state)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Stop every unfinished task of `owner` that was created `via`: "revoke this
+/// add-on's background work". Each goes through [`stop_with`], the single stop
+/// path (it records the `revoked` event), so it is honoured at the task's next
+/// checkpoint like any stop. Returns the ids it stopped.
+pub async fn stop_via(db: &sqlx::PgPool, owner: &str, via: &str) -> Result<Vec<String>> {
+    let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM noo_tasks \
+         WHERE owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1) AND created_via = $2 \
+         AND state IN ('open','running','checkpointed')",
+    )
+    .bind(owner)
+    .bind(via)
+    .fetch_all(db)
+    .await?;
+    let mut stopped = Vec::new();
+    for id in live {
+        let id = id.to_string();
+        if stop_with(db, &id, "background_revoked").await? {
+            stopped.push(id);
+        }
+    }
+    Ok(stopped)
+}
+
+// STUB: replaced by part D (it emits `revoked {reason}`, stops, then emits the final state event).
+/// Stop a task, recording why. The single stop path.
+pub async fn stop_with(db: &sqlx::PgPool, id: &str, _reason: &str) -> Result<bool> {
+    stop(db, id).await
+}
+
+/// How long an `Idempotency-Key` is remembered.
+pub const IDEMPOTENCY_HOURS: i32 = 24;
+
+/// The task a recent create with this key made, if any. `via` is the empty
+/// string for a direct create, `addon:<name>` for a delegated one, so a key
+/// never crosses from one to the other.
+pub async fn idempotent_task(db: &sqlx::PgPool, owner: &str, via: &str, key: &str) -> Result<Option<String>> {
+    let id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT i.task_id FROM noo_task_idempotency i JOIN noo_tasks t ON t.id = i.task_id \
+         WHERE i.owner = $1 AND i.via = $2 AND i.key = $3 AND i.created_at > now() - make_interval(hours => $4)",
+    )
+    .bind(owner)
+    .bind(via)
+    .bind(key)
+    .bind(IDEMPOTENCY_HOURS)
+    .fetch_optional(db)
+    .await?;
+    Ok(id.map(|u| u.to_string()))
+}
+
+/// Record that `task_id` is the answer to `(owner, via, key)` and return the
+/// task id that now owns the key. Race-safe: of two concurrent creates with
+/// one key exactly one wins and both get its id; an expired or orphaned entry
+/// is taken over. A caller that gets back an id other than its own has lost.
+pub async fn claim_idempotency(db: &sqlx::PgPool, owner: &str, via: &str, key: &str, task_id: &str) -> Result<String> {
+    let mine = uuid::Uuid::parse_str(task_id)?;
+    let won: Option<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO noo_task_idempotency (owner, via, key, task_id) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (owner, via, key) DO UPDATE SET task_id = EXCLUDED.task_id, created_at = now() \
+         WHERE noo_task_idempotency.created_at <= now() - make_interval(hours => $5) \
+            OR NOT EXISTS (SELECT 1 FROM noo_tasks WHERE id = noo_task_idempotency.task_id) \
+         RETURNING task_id",
+    )
+    .bind(owner)
+    .bind(via)
+    .bind(key)
+    .bind(mine)
+    .bind(IDEMPOTENCY_HOURS)
+    .fetch_optional(db)
+    .await?;
+    if let Some(id) = won {
+        return Ok(id.to_string());
+    }
+    // Lost: the live entry's task is the answer.
+    idempotent_task(db, owner, via, key).await?.ok_or_else(|| anyhow!("idempotency entry vanished"))
+}
+
+/// Remove a task that lost an idempotency race before it was ever started.
+pub async fn discard_unstarted(db: &sqlx::PgPool, id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(id)?;
+    sqlx::query("DELETE FROM noo_tasks WHERE id = $1 AND state = 'open'").bind(uuid).execute(db).await?;
+    Ok(())
 }
 
 /// The running task of a conversation, for the person — what
@@ -1156,6 +1265,7 @@ mod tests {
             tokens_spent: 0,
             budget_state: None,
             remaining: None,
+            created_via: None,
         };
         let alert = stale_alert(&t, "2026-09-22T00:20:26Z");
         let text = crate::egress::system(&alert, "ref-0").into_string();
@@ -1198,7 +1308,7 @@ mod tests {
             thread_id: "thr".into(), channel: "task".into(), model: None, loops: 0, loop_budget: 5, last_checkpoint: None,
             last_note: None, result: result.map(str::to_string), error: error.map(str::to_string), created_at: String::new(),
             updated_at: String::new(), parent_id: Some("p".into()), role: Some(role.into()), budget_default: false, stale: false,
-            token_budget: None, tokens_spent: 0, budget_state: None, remaining: None,
+            token_budget: None, tokens_spent: 0, budget_state: None, remaining: None, created_via: None,
         }
     }
 
@@ -1355,6 +1465,7 @@ mod stale_alert_tests {
             tokens_spent: 0,
             budget_state: None,
             remaining: None,
+            created_via: None,
         };
         let alert = super::stale_alert(&t, "t1");
         assert!(alert.detail.contains("NODE_ID"), "it must say how to stop it recurring: {}", alert.detail);

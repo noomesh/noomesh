@@ -436,6 +436,50 @@ This is the reverse of the key your add-on presents when it calls the gateway
 same properties; they are not interchangeable, and neither is accepted where
 the other belongs.
 
+### Delegated tasks
+
+An add-on that should do background work for a person who is present declares
+`"delegate": "tasks"` in its manifest and marks the routes that need it with
+`"receives_delegation": true`. The operator must also enable delegation for the
+add-on (default off). Both are required.
+
+**What you receive.** On a request to an opted-in route, in addition to the
+headers above, the gateway sets `X-Noo-Delegation`: a short-lived token (five
+minutes) for that person, acting through your add-on (`act.sub` is
+`addon:<name>`). A client-sent `X-Noo-Delegation` is dropped, and a request
+whose own token is already delegated never receives another. Keep the token in
+memory for the request; never store it, log it, or send it to a model.
+
+**Confinement.** Present it to the gateway as a bearer on these routes only,
+and nowhere else (every other route answers 403):
+
+| Route | Use |
+|---|---|
+| `POST /api/tasks` | create a task; `Idempotency-Key` makes a retry return the same task (`idempotent_replay: true`); optional `context` (at most 32 KiB) |
+| `GET /api/tasks`, `GET /api/tasks/{id}` | list and read |
+| `POST /api/tasks/{id}/stop`, `/ask`, `/answer` | steer |
+| `POST /api/tasks/{id}/context` | `{text, revision}`: push context, picked up at the next loop |
+| `GET /api/tasks/{id}/events?after=<seq>` | pull events |
+| `POST /api/tasks/stop` | `{via: "addon:<name>"}`: revoke your own background work |
+
+`resubmit` (it spends the person's tokens) is not available: it needs the
+person directly. The token is refused when the account is disabled or its role
+is lower than the token's, and when the add-on is switched off or its
+delegation is disabled.
+
+**Isolation.** The token sees only the tasks your add-on created for that
+person (`created_via = addon:<name>`). Any other task, including another
+person's, one created directly, or another add-on's, answers 404, even when the
+person is an operator. Listing never takes the operator's all-tasks view.
+
+**Lifetime.** Authority tracks presence: each proxied request carries a fresh
+token, and five minutes after the person leaves you can start nothing new.
+Running tasks continue on noomesh; keep task ids, not tokens. Switching the
+add-on off does not stop its tasks.
+
+**Revoke.** The person (or you, with a token) calls `POST /api/tasks/stop
+{via}`; an operator runs `noo tasks stop --via addon:<name> [--user <u>]`.
+
 ### Verifying the bearer
 
 The token is a row in `noo_service_keys` under the consumer

@@ -2059,6 +2059,59 @@ CREATE TABLE IF NOT EXISTS noo_prompt_skill_proposals (
 CREATE UNIQUE INDEX IF NOT EXISTS noo_prompt_skill_proposals_one_pending
     ON noo_prompt_skill_proposals (name) WHERE status = 'pending'
 "#,
+}, Migration {
+    revision: ADDON_DELEGATION_REVISION,
+    down_revision: Some(PROMPT_SKILL_PROPOSALS_REVISION),
+    // Tasks an add-on starts for a present person (i143, the add-on delegated
+    // token). `created_via` is the provenance (`addon:<name>`; NULL = created
+    // directly) so "revoke this add-on's background work" is one query;
+    // `context_revision` is the monotonic revision of the context the add-on
+    // pushed. `noo_task_idempotency` makes a retried create return the same
+    // task (owner = the account username). `noo_task_context` holds each
+    // pushed revision until the loop that applies it. `noo_task_events` is the
+    // per-task outbox (`seq` starts at 1, +1 per event) and
+    // `noo_task_event_delivery` its cursor and retry state. Additive; an old
+    // gateway ignores the columns and tables.
+    sql: r#"
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS created_via text;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS context_revision integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS noo_tasks_owner_created_via_idx ON noo_tasks (owner_uuid, created_via);
+CREATE TABLE IF NOT EXISTS noo_task_idempotency (
+    owner      text        NOT NULL,
+    via        text        NOT NULL DEFAULT '',
+    key        text        NOT NULL,
+    task_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner, via, key)
+);
+CREATE TABLE IF NOT EXISTS noo_task_context (
+    task_id    uuid        NOT NULL REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    revision   integer     NOT NULL,
+    text       text        NOT NULL,
+    sha256     text        NOT NULL,
+    at         timestamptz NOT NULL DEFAULT now(),
+    applied_at timestamptz,
+    PRIMARY KEY (task_id, revision)
+);
+CREATE TABLE IF NOT EXISTS noo_task_events (
+    task_id uuid        NOT NULL REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    seq     bigint      NOT NULL,
+    kind    text        NOT NULL,
+    data    jsonb       NOT NULL,
+    at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, seq)
+);
+CREATE TABLE IF NOT EXISTS noo_task_event_delivery (
+    task_id          uuid        PRIMARY KEY REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    addon            text        NOT NULL,
+    last_seq         bigint      NOT NULL DEFAULT 0,
+    next_seq         bigint      NOT NULL DEFAULT 1,
+    attempts         integer     NOT NULL DEFAULT 0,
+    next_try_at      timestamptz NOT NULL DEFAULT now(),
+    first_failure_at timestamptz,
+    undelivered_at   timestamptz
+)
+"#,
 }];
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
@@ -2072,6 +2125,10 @@ pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
 pub const EMBEDDING_SPACES_REVISION: &str = "097_embedding_spaces";
+
+/// The add-on delegated task token's tables and columns (i143 part B). A
+/// constant so a renumber at integration is one line.
+pub const ADDON_DELEGATION_REVISION: &str = "100_addon_delegation";
 
 /// The prompt-skill promotion table. A constant so a renumber at integration
 /// is one line.
@@ -2957,6 +3014,26 @@ mod tests {
         let m = MIGRATIONS.iter().find(|m| m.revision == PROMPT_SKILL_PROPOSALS_REVISION).expect("099 must be in the chain");
         assert_eq!(m.down_revision, Some(SESSION_FLOORS_REVISION));
         for needle in ["noo_prompt_skill_proposals", "content_sha", "UNIQUE (name, content_sha)", "WHERE status = 'pending'"] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
+    }
+
+    /// 097 is the add-on delegated token's schema; the task code writes these
+    /// names, so a rename on either side must fail a test.
+    #[test]
+    fn addon_delegation_revision_sits_on_the_prompt_skills_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == ADDON_DELEGATION_REVISION).expect("100 must be in the chain");
+        assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
+        for needle in [
+            "created_via text",
+            "context_revision integer NOT NULL DEFAULT 0",
+            "noo_task_idempotency",
+            "PRIMARY KEY (owner, via, key)",
+            "noo_task_context",
+            "noo_task_events",
+            "PRIMARY KEY (task_id, seq)",
+            "noo_task_event_delivery",
+        ] {
             assert!(m.sql.contains(needle), "{needle}");
         }
     }
