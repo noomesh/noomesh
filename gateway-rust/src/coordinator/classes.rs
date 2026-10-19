@@ -20,9 +20,8 @@
 //!   true`, and only a degraded candidate may answer with a different
 //!   model than the class's first one.
 //! * **Derived** when nothing is declared: one class per distinct served
-//!   model, holding only that model's candidates — a request that NAMES a
-//!   model is answered by that model or refused, and fails over across
-//!   NODES, never across models.
+//!   model, holding only that model's candidates. A request that NAMES a
+//!   model goes to that model's nodes first (see "Preferences" below).
 //!
 //! ## `chat-default` is the whole mesh (operator rule, 2026-10-17)
 //!
@@ -36,12 +35,25 @@
 //! `cluster.backends.<x>.model` is a PLACEMENT hint (what onboarding put on
 //! the local backend), never a routing pin: it does not narrow the default.
 //!
-//! Only three things narrow an unpinned request: a concrete model name
-//! (its derived class), an explicit node (`node` / `X-Noo-Node`, see
+//! Three things steer an unpinned request: a concrete model name (its
+//! derived class), an explicit node (`node` / `X-Noo-Node`, see
 //! [`select`]), or a DECLARED `chat-default` (`noo cluster class set
-//! chat-default …`), which stays authoritative because it is an explicit
-//! operator choice. `noo cluster class list` says which one is live:
+//! chat-default …`). `noo cluster class list` says which default is live:
 //! `dynamic (all live chat nodes)` or `declared`.
+//!
+//! ## Preferences, not selections (operator rule, 2026-10-19)
+//!
+//! A model name, an alias, a declared class — all of them say which
+//! candidates to try FIRST, never which are the only ones. Behind a class's
+//! own candidates [`select`] appends every other live chat candidate in the
+//! dynamic ranking (`fallback,` in the rank, `+mesh` in the label), and a
+//! model nothing serves resolves to the dynamic default instead of a 404.
+//! The mesh heals: when the node a caller preferred is off doing something
+//! else, another node answers, slower or smaller, and the served-model
+//! header says which. Live failure that day: trellion named awolf's vLLM
+//! model while awolf's GPU ran a voice test, and every knowledge answer
+//! failed with `model_not_found` although two other nodes served chat.
+//! Only a NODE pin is strict — the caller said where.
 //!
 //! The dynamic ranking, lowest first ([`rank_key`]): degraded, unhealthy
 //! (stale heartbeat, unreachable, quarantined), stalled in the last
@@ -64,9 +76,10 @@
 //!
 //! Resolution of a `model` hint: absent / `default` / `auto` → `chat-default`;
 //! an alias → its class; a class name → that class; a concrete model name →
-//! the derived class of that model (the same exact-match filter `apply_pin`
-//! has always applied: serve it or 404). Candidate order: non-degraded
-//! before degraded, healthy before not, declared position, then load.
+//! the derived class of that model, then the rest of the mesh; a name
+//! nothing serves → `chat-default`. Candidate order within a class:
+//! non-degraded before degraded, healthy before not, declared position,
+//! then load.
 //!
 //! The pure parts (`build_table`, `resolve_hint`, `ordered`) take plain
 //! facts and are tested without NATS or Postgres; `load_table` is the thin
@@ -887,7 +900,9 @@ pub fn select(table: &ClassTable, hint: Option<&str>, node: Option<&str>, exclud
 /// (absent → `chat-default`), narrowed to `node` when one is pinned. A node
 /// pin with no model selects from every live chat candidate on that node
 /// (the dynamic pool), even when `chat-default` is declared — the caller
-/// named where, and the declaration is about where NOT named. Pure but for
+/// named where, and the declaration is about where NOT named. Without a node
+/// pin the rest of the mesh follows the class's own candidates (see
+/// "Preferences, not selections" in the module doc). Pure but for
 /// the two live callbacks, so raw chat and the agent loop share it and a
 /// test drives it with facts.
 pub fn select_with(
@@ -900,12 +915,22 @@ pub fn select_with(
 ) -> Result<Selection, Refusal> {
     let node = node.map(str::trim).filter(|n| !n.is_empty());
     let named = resolve_hint(table, hint);
+    // Said once, logged with the selection: where the request could not go
+    // where it asked and the mesh answered instead.
+    let mut notes: Vec<String> = Vec::new();
     let base: &Class = match (named, node, hint) {
         (_, Some(_), None) => match table.all_chat.as_ref() {
             Some(c) => c,
             None => return Err(node_refusal(table, node.unwrap_or_default(), None)),
         },
         (Some(c), _, _) => c,
+        // A model nothing serves is a preference the mesh cannot meet right
+        // now (its node is off doing something else): any live chat node
+        // answers, and the served-model header says which.
+        (None, None, Some(h)) if table.all_chat.is_some() => {
+            notes.push(format!("model '{h}' is not served by any live node; any live chat node answers"));
+            table.all_chat.as_ref().expect("checked by the guard")
+        }
         (None, _, _) => {
             if let Some(n) = node {
                 if !table.nodes.iter().any(|x| x.eq_ignore_ascii_case(n)) {
@@ -933,7 +958,21 @@ pub fn select_with(
     };
     let label = class_label(class);
     let ranked = rank(class, exclude, busy, stalled);
-    if ranked.order.is_empty() {
+    // Behind the preferred candidates, the rest of the mesh: every live chat
+    // candidate not already listed, in the dynamic ranking. Only a node pin
+    // goes without them — the caller said where.
+    let fallback: Vec<&Candidate> = match (node, table.all_chat.as_ref()) {
+        (None, Some(all)) if !class.dynamic => rank(all, exclude, busy, stalled)
+            .order
+            .into_iter()
+            .filter(|f| !ranked.order.iter().any(|c| c.url == f.url && c.backend == f.backend))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if ranked.order.is_empty() && !fallback.is_empty() {
+        notes.push(format!("class '{}' has nothing routable right now; any live chat node answers", class.name));
+    }
+    if ranked.order.is_empty() && fallback.is_empty() {
         let declared = class.candidates.len();
         return Err(Refusal::NoCandidates(if class.declared && declared > 0 {
             format!(
@@ -945,8 +984,9 @@ pub fn select_with(
             format!("class '{}' has no candidates", class.name)
         }));
     }
-    let mut skipped: Vec<String> = ranked.skipped.iter().map(|(c, why)| format!("{}/{}: {why}", c.node_id, c.backend)).collect();
-    let mut candidates = Vec::with_capacity(ranked.order.len());
+    let mut skipped: Vec<String> = notes;
+    skipped.extend(ranked.skipped.iter().map(|(c, why)| format!("{}/{}: {why}", c.node_id, c.backend)));
+    let mut candidates = Vec::with_capacity(ranked.order.len() + fallback.len());
     for c in &ranked.order {
         let (b, st) = (busy(c), stalled(c));
         let mut c = (*c).clone();
@@ -961,6 +1001,12 @@ pub fn select_with(
         } else if c.gpu_shared {
             skipped.push(format!("{}/{}: GPU shared with another workload (demoted)", c.node_id, c.backend));
         }
+        candidates.push(c);
+    }
+    for f in fallback {
+        let mut c = f.clone();
+        c.class_label = format!("{label}+mesh");
+        c.rank = format!("fallback,{}", rank_reason(&c, busy(f), stalled(f)));
         candidates.push(c);
     }
     Ok(Selection { class: class.name.clone(), label, candidates, skipped, last_resort: ranked.last_resort })
@@ -1998,10 +2044,51 @@ mod tests {
         let t = build_table(&incident(), &[], &Declarations::default());
         let sel = select_with(&t, Some("gemma4:e2b-it-qat"), None, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.class, "gemma4:e2b-it-qat");
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
-        assert!(matches!(select_with(&t, Some("llama3.2:1b"), None, &|_| false, &idle, &fresh), Err(Refusal::UnknownModel(_))));
-        // A model class is not ranked by the dynamic key: it is that model or nothing.
+        // The named model first, then the rest of the mesh behind it.
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os", "mcmini"]);
+        assert!(!sel.candidates[0].rank.starts_with("fallback"));
+        assert!(sel.candidates[1].rank.starts_with("fallback,"), "{}", sel.candidates[1].rank);
+        assert_eq!(sel.candidates[1].class_label, "gemma4:e2b-it-qat+mesh");
+        // A model class is not ranked by the dynamic key.
         assert!(!t.class("gemma4:12b").unwrap().dynamic);
+    }
+
+    /// 2026-10-19: trellion named awolf's vLLM model while awolf's GPU ran
+    /// a voice test; every knowledge answer was a `model_not_found` although
+    /// mcmini and pop-os served chat. A model name is a preference.
+    #[test]
+    fn a_model_nothing_serves_is_answered_by_the_mesh_not_refused() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        let sel = select_with(&t, Some("google/gemma-4-12B-it-qat-w4a16-ct"), None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.class, CHAT_DEFAULT);
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["mcmini", "pop-os"]);
+        assert!(sel.skipped.iter().any(|s| s.contains("not served by any live node")), "{:?}", sel.skipped);
+        // With nothing serving chat at all there is still nothing to answer with.
+        let empty = build_table(&[], &[], &Declarations::default());
+        assert!(matches!(select_with(&empty, Some("x"), None, &|_| false, &idle, &fresh), Err(Refusal::UnknownModel(_))));
+    }
+
+    /// A declared class whose every candidate is offline (awolf down,
+    /// pop-os-ma gone) still answers from whatever is live.
+    #[test]
+    fn a_declared_class_with_nothing_live_falls_through_to_the_mesh() {
+        let decl = Declarations {
+            classes: vec![DeclaredClass {
+                name: "fast".into(),
+                pool: false,
+                candidates: vec![DeclaredCandidate { node_id: "awolf".into(), backend: "vllm".into(), model: Some("google/gemma-4-12B-it-qat-w4a16-ct".into()), degraded: false }],
+            }],
+            aliases: vec![],
+        };
+        let t = build_table(&incident(), &[], &decl);
+        let sel = select_with(&t, Some("fast"), None, &|_| false, &idle, &fresh).unwrap();
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["mcmini", "pop-os"]);
+        assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")));
+        assert!(sel.skipped.iter().any(|s| s.contains("class 'fast' has nothing routable")), "{:?}", sel.skipped);
+        // Excluded (already failed this request) stays excluded in the fallback too.
+        let sel = select_with(&t, Some("fast"), None, &|c| c.node_id == "mcmini", &idle, &fresh).unwrap();
+        assert_eq!(first_node(&sel), "pop-os");
+        assert!(matches!(select_with(&t, Some("fast"), None, &|_| true, &idle, &fresh), Err(Refusal::NoCandidates(_))));
     }
 
     #[test]
@@ -2019,7 +2106,9 @@ mod tests {
         assert!(d.declared && !d.dynamic);
         let sel = select_with(&t, None, None, &|_| false, &idle, &fresh).unwrap();
         assert_eq!(sel.label, "chat-default(declared)");
-        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"], "the operator's choice, not the ranking's");
+        // The operator's choice first, not the ranking's; the mesh behind it.
+        assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os", "mcmini"]);
+        assert!(sel.candidates[1].rank.starts_with("fallback,"));
         // The dynamic pool is still there for a node pin.
         assert_eq!(first_node(&select_with(&t, None, Some("mcmini"), &|_| false, &idle, &fresh).unwrap()), "mcmini");
     }
@@ -2032,6 +2121,7 @@ mod tests {
         nodes.push(embedder);
         let t = build_table(&nodes, &[], &Declarations::default());
         let sel = select_with(&t, None, Some("pop-os"), &|_| false, &idle, &fresh).unwrap();
+        // A node pin is the one strict request: no mesh fallback behind it.
         assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["pop-os"]);
         assert_eq!(first_node(&select_with(&t, Some("default"), Some("POP-OS"), &|_| false, &idle, &fresh).unwrap()), "pop-os");
         assert!(matches!(select_with(&t, None, Some("ghost"), &|_| false, &idle, &fresh), Err(Refusal::UnknownNode(_))));
