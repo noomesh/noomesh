@@ -28,6 +28,16 @@ import (
 func Middleware(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A stream the controller opened on this node's own tunnel has
+			// already been authenticated by the tunnel handshake (see
+			// tunnel.go); there is no bearer to check and none is needed.
+			// Every other front door (ControllerLeafOrToken,
+			// ServiceLeafOrToken, OwnHarnessLeafOrToken) falls through to this
+			// function, so this is the one place the marker is read.
+			if IsTunnelController(r) {
+				serveAs(next, w, r, cfg, "")
+				return
+			}
 			if !cfg.HasAuth() {
 				http.Error(w, `{"detail":"Node agent auth not configured — set NOO_NODE_AGENT_TOKEN or NOO_CLUSTER_SECRET"}`, http.StatusServiceUnavailable)
 				return

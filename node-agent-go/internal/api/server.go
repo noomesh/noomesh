@@ -146,6 +146,12 @@ type BusStatus struct {
 	Role string `json:"role,omitempty"`
 }
 
+// Handler is the agent's route table, for in-process callers (the node-held
+// tunnel serves its streams through it). Every route keeps its own gate: a
+// caller reaches a controller-only route only with the principal the gate
+// reads from the request.
+func (s *Server) Handler() http.Handler { return s.mux }
+
 // SetBusStatus installs the NATS status provider. Called once the messaging
 // subsystem is wired (the API server starts first so the node is reachable
 // during registration).

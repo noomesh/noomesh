@@ -116,6 +116,9 @@ type Reporter struct {
 	// natsRPC reports whether control over the bus is live on this node
 	// (subscription accepted by the server, no later refusal). nil = false.
 	natsRPC func() bool
+	// tunnel reports whether the node-held tunnel to the controller is up
+	// right now (internal/tunnel). nil = this build has none.
+	tunnel func() bool
 
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
@@ -273,6 +276,11 @@ func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
 // agent passes ctrlrpc.Service.Ready, so the field is true only while the
 // node can actually answer a control call on the bus.
 func (r *Reporter) SetNatsRPC(f func() bool) { r.natsRPC = f }
+
+// SetTunnel installs the probe behind control_transports.tunnel. The agent
+// passes tunnel.Client.Connected, so the field is true only while the tunnel
+// is up and the controller can send streaming calls down it.
+func (r *Reporter) SetTunnel(f func() bool) { r.tunnel = f }
 
 // natsStatus returns the value to send. nil when no provider is installed —
 // a heartbeat that omits the field means "this agent build does not report
@@ -1006,9 +1014,11 @@ func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }
 // controlTransports reports how the controller can reach this agent. The
 // HTTPS listener is always offered; "nats_rpc" is true only while control
 // over the bus is live (the subscription was accepted by the server and no
-// permission refusal has been seen since); "tunnel" stays false until the
-// node-held tunnel ships.
+// permission refusal has been seen since); "tunnel" is true only while the
+// node-held tunnel to the controller is connected, so a gateway never routes
+// a stream into a tunnel that is not there.
 func (r *Reporter) controlTransports() map[string]bool {
 	rpc := r.natsRPC != nil && r.natsRPC()
-	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": false}
+	tun := r.tunnel != nil && r.tunnel()
+	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": tun}
 }
