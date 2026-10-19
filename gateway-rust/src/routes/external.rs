@@ -188,7 +188,8 @@ async fn embeddings(
     }
     let input = body.get("input").cloned().unwrap_or(Value::Null);
     let api_format = crate::embedding_client::resolve().api_format;
-    match do_embeddings(&state, &input).await {
+    let space = body.get("model").and_then(Value::as_str);
+    match do_embeddings(&state, &input, space).await {
         Ok((resp, n, model)) => {
             audit(
                 &state, &consumer.name, EP, Some("embedding"), Some(&model),
@@ -221,12 +222,16 @@ pub(crate) fn embed_error_to_ext(e: crate::embedding_client::EmbedError) -> ExtF
     }
 }
 
-/// Proxy to the configured embedding backend (tei | openai | ollama wire
-/// format — see `crate::embedding_client`), reshape into OpenAI embeddings
-/// shape. `input` is a string or an array of strings.
+/// Proxy to the embedding space's pool (tei | openai | ollama wire format —
+/// see `crate::embedding_client`), reshape into OpenAI embeddings shape.
+/// `input` is a string or an array of strings. `space` is the body's
+/// `model`: an embedding space (`knowledge`, `code`), a space's model name,
+/// or `default`/absent for `knowledge` (i145). Anything else is a 400 naming
+/// the spaces: an embed is never answered from another model's space.
 async fn do_embeddings(
     state: &Arc<AppState>,
     input: &Value,
+    space: Option<&str>,
 ) -> Result<(Value, usize, String), ExtFail> {
     let inputs: Vec<String> = match input {
         Value::String(s) => vec![s.clone()],
@@ -242,7 +247,7 @@ async fn do_embeddings(
     // Truncate each to 1500 chars (matches the query-side embed in memory.rs).
     let truncated: Vec<String> = inputs.iter().map(|s| s.chars().take(1500).collect()).collect();
 
-    let endpoint = crate::embedding_client::resolve();
+    let endpoint = crate::embedding_client::resolve_space(space).map_err(|e| bad_request(&e))?;
     let model = endpoint.model.clone();
 
     let embeddings = endpoint
@@ -784,7 +789,8 @@ async fn typed_inference(
             }
             // For the typed path, `input` is `{ "input": ... }`.
             let inner = input.get("input").cloned().unwrap_or(Value::Null);
-            match do_embeddings(&state, &inner).await {
+            let space = input.get("model").and_then(Value::as_str);
+            match do_embeddings(&state, &inner, space).await {
                 Ok((resp, n, model)) => {
                     audit(&state, &consumer.name, EP, Some("embedding"), Some(&model),
                           Some("tei"), Some(json!({"inputs": n})), 200, started, None);
@@ -939,7 +945,10 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
             "openai_compatible": true,
             "models": ["default", emb_model],
             "dimension": emb_dimension,
-            "dimension_detail": emb_dimension_detail
+            "dimension_detail": emb_dimension_detail,
+            // i145: what a consumer may send as `model` — a space name (or its
+            // model's name). Vectors from different spaces never mix.
+            "spaces": crate::embedding_spaces::all()
         },
         "rerank": {
             "available": rerank_ok,

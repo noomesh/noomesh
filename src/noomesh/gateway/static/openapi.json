@@ -18791,6 +18791,84 @@
           }
         }
       }
+    },
+    "/api/cluster/embedding-spaces": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get embedding spaces",
+        "description": "[native] GET /api/cluster/embedding-spaces \u2014 every space, its model and its pool.",
+        "operationId": "embedding_spaces_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces/{space}": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update embedding spaces",
+        "description": "[native] PUT /api/cluster/embedding-spaces/{space} \u2014 declare a space (`{model, dims?}`). A new space is fine; an existing one keeps its model (changing it is a re-embed, refused with 409), and may have `dims` filled in.",
+        "operationId": "embedding_space_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete embedding spaces",
+        "description": "[native] DELETE /api/cluster/embedding-spaces/{space} \u2014 forget a space. The default space cannot be removed: every unqualified embed means it.",
+        "operationId": "embedding_space_delete",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

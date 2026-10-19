@@ -95,6 +95,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/model-classes", get(model_classes_get))
         .route("/api/cluster/model-classes/{class}", put(model_class_put))
         .route("/api/cluster/model-classes/{class}", delete(model_class_delete))
+        .route("/api/cluster/embedding-spaces", get(embedding_spaces_get))
+        .route("/api/cluster/embedding-spaces/{space}", put(embedding_space_put))
+        .route("/api/cluster/embedding-spaces/{space}", delete(embedding_space_delete))
         // Operator-only mute for a known-down node's alerts (maintenance.rs).
         .route(
             "/api/cluster/nodes/{node_id}/maintenance",
@@ -3893,6 +3896,15 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
+    // i145: every embedding node serves its space's model, so vectors stay
+    // comparable. A model no space uses is refused with the way to add one.
+    if role == "embed" && desired == "running" {
+        if let Some(m) = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            if let Some(why) = crate::embedding_spaces::placement_refusal(&crate::embedding_spaces::all(), m) {
+                return Err(AppError::Conflict(why));
+            }
+        }
+    }
     // A harness placement may name its KIND in env (followup
     // 1233): `noo` (this gateway's loop, the default) or a foreign kind
     // from config/harness-kinds.json. The node agent enforces what each
@@ -4390,6 +4402,137 @@ async fn model_class_delete(
         json!({"class": class, "deleted": n}),
     ).await;
     Ok(Json(json!({"ok": true, "class": class, "deleted": n})))
+}
+
+// ── embedding spaces (i145) ──────────────────────────────────────────
+
+/// One space's pool for GET: every role=embed placement on its model, and
+/// whether that node advertises `embed` right now. Placements on a model no
+/// space uses are listed apart (`unmatched`): they serve nobody.
+pub(crate) fn embedding_space_view(
+    spaces: &[crate::embedding_spaces::Space],
+    placements: &[(String, String, Option<String>, String)],
+    advertising: &[String],
+) -> Value {
+    use crate::embedding_spaces::same_model;
+    let node = |(n, b, m, d): &(String, String, Option<String>, String)| {
+        json!({
+            "node": n, "backend": b, "model": m, "desired_state": d,
+            "advertising": advertising.iter().any(|a| a.eq_ignore_ascii_case(n)),
+        })
+    };
+    let out: Vec<Value> = spaces
+        .iter()
+        .map(|s| {
+            let pool: Vec<Value> = placements
+                .iter()
+                .filter(|p| p.2.as_deref().is_some_and(|m| same_model(m, &s.model)))
+                .map(node)
+                .collect();
+            let live = pool.iter().filter(|n| n["advertising"] == json!(true) && n["desired_state"] == json!("running")).count();
+            json!({
+                "space": s.space, "model": s.model, "dims": s.dims,
+                "default": s.space == crate::embedding_spaces::DEFAULT_SPACE,
+                "pool": pool, "live": live,
+            })
+        })
+        .collect();
+    let unmatched: Vec<Value> = placements
+        .iter()
+        .filter(|p| !spaces.iter().any(|s| p.2.as_deref().is_some_and(|m| same_model(m, &s.model))))
+        .map(node)
+        .collect();
+    json!({"spaces": out, "unmatched": unmatched})
+}
+
+/// GET /api/cluster/embedding-spaces — every space, its model and its pool.
+async fn embedding_spaces_get(State(state): State<Arc<AppState>>) -> AppResult {
+    let spaces = crate::embedding_spaces::load(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    let placements = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT node_id, backend, model, desired_state FROM noo_backend_placements WHERE role = 'embed' ORDER BY node_id, backend",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("embed placements read: {e}")))?;
+    let advertising: Vec<String> = state.gossip.find_peers_by_capability("embed", 256).into_iter().map(|p| p.node_id).collect();
+    Ok(Json(embedding_space_view(&spaces, &placements, &advertising)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbeddingSpaceBody {
+    model: String,
+    dims: Option<u64>,
+}
+
+/// PUT /api/cluster/embedding-spaces/{space} — declare a space (`{model,
+/// dims?}`). A new space is fine; an existing one keeps its model (changing
+/// it is a re-embed, refused with 409), and may have `dims` filled in.
+async fn embedding_space_put(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+    Json(body): Json<EmbeddingSpaceBody>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    es::valid_space_name(&space).map_err(AppError::BadRequest)?;
+    let model = body.model.trim().to_string();
+    crate::coordinator::classes::valid_model(&model).map_err(AppError::BadRequest)?;
+    let spaces = es::load(&state.db).await.map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    let existing = spaces.iter().find(|s| s.space == space);
+    if let Some(why) = es::change_refusal(existing, &model) {
+        return Err(AppError::Conflict(why));
+    }
+    if let Some(other) = spaces.iter().find(|s| s.space != space && es::same_model(&s.model, &model)) {
+        return Err(AppError::Conflict(format!(
+            "space '{}' already embeds with '{model}': one model, one space, so a node on it serves exactly one",
+            other.space
+        )));
+    }
+    let dims = body.dims.filter(|d| *d > 0).or(existing.and_then(|e| e.dims));
+    if let (Some(e), Some(d)) = (existing.and_then(|e| e.dims), body.dims.filter(|d| *d > 0)) {
+        if e != d {
+            return Err(AppError::Conflict(format!("space '{space}' has {e}-dim vectors; {d} would be another model's width")));
+        }
+    }
+    let rec = es::Space { space: space.clone(), model: existing.map(|e| e.model.clone()).unwrap_or(model), dims };
+    es::upsert(&state.db, &rec, "operator").await.map_err(|e| AppError::Internal(format!("embedding space write: {e}")))?;
+    if let Ok(all) = es::load(&state.db).await {
+        es::set_cache(all);
+    }
+    tracing::info!(space = %rec.space, model = %rec.model, dims = ?rec.dims, created = existing.is_none(), "embedding_space_declared");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_space_declared", "info", "gateway",
+        &format!("embedding_space:{}", rec.space), "ok",
+        json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})))
+}
+
+/// DELETE /api/cluster/embedding-spaces/{space} — forget a space. The
+/// default space cannot be removed: every unqualified embed means it.
+async fn embedding_space_delete(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    if space == es::DEFAULT_SPACE {
+        return Err(AppError::Conflict(format!("'{space}' is the default embedding space; every unqualified embed uses it")));
+    }
+    if !es::delete(&state.db, &space).await.map_err(|e| AppError::Internal(format!("embedding space delete: {e}")))? {
+        return Err(AppError::NotFound(format!("no embedding space '{space}'")));
+    }
+    if let Ok(all) = es::load(&state.db).await {
+        es::set_cache(all);
+    }
+    tracing::info!(space = %space, "embedding_space_removed");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_space_removed", "info", "gateway",
+        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": space})))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -5920,6 +6063,33 @@ mod heartbeat_carry_tests {
 #[cfg(test)]
 mod honesty_tests {
     use super::*;
+
+    /// i145: a space's pool is the embed placements on its model; one on a
+    /// model no space uses is listed apart, not silently in a pool.
+    #[test]
+    fn an_embedding_spaces_pool_is_the_placements_on_its_model() {
+        use crate::embedding_spaces::Space;
+        let spaces = vec![
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024) },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None },
+        ];
+        let p = |n: &str, m: &str, d: &str| (n.to_string(), "ollama".to_string(), Some(m.to_string()), d.to_string());
+        let placements = vec![
+            p("host2", "harrier:latest", "running"),
+            p("host6", "harrier", "stopped"),
+            p("awolf", "nomic-embed-code", "running"),
+            p("host9", "bge-m3", "running"),
+        ];
+        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()]);
+        let k = &v["spaces"][0];
+        assert_eq!(k["space"], "knowledge");
+        assert_eq!(k["default"], true);
+        assert_eq!(k["pool"].as_array().unwrap().len(), 2);
+        assert_eq!(k["live"], 1, "host6 is stopped: in the pool, not live");
+        assert_eq!(v["spaces"][1]["pool"][0]["node"], "awolf");
+        assert_eq!(v["spaces"][1]["live"], 1);
+        assert_eq!(v["unmatched"][0]["node"], "host9");
+    }
 
     // "The system must not lie" audit. Both helpers below exist so the
     // never-fabricate rules are testable without an AppState (repo

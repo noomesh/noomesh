@@ -95,6 +95,7 @@ mod egress;
 mod dlq_drain;
 mod drive;
 mod embedding_client;
+mod embedding_spaces;
 mod google_auth;
 mod host_daemon;
 mod mcp_external;
@@ -467,6 +468,9 @@ async fn main() -> Result<()> {
     // Keep the behavioral-flag (noo_settings) override cache warm so admin UI
     // toggles take effect within ~15s (no restart) for Rust-read flags.
     crate::settings::spawn_refresh(state.db.clone());
+    // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
+    // the space cache warm the same way.
+    crate::embedding_spaces::spawn_refresh(state.db.clone());
 
     // Re-assert the NATS KV buckets periodically. A NATS server that comes
     // back with a fresh JetStream store (what a container recreate does)

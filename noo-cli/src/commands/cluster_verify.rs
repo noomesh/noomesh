@@ -1594,6 +1594,48 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
     ok(NAME, detail)
 }
 
+/// The `embedding spaces` row (i145): each space, its one model and how many
+/// nodes serve it. `x` when the default space (`knowledge`) has no live node
+/// (every unqualified embed fails); `!` when another space has none, or an
+/// embed node serves a model no space uses (it serves nobody).
+pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
+    const NAME: &str = "embedding spaces";
+    let Some(body) = body else {
+        return warn(NAME, "not read", Some("noo cluster embedding-space list".into()));
+    };
+    let empty = Vec::new();
+    let spaces = body["spaces"].as_array().unwrap_or(&empty);
+    if spaces.is_empty() {
+        return warn(NAME, "none recorded yet: the gateway seeds `knowledge` at start", Some("noo cluster embedding-space list".into()));
+    }
+    let listed: Vec<String> = spaces
+        .iter()
+        .map(|s| format!("{}={} ({} live)", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"), s["live"].as_u64().unwrap_or(0)))
+        .collect();
+    let detail = listed.join(", ");
+    let dead: Vec<&Value> = spaces.iter().filter(|s| s["live"].as_u64().unwrap_or(0) == 0).collect();
+    if dead.iter().any(|s| s["default"].as_bool() == Some(true)) {
+        return fail(NAME, format!("{detail} — the default space has no live node: every unqualified embed fails"), "noo cluster embedding-space list");
+    }
+    let unmatched: Vec<String> = body["unmatched"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|n| format!("{}={}", n["node"].as_str().unwrap_or("?"), n["model"].as_str().unwrap_or("?")))
+        .collect();
+    if !dead.is_empty() || !unmatched.is_empty() {
+        let mut why: Vec<String> = Vec::new();
+        if !dead.is_empty() {
+            why.push(format!("no live node for {}", dead.iter().filter_map(|s| s["space"].as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if !unmatched.is_empty() {
+            why.push(format!("serving no space: {}", unmatched.join(", ")));
+        }
+        return warn(NAME, format!("{detail} — {}", why.join("; ")), Some("noo cluster embedding-space list".into()));
+    }
+    ok(NAME, detail)
+}
+
 /// A class candidate that is not a chat target: a non-chat `role`, or a model
 /// whose name is an embedding/reranking model.
 fn is_non_chat_entry(c: &Value) -> bool {
@@ -4562,6 +4604,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(model_classes_check(model_classes.as_ref()));
         // Where an unpinned chat goes: chat-default's live candidates.
         checks.push(default_chat_check(model_classes.as_ref()));
+        let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
+        checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
@@ -4918,6 +4962,29 @@ mod tests {
         assert_eq!(c.verdict, super::Verdict::Ok);
         assert!(c.detail.contains("1 derived"), "{}", c.detail);
         assert_eq!(model_classes_check(None).verdict, super::Verdict::Warn);
+    }
+
+    /// i145: a dead default space fails, a dead other space or a stray
+    /// embedder warns.
+    #[test]
+    fn embedding_spaces_row_fails_on_a_dead_default_and_warns_on_the_rest() {
+        let j = |v: serde_json::Value| v;
+        let good = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 2}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&good));
+        assert_eq!(c.verdict, super::Verdict::Ok);
+        assert!(c.detail.contains("knowledge=harrier (2 live)"), "{}", c.detail);
+        let dead_default = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]}));
+        assert_eq!(embedding_spaces_check(Some(&dead_default)).verdict, super::Verdict::Fail);
+        let dead_code = j(serde_json::json!({"spaces": [
+            {"space": "knowledge", "model": "harrier", "default": true, "live": 1},
+            {"space": "code", "model": "nomic-embed-code", "default": false, "live": 0}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&dead_code));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("no live node for code"), "{}", c.detail);
+        let stray = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 1}],
+            "unmatched": [{"node": "host9", "model": "bge-m3"}]}));
+        assert!(embedding_spaces_check(Some(&stray)).detail.contains("serving no space: host9=bge-m3"));
+        assert_eq!(embedding_spaces_check(None).verdict, super::Verdict::Warn);
     }
 
     /// The `default chat` row lists the live candidates in routing order,
