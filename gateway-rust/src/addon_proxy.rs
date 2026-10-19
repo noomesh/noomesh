@@ -1165,7 +1165,7 @@ pub async fn call(addon: &str, route_name: &str, body: Option<Value>) -> CallOut
 pub(crate) mod tests {
     use super::*;
 
-    fn ctx(sub: &str, role: crate::auth::Role, scopes: &[&str]) -> crate::auth::RequesterCtx {
+    pub(super) fn ctx(sub: &str, role: crate::auth::Role, scopes: &[&str]) -> crate::auth::RequesterCtx {
         crate::auth::RequesterCtx {
             sub: sub.into(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
@@ -1608,6 +1608,7 @@ mod user_read_route_tests {
                     timeout_secs: None,
                     min_role: None,
                     scopes: vec![],
+                    owner_scoped: false,
                     note: None,
                 })
                 .collect(),
@@ -1774,7 +1775,7 @@ mod permission_tests {
     /// from nothing, so a header the client forged is never in it.
     #[test]
     fn a_forged_identity_header_is_replaced_by_the_verified_one() {
-        let h = caller_headers(Some(&ctx("alice", Role::User, &["read"])));
+        let h = caller_headers(Some(&super::tests::ctx("alice", Role::User, &["read"])));
         let all = |n: &str| h.iter().filter(|(k, _)| *k == n).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
         // The client's `x-noo-requester-sub: root` has no way in: there is exactly
         // one copy of each header and it is alice's.
