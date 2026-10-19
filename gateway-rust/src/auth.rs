@@ -2692,7 +2692,9 @@ pub fn is_agent_message_write(method: &axum::http::Method, path: &str) -> bool {
 /// is UUID-shaped (job keys are `noo:jobs:{id}` and share the prefix with
 /// `noo:jobs:queue`, `active`, `history`, `drained_nodes`, so a word is never
 /// an id). Deliberately NOT a prefix: `/api/jobs/{id}/reprioritize`,
-/// `/api/tasks/*` and `/api/scheduler/*` stay operator-only. The handlers
+/// the scheduler's `/api/tasks/submit` and `/api/tasks/inference`, and
+/// `/api/scheduler/*` stay operator-only (a person's own harness tasks are
+/// [`is_task_owner_api`]). The handlers
 /// restrict what a User may submit and make cancel owner-only
 /// (`routes::admin`); this only lets the request reach them.
 pub fn is_job_user_api(method: &axum::http::Method, path: &str) -> bool {
@@ -2703,6 +2705,29 @@ pub fn is_job_user_api(method: &axum::http::Method, path: &str) -> bool {
     match path.strip_prefix("/api/jobs/") {
         Some(id) => *method == Method::DELETE && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok(),
         None => false,
+    }
+}
+
+/// The task writes any account may make on its OWN tasks: create, stop
+/// (one, or its own by `via`), ask, answer, context, resubmit — the same set
+/// the user MCP door's `noo_task_*` tools reach. `routes/tasks.rs` answers
+/// 404 for a task the caller does not own and keeps answer, context and
+/// resubmit owner-only, so opening the tier gate grants nothing beyond them
+/// (operator decision 2026-10-19, i143 requirement C).
+pub fn is_task_owner_api(method: &axum::http::Method, path: &str) -> bool {
+    if *method != axum::http::Method::POST {
+        return false;
+    }
+    if path == "/api/tasks" || path == "/api/tasks/stop" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/api/tasks/") else { return false };
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(id), Some(op), None) => {
+            uuid::Uuid::parse_str(id).is_ok() && matches!(op, "stop" | "ask" | "answer" | "context" | "resubmit")
+        }
+        _ => false,
     }
 }
 
@@ -2803,6 +2828,10 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     // Sending and acking agent mail as oneself. Exact pairs; ownership is
     // enforced in the handlers (see `is_agent_message_write`).
     if is_agent_message_write(method, path) {
+        return true;
+    }
+    // Creating and steering one's OWN tasks (`is_task_owner_api`).
+    if is_task_owner_api(method, path) {
         return true;
     }
     // Submitting an inference job and cancelling one's own (`is_job_user_api`).
@@ -5940,6 +5969,24 @@ mod harness_rail_tests {
         assert_eq!(harness_turn_for(&claims(Some("node:host8"), None), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
         assert_eq!(harness_turn_for(&claims(Some("node:host8"), Some("")), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
         assert_eq!(harness_turn_for(&claims(Some("node:"), Some("c1")), "/api/harness/call"), Err(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn a_person_may_write_only_their_own_task_shapes() {
+        use axum::http::Method;
+        let id = "3f2a9c10-1111-4222-8333-444455556666";
+        for p in ["/api/tasks", "/api/tasks/stop"] {
+            assert!(is_task_owner_api(&Method::POST, p), "{p}");
+        }
+        for op in ["stop", "ask", "answer", "context", "resubmit"] {
+            assert!(is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}/{op}")), "{op}");
+        }
+        assert!(!is_task_owner_api(&Method::DELETE, "/api/tasks"));
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/submit"), "the scheduler's submit is not a person's task");
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/inference"));
+        assert!(!is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}")));
+        assert!(!is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}/stop/x")));
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/not-a-uuid/stop"));
     }
 
     #[test]
