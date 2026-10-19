@@ -176,7 +176,19 @@ def test_node_defaults_name_the_compose_versions():
 
 def test_lock_job_signs_the_tag_into_the_lock():
     wf = (ROOT / ".github/workflows/images-release.yml").read_text()
-    assert '{ echo "# stack $TAG"; cat digests/* | sort; } > "stack-$TAG.lock"' in wf
+    assert '{ echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat digests/* | sort; } > "stack-$TAG.lock"' in wf
+
+
+def test_lock_job_signs_the_migration_head_from_a_seedless_step():
+    """The rollback preflight (rehearsal 0.6.7-rc.1 F2) trusts this line, so it
+    is inside the signed bytes, computed before the signing CLI is fetched, and
+    the signing step refuses a value that is not a revision id."""
+    wf = (ROOT / ".github/workflows/images-release.yml").read_text()
+    computed = wf.index("scripts/mesh-migration-head.sh > mesh-migration-head.txt")
+    assert computed < wf.index("Fetch and verify the signing CLI")
+    assemble = wf.index('echo "# mesh-migration-head $head"')
+    assert wf.index('case "$head" in [0-9][0-9][0-9]_*)') < assemble
+    assert assemble < wf.index('security release-sign "stack-$TAG.lock"')
 
 
 def _lib_dist_fn(name):
