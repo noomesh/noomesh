@@ -650,6 +650,60 @@ pub fn models_fetch_ollama(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     Ok(0)
 }
 
+/// What `noo cluster import-model <node> <name>` was asked to import, resolved
+/// against the controller's store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImportTarget {
+    /// A converted or hand-made model: `<name>.Modelfile` (+ its weight).
+    Plain(String),
+    /// A registry tag `noo models fetch ollama:<tag>` staged. Holds the name
+    /// the node is sent and placed under (`ref.short()`).
+    Staged(OllamaRef),
+}
+
+fn staged_pair_present(store: &Path, r: &OllamaRef) -> bool {
+    let stem = r.stem();
+    store.join(format!("{stem}.Modelfile")).is_file() && store.join(format!("{stem}.gguf")).is_file()
+}
+
+/// Resolve the import-model argument. `ollama:<tag>` names a staged tag and
+/// nothing else; a bare name is the plain store model, or, when no such model
+/// exists, the staged tag of that name. A name that is BOTH is ambiguous and
+/// refused (the node would import the plain one; the operator may mean the
+/// other). A tag that is not staged is refused naming the command that stages
+/// it: never a silent fall-through to a registry pull.
+pub(crate) fn resolve_import_target(arg: &str, store: &Path) -> Result<ImportTarget, String> {
+    let arg = arg.trim();
+    let restage = |r: &OllamaRef| {
+        format!(
+            "{} is not staged in the controller store ({}): no complete {}.Modelfile + {}.gguf pair. Stage it with `noo models fetch ollama:{}`, then re-run",
+            r.short(), store.display(), r.stem(), r.stem(), r.short()
+        )
+    };
+    if let Some(rest) = arg.strip_prefix("ollama:") {
+        let r = parse_ref(rest)?;
+        return if staged_pair_present(store, &r) { Ok(ImportTarget::Staged(r)) } else { Err(restage(&r)) };
+    }
+    let single_component = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    let plain = single_component && store.join(format!("{arg}.Modelfile")).is_file();
+    let staged = parse_ref(arg).ok().filter(|r| staged_pair_present(store, r));
+    match (plain, staged) {
+        (true, Some(r)) => Err(format!(
+            "'{arg}' is both a plain model ({arg}.Modelfile) and a staged registry tag ({}). Say which: `ollama:{}` for the registry tag",
+            r.stem(), r.short()
+        )),
+        (true, None) => Ok(ImportTarget::Plain(arg.to_string())),
+        (false, Some(r)) => Ok(ImportTarget::Staged(r)),
+        (false, None) => match parse_ref(arg) {
+            // A name with a ':' (or a namespace) can only be a registry tag.
+            Ok(r) if arg.contains(':') || arg.contains('/') => Err(restage(&r)),
+            // A bare name may still be an OCI-artifact model the caller stages.
+            _ if single_component => Ok(ImportTarget::Plain(arg.to_string())),
+            _ => Err(format!("'{arg}' is neither a store model name nor a registry.ollama.ai reference (want ollama:<tag>)")),
+        },
+    }
+}
+
 /// Is `name` (a file in the store) one this command staged? The default
 /// `sync-model-files` sweep leaves these out: they ride a placement, not a
 /// push to every node.
@@ -1007,6 +1061,45 @@ mod tests {
         let e = stage(&reg.base, &r, &dir, false, &mut |_, _| {}).unwrap_err();
         assert!(e.to_string().contains("no library/gemma4:nope"), "{e}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_target_resolution() {
+        let dir = tmpdir("import-target");
+        let touch = |n: &str| std::fs::write(dir.join(n), b"x").unwrap();
+        // Nothing staged: a tag is refused naming the fetch command.
+        for arg in ["ollama:gemma4:12b", "gemma4:12b", "user/m:q4"] {
+            let e = resolve_import_target(arg, &dir).unwrap_err();
+            assert!(e.contains("noo models fetch ollama:"), "{arg}: {e}");
+        }
+        // Half a pair is not staged.
+        touch("ollama+library+gemma4+12b.gguf");
+        assert!(resolve_import_target("ollama:gemma4:12b", &dir).unwrap_err().contains("noo models fetch ollama:gemma4:12b"));
+        touch("ollama+library+gemma4+12b.Modelfile");
+        for arg in ["ollama:gemma4:12b", "gemma4:12b", "library/gemma4:12b", "ollama:Gemma4:12B"] {
+            match resolve_import_target(arg, &dir).unwrap() {
+                ImportTarget::Staged(r) => assert_eq!(r.short(), if arg.contains("12B") { "Gemma4:12B" } else { "gemma4:12b" }, "{arg}"),
+                other => panic!("{arg}: {other:?}"),
+            }
+        }
+        // Bare name unambiguous -> staged :latest only if staged.
+        touch("ollama+library+gemma4+latest.gguf");
+        touch("ollama+library+gemma4+latest.Modelfile");
+        assert!(matches!(resolve_import_target("gemma4", &dir).unwrap(), ImportTarget::Staged(_)));
+        // The same bare name as a plain store model too: ambiguous.
+        touch("gemma4.Modelfile");
+        let e = resolve_import_target("gemma4", &dir).unwrap_err();
+        assert!(e.contains("both") && e.contains("ollama:gemma4"), "{e}");
+        assert!(matches!(resolve_import_target("ollama:gemma4", &dir).unwrap(), ImportTarget::Staged(_)));
+        // Plain model, no staged twin.
+        touch("harrier.Modelfile");
+        assert_eq!(resolve_import_target("harrier", &dir).unwrap(), ImportTarget::Plain("harrier".into()));
+        // Unpublished bare name falls to the existing artifact-staging path.
+        assert_eq!(resolve_import_target("newmodel", &dir).unwrap(), ImportTarget::Plain("newmodel".into()));
+        // Not a name at all.
+        assert!(resolve_import_target("../x", &dir).is_err());
+        assert!(resolve_import_target("hf.co/o/r:Q4", &dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

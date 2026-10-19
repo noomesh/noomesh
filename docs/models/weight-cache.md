@@ -272,9 +272,14 @@ What it does, in order:
 - **Pre-warms the gateway's digest** for the weight, as `models fetch` does.
 
 On the node, reconcile asks the store about a placed tag it does not hold; a
-staged tag takes the same import path as `noo cluster import-model` (the
-node-side verb accepts the tag; the CLI verb itself still looks for a
-`<name>.Modelfile` in the store, so place the tag instead). The node
+staged tag takes the same import path as `noo cluster import-model`, which
+now accepts the tag itself: `noo cluster import-model <node> ollama:gemma4:12b
+[--place --role chat]` (a bare `gemma4:12b`, or `gemma4` for `:latest`, works
+when it is not also the name of a plain store model; if it is both, the verb
+refuses and asks for the `ollama:` form). The CLI checks the controller store
+for the complete `ollama+...` pair first and, when it is not staged, refuses
+naming `noo models fetch ollama:<tag>`; a node older than this release has no
+staged-tag import and answers with its own error. The node
 holds a staged Modelfile to a stricter shape than a hand-made one: only the
 directives `FROM`, `TEMPLATE`, `SYSTEM`, `PARAMETER`, `LICENSE`, `MESSAGE`,
 `RENDERER` and `PARSER`; `FROM` must be exactly the staged weight; the weight
