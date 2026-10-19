@@ -183,6 +183,9 @@ pub(super) async fn cluster_status(State(state): State<Arc<AppState>>) -> AppJso
                 // node CAN host, this is what it IS hosting right now.
                 "running_backends": n.get("running_backends").cloned().unwrap_or(Value::Null),
                 "self_node": n.get("self_node").cloned().unwrap_or(Value::Null),
+                // How the controller can reach this agent (Null = a node
+                // known only from the table, never beat since this field).
+                "control_transports": n.get("control_transports").cloned().unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -357,6 +360,10 @@ async fn node_heartbeat(
     // back to a build that does not say must get the bearer again, not
     // inherit the record's old `true`.
     data[crate::node_agent_auth::CAPABILITY] = json!(crate::node_agent_auth::reported(&body));
+    // The control transports the agent offers (https listener / NATS RPC /
+    // tunnel). Written every beat; an agent that does not say is an older
+    // one and reads as the HTTPS listener only.
+    data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     // Which image the node's backend-door sidecars run on
     // B: "published", or "fallback-alpine" — stunnel installed from the
     // alpine mirror at every sidecar start. `noo cluster verify <node>`
@@ -925,6 +932,10 @@ async fn node_register_body(
     // false when the registration does not say, and noted at once so the
     // first call after a registration already uses the right credential.
     data[crate::node_agent_auth::CAPABILITY] = json!(crate::node_agent_auth::reported(&body));
+    // The control transports the agent offers (https listener / NATS RPC /
+    // tunnel). Written every beat; an agent that does not say is an older
+    // one and reads as the HTTPS listener only.
+    data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     crate::node_agent_auth::note(node_id, &data);
 
     // Write full registration to NATS KV
@@ -1586,14 +1597,11 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
         Err(_) => {
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
-            let client2 = build_node_agent_client();
             let mut all_gpus = Vec::new();
             for (node_id, agent_url, hostname) in &agents {
-                let url = format!("{}/gpu", agent_url);
-                let mut req = client2.get(&url).timeout(std::time::Duration::from_secs(3));
-                if let Some((ref k, ref v)) = crate::node_agent_auth::header_for(&url) {
-                    req = req.header(k.as_str(), v.as_str());
-                }
+                let req = crate::node_link::NodeLink::for_base(agent_url)
+                    .request(reqwest::Method::GET, "/gpu")
+                    .timeout(std::time::Duration::from_secs(3));
                 if let Ok(resp) = req.send().await {
                     if let Ok(data) = resp.json::<Value>().await {
                         if data.get("available").and_then(|v| v.as_bool()) == Some(true) {
@@ -1827,60 +1835,12 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
-/// Look up a node's agent URL from NATS KV `mesh_nodes`.
-///
-/// Returns the `agent_url` field if present, otherwise constructs
-/// `{proto}://{ip_address}:8081` using the node's IP. Errors with 404
-/// if the node is not found in the KV store. A node that IS registered but
-/// carries neither field gets a different 404 text naming the real
-/// cause (see `no_address_message`) instead of "not found".
-pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Result<String, AppError> {
-    let mut known = false;
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        if let Ok(Some(entry)) = kv.get(node_id).await {
-            known = true;
-            if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
-                if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
-                    if !url.is_empty() {
-                        return Ok(url.to_string());
-                    }
-                }
-                if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
-                    if !ip.is_empty() {
-                        let proto = "https"; // node agents are mTLS-only
-                        return Ok(format!("{proto}://{ip}:8081"));
-                    }
-                }
-            }
-        }
-    }
-    if known {
-        return Err(AppError::NotFound(no_address_message(node_id)));
-    }
-    Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
-}
-
-/// The node is in `mesh_nodes` but registered without `agent_url` or
-/// `ip_address`, so the gateway has nowhere to send the call.
-fn no_address_message(node_id: &str) -> String {
-    format!(
-        "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
-         Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
-    )
-}
-
-/// Build a reqwest Client suitable for node-agent HTTP calls.
-///
-/// Uses the TLS-aware client builder when cluster CA is configured,
-/// falling back to a plain client with 30s timeout.
-pub(crate) fn build_node_agent_client() -> reqwest::Client {
-    crate::tls::cluster_client()
-}
-
-// Outbound node-agent auth lives in `crate::node_agent_auth::header_for`,
-// which decides PER AGENT: no bearer for an agent that
-// reports `controller_leaf_only`, the legacy bearer below for one that has
-// not said.
+// The agent address, the client and the credential for every controller ->
+// node call live in `crate::node_link` (`NodeLink::for_node`); the
+// credential decision itself is `crate::node_agent_auth`.
+// The per-agent bearer decision is `crate::node_agent_auth::header_for`: no
+// bearer for an agent that reports `controller_leaf_only`, the legacy bearer
+// below for one that has not said.
 
 /// The credential choice, with no environment in it so it can be tested.
 ///
@@ -1983,16 +1943,12 @@ pub(crate) async fn restart_agent_via_rail(
     state: &AppState,
     node_id: &str,
 ) -> Result<(), String> {
-    let agent_url = get_node_agent_url(state, node_id)
+    let link = crate::node_link::NodeLink::for_node(state, node_id)
         .await
         .map_err(|e| e.to_string())?;
-    tracing::info!(node_id = %node_id, url = %agent_url, "restarting node agent");
+    tracing::info!(node_id = %node_id, url = %link.base(), "restarting node agent");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/restart"));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let req = link.request(reqwest::Method::POST, "/restart");
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => Ok(()),
@@ -2037,17 +1993,13 @@ async fn pull_node_artifact(
             )));
         }
     }
-    let agent_url = get_node_agent_url(&state, &node_id).await?;
-    tracing::info!(node_id = %node_id, url = %agent_url, body = %body, "proxying artifact pull");
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
+    tracing::info!(node_id = %node_id, url = %link.base(), body = %body, "proxying artifact pull");
 
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/pull"))
+    let req = link
+        .request(reqwest::Method::POST, "/pull")
         .timeout(std::time::Duration::from_secs(2700))
         .json(&body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.send().await {
         Ok(resp) => {
@@ -2100,18 +2052,14 @@ async fn clean_node(
     Path(node_id): Path<String>,
     body: Option<Json<CleanRequest>>,
 ) -> AppResult {
-    let agent_url = get_node_agent_url(&state, &node_id).await?;
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
     let (remove_folder, deep) = body.map(|b| (b.remove_folder, b.deep)).unwrap_or((false, false));
 
-    tracing::info!(node_id = %node_id, url = %agent_url, remove_folder, deep, "cleaning node");
+    tracing::info!(node_id = %node_id, url = %link.base(), remove_folder, deep, "cleaning node");
 
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/clean"))
+    let req = link
+        .request(reqwest::Method::POST, "/clean")
         .json(&json!({"remove_folder": remove_folder, "deep": deep}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2182,12 +2130,8 @@ async fn gpu_hold_op(
     payload: Value,
 ) -> AppResult {
     let actor = gpu_hold_actor(&ctx)?;
-    let agent_url = get_node_agent_url(state, node_id).await?;
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/gpu/{op}")).json(&payload);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
+    let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload);
     let outcome = req.send().await;
     let (ok, result) = match outcome {
         Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
@@ -2627,7 +2571,7 @@ pub(crate) async fn start_backend_core(
 
     // Find target node
     let (node_id, agent_url, ip_address) = if let Some(nid) = node_id {
-        let url = get_node_agent_url(state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
         // Get IP from KV
         let ip = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
             if let Ok(Some(entry)) = kv.get(nid).await {
@@ -2672,7 +2616,6 @@ pub(crate) async fn start_backend_core(
     // run the same vLLM tag / parser the controller uses, regardless of
     // what their local .env says. Empty/missing fields fall through to
     // the worker's env (backwards compat for hand-started backends).
-    let client = build_node_agent_client();
     let mut start_body = json!({"backend": backend, "model": model});
     if backend == "vllm" {
         start_body["gpu_count"] = json!(1);
@@ -2700,10 +2643,9 @@ pub(crate) async fn start_backend_core(
             }
         }
     }
-    let mut req = client.post(format!("{agent_url}/start")).json(&start_body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
+        .json(&start_body);
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2782,16 +2724,13 @@ pub(crate) async fn stop_backend_core(
     node_id: &str,
     backend: &str,
 ) -> Result<Value, AppError> {
-    let agent_url = get_node_agent_url(state, node_id).await?;
+    let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
 
     tracing::info!(node_id = %node_id, backend = %backend, "stopping backend");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/stop"))
+    let req = link
+        .request(reqwest::Method::POST, "/stop")
         .json(&json!({"backend": backend}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2981,7 +2920,7 @@ async fn models_cache(
     }
 
     let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = get_node_agent_url(&state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
         (nid.clone(), url)
     } else {
         let agents = all_node_agents(&state).await;
@@ -3003,12 +2942,9 @@ async fn models_cache(
 
     tracing::info!(node_id = %node_id, model = %model, "caching model");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/start"))
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": "ollama", "model": model}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -3060,7 +2996,7 @@ pub(crate) async fn models_pull(
 
     // Resolve target node
     let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = get_node_agent_url(&state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
         (nid.clone(), url)
     } else {
         // Auto-select: pick first available node from NATS KV
@@ -3088,12 +3024,9 @@ pub(crate) async fn models_pull(
     tracing::info!(node_id = %node_id, backend = %backend, model = %model, "pulling model");
 
     // Send start request to node agent (triggers pull + start in background)
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/start"))
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": backend, "model": model}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -6620,7 +6553,7 @@ mod backend_image_ref_tests {
 
 #[cfg(test)]
 mod no_address_tests {
-    use super::no_address_message;
+    use crate::node_link::no_address_message;
 
     #[test]
     fn a_known_node_without_an_address_is_not_called_not_found() {
