@@ -196,6 +196,93 @@ disk layout and free space — is behind the bearer.
 
 ---
 
+## Control over the bus
+
+Small controller-to-node control calls no longer need the node's inbound
+`:8081` listener. A node that holds an outbound NATS connection answers them
+as NATS request/reply on `node.<id>.rpc.<op>` (followup i131, phase 1). The
+ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `clean`,
+`cleanup` (`images` | `logs`), `logs` (a container tail, or the container
+list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
+handler the HTTPS route runs** (`internal/api/rpc.go` builds the request the
+route would have received and calls that handler), so status, headers and
+body are the HTTPS answer; `TestEveryOpAnswersWhatItsHTTPSRouteAnswers` pins
+it. Streaming and bulk stay on HTTPS until the tunnel (phase 2): inference
+SSE, embeddings, the container proxy, device blobs, `/metrics`, logs over one
+bus message (the node answers `413` with `Noo-Overflow` and the gateway reads
+the same logs over HTTPS). There is no `tools` op: the agent has no such route.
+
+`pull` and `skills.run` can take minutes. The node acks at once (`202`,
+`Noo-Async: 1`) and publishes a keepalive every 10 s, then the result, on
+`node.<id>.evt.<op_id>`; the gateway chooses the `op_id`, subscribes first,
+and treats 45 s of silence as the node being gone. `start` already returns at
+once over HTTPS; over the bus its eventual outcome is also published on its
+event stream.
+
+### Two gates, and why there are two
+
+1. **The bus.** nats-server permissions (`noo cluster nats-users render`): a
+   node may *subscribe* only `node.<its id>.rpc.>`, may *publish* only
+   `node.<its id>.evt.>` and its reply inbox, and no principal but the gateway
+   may publish `node.*.rpc.>` (the worker, every add-on and every node carry
+   an explicit deny). This gate is silent when it refuses, because NATS
+   returns success to a denied publisher, so it is never the only one.
+2. **The envelope.** Every message carries `{op, node, ts, nonce, arg, query,
+   op_id, timeout_s, body_sha256}` signed by the controller's leaf key (the
+   gateway's own `NOO_TLS_KEY`), with that leaf attached. The node verifies
+   the chain to the cluster CA, that the leaf carries the controller
+   organization (the test `ControllerOnly` applies to a TLS peer), the
+   signature over the whole message including a hash of the body, a 300 s
+   window, and an unseen nonce. The nonce set is bounded (16 384); if it is
+   full of unexpired entries the node refuses rather than forget one. A
+   refused message gets a `403` naming the reason and never reaches a handler.
+
+**Why the leaf and not the fleet signing key.** The signing key that verifies
+rail manifests is deliberately not on the gateway (`scripts/noo-apply.sh`: a
+gateway compromise must not be able to sign code). Using it here would put it
+there. The controller leaf is the identity nodes already trust for `:8081`, so
+this adds no new trust and removes none: a holder of the leaf can do over the
+bus exactly what it can do over HTTPS today, and nothing the signing key
+guards.
+
+### When the bus is not available
+
+| Situation | What happens |
+|---|---|
+| Old node (no `nats_rpc`) | HTTPS, as before |
+| New node, controller NATS file from before this change (the subscription is denied) | The node detects the refusal (it flushes after subscribing and reads the server's async permission error), logs it with the remedy, does **not** advertise `nats_rpc`, and retries every minute; control stays on HTTPS |
+| A grant dropped later, or a reply/event publish denied | Any permission violation naming this node's subjects withdraws `nats_rpc` at the next heartbeat |
+| Gateway's bus is down | Routing, not a retry: nothing was sent, so the call goes over HTTPS |
+| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
+| Bus call fails on `start`, `stop`, `restart`, `clean`, `cleanup`, `pull`, `skills.run`, `mcp.call` | The node is reported unreachable, as the HTTPS path reports it. **Never retried over HTTPS**: the node may have run it |
+
+`NOO_CONTROL_OVER_BUS=0` on the gateway sends everything over HTTPS again.
+`GET /api/cluster/nodes` carries `control_calls` per node (`bus`,
+`https_control`, `https_other`, `fallbacks`, since the gateway started): the
+number the later "outbound-only" gate reads. `noo cluster verify` has a
+`control over bus` row per node: a `health` round trip over NATS, **NOT
+CHECKED** (a warning, never ok) for a node that does not advertise `nats_rpc`,
+**FAIL** for a node that advertises it and does not answer.
+
+### Roll order
+
+1. Upgrade the controller (gateway, CLI) first. Nothing changes: no node
+   advertises `nats_rpc` yet.
+2. `noo cluster nats-users render` on the controller (a stack roll re-renders it too). This writes the new
+   grants and reloads NATS; the `rpc`/`evt` grants are static, so they survive
+   the reload. Node credentials do **not** change and need no re-delivery over
+   the rail: only the controller-side permission file is new.
+3. Upgrade the nodes (`noo upgrade --nodes`, the rail). A new node subscribes,
+   proves the subscription, and starts advertising on its next heartbeat. A
+   node upgraded **before** step 2 simply keeps taking control over HTTPS and
+   picks up the bus within a minute of the render.
+4. `noo cluster verify`: every node shows `control over bus` green.
+
+Rollback: set `NOO_CONTROL_OVER_BUS=0` on the gateway (no node change), or
+roll a node back (it stops subscribing and stops advertising).
+
+---
+
 ## Declared host roots
 
 A node declares where its data lives in its own environment. The controller

@@ -544,6 +544,12 @@ other direction: the other stack never calls noomesh.
 `yielded` or `held`.
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
+- `noo cluster verify host3` has a `control over bus` row: one `health` round
+  trip over NATS. It is a warning reading `NOT CHECKED` (never ok) for a node
+  that does not advertise `nats_rpc`, which keeps taking control calls over
+  HTTPS :8081; a node that advertises it and does not answer FAILS, with
+  `noo cluster nats-users render` as the first remedy. See
+  [Control over the bus](../security/node-agent.md#control-over-the-bus).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
   held are warnings, not failures, because the node is working as designed.
