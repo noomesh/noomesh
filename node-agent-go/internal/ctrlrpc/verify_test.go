@@ -230,3 +230,25 @@ func signCanonical(t *testing.T, l leaf, e Envelope) Envelope {
 	e.Sig = base64.StdEncoding.EncodeToString(sig)
 	return e
 }
+
+// The same vector gateway-rust/src/node_rpc.rs pins
+// (the_canonical_string_matches_the_go_verifier_vector). If either side
+// changes the framing, both tests fail.
+func TestCanonicalVectorMatchesTheGatewaySigner(t *testing.T) {
+	e := Envelope{
+		V: 1, Op: "mcp.call", Node: "host9", TS: 1_800_000_000, Nonce: "0123456789abcdef0123456789abcdef",
+		Arg: "files", Query: "a=1", OpID: "op0123456789", TimeoutS: 120,
+		BodySHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	}
+	got, err := e.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "noo-rpc-v1\nmcp.call\nhost9\n1800000000\n0123456789abcdef0123456789abcdef\nfiles\na=1\nop0123456789\n120\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if string(got) != want {
+		t.Fatalf("canonical framing drifted from the gateway signer:\n got %q\nwant %q", got, want)
+	}
+	if BodyHash(nil) != e.BodySHA256 {
+		t.Fatal("sha256 of the empty body is the vector's body hash")
+	}
+}
