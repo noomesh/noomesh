@@ -163,6 +163,10 @@ pub const RESERVED_PREFIXES: &[&str] = &[
     "/api/logs/",
     "/api/metrics/",
     "/api/grafana-ds/",
+    // The harness task API: a delegated token is valid only on these
+    // routes, and every account may write its own tasks here, so an add-on
+    // path inside it would blur both rules.
+    "/api/tasks",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1682,7 +1686,7 @@ pub(crate) mod tests {
     #[test]
     fn public_paths_live_under_api_and_outside_the_gateways_namespaces() {
         refused_with(|v| v["routes"][0]["path"] = json!("/health"), "/api/");
-        for p in ["/api/addons/evolve/cli-piece", "/api/security/x", "/api/config/agent", "/api/auth/login"] {
+        for p in ["/api/addons/evolve/cli-piece", "/api/security/x", "/api/config/agent", "/api/auth/login", "/api/tasks", "/api/tasks/abc/stop"] {
             refused_with(|v| v["routes"][0]["path"] = json!(p), "namespace");
         }
         // An internal route may name any path on the add-on's side.
