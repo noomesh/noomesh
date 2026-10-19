@@ -1827,7 +1827,8 @@ impl ClusterCa {
         let (_, pem) = x509_parser::pem::parse_x509_pem(&data)
             .map_err(|e| format!("parse PEM {}: {e}", crt.display()))?;
         let cert = pem.parse_x509().map_err(|e| format!("parse cert {}: {e}", crt.display()))?;
-        Ok(cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()).map(str::to_string))
+        let cn = cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()).map(str::to_string);
+        Ok(cn)
     }
 
     /// Is this role leaf present, with CN == its role, and with a private

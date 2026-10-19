@@ -759,7 +759,7 @@ mod pg_tls_url_tests {
             std::fs::write(pg.join(f), "x").unwrap();
         }
         let dir = pg.to_string_lossy().into_owned();
-        let (c, k) = pg_role_leaf("postgresql://noo_app:pw@postgres:5432/db", &dir).expect("noo_app has a leaf");
+        let (c, k) = crate::state::pg_role_leaf("postgresql://noo_app:pw@postgres:5432/db", &dir).expect("noo_app has a leaf");
         assert_eq!((c.as_str(), k.as_str()), (format!("{dir}/noo_app.crt").as_str(), format!("{dir}/noo_app.key").as_str()));
         let out = complete_pg_tls("postgresql://noo_app:pw@postgres:5432/db".into(), &ca, &c, &k);
         assert!(out.contains(&format!("sslcert={dir}/noo_app.crt")) && !out.contains(&gw_cert), "{out}");
