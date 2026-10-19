@@ -918,6 +918,8 @@ pub fn select_with(
     // Said once, logged with the selection: where the request could not go
     // where it asked and the mesh answered instead.
     let mut notes: Vec<String> = Vec::new();
+    // Every candidate stands in for a model the caller named.
+    let mut substituted = false;
     let base: &Class = match (named, node, hint) {
         (_, Some(_), None) => match table.all_chat.as_ref() {
             Some(c) => c,
@@ -928,6 +930,7 @@ pub fn select_with(
         // now (its node is off doing something else): any live chat node
         // answers, and the served-model header says which.
         (None, None, Some(h)) if table.all_chat.is_some() => {
+            substituted = true;
             notes.push(format!("model '{h}' is not served by any live node; any live chat node answers"));
             table.all_chat.as_ref().expect("checked by the guard")
         }
@@ -991,7 +994,7 @@ pub fn select_with(
         let (b, st) = (busy(c), stalled(c));
         let mut c = (*c).clone();
         c.class_label = label.clone();
-        c.rank = rank_reason(&c, b, st);
+        c.rank = if substituted { format!("fallback,{}", rank_reason(&c, b, st)) } else { rank_reason(&c, b, st) };
         if st {
             skipped.push(format!("{}/{}: stalled in the last {}s (demoted)", c.node_id, c.backend, STALL_DEMOTION.as_secs()));
         } else if !c.healthy {
@@ -2063,6 +2066,8 @@ mod tests {
         assert_eq!(sel.class, CHAT_DEFAULT);
         assert_eq!(sel.candidates.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), ["mcmini", "pop-os"]);
         assert!(sel.skipped.iter().any(|s| s.contains("not served by any live node")), "{:?}", sel.skipped);
+        // Every one of them is a fallback for the caller (raw chat's `noo.fallback`).
+        assert!(sel.candidates.iter().all(|c| c.rank.starts_with("fallback,")), "{:?}", sel.candidates.iter().map(|c| &c.rank).collect::<Vec<_>>());
         // With nothing serving chat at all there is still nothing to answer with.
         let empty = build_table(&[], &[], &Declarations::default());
         assert!(matches!(select_with(&empty, Some("x"), None, &|_| false, &idle, &fresh), Err(Refusal::UnknownModel(_))));

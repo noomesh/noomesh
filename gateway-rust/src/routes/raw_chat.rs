@@ -362,6 +362,13 @@ fn can_aggregate(path: &str, body: &Value) -> bool {
     path == CHAT_PATH && body.get("n").and_then(Value::as_u64).unwrap_or(1) <= 1
 }
 
+/// Did the caller get something other than what it asked for? The first
+/// candidate is a fallback too when `select` put it there as a stand-in
+/// (rank `fallback,…`: a model nothing serves, a class with nothing live).
+fn is_fallback(index: usize, cand: &Candidate) -> bool {
+    index != 0 || cand.rank.starts_with("fallback,")
+}
+
 /// The operator-surface wording for a candidate that connected and then said
 /// nothing. Names what happened and the one command that usually clears it.
 fn stall_text(what: &str, secs: u64, cand: &Candidate) -> String {
@@ -586,7 +593,9 @@ where
         backend_type: cand.backend.clone(),
         node_id: cand.node_id.clone(),
         url: cand.url.clone(),
-        fallback: ok.index != 0,
+        // Not the class's first choice, or a stand-in for what was named
+        // (a class or model with nothing live, answered by the mesh).
+        fallback: is_fallback(ok.index, cand),
         attempts: ok.attempts,
     };
     let label = if cand.class_label.is_empty() { class } else { cand.class_label.as_str() };
@@ -853,6 +862,15 @@ mod tests {
         let tap = g.clone();
         tap.mark_streamed();
         assert!(!g.may_retry(1));
+    }
+
+    #[test]
+    fn a_stand_in_first_candidate_is_reported_as_a_fallback() {
+        let mut c = cand("mcmini", "ollama", "gemma4:12b", "https://100.64.0.2:8081");
+        assert!(!is_fallback(0, &c));
+        assert!(is_fallback(1, &c));
+        c.rank = "fallback,rank=gpu,params=12,load=0.20".into();
+        assert!(is_fallback(0, &c), "a model nothing serves, answered by the mesh, says so");
     }
 
     #[tokio::test]
