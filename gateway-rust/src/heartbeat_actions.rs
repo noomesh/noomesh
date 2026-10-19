@@ -2741,6 +2741,30 @@ async fn action_cost_report(
 
 // ─── security_audit ────────────────────────────────────────────────────
 
+/// Event types that record ORDINARY audited activity, not a security
+/// signal. 629 `mcp_tool_call` rows in a day with zero denials once drove
+/// the level to HIGH (record: i139). They stay in the counts and the
+/// by-type list; they just do not count toward the risk level. Anything
+/// not named here (denials, auth/cluster auth failures, traversal, exec
+/// denied, rate limits, unknown types) still counts.
+const ROUTINE_AUDIT_EVENTS: &[&str] =
+    &["mcp_tool_call", "config_update", "auth_success", "auth_logout"];
+
+fn security_risk_level(rows: &[(String, i64)], alert_threshold: i64) -> &'static str {
+    let signal: i64 = rows
+        .iter()
+        .filter(|(t, _)| !ROUTINE_AUDIT_EVENTS.contains(&t.as_str()))
+        .map(|(_, c)| *c)
+        .sum();
+    if signal >= alert_threshold * 3 {
+        "HIGH"
+    } else if signal >= alert_threshold {
+        "MEDIUM"
+    } else {
+        "LOW"
+    }
+}
+
 async fn action_security_audit(
     state: &crate::state::AppState,
     config: &Value,
@@ -2785,13 +2809,7 @@ async fn action_security_audit(
         lines.push(format!("  - {event_type}: {count}"));
     }
 
-    let risk = if total >= alert_threshold * 3 {
-        "HIGH"
-    } else if total >= alert_threshold {
-        "MEDIUM"
-    } else {
-        "LOW"
-    };
+    let risk = security_risk_level(&rows, alert_threshold);
 
     let by_type = if lines.is_empty() {
         "(no events in window)".to_string()
@@ -2957,6 +2975,44 @@ async fn action_idle_scaledown(
 // is gated independently by its own env var; while all are off, this
 // digest is the operator's window into what the agent SEES.
 
+/// Actions whose healthy run is legitimately sub-second: a status read, a
+/// count, an audit summary, a no-op recompute. A fast success from these
+/// says nothing about silent failure, so the self-check does not flag it
+/// (record: i139; graph_signals is a noop when nothing is dirty). The check
+/// stays on for everything else (research, briefing, consolidation, ...)
+/// where a sub-second "success" means the work never ran. A real error on
+/// these actions is still flagged: this only exempts the *fast* test.
+const CHEAP_ACTIONS: &[&str] = &[
+    "cluster_health",
+    "rag_reindex",
+    "security_audit",
+    "agent_self_check",
+    "graph_signals",
+];
+
+/// Why a heartbeat run belongs in the self-check digest, or None.
+/// An error is `status = error` or a non-blank error field (an empty
+/// string is no error). A fast success is flagged only for actions not in
+/// `CHEAP_ACTIONS`.
+fn classify_run_issue(
+    action: &str,
+    status: &str,
+    duration_ms: Option<i32>,
+    error: Option<&str>,
+) -> Option<String> {
+    let err = error.map(str::trim).filter(|e| !e.is_empty());
+    if status == "error" || err.is_some() {
+        let e = err.unwrap_or("(no message)");
+        return Some(format!("error: {}", e.chars().take(120).collect::<String>()));
+    }
+    if status == "success" && !CHEAP_ACTIONS.contains(&action) {
+        if let Some(d) = duration_ms.filter(|d| *d < 1000) {
+            return Some(format!("suspiciously fast: {d}ms (likely silent failure)"));
+        }
+    }
+    None
+}
+
 async fn action_agent_self_check(
     state: &std::sync::Arc<crate::state::AppState>,
     config: &Value,
@@ -2990,11 +3046,15 @@ async fn action_agent_self_check(
             "SELECT task_id, task_name, action, status, duration_ms, started_at, error \
              FROM noo_heartbeat_runs \
              WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
-               AND (status = 'error' OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000)) \
+               AND (status = 'error' \
+                    OR COALESCE(BTRIM(error), '') <> '' \
+                    OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
+                        AND NOT (action = ANY($2)))) \
              ORDER BY started_at DESC \
              LIMIT 50",
         )
         .bind(lookback_hours as i32)
+        .bind(CHEAP_ACTIONS)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
@@ -3090,12 +3150,8 @@ async fn action_agent_self_check(
         for (task_id, task_name, action, status, dur_ms, when, err) in &recent_failures {
             let name = task_name.as_deref().unwrap_or(task_id);
             let when_s = when.format("%m-%d %H:%M");
-            let detail = if let Some(e) = err {
-                format!("error: {}", e.chars().take(120).collect::<String>())
-            } else if let Some(d) = dur_ms {
-                format!("suspiciously fast: {d}ms (likely silent failure)")
-            } else {
-                format!("status={status}")
+            let Some(detail) = classify_run_issue(action, status, *dur_ms, err.as_deref()) else {
+                continue;
             };
             out.push_str(&format!("- `{when_s}` **{name}** ({action}) — {detail}\n"));
         }
@@ -4308,6 +4364,46 @@ mod sanitize_tests {
         let input = "# Deep Research Report\nSummary\nThe user base grew.";
         // "the user" appears in body but there's no pre-heading preamble → keep.
         assert_eq!(sanitize_result_text(input), input);
+    }
+
+    #[test]
+    fn self_check_does_not_flag_graph_signals_noop() {
+        // Real history row: status=success, error "" (empty), 74ms.
+        assert_eq!(classify_run_issue("graph_signals", "success", Some(74), Some("")), None);
+        for a in ["cluster_health", "rag_reindex", "security_audit", "agent_self_check"] {
+            assert_eq!(classify_run_issue(a, "success", Some(74), None), None, "{a}");
+        }
+    }
+
+    #[test]
+    fn self_check_still_flags_real_errors_and_fast_expensive_actions() {
+        let e = classify_run_issue("graph_signals", "error", Some(74), Some("boom")).unwrap();
+        assert_eq!(e, "error: boom");
+        // non-empty error field on a "success" row still shows
+        assert!(classify_run_issue("graph_signals", "success", Some(5000), Some("x")).is_some());
+        // status error with empty message is still an error
+        assert_eq!(
+            classify_run_issue("cluster_health", "error", None, Some("")).unwrap(),
+            "error: (no message)"
+        );
+        // silent-failure check stays for expensive actions
+        let f = classify_run_issue("research", "success", Some(74), Some("")).unwrap();
+        assert_eq!(f, "suspiciously fast: 74ms (likely silent failure)");
+        assert_eq!(classify_run_issue("research", "success", Some(4000), None), None);
+    }
+
+    #[test]
+    fn security_risk_ignores_routine_mcp_calls() {
+        let rows = vec![
+            ("mcp_tool_call".to_string(), 629),
+            ("config_update".to_string(), 8),
+        ];
+        assert_eq!(security_risk_level(&rows, 5), "LOW");
+        let mut bad = rows.clone();
+        bad.push(("exec_denied".to_string(), 5));
+        assert_eq!(security_risk_level(&bad, 5), "MEDIUM");
+        bad.push(("auth_failure".to_string(), 10));
+        assert_eq!(security_risk_level(&bad, 5), "HIGH");
     }
 
     #[test]
