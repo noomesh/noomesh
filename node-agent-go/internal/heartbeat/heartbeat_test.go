@@ -614,6 +614,36 @@ func TestReporter_HeartbeatCarriesControllerLeafOnly(t *testing.T) {
 	}
 }
 
+// Every beat AND the registration carry `control_transports`: the HTTPS
+// listener is on, the node-initiated transports are reserved and off.
+func TestReporter_HeartbeatCarriesControlTransports(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&payload)
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+	t.Setenv("NOO_PKI_DIR", t.TempDir())
+	r := newTestReporter(t, server.URL, nil)
+	for _, send := range []func(){func() { r.SendHeartbeat() }, func() { r.Register(hardware.Capabilities{CPUCores: 1}, "192.168.1.10") }} {
+		payload = nil
+		send()
+		ct, ok := payload["control_transports"].(map[string]any)
+		if !ok {
+			t.Fatalf("control_transports missing or not an object: %#v", payload["control_transports"])
+		}
+		want := map[string]bool{"https_listener": true, "nats_rpc": false, "tunnel": false}
+		if len(ct) != len(want) {
+			t.Fatalf("control_transports has unexpected keys: %#v", ct)
+		}
+		for k, v := range want {
+			if got, ok := ct[k].(bool); !ok || got != v {
+				t.Fatalf("control_transports[%q]=%#v, want %v", k, ct[k], v)
+			}
+		}
+	}
+}
+
 // Every beat carries `backend_leaves`, the map the CLI's
 // `backend doors` row reads: present leaves with their SANs and expiry,
 // and `{}` — never absent — when the node holds none.
