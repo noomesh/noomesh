@@ -147,10 +147,13 @@ pub(crate) fn login_with_ticket(g: &Globals, account: &str, purpose: &str) -> Re
 /// `floor_ttl_secs` (one access-token lifetime plus margin). A running gateway
 /// adopts it within its Postgres re-read interval (5 s); one that is down
 /// loads it at boot. This path deliberately does not call the gateway: the
-/// reset must work with no login, no secret and the gateway down. The table is
-/// created here too (`IF NOT EXISTS`, the same columns as migration 095), so a
-/// new CLI against a gateway that has not yet migrated still resets instead of
-/// failing the whole transaction; the migration is then a no-op.
+/// reset must work with no login, no secret and the gateway down. The floor
+/// row is written only when migration 095's table exists: this connection is
+/// not the role that owns the schema, so creating the table here could leave
+/// it owned by a role the gateway cannot read. Against an unmigrated database
+/// the password still resets and the refresh tokens are still revoked;
+/// already-issued access tokens then last until they expire (15 minutes by
+/// default), as before this change.
 pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str, floor_ttl_secs: i64) -> String {
     let (u, h) = (quote(account), quote(bcrypt_hash));
     format!(
@@ -163,13 +166,14 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str, floor_ttl_secs: 
          scopes = CASE WHEN COALESCE(noo_users.scopes, '[]'::jsonb) @> '[\"admin\"]'::jsonb \
          THEN noo_users.scopes ELSE '{ADMIN_SCOPES}'::jsonb END, \
          role = 'admin';\n\
-         CREATE TABLE IF NOT EXISTS noo_session_floors (account text PRIMARY KEY, floor bigint NOT NULL, expires_at timestamptz NOT NULL);\n\
          UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = {u} AND revoked_at IS NULL;\n\
+         DO $floor$ BEGIN IF to_regclass('noo_session_floors') IS NOT NULL THEN \
          INSERT INTO noo_session_floors (account, floor, expires_at) \
          VALUES ({u}, extract(epoch FROM now())::bigint + 1, now() + interval '{floor_ttl_secs} seconds') \
          ON CONFLICT (account) DO UPDATE SET \
          floor = GREATEST(noo_session_floors.floor, EXCLUDED.floor), \
-         expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at);\n\
+         expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at); \
+         END IF; END $floor$;\n\
          COMMIT;\n"
     )
 }
@@ -241,7 +245,7 @@ mod tests {
         let commit = sql.find("COMMIT;").unwrap();
         for needle in [
             "UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = 'admin'",
-            "CREATE TABLE IF NOT EXISTS noo_session_floors (account text PRIMARY KEY",
+            "IF to_regclass('noo_session_floors') IS NOT NULL THEN",
             "INSERT INTO noo_session_floors (account, floor, expires_at)",
             "VALUES ('admin', extract(epoch FROM now())::bigint + 1, now() + interval '1200 seconds')",
             "GREATEST(noo_session_floors.floor, EXCLUDED.floor)",
@@ -249,6 +253,7 @@ mod tests {
             let at = sql.find(needle).unwrap_or_else(|| panic!("missing {needle}: {sql}"));
             assert!(begin < at && at < commit, "{needle} must sit inside the transaction");
         }
+        assert!(!sql.contains("CREATE TABLE"), "the CLI must never create schema: {sql}");
     }
 
     #[test]
