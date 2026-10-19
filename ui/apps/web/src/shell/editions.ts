@@ -40,6 +40,7 @@ export const CORE_TABS: readonly string[] = [
   'chat', // the reason anyone installs it
   'cluster', // "my machines, as one system" — the core claim
   'backends', // start/stop models across nodes — the differentiator vs plain Ollama
+  'model-prefs', // which model answers each purpose; embedding spaces (operator-gated)
   'tasks', // scheduled work; basic self-hosting need
   'memory', // conversations persist — the other thing cloud does not do privately
   'rag', // document ingest — the reason to have a graph at all

@@ -54,9 +54,21 @@
   "/api/cluster/backends/start": [
    "apps/web/src/features/backends/useBackends.ts"
   ],
+  "/api/cluster/embedding-spaces": [
+   "apps/web/src/features/model-prefs/useModelPrefs.ts"
+  ],
+  "/api/cluster/embedding-spaces/{space}": [
+   "apps/web/src/features/model-prefs/useModelPrefs.ts"
+  ],
   "/api/cluster/gpu-metrics": [
    "apps/web/src/features/observability/useObservability.ts",
    "apps/web/src/kiosk/useKiosk.ts"
+  ],
+  "/api/cluster/model-aliases/{alias}": [
+   "apps/web/src/features/model-prefs/useModelPrefs.ts"
+  ],
+  "/api/cluster/model-classes": [
+   "apps/web/src/features/model-prefs/useModelPrefs.ts"
   ],
   "/api/cluster/nodes": [
    "apps/web/src/features/cluster/useClusterNodes.ts",
@@ -320,12 +332,9 @@
   "/api/cluster/cli-asset/{name}",
   "/api/cluster/delete-tailscale-device",
   "/api/cluster/discover",
-  "/api/cluster/embedding-spaces",
-  "/api/cluster/embedding-spaces/{space}",
   "/api/cluster/enroll-tailnet",
   "/api/cluster/maintenance",
   "/api/cluster/mint-join-key",
-  "/api/cluster/model-classes",
   "/api/cluster/model-classes/{class}",
   "/api/cluster/nodes/register",
   "/api/cluster/nodes/{id}/forget",

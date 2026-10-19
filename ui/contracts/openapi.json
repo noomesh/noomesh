@@ -18869,6 +18869,61 @@
           }
         }
       }
+    },
+    "/api/cluster/model-aliases/{alias}": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update model aliases",
+        "description": "[native] PUT /api/cluster/model-aliases/{alias} \u2014 point one alias (a purpose such as `knowledge`, or any other) at a class or a served model: `{class}`. That target is tried first and the mesh answers behind it (i145 phase D, `noo cluster prefer`). A target nothing serves is accepted with a note.",
+        "operationId": "model_alias_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete model aliases",
+        "description": "[native] DELETE /api/cluster/model-aliases/{alias} \u2014 forget one alias. A purpose then means `chat-default` (the whole mesh) again.",
+        "operationId": "model_alias_delete",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

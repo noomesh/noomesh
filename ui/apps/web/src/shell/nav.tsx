@@ -31,6 +31,7 @@ const CORE_NAV: NavSection[] = [
     items: [
       { id: 'cluster', label: 'Cluster', status: 'live' },
       { id: 'backends', label: 'Backends', status: 'live' },
+      { id: 'model-prefs', label: 'Models', status: 'live' },
       { id: 'tasks', label: 'Tasks', status: 'live' },
     ],
   },
@@ -101,6 +102,7 @@ const CORE_ICONS: Record<string, ReactNode> = {
     </>
   ),
   backends: <path d="M11 3l-6 8h4l-1 6 6-8h-4z" />,
+  'model-prefs': <path d="M4 6h12M4 10h12M4 14h12M8 4v4M13 8v4M7 12v4" />,
   memory: (
     <>
       <ellipse cx="10" cy="5.5" rx="6" ry="2.5" />
