@@ -152,6 +152,9 @@ type Principal struct {
 	// peer node's leaf names a different id, and this node's leaf used from
 	// another box is not on loopback.
 	OwnHarness bool
+	// Tunnel is true when Controller was established by the node's own
+	// tunnel rather than by a TLS peer certificate.
+	Tunnel bool
 }
 
 type principalKey struct{}
@@ -198,6 +201,15 @@ func isService(chain []*x509.Certificate) bool {
 // reaching here with a certificate means the cluster CA signed it.
 func classify(cfg *config.Config, r *http.Request, actor string) Principal {
 	p := Principal{Actor: actor, Identified: canIdentifyPeers(cfg, r)}
+	if IsTunnelController(r) {
+		// The controller, over this node's own authenticated tunnel: as if
+		// the TLS leaf carried the controller organization. There is no
+		// certificate on this request, and none is claimed.
+		p.Identified = true
+		p.Controller = true
+		p.Tunnel = true
+		return p
+	}
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		leaf := r.TLS.PeerCertificates[0]
 		p.CertCN = leaf.Subject.CommonName

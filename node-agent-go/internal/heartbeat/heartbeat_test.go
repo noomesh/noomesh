@@ -927,3 +927,22 @@ func TestHeartbeatCarriesModelBenchOnlyOnceOneHasRun(t *testing.T) {
 		t.Error("host_services still sent beside it")
 	}
 }
+
+func TestControlTransportsAdvertiseTheTunnelOnlyWhileItIsUp(t *testing.T) {
+	r := &Reporter{}
+	if r.controlTransports()["tunnel"] {
+		t.Fatal("no tunnel provider: must not advertise")
+	}
+	up := false
+	r.SetTunnel(func() bool { return up })
+	if r.controlTransports()["tunnel"] {
+		t.Fatal("tunnel down: must not advertise")
+	}
+	up = true
+	if !r.controlTransports()["tunnel"] {
+		t.Fatal("tunnel up: must advertise")
+	}
+	if !r.controlTransports()["https_listener"] {
+		t.Fatal("the HTTPS listener is always offered")
+	}
+}

@@ -41,6 +41,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
 	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/reconcile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/tunnel"
 )
 
 // Agent is the top-level node agent orchestrator.
@@ -57,6 +58,7 @@ type Agent struct {
 	server *api.Server
 	mesh   *messaging.MeshResponder
 	ctrl   *ctrlrpc.Service
+	tun    *tunnel.Client
 	gossip *messaging.GossipAnnouncer
 
 	// native probes backends served outside Docker (darwin/Metal). nil off
@@ -311,6 +313,10 @@ func (a *Agent) Run() error {
 	a.hb.SetGPUContention(func() any { return gy.Report() })
 	gy.SetDrainer(occupancyDrainer{})
 	a.server.SetGPUHold(gy.Hold, gy.Release)
+	// The node-held tunnel (followup i131 phase 2): dial the controller
+	// outbound so streaming and bulk calls need no inbound connection.
+	// Never fatal; the heartbeat advertises it only while it is up.
+	a.startTunnel(ctx)
 	go a.hb.Run(ctx)
 
 	// 4a. GPU watchdog — only where a GPU is actually detected.
@@ -426,6 +432,50 @@ func (a *Agent) startControlBus(ctx context.Context) {
 	a.ctrl = ctrlrpc.NewService(a.nats, a.cfg.NodeID, v, a.server)
 	a.hb.SetNatsRPC(a.ctrl.Ready)
 	a.ctrl.Start(ctx)
+}
+
+// startTunnel dials the controller's tunnel endpoint and keeps it up.
+// NOO_AGENT_TUNNEL=off (or 0/false/no) keeps the node on HTTPS and the bus.
+// Anything that stops it from starting (no https controller URL, no ECDSA
+// leaf, no cluster CA to verify the controller with) is logged with the
+// reason and leaves control on HTTPS; the node never fails to start over it.
+func (a *Agent) startTunnel(ctx context.Context) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NOO_AGENT_TUNNEL"))) {
+	case "off", "0", "false", "no":
+		slog.Info("node tunnel switched off (NOO_AGENT_TUNNEL); streaming calls stay on the HTTPS listener")
+		return
+	}
+	tr, _ := a.http.Transport.(*http.Transport)
+	if tr == nil || tr.TLSClientConfig == nil {
+		slog.Warn("node tunnel not started: no TLS client configuration; control stays on HTTPS")
+		return
+	}
+	caPEM, rerr := os.ReadFile(a.cfg.TLSCA)
+	if a.cfg.TLSCA == "" || rerr != nil {
+		slog.Warn("node tunnel not started: the cluster CA (NOO_TLS_CA) is unreadable, so the controller cannot be verified; control stays on HTTPS",
+			"path", a.cfg.TLSCA, "error", rerr)
+		return
+	}
+	v, verr := ctrlrpc.NewVerifier(a.cfg.NodeID, caPEM)
+	if verr != nil {
+		slog.Warn("node tunnel not started; control stays on HTTPS", "error", verr)
+		return
+	}
+	c, cerr := tunnel.New(tunnel.Options{
+		NodeID:        a.cfg.NodeID,
+		ControllerURL: a.cfg.ControllerURL,
+		TLS:           tr.TLSClientConfig,
+		Sign:          func(r *http.Request) { auth.SetClusterAuth(r, a.cfg.NodeID, a.cfg.ClusterSecret) },
+		Handler:       a.server.Handler(),
+		Verifier:      v,
+	})
+	if cerr != nil {
+		slog.Warn("node tunnel not started; control stays on HTTPS", "error", cerr)
+		return
+	}
+	a.tun = c
+	a.hb.SetTunnel(c.Connected)
+	go c.Run(ctx)
 }
 
 func (a *Agent) startMessaging(ctx context.Context) {
