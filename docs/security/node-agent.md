@@ -885,8 +885,12 @@ contains, one of those.
   the data root, names `~/noomesh/pki`, `~/noomesh/secrets`,
   `~/noomesh/harness-secrets` and both env files in a deny of their own,
   then re-allows the CLI's own `~/noomesh/vendor` and `~/noomesh/bin`, the
-  CA file, and the task's directories. No `sandbox-exec` means a refusal,
-  the same as on Linux.
+  CA file, and the task's directories. On a Mac the harness runs as the
+  operator's own user, so the profile first denies that user's whole real
+  home (`~/.ssh`, `~/Documents`, keychains), re-allowing under it only
+  those same paths and a `stat` of `~` and `~/noomesh`; the self-test
+  plants a file in the real home and proves it unreadable. No
+  `sandbox-exec` means a refusal, the same as on Linux.
 - **Other processes on a Mac.** macOS has no Landlock, and the harness and
   the agent run as the same user as the CLI, so a plain process could read
   their arguments and environment with `sysctl(KERN_PROCARGS2)` (what

@@ -45,9 +45,14 @@
 //! node-agent bearer the translator would be protecting. The translator
 //! adds no reach: it forwards only to the one pinned endpoint, holds no
 //! credential of its own, and dies with the task. The upstream side is the
-//! harness's own: `tls::cluster_client()` (the cluster CA) and the node
-//! agent's bearer and backend hint through
-//! `coordinator::with_backend_hint_url`, exactly as the loop sends.
+//! harness's own: `tls::cluster_client()` (the cluster CA) for a whole-body
+//! reply, `tls::cluster_stream_client()` (no total timeout, the stream idle
+//! bound) for a streamed one, and the node agent's bearer and backend hint
+//! through `coordinator::with_backend_hint_url`, exactly as the loop sends.
+//!
+//! **Reasoning control.** With `NOO_HARNESS_THINKING=off` every forwarded
+//! request carries the upstream's own "do not reason" field
+//! (`coordinator::thinking::disable_on_wire`), whatever the CLI asked.
 //!
 //! **The Responses route is stateless.** Codex sends the whole conversation
 //! in `input` on every HTTP request (its request type has no
@@ -119,6 +124,10 @@ struct Shared {
     upstream: ResolvedBackend,
     wire: Wire,
     client: reqwest::Client,
+    /// For streamed upstream replies: no total timeout, an idle bound.
+    stream_client: reqwest::Client,
+    /// `NOO_HARNESS_THINKING` as it stood when the translator started.
+    thinking: crate::coordinator::thinking::ThinkingMode,
     usage: Mutex<UsageTotals>,
     logged_rewrite: AtomicBool,
     logged_no_usage: AtomicBool,
@@ -191,6 +200,16 @@ impl Translator {
     }
 
     async fn start_with(upstream: ResolvedBackend, log_routes: bool) -> Result<Translator> {
+        Self::start_inner(upstream, log_routes, crate::coordinator::thinking::thinking_mode()).await
+    }
+
+    /// [`start`](Self::start) under an explicit reasoning mode (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn start_thinking(upstream: ResolvedBackend, thinking: crate::coordinator::thinking::ThinkingMode) -> Result<Translator> {
+        Self::start_inner(upstream, false, thinking).await
+    }
+
+    async fn start_inner(upstream: ResolvedBackend, log_routes: bool, thinking: crate::coordinator::thinking::ThinkingMode) -> Result<Translator> {
         let wire = match upstream.api_format.as_str() {
             "ollama" => Wire::Ollama,
             // A node backend is never Anthropic: cloud models run on the
@@ -202,6 +221,8 @@ impl Translator {
             upstream,
             wire,
             client: crate::tls::cluster_client(),
+            stream_client: crate::tls::cluster_stream_client(),
+            thinking,
             usage: Mutex::new(UsageTotals::default()),
             logged_rewrite: AtomicBool::new(false),
             logged_no_usage: AtomicBool::new(false),
@@ -374,8 +395,16 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         }
         Wire::Ollama => (sh.url("/api/chat"), ollama::request(&body)),
     };
+    let mut wire_body = wire_body;
+    if sh.thinking == crate::coordinator::thinking::ThinkingMode::Off {
+        let wire = match sh.wire {
+            Wire::OpenAi => "openai",
+            Wire::Ollama => "ollama",
+        };
+        crate::coordinator::thinking::disable_on_wire(&mut wire_body, wire, &sh.upstream.backend_type, false);
+    }
     let req = if stream {
-        crate::node_link::backend_stream_on(&sh.client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
+        crate::node_link::backend_stream_on(&sh.stream_client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
     } else {
         crate::node_link::backend_request_on(&sh.client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
     }
@@ -1317,5 +1346,39 @@ mod tests {
         t.shutdown().await;
 
         assert!(Translator::start(backend(&url, "anthropic")).await.is_err(), "a node harness never fronts an Anthropic endpoint");
+    }
+
+    /// NOO_HARNESS_THINKING=off: every forwarded request carries the
+    /// upstream's own "do not reason" field, streamed or not, whatever the
+    /// CLI sent; `auto` forwards the CLI's request untouched.
+    #[tokio::test]
+    async fn thinking_off_rides_on_every_forwarded_request() {
+        use crate::coordinator::thinking::ThinkingMode;
+        let m = mock().await;
+        let c = client();
+        let ask = |stream: bool| json!({"model": "x", "stream": stream, "messages": [{"role": "user", "content": "hi"}]});
+
+        let t = Translator::start_thinking(backend(&m.url, "openai"), ThinkingMode::Off).await.unwrap();
+        let url = format!("{}/v1/chat/completions", t.base_url());
+        for stream in [false, true] {
+            c.post(&url).json(&ask(stream)).send().await.unwrap().text().await.unwrap();
+            let up = m.last();
+            assert_eq!(up["chat_template_kwargs"]["enable_thinking"], false, "stream={stream}: {up}");
+            assert_eq!(up["reasoning"]["effort"], "none", "stream={stream}: {up}");
+        }
+        t.shutdown().await;
+
+        let o = Translator::start_thinking(backend(&m.url, "ollama"), ThinkingMode::Off).await.unwrap();
+        let url = format!("{}/v1/chat/completions", o.base_url());
+        c.post(&url).json(&ask(true)).send().await.unwrap().text().await.unwrap();
+        assert_eq!(m.last()["think"], false, "Ollama's /api/chat gets its own switch");
+        o.shutdown().await;
+
+        let a = Translator::start_thinking(backend(&m.url, "openai"), ThinkingMode::Auto).await.unwrap();
+        let url = format!("{}/v1/chat/completions", a.base_url());
+        c.post(&url).json(&ask(false)).send().await.unwrap().text().await.unwrap();
+        let up = m.last();
+        assert!(up.get("reasoning").is_none() && up.get("chat_template_kwargs").is_none(), "auto adds nothing: {up}");
+        a.shutdown().await;
     }
 }

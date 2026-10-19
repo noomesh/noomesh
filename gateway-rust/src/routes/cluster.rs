@@ -3137,9 +3137,9 @@ async fn desired_config_get(
         }
     }
     #[allow(clippy::type_complexity)]
-    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>)> =
+    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>, Vec<String>)> =
         sqlx::query_as(
-            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile \
+            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds \
              FROM noo_node_config WHERE node_id = $1",
         )
         .bind(&node_id)
@@ -3223,7 +3223,7 @@ async fn desired_config_get(
     let placement_json = apply_harness_policy(&harness_policy, placement_json);
 
     let node_json = match node {
-        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile)) => json!({
+        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds)) => json!({
             "node_id": node_id,
             "ip_address": ip,
             "ssh_user": user,
@@ -3238,6 +3238,9 @@ async fn desired_config_get(
             "usage_profile": usage_profile,
             "usage_profile_effective": usage_effective,
             "usage_profile_source": usage_source,
+            // The vendor CLIs this node's bundle carries besides its
+            // harness placement's (`noo cluster vendor install`).
+            "vendor_kinds": vendor_kinds,
         }),
         None => json!(null),
     };
@@ -3282,6 +3285,36 @@ struct NodeConfigBody {
     /// default: dedicated on the controller, shared elsewhere).
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     usage_profile: Option<Option<Value>>,
+    /// The harness kinds whose vendor CLI this node carries whatever its
+    /// placement names (`noo cluster vendor install`). Omitted = keep;
+    /// `[]` or `null` = none.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    vendor_kinds: Option<Option<Value>>,
+}
+
+/// Judge a `vendor_kinds` value: kinds from the harness-kinds table that
+/// run a vendor CLI (`noo` runs none), at most eight, deduplicated in name
+/// order. `null` is none.
+pub(crate) fn validate_vendor_kinds(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or("vendor_kinds must be a list of harness kind names")?;
+    let mut out = std::collections::BTreeSet::new();
+    for k in arr {
+        let k = k.as_str().map(str::trim).ok_or("vendor_kinds must be a list of harness kind names")?;
+        match crate::harness_kinds::get(k) {
+            Some(row) if row.cli.is_some() => {
+                out.insert(k.to_string());
+            }
+            _ => {
+                let vendor: Vec<&str> = crate::harness_kinds::all().iter().filter(|r| r.cli.is_some()).map(|r| r.kind.as_str()).collect();
+                return Err(format!("'{k}' is not a harness kind that runs a vendor CLI (one of {})", vendor.join(", ")));
+            }
+        }
+    }
+    if out.len() > 8 {
+        return Err("vendor_kinds names at most 8 kinds".into());
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// `Option<Option<T>>` so the handler can tell "field absent" (keep) from
@@ -3297,8 +3330,8 @@ where
 /// column/value arity is pinned by a test — the 2026-09-11 cut listed
 /// twelve columns and supplied eleven values, which no compiler sees.
 const NODE_CONFIG_UPSERT: &str =
-        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, NOW()) \
+        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, $18, NOW()) \
          ON CONFLICT (node_id) DO UPDATE SET \
            ip_address = COALESCE($2, noo_node_config.ip_address), \
            ssh_user   = COALESCE($3, noo_node_config.ssh_user), \
@@ -3312,6 +3345,7 @@ const NODE_CONFIG_UPSERT: &str =
            harness_policy = COALESCE($12, noo_node_config.harness_policy), \
            default_loop_budget = CASE WHEN $15 THEN $14 ELSE noo_node_config.default_loop_budget END, \
            usage_profile = CASE WHEN $17 THEN $16 ELSE noo_node_config.usage_profile END, \
+           vendor_kinds = CASE WHEN $19 THEN $18 ELSE noo_node_config.vendor_kinds END, \
            updated_at = NOW()";
 /// PUT /api/cluster/nodes/{node_id}/config — upsert the node config row.
 /// COALESCE keeps existing values for fields omitted from the body.
@@ -3347,6 +3381,11 @@ async fn node_config_put(
             _ => return Err(AppError::BadRequest("usage_profile must be 'shared', 'dedicated' or null".into())),
         },
     };
+    // Absent → keep ($18 empty, $19 false); present → set ($19 true).
+    let (vendor_value, vendor_set): (Vec<String>, bool) = match &body.vendor_kinds {
+        None => (Vec::new(), false),
+        Some(v) => (validate_vendor_kinds(v.as_ref()).map_err(AppError::BadRequest)?, true),
+    };
     let (policy_value, policy_set) = match &body.companion_policy {
         None => (None, false),
         Some(None) => (None, true),
@@ -3377,6 +3416,8 @@ async fn node_config_put(
     .bind(budget_set)
     .bind(usage_value)
     .bind(usage_set)
+    .bind(vendor_value)
+    .bind(vendor_set)
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Internal(format!("node_config upsert: {e}")))?;
@@ -5856,6 +5897,27 @@ mod arch_tests {
 #[cfg(test)]
 mod node_config_upsert_tests {
     use super::NODE_CONFIG_UPSERT;
+
+    #[test]
+    fn vendor_kinds_name_vendor_cli_kinds_only() {
+        use serde_json::json;
+        let v = |x: serde_json::Value| super::validate_vendor_kinds(Some(&x));
+        // The shipped table's foreign kinds all run a CLI.
+        let foreign: Vec<&str> = crate::harness_kinds::all().iter().filter(|r| r.cli.is_some()).map(|r| r.kind.as_str()).collect();
+        assert!(!foreign.is_empty(), "the shipped table has a vendor kind");
+        let mut want: Vec<String> = foreign.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        let mut twice: Vec<&str> = foreign.clone();
+        twice.extend(foreign.iter());
+        assert_eq!(v(json!(twice)).unwrap(), want, "deduplicated, name order");
+        assert!(v(json!([])).unwrap().is_empty());
+        assert!(super::validate_vendor_kinds(None).unwrap().is_empty());
+        assert!(v(serde_json::Value::Null).unwrap().is_empty(), "null clears");
+        assert!(v(json!(["noo"])).unwrap_err().contains("runs a vendor CLI"), "noo runs no CLI");
+        assert!(v(json!(["nope"])).is_err());
+        assert!(v(json!("copilot")).is_err(), "a list, not a string");
+        assert!(v(json!([1])).is_err());
+    }
 
     /// PINNED: every column named in the INSERT gets exactly one value.
     #[test]

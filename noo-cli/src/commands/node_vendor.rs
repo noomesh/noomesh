@@ -19,7 +19,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use super::cluster_vendor::wrapper_script;
+use super::cluster_vendor::{wrapper_script, VENDOR_SLOTS};
 
 /// The vendor kinds' manifests, parsed and judged.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -45,10 +45,10 @@ fn re_path(s: &str) -> bool {
         && s.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
-/// Parse and judge a vendor-cli manifest, the same rules as the Linux
+/// Parse and judge the manifest of the vendor slot `kind`
+/// (`cluster_vendor::VENDOR_SLOTS`), the same rules as the Linux
 /// applier's vendor_manifest_ok.
-pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<Manifest, String> {
-    let kind = "vendor-cli";
+pub(crate) fn parse_slot_manifest(kind: &str, bytes: &[u8]) -> Result<Manifest, String> {
     let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("{kind}: manifest does not parse ({e})"))?;
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
     let m = Manifest {
@@ -85,19 +85,25 @@ fn sha256_hex(b: &[u8]) -> String {
 }
 
 /// Before anything installs: each vendor payload rides with its manifest,
-/// the manifest is well-formed, and the payload hashes to it.
+/// the manifest is well-formed, the payload hashes to it, and no two slots
+/// install the same CLI.
 pub(crate) fn check(payloads: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
-    let kind = "vendor-cli";
-    let mk = format!("{kind}-manifest");
-    match (payloads.get(kind), payloads.get(&mk)) {
-        (None, None) => {}
-        (Some(p), Some(m)) => {
-            let m = parse_manifest(m)?;
-            if sha256_hex(p) != m.sha256 {
-                return Err(format!("REFUSED {kind} — the payload does not hash to its manifest's sha256"));
+    let mut names: Vec<String> = Vec::new();
+    for (kind, mk) in VENDOR_SLOTS {
+        match (payloads.get(kind), payloads.get(mk)) {
+            (None, None) => {}
+            (Some(p), Some(m)) => {
+                let m = parse_slot_manifest(kind, m)?;
+                if sha256_hex(p) != m.sha256 {
+                    return Err(format!("REFUSED {kind} — the payload does not hash to its manifest's sha256"));
+                }
+                if names.contains(&m.name) {
+                    return Err(format!("REFUSED {kind} — a second slot carries {}", m.name));
+                }
+                names.push(m.name);
             }
+            _ => return Err(format!("REFUSED {kind} — the payload and its manifest must ride together")),
         }
-        _ => return Err(format!("REFUSED {kind} — the payload and its manifest must ride together")),
     }
     Ok(())
 }
@@ -143,7 +149,7 @@ pub(crate) type Writer<'a> = &'a dyn Fn(&Path, &[u8], u32) -> Result<(), String>
 
 /// Install one payload under `<vendor>/<name>/<version>`; `Ok(true)` when
 /// that version, from those exact bytes, was already there.
-fn install_one(tar: &str, vendor: &Path, payload: &[u8], m: &Manifest, darwin: bool) -> Result<bool, String> {
+fn install_one(kind: &str, tar: &str, vendor: &Path, payload: &[u8], m: &Manifest, darwin: bool) -> Result<bool, String> {
     let dest = vendor.join(&m.name).join(&m.version);
     if std::fs::read_to_string(dest.join(".noo-sha256")).is_ok_and(|s| s.trim() == m.sha256) {
         return Ok(true);
@@ -155,7 +161,7 @@ fn install_one(tar: &str, vendor: &Path, payload: &[u8], m: &Manifest, darwin: b
     std::fs::create_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
     let fail = |e: String| -> Result<bool, String> {
         let _ = std::fs::remove_dir_all(&stage);
-        Err(format!("vendor-cli: {e}"))
+        Err(format!("{kind}: {e}"))
     };
     use std::os::unix::fs::PermissionsExt;
     if m.unpack == "none" {
@@ -213,7 +219,7 @@ fn prune(vendor: &Path, bin: &Path, name: &str, keep: &str) {
     }
 }
 
-/// Install what the bundle carries: the CLI, its
+/// Install what the bundle carries, slot by slot: each CLI, its
 /// wrapper at `<base>/bin/<cli>` (written by `write`, the applier's own
 /// as-the-user atomic writer) and the pruning. Returns one entry per
 /// payload for the apply report; `check` has already judged them.
@@ -227,23 +233,25 @@ pub(crate) fn install(
     let vendor = base.join("vendor");
     let bin = base.join("bin");
     let mut done: Vec<Done> = Vec::new();
-    let Some(p) = payloads.get("vendor-cli") else { return Ok(done) };
-    let m = parse_manifest(&payloads["vendor-cli-manifest"])?;
-    let same = install_one(tar, &vendor, p, &m, darwin)?;
-    let wrapper = wrapper_script(&vendor.display().to_string(), &m.name, &m.version, &m.entry);
-    let wpath = bin.join(&m.name);
-    let wrapper_same = std::fs::read_to_string(&wpath).is_ok_and(|t| t == wrapper);
-    if !wrapper_same {
-        let _ = std::fs::create_dir_all(&bin);
-        write(&wpath, wrapper.as_bytes(), 0o755)?;
+    for (kind, mk) in VENDOR_SLOTS {
+        let Some(p) = payloads.get(kind) else { continue };
+        let m = parse_slot_manifest(kind, payloads.get(mk).map_or(&[][..], |b| b.as_slice()))?;
+        let same = install_one(kind, tar, &vendor, p, &m, darwin)?;
+        let wrapper = wrapper_script(&vendor.display().to_string(), &m.name, &m.version, &m.entry);
+        let wpath = bin.join(&m.name);
+        let wrapper_same = std::fs::read_to_string(&wpath).is_ok_and(|t| t == wrapper);
+        if !wrapper_same {
+            let _ = std::fs::create_dir_all(&bin);
+            write(&wpath, wrapper.as_bytes(), 0o755)?;
+        }
+        prune(&vendor, &bin, &m.name, &m.version);
+        let unchanged = same && wrapper_same;
+        done.push((kind, unchanged, if unchanged {
+            format!("{kind}: {} {} unchanged — already installed, nothing to do", m.name, m.version)
+        } else {
+            format!("{kind}: {} {} installed ({}, wrapper {})", m.name, m.version, vendor.join(&m.name).join(&m.version).display(), wpath.display())
+        }));
     }
-    prune(&vendor, &bin, &m.name, &m.version);
-    let unchanged = same && wrapper_same;
-    done.push(("vendor-cli", unchanged, if unchanged {
-        format!("vendor-cli: {} {} unchanged — already installed, nothing to do", m.name, m.version)
-    } else {
-        format!("vendor-cli: {} {} installed ({}, wrapper {})", m.name, m.version, vendor.join(&m.name).join(&m.version).display(), wpath.display())
-    }));
     Ok(done)
 }
 
@@ -309,6 +317,36 @@ mod tests {
         assert!(w.contains(&format!("exec \"{}/noomesh/vendor/copilot/1.0.0/copilot\"", d.display())));
         let again = install(&p, &base, "tar", true, &write).unwrap();
         assert!(again[0].1 && again[0].2.contains("unchanged"), "{again:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_clis_install_from_their_own_slots() {
+        let d = tmp("two");
+        let base = d.join("noomesh");
+        let a = tgz(&d, &[("copilot", MACHO)]);
+        let b = tgz(&d, &[("bin/codex", &[MACHO, b"codex"].concat())]);
+        let mut p = BTreeMap::new();
+        p.insert("vendor-cli".to_string(), b.clone());
+        p.insert("vendor-cli-manifest".to_string(), cli_manifest(&b, "codex", "0.46.0", "bin/codex", "tgz"));
+        p.insert("vendor-cli-2".to_string(), a.clone());
+        p.insert("vendor-cli-2-manifest".to_string(), cli_manifest(&a, "copilot", "1.0.0", "copilot", "tgz"));
+        check(&p).unwrap();
+        let done = install(&p, &base, "tar", true, &write).unwrap();
+        let kinds: Vec<&str> = done.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(kinds, ["vendor-cli", "vendor-cli-2"]);
+        assert!(done[1].2.starts_with("vendor-cli-2: copilot 1.0.0 installed"), "{done:?}");
+        assert!(base.join("bin/codex").exists() && base.join("bin/copilot").exists());
+        // A tampered slot 2 is refused by name; so is a second slot for the same CLI.
+        let mut bad = p.clone();
+        bad.get_mut("vendor-cli-2").unwrap().push(0);
+        assert!(check(&bad).unwrap_err().starts_with("REFUSED vendor-cli-2"));
+        let mut dup = p.clone();
+        dup.insert("vendor-cli-2".to_string(), b.clone());
+        dup.insert("vendor-cli-2-manifest".to_string(), cli_manifest(&b, "codex", "0.46.0", "bin/codex", "tgz"));
+        assert!(check(&dup).unwrap_err().contains("a second slot carries codex"));
+        let alone: BTreeMap<String, Vec<u8>> = [("vendor-cli-3".to_string(), a.clone())].into_iter().collect();
+        assert!(check(&alone).unwrap_err().contains("ride together"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

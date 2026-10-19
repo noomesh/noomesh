@@ -616,6 +616,15 @@ func TestAKindChangeRestartsTheRunningHarness(t *testing.T) {
 	if len(f.Calls) != 2 {
 		t.Fatalf("restarted again for nothing: %v", f.Calls)
 	}
+	// What the heartbeat reports as the running kind.
+	if got := r.HarnessRunningKind(); got != "copilot" {
+		t.Fatalf("running kind = %q, want copilot", got)
+	}
+	// Stopping forgets it: a stopped harness runs no kind.
+	r.convergeHarness(ctx, placement{Backend: "harness", Role: "harness", DesiredState: "stopped"}, chat)
+	if got := r.HarnessRunningKind(); got != "" {
+		t.Fatalf("after stop the running kind = %q, want none", got)
+	}
 }
 
 func TestHarnessPlacementViewHidesSecretsAndReportsUnplaced(t *testing.T) {

@@ -1969,7 +1969,22 @@ BEGIN
     END IF;
 END $grant$;
 "#, audit_append_only_sql!()),
+}, Migration {
+    revision: NODE_VENDOR_KINDS_REVISION,
+    down_revision: Some(AUDIT_CHAIN_REVISION),
+    // i83: the vendor CLIs a node carries whatever its harness placement
+    // names (`noo cluster vendor install`, `set-config --vendor-kinds`). The
+    // provision bundle carries the placement's kind's CLI and these, so a
+    // node can switch kinds without a restage. NOT NULL DEFAULT '{}': every
+    // existing row carries exactly what it did (the placement's CLI only).
+    sql: r#"
+ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS vendor_kinds text[] NOT NULL DEFAULT '{}'
+"#,
 }];
+
+/// The node vendor-kinds revision. A constant so a renumber at rebase is
+/// one line.
+pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 
 /// The kiosk-seat revision (i77).
 pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
@@ -2792,6 +2807,18 @@ mod tests {
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_token_allowances"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text"));
         assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
+    }
+
+    /// The vendor-kinds revision is the chain head, sits on the audit chain,
+    /// and adds what `routes::cluster` reads and writes.
+    #[test]
+    fn node_vendor_kinds_revision_sits_on_the_audit_chain_and_adds_the_column() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_VENDOR_KINDS_REVISION).expect("must be in the chain");
+        assert_eq!(m.down_revision, Some(AUDIT_CHAIN_REVISION));
+        assert!(m.sql.contains("ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS vendor_kinds text[] NOT NULL DEFAULT '{}'"));
+        let cluster = include_str!("routes/cluster.rs");
+        assert!(cluster.contains("usage_profile, vendor_kinds"), "desired-config must read vendor_kinds");
+        assert!(cluster.contains("vendor_kinds = CASE WHEN"), "the upsert must write vendor_kinds");
     }
 
     /// 092 adds the chain columns and makes the app role INSERT-only, and the

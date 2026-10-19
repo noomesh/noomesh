@@ -94,7 +94,8 @@ def test_host_telemetry_kind_is_registered_in_all_three() -> None:
     assert "host-telemetry" in _rust_list()
 
 
-VENDOR_KINDS = ["vendor-cli", "vendor-cli-manifest"]
+VENDOR_SLOTS = ["vendor-cli", "vendor-cli-2", "vendor-cli-3"]
+VENDOR_KINDS = [k for slot in VENDOR_SLOTS for k in (slot, f"{slot}-manifest")]
 
 
 def test_vendor_kinds_are_registered_in_all_three() -> None:
@@ -117,5 +118,18 @@ def test_vendor_manifests_are_text_kinds_in_both_appliers() -> None:
     m = re.search(r"const TEXT_KINDS: &\[&str\] = &\[(.*?)\];", text, re.S)
     assert m
     rust = re.findall(r'"([^"]+)"', m.group(1))
-    for kind in ("vendor-cli-manifest",):
+    for kind in (f"{slot}-manifest" for slot in VENDOR_SLOTS):
         assert kind in shell and kind in rust, kind
+
+
+def test_vendor_slots_agree_with_the_applier_and_the_cli() -> None:
+    """The Linux applier walks VENDOR_SLOTS; noo-cli's
+    cluster_vendor::VENDOR_SLOTS fills them. A slot one side lacks is a CLI
+    signed and shipped that the node never installs."""
+    assert _shell_list("scripts/noo-apply.sh", "VENDOR_SLOTS") == VENDOR_SLOTS
+    text = (REPO / "noo-cli/src/commands/cluster_vendor.rs").read_text()
+    m = re.search(r"pub\(crate\) const VENDOR_SLOTS: \[\(&str, &str\); \d+\] = \[(.*?)\];", text, re.S)
+    assert m, "cluster_vendor.rs: no VENDOR_SLOTS array"
+    pairs = re.findall(r'\("([^"]+)", "([^"]+)"\)', m.group(1))
+    assert [p for p, _ in pairs] == VENDOR_SLOTS
+    assert all(mf == f"{p}-manifest" for p, mf in pairs)

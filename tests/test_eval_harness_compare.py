@@ -148,6 +148,28 @@ def test_a_kind_that_never_runs_times_out_instead_of_hanging():
     assert hc.restored
 
 
+def test_ready_needs_the_node_to_report_the_placed_kind_running():
+    """``running`` alone is not ready: a harness still running the previous
+    kind (or one that fell back to ``noo``) would be measured as this one."""
+    fake = FakeHarnessGateway(original_kind="noo")
+    fake.report_kind = "noo"            # stuck: the node keeps running noo
+    hc = _run(_spec(kinds=["copilot"], ready_timeout_s=60), fake)
+    k = hc.kind_runs[0]
+    assert not k.ready and "not running 60s after placing copilot" in k.error, k.error
+    assert "running kind: noo" in k.error, k.error
+    assert all(r.state == "not run" for r in hc.runs), "no task runs under the wrong kind"
+    # An agent that reports no kind never qualifies either, and says why.
+    fake = FakeHarnessGateway(original_kind="noo")
+    fake.report_kind = ""
+    k = _run(_spec(kinds=["noo"], ready_timeout_s=60), fake).kind_runs[0]
+    assert not k.ready and "an agent older than the kind report" in k.error, k.error
+    # The node's own report is what is read.
+    n = fake._node()
+    assert hcmp.harness_running_kind(n) == "" and hcmp.harness_running_kind(None) == ""
+    fake.report_kind = None
+    assert hcmp.harness_running_kind(fake._node()) == "noo"
+
+
 def test_a_task_the_controller_ran_in_process_does_not_count_for_the_kind():
     fake = FakeHarnessGateway()
     real_create = fake._create

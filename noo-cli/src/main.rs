@@ -327,6 +327,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // node never fetches them. Group stub after the subactions.
     (&["cluster", "vendor", "stage"], commands::cluster_vendor_stage),
     (&["cluster", "vendor", "status"], commands::cluster_vendor_status),
+    (&["cluster", "vendor", "install"], commands::cluster_vendor_install),
     (&["cluster", "vendor"], commands::cluster_vendor_usage),
     // Move ONE node's agent out of its container. The node is
     // a required positional rather than a --host-process flag on

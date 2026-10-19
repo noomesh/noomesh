@@ -50,9 +50,14 @@ binary itself: in its signed bundle, from the controller.
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)
    puts the staged CLI in the bundle of every node whose
-   harness placement names that kind. If it is not staged, the restage for
-   that node is refused with the `noo cluster vendor stage` command to run:
-   a restage never downloads.
+   harness placement names that kind, and of every node whose
+   `vendor_kinds` lists it. `noo cluster vendor install <node> <kind>...`
+   adds kinds to that list (`noo cluster set-config <node> --vendor-kinds
+   <kind,kind>|none` sets it), so a node carries those CLIs whatever its
+   placement names and can move between kinds without a restage. Each CLI
+   rides in its own bundle slot, verified on its own. If one is not staged,
+   the restage for that node is refused with the `noo cluster vendor stage`
+   command to run: a restage never downloads.
 4. **Placement.** The node's applier checks the sha256 again, unpacks the
    CLI under `/opt/noo/vendor/<cli>/<version>/` (`~/noomesh/vendor/` on a
    Mac) and writes a small wrapper named for the CLI at
@@ -105,6 +110,38 @@ itself, and that agent is what starts the harness
 that harness only when one is placed there and the node's agent reports it
 running. Without one, the controller runs the turn in process, as it
 always has, and a task's `why` says which of the two is missing.
+
+### Slow node models
+
+A reasoning model on a slow node can spend several minutes on one model
+call, mostly thinking (gemma4:12b on an M4 Mac mini took 3 to 4.5 minutes
+per call). Three things keep such a turn from being lost:
+
+- **Streams time out on silence, not on length.** A streamed answer has no
+  total time limit; it is cut only when no byte arrives for
+  `NOO_BACKEND_STREAM_IDLE_SECS` (default 300 s, which also covers the wait
+  for the first token). A cut stream ends the turn with an error that says
+  so, `the model stream was cut after Ns: <cause>`, and keeps whatever had
+  already arrived. It is not treated as an empty answer, so the model is not
+  nudged into another long call.
+- **The turn stops at its deadline and saves first.** Your message is saved
+  when the turn starts. The loop does not start another model call that
+  cannot finish before `NOO_HARNESS_TURN_TIMEOUT_SECS` (default 900 s), and
+  it ends a call still running at the deadline. It then saves the answer so
+  far, or a note that the model did not finish, while the turn's credential
+  is still valid.
+- **Reasoning can be switched off per node.** Place the harness with
+  `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
+  model not to reason, for the `noo` loop and for a foreign kind's CLI
+  alike. `on` forces reasoning; `auto`, the default, leaves it to the caller.
+  The harness re-reads the placement every minute, so no restart is needed.
+
+```sh
+noo cluster place <node> harness auto --env NOO_HARNESS_THINKING=off
+```
+
+Both variables are described in
+[../reference/env.md](../reference/env.md).
 
 ## Probe a kind before placing it
 
