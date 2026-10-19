@@ -2017,7 +2017,7 @@ CREATE TABLE IF NOT EXISTS noo_embedding_spaces (
     // The per-account "not before" floor (`session_floor.rs`), made durable.
     // Redis held it alone, so a floor written by another gateway instance, or
     // before a restart, was invisible while Redis was down. One row per
-    // account: the highest floor (unix seconds) and when it stops mattering
+    // account: the highest floor (unix MILLISECONDS, `floor_ms`) and when it stops mattering
     // (one access-token lifetime past the raise; after that no token that
     // predates it can still be valid). `noo security admin-password reset`
     // writes the same row from the host. Additive; nothing reads it until the
@@ -2025,7 +2025,7 @@ CREATE TABLE IF NOT EXISTS noo_embedding_spaces (
     sql: r#"
 CREATE TABLE IF NOT EXISTS noo_session_floors (
     account    text        PRIMARY KEY,
-    floor      bigint      NOT NULL,
+    floor_ms   bigint      NOT NULL,
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS noo_session_floors_expires_idx ON noo_session_floors (expires_at)
@@ -2913,7 +2913,7 @@ mod tests {
     fn session_floors_revision_sits_on_embedding_spaces_and_names_the_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == SESSION_FLOORS_REVISION).expect("098 must be in the chain");
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACES_REVISION));
-        for needle in ["noo_session_floors", "account    text        PRIMARY KEY", "floor      bigint", "expires_at timestamptz"] {
+        for needle in ["noo_session_floors", "account    text        PRIMARY KEY", "floor_ms   bigint", "expires_at timestamptz"] {
             assert!(m.sql.contains(needle), "{needle}");
         }
     }

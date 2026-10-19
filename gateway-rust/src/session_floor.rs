@@ -9,9 +9,28 @@
 //! password reset or a logout used to leave the bearer working until it
 //! expired (15 minutes by default) and let an open dashboard socket reconnect
 //! with it after the close frame. The floor closes that: each of those events
-//! records `noo:auth:notbefore:<account> = <unix seconds>` and
+//! records `noo:auth:notbefore_ms:<account> = <unix MILLISECONDS>` and
 //! `require_any_auth` — the one gate every bearer path passes, including the
-//! `/ws/*` handshake — refuses a token whose `iat` is older than the floor.
+//! `/ws/*` handshake — refuses a token minted before the floor.
+//!
+//! ## Millisecond precision
+//!
+//! Floors are whole milliseconds everywhere (memory, Redis, Postgres
+//! `noo_session_floors.floor_ms`, the CLI's reset). A person's access token
+//! carries `iat_ms` beside `iat`; its time is `iat_ms` when present, else
+//! `iat * 1000` (the START of its second). Seconds-only floors let a token
+//! minted in the same second as a logout survive it (found by the 0.6.7-rc.1
+//! rehearsal): with milliseconds a logout at `t` refuses a token minted
+//! before `t` and accepts one minted after, in the same second. A token
+//! without `iat_ms` (internal and delegated tokens, or one minted before the
+//! upgrade) is read as the start of its second, so one minted in the logout
+//! second is refused: the safe side.
+//!
+//! Upgrade: 0.6.7 wrote SECONDS under `noo:auth:notbefore:<account>`. That key
+//! is still read (x1000, max with the new one) so a revocation made just
+//! before the upgrade holds until it expires; it is never written again.
+//! Postgres has no seconds era: migration 095 was never released, so
+//! `floor_ms` is its only shape.
 //!
 //! ## Three tiers (decided, not defaulted)
 //!
@@ -66,7 +85,10 @@ use std::time::{Duration, Instant};
 
 use crate::state::AppState;
 
-const KEY_PREFIX: &str = "noo:auth:notbefore:";
+const KEY_PREFIX: &str = "noo:auth:notbefore_ms:";
+/// The 0.6.7 key, whole unix SECONDS. Read (x1000) so a revocation made
+/// before the upgrade still holds; never written.
+const LEGACY_KEY_PREFIX: &str = "noo:auth:notbefore:";
 /// How long a lookup (including "no floor") is trusted before Redis is asked
 /// again. Bounds the Redis load to one GET per active account per interval and
 /// the cross-instance propagation delay to the same number.
@@ -81,13 +103,13 @@ const REDIS_BUDGET: Duration = Duration::from_millis(250);
 /// Entries kept; past this the map is cleared (a floor re-learns from Redis).
 const MAP_CAP: usize = 10_000;
 
-/// Why a floor is being raised. Decides whether the floor sits one second
-/// ahead of now.
+/// Why a floor is being raised. Decides whether the floor sits one
+/// millisecond ahead of now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// An operator changed the account (disable, role, scopes, password): a
-    /// token minted in the SAME second as the change must die too, and the
-    /// person re-authenticates by hand anyway.
+    /// token minted in the SAME millisecond as the change must die too, and
+    /// the person re-authenticates by hand anyway.
     AccountChange,
     /// The person logged out: tokens minted from now on are theirs.
     Logout,
@@ -100,38 +122,58 @@ pub fn floor_ttl_secs() -> i64 {
     crate::auth_refresh::default_access_minutes().max(15) * 60 + 300
 }
 
-/// The floor value for `reason` at unix time `now`.
-pub fn floor_for(reason: Reason, now: i64) -> i64 {
+/// The floor value (unix ms) for `reason` at unix time `now_ms`.
+pub fn floor_for(reason: Reason, now_ms: i64) -> i64 {
     match reason {
-        Reason::AccountChange => now + 1,
-        Reason::Logout => now,
+        Reason::AccountChange => now_ms + 1,
+        Reason::Logout => now_ms,
     }
 }
 
-/// Whether a token is refused by a floor. Pure.
-pub fn refused(iat: Option<i64>, floor: i64) -> bool {
-    if floor <= 0 {
+/// Whether a token minted at `token_ms` is refused by `floor_ms`. Pure.
+pub fn refused(token_ms: Option<i64>, floor_ms: i64) -> bool {
+    if floor_ms <= 0 {
         return false;
     }
-    match iat {
-        Some(i) => i < floor,
+    match token_ms {
+        Some(t) => t < floor_ms,
         None => true,
     }
 }
 
-/// `iat` of a JWT whose signature was ALREADY verified. Reads the payload
+/// When a JWT whose signature was ALREADY verified was minted, in unix ms:
+/// `iat_ms` if the token carries one, else `iat * 1000`. Reads the payload
 /// segment only; never use it to trust an unverified token.
-pub fn token_iat(token: &str) -> Option<i64> {
+pub fn token_time_ms(token: &str) -> Option<i64> {
     use base64::Engine as _;
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("iat")?.as_i64()
+    if let Some(ms) = v.get("iat_ms").and_then(|m| m.as_i64()).filter(|m| *m > 0) {
+        return Some(ms);
+    }
+    v.get("iat")?.as_i64().map(|s| s.saturating_mul(1000))
+}
+
+/// Combine the Redis answers for the ms key and the 0.6.7 seconds key into
+/// one floor in ms: the max of what was found; `Failed` only when nothing was
+/// found and a read failed (an unreadable key never forgets a found one).
+pub fn combine_redis(ms: Tier, legacy_secs: Tier) -> Tier {
+    let legacy = match legacy_secs {
+        Tier::Found(s) => Tier::Found(s.saturating_mul(1000)),
+        other => other,
+    };
+    match (ms, legacy) {
+        (Tier::Found(a), Tier::Found(b)) => Tier::Found(a.max(b)),
+        (Tier::Found(a), _) | (_, Tier::Found(a)) => Tier::Found(a),
+        (Tier::Failed, _) | (_, Tier::Failed) => Tier::Failed,
+        _ => Tier::Absent,
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Entry {
-    /// Highest floor known for the account (0 = none).
+    /// Highest floor (unix ms) known for the account (0 = none).
     floor: i64,
     /// When a LOCALLY-raised floor stops mattering.
     floor_until: Instant,
@@ -278,7 +320,7 @@ pub struct Raised {
 /// Record the floor for `account`. Never fails the caller; see the module doc.
 pub async fn raise(state: &AppState, account: &str, reason: Reason) -> Raised {
     let account = crate::auth::account_of(account);
-    let floor = floor_for(reason, chrono::Utc::now().timestamp());
+    let floor = floor_for(reason, chrono::Utc::now().timestamp_millis());
     let ttl = floor_ttl_secs();
     local().raise(account, floor, Duration::from_secs(ttl as u64), Instant::now());
     let shared = match state.redis.as_ref() {
@@ -314,10 +356,10 @@ pub async fn raise(state: &AppState, account: &str, reason: Reason) -> Raised {
 }
 
 /// The durable write. Never lowers a floor or its expiry.
-const UPSERT_SQL: &str = "INSERT INTO noo_session_floors (account, floor, expires_at) \
+const UPSERT_SQL: &str = "INSERT INTO noo_session_floors (account, floor_ms, expires_at) \
      VALUES ($1, $2, now() + make_interval(secs => $3)) \
      ON CONFLICT (account) DO UPDATE SET \
-     floor = GREATEST(noo_session_floors.floor, EXCLUDED.floor), \
+     floor_ms = GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms), \
      expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at)";
 
 async fn write_durable(db: &sqlx::PgPool, account: &str, floor: i64, ttl: i64) -> bool {
@@ -333,7 +375,7 @@ async fn write_durable(db: &sqlx::PgPool, account: &str, floor: i64, ttl: i64) -
 }
 
 async fn read_durable(db: &sqlx::PgPool, account: &str) -> Tier {
-    let q = sqlx::query_scalar::<_, i64>("SELECT floor FROM noo_session_floors WHERE account = $1 AND expires_at > now()")
+    let q = sqlx::query_scalar::<_, i64>("SELECT floor_ms FROM noo_session_floors WHERE account = $1 AND expires_at > now()")
         .bind(account)
         .fetch_optional(db);
     match tokio::time::timeout(PG_BUDGET, q).await {
@@ -349,7 +391,7 @@ async fn read_durable(db: &sqlx::PgPool, account: &str) -> Tier {
 pub async fn load_durable(db: &sqlx::PgPool) -> usize {
     let _ = sqlx::query("DELETE FROM noo_session_floors WHERE expires_at < now() - interval '1 day'").execute(db).await;
     let rows = sqlx::query_as::<_, (String, i64, i64)>(
-        "SELECT account, floor, GREATEST(extract(epoch FROM (expires_at - now())), 0)::bigint \
+        "SELECT account, floor_ms, GREATEST(extract(epoch FROM (expires_at - now())), 0)::bigint \
          FROM noo_session_floors WHERE expires_at > now()",
     )
     .fetch_all(db)
@@ -371,6 +413,14 @@ pub async fn load_durable(db: &sqlx::PgPool) -> usize {
     }
 }
 
+/// One Redis floor key: absent, found (a positive integer) or unreadable.
+async fn read_key(r: &crate::cache::RedisCache, key: &str) -> Tier {
+    match tokio::time::timeout(REDIS_BUDGET, r.get_string_checked(key)).await {
+        Ok(Ok(v)) => v.and_then(|s| s.parse::<i64>().ok()).filter(|v| *v > 0).map_or(Tier::Absent, Tier::Found),
+        _ => Tier::Failed,
+    }
+}
+
 /// Whether a signature-verified `token` for `sub` predates its account's
 /// floor and must be refused.
 pub async fn refuses(state: &AppState, sub: &str, token: &str) -> bool {
@@ -382,11 +432,9 @@ pub async fn refuses(state: &AppState, sub: &str, token: &str) -> bool {
     if ask_redis {
         let answer = match state.redis.as_ref() {
             Some(r) => {
-                let key = format!("{KEY_PREFIX}{account}");
-                match tokio::time::timeout(REDIS_BUDGET, r.get_string_checked(&key)).await {
-                    Ok(Ok(v)) => v.and_then(|s| s.parse::<i64>().ok()).filter(|v| *v > 0).map_or(Tier::Absent, Tier::Found),
-                    _ => Tier::Failed,
-                }
+                let ms = read_key(r, &format!("{KEY_PREFIX}{account}")).await;
+                let legacy = read_key(r, &format!("{LEGACY_KEY_PREFIX}{account}")).await;
+                combine_redis(ms, legacy)
             }
             None => Tier::Absent,
         };
@@ -408,7 +456,7 @@ pub async fn refuses(state: &AppState, sub: &str, token: &str) -> bool {
             "session floor unreadable from Redis and Postgres; applying this process's floors only"
         );
     }
-    refused(token_iat(token), floor)
+    refused(token_time_ms(token), floor)
 }
 
 /// Everything that must happen when an account's standing changes, in one
@@ -463,6 +511,12 @@ pub struct Summary {
 mod tests {
     use super::*;
 
+    fn tok(claims: &str) -> String {
+        use base64::Engine as _;
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!("{}.{}.sig", e.encode(r#"{"alg":"HS256"}"#), e.encode(claims))
+    }
+
     #[test]
     fn a_token_older_than_the_floor_is_refused_and_a_newer_one_is_not() {
         assert!(refused(Some(99), 100));
@@ -482,24 +536,83 @@ mod tests {
     }
 
     #[test]
-    fn an_account_change_sits_one_second_ahead_and_a_logout_does_not() {
-        assert_eq!(floor_for(Reason::AccountChange, 1000), 1001);
-        assert_eq!(floor_for(Reason::Logout, 1000), 1000);
-        // a token minted in the same second as the change is refused...
-        assert!(refused(Some(1000), floor_for(Reason::AccountChange, 1000)));
-        // ...a token minted in the same second as a logout is the person's next login.
-        assert!(!refused(Some(1000), floor_for(Reason::Logout, 1000)));
+    fn an_account_change_sits_one_millisecond_ahead_and_a_logout_does_not() {
+        assert_eq!(floor_for(Reason::AccountChange, 1_000_000), 1_000_001);
+        assert_eq!(floor_for(Reason::Logout, 1_000_000), 1_000_000);
+        assert!(refused(Some(1_000_000), floor_for(Reason::AccountChange, 1_000_000)));
+        assert!(!refused(Some(1_000_000), floor_for(Reason::Logout, 1_000_000)));
+    }
+
+    // ---- same-second ordering (found by the 0.6.7-rc.1 rehearsal) -------
+
+    #[test]
+    fn a_token_minted_before_a_logout_in_the_same_second_is_refused() {
+        // token at 1000.100 s, logout at 1000.400 s
+        let t = tok(r#"{"sub":"a","iat":1000,"iat_ms":1000100}"#);
+        let floor = floor_for(Reason::Logout, 1_000_400);
+        assert!(refused(token_time_ms(&t), floor), "the logged-out bearer must not survive in its own second");
     }
 
     #[test]
-    fn iat_is_read_from_the_payload_segment() {
-        use base64::Engine as _;
-        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let tok = format!("{}.{}.sig", e.encode(r#"{"alg":"HS256"}"#), e.encode(r#"{"sub":"a","iat":1234}"#));
-        assert_eq!(token_iat(&tok), Some(1234));
-        assert_eq!(token_iat("not-a-jwt"), None);
-        let no_iat = format!("{}.{}.sig", e.encode("{}"), e.encode(r#"{"sub":"a"}"#));
-        assert_eq!(token_iat(&no_iat), None);
+    fn a_token_minted_after_a_logout_in_the_same_second_is_accepted() {
+        // logout at 1000.100 s, the next login's token at 1000.400 s
+        let t = tok(r#"{"sub":"a","iat":1000,"iat_ms":1000400}"#);
+        let floor = floor_for(Reason::Logout, 1_000_100);
+        assert!(!refused(token_time_ms(&t), floor), "the person's next login is theirs");
+    }
+
+    #[test]
+    fn a_pre_upgrade_token_in_the_logout_second_is_refused() {
+        // no iat_ms: read as the START of its second, so it is not newer than a logout inside that second
+        let t = tok(r#"{"sub":"a","iat":1000}"#);
+        assert_eq!(token_time_ms(&t), Some(1_000_000));
+        assert!(refused(token_time_ms(&t), floor_for(Reason::Logout, 1_000_400)));
+        assert!(!refused(token_time_ms(&t), floor_for(Reason::Logout, 1_000_000)), "only a logout at the very start of the second ties");
+    }
+
+    #[test]
+    fn an_account_change_refuses_a_token_minted_in_the_same_millisecond() {
+        let t = tok(r#"{"sub":"a","iat":1000,"iat_ms":1000400}"#);
+        assert!(refused(token_time_ms(&t), floor_for(Reason::AccountChange, 1_000_400)));
+    }
+
+    #[test]
+    fn a_legacy_seconds_floor_in_redis_is_honoured_and_scaled() {
+        // 0.6.7 wrote 1000 (seconds) under the old key; nothing under the new one
+        let f = combine_redis(Tier::Absent, Tier::Found(1000));
+        assert_eq!(f, Tier::Found(1_000_000));
+        let old_token = tok(r#"{"sub":"a","iat":999,"iat_ms":999500}"#);
+        assert!(refused(token_time_ms(&old_token), f.floor()), "a revocation made just before the upgrade still holds");
+        let newer = tok(r#"{"sub":"a","iat":1000,"iat_ms":1000500}"#);
+        assert!(!refused(token_time_ms(&newer), f.floor()));
+    }
+
+    #[test]
+    fn the_higher_of_the_two_redis_keys_wins_and_a_failed_read_forgets_nothing() {
+        assert_eq!(combine_redis(Tier::Found(5_000_500), Tier::Found(5)), Tier::Found(5_000_500));
+        assert_eq!(combine_redis(Tier::Found(4_000_000), Tier::Found(5)), Tier::Found(5_000));
+        assert_eq!(combine_redis(Tier::Failed, Tier::Found(7)), Tier::Found(7_000));
+        assert_eq!(combine_redis(Tier::Found(9), Tier::Failed), Tier::Found(9));
+        assert_eq!(combine_redis(Tier::Failed, Tier::Absent), Tier::Failed);
+        assert_eq!(combine_redis(Tier::Absent, Tier::Absent), Tier::Absent);
+    }
+
+    #[test]
+    fn iat_ms_wins_when_present_and_iat_is_the_fallback() {
+        assert_eq!(token_time_ms(&tok(r#"{"sub":"a","iat":1234,"iat_ms":1234567}"#)), Some(1_234_567));
+        assert_eq!(token_time_ms(&tok(r#"{"sub":"a","iat":1234}"#)), Some(1_234_000));
+        assert_eq!(token_time_ms(&tok(r#"{"sub":"a","iat":1234,"iat_ms":"x"}"#)), Some(1_234_000), "a malformed iat_ms falls back");
+        assert_eq!(token_time_ms("not-a-jwt"), None);
+        assert_eq!(token_time_ms(&tok(r#"{"sub":"a"}"#)), None);
+    }
+
+    #[test]
+    fn floors_are_stored_in_milliseconds_under_new_names() {
+        assert_eq!(KEY_PREFIX, "noo:auth:notbefore_ms:");
+        assert_ne!(KEY_PREFIX, LEGACY_KEY_PREFIX);
+        assert!(UPSERT_SQL.contains("floor_ms"));
+        let src = include_str!("session_floor.rs");
+        assert!(src.contains("timestamp_millis()"), "raise must stamp in ms");
     }
 
     #[test]
@@ -613,7 +726,7 @@ mod tests {
         let src = include_str!("session_floor.rs");
         let raise = &src[src.find("pub async fn raise").unwrap()..src.find("const UPSERT_SQL").unwrap()];
         assert!(raise.contains("write_durable("), "raise must persist the floor");
-        assert!(UPSERT_SQL.contains("GREATEST(noo_session_floors.floor, EXCLUDED.floor)"));
+        assert!(UPSERT_SQL.contains("GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms)"));
         assert!(UPSERT_SQL.contains("GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at)"));
         assert!(src.contains("pub async fn load_durable"));
         assert!(include_str!("main.rs").contains("session_floor::load_durable("), "the floors are loaded at boot");

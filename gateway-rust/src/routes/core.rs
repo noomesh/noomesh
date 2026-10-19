@@ -109,6 +109,11 @@ fn issue_access_token(user: &UserRecord) -> Result<(String, i64), TokenIssueErro
         "scopes": dual_emit_scopes(user.role, &user.scopes),
         "exp": exp.timestamp(),
         "iat": now.timestamp(),
+        // Millisecond mint time: the session floor (`session_floor.rs`) is in
+        // ms, so a token minted in the same second as a logout is ordered
+        // against it correctly. Person sessions only; delegated tokens keep
+        // their exact claim sets.
+        "iat_ms": now.timestamp_millis(),
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
