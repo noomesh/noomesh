@@ -928,7 +928,7 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             } else {
                 println!("{}", ui::muted(&root_line));
                 println!("{}", ui::status_line(Glyph::Err, &why));
-                ui::guide(&[("noo onboard", "set up an install here, or enrol this host as a node")]);
+                ui::guide(&[("noo onboard", "set up an install here, or enroll this host as a node")]);
             }
             return Ok(1);
         }
@@ -1092,11 +1092,7 @@ fn env_or_dotenv(root: &Path, key: &str) -> Option<String> {
         return Some(v);
     }
     let text = std::fs::read_to_string(root.join(".env")).ok()?;
-    let prefix = format!("{key}=");
-    text.lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
-        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+    crate::envfile::dotenv_last(&text, key)
 }
 
 /// Read `posture list`'s JSON for the two rows the scan judges.

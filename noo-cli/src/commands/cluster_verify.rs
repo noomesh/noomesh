@@ -342,7 +342,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let paused: Vec<&str> = gc["paused_backends"].as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let paused = if paused.is_empty() { "GPU backends".to_string() } else { paused.join(", ") };
+    let none_paused = paused.is_empty();
+    let paused = if none_paused { "GPU backends".to_string() } else { paused.join(", ") };
+    // "GPU backends paused" when none were is a false statement (rehearsal F4).
+    let paused_phrase = if none_paused { "no GPU backend paused".to_string() } else { format!("{paused} paused") };
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
     if method == "not-measured" && state != "held" && state != "yielded" {
@@ -353,10 +356,10 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
         "yielded" => warn("gpu",
-            format!("yielded: {paused} paused (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
         "held" => warn("gpu",
-            format!("held by operator{}: {paused} paused",
+            format!("held by operator{}: {paused_phrase}",
                 gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
             Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
@@ -1494,6 +1497,10 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
             .cloned()
             .collect(),
     };
+    // An embedder is never a chat target. A current gateway already leaves it
+    // out; an older one listed whatever the node had loaded, so the row does
+    // not count one either (rehearsal 0.6.7-rc.1 F1).
+    let order: Vec<Value> = order.into_iter().filter(|c| !is_non_chat_entry(c)).collect();
     if order.is_empty() {
         return fail(NAME, format!("chat-default ({mode}) has no live candidate: an unpinned chat request gets 503"), "noo cluster class list");
     }
@@ -1536,6 +1543,19 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
     ok(NAME, detail)
+}
+
+/// A class candidate that is not a chat target: a non-chat `role`, or a model
+/// whose name is an embedding/reranking model.
+fn is_non_chat_entry(c: &Value) -> bool {
+    if matches!(c["role"].as_str(), Some(r) if !r.is_empty() && r != "chat") {
+        return true;
+    }
+    let m = c["model"].as_str().unwrap_or("").to_ascii_lowercase();
+    let base = m.rsplit('/').next().unwrap_or(&m);
+    base.contains("embed")
+        || base.contains("rerank")
+        || ["harrier", "bge-", "bge:", "e5-", "gte-", "all-minilm", "minilm", "snowflake"].iter().any(|p| base.starts_with(p))
 }
 
 /// Run this binary with `words` and `--json`; the parsed stdout and the exit
@@ -3495,11 +3515,8 @@ fn controller_mtls_on() -> Option<bool> {
 }
 
 fn mtls_on_in_dotenv(text: &str) -> bool {
-    let v = text
-        .lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix("NOO_MTLS_GATEWAY="))
-        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase())
+    let v = crate::envfile::dotenv_last(text, "NOO_MTLS_GATEWAY")
+        .map(|v| v.to_ascii_lowercase())
         .unwrap_or_default();
     !matches!(v.as_str(), "0" | "false" | "no" | "off")
 }
@@ -3508,11 +3525,7 @@ fn mtls_on_in_dotenv(text: &str) -> bool {
 /// reads it); `None` when the file is unreadable OR the key is absent.
 fn dotenv_value(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(crate::envfile::repo_root().join(".env")).ok()?;
-    let prefix = format!("{key}=");
-    text.lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
-        .map(|v| v.trim().trim_matches('"').to_string())
+    crate::envfile::dotenv_last(&text, key)
 }
 
 /// The "nats tls" row: the bus runs ONE shipped config, which requires a
@@ -4251,13 +4264,16 @@ mod gateway_redis_tests {
 }
 
 /// The `(remedy, row name)` pairs a section prints under its table: every
-/// FAIL row's, and in the controller section every WARN row's too.
+/// FAIL row's, and in the controller section every WARN row's too. In a
+/// node section only the held `gpu` WARN prints its remedy: `gpu release` is
+/// the one way out of an operator hold and was visible only in `--json`
+/// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
     let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
     for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && title == "controller"))
+        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu")))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
         match out.iter_mut().find(|(x, _)| *x == r) {
@@ -4744,7 +4760,7 @@ fn with_warmup_json(checks: &mut Value, name: &str, seen: Option<&warmup::Warmup
     }
 }
 
-/// After `provision --wait` reports applied: an enrolment is not done until
+/// After `provision --wait` reports applied: an enrollment is not done until
 /// the node verifies. Prints the table; the caller decides the exit code.
 pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
     // "Applied" means the agent RESTARTED on the new build a moment ago; its
@@ -4791,7 +4807,7 @@ pub(crate) fn heard_since(n: &Value, since: i64) -> bool {
 
 /// The human Seats section header, by what the seat registry returned:
 /// `None` (an older gateway without one) prints nothing; an empty registry
-/// prints the section with one line naming the verb that enrols a seat.
+/// prints the section with one line naming the verb that enrolls a seat.
 pub(crate) fn seats_heading(count: Option<usize>) -> Option<(String, Option<&'static str>)> {
     let n = count?;
     Some((format!("Seats ({n})"), (n == 0).then_some(NO_SEATS_LINE)))
@@ -4884,6 +4900,18 @@ mod tests {
         let c = default_chat_check(Some(&one));
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
+
+        // rehearsal 0.6.7-rc.1 F1: an embedder in the order is not a candidate,
+        // so it neither appears in the row nor makes a two-node mesh look it.
+        let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
+            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true}]}]});
+        let c = default_chat_check(Some(&emb));
+        assert!(!c.detail.contains("harrier"), "{}", c.detail);
+        assert!(c.detail.contains("one node"), "only awolf is a chat node: {}", c.detail);
+        let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
+        assert_eq!(default_chat_check(Some(&only_emb)).verdict, super::Verdict::Fail);
 
         let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
         assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
@@ -8243,6 +8271,20 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+    }
+
+    #[test]
+    fn held_with_nothing_paused_says_so_and_the_remedy_prints_in_a_node_section() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "method": "nvidia-smi", "paused_backends": []}))).unwrap();
+        assert_eq!(c.detail, "held by operator: no GPU backend paused");
+        let checks = vec![c];
+        let r = remedies_to_print("host3", &checks);
+        assert_eq!(r.len(), 1, "the gpu warn prints its remedy in a node section");
+        assert!(r[0].0.starts_with("noo cluster gpu release host3"));
+        // other node warns stay remedy-less
+        let other = vec![warn("harness", "x", Some("noo cluster desired host3".into()))];
+        assert!(remedies_to_print("host3", &other).is_empty());
     }
 
     #[test]

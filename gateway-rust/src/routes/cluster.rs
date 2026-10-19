@@ -1831,10 +1831,14 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 ///
 /// Returns the `agent_url` field if present, otherwise constructs
 /// `{proto}://{ip_address}:8081` using the node's IP. Errors with 404
-/// if the node is not found in the KV store.
+/// if the node is not found in the KV store. A node that IS registered but
+/// carries neither field gets a different 404 text naming the real
+/// cause (see `no_address_message`) instead of "not found".
 pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Result<String, AppError> {
+    let mut known = false;
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         if let Ok(Some(entry)) = kv.get(node_id).await {
+            known = true;
             if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                 if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
                     if !url.is_empty() {
@@ -1850,7 +1854,19 @@ pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Resul
             }
         }
     }
+    if known {
+        return Err(AppError::NotFound(no_address_message(node_id)));
+    }
     Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
+}
+
+/// The node is in `mesh_nodes` but registered without `agent_url` or
+/// `ip_address`, so the gateway has nowhere to send the call.
+fn no_address_message(node_id: &str) -> String {
+    format!(
+        "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
+         Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
+    )
 }
 
 /// Build a reqwest Client suitable for node-agent HTTP calls.
@@ -2335,7 +2351,7 @@ async fn proposals_decide(
 /// one.
 pub(crate) fn bootstrap_instructions(host: &str) -> String {
     format!(
-        "Automated push enrolment does not exist (pull architecture) \
+        "Automated push enrollment does not exist (pull architecture) \
          and the controller\u{2192}node SSH lane was removed 2026-09-11. \
          Enrol {host} with the token rail \u{2014} on the controller:\n\n  \
          noo cluster bootstrap-token create --node {host}\n\n\
@@ -6599,5 +6615,18 @@ mod backend_image_ref_tests {
         // llamacpp / embedding forward only an operator override
         assert_eq!(backend_image_ref("llamacpp", &with(&[("LLAMACPP_IMAGE", "a/b:2")])).as_deref(), Some("a/b:2"));
         assert_eq!(backend_image_ref("llamacpp", &with(&[("NOO_BACKEND_IMAGE_LLAMACPP", "a/b:2")])), None);
+    }
+}
+
+#[cfg(test)]
+mod no_address_tests {
+    use super::no_address_message;
+
+    #[test]
+    fn a_known_node_without_an_address_is_not_called_not_found() {
+        let m = no_address_message("gpu-box");
+        assert!(m.contains("gpu-box") && m.contains("no reachable address"), "{m}");
+        assert!(m.contains("NODE_IP"), "{m}");
+        assert!(!m.contains("not found"), "{m}");
     }
 }

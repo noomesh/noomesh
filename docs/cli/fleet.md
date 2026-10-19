@@ -181,11 +181,12 @@ noo cluster class unset chat-default
 
 A **model class** is a name a consumer sends as `model` on
 `/v1/chat/completions` or `/api/external/chat/completions`, and the ordered
-list of `node/backend[=model]` candidates the gateway fails over across.
+list of `node/backend[=model]` candidates the gateway tries first.
 `node/backend` with no `=model` means the placement's model (a class never
-restates a placement); `--degraded` candidates are the only ones allowed to
-answer with a different model, and only once every other candidate has
-failed. With nothing declared, every served model is its own class and
+restates a placement); `--degraded` candidates come after the others. A
+class is a preference, not a fence: when none of its candidates can
+answer, every other live chat node follows in the dynamic ranking below,
+and a model nothing serves is answered by `chat-default`. With nothing declared, every served model is its own class and
 `chat-default` is **dynamic**: every live chat node in the mesh, whatever
 model it serves, ranked per request — healthy before not, a node that
 stalled in the last 5 minutes after one that did not, thermal
@@ -196,17 +197,21 @@ thermal-`critical` node is left out unless nothing else is. Nodes come and
 go: a busy, hot or offline node drops out and rejoins on its own. The
 yaml's `cluster.backends.<x>.model` (what onboarding put on the local
 backend) is a placement hint and does not narrow this. Declaring
-`chat-default` replaces the dynamic pool with your list; `class list`
+`chat-default` puts your list ahead of the dynamic pool; `class list`
 prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 `noo cluster verify --controller` has a `default chat` row listing the live
 candidates in order (`!` when only CPU candidates or one node remain, `x`
 when none).
 
-To send one request to one node, name it: a `node` field in the body or an
+To prefer one node for a request, name it: a `node` field in the body or an
 `X-Noo-Node` header on `/v1/chat/completions`,
-`/api/external/chat/completions` or `/api/inference`. An unknown node, or
-one serving no chat, is refused with 422; a node that does not serve the
-model you named, with 409. The `legacy lanes` row of
+`/api/external/chat/completions` or `/api/inference` (`noo inference run
+-n`). It is tried first; when it cannot answer, the pool does and the answer
+says `fallback: true`. A name that is no node of this mesh is refused with
+422. Add `node_strict: true` / `X-Noo-Node-Strict: 1` (`--strict-node`) to
+keep the request on that node alone: a node serving no chat is then refused
+with 422, one that does not serve the model you named with 409, and nothing
+ever goes elsewhere. The `legacy lanes` row of
 `noo cluster verify --controller` includes `cluster_hmac_v1`: the callers (a
 node by name, from the gateway's counters and from each agent's heartbeat)
 still signing the old, replayable cluster token instead of the request-bound
@@ -341,7 +346,11 @@ noo jobs status <job-id> --wait
 noo jobs list --watch
 ```
 
-`inference run` posts to `/api/inference` and prints the response;
+`inference run` posts to `/api/inference` and prints the response.
+`-n <node>` names the node to try first: when it cannot answer, the pool
+does and the CLI says so (`! answered by <model> — <node> could not:
+…`). `--strict-node` keeps the prompt on that node alone and fails
+when it cannot answer — for locality or privacy, or a liveness check;
 `inference agent` runs the coordinator loop with tools (`--no-tools`
 disables them). A job that ends in any state other than `completed` exits
 1. `jobs scheduler` shows dispatch counters; `jobs pause`/`resume` stop and
@@ -556,7 +565,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster scale` | `<backend> -r\|--replicas <n> [-m\|--model <model>] [-y\|--yes]` | Scale a backend to N replicas fleet-wide; scale-down asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Show the desired config and every placement (with its role) the node-agent converges to |
-| `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrolment proposals agents filed, with each host in full |
+| `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
@@ -634,7 +643,7 @@ other direction: the other stack never calls noomesh.
 ### `noo inference` — Run prompts on the GPU cluster
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo inference run` | `<prompt> [-m <model>] [-b <backend>] [-n <node>] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one direct model inference through the gateway and print the response |
+| `noo inference run` | `<prompt> [-m <model>] [-b <backend>] [-n <node> [--strict-node]] [-u <user>] [--max-tokens <n>] [-t <temperature>]` | Run one direct model inference through the gateway and print the response |
 | `noo inference agent` | `<prompt>` | Run a prompt through the gateway agent runner and print the response |
 
 ### `noo jobs` — Job queue & scheduler management

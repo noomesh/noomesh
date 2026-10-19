@@ -222,6 +222,36 @@ fn accept_key(key: &str, file: &Path, trusted: bool, notes: &mut Vec<String>) ->
     false
 }
 
+/// The value `.env`-style `text` assigns `key`: the LAST assignment wins
+/// (compose reads the file that way), `export ` is allowed, surrounding
+/// quotes are removed. None when the key is not assigned. The one reader
+/// the security scan and `cluster verify` share, so a duplicated key
+/// cannot be judged by its first (overridden) value.
+pub(crate) fn dotenv_last(text: &str, key: &str) -> Option<String> {
+    text.lines().rev().find_map(|l| {
+        let l = l.trim();
+        let l = l.strip_prefix("export ").map(str::trim_start).unwrap_or(l);
+        let v = l.strip_prefix(key)?.strip_prefix('=')?;
+        Some(v.trim().trim_matches('"').trim_matches('\'').to_string())
+    })
+}
+
+#[cfg(test)]
+mod dotenv_last_tests {
+    use super::dotenv_last;
+
+    #[test]
+    fn last_assignment_wins_for_a_duplicated_key() {
+        let t = "NOO_MTLS_GATEWAY=true\nA=1\nNOO_MTLS_GATEWAY=false\n";
+        assert_eq!(dotenv_last(t, "NOO_MTLS_GATEWAY").as_deref(), Some("false"));
+        let t = "NOO_MTLS_GATEWAY=false\nNOO_MTLS_GATEWAY=\"true\"\n";
+        assert_eq!(dotenv_last(t, "NOO_MTLS_GATEWAY").as_deref(), Some("true"));
+        assert_eq!(dotenv_last("export K='v'\r\n", "K").as_deref(), Some("v"));
+        assert_eq!(dotenv_last("KK=1\n", "K"), None);
+        assert_eq!(dotenv_last("", "K"), None);
+    }
+}
+
 /// Load `<repo>/.env` into the process env. Already-exported vars win.
 /// Values may be quoted; lines starting with `#` are skipped.
 ///

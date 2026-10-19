@@ -82,8 +82,8 @@ struct EnrollCred {
 /// unpadded encoding so a hand-relayed blob survives copy mangling.
 fn parse_blob(blob: &str) -> Result<EnrollCred, String> {
     if blob.trim().starts_with("noo-seat1.") {
-        return Err("this is a kiosk SEAT enrolment paste — run it as `noo kiosk enroll noo-seat1.…`; \
-                    a seat never enrols as a node".into());
+        return Err("this is a kiosk SEAT enrollment paste — run it as `noo kiosk enroll noo-seat1.…`; \
+                    a seat never enrolls as a node".into());
     }
     let b64 = blob
         .strip_prefix("noo1.")
@@ -106,7 +106,7 @@ fn parse_blob(blob: &str) -> Result<EnrollCred, String> {
     // never redeems a token minted for something that is not a node.
     if let Some(role) = v.get("role").filter(|r| !r.is_null()) {
         if role.as_str() != Some("node") {
-            return Err(format!("this enrolment blob claims role {role}, not a node — refusing"));
+            return Err(format!("this enrollment blob claims role {role}, not a node — refusing"));
         }
     }
     let field = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
@@ -1836,10 +1836,10 @@ mod tests {
         assert!(err.contains("noo upgrade"), "err was: {err}");
     }
 
-    /// A seat's paste never enrols a node (i77), in either spelling: the
+    /// A seat's paste never enrolls a node (i77), in either spelling: the
     /// `noo-seat1.` blob, or a `noo1.` blob carrying a non-node role claim.
     #[test]
-    fn a_seat_blob_is_refused_by_the_node_enrolment() {
+    fn a_seat_blob_is_refused_by_the_node_enrollment() {
         let seat = crate::commands::kiosk_seat::compose_seat_blob(&crate::commands::kiosk_seat::SeatBlob {
             url: "https://c:8080".into(), token: "noo-st-x".into(), ca: "ab".into(), seat: "lobby".into(),
             sigpub: "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----\n".into(),

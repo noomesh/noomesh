@@ -47,7 +47,8 @@ ENV UV_BREAK_SYSTEM_PACKAGES=1 \
 # Vendor telemetry off (docs/security/telemetry.md), baked into the image so
 # a container started outside compose carries it too; compose sets the same.
 ENV HF_HUB_DISABLE_TELEMETRY=1 \
-    DO_NOT_TRACK=1
+    DO_NOT_TRACK=1 \
+    ORT_DISABLE_TELEMETRY=1
 
 # THE interpreter. Every Python service image FROMs this tier, so this ARG is
 # the version the fleet runs. It is pinned to `.python-version` at the repo root

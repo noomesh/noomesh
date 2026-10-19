@@ -230,7 +230,7 @@ async fn seat_token_create(
         "expires_at": t.expires_at.to_rfc3339(),
         "controller_url": gateway,
         "ca_sha256": ca_sha256,
-        "note": "single-use; enrols a kiosk SEAT, never a node — it expires, burns on first use, \
+        "note": "single-use; enrolls a kiosk SEAT, never a node — it expires, burns on first use, \
                  and can be revoked by id",
     })))
 }

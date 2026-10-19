@@ -20,7 +20,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "down"], "<backend> [--node <node>] [-y|--yes]", "Stop a backend on one node or all nodes; destructive, asks for confirmation (-y)"),
         (&["cluster", "scale"], "<backend> -r|--replicas <n> [-m|--model <model>] [-y|--yes]", "Scale a backend to N replicas fleet-wide; scale-down asks for confirmation (-y)"),
         (&["cluster", "desired"], "<node>", "Show the desired config and every placement (with its role) the node-agent converges to"),
-        (&["cluster", "proposals"], "[--status <s>] [--limit <n>]", "List the enrolment proposals agents filed, with each host in full"),
+        (&["cluster", "proposals"], "[--status <s>] [--limit <n>]", "List the enrollment proposals agents filed, with each host in full"),
         (&["cluster", "show"], "<node>", "Show one node in full: hardware, agent version, tier drift, bus principal, roles"),
         (&["cluster", "forget"], "<node> [--purge-tailscale] [-y|--yes]", "Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device"),
         (&["cluster", "place"], "<node> <backend|harness> <model|auto> [--on cpu|gpu] [--env KEY=VALUE]... [--kind noo|claude-code|copilot|codex] [--role chat|embed|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]", "Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env"),
@@ -220,7 +220,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["models", "switch"], "<model> [--backend <b>] [-y|--yes]", "Switch the active model: rewrites .env/noomesh.yaml, restarts; asks (-y)"),
     (&["models", "refresh"], "[--backend <b>] [--llm]", "Rebuild the model catalog cache from HuggingFace, bypassing the TTL"),
     (&["health"], "", "Probe gateway /health and report per-dependency state; exit 5 if degraded"),
-    (&["inference", "run"], "<prompt> [-m <model>] [-b <backend>] [-n <node>] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one direct model inference through the gateway and print the response"),
+    (&["inference", "run"], "<prompt> [-m <model>] [-b <backend>] [-n <node> [--strict-node]] [-u <user>] [--max-tokens <n>] [-t <temperature>]", "Run one direct model inference through the gateway and print the response"),
     (&["db", "status"], "", "Show gateway health and every migration stamp (mesh/trellion/evolve); --json supported"),
     (&["doctor", "docker"], "", "Detect unclean-shutdown docker damage (ghosts, empty names) and print recovery"),
     (&["doctor", "privileges"], "", "Report standing power on this box: sudoers drop-ins, gate binaries, SSH keys"),
@@ -371,12 +371,12 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["addons", "upgrade"], "[<name>...] [--check] [--allow-downgrade]", "Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin"),
     (&["addons", "verify"], "", "Re-verify add-on locks offline and compare local and running images with the pins"),
     (&["addons", "launch-pins"], "[--root <dir>] <tag> [<name>...]", "Hidden: print verified add-on image pins for the launcher (internal)"),
-    (&["kiosk", "enroll"], "<blob> [--controller <https://…>] [--dry-run]", "Enrol this display as a kiosk seat (never a node); its CLI + assets then ride the rail"),
+    (&["kiosk", "enroll"], "<blob> [--controller <https://…>] [--dry-run]", "Enroll this display as a kiosk seat (never a node); its CLI + assets then ride the rail"),
     (&["kiosk", "invite"], "<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]", "Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands"),
     (&["kiosk", "labels"], "on|off|status", "Controller: entity names on the kiosk graph (kiosk.graph_labels; audited, no restart)"),
     (&["kiosk", "reload"], "", "Reload the page on the display and report the console build either side"),
     (&["kiosk", "seat-sync"], "", "Hidden: the seat's sync tick, run by noo-seat-sync.timer as root (internal)"),
-    (&["kiosk", "seat-token"], "<seat-name> [--ttl <1h|30m|secs>]", "Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>`"),
+    (&["kiosk", "seat-token"], "<seat-name> [--ttl <1h|30m|secs>] [--controller <https://…>]", "Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>`"),
     (&["kiosk", "serve"], "[--port <n>]", "Hidden: the display's local proxy, run by kiosk-serve.service (internal)"),
     (&["kiosk", "setup"], "--mode dedicated|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health|graph] [--rotate <secs>] [--poll <secs>] [--quality lean|full] [--browser <bin>] [--dry-run] [-y|--yes]", "Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog"),
     (&["kiosk", "status"], "", "Report the seat: units, mint, expiry, heartbeat, graph labels (no privilege needed)"),
@@ -394,23 +394,28 @@ pub fn is_native_group(word: &str) -> bool {
     USAGE.iter().any(|(w, _, _)| w.first() == Some(&word))
 }
 
-/// The native subcommands under `group`, in declaration order, deduplicated.
-pub fn subcommands_of(group: &str) -> Vec<&'static str> {
+/// The native next words under the command path `prefix` (`["cluster",
+/// "class"]` -> `list`, `set`, `unset`), in declaration order, deduplicated.
+/// Hidden rows (aliases, retired verbs) still dispatch; they are not offered.
+pub fn subcommands_under(prefix: &[&str]) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for (w, _, about) in USAGE.iter() {
-        // Hidden rows (aliases, retired verbs) still dispatch; they are not offered.
         if about.starts_with("Hidden:") {
             continue;
         }
-        if w.first() == Some(&group) {
-            if let Some(sub) = w.get(1) {
-                if !out.contains(sub) {
-                    out.push(sub);
-                }
+        if w.len() > prefix.len() && w[..prefix.len()] == *prefix {
+            let sub = w[prefix.len()];
+            if !out.contains(&sub) {
+                out.push(sub);
             }
         }
     }
     out
+}
+
+/// True when `words` is a complete command row (not just a group prefix).
+pub fn is_command(words: &[&str]) -> bool {
+    USAGE.iter().any(|(w, _, _)| *w == words)
 }
 
 /// (syntax, description) for exactly these command words.

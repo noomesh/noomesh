@@ -1087,6 +1087,25 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             if prev.is_empty() { "unpinned".into() } else { prev.clone() }, root.display()));
     }
 
+    // -3. A rollback must be able to run on the database it will meet. The
+    //    target's signed lock (or this CLI's table, for releases that predate
+    //    the lock line) says which mesh migrations that release knows; a DB
+    //    stamped beyond them makes its gateway refuse to start. Refused HERE,
+    //    before any other stage, with nothing changed (rehearsal 0.6.7-rc.1
+    //    F2). The lock is fetched and verified first (read-only) because it
+    //    carries the head. No override: restoring a backup is what clears it.
+    let target_stack_lock = fetch_stack_lock(g, &tag);
+    if let Err((code, msg, fix)) = crate::commands::stack_db_compat::preflight(&prev, &tag, target_stack_lock.as_deref(), &|| {
+        crate::commands::db::mesh_stamp_from_postgres()
+            .or_else(|| {
+                crate::http::get_json_try(g, "/api/db/migrations", true, 10).ok()
+                    .and_then(|v| v["mesh"]["current"].as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            })
+            .ok_or_else(|| "neither postgres nor the gateway reported the mesh stamp".to_string())
+    }) {
+        fail(g.json, ExitCode::Generic, code, &msg, Some(fix));
+    }
+
     // -2. Every controller service must hold its own gateway key BEFORE the
     //    roll: this release's gateway refuses the
     //    controller-secret HMAC a keyless worker used to fall back to, and the
@@ -1132,7 +1151,6 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    pulled by digest here (pulls change nothing that runs). One that
     //    cannot is a hold: the roll is refused naming it, with nothing
     //    changed. The pins are written beside stack.lock in step 2.
-    let target_stack_lock = fetch_stack_lock(g, &tag);
     // i57c: a dist install is pull-only and digest-pinned. A release with no
     // signed lock has nothing to check its images against, so the roll is
     // refused HERE, on its own, ahead of the add-on preflight (which used to

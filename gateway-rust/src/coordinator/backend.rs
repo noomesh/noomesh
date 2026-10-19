@@ -591,7 +591,7 @@ async fn unpinned_from_table(state: &AppState, exclude_urls: &[String]) -> Optio
 /// `url` (node-agent address, or the controller-local docker URL) — so a
 /// failed node's every backend is out, as the KV scan always did.
 pub(crate) fn pick_unpinned(table: &super::classes::ClassTable, exclude_urls: &[String]) -> Option<super::classes::Selection> {
-    super::classes::select(table, None, None, &|c| exclude_urls.iter().any(|u| u == &c.url)).ok()
+    super::classes::select(table, None, None, false, &|c| exclude_urls.iter().any(|u| u == &c.url)).ok()
 }
 
 /// Resolve a backend using the mesh discovery chain.
@@ -629,7 +629,7 @@ fn is_excluded(exclude_urls: &[String], local_url: &str, node_ip: &str) -> bool 
 /// Does a served model name satisfy a pin? Ollama reports `name:tag` and
 /// treats a missing tag as `:latest`, so `gemma4` and `gemma4:latest` are one
 /// model; case is not significant in either runtime's naming.
-fn model_matches_pin(served: &str, pin: &str) -> bool {
+pub(crate) fn model_matches_pin(served: &str, pin: &str) -> bool {
     fn norm(m: &str) -> String {
         let m = m.trim().to_ascii_lowercase();
         m.strip_suffix(":latest").map(str::to_string).unwrap_or(m)
@@ -725,7 +725,7 @@ fn apply_pin(all: &mut Vec<Candidate>, pin: &str) -> Result<(), String> {
     if all.iter().all(|c| c.excluded) {
         let who = all.iter().map(|c| format!("{}={}", c.node_id, c.backend_type)).collect::<Vec<_>>().join(" ");
         return Err(format!(
-            "every node serving '{pin}' failed this request ({who}); refusing to answer with a different model"
+            "every node serving '{pin}' failed this request ({who}) and no other node can answer"
         ));
     }
     all.retain(|c| !c.excluded);
@@ -1028,13 +1028,20 @@ pub(crate) async fn resolve_backend_and_node(state: &AppState, requested_model: 
         }
     }
 
-    // An explicit pin is a filter, not a preference: serve it or say who does.
-    // Only when the mesh reported backends at all - an empty list still falls
-    // through to discovery and the static last resort below, as before.
+    // A named model is a preference (operator rule 2026-10-19, see
+    // `classes`' "Preferences, not selections"): its own nodes first; when
+    // none of them can take this request (not served, or every one already
+    // failed it), any live chat node answers, as raw chat does. Only when
+    // the mesh reported backends at all - an empty list still falls through
+    // to discovery and the static last resort below, as before.
     if let (Some(pin), false) = (requested_model, candidates.is_empty()) {
-        apply_pin(&mut candidates, pin).map_err(|e| {
-            if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) }
-        })?;
+        if let Err(e) = apply_pin(&mut candidates, pin) {
+            if let Some(found) = unpinned_from_table(state, exclude_urls).await {
+                tracing::warn!(requested_model = pin, reason = %e, node = ?found.1, model = %found.0.model, "backend_preference_unmet_mesh_answers");
+                return Ok(found);
+            }
+            return Err(if e.starts_with(&not_served_prefix(pin)) { anyhow::Error::new(ModelNotServed(e)) } else { anyhow::anyhow!(e) });
+        }
     } else {
         candidates.retain(|c| !c.excluded);
     }
@@ -1689,7 +1696,7 @@ mod unpinned_tests {
             node("mcmini", "192.0.2.212", "ollama", "gemma4:12b", true, 0.4),
         ];
         let t = build_table(&nodes, &[], &Declarations::default());
-        let raw = select(&t, None, None, &|_| false).expect("raw chat selection");
+        let raw = select(&t, None, None, false, &|_| false).expect("raw chat selection");
         let task = pick_unpinned(&t, &[]).expect("heartbeat selection");
         assert_eq!(raw.candidates[0].node_id, "mcmini");
         assert_eq!(task.candidates[0].node_id, raw.candidates[0].node_id);

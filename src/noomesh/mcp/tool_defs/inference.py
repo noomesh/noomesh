@@ -35,9 +35,14 @@ class PaiInference(ToolDef):
     model: Optional[str] = Field(default=None, description="Model name (auto-selected if omitted)")
     backend: Optional[str] = Field(default=None, description="Backend type: vllm, ollama, llamacpp")
     node: Optional[str] = Field(default=None, description=(
-        "Pin to a specific cluster node by id (e.g. 'host9') — sends the "
-        "prompt to the model running ON that node instead of auto-routing. "
-        "Use when the user addresses a particular node ('ask host9 ...')."
+        "Prefer a specific cluster node by id (e.g. 'host9') — sends the "
+        "prompt to the model running ON that node first; if it cannot "
+        "answer, the mesh does and the result says so. Use when the user "
+        "addresses a particular node ('ask host9 ...')."
+    ))
+    node_strict: bool = Field(default=False, description=(
+        "With node: answer from that node ONLY, never another (locality or "
+        "privacy). Fails when the node cannot answer."
     ))
     max_tokens: Optional[int] = Field(default=None, description="Maximum tokens to generate")
     temperature: Optional[float] = Field(default=None, description="Sampling temperature (0.0-2.0)")

@@ -322,8 +322,35 @@ func (n *Native) Running(ctx context.Context) map[string]string {
 		out["ollama"] = held
 		return out
 	}
-	out["ollama"] = n.loadedModel(ctx, base)
+	// Nothing held: the loaded model is only an identity if it is not an
+	// embedder. On the self-node the same ollama is the stack's embedder, and
+	// its loaded model is usually harrier; reporting that as the backend's
+	// model made it a chat candidate (rehearsal 0.6.7-rc.1 F1). The gateway
+	// excludes it as well; this keeps the agent from saying it.
+	if m := n.loadedModel(ctx, base); !looksLikeEmbedder(m) {
+		out["ollama"] = m
+	} else {
+		out["ollama"] = ""
+	}
 	return out
+}
+
+// looksLikeEmbedder is the name test for an embedding/reranking model, the
+// agent-side twin of the gateway's is_embedding_model_name.
+func looksLikeEmbedder(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	if strings.Contains(m, "embed") || strings.Contains(m, "rerank") {
+		return true
+	}
+	for _, p := range []string{"harrier", "bge-", "bge:", "e5-", "gte-", "all-minilm", "minilm", "snowflake"} {
+		if strings.HasPrefix(m, p) {
+			return true
+		}
+	}
+	return m == "bge" || m == "tei"
 }
 
 // Loaded reports what each backend this lane owns has in memory right now,

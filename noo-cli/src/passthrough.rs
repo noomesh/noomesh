@@ -184,13 +184,15 @@ pub(crate) fn no_python_message(argv: &[String]) -> String {
     // this binary already serves. `noo security keys list` hit this:
     // `security` has 40-odd native subcommands, the verb is `service-key`,
     // and the answer named the GROUP rather than the word that was wrong.
-    if let Some((group, _)) = native_group_misuse(argv) {
-        let subs = crate::usage::subcommands_of(&group);
-        // Name only the unknown token, not the whole command line (and its
-        // arguments): `class` is not a subcommand of `noo cluster`.
-        let unknown = argv.get(1).cloned().unwrap_or_else(|| argv.join(" "));
+    if let Some(m) = native_group_misuse(argv) {
+        let subs = crate::usage::subcommands_under(&m.path.iter().map(String::as_str).collect::<Vec<_>>());
+        let path = m.path.join(" ");
+        // Name only the unknown token, at the deepest level that parsed
+        // (`show` is not a subcommand of `noo cluster class`), never the
+        // whole command line or a level that did parse.
+        let unknown = m.unknown.clone().unwrap_or_else(|| argv.join(" "));
         return format!(
-            "`{unknown}` is not a subcommand of `noo {group}` — which IS in this \
+            "`{unknown}` is not a subcommand of `noo {path}` — which IS in this \
              binary, natively. Its subcommands: {}.",
             subs.join(", ")
         );
@@ -204,13 +206,39 @@ pub(crate) fn no_python_message(argv: &[String]) -> String {
     )
 }
 
-/// A native group followed by a word or flag it does not own. Returns the
-/// group and the nearest real subcommand, if any: `--verify` is the
-/// subcommand `verify` typed as a flag; `verfy` is a plain typo.
-pub(crate) fn native_group_misuse(argv: &[String]) -> Option<(String, Option<&'static str>)> {
-    let group = argv.first().filter(|w| crate::usage::is_native_group(w))?;
-    let subs = crate::usage::subcommands_of(group);
-    let near = argv.get(1).and_then(|tok| {
+/// A native group (or nested group) followed by a word or flag it does not
+/// own. `path` is the deepest command path that parsed (`cluster class`),
+/// `unknown` the first token after it, `near` the nearest real next word:
+/// `--verify` is the subcommand `verify` typed as a flag; `verfy` is a typo.
+#[derive(Debug)]
+pub(crate) struct Misuse {
+    pub path: Vec<String>,
+    pub unknown: Option<String>,
+    pub near: Option<&'static str>,
+}
+
+pub(crate) fn native_group_misuse(argv: &[String]) -> Option<Misuse> {
+    argv.first().filter(|w| crate::usage::is_native_group(w))?;
+    // Walk down while the next word extends a known command path. A complete
+    // command row is a leaf: whatever follows it is an argument, not a verb,
+    // so it is not a "group misuse".
+    let mut path: Vec<&str> = vec![argv[0].as_str()];
+    for tok in &argv[1..] {
+        if tok.starts_with('-') || crate::usage::is_command(&path) {
+            break;
+        }
+        if crate::usage::subcommands_under(&path).contains(&tok.as_str()) {
+            path.push(tok.as_str());
+        } else {
+            break;
+        }
+    }
+    if crate::usage::is_command(&path) && argv.len() > path.len() {
+        return None;
+    }
+    let subs = crate::usage::subcommands_under(&path);
+    let unknown = argv.get(path.len()).cloned();
+    let near = unknown.as_ref().and_then(|tok| {
         let bare = tok.trim_start_matches('-');
         if bare.is_empty() {
             return None;
@@ -220,16 +248,17 @@ pub(crate) fn native_group_misuse(argv: &[String]) -> Option<(String, Option<&'s
             .find(|s| *s == bare)
             .or_else(|| subs.iter().copied().find(|s| crate::edit_distance(s, bare) <= 2))
     });
-    Some((group.clone(), near))
+    Some(Misuse { path: path.iter().map(|s| s.to_string()).collect(), unknown, near })
 }
 
 /// The remedy line for [`no_python_message`]. NOO_PY_CLI is the fallback for
 /// commands that are not ported natively; for a native group it is wrong.
 pub(crate) fn no_python_hint(argv: &[String]) -> String {
-    if let Some((group, near)) = native_group_misuse(argv) {
-        return match near {
-            Some(sub) => format!("did you mean `noo {group} {sub}`?"),
-            None => format!("`noo {group} --help` lists its subcommands"),
+    if let Some(m) = native_group_misuse(argv) {
+        let path = m.path.join(" ");
+        return match m.near {
+            Some(sub) => format!("did you mean `noo {path} {sub}`?"),
+            None => format!("`noo {path} --help` lists its subcommands"),
         };
     }
     "set NOO_PY_CLI to the Python `noo` entry point".to_string()
@@ -260,10 +289,29 @@ mod tests {
 
     #[test]
     fn the_unknown_subcommand_message_names_only_the_unknown_token() {
-        let a = argv(&["cluster", "class", "set", "chat-default", "host3/vllm", "host6/ollama=gemma4:12b"]);
+        let a = argv(&["cluster", "bogus", "chat-default", "host3/vllm", "host6/ollama=gemma4:12b"]);
         let msg = no_python_message(&a);
-        assert!(msg.starts_with("`class` is not a subcommand of `noo cluster`"), "{msg}");
+        assert!(msg.starts_with("`bogus` is not a subcommand of `noo cluster`"), "{msg}");
         assert!(!msg.contains("chat-default") && !msg.contains("gemma4"), "{msg}");
+    }
+
+    /// i136a: `noo cluster class show chat-default` blamed `class` (which
+    /// parsed) and suggested the command the user had just typed.
+    #[test]
+    fn a_nested_group_blames_the_token_at_the_deepest_level_that_parsed() {
+        let a = argv(&["cluster", "class", "show", "chat-default"]);
+        let msg = no_python_message(&a);
+        assert!(msg.starts_with("`show` is not a subcommand of `noo cluster class`"), "{msg}");
+        assert!(!msg.contains("chat-default"), "{msg}");
+        assert!(msg.contains("Its subcommands: list, set, unset."), "valid verbs: {msg}");
+        assert_eq!(no_python_hint(&a), "`noo cluster class --help` lists its subcommands");
+        // a near-miss verb still gets a real suggestion at the nested level
+        assert_eq!(no_python_hint(&argv(&["cluster", "class", "lst"])), "did you mean `noo cluster class list`?");
+        // a complete nested command with arguments is not a misuse
+        assert!(native_group_misuse(&argv(&["cluster", "class", "set", "chat-default", "host3/vllm"])).is_none());
+        let m = native_group_misuse(&a).expect("misuse found");
+        assert_eq!(m.path, vec!["cluster", "class"]);
+        assert_eq!(m.unknown.as_deref(), Some("show"));
     }
 
     fn argv(words: &[&str]) -> Vec<String> {
