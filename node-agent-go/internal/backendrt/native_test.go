@@ -298,9 +298,10 @@ func TestPlacedModelWinsOverALoadedOne(t *testing.T) {
 	defer srv.Close()
 	n := NewNativeAt(srv.URL)
 	n.SetHeld("")
-	// Nothing placed yet: the loaded model is the best available answer.
-	if got := n.Running(context.Background())["ollama"]; got != "harrier:latest" {
-		t.Fatalf("nothing held → loaded model, got %q", got)
+	// Nothing placed yet and the loaded model is an embedder: it is not the
+	// backend's identity (rehearsal 0.6.7-rc.1 F1).
+	if got := n.Running(context.Background())["ollama"]; got != "" {
+		t.Fatalf("nothing held, embedder loaded → empty model, got %q", got)
 	}
 	n.SetHeld("llama3.2:3b")
 	defer n.SetHeld("")
@@ -314,5 +315,27 @@ func TestPlacedModelWinsOverALoadedOne(t *testing.T) {
 	var none *Native
 	if len(none.Loaded(context.Background())) != 0 {
 		t.Fatal("nil lane reports nothing loaded")
+	}
+}
+
+// rehearsal 0.6.7-rc.1 F1: the self-node's ollama is the stack's embedder; with
+// nothing held, a loaded embedding model must not become the backend's model.
+func TestAnEmbedderLoadedAndNothingHeldIsNotTheBackendsModel(t *testing.T) {
+	n := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[]}`))
+		case "/api/ps":
+			_, _ = w.Write([]byte(`{"models":[{"name":"harrier:latest","model":"harrier:latest"}]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	})
+	got := n.Running(context.Background())
+	if m, ok := got["ollama"]; !ok || m != "" {
+		t.Errorf("Running = %v, want ollama present with an empty model", got)
+	}
+	if l := n.Loaded(context.Background()); l["ollama"] != "harrier:latest" {
+		t.Errorf("Loaded still reports what is in memory: %v", l)
 	}
 }

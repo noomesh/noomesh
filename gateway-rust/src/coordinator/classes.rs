@@ -170,6 +170,10 @@ pub struct NodeFacts {
     pub model_missing: Vec<String>,
     /// Backends whose placement role is not `chat`.
     pub non_chat: Vec<String>,
+    /// `(backend, model)` the agent's `model_presence` reports under a role
+    /// other than chat (`ollama#embed`). Empty from an agent that predates
+    /// the field: the placements and the name registry still apply.
+    pub reported_non_chat_models: Vec<(String, String)>,
     pub load: f64,
     pub tier: Option<i64>,
     /// `vram_gb > 0`, or unified memory (Apple silicon).
@@ -361,6 +365,51 @@ fn same_model(a: &str, b: &str) -> bool {
     norm_model(a) == norm_model(b)
 }
 
+/// True for a model name that is an embedding or reranking model, never a
+/// chat model: the registry that still works when an old agent sends no role
+/// and no placement names the model (the controller's adopted
+/// `noo-ollama-embed` hosts the embedder without any embed placement row).
+/// Conservative on purpose: a family name or an explicit `embed`/`rerank`
+/// token, nothing a chat model is called.
+pub fn is_embedding_model_name(model: &str) -> bool {
+    let m = norm_model(model);
+    let base = m.rsplit('/').next().unwrap_or(&m);
+    if base.contains("embed") || base.contains("rerank") {
+        return true;
+    }
+    ["harrier", "bge-", "bge:", "e5-", "gte-", "all-minilm", "minilm", "snowflake"]
+        .iter()
+        .any(|p| base.starts_with(p))
+        || base == "bge"
+        || base == "tei"
+}
+
+/// What a running `(backend, model)` on this node is for chat: the model to
+/// list as the chat candidate, or `None` when the backend is serving a
+/// non-chat model with no chat model placed beside it.
+///
+/// The candidate's model is the model PLACED for the chat role, not "whatever
+/// the heartbeat says is loaded": on a shared ollama the loaded model flips
+/// between the chat model and the embedder. Evidence the reported model is not
+/// chat, in order: an embed/rerank placement row for it, the agent's own
+/// `model_presence` role, then the name registry (works for an old agent that
+/// sends no role at all, and for an embedder that has no placement row). A
+/// model the operator placed as chat is always chat.
+fn chat_model_for(n: &NodeFacts, placements: &[PlacementRow], backend: &str, reported: &str) -> Option<String> {
+    let rows = || placements.iter().filter(|(node, b, _, _)| node == &n.node_id && b == backend);
+    let placed_chat: Vec<&str> = rows().filter(|(_, _, _, r)| r == "chat").filter_map(|(_, _, m, _)| m.as_deref()).collect();
+    if placed_chat.iter().any(|m| same_model(m, reported)) {
+        return Some(reported.to_string());
+    }
+    let not_chat = rows().any(|(_, _, m, r)| r != "chat" && m.as_deref().is_some_and(|m| same_model(m, reported)))
+        || n.reported_non_chat_models.iter().any(|(b, m)| b == backend && same_model(m, reported))
+        || is_embedding_model_name(reported);
+    if !not_chat {
+        return Some(reported.to_string());
+    }
+    placed_chat.first().map(|m| m.to_string())
+}
+
 /// Lower sorts first: vLLM, then a GPU-backed runtime, then CPU.
 fn engine_rank(backend: &str, gpu: bool) -> u8 {
     if backend.starts_with("vllm") {
@@ -537,7 +586,8 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) || n.paused_backends.iter().any(|b| b == bt) {
                 continue;
             }
-            served.push(candidate(n, bt, m, 0, false, CandidateStatus::Placed));
+            let Some(chat_model) = chat_model_for(n, placements, bt, m) else { continue };
+            served.push(candidate(n, bt, &chat_model, 0, false, CandidateStatus::Placed));
         }
     }
 
@@ -584,7 +634,11 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
                 .min_by_key(|(_, _, _, role)| if role == "chat" { 0 } else { 1 })
                 .and_then(|(_, _, m, _)| m.clone());
             let node = nodes.iter().find(|n| n.node_id == dc.node_id);
-            let running_model = node.and_then(|n| n.running.iter().find(|(b, _)| b == &dc.backend).map(|(_, m)| m.clone()));
+            // What the backend runs, as a CHAT model: an embedder it reports
+            // is never the declared candidate's model (see `chat_model_for`).
+            let running_model = node.and_then(|n| {
+                n.running.iter().find(|(b, _)| b == &dc.backend).and_then(|(_, m)| chat_model_for(n, placements, &dc.backend, m))
+            });
             let model = dc.model.clone().or(placed_model).or_else(|| running_model.clone()).unwrap_or_default();
             let (status, facts) = match node {
                 Some(n) => {
@@ -1045,6 +1099,16 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         .and_then(Value::as_object)
         .map(|o| o.keys().filter(|b| crate::model_presence::backend_model_missing(data, b)).cloned().collect())
         .unwrap_or_default();
+    let reported_non_chat_models: Vec<(String, String)> = data
+        .get("model_presence")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(_, e)| !matches!(e["role"].as_str(), None | Some("") | Some("chat")))
+                .filter_map(|(k, e)| Some((k.split('#').next()?.to_string(), e["model"].as_str().filter(|m| !m.is_empty())?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let vram = data.get("vram_gb").and_then(Value::as_f64).unwrap_or(0.0);
     let unified = data
         .pointer("/capabilities/unified_memory")
@@ -1057,6 +1121,7 @@ pub fn node_facts_from_kv(key: &str, data: &Value, non_chat: &[(String, String)]
         running,
         available_models,
         model_missing,
+        reported_non_chat_models,
         non_chat: non_chat.iter().filter(|(n, _)| n == &node_id).map(|(_, b)| b.clone()).collect(),
         load: data.get("load").and_then(Value::as_f64).map(|l| l.clamp(0.0, 1.0)).unwrap_or(0.0),
         tier: data.get("tier").and_then(Value::as_i64),
@@ -1425,6 +1490,74 @@ mod tests {
         ];
         assert_eq!(non_chat_pairs(&rows), vec![("host2".to_string(), "ollama".to_string())],
             "only the dedicated embedder is excluded from chat; host6 serves both");
+    }
+
+    /// rehearsal 0.6.7-rc.1 F1: the controller's adopted ollama hosts the
+    /// embedder; the heartbeat reports whatever it has loaded.
+    fn embed_node(reported: &str) -> NodeFacts {
+        node("ctl", "10.0.0.2", &[("ollama", reported)], &["qwen2.5:0.5b", "harrier:latest"], false, 2, 0.1)
+    }
+
+    fn pool_has_only_chat(t: &ClassTable, model: &str) {
+        let d = t.class(CHAT_DEFAULT).expect("chat-default");
+        let got: Vec<String> = d.candidates.iter().map(|c| format!("{}={}", c.backend, c.model)).collect();
+        assert_eq!(got, vec![format!("ollama={model}")], "{got:?}");
+        assert!(t.class("harrier:latest").is_none() && t.class("harrier").is_none(), "no derived class for the embedder");
+    }
+
+    #[test]
+    fn a_loaded_embedder_is_never_the_chat_candidate_the_placed_chat_model_is() {
+        let rows: Vec<PlacementRow> = vec![
+            ("ctl".into(), "ollama".into(), Some("qwen2.5:0.5b".into()), "chat".into()),
+            ("ctl".into(), "ollama".into(), Some("harrier:latest".into()), "embed".into()),
+        ];
+        let t = build_table(&[embed_node("harrier:latest")], &rows, &Declarations::default());
+        pool_has_only_chat(&t, "qwen2.5:0.5b");
+        // And it does not flip when the chat model is the loaded one.
+        let t = build_table(&[embed_node("qwen2.5:0.5b")], &rows, &Declarations::default());
+        pool_has_only_chat(&t, "qwen2.5:0.5b");
+    }
+
+    #[test]
+    fn an_old_agent_without_roles_still_excludes_the_embedder_by_placement_or_name() {
+        // No model_presence at all (reported_non_chat_models empty): the
+        // embed placement row names it.
+        let placed_embed: Vec<PlacementRow> = vec![
+            ("ctl".into(), "ollama".into(), Some("qwen2.5:0.5b".into()), "chat".into()),
+            ("ctl".into(), "ollama".into(), Some("my-embedder".into()), "embed".into()),
+        ];
+        let t = build_table(&[embed_node("my-embedder")], &placed_embed, &Declarations::default());
+        pool_has_only_chat(&t, "qwen2.5:0.5b");
+        // No embed row either (the adopted noo-ollama-embed): the name does.
+        let chat_only: Vec<PlacementRow> = vec![("ctl".into(), "ollama".into(), Some("qwen2.5:0.5b".into()), "chat".into())];
+        let t = build_table(&[embed_node("harrier:latest")], &chat_only, &Declarations::default());
+        pool_has_only_chat(&t, "qwen2.5:0.5b");
+        // No chat placement at all: the embedder alone is no candidate.
+        let t = build_table(&[embed_node("harrier:latest")], &[], &Declarations::default());
+        assert!(t.class(CHAT_DEFAULT).is_none(), "{:?}", t.classes);
+    }
+
+    #[test]
+    fn an_agent_reported_embed_role_excludes_a_model_no_placement_or_name_gives_away() {
+        let data = serde_json::json!({"id": "ctl", "ip_address": "10.0.0.2", "running_backends": {"ollama": "zzz-model"},
+            "model_presence": {"ollama": {"model": "qwen2.5:0.5b", "role": "chat", "present": true},
+                               "ollama#embed": {"model": "zzz-model", "role": "embed", "present": true}}});
+        let n = node_facts_from_kv("ctl", &data, &[], 0.0);
+        assert_eq!(n.reported_non_chat_models, vec![("ollama".to_string(), "zzz-model".to_string())]);
+        let rows: Vec<PlacementRow> = vec![("ctl".into(), "ollama".into(), Some("qwen2.5:0.5b".into()), "chat".into())];
+        let t = build_table(&[n], &rows, &Declarations::default());
+        pool_has_only_chat(&t, "qwen2.5:0.5b");
+    }
+
+    #[test]
+    fn a_model_placed_as_chat_is_chat_whatever_its_name_and_chat_models_are_untouched() {
+        assert!(is_embedding_model_name("harrier:latest") && is_embedding_model_name("nomic-embed-text") && is_embedding_model_name("BAAI/bge-m3"));
+        for m in ["qwen2.5:0.5b", "gemma4:12b", "llama3.2:1b"] {
+            assert!(!is_embedding_model_name(m), "{m}");
+        }
+        let rows: Vec<PlacementRow> = vec![("ctl".into(), "ollama".into(), Some("harrier-chat".into()), "chat".into())];
+        let t = build_table(&[embed_node("harrier-chat")], &rows, &Declarations::default());
+        pool_has_only_chat(&t, "harrier-chat");
     }
 
     #[test]

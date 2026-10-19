@@ -691,7 +691,7 @@ pub(crate) fn pick_chat_backend(
     let mut skipped = Vec::new();
     for bt in ["vllm", "ollama", "llamacpp"] {
         let Some(m) = running.get(bt).and_then(|m| m.as_str()).filter(|m| !m.is_empty()) else { continue };
-        if non_chat.contains(&(node_id.to_string(), bt.to_string())) {
+        if non_chat.contains(&(node_id.to_string(), bt.to_string())) || crate::coordinator::classes::is_embedding_model_name(m) {
             skipped.push((bt.to_string(), m.to_string()));
             continue;
         }
