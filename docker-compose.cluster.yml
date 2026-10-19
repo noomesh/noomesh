@@ -18,6 +18,33 @@ x-default-logging: &default-logging
     max-size: "50m"
     max-file: "3"
 
+# ── The stunnel doors the controller's own HOST node-agent also dials ──────
+# ollama, ollama-embed, ollama-embed-cpu and llamacpp are dialled by the
+# gateway, worker, trellion (their service leaves, pinned statically in
+# docker/stunnel-<door>.conf) AND by the controller's own node-agent with its
+# NODE leaf, whose only distinguishing name is this controller's node id,
+# which a static conf cannot list. The door appends it at start:
+# `checkHost = $NODE_ID`, so exactly one node's leaf is accepted besides the
+# service leaves. A node id that is unset or not a plain node name REFUSES to
+# start (exit 78) with the fix in the message, rather than opening the door to
+# every cluster-CA leaf again or silently locking the host agent out.
+# tests/test_stunnel_door_pinning.py pins the doors that use this.
+x-stunnel-self-pin: &stunnel-self-pin
+  - sh
+  - -c
+  - |
+    set -eu
+    id="$${NOO_STUNNEL_SELF_NODE:-}"
+    case "$$id" in
+      ""|auto|*[!A-Za-z0-9._-]*)
+        echo "stunnel: this door pins the controller's own node-agent by its node id, and NODE_ID is '$$id' (unset, 'auto', or not a plain node name). Set NODE_ID in .env to this controller's node id (the one 'noo cluster status' lists for it), then: noo stack restart --force" >&2
+        exit 78
+        ;;
+    esac
+    cp /etc/stunnel/stunnel.conf /tmp/stunnel.conf
+    printf 'checkHost = %s\n' "$$id" >> /tmp/stunnel.conf
+    exec stunnel /tmp/stunnel.conf
+
 # ── Image floor for the file-backed secret wiring ─────────────────────────
 # This file hands the gateway and the worker `<NAME>_FILE` pointers and no
 # plain values. An image older than the readers would see neither and boot
@@ -1476,6 +1503,9 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
     user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
     profiles: ["llamacpp", "cpu"]
     volumes:
       - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro
@@ -1645,6 +1675,9 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
     user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
     profiles: ["embed-cpu"]
     volumes:
       - ./docker/stunnel-ollama-embed-cpu.conf:/etc/stunnel/stunnel.conf:ro
@@ -1695,6 +1728,9 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
     user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
     profiles: ["standalone"]
     volumes:
       - ./docker/stunnel-ollama-embed.conf:/etc/stunnel/stunnel.conf:ro
@@ -1780,6 +1816,9 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
     user: nonroot
+    entrypoint: *stunnel-self-pin
+    environment:
+      - NOO_STUNNEL_SELF_NODE=${NODE_ID:-}
     profiles: ["ollama", "gpu-tier2"]
     volumes:
       - ./docker/stunnel-ollama.conf:/etc/stunnel/stunnel.conf:ro

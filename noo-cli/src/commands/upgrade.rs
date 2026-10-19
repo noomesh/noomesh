@@ -1237,6 +1237,29 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             Some("noo systems status   # then re-run: noo upgrade --stack")),
     }
 
+    // -1d. The four stunnel doors the controller's own node-agent dials
+    //    (ollama, ollama-embed, ollama-embed-cpu, llamacpp) now pin that agent
+    //    by this controller's node id (`checkHost = $NODE_ID`, appended at
+    //    start by compose) and REFUSE to start without a usable one, rather
+    //    than accept any cluster certificate again. An install whose .env has
+    //    no NODE_ID would come up with those doors down: say so now, with the
+    //    fix, while the old stack is still serving. Not a refusal of the roll:
+    //    most controllers run none of the four.
+    if !g.json {
+        // The CLI loaded .env into its environment at startup, and the
+        // launcher exports noomesh.yaml `compose_env:` the same way: the
+        // process environment is what compose will see.
+        let node_id = std::env::var("NODE_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::onboard::env::read_env_key(&root.join(".env"), "NODE_ID"));
+        if let Some(why) = door_node_id_problem(&node_id) {
+            ui::warned(&format!(
+                "{why} — the ollama, ollama-embed, ollama-embed-cpu and llamacpp stunnel doors pin this controller's own node-agent by that id and will refuse to start without it. Set NODE_ID in .env to this controller's node id, then: noo stack restart --force"
+            ));
+        }
+    }
+
     // 0. Move any RETIRED gate key out of noomesh.yaml BEFORE the roll,
     //    while the old gateway is still up to accept the write.
     migrate_retired_yaml_gates(g, &root);
@@ -1701,6 +1724,21 @@ fn reconcile_bus_keys(root: &std::path::Path) -> Result<Vec<String>, AuditKeyRef
     crate::commands::secrets::mint_unset(PER_SERVICE_KEYS, &sops)
         .map(|(minted, _)| minted)
         .map_err(AuditKeyRefusal::Store)
+}
+
+/// Why `NODE_ID` (as `.env` holds it) cannot be pinned by the stunnel doors:
+/// unset, `auto`, or not a plain node name. The same predicate the doors'
+/// entrypoint applies (`x-stunnel-self-pin` in docker-compose.cluster.yml:
+/// `""|auto|*[!A-Za-z0-9._-]*`); `None` = usable.
+fn door_node_id_problem(raw: &str) -> Option<String> {
+    let id = raw.trim().trim_matches(|c: char| c == '"' || c == '\'');
+    if id.is_empty() {
+        return Some("NODE_ID is not set (.env, or compose_env: in noomesh.yaml)".to_string());
+    }
+    if id == "auto" || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Some(format!("NODE_ID is '{id}', which is not a plain node name"));
+    }
+    None
 }
 
 /// `SVC_LIST` names the mounted service certs the CURRENT release's compose
@@ -5731,5 +5769,25 @@ mod keyless_tests {
         ];
         assert_eq!(super::pick_latest_stack(&rels).as_deref(), Some("0.2.104"));
         assert_eq!(super::pick_latest_stack(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod door_node_id_tests {
+    /// The roll warns about a NODE_ID the doors would refuse, using the doors'
+    /// own rule (tests/test_stunnel_door_pinning.py runs the shell side).
+    #[test]
+    fn door_node_id_problem_matches_the_doors_rule() {
+        for ok in ["host8", "pop-os", "node_1.lan", "\"host8\"", "'host8'"] {
+            assert_eq!(super::door_node_id_problem(ok), None, "{ok}");
+        }
+        for bad in ["", "  ", "auto", "a b", "x;y", "host8/../x", "$(id)"] {
+            assert!(super::door_node_id_problem(bad).is_some(), "{bad:?}");
+        }
+        let src = include_str!("upgrade.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let body = &body[..body.find("\nfn ").unwrap()];
+        assert!(body.contains("door_node_id_problem("), "the roll must call it");
     }
 }
