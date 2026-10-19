@@ -89,6 +89,15 @@ answers **HTTP 503** with `{"error": "<why>", "addon": "<name>"}`, and the
 and reports each add-on as `enabled`, `disabled` or `unlicensed` (flag on,
 no valid entitlement).
 
+## Who can use an add-on's routes
+
+An add-on's HTTP routes are scoped by role like the core's. Each route in the
+add-on's manifest names the lowest role that may call it; a route that names
+none is Operator-only, so a User-tier login reads nothing an add-on did not
+vouch for. The evolve add-on's loop, GA, RL-policy and meta-loop reads
+describe the whole installation and are Operator and Admin only. Add-on authors:
+[development/addons.md](../development/addons.md#who-may-call-a-route).
+
 ## Licensed add-ons
 
 A licensed add-on needs an entitlement token from PersonifAI. Register at

@@ -28,8 +28,10 @@ the gateway refuses JWTs rather than accepting the well-known default. The
    otherwise User. Operators may call anything. Users may `GET` only an
    allow-list of the surfaces a person needs (conversations, memory, RAG and
    graph reads, their jobs, agent mail, usage, the dashboard's cluster/scheduler
-   overview, the runbooks, `/ws/*`, add-on read routes); a route not on the list
+   overview, the runbooks, `/ws/*`, and the add-on read routes whose manifest says `min_role: user`); a route not on the list
    is closed to a User until it is added on purpose, as for kiosk tokens.
+   An add-on route that declares no `min_role` is Operator+ for every method (see
+   [development/addons.md](../development/addons.md#who-may-call-a-route)).
    Installation-wide reads are Operator+: `/metrics`, `/api/metrics/*`,
    `/api/logs/*`, `/api/config*`, `/api/settings*` and `/api/v1/settings` (except
    `user-dirs` and `preference`), `/api/security/*` (audit, violations, PKI, posture,
