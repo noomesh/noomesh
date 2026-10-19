@@ -928,7 +928,7 @@ pub fn security_scan(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             } else {
                 println!("{}", ui::muted(&root_line));
                 println!("{}", ui::status_line(Glyph::Err, &why));
-                ui::guide(&[("noo onboard", "set up an install here, or enrol this host as a node")]);
+                ui::guide(&[("noo onboard", "set up an install here, or enroll this host as a node")]);
             }
             return Ok(1);
         }

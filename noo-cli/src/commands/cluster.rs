@@ -839,7 +839,7 @@ fn parse_proposals_args(args: &[String]) -> Result<ProposalsArgs, Unhandled> {
 /// `noo cluster proposals [--status <s>] [--limit <n>]` — POST
 /// /api/cluster/proposals.
 ///
-/// The enrolment proposals agents file, with the host IN FULL. A channel
+/// The enrollment proposals agents file, with the host IN FULL. A channel
 /// notice masks a tailnet host (the egress floor), so before this the only
 /// way to see which machine was asking was the dashboard; the notice now
 /// names this command as its next step.
@@ -863,10 +863,10 @@ pub fn cluster_proposals(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     let s = |v: &serde_json::Value| v.as_str().filter(|x| !x.is_empty()).unwrap_or(dash).to_string();
     if proposals.is_empty() {
         let scope = a.status.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
-        println!("{}", ui::muted(&format!("no{scope} enrolment proposals")));
+        println!("{}", ui::muted(&format!("no{scope} enrollment proposals")));
         return Ok(0);
     }
-    println!("{}", ui::header("enrolment proposals", Some(&format!("{} shown", proposals.len()))));
+    println!("{}", ui::header("enrollment proposals", Some(&format!("{} shown", proposals.len()))));
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut any_pending = false;
     for p in proposals {
@@ -2960,8 +2960,8 @@ pub fn cluster_exec(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
 ///
 /// The Python verb ssh'd into every node to rewrite the `noo-controller`
 /// line in `/etc/hosts`. A node finds the controller through its own
-/// enrolment config and MagicDNS now; when that is wrong, re-running the
-/// enrolment paste on the node fixes it in place.
+/// enrollment config and MagicDNS now; when that is wrong, re-running the
+/// enrollment paste on the node fixes it in place.
 pub fn cluster_reconnect(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
     fail(
         g.json,
@@ -2970,7 +2970,7 @@ pub fn cluster_reconnect(g: &Globals, _args: &[String]) -> Result<i32, Unhandled
         "cluster reconnect is retired: it rewrote /etc/hosts on every node over \
          SSH, and the controller\u{2192}node SSH lane was removed 2026-09-11",
         Some(
-            "one flapping agent:   noo cluster restart-agent <node>\n               a node that moved:    re-run the enrolment paste on it (noo enroll \
+            "one flapping agent:   noo cluster restart-agent <node>\n               a node that moved:    re-run the enrollment paste on it (noo enroll \
              adapts in place)\n               a node that is gone:  noo cluster forget <node>",
         ),
     );

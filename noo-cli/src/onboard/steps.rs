@@ -3028,7 +3028,7 @@ fn ensure_pki(ctx: &mut Ctx) {
         // (override -> $CONTROLLER_URL -> this file -> localhost). It has
         // only ever been written by `prep-host.sh`, which runs on an
         // ENROLLED NODE — and a controller is never enrolled, it is the
-        // thing nodes enrol into. So the one box guaranteed to be running a
+        // thing nodes enroll into. So the one box guaranteed to be running a
         // gateway was the one box with no record of where that gateway is,
         // and every `noo` command there fell through to
         // `https://localhost:8080`.

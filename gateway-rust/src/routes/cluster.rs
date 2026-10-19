@@ -2335,7 +2335,7 @@ async fn proposals_decide(
 /// one.
 pub(crate) fn bootstrap_instructions(host: &str) -> String {
     format!(
-        "Automated push enrolment does not exist (pull architecture) \
+        "Automated push enrollment does not exist (pull architecture) \
          and the controller\u{2192}node SSH lane was removed 2026-09-11. \
          Enrol {host} with the token rail \u{2014} on the controller:\n\n  \
          noo cluster bootstrap-token create --node {host}\n\n\

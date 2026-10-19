@@ -397,7 +397,7 @@ fn all_hints() -> Vec<Hint> {
 
 /// The gateway tells an operator what to run too: every operator alert
 /// carries one `investigate` command (`gateway-rust/src/egress.rs` renders
-/// it as `Next: …`), and alert summaries, enrolment notices and error
+/// it as `Next: …`), and alert summaries, enrollment notices and error
 /// bodies name commands in backticks. Those reach a phone, not this
 /// crate's source, so the lint above never saw them — and one shipped with
 /// a flag (`noo logs search --source`) the parser's usage table does not
