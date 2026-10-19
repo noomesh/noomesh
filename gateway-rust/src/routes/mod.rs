@@ -352,6 +352,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // add-on's manifest per request, so they name no add-on.
         .merge(crate::addon_ui::router())
         .merge(crate::addon_ws::router())
+        .merge(crate::tunnel::router())
         .merge(websocket::router());
 
     // ── HTTP add-ons: routes from the manifest each add-on SHIPS ──
