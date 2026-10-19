@@ -111,6 +111,7 @@ mod addon_auth;
 mod alert_digest;
 mod addons;
 mod addon_proxy;
+mod addon_registry;
 mod google_drive;
 mod agent_activities;
 mod agent_meta_loop;

@@ -643,7 +643,7 @@ pub(crate) fn config_with_legacy_mirrors(doc: &Value) -> Value {
 /// section must be added here; `gated_config_sections_are_real()` pins each
 /// name against `config.rs` so a rename cannot quietly empty the list.
 pub(crate) const GATED_CONFIG_SECTIONS: &[&str] =
-    &["security", "tls", "tools", "workspace", "watched_folders"];
+    &["security", "tls", "tools", "workspace", "watched_folders", "addon_delegation"];
 
 /// Who may write a gate-bearing config section: an Admin **person**, and only
 /// over their own credential.
@@ -1566,7 +1566,7 @@ const FLAG_REGISTRY: &[FlagSpec] = &[
     // the capability exists and is simply off.
     //
     // They live in evolve's compose env now, and evolve's
-    // `/api/agent/meta-loop/status` reports the three unbuilt ones as
+    // its meta-loop status route reports the three unbuilt ones as
     // UNIMPLEMENTED rather than "off" — different claims, kept different.
     //
     // NOO_SELF_MODIFY_ENABLED (category "selfdev") was deleted when the

@@ -61,44 +61,54 @@ fn bad_gateway(addon: &str, why: impl std::fmt::Display) -> (StatusCode, Value) 
 }
 
 async fn respond(addon_id: &str) -> (StatusCode, Value) {
-    let Some(addon) = crate::addons::ADDONS.iter().find(|a| a.name == addon_id) else {
+    // A compiled HTTP add-on, or one registered at runtime (a third-party
+    // add-on whose manifest the registry accepted). A third-party add-on that
+    // was refused at load is known by its refusal.
+    let compiled = crate::addons::ADDONS.iter().find(|a| a.name == addon_id);
+    let known = compiled.is_some()
+        || crate::addon_registry::get(addon_id).is_some()
+        || crate::addon_registry::refusal(addon_id).is_some();
+    if !known {
         return (StatusCode::NOT_FOUND, json!({ "error": "unknown_addon" }));
-    };
+    }
     // Only an HTTP add-on (one that ships a route manifest) can have a piece.
-    if !addon.routes_manifest {
+    if compiled.is_some_and(|a| !a.routes_manifest) {
         return (StatusCode::NOT_FOUND, json!({ "error": "no_cli_piece" }));
     }
-    if !crate::addons::enabled(addon.name) {
+    let name = addon_id;
+    // A refused add-on is on but not registered: say why, whatever its state.
+    if let Some(why) = crate::addon_proxy::refusal(name) {
+        if crate::addons::enabled(name) || compiled.is_none() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": why, "addon": name, "state": "unhealthy" }),
+            );
+        }
+    }
+    if !crate::addons::enabled(name) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({
-                "error": crate::addons::refusal_msg(addon.name),
-                "addon": addon.name,
-                "state": crate::addons::health_word(addon.name),
+                "error": crate::addons::refusal_msg(name),
+                "addon": name,
+                "state": crate::addons::health_word(name),
             }),
-        );
-    }
-    // On, but its manifest was missing or refused at startup: say why.
-    if let Some(why) = crate::addon_proxy::refusal(addon.name) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": why, "addon": addon.name, "state": "unhealthy" }),
         );
     }
     let manifest = crate::addon_proxy::manifests()
         .into_iter()
-        .find(|m| m.addon == addon.name);
+        .find(|m| m.addon == name);
     // A manifest without the row: this add-on has no CLI piece.
     let Some(manifest) = manifest.filter(|m| m.routes.iter().any(|r| r.name == PIECE_ROUTE)) else {
         return (StatusCode::NOT_FOUND, json!({ "error": "no_cli_piece" }));
     };
-    let raw = match crate::addon_proxy::call(addon.name, PIECE_ROUTE, None).await {
+    let raw = match crate::addon_proxy::call(name, PIECE_ROUTE, None).await {
         crate::addon_proxy::CallOutcome::Ok(v) => v,
-        crate::addon_proxy::CallOutcome::Unavailable(why) => return bad_gateway(addon.name, why),
+        crate::addon_proxy::CallOutcome::Unavailable(why) => return bad_gateway(name, why),
     };
     match validate_piece(&manifest, &raw) {
         Ok(piece) => (StatusCode::OK, piece),
-        Err(why) => bad_gateway(addon.name, format!("invalid piece: {why}")),
+        Err(why) => bad_gateway(name, format!("invalid piece: {why}")),
     }
 }
 

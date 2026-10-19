@@ -33,6 +33,15 @@ pub struct AppConfig {
     /// and what the gateway will route to cannot disagree.
     #[serde(default)]
     pub addons: std::collections::HashMap<String, bool>,
+    /// What an operator allows each add-on to do on a present person's behalf.
+    /// Separate from `addons:` on purpose: that map is `name: bool`, read as
+    /// such by the launcher and the CLI (and by an older gateway, which would
+    /// refuse a whole config it could not parse), and a switch that widens an
+    /// add-on's authority deserves its own gated section
+    /// (`settings::GATED_CONFIG_SECTIONS`). Absent = nothing is delegated.
+    /// Read by `addon_registry`; see "Delegation" there.
+    #[serde(default)]
+    pub addon_delegation: std::collections::HashMap<String, AddonDelegationConfig>,
     #[serde(default)]
     pub cluster: ClusterConfig,
     #[serde(default)]
@@ -68,6 +77,20 @@ pub struct AppConfig {
     /// Systems that extend this database — the design's broker manifest.
     #[serde(default)]
     pub systems: std::collections::BTreeMap<String, SystemConfig>,
+}
+
+/// `addon_delegation.<name>` in noomesh.yaml. The manifest declares
+/// (`delegate: "tasks"`), the operator allows (`tasks: true`); both are
+/// needed, and the default is off.
+///
+/// Unknown keys are ignored, not refused: a config with a key a newer
+/// release added must still parse on this one (an unparseable noomesh.yaml
+/// reads as an EMPTY config).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct AddonDelegationConfig {
+    /// Let this add-on create and steer a present person's tasks.
+    #[serde(default)]
+    pub tasks: bool,
 }
 
 /// One entry in the `systems:` manifest.
