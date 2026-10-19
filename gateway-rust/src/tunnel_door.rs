@@ -15,9 +15,14 @@
 //! What the door is NOT: it dials nothing. It forwards to a node that holds a
 //! live tunnel to this gateway, by id, and to nowhere else. It binds loopback
 //! only, starts with the first tunnel (a fleet with no tunnel has no
-//! listener), and every path carries a 256-bit secret generated at start and
-//! never written down or logged; a request without it is a 404. The secret is
-//! the only thing a process in the gateway's network namespace lacks. The
+//! listener), and every request carries a 256-bit secret in the
+//! `x-noo-tunnel-door` HEADER, generated per process and held only in memory
+//! (never in env, a file, a metric or a URL); a request without it, or with a
+//! wrong one, is a 404. It is a header and not part of the path because
+//! reqwest prints the full URL in its error text and callers log that: a
+//! secret in the URL would reach the gateway log on the first failed stream.
+//! The secret is the only thing a process in the gateway's network namespace
+//! lacks. The
 //! node never sees the door: it sees a stream from its tunnel, served as the
 //! controller; nothing in the request names a principal.
 //!
@@ -33,6 +38,9 @@ use std::sync::{Arc, OnceLock};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
+
+/// The header that carries the door secret.
+pub const DOOR_HEADER: &str = "x-noo-tunnel-door";
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures::StreamExt;
@@ -102,7 +110,7 @@ pub fn carry(url: &str) -> String {
     let node = hub().node_for_host(&key);
     if let (Some(node), Some(door)) = (node.as_deref(), DOOR.get()) {
         if crate::tunnel::enabled() && hub().live(node).is_some() {
-            let mut target = format!("http://127.0.0.1:{}/{}/{}{}", door.port, door.secret, urlencoding::encode(node), u.path());
+            let mut target = format!("http://127.0.0.1:{}/{}{}", door.port, urlencoding::encode(node), u.path());
             if let Some(q) = u.query() {
                 target.push('?');
                 target.push_str(q);
@@ -120,7 +128,22 @@ pub fn door_url(node: &str, path: &str) -> Option<String> {
     if !crate::tunnel::enabled() || hub().live(node).is_none() {
         return None;
     }
-    Some(format!("http://127.0.0.1:{}/{}/{}{}", door.port, door.secret, urlencoding::encode(node), path))
+    Some(format!("http://127.0.0.1:{}/{}{}", door.port, urlencoding::encode(node), path))
+}
+
+/// The door secret, for tests only.
+#[cfg(test)]
+pub fn test_secret() -> String {
+    DOOR.get().map(|d| d.secret.clone()).unwrap_or_default()
+}
+
+/// Add the door secret to a request aimed at the door; any other request is
+/// returned unchanged. The secret never appears in the URL.
+pub fn mark(req: reqwest::RequestBuilder, url: &str) -> reqwest::RequestBuilder {
+    match DOOR.get() {
+        Some(d) if url.starts_with(&format!("http://127.0.0.1:{}/", d.port)) => req.header(DOOR_HEADER, d.secret.as_str()),
+        _ => req,
+    }
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -138,13 +161,9 @@ fn error_response(status: StatusCode, code: &str, detail: String) -> Response {
     r
 }
 
-/// Split `/{secret}/{node}/{rest}` into `(node, "/rest?query")`.
-fn parse_target(secret: &str, path: &str, query: Option<&str>) -> Option<(String, String)> {
-    let p = path.strip_prefix('/')?;
-    let (sec, tail) = p.split_once('/')?;
-    if !ct_eq(sec, secret) {
-        return None;
-    }
+/// Split `/{node}/{rest}` into `(node, "/rest?query")`.
+fn parse_target(path: &str, query: Option<&str>) -> Option<(String, String)> {
+    let tail = path.strip_prefix('/')?;
     let (node_enc, rest) = match tail.split_once('/') {
         Some((n, r)) => (n, format!("/{r}")),
         None => (tail, "/".to_string()),
@@ -163,7 +182,13 @@ fn parse_target(secret: &str, path: &str, query: Option<&str>) -> Option<(String
 
 async fn door(State(secret): State<Arc<String>>, req: axum::extract::Request) -> Response {
     let (parts, body) = req.into_parts();
-    let Some((node, target)) = parse_target(&secret, parts.uri.path(), parts.uri.query()) else {
+    // Secret first, before the path is looked at; nothing below prints the
+    // request path or headers.
+    let presented = parts.headers.get(DOOR_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !ct_eq(presented, &secret) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some((node, target)) = parse_target(parts.uri.path(), parts.uri.query()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(sess) = hub().live(&node) else {
@@ -172,6 +197,7 @@ async fn door(State(secret): State<Arc<String>>, req: axum::extract::Request) ->
     let headers: Vec<(String, String)> = parts
         .headers
         .iter()
+        .filter(|(k, _)| k.as_str() != DOOR_HEADER)
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
         .collect();
     let stream = body.into_data_stream().map(|r| r.map_err(std::io::Error::other)).boxed();
@@ -202,21 +228,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_door_path_is_secret_node_and_the_untouched_rest() {
-        let (n, t) = parse_target("s3cret", "/s3cret/host9/v1/chat/completions", Some("a=1&b=%2F")).unwrap();
+    fn the_door_path_is_node_and_the_untouched_rest() {
+        let (n, t) = parse_target("/host9/v1/chat/completions", Some("a=1&b=%2F")).unwrap();
         assert_eq!((n.as_str(), t.as_str()), ("host9", "/v1/chat/completions?a=1&b=%2F"));
-        let (n, t) = parse_target("s3cret", "/s3cret/pop%2Dos/api/containers/x/proxy/a%2Fb", None).unwrap();
+        let (n, t) = parse_target("/pop%2Dos/api/containers/x/proxy/a%2Fb", None).unwrap();
         assert_eq!((n.as_str(), t.as_str()), ("pop-os", "/api/containers/x/proxy/a%2Fb"), "the rest keeps its percent-encoding");
-        assert_eq!(parse_target("s3cret", "/s3cret/host9", None).unwrap().1, "/");
-    }
-
-    #[test]
-    fn a_door_request_without_the_secret_is_not_a_door_request() {
-        assert!(parse_target("s3cret", "/wrong/host9/gpu", None).is_none());
-        assert!(parse_target("s3cret", "/s3cre/host9/gpu", None).is_none());
-        assert!(parse_target("s3cret", "/s3cret//gpu", None).is_none(), "an empty node id");
-        assert!(parse_target("s3cret", "/", None).is_none());
-        assert!(parse_target("s3cret", "", None).is_none());
+        assert_eq!(parse_target("/host9", None).unwrap().1, "/");
+        assert!(parse_target("//gpu", None).is_none(), "an empty node id");
+        assert!(parse_target("/", None).is_none());
+        assert!(parse_target("", None).is_none());
     }
 
     #[test]

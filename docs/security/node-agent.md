@@ -379,7 +379,7 @@ tunnel for it, and not otherwise:
 Streams that hold only a URL reach the tunnel through a loopback door inside
 the gateway (`tunnel_door.rs`): a listener on `127.0.0.1` that starts with the
 first tunnel, forwards **only** to a node that holds a live tunnel to this
-gateway, and requires a 256-bit secret in every path. It dials nothing. A
+gateway, and requires a 256-bit per-process secret in the `x-noo-tunnel-door` header (never in the URL, which reqwest prints in error text). It dials nothing. A
 gateway run with `HTTP_PROXY` set must also set `NO_PROXY=127.0.0.1`, or the
 client would send door requests to the proxy.
 

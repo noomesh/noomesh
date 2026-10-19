@@ -864,26 +864,57 @@ async fn sse_bytes_are_identical_over_the_tunnel_and_over_https() {
 }
 
 #[tokio::test]
-async fn the_door_refuses_a_request_without_its_secret_and_a_node_without_a_tunnel() {
+async fn the_door_wants_its_secret_in_the_header_and_never_in_a_url() {
     crate::tunnel_door::ensure_started().await;
-    let door = crate::tunnel_door::door_url("door-ghost", "/health");
-    assert!(door.is_none(), "no door URL for a node with no live tunnel");
-    // Make a URL with a real secret for a live node, then break the secret.
+    assert!(crate::tunnel_door::door_url("door-ghost", "/health").is_none(), "no door URL for a node with no live tunnel");
     let (sess, rx) = install("door-live");
     serve_node(sess, rx, |_| vec![head(0, 200, &[]), data(0, b"ok"), end(0)]);
-    let good = crate::tunnel_door::door_url("door-live", "/health").expect("door url");
+    let url = crate::tunnel_door::door_url("door-live", "/health").expect("door url");
+    let secret = crate::tunnel_door::test_secret();
+    assert!(secret.len() >= 64);
+    assert!(!url.contains(&secret), "the secret must not be part of the URL: {url}");
     let client = reqwest::Client::new();
-    assert_eq!(client.get(&good).send().await.unwrap().text().await.unwrap(), "ok");
-    let wrong_secret = {
-        let (head, tail) = good.split_once("127.0.0.1:").unwrap();
-        let (port, rest) = tail.split_once('/').unwrap();
-        let (_secret, rest) = rest.split_once('/').unwrap();
-        format!("{head}127.0.0.1:{port}/{}/{rest}", "0".repeat(64))
-    };
-    assert_eq!(client.get(&wrong_secret).send().await.unwrap().status(), 404);
-    // A node with no live tunnel behind a good secret is a plain 502.
-    let ghost = good.replace("/door-live/", "/door-ghost/");
-    let r = client.get(&ghost).send().await.unwrap();
+    let hdr = crate::tunnel_door::DOOR_HEADER;
+
+    // With the header: served.
+    assert_eq!(client.get(&url).header(hdr, &secret).send().await.unwrap().text().await.unwrap(), "ok");
+    // Marked by node_link's helper: served too.
+    let marked = crate::tunnel_door::mark(client.get(&url), &url);
+    assert_eq!(marked.send().await.unwrap().text().await.unwrap(), "ok");
+    // No header, a wrong header, and the secret in the PATH but not the header: all 404.
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
+    assert_eq!(client.get(&url).header(hdr, "0".repeat(secret.len())).send().await.unwrap().status(), 404);
+    assert_eq!(client.get(&url).header(hdr, &secret[..secret.len() - 1]).send().await.unwrap().status(), 404);
+    let in_path = url.replacen("/door-live/", &format!("/{secret}/door-live/"), 1);
+    assert_eq!(client.get(&in_path).send().await.unwrap().status(), 404);
+    // A node with no live tunnel behind the right header is a plain 502.
+    let ghost = url.replace("/door-live/", "/door-ghost/");
+    let r = client.get(&ghost).header(hdr, &secret).send().await.unwrap();
     assert_eq!(r.status(), 502);
     assert_eq!(r.headers().get("x-noo-tunnel-error").unwrap(), "tunnel_unavailable");
+}
+
+#[tokio::test]
+async fn a_failed_door_request_does_not_put_the_secret_in_its_error_text() {
+    crate::tunnel_door::ensure_started().await;
+    let (sess, rx) = install("door-fail");
+    serve_node(sess, rx, |_| vec![head(0, 200, &[]), Frame::new(255, 0, Bytes::new())]);
+    let url = crate::tunnel_door::door_url("door-fail", "/sse").expect("door url");
+    let secret = crate::tunnel_door::test_secret();
+    let client = reqwest::Client::new();
+    // The tunnel dies after the head: the body read fails.
+    let resp = crate::tunnel_door::mark(client.get(&url), &url).send().await.expect("head arrives");
+    let err = resp.bytes().await.err().expect("the aborted body is an error");
+    let mut text = err.to_string();
+    let mut src = std::error::Error::source(&err);
+    while let Some(e) = src {
+        text.push_str(&e.to_string());
+        text.push_str(&format!("{e:?}"));
+        src = e.source();
+    }
+    assert!(!text.contains(&secret), "{text}");
+    // A request that cannot connect at all: reqwest prints the URL; it holds no secret.
+    let dead = "http://127.0.0.1:1/door-fail/sse".to_string();
+    let e = crate::tunnel_door::mark(client.get(&dead), &dead).send().await.err().expect("refused");
+    assert!(!format!("{e} {e:?}").contains(&secret));
 }
