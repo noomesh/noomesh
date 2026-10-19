@@ -266,11 +266,9 @@ pub(crate) mod tests {
 
     /// A fake `docker` CLI whose `diff` prints `added` after `sleep` seconds.
     pub(crate) fn fake_docker_cli(name: &str, added: &[&str], sleep: u32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let bin = scratch(name).join("docker");
         let lines: String = added.iter().map(|a| format!("echo 'A {a}'\n")).collect();
-        std::fs::write(&bin, format!("#!/bin/sh\n[ \"$1\" = diff ] || exit 1\nsleep {sleep}\n{lines}")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_exec(&bin, format!("#!/bin/sh\n[ \"$1\" = diff ] || exit 1\nsleep {sleep}\n{lines}"), 0o755);
         bin
     }
 

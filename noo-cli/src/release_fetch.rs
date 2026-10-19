@@ -680,12 +680,7 @@ mod tests {
             }
         }
         let p = dir.join("gh");
-        std::fs::write(&p, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::write_exec(&p, script, 0o755);
         p
     }
 

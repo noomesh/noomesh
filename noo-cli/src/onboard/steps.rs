@@ -7784,8 +7784,7 @@ mod compose_prereq_tests {
         let dir = std::env::temp_dir().join(format!("noo-compose-prereq-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("docker");
-        std::fs::write(&bin, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_exec(&bin, format!("#!/bin/sh\n{body}"), 0o755);
         bin.to_string_lossy().into_owned()
     }
 

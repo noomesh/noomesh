@@ -1713,7 +1713,6 @@ mod tests {
     /// Runs the script for real against stub `plutil` / `launchctl` that log
     /// their argv, so the test checks behaviour, not spelling.
     fn run_script(home: &std::path::Path, labels: &[&str], loaded: &str, models: Option<&str>) -> (i32, String, String) {
-        use std::os::unix::fs::PermissionsExt;
         let agents = home.join("Library/LaunchAgents");
         std::fs::create_dir_all(&agents).unwrap();
         for l in labels {
@@ -1724,8 +1723,7 @@ mod tests {
         let log = home.join("log");
         let stub = |name: &str, body: &str| {
             let p = bin.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n{body}\n", log.display())).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_exec::write_exec(&p, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n{body}\n", log.display()), 0o755);
         };
         stub("plutil", "exit 0");
         // launchctl print succeeds only for the loaded domain's job.
