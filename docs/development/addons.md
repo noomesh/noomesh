@@ -178,6 +178,12 @@ The routes are mounted once, when the router is built at startup. A reload
 rebuilds the registry (what is registered, what is delegated), but an add-on that
 appears later gets its routes at the next start.
 
+**Getting a lock the operator trusts.** A third-party add-on is released as a
+signed `noo-addon-lock/2` bundle (see "The signed add-on lock" below). The
+operator trusts your signing key with `noo addons trust-key <name> <pubkey>
+--registry <root>` (the CLI ships no key for you), and your images must sit
+under that registry root and be pullable anonymously.
+
 **Upgrading.** An install that upgrades keeps its enabled add-ons working on the
 first boot: the new launcher already verified every composed licensed add-on's
 pin before the gateway started. If the gateway is started by an older launcher

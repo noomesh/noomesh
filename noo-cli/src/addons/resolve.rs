@@ -75,6 +75,11 @@ pub enum Refusal {
     /// The lock is a `noo-addon-lock/1` lock: it lists no `files`, so no
     /// compose overlay travels with it (N6 retired that path).
     Unbundled { tag: String },
+    /// A third-party add-on (no `ADDON_ROWS` entry) with no key the operator
+    /// trusted for it, or an unreadable `noomesh.yaml`.
+    Untrusted(String),
+    /// The lock handed over with `--lock` could not be read.
+    Supplied(String),
 }
 
 impl Refusal {
@@ -101,7 +106,13 @@ impl Refusal {
                 ),
                 _ => format!("{reference}: {}", err.summary()),
             },
+            Refusal::Lock(addon_lock::AddonLockError::BadSignature(e)) if third_party(addon) => format!(
+                "{addon}'s lock is not signed by a key you trust for it ({e}). If you trust its signer, add the \
+                 key: `noo addons trust-key {addon} <pubkey> --registry <root>`"
+            ),
             Refusal::Lock(e) => format!("{addon}'s lock refused: {e}"),
+            Refusal::Untrusted(e) => e.clone(),
+            Refusal::Supplied(e) => format!("the lock supplied for {addon} could not be read: {e}"),
             Refusal::NotForStack { tag, version, supports } => format!(
                 "{addon} {version} does not support stack {tag} (it lists {})",
                 supports.join(", ")
@@ -243,8 +254,30 @@ pub fn fetch_and_check(
     Ok((v, fetched))
 }
 
-/// The anchor for `addon` from the installed, unexpired entitlement.
+/// Is `addon` one the CLI has no row for? Those are trusted only through
+/// `noo addons trust-key`, never through the entitlement.
+pub fn third_party(addon: &str) -> bool {
+    super::trust::name_ok(addon) && !super::trust::is_builtin(addon)
+}
+
+/// The anchor for `addon`: from the installed, unexpired entitlement for an
+/// add-on the CLI ships, from the operator's `addon_trust` for any other.
 pub fn installed_anchor(addon: &str) -> Result<TrustAnchor, Refusal> {
+    if third_party(addon) {
+        return match super::trust::trusted_anchor(addon) {
+            Ok(Some(a)) if !a.keys.is_empty() => Ok(a),
+            Ok(_) => Err(Refusal::Untrusted(format!(
+                "no key is trusted for {addon}, so its lock cannot be verified. If you trust its signer: \
+                 `noo addons trust-key {addon} <pubkey> --registry <root>`"
+            ))),
+            Err(e) => Err(Refusal::Untrusted(format!("the trust list could not be read to resolve {addon}: {e}"))),
+        };
+    }
+    installed_anchor_from_entitlement(addon)
+}
+
+/// The anchor for a built-in `addon` from the installed, unexpired entitlement.
+fn installed_anchor_from_entitlement(addon: &str) -> Result<TrustAnchor, Refusal> {
     let token = crate::entitlement::installed_token_checked()
         .map_err(Refusal::Store)?
         .ok_or_else(|| Refusal::NoEntitlement("none installed".into()))?;

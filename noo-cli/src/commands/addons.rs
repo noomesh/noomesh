@@ -450,19 +450,49 @@ pub(crate) fn enable_gate(
 }
 
 fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
-    let (name, force) = match args {
-        [n] => (n, false),
-        [n, f] if on && f == "--force" => (n, true),
-        _ => return Err(Unhandled),
-    };
-    let Some(r) = row(name) else {
-        fail(
+    let (mut name, mut force, mut lock) = (None, false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--force" if on => force = true,
+            "--lock" if on => match it.next() {
+                Some(v) if !v.starts_with('-') => lock = Some(v.clone()),
+                _ => return Err(Unhandled),
+            },
+            s if !s.starts_with('-') && name.is_none() => name = Some(a),
+            _ => return Err(Unhandled),
+        }
+    }
+    let Some(name) = name else { return Err(Unhandled) };
+    let r: &'static AddonRow = match row(name) {
+        Some(r) => r,
+        // Not an add-on the CLI ships. It can still be enabled when the
+        // operator trusts a signing key for it (`noo addons trust-key`); turning
+        // one OFF is a file edit and needs no trust.
+        None if crate::addons::trust::name_ok(name)
+            && (!on || matches!(crate::addons::trust::trusted_anchor(name), Ok(Some(_)))) =>
+        {
+            let key: &'static str = Box::leak(name.clone().into_boxed_str());
+            Box::leak(Box::new(AddonRow { key, title: key, blurb: &[], licensed: None, default_on: false }))
+        }
+        None if crate::addons::trust::name_ok(name) => fail(
+            g.json,
+            ExitCode::Usage,
+            "untrusted_addon",
+            &format!(
+                "`{name}` is not an add-on this CLI ships, and no signing key is trusted for it. Known add-ons: {}. \
+                 To enable a third-party add-on, trust its signer first",
+                names()
+            ),
+            Some(&format!("noo addons trust-key {name} <pubkey> --registry <root>")),
+        ),
+        None => fail(
             g.json,
             ExitCode::Usage,
             "unknown_addon",
             &format!("unknown add-on `{name}` — known add-ons: {}", names()),
             None,
-        );
+        ),
     };
     // From here on the canonical key, whatever spelling was typed.
     let name = r.key;
@@ -482,7 +512,7 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // data operation, and nothing it needs can be missing.
     let mut enabled_report = None;
     let path = if on {
-        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force }) {
+        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force, lock: lock.clone() }) {
             Ok(e) => {
                 let p = e.config.clone();
                 enabled_report = Some(e);
@@ -819,4 +849,92 @@ compose_env:
         }
         assert!(seen >= 4, "only found {seen} gateway add-ons — the parse is wrong, not the table");
     }
+}
+
+// ── third-party trust and delegation ───────────────────────────────────
+
+/// Edit noomesh.yaml TEXT through `f` and write it back only if it still
+/// parses. A missing file is an empty one.
+fn edit_yaml(f: impl FnOnce(&str) -> Result<String, String>) -> Result<std::path::PathBuf, String> {
+    let path = config_path();
+    let text = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+    } else {
+        String::new()
+    };
+    let updated = f(&text)?;
+    crate::addons::trust::write_checked(&path, &text, &updated)?;
+    Ok(path)
+}
+
+/// `noo addons trust-key <name> <pubkey> [--registry <root>]`
+pub fn addons_trust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (mut pos, mut registry) = (Vec::new(), None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--registry" => match it.next() {
+                Some(v) if !v.starts_with('-') => registry = Some(v.as_str()),
+                _ => return Err(Unhandled),
+            },
+            s if s.starts_with('-') => return Err(Unhandled),
+            _ => pos.push(a.as_str()),
+        }
+    }
+    let [name, key] = pos[..] else { return Err(Unhandled) };
+    let path = match edit_yaml(|t| crate::addons::trust::add_key(t, name, key, registry)) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Usage, "trust_key", &e, Some("noo addons trust-key <name> <pubkey> --registry <host/path>")),
+    };
+    if g.json {
+        println!("{}", json!({"addon": name, "trusted_key": key.to_ascii_lowercase(), "config": path.display().to_string()}));
+    } else {
+        ui::done(&format!("{name}: signing key {} trusted ({})", key.to_ascii_lowercase(), path.display()));
+        ui::guide(&[
+            ("noo addons enable <name>", "(add --lock <path|https-url> to hand it the lock) verifies the add-on's signed lock against this key, pins it, then declares it ON"),
+            ("noo addons untrust-key <name> <pubkey>", "removes the key again"),
+        ]);
+    }
+    Ok(0)
+}
+
+/// `noo addons untrust-key <name> <pubkey>`
+pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [name, key] = args else { return Err(Unhandled) };
+    let path = match edit_yaml(|t| crate::addons::trust::remove_key(t, name, key)) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Usage, "untrust_key", &e, Some("noo addons list")),
+    };
+    if g.json {
+        println!("{}", json!({"addon": name, "removed_key": key.to_ascii_lowercase(), "config": path.display().to_string()}));
+    } else {
+        ui::done(&format!("{name}: signing key {} no longer trusted ({})", key.to_ascii_lowercase(), path.display()));
+        println!("{}", ui::note("a pin made under it stays until `noo addons verify` or the next start re-checks it against the remaining keys"));
+    }
+    Ok(0)
+}
+
+/// `noo addons set <name> --delegate tasks|off`
+pub fn addons_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [name, flag, value] = args else { return Err(Unhandled) };
+    if flag != "--delegate" {
+        return Err(Unhandled);
+    }
+    let on = match value.as_str() {
+        "tasks" => true,
+        "off" => false,
+        _ => fail(g.json, ExitCode::Usage, "usage", &format!("--delegate takes `tasks` or `off`, not `{value}`"), Some("noo addons set <name> --delegate tasks|off")),
+    };
+    let path = match edit_yaml(|t| crate::addons::trust::set_delegation(t, name, on)) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "config", &e, None),
+    };
+    if g.json {
+        println!("{}", json!({"addon": name, "delegate_tasks": on, "config": path.display().to_string(), "restart_required": true}));
+    } else {
+        ui::done(&format!("{name}: addon_delegation.{name}.tasks = {on} ({})", path.display()));
+        println!("{}", ui::note("it takes effect only if the add-on's manifest also declares `delegate: \"tasks\"`"));
+        ui::guide(&[("noo stack restart --force", "the gateway reads it at start")]);
+    }
+    Ok(0)
 }

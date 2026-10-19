@@ -31,7 +31,7 @@ use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-const UPGRADE_USAGE: &str = "usage: noo addons upgrade [<name>...] [--check] [--allow-downgrade]";
+const UPGRADE_USAGE: &str = "usage: noo addons upgrade [<name>...] [--check] [--allow-downgrade] [--lock <path|https-url>]";
 const VERIFY_USAGE: &str = "usage: noo addons verify";
 
 /// The add-ons a verb acts on: the named ones (licensed only), else every
@@ -49,7 +49,12 @@ fn targets(g: &Globals, root: &Path, named: &[String]) -> Vec<&'static str> {
             Some(r) if r.licensed.is_some() => r.key,
             Some(r) => fail(g.json, ExitCode::Usage, "not_licensed",
                 &format!("{} ships with the stack and has no signed lock of its own", r.key), Some("noo addons list")),
-            None => fail(g.json, ExitCode::Usage, "unknown_addon", &format!("unknown add-on `{n}`"), Some("noo addons list")),
+            // Not an add-on the CLI ships: acceptable when the operator trusts a
+            // signing key for it (`noo addons trust-key`).
+            None if matches!(addons::trust::trusted_anchor(n), Ok(Some(_))) => Box::leak(n.clone().into_boxed_str()) as &'static str,
+            None => fail(g.json, ExitCode::Usage, "unknown_addon",
+                &format!("unknown add-on `{n}`, and no signing key is trusted for it"),
+                Some(&format!("noo addons trust-key {n} <pubkey> --registry <root>"))),
         })
         .collect()
 }
@@ -66,10 +71,16 @@ fn require_tag(g: &Globals, root: &Path) -> String {
 /// `noo addons upgrade`
 pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (mut check, mut allow_downgrade, mut named) = (false, false, Vec::new());
-    for a in args {
+    let mut lock_ref: Option<String> = None;
+    let mut args_it = args.iter();
+    while let Some(a) = args_it.next() {
         match a.as_str() {
             "--check" => check = true,
             "--allow-downgrade" => allow_downgrade = true,
+            "--lock" => match args_it.next() {
+                Some(v) if !v.starts_with('-') => lock_ref = Some(v.clone()),
+                _ => fail(g.json, ExitCode::Usage, "usage", "--lock needs a path or an https:// URL", Some(UPGRADE_USAGE)),
+            },
             "--help" | "-h" => {
                 println!("{UPGRADE_USAGE}");
                 return Ok(0);
@@ -98,12 +109,27 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
     };
-    let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client: &client };
+    // A third-party add-on is fetched with NO credential: the vendor token is
+    // never sent to a registry the operator named.
+    let plain = addons::lock_fetch::Client::new(None);
+    if lock_ref.is_some() && (named.len() != 1 || !resolve::third_party(&named[0])) {
+        fail(g.json, ExitCode::Usage, "usage", "--lock names one third-party add-on's lock: give exactly that add-on", Some(UPGRADE_USAGE));
+    }
     let mut rows = Vec::new();
     let mut failed = 0;
     for addon in list {
+        let third_party = resolve::third_party(addon);
+        let client = if third_party { &plain } else { &client };
+        let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
         let installed = current.get(addon).cloned();
-        let outcome = if check {
+        let supplied = match (third_party, lock_ref.as_deref()) {
+            (true, Some(r)) => Some(addons::trust::fetch_supplied(r).map_err(resolve::Refusal::Supplied)),
+            _ => None,
+        };
+        let outcome = if let Some(Err(e)) = &supplied {
+            Err(e.clone())
+        } else if check {
+            let supplied = supplied.and_then(Result::ok);
             resolve::installed_anchor(addon)
                 .and_then(|anchor| {
                     let want = resolve::Want {
@@ -114,12 +140,14 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         allow_downgrade,
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
-                    resolve::fetch_and_check(&client, &anchor, &want)
+                    addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
                         .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
                 })
         } else {
-            addons::prepare(&ctx, addon, &mut resolve::LiveDocker::new(&root))
+            let supplied = supplied.and_then(Result::ok);
+            resolve::installed_anchor(addon)
+                .and_then(|anchor| addons::prepare_from(&ctx, addon, &anchor, supplied, &mut resolve::LiveDocker::new(&root)))
                 .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone())))
         };
         match outcome {
@@ -308,11 +336,18 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for n in names {
-        let Some(r) = crate::commands::addons::row(n) else { continue };
-        if r.licensed.is_none() || !seen.insert(r.key) {
+        // A built-in add-on is covered when it is licensed; any other name is a
+        // third-party add-on whose lock must verify against a trusted key (no
+        // key, no verdict: it is refused here, by name).
+        let addon: &str = match crate::commands::addons::row(n) {
+            Some(r) if r.licensed.is_none() => continue,
+            Some(r) => r.key,
+            None if resolve::third_party(n) => n.as_str(),
+            None => continue,
+        };
+        if !seen.insert(addon.to_string()) {
             continue;
         }
-        let addon = r.key;
         let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check(root, addon, tag, &a));
         match res {
             Ok(pin) => {

@@ -42,6 +42,12 @@ pub struct AppConfig {
     /// Read by `addon_registry`; see "Delegation" there.
     #[serde(default)]
     pub addon_delegation: std::collections::HashMap<String, AddonDelegationConfig>,
+    /// Signing keys the operator trusts for add-ons the CLI does not ship
+    /// (`noo addons trust-key`). The CLI verifies locks with them; the gateway
+    /// only holds the section so it is a GATED config section (admin-only to
+    /// write), because a key here decides which add-on code the controller runs.
+    #[serde(default)]
+    pub addon_trust: std::collections::HashMap<String, AddonTrustConfig>,
     #[serde(default)]
     pub cluster: ClusterConfig,
     #[serde(default)]
@@ -91,6 +97,16 @@ pub struct AddonDelegationConfig {
     /// Let this add-on create and steer a present person's tasks.
     #[serde(default)]
     pub tasks: bool,
+}
+
+/// `addon_trust.<name>` in noomesh.yaml: read by the CLI, carried here so the
+/// section is typed and gated. Unknown keys are ignored.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct AddonTrustConfig {
+    #[serde(default)]
+    pub registry: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 /// One entry in the `systems:` manifest.
