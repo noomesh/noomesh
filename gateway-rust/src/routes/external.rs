@@ -287,10 +287,12 @@ async fn rerank(
         return forbidden(&state, &consumer, EP, "rerank", started);
     }
     let input = body.get("input").cloned().unwrap_or(Value::Null);
-    match do_rerank(&state, &input).await {
+    let wanted = body.get("model").and_then(Value::as_str).or_else(|| input.get("model").and_then(Value::as_str));
+    match do_rerank(&state, &input, wanted).await {
         Ok((resp, n)) => {
+            let served = resp["noo"]["model"].as_str().unwrap_or("default").to_string();
             audit(
-                &state, &consumer.name, EP, Some("rerank"), Some("default"),
+                &state, &consumer.name, EP, Some("rerank"), Some(&served),
                 Some("reranker"), Some(json!({"documents": n})), 200, started, None,
             );
             (StatusCode::OK, Json(resp)).into_response()
@@ -299,20 +301,28 @@ async fn rerank(
     }
 }
 
-/// Rerank `{query, documents}` → `{results: [{index, score}]}`.
+/// Rerank `{query, documents}` → `{results: [{index, score}], noo: {...}}`.
 ///
 /// Routing (the gateway owns this; consumers never reach a reranker directly):
-///   1. Mesh-route to a node advertising the `rerank` capability, proxying
-///      through that node's node-agent on :8081 (mTLS + HMAC). The node-agent
-///      forwards to its local reranker container. The gateway opens no direct
-///      connection to a remote reranker container.
-///   2. If no node advertises it → the LLM-based reranker on the worker pool.
+///   1. Every node advertising the `rerank` capability, tried in turn
+///      through its node-agent on :8081 (mTLS + HMAC). A named `model` is a
+///      PREFERENCE (i145): nodes whose role=rerank placement serves it go
+///      first, every other reranker after. Rerank scores are per request,
+///      so another reranker is a fine stand-in, never a mixed index.
+///   2. When none answers (or none advertises), the LLM reranker.
 ///
-/// There is no third path. The `NOO_RERANK_URL` co-located bypass was removed:
-/// it skipped mesh routing AND sent no auth headers.
+/// `noo` says what served: `served_by` (a node, or `llm`), `model`,
+/// `fallback` (true when the preference or the reranker tier was unmet) and
+/// `requested_model`. It used to take the FIRST node only, so one wedged
+/// reranker failed the request with the rest of the fleet idle, and the LLM
+/// tier ran only when no node advertised at all.
+///
+/// There is no other path. The `NOO_RERANK_URL` co-located bypass was
+/// removed: it skipped mesh routing AND sent no auth headers.
 async fn do_rerank(
     state: &Arc<AppState>,
     input: &Value,
+    wanted: Option<&str>,
 ) -> Result<(Value, usize), ExtFail> {
     let query = input
         .get("query")
@@ -326,15 +336,62 @@ async fn do_rerank(
     if docs.is_empty() {
         return Err(bad_request("input.documents is empty"));
     }
-    // Resolve the reranker. When no node advertises the `rerank` capability,
-    // fall back to the LLM-based reranker on the worker pool — so
-    // /api/external/rerank still works with no reranker container anywhere.
-    let results: Vec<Value> = match rerank_target(state).await {
-        Ok((url, headers)) => tei_rerank(query, &docs, &url, &headers).await?,
-        Err(_) => llm_rerank_fallback(state, query, &docs).await?,
-    };
+    let wanted = crate::coordinator::model_hint(wanted);
+    let mut cands = Vec::new();
+    for t in mesh_targets(state, "rerank", "rerank", 8).await {
+        let declared = crate::model_presence::node_role_model(state, &t.node_id, "rerank").await;
+        cands.push((t, declared));
+    }
+    let ordered = rerank_order(cands, wanted);
+    let mut failures: Vec<String> = Vec::new();
+    for (t, declared, stand_in) in &ordered {
+        match tei_rerank(query, &docs, &t.url, &t.headers).await {
+            Ok(results) => {
+                let n = results.len();
+                if !failures.is_empty() {
+                    tracing::warn!(node = %t.node_id, failed = ?failures, "rerank_failover: an earlier reranker failed; this one answered");
+                }
+                let noo = rerank_noo(&t.node_id, declared.as_deref(), wanted, *stand_in || !failures.is_empty());
+                return Ok((json!({"results": results, "noo": noo}), n));
+            }
+            Err(e) => {
+                tracing::warn!(node = %t.node_id, error = %e.detail, "rerank_node_failed: trying the next reranker");
+                failures.push(t.node_id.clone());
+            }
+        }
+    }
+    if !ordered.is_empty() {
+        tracing::warn!(failed = ?failures, "rerank_all_nodes_failed: answering with the LLM reranker");
+    }
+    let results = llm_rerank_fallback(state, query, &docs).await?;
     let n = results.len();
-    Ok((json!({"results": results}), n))
+    Ok((json!({"results": results, "noo": rerank_noo("llm", None, wanted, true)}), n))
+}
+
+/// The reranker order: nodes serving the requested model first (in the
+/// mesh order), then every other one, each flagged as a stand-in when a
+/// model was requested and it does not serve it. No request = mesh order,
+/// nobody a stand-in.
+pub(crate) fn rerank_order<T>(cands: Vec<(T, Option<String>)>, wanted: Option<&str>) -> Vec<(T, Option<String>, bool)> {
+    let Some(w) = wanted else {
+        return cands.into_iter().map(|(t, m)| (t, m, false)).collect();
+    };
+    let serves = |m: &Option<String>| m.as_deref().is_some_and(|m| crate::embedding_spaces::same_model(m, w));
+    let (first, rest): (Vec<_>, Vec<_>) = cands.into_iter().partition(|(_, m)| serves(m));
+    first.into_iter().map(|(t, m)| (t, m, false)).chain(rest.into_iter().map(|(t, m)| (t, m, true))).collect()
+}
+
+/// The `noo` block of a rerank answer.
+pub(crate) fn rerank_noo(served_by: &str, model: Option<&str>, requested: Option<&str>, fallback: bool) -> Value {
+    let mut v = json!({
+        "served_by": served_by,
+        "model": model.unwrap_or(if served_by == "llm" { "llm" } else { "default" }),
+        "fallback": fallback,
+    });
+    if let Some(r) = requested {
+        v["requested_model"] = json!(r);
+    }
+    v
 }
 
 /// Normalize a `[{index, score}]` array into the response shape.
@@ -506,33 +563,7 @@ pub(crate) async fn mesh_targets(
     out
 }
 
-/// Mesh URL source for rerank — mirror of [`embed_target`].
-///
-/// Picks the least-loaded peer advertising `rerank` and targets its
-/// node-agent's `/rerank` proxy, which the gateway reaches over mTLS with an
-/// HMAC bearer.
-///
-/// There is deliberately NO env bypass. `NOO_RERANK_URL` used to win when
-/// set and returned `Vec::new()` for the headers — a direct, UNAUTHENTICATED
-/// hop that skipped mesh routing entirely. That is the same shape as the
-/// embed fallback that was already deleted for the same reason: a second
-/// transport that drifts from the audited one and carries none of its
-/// guarantees. Rerank is now mesh-or-nothing, and "nothing" degrades to the
-/// LLM reranker rather than to an unauthenticated request.
-async fn rerank_target(
-    state: &Arc<AppState>,
-) -> Result<(String, Vec<(String, String)>), ExtFail> {
-    // GPU-first, least-loaded, and MORE THAN ONE so a wedged node doesn't
-    // fail the request while the rest of the fleet is idle.
-    let targets = mesh_targets(state, "rerank", "rerank", 5).await;
-    let first = targets.into_iter().next().ok_or_else(|| upstream(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "rerank not available (no node advertises the capability)",
-    ))?;
-    Ok((first.url, first.headers))
-}
-
-/// Mesh URL source for embeddings — mirror of [`rerank_target`]'s mesh leg,
+/// Mesh URL source for embeddings — the same mesh leg [`do_rerank`] walks,
 /// for the `embed` capability. Picks the least-loaded peer whose node-agent
 /// fronts a local embedding container (nodes advertise `embed` only when a
 /// TEI container is actually running) and returns the node-agent's `/embed`
@@ -803,9 +834,11 @@ async fn typed_inference(
             if !consumer.has_scope("rerank") {
                 return forbidden(&state, &consumer, EP, "rerank", started);
             }
-            match do_rerank(&state, &input).await {
+            let wanted = input.get("model").and_then(Value::as_str);
+            match do_rerank(&state, &input, wanted).await {
                 Ok((resp, n)) => {
-                    audit(&state, &consumer.name, EP, Some("rerank"), Some("default"),
+                    let served = resp["noo"]["model"].as_str().unwrap_or("default").to_string();
+                    audit(&state, &consumer.name, EP, Some("rerank"), Some(&served),
                           Some("reranker"), Some(json!({"documents": n})), 200, started, None);
                     (StatusCode::OK, Json(resp)).into_response()
                 }
@@ -1119,5 +1152,28 @@ mod usage_projection_tests {
         let src = include_str!("external.rs");
         let sig = src.split("fn usage_row_json(").nth(1).unwrap().split(") -> Value").next().unwrap();
         assert!(!sig.contains("error"), "{sig}");
+    }
+}
+
+#[cfg(test)]
+mod rerank_preference_tests {
+    use super::{rerank_noo, rerank_order};
+
+    /// i145 phase C: a named rerank model is a preference. Its nodes go
+    /// first, every other reranker follows as a flagged stand-in.
+    #[test]
+    fn a_rerank_model_is_tried_first_and_the_rest_stand_in() {
+        let c = |n: &str, m: Option<&str>| (n.to_string(), m.map(str::to_string));
+        let cands = vec![c("gpu-1", Some("bge-reranker-base")), c("mac", Some("qwen3-reranker")), c("old", None)];
+        let o = rerank_order(cands.clone(), Some("qwen3-reranker"));
+        let order: Vec<(&str, bool)> = o.iter().map(|(n, _, s)| (n.as_str(), *s)).collect();
+        assert_eq!(order, [("mac", false), ("gpu-1", true), ("old", true)]);
+        let o = rerank_order(cands, None);
+        assert!(o.iter().all(|(_, _, s)| !s), "no request: mesh order, nobody a stand-in");
+        assert_eq!(o[0].0, "gpu-1");
+        let n = rerank_noo("llm", None, Some("qwen3-reranker"), true);
+        assert_eq!((n["served_by"].as_str(), n["model"].as_str(), n["fallback"].as_bool()), (Some("llm"), Some("llm"), Some(true)));
+        assert_eq!(n["requested_model"], "qwen3-reranker");
+        assert!(rerank_noo("gpu-1", Some("bge"), None, false).get("requested_model").is_none());
     }
 }
