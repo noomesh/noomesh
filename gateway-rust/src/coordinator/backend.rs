@@ -629,7 +629,7 @@ fn is_excluded(exclude_urls: &[String], local_url: &str, node_ip: &str) -> bool 
 /// Does a served model name satisfy a pin? Ollama reports `name:tag` and
 /// treats a missing tag as `:latest`, so `gemma4` and `gemma4:latest` are one
 /// model; case is not significant in either runtime's naming.
-fn model_matches_pin(served: &str, pin: &str) -> bool {
+pub(crate) fn model_matches_pin(served: &str, pin: &str) -> bool {
     fn norm(m: &str) -> String {
         let m = m.trim().to_ascii_lowercase();
         m.strip_suffix(":latest").map(str::to_string).unwrap_or(m)

@@ -1755,13 +1755,20 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // marks them so each backend is tried at most once per request).
     let mut failed_backend_urls: Vec<String> = Vec::new();
 
-    let _ = writer.send_event("metadata", json!({
+    // A named model is a preference: when the mesh answered with another,
+    // say so instead of switching silently.
+    let mut opening = json!({
         "conversation_id": conversation_id,
         "model": backend.model,
         "backend": backend.backend_type,
         "api_format": backend.api_format,
         "engine": "rust",
-    })).await;
+    });
+    if let Some(asked) = effective_model.filter(|m| !super::backend::model_matches_pin(&backend.model, m)) {
+        opening["requested_model"] = json!(asked);
+        opening["fallback"] = json!(true);
+    }
+    let _ = writer.send_event("metadata", opening).await;
 
     // 2. Build session — try cache first, then DB
     let mut session = rt.load_session(conversation_id, "dashboard").await;
