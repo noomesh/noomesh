@@ -109,7 +109,9 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// No Docker check here: a node serving ollama natively (a Mac with no
 	// Docker) imports through the host binary below, and reconcile calls
 	// this for such a node too. Only the container path needs Docker.
-	name = strings.TrimSpace(name)
+	// `ollama:<tag>` is how the operator spells a staged registry tag; the
+	// model ollama creates is the tag itself.
+	name = strings.TrimPrefix(strings.TrimSpace(name), "ollama:")
 	cands, err := storeCandidates(name)
 	if err != nil {
 		return nil, err
@@ -300,7 +302,7 @@ func requireGGUFMagic(path string) error {
 // an unplaced node (the controller's own agent, a dev box) keeps pulling from
 // the registry as it always did, and is not made to depend on a staged copy.
 func ModelInStore(ctx context.Context, name string) (bool, error) {
-	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(strings.TrimSpace(name), "ollama:")
 	if plain := strings.TrimSuffix(name, ":latest"); safeArtifactName(plain) && !strings.Contains(plain, ":") {
 		_, err := lookupArtifactManifest(ctx, "modelfile", plain+".Modelfile")
 		if err == nil {
