@@ -373,7 +373,7 @@ tunnel for it, and not otherwise:
 | Call | Takes |
 |---|---|
 | a small control op (`start`, `health`, ...) on a node with the bus | NATS, as before |
-| `NodeRequest::send` for anything else (container proxy, logs bodies, device blobs, pulls on a node without the bus) | the tunnel, else HTTPS :8081 |
+| `NodeRequest::send` for anything else (container proxy, logs bodies, device blobs, pulls on a node without the bus), including a link built from an address | the tunnel, else HTTPS :8081 |
 | `backend_stream` / `NodeLink::stream` (inference SSE) | the tunnel, else HTTPS :8081 |
 
 Streams that hold only a URL reach the tunnel through a loopback door inside
@@ -416,9 +416,11 @@ gateway holds none or gets no answer.
 
 Rollback: `NOO_NODE_TUNNEL=0` on the gateway, or roll a node back.
 
-**Not in this slice:** turning `:8081` off (phase 3), Prometheus/metrics
-scrapes, tailnet dialback, and the container-proxy and device callers that
-still pin an agent URL by hand.
+**Not in this slice:** turning `:8081` off (phase 3), Prometheus and other
+metrics scrapes, tailnet dialback, and discovery handing out `noo-node://<id>`
+instead of `https://<ip>:8081` (a caller that holds only an address still
+reaches the tunnel: the gateway maps a node's `agent_url` and
+`ip_address:8081` to its live tunnel).
 
 ---
 
