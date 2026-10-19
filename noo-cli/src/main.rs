@@ -214,6 +214,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["recall", "lifecycle-stats"], commands::recall_stats), // alias (endpoint naming)
     (&["prompt-skills", "list"], commands::prompt_skills_list),
     (&["prompt-skills", "info"], commands::prompt_skills_info),
+    (&["prompt-skills", "proposals"], commands::prompt_skills_proposals),
     (&["prompt-skills", "get"], commands::prompt_skills_info), // alias (agent naming)
     (&["models", "cached"], commands::models_cached),
     // Streaming NDJSON/SSE progress from /api/terminal/ollama/pull.
@@ -450,6 +451,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["inference", "agent"], commands::inference_agent),
     (&["prompt-skills", "create"], commands::prompt_skills_create),
     (&["prompt-skills", "evolve"], commands::prompt_skills_evolve),
+    (&["prompt-skills", "decide"], commands::prompt_skills_decide),
     // ── WP-A4: observability — logs (containers/LogQL/Loki status), memory
     // conversation listing, recall archive/lifecycle/refresh triggers +
     // local test stub, heartbeat task add/remove. `debug query` stays

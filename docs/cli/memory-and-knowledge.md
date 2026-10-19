@@ -361,6 +361,8 @@ see [add-ons.md](../getting-started/add-ons.md).
 | `noo prompt-skills list` | — | List prompt skill templates with priority and fitness |
 | `noo prompt-skills info` | `<name>` | Show one prompt skill's metadata and content |
 | `noo prompt-skills get` | `<name>` | Hidden: alias of `prompt-skills info` |
+| `noo prompt-skills proposals` | `[--status <s>] [--limit <n>]` | List runtime skills awaiting promotion, with who filed them |
 | `noo prompt-skills create` | `<name> [-f <file>] [-d <description>] [--tags <csv>] [-p <priority>]` | Create a prompt skill from a file or stdin content |
 | `noo prompt-skills evolve` | `[-o <observation>] [--skill <name>] [--role <role>] [--apply]` | Propose (or with --apply, write) an LLM-evolved prompt skill |
+| `noo prompt-skills decide` | `<id> (--promote \| --reject) [--reason <text>]` | Promote a reviewed runtime skill to instructions, or reject it |
 <!-- END GENERATED -->

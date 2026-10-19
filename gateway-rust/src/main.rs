@@ -412,6 +412,13 @@ async fn main() -> Result<()> {
     // open because the credential IS a database row.
     crate::addon_auth::init(&state.db).await;
 
+    // Operator decisions on runtime prompt skills (promoted / rejected). Until
+    // loaded every runtime skill is framed as data, so a failure here demotes
+    // promoted skills, loudly, and never the other way round.
+    if let Err(e) = crate::routes::settings::refresh_skill_decisions(&state).await {
+        tracing::error!(error = %e, "prompt_skill_decisions_unavailable: promoted skills are framed as data until this loads (is migration 096 applied?)");
+    }
+
     // A retired gate key left in noomesh.yaml does not serve either.
     // Checked AFTER the posture pass so the message can be about the yaml
     // alone: by this point posture has already had its say, and anything the

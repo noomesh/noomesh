@@ -2030,6 +2030,35 @@ CREATE TABLE IF NOT EXISTS noo_session_floors (
 );
 CREATE INDEX IF NOT EXISTS noo_session_floors_expires_idx ON noo_session_floors (expires_at)
 "#,
+}, Migration {
+    revision: PROMPT_SKILL_PROPOSALS_REVISION,
+    down_revision: Some(SESSION_FLOORS_REVISION),
+    // Promotion proposals for prompt skills written at runtime. One row per
+    // (skill name, hash of the text a person would review): `pending` until
+    // an operator decides, then `promoted` or `rejected`; `superseded` when
+    // the text changed before a decision, `withdrawn` when the skill was
+    // retired. The gateway injects a skill as instructions only while a
+    // `promoted` row matches its CURRENT text. Additive; an old gateway
+    // ignores the table and keeps framing every runtime skill as data.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_prompt_skill_proposals (
+    id           bigserial   PRIMARY KEY,
+    name         text        NOT NULL,
+    content_sha  text        NOT NULL,
+    description  text        NOT NULL DEFAULT '',
+    content      text        NOT NULL,
+    proposed_by  text        NOT NULL,
+    proposed_at  timestamptz NOT NULL DEFAULT now(),
+    status       text        NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'promoted', 'rejected', 'superseded', 'withdrawn')),
+    decided_by   text,
+    decided_at   timestamptz,
+    reason       text,
+    UNIQUE (name, content_sha)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS noo_prompt_skill_proposals_one_pending
+    ON noo_prompt_skill_proposals (name) WHERE status = 'pending'
+"#,
 }];
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
@@ -2043,6 +2072,10 @@ pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
 pub const EMBEDDING_SPACES_REVISION: &str = "097_embedding_spaces";
+
+/// The prompt-skill promotion table. A constant so a renumber at integration
+/// is one line.
+pub const PROMPT_SKILL_PROPOSALS_REVISION: &str = "099_prompt_skill_proposals";
 
 /// The durable session floor table (`session_floor.rs`).
 pub const SESSION_FLOORS_REVISION: &str = "098_session_floors";
@@ -2914,6 +2947,16 @@ mod tests {
         let m = MIGRATIONS.iter().find(|m| m.revision == SESSION_FLOORS_REVISION).expect("098 must be in the chain");
         assert_eq!(m.down_revision, Some(EMBEDDING_SPACES_REVISION));
         for needle in ["noo_session_floors", "account    text        PRIMARY KEY", "floor_ms   bigint", "expires_at timestamptz"] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
+    }
+
+    /// 096 is the prompt-skill promotion table the gateway reads at boot.
+    #[test]
+    fn prompt_skill_proposals_revision_sits_on_the_session_floors_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PROMPT_SKILL_PROPOSALS_REVISION).expect("099 must be in the chain");
+        assert_eq!(m.down_revision, Some(SESSION_FLOORS_REVISION));
+        for needle in ["noo_prompt_skill_proposals", "content_sha", "UNIQUE (name, content_sha)", "WHERE status = 'pending'"] {
             assert!(m.sql.contains(needle), "{needle}");
         }
     }

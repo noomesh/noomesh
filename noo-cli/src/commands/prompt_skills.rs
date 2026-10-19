@@ -39,6 +39,8 @@ pub fn prompt_skills_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
                 s["priority"].as_u64().unwrap_or(5).to_string(),
                 format!("{:.1}", s["fitness"].as_f64().unwrap_or(0.0)),
                 if s["is_core"].as_bool().unwrap_or(false) { "yes".into() } else { String::new() },
+                // An older gateway sends no trust: shown blank, not guessed.
+                s["trust"].as_str().unwrap_or("").to_string(),
                 ui::muted(&truncate(s["description"].as_str().unwrap_or(""), 60)),
             ]
         })
@@ -46,7 +48,7 @@ pub fn prompt_skills_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     print!(
         "{}",
         ui::table(
-            &[Col::left("name"), Col::right("priority"), Col::right("fitness"), Col::left("core"), Col::left("description")],
+            &[Col::left("name"), Col::right("priority"), Col::right("fitness"), Col::left("core"), Col::left("trust"), Col::left("description")],
             &rows,
         )
     );
@@ -348,4 +350,116 @@ mod evolve_flag_tests {
         assert!(evolve_body(&a(&["--skill"])).is_err());
         assert!(evolve_body(&a(&["--observation"])).is_err());
     }
+}
+
+/// `noo prompt-skills proposals [--status <s>] [--limit <n>]` — GET
+/// /api/prompt-skills/proposals. Skills written at runtime are data to the
+/// model until a person promotes the text they reviewed.
+pub fn prompt_skills_proposals(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut status: Option<String> = None;
+    let mut limit: Option<u32> = None;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--status" => status = Some(iter.next().ok_or(Unhandled)?.clone()),
+            "--limit" => limit = Some(iter.next().ok_or(Unhandled)?.parse().map_err(|_| Unhandled)?),
+            _ => return Err(Unhandled),
+        }
+    }
+    let mut path = String::from("/api/prompt-skills/proposals");
+    let mut q: Vec<String> = Vec::new();
+    if let Some(s) = &status {
+        q.push(format!("status={}", super::urlencode(s)));
+    }
+    if let Some(l) = limit {
+        q.push(format!("limit={l}"));
+    }
+    if !q.is_empty() {
+        path = format!("{path}?{}", q.join("&"));
+    }
+    let body = get_json(g, &path, true, 20);
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let empty = Vec::new();
+    let rows = body["proposals"].as_array().unwrap_or(&empty);
+    if rows.is_empty() {
+        println!("{}", ui::muted("no proposals: a skill written at runtime files one"));
+        return Ok(0);
+    }
+    println!("{}", ui::header("prompt skill proposals", Some(&format!("{} pending", body["pending"].as_u64().unwrap_or(0)))));
+    println!();
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|p| {
+            vec![
+                p["id"].to_string(),
+                ui::state(p["status"].as_str().unwrap_or("?")),
+                truncate(p["name"].as_str().unwrap_or("?"), 28),
+                truncate(p["proposed_by"].as_str().unwrap_or(""), 16),
+                truncate(p["decided_by"].as_str().unwrap_or(""), 16),
+                ui::muted(&truncate(p["description"].as_str().unwrap_or(""), 50)),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        ui::table(
+            &[Col::right("id"), Col::left("status"), Col::left("skill"), Col::left("proposed by"), Col::left("decided by"), Col::left("description")],
+            &table,
+        )
+    );
+    if body["pending"].as_u64().unwrap_or(0) > 0 {
+        ui::guide(&[
+            ("noo prompt-skills info <skill>", "shows the text you would promote"),
+            ("noo prompt-skills decide <id> --promote | --reject", "promote makes it instructions (system message); reject stops it being injected"),
+        ]);
+    }
+    Ok(0)
+}
+
+/// `noo prompt-skills decide <id> (--promote | --reject) [--reason <text>]` —
+/// POST /api/prompt-skills/proposals/{id}/decide. A person's act: the gateway
+/// refuses agent, harness, MCP-door and service credentials.
+pub fn prompt_skills_decide(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut id: Option<i64> = None;
+    let (mut promote, mut reject) = (false, false);
+    let mut reason: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "--promote" => promote = true,
+            "--reject" => reject = true,
+            "--reason" => reason = Some(iter.next().ok_or(Unhandled)?.clone()),
+            s if !s.starts_with('-') && id.is_none() => id = Some(s.parse().map_err(|_| Unhandled)?),
+            _ => return Err(Unhandled),
+        }
+    }
+    let id = id.ok_or(Unhandled)?;
+    if promote == reject {
+        fail(g.json, ExitCode::Usage, "usage", "Pass exactly one of --promote / --reject", Some("noo prompt-skills proposals"));
+    }
+    let decision = if promote { "promote" } else { "reject" };
+    let body = post_json(
+        g,
+        &format!("/api/prompt-skills/proposals/{id}/decide"),
+        &serde_json::json!({"decision": decision, "reason": reason}),
+        true,
+        20,
+    );
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let name = body["name"].as_str().unwrap_or("?");
+    if promote {
+        ui::done(&format!("promoted '{name}': its reviewed text is now instructions (system message)"));
+    } else {
+        ui::done(&format!("rejected '{name}': it is no longer injected"));
+    }
+    if let Some(note) = body["live"].as_str() {
+        println!("  {}", ui::muted(note));
+    }
+    Ok(0)
 }
