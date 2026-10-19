@@ -398,9 +398,12 @@ async fn graph(State(state): State<Arc<AppState>>) -> AppResult {
 /// uses it to say "knowledge pack disabled" instead of "the graph is empty",
 /// which is the distinction the design was about.
 async fn addons(State(_state): State<Arc<AppState>>) -> AppResult {
-    let map: Map<String, Value> = crate::addons::ADDONS
-        .iter()
-        .map(|a| (a.name.to_string(), json!(crate::addons::health_word(a.name))))
+    let map: Map<String, Value> = crate::addons::health_names()
+        .into_iter()
+        .map(|n| {
+            let word = json!(crate::addons::health_word(&n));
+            (n, word)
+        })
         .collect();
     Ok(Json(json!({ "addons": Value::Object(map) })))
 }

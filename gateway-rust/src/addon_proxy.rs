@@ -11,12 +11,14 @@
 //! ## The manifest ships with the add-on
 //!
 //! Add-ons are pieces that extend the core at runtime; the core carries none
-//! of their route names. An HTTP add-on (`Addon::routes_manifest` in
-//! `addons.rs`) ships its manifest in its own image, and its compose overlay
-//! delivers it READ-ONLY at `<ROUTES_DIR>/<addon>/routes.json` (a one-shot
-//! service from the add-on's image fills a volume the gateway mounts; a dev
-//! overlay bind-mounts the source file). It is read ONCE, when the router is
-//! built at startup, and only for an add-on whose switch is on. A file is
+//! of their route names. An HTTP add-on ships its manifest in its own image,
+//! and its compose overlay delivers it READ-ONLY at
+//! `<ROUTES_DIR>/<addon>/routes.json` (a one-shot service from the add-on's
+//! image fills a volume the gateway mounts; a dev overlay bind-mounts the
+//! source file). The runtime registry ([`crate::addon_registry`]) reads it
+//! ONCE, when the router is built at startup, for every add-on the operator
+//! switched on (`addons.<name>: true`) whose launcher-verified lock lists
+//! this stack: a third-party add-on needs no row in `addons.rs`. A file is
 //! used, not a fetch from the add-on, so nothing at boot depends on the
 //! network or on the add-on being up first.
 //!
@@ -26,7 +28,7 @@
 //!
 //! - version 1, `addon` = the add-on it was delivered for;
 //! - the upstream is that add-on's own service: `base_url_env` is
-//!   `NOO_<ADDON>_URL` and `base_url_default` is `https://noo-<addon>[:port]`
+//!   `NOO_<ADDON>_URL` (`-` becomes `_`) and `base_url_default` is `https://noo-<addon>[:port]`
 //!   with no credentials, path or query — no other host can be named;
 //! - paths are plain (`/`-separated, no `..`, no wildcard), public ones live
 //!   under `/api/` and outside the gateway's own namespaces
@@ -50,6 +52,20 @@
 //! it. The most likely cause is an add-on image from before manifests shipped
 //! with the add-on, and the message says so. A switched-off add-on mounts
 //! nothing and the gateway starts normally.
+//!
+//! ## Delegation keys
+//!
+//! Two top-level manifest keys prepare an add-on to act for a present person
+//! through that person's own tasks (noomesh-internal i143). They are parsed
+//! and validated here and exposed by the registry; nothing here mints a token.
+//!
+//! - `delegate: "tasks"`: the only accepted value. Declaring it grants
+//!   nothing; the operator must also enable it (`addon_delegation.<name>.tasks`).
+//! - `task_events: {"method": "POST", "path": "/..."}`: where the gateway
+//!   POSTs task events. Valid only with `delegate`, POST only, a plain path
+//!   without `{param}`, and it must not equal or match any PUBLIC route of the
+//!   same manifest (an `internal` route's path is fine), so it is never
+//!   reachable through the front door.
 //!
 //! ## What a route can say
 //!
@@ -101,7 +117,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path as FsPath;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, RawQuery},
@@ -153,15 +169,36 @@ pub const RESERVED_PREFIXES: &[&str] = &[
 #[serde(deny_unknown_fields)]
 pub struct AddonManifest {
     pub version: u32,
-    /// Must be the add-on the file was delivered for, and a row of
-    /// [`crate::addons::ADDONS`] with `routes_manifest` — that table owns the
-    /// enable flag, polarity, entitlement and refusal text.
+    /// Must be the add-on the file was delivered for (a plain name,
+    /// [`crate::addon_registry::name_ok`]). The runtime registry
+    /// ([`crate::addon_registry`]) decides whether it is registered at all:
+    /// operator-enabled, and verified by the launcher.
     pub addon: String,
     pub base_url_env: String,
     pub base_url_default: String,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     pub routes: Vec<RouteSpec>,
+    /// `"tasks"`: the add-on asks to act for a present person through that
+    /// person's own tasks (noomesh-internal i143). Declaring it does nothing
+    /// by itself: the operator must also enable it
+    /// (`addon_delegation.<name>.tasks`, see [`crate::addon_registry`]). The
+    /// only accepted value is `"tasks"`; [`validate`] refuses any other.
+    #[serde(default)]
+    pub delegate: Option<String>,
+    /// Where the gateway POSTs task events for this add-on. Valid only with
+    /// `delegate: "tasks"`, POST only, and never a public route of the same
+    /// manifest: it is reachable by the gateway, not through the front door.
+    #[serde(default)]
+    pub task_events: Option<TaskEventsSpec>,
+}
+
+/// The manifest's `task_events` route: `{"method": "POST", "path": "/..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskEventsSpec {
+    pub method: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,7 +278,7 @@ impl RouteSpec {
 }
 
 impl AddonManifest {
-    fn base_url(&self) -> String {
+    pub(crate) fn base_url(&self) -> String {
         std::env::var(&self.base_url_env)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -313,7 +350,9 @@ fn user_tier_could_call(method: &axum::http::Method, path: &str) -> bool {
 }
 
 fn check_upstream(m: &AddonManifest, addon: &str) -> Result<(), String> {
-    let want_env = format!("NOO_{}_URL", addon.to_ascii_uppercase());
+    // `-` is not legal in an environment variable name: `pai-voice` reads
+    // `NOO_PAI_VOICE_URL`. The container stays `noo-<addon>` verbatim.
+    let want_env = format!("NOO_{}_URL", addon.to_ascii_uppercase().replace('-', "_"));
     if m.base_url_env != want_env {
         return Err(format!(
             "base_url_env is {:?}; an add-on's override variable is {want_env}",
@@ -351,7 +390,9 @@ fn scope_ok(s: &str) -> bool {
     let plain = |t: &str| {
         !t.is_empty() && t.len() <= 32 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     };
-    plain(addon) && plain(word) && !word.contains(':')
+    // The add-on part may hold `-` (`pai-voice:read`); a word never does.
+    let plain_addon = |t: &str| plain(&t.replace('-', "_"));
+    plain_addon(addon) && plain(word) && !word.contains(':')
 }
 
 fn check_route(r: &RouteSpec) -> Result<(), String> {
@@ -455,8 +496,11 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
     if m.addon != addon {
         return Err(format!("it names add-on {:?}, but was delivered for {addon:?}", m.addon));
     }
-    if !crate::addons::ADDONS.iter().any(|a| a.name == addon && a.routes_manifest) {
-        return Err(format!("{addon:?} is not declared as an HTTP add-on in addons::ADDONS"));
+    if !crate::addon_registry::name_ok(addon) {
+        return Err(format!(
+            "{addon:?} is not a valid add-on name ({})",
+            crate::addon_registry::NAME_RULE
+        ));
     }
     check_upstream(m, addon)?;
     if m.timeout_secs == 0 || m.timeout_secs > MAX_TIMEOUT_SECS {
@@ -465,6 +509,7 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
     if m.routes.is_empty() {
         return Err("it declares no routes".into());
     }
+    check_delegation(m)?;
     let mut names = HashSet::new();
     let mut mounted = HashSet::new();
     for r in &m.routes {
@@ -497,6 +542,64 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── Delegation keys ──────────────────────────────────────────────────────
+
+/// The only value `delegate` accepts.
+pub const DELEGATE_TASKS: &str = "tasks";
+
+/// Validate the manifest's `delegate` and `task_events` keys. `Err` is a
+/// sentence naming the key and what to change; nothing here mints or grants
+/// anything, it only decides whether the manifest is acceptable.
+fn check_delegation(m: &AddonManifest) -> Result<(), String> {
+    if let Some(d) = m.delegate.as_deref() {
+        if d != DELEGATE_TASKS {
+            return Err(format!(
+                "delegate {d:?} is not supported — the only value is \"{DELEGATE_TASKS}\" \
+                 (an unknown value is refused, never read as tasks)"
+            ));
+        }
+    }
+    let Some(ev) = m.task_events.as_ref() else { return Ok(()) };
+    if m.delegate.as_deref() != Some(DELEGATE_TASKS) {
+        return Err(format!(
+            "task_events is valid only with \"delegate\": \"{DELEGATE_TASKS}\" — without \
+             delegation nothing is ever sent there; add the delegate key or remove task_events"
+        ));
+    }
+    if ev.method != "POST" {
+        return Err(format!(
+            "task_events method {:?} — the gateway POSTs task events, so only \"POST\" is accepted",
+            ev.method
+        ));
+    }
+    let params = path_shape(&ev.path).map_err(|e| format!("task_events: {e}"))?;
+    if !params.is_empty() {
+        return Err(format!("task_events path {:?} takes no {{param}} segments", ev.path));
+    }
+    for r in m.routes.iter().filter(|r| !r.internal) {
+        for pat in std::iter::once(&r.path).chain(r.aliases.iter()) {
+            if pattern_matches(pat, &ev.path) {
+                return Err(format!(
+                    "task_events path {:?} equals or matches the public route {:?} ({}): it would \
+                     be reachable through the front door. Give task events a path no public route \
+                     of this manifest covers",
+                    ev.path, pat, r.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does the route pattern `pat` (`{param}` segments match any non-empty
+/// segment) cover `path`? The one matcher the tier gate and the
+/// `task_events` check share.
+fn pattern_matches(pat: &str, path: &str) -> bool {
+    let p: Vec<&str> = pat.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    p.len() == segs.len() && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+}
+
 // ── Loading ──────────────────────────────────────────────────────────────
 
 /// What startup found: the manifests that will be mounted, and the add-ons
@@ -519,71 +622,69 @@ fn missing_reason(addon: &str, path: &FsPath) -> String {
     )
 }
 
-/// Read and validate the manifest of every HTTP add-on whose switch is on.
-/// Pure over `dir` and `flag_on`, so every outcome is testable without a
-/// global.
+/// Read and validate ONE add-on's manifest at `<dir>/<addon>/routes.json`.
+///
+/// - `Ok(Some(m))`: present and valid.
+/// - `Ok(None)`: the file is not there and `required` is false (a NATS-only
+///   add-on, or one that simply ships no routes): nothing to say.
+/// - `Err(why)`: missing while `required`, unreadable, not a manifest, or
+///   refused by [`validate`]; the sentence is the operator's.
+///
+/// `addon` must already be a plain name ([`crate::addon_registry::name_ok`]);
+/// it is joined into a path.
+pub fn read_manifest(dir: &FsPath, addon: &str, required: bool) -> Result<Option<AddonManifest>, String> {
+    if !crate::addon_registry::name_ok(addon) {
+        return Err(format!(
+            "add-on name {addon:?} is not valid ({}); its route manifest was not read",
+            crate::addon_registry::NAME_RULE
+        ));
+    }
+    let path = dir.join(addon).join(ROUTES_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if required { Err(missing_reason(addon, &path)) } else { Ok(None) };
+        }
+        Err(e) => return Err(format!("add-on {addon:?}: cannot read its route manifest {}: {e}", path.display())),
+    };
+    serde_json::from_str::<AddonManifest>(&raw)
+        .map_err(|e| format!("not a valid manifest: {e}"))
+        .and_then(|m| validate(&m, addon).map(|()| m))
+        .map(Some)
+        .map_err(|why| {
+            format!(
+                "add-on {addon:?}: route manifest {} refused: {why}. None of its routes are \
+                 mounted; fix the manifest in the add-on's image",
+                path.display()
+            )
+        })
+}
+
+/// Read and validate the manifest of every compiled HTTP add-on whose switch
+/// is on. Pure over `dir` and `flag_on`, so every outcome is testable without
+/// a global. The runtime registry ([`crate::addon_registry`]) reads further
+/// (operator-enabled add-ons the table has never heard of) through
+/// [`read_manifest`]; this is the table-driven subset.
 pub fn load_all(dir: &FsPath, flag_on: impl Fn(&str) -> bool) -> Loaded {
     let mut out = Loaded::default();
     for a in crate::addons::ADDONS.iter().filter(|a| a.routes_manifest) {
         if !flag_on(a.name) {
             continue; // off: mounts nothing, refuses nothing
         }
-        let path = dir.join(a.name).join(ROUTES_FILE);
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                out.refused.insert(a.name.to_string(), missing_reason(a.name, &path));
-                continue;
-            }
-            Err(e) => {
-                out.refused.insert(
-                    a.name.to_string(),
-                    format!("add-on {:?}: cannot read its route manifest {}: {e}", a.name, path.display()),
-                );
-                continue;
-            }
-        };
-        let parsed = serde_json::from_str::<AddonManifest>(&raw)
-            .map_err(|e| format!("not a valid manifest: {e}"))
-            .and_then(|m| validate(&m, a.name).map(|()| m));
-        match parsed {
-            Ok(m) => out.manifests.push(m),
+        match read_manifest(dir, a.name, true) {
+            Ok(Some(m)) => out.manifests.push(m),
+            Ok(None) => {}
             Err(why) => {
-                out.refused.insert(
-                    a.name.to_string(),
-                    format!(
-                        "add-on {:?}: route manifest {} refused: {why}. None of its routes are \
-                         mounted; fix the manifest in the add-on's image",
-                        a.name,
-                        path.display()
-                    ),
-                );
+                out.refused.insert(a.name.to_string(), why);
             }
         }
     }
     out
 }
 
-static LOADED: OnceLock<Loaded> = OnceLock::new();
-/// Refusals found at load AND at mount (a collision with a core route).
+/// Refusals found at MOUNT time (a collision with a core route). Refusals
+/// found at load time live in the registry snapshot.
 static REFUSED: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
-
-fn flag_on(name: &str) -> bool {
-    crate::addons::state(name) != crate::addons::AddonState::Disabled
-}
-
-fn loaded() -> &'static Loaded {
-    LOADED.get_or_init(|| {
-        let l = load_all(FsPath::new(ROUTES_DIR), flag_on);
-        for m in &l.manifests {
-            tracing::info!(addon = %m.addon, routes = m.routes.len(), "add-on route manifest loaded");
-        }
-        for (addon, why) in &l.refused {
-            refuse(addon, why.clone());
-        }
-        l
-    })
-}
 
 fn refuse(addon: &str, why: String) {
     tracing::error!(addon, "add-on routes refused: {why}");
@@ -592,18 +693,21 @@ fn refuse(addon: &str, why: String) {
     }
 }
 
-/// Why this add-on's routes are refused, if they are. `None` for an add-on
-/// that is off, has no manifest by design, or loaded cleanly.
+/// Why this add-on's routes are refused, if they are: at load (the registry
+/// snapshot) or at mount. `None` for an add-on that is off, has no manifest
+/// by design, or loaded cleanly.
 pub fn refusal(addon: &str) -> Option<String> {
-    let _ = loaded();
-    REFUSED.lock().ok()?.get(addon).cloned()
+    if let Some(why) = REFUSED.lock().ok().and_then(|r| r.get(addon).cloned()) {
+        return Some(why);
+    }
+    crate::addon_registry::refusal(addon)
 }
 
-/// The manifests in force: loaded, valid, and not refused at mount.
+/// The manifests in force: registered, valid, and not refused at mount.
 pub fn manifests() -> Vec<AddonManifest> {
-    loaded()
-        .manifests
+    crate::addon_registry::all()
         .iter()
+        .map(|e| e.manifest())
         .filter(|m| refusal(&m.addon).is_none())
         .cloned()
         .collect()
@@ -672,17 +776,12 @@ fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
 }
 
 fn matching_routes<'a>(manifests: &'a [AddonManifest], method: &str, path: &str) -> Vec<&'a RouteSpec> {
-    let segs: Vec<&str> = path.split('/').collect();
     manifests
         .iter()
         .flat_map(|m| m.routes.iter())
         .filter(|r| !r.internal && r.method == method)
         .filter(|r| {
-            std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| {
-                let p: Vec<&str> = pat.split('/').collect();
-                p.len() == segs.len()
-                    && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
-            })
+            std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| pattern_matches(pat, path))
         })
         .collect()
 }
@@ -707,6 +806,9 @@ pub fn addon_router(manifest: &AddonManifest) -> Router<Arc<AppState>> {
 /// on an overlap; it is tried on a copy), so it can neither replace a gateway
 /// handler nor take the gateway down at startup.
 pub fn mount(core: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    // Boot: build the registry now so its refusals and registrations are in
+    // the log before the first request, not at the first lookup.
+    crate::addon_registry::reload();
     merge_each(core, manifests(), refuse)
 }
 
@@ -1352,6 +1454,116 @@ pub(crate) mod tests {
         v["addon"] = json!("trellion");
         let m: AddonManifest = serde_json::from_value(v).unwrap();
         assert!(validate(&m, "evolve").unwrap_err().contains("delivered for"));
+    }
+
+    // ── delegation keys: delegate, task_events ───────────────────────────
+
+    fn delegating(edit: impl FnOnce(&mut Value)) -> Value {
+        let mut v = sample_json();
+        v["delegate"] = json!("tasks");
+        v["task_events"] = json!({"method": "POST", "path": "/internal/task-events"});
+        edit(&mut v);
+        v
+    }
+
+    #[test]
+    fn delegate_tasks_with_task_events_is_valid_and_parsed() {
+        let v = delegating(|_| {});
+        check(v.clone()).expect("a delegating manifest with its events route is accepted");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert_eq!(m.delegate.as_deref(), Some(DELEGATE_TASKS));
+        assert_eq!(
+            m.task_events,
+            Some(TaskEventsSpec { method: "POST".into(), path: "/internal/task-events".into() })
+        );
+        // Both keys are optional: the plain sample declares neither.
+        let plain = sample();
+        assert!(plain.delegate.is_none() && plain.task_events.is_none());
+        // delegate alone is fine; task_events is the optional second half.
+        let mut only = sample_json();
+        only["delegate"] = json!("tasks");
+        check(only).expect("delegate without task_events is valid");
+    }
+
+    #[test]
+    fn an_unknown_delegate_value_is_refused_never_read_as_tasks() {
+        for bad in [json!("mcp"), json!("Tasks"), json!(""), json!("tasks,mcp")] {
+            let e = check(delegating(|v| v["delegate"] = bad.clone())).expect_err("refused");
+            assert!(e.contains("delegate") && e.contains("only value is \"tasks\""), "{bad}: {e}");
+        }
+        // A non-string is a parse error, still a refusal.
+        assert!(check(delegating(|v| v["delegate"] = json!(true))).is_err());
+        assert!(check(delegating(|v| v["delegate"] = json!(["tasks"]))).is_err());
+    }
+
+    #[test]
+    fn task_events_without_delegate_tasks_is_refused() {
+        let mut v = sample_json();
+        v["task_events"] = json!({"method": "POST", "path": "/internal/task-events"});
+        let e = check(v).expect_err("refused");
+        assert!(e.contains("task_events") && e.contains("delegate"), "{e}");
+    }
+
+    #[test]
+    fn task_events_must_be_post_and_well_formed() {
+        for method in ["GET", "PUT", "post", ""] {
+            let e = check(delegating(|v| v["task_events"]["method"] = json!(method))).expect_err("refused");
+            assert!(e.contains("POST"), "{method:?}: {e}");
+        }
+        for path in ["internal/task-events", "/", "/a/../b", "/a//b", "/a/{id}", "/a b"] {
+            let e = check(delegating(|v| v["task_events"]["path"] = json!(path))).expect_err("refused");
+            assert!(e.contains("task_events"), "{path:?}: {e}");
+        }
+        // Unknown keys inside task_events, and a missing half, are refused.
+        assert!(check(delegating(|v| v["task_events"]["scope"] = json!("public"))).is_err());
+        assert!(check(delegating(|v| v["task_events"] = json!({"method": "POST"}))).is_err());
+    }
+
+    #[test]
+    fn task_events_may_not_equal_or_match_a_public_route() {
+        // Equal to a public route, an alias, and a `{param}` route it matches.
+        for path in ["/api/sample/status", "/api/sample-alt/status", "/api/sample/run", "/api/sample/items/abc"] {
+            let e = check(delegating(|v| v["task_events"]["path"] = json!(path))).expect_err("refused");
+            assert!(e.contains("public route") && e.contains("front door"), "{path}: {e}");
+        }
+        // The method does not rescue it: a POST path that a public GET covers is still public.
+        let e = check(delegating(|v| v["task_events"]["path"] = json!("/api/sample/status"))).unwrap_err();
+        assert!(e.contains("/api/sample/status"), "{e}");
+        // An internal route is not public: its path is a fine events path.
+        check(delegating(|v| v["task_events"]["path"] = json!("/api/sample/dispatch")))
+            .expect("an internal route's path is not reachable through the front door");
+        // A path no public route covers.
+        check(delegating(|v| v["task_events"]["path"] = json!("/api/sample/items/abc/extra"))).expect("no route covers it");
+    }
+
+    // ── add-on names beyond the compiled table ───────────────────────────
+
+    #[test]
+    fn a_hyphenated_third_party_name_validates_with_its_own_env_var_and_scopes() {
+        let mut v = sample_json();
+        v["addon"] = json!("pai-voice");
+        v["base_url_env"] = json!("NOO_PAI_VOICE_URL");
+        v["base_url_default"] = json!("https://noo-pai-voice:8090");
+        v["routes"][1]["scopes"] = json!(["pai-voice:read_items"]);
+        let m: AddonManifest = serde_json::from_value(v.clone()).unwrap();
+        validate(&m, "pai-voice").expect("a name outside the compiled table is valid");
+        // The env var and the host still have to be the add-on's own.
+        v["base_url_env"] = json!("NOO_EVOLVE_URL");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "pai-voice").unwrap_err().contains("NOO_PAI_VOICE_URL"));
+        // A bad name is refused before it is joined into a path.
+        let m = sample();
+        assert!(validate(&m, "../x").unwrap_err().contains("not a valid add-on name"));
+    }
+
+    #[test]
+    fn read_manifest_reads_one_addon_and_distinguishes_absent_from_required() {
+        let dir = scratch("read-one");
+        assert_eq!(read_manifest(&dir, "evolve", false).unwrap().map(|m| m.addon), None, "absent and optional: nothing to say");
+        assert!(read_manifest(&dir, "evolve", true).unwrap_err().contains("missing"));
+        plant(&dir, "evolve", &sample_json().to_string());
+        assert_eq!(read_manifest(&dir, "evolve", true).unwrap().unwrap().addon, "evolve");
+        assert!(read_manifest(&dir, "../evolve", false).unwrap_err().contains("not valid"));
     }
 
     // ── validation ───────────────────────────────────────────────────────

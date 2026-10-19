@@ -1864,15 +1864,13 @@ async fn health(
     // Built from the addon table: a new add-on declares one row in
     // addons::ADDONS and appears here with no /health change.
     let addons = serde_json::Value::Object(
-        crate::addons::ADDONS
-            .iter()
-            .map(|a| {
-                (
-                    a.name.to_string(),
-                    // Licensed add-ons have a third word: flag on, no
-                    // licence → "unlicensed".
-                    json!(crate::addons::health_word(a.name)),
-                )
+        crate::addons::health_names()
+            .into_iter()
+            .map(|name| {
+                // Licensed add-ons have a third word: flag on, no
+                // licence → "unlicensed".
+                let word = json!(crate::addons::health_word(&name));
+                (name, word)
             })
             .collect(),
     );
