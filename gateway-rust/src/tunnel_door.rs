@@ -80,21 +80,36 @@ pub async fn ensure_started() {
     };
     let _ = std_listener.set_nonblocking(true);
     let Ok(addr) = std_listener.local_addr() else { return };
-    let listener = match tokio::net::TcpListener::from_std(std_listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "tunnel door: could not listen; streams stay on HTTPS");
-            return;
-        }
-    };
     let secret = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     let app: Router = Router::new().fallback(door).with_state(Arc::new(secret.clone()));
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "tunnel door stopped");
-        }
+    #[cfg(not(test))]
+    {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(error = %e, "tunnel door: could not listen; streams stay on HTTPS");
+                return;
+            }
+        };
+        tokio::spawn(serve_door(listener, app));
+    }
+    // Each #[tokio::test] runs its own runtime, and a door spawned on the
+    // first one would die with it; the shared test door gets its own.
+    #[cfg(test)]
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("door runtime")
+            .block_on(async move { serve_door(tokio::net::TcpListener::from_std(std_listener).expect("door listener"), app).await })
     });
     let _ = DOOR.set(Door { port: addr.port(), secret });
+}
+
+async fn serve_door(listener: tokio::net::TcpListener, app: Router) {
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(error = %e, "tunnel door stopped");
+    }
 }
 
 fn host_key(u: &reqwest::Url) -> Option<String> {

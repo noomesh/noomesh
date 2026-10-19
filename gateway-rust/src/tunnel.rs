@@ -63,7 +63,7 @@ use axum::{Extension, Json, Router};
 use base64::Engine as _;
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::routes::{AppError, AppResult};

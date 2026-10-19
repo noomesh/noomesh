@@ -9,6 +9,7 @@
 use super::*;
 use futures::StreamExt;
 use reqwest::Method;
+use serde_json::Value;
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -161,7 +162,7 @@ async fn a_request_goes_out_as_one_open_with_the_principal_and_no_credentials() 
     sess.on_frame(data(open.stream, b"data: 1\n\n"));
     sess.on_frame(data(open.stream, b"data: [DONE]\n\n"));
     sess.on_frame(end(open.stream));
-    let resp = h.await.unwrap().ok().expect("a response");
+    let resp = h.await.unwrap().expect("a response");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.headers, vec![("content-type".to_string(), "text/event-stream".to_string())]);
     let (body, err) = collect(resp).await;
@@ -178,7 +179,7 @@ async fn backpressure_a_slow_reader_gets_no_credit_and_a_reader_that_reads_does(
     let open = next_frame(&mut rx).await;
     let id = open.stream;
     sess.on_frame(head(id, 200, &[]));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
 
     // The node fills its whole window; the consumer pulls nothing.
     let chunk = vec![7u8; MAX_DATA];
@@ -208,7 +209,7 @@ async fn a_node_that_overruns_the_stream_window_has_the_stream_reset() {
     let open = next_frame(&mut rx).await;
     let id = open.stream;
     sess.on_frame(head(id, 200, &[]));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     // 1-byte frames cost MIN_COST each, so a compliant node sends at most
     // WINDOW / MIN_COST of them before it must wait; 400 is a flood.
     for _ in 0..400 {
@@ -256,7 +257,7 @@ async fn a_request_body_waits_for_the_nodes_credit() {
     assert_eq!(more, 2 * MAX_DATA);
     sess.on_frame(head(id, 200, &[]));
     sess.on_frame(end(id));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     assert_eq!(collect(resp).await.0.len(), 0);
 }
 
@@ -281,7 +282,7 @@ async fn the_per_node_stream_cap_answers_busy_and_a_finished_stream_frees_its_pl
     // Finish the first.
     sess.on_frame(head(o1.stream, 200, &[]));
     sess.on_frame(end(o1.stream));
-    let r1 = handles.remove(0).await.unwrap().ok().expect("first response");
+    let r1 = handles.remove(0).await.unwrap().expect("first response");
     assert!(collect(r1).await.1.is_none());
     // Its place is free again.
     let s = sess.clone();
@@ -289,7 +290,7 @@ async fn the_per_node_stream_cap_answers_busy_and_a_finished_stream_frees_its_pl
     let o3 = next_open(&mut rx).await;
     sess.on_frame(head(o3.stream, 204, &[]));
     sess.on_frame(end(o3.stream));
-    assert_eq!(h3.await.unwrap().ok().expect("third").status, 204);
+    assert_eq!(h3.await.unwrap().expect("third").status, 204);
     drop(o2);
 }
 
@@ -300,14 +301,14 @@ async fn a_tunnel_that_drops_mid_stream_ends_the_body_with_a_distinct_error() {
     let h = tokio::spawn(async move { s2.request(get("/sse"), None).await });
     let id = next_frame(&mut rx).await.stream;
     sess.on_frame(head(id, 200, &[("content-type", "text/event-stream")]));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     sess.on_frame(data(id, b"data: 1\n\n"));
     let mut body = resp.body;
     assert_eq!(&body.next().await.unwrap().unwrap()[..], b"data: 1\n\n");
 
     let before = crate::node_rpc::counts().get("t-node").map(|c| c.tunnel_aborts).unwrap_or(0);
     sess.close("the connection failed");
-    let err = body.next().await.expect("an error item, not a clean end").err().expect("an error");
+    let err = body.next().await.expect("an error item, not a clean end").expect_err("an error");
     match &err {
         TunnelError::Lost { node, reason } => {
             assert_eq!(node, "t-node");
@@ -343,7 +344,7 @@ async fn a_caller_that_stops_reading_resets_the_stream_at_the_node() {
     let h = tokio::spawn(async move { s2.request(get("/sse"), None).await });
     let id = next_frame(&mut rx).await.stream;
     sess.on_frame(head(id, 200, &[]));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     drop(resp);
     let (r, _) = frame_of(&mut rx, FRAME_RESET, id).await;
     assert_eq!(&r.payload[..], b"the caller stopped reading");
@@ -354,7 +355,7 @@ async fn a_caller_that_stops_reading_resets_the_stream_at_the_node() {
     let id2 = next_frame(&mut rx).await.stream;
     sess.on_frame(head(id2, 200, &[]));
     sess.on_frame(end(id2));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     assert!(collect(resp).await.1.is_none());
     assert!(!settle(&mut rx).await.iter().any(|f| f.kind == FRAME_RESET), "no RESET for a stream that ended cleanly");
 }
@@ -464,9 +465,8 @@ async fn drive_pings_on_the_interval_and_drops_a_peer_that_goes_silent() {
     // Pings are sent.
     let mut pings = 0;
     while pings < 2 {
-        match tokio::time::timeout(Duration::from_secs(2), sent.recv()).await.expect("a message").expect("open") {
-            Message::Ping(_) => pings += 1,
-            _ => {}
+        if let Message::Ping(_) = tokio::time::timeout(Duration::from_secs(2), sent.recv()).await.expect("a message").expect("open") {
+            pings += 1;
         }
     }
     // The peer never answers: dropped inside dead_after (+ one interval).
@@ -501,7 +501,7 @@ async fn drive_keeps_a_peer_that_answers_and_moves_frames_both_ways() {
     incoming.send(Ok(Message::Binary(head(open.stream, 200, &[]).encode()))).unwrap();
     incoming.send(Ok(Message::Binary(data(open.stream, b"hi").encode()))).unwrap();
     incoming.send(Ok(Message::Binary(end(open.stream).encode()))).unwrap();
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     assert_eq!(collect(resp).await.0, b"hi");
     // Keep answering pings for longer than dead_after: still alive.
     let until = tokio::time::Instant::now() + Duration::from_millis(400);
@@ -796,7 +796,7 @@ async fn a_read_the_tunnel_lost_is_repeated_over_https_once_but_a_write_never_is
     serve_node(sess, rx, |_| vec![Frame::new(255, 0, Bytes::new())]);
     let link = tunnelled_link(node, &url);
     let https_before = crate::node_rpc::counts().get(node).map(|c| c.https_other + c.https_control).unwrap_or(0);
-    let err = link.request(Method::POST, "/api/containers/start").send().await.err().expect("a write is not retried");
+    let err = link.request(Method::POST, "/api/containers/start").send().await.expect_err("a write is not retried");
     assert!(err.to_string().contains(node) && err.to_string().contains("tunnel-lost"), "{err}");
     let https_after = crate::node_rpc::counts().get(node).map(|c| c.https_other + c.https_control).unwrap_or(0);
     assert_eq!(https_before, https_after, "the write was not sent over HTTPS");
@@ -930,9 +930,12 @@ async fn a_failed_door_request_does_not_put_the_secret_in_its_error_text() {
     let url = crate::tunnel_door::door_url("door-fail", "/sse").expect("door url");
     let secret = crate::tunnel_door::test_secret();
     let client = reqwest::Client::new();
-    // The tunnel dies after the head: the body read fails.
-    let resp = crate::tunnel_door::mark(client.get(&url), &url).send().await.expect("head arrives");
-    let err = resp.bytes().await.err().expect("the aborted body is an error");
+    // The tunnel dies after the head. Depending on whether the door flushed
+    // the head first, the failure surfaces on send or on the body read.
+    let err = match crate::tunnel_door::mark(client.get(&url), &url).send().await {
+        Ok(resp) => resp.bytes().await.expect_err("the aborted body is an error"),
+        Err(e) => e,
+    };
     let mut text = err.to_string();
     let mut src = std::error::Error::source(&err);
     while let Some(e) = src {
@@ -943,7 +946,7 @@ async fn a_failed_door_request_does_not_put_the_secret_in_its_error_text() {
     assert!(!text.contains(&secret), "{text}");
     // A request that cannot connect at all: reqwest prints the URL; it holds no secret.
     let dead = "http://127.0.0.1:1/door-fail/sse".to_string();
-    let e = crate::tunnel_door::mark(client.get(&dead), &dead).send().await.err().expect("refused");
+    let e = crate::tunnel_door::mark(client.get(&dead), &dead).send().await.expect_err("refused");
     assert!(!format!("{e} {e:?}").contains(&secret));
 }
 
@@ -956,7 +959,7 @@ async fn the_receive_window_is_enforced_in_bytes_not_in_events() {
     let h = tokio::spawn(async move { s2.request(get("/x"), None).await });
     let id = next_frame(&mut rx).await.stream;
     sess.on_frame(head(id, 200, &[]));
-    let resp = h.await.unwrap().ok().expect("response");
+    let resp = h.await.unwrap().expect("response");
     // 8 full frames fill the 256 KiB window exactly; a ninth is over it, well
     // inside the event-count cap (272) that used to be the only limit.
     let chunk = vec![1u8; MAX_DATA];
@@ -977,7 +980,7 @@ async fn reading_gives_the_window_back_so_a_compliant_node_never_trips_it() {
     let h = tokio::spawn(async move { s2.request(get("/x"), None).await });
     let id = next_frame(&mut rx).await.stream;
     sess.on_frame(head(id, 200, &[]));
-    let mut body = h.await.unwrap().ok().expect("response").body;
+    let mut body = h.await.unwrap().expect("response").body;
     let chunk = vec![1u8; MAX_DATA];
     for _ in 0..40 {
         // Fill the window, read it all, repeat: 40 frames through an 8-frame window.
