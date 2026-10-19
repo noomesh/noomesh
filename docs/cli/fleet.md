@@ -318,6 +318,29 @@ and needs `--apply` to act; `auto-place <model>...` plans a set across
 the fleet; `reconcile-models` does the same for `NOO_DESIRED_MODELS` minus
 what is already running.
 
+### Embedding spaces: one model per purpose
+
+```sh
+noo cluster embedding-space list
+noo cluster embedding-space set code nomic-embed-code
+noo cluster place gpu-2 ollama nomic-embed-code --role embed
+```
+
+Vectors from two embedding models cannot be compared, so embeddings never
+fall back across models the way chat falls back across the mesh. The unit
+is an **embedding space**: a purpose bound to one model. `knowledge`
+(documents, memory, recall) exists from the first start, seeded with the
+model the fleet already serves; add others, such as a `code` space with a
+code embedder, beside it. A space's pool is every node whose role=embed
+placement serves its model: the gateway spreads that space's requests across
+the pool and never sends them to a node on another model, and a reply that
+names another model is discarded and the next node tried. Callers send the
+space as `model` on `/api/external/embeddings` (`knowledge` when absent).
+An embed placement on a model no space uses is refused; a space's model does
+not change by setting (that is a re-embed: declare a new space instead).
+One node agent serves one embed model today, so a node belongs to one
+space's pool.
+
 ### Get a model onto the fleet
 
 ```sh
@@ -591,6 +614,9 @@ other direction: the other stack never calls noomesh.
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
+| `noo cluster embedding-space list` | | Show each embedding space, its model and the nodes serving it |
+| `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
+| `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |

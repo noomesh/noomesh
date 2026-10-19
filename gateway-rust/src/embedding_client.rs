@@ -28,8 +28,12 @@
 //! Config resolution (env → yaml → default, phase-2 pattern):
 //!   PAGEINDEX_EMBEDDING_URL     / services.embedding_url     → http://noo-ollama:11434
 //!   PAGEINDEX_EMBEDDING_BACKEND / services.embedding_backend → "ollama"
-//!   PAGEINDEX_EMBEDDING_MODEL   / services.embedding_model   → EMBEDDING_MODEL → TEI_MODEL → "harrier"
-//!   EMBEDDING_DIM               / services.embedding_dim     → 0 (= unknown / don't check)
+//!
+//! The MODEL (and vector width) come from the embedding space record in the
+//! DB (`embedding_spaces`, i145): a caller names a space, `knowledge` by
+//! default. `PAGEINDEX_EMBEDDING_MODEL` → `EMBEDDING_MODEL` → `TEI_MODEL` →
+//! `harrier` and `EMBEDDING_DIM` only seed `knowledge` on an empty table
+//! ([`configured_model`]).
 //!
 //! TLS: on installs that still run a co-located TEI sidecar behind stunnel,
 //! the endpoint may be that sidecar (https with the private cluster PKI), so
@@ -43,6 +47,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::config::{env_or_yaml, env_or_yaml_u64};
+use crate::embedding_spaces::same_model;
 use crate::log_gate::LogGate;
 
 /// A node whose embedder keeps failing is logged when it starts failing,
@@ -134,7 +139,9 @@ impl std::fmt::Display for EmbedError {
     }
 }
 
-/// Resolve the configured embedding endpoint (env → yaml → default).
+/// Resolve the embedding endpoint for the default space: where the static
+/// path posts and in which wire format (env → yaml → default), with the
+/// space's model.
 pub fn resolve() -> EmbeddingEndpoint {
     // Ollama-first defaults: TEI is no longer deployed on the controller
     // (the old noo-tei/tei defaults pointed at nothing on a normal install),
@@ -162,26 +169,55 @@ pub fn resolve() -> EmbeddingEndpoint {
     )
     .to_lowercase();
 
-    let mut model = env_or_yaml(
-        "PAGEINDEX_EMBEDDING_MODEL",
-        |c| c.services.embedding_model.clone(),
-        "",
-    );
-    if model.is_empty() {
-        // EMBEDDING_MODEL is the stack-wide model name; TEI_MODEL is the
-        // legacy deploy-time name kept for older installs.
-        model = std::env::var("EMBEDDING_MODEL")
-            .or_else(|_| std::env::var("TEI_MODEL"))
-            // harrier: the product's default embedder (1024-dim, matching
-            // trellion's hardcoded vector(1024) DDL). Locally converted —
-            // the CLI's embed-ensure step fetches it from the
-            // models-harrier-v1 release when absent.
-            .unwrap_or_else(|_| "harrier".into());
+    // The model and width come from the default embedding space (i145):
+    // the DB record, not env. Before the first boot has seeded one (and in
+    // unit tests) the configured model stands in.
+    match crate::embedding_spaces::resolve(&crate::embedding_spaces::all(), None) {
+        Ok(space) => EmbeddingEndpoint { url, api_format, model: space.model.clone(), dims: space.dims.unwrap_or(0) },
+        Err(_) => EmbeddingEndpoint {
+            url,
+            api_format,
+            model: configured_model(),
+            dims: env_or_yaml_u64("EMBEDDING_DIM", |c| c.services.embedding_dim, 0),
+        },
     }
+}
 
-    let dims = env_or_yaml_u64("EMBEDDING_DIM", |c| c.services.embedding_dim, 0);
+/// The endpoint for the space a caller names (`None`/`default` = the default
+/// space). `Err` names the spaces there are; with no space recorded yet the
+/// default resolves to the configured model and anything else is refused.
+pub fn resolve_space(requested: Option<&str>) -> Result<EmbeddingEndpoint, String> {
+    let spaces = crate::embedding_spaces::all();
+    if spaces.is_empty() {
+        let named = requested.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default") && !s.eq_ignore_ascii_case("auto"));
+        let ep = resolve();
+        return match named {
+            None => Ok(ep),
+            Some(n) if n.eq_ignore_ascii_case(crate::embedding_spaces::DEFAULT_SPACE) || same_model(n, &ep.model) => Ok(ep),
+            Some(n) => Err(format!("'{n}' is not an embedding space; no space is recorded yet, only the default ({})", crate::embedding_spaces::DEFAULT_SPACE)),
+        };
+    }
+    let space = crate::embedding_spaces::resolve(&spaces, requested)?;
+    let base = resolve();
+    Ok(EmbeddingEndpoint { model: space.model.clone(), dims: space.dims.unwrap_or(0), ..base })
+}
 
-    EmbeddingEndpoint { url, api_format, model, dims }
+/// The embed model the env/yaml names: only the SEED for the `knowledge`
+/// space on an empty table, and the stand-in before one is recorded.
+pub fn configured_model() -> String {
+    let model = env_or_yaml("PAGEINDEX_EMBEDDING_MODEL", |c| c.services.embedding_model.clone(), "");
+    if !model.is_empty() {
+        return model;
+    }
+    // EMBEDDING_MODEL is the stack-wide model name; TEI_MODEL is the
+    // legacy deploy-time name kept for older installs.
+    std::env::var("EMBEDDING_MODEL")
+        .or_else(|_| std::env::var("TEI_MODEL"))
+        // harrier: the product's default embedder (1024-dim, matching
+        // trellion's hardcoded vector(1024) DDL). Locally converted —
+        // the CLI's embed-ensure step fetches it from the
+        // models-harrier-v1 release when absent.
+        .unwrap_or_else(|_| "harrier".into())
 }
 
 impl EmbeddingEndpoint {
@@ -400,12 +436,12 @@ impl EmbeddingEndpoint {
                 "no embed target: no node advertises `embed` and no static endpoint is configured".into(),
             ));
         }
-        // Vector-space consistency: only targets on the fleet's embed model
+        // Vector-space consistency: only targets on the space's model
         // join the spread set (see `consistent_candidates`).
         let cands = consistent_candidates(cands, &self.model);
         if cands.is_empty() {
             return Err(EmbedError::Unavailable(
-                "no embed target on the fleet's embed model (see embed_target_model_mismatch); refusing to embed with a different model".into(),
+                "no embed target on this embedding space's model (see embed_target_model_mismatch); refusing to embed with a different model".into(),
             ));
         }
         // Admission: a bounded wait for a free slot, then shed. Interactive
@@ -505,21 +541,14 @@ impl EmbeddingEndpoint {
         texts: &[String],
         timeout: Duration,
     ) -> Result<Vec<Vec<f64>>, EmbedError> {
-        // Deliberately send NO model. The node-agent fills it in from the
-        // role=embed placement, which is the single place the fleet declares
-        // what its embedder serves.
-        //
-        // Sending a configured model here is what broke the harrier cutover:
-        // the placement said `harrier` while PAGEINDEX_EMBEDDING_MODEL still
-        // said `bge-base-en-v1.5`, so the gateway asked harrier's ollama for
-        // a model it does not have and got a bare 404 — with the mesh,
-        // capability resolution and mTLS all working correctly. The system
-        // already knew the right answer; an env var overrode it with a stale
-        // one.
-        //
-        // A caller that genuinely needs a specific model can still pin it
-        // via PAGEINDEX_EMBEDDING_MODEL, which is honoured on the DIRECT
-        // path (`embed`). On the mesh path, declaration wins.
+        // The space's model, by name (i145). This used to be omitted on
+        // purpose: a stale PAGEINDEX_EMBEDDING_MODEL (`bge-base-en-v1.5`
+        // while the placement said `harrier`) broke the harrier cutover with
+        // a bare 404. The model now comes from the embedding space record,
+        // and only nodes declaring that model are candidates
+        // ([`consistent_candidates`]), so naming it cannot disagree with the
+        // placement; it makes a node that does NOT hold it fail fast (and
+        // the next target answer) instead of embedding in another space.
         // `options.num_ctx` rides along so the node's ollama allocates a
         // small window per slot; the node-agent forwards it to ollama's
         // native API (its OpenAI route drops it) and strips it for engines
@@ -528,6 +557,7 @@ impl EmbeddingEndpoint {
         // forwards it on the native route and strips it for engines that
         // have no such field.
         let body = serde_json::json!({
+            "model": self.model,
             "input": texts,
             "options": {"num_ctx": EMBED_NUM_CTX},
             "keep_alive": EMBED_KEEP_ALIVE,
@@ -552,21 +582,12 @@ impl EmbeddingEndpoint {
             .json()
             .await
             .map_err(|e| EmbedError::Parse(e.to_string()))?;
-        // The reply names the model that ACTUALLY served the request —
-        // authoritative, unlike anything in config. Surface it: this is the
-        // vector space the corpus is being written into, and the whole class
-        // of bug here is vectors from an unexpected space landing silently.
-        // (It is also what should populate `embedding_model` once the write
-        // path carries provenance through.)
-        if let Some(served) = data.get("model").and_then(|m| m.as_str()) {
-            if !served.is_empty() && served != self.model {
-                tracing::info!(
-                    served_model = %served,
-                    configured_model = %self.model,
-                    "embed_served_by: mesh embedder differs from configured model \
-                     (expected — the placement is authoritative on the mesh path)"
-                );
-            }
+        // The reply names the model that ACTUALLY served the request. Vectors
+        // from another model are another space: refused, so the balancer
+        // fails this target and tries the next (they used to be logged and
+        // kept).
+        if let Some(why) = served_model_refusal(data.get("model").and_then(|m| m.as_str()), &self.model) {
+            return Err(EmbedError::Parse(why));
         }
         // The mesh proxy always answers in the OpenAI shape, whatever
         // dialect it spoke to the engine underneath.
@@ -657,54 +678,42 @@ fn log_mismatch(target: &str, what: &str) {
     }
 }
 
-/// Same model modulo case and ollama's implicit `:latest` tag.
-fn same_model(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim().to_lowercase().trim_end_matches(":latest").to_string();
-    norm(a) == norm(b)
-}
-
-/// Keep only candidates in the fleet's vector space.
+/// Keep only candidates in the space's vector space: the ones whose
+/// declared model is the space's (`model`, from the embedding space record).
 ///
-/// The fleet's model is what the role=embed placements declare (the most
-/// common declaration among the mesh targets that report one); with none
-/// reporting, it is the configured model. A mesh node declaring another
-/// model, or a static endpoint whose configured model differs from the
-/// fleet's, is dropped with a warning naming both models -- never silently,
-/// since mixing models in one index corrupts retrieval without any error.
-pub(crate) fn consistent_candidates(cands: Vec<Candidate>, configured_model: &str) -> Vec<Candidate> {
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for c in &cands {
-        if let Candidate::Mesh(_, Some(m)) = c {
-            match counts.iter_mut().find(|(k, _)| same_model(k, m)) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((m.clone(), 1)),
-            }
-        }
-    }
-    // Most common declaration; ties go to the first declared.
-    let fleet = counts
-        .iter()
-        .fold(None::<&(String, usize)>, |best, c| match best {
-            Some(b) if b.1 >= c.1 => Some(b),
-            _ => Some(c),
-        })
-        .map(|(m, _)| m.clone())
-        .unwrap_or_else(|| configured_model.to_string());
+/// There is no vote. The fleet's model used to be the most common role=embed
+/// declaration among the targets, so two of three nodes moving to another
+/// model flipped it and excluded the one node still right (i145). A mesh node
+/// declaring another model, or a static endpoint configured for another, is
+/// dropped with a warning naming both -- never silently, since mixing models
+/// in one index corrupts retrieval without any error. A mesh node that
+/// declares nothing (an agent too old to report) stays: it is sent the
+/// space's model by name, so an engine without it fails and the next target
+/// answers, and its reply's model is checked ([`served_model_refusal`]).
+pub(crate) fn consistent_candidates(cands: Vec<Candidate>, model: &str) -> Vec<Candidate> {
     cands
         .into_iter()
         .filter(|c| {
-            let (key, model) = match c {
+            let (key, declared) = match c {
                 Candidate::Mesh(t, Some(m)) => (t.node_id.as_str(), m.as_str()),
-                Candidate::Mesh(_, None) => return true, // declaration wins on the mesh path; nothing to compare
+                Candidate::Mesh(_, None) => return true,
                 Candidate::Static(e) => (e.url.as_str(), e.model.as_str()),
             };
-            if same_model(model, &fleet) {
+            if same_model(declared, model) {
                 return true;
             }
-            log_mismatch(key, &format!("serves model '{model}' but the fleet's embed model is '{fleet}'"));
+            log_mismatch(key, &format!("serves model '{declared}' but this embedding space's model is '{model}'"));
             false
         })
         .collect()
+}
+
+/// Why a mesh reply cannot be used: it names a model other than the space's.
+/// The vectors would be from another space; the target fails and the next
+/// one is tried.
+pub(crate) fn served_model_refusal(served: Option<&str>, model: &str) -> Option<String> {
+    let served = served.map(str::trim).filter(|s| !s.is_empty())?;
+    (!same_model(served, model)).then(|| format!("served model '{served}', not the space's '{model}'"))
 }
 
 /// The primary endpoint plus the comma-separated `extra` URLs, each
@@ -967,8 +976,9 @@ mod tests {
         ep.embed_via_mesh(&format!("{url}/embed"), &[], &texts(), T).await.unwrap();
         let b = seen.lock().unwrap()[0].clone();
         assert_eq!(b["options"]["num_ctx"], json!(EMBED_NUM_CTX), "body: {b}");
-        // Declaration still wins on the mesh path: no model is sent.
-        assert!(b.get("model").is_none(), "mesh path must not pin a model: {b}");
+        // The space's model is sent by name (i145), so a node without it
+        // fails instead of answering from another space.
+        assert_eq!(b["model"], json!("harrier"), "body: {b}");
     }
 
     // The embed model must stay resident: every ollama-dialect body (direct
@@ -1243,13 +1253,10 @@ mod tests {
         let (mesh_url, smesh) = server(200).await;
         let (stale_url, sstale) = server(200).await;
         let bal = EmbedBalancer::new();
-        let mut ep = ollama("http://unused");
-        ep.model = "bge-base-en-v1.5".into(); // the stale configured model
+        let ep = ollama("http://unused"); // the space's model: harrier
+        let stale = EmbeddingEndpoint { url: stale_url.clone(), model: "bge-base-en-v1.5".into(), ..ep.clone() };
         for _ in 0..6 {
-            let cands = vec![
-                mesh_declaring("node-a", &mesh_url, Some("harrier:latest")),
-                Candidate::Static(EmbeddingEndpoint { url: stale_url.clone(), ..ep.clone() }),
-            ];
+            let cands = vec![mesh_declaring("node-a", &mesh_url, Some("harrier:latest")), Candidate::Static(stale.clone())];
             ep.embed_over(&bal, cands, &texts(), T).await.unwrap();
         }
         assert_eq!(smesh.lock().unwrap().len(), 6);
@@ -1257,28 +1264,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_static_on_the_fleet_model_joins_and_no_consistent_target_fails_loudly() {
+    async fn a_static_on_the_spaces_model_joins_and_no_consistent_target_fails_loudly() {
         let (mesh_url, _) = server(200).await;
         let (static_url, sstatic) = server(200).await;
         let bal = EmbedBalancer::new();
-        let ep = ollama("http://unused"); // configured model: harrier
+        let ep = ollama("http://unused"); // the space's model: harrier
         for _ in 0..4 {
             let cands = vec![mesh("a", &mesh_url), Candidate::Static(EmbeddingEndpoint { url: static_url.clone(), ..ep.clone() })];
             ep.embed_over(&bal, cands, &texts(), T).await.unwrap();
         }
         assert_eq!(sstatic.lock().unwrap().len(), 2, "same model => in the spread");
 
-        // Only a wrong-model static is left: fail, do not embed with it.
+        // Only targets on another model are left: fail, do not embed with them.
         let (only, sonly) = server(200).await;
-        let mut stale = ollama(&only);
-        stale.model = "bge".into();
-        let cands = vec![mesh_declaring("a", "http://127.0.0.1:1", Some("harrier")), Candidate::Static(stale.clone())];
-        let r = EmbeddingEndpoint { model: "bge".into(), ..ep.clone() }
-            .embed_over(&EmbedBalancer::new(), vec![mesh_declaring("a", "http://127.0.0.1:1", Some("harrier")), Candidate::Static(stale)], &texts(), T)
+        let (other, sother) = server(200).await;
+        let stale = EmbeddingEndpoint { model: "bge".into(), ..ollama(&only) };
+        let r = ep
+            .embed_over(&EmbedBalancer::new(), vec![mesh_declaring("b", &other, Some("bge")), Candidate::Static(stale)], &texts(), T)
             .await;
-        drop(cands);
         assert!(r.is_err());
-        assert_eq!(sonly.lock().unwrap().len(), 0);
+        assert_eq!(sonly.lock().unwrap().len() + sother.lock().unwrap().len(), 0);
+    }
+
+    /// i145: there is no vote. Two of three nodes on another model do not
+    /// make it the space's model; the one node still on the space's model
+    /// takes every request.
+    #[tokio::test]
+    async fn a_majority_on_another_model_does_not_move_the_space() {
+        let (a, sa) = server(200).await;
+        let (b, sb) = server(200).await;
+        let (c, sc) = server(200).await;
+        let bal = EmbedBalancer::new();
+        let ep = ollama("http://unused"); // the space's model: harrier
+        for _ in 0..5 {
+            let cands = vec![
+                mesh_declaring("a", &a, Some("bge-m3")),
+                mesh_declaring("b", &b, Some("bge-m3")),
+                mesh_declaring("c", &c, Some("harrier")),
+            ];
+            ep.embed_over(&bal, cands, &texts(), T).await.unwrap();
+        }
+        assert_eq!(sa.lock().unwrap().len() + sb.lock().unwrap().len(), 0, "the majority's model is not the space's");
+        assert_eq!(sc.lock().unwrap().len(), 5);
+    }
+
+    /// A node that declares nothing is asked by name; a reply naming another
+    /// model is another space's vectors: refused, and the next target answers.
+    #[tokio::test]
+    async fn a_reply_from_another_model_is_refused_and_the_next_target_answers() {
+        let (harrier_url, sh) = server(200).await; // answers model "harrier"
+        let bal = EmbedBalancer::new();
+        let ep = EmbeddingEndpoint { model: "nomic-embed-code".into(), ..ollama("http://unused") };
+        let r = ep.embed_over(&bal, vec![mesh_declaring("undeclared", &harrier_url, None)], &texts(), T).await;
+        assert!(r.is_err(), "harrier's vectors are not the code space's");
+        assert_eq!(sh.lock().unwrap().len(), 1);
+        assert_eq!(served_model_refusal(Some("harrier:latest"), "harrier"), None);
+        assert_eq!(served_model_refusal(None, "harrier"), None, "a reply that names no model is not refused on that ground");
+        assert!(served_model_refusal(Some("bge"), "harrier").is_some());
     }
 
     #[tokio::test]
