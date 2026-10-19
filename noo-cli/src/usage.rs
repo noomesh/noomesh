@@ -394,23 +394,28 @@ pub fn is_native_group(word: &str) -> bool {
     USAGE.iter().any(|(w, _, _)| w.first() == Some(&word))
 }
 
-/// The native subcommands under `group`, in declaration order, deduplicated.
-pub fn subcommands_of(group: &str) -> Vec<&'static str> {
+/// The native next words under the command path `prefix` (`["cluster",
+/// "class"]` -> `list`, `set`, `unset`), in declaration order, deduplicated.
+/// Hidden rows (aliases, retired verbs) still dispatch; they are not offered.
+pub fn subcommands_under(prefix: &[&str]) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for (w, _, about) in USAGE.iter() {
-        // Hidden rows (aliases, retired verbs) still dispatch; they are not offered.
         if about.starts_with("Hidden:") {
             continue;
         }
-        if w.first() == Some(&group) {
-            if let Some(sub) = w.get(1) {
-                if !out.contains(sub) {
-                    out.push(sub);
-                }
+        if w.len() > prefix.len() && w[..prefix.len()] == *prefix {
+            let sub = w[prefix.len()];
+            if !out.contains(&sub) {
+                out.push(sub);
             }
         }
     }
     out
+}
+
+/// True when `words` is a complete command row (not just a group prefix).
+pub fn is_command(words: &[&str]) -> bool {
+    USAGE.iter().any(|(w, _, _)| *w == words)
 }
 
 /// (syntax, description) for exactly these command words.
