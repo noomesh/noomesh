@@ -17,8 +17,8 @@ Now a `stunnel-ollama-embed` sidecar (`docker/stunnel-ollama-embed.conf`,
 `https://noo-stunnel-ollama-embed:11434`. What this pins, from the shipped
 files:
 
-  1. the ONE URL onboard writes for the three standalone pointers
-     (`PAGEINDEX_EMBEDDING_URL`, `OLLAMA_URL`, `PAGEINDEX_LLM_URL`) and the
+  1. the ONE URL onboard writes for the two standalone pointers
+     (`PAGEINDEX_EMBEDDING_URL`, `OLLAMA_URL`; no LLM pointer since i145) and the
      launchers' default are that https door — and the plaintext literal is
      gone from every code line that used to write it;
   2. the leaf: `ollama-embed` is issued by onboard (SVC_LIST), its SANs carry
@@ -90,8 +90,8 @@ def test_onboard_writes_the_https_door_for_every_standalone_pointer(steps_src):
     body = steps_src[steps_src.index("fn apply_topology_env") :]
     body = body[: body.index("\n}\n")]
     keys = re.findall(r'\("(PAGEINDEX_EMBEDDING_URL|OLLAMA_URL|PAGEINDEX_LLM_URL)", (\w+)\)', body)
-    assert sorted(k for k, _ in keys) == ["OLLAMA_URL", "PAGEINDEX_EMBEDDING_URL", "PAGEINDEX_LLM_URL"], (
-        f"apply_topology_env no longer writes the three standalone pointers from the const: {keys}"
+    assert sorted(k for k, _ in keys) == ["OLLAMA_URL", "PAGEINDEX_EMBEDDING_URL"], (
+        f"apply_topology_env no longer writes the two standalone pointers from the const: {keys}"
     )
     for key, value in keys:
         assert value == "STANDALONE_OLLAMA_EMBED_URL", f"{key} is written from {value}, not the door const"

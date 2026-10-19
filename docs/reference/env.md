@@ -329,12 +329,12 @@ The agent does not read `noomesh.yaml`; `noo cluster provision` renders
 | `NOO_SANDBOX_EXTRA` | `0` | extra anonymous sandbox replicas (`sandbox-extra`, same image and hardening as `noo-sandbox`); they share the `sandbox` DNS name, which Docker rotates across them, so `python_exec` calls spread without a client change |
 | `NOO_WORKER_EXTRA` | `0` | extra anonymous worker replicas (`worker-extra`, same image/env as `noo-worker`); they share the `workers` NATS queue group so each request runs once. Measure with `scripts/bench-sessions.py` before raising it |
 | `NOO_TRELLION_DATABASE_URL` | compose-injected (`noo_trellion@postgres/noomesh`) | trellion's own DSN |
-| `NOO_TRELLION_EMBEDDING_URL`, `NOO_TRELLION_LLM_URL`, `NOO_TRELLION_GATEWAY_URL` | compose (all three default to the gateway) | trellion's view of the embedder, the LLM and the gateway. Trellion never dials a backend directly: its embeddings and its LLM calls (graph extraction, answer synthesis, image descriptions) go through the gateway, which routes them over the mesh like any chat |
+| `NOO_TRELLION_EMBEDDING_URL`, `NOO_TRELLION_GATEWAY_URL` | compose (both default to the gateway) | trellion's view of the embedder and the gateway (`NOO_TRELLION_LLM_URL` is retired, i145: its LLM calls use the gateway address). Trellion never dials a backend directly: its embeddings and its LLM calls (graph extraction, answer synthesis, image descriptions) go through the gateway, which routes them over the mesh like any chat |
 | `DATABASE_URL`, `PAGEINDEX_DSN`, `PGVECTOR_URL` | — | DSN, resolved in that order for the Python side. No password in the URL on the gateway or worker: libpq/sqlx take it from `PGPASSFILE` |
 | `PGPASSFILE` | `/run/secrets/pgpass` when the store holds a role password | the pgpass file compose delivers (0400). The launcher derives its body — `noo` + `noo_app` for the gateway, `noo_app` for the worker (`derive_file_secrets`, `scripts/lib-secrets.sh`) |
 | `NOO_PGPASS_GATEWAY`, `NOO_PGPASS_WORKER` | derived | **launcher-process only** — the two pgpass bodies compose copies into the containers; never in `.env`, the store, or any container's environment |
 | `PAGEINDEX_EMBEDDING_URL`, `PAGEINDEX_EMBEDDING_BACKEND`, `PAGEINDEX_EMBEDDING_MODEL`, `EMBEDDING_DIM`, `EMBEDDING_MODEL` | — | embedding (same client rules as the gateway) |
-| `PAGEINDEX_LLM_URL`, `PAGEINDEX_LLM_MODEL` | — | the worker's direct LLM endpoint, and the model name trellion asks the gateway for: `default` (the chat-default class, which a `--pool` declaration spreads across nodes) unless set; a model name is an exact-match hint that pins trellion to the nodes serving it |
+| `PAGEINDEX_LLM_URL`, `PAGEINDEX_LLM_MODEL` | — | **retired** (the launcher warns about a leftover line). The worker and trellion call the gateway as a purpose (`knowledge`, `graph`); which model serves it is a preference in the DB: `noo cluster class set <class> <node>/<backend> --alias knowledge`. Undeclared, a purpose is any live chat node |
 | `NOO_EMBEDDING_BACKPRESSURE_THRESHOLD` | `5000` | pause ingest when the embed queue is deep |
 | `NOO_MIGRATIONS_ENVS` | — | which Alembic envs the migration step runs |
 | `NOO_CONFIG`, `NOO_SETTINGS_FILE` | — | config file path; settings snapshot path |
@@ -367,9 +367,9 @@ lives in its own repository.
 Variables the stack sets for them:
 
 - **trellion** (`docker-compose.trellion.yml`): `NOO_TRELLION_EMBEDDING_URL`,
-  `NOO_TRELLION_LLM_URL`, `NOO_TRELLION_GATEWAY_URL`, `NOO_WORKER_MEM_LIMIT`,
+  `NOO_TRELLION_GATEWAY_URL`, `NOO_WORKER_MEM_LIMIT`,
   `NOO_PROACTIVE_ENABLED`, `CLOUD_DEFAULT_PROVIDER`, `OPENAI_BASE_URL`,
-  `PAGEINDEX_LLM_MODEL`, `TRELLION_EMBED_MAX_INFLIGHT` (requests in flight per
+  `TRELLION_EMBED_MAX_INFLIGHT` (requests in flight per
   process, default 1) and `TRELLION_EMBED_BATCH_MAX` (largest batch, default
   32), the last two set in `noomesh.yaml` `compose_env`. Other `TRELLION_*`
   variables (`TRELLION_ENTITY_QUALITY`, `TRELLION_ENTITY_QUALITY_CONFIG`,

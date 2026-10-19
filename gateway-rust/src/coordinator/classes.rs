@@ -106,6 +106,16 @@ pub const CHAT_DEFAULT: &str = "chat-default";
 /// catalogue can show them as ids a consumer may send.
 pub const BUILTIN_ALIASES: [&str; 2] = ["default", "auto"];
 
+/// Purpose aliases (proposal i145): the fixed names a caller sends instead
+/// of a model name, so which model serves that purpose is a preference in
+/// the DB, not a value in the caller's env. trellion's answers and page
+/// extraction send `knowledge`; the worker's conversation (temporal)
+/// extraction sends `graph`. Undeclared, each one means [`CHAT_DEFAULT`]
+/// (the whole mesh) and is NOT a fallback: no preference was unmet. Unlike
+/// the built-ins they may be declared (`noo cluster class set <class> …
+/// --alias knowledge`), and the declaration wins.
+pub const PURPOSE_ALIASES: [&str; 2] = ["knowledge", "graph"];
+
 /// The node agent's heartbeat cadence (node-agent-go `config.HeartbeatInterval`
 /// default, seconds). A record older than twice this is a node the gateway
 /// is not hearing from; its candidates sort after the ones it is.
@@ -709,6 +719,11 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
     for (a, c) in &decl.aliases {
         if !aliases.iter().any(|(x, _)| x == a) {
             aliases.push((a.clone(), c.clone()));
+        }
+    }
+    for p in PURPOSE_ALIASES {
+        if !aliases.iter().any(|(x, _)| x.eq_ignore_ascii_case(p)) {
+            aliases.push((p.to_string(), CHAT_DEFAULT.to_string()));
         }
     }
     let mut node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
@@ -1994,6 +2009,32 @@ mod tests {
         for alias in BUILTIN_ALIASES {
             assert_eq!(first_node(&select_with(&t, Some(alias), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
         }
+    }
+
+    /// i145: a caller sends a purpose, the DB says what it means. Undeclared,
+    /// a purpose is the whole mesh and NOT a fallback; declared, it is that
+    /// preference first and the mesh behind it.
+    #[test]
+    fn a_purpose_alias_is_the_mesh_until_declared_and_then_a_preference() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        for p in PURPOSE_ALIASES {
+            let sel = select_with(&t, Some(p), None, false, &|_| false, &idle, &fresh).unwrap();
+            assert_eq!(sel.class, CHAT_DEFAULT, "{p}");
+            assert_eq!(sel.label, "chat-default(dynamic)", "{p}");
+            assert!(sel.candidates.iter().all(|c| !c.rank.starts_with("fallback,")), "{p}: no preference was unmet: {:?}", sel.candidates);
+        }
+        assert!(t.ids().iter().any(|i| i == "knowledge") && t.ids().iter().any(|i| i == "graph"), "{:?}", t.ids());
+        // Declared: `knowledge` prefers pop-os's model, mcmini stays behind it.
+        let decl = Declarations { classes: vec![], aliases: vec![("knowledge".into(), "gemma4:e2b-it-qat".into())] };
+        let t = build_table(&incident(), &[], &decl);
+        let sel = select_with(&t, Some("knowledge"), None, false, &|_| false, &idle, &fresh).unwrap();
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["pop-os", "mcmini"], "{:?}", sel.candidates);
+        assert!(sel.candidates[1].rank.starts_with("fallback,"), "{:?}", sel.candidates[1]);
+        // `graph` is still undeclared: the mesh, best node first.
+        assert_eq!(first_node(&select_with(&t, Some("graph"), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        // Purposes are declarable (the built-ins are not).
+        assert!(valid_name("knowledge").is_ok());
     }
 
     #[test]

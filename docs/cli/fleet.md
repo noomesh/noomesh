@@ -203,6 +203,17 @@ prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 candidates in order (`!` when only CPU candidates or one node remain, `x`
 when none).
 
+**Purposes.** Stack services name a purpose instead of a model:
+trellion's answers and ingestion send `knowledge`, conversation
+extraction sends `graph`. `class list` shows them as `(purpose)` aliases.
+Undeclared, a purpose means `chat-default` (any live chat node) and is not
+a fallback. To prefer a model for one, give a class the purpose as an
+alias; the mesh still answers behind it when that class cannot:
+
+```sh
+noo cluster class set knowledge-big node-1/vllm --alias knowledge
+```
+
 To prefer one node for a request, name it: a `node` field in the body or an
 `X-Noo-Node` header on `/v1/chat/completions`,
 `/api/external/chat/completions` or `/api/inference` (`noo inference run

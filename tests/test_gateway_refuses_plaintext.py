@@ -180,7 +180,9 @@ def test_the_scheme_sites_that_used_to_follow_the_env_are_unconditional() -> Non
         # adapter in process the earlier change, so it builds no scheme.
         "src/noomesh/gateway/helpers.py": 'return f"https://127.0.0.1:{port}"',
         "src/noomesh/cli_utils.py": 'return "https://localhost:8080"',
-        "src/noomesh/workers/graph.py": '"https://noo-vllm:8000"',
+        # workers/graph.py left this list (i145): it calls the gateway through
+        # llm_purposes, which builds the one https address.
+        "src/noomesh/llm_purposes.py": 'or "https://gateway:8080"',
         "src/noomesh/_providers/backend_resolver.py": 'return f"https://{ip}:{port}"',
         "src/noomesh/cluster/messaging.py": '"tls://localhost:4222"',
         "src/noomesh/secrets.py": '"rediss://localhost:6379"',

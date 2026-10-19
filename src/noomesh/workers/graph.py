@@ -56,24 +56,21 @@ def _get_temporal_extractor():
         extractor_factory = provider(CONVERSATION_EXTRACTOR)
         engine = rag.store._engine  # PageIndexStore async engine
         graph = graph_store_factory(engine)
-        # Use the same vLLM endpoint used by the coordinator
-        import os
-        # vLLM serves TLS itself (client certificate required); there is
-        # no plain door on the compose network to default to.
-        llm_url = os.getenv("PAGEINDEX_LLM_URL", "https://noo-vllm:8000")
+        # Through the gateway, as the `graph` purpose (i145): mesh-routed with
+        # failover, and which model extracts is a preference in the DB. It
+        # used to dial the controller's own vLLM directly (PAGEINDEX_LLM_URL
+        # and VLLM_MODEL): one node, no fallback.
+        from .. import llm_purposes
         from ..config import get_config
         tg_cfg = None
         try:
-            cfg = get_config()
-            model = cfg.cluster.backends.get("vllm", None)
-            model_name = getattr(model, "model", None) or os.getenv("VLLM_MODEL", "")
-            tg_cfg = cfg.temporal_graph
+            tg_cfg = get_config().temporal_graph
         except Exception:
-            model_name = os.getenv("VLLM_MODEL", "")
+            pass
         extractor_kwargs: dict[str, Any] = {
             "graph_store": graph,
-            "llm_url": llm_url,
-            "model": model_name or "google/gemma-4-E4B-it",
+            "llm_url": llm_purposes.gateway_url(),
+            "model": llm_purposes.GRAPH,
         }
         if tg_cfg is not None:
             extractor_kwargs.update(

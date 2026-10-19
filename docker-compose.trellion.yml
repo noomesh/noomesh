@@ -278,25 +278,15 @@ x-trellion-env: &trellion-env
   # trellion warns-and-ignores non-gateway backends; no tei default.
   PAGEINDEX_EMBEDDING_BACKEND: '${PAGEINDEX_EMBEDDING_BACKEND:-}'
   PAGEINDEX_EMBEDDING_MODEL: '${PAGEINDEX_EMBEDDING_MODEL:-}'
-  # Same shape for the LLM (2026-09-09): NOT ${PAGEINDEX_LLM_URL}. That
-  # value names a backend the WORKER dials directly; trellion's graph
-  # extraction, answer synthesis and image descriptions go through the
-  # gateway's /v1/chat/completions instead, which resolves the backend
-  # over the mesh exactly as the chat channels do (a placement on any
-  # node, role=chat, PAGEINDEX_LLM_MODEL as the exact-match hint) and
-  # carries the node credential for the last hop that trellion never
-  # had. Pointed straight at a backend, extraction was pinned to the
-  # controller's own ollama and shared the GPU with every chat
-  #. Override with NOO_TRELLION_LLM_URL to target
-  # something other than the gateway.
-  PAGEINDEX_LLM_URL: '${NOO_TRELLION_LLM_URL:-https://gateway:8080}'
-  # `default` = the gateway's chat-default class (2026-10-16), not one
-  # model's exact name: an exact name is served only where that model is
-  # placed, so every answer and extraction queued on one node while others
-  # sat idle. Declare chat-default as a pool (`noo cluster class set
-  # chat-default … --pool`) and trellion spreads with the rest of the mesh;
-  # set PAGEINDEX_LLM_MODEL to a model or class name to steer it instead.
-  PAGEINDEX_LLM_MODEL: '${PAGEINDEX_LLM_MODEL:-default}'
+  # No LLM URL or model here (i145). trellion's graph extraction, answer
+  # synthesis and image descriptions go through the gateway's
+  # /v1/chat/completions (2026-09-09: pointed straight at a backend they
+  # were pinned to the controller's own ollama) as the `knowledge` purpose;
+  # which model answers is a preference in the DB (`noo cluster class set
+  # … --alias knowledge`), the mesh when nothing is declared. The worker
+  # pool hands trellion the gateway address and the purpose, so no env
+  # value restates either. A PAGEINDEX_LLM_* line left in .env does nothing;
+  # the launcher warns (scripts/retired-env-keys).
   # harrier / 1024: the default embedder and trellion's vector(1024) DDL.
   EMBEDDING_MODEL: '${EMBEDDING_MODEL:-harrier}'
   EMBEDDING_DIM: '${EMBEDDING_DIM:-1024}'

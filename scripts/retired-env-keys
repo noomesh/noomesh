@@ -21,3 +21,6 @@ NOO_INTEL_IMAGE|a licensed add-on runs only the image its own signed lock pins (
 NOO_EVOLVE_IMAGE|a licensed add-on runs only the image its own signed lock pins (addons.lock, written by noo addons upgrade); there is no override
 NOO_INTEL_IMAGE_PREFIX|the add-on registry comes from the entitlement's add-on trust block, and its images are pinned by digest (noo addons upgrade)
 NOO_EVOLVE_IMAGE_PREFIX|the add-on registry comes from the entitlement's add-on trust block, and its images are pinned by digest (noo addons upgrade)
+PAGEINDEX_LLM_URL|the worker's LLM calls go through the gateway as a purpose (knowledge, graph), mesh-routed with failover (i145)
+PAGEINDEX_LLM_MODEL|which model serves trellion is a preference in the DB: noo cluster class set <class> <node>/<backend> --alias knowledge (undeclared = any live chat node) (i145)
+NOO_TRELLION_LLM_URL|trellion's LLM calls go to the gateway address (NOO_TRELLION_GATEWAY_URL), as the knowledge purpose (i145)
