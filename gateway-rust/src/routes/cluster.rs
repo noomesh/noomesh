@@ -102,6 +102,8 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/cluster/maintenance", get(crate::maintenance::maintenance_list))
         .route("/api/cluster/nodes/{node_id}/restart-agent", post(restart_node_agent))
+        // "control over bus" verify row: one health round trip over NATS.
+        .route("/api/cluster/nodes/{node_id}/control-probe", get(control_probe))
         .route("/api/cluster/nodes/{node_id}/pull", post(pull_node_artifact))
         .route("/api/cluster/nodes/{node_id}/clean", post(clean_node))
         // Shared-GPU operator hold (node agent `internal/gpuyield`).
@@ -1416,8 +1418,16 @@ fn node_stats(nodes: &[Value], offline_merge_error: Option<&str>) -> Value {
 
 /// List all cluster nodes — dashboard-expected format.
 pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson {
-    let (nodes, offline_merge_error) = collect_cluster_nodes(&state).await;
+    let (mut nodes, offline_merge_error) = collect_cluster_nodes(&state).await;
     let stats = node_stats(&nodes, offline_merge_error.as_deref());
+    // Control calls by transport since this gateway started, per node: the
+    // number the "outbound-only" gate (i131 phase 3) reads. Zeros for a node
+    // this gateway has not called.
+    for n in nodes.iter_mut() {
+        if let Some(id) = n.get("id").and_then(Value::as_str).map(str::to_string) {
+            n["control_calls"] = crate::node_rpc::counts_json(&id);
+        }
+    }
 
     Json(json!({
         "nodes": nodes,
@@ -1962,6 +1972,26 @@ pub(crate) async fn restart_agent_via_rail(
             Err(format!("Failed to contact node agent: {e}"))
         }
     }
+}
+
+/// GET /api/cluster/nodes/{node_id}/control-probe
+///
+/// One `health` round trip over the bus, for `noo cluster verify`'s "control
+/// over bus" row. Never falls back to HTTPS: the point is to learn whether
+/// the BUS works. A node that does not advertise `nats_rpc` answers
+/// `checked: false` (the row reads NOT CHECKED, never ok).
+async fn control_probe(
+    State(state): State<Arc<AppState>>,
+    caller: Option<axum::Extension<crate::auth::ClusterNode>>,
+    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> AppResult {
+    super::operator_read_guard(&requester)?;
+    if caller.is_some() {
+        return Err(AppError::Forbidden("a node may not probe the controller's control paths".into()));
+    }
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
+    Ok(Json(link.probe_bus().await))
 }
 
 /// Proxy an artifact pull to a node's `/pull` endpoint.

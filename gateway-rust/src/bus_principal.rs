@@ -694,6 +694,8 @@ mod publish_sites {
         "agent_messages.rs",
         "routes/admin.rs",
         "routes/cluster.rs",
+        // Control over the bus (i131): publishes `node.<id>.rpc.<op>`, never `worker.*`.
+        "node_rpc.rs",
         "autonomy_loop.rs",
         "bus.rs",
     ];
