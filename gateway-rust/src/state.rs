@@ -763,10 +763,10 @@ mod pg_tls_url_tests {
         assert_eq!((c.as_str(), k.as_str()), (format!("{dir}/noo_app.crt").as_str(), format!("{dir}/noo_app.key").as_str()));
         let out = complete_pg_tls("postgresql://noo_app:pw@postgres:5432/db".into(), &ca, &c, &k);
         assert!(out.contains(&format!("sslcert={dir}/noo_app.crt")) && !out.contains(&gw_cert), "{out}");
-        assert!(pg_role_leaf("postgresql://noo@postgres/db", &dir).is_none(), "no leaf for `noo` here: fall back");
-        assert!(pg_role_leaf("postgresql://../x@postgres/db", &dir).is_none());
-        assert!(pg_role_leaf("postgresql://noo_app@postgres/db", "").is_none(), "no NOO_TLS_PG_DIR: unchanged behaviour");
-        assert!(pg_role_leaf("postgresql://postgres/db", &dir).is_none(), "no user in the DSN");
+        assert!(crate::state::pg_role_leaf("postgresql://noo@postgres/db", &dir).is_none(), "no leaf for `noo` here: fall back");
+        assert!(crate::state::pg_role_leaf("postgresql://../x@postgres/db", &dir).is_none());
+        assert!(crate::state::pg_role_leaf("postgresql://noo_app@postgres/db", "").is_none(), "no NOO_TLS_PG_DIR: unchanged behaviour");
+        assert!(crate::state::pg_role_leaf("postgresql://postgres/db", &dir).is_none(), "no user in the DSN");
         let _ = gw_key;
     }
 
