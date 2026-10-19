@@ -177,6 +177,23 @@ pub struct BudgetCheck {
     /// once: the check that returns it clears it.
     #[serde(default)]
     pub clarification: Option<Clarification>,
+    /// Context the owner added since the last loop (i143 C), already
+    /// phrased as "The owner updated this task's context (revision N): …".
+    /// Handed over once, like `clarification`: the check that returns it
+    /// marks it applied. A runner prepends it to the loop's prompt
+    /// ([`with_context`]). An older harness does not know the field and
+    /// ignores it (serde skips unknown fields), so the revision is marked
+    /// applied but that harness's loop never sees it.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// The loop prompt with the owner's new context in front, when there is some.
+pub fn with_context(prompt: String, context: Option<&str>) -> String {
+    match context.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => format!("{c}\n\n{prompt}"),
+        None => prompt,
+    }
 }
 
 impl BudgetCheck {
@@ -339,6 +356,15 @@ pub async fn check(state: &AppState, task_id: &str) -> Result<BudgetCheck> {
         }
         Verdict::Proceed => {
             let handed = if clarification.is_some() { take_clarification(db, task_id).await? } else { None };
+            // The owner's new context, once (i143 C). A read failure leaves
+            // the revisions unapplied for the next boundary.
+            let context = match crate::task_context::take_pending(db, task_id).await {
+                Ok(c) => c.map(|(rev, text)| crate::task_context::preamble(rev, &text)),
+                Err(e) => {
+                    tracing::warn!(task = task_id, error = %e, "task_budget: pending context not read");
+                    None
+                }
+            };
             Ok(BudgetCheck {
                 proceed: true,
                 reason: None,
@@ -346,6 +372,7 @@ pub async fn check(state: &AppState, task_id: &str) -> Result<BudgetCheck> {
                 remaining_allowance: allowance.as_ref().map(AllowanceSpend::remaining),
                 state: task.state.clone(),
                 clarification: handed,
+                context,
             })
         }
     }
@@ -504,6 +531,8 @@ pub async fn ask(state: &AppState, task: &Task, question: &str) -> Result<(), Re
         return Err(Refusal::Conflict(format!("task {} changed under the question; read it again", task.id)));
     }
     post(state, task, "note", json!({"text": q, "task_id": task.id, "question": true, "loop": task.loops})).await;
+    // i143 D: the question, to an add-on's task's event stream.
+    crate::task_events::emit_logged(&state.db, &task.id, "question", json!({"question": q})).await;
     Ok(())
 }
 

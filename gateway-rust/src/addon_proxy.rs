@@ -1328,6 +1328,56 @@ pub async fn call(addon: &str, route_name: &str, body: Option<Value>) -> CallOut
     }
 }
 
+/// What the add-on answered to a pushed task event.
+pub struct EventPost {
+    /// The HTTP status, or `None` when nothing was sent or nothing came back.
+    pub status: Option<u16>,
+    /// The parsed JSON body, when there was one.
+    pub body: Option<Value>,
+    /// A short reason for a log line when the push did not succeed.
+    pub detail: String,
+}
+
+/// Push one task event to the add-on's manifest `task_events` route (i143 D).
+///
+/// Same gates as [`forward`] (the add-on must be enabled, HTTPS only, the
+/// cluster client certificate), the gateway's caller bearer, and the
+/// `X-Noo-Requester-*` headers set to `requester` (the task's OWNER). It
+/// returns what happened instead of a `Response`: the caller is the delivery
+/// loop, which decides on the status.
+pub async fn post_task_event(
+    entry: &crate::addon_registry::AddonEntry,
+    spec: &TaskEventsSpec,
+    requester: &crate::auth::RequesterCtx,
+    body: &Value,
+) -> EventPost {
+    let manifest = entry.manifest();
+    let fail = |detail: String| EventPost { status: None, body: None, detail };
+    if !crate::addons::enabled(&manifest.addon) {
+        return fail(format!("add-on {} is {}", manifest.addon, crate::addons::health_word(&manifest.addon)));
+    }
+    let base = entry.upstream();
+    if let Some(reason) = plaintext_refusal(&manifest.addon, &manifest.base_url_env, &base) {
+        return fail(reason);
+    }
+    let url = format!("{}{}", base.trim_end_matches('/'), spec.path);
+    let method = reqwest::Method::from_bytes(spec.method.to_ascii_uppercase().as_bytes()).unwrap_or(reqwest::Method::POST);
+    let timeout = std::time::Duration::from_secs(manifest.timeout_secs.clamp(1, 30));
+    let mut req = crate::tls::cluster_client().request(method, &url).timeout(timeout);
+    for (name, value) in caller_headers(Some(requester)) {
+        req = req.header(name, value);
+    }
+    match req.json(body).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&text).ok();
+            EventPost { status: Some(status), body: parsed, detail: format!("{} answered {status}", container_of(&manifest.addon)) }
+        }
+        Err(e) => fail(format!("{} unreachable: {e}", container_of(&manifest.addon))),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
