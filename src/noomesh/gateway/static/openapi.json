@@ -18734,6 +18734,29 @@
           }
         }
       }
+    },
+    "/api/cluster/nodes/{node_id}/control-probe": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get control probe",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/control-probe",
+        "operationId": "control_probe",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
