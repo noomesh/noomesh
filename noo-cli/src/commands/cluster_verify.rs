@@ -4744,7 +4744,7 @@ fn with_warmup_json(checks: &mut Value, name: &str, seen: Option<&warmup::Warmup
     }
 }
 
-/// After `provision --wait` reports applied: an enrolment is not done until
+/// After `provision --wait` reports applied: an enrollment is not done until
 /// the node verifies. Prints the table; the caller decides the exit code.
 pub(crate) fn verify_node_after_apply(g: &Globals, node: &str) -> bool {
     // "Applied" means the agent RESTARTED on the new build a moment ago; its
@@ -4791,7 +4791,7 @@ pub(crate) fn heard_since(n: &Value, since: i64) -> bool {
 
 /// The human Seats section header, by what the seat registry returned:
 /// `None` (an older gateway without one) prints nothing; an empty registry
-/// prints the section with one line naming the verb that enrols a seat.
+/// prints the section with one line naming the verb that enrolls a seat.
 pub(crate) fn seats_heading(count: Option<usize>) -> Option<(String, Option<&'static str>)> {
     let n = count?;
     Some((format!("Seats ({n})"), (n == 0).then_some(NO_SEATS_LINE)))

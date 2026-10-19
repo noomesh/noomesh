@@ -1,4 +1,4 @@
-# Kiosk displays: set up, enrol as a seat, keep current
+# Kiosk displays: set up, enroll as a seat, keep current
 
 A kiosk is a screen with no keyboard that shows the dashboard's `/kiosk.html`
 from the controller: a Linux box running `cage` + Chromium under systemd, a
@@ -26,7 +26,7 @@ noo kiosk status
 `--mode dedicated` hands the box to the display (tty1, no desktop login);
 `--mode shared` leaves a laptop usable and puts the display on its own VT.
 
-## 2. Enrol it as a seat
+## 2. Enroll it as a seat
 
 On the **controller**, mint a one-time seat token:
 
@@ -35,11 +35,20 @@ noo kiosk seat-token lobby
 ```
 
 It prints one line, `noo kiosk enroll noo-seat1.<blob>`. The blob carries the
-controller URL, the single-use token (default lifetime one hour, `--ttl` to
+controller URL (see below), the single-use token (default lifetime one hour, `--ttl` to
 change it, at most 24h), the cluster CA fingerprint and the fleet signing
-public key. A seat token cannot enrol a node, and a node's enrolment paste
-cannot enrol a seat: `noo enroll` refuses a `noo-seat1.` blob and
+public key. A seat token cannot enroll a node, and a node's enrollment paste
+cannot enroll a seat: `noo enroll` refuses a `noo-seat1.` blob and
 `noo kiosk enroll` refuses a `noo1.` one.
+
+The controller URL in the paste is the controller's HTTPS front door, the
+`tailscale serve` address `noo` prints as "Dashboard"
+(`https://<controller>.<tailnet>.ts.net`), whenever that front door serves the
+gateway. That is often the only address a display can reach: the gateway's own
+port 8080 may be closed to it. Only when there is no front door does the paste
+carry `services.gateway_url`. To pick the address yourself, run
+`noo kiosk seat-token lobby --controller https://<address>`. The command prints
+which address it used and why.
 
 On the **display box**, as the same account that ran `noo kiosk setup` (not
 root), paste it:
@@ -63,8 +72,17 @@ This:
    - `noo-seat-sync.service` and `noo-seat-sync.timer`, enabled now.
 
 Nothing after this step needs `sudo`. Add `--controller <url>` when the seat
-reaches the controller by a different address than the one the controller
-advertises. `--dry-run` prints the root script without redeeming the token.
+reaches the controller at a different address from the one in the paste.
+`--dry-run` prints the root script without redeeming the token.
+
+The seat trusts the platform's public root certificates and also the pinned
+cluster CA. It can therefore use either the front door, which has a public
+ts.net certificate, or the gateway port, which has a cluster-CA certificate. A
+certificate from any other private CA is refused. The CA fingerprint check in
+step 1 is unchanged and still ties the paste to this controller. No seat call
+needs a client certificate. Enrollment uses the single-use token, and every
+later call carries a proof signed with the seat's birth key. A front door that
+terminates TLS therefore has nothing to strip.
 
 ## 3. Keep it current
 
@@ -130,7 +148,7 @@ A seat that is off during an upgrade picks up its bundle on the next boot.
 |---|---|
 | "never heard from since it enrolled" | on the seat: `systemctl status noo-seat-sync.timer`, `journalctl -u noo-seat-sync -n 30` |
 | `decrypt failed` in the apply report | the seat's birth key changed (re-enrolled elsewhere?); mint a new token and run `noo kiosk enroll` again |
-| `signature does not verify` | the seat's `signing.pub` is older than every key the controller still holds; re-enrol |
+| `signature does not verify` | the seat's `signing.pub` is older than every key the controller still holds; re-enroll |
 | `seat cli` warns that `~/.local/bin/noo` differs | the seat user runs `noo` from another path; put `~/.local/bin` first on `PATH` |
 | `display` FAIL, console build behind | on the seat: `noo kiosk reload` |
 

@@ -21,7 +21,11 @@
 //! 1. controller: `noo kiosk seat-token <seat>` mints a one-time `role=seat`
 //!    token and prints `noo kiosk enroll noo-seat1.<blob>` (the blob carries
 //!    the controller URL, the token, the cluster CA pin and the fleet signing
-//!    PUBLIC key — the bundle trust anchor).
+//!    PUBLIC key — the bundle trust anchor). The URL is the controller's
+//!    HTTPS front door when `tailscale serve` fronts the gateway (a seat may
+//!    reach nothing else), else `services.gateway_url`; `--controller`
+//!    overrides. The seat trusts public roots AND the pinned cluster CA, so
+//!    either door works.
 //! 2. seat: `noo kiosk enroll <blob>` pins the CA, generates the birth key,
 //!    redeems the token at `/api/cluster/seat-enroll`, then asks for sudo
 //!    ONCE to install `/etc/noo-seat`, the root copy of the CLI the timer runs
@@ -80,7 +84,7 @@ pub(crate) const SEAT_KINDS: &[&str] = &[
     "seat-meta",
 ];
 
-// ═══ the enrolment blob ═══════════════════════════════════════════════
+// ═══ the enrollment blob ═══════════════════════════════════════════════
 
 /// What `noo kiosk enroll <blob>` needs, in one paste.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +111,10 @@ pub(crate) fn compose_seat_blob(b: &SeatBlob) -> String {
 pub(crate) fn parse_seat_blob(s: &str) -> Result<SeatBlob, String> {
     let s = s.trim();
     if s.starts_with("noo1.") {
-        return Err("this is a NODE enrolment paste (`noo enroll noo1.…`); a seat enrols with \
+        return Err("this is a NODE enrollment paste (`noo enroll noo1.…`); a seat enrolls with \
                     `noo kiosk enroll noo-seat1.…` from `noo kiosk seat-token <seat>` on the controller".into());
     }
-    let b64 = s.strip_prefix(BLOB_PREFIX).ok_or("not a noo-seat1. enrolment blob")?.trim_end_matches('=');
+    let b64 = s.strip_prefix(BLOB_PREFIX).ok_or("not a noo-seat1. enrollment blob")?.trim_end_matches('=');
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(b64)
@@ -144,9 +148,9 @@ pub(crate) fn valid_seat_name(n: &str) -> bool {
     !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-// ═══ seat configuration (written at enrol, root-owned) ════════════════
+// ═══ seat configuration (written at enroll, root-owned) ════════════════
 
-/// `/etc/noo-seat/seat.json`. Root-owned and written once by the enrol step,
+/// `/etc/noo-seat/seat.json`. Root-owned and written once by the enroll step,
 /// so nothing the seat user can change decides where the root applier writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SeatConfig {
@@ -556,15 +560,101 @@ pub(crate) fn carry_browser_line(new: &str, installed: Option<&str>) -> String {
     s
 }
 
+// ═══ the seat's transport: which URL, which roots ═══════════════════════
+
+/// The URL a seat token carries. The operator's `--controller` wins; then
+/// the controller's HTTPS front door (the `tailscale serve` URL `noo` prints
+/// as "Dashboard" — what a kiosk already shows, and the only address a seat
+/// that can reach the tailnet but not the gateway's own port can use); then
+/// the gateway's `services.gateway_url` the mint answered with.
+pub(crate) fn seat_token_url(explicit: Option<&str>, front_door: Option<&str>, gateway: &str) -> (String, &'static str) {
+    let clean = |u: &str| u.trim().trim_end_matches('/').to_string();
+    if let Some(u) = explicit.map(clean).filter(|u| !u.is_empty()) {
+        return (u, "--controller");
+    }
+    if let Some(u) = front_door.map(clean).filter(|u| !u.is_empty()) {
+        return (u, "the controller's HTTPS front door (tailscale serve)");
+    }
+    (clean(gateway), "services.gateway_url (no HTTPS front door is serving the gateway)")
+}
+
+/// A `--controller` the seat can use: https, with a host.
+pub(crate) fn validate_seat_controller(url: &str) -> Result<(), String> {
+    let host = url.strip_prefix("https://").map(|r| r.split('/').next().unwrap_or("")).unwrap_or("");
+    if host.is_empty() {
+        return Err(format!("--controller must be an https:// URL with a host (got {url:?})"));
+    }
+    Ok(())
+}
+
+/// This controller's HTTPS front door, when `tailscale serve` fronts the
+/// gateway (the same check `noo stack status` makes before printing it).
+fn controller_front_door() -> Option<String> {
+    let urls = crate::tailnet_serve::front_door_urls(8080 + crate::envfile::port_offset(), &crate::envfile::instance())?;
+    urls.into_iter().find(|(label, _)| *label == "Dashboard").map(|(_, u)| u)
+}
+
+/// The public roots a seat trusts beside the cluster CA: the platform's
+/// store, or Mozilla's set when the box has none (a minimal image without
+/// `ca-certificates`).
+fn public_roots() -> Vec<ureq::tls::Certificate<'static>> {
+    let native = rustls_native_certs::load_native_certs().certs;
+    if !native.is_empty() {
+        return native.iter().map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned()).collect();
+    }
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter()
+        .map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned())
+        .collect()
+}
+
+/// The roots a seat client trusts: the pinned cluster CA AND `public`. The
+/// union is what lets one seat use either door — the `tailscale serve`
+/// front door (a public ts.net certificate) or the gateway's own port (a
+/// cluster-CA leaf). A certificate from any other private CA is refused.
+///
+/// The CA pin is not weakened by this: the pinned CA still came from the
+/// paste-bound fetch (`fetch_ca_pem`), and nothing a seat sends is a bearer
+/// a different server could replay — enrollment spends a single-use token
+/// bound to this seat's name, and every later call carries a proof signed by
+/// the seat's birth key over (purpose, seat, sha, ts).
+pub(crate) fn seat_agent_with(
+    ca_pem: &[u8],
+    public: Vec<ureq::tls::Certificate<'static>>,
+    timeout: u64,
+) -> Result<ureq::Agent, String> {
+    let ca = ureq::tls::Certificate::from_pem(ca_pem)
+        .map_err(|e| format!("the controller's CA is not a usable certificate: {e}"))?;
+    let mut roots = public;
+    roots.push(ca);
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::new_with_certs(&roots))
+        .build();
+    Ok(ureq::Agent::config_builder()
+        .tls_config(tls)
+        .timeout_global(Some(std::time::Duration::from_secs(timeout)))
+        .http_status_as_error(false)
+        .build()
+        .into())
+}
+
+/// [`seat_agent_with`] over this box's public roots: the client for the
+/// seat-token redeem and every seat rail call.
+pub(crate) fn seat_agent(ca_pem: &[u8], timeout: u64) -> Result<ureq::Agent, String> {
+    seat_agent_with(ca_pem, public_roots(), timeout)
+}
+
 // ═══ commands ═════════════════════════════════════════════════════════
 
-/// `noo kiosk seat-token <seat> [--ttl <1h|30m|secs>]` — on the controller.
+/// `noo kiosk seat-token <seat> [--ttl <1h|30m|secs>] [--controller <url>]` —
+/// on the controller. The paste's URL is chosen by [`seat_token_url`].
 pub fn kiosk_seat_token(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut seat: Option<String> = None;
     let mut ttl: Option<i64> = None;
+    let mut controller: Option<String> = None;
     let mut it = args.iter();
     while let Some(t) = it.next() {
         match t.as_str() {
+            "--controller" => controller = Some(it.next().ok_or(Unhandled)?.trim().trim_end_matches('/').to_string()),
             "--ttl" => ttl = Some(super::cluster_provision::parse_ttl_seconds(it.next().ok_or(Unhandled)?).ok_or(Unhandled)?),
             s if s.starts_with('-') => return Err(Unhandled),
             s if seat.is_none() => seat = Some(s.to_string()),
@@ -573,8 +663,12 @@ pub fn kiosk_seat_token(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     }
     let Some(seat) = seat.filter(|s| valid_seat_name(s)) else {
         fail(g.json, ExitCode::Usage, "usage", "a seat name is required ([a-zA-Z0-9._-], <= 64)",
-            Some("noo kiosk seat-token <seat-name> [--ttl 1h]"));
+            Some("noo kiosk seat-token <seat-name> [--ttl 1h] [--controller https://<controller>.<tailnet>.ts.net]"));
     };
+    if let Some(Err(e)) = controller.as_deref().map(validate_seat_controller) {
+        fail(g.json, ExitCode::Usage, "usage", &e,
+            Some("noo kiosk seat-token <seat-name> --controller https://<controller>.<tailnet>.ts.net"));
+    }
     let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
     if let Err(e) = ca.ensure_signing_key() {
         fail(g.json, ExitCode::Generic, "signing_key", &e, Some("noo security pki status"));
@@ -592,8 +686,11 @@ pub fn kiosk_seat_token(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(v) => v,
         Err(e) => fail(g.json, ExitCode::Generic, "mint_failed", &e, None),
     };
+    let front_door = if controller.is_none() { controller_front_door() } else { None };
+    let (url, url_from) = seat_token_url(controller.as_deref(), front_door.as_deref(),
+        resp["controller_url"].as_str().unwrap_or_default());
     let blob = SeatBlob {
-        url: resp["controller_url"].as_str().unwrap_or_default().to_string(),
+        url,
         token: resp["token"].as_str().unwrap_or_default().to_string(),
         ca: resp["ca_sha256"].as_str().unwrap_or_default().to_string(),
         seat: seat.clone(),
@@ -604,14 +701,16 @@ pub fn kiosk_seat_token(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     }
     let enroll = format!("noo kiosk enroll {}", compose_seat_blob(&blob));
     if g.json {
-        println!("{}", json!({"id": resp["id"], "seat_name": seat, "role": "seat", "expires_at": resp["expires_at"], "enroll_command": enroll}));
+        println!("{}", json!({"id": resp["id"], "seat_name": seat, "role": "seat", "expires_at": resp["expires_at"],
+            "controller_url": blob.url, "controller_url_from": url_from, "enroll_command": enroll}));
         return Ok(0);
     }
     println!("{}", ui::header("kiosk seat token", Some(&seat)));
+    println!("{}", ui::note(&format!("the seat reaches the controller at {} — from {url_from}", blob.url)));
     println!("{}", ui::note("on the seat, as the account that runs `noo` (not root):"));
     ui::value(&enroll);
     println!("{}", ui::note(&format!(
-        "single-use; enrols a SEAT, never a node; expires {} — if the paste leaks, revoke it: \
+        "single-use; enrolls a SEAT, never a node; expires {} — if the paste leaks, revoke it: \
          POST /api/cluster/seat-tokens/{}/revoke",
         resp["expires_at"].as_str().unwrap_or("?"), resp["id"].as_str().unwrap_or("?"))));
     Ok(0)
@@ -637,7 +736,7 @@ fn kiosk_json(env: &BTreeMap<String, String>) -> Value {
     })
 }
 
-/// The systemd units the enrol step installs. Root, oneshot, every minute.
+/// The systemd units the enroll step installs. Root, oneshot, every minute.
 pub(crate) fn render_sync_service() -> String {
     format!(
         "# Written by `noo kiosk enroll <blob>`. The seat's rail: a signed heartbeat,\n\
@@ -677,7 +776,7 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The ONE root step of enrolment, as a script: printed in full before it
+/// The ONE root step of enrollment, as a script: printed in full before it
 /// runs, so the operator sees exactly what sudo is asked to do. `work` holds
 /// the files it installs (birth key + cert, CA, signing anchor, config,
 /// units); `exe` is this `noo`.
@@ -731,7 +830,7 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     let usage = "noo kiosk enroll noo-seat1.<blob> [--controller <https://…>]   (the blob comes from `noo kiosk seat-token <seat>` on the controller)";
     let Some(blob) = blob else {
-        fail(g.json, ExitCode::Usage, "usage", "the seat enrolment blob is required", Some(usage));
+        fail(g.json, ExitCode::Usage, "usage", "the seat enrollment blob is required", Some(usage));
     };
     let b = match parse_seat_blob(&blob) {
         Ok(b) => b,
@@ -761,6 +860,9 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::step("fetching the cluster CA and checking it against the paste's pin");
     let ca_pem = match super::enroll::fetch_ca_pem(&url, &b.ca) {
         Ok(p) => p,
+        Err(e) if controller.is_none() && !e.contains("MISMATCH") => fail(g.json, ExitCode::Generic, "ca_pin",
+            &format!("{e} — if this seat reaches the controller only through its HTTPS front door, name it"),
+            Some("noo kiosk enroll <blob> --controller https://<controller>.<tailnet>.ts.net")),
         Err(e) => fail(g.json, ExitCode::Generic, "ca_pin", &e, None),
     };
     // 2. the birth keypair, in a private dir that is shredded on every exit
@@ -805,7 +907,7 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     // 3. redeem
     ui::step("redeeming the seat token");
-    let agent = match super::enroll::ca_agent(&ca_pem, 30) {
+    let agent = match seat_agent(&ca_pem, 30) {
         Ok(a) => a,
         Err(e) => { cleanup(&work); fail(g.json, ExitCode::Generic, "ca_agent", &e, None) }
     };
@@ -1037,7 +1139,7 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             .arg("-in").arg(&enc).arg("-out").arg(&tarp)
             .output().map_err(|e| format!("openssl: {e}"))?;
         if !out.status.success() {
-            return Err(format!("decrypt failed — is this bundle for this seat's birth key? re-enrol if the key changed: {}",
+            return Err(format!("decrypt failed — is this bundle for this seat's birth key? re-enroll if the key changed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()));
         }
         let mut tar = std::fs::read(&tarp).map_err(|e| e.to_string())?;
@@ -1132,7 +1234,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(c) => c,
         Err(e) => { say(&format!("no CA anchor: {e}")); return Ok(78); }
     };
-    let agent = match super::enroll::ca_agent(&ca, 900) {
+    let agent = match seat_agent(&ca, 900) {
         Ok(a) => a,
         Err(e) => { say(&e); return Ok(1); }
     };
@@ -1422,7 +1524,7 @@ mod tests {
             v["role"] = role.clone();
             assert!(parse_seat_blob(&enc(v)).is_err(), "role {role}");
         }
-        assert!(parse_seat_blob("noo1.eyJ2IjoxfQ").unwrap_err().contains("NODE enrolment"));
+        assert!(parse_seat_blob("noo1.eyJ2IjoxfQ").unwrap_err().contains("NODE enrollment"));
         let mut v = base.clone();
         v["role"] = json!("seat");
         v["seat"] = json!("../etc");
@@ -1629,10 +1731,194 @@ mod tests {
         assert!(s.contains("install -m 0600 -o root -g root '/tmp/w/birth.key' /etc/noo-seat/birth.key"));
         assert!(s.contains(SEAT_APPLIER_BIN));
         assert!(s.contains("systemctl enable --now noo-seat-sync.timer"));
-        // Nothing node-shaped is installed by a seat's enrolment.
+        // Nothing node-shaped is installed by a seat's enrollment.
         for n in ["noo-node-agent", "noo-hostd", "noo-apply", "noo-fetch", "sudoers", "/etc/noo/"] {
             assert!(!s.contains(n), "{n}");
         }
         assert!(render_sync_service().contains("ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"));
+    }
+
+    // ── the seat's transport: token URL + trust union ──────────────────
+
+    #[test]
+    fn the_token_url_prefers_the_override_then_the_front_door_then_the_gateway() {
+        let gw = "https://ctl.tail.ts.net:8080";
+        let fd = Some("https://ctl.tail.ts.net/");
+        let (u, from) = seat_token_url(Some("https://other.tail.ts.net/"), fd, gw);
+        assert_eq!(u, "https://other.tail.ts.net");
+        assert_eq!(from, "--controller");
+        let (u, from) = seat_token_url(None, fd, gw);
+        assert_eq!(u, "https://ctl.tail.ts.net", "the front door wins over the gateway port");
+        assert!(from.contains("front door"), "{from}");
+        let (u, from) = seat_token_url(None, None, gw);
+        assert_eq!(u, gw, "no front door: services.gateway_url");
+        assert!(from.contains("gateway_url"), "{from}");
+        // An empty override or front door is no answer at all.
+        assert_eq!(seat_token_url(Some("  "), Some(""), gw).0, gw);
+        // A named instance's front door keeps its mount path (serve strips it).
+        assert_eq!(seat_token_url(None, Some("https://ctl.tail.ts.net/obtest"), gw).0, "https://ctl.tail.ts.net/obtest");
+    }
+
+    #[test]
+    fn a_controller_override_must_be_https_with_a_host() {
+        assert!(validate_seat_controller("https://ctl.tail.ts.net").is_ok());
+        assert!(validate_seat_controller("https://ctl.tail.ts.net:8080").is_ok());
+        for bad in ["http://ctl.tail.ts.net", "ctl.tail.ts.net", "https://", "https:///x"] {
+            assert!(validate_seat_controller(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_seat_rail_never_goes_back_to_the_cluster_ca_only_client() {
+        // Every seat call (redeem, heartbeat, fetch, fetched, applied) rides
+        // `seat_agent`; the node's `ca_agent` trusts the cluster CA alone and
+        // refuses the front door's public certificate (homeserver, 10-17).
+        let src = include_str!("kiosk_seat.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(!prod.contains("enroll::ca_agent("), "a seat call uses the cluster-CA-only client");
+        assert_eq!(prod.matches("seat_agent(&").count(), 2, "redeem + seat-sync both use seat_agent");
+    }
+
+    struct TestCa {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    fn test_ca(name: &str) -> TestCa {
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, name);
+        let key = rcgen::KeyPair::generate().unwrap();
+        TestCa { cert: p.self_signed(&key).unwrap(), key }
+    }
+
+    /// A 127.0.0.1 leaf signed by `ca`.
+    fn leaf(ca: &TestCa) -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
+        let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        p.subject_alt_names.push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        (cert.der().clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+    }
+
+    /// A fake controller door: TLS with `ca`'s leaf, no client-certificate
+    /// request (what `tailscale serve` does), answering 200 `{"status":"ok"}`
+    /// and recording each `<METHOD> <path> <birth-proof?> <body>` it served.
+    fn fake_door(ca: &TestCa) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, Mutex};
+        let (cert, key) = leaf(ca);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = Arc::new(rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(tcp) = tcp else { continue };
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+                let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else { continue };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let len = head.lines()
+                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if buf.is_empty() {
+                    continue; // a refused handshake
+                }
+                let raw = String::from_utf8_lossy(&buf).to_string();
+                let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                let first = head.lines().next().unwrap_or("").to_string();
+                let proof = head.lines().any(|l| l.to_ascii_lowercase().starts_with("x-noo-birth-proof:"));
+                let mut parts = first.split(' ');
+                let line = format!("{} {} {} {body}", parts.next().unwrap_or(""), parts.next().unwrap_or(""),
+                    if proof { "proof" } else { "-" });
+                seen2.lock().unwrap().push(line);
+                let out = r#"{"status":"ok"}"#;
+                let _ = write!(tls, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len());
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        (format!("https://127.0.0.1:{port}"), seen)
+    }
+
+    fn der_cert(ca: &TestCa) -> ureq::tls::Certificate<'static> {
+        ureq::tls::Certificate::from_der(ca.cert.der().as_ref()).to_owned()
+    }
+
+    #[test]
+    fn the_seat_client_trusts_public_roots_and_the_cluster_ca_and_nothing_else() {
+        let cluster = test_ca("noo cluster CA (test)");
+        let public = test_ca("Test Public Root");
+        let stranger = test_ca("someone else's private CA");
+        let agent = seat_agent_with(cluster.cert.pem().as_bytes(), vec![der_cert(&public)], 10).unwrap();
+        let get = |url: &str| agent.get(&format!("{url}/bootstrap/seat/lobby/bundle")).call().map(|r| r.status().as_u16());
+
+        let (front_door, _) = fake_door(&public);
+        assert_eq!(get(&front_door).expect("a public-root front door is trusted"), 200);
+        let (gateway_port, _) = fake_door(&cluster);
+        assert_eq!(get(&gateway_port).expect("the gateway's cluster-CA leaf is still trusted"), 200);
+        let (other, seen) = fake_door(&stranger);
+        let e = get(&other).expect_err("an unrelated private CA must be refused").to_string();
+        assert!(e.contains("UnknownIssuer") || e.to_lowercase().contains("certificate"), "{e}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent to the refused server");
+
+        // The node's cluster-CA-only client is exactly what failed live: it
+        // refuses the front door the seat client accepts.
+        let node_only = super::super::enroll::ca_agent(cluster.cert.pem().as_bytes(), 10).unwrap();
+        let e = node_only.get(&format!("{front_door}/bootstrap/ca.crt")).call().expect_err("cluster CA alone refuses a public cert");
+        assert!(e.to_string().contains("UnknownIssuer"), "{e}");
+    }
+
+    #[test]
+    fn a_seat_enrolls_and_syncs_through_a_public_cert_front_door() {
+        // The homeserver shape: the seat reaches only the `tailscale serve`
+        // door (public cert, no client-certificate request). Redeem, then the
+        // signed rail calls the timer makes, all over the one seat client.
+        let cluster = test_ca("noo cluster CA (test)");
+        let public = test_ca("Test Public Root");
+        let (door, seen) = fake_door(&public);
+        let agent = seat_agent_with(cluster.cert.pem().as_bytes(), vec![der_cert(&public)], 10).unwrap();
+
+        let body = json!({"token": "noo-st-abc", "seat_name": "lobby", "birth_cert": "-----BEGIN CERTIFICATE-----"});
+        let mut r = agent.post(&format!("{door}/api/cluster/seat-enroll")).send_json(&body).expect("redeem over the front door");
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(r.body_mut().read_to_string().unwrap().contains("ok"));
+        for (path, sig) in [("heartbeat", true), ("fetched", true), ("applied", true)] {
+            let st = agent.post(&format!("{door}/bootstrap/seat/lobby/{path}"))
+                .header("content-type", "application/json")
+                .header("x-noo-birth-proof", if sig { "1.c2ln" } else { "" })
+                .send(&br#"{"sha":"x"}"#[..]).expect(path).status().as_u16();
+            assert_eq!(st, 200, "{path}");
+        }
+        let st = agent.get(&format!("{door}/bootstrap/seat/lobby/bundle")).header("x-noo-birth-proof", "1.c2ln").call().unwrap().status().as_u16();
+        assert_eq!(st, 200);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert!(seen[0].starts_with("POST /api/cluster/seat-enroll - ") && seen[0].contains("noo-st-abc"), "{}", seen[0]);
+        for (i, p) in ["heartbeat", "fetched", "applied"].iter().enumerate() {
+            assert!(seen[i + 1].starts_with(&format!("POST /bootstrap/seat/lobby/{p} proof ")), "{}", seen[i + 1]);
+        }
+        assert!(seen[4].starts_with("GET /bootstrap/seat/lobby/bundle proof"), "{}", seen[4]);
     }
 }

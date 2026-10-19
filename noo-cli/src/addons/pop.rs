@@ -15,7 +15,7 @@
 //! The controller's identity is its mesh CA: the entitlement's existing
 //! `bound` field already names the CA fingerprint, the CA lives exactly as
 //! long as the cluster (3650 days; the bundle-signing key rotates on its own
-//! and the self node's birth key is re-minted on re-enrolment), and only this
+//! and the self node's birth key is re-minted on re-enrollment), and only this
 //! CLI reads `ca.key`. None of the cluster's keys is ed25519 (the CA and
 //! `signing.key` are P-384, birth keys RSA-4096), and the proxy speaks
 //! ed25519, so the PoP key is DERIVED from the CA private key, one way and

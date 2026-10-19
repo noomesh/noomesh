@@ -556,7 +556,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
 | `noo cluster scale` | `<backend> -r\|--replicas <n> [-m\|--model <model>] [-y\|--yes]` | Scale a backend to N replicas fleet-wide; scale-down asks for confirmation (-y) |
 | `noo cluster desired` | `<node>` | Show the desired config and every placement (with its role) the node-agent converges to |
-| `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrolment proposals agents filed, with each host in full |
+| `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
