@@ -1,0 +1,10 @@
+{
+  "classes": [
+    { "name": "chat-default", "declared": false, "pool": [], "dynamic": true, "candidates": [], "routing_order": [] },
+    { "name": "fast", "declared": true, "pool": [], "dynamic": false, "candidates": [], "routing_order": [] }
+  ],
+  "aliases": [
+    { "alias": "knowledge", "class": "chat-default", "builtin": true, "purpose": true },
+    { "alias": "graph", "class": "fast", "builtin": true, "purpose": true }
+  ]
+}

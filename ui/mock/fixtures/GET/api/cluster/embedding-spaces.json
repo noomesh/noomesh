@@ -1,0 +1,13 @@
+{
+  "spaces": [
+    {
+      "space": "knowledge",
+      "model": "harrier-embed",
+      "dims": 1024,
+      "default": true,
+      "pool": [{ "node": "prime-01", "backend": "llamacpp", "model": "harrier-embed", "desired_state": "running", "advertising": true }],
+      "live": 1
+    }
+  ],
+  "unmatched": []
+}

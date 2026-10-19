@@ -13,6 +13,7 @@ import { UsagePanel } from '@/features/usage/UsagePanel';
 import { SecurityPanel } from '@/features/security/SecurityPanel';
 import { AutonomyPanel } from '@/features/autonomy/AutonomyPanel';
 import { AdminPanel } from '@/features/admin/AdminPanel';
+import { ModelPrefsPanel } from '@/features/model-prefs/ModelPrefsPanel';
 import { DocsPanel } from '@/features/docs/DocsPanel';
 import { WorkflowPanel } from '@/features/workflow/WorkflowPanel';
 
@@ -29,6 +30,7 @@ export const CORE_PANELS: Record<string, ComponentType> = {
   security: SecurityPanel,
   autonomy: AutonomyPanel,
   admin: AdminPanel,
+  'model-prefs': ModelPrefsPanel,
   docs: DocsPanel,
   workflow: WorkflowPanel,
 };

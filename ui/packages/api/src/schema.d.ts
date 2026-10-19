@@ -10009,6 +10009,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/model-aliases/{alias}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update model aliases
+         * @description [native] PUT /api/cluster/model-aliases/{alias} — point one alias (a purpose such as `knowledge`, or any other) at a class or a served model: `{class}`. That target is tried first and the mesh answers behind it (i145 phase D, `noo cluster prefer`). A target nothing serves is accepted with a note.
+         */
+        put: operations["model_alias_put"];
+        post?: never;
+        /**
+         * Delete model aliases
+         * @description [native] DELETE /api/cluster/model-aliases/{alias} — forget one alias. A purpose then means `chat-default` (the whole mesh) again.
+         */
+        delete: operations["model_alias_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -22732,6 +22756,56 @@ export interface operations {
         };
     };
     embedding_space_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    model_alias_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    model_alias_delete: {
         parameters: {
             query?: never;
             header?: never;
