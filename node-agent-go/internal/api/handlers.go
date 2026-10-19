@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
@@ -103,7 +104,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if auth.IsOwnHarnessLeafWithoutBearer(s.cfg, r) {
 		body[auth.OwnHarnessLeafOnlyField] = true
 	}
-	if !auth.HasValidToken(s.cfg, r) && !auth.IsControllerLeafWithoutBearer(s.cfg, r) {
+	if !auth.IsBusController(r) && !auth.HasValidToken(s.cfg, r) && !auth.IsControllerLeafWithoutBearer(s.cfg, r) {
 		writeJSON(w, http.StatusOK, body)
 		return
 	}
@@ -206,11 +207,17 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 
 	// Return immediately — pull + start runs in background.
 	// The BackendManager polls the health endpoint to know when it's ready.
+	// Over the control bus the outcome is also published on the op's event
+	// stream (node.<id>.evt.<op_id>); over HTTPS the reporter is a no-op and
+	// the outcome is only logged, as before.
+	rep := ctrlrpc.ReporterFrom(r.Context())
 	go func() {
 		if err := s.docker.StartBackend(req.Backend, req.Model, gpuCount, overrides); err != nil {
 			slog.Error("backend start failed", "backend", req.Backend, "error", err)
+			rep.Done(http.StatusInternalServerError, map[string]string{"status": "failed", "backend": req.Backend, "detail": err.Error()})
 		} else {
 			slog.Info("backend started", "backend", req.Backend, "model", req.Model, "image_override", overrides.Image)
+			rep.Done(http.StatusOK, map[string]string{"status": "started", "backend": req.Backend, "model": req.Model})
 		}
 	}()
 

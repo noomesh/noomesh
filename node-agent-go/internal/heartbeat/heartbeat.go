@@ -108,6 +108,10 @@ type Reporter struct {
 	// broken. nil = this agent has no messaging at all.
 	busStatus func() any
 
+	// natsRPC reports whether control over the bus is live on this node
+	// (subscription accepted by the server, no later refusal). nil = false.
+	natsRPC func() bool
+
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
 	gpuContention func() any
@@ -257,6 +261,11 @@ func (r *Reporter) gpuContentionReport() any {
 // every heartbeat as `nats_status`.
 func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
 
+// SetNatsRPC installs the probe behind control_transports.nats_rpc. The
+// agent passes ctrlrpc.Service.Ready, so the field is true only while the
+// node can actually answer a control call on the bus.
+func (r *Reporter) SetNatsRPC(f func() bool) { r.natsRPC = f }
+
 // natsStatus returns the value to send. nil when no provider is installed —
 // a heartbeat that omits the field means "this agent build does not report
 // it", which the gateway must not read as either connected or disconnected.
@@ -292,7 +301,7 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 		// Which control transports this agent offers. Only the HTTPS
 		// listener exists today; the others are reserved for the
 		// node-initiated control plane. Absent = an older agent = listener only.
-		"control_transports": controlTransports(),
+		"control_transports": r.controlTransports(),
 		// The door leaves this node holds. The controller
 		// rebuilds the node record on registration; sending them here keeps
 		// the report from vanishing until the next beat.
@@ -576,7 +585,7 @@ func (r *Reporter) SendHeartbeat() {
 	// gateway drops NOO_NODE_AGENT_TOKEN for this node. An agent that omits
 	// it keeps receiving the bearer — both roll orders stay safe.
 	payload["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
-	payload["control_transports"] = controlTransports()
+	payload["control_transports"] = r.controlTransports()
 
 	// The backend door leaves this node HOLDS under $NOO_PKI_DIR/services/
 	// per door service, the leaf's DNS SANs and NotAfter.
@@ -978,8 +987,11 @@ func servedCertNotAfter(certPath string) int64 {
 func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }
 
 // controlTransports reports how the controller can reach this agent. The
-// HTTPS listener is the only transport that exists; "nats_rpc" and "tunnel"
-// stay false until the node-initiated control plane ships.
-func controlTransports() map[string]bool {
-	return map[string]bool{"https_listener": true, "nats_rpc": false, "tunnel": false}
+// HTTPS listener is always offered; "nats_rpc" is true only while control
+// over the bus is live (the subscription was accepted by the server and no
+// permission refusal has been seen since); "tunnel" stays false until the
+// node-held tunnel ships.
+func (r *Reporter) controlTransports() map[string]bool {
+	rpc := r.natsRPC != nil && r.natsRPC()
+	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": false}
 }
