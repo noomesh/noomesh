@@ -1169,7 +1169,7 @@ fn browser_proxy_path(container_name: &str) -> String {
 /// Add the second credential a proxied browser call carries: the browser
 /// door's bearer (upstream header). The agent's own credential is already on
 /// the request, applied by the `NodeLink` it was built from.
-fn browser_proxied(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+fn browser_proxied(mut req: crate::node_link::NodeRequest) -> crate::node_link::NodeRequest {
     if let Some((_, bearer)) = browser_auth_header() {
         req = req.header(UPSTREAM_AUTH_HEADER, bearer);
     }
