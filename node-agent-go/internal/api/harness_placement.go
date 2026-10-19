@@ -19,6 +19,12 @@ type HarnessPlacement struct {
 	Env          map[string]string `json:"env"`
 	DesiredState string            `json:"desired_state"`
 	Placed       bool              `json:"placed"`
+	// Profile is the node's resolved harness profile exactly as the
+	// controller sent it in desired-config (stream_idle_secs, thinking,
+	// claude_prompt, ...: the harness applies those), omitted when the node
+	// has none. It holds no secret: the controller's resolution is numbers,
+	// enums and kind names.
+	Profile json.RawMessage `json:"profile,omitempty"`
 }
 
 // SetHarnessPlacement installs the provider of the node's desired harness

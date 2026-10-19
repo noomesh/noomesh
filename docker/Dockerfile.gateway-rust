@@ -127,6 +127,9 @@ COPY tests/fixtures/own_image_cases.json /tests/fixtures/own_image_cases.json
 # The harness kinds table (src/harness_kinds.rs include_str!s it as
 # ../../config/harness-kinds.json); the node agent embeds a copy of it.
 COPY config/harness-kinds.json /config/harness-kinds.json
+# The harness profile defaults per tier (src/harness_profile.rs include_str!s
+# it as ../../config/harness-profiles.json).
+COPY config/harness-profiles.json /config/harness-profiles.json
 # The provisioned Grafana dashboards: src/routes/grafana_ds.rs include_str!s
 # each one as ../../../configs/grafana/dashboards/… and builds the read-only
 # tier's query allow-list from them. One line per file;

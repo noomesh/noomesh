@@ -15,9 +15,12 @@
 //! - [`probe`]: `noo-gateway harness probe`, one run of a kind's real CLI
 //!   through the driver's own env, launch recipe, jail and spawn, against
 //!   the node's model or the scripted [`probe_mock`] model.
+//! - [`profile`]: the node's harness profile from `/harness/placement`
+//!   (stream idle, thinking, the Claude Code launch variant).
 
 pub mod driver;
 pub mod jail;
 pub mod probe;
 pub mod probe_mock;
+pub mod profile;
 pub mod translator;

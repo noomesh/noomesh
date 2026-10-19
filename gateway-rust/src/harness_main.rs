@@ -22,8 +22,16 @@
 //! | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type |
 //! | `NOO_HARNESS_MAX_TURNS` | concurrent turns (default 8) |
 //! | `NOO_HARNESS_KIND` | the loop: `noo` (default) runs ours; any other kind runs that vendor's headless CLI through [`crate::harness::driver`] |
-//! | `NOO_HARNESS_THINKING` | `on`/`off`/`auto` (default): reasoning control for every model call; else read from the placement's env |
-//! | `NOO_BACKEND_STREAM_IDLE_SECS` | how long a streamed model answer may go silent before it counts as cut (default 120) |
+//! | `NOO_HARNESS_THINKING` | `on`/`off`/`auto` (default): reasoning control for every model call; else the placement's env, else the profile's `thinking` |
+//! | `NOO_BACKEND_STREAM_IDLE_SECS` | how long a streamed model answer may go silent before it counts as cut; else the placement's env, else the profile's `stream_idle_secs`, else 300 |
+//!
+//! The node's harness profile (`profile` in the agent's `/harness/placement`
+//! answer, resolved by the gateway from the node's tier, measured speed and
+//! overrides; [`crate::harness::profile`]) fills what the env and the
+//! placement leave unset: `thinking`, `stream_idle_secs` (fixed at start for
+//! the whole process, `tls::set_stream_idle_override`; a later change waits
+//! for the next restart) and `claude_prompt` (full or slim Claude Code,
+//! re-read every minute with the rest).
 //!
 //! openapi-drift: not-gateway-routes — this is the harness entry point: it mounts nothing on the
 //! gateway's listener, and its tests stand up a fake NODE AGENT (`/harness/placement`) whose
@@ -169,35 +177,39 @@ pub async fn run() -> Result<()> {
         }
     };
     tracing::info!("harness: kind={kind} source={source}");
+    // The placement once more, for the env keys and the node's harness
+    // profile. Read BEFORE anything builds a stream client: the profile's
+    // stream idle bound is fixed for the process here.
+    let placement = read_placement(&model_url, &client).await;
+    let profile = profile_of(&placement);
+    match &profile {
+        Some(p) => tracing::info!(
+            tier = ?p.tier, first_byte_secs = ?p.first_byte_secs, stream_idle_secs = ?p.stream_idle_secs,
+            thinking = ?p.thinking, ollama_context = ?p.ollama_context, claude_prompt = ?p.claude_prompt,
+            foreign_kinds = ?p.foreign_kinds, "harness: profile from the node agent"
+        ),
+        None => tracing::info!("harness: no harness profile from the node agent; built-in defaults"),
+    }
+    let started_idle = {
+        let env_idle = std::env::var(crate::tls::STREAM_IDLE_ENV).ok();
+        let placement_idle = placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(|p| placement_env(p, crate::tls::STREAM_IDLE_ENV));
+        let (secs, idle_source) =
+            crate::harness::profile::resolve_stream_idle(env_idle.as_deref(), placement_idle.as_deref(), profile.as_ref());
+        if let Some(secs) = secs {
+            if !crate::tls::set_stream_idle_override(Duration::from_secs(secs)) {
+                tracing::warn!(seconds = secs, "harness: the stream idle bound was already fixed; the profile's value is not applied");
+            }
+        }
+        tracing::info!("harness: stream_idle={}s source={idle_source}", crate::tls::stream_idle().as_secs());
+        secs
+    };
     // NOO_HARNESS_THINKING for every model call this harness makes, ours
     // and a foreign CLI's (the translator): the process env, else the
-    // placement's env, else `auto`. Decided once, at start.
+    // placement's env, else the profile, else `auto`.
     let (thinking, thinking_source) =
-        resolve_thinking(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &model_url, &client).await;
+        thinking_after_read(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &placement);
     coordinator::thinking::set_process_mode(thinking);
     tracing::info!("harness: thinking={thinking:?} source={thinking_source}");
-    // A placement env change does not restart the harness (only a kind
-    // change does), so re-read it every minute: `noo cluster place <node>
-    // harness <model> --env NOO_HARNESS_THINKING=off` then lands within one.
-    {
-        let client = client.clone();
-        let model_url = model_url.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let (mode, source) =
-                    resolve_thinking(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &model_url, &client).await;
-                if source == "unreachable" {
-                    continue;
-                }
-                if coordinator::thinking::set_process_mode(mode) != Some(mode) {
-                    tracing::info!("harness: thinking={mode:?} source={source} (changed)");
-                }
-            }
-        });
-    }
     let driver: Option<Arc<crate::harness::driver::DriverCtx>> = if kind == "noo" {
         None
     } else {
@@ -219,8 +231,56 @@ pub async fn run() -> Result<()> {
             Ok(r) => tracing::info!(elapsed_ms = r.elapsed.as_millis() as u64, proved = ?r.proved, unproved = ?r.unproved, "harness jail self-test: {r}"),
             Err(r) => tracing::error!(event = "harness_jail_selftest_failed", reason = %r, "harness_jail_selftest_failed: {r}"),
         }
+        // full or slim Claude Code: the profile, else full. Only a kind
+        // with a `launch_slim` is affected.
+        let (variant, variant_source) = crate::harness::profile::resolve_claude_prompt(None, profile.as_ref());
+        ctx.prompt.set(variant);
+        if ctx.launch_slim.is_some() {
+            tracing::info!("harness: claude_prompt={} source={variant_source}", variant.name());
+        }
         Some(Arc::new(ctx))
     };
+    // A placement or profile change does not restart the harness (only a
+    // kind change does), so re-read both every minute: `noo cluster place
+    // <node> harness <model> --env NOO_HARNESS_THINKING=off` or `noo cluster
+    // profile <node> --set claude_prompt=slim` then lands within one. The
+    // stream idle bound is the exception: the stream clients bake it in.
+    {
+        let client = client.clone();
+        let model_url = model_url.clone();
+        let switch = driver.as_ref().filter(|d| d.launch_slim.is_some()).map(|d| d.prompt.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await;
+            let mut idle_warned = false;
+            loop {
+                tick.tick().await;
+                let placement = read_placement(&model_url, &client).await;
+                let (mode, source) =
+                    thinking_after_read(std::env::var(coordinator::thinking::THINKING_ENV).ok(), &placement);
+                if source == "unreachable" {
+                    continue;
+                }
+                if coordinator::thinking::set_process_mode(mode) != Some(mode) {
+                    tracing::info!("harness: thinking={mode:?} source={source} (changed)");
+                }
+                let profile = profile_of(&placement);
+                if let Some(sw) = &switch {
+                    let (variant, src) = crate::harness::profile::resolve_claude_prompt(None, profile.as_ref());
+                    if sw.set(variant) != variant {
+                        tracing::info!("harness: claude_prompt={} source={src} (changed; from the next run)", variant.name());
+                    }
+                }
+                let placement_idle = placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(|p| placement_env(p, crate::tls::STREAM_IDLE_ENV));
+                let (idle, _) = crate::harness::profile::resolve_stream_idle(None, placement_idle.as_deref(), profile.as_ref());
+                let idle_moved = idle != started_idle && std::env::var(crate::tls::STREAM_IDLE_ENV).ok().is_none_or(|v| v.trim().is_empty());
+                if idle_moved && !idle_warned {
+                    tracing::warn!(now = ?idle, started = ?started_idle, "harness: the profile's stream_idle_secs changed; it applies when the harness restarts");
+                }
+                idle_warned = idle_moved;
+            }
+        });
+    }
     let subject = coordinator::harness_run_subject(&node);
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
@@ -401,22 +461,39 @@ async fn placement_kind(client: &reqwest::Client, agent_url: &str) -> Result<Opt
 /// non-secret keys), else `auto`. An unreachable agent is `auto` with the
 /// source `unreachable`, which the minute re-read ignores (it keeps what it
 /// had rather than flip a node's setting on a missed answer).
+///
+/// Between the placement's env and `auto` sits the node's harness profile
+/// (`profile.thinking`, source `profile`).
+#[cfg_attr(not(test), allow(dead_code))]
 async fn resolve_thinking(
     env_val: Option<String>,
     model_url: &str,
     client: &reqwest::Client,
 ) -> (coordinator::thinking::ThinkingMode, &'static str) {
+    if env_val.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+        return thinking_after_read(env_val, &Ok(None));
+    }
+    thinking_after_read(env_val, &read_placement(model_url, client).await)
+}
+
+/// [`resolve_thinking`] on a placement already read ([`read_placement`]):
+/// env > the placement's env > the profile > `auto`; `unreachable` when the
+/// read failed and the env did not decide.
+fn thinking_after_read(
+    env_val: Option<String>,
+    placement: &Result<Option<serde_json::Value>>,
+) -> (coordinator::thinking::ThinkingMode, &'static str) {
     use crate::coordinator::thinking::{parse_thinking_mode, ThinkingMode};
     if let Some(v) = env_val.filter(|v| !v.trim().is_empty()) {
         return (parse_thinking_mode(Some(&v)), "env");
     }
-    if !coordinator::is_node_agent_url(model_url) {
-        return (ThinkingMode::Auto, "default");
-    }
-    match fetch_placement(client, model_url).await {
-        Ok(Some(p)) => match thinking_from_placement(&p) {
+    match placement {
+        Ok(Some(p)) => match thinking_from_placement(p) {
             Some(v) => (parse_thinking_mode(Some(&v)), "placement"),
-            None => (ThinkingMode::Auto, "default"),
+            None => match crate::harness::profile::HarnessProfile::from_placement(p).and_then(|pr| pr.thinking) {
+                Some(m) => (m, "profile"),
+                None => (ThinkingMode::Auto, "default"),
+            },
         },
         Ok(None) => (ThinkingMode::Auto, "default"),
         Err(e) => {
@@ -426,19 +503,34 @@ async fn resolve_thinking(
     }
 }
 
+/// The placement answer of this harness's own agent: `Ok(None)` when the
+/// model endpoint is not a node agent (nothing to read) or the agent has no
+/// such route; `Err` when it could not be asked.
+async fn read_placement(model_url: &str, client: &reqwest::Client) -> Result<Option<serde_json::Value>> {
+    if !coordinator::is_node_agent_url(model_url) {
+        return Ok(None);
+    }
+    fetch_placement(client, model_url).await
+}
+
+/// The harness profile in a placement read, if the agent sent one.
+fn profile_of(placement: &Result<Option<serde_json::Value>>) -> Option<crate::harness::profile::HarnessProfile> {
+    placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(crate::harness::profile::HarnessProfile::from_placement)
+}
+
 /// `env.NOO_HARNESS_THINKING` of a placement answer, when set.
 fn thinking_from_placement(v: &serde_json::Value) -> Option<String> {
-    v.get("env")
-        .and_then(|e| e.get(coordinator::thinking::THINKING_ENV))
-        .and_then(|t| t.as_str())
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
+    placement_env(v, coordinator::thinking::THINKING_ENV)
+}
+
+/// `env.<key>` of a placement answer, when set and not blank.
+fn placement_env(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get("env").and_then(|e| e.get(key)).and_then(|t| t.as_str()).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
 }
 
 /// `GET {base of agent_url}/harness/placement`. `Ok(None)` = the agent has
 /// no such route (404, an older agent).
-async fn fetch_placement(client: &reqwest::Client, agent_url: &str) -> Result<Option<serde_json::Value>> {
+pub(crate) async fn fetch_placement(client: &reqwest::Client, agent_url: &str) -> Result<Option<serde_json::Value>> {
     let mut u = reqwest::Url::parse(agent_url.trim())?;
     u.set_path("");
     u.set_query(None);
@@ -630,6 +722,60 @@ mod tests {
         // The fake agent's URL is not on the agent port, so resolve_thinking
         // itself stops at "not a node agent"; the env wins over everything.
         assert_eq!(resolve_thinking(Some(" on ".into()), &off, &c).await, (ThinkingMode::On, "env"));
+    }
+
+    /// PINNED (the harness profile contract): thinking is the process env,
+    /// else the placement's env, else the profile, else auto; an unread
+    /// placement is `unreachable` (the minute re-read keeps what it had).
+    #[test]
+    fn thinking_is_env_then_placement_env_then_profile_then_auto() {
+        use crate::coordinator::thinking::ThinkingMode;
+        let both = Ok(Some(json!({"placed": true, "kind": "noo", "env": {"NOO_HARNESS_THINKING": "on"}, "profile": {"thinking": "off"}})));
+        let profile_only = Ok(Some(json!({"placed": true, "kind": "noo", "env": {}, "profile": {"thinking": "off"}})));
+        let neither = Ok(Some(json!({"placed": true, "kind": "noo", "env": {}, "profile": {"thinking": "sometimes"}})));
+        let old_agent = Ok(Some(json!({"placed": true, "kind": "noo", "env": {}})));
+        assert_eq!(thinking_after_read(Some("auto".into()), &both), (ThinkingMode::Auto, "env"));
+        assert_eq!(thinking_after_read(Some(" ".into()), &both), (ThinkingMode::On, "placement"));
+        assert_eq!(thinking_after_read(None, &profile_only), (ThinkingMode::Off, "profile"));
+        assert_eq!(thinking_after_read(None, &neither), (ThinkingMode::Auto, "default"), "an unknown profile word is no value");
+        assert_eq!(thinking_after_read(None, &old_agent), (ThinkingMode::Auto, "default"));
+        assert_eq!(thinking_after_read(None, &Ok(None)), (ThinkingMode::Auto, "default"));
+        assert_eq!(thinking_after_read(None, &Err(anyhow!("down"))), (ThinkingMode::Auto, "unreachable"));
+        assert_eq!(thinking_after_read(Some("off".into()), &Err(anyhow!("down"))), (ThinkingMode::Off, "env"), "the env needs no agent");
+    }
+
+    /// The profile rides the placement answer the harness already reads.
+    #[tokio::test]
+    async fn the_profile_comes_from_the_placement_answer() {
+        use crate::harness::profile::{ClaudePrompt, HarnessProfile};
+        let c = reqwest::Client::new();
+        let body = json!({"kind": "claude-code", "env": {"NOO_BACKEND_STREAM_IDLE_SECS": "450"}, "desired_state": "running", "placed": true,
+                          "profile": {"tier": 2, "stream_idle_secs": 300, "thinking": "off", "claude_prompt": "slim", "sources": {}, "bench": null}});
+        let agent = fake_agent(200, body).await;
+        let read = fetch_placement(&c, &agent).await;
+        let p: HarnessProfile = profile_of(&read).expect("a profile");
+        assert_eq!((p.tier, p.stream_idle_secs, p.claude_prompt), (Some(2), Some(300), Some(ClaudePrompt::Slim)));
+        let placed = read.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(placement_env(placed, crate::tls::STREAM_IDLE_ENV).as_deref(), Some("450"));
+        assert_eq!(profile_of(&Ok(Some(json!({"placed": true})))), None, "an older agent sends none");
+        assert_eq!(profile_of(&Err(anyhow!("down"))), None);
+        // A model endpoint that is not a node agent has nothing to read.
+        assert!(read_placement("http://vllm:8000/v1", &c).await.unwrap().is_none());
+    }
+
+    /// The profile is read, and the stream idle bound fixed, BEFORE the
+    /// driver (whose translator builds the stream client) and before any
+    /// turn is taken; the slim switch is set on the driver it built.
+    #[test]
+    fn the_profile_is_applied_before_any_stream_client_or_turn() {
+        let code = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness_main.rs")).unwrap();
+        let run = &code[code.find("pub async fn run()").expect("run()")..code.find("async fn run_turn").expect("run_turn")];
+        let read = run.find("read_placement(&model_url, &client).await").expect("run() reads the placement");
+        let idle = run.find("tls::set_stream_idle_override(").expect("run() applies the profile's stream idle");
+        let driver = run.find("DriverCtx::from_env(").expect("driver");
+        let slim = run.find("ctx.prompt.set(variant)").expect("run() sets the launch variant");
+        let subs = run.find("queue_subscribe(").expect("subscribes");
+        assert!(read < idle && idle < driver && driver < slim && slim < subs, "read, idle, driver, variant, then turns");
     }
 
     #[test]

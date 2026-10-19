@@ -92,3 +92,28 @@ func TestHarnessPlacementRouteRefusesEveryoneButTheOwnHarness(t *testing.T) {
 		t.Errorf("own harness with bearer: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// The node's resolved harness profile rides along as `profile`, verbatim,
+// and is omitted when the node has none.
+func TestHarnessPlacementCarriesTheProfile(t *testing.T) {
+	own := testLeaf(t, "test-node", "Mesh Cluster Node")
+	prof := `{"tier":2,"first_byte_secs":600,"stream_idle_secs":300,"thinking":"off","claude_prompt":"slim"}`
+	h := placementServer(t, func() HarnessPlacement {
+		return HarnessPlacement{Kind: "noo", Env: map[string]string{"NOO_HARNESS_THINKING": "on"}, DesiredState: "running", Placed: true,
+			Profile: []byte(prof)}
+	})
+	rec := getPlacement(h, own, "127.0.0.1:5000", "")
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body !=
+		`{"kind":"noo","env":{"NOO_HARNESS_THINKING":"on"},"desired_state":"running","placed":true,"profile":`+prof+`}` {
+		t.Fatalf("body: %s", body)
+	}
+	none := placementServer(t, func() HarnessPlacement {
+		return HarnessPlacement{Kind: "noo", DesiredState: "running", Placed: true}
+	})
+	if rec := getPlacement(none, own, "127.0.0.1:5000", ""); strings.Contains(rec.Body.String(), "profile") {
+		t.Fatalf("no profile must omit the key: %s", rec.Body)
+	}
+}

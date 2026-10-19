@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -34,7 +35,8 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		// starts: a foreign runner is not shipped, and a kind the node's
 		// chat backend cannot serve would take turns it cannot answer.
 		// Both are refusals at placement time, not failures at turn time.
-		if why := harnessKindRefusal(p, all, r.runnerInstalled, r.cliInstalled); why != "" {
+		if why := harnessKindRefusalProfiled(p, all, r.runnerInstalled, r.cliInstalled,
+			harnessprofile.Current(), r.nodeName()); why != "" {
 			slog.Error("reconcile.harness_kind_refused", "detail", why)
 			refusals.Record("backend_start", harnessRefusalTarget, why)
 			return
@@ -305,6 +307,39 @@ func (r *Reconciler) crashLooping(ctx context.Context) string {
 // installed is the runner check and cliInstalled the vendor-CLI check (nil
 // skips either).
 func harnessKindRefusal(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool) string {
+	return harnessKindRefusalProfiled(p, all, installed, cliInstalled, nil, "")
+}
+
+// harnessKindRefusalProfiled is harnessKindRefusal plus the node's harness
+// profile: after every check above passes, a FOREIGN kind (one with a vendor
+// CLI) that the profile does not list in foreign_kinds is refused, naming the
+// tier and the command that offers it. No profile (nil) adds no refusal, so a
+// node on a pre-profile controller behaves exactly as before. `noo` is never
+// refused by the profile. node names the node in the fix ("<node>" if empty).
+func harnessKindRefusalProfiled(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool, prof *harnessprofile.Profile, node string) string {
+	if why := harnessKindRefusalBase(p, all, installed, cliInstalled); why != "" {
+		return why
+	}
+	return profileKindRefusal(desiredHarnessKind(p), prof, node)
+}
+
+// profileKindRefusal is the profile's half of the refusal (see
+// harnessKindRefusalProfiled).
+func profileKindRefusal(kind string, prof *harnessprofile.Profile, node string) string {
+	if prof == nil {
+		return ""
+	}
+	k, known := harnessKindByName(kind)
+	if !known || k.CLI == nil || prof.Offers(kind) {
+		return ""
+	}
+	if node == "" {
+		node = "<node>"
+	}
+	return fmt.Sprintf("harness kind %q: this node's profile (tier %d) does not offer it; set it with `noo cluster profile %s --set foreign_kinds=…`", kind, prof.Tier, node)
+}
+
+func harnessKindRefusalBase(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool) string {
 	kind := strings.TrimSpace(p.Env["NOO_HARNESS_KIND"])
 	if kind == "" {
 		kind = "noo"
@@ -332,4 +367,12 @@ func harnessKindRefusal(p placement, all []placement, installed func(runner stri
 		return fmt.Sprintf("harness kind %q: its runner is present but the %q command is not installed on this node", kind, *k.CLI)
 	}
 	return ""
+}
+
+// nodeName is this node's id for messages, "" when unknown.
+func (r *Reconciler) nodeName() string {
+	if r.cfg == nil {
+		return ""
+	}
+	return r.cfg.NodeID
 }

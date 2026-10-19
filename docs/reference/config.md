@@ -499,6 +499,12 @@ These sections were read by nothing. Companion gating is
 file. The agent loop's placement policy is the same kind of thing:
 `harness_policy: auto|manual|off` under a node, or
 `noo cluster provision <node> --harness …` / `set-config --harness …`. `noo cluster desired <node>` shows what applies.
+A node's **harness profile** (first-byte wait, stream idle bound, thinking
+default, ollama context, Claude Code launch variant, foreign kinds) is the same
+kind of thing: tier defaults declared in `config/harness-profiles.json` (built
+into the gateway and the CLI, not a `noomesh.yaml` section), per-node overrides
+with `noo cluster profile <node> --set k=v`, see
+[Harness profiles](../getting-started/supported-agent-harnesses.md#harness-profiles).
 
 ### `systems` — the per-system database manifest (gateway broker)
 

@@ -40,6 +40,7 @@ import (
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -90,6 +91,10 @@ type desiredConfig struct {
 	// The controller's node reclaim policy (disk_watermark location). A
 	// pre-policy gateway omits it; nil means "do not act".
 	DiskReclaim *diskreclaim.Policy `json:"disk_reclaim"`
+	// The node's resolved harness profile (tier default, override,
+	// measured). A pre-profile gateway omits it; absent means "no
+	// profile", which is exactly the behaviour before profiles existed.
+	HarnessProfile json.RawMessage `json:"harness_profile"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -124,6 +129,9 @@ type Reconciler struct {
 	// answered with, for GET /harness/placement. Guarded by harnessMu.
 	harnessMu      sync.RWMutex
 	harnessDesired *placement
+	// chatDesired is the last desired chat placement (POST /bench benches
+	// it). Guarded by harnessMu.
+	chatDesired *placement
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -275,6 +283,10 @@ func (r *Reconciler) Once(ctx context.Context) {
 		slog.Warn("reconcile.fetch_failed", "error", err)
 		return
 	}
+	// Before the empty-state return below: the profile is the node's, not a
+	// placement's (the inference proxy reads first_byte_secs from it).
+	applyHarnessProfile(desired.HarnessProfile)
+	r.recordChatPlacement(desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
@@ -380,6 +392,10 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// merge into one daemon spec - see multirole.go).
 	r.recordHarnessPlacement(desired.Placements)
 	effective, envWarnings := effectivePlacements(desired.Placements)
+	// The profile's ollama context default joins the ollama placement's env
+	// BEFORE its spec hash is taken, so a changed default recreates the
+	// container like any placement env edit.
+	effective = withProfileOllamaContext(effective, harnessprofile.Current())
 	r.surfaceEnvConflicts(envWarnings)
 	ollamaRows := runningOllama(desired.Placements)
 	// The shared-GPU yield sizes what the GPU backends need from these.
@@ -437,12 +453,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 					// its plist (OllamaGuard.Tuning); only when several
 					// roles share the daemon - a lone placement's env is
 					// left as it has always been.
-					if len(ollamaRows) > 1 {
-						env, _ := mergeOllamaEnv(ollamaRows)
-						backendrt.SetOllamaTuning(buildPlacementEnv(placement{Backend: "ollama", Env: env}))
-					} else {
-						backendrt.SetOllamaTuning(nil)
-					}
+					backendrt.SetOllamaTuning(nativeOllamaTuning(ollamaRows, harnessprofile.Current()))
 				}
 				continue
 			}

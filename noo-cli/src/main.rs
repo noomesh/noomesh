@@ -58,6 +58,7 @@ mod credentials;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
+mod harness_profiles;
 mod registry;
 mod release_fetch;
 mod release_sig;
@@ -266,6 +267,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    // A node's harness profile: resolved per field (override > measured >
+    // tier default), its overrides, and its chat-model bench.
+    (&["cluster", "profile"], commands::cluster_profile),
     (&["cluster", "up"], commands::cluster_up),
     // Batch 3: HTTP/local control + SSH provisioning-adjacent commands.
     (&["cluster", "init-secret"], commands::cluster_init_secret),
