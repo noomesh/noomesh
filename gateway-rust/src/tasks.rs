@@ -293,6 +293,8 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     .bind(new.created_via)
     .execute(db)
     .await?;
+    // i143 D: the first event of an add-on's task (a no-op for any other).
+    crate::task_events::emit_state(db, &id.to_string(), "open", None).await;
     get(db, &id.to_string()).await?.ok_or_else(|| anyhow!("task vanished after insert"))
 }
 
@@ -590,7 +592,7 @@ pub async fn finish(db: &sqlx::PgPool, id: &str, ok: bool, text: &str, require_t
 pub const NO_TOOLS_MARK: &str = "[completed without calling any tool]";
 
 /// Tools that are not looking at anything: the loop's own bookkeeping.
-const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_task_ask", "noo_agent_message"];
+pub(crate) const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_task_ask", "noo_agent_message"];
 
 /// What the evidence gate says about a success claim.
 #[derive(Debug, PartialEq, Eq)]
@@ -706,17 +708,43 @@ async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result
     .execute(db)
     .await?
     .rows_affected();
+    if n > 0 {
+        // i143 D: `result` (the answer, or null on failure) then the final
+        // `state`. Here, not in `finish`, so a parent settled by
+        // `settle_parent` reports too.
+        crate::task_events::emit_finished(db, id, ok, text).await;
+    }
     Ok(n > 0)
 }
 
-/// The operator's stop: honoured at the next checkpoint.
+/// The owner's stop: honoured at the next checkpoint.
 pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
+    stop_with(db, id, "stopped_by_owner").await
+}
+
+/// Stop a live task, telling an add-on why (i143 D): a `revoked {reason}`
+/// event, then the state change, then the final `state` event.
+/// `reason` is `stopped_by_owner` | `background_revoked` | `account_disabled`.
+/// Every stop path goes through here so the final `state` event always
+/// follows the revoked one.
+pub async fn stop_with(db: &sqlx::PgPool, id: &str, reason: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
+    let live: Option<String> = sqlx::query_scalar("SELECT state FROM noo_tasks WHERE id = $1 AND state IN ('open','running','checkpointed')")
+        .bind(uuid)
+        .fetch_optional(db)
+        .await?;
+    if live.is_none() {
+        return Ok(false);
+    }
+    crate::task_events::emit_revoked(db, id, reason).await;
     let n = sqlx::query("UPDATE noo_tasks SET state = 'stopped', updated_at = now() WHERE id = $1 AND state IN ('open','running','checkpointed')")
         .bind(uuid)
         .execute(db)
         .await?
         .rows_affected();
+    if n > 0 {
+        crate::task_events::emit_final_state(db, id, Some(reason)).await;
+    }
     Ok(n > 0)
 }
 
@@ -747,13 +775,33 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
         }
     }
     let after = get(&state.db, id).await?.map(|t| t.state).unwrap_or_else(|| "failed".into());
+    // i143 D: progress at each checkpoint with a note, and the state change
+    // it caused. Nothing after a terminal state (the exhausted path above
+    // already emitted its final one).
+    if matches!(after.as_str(), "open" | "running" | "checkpointed") {
+        if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
+            crate::task_events::emit_logged(&state.db, id, "progress", json!({"loop": loops, "note": n})).await;
+        }
+        if task.state == "running" && after == "checkpointed" {
+            crate::task_events::emit_state(&state.db, id, "checkpointed", None).await;
+        }
+    }
     Ok(after)
 }
 
 /// Mark the task running on `node` (or in process when `None`) before a
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
-    set_state(db, id, "running", node).await
+    let before = match uuid::Uuid::parse_str(id) {
+        Ok(u) => sqlx::query_scalar::<_, String>("SELECT state FROM noo_tasks WHERE id = $1").bind(u).fetch_optional(db).await.ok().flatten(),
+        Err(_) => None,
+    };
+    set_state(db, id, "running", node).await?;
+    // i143 D: a state change, once (a resume of a running task is not one).
+    if before.as_deref() != Some("running") {
+        crate::task_events::emit_state(db, id, "running", None).await;
+    }
+    Ok(())
 }
 
 // ── the runner ──────────────────────────────────────────────────────────
@@ -827,6 +875,8 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
             None if loops == 0 => objective_prompt(&req.objective, &req.thread_id, req.loop_budget),
             None => continuation_prompt(&req.objective, loops + 1, req.loop_budget),
         };
+        // The owner's context since the last loop (i143 C), in front.
+        let prompt = crate::task_budget::with_context(prompt, check.context.as_deref());
         let outcome = crate::coordinator::run_inner(
             &rt,
             &prompt,

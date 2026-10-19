@@ -500,6 +500,7 @@ async fn main() -> Result<()> {
     // controller's own resume at boot.
     tasks::spawn_ready_watcher(state.clone());
     tasks::spawn_stale_sweep(state.clone());
+    task_events::spawn_delivery(state.clone());
 
     // Start gossip mesh (uses interior mutability — safe from Arc)
     //
