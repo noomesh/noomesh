@@ -224,7 +224,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
       - name: Resolve tag
         run: |
@@ -318,7 +318,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
       # deps-base does `COPY --from=trellion` (compose supplies this as the
       # `trellion` additional build-context = the ../trellion sibling). CI
@@ -650,7 +650,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
       - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v3.2.0
         if: env.RETAG != 'true'
