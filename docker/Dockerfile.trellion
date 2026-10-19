@@ -59,7 +59,15 @@ COPY src ./src
 # each env has its own version table and file set.
 COPY docker/entrypoint.py /opt/entrypoint.py
 
-RUN chown -R nonroot:nonroot /app
+# Byte-compile the noomesh sources NOW: the services run `read_only: true`
+# (a runtime write to /app/src/**/__pycache__ would be EROFS) with
+# PYTHONDONTWRITEBYTECODE=1, so without this every start would re-parse the
+# tree. Timestamp-based pycs stay valid as long as the sources are these ones;
+# a dev bind-mount of ./src over /app/src simply bypasses them. `-q` and a
+# failing exit on a syntax error: a broken source file fails the image build,
+# not the first import in production.
+RUN python -m compileall -q /app/src \
+    && chown -R nonroot:nonroot /app
 
 USER nonroot
 

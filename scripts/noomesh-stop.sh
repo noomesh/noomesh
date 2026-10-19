@@ -118,3 +118,11 @@ ui_guide_cmd "noo stack rebuild" "rebuild the custom images first, then start"
 
 # fu76: materialized file credentials live only while the stack runs.
 rm -rf secrets/.runtime 2>/dev/null || true
+# The RAM copies the containers' `secrets:` bind (lib-secrets.sh
+# write_secret_files). Only on a full stop: stopping one service leaves the
+# rest running, and a restart policy re-resolves their bind sources. The
+# next `noo stack start` writes them again before compose creates anything.
+if [ ${#SERVICES[@]} -eq 0 ]; then
+    # shellcheck source=lib-secrets.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-secrets.sh" 2>/dev/null && remove_secret_files || true
+fi

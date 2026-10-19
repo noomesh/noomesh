@@ -67,7 +67,7 @@ def _interpolates(value: str, key: str) -> bool:
 
 def _secret_sources() -> dict[str, str]:
     """Top-level secret name → source variable, across every overlay."""
-    return {k: v.get("environment") for k, v in (full_projection().get("secrets") or {}).items()}
+    return {k: v.get("x-noo-source") for k, v in (full_projection().get("secrets") or {}).items()}
 
 
 def _delivered_key(svc: dict) -> str | None:

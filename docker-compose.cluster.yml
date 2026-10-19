@@ -146,24 +146,38 @@ services:
     # the operator account isn't gid 1000.
     group_add:
       - "${NOO_HOST_GID:-1000}"
-    # Container hardening, the sandbox's first two lines (the sandbox below
-    # also drops to a read-only rootfs; see why this service does not).
+    # Container hardening: cap_drop ALL, no-new-privileges and a READ-ONLY
+    # root filesystem (i132; was the sandbox's alone until 2026-10-19).
     # The gateway runs as uid 65532 and holds no capability it uses: it binds
     # 8080 (> 1024), opens no raw socket and execs no setuid binary, so
     # dropping ALL removes nothing it needs and denies a compromised process
     # the defaults Docker would grant (NET_RAW, SETUID, SETGID, CHOWN,
     # DAC_OVERRIDE, ...). `no-new-privileges` stops any exec from gaining
-    # more than the process has. NOT `read_only`: the gateway writes the
-    # mounted noomesh.yaml, prompts/ and the compose override (rw, on
-    # purpose), spawns the coding-harness CLIs, python3 (worker delegation)
-    # and openssl, each of which writes under HOME and /tmp, and the set of
-    # paths cannot be enumerated statically with confidence. A path missed
-    # there is a runtime EROFS in a live controller, not a build failure.
-    # tests/test_gateway_worker_hardening.py pins this block.
+    # more than the process has.
+    # `read_only: true`: the write set was measured with `docker diff
+    # noo-gateway` on the live controller and is closed by what follows.
+    #   * the mounted noomesh.yaml, prompts/, the compose override, /data and
+    #     the spool are bind mounts or volumes: they stay writable (below).
+    #   * /tmp (tmpfs): the PKI copy startup_tasks::stage_pki makes at
+    #     /tmp/pki (the leaf KEYS, now RAM-only), the CA bundle, harness
+    #     workspaces (NOO_HARNESS_WORKDIR defaults to /tmp/noo-harness),
+    #     openssl and python3 scratch. The `-unused` mount points of the
+    #     dist-mode overlays are created inside it.
+    #   * /home/nonroot (tmpfs): HOME for the processes the gateway spawns
+    #     (python3 worker delegation, git, the coding-harness CLIs).
+    #   * /root/.claude is the claude-config volume (a mount, not a write).
+    # Python bytecode is off: the gateway image has no noomesh source tree.
+    # tmpfs sizes are caps on RAM, not reservations.
+    # tests/test_gateway_worker_hardening.py and tests/test_read_only_rootfs.py
+    # pin this block.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/nonroot:size=64m,mode=0700,uid=65532,gid=65532
     ports:
       # NOO_BIND_ADDR (H-N2/N3/N5): host interface every cluster-plane port binds to.
       # Defaults to 0.0.0.0 (non-breaking). Set NOO_BIND_ADDR=<tailnet-ip> in .env to
@@ -900,20 +914,34 @@ services:
       - { source: whatsapp_token, target: whatsapp_token, uid: "65532", gid: "65532", mode: 0400 }
       - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
       - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
-    # Same two hardening lines as the gateway (anchored: worker-extra gets
-    # them too). uid 65532, listens on 8090, no capability in use. NOT
-    # `read_only`: tool code the worker runs writes where the operator's
-    # config says (`workspace_dir`, the audit archive's `./audit-archive`,
-    # `output_dir`), so the writable set is not a fixed list of paths.
+    # Same hardening as the gateway (anchored: worker-extra gets it too):
+    # no capability, no privilege gain, READ-ONLY root filesystem (i132).
+    # uid 65532, listens on 8090. Measured with `docker diff noo-worker`: the
+    # writes outside mounts were the leaf key copy entrypoint-style code makes
+    # at /tmp/pki and Python bytecode under /app/src (now compiled at image
+    # build + PYTHONDONTWRITEBYTECODE=1). Tool code the worker runs writes
+    # where the operator's config says: `workspace_dir`, the audit archive
+    # (`${NOO_DATA_DIR}/audit-archive`, config.py) and `output_dir` default
+    # to /data (the noo-data volume) or /tmp; a configuration that points one
+    # at a path in the image fails with EROFS and the setting's own error.
     cap_drop: &worker-cap-drop
       - ALL
     security_opt: &worker-security-opt
       - no-new-privileges:true
+    read_only: true
+    # /tmp (the PKI/key copies, scratch, the default workspace fallback) and
+    # /home/nonroot (HOME: ~/.config/mesh, ~/.cache for libraries). RAM caps.
+    tmpfs: &worker-tmpfs
+      - /tmp:size=256m,mode=1777
+      - /home/nonroot:size=64m,mode=0700,uid=65532,gid=65532
     environment: &worker-env
       # Vendor telemetry off (docs/security/telemetry.md): huggingface_hub and
       # the libraries built on it honour these.
       - HF_HUB_DISABLE_TELEMETRY=1
       - DO_NOT_TRACK=1
+      # The rootfs is read-only: /app/src is compiled at image build
+      # (docker/Dockerfile.worker `compileall`), so nothing is written back.
+      - PYTHONDONTWRITEBYTECODE=1
       - NATS_URL=${NATS_URL:-tls://nats:4222}
       - REDIS_URL=${REDIS_URL:-rediss://redis:6379}
       - REDIS_PASSWORD_FILE=${REDIS_PASSWORD:+/run/secrets/redis_password}
@@ -1044,6 +1072,8 @@ services:
     secrets: *worker-secrets
     cap_drop: *worker-cap-drop
     security_opt: *worker-security-opt
+    read_only: true
+    tmpfs: *worker-tmpfs
     environment: *worker-env
     volumes: *worker-volumes
     networks: *worker-networks
@@ -3025,32 +3055,44 @@ volumes:
       device: ${NOO_PG_DATA:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/postgres}
   claude-config:
 
-# ── Tier-1 secrets, delivered as FILES (2026-09-29) ─────────────────────
-# Every entry is sourced from an ENVIRONMENT VARIABLE of the process that
-# runs compose — never from a file on the host. The launcher
-# (scripts/lib-secrets.sh `load_secrets`) exports each value from
-# secrets/env.sops, compose copies it into the consuming container at
-# create time as /run/secrets/<target> with the uid/gid/mode each service
-# names, and nothing is written anywhere else: no host file, no tmpfs to
-# clean up, nothing in Config.Env. See docs/security/secrets.md.
+# ── Tier-1 secrets, delivered as FILES (2026-09-29; RAM files 2026-10-19) ──
+# Every entry is sourced from a FILE the launcher writes on every start to a
+# directory on tmpfs, `${NOO_SECRET_RUNDIR}` (scripts/lib-secrets.sh
+# `write_secret_files`: /run/noo/secrets as root, /dev/shm/noo-secrets-<uid>
+# otherwise), and removes on `noo stack stop`. The files live in RAM only:
+# nothing plaintext reaches a disk, and nothing is copied into a container's
+# writable layer or Config.Env. They are `file:` secrets, not `environment:`
+# ones, because the gateway, worker and trellion run `read_only: true` and
+# compose refuses to create an `environment:`-sourced secret in a read-only
+# service (it copies the value into the container's layer; `file` is the sole
+# supported option there).
 #
-# The launcher also guarantees every variable below is SET (empty when
-# the store has no value): compose refuses to create a service whose
-# secret's variable is unset ("required by secret … is not set"), which
-# is also what makes a bare `docker compose up` — no launcher, no store —
-# fail loudly instead of starting with empty credentials. An EMPTY value
-# creates the container with no file at all; the `${NAME:+…}` pointers
-# in each service then leave `<NAME>_FILE` unset, so an optional secret
-# reads as unset rather than as a broken mount.
+# `x-noo-source:` names the variable of the launcher's environment (the
+# decrypted store) the file's content comes from; compose ignores `x-` keys,
+# the launcher reads them. The default after `:-` is a path that does not
+# exist, on purpose: a compose run that did not go through the launcher
+# (an older CLI's scripts, a bare `docker compose up`) fails creating the
+# container with "bind source path does not exist: /nonexistent/noo-secret-
+# rundir-unset/..." instead of starting a service with no credentials.
+# `ps`, `logs`, `config` and `down` do not need the files.
+#
+# The launcher also exports every source variable below (empty when the store
+# has no value) and writes an EMPTY file for it: the bind source must exist,
+# and the `${NAME:+...}` pointers in each service then leave `<NAME>_FILE`
+# unset, so an optional secret reads as unset rather than as a broken mount.
 #
 # The two pgpass bodies are DERIVED by the launcher (derive_file_secrets)
-# from the role passwords — one line per role that container logs in as.
+# from the role passwords - one line per role that container logs in as.
 #
-# Ownership: Docker writes each file owned by the CONTAINER's user when the
-# image declares one (measured 2026-09-29 — a DHI image with `USER 0` got
-# root-owned files whatever uid was asked for). So `uid`/`gid` on each
-# service RESTATE the image's user, and only decide ownership for an image
-# with no USER line; tests/test_compose_secret_files.py pins them to it.
+# Ownership: a `file:` secret is bind-mounted with the HOST file's owner and
+# mode (compose ignores `uid`/`gid`/`mode` for it and warns). So the launcher
+# gives each file to the uid its consumers run as, 0400, and READS that uid
+# from the `uid:` on each service entry below: the entries still RESTATE the
+# image's user, and tests/test_compose_secret_files.py pins them to it. A
+# secret also taken by a root-in-container service (node-agent, browser) is
+# owned by the non-root consumer; root reads it through CAP_DAC_OVERRIDE
+# (tests/test_secret_rundir.py: those services drop no capability). Two
+# different non-root uids on one secret is refused at launch.
 #
 # The add-on overlays (trellion, trellion-intel, evolve) reuse these entries
 # and declare the few only they take (their own gateway keys, their pgpass
@@ -3058,92 +3100,131 @@ volumes:
 # across `-f` files.
 secrets:
   noo_jwt_secret:
-    environment: NOO_JWT_SECRET
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_jwt_secret
+    x-noo-source: NOO_JWT_SECRET
   noo_cluster_secret:
-    environment: NOO_CLUSTER_SECRET
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_cluster_secret
+    x-noo-source: NOO_CLUSTER_SECRET
   noo_controller_secret:
-    environment: NOO_CONTROLLER_SECRET
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_controller_secret
+    x-noo-source: NOO_CONTROLLER_SECRET
   # The bus-principal keys. All three live here, not in
   # the add-on overlays, because the gateway (this file) takes all three.
   # The browser door's key: gateway, worker, browser.
   noo_browser_key:
-    environment: NOO_BROWSER_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_browser_key
+    x-noo-source: NOO_BROWSER_KEY
   noo_bus_key_worker:
-    environment: NOO_BUS_KEY_WORKER
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_bus_key_worker
+    x-noo-source: NOO_BUS_KEY_WORKER
   noo_bus_key_trellion:
-    environment: NOO_BUS_KEY_TRELLION
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_bus_key_trellion
+    x-noo-source: NOO_BUS_KEY_TRELLION
   noo_bus_key_trellion_intel:
-    environment: NOO_BUS_KEY_TRELLION_INTEL
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_bus_key_trellion_intel
+    x-noo-source: NOO_BUS_KEY_TRELLION_INTEL
   noo_node_agent_token:
-    environment: NOO_NODE_AGENT_TOKEN
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_node_agent_token
+    x-noo-source: NOO_NODE_AGENT_TOKEN
   noo_admin_password:
-    environment: NOO_ADMIN_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_admin_password
+    x-noo-source: NOO_ADMIN_PASSWORD
   noo_audit_hmac_key:
-    environment: NOO_AUDIT_HMAC_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_audit_hmac_key
+    x-noo-source: NOO_AUDIT_HMAC_KEY
   redis_password:
-    environment: REDIS_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/redis_password
+    x-noo-source: REDIS_PASSWORD
   noo_tailscale_oauth_client_secret:
-    environment: NOO_TAILSCALE_OAUTH_CLIENT_SECRET
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_tailscale_oauth_client_secret
+    x-noo-source: NOO_TAILSCALE_OAUTH_CLIENT_SECRET
   noo_tailscale_api_key:
-    environment: NOO_TAILSCALE_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_tailscale_api_key
+    x-noo-source: NOO_TAILSCALE_API_KEY
   noo_agent_review_key:
-    environment: NOO_AGENT_REVIEW_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_agent_review_key
+    x-noo-source: NOO_AGENT_REVIEW_KEY
   noo_agent_signing_key:
-    environment: NOO_AGENT_SIGNING_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_agent_signing_key
+    x-noo-source: NOO_AGENT_SIGNING_KEY
   noo_jwt_signing_key:
-    environment: NOO_JWT_SIGNING_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_jwt_signing_key
+    x-noo-source: NOO_JWT_SIGNING_KEY
   noo_entitlement:
-    environment: NOO_ENTITLEMENT
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_entitlement
+    x-noo-source: NOO_ENTITLEMENT
   noo_app_db_password:
-    environment: NOO_APP_DB_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_app_db_password
+    x-noo-source: NOO_APP_DB_PASSWORD
   noo_evolve_db_password:
-    environment: NOO_EVOLVE_DB_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_evolve_db_password
+    x-noo-source: NOO_EVOLVE_DB_PASSWORD
   noo_evolve_ddl_password:
-    environment: NOO_EVOLVE_DDL_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_evolve_ddl_password
+    x-noo-source: NOO_EVOLVE_DDL_PASSWORD
   noo_trellion_db_password:
-    environment: NOO_TRELLION_DB_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_trellion_db_password
+    x-noo-source: NOO_TRELLION_DB_PASSWORD
   noo_trellion_ddl_password:
-    environment: NOO_TRELLION_DDL_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_trellion_ddl_password
+    x-noo-source: NOO_TRELLION_DDL_PASSWORD
   nats_gateway_password:
-    environment: NATS_GATEWAY_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_gateway_password
+    x-noo-source: NATS_GATEWAY_PASSWORD
   nats_worker_password:
-    environment: NATS_WORKER_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_worker_password
+    x-noo-source: NATS_WORKER_PASSWORD
   # A node's own bus password — only the opt-in containerised node agent
   # (profiles node-agent-compose / sensors) reads it; exported empty on a
   # controller, so no file is created.
   nats_node_password:
-    environment: NATS_NODE_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_node_password
+    x-noo-source: NATS_NODE_PASSWORD
   noo_svc_key_worker:
-    environment: NOO_SVC_KEY_WORKER
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_svc_key_worker
+    x-noo-source: NOO_SVC_KEY_WORKER
   postgres_password:
-    environment: POSTGRES_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/postgres_password
+    x-noo-source: POSTGRES_PASSWORD
   grafana_admin_password:
-    environment: GRAFANA_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/grafana_admin_password
+    x-noo-source: GRAFANA_PASSWORD
   pgpass_gateway:
-    environment: NOO_PGPASS_GATEWAY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/pgpass_gateway
+    x-noo-source: NOO_PGPASS_GATEWAY
   pgpass_worker:
-    environment: NOO_PGPASS_WORKER
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/pgpass_worker
+    x-noo-source: NOO_PGPASS_WORKER
   # Tier-2 provider and channel credentials. Optional on
   # every install: the launcher exports each source EMPTY when the store
   # lacks it, which creates no file and leaves the pointer unset.
   anthropic_api_key:
-    environment: ANTHROPIC_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/anthropic_api_key
+    x-noo-source: ANTHROPIC_API_KEY
   openai_api_key:
-    environment: OPENAI_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/openai_api_key
+    x-noo-source: OPENAI_API_KEY
   google_api_key:
-    environment: GOOGLE_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/google_api_key
+    x-noo-source: GOOGLE_API_KEY
   tavily_api_key:
-    environment: TAVILY_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/tavily_api_key
+    x-noo-source: TAVILY_API_KEY
   brave_search_api_key:
-    environment: BRAVE_SEARCH_API_KEY
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/brave_search_api_key
+    x-noo-source: BRAVE_SEARCH_API_KEY
   telegram_bot_token:
-    environment: TELEGRAM_BOT_TOKEN
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/telegram_bot_token
+    x-noo-source: TELEGRAM_BOT_TOKEN
   whatsapp_token:
-    environment: WHATSAPP_TOKEN
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/whatsapp_token
+    x-noo-source: WHATSAPP_TOKEN
   google_chat_bearer_token:
-    environment: GOOGLE_CHAT_BEARER_TOKEN
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/google_chat_bearer_token
+    x-noo-source: GOOGLE_CHAT_BEARER_TOKEN
   google_chat_credentials_json:
-    environment: NOO_FILECRED_GOOGLE_CHAT_B64
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/google_chat_credentials_json
+    x-noo-source: NOO_FILECRED_GOOGLE_CHAT_B64
 
 configs:
   prometheus_config:

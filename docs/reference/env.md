@@ -44,7 +44,7 @@ so `printenv` is not an option):
 
 ```bash
 docker inspect noo-gateway --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^NOO_'
-docker diff noo-gateway | grep /run/secrets     # which secret files it was given (names only)
+docker inspect noo-gateway --format '{{range .Mounts}}{{println .Destination}}{{end}}' | grep /run/secrets     # which secret files it was given (names only)
 ```
 
 ## Bootstrap flags (`.env`, read by the launcher before anything else)
@@ -61,6 +61,8 @@ docker diff noo-gateway | grep /run/secrets     # which secret files it was give
 | Variable | Default | Read by | Purpose |
 |---|---|---|---|
 | `NOO_SECRETS_BACKEND` | `env` when unset (onboarding always writes `sops`) | `scripts/lib-secrets.sh` | `sops` decrypts `secrets/env.sops` into the launcher environment; `env` (plaintext `.env`) is retired — the launcher refuses to start it, and verify, scan and upgrade fail it ([secrets](../security/secrets.md#noo_secrets_backend)) |
+| `NOO_SECRET_RUNDIR` | unset: `/run/noo/secrets` as root, `/dev/shm/noo-secrets-<uid>` otherwise | `scripts/lib-secrets.sh` | the tmpfs directory the launcher writes the compose `file:` secrets to (0700, must be RAM-backed or the launch is refused); exported to compose, which has a nonexistent default so a launch that skipped the launcher fails instead of starting without credentials ([secrets](../security/secrets.md#where-the-files-live)) |
+| `NOO_SECRET_CHOWN_IMAGE` | `alpine` | `scripts/lib-secrets.sh` | the image of the throwaway container that hands the secret files to their containers' uids when the launcher is not root (no network, only `CAP_CHOWN`) |
 | `NOO_INSTALL_MODE` | `dev` | `scripts/noomesh-start.sh` | `dist` starts from published images (`docker-compose.dist.yml`); `dev` builds from source |
 | `NOO_INSTANCE`, `NOO_PORT_OFFSET` | unset, `0` | `scripts/lib-instance.sh` | a second stack on one host: compose project `noo-<instance>`, container prefix, network, and every host port shifted by the offset ([multi-instance](../getting-started/multi-instance.md)) |
 | `NOO_IMAGE_PREFIX`, `NOO_IMAGE_TAG` | `ghcr.io/<owner>`, newest `stack-v*` tag | launcher, compose | which images dist mode pulls; `NOO_IMAGE_DIGEST_<IMAGE>` pins are exported from `stack.lock`. The lock pins the first-party images AND the third-party runtime images (nats, nginx, redis, loki, prometheus, alertmanager, grafana, node-exporter, TEI, vLLM, ollama); a dist start refuses to pull one of those by tag or at a digest the lock does not name (an override such as `VLLM_IMAGE` of a locked repository must name its digest, or be unset). The first line of the lock, `# stack <tag>`, is inside the signed bytes: `noo upgrade --stack` refuses a lock signed for another tag, and a lock from before that line existed (stack tags up to v0.6.5) is accepted without it, with a warning. |

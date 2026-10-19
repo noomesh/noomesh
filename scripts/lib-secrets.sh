@@ -87,6 +87,10 @@ load_secrets() {
             ;;
     esac
     derive_file_secrets
+    # The `file:` secrets compose bind-mounts (read-only services refuse
+    # `environment:` ones). Fails CLOSED: a launch whose secret files could
+    # not be put in RAM must not reach `docker compose up`.
+    write_secret_files
 }
 
 # check_secrets_at_rest — refuse to START an install whose secrets sit in
@@ -121,16 +125,21 @@ check_secrets_at_rest() {
     esac
 }
 
-# ── File-backed delivery (2026-09-29) ───────────────────────────────────────
+# ── File-backed delivery (2026-09-29, RAM files 2026-10-19) ─────────────────
 # docker-compose.cluster.yml hands every tier-1 secret to noomesh's own
-# containers as a FILE: a top-level `secrets:` entry whose source is
-# `environment: VAR` — a variable of THIS process — which compose copies into
-# the container at create time as /run/secrets/<target>. Nothing here writes
-# a file: the values live in this launcher's environment (where
-# _load_secrets_sops already put them) and in the consuming container, and
-# nowhere else. tests/test_compose_secret_files.py (G4) fails the build if
-# this library, or a launcher that sources it, grows a redirection into
-# secrets/ or a mkdir of a runtime secrets directory.
+# containers as a FILE: /run/secrets/<target>, bind-mounted from a top-level
+# `secrets:` entry whose source is `file: ${NOO_SECRET_RUNDIR}/<name>`. The
+# gateway, worker(s) and trellion run `read_only: true`, and compose REFUSES
+# an `environment:`-sourced secret on a read-only service ("cannot create
+# secret ... in read-only service ...: `file` is the sole supported option"),
+# so the launcher writes the files itself, to a directory on tmpfs
+# (`write_secret_files` below): mode 0400, owned by the uid of the container
+# that reads each one, removed by `noo stack stop`. They live in RAM only:
+# nothing plaintext reaches a disk, and nothing is copied into a container's
+# writable layer (the old `environment:` delivery was: the audit's LOW).
+# tests/test_compose_secret_files.py (G4) and tests/test_secret_rundir.py
+# hold the rules: no redirection into the checkout's secrets/, and the only
+# writes are into the tmpfs-checked rundir.
 
 # The pgpass bodies the launcher derives: which DRIVER reads the file, then
 # `role:VAR` pairs — one line per role that container logs in as, the
@@ -157,7 +166,8 @@ NOO_PGPASS_ROLES_TRELLION="libpq noo_app:NOO_APP_DB_PASSWORD noo_trellion:NOO_TR
 NOO_PGPASS_ROLES_EVOLVE="libpq noo_evolve:NOO_EVOLVE_DB_PASSWORD noo_evolve_ddl:NOO_EVOLVE_DDL_PASSWORD"
 
 # file_secret_sources [compose-file] — the VARIABLE each top-level compose
-# secret is sourced from, one per line. Read from the file itself so the list
+# secret is sourced from, one per line: `environment: VAR` (an add-on overlay
+# not yet moved to files) or `x-noo-source: VAR` (the `file:` form). Read from the file itself so the list
 # has one home: the compose declaration. The add-on overlays beside it
 # (docker-compose.<addon>.yml) declare their own top-level secrets (compose
 # merges them across `-f` files), so every `docker-compose.*.yml` next to the
@@ -180,6 +190,7 @@ _file_secret_sources_one() {
         /^secrets:[[:space:]]*$/ { inblk = 1; next }
         inblk && /^[^[:space:]#]/ { inblk = 0 }
         inblk && /^[[:space:]]+environment:[[:space:]]*[A-Z_][A-Z0-9_]*[[:space:]]*$/ { print $2 }
+        inblk && /^[[:space:]]+x-noo-source:[[:space:]]*[A-Z_][A-Z0-9_]*[[:space:]]*$/ { print $2 }
     ' "$1"
 }
 
@@ -258,6 +269,251 @@ derive_file_secrets() {
             export "$v="
         fi
     done
+}
+
+# ── RAM-backed secret files ──────────────────────────────────────────────────
+
+# secret_rundir — where the secret files go, as a path. NOO_SECRET_RUNDIR wins
+# (tests, and an operator who wants another tmpfs). Otherwise:
+#   root:      /run/noo/secrets   (systemd's /run is tmpfs on every Linux box)
+#   non-root:  /dev/shm/noo-secrets-<uid>
+# A controller's launcher runs as the OPERATOR, not root: `noo stack start`
+# is the operator's shell and noo-hostd is installed as a USER unit (its
+# install.go default: it needs the operator's docker group and age key). Root
+# only appears for a `sudo noo ...` or a system-unit hostd, hence the root
+# default. For the operator the obvious home would be $XDG_RUNTIME_DIR, and it
+# is NOT used first because /run/user/<uid> is unmounted when the last session
+# ends unless linger is on, and a container's restart policy (a crash, a
+# daemon restart) re-resolves its bind sources: a vanished source is a service
+# that cannot come back until someone re-runs the launcher. /dev/shm lives
+# until reboot regardless of sessions. XDG_RUNTIME_DIR is the fallback for a
+# host without /dev/shm.
+secret_rundir() {
+    if [ -n "${NOO_SECRET_RUNDIR:-}" ]; then
+        printf '%s' "$NOO_SECRET_RUNDIR"
+    elif [ "$(id -u)" = 0 ]; then
+        printf '%s' /run/noo/secrets
+    elif [ -d /dev/shm ] && [ -w /dev/shm ]; then
+        printf '/dev/shm/noo-secrets-%s' "$(id -u)"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        printf '%s/noo/secrets' "$XDG_RUNTIME_DIR"
+    else
+        printf '/dev/shm/noo-secrets-%s' "$(id -u)"
+    fi
+}
+
+# _secret_compose_files [compose-file] — the base plus every overlay beside it
+# and every licensed add-on's overlay (the same set file_secret_sources reads).
+_secret_compose_files() {
+    local compose="${1:-docker-compose.cluster.yml}" f
+    for f in "$compose" "$(dirname "$compose")"/docker-compose.*.yml "$(dirname "$compose")"/addons/*/docker-compose.yml; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done | awk '!seen[$0]++'
+}
+
+# _secret_file_plan <compose-file>... — one line per top-level secret that is
+# sourced from `file: ${NOO_SECRET_RUNDIR...}/<name>`:
+#   <name> <SOURCE_VAR> <owner uid>
+# SOURCE_VAR is the `x-noo-source:` extension on the same entry (compose
+# ignores `x-` keys). OWNER is the uid every service that takes the secret
+# runs as, read from the services' own `uid:` (so the compose file is the one
+# home of that fact): the single non-zero uid among them, or 0 when only
+# root containers take it. A container running as root reads a file owned by
+# 65532 through the default CAP_DAC_OVERRIDE (tests/test_secret_rundir.py
+# holds: no root consumer of a shared secret drops it). Two different
+# non-zero uids cannot be served by one file and print CONFLICT as the owner;
+# a file: entry with no x-noo-source prints NOSOURCE.
+_secret_file_plan() {
+    awk '
+        FNR == 1 { insec = 0; cur = "" }
+        /^secrets:[[:space:]]*$/ { insec = 1; cur = ""; next }
+        insec && /^[^[:space:]#]/ { insec = 0; cur = "" }
+        insec && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { cur = $1; sub(/:$/, "", cur); next }
+        insec && cur != "" && /^[[:space:]]+file:/ && /NOO_SECRET_RUNDIR/ { order[++n] = cur; next }
+        insec && cur != "" && /^[[:space:]]+x-noo-source:/ { v = $2; gsub(/["\047]/, "", v); src[cur] = v; next }
+        !insec && /source:[[:space:]]*[A-Za-z0-9_.-]+/ && /uid:/ {
+            line = $0
+            match(line, /source:[[:space:]]*[A-Za-z0-9_.-]+/)
+            s = substr(line, RSTART, RLENGTH); sub(/^source:[[:space:]]*/, "", s)
+            match(line, /uid:[[:space:]]*"?[0-9]+/)
+            u = substr(line, RSTART, RLENGTH); sub(/^uid:[[:space:]]*"?/, "", u)
+            if (u != "0") { if (nz[s] == "") nz[s] = u; else if (nz[s] != u) conflict[s] = 1 }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                k = order[i]
+                if (done[k]++) continue
+                o = (k in conflict) ? "CONFLICT" : ((nz[k] != "") ? nz[k] : "0")
+                sv = src[k]
+                if (sv == "") { sv = "-"; o = "NOSOURCE" }
+                print k, sv, o
+            }
+        }
+    ' "$@"
+}
+
+# _secret_rundir_prepare <dir> - create the directory 0700, own it, and prove
+# it is RAM. Refuses (return 1, reason and remedy on stderr) when it is a
+# symlink, belongs to someone else, or sits on a disk filesystem: a plaintext
+# secret on disk is exactly what this exists to prevent.
+_secret_rundir_prepare() {
+    local d="$1" fstype owner
+    if [ -L "$d" ]; then
+        echo "ERROR: $d is a symlink - refusing to put secrets behind it." >&2
+        echo "       Remove it, or point NOO_SECRET_RUNDIR at a directory on tmpfs." >&2
+        return 1
+    fi
+    if ! (umask 077; mkdir -p "$d") 2>/dev/null; then
+        echo "ERROR: cannot create the secret directory $d." >&2
+        echo "       Set NOO_SECRET_RUNDIR to a directory you can create on tmpfs (e.g. /dev/shm/noo-secrets-$(id -u))." >&2
+        return 1
+    fi
+    owner="$(stat -c %u "$d" 2>/dev/null || true)"
+    if [ "$owner" != "$(id -u)" ]; then
+        echo "ERROR: $d is owned by uid ${owner:-?}, not by uid $(id -u) - refusing to write secrets into it." >&2
+        echo "       Remove it (or choose another NOO_SECRET_RUNDIR) and start again." >&2
+        return 1
+    fi
+    chmod 0700 "$d" 2>/dev/null || true
+    fstype="$(stat -f -c %T "$d" 2>/dev/null || true)"
+    case "$fstype" in
+        tmpfs|ramfs) return 0 ;;
+    esac
+    echo "ERROR: the secret directory $d is on a '${fstype:-unknown}' filesystem, not RAM." >&2
+    echo "       noomesh writes the secret files the containers read only to tmpfs, so no plaintext" >&2
+    echo "       secret ever reaches a disk. Fix: set NOO_SECRET_RUNDIR to a directory on tmpfs" >&2
+    echo "       (check with: stat -f -c %T <dir> - it must print tmpfs), e.g. /dev/shm/noo-secrets-$(id -u)." >&2
+    return 1
+}
+
+# _secret_tmp_cleanup <dir> - remove this process's temp files and manifest.
+_secret_tmp_cleanup() {
+    local d="${1:?}" f
+    for f in "$d"/.$$.* "$d"/.chown.$$; do
+        [ -e "$f" ] && rm -f "$f"
+    done
+    return 0
+}
+
+# _secret_chown_files <dir> <manifest> - hand each file in the manifest
+# ("<uid> <name>" per line) to its uid. As root: chown. Otherwise the same
+# throwaway-container pattern as lib-reown.sh and the ingest dir (no sudo, the
+# operator is in the docker group): a root-in-container `chown` over a bind of
+# the directory, with nothing but CAP_CHOWN (+ read/search to get at the
+# 0700 directory), no network and a read-only rootfs. The container sees the
+# MANIFEST (uids and file names), never a secret value. NOO_SECRET_CHOWN_CMD
+# replaces it (tests): called as `$NOO_SECRET_CHOWN_CMD <dir> <manifest>`.
+_secret_chown_files() {
+    local d="$1" m="$2" uid name
+    if [ -n "${NOO_SECRET_CHOWN_CMD:-}" ]; then
+        # shellcheck disable=SC2086  # a command line, split on purpose
+        $NOO_SECRET_CHOWN_CMD "$d" "$m"
+        return $?
+    fi
+    if [ "$(id -u)" = 0 ]; then
+        while read -r uid name; do
+            chown "$uid:$uid" -- "$d/$name" || return 1
+        done < "$d/$m"
+        return 0
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "ERROR: cannot hand the secret files to the containers' uids: docker is not on PATH and this is not root." >&2
+        return 1
+    fi
+    # The docker CLI gets a MINIMAL environment: this process holds the
+    # decrypted store (and, mid-launch, a stale image pin from it that the
+    # launcher re-asserts later); a `docker run` that only chowns files needs
+    # none of it, only the way to reach the daemon.
+    # shellcheck disable=SC2016  # expands inside the container
+    env -i PATH="$PATH" HOME="${HOME:-/}" ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
+        ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} \
+        ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
+        docker run --rm --network none --read-only --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH \
+        --security-opt no-new-privileges -v "$d":/d "${NOO_SECRET_CHOWN_IMAGE:-alpine}" \
+        sh -c 'cd /d && while read -r u f; do chown "$u:$u" -- "$f" || exit 1; done < "$1"' sh "$m" >/dev/null
+}
+
+# write_secret_files [compose-file] - write every `file:` secret the compose
+# files declare into secret_rundir, then export NOO_SECRET_RUNDIR for compose.
+#
+#   absent    no `file:` secret in the compose files (an older compose): nothing
+#             written, nothing exported, return 0. That compose reads
+#             `environment:` sources, which derive_file_secrets already set.
+#   present   one file per secret: the value from this process's environment
+#             (the store's decrypt) or .env, exactly as compose's old
+#             `environment:` delivery took it. An unset secret is an EMPTY
+#             file (the pointer env `${NAME:+/run/secrets/...}` stays unset, so
+#             the reader never opens it, but the bind source must exist or
+#             compose refuses to create the container).
+#   written   each file 0400 BEFORE it is handed to its uid, via a temp name
+#             and an atomic rename, so a container that restarts mid-launch
+#             never sees a half-written file. Files the compose files no
+#             longer name are removed.
+#   fails     return 1 with the reason: rundir not tmpfs, not creatable, not
+#             owned by us, owner conflict between consumers, chown failed.
+#             The temp files are removed; load_secrets passes the failure up
+#             and every launcher aborts before `compose up`.
+write_secret_files() {
+    local compose="${1:-docker-compose.cluster.yml}" plan d name var owner tmp manifest bad f
+    [ -f "$compose" ] || return 0
+    # shellcheck disable=SC2046  # a file list, split on purpose
+    plan="$(_secret_file_plan $(_secret_compose_files "$compose"))" || return 1
+    [ -n "$plan" ] || return 0
+    bad="$(printf '%s\n' "$plan" | awk '$3 == "CONFLICT" || $3 == "NOSOURCE" { print $1 " (" $3 ")" }')"
+    if [ -n "$bad" ]; then
+        echo "ERROR: compose secret(s) the launcher cannot place: $bad" >&2
+        echo "       CONFLICT: services with different non-root uids take the same secret (one file has one owner)." >&2
+        echo "       NOSOURCE: no 'x-noo-source: <VARIABLE>' beside its file: entry." >&2
+        return 1
+    fi
+    d="$(secret_rundir)"
+    _secret_rundir_prepare "$d" || return 1
+    manifest=".chown.$$"
+    { : > "$d/$manifest" && chmod 0644 "$d/$manifest"; } || return 1
+    while read -r name var owner; do
+        tmp=".$$.$name"
+        if [ -n "${!var+x}" ]; then
+            (umask 077; printf '%s' "${!var}" > "$d/$tmp") || { _secret_tmp_cleanup "$d"; echo "ERROR: could not write secret file $name under $d" >&2; return 1; }
+        else
+            (umask 077; _secret_value "$var" > "$d/$tmp") || { _secret_tmp_cleanup "$d"; echo "ERROR: could not write secret file $name under $d" >&2; return 1; }
+        fi
+        chmod 0400 "$d/$tmp" || { _secret_tmp_cleanup "$d"; return 1; }
+        printf '%s %s\n' "$owner" "$tmp" >> "$d/$manifest"
+    done <<EOF
+$plan
+EOF
+    if ! _secret_chown_files "$d" "$manifest"; then
+        _secret_tmp_cleanup "$d"
+        echo "ERROR: could not hand the secret files under $d to their containers' uids." >&2
+        echo "       Fix: make sure docker can run '${NOO_SECRET_CHOWN_IMAGE:-alpine}' (docker pull ${NOO_SECRET_CHOWN_IMAGE:-alpine}), or run the launcher as root." >&2
+        return 1
+    fi
+    while read -r name var owner; do
+        mv -f "$d/.$$.$name" "$d/$name" || { _secret_tmp_cleanup "$d"; return 1; }
+    done <<EOF
+$plan
+EOF
+    _secret_tmp_cleanup "$d"
+    # Drop files no declared secret names any more (a renamed secret must not
+    # leave its old plaintext behind).
+    for f in "$d"/*; do
+        [ -e "$f" ] || continue
+        printf '%s\n' "$plan" | awk -v n="$(basename "$f")" '$1 == n { found = 1 } END { exit !found }' || rm -f "$f"
+    done
+    export NOO_SECRET_RUNDIR="$d"
+}
+
+# remove_secret_files - `noo stack stop`: delete the secret files and the
+# directory. Safe to call with nothing there. A running container keeps its
+# own bind of the (now unlinked) inode; nothing else can read it.
+remove_secret_files() {
+    local d f
+    d="$(secret_rundir)"
+    [ -d "$d" ] && [ ! -L "$d" ] || return 0
+    for f in "${d:?}"/* "${d:?}"/.[!.]*; do
+        [ -e "$f" ] && rm -f "$f"
+    done
+    rmdir "$d" 2>/dev/null || true
 }
 
 # Store keys load_secrets never exports (see _load_secrets_sops). The CLI-only

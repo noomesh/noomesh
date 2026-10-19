@@ -122,17 +122,59 @@ agent sets `User: "0"` on them explicitly.
 | Service | `cap_drop` | `no-new-privileges` | Read-only root filesystem |
 |---|---|---|---|
 | `sandbox` | ALL (plus the few it adds back) | yes | yes |
-| `gateway` | ALL | yes | no |
-| `worker`, `worker-extra` | ALL | yes | no |
+| `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
+| `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
+| `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
 
-The gateway and the worker run as an unprivileged user, bind ports above 1024
-and use no capability, so dropping all of them removes nothing they need.
-Their root filesystem stays writable: the gateway writes the mounted
-`noomesh.yaml`, prompts and compose override and starts helper processes that
-write under their home and `/tmp`, and the worker's tools write where the
-operator's configuration points. The worker mounts `noomesh.yaml` read-only
-because nothing in it writes the file; the gateway's settings route does, so
-the gateway keeps it read-write.
+The gateway, the worker and trellion run as an unprivileged user, bind ports
+above 1024 and use no capability, so dropping all of them removes nothing they
+need.
+
+### Read-only root filesystem
+
+Since 2026-10-19 the four services above cannot write to their image. The
+write set was measured, not guessed: `docker diff` on the live controller
+listed, outside mounts, only
+
+* a copy of the PKI tree under `/tmp/pki` (the gateway's `stage_pki`, and the
+  leaf-key copy `db/engine.py` makes in the worker and trellion), the CA
+  bundle `/tmp/noo-ca-bundle.pem` and the mount points of the dev-mode source
+  overlays: all under `/tmp`;
+* `/tmp/.ses` and the onnxruntime id and event store under
+  `~/.cache/Microsoft` in trellion (the latter is vendor telemetry and is
+  switched off, [telemetry.md](telemetry.md));
+* Python bytecode under `/app/src/**/__pycache__`.
+
+Each service gets a size-capped tmpfs for `/tmp` and for its home directory
+(`/home/nonroot`, owned by uid 65532, mode 0700). The caps bound host RAM, not
+disk, and are not reservations. Because they are RAM, the **key copies in
+`/tmp/pki` no longer persist in the container's layer** (before this change
+`docker diff` showed `/tmp/pki/gateway/gateway.key`, readable by anyone with the
+docker group); a tmpfs is gone when the container stops. Bytecode is compiled
+at image build (`python -m compileall /app/src` in `Dockerfile.worker` and
+`Dockerfile.trellion`) and `PYTHONDONTWRITEBYTECODE=1` stops the runtime
+writing it. The mounted `noomesh.yaml`, `prompts/`, the compose override, the
+`/data` volume and the host spool are bind mounts and volumes, not image
+paths; they stay writable where they were (the worker mounts `noomesh.yaml`
+read-only because nothing in it writes the file; the gateway's settings route
+does).
+
+Secrets are the other thing a writable layer would have kept. Compose refuses
+an `environment:`-sourced secret in a read-only service, so they are `file:`
+secrets bind-mounted from a tmpfs directory the launcher writes
+([secrets.md](secrets.md#where-the-files-live)): nothing plaintext reaches a
+disk or a layer.
+
+What to expect when a path is missed: the write fails with `Read-only file
+system` (EROFS) naming it, in that service's log, not at build time. A
+configuration that points a worker tool at a directory inside the image
+(`workspace_dir`, `output_dir`, the audit archive) now fails the same way; the
+defaults are `/data` and `/tmp`. Verify a roll with:
+
+```sh
+docker inspect -f '{{.Name}} {{.HostConfig.ReadonlyRootfs}}' noo-gateway noo-worker noo-trellion
+docker diff noo-gateway noo-worker noo-trellion    # only mount points (A /opt/noo/addon-routes, /root/.claude): no files
+```
 
 `NOO_NODE_AGENT_PRIVILEGED` defaults to `false` for the opt-in
 `node-agent-compose` lane. The containerised agent holds no Docker socket and

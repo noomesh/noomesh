@@ -7,9 +7,12 @@ The operator's rule is "always sops, never plaintext", and the worry that goes
 with it is "something just lying about". Since 2026-09-29 the base compose
 file delivers every tier-1 secret to the gateway, the worker(s), redis,
 postgres, grafana and the browser through a top-level `secrets:` entry whose
-source is `environment: VAR` — a variable of the launcher process — which
-compose copies into the container at create time as `/run/secrets/<target>`.
-No host file, nothing in `Config.Env`. What keeps that true:
+source is `file: ${NOO_SECRET_RUNDIR}/<name>` — a file the launcher writes to
+a tmpfs directory (scripts/lib-secrets.sh `write_secret_files`; see
+tests/test_secret_rundir.py), bind-mounted as `/run/secrets/<target>`. (It was
+`environment: VAR` until the services went `read_only`: compose refuses that
+form there.) Nothing on a disk, nothing in `Config.Env`, nothing in a
+container's writable layer. What keeps that true:
 
 G1  No file-backed NAME — tier-1, and since an earlier change the tier-2
     provider/channel keys (TAVILY_API_KEY, TELEGRAM_BOT_TOKEN, …; both
@@ -23,7 +26,8 @@ G2  Every top-level secret is referenced; every service-level secret has a
     every pointer names a file the service is given.
 G4  The launcher writes no secret to disk: `lib-secrets.sh` and the three
     launchers have no redirection into `secrets/` and no `mkdir` of a
-    runtime secrets directory.
+    runtime secrets directory. (The only writes are into the tmpfs-checked
+    `$d` of `write_secret_files`; tests/test_secret_rundir.py.)
     Plus: the pgpass derivation has one declaration in two languages (the
     launcher and the onboard wizard's compose wrapper) and they produce the
     same bytes; the CLI's verify-row tier-1 list is the union of the two
@@ -133,8 +137,16 @@ def top_level_secrets() -> dict[str, str]:
     add-on overlay (compose merges top-level `secrets:` across `-f` files;
     the add-ons declare their own keys and pgpass bodies)."""
     raw = full_projection().get("secrets") or {}
-    out = {k: v.get("environment") for k, v in raw.items()}
-    assert all(out.values()), f"a top-level secret is not sourced from `environment:` (a file: source leaves a host file lying about): {out}"
+    out = {k: v.get("x-noo-source") for k, v in raw.items()}
+    assert all(out.values()), f"a top-level secret names no `x-noo-source:` variable (the launcher cannot write its file): {out}"
+    # (`config --no-interpolate` prefixes the project directory to a path it
+    # reads as relative, so the check is on the tail, not the start.)
+    want = "${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/"
+    bad = {k: v.get("file") for k, v in raw.items() if not str(v.get("file", "")).endswith(want + k)}
+    assert not bad, (
+        "a top-level secret is not sourced from `file: ${NOO_SECRET_RUNDIR:-...}/<name>` (an `environment:` source "
+        f"is refused on a read-only service; any other file leaves a plaintext host file lying about): {bad}"
+    )
     return out
 
 
