@@ -487,12 +487,8 @@ fn apply_topology_env(ctx: &mut Ctx) {
             // the gateway on the compose default `stunnel-ollama`, which does
             // not exist on standalone — every chat channel failed.
             ("OLLAMA_URL", STANDALONE_OLLAMA_EMBED_URL),
-            // The worker's direct LLM pointer (temporal extraction, the
-            // agent orchestrator); blank made the container default to a
-            // vLLM that standalone never runs (2026-09-07). trellion does
-            // NOT read this any more — compose points it at the gateway,
-            // which mesh-routes its calls (2026-09-09).
-            ("PAGEINDEX_LLM_URL", STANDALONE_OLLAMA_EMBED_URL),
+            // No PAGEINDEX_LLM_URL (i145): the worker's LLM calls go through
+            // the gateway as a purpose; the env value is ignored.
             ("LOKI_URL", ""),
             ("LOKI_PUSH_URL", ""),
         ] {
@@ -500,12 +496,9 @@ fn apply_topology_env(ctx: &mut Ctx) {
         }
     } else {
         // Tiered/controller install: loki rides the controller profile;
-        // the LLM/ollama pointers follow the GPU tier that deploys them.
+        // the ollama pointer follows the GPU tier that deploys it.
         ctx.update_env("LOKI_URL", "https://loki:3100");
         ctx.update_env("LOKI_PUSH_URL", "https://loki:3100/loki/api/v1/push");
-        if ctx.state.tier == 1 {
-            ctx.update_env("PAGEINDEX_LLM_URL", "https://noo-vllm:8000");
-        }
         if ctx.state.tier == 2 {
             ctx.update_env("OLLAMA_URL", "https://stunnel-ollama:11434");
         }

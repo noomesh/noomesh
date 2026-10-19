@@ -238,7 +238,13 @@ fn alias_rows(aliases: &[serde_json::Value]) -> String {
                 format!(
                     "→ {}{}",
                     a["class"].as_str().unwrap_or("?"),
-                    if a["builtin"].as_bool().unwrap_or(false) { "  (built in)" } else { "" }
+                    if a["builtin"].as_bool().unwrap_or(false) {
+                        "  (built in)"
+                    } else if a["purpose"].as_bool().unwrap_or(false) {
+                        "  (purpose)"
+                    } else {
+                        ""
+                    }
                 ),
             )
         })
@@ -286,8 +292,10 @@ mod tests {
             serde_json::json!({"alias": "default", "class": "chat-default", "builtin": true}),
             serde_json::json!({"alias": "auto", "class": "chat-default", "builtin": true}),
             serde_json::json!({"alias": "gemma4:12b-Any", "class": "chat-default", "builtin": false}),
+            serde_json::json!({"alias": "knowledge", "class": "chat-default", "builtin": false, "purpose": true}),
         ];
         let out = alias_rows(&aliases);
+        assert!(out.lines().any(|l| l.contains("knowledge") && l.contains("(purpose)")), "{out}");
         let keys: Vec<&str> = out.lines().map(|l| l.split_whitespace().next().unwrap_or("")).collect();
         // Strip any styling escape the key may carry.
         let plain: Vec<String> = keys.iter().map(|k| {
@@ -298,7 +306,7 @@ mod tests {
             }
             s
         }).collect();
-        assert_eq!(plain, ["default", "auto", "gemma4:12b-Any"], "{out}");
+        assert_eq!(plain, ["default", "auto", "gemma4:12b-Any", "knowledge"], "{out}");
         assert!(!out.contains("Default") && !out.contains("Auto"), "{out}");
         assert!(out.contains("→ chat-default  (built in)"), "{out}");
     }

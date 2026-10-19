@@ -4171,7 +4171,7 @@ async fn model_classes_get(State(state): State<Arc<AppState>>) -> AppResult {
             })
         })
         .collect();
-    let aliases: Vec<Value> = table.aliases.iter().map(|(a, c)| json!({"alias": a, "class": c, "builtin": crate::coordinator::classes::BUILTIN_ALIASES.contains(&a.as_str())})).collect();
+    let aliases: Vec<Value> = table.aliases.iter().map(|(a, c)| json!({"alias": a, "class": c, "builtin": crate::coordinator::classes::BUILTIN_ALIASES.contains(&a.as_str()), "purpose": crate::coordinator::classes::PURPOSE_ALIASES.iter().any(|p| p.eq_ignore_ascii_case(a))})).collect();
     Ok(Json(json!({"classes": classes, "aliases": aliases})))
 }
 

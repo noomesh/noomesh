@@ -602,7 +602,7 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         if [ -z "${OLLAMA_URL:-}" ]; then
             export OLLAMA_URL="https://noo-stunnel-ollama-embed:11434"
         fi
-        for _v in OLLAMA_URL PAGEINDEX_EMBEDDING_URL PAGEINDEX_LLM_URL; do
+        for _v in OLLAMA_URL PAGEINDEX_EMBEDDING_URL; do
             _cur="$(eval "printf '%s' \"\${$_v:-}\"")"
             if [ -z "$_cur" ] && [ -f ".env" ]; then
                 _cur="$(grep -E "^[[:space:]]*$_v=" .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
