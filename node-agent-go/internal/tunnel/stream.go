@@ -83,6 +83,8 @@ func newReqBody(grant func(int)) *reqBody {
 	return b
 }
 
+var errEmptyData = errors.New("the gateway sent an empty DATA frame")
+
 var errWindowExceeded = errors.New("the gateway sent more request body than the stream window allows")
 
 // push queues a DATA payload. window is the per-stream limit.
@@ -98,10 +100,10 @@ func (b *reqBody) push(p []byte, window int) error {
 	}
 	b.queued += cost
 	if len(p) == 0 {
-		// Nothing to read; give the credit straight back.
-		b.queued -= cost
-		go b.grant(cost)
-		return nil
+		// The gateway never sends an empty DATA frame. Taking one would owe
+		// credit for nothing, and granting it from here could pile up
+		// goroutines behind a stalled writer; it is a protocol error.
+		return errEmptyData
 	}
 	b.chunks = append(b.chunks, chunk{b: p, cost: cost})
 	b.cond.Broadcast()

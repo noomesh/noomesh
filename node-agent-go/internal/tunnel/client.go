@@ -25,6 +25,9 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 )
 
+// handshakeLimit bounds a handshake message (challenge, ready).
+const handshakeLimit = 64 << 10
+
 // Path is where the gateway serves the tunnel.
 const Path = "/api/node/tunnel"
 
@@ -263,6 +266,9 @@ func (c *Client) session(ctx context.Context) (connected bool, err error) {
 
 func (c *Client) handshake(conn *websocket.Conn) (readyMsg, error) {
 	var ready readyMsg
+	// Handshake messages are small JSON; bound what is read before the
+	// session's own limit takes over.
+	conn.SetReadLimit(handshakeLimit)
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	typ, data, err := conn.ReadMessage()
 	if err != nil {
@@ -321,8 +327,10 @@ func (c *Client) handshake(conn *websocket.Conn) (readyMsg, error) {
 	if ready.T != "ready" || ready.V != ProtocolVersion {
 		return ready, errors.New("tunnel handshake: the gateway did not say ready")
 	}
-	if ready.Window < 8*MinCost || ready.Window > MaxWindow {
-		ready.Window = DefaultWindow
+	// A window below one maximum frame could never be satisfied: every
+	// response write would wait for credit that cannot exist.
+	if ready.Window < MaxData || ready.Window > MaxWindow {
+		return ready, fmt.Errorf("tunnel handshake: the gateway offered a window of %d bytes; it must be between %d and %d", ready.Window, MaxData, MaxWindow)
 	}
 	if ready.MaxStreams <= 0 || ready.MaxStreams > NodeStreamCeiling {
 		ready.MaxStreams = NodeStreamCeiling

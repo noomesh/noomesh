@@ -468,11 +468,11 @@ impl NodeRequest {
             (reqwest::header::HeaderName::try_from(key), reqwest::header::HeaderValue::try_from(value))
         {
             self.headers.push((name.as_str().to_string(), String::from_utf8_lossy(val.as_bytes()).into_owned()));
-            self.http = self.http.header(name, val);
+            self.http = with_header(self.http, name.as_str(), val.as_bytes());
         } else {
             // As before: an invalid header is an error when the call is sent,
             // not a silent omission.
-            self.http = self.http.header("invalid header", "x");
+            self.http = with_header(self.http, "invalid header", b"x");
         }
         self
     }
@@ -568,6 +568,13 @@ impl NodeRequest {
             }
         }
     }
+}
+
+/// `RequestBuilder::header` with concrete types, called from outside the
+/// generic `NodeRequest::header`: inside it, rustc prefers that function's
+/// `HeaderName: TryFrom<K>` bound over the blanket impls and rejects it.
+fn with_header(rb: reqwest::RequestBuilder, name: &str, value: &[u8]) -> reqwest::RequestBuilder {
+    rb.header(name, value)
 }
 
 /// A unary call to a backend URL the caller already holds. The URL may be a

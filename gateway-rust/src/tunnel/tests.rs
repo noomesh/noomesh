@@ -7,7 +7,6 @@
 //! WebSocket.
 
 use super::*;
-use base64::Engine as _;
 use futures::StreamExt;
 use reqwest::Method;
 
@@ -430,7 +429,7 @@ async fn the_newest_tunnel_for_a_node_wins_and_the_old_one_ending_does_not_evict
 #[test]
 fn hosts_map_to_nodes_case_insensitively() {
     let hub = Hub::new();
-    hub.note_host(&at("Host9.TAIL"), "host9");
+    hub.claim_host(&at("Host9.TAIL"), "host9").unwrap();
     assert_eq!(hub.node_for_host(&at("host9.tail")).as_deref(), Some("host9"));
     assert_eq!(hub.node_for_host(&at("other")), None);
 }
@@ -720,7 +719,7 @@ async fn a_link_that_only_holds_an_address_finds_the_tunnel_by_host() {
     let node = "route-addr";
     let (sess, rx) = install(node);
     serve_node(sess, rx, |open| vec![head(0, 200, &[]), data(0, open["path"].as_str().unwrap().as_bytes()), end(0)]);
-    hub().note_host(&at("route-addr.test"), node);
+    hub().claim_host(&at("route-addr.test"), node).unwrap();
     // for_base is what most call sites build (a record's agent_url in hand).
     let link = crate::node_link::NodeLink::for_base(&agent("route-addr.test", ""));
     let resp = link.request(Method::GET, "/api/containers/web/proxy/index").send().await.expect("answered over the tunnel");
@@ -732,12 +731,41 @@ async fn a_link_that_only_holds_an_address_finds_the_tunnel_by_host() {
 }
 
 #[test]
-fn a_node_record_answers_to_its_agent_url_and_its_ip() {
-    let r = json!({"agent_url": "https://Host9.tail.ts.net:9000", "ip_address": "100.64.0.9"});
-    assert_eq!(host_keys(&r), vec!["Host9.tail.ts.net:9000".to_string(), at("100.64.0.9")]);
-    assert_eq!(host_keys(&json!({"ip_address": "10.0.0.2"})), vec![at("10.0.0.2")]);
-    assert!(host_keys(&json!({"agent_url": "", "ip_address": ""})).is_empty());
-    assert!(host_keys(&json!({})).is_empty());
+fn a_peer_address_is_keyed_with_the_agent_port_and_v4_mapped_v6_is_v4() {
+    let v4: std::net::IpAddr = "100.64.0.9".parse().unwrap();
+    assert_eq!(peer_key(v4), at("100.64.0.9"));
+    let mapped: std::net::IpAddr = "::ffff:100.64.0.9".parse().unwrap();
+    assert_eq!(peer_key(mapped), at("100.64.0.9"));
+    let v6: std::net::IpAddr = "fd00::9".parse().unwrap();
+    assert_eq!(peer_key(v6), at("[fd00::9]"));
+}
+
+/// Node A cannot capture node B's calls by claiming B's address, however it
+/// gets there; only the address the gateway observed is ever claimed, and an
+/// address a live node holds is not shared.
+#[tokio::test]
+async fn node_a_claiming_node_bs_address_does_not_capture_bs_calls() {
+    let hub_ = hub();
+    let (b_sess, b_rx) = install("hijack-b");
+    serve_node(b_sess, b_rx, |_| vec![head(0, 200, &[]), data(0, b"from-b"), end(0)]);
+    let (a_sess, a_rx) = install("hijack-a");
+    serve_node(a_sess, a_rx, |_| vec![head(0, 200, &[]), data(0, b"from-a"), end(0)]);
+    let b_addr = at("hijack-b.test");
+    hub_.claim_host(&b_addr, "hijack-b").unwrap();
+    // A reports (or is seen at) B's address: refused, and B still owns it.
+    assert_eq!(hub_.claim_host(&b_addr, "hijack-a"), Err("hijack-b".to_string()));
+    assert_eq!(node_for_base(&agent("hijack-b.test", "")).as_deref(), Some("hijack-b"));
+    let link = crate::node_link::NodeLink::for_base(&agent("hijack-b.test", ""));
+    assert_eq!(link.request(Method::GET, "/x").send().await.unwrap().text().await.unwrap(), "from-b");
+    // A's own address is its own, and moving it drops the old one.
+    hub_.claim_host(&at("hijack-a.test"), "hijack-a").unwrap();
+    hub_.claim_host(&at("hijack-a2.test"), "hijack-a").unwrap();
+    assert_eq!(node_for_base(&agent("hijack-a.test", "")), None);
+    assert_eq!(node_for_base(&agent("hijack-a2.test", "")).as_deref(), Some("hijack-a"));
+    // Once B's tunnel is gone its address is free to be claimed by whoever
+    // really connects from it.
+    hub_.live("hijack-b").unwrap().close("x");
+    assert_eq!(hub_.claim_host(&b_addr, "hijack-a"), Ok(()));
 }
 
 #[tokio::test]
@@ -843,7 +871,7 @@ async fn sse_bytes_are_identical_over_the_tunnel_and_over_https() {
         out.push(end(0));
         out
     });
-    hub().note_host(&at("sse-par.test"), node);
+    hub().claim_host(&at("sse-par.test"), node).unwrap();
     crate::tunnel_door::ensure_started().await;
     let target = crate::tunnel_door::carry(&agent("sse-par.test", "/v1/chat/completions"));
     assert!(target.starts_with("http://127.0.0.1:") && target.ends_with("/sse-par/v1/chat/completions"), "{target}");
@@ -917,4 +945,108 @@ async fn a_failed_door_request_does_not_put_the_secret_in_its_error_text() {
     let dead = "http://127.0.0.1:1/door-fail/sse".to_string();
     let e = crate::tunnel_door::mark(client.get(&dead), &dead).send().await.err().expect("refused");
     assert!(!format!("{e} {e:?}").contains(&secret));
+}
+
+// ── review fixes ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_receive_window_is_enforced_in_bytes_not_in_events() {
+    let (sess, mut rx) = pair(SessionParams::default());
+    let s2 = sess.clone();
+    let h = tokio::spawn(async move { s2.request(get("/x"), None).await });
+    let id = next_frame(&mut rx).await.stream;
+    sess.on_frame(head(id, 200, &[]));
+    let resp = h.await.unwrap().ok().expect("response");
+    // 8 full frames fill the 256 KiB window exactly; a ninth is over it, well
+    // inside the event-count cap (272) that used to be the only limit.
+    let chunk = vec![1u8; MAX_DATA];
+    for _ in 0..(WINDOW / MAX_DATA) {
+        sess.on_frame(data(id, &chunk));
+    }
+    assert!(rx.try_recv().map(|f| f.kind != FRAME_RESET).unwrap_or(true));
+    sess.on_frame(data(id, &chunk));
+    let (r, _) = frame_of(&mut rx, FRAME_RESET, id).await;
+    assert!(String::from_utf8_lossy(&r.payload).contains("window"));
+    drop(resp);
+}
+
+#[tokio::test]
+async fn reading_gives_the_window_back_so_a_compliant_node_never_trips_it() {
+    let (sess, mut rx) = pair(SessionParams::default());
+    let s2 = sess.clone();
+    let h = tokio::spawn(async move { s2.request(get("/x"), None).await });
+    let id = next_frame(&mut rx).await.stream;
+    sess.on_frame(head(id, 200, &[]));
+    let mut body = h.await.unwrap().ok().expect("response").body;
+    let chunk = vec![1u8; MAX_DATA];
+    for _ in 0..40 {
+        // Fill the window, read it all, repeat: 40 frames through an 8-frame window.
+        sess.on_frame(data(id, &chunk));
+        let got = body.next().await.unwrap().unwrap();
+        assert_eq!(got.len(), MAX_DATA);
+    }
+    while let Ok(f) = rx.try_recv() {
+        assert_ne!(f.kind, FRAME_RESET);
+    }
+}
+
+#[tokio::test]
+async fn a_credit_grant_past_the_window_is_a_violation_and_never_reaches_the_semaphore() {
+    let (sess, mut rx) = pair(SessionParams::default());
+    let s2 = sess.clone();
+    let h = tokio::spawn(async move { s2.request(get("/x"), None).await });
+    let id = next_frame(&mut rx).await.stream;
+    // The semaphore starts full (the request body was sent whole): any grant
+    // at all is more than the node can have been sent.
+    sess.on_frame(Frame::new(FRAME_CREDIT, id, u32::MAX.to_be_bytes().to_vec()));
+    let (r, _) = frame_of(&mut rx, FRAME_RESET, id).await;
+    assert!(String::from_utf8_lossy(&r.payload).contains("credit"));
+    assert!(h.await.unwrap().is_err());
+    assert!(!sess.is_closed(), "one bad stream does not end the session");
+    // And repeated grants cannot overflow whatever the stream state.
+    for _ in 0..1000 {
+        sess.on_frame(Frame::new(FRAME_CREDIT, id, u32::MAX.to_be_bytes().to_vec()));
+    }
+}
+
+#[tokio::test]
+async fn a_head_deadline_frees_the_place_and_stops_the_body_pump() {
+    let (sess, mut rx) = pair(SessionParams::default());
+    let held = Arc::new(());
+    let h2 = held.clone();
+    // A request body that never yields: the pump parks on it.
+    let body = futures::stream::pending::<Result<Bytes, std::io::Error>>().inspect(move |_| {
+        let _keep = &h2;
+    });
+    let req = TunnelRequest { method: "POST".into(), path: "/slow".into(), headers: vec![], body: TunnelBody::Stream(body.boxed()) };
+    let e = sess.request_with(req, None, Some(Duration::from_millis(80))).await.err().expect("head timeout");
+    assert!(matches!(e, TunnelError::Timeout { .. }), "{e:?}");
+    // The pump (which owns the body stream and so a clone of `held`) is aborted.
+    for _ in 0..50 {
+        if Arc::strong_count(&held) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(Arc::strong_count(&held), 1, "the body pump outlived its request");
+    assert_eq!(sess.open_streams(), 0);
+    let _ = next_frame(&mut rx).await;
+}
+
+#[tokio::test]
+async fn the_door_header_is_sensitive_and_a_redirect_from_a_node_is_not_followable() {
+    crate::tunnel_door::ensure_started().await;
+    let (sess, rx) = install("door-redirect");
+    serve_node(sess, rx, |_| vec![head(0, 302, &[("location", "http://evil.invalid/steal"), ("x-keep", "1")]), end(0)]);
+    let url = crate::tunnel_door::door_url("door-redirect", "/go").expect("door url");
+    let client = reqwest::Client::new();
+    let req = crate::tunnel_door::mark(client.get(&url), &url).build().unwrap();
+    let v = req.headers().get(crate::tunnel_door::DOOR_HEADER).expect("marked");
+    assert!(v.is_sensitive(), "the secret must not show up in Debug output");
+    assert!(!format!("{req:?}").contains(&crate::tunnel_door::test_secret()));
+    // The node's redirect arrives as a 302 with no Location: nothing to follow.
+    let resp = client.execute(req).await.unwrap();
+    assert_eq!(resp.status(), 302);
+    assert!(resp.headers().get("location").is_none());
+    assert_eq!(resp.headers().get("x-keep").unwrap(), "1");
 }

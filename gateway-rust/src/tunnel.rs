@@ -49,7 +49,7 @@
 //! streams open; the next call is answered 503.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -260,6 +260,9 @@ struct Slot {
     events: mpsc::Sender<Event>,
     /// The node's credit for our request body.
     credit: Arc<Semaphore>,
+    /// Cost of response DATA queued for the consumer and not yet read: the
+    /// receive window, enforced in bytes.
+    inflight: Arc<AtomicUsize>,
 }
 
 /// One live tunnel from one node. Built by [`Session::new`], fed by
@@ -388,9 +391,19 @@ impl Session {
             FRAME_DATA => {
                 if f.payload.len() > MAX_DATA {
                     self.violation(f.stream, "DATA frame larger than the maximum");
-                } else {
-                    self.deliver(f.stream, Event::Data(f.payload));
+                    return;
                 }
+                // The receive window, in bytes: a node that ignores credit
+                // cannot make the gateway queue more than one window per stream.
+                let inflight = self.streams.lock().ok().and_then(|m| m.get(&f.stream).map(|s| s.inflight.clone()));
+                if let Some(inf) = inflight {
+                    let c = cost(f.payload.len());
+                    if inf.fetch_add(c, Ordering::SeqCst) + c > self.params.window {
+                        self.violation(f.stream, "the node sent more than the stream window allows");
+                        return;
+                    }
+                }
+                self.deliver(f.stream, Event::Data(f.payload));
             }
             FRAME_END => {
                 if let Some(s) = self.take_slot(f.stream) {
@@ -407,8 +420,15 @@ impl Session {
                     let n = u32::from_be_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]) as usize;
                     let credit = self.streams.lock().ok().and_then(|m| m.get(&f.stream).map(|s| s.credit.clone()));
                     if let Some(c) = credit {
-                        // Semaphore::MAX_PERMITS bounds a hostile grant.
-                        c.add_permits(n.min(Semaphore::MAX_PERMITS / 2));
+                        // A node can only give back what it was sent, so the
+                        // credit on a stream never exceeds its window. A grant
+                        // past that is a protocol violation, and never reaches
+                        // the semaphore (whose add_permits asserts on overflow).
+                        if n > self.params.window.saturating_sub(c.available_permits()) {
+                            self.violation(f.stream, "credit grant exceeds the stream window");
+                        } else {
+                            c.add_permits(n);
+                        }
                     }
                 }
             }
@@ -436,6 +456,17 @@ impl Session {
     /// Open a stream, send the request, and wait for the response head. The
     /// returned body streams the rest; dropping it resets the stream.
     pub async fn request(self: &Arc<Self>, req: TunnelRequest, total: Option<Duration>) -> Result<TunnelResponse, TunnelError> {
+        self.request_with(req, total, total).await
+    }
+
+    /// [`Session::request`] with a separate bound on the wait for the response
+    /// head (`head`), for callers that have no total bound of their own.
+    pub async fn request_with(
+        self: &Arc<Self>,
+        req: TunnelRequest,
+        total: Option<Duration>,
+        head: Option<Duration>,
+    ) -> Result<TunnelResponse, TunnelError> {
         if self.is_closed() {
             return Err(TunnelError::NoTunnel(self.node.clone()));
         }
@@ -457,13 +488,14 @@ impl Session {
         }
         let (etx, mut erx) = mpsc::channel::<Event>(self.params.window / MIN_COST + 16);
         let credit = Arc::new(Semaphore::new(self.params.window));
+        let inflight = Arc::new(AtomicUsize::new(0));
         match self.streams.lock() {
             Ok(mut m) => {
-                m.insert(id, Slot { events: etx, credit: credit.clone() });
+                m.insert(id, Slot { events: etx, credit: credit.clone(), inflight: inflight.clone() });
             }
             Err(_) => return Err(TunnelError::NoTunnel(self.node.clone())),
         }
-        let mut guard = StreamGuard { sess: self.clone(), id, _permit: permit, finished: false };
+        let mut guard = StreamGuard { sess: self.clone(), id, _permit: permit, finished: false, pump: None };
 
         let headers: Vec<(String, String)> =
             req.headers.iter().filter(|(k, _)| !drop_request_header(k)).cloned().collect();
@@ -476,29 +508,31 @@ impl Session {
         if self.out.send(Frame::new(FRAME_OPEN, id, open.to_string())).await.is_err() {
             return Err(TunnelError::Lost { node: self.node.clone(), reason: "the tunnel's writer is gone".into() });
         }
-        tokio::spawn(pump_body(self.clone(), id, credit, req.body));
+        guard.pump = Some(tokio::spawn(pump_body(self.clone(), id, credit, req.body)));
 
-        let deadline = total.map(|d| tokio::time::Instant::now() + d);
+        let now = tokio::time::Instant::now();
+        let deadline = total.map(|d| now + d);
+        let head_deadline = head.map(|d| now + d);
         let node = self.node.clone();
-        let first = recv_by(&mut erx, deadline).await;
+        let first = recv_by(&mut erx, head_deadline).await;
         let (status, headers) = match first {
             Err(()) => {
-                return Err(TunnelError::Timeout { node, secs: total.map(|d| d.as_secs()).unwrap_or(0) });
+                return Err(TunnelError::Timeout { node, secs: head.map(|d| d.as_secs()).unwrap_or(0) });
             }
             Ok(Some(Event::Head { status, headers })) => (status, headers),
             Ok(Some(Event::Reset(why))) => {
-                guard.finished = true;
+                guard.finish();
                 return Err(TunnelError::Reset { node, reason: why });
             }
             Ok(Some(Event::Gone(why))) => {
-                guard.finished = true;
+                guard.finish();
                 return Err(TunnelError::Lost { node, reason: why });
             }
             Ok(Some(Event::End)) | Ok(Some(Event::Data(_))) => {
                 return Err(TunnelError::Lost { node, reason: "the node answered without a response head".into() });
             }
             Ok(None) => {
-                guard.finished = true;
+                guard.finish();
                 let why = self.reason();
                 return Err(TunnelError::Lost { node, reason: if why.is_empty() { "the tunnel closed before the response".into() } else { why } });
             }
@@ -508,12 +542,13 @@ impl Session {
         struct St {
             erx: mpsc::Receiver<Event>,
             guard: StreamGuard,
+            inflight: Arc<AtomicUsize>,
             node: String,
             deadline: Option<tokio::time::Instant>,
             idle_secs: u64,
             done: bool,
         }
-        let st = St { erx, guard, node: self.node.clone(), deadline, idle_secs: total.map(|d| d.as_secs()).unwrap_or(0), done: false };
+        let st = St { erx, guard, inflight, node: self.node.clone(), deadline, idle_secs: total.map(|d| d.as_secs()).unwrap_or(0), done: false };
         let body = futures::stream::unfold(st, |mut st| async move {
             if st.done {
                 return None;
@@ -527,23 +562,24 @@ impl Session {
                     Some((Err(e), st))
                 }
                 Ok(Some(Event::Data(b))) => {
+                    st.inflight.fetch_sub(cost(b.len()), Ordering::SeqCst);
                     st.guard.grant(b.len());
                     Some((Ok(b), st))
                 }
                 Ok(Some(Event::End)) => {
-                    st.guard.finished = true;
+                    st.guard.finish();
                     None
                 }
                 Ok(Some(Event::Reset(why))) => {
                     st.done = true;
-                    st.guard.finished = true;
+                    st.guard.finish();
                     crate::node_rpc::note_tunnel_abort(&st.node);
                     let e = TunnelError::Reset { node: st.node.clone(), reason: why };
                     Some((Err(e), st))
                 }
                 Ok(Some(Event::Gone(why))) => {
                     st.done = true;
-                    st.guard.finished = true;
+                    st.guard.finish();
                     crate::node_rpc::note_tunnel_abort(&st.node);
                     let e = TunnelError::Lost { node: st.node.clone(), reason: why };
                     Some((Err(e), st))
@@ -556,7 +592,7 @@ impl Session {
                 }
                 Ok(None) => {
                     st.done = true;
-                    st.guard.finished = true;
+                    st.guard.finish();
                     crate::node_rpc::note_tunnel_abort(&st.node);
                     let why = st.guard.sess.reason();
                     let e = TunnelError::Lost {
@@ -588,9 +624,15 @@ struct StreamGuard {
     id: u32,
     _permit: OwnedSemaphorePermit,
     finished: bool,
+    /// The task uploading the request body; aborted with the stream.
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl StreamGuard {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+
     /// The consumer took `n` bytes: give the node that much window back.
     fn grant(&self, n: usize) {
         self.sess.send_soon(credit_frame(self.id, cost(n)));
@@ -599,6 +641,9 @@ impl StreamGuard {
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
+        if let Some(h) = self.pump.take() {
+            h.abort();
+        }
         // A stream the node already ended (END/RESET) has no slot left and
         // needs no reset.
         let had_slot = self.sess.take_slot(self.id).is_some();
@@ -722,10 +767,22 @@ impl Hub {
         }
     }
 
-    pub fn note_host(&self, hostport: &str, node: &str) {
-        if let Ok(mut h) = self.hosts.write() {
-            h.insert(hostport.to_ascii_lowercase(), node.to_string());
+    /// Record that `hostport` is the address `node`'s tunnel was observed
+    /// coming from. Refused (the other node's id is returned) when another
+    /// node with a live tunnel already holds it; the node's own earlier
+    /// addresses are dropped first. Only the gateway's own observation of the
+    /// connection may be passed here, never an address a node reports.
+    pub fn claim_host(&self, hostport: &str, node: &str) -> Result<(), String> {
+        let key = hostport.to_ascii_lowercase();
+        let Ok(mut h) = self.hosts.write() else { return Err(String::new()) };
+        if let Some(owner) = h.get(&key) {
+            if owner != node && self.live(owner).is_some() {
+                return Err(owner.clone());
+            }
         }
+        h.retain(|_, v| v != node);
+        h.insert(key, node.to_string());
+        Ok(())
     }
 
     pub fn node_for_host(&self, hostport: &str) -> Option<String> {
@@ -764,7 +821,6 @@ pub fn hub() -> &'static Hub {
 /// by the key in `cert_der`, under `alg` (`ES256` / `ES384`). The provider's
 /// own verification algorithms are used, so nothing new is trusted.
 fn verify_ecdsa(cert_der: &[u8], alg: &str, msg: &[u8], sig_der: &[u8]) -> Result<(), String> {
-    use rustls::pki_types::SignatureVerificationAlgorithm;
     use x509_parser::prelude::FromDer;
     let scheme = match alg {
         "ES256" => rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -916,10 +972,10 @@ pub(crate) fn admit(
 /// to. Anything less is refused with the remedy. After the upgrade the node
 /// must still answer the gateway's signed challenge.
 async fn upgrade(
-    State(state): State<Arc<AppState>>,
     caller: Option<Extension<crate::auth::ClusterNode>>,
     peer: Option<Extension<Option<crate::node_identity::VerifiedPeer>>>,
     thumb: Option<Extension<Option<crate::node_identity::PeerThumbprint>>>,
+    axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !enabled() {
@@ -935,11 +991,13 @@ async fn upgrade(
             return refuse(status, why);
         }
     };
-    ws.max_message_size(MAX_DATA + 64 * 1024)
-        .on_upgrade(move |socket| run_socket(state, socket, node, thumbprint))
+    // Limits before anything is buffered: the frame as well as the message.
+    ws.max_frame_size(MAX_DATA + 64 * 1024)
+        .max_message_size(MAX_DATA + 64 * 1024)
+        .on_upgrade(move |socket| run_socket(socket, node, thumbprint, remote.ip()))
 }
 
-async fn run_socket(state: Arc<AppState>, mut socket: WebSocket, node: String, thumbprint: String) {
+async fn run_socket(mut socket: WebSocket, node: String, thumbprint: String, peer_ip: std::net::IpAddr) {
     if let Err(e) = handshake(&mut socket, &node, &thumbprint).await {
         tracing::warn!(node = %node, error = %e, "node tunnel handshake refused");
         let refused = json!({"t": "refused", "reason": e});
@@ -955,7 +1013,7 @@ async fn run_socket(state: Arc<AppState>, mut socket: WebSocket, node: String, t
     // The loopback door lets callers that hold only a reqwest builder reach
     // this session; it starts with the first tunnel.
     crate::tunnel_door::ensure_started().await;
-    note_hosts(&state, &node).await;
+    claim_peer_address(&node, peer_ip);
 
     let (out_tx, out_rx) = mpsc::channel(OUT_QUEUE);
     let sess = Session::new(&node, hub().next_conn_id(), out_tx, params);
@@ -971,30 +1029,26 @@ async fn run_socket(state: Arc<AppState>, mut socket: WebSocket, node: String, t
     tracing::info!(node = %node, reason = %sess.reason(), "node tunnel down");
 }
 
-/// Remember which `host:port` this node's agent is reachable at (its
-/// `agent_url`, and its `ip_address` on the agent port), so a call that only
-/// holds an address or a backend URL can find the tunnel.
-async fn note_hosts(state: &Arc<AppState>, node: &str) {
-    let Ok(kv) = state.js.get_key_value("mesh_nodes").await else { return };
-    let Ok(Some(entry)) = kv.get(node).await else { return };
-    let Ok(record) = serde_json::from_slice::<Value>(&entry) else { return };
-    for key in host_keys(&record) {
-        hub().note_host(&key, node);
+/// The `host:port` key for an observed peer address.
+pub(crate) fn peer_key(ip: std::net::IpAddr) -> String {
+    let ip = ip.to_canonical();
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}:{}", crate::node_link::AGENT_PORT),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]:{}", crate::node_link::AGENT_PORT),
     }
 }
 
-/// The `host:port` keys a node record answers to.
-pub(crate) fn host_keys(record: &Value) -> Vec<String> {
-    let mut keys = Vec::new();
-    if let Some(Ok(u)) = record.get("agent_url").and_then(Value::as_str).filter(|s| !s.is_empty()).map(reqwest::Url::parse) {
-        if let (Some(h), Some(p)) = (u.host_str(), u.port_or_known_default()) {
-            keys.push(format!("{h}:{p}"));
-        }
+/// Let a caller that holds only an address find this node's tunnel, keyed by
+/// the address the gateway SAW the tunnel connect from: never by an
+/// `agent_url` or `ip_address` the node reports, which any node could set to
+/// another node's address to receive that node's traffic. An address another
+/// live node already holds is not shared; calls to it stay on HTTPS.
+fn claim_peer_address(node: &str, ip: std::net::IpAddr) {
+    let key = peer_key(ip);
+    if let Err(owner) = hub().claim_host(&key, node) {
+        tracing::warn!(node = %node, address = %key, held_by = %owner,
+            "node tunnel: this address is already held by another node's live tunnel; calls to it by address stay on HTTPS");
     }
-    if let Some(ip) = record.get("ip_address").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        keys.push(format!("{ip}:{}", crate::node_link::AGENT_PORT));
-    }
-    keys
 }
 
 /// The node with a LIVE tunnel whose agent is `base` (`https://host:port`).
@@ -1003,6 +1057,13 @@ pub fn node_for_base(base: &str) -> Option<String> {
     let key = format!("{}:{}", u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?);
     let node = hub().node_for_host(&key)?;
     hub().live(&node).map(|_| node)
+}
+
+/// Resolves when the session is closed. The `watch` guard lives and dies
+/// inside this function so no non-`Send` guard is held across the caller's
+/// `select!`.
+async fn closed(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|c| *c).await;
 }
 
 /// Pump one session until it ends: frames in from the node, frames out to it,
@@ -1021,7 +1082,7 @@ where
     let reason: &str = loop {
         tokio::select! {
             biased;
-            _ = shutdown.wait_for(|closed| *closed) => break "the session was closed",
+            _ = closed(&mut shutdown) => break "the session was closed",
             msg = stream.next() => match msg {
                 None => break "the node closed the connection",
                 Some(Err(_)) => break "the connection failed",
