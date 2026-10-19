@@ -2521,6 +2521,24 @@ mod tests {
     const C: Migration = Migration { revision: "003_c", down_revision: Some("002_b"), sql: "" };
     const CHAIN: &[Migration] = &[A, B, C];
 
+    /// scripts/mesh-migration-head.sh feeds the SIGNED stack lock's
+    /// `# mesh-migration-head` line, which `noo upgrade --stack` trusts when it
+    /// refuses a rollback below the database stamp. If the script and the
+    /// real chain disagree, that refusal is wrong in one direction or the other.
+    #[test]
+    fn the_release_script_reads_the_real_chain_head() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let out = std::process::Command::new("sh")
+            .arg(root.join("scripts/mesh-migration-head.sh"))
+            .arg(root.join("gateway-rust/src/mesh_migrate.rs"))
+            .output()
+            .expect("sh must be able to run scripts/mesh-migration-head.sh");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let want = MIGRATIONS.last().expect("the chain is not empty").revision;
+        assert_eq!(got, want, "the script's head must be the chain's last revision");
+    }
+
     #[test]
     fn empty_chain_plans_nothing_even_when_db_is_ahead() {
         // Step 1's real case: Alembic has stamped 046, we have ported none.
