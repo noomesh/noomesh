@@ -3295,7 +3295,7 @@ async fn action_agent_self_check(
                 "_Scan id: `{scan_id}`._ Each action is auditable in \
                  `noo_agent_decisions`; activity proposals live in \
                  `noo_activity_proposals`. Which phases are armed: \
-                 `GET /api/agent/meta-loop/status`.\n"
+                 the evolve add-on's meta-loop status route.\n"
             ));
         }
         crate::agent_meta_loop::MetaLoopOutcome::Unavailable { .. } => {
