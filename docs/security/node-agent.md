@@ -395,7 +395,9 @@ else plain alpine with stunnel installed at first start; the conf travels
 in `STUNNEL_CONF` (the agent owns no host directory a root-in-container
 sidecar should read from); `no-new-privileges`, `CapDrop ALL` plus
 `DAC_OVERRIDE` to read the leaf key, and `NET_BIND_SERVICE` only for a
-door below 1024. The sidecar forwards plaintext to the backend container
+door below 1024. The agent runs it as root (`User: "0"`) whatever the image's
+`USER` says: the published image runs the controller's doors as uid 65532, but
+a node's leaf is a root-owned `0600` file. The sidecar forwards plaintext to the backend container
 on the bridge; the backend's raw port stays reachable to OTHER containers
 on that bridge until each backend gets a private network (a deferred step
 the operator is exploring) — the sidecar is the door every client is
