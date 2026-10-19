@@ -55,6 +55,19 @@ TELEMETRY_SWITCHES: dict[str, dict[str, str]] = {
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
     },
+    # onnxruntime (>= 1.2x, Linux too) ships Microsoft's 1DS client: it keeps a
+    # device id and an event store under ~/.cache/Microsoft/DeveloperTools/
+    # .onnxruntime and uploads to mobile.events.data.microsoft.com/OneCollector.
+    # `ORT_DISABLE_TELEMETRY` (read from the environment when the telemetry
+    # object is built) stops all of it: probed with onnxruntime 1.31.0 and an
+    # InferenceSession, no switch -> deviceid + onnxruntime.db written under
+    # $HOME, switch set -> nothing written. Reaches us through markitdown ->
+    # magika in trellion, and directly in whisper and piper.
+    "onnx": {
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "DO_NOT_TRACK": "1",
+        "ORT_DISABLE_TELEMETRY": "1",
+    },
     # Ollama has no usage telemetry; this keeps prompts off ollama.com
     "ollama": {
         "OLLAMA_NO_CLOUD": "1",
@@ -82,13 +95,13 @@ SERVICE_CLASS: dict[str, str] = {
     # our Python services
     "worker": "hf",
     "worker-extra": "hf",
-    "trellion": "hf",
-    "trellion-intel": "hf",
+    "trellion": "onnx",
+    "trellion-intel": "onnx",
     "noo-evolve": "hf",
     # one-shot from the evolve image: copies a file, no network at all
     "noo-evolve-routes": "none",
-    "whisper": "hf",
-    "piper": "hf",
+    "whisper": "onnx",
+    "piper": "onnx",
     "sandbox": "hf",
     "sandbox-extra": "hf",
     "browser": "hf",
@@ -295,6 +308,14 @@ def test_python_images_bake_the_hf_switches(dockerfile):
         assert re.search(rf"\b{k}={v}\b", env_lines), f"{dockerfile}: no ENV {k}={v}"
 
 
+def test_the_trellion_base_image_bakes_the_onnxruntime_switch():
+    """deps-core is the base of deps-base (trellion): a container started
+    outside compose carries the switch too."""
+    text = (ROOT / "docker/Dockerfile.deps-core").read_text()
+    env_lines = " ".join(m.group(0) for m in re.finditer(r"^ENV\s(?:[^\n]*\\\n)*[^\n]*", text, re.M))
+    assert re.search(r"\bORT_DISABLE_TELEMETRY=1\b", env_lines), "docker/Dockerfile.deps-core: no ENV ORT_DISABLE_TELEMETRY=1"
+
+
 @pytest.mark.parametrize(
     "path",
     ["src/noomesh/tools/browser/server.py", "noo-cli/src/commands/kiosk_assets/noo-kiosk-launch"],
@@ -329,9 +350,10 @@ def test_no_phone_home_python_dependency():
 
 def test_the_doc_names_every_switch():
     doc = DOC.read_text()
-    for cls in ("vllm", "hf", "ollama"):
+    for cls in ("vllm", "hf", "onnx", "ollama"):
         for k in TELEMETRY_SWITCHES[cls]:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
+    assert "onnxruntime" in doc and "mobile.events.data.microsoft.com" in doc, "the onnxruntime row names what it sends and where"
     for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Grafana", "NATS"):
         assert svc in doc, f"docs/security/telemetry.md has no row for {svc}"
 
