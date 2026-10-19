@@ -292,66 +292,6 @@ pub fn prompt_skills_evolve(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     Ok(0)
 }
 
-#[cfg(test)]
-mod evolve_flag_tests {
-    use super::{create_outcome, evolve_body, evolve_refusal, skill_error};
-
-    #[test]
-    fn a_refusal_is_not_a_none_verdict() {
-        let refused = serde_json::json!({"action": "none", "error": "core skills are never mutated: 'cli-guide'"});
-        assert_eq!(evolve_refusal(&refused), Some("core skills are never mutated: 'cli-guide'"));
-        let verdict = serde_json::json!({"action": "none", "rationale": "fine"});
-        assert_eq!(evolve_refusal(&verdict), None);
-        assert_eq!(evolve_refusal(&serde_json::json!({"action": "none", "error": "  "})), None);
-        assert_eq!(evolve_refusal(&serde_json::json!({"action": "create", "error": null})), None);
-    }
-
-    fn a(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    // Reply shapes copied from gateway-rust/src/routes/settings.rs
-    // (`prompt_skills_create` / `prompt_skills_get`), never invented.
-    #[test]
-    fn create_accepts_the_gateways_created_reply() {
-        let real = serde_json::json!({"status": "created", "name": "my-skill", "path": "/skills/evolved/my-skill.md"});
-        assert!(create_outcome(&real).is_ok(), "the real success reply has no `ok` key");
-    }
-
-    #[test]
-    fn create_reports_the_gateways_error_reply() {
-        let real = serde_json::json!({"error": "Failed to write skill file: denied"});
-        assert_eq!(create_outcome(&real).unwrap_err(), "Failed to write skill file: denied");
-        // The old mocked shape is not a success either.
-        assert!(create_outcome(&serde_json::json!({"ok": true})).is_err());
-    }
-
-    #[test]
-    fn info_sees_the_not_found_reply() {
-        let real = serde_json::json!({"error": "Prompt skill 'nope' not found"});
-        assert_eq!(skill_error(&real), Some("Prompt skill 'nope' not found"));
-        let found = serde_json::json!({"name": "x", "priority": 5, "fitness": 0.0, "content": "c"});
-        assert_eq!(skill_error(&found), None);
-    }
-
-    #[test]
-    fn evolve_flags_build_the_request_body() {
-        let b = evolve_body(&a(&["-o", "slow loops", "--skill", "rag-tips", "--role", "coder", "--apply"])).unwrap();
-        assert_eq!(
-            b,
-            serde_json::json!({"observation": "slow loops", "skill": "rag-tips", "role": "coder", "apply": true})
-        );
-        assert_eq!(evolve_body(&a(&[])).unwrap(), serde_json::json!({}), "no flag, no apply: a proposal");
-    }
-
-    #[test]
-    fn evolve_rejects_unknown_flags_and_missing_values() {
-        assert!(evolve_body(&a(&["--force"])).is_err());
-        assert!(evolve_body(&a(&["--skill"])).is_err());
-        assert!(evolve_body(&a(&["--observation"])).is_err());
-    }
-}
-
 /// `noo prompt-skills proposals [--status <s>] [--limit <n>]` — GET
 /// /api/prompt-skills/proposals. Skills written at runtime are data to the
 /// model until a person promotes the text they reviewed.
@@ -462,4 +402,64 @@ pub fn prompt_skills_decide(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         println!("  {}", ui::muted(note));
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod evolve_flag_tests {
+    use super::{create_outcome, evolve_body, evolve_refusal, skill_error};
+
+    #[test]
+    fn a_refusal_is_not_a_none_verdict() {
+        let refused = serde_json::json!({"action": "none", "error": "core skills are never mutated: 'cli-guide'"});
+        assert_eq!(evolve_refusal(&refused), Some("core skills are never mutated: 'cli-guide'"));
+        let verdict = serde_json::json!({"action": "none", "rationale": "fine"});
+        assert_eq!(evolve_refusal(&verdict), None);
+        assert_eq!(evolve_refusal(&serde_json::json!({"action": "none", "error": "  "})), None);
+        assert_eq!(evolve_refusal(&serde_json::json!({"action": "create", "error": null})), None);
+    }
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // Reply shapes copied from gateway-rust/src/routes/settings.rs
+    // (`prompt_skills_create` / `prompt_skills_get`), never invented.
+    #[test]
+    fn create_accepts_the_gateways_created_reply() {
+        let real = serde_json::json!({"status": "created", "name": "my-skill", "path": "/skills/evolved/my-skill.md"});
+        assert!(create_outcome(&real).is_ok(), "the real success reply has no `ok` key");
+    }
+
+    #[test]
+    fn create_reports_the_gateways_error_reply() {
+        let real = serde_json::json!({"error": "Failed to write skill file: denied"});
+        assert_eq!(create_outcome(&real).unwrap_err(), "Failed to write skill file: denied");
+        // The old mocked shape is not a success either.
+        assert!(create_outcome(&serde_json::json!({"ok": true})).is_err());
+    }
+
+    #[test]
+    fn info_sees_the_not_found_reply() {
+        let real = serde_json::json!({"error": "Prompt skill 'nope' not found"});
+        assert_eq!(skill_error(&real), Some("Prompt skill 'nope' not found"));
+        let found = serde_json::json!({"name": "x", "priority": 5, "fitness": 0.0, "content": "c"});
+        assert_eq!(skill_error(&found), None);
+    }
+
+    #[test]
+    fn evolve_flags_build_the_request_body() {
+        let b = evolve_body(&a(&["-o", "slow loops", "--skill", "rag-tips", "--role", "coder", "--apply"])).unwrap();
+        assert_eq!(
+            b,
+            serde_json::json!({"observation": "slow loops", "skill": "rag-tips", "role": "coder", "apply": true})
+        );
+        assert_eq!(evolve_body(&a(&[])).unwrap(), serde_json::json!({}), "no flag, no apply: a proposal");
+    }
+
+    #[test]
+    fn evolve_rejects_unknown_flags_and_missing_values() {
+        assert!(evolve_body(&a(&["--force"])).is_err());
+        assert!(evolve_body(&a(&["--skill"])).is_err());
+        assert!(evolve_body(&a(&["--observation"])).is_err());
+    }
 }

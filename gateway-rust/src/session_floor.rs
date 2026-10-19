@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn the_higher_of_the_two_redis_keys_wins_and_a_failed_read_forgets_nothing() {
         assert_eq!(combine_redis(Tier::Found(5_000_500), Tier::Found(5)), Tier::Found(5_000_500));
-        assert_eq!(combine_redis(Tier::Found(4_000_000), Tier::Found(5)), Tier::Found(5_000));
+        assert_eq!(combine_redis(Tier::Found(4_000), Tier::Found(5)), Tier::Found(5_000), "a higher old-key floor wins");
         assert_eq!(combine_redis(Tier::Failed, Tier::Found(7)), Tier::Found(7_000));
         assert_eq!(combine_redis(Tier::Found(9), Tier::Failed), Tier::Found(9));
         assert_eq!(combine_redis(Tier::Failed, Tier::Absent), Tier::Failed);

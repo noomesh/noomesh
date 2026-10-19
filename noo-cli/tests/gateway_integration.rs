@@ -906,8 +906,10 @@ fn prompt_skills_decide_posts_the_decision_and_needs_exactly_one_verdict() {
     let reqs = mock.requests();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(reqs[0].starts_with("POST /api/prompt-skills/proposals/7/decide "), "request was:\n{}", reqs[0]);
-    assert!(reqs[0].contains(r#""decision":"promote""#) && reqs[0].contains("read it"), "{}", reqs[0]);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("promoted 'my-skill'"));
+    let body: serde_json::Value = serde_json::from_str(reqs[0].split("\r\n\r\n").last().unwrap_or("").split("\n\n").last().unwrap_or("").trim()).unwrap_or_default();
+    assert_eq!(body["decision"], "promote", "{}", reqs[0]);
+    assert_eq!(body["reason"], "read it", "{}", reqs[0]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Promoted 'my-skill'"));
     // Neither or both verdicts: a usage error before any request.
     for extra in [&["7"][..], &["7", "--promote", "--reject"]] {
         let mut argv = vec!["--gateway", "http://127.0.0.1:9", "prompt-skills", "decide"];

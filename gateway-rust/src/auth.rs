@@ -2924,7 +2924,17 @@ pub const USER_READ_PREFIXES: &[&str] = &[
 /// add-on's mounted GET routes are NOT here: each declares its own `min_role`
 /// and `scopes`, which `scope_allows_for` asks `addon_proxy::mounted_get_allows`
 /// (absent means Operator, so a User reads none an add-on did not vouch for).
+/// Operator-only reads that sit under a User-readable prefix: the skill
+/// promotion queue lives below `/api/prompt-skills`, which a User may list.
+const USER_READ_EXCLUDED_PREFIXES: &[&str] = &["/api/prompt-skills/proposals"];
+
 pub fn user_may_read(path: &str) -> bool {
+    if USER_READ_EXCLUDED_PREFIXES
+        .iter()
+        .any(|p| path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
+    {
+        return false;
+    }
     USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
             // `/x/` prefixes match by starts_with; a bare `/x` entry matches
