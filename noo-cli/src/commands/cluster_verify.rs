@@ -112,6 +112,39 @@ pub(crate) fn self_agent_lane_check(
     }
 }
 
+/// The `control over bus` row. The verdicts, in order:
+/// - the node does not advertise `control_transports.nats_rpc` (an older
+///   agent, or one whose subscription the controller's NATS file refused):
+///   NOT CHECKED, never ok. Control calls use HTTPS.
+/// - it advertises it and the gateway's round-trip `health` over NATS
+///   answered: ok, with the round trip time.
+/// - it advertises it and the round trip failed: FAIL. The node says it
+///   listens and nothing answers, which is the shape of a silently denied
+///   publish (NATS refuses those without telling the sender).
+/// - it advertises it but no probe result reached us (an older gateway, or
+///   the probe call failed): NOT CHECKED.
+pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
+    const NAME: &str = "control over bus";
+    let advertised = n["control_transports"]["nats_rpc"].as_bool();
+    let https_only = "control calls use HTTPS :8081 for this node";
+    match advertised {
+        None => warn(NAME, format!("NOT CHECKED — the agent does not report control_transports (older agent); {https_only}"),
+            Some(format!("noo cluster provision {id} --wait"))),
+        Some(false) => warn(NAME, format!("NOT CHECKED — the node does not advertise nats_rpc; {https_only}"),
+            Some("noo cluster nats-users render   # if the controller's NATS file predates control over the bus; the node re-subscribes within a minute".to_string())),
+        Some(true) => {
+            let p = &n["bus_control_probe"];
+            match (p["checked"].as_bool(), p["ok"].as_bool()) {
+                (Some(true), Some(true)) => ok(NAME, format!("health round trip over NATS in {} ms", p["rtt_ms"].as_u64().unwrap_or(0))),
+                (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the round trip failed").to_string(),
+                    format!("noo cluster nats-users render   # re-render the grants; then noo cluster restart-agent {id}")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the round-trip probe (older gateway)")),
+                    None),
+            }
+        }
+    }
+}
+
 /// A heartbeat older than this is a node the controller is not hearing.
 pub(crate) const HEARTBEAT_MAX_AGE_SECS: i64 = 120;
 /// Right after `noo cluster provision <node> --wait`, a field the restarted
@@ -187,6 +220,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     } else {
         out.push(ok("bus", "connected on its own principal"));
     }
+
+    // 2b. Control over the bus (i131): the small control calls ride NATS on a
+    //     connection the node holds outbound instead of the :8081 listener.
+    out.push(control_bus_row(id, n));
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
@@ -857,7 +894,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // Control over the bus: a node that advertises it gets one health round
+    // trip over NATS, run by the gateway (the only principal that may send).
+    // Nothing is asked of a node that does not advertise, so its row reads
+    // NOT CHECKED rather than being failed for something it never claimed.
+    let bus_probe = if n["control_transports"]["nats_rpc"].as_bool() == Some(true) {
+        get_json_opt(g, &format!("/api/cluster/nodes/{}/control-probe", crate::commands::urlencode(&id)), true, 15)
+    } else {
+        None
+    };
     if let Some(obj) = n.as_object_mut() {
+        if let Some(p) = bus_probe {
+            obj.insert("bus_control_probe".into(), p);
+        }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
         }
@@ -5417,13 +5466,75 @@ mod tests {
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
     }
 
+    // ── control over bus (i131 phase 1) ───────────────────────────────
+
+    fn with_transports(now: i64, t: Value) -> Value {
+        let mut n = healthy(now);
+        n["control_transports"] = t;
+        n
+    }
+
+    #[test]
+    fn control_over_bus_is_not_checked_for_a_node_that_does_not_advertise_it() {
+        let now = 1_800_000_000;
+        // No field at all: an older agent.
+        let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").expect("the row is always present");
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // Reports transports, nats_rpc false: the same, with the render remedy.
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": false, "tunnel": false}));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("HTTPS"), "{}", r.detail);
+        assert!(r.remedy.as_deref().unwrap().contains("nats-users render"));
+        // Never ok for a node that did not advertise it, whatever a probe field says.
+        let mut n = n;
+        n["bus_control_probe"] = serde_json::json!({"checked": true, "ok": true, "rtt_ms": 3});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "control over bus"), Verdict::Warn, "a verdict from a probe nobody asked for is not a pass");
+    }
+
+    #[test]
+    fn control_over_bus_passes_only_on_a_round_trip_and_fails_when_the_node_claims_it_and_nothing_answers() {
+        let now = 1_800_000_000;
+        let adv = || with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": false}));
+        // Round trip answered.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": true, "rtt_ms": 7});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("7 ms"), "{}", r.detail);
+        // Claims it, no answer: a FAIL with the render remedy.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": false, "detail": "no answer over the bus (timeout) although the node advertises nats_rpc"});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.detail.contains("timeout") && r.remedy.as_deref().unwrap().contains("nats-users render"));
+        // Claims it, no probe result reached us (older gateway, or the call failed): not a pass.
+        let c = node_checks(&adv(), "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // The gateway could not try (its own bus down): NOT CHECKED, with its reason.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": false, "ok": false, "detail": "the gateway's own bus connection is down"});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("gateway's own bus"), "{}", r.detail);
+    }
+
     #[test]
     fn a_healthy_node_passes_every_invariant() {
         let now = 1_800_000_000;
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 19, "thirteen node invariants (the log shipper, peer identity, backend doors, vendor telemetry and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 20, "fourteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
