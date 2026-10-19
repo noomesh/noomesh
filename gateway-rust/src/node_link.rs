@@ -378,7 +378,8 @@ impl NodeLink {
     pub fn stream(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         if let Some(node) = self.tunnel_node() {
             if let Some(door) = crate::tunnel_door::door_url(&node, path) {
-                return crate::tls::cluster_stream_client().request(method, door);
+                let req = crate::tls::cluster_stream_client().request(method, door.as_str());
+                return crate::tunnel_door::mark(req, &door);
             }
         }
         self.build_on(&crate::tls::cluster_stream_client(), method, path)
@@ -612,7 +613,8 @@ pub fn backend_stream_on(
     // loopback door); anything else is the HTTPS request, counted. The hint
     // and credential are decided on the ORIGINAL url, as always.
     let target = crate::tunnel_door::carry(url);
-    crate::coordinator::with_backend_hint_url(client.request(method, target), url, backend_type)
+    let req = crate::tunnel_door::mark(client.request(method, target.as_str()), &target);
+    crate::coordinator::with_backend_hint_url(req, url, backend_type)
 }
 
 /// The node is in `mesh_nodes` but registered without `agent_url` or
