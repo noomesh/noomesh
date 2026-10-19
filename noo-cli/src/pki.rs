@@ -62,6 +62,14 @@
 //!                                     1244 A), carried to that node by the
 //!                                     provision bundle; node-scoped so one
 //!                                     node's leaf is revocable on its own
+//!   gateway/pg/<role>.crt|key         the gateway's Postgres role leaves
+//!   services/<owner>/pg/<role>.crt|key
+//!                                     CN=<role>, O=Mesh Cluster Service —
+//!                                     one leaf per Postgres role per
+//!                                     container (`PG_LEAVES`), so
+//!                                     pg_hba's `clientcert=verify-full`
+//!                                     can say which role a certificate
+//!                                     may log in as
 //!   sso/grafana.key|pub               the Grafana SSO pair (not a cert)
 //!   public/{nodes,services}/…/*.crt   a copy of every certificate under
 //!                                     nodes/ and services/ and nothing
@@ -430,6 +438,143 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("postgres-standby", KeyReader::Cli),
 ];
 
+// ── Postgres client identities: a leaf per ROLE, per container ───────
+//
+// `docker/postgres/pg_hba.conf` used to ask only that a TCP client present
+// SOME cluster-CA leaf (`clientcert=verify-ca`) and then know a role's
+// password: the gateway leaf logged in as `noo`, `noo_app`, anything, and
+// five roles shared it. A role leaf is a leaf whose CN IS the role name, so
+// `clientcert=verify-full` (CN == the database role being asked for) makes
+// the certificate say WHICH role may use it, not just that it is ours.
+//
+// Layout: each container's role leaves live INSIDE the directory it already
+// mounts, so no mount changes and no container reaches another's key:
+//
+//   gateway/pg/<role>.crt|key            the gateway     (noo, noo_app)
+//   services/worker/pg/<role>.crt|key    worker, worker-extra (noo_app)
+//   services/trellion/pg/<role>...       trellion        (noo_app, noo_trellion, noo_trellion_ddl)
+//   services/trellion-intel/pg/<role>... trellion-intel  (the same three)
+//
+// trellion-intel `extends` trellion's service and swaps only the leaf mount
+// (`/app/pki/leaf`), so its DSNs, which name `/app/pki/leaf/pg/<role>.*`,
+// resolve to ITS OWN role leaves with no change in the add-on repo.
+//
+// Add-on roles whose clients live in the add-on repos (noo_evolve,
+// noo_evolve_ddl) and the standby's `replicator` are NOT here; pg_hba keeps
+// them on `verify-ca` until their repos present a leaf of their own
+// (docs/security/networks-and-containers.md).
+
+/// One Postgres role leaf: which container presents it, and as which role.
+#[derive(Debug)]
+pub struct PgLeaf {
+    /// The directory-owner: `gateway`, or a `services/<owner>` name.
+    pub owner: &'static str,
+    /// The database role; also the leaf's CN and its file name.
+    pub role: &'static str,
+    /// Containers that present this leaf (restarted when it rotates).
+    pub consumers: &'static [&'static str],
+}
+
+/// Every role leaf. The per-role `verify-full` lines in pg_hba.conf are the
+/// distinct roles in this table (tests/test_postgres_role_identity.py).
+pub const PG_LEAVES: &[PgLeaf] = &[
+    PgLeaf { owner: "gateway", role: "noo", consumers: &["noo-gateway"] },
+    PgLeaf { owner: "gateway", role: "noo_app", consumers: &["noo-gateway"] },
+    PgLeaf { owner: "worker", role: "noo_app", consumers: &["noo-worker"] },
+    PgLeaf { owner: "trellion", role: "noo_app", consumers: &["noo-trellion"] },
+    PgLeaf { owner: "trellion", role: "noo_trellion", consumers: &["noo-trellion"] },
+    PgLeaf { owner: "trellion", role: "noo_trellion_ddl", consumers: &["noo-trellion"] },
+    PgLeaf { owner: "trellion-intel", role: "noo_app", consumers: &["noo-trellion-intel"] },
+    PgLeaf { owner: "trellion-intel", role: "noo_trellion", consumers: &["noo-trellion-intel"] },
+    PgLeaf { owner: "trellion-intel", role: "noo_trellion_ddl", consumers: &["noo-trellion-intel"] },
+];
+
+/// Every consumer container has this uid (gateway, worker and the trellion
+/// images all run as `nonroot`), so every role key is `ContainerUid`.
+pub const PG_LEAF_UID: u32 = 65532;
+
+impl PgLeaf {
+    /// The PKI-relative directory: `gateway/pg` or `services/<owner>/pg`.
+    pub fn dir_rel(&self) -> String {
+        if self.owner == "gateway" { "gateway/pg".into() } else { format!("services/{}/pg", self.owner) }
+    }
+    /// PKI-relative `<dir>/<role>.crt`.
+    pub fn cert_rel(&self) -> String {
+        format!("{}/{}.crt", self.dir_rel(), self.role)
+    }
+    /// PKI-relative `<dir>/<role>.key`.
+    pub fn key_rel(&self) -> String {
+        format!("{}/{}.key", self.dir_rel(), self.role)
+    }
+}
+
+/// The leaf a PKI-relative `.crt` or `.key` path is, if it is one of
+/// [`PG_LEAVES`].
+pub fn pg_leaf_at(rel: &str) -> Option<&'static PgLeaf> {
+    PG_LEAVES.iter().find(|l| l.cert_rel() == rel || l.key_rel() == rel)
+}
+
+/// The distinct roles with a leaf, in table order.
+pub fn pg_leaf_roles() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for l in PG_LEAVES {
+        if !out.contains(&l.role) {
+            out.push(l.role);
+        }
+    }
+    out
+}
+
+/// The roles a pg_hba.conf body protects with `clientcert=verify-full`: the
+/// user column of every `hostssl` line that names one role, not `all`, and
+/// keeps the password (`scram-sha-256`). A line that says verify-full with
+/// `trust` or `cert` does not count: the role's password check is the other
+/// half of the rule.
+pub fn pg_hba_verify_full_roles(hba: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in hba.lines() {
+        let f: Vec<&str> = line.split('#').next().unwrap_or("").split_whitespace().collect();
+        if f.len() >= 6
+            && f[0] == "hostssl"
+            && f[2] != "all"
+            && f[4] == "scram-sha-256"
+            && f[5..].contains(&"clientcert=verify-full")
+            && !out.contains(&f[2].to_string())
+        {
+            out.push(f[2].to_string());
+        }
+    }
+    out
+}
+
+/// What keeps a Postgres role on a shared leaf: for every role in
+/// [`PG_LEAVES`], each leaf that is missing, has the wrong CN or has no key
+/// (its container would present the wrong identity or none), and, when the
+/// pg_hba.conf body is known, a role the file does not hold to
+/// `clientcert=verify-full` (any cluster-CA leaf then reaches its password
+/// check). Empty = every role has its leaf and the file enforces it. `hba`
+/// `None` = the file could not be read: only the leaves are judged, and the
+/// caller must say the file was NOT CHECKED.
+pub fn pg_identity_gaps(ca: &ClusterCa, hba: Option<&str>) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for leaf in PG_LEAVES {
+        if let Err(why) = ca.pg_leaf_state(leaf) {
+            gaps.push(format!("{} ({}): {why}", leaf.role, leaf.owner));
+        }
+    }
+    if let Some(hba) = hba {
+        let enforced = pg_hba_verify_full_roles(hba);
+        for role in pg_leaf_roles() {
+            if !enforced.iter().any(|r| r == role) {
+                gaps.push(format!(
+                    "{role}: pg_hba.conf has no `hostssl … {role} … scram-sha-256 clientcert=verify-full` line, so any cluster-CA leaf reaches its password check"
+                ));
+            }
+        }
+    }
+    gaps
+}
+
 /// Something `fix_key_modes` did, or could not do, to one key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyFix {
@@ -493,6 +638,11 @@ impl ClusterCa {
             ["ca.key"] | ["signing.key"] => KeyReader::Cli,
             ["sso", "grafana.key"] | ["gateway", "gateway.key"] => {
                 KeyReader::ContainerUid(Self::GATEWAY_CONTAINER_GID)
+            }
+            // A Postgres role leaf (i132): read by the owning container's
+            // nonroot process, like the leaf beside it.
+            ["gateway", "pg", _] | ["services", _, "pg", _] if pg_leaf_at(&parts.join("/")).is_some() => {
+                KeyReader::ContainerUid(PG_LEAF_UID)
             }
             ["nodes", _, "node.key"] => KeyReader::Cli,
             // A node's backend door leaf: on THIS disk only the CLI reads
@@ -1649,6 +1799,71 @@ impl ClusterCa {
         )
     }
 
+    /// Issue one Postgres role leaf: CN = the role, O = "Mesh Cluster
+    /// Service", client authentication. Its one DNS SAN is a name no door
+    /// pins on (`pg-<owner>-<role>`), so a role leaf can never pass a
+    /// stunnel `checkHost` pin meant for the gateway, worker or trellion.
+    pub fn issue_pg_leaf(&self, leaf: &PgLeaf, days: i64) -> Result<(PathBuf, PathBuf), String> {
+        self.issue_leaf(
+            leaf.role,
+            "Mesh Cluster Service",
+            &self.dir.join(leaf.cert_rel()),
+            &self.dir.join(leaf.key_rel()),
+            &[format!("pg-{}-{}", leaf.owner, leaf.role)],
+            &[],
+            days,
+        )
+    }
+
+    /// The CN of an issued role leaf: `Ok(None)` when there is no such
+    /// file, `Err` when it cannot be read or parsed (so a caller can tell
+    /// "missing" from "cannot tell").
+    pub fn pg_leaf_cn(&self, leaf: &PgLeaf) -> Result<Option<String>, String> {
+        let crt = self.dir.join(leaf.cert_rel());
+        if !crt.is_file() {
+            return Ok(None);
+        }
+        let data = std::fs::read(&crt).map_err(|e| format!("read {}: {e}", crt.display()))?;
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&data)
+            .map_err(|e| format!("parse PEM {}: {e}", crt.display()))?;
+        let cert = pem.parse_x509().map_err(|e| format!("parse cert {}: {e}", crt.display()))?;
+        Ok(cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()).map(str::to_string))
+    }
+
+    /// Is this role leaf present, with CN == its role, and with a private
+    /// key beside it? `Err` carries the reason it is not.
+    pub fn pg_leaf_state(&self, leaf: &PgLeaf) -> Result<(), String> {
+        match self.pg_leaf_cn(leaf) {
+            Ok(Some(cn)) if cn == leaf.role => {}
+            Ok(Some(cn)) => return Err(format!("{} has CN {cn}, not {}", leaf.cert_rel(), leaf.role)),
+            Ok(None) => return Err(format!("{} does not exist", leaf.cert_rel())),
+            Err(e) => return Err(e),
+        }
+        if !self.dir.join(leaf.key_rel()).is_file() {
+            return Err(format!("{} does not exist", leaf.key_rel()));
+        }
+        Ok(())
+    }
+
+    /// Issue every role leaf in [`PG_LEAVES`] that is missing, has no key,
+    /// or whose CN is not its role. Idempotent: a leaf that is right is left
+    /// alone, so a second call changes nothing. Returns, per leaf,
+    /// `Ok(true)` when it issued one, `Ok(false)` when it was already right,
+    /// `Err` with the reason when it could not.
+    pub fn ensure_pg_leaves(&self, days: i64) -> Vec<(&'static PgLeaf, Result<bool, String>)> {
+        PG_LEAVES
+            .iter()
+            .map(|l| {
+                let r = if self.pg_leaf_state(l).is_ok() {
+                    Ok(false)
+                } else {
+                    self.issue_pg_leaf(l, days).map(|_| true)
+                };
+                (l, r)
+            })
+            .collect()
+    }
+
     /// `nodes/<node>/services/<service>` under this PKI dir.
     pub fn node_service_dir(&self, node: &str, service: &str) -> PathBuf {
         self.dir.join("nodes").join(node).join("services").join(service)
@@ -2387,6 +2602,129 @@ mod key_mode_tests {
         }
     }
 
+    /// A Postgres role leaf is named for the ROLE (i132): `clientcert=verify-full`
+    /// compares the CN with the role being asked for, so each leaf carries
+    /// CN=<role> however it was issued, keeps it through a rotation, and its
+    /// key is handed to the container that reads it.
+    #[test]
+    fn a_postgres_role_leaf_carries_the_role_as_its_cn_and_keeps_it_on_rotation() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        for l in PG_LEAVES {
+            let (crt, key) = ca.issue_pg_leaf(l, 90).unwrap();
+            assert_eq!(crt, ca.dir.join(l.cert_rel()));
+            assert_eq!(key, ca.dir.join(l.key_rel()));
+            assert_eq!(ca.pg_leaf_cn(l).unwrap().as_deref(), Some(l.role), "CN is the role: {}", l.cert_rel());
+            assert_eq!(ca.key_reader(&key), KeyReader::ContainerUid(PG_LEAF_UID), "{}", l.key_rel());
+            assert_eq!(readable_by_uid(&key, PG_LEAF_UID), Some(true), "the {} consumers can start", l.role);
+            // Rotation re-issues in place from the old certificate's subject.
+            ca.reissue_in_place(&crt, 90, &NodeRole::Worker).unwrap();
+            assert_eq!(ca.pg_leaf_cn(l).unwrap().as_deref(), Some(l.role), "rotation kept the CN");
+            // A client leaf: it must never be mistaken for the door pins'
+            // callers (stunnel checkHost gateway/worker/trellion/...).
+            let data = std::fs::read(&crt).unwrap();
+            let (_, pem) = x509_parser::pem::parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+            let dns: Vec<String> = cert.subject_alternative_name().unwrap().unwrap().value.general_names.iter()
+                .filter_map(|g| if let x509_parser::extensions::GeneralName::DNSName(d) = g { Some(d.to_string()) } else { None })
+                .collect();
+            for pinned in ["gateway", "worker", "trellion", "trellion-intel", "evolve", "localhost"] {
+                assert!(!dns.contains(&pinned.to_string()), "{} carries the pinned name {pinned}: {dns:?}", l.cert_rel());
+            }
+            assert!(cert.extended_key_usage().unwrap().expect("EKU").value.client_auth);
+        }
+        assert_eq!(pg_leaf_at("gateway/pg/noo_app.key").map(|l| l.owner), Some("gateway"));
+        assert_eq!(pg_leaf_at("services/worker/pg/noo_app.crt").map(|l| l.owner), Some("worker"));
+        assert!(pg_leaf_at("services/worker/pg/noo.key").is_none(), "the worker has no `noo` leaf");
+        assert!(pg_leaf_at("services/worker/service.key").is_none());
+        assert_eq!(pg_leaf_roles(), vec!["noo", "noo_app", "noo_trellion", "noo_trellion_ddl"]);
+    }
+
+    /// The upgrade path: an install that has only the shared leaves gets
+    /// every role leaf from one call, a second call changes nothing, and a
+    /// leaf with the wrong CN (or no key) is replaced rather than trusted.
+    #[test]
+    fn ensure_pg_leaves_mints_the_missing_ones_once_and_repairs_a_wrong_cn() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        ca.issue_service_cert("worker", &[], &[], 90).unwrap();
+        for l in PG_LEAVES {
+            assert_eq!(ca.pg_leaf_cn(l), Ok(None), "an old install has none");
+            assert!(ca.pg_leaf_state(l).is_err());
+        }
+        let first = ca.ensure_pg_leaves(90);
+        assert_eq!(first.len(), PG_LEAVES.len());
+        assert!(first.iter().all(|(_, r)| *r == Ok(true)), "{:?}", first.iter().map(|(l, r)| (l.cert_rel(), r.clone())).collect::<Vec<_>>());
+        let worker = PG_LEAVES.iter().find(|l| l.owner == "worker").unwrap();
+        let before = std::fs::read(ca.dir.join(worker.cert_rel())).unwrap();
+        let second = ca.ensure_pg_leaves(90);
+        assert!(second.iter().all(|(_, r)| *r == Ok(false)), "idempotent");
+        assert_eq!(std::fs::read(ca.dir.join(worker.cert_rel())).unwrap(), before, "a right leaf is not re-issued");
+        // The worker's own service leaf is untouched and is not a role identity.
+        assert_eq!(ca.pg_leaf_cn(worker).unwrap().as_deref(), Some("noo_app"));
+        // A leaf whose CN is wrong is repaired.
+        let gw = PG_LEAVES.iter().find(|l| l.owner == "gateway" && l.role == "noo").unwrap();
+        ca.issue_leaf("gateway-host", "Mesh Cluster Service", &ca.dir.join(gw.cert_rel()), &ca.dir.join(gw.key_rel()),
+            &["x".to_string()], &[], 90).unwrap();
+        assert!(ca.pg_leaf_state(gw).unwrap_err().contains("not noo"));
+        let third = ca.ensure_pg_leaves(90);
+        let fixed = third.iter().find(|(l, _)| l.owner == "gateway" && l.role == "noo").unwrap();
+        assert_eq!(fixed.1, Ok(true), "wrong CN replaced");
+        assert_eq!(ca.pg_leaf_cn(gw).unwrap().as_deref(), Some("noo"));
+        // A leaf with no key beside it is not usable either.
+        std::fs::remove_file(ca.dir.join(gw.key_rel())).unwrap();
+        assert!(ca.pg_leaf_state(gw).unwrap_err().contains("does not exist"));
+        assert!(ca.ensure_pg_leaves(90).iter().any(|(l, r)| l.role == "noo" && *r == Ok(true)));
+    }
+
+    /// The hba reader counts a role only when the line keeps the password,
+    /// and the gap list says WHICH half is missing for which role.
+    #[test]
+    fn pg_identity_gaps_name_the_role_and_the_missing_half() {
+        let ca = ClusterCa::new(scratch());
+        ca.generate_ca("t", 3650).unwrap();
+        let hba = "hostssl all all samehost scram-sha-256 clientcert=verify-ca\n\
+                   hostssl all noo all scram-sha-256 clientcert=verify-full\n\
+                   hostssl all noo_app all scram-sha-256 clientcert=verify-full\n\
+                   hostssl all noo_trellion all scram-sha-256 clientcert=verify-full\n\
+                   hostssl all noo_trellion_ddl all scram-sha-256 clientcert=verify-full\n\
+                   hostssl all all all scram-sha-256 clientcert=verify-ca\n";
+        assert_eq!(pg_hba_verify_full_roles(hba), vec!["noo", "noo_app", "noo_trellion", "noo_trellion_ddl"]);
+        // An upgraded install, leaves not minted yet: every leaf is a gap.
+        let before = pg_identity_gaps(&ca, Some(hba));
+        assert_eq!(before.len(), PG_LEAVES.len(), "{before:?}");
+        assert!(before.iter().all(|g| g.contains("does not exist")), "{before:?}");
+        ca.ensure_pg_leaves(90);
+        assert_eq!(pg_identity_gaps(&ca, Some(hba)), Vec::<String>::new(), "leaves + a strict file = no gap");
+        // The OLD file: leaves are right but the file still takes any leaf.
+        let old = "hostssl all all all scram-sha-256 clientcert=verify-ca\n";
+        let gaps = pg_identity_gaps(&ca, Some(old));
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        assert!(gaps.iter().any(|g| g.starts_with("noo_app: pg_hba.conf has no") && g.contains("clientcert=verify-full")), "{gaps:?}");
+        // verify-full that drops the password does not count.
+        let no_pw = hba.replace("noo_app all scram-sha-256", "noo_app all cert");
+        assert!(pg_identity_gaps(&ca, Some(&no_pw)).iter().any(|g| g.starts_with("noo_app:")));
+        // An unreadable file judges the leaves only.
+        assert_eq!(pg_identity_gaps(&ca, None), Vec::<String>::new());
+        std::fs::remove_file(ca.dir.join("services/worker/pg/noo_app.key")).unwrap();
+        assert_eq!(pg_identity_gaps(&ca, None).len(), 1);
+    }
+
+    /// Each role leaf sits in a directory its owner already mounts (the
+    /// compose guard test_postgres_role_identity.py pins the mounts), and
+    /// two owners never share a file.
+    #[test]
+    fn role_leaves_live_in_their_owners_directory_and_never_collide() {
+        let mut seen = std::collections::HashSet::new();
+        for l in PG_LEAVES {
+            assert!(seen.insert(l.key_rel()), "two leaves share {}", l.key_rel());
+            assert!(l.dir_rel() == "gateway/pg" || l.dir_rel().starts_with("services/"), "{}", l.dir_rel());
+            let owner_in_svc_list = l.owner == "gateway" || crate::onboard::steps::SVC_LIST.contains(&l.owner);
+            assert!(owner_in_svc_list, "{}: the owner's directory is issued by onboard, so it exists", l.owner);
+            assert!(!l.consumers.is_empty());
+        }
+    }
+
     /// Noo-worker (and worker-extra, through the
     /// compose anchor) presents a leaf of its own, `services/worker`, never
     /// the controller's gateway leaf. It must be a SERVICE leaf: a node
@@ -2508,8 +2846,14 @@ mod key_mode_tests {
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         // The stunnel doors and the NVIDIA exporter run as 65532 (i132).
         for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "tei", "reranker", "llamacpp", "nvidia-exporter"] {
-            assert_eq!(r(&format!("services/{door}/service.key")), KeyReader::ContainerUid(65532), "{door}: Dockerfile USER nonroot (65532) + compose user:");
+            assert_eq!(r(&format!("services/{door}/service.key")), KeyReader::ContainerUid(65532), "{door}: Dockerfile USER 65532 + compose user:");
         }
+        // Postgres role leaves: read by the owner's nonroot process; an
+        // unlisted file under a `pg/` directory is not one.
+        assert_eq!(r("gateway/pg/noo_app.key"), KeyReader::ContainerUid(65532));
+        assert_eq!(r("services/worker/pg/noo_app.key"), KeyReader::ContainerUid(65532));
+        assert_eq!(r("services/trellion-intel/pg/noo_trellion_ddl.key"), KeyReader::ContainerUid(65532));
+        assert_eq!(r("services/worker/pg/noo.key"), KeyReader::Unknown, "the worker has no `noo` leaf");
         assert_eq!(r("services/not-a-thing/service.key"), KeyReader::Unknown);
         assert_eq!(r("stray.key"), KeyReader::Unknown);
         // A relative path resolves the same way.

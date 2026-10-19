@@ -398,9 +398,9 @@ services:
       - NOO_BACKEND_IMAGE_VLLM=${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
       - NOO_BACKEND_IMAGE_VLLM_SECONDARY=${VLLM2_IMAGE:-vllm/vllm-openai:v0.25.0${NOO_IMAGE_DIGEST_VLLM:-}}
       - NOO_BACKEND_IMAGE_OLLAMA=${OLLAMA_IMAGE:-ollama/ollama:0.40.5${NOO_IMAGE_DIGEST_OLLAMA:-}}
-      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
-      - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
-      - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/gateway.crt&sslkey=/app/pki/gateway/gateway.key
+      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo_app.crt&sslkey=/app/pki/gateway/pg/noo_app.key
+      - PGVECTOR_URL=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
+      - PAGEINDEX_DSN=postgresql://noo@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/gateway/pg/noo.crt&sslkey=/app/pki/gateway/pg/noo.key
       # Makes /app/src win over the empty `noomesh` stub in site-packages.
       # The image sets this too (Dockerfile.gateway-rust); it is repeated here
       # so an image built BEFORE that ENV landed still boots. Without it
@@ -519,6 +519,11 @@ services:
       # TLS — host paths in .env are mapped to container-internal /app/pki/ paths.
       # ${VAR:+...} means: if VAR is set and non-empty, use the container path.
       - NOO_TLS_CERT=${NOO_TLS_CERT:+/app/pki/gateway/gateway.crt}
+      # The role leaves Postgres' pg_hba (clientcert=verify-full) matches to a
+      # role by CN. A DSN that names no sslcert presents the one for its user
+      # from here (gateway-rust/src/state.rs pg_role_leaf); every compose DSN
+      # above names its own.
+      - NOO_TLS_PG_DIR=${NOO_TLS_CERT:+/app/pki/gateway/pg}
       - NOO_TLS_KEY=${NOO_TLS_KEY:+/app/pki/gateway/gateway.key}
       - NOO_TLS_CA=${NOO_TLS_CA:+/app/pki/ca.crt}
       - NOO_MTLS_GATEWAY=${NOO_MTLS_GATEWAY:-}
@@ -931,8 +936,8 @@ services:
       # No password in either DSN: noo_app's comes from the pgpass file
       # (see the gateway service; NOO_PGPASS_WORKER, one line, noo_app).
       - PGPASSFILE=${NOO_PGPASS_WORKER:+/run/secrets/pgpass}
-      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key
-      - PAGEINDEX_DSN=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key
+      - DATABASE_URL=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key
+      - PAGEINDEX_DSN=postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key
       # The browser container's door key (tools/browser_tool.py), not the
       # fleet secret.
       - NOO_BROWSER_KEY_FILE=${NOO_BROWSER_KEY:+/run/secrets/noo_browser_key}

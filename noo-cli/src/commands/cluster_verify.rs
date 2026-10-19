@@ -2938,6 +2938,48 @@ pub(crate) fn postgres_hba_check(hba: Option<&str>, compose: Option<&str>) -> Ch
     ok("postgres hba", "TLS + cluster-CA client certificate + password on every TCP connection; plaintext rejected; socket-only trust")
 }
 
+/// The "postgres role identity" row (i132): every Postgres role this stack's
+/// containers connect as has its own client leaf (CN = the role) AND
+/// pg_hba.conf holds that role to `clientcert=verify-full`. A role missing
+/// either half is still reachable with a leaf that is not its own, or its
+/// container cannot log in at all. FAIL names the role, the half, and the
+/// verb that fixes it. A pg_hba.conf that could not be read is a WARN: the
+/// leaves were judged, the file was NOT CHECKED.
+pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Option<&str>) -> Check {
+    if !ca.ca_exists() {
+        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only security".into()));
+    }
+    let gaps = crate::pki::pg_identity_gaps(ca, hba);
+    if !gaps.is_empty() {
+        let missing_file = gaps.iter().any(|g| g.contains("does not exist") || g.contains("has CN"));
+        return fail(
+            "postgres role identity",
+            format!(
+                "{} role(s) still on a shared leaf or without one: {}",
+                gaps.len(),
+                gaps.join("; ")
+            ),
+            if missing_file {
+                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only security)"
+            } else {
+                "noo upgrade --stack   # re-materialises docker/postgres/pg_hba.conf; then: noo stack restart --force postgres"
+            },
+        );
+    }
+    let roles = crate::pki::pg_leaf_roles().join(", ");
+    match hba {
+        Some(_) => ok(
+            "postgres role identity",
+            format!("each of {roles} has its own client certificate (CN = the role) and pg_hba.conf requires it (clientcert=verify-full) on top of the password"),
+        ),
+        None => warn(
+            "postgres role identity",
+            format!("the leaves for {roles} are right, but docker/postgres/pg_hba.conf could not be read: NOT CHECKED that it enforces them"),
+            Some("noo stack status".into()),
+        ),
+    }
+}
+
 /// What one `psql` probe from inside the postgres container proved.
 /// `(exit_ok, stderr)` for a connection that presented NO client
 /// certificate over TLS, and for one that offered no TLS at all; `None`
@@ -4780,6 +4822,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // that presents none.
         let hba = std::fs::read_to_string(root.join("docker/postgres/pg_hba.conf")).ok();
         checks.push(postgres_hba_check(hba.as_deref(), compose.as_deref()));
+        // And each role reachable only with ITS certificate (i132): a leaf
+        // per role (CN = role) and a `clientcert=verify-full` line for it.
+        checks.push(postgres_role_identity_check(
+            &crate::pki::ClusterCa::new(crate::pki::pki_dir()),
+            hba.as_deref(),
+        ));
         let (no_cert, plaintext) = postgres_live_probes();
         checks.push(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
@@ -8103,6 +8151,45 @@ mod tests {
         let bad_compose = compose.replace("ARGS=\"$$ARGS -c ssl=on", "if [ -n \"$$NOO_PG_TLS\" ]; then ARGS=\"$$ARGS -c ssl=on");
         assert_eq!(postgres_hba_check(Some(&hba), Some(&bad_compose)).verdict, Verdict::Fail);
         assert_eq!(postgres_hba_check(None, Some(&compose)).verdict, Verdict::Warn);
+    }
+
+    /// The role-identity row over the shipped file and a scratch PKI: ok when
+    /// every role has its leaf and the file enforces it, and each missing half
+    /// fails naming the role.
+    #[test]
+    fn postgres_role_identity_row_needs_both_the_leaf_and_the_rule() {
+        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
+        let dir = std::env::temp_dir().join(format!("noo-pg-identity-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = crate::pki::ClusterCa::new(dir.clone());
+        assert_eq!(postgres_role_identity_check(&ca, Some(&hba)).verdict, Verdict::Warn, "no CA is not a pass");
+        ca.generate_ca("t", 3650).unwrap();
+        // An upgraded install before the roll: no leaves yet.
+        let c = postgres_role_identity_check(&ca, Some(&hba));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("noo_app (worker)") && c.detail.contains("does not exist"), "{}", c.detail);
+        ca.ensure_pg_leaves(90);
+        let c = postgres_role_identity_check(&ca, Some(&hba));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // planted: the OLD file (any cluster-CA leaf reaches every role)
+        let old = "hostssl all all all scram-sha-256 clientcert=verify-ca\nhostnossl all all all reject\n";
+        let c = postgres_role_identity_check(&ca, Some(old));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo_app: pg_hba.conf has no") && c.detail.contains("any cluster-CA leaf"), "{}", c.detail);
+        // planted: one role downgraded back to verify-ca
+        let weak = hba.replace(
+            "hostssl all             noo_trellion    all                     scram-sha-256   clientcert=verify-full",
+            "hostssl all             noo_trellion    all                     scram-sha-256   clientcert=verify-ca",
+        );
+        assert_ne!(weak, hba, "the shipped line changed shape: update this test");
+        let c = postgres_role_identity_check(&ca, Some(&weak));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo_trellion: pg_hba.conf"), "{}", c.detail);
+        // the file unreadable: leaves judged, the file said NOT CHECKED
+        let c = postgres_role_identity_check(&ca, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOT CHECKED"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The live row, over the exact stderr a Postgres 18 with the shipped

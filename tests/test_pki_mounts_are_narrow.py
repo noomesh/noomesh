@@ -59,6 +59,25 @@ GATEWAY_ONLY = {"sso", "public/nodes", "public/services"}
 # Exactly what the gateway mounts, and the two private keys that reaches.
 GATEWAY_PKI_MOUNTS = {"ca.crt", "gateway", "sso", "public/nodes", "public/services"}
 GATEWAY_OWN_KEYS = {"gateway/gateway.key", "sso/grafana.key"}
+
+
+def pg_leaf_keys() -> dict[str, set[str]]:
+    """owner -> the Postgres role-leaf private keys the CLI writes for it
+    (`PG_LEAVES` in noo-cli/src/pki.rs, i132): inside the directory that owner
+    already mounts (`gateway/pg/`, `services/<owner>/pg/`), so a role leaf adds
+    no mount and reaches no other container's key."""
+    src = (ROOT / "noo-cli" / "src" / "pki.rs").read_text()
+    table = src.split("pub const PG_LEAVES", 1)[1].split("];", 1)[0]
+    out: dict[str, set[str]] = {}
+    for owner, role in re.findall(r'owner: "([a-z-]+)", role: "([a-z_]+)"', table):
+        base = "gateway/pg" if owner == "gateway" else f"services/{owner}/pg"
+        out.setdefault(owner, set()).add(f"{base}/{role}.key")
+    assert out.get("gateway"), "no gateway role leaves found in PG_LEAVES"
+    return out
+
+
+# The gateway's own role-leaf keys are its own keys too.
+GATEWAY_OWN_KEYS = GATEWAY_OWN_KEYS | pg_leaf_keys()["gateway"]
 # The controller's own processes: they present gateway/gateway.crt because
 # they ARE the controller (see test_monitoring_holds_no_gateway_key.py).
 # trellion, trellion-intel, worker and worker-extra present their own leaves
@@ -173,6 +192,8 @@ def pki_key_layout() -> set[str]:
     keys = {"ca.key", "signing.key", "gateway/gateway.key", "sso/grafana.key"}
     keys |= {f"services/{s}/service.key" for s in services}
     keys |= {"nodes/host9/node.key", "nodes/host9/services/vllm/service.key"}
+    for owner_keys in pg_leaf_keys().values():
+        keys |= owner_keys
     return keys
 
 
@@ -199,8 +220,7 @@ def test_the_composed_stack_mounts_pki_narrowly():
 
 def test_the_gateway_reaches_only_its_own_keys():
     """an earlier change, statically: the gateway's PKI mounts, over the key
-    layout the CLI writes, reach exactly `gateway/gateway.key` and
-    `sso/grafana.key`. The pre-1239 root mount reached every key in the
+    layout the CLI writes, reach exactly `gateway/gateway.key`, `sso/grafana.key` and its own role-leaf keys. The pre-1239 root mount reached every key in the
     tree; mounting `services/loki` would reach loki's."""
     keys = pki_key_layout()
     for services in (full_projection()["services"], untag(load_raw(ROOT / "docker-compose.cluster.yml"))["services"]):
@@ -252,3 +272,18 @@ def test_the_checker_catches_a_wide_mount():
     assert violations(good) == ([], 1)
     gw = {"gateway": {"volumes": [f"${{NOO_PKI_DIR:-./.pki-placeholder}}/{r}:/app/pki/x:ro" for r in sorted(GATEWAY_PKI_MOUNTS)]}}
     assert violations(gw) == ([], len(GATEWAY_PKI_MOUNTS))
+
+
+def test_a_container_reaches_only_its_own_role_leaf_keys():
+    """i132: role leaves live inside the directory their owner already mounts,
+    so no container's mounts reach another owner's role keys (the gateway's
+    `noo` leaf is never in the worker's or trellion's hands)."""
+    keys = pki_key_layout()
+    owners = pg_leaf_keys()
+    mount_of_owner = {"gateway": "gateway", "worker": "services/worker", "trellion": "services/trellion", "trellion-intel": "services/trellion-intel"}
+    for owner, own in owners.items():
+        reached = keys_reached([mount_of_owner[owner]], keys)
+        assert own <= reached, f"{owner}: its mount does not reach its own role keys"
+        for other, theirs in owners.items():
+            if other != owner:
+                assert not (theirs & reached), f"{owner}'s mount reaches {other}'s role-leaf keys: {sorted(theirs & reached)}"

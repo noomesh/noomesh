@@ -138,7 +138,7 @@ x-trellion-env: &trellion-env
   #
   # An older trellion image ignores this variable and falls through to
   # PAGEINDEX_DSN below (still `pai`), so the transition is order-free.
-  NOO_TRELLION_DDL_DATABASE_URL: 'postgresql://noo_trellion_ddl@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  NOO_TRELLION_DDL_DATABASE_URL: 'postgresql://noo_trellion_ddl@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_trellion_ddl.crt&sslkey=/app/pki/leaf/pg/noo_trellion_ddl.key'
   # Trellion's OWN engine (snapshot/consolidation handlers,
   # workers/common._trellion_engine, autonomy trellion bootstrap)
   # connects as the scoped noo_trellion role: owner of the 27 memory
@@ -150,7 +150,7 @@ x-trellion-env: &trellion-env
   # PAGEINDEX_DSN/DATABASE_URL and touch mesh tables — flipping them
   # to noo_trellion would fail those inits silently (they are all
   # try/except warnings). noo_app remains the mixed-plane identity.
-  NOO_TRELLION_DATABASE_URL: 'postgresql://noo_trellion@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  NOO_TRELLION_DATABASE_URL: 'postgresql://noo_trellion@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_trellion.crt&sslkey=/app/pki/leaf/pg/noo_trellion.key'
   # NOO_TRELLION_DB_PASSWORD is NOT delivered. It used to be, "because
   # trellion CREATES the role" (noo-trellion #34) —
   # but role creation became the broker's job in phase A′ (trellion
@@ -190,7 +190,7 @@ x-trellion-env: &trellion-env
   # each-consumer-declares rule the gateway (state.rs) and trellion's
   # engine already follow. Absent schemas in the path are silently
   # skipped, so legacy installs resolve identically.
-  DATABASE_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  DATABASE_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
   # noo_app, NOT superuser — an earlier change closed (2026-08-05). The two
   # things that made these superuser by accident are both fixed at the
   # source: partition DDL goes through SECURITY DEFINER functions (036's
@@ -199,8 +199,8 @@ x-trellion-env: &trellion-env
   # Everything else the worker plane does on these DSNs is DML, which
   # noo_app holds on every table plus by default privilege. A compromised
   # worker container can no longer drop a database.
-  PGVECTOR_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
-  PAGEINDEX_DSN: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  PGVECTOR_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
+  PAGEINDEX_DSN: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
   REDIS_URL: '${REDIS_URL:-rediss://redis:6379}'
   REDIS_PASSWORD_FILE: '${REDIS_PASSWORD:+/run/secrets/redis_password}'
   NATS_URL: '${NATS_URL:-tls://nats:4222}'

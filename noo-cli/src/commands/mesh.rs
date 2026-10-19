@@ -71,6 +71,37 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
         }
     }
 
+    // Postgres role leaves (i132). This release's pg_hba requires a client
+    // certificate whose CN is the role being asked for, and its compose points
+    // each DSN at `gateway/pg/<role>.*` or `<leaf>/pg/<role>.*`. An install
+    // started from a checkout that predates them (no `noo upgrade --stack`
+    // in between) has none: mint what is absent, as the operator, BEFORE the
+    // launcher recreates anything. Idempotent; a leaf that cannot be issued
+    // refuses the start here, with the fix, instead of leaving the database
+    // unreachable for every container.
+    if ["start", "restart", "rebuild"].iter().any(|verb| name == format!("noomesh-{verb}.sh")) {
+        let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+        if ca.ca_exists() {
+            let failed: Vec<String> = ca
+                .ensure_pg_leaves(crate::pki::DEFAULT_DAYS)
+                .into_iter()
+                .filter_map(|(l, r)| r.err().map(|e| format!("{} ({}): {e}", l.role, l.cert_rel())))
+                .collect();
+            if !failed.is_empty() {
+                fail(
+                    g.json,
+                    ExitCode::Generic,
+                    "pg_role_leaf_failed",
+                    &format!(
+                        "could not issue the Postgres client certificate(s) this release's pg_hba requires: {} — nothing was started",
+                        failed.join("; ")
+                    ),
+                    Some("noo security pki fix-modes   # then re-run the same command"),
+                );
+            }
+        }
+    }
+
     // The gateway refuses to boot without its audit key. Mint it into the
     // encrypted store when absent, BEFORE the launcher can recreate the
     // gateway; a store that cannot be read is left to the launcher, which
