@@ -374,7 +374,12 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         }
         Wire::Ollama => (sh.url("/api/chat"), ollama::request(&body)),
     };
-    let req = crate::coordinator::with_backend_hint_url(sh.client.post(&url).json(&wire_body), &sh.upstream.url, &sh.upstream.backend_type);
+    let req = if stream {
+        crate::node_link::backend_stream_on(&sh.client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
+    } else {
+        crate::node_link::backend_request_on(&sh.client, reqwest::Method::POST, &url, &sh.upstream.backend_type)
+    }
+    .json(&wire_body);
     let resp = req.send().await.map_err(|e| (502, format!("the model endpoint did not answer: {e}")))?;
     let status = resp.status();
     if !status.is_success() {

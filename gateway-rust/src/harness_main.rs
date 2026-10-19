@@ -315,12 +315,11 @@ async fn resolve_kind(env_kind: Option<String>, model_url: &str, client: &reqwes
 /// = the agent answered that nothing (or nothing with a kind) is placed.
 async fn placement_kind(client: &reqwest::Client, agent_url: &str) -> Result<Option<String>> {
     let mut u = reqwest::Url::parse(agent_url.trim())?;
-    u.set_path("/harness/placement");
+    u.set_path("");
     u.set_query(None);
-    let mut req = client.get(u).timeout(Duration::from_secs(10));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(agent_url) {
-        req = req.header(k, v);
-    }
+    let req = crate::node_link::NodeLink::for_base(u.as_str().trim_end_matches('/'))
+        .request_on(client, reqwest::Method::GET, "/harness/placement")
+        .timeout(Duration::from_secs(10));
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         tracing::warn!("harness: the node agent has no harness placement route (404); running kind noo");
