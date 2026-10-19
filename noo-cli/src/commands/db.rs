@@ -300,6 +300,18 @@ fn psql(container: &str, db: &str, sql: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The mesh chain's stamp straight from Postgres (`docker exec … psql`), for
+/// callers that must know it while the gateway may be down - the stack
+/// rollback preflight. Per-system schema first, `public` second, like
+/// `noo db status`. `None` = postgres could not be asked or holds no stamp.
+pub(crate) fn mesh_stamp_from_postgres() -> Option<String> {
+    let pg = std::env::var("PGCONTAINER").unwrap_or_else(|_| crate::envfile::container("postgres"));
+    let db = resolve_db(&pg);
+    ["mesh.alembic_version_mesh", "public.alembic_version_mesh"]
+        .iter()
+        .find_map(|t| psql(&pg, &db, &format!("SELECT version_num FROM {t}")).filter(|s| !s.is_empty()))
+}
+
 /// One migration chain's stamp, as read from Postgres.
 struct ChainStamp {
     system: &'static str,
