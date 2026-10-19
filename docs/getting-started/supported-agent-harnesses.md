@@ -256,14 +256,37 @@ supported-hardware.md. Leave the foreign kinds out until a vendor CLI has been r
 
 Not recorded yet.
 
+## Which harnesses we support, and in what order
+
+The foreign kinds we support, in priority order, are **Claude Code**,
+**Codex** and **GitHub Copilot CLI**. They are the three in the table above,
+and fixes, testing and documentation go to them first. A further kind is
+considered only after these three have run on real node models.
+
+An agent that is not a headless CLI is not a harness kind. Assistant-style
+agents such as OpenClaw, Hermes Agent or Grok Build connect to noomesh as MCP
+clients through the user door, wherever they run and on whatever model they
+bring: see [../channels/mcp-your-client.md](../channels/mcp-your-client.md).
+So does your own Claude Code, Codex or Copilot on a laptop.
+
+A tool that improves an agent's prompts, tools and skills, rather than
+running tasks, is not a harness kind either.
+
 ## Getting a harness added
 
 A new kind is a change to `config/harness-kinds.json`, not a configuration
 value: the gateway and the node agent are built with that table, so a node
 or controller learns a new kind by upgrading. The row declares which chat
 backends the kind can use, its vendor CLI (`cli`), its launch recipe and its vendor
-telemetry switches (or that it has none); a test fails otherwise. To ask for
-one, open an issue naming the harness and the wire it speaks.
+telemetry switches (or that it has none); a test fails otherwise.
+
+A candidate must be a headless CLI that runs from a prompt and exits, takes
+a model endpoint we control, loads an MCP server from its configuration,
+publishes versioned releases with checksums the controller can pin, and lets
+its telemetry and update checks be switched off. It is offered once
+`noo-gateway harness probe --kind <kind> --mock-model` passes inside the
+jail, and recommended once it has passed against a real node model. To ask
+for one, open an issue naming the harness and the wire it speaks.
 
 See also [supported-hardware.md](supported-hardware.md) for the machines a
 harness can run on.
