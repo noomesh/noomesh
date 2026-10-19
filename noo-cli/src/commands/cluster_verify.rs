@@ -1494,6 +1494,10 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
             .cloned()
             .collect(),
     };
+    // An embedder is never a chat target. A current gateway already leaves it
+    // out; an older one listed whatever the node had loaded, so the row does
+    // not count one either (rehearsal 0.6.7-rc.1 F1).
+    let order: Vec<Value> = order.into_iter().filter(|c| !is_non_chat_entry(c)).collect();
     if order.is_empty() {
         return fail(NAME, format!("chat-default ({mode}) has no live candidate: an unpinned chat request gets 503"), "noo cluster class list");
     }
@@ -1536,6 +1540,19 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
     }
     ok(NAME, detail)
+}
+
+/// A class candidate that is not a chat target: a non-chat `role`, or a model
+/// whose name is an embedding/reranking model.
+fn is_non_chat_entry(c: &Value) -> bool {
+    if matches!(c["role"].as_str(), Some(r) if !r.is_empty() && r != "chat") {
+        return true;
+    }
+    let m = c["model"].as_str().unwrap_or("").to_ascii_lowercase();
+    let base = m.rsplit('/').next().unwrap_or(&m);
+    base.contains("embed")
+        || base.contains("rerank")
+        || ["harrier", "bge-", "bge:", "e5-", "gte-", "all-minilm", "minilm", "snowflake"].iter().any(|p| base.starts_with(p))
 }
 
 /// Run this binary with `words` and `--json`; the parsed stdout and the exit
@@ -4884,6 +4901,18 @@ mod tests {
         let c = default_chat_check(Some(&one));
         assert_eq!(c.verdict, super::Verdict::Warn);
         assert!(c.detail.contains("one node"), "{}", c.detail);
+
+        // rehearsal 0.6.7-rc.1 F1: an embedder in the order is not a candidate,
+        // so it neither appears in the row nor makes a two-node mesh look it.
+        let emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true},
+            {"node_id": "awolf", "backend": "vllm", "model": "HF", "gpu": true}]}]});
+        let c = default_chat_check(Some(&emb));
+        assert!(!c.detail.contains("harrier"), "{}", c.detail);
+        assert!(c.detail.contains("one node"), "only awolf is a chat node: {}", c.detail);
+        let only_emb = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": [
+            {"node_id": "ctl", "backend": "ollama", "model": "harrier:latest", "gpu": true}]}]});
+        assert_eq!(default_chat_check(Some(&only_emb)).verdict, super::Verdict::Fail);
 
         let none = serde_json::json!({"classes": [{"name": "chat-default", "dynamic": true, "routing_order": []}]});
         assert_eq!(default_chat_check(Some(&none)).verdict, super::Verdict::Fail);
