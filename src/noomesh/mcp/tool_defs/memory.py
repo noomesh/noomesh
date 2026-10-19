@@ -17,6 +17,23 @@ from ..tool_models import HttpMethod, RiskLevel, ToolDef, register
 
 
 @register
+class ConversationPublish(ToolDef):
+    """Publish a source conversation entry, session ending or deletion to your
+    own conversation memory. Infrastructure import: preserves original words,
+    roles and source IDs; assistant dialogue is not verified action evidence.
+    Version 1 publications are idempotent and deletion prevents late replays."""
+
+    name: ClassVar[str] = "noo_conversation_publish"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.POST
+    path: ClassVar[str] = "/api/conversations/import"
+    tags: ClassVar[List[str]] = ["memory", "conversation", "external"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.MEDIUM
+
+    publication: dict = Field(description="Conversation publication v1 with publisher_id, event_id, conversation_id and operation (entry, session_end, delete).")
+
+
+@register
 class PaiMemorySearch(ToolDef):
     """Search conversation memory for past interactions. Returns semantically
     similar conversations ranked by relevance. Use this for recalling previous
