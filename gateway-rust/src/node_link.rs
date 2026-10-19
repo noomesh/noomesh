@@ -113,6 +113,9 @@ impl NodeLink {
                     return Ok(Self::with_node(format!("https://{ip}:{AGENT_PORT}"), node_id));
                 }
             }
+            // Registered, but with nowhere to send the call: say so, rather
+            // than "not found".
+            return Err(AppError::NotFound(no_address_message(node_id)));
         }
         Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
     }
@@ -250,6 +253,15 @@ pub fn backend_stream_on(
     backend_type: &str,
 ) -> reqwest::RequestBuilder {
     crate::coordinator::with_backend_hint_url(client.request(method, url), url, backend_type)
+}
+
+/// The node is in `mesh_nodes` but registered without `agent_url` or
+/// `ip_address`, so the gateway has nowhere to send the call.
+pub(crate) fn no_address_message(node_id: &str) -> String {
+    format!(
+        "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
+         Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
+    )
 }
 
 #[cfg(test)]
