@@ -1237,6 +1237,34 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             Some("noo systems status   # then re-run: noo upgrade --stack")),
     }
 
+    // -1c. The Postgres role leaves (i132). This release's pg_hba requires a
+    //    client certificate whose CN is the role being asked for
+    //    (`clientcert=verify-full`) for noo, noo_app, noo_trellion and
+    //    noo_trellion_ddl, and its compose DSNs name `gateway/pg/<role>.*` or
+    //    `<leaf dir>/pg/<role>.*` inside what each container already mounts.
+    //    An install upgraded from before has only the shared leaves, so the
+    //    role leaves are
+    //    minted HERE, before anything moves: a leaf that cannot be issued
+    //    stops the roll with the slice, pin and running stack untouched,
+    //    because a Postgres that enforces the new rule in front of clients
+    //    that cannot present it is a database nobody can reach.
+    match reconcile_pg_leaves(&crate::pki::ClusterCa::new(crate::pki::pki_dir())) {
+        Ok(minted) => if !g.json && !minted.is_empty() {
+            ui::done(&format!("issued {} Postgres client certificate(s) ({}) — new in this release: pg_hba now requires the certificate's CN to be the role", minted.len(), minted.join(", ")));
+        },
+        Err(failures) => {
+            let (leaf, why) = &failures[0];
+            let dir = crate::pki::pki_dir().join(leaf.dir_rel());
+            let why = super::pki::permission_denied_hint(why, &dir).unwrap_or_else(|| why.clone());
+            fail(g.json, ExitCode::Generic, "pg_role_leaf_failed",
+                &format!("could not issue the Postgres client certificate for role {} ({}): {why}{} — nothing was changed; \
+                          without it this release's Postgres would refuse that container's logins",
+                    leaf.role, leaf.cert_rel(),
+                    if failures.len() > 1 { format!(" ({} more leaf(s) failed too)", failures.len() - 1) } else { String::new() }),
+                Some("noo security pki fix-modes   # then re-run: noo upgrade --stack"));
+        }
+    }
+
     // -1d. The four stunnel doors the controller's own node-agent dials
     //    (ollama, ollama-embed, ollama-embed-cpu, llamacpp) now pin that agent
     //    by this controller's node id (`checkHost = $NODE_ID`, appended at
@@ -1739,6 +1767,29 @@ fn door_node_id_problem(raw: &str) -> Option<String> {
         return Some(format!("NODE_ID is '{id}', which is not a plain node name"));
     }
     None
+}
+
+/// Issue the Postgres role leaves an upgraded install does not have yet.
+/// `Ok` lists the leaves issued as `role@owner` (empty when every leaf was
+/// already right, and when there is no CA: `upgrade_stack` refuses an
+/// install with no PKI before it reaches here). `Err` lists every leaf that
+/// could not be issued with the reason, so the caller refuses the roll
+/// rather than starting a Postgres that enforces `verify-full` in front of
+/// clients with no leaf.
+fn reconcile_pg_leaves(ca: &crate::pki::ClusterCa) -> Result<Vec<String>, Vec<(&'static crate::pki::PgLeaf, String)>> {
+    if !ca.ca_exists() {
+        return Ok(Vec::new());
+    }
+    let mut minted = Vec::new();
+    let mut failed = Vec::new();
+    for (leaf, res) in ca.ensure_pg_leaves(crate::pki::DEFAULT_DAYS) {
+        match res {
+            Ok(true) => minted.push(format!("{}@{}", leaf.role, leaf.owner)),
+            Ok(false) => {}
+            Err(e) => failed.push((leaf, e)),
+        }
+    }
+    if failed.is_empty() { Ok(minted) } else { Err(failed) }
 }
 
 /// `SVC_LIST` names the mounted service certs the CURRENT release's compose
@@ -5769,6 +5820,74 @@ mod keyless_tests {
         ];
         assert_eq!(super::pick_latest_stack(&rels).as_deref(), Some("0.2.104"));
         assert_eq!(super::pick_latest_stack(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod pg_leaf_tests {
+    use crate::pki::{ClusterCa, PG_LEAVES};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-pg-leaves-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An install upgraded from before role leaves has only the shared
+    /// service leaves: the reconcile mints every role leaf, and a second
+    /// roll changes nothing.
+    #[test]
+    fn an_old_install_gets_every_role_leaf_once() {
+        let ca = ClusterCa::new(scratch("old"));
+        ca.generate_ca("t", 3650).unwrap();
+        ca.issue_service_cert("worker", &[], &[], 90).unwrap();
+        let first = super::reconcile_pg_leaves(&ca).expect("mints");
+        assert_eq!(first.len(), PG_LEAVES.len());
+        assert!(first.contains(&"noo_app@worker".to_string()), "{first:?}");
+        assert_eq!(super::reconcile_pg_leaves(&ca).unwrap(), Vec::<String>::new(), "a second roll issues nothing");
+        for l in PG_LEAVES {
+            assert_eq!(ca.pg_leaf_cn(l).unwrap().as_deref(), Some(l.role));
+        }
+    }
+
+    /// No CA: nothing to issue and nothing to refuse (upgrade_stack's
+    /// install-incomplete guard owns that case).
+    #[test]
+    fn no_ca_is_not_a_refusal_here() {
+        let ca = ClusterCa::new(scratch("noca"));
+        assert_eq!(super::reconcile_pg_leaves(&ca).unwrap(), Vec::<String>::new());
+    }
+
+    /// A leaf that cannot be issued (the services dir is a FILE, the way an
+    /// unwritable directory fails) is an Err naming the leaf, not a silent
+    /// skip: the roll must stop.
+    #[test]
+    fn an_unissuable_leaf_is_reported_so_the_roll_can_refuse() {
+        let ca = ClusterCa::new(scratch("fail"));
+        ca.generate_ca("t", 3650).unwrap();
+        std::fs::write(ca.dir.join("services"), b"in the way").unwrap();
+        let err = super::reconcile_pg_leaves(&ca).expect_err("cannot issue under a file");
+        // The gateway's leaves live under gateway/, so they still issue.
+        assert_eq!(err.len(), PG_LEAVES.iter().filter(|l| l.owner != "gateway").count());
+        assert!(err.iter().all(|(_, why)| !why.is_empty()));
+        assert!(err.iter().any(|(l, _)| l.owner == "worker" && l.role == "noo_app"));
+    }
+
+    /// The step runs BEFORE anything moves (the pin, the slice, the
+    /// launcher) and refuses rather than warns.
+    #[test]
+    fn the_role_leaf_stage_runs_before_anything_moves_and_refuses() {
+        let src = include_str!("upgrade.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
+        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in upgrade_stack"));
+        let stage = at("reconcile_pg_leaves(&crate::pki::ClusterCa::new(");
+        for later in ["crate::onboard::standalone::materialize(&root)", "write_stack_lock(g, &tag", "reconcile_service_certs(g)", "let mut status = launch();"] {
+            assert!(stage < at(later), "the role leaves must exist before `{later}`");
+        }
+        assert!(body[stage..at("migrate_retired_yaml_gates(g, &root)")].contains("pg_role_leaf_failed"), "a missing leaf is a refusal, not a warning");
     }
 }
 

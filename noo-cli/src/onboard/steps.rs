@@ -3096,6 +3096,24 @@ fn ensure_pki(ctx: &mut Ctx) {
             }
         }
 
+        // Postgres role leaves (i132): one client identity per role and
+        // container, CN = the role, so pg_hba's `clientcert=verify-full` can
+        // say which role a certificate may log in as. Not part of SVC_LIST:
+        // a role leaf is named for its ROLE and has no SANs to keep covered.
+        // Issued when missing (or when a hand-made one has the wrong CN or
+        // no key); a failure is a warning here, and `noo upgrade --stack`
+        // refuses to roll without them.
+        for (leaf, res) in ca.ensure_pg_leaves(DEFAULT_DAYS) {
+            match res {
+                Ok(true) => ctx.success(&format!("Postgres client certificate for role {} ({}) generated", leaf.role, leaf.owner)),
+                Ok(false) => ctx.info(&format!("Postgres client certificate for role {} ({}) already exists", leaf.role, leaf.owner)),
+                Err(e) => ctx.warn(&format!(
+                    "Postgres client certificate for role {} ({}): {e} — then: noo security pki fix-modes, and re-run: noo onboard --only security",
+                    leaf.role, leaf.owner
+                )),
+            }
+        }
+
         // Node cert — same coverage rule as service certs (finding #33):
         // the gateway dials the agent back by its registered tailnet name,
         // so the node cert must carry it or the callback handshake fails.
