@@ -227,6 +227,17 @@ about escaping in the password field — libpq needs `\\` and `\:`, sqlx takes
 the rest of the line verbatim — so each body is written for the driver that
 reads it.
 
+**A role's password is not the only thing that opens it.** Every login to
+`noo`, `noo_app`, `noo_trellion` and `noo_trellion_ddl` also needs the client
+leaf issued for that role (CN = the role: `gateway/pg/<role>.*`,
+`services/<owner>/pg/<role>.*`, `0640` handed to the container's uid), checked
+by `pg_hba.conf` with `clientcert=verify-full`. The leaves are not secrets in
+the store: they are minted by `noo onboard`, `noo upgrade --stack` and the
+launchers, rotated by `noo security pki rotate-all` like every other leaf, and
+a rotated password does not touch them. The add-on roles `noo_evolve` and
+`noo_evolve_ddl` still need only a cluster-CA certificate plus the password
+(see [Networks and containers](networks-and-containers.md)).
+
 **Optional secrets stay optional.** The launcher makes every source variable
 exist, empty when the store has no value (compose otherwise refuses to create
 the service). An empty value creates the container with **no** file, and each
@@ -444,7 +455,10 @@ The live Postgres probe runs `psql` inside the postgres container against
 the container's routable address (the unix socket is `trust`, and a check
 that cannot fail proves nothing), over TLS with the server's own leaf
 presented as the client certificate — since 2026-09-28 `pg_hba` refuses
-any TCP client without one (`docker/postgres/pg_hba.conf`). It leaves one
+any TCP client without one (`docker/postgres/pg_hba.conf`); since the per-role
+client leaves, the role-named certificate that other containers must present
+is not needed for a login from the postgres container itself (the `samehost`
+rule; see [Networks and containers](networks-and-containers.md)). It leaves one
 `password authentication failed` line per role in the Postgres log — that
 is the negative control working. A probe refused with `connection requires
 a valid client certificate` is reported as the check's own

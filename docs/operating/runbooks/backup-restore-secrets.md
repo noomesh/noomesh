@@ -323,8 +323,11 @@ socket, which is the one path `pg_hba` still trusts. Postgres accepts no TCP
 client without TLS **and** a cluster-CA client certificate (since 2026-09-28,
 `docker/postgres/pg_hba.conf`), so a `psql -h 127.0.0.1 -p 5433` from the host
 needs `sslmode=verify-ca sslrootcert=$NOO_PKI_DIR/ca.crt
-sslcert=$NOO_PKI_DIR/gateway/gateway.crt sslkey=<a 0600 copy of gateway.key>`
-on top of the password — libpq refuses the 0644 key as mounted. Prefer the
+sslcert=$NOO_PKI_DIR/gateway/pg/noo.crt sslkey=<a 0600 copy of gateway/pg/noo.key>`
+on top of the password — libpq refuses the key as mounted. The certificate
+must be the one issued for the role you log in as (its CN is the role:
+`gateway/pg/noo.crt` for `noo`, `gateway/pg/noo_app.crt` for `noo_app`);
+the gateway's own `gateway/gateway.crt` is refused for those roles. Prefer the
 `docker exec` form.
 
 (`noo` / `noomesh` are the defaults for `POSTGRES_USER` / `POSTGRES_DB`.)
