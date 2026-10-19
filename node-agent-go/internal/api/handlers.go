@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logring"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
+	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
 	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
@@ -146,6 +148,19 @@ func (s *Server) handleStartBackend(w http.ResponseWriter, r *http.Request) {
 					"its lifecycle — start, stop and model changes are the operator's, not the "+
 					"controller's. The backend IS reported and routable.",
 				req.Backend, s.native.Runtime(), nativeModelLabel(model)),
+		})
+		return
+	}
+
+	// Paused for other work on the GPU (internal/gpuyield): an imperative
+	// start (`noo cluster up`, the autonomy engine) must not take the GPU
+	// back from it. 409 names why; `noo cluster gpu release` or the GPU
+	// freeing ends it.
+	if gpuyield.HoldsStart(req.Backend) {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":   "gpu_in_use_by_other",
+			"backend": req.Backend,
+			"detail":  req.Backend + " is paused: this node's GPU is in use by other work (gpu_contention); it resumes when the GPU frees or the hold is released",
 		})
 		return
 	}
@@ -508,4 +523,32 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+// handleGPUHold pauses this node's GPU backends and keeps them paused until
+// a release (operator hold, internal/gpuyield). Body: {"reason": "..."}.
+// Controller-only: the gateway calls it for `noo cluster gpu hold`.
+func (s *Server) handleGPUHold(w http.ResponseWriter, r *http.Request) {
+	if s.gpuHold == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "gpu yield not running on this agent"})
+		return
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	reason := strings.TrimSpace(body.Reason)
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "held", "gpu_contention": s.gpuHold(r.Context(), reason)})
+}
+
+// handleGPURelease ends an operator hold: back to the automatic policy.
+func (s *Server) handleGPURelease(w http.ResponseWriter, r *http.Request) {
+	if s.gpuRelease == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "gpu yield not running on this agent"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "released", "gpu_contention": s.gpuRelease()})
 }

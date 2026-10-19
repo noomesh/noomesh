@@ -109,6 +109,15 @@ var (
 	refusedValue string // the target currently recorded under RefusalScope, "" for none
 )
 
+// Placed: this node takes weights and images from the controller's store.
+// Read from the raw variable, not CacheURL(): a REFUSED (plaintext or
+// certificate-less) value is a mis-provisioned placed node, which must refuse
+// rather than fall back to the WAN.
+func Placed() bool { return strings.TrimSpace(rawCacheURL()) != "" }
+
+// rawCacheURL is the ONE read of NOO_MODEL_CACHE_URL.
+func rawCacheURL() string { return os.Getenv("NOO_MODEL_CACHE_URL") }
+
 // CacheURL is the ONE reader of NOO_MODEL_CACHE_URL (a source-grep test
 // pins that). It returns the store's base URL without a trailing slash, or
 // "" when the feature is off — OR when the configured value is refused.
@@ -128,7 +137,7 @@ var (
 // already reads "" as "no data plane to pull from" and refuses its own
 // work; the loud half is the log line and the refusals record.
 func CacheURL() string {
-	raw := os.Getenv("NOO_MODEL_CACHE_URL")
+	raw := rawCacheURL()
 	cfg := nodeconfig.Load()
 	u, err := resolveCacheURL(raw, cfg.TLSCert != "" && cfg.TLSKey != "")
 	refuseMu.Lock()

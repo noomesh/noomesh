@@ -89,6 +89,13 @@ fn map_mut<'a>(v: &'a mut Value, k: &str) -> &'a mut Value {
 /// `cluster.default_backend = backend`, `cluster.backends.<backend>.{enabled=true,
 /// model=...}`, and disable the other inference backend. Parity with
 /// `_update_yaml_config`.
+///
+/// The model recorded here is the LOCAL backend's placement hint (what this
+/// box pulls and serves, and the static `OLLAMA_URL` last resort's model).
+/// It is not a routing pin: the gateway sends unpinned chat to every live
+/// chat node (`chat-default` dynamic) and logs once that the yaml value is
+/// a hint. Existing yamls with `default_backend: ollama` + a model keep
+/// working unchanged — the value simply stops narrowing the default.
 pub fn update_yaml_config(ctx: &Ctx, backend: &str, model: &str) {
     let Some(path) = config_path(ctx) else { return };
     let mut data = load(&path);

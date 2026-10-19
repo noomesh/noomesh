@@ -102,27 +102,20 @@ fn prompt_secret(label: &str) -> String {
 }
 
 /// Obtain a password with the agent-first contract:
-///   `--password-stdin`  → one line from stdin, no confirm (>= 8 chars, the
-///                         same check Python applies on this path);
+///   `--password-stdin`  → one line from stdin, no confirm (the shared
+///                         password policy: 12 characters, not a common
+///                         password, not containing the username);
 ///   `--json` w/o flag   → error (never prompt in machine mode);
 ///   non-TTY w/o flag    → error instead of blocking on a pipe;
 ///   TTY                 → getpass-style double prompt, echo off, must match.
 /// The password itself is never echoed or printed anywhere.
-fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str) -> String {
+fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str, username: &str) -> String {
     use std::io::BufRead as _;
     if password_stdin {
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
         let password = line.trim_end_matches(['\n', '\r']).to_string();
-        if password.len() < 8 {
-            fail(
-                g.json,
-                ExitCode::Generic,
-                "weak_password",
-                "Password must be at least 8 characters",
-                None,
-            );
-        }
+        refuse_weak(g, &password, username);
         return password;
     }
     if g.json {
@@ -148,7 +141,25 @@ fn read_password(g: &Globals, password_stdin: bool, prompt: &str, confirm: &str)
     if password != confirmed {
         fail(false, ExitCode::Generic, "password_mismatch", "Passwords do not match", None);
     }
+    refuse_weak(g, &password, username);
     password
+}
+
+/// Exit with `weak_password` unless the shared policy
+/// ([`crate::password_policy`]) accepts `password` for `username`. The gateway
+/// applies the same rule; checking here saves the round trip and keeps the
+/// password off the wire when it would be refused. Only a password being SET
+/// is checked: existing accounts keep logging in.
+fn refuse_weak(g: &Globals, password: &str, username: &str) {
+    if let Some(why) = crate::password_policy::weak_password(password, username) {
+        fail(
+            g.json,
+            ExitCode::Generic,
+            "weak_password",
+            why,
+            Some("use at least 12 characters that are not a common password and do not contain the username"),
+        );
+    }
 }
 
 // ── security user ───────────────────────────────────────────────────────────
@@ -231,7 +242,7 @@ pub fn security_user_create(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         // `noo security users set-scopes <user> read write`.
         scopes = vec!["read".into()];
     }
-    let password = read_password(g, password_stdin, "Password: ", "Confirm password: ");
+    let password = read_password(g, password_stdin, "Password: ", "Confirm password: ", &username);
     let body = post_json(
         g,
         "/api/security/users",
@@ -549,7 +560,7 @@ pub fn security_user_set_password(g: &Globals, args: &[String]) -> Result<i32, U
         }
     }
     let username = username.ok_or(Unhandled)?;
-    let password = read_password(g, password_stdin, "New password: ", "Confirm: ");
+    let password = read_password(g, password_stdin, "New password: ", "Confirm: ", &username);
     let body = put_json(
         g,
         &format!("/api/security/users/{username}/password"),
@@ -1286,6 +1297,39 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
             }),
         ])
     );
+    // The hash chain: deletion and reordering evidence. Said plainly when it
+    // could not be judged; "not checked" is never shown as ok.
+    let chain = &body["chain"];
+    if chain["checked"].as_bool() == Some(true) {
+        let head = match chain["head"]["seq"].as_i64() {
+            Some(seq) => format!(
+                "seq {seq} {}",
+                ui::muted(&format!("hash {}", chain["head"]["chain_hash"].as_str().unwrap_or("?")))
+            ),
+            None => ui::muted("none"),
+        };
+        print!(
+            "{}",
+            ui::kv(&[
+                ("chain", format!(
+                    "{} chained, {} before the chain {}",
+                    chain["chained_rows"].as_u64().unwrap_or(0),
+                    chain["unchained_rows"].as_u64().unwrap_or(0),
+                    ui::muted(&format!("({} removed by retention)", chain["retired_rows"].as_u64().unwrap_or(0)))
+                )),
+                ("chain head", head),
+            ])
+        );
+        println!("{}", ui::muted("record the chain head somewhere the database owner cannot write: it is what shows the newest rows were not cut off"));
+    } else {
+        println!(
+            "{}",
+            ui::status_line(
+                Glyph::Warn,
+                &format!("chain not checked: {}", chain["note"].as_str().unwrap_or("the gateway did not report a chain section (older gateway?)"))
+            )
+        );
+    }
     let empty = Vec::new();
     let breaks = body["breaks"].as_array().unwrap_or(&empty);
     if !breaks.is_empty() {
@@ -1321,6 +1365,83 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
     }
 }
 
+// ── security audit list ─────────────────────────────────────────────────────
+
+/// `noo security audit list` — GET /api/security/audit/list.
+///
+/// Reads the security audit log (Operator and above), newest first. Filters are
+/// applied by the gateway; `--cursor` continues from a previous page's
+/// `next_cursor`. Reading is itself recorded as an `audit_log_read` row.
+pub fn security_audit_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut query: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(tok) = iter.next() {
+        let key = match tok.as_str() {
+            "--since" => "since",
+            "--event" | "--event-type" => "event_type",
+            "--actor" => "actor",
+            "--limit" | "-n" => "limit",
+            "--cursor" => "cursor",
+            _ => return Err(Unhandled),
+        };
+        let v = iter.next().ok_or(Unhandled)?;
+        if key == "limit" && v.parse::<u32>().is_err() {
+            return Err(Unhandled);
+        }
+        query.push(format!("{key}={}", super::urlencode(v)));
+    }
+    let path = if query.is_empty() {
+        "/api/security/audit/list".to_string()
+    } else {
+        format!("/api/security/audit/list?{}", query.join("&"))
+    };
+    let body = get_json(g, &path, true, 30);
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let empty = Vec::new();
+    let events = body["events"].as_array().unwrap_or(&empty);
+    if events.is_empty() {
+        println!("{}", ui::muted("no audit rows match"));
+        return Ok(0);
+    }
+    println!("{}", ui::header("security audit", Some(&format!("{} rows, newest first", events.len()))));
+    let rows: Vec<Vec<String>> = events
+        .iter()
+        .map(|e| {
+            let glyph = match e["severity"].as_str().unwrap_or("info") {
+                "critical" | "error" => Glyph::Err,
+                "warning" => Glyph::Warn,
+                _ => Glyph::Bullet,
+            };
+            let ip = e["details"]["source_ip"].as_str().unwrap_or("");
+            vec![
+                ui::glyph_cell(glyph),
+                ui::muted(e["timestamp"].as_str().unwrap_or("")),
+                cell(&e["event_type"]),
+                cell(&e["actor"]),
+                cell(&e["resource"]),
+                cell(&e["outcome"]),
+                ui::muted(ip),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        ui::table(
+            &[Col::left(""), Col::left("at"), Col::left("event"), Col::left("actor"), Col::left("resource"), Col::left("outcome"), Col::left("from")],
+            &rows,
+        )
+    );
+    if let Some(next) = body["next_cursor"].as_str() {
+        println!();
+        ui::guide(&[("noo security audit list --cursor <next>", &format!("more rows; cursor {next}"))]);
+    }
+    println!("{}", ui::muted("--json shows each row's details (source_ip, conversation_id) and chain position"));
+    Ok(0)
+}
+
 // ── security posture ────────────────────────────────────────────────────────
 
 /// `noo security posture list` — GET /api/security/posture.
@@ -1330,7 +1451,11 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
     }
     // Reading posture takes an Operator-role login (`users_admin_read_guard`);
     // the WRITES below take the operator certificate + a bound token
-    let body = get_json(g, "/api/security/posture", true, TIMEOUT);
+    let mut body = get_json(g, "/api/security/posture", true, TIMEOUT);
+    // The gateway cannot see containers; this host can. Without this the
+    // node-agent row's "running" was the gateway's own env var, which no
+    // container ever read.
+    annotate_actual(&mut body, &node_agent_privileged_actual());
     if g.json {
         println!("{body}");
         return Ok(0);
@@ -1341,7 +1466,8 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
         println!("{}", ui::muted("no posture gates"));
         return Ok(0);
     }
-    let pending = gates.iter().filter(|g| g["pending_restart"].as_bool().unwrap_or(false)).count();
+    let drifted = |g: &Value| g["actual_drift"].as_bool().unwrap_or(false);
+    let pending = gates.iter().filter(|g| g["pending_restart"].as_bool().unwrap_or(false) || drifted(g)).count();
     // An OPEN bridge is the most perishable thing in the install: a
     // compatibility window someone is holding open on purpose and is expected
     // to shut. Printed among thirty gates it reads as one more row, which is
@@ -1408,19 +1534,31 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
         .iter()
         .map(|gate| {
             let pending = gate["pending_restart"].as_bool().unwrap_or(false);
+            let drift = drifted(gate);
+            let unseen = gate["actual_error"].is_string();
             vec![
-                ui::glyph_cell(if pending { Glyph::Warn } else { Glyph::Ok }),
+                ui::glyph_cell(if pending || drift || unseen { Glyph::Warn } else { Glyph::Ok }),
                 cell(&gate["key"]),
-                match &gate["running"] {
-                    Value::Null => ui::muted("unset"),
-                    v => cell(v),
+                // A gate whose truth lives in a container shows THE
+                // CONTAINER's state, or that it could not be read.
+                match (&gate["actual"], &gate["running"]) {
+                    (Value::String(a), _) => format!("{a} (container)"),
+                    _ if unseen => ui::muted("container not checked"),
+                    (_, Value::Null) => ui::muted("unset"),
+                    (_, v) => cell(v),
                 },
                 match &gate["db_value"] {
                     Value::Null => String::new(),
                     v => cell(v),
                 },
                 cell(&gate["source"]),
-                if pending { ui::warn("pending") } else { ui::muted("no") },
+                if drift {
+                    ui::warn("recreate node-agent")
+                } else if pending {
+                    ui::warn("pending")
+                } else {
+                    ui::muted("no")
+                },
             ]
         })
         .collect();
@@ -1455,10 +1593,21 @@ pub fn security_posture_list(g: &Globals, args: &[String]) -> Result<i32, Unhand
 /// of three processes ignore it, and finding out from an outage — is the
 /// failure this list exists to prevent.
 ///
-/// EMPTY since an earlier release: its one entry, `NOO_NATS_LEGACY_SHARED_CREDS`,
-/// bridged to the shared bus user, and that user is retired. The mechanism
-/// stays — the next pre-DB gate needs it, and R43 is what happens without it.
-const POSTURE_KEYS_MIRRORED_TO_ENV: &[&str] = &[];
+/// `NOO_NODE_AGENT_PRIVILEGED` is the one entry, for a different reason: it is
+/// consumed by COMPOSE INTERPOLATION (`privileged: ${NOO_NODE_AGENT_PRIVILEGED}`
+/// in `docker-compose.cluster.yml`), which reads `.env` and nothing else. A DB
+/// row alone reached no reader at all — `apply-profile hardened` reported the
+/// node-agent unprivileged while its container kept `--privileged`. Its
+/// mirror is written as `true`/`false` (never dropped: an absent line means
+/// "compose's default"), and a change recreates the container
+/// ([`converge_node_agent`]).
+///
+/// The previous entry, `NOO_NATS_LEGACY_SHARED_CREDS`, bridged to the shared
+/// bus user, and that user is retired.
+const POSTURE_KEYS_MIRRORED_TO_ENV: &[&str] = &[NODE_AGENT_PRIVILEGED_KEY];
+
+/// The posture key whose truth is a container's `HostConfig.Privileged`.
+const NODE_AGENT_PRIVILEGED_KEY: &str = "NOO_NODE_AGENT_PRIVILEGED";
 
 fn truthy_posture_value(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
@@ -1496,7 +1645,13 @@ fn mirror_into_env(written: &[(String, String)]) -> Vec<Result<String, (String, 
     keys_to_mirror(written)
         .into_iter()
         .map(|(key, value)| {
-            match crate::envfile::set_env_flag(&key, truthy_posture_value(&value)) {
+            let on = truthy_posture_value(&value);
+            let wrote = if key == NODE_AGENT_PRIVILEGED_KEY {
+                crate::envfile::set_env_value(&key, Some(if on { "true" } else { "false" }))
+            } else {
+                crate::envfile::set_env_flag(&key, on)
+            };
+            match wrote {
                 Ok(()) => Ok(key),
                 Err(e) => Err((key.clone(), format!("could not mirror {key} into .env: {e}"))),
             }
@@ -1509,6 +1664,9 @@ fn mirror_into_env(written: &[(String, String)]) -> Vec<Result<String, (String, 
 fn print_mirror_outcome(results: &[Result<String, (String, String)>]) {
     for r in results {
         match r {
+            Ok(key) if key == NODE_AGENT_PRIVILEGED_KEY => ui::done(&format!(
+                "{key} mirrored into .env — compose reads it when the node-agent container is created"
+            )),
             Ok(key) => ui::done(&format!(
                 "{key} mirrored into .env — the workers and the node-agent read it before any DB exists"
             )),
@@ -1517,6 +1675,124 @@ fn print_mirror_outcome(results: &[Result<String, (String, String)>]) {
                 println!("{}", ui::note("the DB row IS set; the workers and node-agent read this one from .env, so set it there by hand"));
             }
         }
+    }
+}
+
+/// Parse `docker inspect -f '{{.HostConfig.Privileged}}'`. Pure so every arm
+/// (running, absent, docker failing, garbage) is pinned without docker.
+pub(crate) fn parse_privileged_inspect(success: bool, stdout: &str, stderr: &str, container: &str) -> Result<bool, String> {
+    if !success {
+        let why = stderr.trim();
+        return Err(if why.contains("No such") || why.contains("no such") {
+            format!("no {container} container on this host (the node-agent here is not compose-managed, or the stack is down)")
+        } else if why.is_empty() {
+            format!("docker inspect {container} failed with no message")
+        } else {
+            format!("docker inspect {container} failed: {why}")
+        });
+    }
+    match stdout.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("docker inspect {container} answered {other:?}, expected true or false")),
+    }
+}
+
+/// Is the node-agent container privileged RIGHT NOW (docker's own answer,
+/// not the posture row and not an env var). `Err` = could not be seen; a
+/// caller must say "not checked", never treat it as unprivileged.
+pub(crate) fn node_agent_privileged_actual() -> Result<bool, String> {
+    let container = crate::envfile::container("node-agent");
+    match std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.HostConfig.Privileged}}", &container])
+        .output()
+    {
+        Ok(o) => parse_privileged_inspect(
+            o.status.success(),
+            &String::from_utf8_lossy(&o.stdout),
+            &String::from_utf8_lossy(&o.stderr),
+            &container,
+        ),
+        Err(e) => Err(format!("docker is not runnable: {e}")),
+    }
+}
+
+/// Does the container's actual state disagree with the desired posture value?
+/// `None` when either side is unknown (nothing to compare is not a match).
+pub(crate) fn privileged_drift(desired: Option<&str>, actual: Option<bool>) -> Option<bool> {
+    Some(truthy_posture_value(desired?) != actual?)
+}
+
+/// Add the node-agent's ACTUAL container state to a `posture list` body:
+/// `actual` ("true"/"false") or `actual_error`, and `actual_drift`. The
+/// gateway cannot inspect containers (it has no docker access by design), so
+/// this host-local fact is added here, where docker is. `actual` is the word
+/// "at desired" has to mean.
+fn annotate_actual(body: &mut Value, actual: &Result<bool, String>) {
+    let Some(gates) = body["posture"].as_array_mut() else { return };
+    for gate in gates.iter_mut().filter(|g| g["key"] == NODE_AGENT_PRIVILEGED_KEY) {
+        match actual {
+            Ok(a) => {
+                gate["actual"] = json!(a.to_string());
+                let desired = gate["db_value"].as_str().map(String::from);
+                gate["actual_drift"] = json!(privileged_drift(desired.as_deref(), Some(*a)).unwrap_or(false));
+            }
+            Err(why) => gate["actual_error"] = json!(why),
+        }
+    }
+}
+
+/// After the node-agent's posture value was written and mirrored: make the
+/// container match, by recreating it when it does not. `Ok(true)` = it was
+/// recreated and now matches, `Ok(false)` = already matched. `Err` = could not
+/// be seen, or the recreate did not take.
+fn converge_node_agent(desired_on: bool) -> Result<bool, String> {
+    let before = node_agent_privileged_actual()?;
+    if before == desired_on {
+        return Ok(false);
+    }
+    super::mesh::recreate_service("node-agent")?;
+    let after = node_agent_privileged_actual()?;
+    if after == desired_on {
+        Ok(true)
+    } else {
+        Err(format!(
+            "recreated the node-agent but docker still reports privileged={after} (wanted {desired_on}); is .env being read by the launcher?"
+        ))
+    }
+}
+
+/// Run [`converge_node_agent`] for a just-written posture and say what happened.
+/// `None` when the node-agent key was not part of this write (or its mirror
+/// failed, which has already been reported).
+fn converge_after_write(written: &[(String, String)], results: &[Result<String, (String, String)>]) -> Option<Value> {
+    let (_, value) = written.iter().find(|(k, _)| k == NODE_AGENT_PRIVILEGED_KEY)?;
+    if !results.iter().any(|r| matches!(r, Ok(k) if k == NODE_AGENT_PRIVILEGED_KEY)) {
+        return None;
+    }
+    let desired = truthy_posture_value(value);
+    Some(match converge_node_agent(desired) {
+        Ok(recreated) => json!({"desired_privileged": desired, "recreated": recreated, "matches": true}),
+        Err(e) => json!({"desired_privileged": desired, "recreated": false, "matches": false, "error": e}),
+    })
+}
+
+fn print_converge_outcome(outcome: &Option<Value>) {
+    let Some(o) = outcome else { return };
+    let want = o["desired_privileged"].as_bool().unwrap_or(false);
+    let state = if want { "privileged" } else { "unprivileged" };
+    if o["matches"].as_bool() == Some(true) {
+        if o["recreated"].as_bool() == Some(true) {
+            ui::done(&format!("node-agent container recreated: it is now {state} (docker inspect)"));
+        } else {
+            ui::done(&format!("node-agent container already {state} (docker inspect)"));
+        }
+    } else {
+        println!("{}", ui::status_line(Glyph::Warn, &format!(
+            "node-agent container NOT confirmed {state}: {}",
+            o["error"].as_str().unwrap_or("unknown")
+        )));
+        println!("{}", ui::note("the posture row and .env are set; apply them with: noo stack restart --force node-agent"));
     }
 }
 
@@ -1532,15 +1808,17 @@ pub fn security_posture_set(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     let needs_mirror = !keys_to_mirror(&written).is_empty();
     let results = mirror_into_env(&written);
     let mirrored = needs_mirror.then(|| results.iter().all(|r| r.is_ok()));
+    let node_agent = converge_after_write(&written, &results);
     if g.json {
         if let Some(ok) = mirrored {
-            println!("{}", json!({"posture": body, "env_mirrored": ok}));
+            println!("{}", json!({"posture": body, "env_mirrored": ok, "node_agent": node_agent}));
         } else {
             println!("{body}");
         }
     } else {
         ui::done(&format!("posture {key} = {value}"));
         print_mirror_outcome(&results);
+        print_converge_outcome(&node_agent);
         ui::warned("restart the gateway to apply");
         ui::guide(&[("noo stack restart gateway", "posture gates are read at start; the change is live after the restart")]);
     }
@@ -1589,6 +1867,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
         })
         .collect();
     let results = mirror_into_env(&written);
+    let node_agent = converge_after_write(&written, &results);
 
     if g.json {
         println!(
@@ -1599,6 +1878,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
                     Ok(k) => json!({"key": k, "ok": true}),
                     Err((k, msg)) => json!({"key": k, "ok": false, "error": msg}),
                 }).collect::<Vec<_>>(),
+                "node_agent": node_agent,
             })
         );
         return Ok(0);
@@ -1661,6 +1941,7 @@ pub fn security_posture_apply_profile(g: &Globals, args: &[String]) -> Result<i3
     }
 
     print_mirror_outcome(&results);
+    print_converge_outcome(&node_agent);
     ui::done(&format!("'{profile}' applied ({applied} key(s) written)"));
     ui::warned("restart the gateway to apply");
     ui::guide(&[
@@ -2797,6 +3078,48 @@ mod posture_mirror_tests {
         assert_eq!(keys_to_mirror_from(MIRRORED, &from_set).len(), 1);
     }
 
+    /// The node-agent gate was cosmetic: `POSTURE_KEYS_MIRRORED_TO_ENV` was
+    /// empty and only compose interpolation reads the key. It now reaches
+    /// `.env`, whoever wrote it.
+    #[test]
+    fn the_node_agent_gate_is_mirrored_for_compose() {
+        let from_profile = w(&[("NOO_NODE_AGENT_PRIVILEGED", "false"), ("NOO_EXEC_APPROVAL_MODE", "approval")]);
+        assert_eq!(keys_to_mirror(&from_profile), w(&[("NOO_NODE_AGENT_PRIVILEGED", "false")]));
+    }
+
+    #[test]
+    fn docker_inspect_answers_are_parsed_without_guessing() {
+        let p = |ok, out, err| parse_privileged_inspect(ok, out, err, "noo-node-agent");
+        assert_eq!(p(true, "true\n", ""), Ok(true));
+        assert_eq!(p(true, "false\n", ""), Ok(false));
+        assert!(p(false, "", "Error: No such object: noo-node-agent").unwrap_err().contains("no noo-node-agent container"));
+        assert!(p(false, "", "").unwrap_err().contains("failed with no message"));
+        assert!(p(true, "<no value>", "").is_err(), "garbage is not unprivileged");
+    }
+
+    /// "At desired" has to mean the container: a privileged container under a
+    /// `false` row is drift, an unreadable container is not a match.
+    #[test]
+    fn the_listing_reports_the_container_not_the_gateways_env() {
+        assert_eq!(privileged_drift(Some("false"), Some(true)), Some(true));
+        assert_eq!(privileged_drift(Some("false"), Some(false)), Some(false));
+        assert_eq!(privileged_drift(Some("true"), Some(true)), Some(false));
+        assert_eq!(privileged_drift(None, Some(true)), None);
+        assert_eq!(privileged_drift(Some("false"), None), None);
+        let mut body = json!({"posture": [
+            {"key": "NOO_NODE_AGENT_PRIVILEGED", "running": "false", "db_value": "false"},
+            {"key": "NOO_EXEC_APPROVAL_MODE", "running": "strict", "db_value": "strict"},
+        ]});
+        annotate_actual(&mut body, &Ok(true));
+        assert_eq!(body["posture"][0]["actual"], "true");
+        assert_eq!(body["posture"][0]["actual_drift"], true);
+        assert!(body["posture"][1]["actual"].is_null(), "only the container-backed gate is annotated");
+        let mut body = json!({"posture": [{"key": "NOO_NODE_AGENT_PRIVILEGED", "running": "false", "db_value": "false"}]});
+        annotate_actual(&mut body, &Err("no container".into()));
+        assert_eq!(body["posture"][0]["actual_error"], "no container");
+        assert!(body["posture"][0]["actual"].is_null());
+    }
+
     /// The retired bus bridge is no longer mirrored — a posture
     /// write of it (an unknown key now) must not re-create a `.env` line.
     #[test]
@@ -2993,5 +3316,34 @@ mod clifix_security_tests {
         confirm_precedes(src, "pub fn security_user_disable(", "post_json(");
         confirm_precedes(src, "pub fn security_service_key_revoke(", "post_json(");
         confirm_precedes(src, "pub fn security_team_delete(", "delete_json(");
+    }
+}
+
+#[cfg(test)]
+mod password_policy_tests {
+    /// Both the `--password-stdin` path and the prompt path run the shared
+    /// policy before the password is sent anywhere.
+    #[test]
+    fn read_password_applies_the_shared_policy_on_both_paths() {
+        let src = include_str!("security.rs");
+        let start = src.find("fn read_password(").expect("read_password");
+        let rest = &src[start..];
+        let end = rest.find("\n/// Exit with `weak_password`").expect("refuse_weak follows");
+        let body = &rest[..end];
+        assert_eq!(body.matches("refuse_weak(g, &password, username)").count(), 2, "stdin and prompt paths");
+        assert!(!body.contains(".len() < 8"), "the old 8-character rule is gone");
+        for sig in ["pub fn security_user_create(", "pub fn security_user_set_password("] {
+            let s = src.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            let r = &src[s..];
+            let e = r[sig.len()..].find("\npub fn ").map(|i| i + sig.len()).unwrap_or(r.len());
+            assert!(r[..e].contains("&username)"), "{sig} must pass the username to the policy");
+        }
+    }
+
+    #[test]
+    fn a_short_or_common_password_is_refused_by_the_shared_rule() {
+        assert!(crate::password_policy::weak_password("hunter22", "alice").is_some());
+        assert!(crate::password_policy::weak_password("Password123!", "alice").is_some());
+        assert!(crate::password_policy::weak_password("a-long-enough-phrase", "alice").is_none());
     }
 }

@@ -1795,13 +1795,13 @@ fn security_user_create_reads_password_from_stdin() {
 
 #[test]
 fn security_user_create_stdin_password_too_short_exits_1() {
-    // Fails locally (< 8 chars) — must never reach the gateway.
+    // Fails locally (< 12 chars) — must never reach the gateway.
     let out = run_with_stdin(
         &["--gateway", &gw(closed_port()), "security", "user", "create", "alice", "--password-stdin"],
         "short\n",
     );
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("at least 8 characters"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("at least 12 characters"));
 }
 
 #[test]

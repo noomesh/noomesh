@@ -25,8 +25,20 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 
 1. **A user JWT** (`Authorization: Bearer <token>`) from `POST /auth/token`.
    Role is derived from scopes: `admin` → Admin, `write` → Operator,
-   otherwise User. Operators may call anything; Users may `GET` (except
-   `/metrics`, `/api/metrics/query` and `/api/logs/*`, which are Operator+),
+   otherwise User. Operators may call anything. Users may `GET` only an
+   allow-list of the surfaces a person needs (conversations, memory, RAG and
+   graph reads, their jobs, agent mail, usage, the dashboard's cluster/scheduler
+   overview, the runbooks, `/ws/*`, add-on read routes); a route not on the list
+   is closed to a User until it is added on purpose, as for kiosk tokens.
+   Installation-wide reads are Operator+: `/metrics`, `/api/metrics/*`,
+   `/api/logs/*`, `/api/config*`, `/api/settings*` and `/api/v1/settings` (except
+   `user-dirs` and `preference`), `/api/security/*` (audit, violations, PKI, posture,
+   users, service keys; except the caller's own key), a node's
+   `desired-config` and the other fleet reads under `/api/cluster/`, snapshots and
+   the knowledge-base admin lists. The handlers behind the sensitive ones refuse a
+   User themselves as well (`403 operator role required`), so a mis-edited
+   allow-list cannot reopen them. `GET /api/coordinator/context` answers a User
+   without backend URLs or peer ids. Users also
    use the chat and query surface (`/api/inference*`, `/api/conversations`,
    `/api/voice/`, `/upload`, `POST /api/v1/rag/query`, `/api/memory/search`,
    `POST /api/v1/graph/entities/resolve`, `/tools/select`), file a
@@ -104,8 +116,24 @@ curl -s --cacert "${NOO_PKI_DIR:-$HOME/.config/mesh/pki}/ca.crt" -X POST https:/
 ```
 
 A refresh token is set as a cookie; `POST /auth/refresh` (alias
-`/api/auth/refresh`) rotates it, `POST /auth/logout` revokes it,
-`GET /auth/me` returns the caller's identity and scopes. Lifetimes:
+`/api/auth/refresh`) rotates it, `POST /auth/logout` revokes it (a bearer-only
+logout, as the CLI makes, counts too) and ends the access token it was using,
+`GET /auth/me` returns the caller's identity and scopes (`401` for a disabled
+or deleted account, or a token issued before the account's session floor).
+
+**Ending sessions.** `disable`, `set-role`, `set-scopes`, `set-password`,
+`service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
+end the account's sessions immediately: every refresh token is revoked, open
+`/ws/*` sockets close (4401), the service-key cache is dropped, and a per-account
+"not before" time (Redis key `noo:auth:notbefore:<account>`, kept for one
+access-token lifetime) makes `require_any_auth` — and so the WebSocket handshake
+— refuse any access token issued before it, so a reconnect with the old JWT
+fails. If Redis is down the gateway applies the floors it holds in memory
+(never fewer), logs a warning, and does not refuse every request; keys not
+bound to the account are not touched by `disable`. Passwords set through
+`POST /api/security/users` and `PUT …/{username}/password` must be at least
+12 characters, not on the common list and not contain the username (`400`);
+existing passwords are not re-checked. Lifetimes:
 `NOO_TOKEN_EXPIRE_MINUTES` (15), `NOO_REFRESH_TOKEN_DAYS` (30). Failed
 logins are audited and lock the account after repeated failures.
 
@@ -171,17 +199,48 @@ The `model` a consumer sends is a **class**, an **alias** or a concrete
 served model name; it is never a node. A class is an ordered list of
 `(node, backend, model)` candidates the operator declared (`noo cluster
 class set`), or — with nothing declared — one derived class per served
-model, where `chat-default` (aliases `default`, `auto`, and an absent
-`model`) is the configured default model's candidates. The gateway tries
+model. Undeclared, `chat-default` (aliases `default`, `auto`, and an
+absent `model`) is **dynamic**: every live chat node in the mesh, whatever
+it serves, ranked per request (healthy, not stalled in the last 5 min, not
+thermally hot, GPU not shared, vLLM/GPU before CPU, larger model, fewest
+in flight, load; quarantined and thermal-`critical` nodes only when
+nothing else is left). A declared `chat-default` puts its candidates first.
+
+A `model` is a **preference**, not a selection: the class it names is
+tried first, and behind it every other live chat node in that same
+ranking, so a request is answered (perhaps slower, perhaps by a smaller
+model) while any chat node is up. A model nothing serves right now — its
+node is off doing something else — is answered by `chat-default` instead
+of a `404`. `X-Noo-Served-Model` says what answered. Only a strict node
+pin (below) never falls back.
+
+To prefer one node, send `"node": "<id>"` in the body or an
+`X-Noo-Node: <id>` header (also on `/api/inference` and the
+`noo_inference` tool). That node is tried first, then the class's other
+nodes, then the rest of the pool, and an answer from anywhere else says
+`fallback: true` (`/api/inference` also returns `requested_node` and
+`node_unavailable`). A name that is no node of this mesh is a `422`
+(`node_not_found`) either way: a typo does not become "any node".
+
+To keep a request on that node ALONE — locality, privacy, a liveness
+check — add `"node_strict": true` or `X-Noo-Node-Strict: 1` (`0`,
+`false`, `no`, `off` turn it off; any other value turns it on). A strict
+request never reaches another node: `422` (`node_serves_no_chat`) when
+the node serves no chat, `409` (`node_cannot_serve`) when it serves chat
+but not the `model` named, and a `504`/`502` when it cannot answer.
+
+The gateway tries
 candidates in order (non-degraded before degraded, healthy before not,
 declared position, load): a candidate that cannot be connected to within
 5 s, that sends no response headers within 30 s on a streaming request,
 or that answers a `502`/`503`/`504` marking the backend itself as down,
 is skipped for the next one (at most three attempts, 300 s overall), and
 the operator is alerted (`inference.backend_failover`, 15 min cooldown).
-A different model answers **only** from a candidate the class declares
-`degraded: true`, and only once every other candidate has failed. A
-streaming answer is never retried once a byte has reached the client.
+The 30 s window only decides when to move on: the last candidate a
+request can still try gets the rest of the 300 s to start answering. A
+class's `degraded: true` candidates come after its others and before the
+rest of the mesh. A streaming answer is never retried once a byte has
+reached the client.
 
 Every chat answer says what served it:
 
@@ -319,7 +378,7 @@ receives flat JSON events, each with a `type`:
 | GET | `/api/cluster/backends`, `/api/cluster/gpu-metrics` | running backends; live GPU probe across nodes |
 | POST | `/api/cluster/backends/start`, `/stop`, `/clear-cooldowns` | backend lifecycle |
 | POST | `/api/cluster/suggest-placement` | hardware-fit recommendation |
-| POST | `/api/cluster/discover`, `/propose`, `/proposals` (the list), `/proposals/decide`; GET `/proposals/{id}` | node discovery and the propose/approve enrollment flow (`enroll_now` and `proposals/{id}/retry` were removed; re-enroll with a new bootstrap token) |
+| POST | `/api/cluster/discover`, `/propose` (`proposed_by` is the authenticated caller; a body field of that name is ignored), `/proposals` (the list), `/proposals/decide`; GET `/proposals/{id}` | node discovery and the propose/approve enrollment flow (`enroll_now` and `proposals/{id}/retry` were removed; re-enroll with a new bootstrap token) |
 | POST | `/api/cluster/nodes/{node_id}/logs` | a node pushes its log batch (Loki push shape, optional gzip); node credential only, `{node_id}` must be the caller; `node` label overwritten with the verified id. `204` accepted, `400`/`413` drop the batch, `429` + `Retry-After` over the per-node budget (`NOO_LOGS_INGEST_BYTES_PER_MIN`, `NOO_LOGS_INGEST_REQUESTS_PER_MIN`), `503` Loki unavailable |
 | POST | `/api/cluster/mint-join-key`, `/api/cluster/delete-tailscale-device` | tailnet join keys, device removal |
 | GET | `/api/cluster/replication-status` | Postgres replication view |
@@ -592,7 +651,7 @@ answers when it does not reply.
 | GET, POST | `/api/activities`; POST `…/{id}/progress`, `/link-task`, `/complete`; PUT `…/{id}/status` | agent activities |
 | GET | `/api/agent/loops` | managed loops |
 | GET, POST, DELETE | `/api/proactive/status`, `/rules`, `/history`, `/rules/{rule_id}` | the proactive loop |
-| GET, POST | `/api/approval/pending`, `/stats`; POST `…/{request_id}/approve`, `/deny`, `/decide` | exec-approval queue. `pending` is scoped to the requester for `user` tier (unbound rows stay operator-only) and echoes `scope`; `/stats` is four aggregate counts, global; approve/deny/decide need a named Operator+ |
+| GET, POST | `/api/approval/pending`, `/stats`; POST `…/{request_id}/approve`, `/deny`, `/decide` | exec-approval queue. `pending` is scoped to the requester for `user` tier (unbound rows stay operator-only) and echoes `scope`; `/stats` is four aggregate counts, global; approve/deny/decide need a named Operator+ **person** (an ordinary login: a worker-delegated tool token, harness or MCP-door key, service identity or non-user account gets 403) |
 | GET | `/api/exec-approval/status` | current mode |
 
 ## Agents, workflows, skills, tools (`routes/agents.rs`, `routes/peers.rs`, `routes/ui.rs`)
@@ -653,11 +712,12 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/security/kb-rules`; GET `/api/security/role-grants` | knowledge-base access rules and grants |
 | GET, POST | `/api/security/posture`; POST `/api/security/posture/profile` | posture gates — POST needs an operator client certificate plus a certificate-bound Admin token; an app login is refused however privileged |
 | GET, POST | `/api/security/service-keys`, `…/self`; GET `…/scopes`; POST `…/self/revoke`, `…/{consumer}/revoke`, `/revoke-and-disable`, `/rotate`, `/retire`, `/quota` | service keys (`retire` finishes a rotation by deactivating the superseded key once the new one has been seen) |
-| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key and names the rows that fail; Operator+) |
+| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key, checks the hash chain for deleted or reordered rows, and names what fails; Operator+. Its `chain` section reports `checked` (false with a `note` when it could not judge), the chained and pre-chain row counts, rows removed by retention, the `head` `{seq, chain_hash}` to record off-box, and the `first_break`) |
+| GET | `/api/security/audit/list` | read the security audit log, newest first. **Operator+** (a lower tier gets `403`). Query: `since` (RFC 3339 time or a window `30m`/`24h`/`7d`/`2w`; anything else is `400`), `event_type` and `actor` (exact), `limit` (default 100, max 500), `cursor` (the previous page's `next_cursor`; a forged one is `400`). Answers `{events, count, next_cursor}`; an event has `id`, `timestamp`, `event_type`, `severity`, `actor`, `resource`, `outcome`, `request_id`, `details` (where `source_ip` and, inside an agent turn, `conversation_id` are recorded), `chain_seq`, `entry_hash`. Listing does not verify. Each read writes an `audit_log_read` row (after the read, so it does not list itself) (`noo security audit list`) |
 | GET, POST | `/api/users`, `/disable`, `/propose`, `/proposals`; `/api/kb/grants`, `/rules`, `/teams`, `/teams/create`, `/teams/delete` | older short forms of some of the operations above |
 | GET, PUT | `/api/settings`, `/api/v1/settings`; GET `…/export`, `/api/v1/settings/preference` | the settings snapshot |
 | GET, POST | `/api/settings/flags`, `/api/settings/flags/set` | behavioural flags ([config.md](config.md#behavioural-flags)) |
-| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`) |
+| GET, PUT | `/api/config`, `/api/config/{section}` | read / deep-merge into `noomesh.yaml` (`noo config get/set`). Reads are Operator+ and redact any credential-shaped key's value (`*_key`, `*token*`, `*secret*`, `*password*`; names ending `_env` or `_tokens` are exempt). A `PUT` (here and on `/api/settings`) that carries a non-empty string under a credential-shaped key at any depth is refused `422` with the remedy `noo security secrets rotate <NAME> --set-from-stdin` |
 | GET | `/api/v1/settings/browse` | browse the server's folders |
 | GET, POST, DELETE | `/api/v1/settings/user-dirs` | watched-folder management (adding a `writable` folder is admin-only) |
 | GET | `/api/v1/settings/restart-status` | restart-needed flag |

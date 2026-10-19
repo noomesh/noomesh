@@ -87,6 +87,10 @@ x-trellion-env: &trellion-env
   # (faster-whisper, tokenizers, model fetches) honours these.
   HF_HUB_DISABLE_TELEMETRY: '1'
   DO_NOT_TRACK: '1'
+  # onnxruntime's own Microsoft 1DS telemetry (docs/security/telemetry.md): magika
+  # via markitdown loads it. The image bakes the same switch (deps-core); this
+  # covers a container recreated before its image is rebuilt.
+  ORT_DISABLE_TELEMETRY: '1'
   # Surfaces: trellion serves ONLY the ML pack —
   # the core subjects moved to the always-on noo-worker. Overridable
   # (=all) as a one-release escape hatch if the split misbehaves.
@@ -510,6 +514,15 @@ services:
       # rehearsal, defect #20). The launchers detect the missing checkout
       # and repoint DEST at a scratch path so the baked package survives.
       - ${TRELLION_SRC:-../trellion/src/trellion}:${TRELLION_SRC_DEST:-/opt/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/site-packages/trellion}:ro
+    # The gateway/worker hardening: no capabilities and no privilege gain.
+    # The image runs as nonroot, so nothing here needs a capability; this
+    # container parses untrusted documents, so a parser bug must not be able
+    # to regain one through a setuid binary. (noomesh.yaml, the override and
+    # the host spool stay writable: worker.settings writes them from here.)
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

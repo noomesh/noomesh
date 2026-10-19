@@ -35,6 +35,11 @@
 //! changes what `noomesh.yaml` parses — while others are genuinely orphaned
 //! helpers. the design carries the triaged list; when it is empty this line
 //! comes off and the gate starts catching new rot.
+// The channel turn wraps its future in the principal and shared-room scopes;
+// the in-process task runner nests those again, and the layout of that async
+// block passes the default query depth (128).
+#![recursion_limit = "256"]
+
 #![allow(unknown_lints)]
 #![allow(dead_code)]
 // Doc-comment formatting across ~55 sites (list indentation and lazy
@@ -66,6 +71,7 @@ mod task_budget;
 mod text;
 mod auth_refresh;
 mod cache;
+mod cluster_token_v2;
 mod cert_expiry;
 mod config;
 mod coordinator;
@@ -106,6 +112,8 @@ mod agent_activities;
 mod agent_meta_loop;
 mod audit_partition;
 mod audit_integrity;
+mod audit_chain;
+mod audit_context;
 mod autonomy_audit;
 mod autonomy_evaluators;
 mod held_column;
@@ -169,6 +177,8 @@ mod routes;
 mod security;
 mod settings;
 mod service_keys;
+mod password_policy;
+mod session_floor;
 mod session;
 mod state;
 mod stt_client;
@@ -427,6 +437,14 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
+    // A gateway with no audit key does not serve either: every audit row
+    // would be refused, i.e. "audit logging on by default" would be false.
+    if let Some(msg) = crate::audit_integrity::boot_refusal() {
+        tracing::error!("{msg}");
+        eprintln!("noo-gateway: {msg}");
+        std::process::exit(2);
+    }
+
     // A NOO_TRUSTED_PROXIES entry covering this gateway's own attachment
     // point does not serve either: on a published port every remote
     // client arrives from the docker bridge, so trusting the bridge hands the
@@ -548,13 +566,18 @@ async fn main() -> Result<()> {
     // audit insert runs. Mirrors gateway/audit_archive.py::ensure_current_and_next
     // (Python lifespan was dead in prod; this restores it).
     audit_partition::ensure_current_and_next(&state).await;
+    // The retention job (export then drop) as a seeded weekly heartbeat task.
+    audit_partition::seed_rotation_task(&state.db).await;
     // The audit key's one-time hand-over row (or genesis row), before any
-    // loop can write an audit row under the new key. Idempotent; a missing
-    // NOO_AUDIT_HMAC_KEY is logged at error! and every audit row is refused.
+    // loop can write an audit row under the new key. Idempotent. A missing
+    // NOO_AUDIT_HMAC_KEY never reaches here: it is a boot refusal above.
     audit_integrity::ensure_checkpoint(&state.db).await;
     // Then the hash-v2 marker: after it, a row hashed v1
     // (time not covered) fails verification. Once; idempotent.
     audit_integrity::ensure_hash_v2_marker(&state.db).await;
+    // Then the hash chain's first row: from here a deleted or reordered audit
+    // row fails `noo security audit verify`. Once; idempotent.
+    audit_chain::ensure_genesis(&state.db).await;
 
     // Log initial cluster snapshot (proof-of-wiring for cluster_manager.rs).
     // Same data is available to autonomy actions, heartbeat tasks, and

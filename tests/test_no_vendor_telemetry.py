@@ -55,6 +55,19 @@ TELEMETRY_SWITCHES: dict[str, dict[str, str]] = {
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
     },
+    # onnxruntime (>= 1.2x, Linux too) ships Microsoft's 1DS client: it keeps a
+    # device id and an event store under ~/.cache/Microsoft/DeveloperTools/
+    # .onnxruntime and uploads to mobile.events.data.microsoft.com/OneCollector.
+    # `ORT_DISABLE_TELEMETRY` (read from the environment when the telemetry
+    # object is built) stops all of it: probed with onnxruntime 1.31.0 and an
+    # InferenceSession, no switch -> deviceid + onnxruntime.db written under
+    # $HOME, switch set -> nothing written. Reaches us through markitdown ->
+    # magika in trellion, and directly in whisper and piper.
+    "onnx": {
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "DO_NOT_TRACK": "1",
+        "ORT_DISABLE_TELEMETRY": "1",
+    },
     # Ollama has no usage telemetry; this keeps prompts off ollama.com
     "ollama": {
         "OLLAMA_NO_CLOUD": "1",
@@ -82,13 +95,13 @@ SERVICE_CLASS: dict[str, str] = {
     # our Python services
     "worker": "hf",
     "worker-extra": "hf",
-    "trellion": "hf",
-    "trellion-intel": "hf",
+    "trellion": "onnx",
+    "trellion-intel": "onnx",
     "noo-evolve": "hf",
     # one-shot from the evolve image: copies a file, no network at all
     "noo-evolve-routes": "none",
-    "whisper": "hf",
-    "piper": "hf",
+    "whisper": "onnx",
+    "piper": "onnx",
     "sandbox": "hf",
     "sandbox-extra": "hf",
     "browser": "hf",
@@ -295,6 +308,14 @@ def test_python_images_bake_the_hf_switches(dockerfile):
         assert re.search(rf"\b{k}={v}\b", env_lines), f"{dockerfile}: no ENV {k}={v}"
 
 
+def test_the_trellion_base_image_bakes_the_onnxruntime_switch():
+    """deps-core is the base of deps-base (trellion): a container started
+    outside compose carries the switch too."""
+    text = (ROOT / "docker/Dockerfile.deps-core").read_text()
+    env_lines = " ".join(m.group(0) for m in re.finditer(r"^ENV\s(?:[^\n]*\\\n)*[^\n]*", text, re.M))
+    assert re.search(r"\bORT_DISABLE_TELEMETRY=1\b", env_lines), "docker/Dockerfile.deps-core: no ENV ORT_DISABLE_TELEMETRY=1"
+
+
 @pytest.mark.parametrize(
     "path",
     ["src/noomesh/tools/browser/server.py", "noo-cli/src/commands/kiosk_assets/noo-kiosk-launch"],
@@ -329,9 +350,10 @@ def test_no_phone_home_python_dependency():
 
 def test_the_doc_names_every_switch():
     doc = DOC.read_text()
-    for cls in ("vllm", "hf", "ollama"):
+    for cls in ("vllm", "hf", "onnx", "ollama"):
         for k in TELEMETRY_SWITCHES[cls]:
             assert k in doc, f"docs/security/telemetry.md does not mention {k}"
+    assert "onnxruntime" in doc and "mobile.events.data.microsoft.com" in doc, "the onnxruntime row names what it sends and where"
     for svc in ("vLLM", "Ollama", "text-embeddings-inference", "Loki", "Grafana", "NATS"):
         assert svc in doc, f"docs/security/telemetry.md has no row for {svc}"
 
@@ -651,3 +673,36 @@ def test_the_doc_has_a_row_for_the_addon_registry_and_its_switch():
         "the route selector must keep NOO_ADDON_REGISTRY_TOKEN as the switch off the proxy"
     )
 
+
+
+# ── onnxruntime: the switch reaches every process that loads ORT ─────────
+#
+# Evidence (2026-10-19, ORT 1.31.0, the pinned version): the wheel's own
+# Privacy.md says 1DS telemetry is ON by default on Linux and that
+# `ORT_DISABLE_TELEMETRY=1` "before ONNX Runtime initializes ... prevents the
+# uploader, events, and persistent device identifier from being created".
+# Observed in a throwaway container: without it, an InferenceSession made an
+# HTTPS connection to a onedscolprd*.cloudapp.azure.com collector and wrote
+# ~/.cache/Microsoft/DeveloperTools/.onnxruntime/{deviceid,onnxruntime.db};
+# with it, no connection and no files. The Python `disable_telemetry_events()`
+# only suppresses non-essential events after init, so the env var is the switch.
+
+ORT_LOADERS = ("trellion", "whisper", "piper")
+
+
+def _env_of(service: dict) -> dict:
+    env = service.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(e.split("=", 1) if "=" in e else (e, "") for e in env)
+    return {str(k): str(v) for k, v in env.items()}
+
+
+def test_every_ort_loading_service_runs_with_telemetry_disabled_in_the_rendered_compose():
+    from tests._compose_projection import full_projection
+
+    services = full_projection()["services"]
+    for name in ORT_LOADERS:
+        assert name in services, f"{name} is not in the rendered compose: the guard would check nothing"
+        assert _env_of(services[name]).get("ORT_DISABLE_TELEMETRY") == "1", (
+            f"{name} loads onnxruntime but its rendered environment does not set ORT_DISABLE_TELEMETRY=1"
+        )

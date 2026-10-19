@@ -104,6 +104,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/nodes/{node_id}/restart-agent", post(restart_node_agent))
         .route("/api/cluster/nodes/{node_id}/pull", post(pull_node_artifact))
         .route("/api/cluster/nodes/{node_id}/clean", post(clean_node))
+        // Shared-GPU operator hold (node agent `internal/gpuyield`).
+        .route("/api/cluster/nodes/{node_id}/gpu/hold", post(gpu_hold))
+        .route("/api/cluster/nodes/{node_id}/gpu/release", post(gpu_release))
         // ── Native Rust [ported from workers/cluster.py 2026-07-18] ──
         .route("/api/cluster/mint-join-key", post(mint_join_key))
         .route("/api/cluster/delete-tailscale-device", post(delete_tailscale_device))
@@ -369,6 +372,13 @@ async fn node_heartbeat(
     // `backend doors` reads a door miss on a container still warming up as
     // `starting` only from this; an agent that omits it changes nothing.
     carry_reported(&mut data, &body, "backend_containers");
+    // Shared-GPU contention (node agent `internal/gpuyield`): whether work
+    // outside noomesh holds the GPU and which GPU backends are paused for
+    // it. The node stays online while yielded; this is the WHY behind its
+    // missing backend. Field names are a contract with the router and the
+    // CLI: {state, foreign_mb, total_mb, free_mb, method, since,
+    // paused_backends, need_mb, reason, policy}. An older agent omits it.
+    carry_reported(&mut data, &body, "gpu_contention");
     // Per placed backend: does its model server HOLD the placement's model
     // (`crate::model_presence`). Unlike the reports above this
     // is REPLACED every beat and dropped when the beat omits it: a stale
@@ -908,6 +918,7 @@ async fn node_register_body(
     carry_reported(&mut data, &body, "image_sources");
     carry_reported(&mut data, &body, "image_source_mode");
     carry_reported(&mut data, &body, "backend_containers");
+    carry_reported(&mut data, &body, "gpu_contention");
     carry_reported(&mut data, &body, "model_presence");
     carry_reported(&mut data, &body, "model_stats");
     // The agent admits the gateway's leaf with no bearer;
@@ -1820,10 +1831,14 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 ///
 /// Returns the `agent_url` field if present, otherwise constructs
 /// `{proto}://{ip_address}:8081` using the node's IP. Errors with 404
-/// if the node is not found in the KV store.
+/// if the node is not found in the KV store. A node that IS registered but
+/// carries neither field gets a different 404 text naming the real
+/// cause (see `no_address_message`) instead of "not found".
 pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Result<String, AppError> {
+    let mut known = false;
     if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
         if let Ok(Some(entry)) = kv.get(node_id).await {
+            known = true;
             if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
                 if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
                     if !url.is_empty() {
@@ -1839,7 +1854,19 @@ pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Resul
             }
         }
     }
+    if known {
+        return Err(AppError::NotFound(no_address_message(node_id)));
+    }
     Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
+}
+
+/// The node is in `mesh_nodes` but registered without `agent_url` or
+/// `ip_address`, so the gateway has nowhere to send the call.
+fn no_address_message(node_id: &str) -> String {
+    format!(
+        "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
+         Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
+    )
 }
 
 /// Build a reqwest Client suitable for node-agent HTTP calls.
@@ -2105,6 +2132,83 @@ async fn clean_node(
     }
 }
 
+/// Operator hold on a node's GPU: pause its GPU backends now and keep them
+/// paused (no automatic resume) until a release. For handing the GPU to work
+/// outside noomesh that will not start while the GPU is occupied.
+///
+/// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?}`. Operator only; audited.
+async fn gpu_hold(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> AppResult {
+    let reason = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("reason").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect::<String>();
+    gpu_hold_op(&state, ctx, &node_id, "hold", json!({"reason": reason})).await
+}
+
+/// End an operator GPU hold: the node returns to the automatic shared-GPU
+/// policy and resumes its GPU backends once the GPU has stayed free.
+///
+/// POST /api/cluster/nodes/{node_id}/gpu/release. Operator only; audited.
+async fn gpu_release(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> AppResult {
+    gpu_hold_op(&state, ctx, &node_id, "release", json!({})).await
+}
+
+/// The operator gate for the GPU hold routes: role Operator or above.
+pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
+    match ctx {
+        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
+        _ => Err(AppError::Forbidden("operator role required to hold or release a node's GPU".into())),
+    }
+}
+
+async fn gpu_hold_op(
+    state: &AppState,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    node_id: &str,
+    op: &str,
+    payload: Value,
+) -> AppResult {
+    let actor = gpu_hold_actor(&ctx)?;
+    let agent_url = get_node_agent_url(state, node_id).await?;
+    let client = build_node_agent_client();
+    let mut req = client.post(format!("{agent_url}/gpu/{op}")).json(&payload);
+    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
+        req = req.header(&k, &v);
+    }
+    let outcome = req.send().await;
+    let (ok, result) = match outcome {
+        Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            (false, Err(AppError::Internal(format!("Node agent returned {status}: {body}"))))
+        }
+        Err(e) => (false, Err(AppError::Internal(format!("Failed to contact node agent: {e}")))),
+    };
+    tracing::info!(node_id = %node_id, op, ok, actor = %actor, "node_gpu_hold");
+    crate::routes::core::audit_event(
+        &state.db, &format!("node_gpu_{op}"), "info", &actor,
+        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
+        json!({"node": node_id, "op": op, "request": payload}),
+    ).await;
+    let mut out = result?;
+    out["node"] = json!(node_id);
+    Ok(Json(out))
+}
+
 /// GET /api/cluster/proposals/{id}
 ///
 /// Single-proposal status + execution log, so a caller can poll an
@@ -2247,7 +2351,7 @@ async fn proposals_decide(
 /// one.
 pub(crate) fn bootstrap_instructions(host: &str) -> String {
     format!(
-        "Automated push enrolment does not exist (pull architecture) \
+        "Automated push enrollment does not exist (pull architecture) \
          and the controller\u{2192}node SSH lane was removed 2026-09-11. \
          Enrol {host} with the token rail \u{2014} on the controller:\n\n  \
          noo cluster bootstrap-token create --node {host}\n\n\
@@ -2457,6 +2561,34 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
     cooldowns::is_cooled_down(&format!("{node_id}:{backend}"))
 }
 
+/// The image ref the controller tells a node to run for `backend`, or None
+/// (the node then uses its own versioned default, which a registry node
+/// refuses and a rail node takes only from the controller's staged tar).
+///
+/// Order: an operator override in this process's own environment
+/// (`VLLM_IMAGE` ...), else the compose-rendered `NOO_BACKEND_IMAGE_<X>`,
+/// which carries the digest-pinned ref from the signed stack lock
+/// (`tag@sha256:...`, docker-compose.cluster.yml). Blank values are absent.
+pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let (operator, locked) = match backend {
+        "vllm" => ("VLLM_IMAGE", "NOO_BACKEND_IMAGE_VLLM"),
+        "vllm-secondary" => ("VLLM2_IMAGE", "NOO_BACKEND_IMAGE_VLLM_SECONDARY"),
+        "ollama" => ("OLLAMA_IMAGE", "NOO_BACKEND_IMAGE_OLLAMA"),
+        // First-party / per-architecture images: the node derives its own
+        // release ref (prefix:tag, rail-staged); only an operator override
+        // is forwarded.
+        "llamacpp" => ("LLAMACPP_IMAGE", ""),
+        "embedding" => ("TEI_IMAGE", ""),
+        _ => return None,
+    };
+    [operator, locked]
+        .iter()
+        .filter(|k| !k.is_empty())
+        .filter_map(|k| get(k))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
 /// POST /api/cluster/backends/start — Start a backend on a node.
 ///
 /// Native Rust: resolves node, sends POST to node-agent, polls health.
@@ -2545,21 +2677,10 @@ pub(crate) async fn start_backend_core(
     if backend == "vllm" {
         start_body["gpu_count"] = json!(1);
     }
-    let env = std::env::var;
-    if let Some((image_key, _)) = match backend.as_str() {
-        "vllm" => Some(("VLLM_IMAGE", "")),
-        "vllm-secondary" => Some(("VLLM2_IMAGE", "")),
-        "llamacpp" => Some(("LLAMACPP_IMAGE", "")),
-        "ollama" => Some(("OLLAMA_IMAGE", "")),
-        "embedding" => Some(("TEI_IMAGE", "")),
-        _ => None,
-    } {
-        if let Ok(v) = env(image_key) {
-            if !v.is_empty() {
-                start_body["image"] = json!(v);
-            }
-        }
+    if let Some(image) = backend_image_ref(backend.as_str(), &|k: &str| std::env::var(k).ok()) {
+        start_body["image"] = json!(image);
     }
+    let env = std::env::var;
     if backend == "vllm" {
         for (key, json_field) in [
             ("VLLM_TOOL_PARSER", "tool_parser"),
@@ -3015,8 +3136,14 @@ pub(crate) async fn models_pull(
 async fn desired_config_get(
     State(state): State<Arc<AppState>>,
     caller: Option<axum::Extension<crate::auth::ClusterNode>>,
+    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Path(node_id): Path<String>,
 ) -> AppResult {
+    // A JWT caller below Operator is refused (a `read` account used to pass:
+    // the tier gate let every GET through and this handler assumed any
+    // non-node caller was an operator). A node carries ClusterNode and no
+    // RequesterCtx, so this does not touch the node path below.
+    super::operator_read_guard(&requester)?;
     // A node may read its OWN config and no other. the design
     //
     // Before this, the handler took node_id from the PATH and returned that
@@ -3848,13 +3975,40 @@ async fn model_classes_get(State(state): State<Arc<AppState>>) -> AppResult {
         .classes
         .iter()
         .map(|c| {
+            // The order a request would take right now (in-flight and stall
+            // memory included), and who is left out — `noo cluster verify`'s
+            // `default chat` row lists it.
+            let ranked = crate::coordinator::classes::rank(
+                c,
+                &|_| false,
+                &|x| crate::coordinator::classes::in_flight(&x.url, &x.backend),
+                &|x| crate::coordinator::classes::recently_stalled(&x.url, &x.backend),
+            );
+            let order: Vec<Value> = ranked
+                .order
+                .iter()
+                .map(|x| {
+                    let busy = crate::coordinator::classes::in_flight(&x.url, &x.backend);
+                    let stalled = crate::coordinator::classes::recently_stalled(&x.url, &x.backend);
+                    json!({
+                        "node_id": x.node_id, "backend": x.backend, "model": x.model,
+                        "gpu": x.gpu || x.backend.starts_with("vllm"),
+                        "reason": crate::coordinator::classes::rank_reason(x, busy, stalled),
+                    })
+                })
+                .collect();
+            let skipped: Vec<Value> = ranked.skipped.iter().map(|(x, why)| json!({"node_id": x.node_id, "backend": x.backend, "reason": why})).collect();
             json!({
                 "name": c.name,
                 "declared": c.declared,
                 "pool": c.pool,
+                "dynamic": c.dynamic,
                 "routable": c.routable_count(),
                 "healthy": c.healthy_count(),
                 "candidates": c.candidates,
+                "routing_order": order,
+                "skipped": skipped,
+                "last_resort": ranked.last_resort,
             })
         })
         .collect();
@@ -5278,6 +5432,17 @@ async fn notify_proposal(
     notified
 }
 
+/// Who a proposal is attributed to: the authenticated account (JWT `sub`,
+/// including the connection label), else the authenticated node, else
+/// `unknown`. Pure so a test pins that no request field can set it.
+fn proposer_of(actor: Option<&str>, node: Option<&str>) -> String {
+    actor
+        .or(node)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// POST /api/cluster/propose — Agent proposes adding a node.
 /// [ported from workers/cluster.py::_cluster_propose 2026-07-18]
 ///
@@ -5289,6 +5454,8 @@ async fn notify_proposal(
 /// noo_cluster_propose_node MCP tool + static/modules/proposals.js.
 async fn cluster_propose(
     State(state): State<Arc<AppState>>,
+    actor: Option<axum::Extension<crate::auth::AuthActor>>,
+    node: Option<axum::Extension<crate::auth::ClusterNode>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
@@ -5302,12 +5469,10 @@ async fn cluster_propose(
     };
     let role = get_trimmed("role");
     let reason = get_trimmed("reason");
-    let proposed_by = body.get("proposed_by")
-        .or_else(|| body.get("conversation_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("agent")
-        .to_string();
+    // Provenance comes from the verified credential, never the body: a
+    // `proposed_by` field the caller supplies is ignored (an operator-door
+    // agent could otherwise file a proposal "from" any account).
+    let proposed_by = proposer_of(actor.as_ref().map(|e| e.0 .0.as_str()), node.as_ref().map(|e| e.0 .0.as_str()));
 
     if host.is_empty() {
         return Err(AppError::BadRequest("host required".into()));
@@ -5507,6 +5672,50 @@ mod heartbeat_carry_tests {
         // `{}` (nothing running) replaces an older report.
         carry_reported(&mut data, &json!({"backend_containers": {}}), "backend_containers");
         assert_eq!(data["backend_containers"], json!({}));
+    }
+
+    /// `gpu_contention` rides the record from both writers,
+    /// so `noo cluster status`/`verify` and the router can see a node that
+    /// yielded its GPU to other work (and why its backend is gone).
+    #[test]
+    fn heartbeat_and_register_carry_gpu_contention() {
+        let src = include_str!("cluster.rs");
+        let body_of = |sig: &str| src.split(sig).nth(1).expect("the handler")
+            .split("\nasync fn ").next().unwrap().to_string();
+        assert!(body_of("async fn node_heartbeat(").contains("carry_reported(&mut data, &body, \"gpu_contention\")"),
+            "node_heartbeat does not carry gpu_contention");
+        assert!(body_of("async fn node_register_body(").contains("carry_reported(&mut data, &body, \"gpu_contention\")"),
+            "node_register_body does not carry gpu_contention");
+        let mut data = json!({"id": "host3"});
+        let beat = json!({"gpu_contention": {"state": "yielded", "foreign_mb": 11468, "total_mb": 16376,
+            "free_mb": 4908, "method": "memory-accounting", "since": "2026-10-17T12:00:00Z",
+            "paused_backends": ["vllm"]}});
+        carry_reported(&mut data, &beat, "gpu_contention");
+        assert_eq!(data["gpu_contention"]["state"], "yielded");
+        assert_eq!(data["gpu_contention"]["paused_backends"], json!(["vllm"]));
+        assert_eq!(data["gpu_contention"]["method"], "memory-accounting");
+        // Resumed: the next beat replaces it.
+        carry_reported(&mut data, &json!({"gpu_contention": {"state": "free", "paused_backends": []}}), "gpu_contention");
+        assert_eq!(data["gpu_contention"]["state"], "free");
+        // An older agent omits it: nothing synthesised.
+        let mut old = json!({"id": "host9"});
+        carry_reported(&mut old, &json!({"load": 0.1}), "gpu_contention");
+        assert!(old.get("gpu_contention").is_none());
+    }
+
+    /// The GPU hold routes are operator-only, and both are audited.
+    #[test]
+    fn gpu_hold_is_operator_only_and_audited() {
+        assert!(gpu_hold_actor(&None).is_err(), "no requester: refused");
+        // The code above the tests only: this test's own literals would
+        // otherwise satisfy every `contains` below.
+        let src = include_str!("cluster.rs").split("fn gpu_hold_is_operator_only_and_audited").next().unwrap();
+        let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
+            .split("\nasync fn ").next().unwrap();
+        assert!(op.contains("gpu_hold_actor(&ctx)?"), "the operator gate must run first");
+        assert!(op.contains("audit_event("), "hold/release must be audited");
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
     }
 
     /// `stunnel_image` rides the record from both
@@ -6073,7 +6282,7 @@ mod model_class_tests {
             running: vec![("vllm".into(), "HF".into()), ("ollama".into(), "gemma4:26b".into())],
             heartbeat_age_secs: Some(1.0), inbound_ok: true, gpu: true, ..Default::default()
         }];
-        let t = build_table(&nodes, &[], &Declarations::default(), "HF", "vllm");
+        let t = build_table(&nodes, &[], &Declarations::default());
         assert_eq!(served_model_in(&t, "host3", "vllm").as_deref(), Some("HF"));
         assert_eq!(served_model_in(&t, "host3", "ollama").as_deref(), Some("gemma4:26b"));
         assert_eq!(served_model_in(&t, "host3", "llamacpp"), None);
@@ -6340,5 +6549,84 @@ mod placement_role_tests {
         // Re-running is harmless.
         sqlx::raw_sql(mig.sql).execute(&db).await.expect("087 is idempotent");
         drop_db(&admin, db, "mrp_migrate_test").await;
+    }
+}
+
+#[cfg(test)]
+mod proposer_tests {
+    use super::proposer_of;
+
+    #[test]
+    fn provenance_is_the_verified_caller_never_a_request_field() {
+        assert_eq!(proposer_of(Some("alice/laptop"), Some("host3")), "alice/laptop");
+        assert_eq!(proposer_of(None, Some("host3")), "host3");
+        assert_eq!(proposer_of(None, None), "unknown");
+        assert_eq!(proposer_of(Some(""), None), "unknown");
+    }
+
+    #[test]
+    fn the_handler_does_not_read_proposed_by_from_the_body() {
+        let src = include_str!("cluster.rs");
+        let start = src.find("async fn cluster_propose(").unwrap();
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").unwrap();
+        let body = &rest[..end];
+        assert!(body.contains("proposer_of("));
+        assert!(!body.contains("body.get(\"proposed_by\")"), "caller-asserted provenance is back");
+        assert!(!body.contains("body.get(\"conversation_id\")"));
+    }
+}
+
+#[cfg(test)]
+mod backend_image_ref_tests {
+    use super::backend_image_ref;
+    use std::collections::HashMap;
+
+    fn with(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| m.get(k).cloned()
+    }
+
+    const PINNED: &str = "vllm/vllm-openai:v0.25.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The controller sends the lock-pinned ref even when no operator override
+    /// is set (until now it sent one only when VLLM_IMAGE was in its env).
+    #[test]
+    fn the_locked_digest_ref_is_sent_without_an_operator_override() {
+        let get = with(&[("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &get).as_deref(), Some(PINNED));
+    }
+
+    #[test]
+    fn an_operator_override_wins_and_blank_values_are_absent() {
+        let get = with(&[("VLLM_IMAGE", "my/vllm:1@sha256:aa"), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &get).as_deref(), Some("my/vllm:1@sha256:aa"));
+        let blank = with(&[("VLLM_IMAGE", "  "), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &blank).as_deref(), Some(PINNED));
+        assert_eq!(backend_image_ref("vllm", &with(&[])), None);
+        assert_eq!(backend_image_ref("reranker", &get), None);
+    }
+
+    #[test]
+    fn each_node_backend_has_its_own_locked_variable() {
+        for (b, v) in [("vllm-secondary", "NOO_BACKEND_IMAGE_VLLM_SECONDARY"), ("ollama", "NOO_BACKEND_IMAGE_OLLAMA")] {
+            assert_eq!(backend_image_ref(b, &with(&[(v, "x/y:1@sha256:bb")])).as_deref(), Some("x/y:1@sha256:bb"), "{b}");
+        }
+        // llamacpp / embedding forward only an operator override
+        assert_eq!(backend_image_ref("llamacpp", &with(&[("LLAMACPP_IMAGE", "a/b:2")])).as_deref(), Some("a/b:2"));
+        assert_eq!(backend_image_ref("llamacpp", &with(&[("NOO_BACKEND_IMAGE_LLAMACPP", "a/b:2")])), None);
+    }
+}
+
+#[cfg(test)]
+mod no_address_tests {
+    use super::no_address_message;
+
+    #[test]
+    fn a_known_node_without_an_address_is_not_called_not_found() {
+        let m = no_address_message("gpu-box");
+        assert!(m.contains("gpu-box") && m.contains("no reachable address"), "{m}");
+        assert!(m.contains("NODE_IP"), "{m}");
+        assert!(!m.contains("not found"), "{m}");
     }
 }

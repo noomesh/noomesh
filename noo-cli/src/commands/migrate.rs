@@ -122,6 +122,32 @@ fn sha256_file(p: &Path) -> Option<String> {
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
+/// A fresh staging directory for plaintext (the dump, the decrypted tarball,
+/// the controller's secrets and CA key): `<tmp>/<prefix>-<64 random bits>`,
+/// created with mode 0700, refusing one that already exists. The previous
+/// `<prefix>-<pid>` was predictable, created with the default umask, and
+/// `remove_dir_all`-ed first — so another local user could pre-create it
+/// (or race the 0644 dump and tarball inside it) and read the controller's
+/// whole state. mkdtemp semantics: the name is unguessable, and `mkdir`
+/// failing with EEXIST is a retry, never a reuse.
+fn private_stage(prefix: &str) -> Result<PathBuf, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    for _ in 0..16 {
+        let mut raw = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut raw))
+            .map_err(|e| format!("cannot read /dev/urandom for a private staging name: {e}"))?;
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", hex::encode(raw)));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot create the private staging directory {}: {e}", dir.display())),
+        }
+    }
+    Err("could not find an unused private staging directory name".into())
+}
+
 // ═══ export ═════════════════════════════════════════════════════════════
 
 /// Decrypt + safely extract a migration archive into a temp stage for the
@@ -133,9 +159,7 @@ pub(crate) fn open_archive(
     pass_file: &Option<String>,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, serde_json::Value), String> {
     let pass = resolve_passphrase(g, pass_file, false);
-    let stage = std::env::temp_dir().join(format!("noo-archive-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    let stage = private_stage("noo-archive")?;
     let tarball = stage.join("bundle.tar.gz");
     if !openssl_crypt(false, Path::new(archive), &tarball, &pass) {
         let _ = std::fs::remove_dir_all(&stage);
@@ -225,8 +249,10 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }));
     let pass = resolve_passphrase(g, &pass_file, true);
 
-    let stage = std::env::temp_dir().join(format!("noo-migrate-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
+    let stage = match private_stage("noo-migrate") {
+        Ok(s) => s,
+        Err(e) => fail(g.json, ExitCode::Generic, "stage_failed", &e, Some("check that the temp directory is writable")),
+    };
     let result = (|| -> Result<(String, usize), String> {
         std::fs::create_dir_all(stage.join("db")).map_err(|e| e.to_string())?;
 
@@ -235,7 +261,7 @@ pub fn migrate_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::step(&format!("dumping the database ({pg})"));
         let dump = Command::new("bash")
             .arg("-c")
-            .arg(format!("set -o pipefail; docker exec {pg} pg_dump -U noo noomesh | gzip > '{}'",
+            .arg(format!("umask 077; set -o pipefail; docker exec {pg} pg_dump -U noo noomesh | gzip > '{}'",
                 stage.join("db/pg.sql.gz").display()))
             .status()
             .map(|s| s.success())
@@ -394,4 +420,50 @@ pub fn migrate_import(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         fwd.push(f);
     }
     crate::onboard::onboard(g, &fwd)
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// The plaintext staging directory is private and unguessable: 0700, a
+    /// random suffix (not the pid), and a second call never reuses the first.
+    #[test]
+    fn the_staging_directory_is_private_and_unpredictable() {
+        let a = private_stage("noo-migrate-test").unwrap();
+        let b = private_stage("noo-migrate-test").unwrap();
+        assert_ne!(a, b);
+        for d in [&a, &b] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {:o}", d.display(), mode);
+            let name = d.file_name().unwrap().to_string_lossy().to_string();
+            assert!(!name.ends_with(&format!("-{}", std::process::id())), "the suffix is the pid again: {name}");
+            assert_eq!(name.len(), "noo-migrate-test-".len() + 16, "64 random bits, hex: {name}");
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The old name was predictable; a squatter who pre-creates the pid-named
+    /// directory gets nothing from a new staging directory.
+    #[test]
+    fn a_pre_created_pid_named_directory_is_never_adopted() {
+        let squat = std::env::temp_dir().join(format!("noo-migrate-test2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&squat);
+        let s = private_stage("noo-migrate-test2").unwrap();
+        assert_ne!(s, squat);
+        let _ = std::fs::remove_dir_all(&squat);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// The export source carries no pid-named stage and the dump runs under a
+    /// restrictive umask.
+    #[test]
+    fn export_and_import_no_longer_stage_under_a_pid_name() {
+        let src = include_str!("migrate.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains("std::process::id()"), "a pid-named stage is back");
+        assert!(code.contains("umask 077; set -o pipefail; docker exec"), "the dump lost its umask");
+    }
 }

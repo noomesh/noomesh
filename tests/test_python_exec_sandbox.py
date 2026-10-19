@@ -30,13 +30,33 @@ def test_refuses_in_process_without_sandbox_or_optin():
     assert "NOO_SANDBOX_URL" in out
 
 
-def test_optin_allows_in_process_execution():
+def test_optin_allows_in_process_execution(monkeypatch):
+    monkeypatch.setattr(pt, "_inside_the_stack", lambda: False)  # a source checkout
     os.environ["NOO_ALLOW_LOCAL_PYTHON_EXEC"] = "1"
     try:
         out = _run_python({"code": "print(6 * 7)"}, None)
     finally:
         _clear_optin()
     assert "42" in out                   # explicit dev opt-in runs it
+
+
+def test_optin_is_refused_inside_the_deployed_stack(monkeypatch):
+    """The hatch is a checkout-only dev tool: in a container, or under the
+    launcher (NOO_LAUNCHED=1), the env var opens nothing and the code is NOT run."""
+    monkeypatch.setenv("NOO_ALLOW_LOCAL_PYTHON_EXEC", "1")
+    monkeypatch.setattr(pt, "_inside_the_stack", lambda: True)
+    out = _run_python({"code": "print('PWNED')"}, None)
+    assert "disabled" in out.lower()
+    assert "PWNED" not in out
+    assert "deployed stack" in out
+
+
+def test_launcher_sentinel_counts_as_the_stack(monkeypatch):
+    monkeypatch.setattr(pt.os.path, "exists", lambda p: False)
+    monkeypatch.setenv("NOO_LAUNCHED", "1")
+    assert pt._inside_the_stack() is True
+    monkeypatch.delenv("NOO_LAUNCHED")
+    assert pt._inside_the_stack() is False
 
 
 def test_sandbox_path_used_when_configured_not_subprocess():

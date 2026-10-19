@@ -65,6 +65,7 @@ mod envfile;
 #[cfg(test)]
 mod hint_lint;
 mod host_access;
+mod password_policy;
 mod http;
 pub(crate) mod onboard;
 mod operator_cert;
@@ -263,6 +264,8 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "logs"], commands::cluster_logs),
     (&["cluster", "restart-agent"], commands::cluster_restart_agent),
     (&["cluster", "maintenance"], commands::cluster_maintenance),
+    (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
+    (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
     (&["cluster", "up"], commands::cluster_up),
     // Batch 3: HTTP/local control + SSH provisioning-adjacent commands.
     (&["cluster", "init-secret"], commands::cluster_init_secret),
@@ -496,6 +499,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "org", "list"], commands::security_org_list),
     (&["security", "org", "create"], commands::security_org_create),
     (&["security", "audit", "verify"], commands::security_audit_verify),
+    (&["security", "audit", "list"], commands::security_audit_list),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),

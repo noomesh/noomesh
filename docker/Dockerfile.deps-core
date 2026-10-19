@@ -47,7 +47,8 @@ ENV UV_BREAK_SYSTEM_PACKAGES=1 \
 # Vendor telemetry off (docs/security/telemetry.md), baked into the image so
 # a container started outside compose carries it too; compose sets the same.
 ENV HF_HUB_DISABLE_TELEMETRY=1 \
-    DO_NOT_TRACK=1
+    DO_NOT_TRACK=1 \
+    ORT_DISABLE_TELEMETRY=1
 
 # THE interpreter. Every Python service image FROMs this tier, so this ARG is
 # the version the fleet runs. It is pinned to `.python-version` at the repo root
@@ -77,9 +78,16 @@ RUN mkdir -p src/noomesh && touch src/noomesh/__init__.py
 # re-fattens sandbox and the worker, which is exactly what this
 # split exists to prevent. No torch index pin needed: nothing in this
 # set resolves torch.
+#
+# Third-party packages come from docker/core-lock/requirements.txt, installed with
+# --require-hashes: every wheel is pinned by sha256, so a release published
+# after the lock was written (or a swapped one) cannot enter the image. The
+# project itself is then installed editable with --no-deps. Regenerate the lock
+# with the command in its header; contributors keep `pip install -e .[dev]`.
+COPY docker/core-lock/requirements.txt /tmp/requirements-core.txt
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
-    uv pip install --system \
-    -e ".[web,cache,feedback,pgvector,mcp]"
+    uv pip install --system --require-hashes -r /tmp/requirements-core.txt \
+    && uv pip install --system --no-deps -e .
 
 # Marker so downstream images can verify they're built on top of a
 # compatible base (handy for debugging mismatched layers).

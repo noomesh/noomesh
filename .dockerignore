@@ -52,6 +52,7 @@ docs/
 tests/
 !tests/fixtures/redaction_corpus.json
 !tests/fixtures/audit_hash_v2_vectors.json
+!tests/fixtures/audit_chain_vectors.json
 !tests/fixtures/kb_audience_isolation.json
 !tests/fixtures/own_image_cases.json
 

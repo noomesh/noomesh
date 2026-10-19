@@ -33,14 +33,15 @@ use crate::state::AppState;
 
 /// Chat context key for this channel.
 ///
-/// A named space is keyed by the SPACE, not the sender: everyone talking in
-/// a room shares one conversation, which is what makes the bot follow a
-/// group thread. A DM is keyed by the sender. This is the adapter-specific
-/// rule that used to live in `ChannelManager._chat_context_id`, and it
-/// travels with the harness rather than moving into the memory plane.
+/// A named space is keyed by (SPACE, SENDER): the room is shared for
+/// delivery and for knowledge, but each member has their own thread, so one
+/// member's history is never loaded as another's context. A DM is keyed by
+/// the sender. This is the adapter-specific rule that used to live in
+/// `ChannelManager._chat_context_id`, and it travels with the harness rather
+/// than moving into the memory plane.
 fn chat_context_id(chat_type: &str, space_name: &str, sender_id: &str) -> String {
     if chat_type == "space" && !space_name.is_empty() {
-        format!("google_chat:{space_name}")
+        format!("google_chat:{space_name}:{sender_id}")
     } else {
         format!("google_chat:{sender_id}")
     }
@@ -335,7 +336,23 @@ async fn process_message(
             chat_type: t.chat_type,
         }
     };
-    let (result, banner) = crate::routes::communication::CHANNEL_APPROVAL_TARGET
+    // The linked account's REAL role and scopes, not a blanket tier.
+    let Some(principal) = crate::bus_principal::account_principal(&state.db, &canonical_user).await else {
+        let target = resolve_reply_target(ev);
+        if let Err(e) = crate::routes::communication::send_google_chat_reply(
+            &target.recipient,
+            super::ACCOUNT_UNAVAILABLE_REPLY,
+            target.thread_id.as_deref(),
+            Some(&target.chat_type),
+        )
+        .await
+        {
+            tracing::warn!(error = %crate::redact::scrub(&e), "gchat_refusal_send_failed");
+        }
+        tracing::warn!(user = %canonical_user, "gchat_turn_refused: account disabled or unresolvable");
+        return Ok(());
+    };
+    let (result, banner) = super::scoped_turn(principal, &ev.chat_type, crate::routes::communication::CHANNEL_APPROVAL_TARGET
         .scope(Some(approval_target), async {
             crate::routes::communication::GATED_TOOL_FAILURES
                 .scope(Default::default(), async {
@@ -359,7 +376,7 @@ async fn process_message(
                         .await
                 })
                 .await
-        })
+        }))
         .await;
     let result = result.map_err(|e| anyhow!("inference failed: {e}"))?;
 
@@ -441,13 +458,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn space_keys_by_space_not_sender() {
-        // Everyone in a room must share one conversation, otherwise the bot
-        // holds a separate thread per speaker and follows none of them.
+    fn space_keys_by_space_and_sender() {
+        // Each member of a room has their own thread: one member's history
+        // is never loaded as another's context.
         let a = chat_context_id("space", "spaces/AAA", "users/1");
         let b = chat_context_id("space", "spaces/AAA", "users/2");
-        assert_eq!(a, b);
-        assert_eq!(a, "google_chat:spaces/AAA");
+        assert_ne!(a, b);
+        assert_eq!(a, "google_chat:spaces/AAA:users/1");
+        // And the same member in a different space has a different thread.
+        assert_ne!(a, chat_context_id("space", "spaces/BBB", "users/1"));
+        // The same member in the same space keeps the same thread.
+        assert_eq!(a, chat_context_id("space", "spaces/AAA", "users/1"));
     }
 
     #[test]

@@ -191,10 +191,14 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Caller, R
 
     let redis = state.redis.as_ref();
     admit(consumer, |name, limit| async move {
-        let redis = redis?;
+        // Redis absent or erroring: meter in-process instead of not at all.
+        let Some(redis) = redis else {
+            return crate::service_keys::local_quota_exceeded(&name, limit);
+        };
         match redis.check_consumer_quota(&name, limit).await {
             Ok(crate::cache::RateResult::Limited { retry_after }) => Some(retry_after),
-            _ => None,
+            Ok(_) => None,
+            Err(_) => crate::service_keys::local_quota_exceeded(&name, limit),
         }
     })
     .await
@@ -238,10 +242,11 @@ where
     // normally applied — meaning a `--quota` on an MCP key was silently
     // unenforced, and only the coarse per-IP limiter applied (which is
     // skipped for a loopback peer). the design.
-    if let Some(limit) = consumer.rpm_limit {
-        if let Some(retry_after) = charge(consumer.name.clone(), limit).await {
-            return Err(crate::auth::consumer_quota_exceeded(&consumer.name, retry_after));
-        }
+    // Every consumer is metered: a key with no cap of its own gets the door
+    // default (`service_keys::door_rpm`), not an unbounded budget.
+    let limit = crate::service_keys::door_rpm(&consumer);
+    if let Some(retry_after) = charge(consumer.name.clone(), limit).await {
+        return Err(crate::auth::consumer_quota_exceeded(&consumer.name, retry_after));
     }
 
     // A bound user always resolves with a role (`service_keys::resolve`

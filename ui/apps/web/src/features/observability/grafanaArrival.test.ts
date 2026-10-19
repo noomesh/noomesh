@@ -38,7 +38,7 @@ describe('arriving from a bookmark of Grafana', () => {
     const t = 1_000_000;
     expect(mayAutoOpen(null, t)).toBe(true);
     expect(mayAutoOpen(t, t + 5_000)).toBe(false);
-    // A session that expired after its 15 minutes is a fresh arrival.
+    // A session that expired after its 5 minutes is a fresh arrival.
     expect(mayAutoOpen(t, t + AUTO_OPEN_GAP_MS)).toBe(true);
     expect(mayAutoOpen(t, t + 15 * 60_000)).toBe(true);
     // A clock that went backwards is not a loop.

@@ -690,7 +690,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     //  3. The host of `services.gateway_url` in noomesh.yaml — what this
     //     controller ADVERTISES. A LAN-only controller (no tailnet) sets it
     //     to reach nodes at all: `bootstrap-token create` refuses to mint
-    //     while it still says localhost, so by the time a node enrols the
+    //     while it still says localhost, so by the time a node enrolls the
     //     value is the name the node just used. Skipping it here sent a
     //     LAN node to the literal below, which nothing resolved: "registered
     //     with controller" only after the operator hand-edited /etc/hosts

@@ -10,6 +10,7 @@
 //! | `self_call_shared_secret` | a controller- or fleet-secret HMAC buying inference (transitional bridge, `NOO_SELF_CALL_SHARED_SECRET`) |
 //! | `cluster_hmac_non_inference` | a controller-secret HMAC (or a fleet HMAC in the legacy full-access mode) resolving to `ClusterKind::Internal` on any other route. The add-ons' HMAC is no longer admitted here: it is REFUSED first and counted as `addon_shared_secret_refused` (`addon_hmac_refusal.rs`) |
 //! | `node_token_no_cert` | a fleet-secret HMAC resolving to `ClusterKind::Node` with no client certificate on the connection |
+//! | `cluster_hmac_v1` | a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0` |
 //! | (node side) `static_token` / `whois_non_controller` | reported by each node agent on its heartbeat as `legacy_lanes` |
 //!
 //! The `noo` CLI is no longer on any of these lanes. Its controller-secret
@@ -57,6 +58,14 @@ pub const LANE_ADDON_EXCHANGED: &str = "addon_exchanged_token";
 /// token bound to it — the replacement for the CLI's
 /// `cli-posture` use of [`LANE_HMAC_NON_INFERENCE`].
 pub const LANE_OPERATOR_CERT: &str = "operator_client_cert";
+/// A fleet-secret HMAC in the v1 wire form (`<actor>:<ts>:<hmac>`): signed
+/// over actor and time only, so a captured header replays on any route for
+/// five minutes. Admitted while `NOO_CLUSTER_TOKEN_V1` is open; every count
+/// is a caller that still has to upgrade to v2. When the gate is closed the
+/// same use is counted as [`LANE_HMAC_V1`] with the refusal in the log.
+pub const LANE_HMAC_V1: &str = "cluster_hmac_v1";
+/// Comparator: the request-bound v2 form, the replacement for [`LANE_HMAC_V1`].
+pub const LANE_HMAC_V2: &str = "cluster_hmac_v2";
 /// REFUSED, not admitted: a controller-secret HMAC signed by the `noo` CLI
 /// (`operator_auth::is_cli_actor`). Every count is an old `noo` binary that
 /// needs `noo upgrade --all`.
@@ -220,6 +229,19 @@ pub fn operator_cert_use(operator: &str, path: &str) -> LaneUse {
     }
 }
 
+/// A fleet-secret HMAC admitted (or, gate closed, refused) in the v1 form.
+pub fn hmac_v1_use(actor: &str, path: &str) -> LaneUse {
+    LaneUse {
+        lane: LANE_HMAC_V1,
+        labels: vec![("caller", bounded_name("caller", actor)), ("route_class", route_class(path).into())],
+    }
+}
+
+/// The comparator: a fleet-secret HMAC admitted in the request-bound form.
+pub fn hmac_v2_use(actor: &str) -> LaneUse {
+    LaneUse { lane: LANE_HMAC_V2, labels: vec![("caller", bounded_name("caller", actor))] }
+}
+
 /// A controller-secret HMAC from the `noo` CLI, refused by the middleware.
 pub fn cli_refusal_use(actor: &str, path: &str) -> LaneUse {
     LaneUse {
@@ -285,6 +307,8 @@ pub const NODE_NO_CERT_LOG_EVERY: Duration = Duration::from_secs(3600);
 /// How often the HMAC-on-a-non-inference-route DEBUG repeats per
 /// (kind, route class, caller).
 pub const HMAC_NON_INFERENCE_LOG_EVERY: Duration = Duration::from_secs(600);
+/// How often the v1-token INFO repeats per caller.
+pub const HMAC_V1_LOG_EVERY: Duration = Duration::from_secs(3600);
 /// How often the old-CLI refusal WARN repeats per (caller, route class).
 pub const CLI_REFUSED_LOG_EVERY: Duration = Duration::from_secs(600);
 
@@ -316,6 +340,17 @@ pub async fn observe(metrics: &crate::metrics::MetricsState, uses: &[LaneUse], p
                         peer = %peer.describe(),
                         "legacy lane: a shared-secret HMAC was admitted as Internal on a non-inference \
                          route (an add-on here is on its HMAC fallback, not its own key)"
+                    );
+                }
+            }
+            LANE_HMAC_V1 => {
+                let key = format!("{LANE_HMAC_V1}|{}", u.label("caller"));
+                if log_due(&key, HMAC_V1_LOG_EVERY) {
+                    tracing::info!(
+                        caller = u.label("caller"), route_class = u.label("route_class"), peer = %peer.describe(),
+                        "legacy lane: a v1 cluster token (not bound to its request) — that caller must upgrade \
+                         to sign v2 (once per caller per hour; the count is \
+                         noo_legacy_lane_uses_total{{lane=\"cluster_hmac_v1\"}})"
                     );
                 }
             }

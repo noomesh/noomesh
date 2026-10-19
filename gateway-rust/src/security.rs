@@ -96,24 +96,16 @@ impl std::fmt::Display for RiskLevel {
 /// Uses a static risk map with dynamic escalation for dangerous code patterns.
 /// In the future this will read `execution.risk_level` from tools.json.
 pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
-    // A config write to a gate-bearing section is a write to the rules that
-    // constrain the writer: High, so it gates under approval
-    // mode. The route refuses these to a cluster credential (which is what the
-    // worker's callback presents) and the retired gate KEYS outright — this is
-    // the wall behind those, and it costs nothing: the operator asked for no
-    // escape.
-    //
-    // Widened from `security` alone to the whole `GATED_CONFIG_SECTIONS` list,
-    // because `tools.allowed_paths`, `workspace.path` and a `watched_folders`
-    // entry marked `writable` each feed `local_files::FilePolicy` — a write
-    // inside a writable root classifies MEDIUM instead of HIGH, so widening
-    // the roots is another way to route a file write around this same gate.
+    // A config write is a write to the rules that constrain the writer, so EVERY
+    // `noo_config_set` is High and gates under approval mode. Gate-bearing
+    // sections (`GATED_CONFIG_SECTIONS`: security, tools.allowed_paths,
+    // workspace.path, watched_folders...) are additionally refused by the route to a
+    // cluster credential (which is what the worker's callback presents) and the
+    // retired gate KEYS outright. This is the wall behind those. Ungated sections
+    // (services, models...) used to be Medium and ran unattended; a model-driven
+    // change to any of them is a person's decision too.
     if tool_name == "noo_config_set" {
-        if let Some(section) = args.get("section").and_then(|v| v.as_str()) {
-            if crate::routes::settings::GATED_CONFIG_SECTIONS.contains(&section) {
-                return RiskLevel::High;
-            }
-        }
+        return RiskLevel::High;
     }
     let base = match tool_name {
         // Low: read-only queries, search, status checks
@@ -154,7 +146,7 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
         "noo_python_exec" | "python_tool"
         | "noo_browser" | "browser"
         | "noo_inference" | "noo_agentic_inference"
-        | "noo_channel_send" | "noo_agent_message" | "noo_agent_send" | "noo_task_delegate" | "noo_rag_ingest"
+        | "noo_task_delegate"
         | "noo_job_submit" | "noo_job_cancel" | "noo_job_reprioritize"
         | "noo_rag_retag"
         | "noo_scheduler_pause" | "noo_scheduler_resume"
@@ -162,14 +154,12 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
         | "noo_agents_collaborate" | "noo_workflow_run"
         | "noo_coding_task" | "noo_models_pull"
         | "noo_prompt_skills_create" | "noo_prompt_skills_evolve"
-        | "noo_heartbeat_create_task" | "noo_heartbeat_delete_task"
-        | "noo_heartbeat_run_task" | "noo_heartbeat_toggle_task"
+        | "noo_heartbeat_delete_task" | "noo_heartbeat_toggle_task"
         | "noo_hofstadter_run" | "noo_hofstadter_approve"
         | "noo_hofstadter_reject" | "noo_hofstadter_enable"
         | "noo_hofstadter_disable" | "noo_ga_toggle"
         | "noo_autonomy_add_location" | "noo_autonomy_enable"
-        | "noo_autonomy_disable" | "noo_config_set"
-        | "noo_approval_approve" | "noo_approval_deny"
+        | "noo_autonomy_disable"
         | "noo_recall_archive" | "noo_recall_lifecycle"
         | "noo_recall_refresh"
         | "noo_graph_extract_relations" | "noo_graph_run_clustering"
@@ -184,6 +174,18 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
         // Medium, pinned by tests).
         "noo_local_files" | "local_files"
         | "noo_skill_execute" | "skill_execute"
+        // A scheduled task is standing authority: creating one, or running one now,
+        // makes the agent act later (or now) with no person in the loop.
+        | "noo_heartbeat_create_task" | "noo_heartbeat_run_task"
+        // An approval DECISION is a human's. These are not model tools any more
+        // (no manifest entry); High here is the wall behind that, and the
+        // routes refuse a non-person credential too.
+        | "noo_approval_approve" | "noo_approval_deny"
+        // Outbound messages: High unless the destination is known-good; the
+        // context-free answer is the conservative one. See
+        // `middleware::effective_risk` for the downgrade to Medium (saved
+        // recipient / the chat that asked; an agent of the caller's own tier or below).
+        | "noo_channel_send" | "noo_agent_message" | "noo_agent_send"
         | "noo_device_camera" | "noo_device_audio"
         // Deletes graph rows (stages them first, restorable 30 days); admin only.
         | "noo_graph_entity_cleanup" => RiskLevel::High,
@@ -198,6 +200,13 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
         // bug in the lists above, not a reason to weaken the default.
         _ => RiskLevel::High,
     };
+
+    // Ingest of text the caller supplied is a write to the knowledge base (Medium); ingest
+    // of a path, URL, glob or directory makes the gateway FETCH or READ something the
+    // model named, so it is High. Anything that is not clearly text-only is High.
+    if tool_name == "noo_rag_ingest" {
+        return if rag_ingest_is_text_only(args) { RiskLevel::Medium } else { RiskLevel::High };
+    }
 
     // Dynamic escalation: python_exec with dangerous code → High
     if matches!(tool_name, "noo_python_exec" | "python_tool") && base < RiskLevel::High {
@@ -228,6 +237,22 @@ pub fn classify_tool_risk(tool_name: &str, args: &Value) -> RiskLevel {
     }
 
     base
+}
+
+/// Argument names under which an ingest can point at something to fetch or read.
+const RAG_SOURCE_KEYS: &[&str] = &["source", "sources", "path", "paths", "url", "urls", "uri", "file", "files", "directory", "dir", "glob"];
+
+/// True only for an ingest of caller-supplied text: a non-empty `text` and no
+/// source-like argument with a value.
+fn rag_ingest_is_text_only(args: &Value) -> bool {
+    let has_text = args.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty());
+    let has_source = RAG_SOURCE_KEYS.iter().any(|k| match args.get(*k) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(_) => true,
+    });
+    has_text && !has_source
 }
 
 /// [`classify_tool_risk`] with the file-write policy in hand: a
@@ -723,13 +748,12 @@ mod tests {
         assert_eq!(classify_tool_risk("noo_memory_search", &args), RiskLevel::Low);
     }
 
-    /// PINNED: the model's config tool is Medium for
-    /// ordinary sections and High for the one that holds its own gate.
+    /// PINNED: the model's config tool is High for every section.
     #[test]
     fn config_set_of_the_security_section_is_high() {
         assert_eq!(classify_tool_risk("noo_config_set", &json!({"section": "security", "updates": {"exec_approval_mode": "auto"}})), RiskLevel::High);
         assert_eq!(classify_tool_risk("noo_config_set", &json!({"section": "security", "updates": {"rate_limit_rpm": 1}})), RiskLevel::High);
-        assert_eq!(classify_tool_risk("noo_config_set", &json!({"section": "services", "updates": {"x": 1}})), RiskLevel::Medium);
+        assert_eq!(classify_tool_risk("noo_config_set", &json!({"section": "services", "updates": {"x": 1}})), RiskLevel::High);
     }
 
     /// Every gate-bearing section, not just `security`: widening
@@ -745,22 +769,60 @@ mod tests {
                 "noo_config_set of '{section}' must gate"
             );
         }
-        // ...and an ordinary section is still Medium, or every config write
-        // would queue for a human under the new `strict` default.
-        for section in ["memory", "web_search", "heartbeat", "self_identity"] {
+        // ...and so is an ordinary one: a model-driven config change is a person's decision.
+        for section in ["memory", "web_search", "heartbeat", "self_identity", ""] {
             assert_eq!(
                 classify_tool_risk("noo_config_set", &json!({"section": section, "updates": {"x": 1}})),
-                RiskLevel::Medium,
-                "noo_config_set of '{section}' should not gate"
+                RiskLevel::High,
+                "noo_config_set of '{section}' must gate"
             );
         }
+    }
+
+    /// The model must never see, nor be able to run unattended, an approval DECISION.
+    #[test]
+    fn approval_decisions_are_high_and_not_in_any_manifest() {
+        for t in ["noo_approval_approve", "noo_approval_deny"] {
+            assert_eq!(classify_tool_risk(t, &json!({"request_id": "x"})), RiskLevel::High, "{t}");
+            for manifest in [include_str!("../mcp-tools-local.json"), include_str!("../mcp-tools.json")] {
+                assert!(!manifest.contains(&format!("\"{t}\"")), "{t} must not be a model-visible tool");
+            }
+        }
+        // The delegated route table (built from those manifests) cannot reach the decision routes.
+        for p in ["/api/approval/abc123/approve", "/api/approval/abc123/deny", "/api/approval/abc123/decide"] {
+            assert!(!crate::worker_delegation::route_allowed("POST", p), "{p} must not be a worker-delegated route");
+        }
+    }
+
+    /// Outbound and standing-authority tools: the context-free answer is the conservative one.
+    #[test]
+    fn side_effect_tools_classify_by_their_arguments() {
+        // heartbeat tasks: standing authority
+        assert_eq!(classify_tool_risk("noo_heartbeat_create_task", &json!({})), RiskLevel::High);
+        assert_eq!(classify_tool_risk("noo_heartbeat_run_task", &json!({"task_id": "t"})), RiskLevel::High);
+        // ingest: text-only is Medium; any path/URL/glob source (or an unreadable shape) is High
+        assert_eq!(classify_tool_risk("noo_rag_ingest", &json!({"text": "hello", "title": "t"})), RiskLevel::Medium);
+        for a in [
+            json!({"source": "/etc/hosts"}),
+            json!({"source": "https://example.com/x"}),
+            json!({"text": "hi", "source": "/data/docs"}),
+            json!({"text": "hi", "url": "http://x"}),
+            json!({"path": "/x"}),
+            json!({}),
+            json!({"text": "   "}),
+        ] {
+            assert_eq!(classify_tool_risk("noo_rag_ingest", &a), RiskLevel::High, "{a}");
+        }
+        // outbound messages without context: High (middleware::effective_risk downgrades known-good ones)
+        let a = json!({"channel": "telegram", "recipient": "1", "message": "hi"});
+        assert_eq!(classify_tool_risk("noo_channel_send", &a), RiskLevel::High);
+        assert_eq!(classify_tool_risk("noo_agent_send", &json!({"to": "root", "text": "hi"})), RiskLevel::High);
     }
 
     #[test]
     fn test_inference_tools_are_medium_risk() {
         let args = json!({});
         assert_eq!(classify_tool_risk("noo_inference", &args), RiskLevel::Medium);
-        assert_eq!(classify_tool_risk("noo_channel_send", &args), RiskLevel::Medium);
     }
 
     #[test]

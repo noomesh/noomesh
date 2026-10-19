@@ -33,7 +33,9 @@
 //! `include_usage`), the first chunk is required within
 //! [`FIRST_TOKEN_TIMEOUT`] and each later chunk within [`STREAM_IDLE_TIMEOUT`],
 //! and `chat_aggregate` folds the frames back into one `chat.completion`
-//! body; the caller still sees a non-streaming response and a long answer that
+//! body. Those windows only decide when to MOVE ON: the last candidate a
+//! request can still try is given the rest of [`OVERALL_DEADLINE`] to start
+//! answering, since cutting it off would turn a slow answer into none; the caller still sees a non-streaming response and a long answer that
 //! keeps producing tokens is never cut. A stall is a failover like any other
 //! and its failure text says so plainly and names the restart command.
 //! `n > 1` and non-chat paths (`/v1/responses` native) keep the old
@@ -263,18 +265,22 @@ impl RetryGuard {
 
 // ── resolution ───────────────────────────────────────────────────────────
 
-/// The class a hint names and its routable candidates in order.
+/// The class a hint names and its routable candidates in order: the pinned
+/// `node`'s first when the caller named one (`node` body field /
+/// `X-Noo-Node`), then the mesh — or that node alone when `strict`
+/// (`node_strict` / `X-Noo-Node-Strict`), see `classes::select_with`.
 ///
 /// With no class table at all (a fleet whose nodes report nothing — the
 /// one-box standalone whose only backend is the `ollama-embed` container,
 /// or a gateway whose KV is empty), the legacy resolver's static
 /// `OLLAMA_URL` last resort is wrapped as the single candidate of
 /// `chat-default`, so a standalone install keeps answering.
-pub async fn resolve_candidates(state: &AppState, hint: Option<&str>) -> Result<(String, Vec<Candidate>), RawChatError> {
+pub async fn resolve_candidates(state: &AppState, hint: Option<&str>, node: Option<&str>, strict: bool) -> Result<(String, Vec<Candidate>), RawChatError> {
     let table = classes::load_table(state)
         .await
         .map_err(|e| RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("class table unavailable: {e}")))?;
-    if table.classes.is_empty() {
+    let node = node.map(str::trim).filter(|n| !n.is_empty());
+    if table.classes.is_empty() && node.is_none() {
         // The raw proxy forwards to cluster backends only; a cloud model
         // runs through the agent loop (`/api/inference`), which holds the
         // provider auth. Same 404 a cloud name got before cloud backends
@@ -295,35 +301,38 @@ pub async fn resolve_candidates(state: &AppState, hint: Option<&str>) -> Result<
         );
         return Ok((classes::CHAT_DEFAULT.to_string(), vec![cand]));
     }
-    let Some(class) = classes::resolve_hint(&table, hint) else {
-        return Err(RawChatError::new(
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            format!(
-                "model '{}' is not a class, alias or served model; ids: {}",
-                hint.unwrap_or(classes::CHAT_DEFAULT),
-                table.ids().join(", ")
-            ),
-        ));
-    };
-    let cands: Vec<Candidate> = classes::ordered(class, &[]).into_iter().cloned().collect();
-    if cands.is_empty() {
-        let declared = class.candidates.len();
-        return Err(RawChatError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backend_unavailable",
-            if declared > 0 {
-                format!(
-                    "class '{}' has {declared} declared candidate(s) and none is placed or available: {}",
-                    class.name,
-                    class.candidates.iter().map(|c| format!("{}/{}={} ({})", c.node_id, c.backend, c.model, c.health)).collect::<Vec<_>>().join("; ")
-                )
-            } else {
-                format!("class '{}' has no candidates", class.name)
-            },
-        ));
+    let sel = classes::select(&table, hint, node, strict, &|_| false).map_err(refusal_error)?;
+    log_selection(&sel, node, strict);
+    Ok((sel.class, sel.candidates))
+}
+
+/// A selection refusal on the raw surfaces. A node pin is the caller's own
+/// input, so its refusal says what was wrong with it (the node name the
+/// caller sent, nothing about addresses).
+pub fn refusal_error(r: classes::Refusal) -> RawChatError {
+    use classes::Refusal::*;
+    match r {
+        UnknownModel(m) => RawChatError::new(StatusCode::NOT_FOUND, "model_not_found", m),
+        NoCandidates(m) => RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", m),
+        UnknownNode(m) => RawChatError { public: Some(m.clone()), ..RawChatError::new(StatusCode::UNPROCESSABLE_ENTITY, "node_not_found", m) },
+        NodeServesNoChat(m) => RawChatError { public: Some(m.clone()), ..RawChatError::new(StatusCode::UNPROCESSABLE_ENTITY, "node_serves_no_chat", m) },
+        // The public text names only what the caller sent; what the node
+        // DOES serve stays in the detail (operator-side, under the ref).
+        NodeCannotServe(m) => {
+            let public = m.split("; it serves").next().unwrap_or(&m).to_string();
+            RawChatError { public: Some(public), ..RawChatError::new(StatusCode::CONFLICT, "node_cannot_serve", m) }
+        }
     }
-    Ok((class.name.clone(), cands))
+}
+
+/// One line per request saying where it can go and why, and which nodes
+/// were left out or demoted (offline, thermal, stalled, quarantined).
+fn log_selection(sel: &classes::Selection, node: Option<&str>, strict: bool) {
+    let order: Vec<String> = sel.candidates.iter().map(|c| format!("{}/{}={} [{}]", c.node_id, c.backend, c.model, c.rank)).collect();
+    if sel.last_resort {
+        tracing::warn!(class = %sel.label, order = ?order, "raw_chat_only_excluded_candidates_left");
+    }
+    tracing::info!(class = %sel.label, node_pin = ?node, node_strict = strict, order = ?order, skipped = ?sel.skipped, "raw_chat_candidates");
 }
 
 // ── the loop ─────────────────────────────────────────────────────────────
@@ -353,6 +362,13 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 /// (the aggregator folds one choice).
 fn can_aggregate(path: &str, body: &Value) -> bool {
     path == CHAT_PATH && body.get("n").and_then(Value::as_u64).unwrap_or(1) <= 1
+}
+
+/// Did the caller get something other than what it asked for? The first
+/// candidate is a fallback too when `select` put it there as a stand-in
+/// (rank `fallback,…`: a model nothing serves, a class with nothing live).
+fn is_fallback(index: usize, cand: &Candidate) -> bool {
+    index != 0 || cand.rank.starts_with("fallback,")
 }
 
 /// The operator-surface wording for a candidate that connected and then said
@@ -428,7 +444,18 @@ where
         let url = format!("{}{}", cand.url.trim_end_matches('/'), path);
         let req = coordinator::with_backend_hint_url(client.post(&url).json(&body).timeout(remaining), &url, &cand.backend);
         let window_start = Instant::now();
-        let header_limit = if aggregate { timeouts.first_token } else { timeouts.header };
+        // The stall windows exist to move on to a better candidate. With
+        // nothing left to move on to, cutting this one off only turns a slow
+        // answer into none: the last candidate gets the rest of the
+        // deadline to start answering (a 12B on ollama prefilling a long
+        // prompt, or queued behind another request, takes longer than 30 s).
+        let last = !guard.may_retry(tried)
+            || !candidates[i + 1..].iter().any(|c| {
+                !(c.url == cand.url && c.backend == cand.backend) && !failed.iter().any(|(u, b)| u == &c.url && b == &c.backend)
+            });
+        let first_token = if last { remaining } else { timeouts.first_token };
+        let header = if last { remaining } else { timeouts.header };
+        let header_limit = if aggregate { first_token } else { header };
         let sent = if stream || aggregate {
             tokio::time::timeout(header_limit, req.send()).await
         } else {
@@ -438,11 +465,17 @@ where
         let failure = match sent {
             Err(_) if aggregate => {
                 stalled = true;
-                stall_text("no response", timeouts.first_token.as_secs(), cand)
+                stall_text("no response", first_token.as_secs(), cand)
             }
             Err(_) => {
                 stalled = true;
-                stall_text("no response headers", timeouts.header.as_secs(), cand)
+                stall_text("no response headers", header.as_secs(), cand)
+            }
+            // The request's own timeout (the deadline) can fire before the
+            // window does when the window IS the deadline: still a stall.
+            Ok(Err(e)) if e.is_timeout() => {
+                stalled = true;
+                stall_text("no response", header_limit.as_secs(), cand)
             }
             Ok(Err(e)) => format!("unreachable: {e}"),
             Ok(Ok(resp)) if resp.status().is_success() => {
@@ -451,12 +484,12 @@ where
                     return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Stream(Box::new(resp)), guard });
                 }
                 if aggregate {
-                    let first_wait = timeouts.first_token.saturating_sub(window_start.elapsed());
+                    let first_wait = first_token.saturating_sub(window_start.elapsed());
                     match chat_aggregate::read_aggregated(resp, first_wait, timeouts.idle, deadline).await {
                         Ok(data) => return Ok(CoreSuccess { index: i, attempts: tried, body: CoreBody::Json(data), guard }),
                         Err(ReadFailure::NoFirstChunk) => {
                             stalled = true;
-                            stall_text("no token", timeouts.first_token.as_secs(), cand)
+                            stall_text("no token", first_token.as_secs(), cand)
                         }
                         Err(ReadFailure::Idle) => {
                             stalled = true;
@@ -492,6 +525,10 @@ where
             }
         };
         all_stalled &= stalled;
+        if stalled {
+            // Demote it for the next requests too, not only this one.
+            classes::note_stall(&cand.url, &cand.backend);
+        }
 
         tracing::error!(class, node = %cand.node_id, url = %cand.url, attempt = tried, failure = %failure, "raw_chat_candidate_failed");
         failed.push((cand.url.clone(), cand.backend.clone()));
@@ -558,11 +595,15 @@ where
         backend_type: cand.backend.clone(),
         node_id: cand.node_id.clone(),
         url: cand.url.clone(),
-        fallback: ok.index != 0,
+        // Not the class's first choice, or a stand-in for what was named
+        // (a class or model with nothing live, answered by the mesh).
+        fallback: is_fallback(ok.index, cand),
         attempts: ok.attempts,
     };
+    let label = if cand.class_label.is_empty() { class } else { cand.class_label.as_str() };
     tracing::info!(
-        class, node = %cand.node_id, backend = %cand.backend, model = %cand.model,
+        class = %label, node = %cand.node_id, backend = %cand.backend, model = %cand.model,
+        rank = %cand.rank,
         attempt = ok.attempts, fallback = served.fallback, stream, source, "raw_chat_served"
     );
     // Rebuilt per attempt: usage is charged to the candidate that answered.
@@ -589,17 +630,28 @@ where
 /// surfaces make. `body["model"]` is rewritten per attempt to the
 /// candidate's concrete model; `stream_options.include_usage` is set on a
 /// streaming request so vLLM emits the usage frame.
+///
+/// `pin` holds the `X-Noo-Node` / `X-Noo-Node-Strict` headers; `node` and
+/// `node_strict` fields in the body do the same (a header wins). A node is
+/// a preference: it is tried first, then the mesh, and the answer's
+/// `fallback` says when another node answered. Strict keeps the request on
+/// that node: 422 when it serves no chat, 409 when it serves chat but not
+/// the named model, and never another node. A name that is no node of this
+/// mesh is a 422 either way. Both fields are removed before the body is
+/// forwarded.
 pub async fn chat_completions(
     state: &AppState,
     body: &mut Value,
     source: &'static str,
     actor: UsageActor,
+    pin: &PinHeaders,
 ) -> Result<Outcome, RawChatError> {
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
+    let pin = node_pin(body, pin)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
-    let (class, cands) = resolve_candidates(state, hint.as_deref()).await?;
+    let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict).await?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         body["stream_options"] = json!({"include_usage": true});
@@ -611,6 +663,67 @@ pub async fn chat_completions(
         ("/v1/chat/completions".to_string(), b)
     })
     .await
+}
+
+/// The header naming the node a chat request prefers.
+pub const HEADER_NODE: &str = "x-noo-node";
+/// The header that makes that node the ONLY one (`1`/`true`/`yes`/`on`).
+pub const HEADER_NODE_STRICT: &str = "x-noo-node-strict";
+
+/// The two pin headers as sent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PinHeaders {
+    pub node: Option<String>,
+    /// `Some` when `X-Noo-Node-Strict` was sent.
+    pub strict: Option<bool>,
+}
+
+/// What a request pins once headers and body are read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodePin {
+    pub node: Option<String>,
+    pub strict: bool,
+}
+
+/// The `X-Noo-Node` header's value, if sent and non-blank.
+pub fn node_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers.get(HEADER_NODE).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// Both pin headers. An `X-Noo-Node-Strict` value that is not a yes/no
+/// word reads as yes: a caller who sent the header meant something by it,
+/// and the safe reading of a locality request is the strict one.
+pub fn pin_headers(headers: &axum::http::HeaderMap) -> PinHeaders {
+    let strict = headers.get(HEADER_NODE_STRICT).and_then(|v| v.to_str().ok()).map(|v| {
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    });
+    PinHeaders { node: node_header(headers), strict }
+}
+
+/// The node a request prefers (the header, else the body's `node`) and
+/// whether it is strict (the header, else the body's `node_strict`). Both
+/// fields are taken out of the body either way — a backend must not see
+/// them.
+pub fn node_pin(body: &mut Value, headers: &PinHeaders) -> Result<NodePin, RawChatError> {
+    let obj = body.as_object_mut();
+    let (field, strict_field) = match obj {
+        Some(o) => (o.remove("node"), o.remove("node_strict")),
+        None => (None, None),
+    };
+    let from_body = match field {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        Some(_) => return Err(RawChatError::bad_request("'node' must be a string naming a node")),
+    };
+    let strict_body = match strict_field {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(_) => return Err(RawChatError::bad_request("'node_strict' must be true or false")),
+    };
+    Ok(NodePin {
+        node: headers.node.as_deref().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).or(from_body),
+        strict: headers.strict.or(strict_body).unwrap_or(false),
+    })
 }
 
 // ── rendering ────────────────────────────────────────────────────────────
@@ -672,6 +785,54 @@ pub fn stream_response(resp: reqwest::Response, served: &Served, usage: StreamUs
         .body(Body::from_stream(body))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build error").into_response());
     with_served_headers(r, served)
+}
+
+#[cfg(test)]
+mod node_pin_tests {
+    use super::*;
+
+    #[test]
+    fn the_node_pin_comes_from_the_header_or_the_body_and_never_reaches_the_backend() {
+        let none = PinHeaders::default();
+        let header = |n: &str| PinHeaders { node: Some(n.into()), strict: None };
+        let mut body = json!({"model": "default", "node": "mcmini", "messages": []});
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: false }, "a preference by default");
+        assert!(body.get("node").is_none(), "stripped before forwarding");
+        let mut body = json!({"node": "mcmini"});
+        assert_eq!(node_pin(&mut body, &header("pop-os")).unwrap().node.as_deref(), Some("pop-os"), "the header wins");
+        let mut body = json!({"node": "  "});
+        assert_eq!(node_pin(&mut body, &none).unwrap().node, None);
+        let mut body = json!({"node": 7});
+        assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
+        // Strict: the body field, the header (which wins), both stripped.
+        let mut body = json!({"node": "mcmini", "node_strict": true});
+        assert_eq!(node_pin(&mut body, &none).unwrap(), NodePin { node: Some("mcmini".into()), strict: true });
+        assert!(body.get("node_strict").is_none());
+        let mut body = json!({"node": "mcmini", "node_strict": true});
+        assert!(!node_pin(&mut body, &PinHeaders { node: None, strict: Some(false) }).unwrap().strict);
+        let mut body = json!({"node_strict": "yes"});
+        assert_eq!(node_pin(&mut body, &none).unwrap_err().status, StatusCode::BAD_REQUEST);
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(HEADER_NODE, HeaderValue::from_static(" mcmini "));
+        assert_eq!(pin_headers(&h), PinHeaders { node: Some("mcmini".into()), strict: None });
+        for (v, strict) in [("1", true), ("true", true), ("YES", true), ("on", true), ("anything", true), ("0", false), ("false", false), ("no", false), ("off", false)] {
+            h.insert(HEADER_NODE_STRICT, HeaderValue::from_str(v).unwrap());
+            assert_eq!(pin_headers(&h).strict, Some(strict), "{v}");
+        }
+    }
+
+    #[test]
+    fn node_refusals_are_422_and_409_and_do_not_list_what_the_node_serves() {
+        use classes::Refusal;
+        assert_eq!(refusal_error(Refusal::UnknownNode("node 'x' is not a node".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal_error(Refusal::NodeServesNoChat("node 'x' serves no chat".into())).status, StatusCode::UNPROCESSABLE_ENTITY);
+        let e = refusal_error(Refusal::NodeCannotServe("node 'pop-os' does not serve 'gemma4:12b'; it serves ollama=gemma4:e2b-it-qat".into()));
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.public_message(), "node 'pop-os' does not serve 'gemma4:12b'");
+        assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
+        assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
+        assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 #[cfg(test)]
@@ -763,6 +924,15 @@ mod tests {
         assert!(!g.may_retry(1));
     }
 
+    #[test]
+    fn a_stand_in_first_candidate_is_reported_as_a_fallback() {
+        let mut c = cand("mcmini", "ollama", "gemma4:12b", "https://100.64.0.2:8081");
+        assert!(!is_fallback(0, &c));
+        assert!(is_fallback(1, &c));
+        c.rank = "fallback,rank=gpu,params=12,load=0.20".into();
+        assert!(is_fallback(0, &c), "a model nothing serves, answered by the mesh, says so");
+    }
+
     #[tokio::test]
     async fn served_envelope_and_headers_say_class_and_model_and_fallback_only() {
         let served = Served {
@@ -839,6 +1009,8 @@ mod tests {
         Steady { frames: usize, gap: Duration },
         /// Two content frames, then silence.
         DiesMidAnswer,
+        /// Say nothing for `wait` (a long prefill, a queue), then answer.
+        LateStart { wait: Duration, text: &'static str },
     }
 
     struct FakeBackend {
@@ -924,6 +1096,14 @@ mod tests {
                             }
                             let _ = sock.write_all(b"0\r\n\r\n").await;
                         }
+                        Fake::LateStart { wait, text } => {
+                            tokio::time::sleep(wait).await;
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            for f in [delta(text), fin, usage, "data: [DONE]\n\n".to_string()] {
+                                let _ = sock.write_all(&chunk(&f)).await;
+                            }
+                            let _ = sock.write_all(b"0\r\n\r\n").await;
+                        }
                         Fake::DiesMidAnswer => {
                             let _ = sock.write_all(head.as_bytes()).await;
                             let _ = sock.write_all(&chunk(&delta("one "))).await;
@@ -948,6 +1128,10 @@ mod tests {
     type Alerts = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn run(cands: &[Candidate], stream: bool, t: Timeouts) -> (Result<CoreSuccess, RawChatError>, Alerts) {
+        run_until(cands, stream, t, Duration::from_secs(20)).await
+    }
+
+    async fn run_until(cands: &[Candidate], stream: bool, t: Timeouts, within: Duration) -> (Result<CoreSuccess, RawChatError>, Alerts) {
         let alerts: Alerts = Arc::new(Mutex::new(Vec::new()));
         let sink = alerts.clone();
         let client = reqwest::Client::new();
@@ -957,7 +1141,7 @@ mod tests {
             cands,
             stream,
             t,
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + within,
             |c| (CHAT_PATH.to_string(), json!({"model": c.model, "messages": [{"role":"user","content":"hi"}]})),
             move |url, detail| {
                 sink.lock().unwrap().push((url, detail));
@@ -997,6 +1181,30 @@ mod tests {
             assert!(detail.contains("no token") || detail.contains("no response"), "{detail}");
             assert!(detail.contains("noo cluster restart-backends node-a noo-vllm"), "names the node and container: {detail}");
         }
+    }
+
+    /// 2026-10-19: every external chat to mcmini (the only live chat-default
+    /// candidate, a 12B on ollama) was cut at 30 s and answered 504, for
+    /// hours, although the node answered when given time. With nothing left
+    /// to fail over to, the window is the deadline.
+    #[tokio::test]
+    async fn the_last_candidate_is_given_the_deadline_not_the_stall_window() {
+        let slow = fake_backend(Fake::LateStart { wait: Duration::from_millis(700), text: "late but whole" }).await;
+        for stream in [false, true] {
+            let (r, alerts) = run(&[cand("mcmini", "ollama", "gemma4:12b", &slow.url)], stream, FAST).await;
+            let ok = r.unwrap_or_else(|e| panic!("stream={stream}: {}", e.detail));
+            if !stream {
+                let (_, data) = json_of(Ok(ok));
+                assert_eq!(data.pointer("/choices/0/message/content").and_then(Value::as_str), Some("late but whole"));
+            }
+            assert!(alerts.lock().unwrap().is_empty());
+        }
+        // Not the last: the same slow start still fails over at the window.
+        let spare = fake_backend(Fake::Answer("spare")).await;
+        let started = Instant::now();
+        let (r, _) = run(&[cand("a", "ollama", "m", &slow.url), cand("b", "ollama", "m", &spare.url)], false, FAST).await;
+        assert_eq!(json_of(r).0, 1);
+        assert!(started.elapsed() < Duration::from_millis(650), "moved on at the window");
     }
 
     #[tokio::test]
@@ -1047,12 +1255,14 @@ mod tests {
         let b = fake_backend(Fake::Silent).await;
         let cands = [cand("node-one", "vllm", "m", &a.url), cand("node-two", "ollama", "m", &b.url)];
         let started = Instant::now();
-        let (r, alerts) = run(&cands, false, FAST).await;
+        let (r, alerts) = run_until(&cands, false, FAST, Duration::from_secs(1)).await;
         let e = match r {
             Err(e) => e,
             Ok(_) => panic!("both candidates are wedged"),
         };
-        assert!(started.elapsed() < Duration::from_secs(5), "must not hang to the deadline");
+        // The last candidate is waited on to the deadline, never past it.
+        assert!(started.elapsed() >= Duration::from_millis(900), "the last candidate gets the rest of the deadline");
+        assert!(started.elapsed() < Duration::from_secs(5), "must not hang past the deadline");
         assert_eq!(e.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(e.kind, "backend_timeout");
         assert!(e.detail.contains("stalled"), "{}", e.detail);

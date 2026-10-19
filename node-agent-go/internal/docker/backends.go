@@ -239,7 +239,7 @@ func pkiServiceLeafTarget(service string) string {
 // These are the same configs the compose file defines, expressed as Go structs.
 var backendSpecs = map[string]BackendSpec{
 	"vllm": {
-		Image:         "${VLLM_IMAGE:-vllm/vllm-openai:latest}",
+		Image:         "${VLLM_IMAGE:-vllm/vllm-openai:v0.25.0}",
 		ContainerName: "noo-vllm",
 		Env: map[string]string{
 			"VLLM_MODEL":             "${VLLM_MODEL:-google/gemma-4-E4B-it}",
@@ -367,7 +367,7 @@ var backendSpecs = map[string]BackendSpec{
 	// small embedder (harrier is 0.6B at Q4, ~397MB) is entirely viable on
 	// CPU — unlike a chat model, where CPU-only would be painful.
 	"ollama": {
-		Image:         "ollama/ollama:latest",
+		Image:         "${OLLAMA_IMAGE:-ollama/ollama:0.40.5}",
 		ContainerName: "noo-ollama",
 		Env: map[string]string{
 			"OLLAMA_HOST":  "0.0.0.0",
@@ -672,22 +672,17 @@ func (c *Client) StartBackendSDK(backend, model string, gpuCount int, overrides 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	// CPU/GPU image auto-select: on a node without an NVIDIA GPU, a backend
-	// that declares a CPUImage (embedding/reranker) uses it instead of the
-	// CUDA image. Done before override/env resolution so a controller image
-	// override still wins. The GPU device reservation is independently
-	// gated by hasNvidiaGPU() below, so image and reservation stay in sync.
-	if spec.CPUImage != "" && !hasNvidiaGPU() {
-		spec.Image = spec.CPUImage
+	// ONE image choice (image_choice.go, shared with BackendImageRef):
+	// CPU/GPU auto-select (an embedding/reranker CPUImage on a node without an
+	// NVIDIA GPU; the GPU device reservation is independently gated by
+	// hasNvidiaGPU() below), then the controller's override, else
+	// ${VLLM_IMAGE:-default} env substitution - and the policy that refuses a
+	// floating or digest-less third-party ref.
+	choice, err := chooseBackendImage(backend, spec, overrides.Image)
+	if err != nil {
+		return err
 	}
-
-	// Resolve image name. Controller-supplied override wins; otherwise
-	// fall through to ${VLLM_IMAGE:-default} env substitution.
-	if overrides.Image != "" {
-		spec.Image = overrides.Image
-	} else {
-		spec.Image = resolveEnv(spec.Image)
-	}
+	spec.Image = choice.Ref
 
 	// Reranker engine correction: a placement/RERANK_IMAGE override can point
 	// at the other engine's image than RERANK_ENGINE selected (e.g. desired
@@ -828,15 +823,32 @@ func (c *Client) StartBackendSDK(backend, model string, gpuCount int, overrides 
 
 	// The image: local if the controller vouches for it, else over the
 	// artifact rail; never a registry pull for our own images (image_source.go).
+	ctx = withRailOnly(ctx, choice.RailOnly)
 	if err := ensureImageFn(ctx, c, spec.Image); err != nil {
 		return fmt.Errorf("backend %s image: %w", backend, err)
 	}
 
-	// Model-weight store (delivery layer): if the controller store is
-	// configured, copy the placed model's weights from it into this node's HF
-	// cache before the backend starts, then run offline. Best-effort — a miss
-	// falls through to a normal HF download. GGUF/Ollama use other paths.
-	if c.preseedModel(ctx, backend, model) {
+	// Model-weight store (delivery layer): copy the placed model's weights
+	// from the controller's store into this node's HF cache before the
+	// backend starts, then run offline.
+	//
+	// On a PLACED node (NOO_MODEL_CACHE_URL set: it takes its weights from the
+	// controller) the run is ALWAYS offline and holds no Hugging Face token: a
+	// store miss is an explained refusal, never a WAN download from
+	// huggingface.co. The weights a node runs are the ones the controller
+	// holds, and a mis-staged cache shows up as a refusal `noo cluster
+	// verify` names instead of a multi-GB download that hides it. A node with
+	// no store configured (the controller's own agent, a dev box) keeps the
+	// old behaviour: online on a miss, the token passed through.
+	if hfBackend(backend) && placedNode() && !isGGUFModel(model) {
+		hit := c.preseedModel(ctx, backend, model)
+		if !hit && model != "" && !hfRepoCachedLocally(model) {
+			return &ModelNotStagedError{Backend: backend, Model: model}
+		}
+		envOverrides["HF_HUB_OFFLINE"] = "1"
+		envOverrides["HF_TOKEN"] = ""
+		envOverrides["HUGGING_FACE_HUB_TOKEN"] = ""
+	} else if c.preseedModel(ctx, backend, model) {
 		envOverrides["HF_HUB_OFFLINE"] = "1"
 	}
 	// GGUF weights (llama.cpp) are a flat file; copy from the store if present.
@@ -1319,7 +1331,7 @@ func fetchArtifactManifest(ctx context.Context, kind, name string) *artifactMani
 	}
 	if secret := nodeconfig.Load().ClusterSecret; secret != "" {
 		nodeID := os.Getenv("NODE_ID")
-		req.Header.Set("Authorization", "Bearer "+auth.CreateClusterToken(nodeID, secret))
+		auth.SetClusterAuth(req, nodeID, secret)
 	}
 	transport, err := nodeconfig.Load().HTTPTransport()
 	if err != nil {
@@ -1820,4 +1832,36 @@ func ExpectsGGUFModel(backend string) bool {
 	default:
 		return false
 	}
+}
+
+// hfBackend: backends that load an HF repo id (vs a flat GGUF / ollama tag).
+func hfBackend(backend string) bool {
+	switch backend {
+	case "vllm", "embedding", "reranker":
+		return true
+	}
+	return false
+}
+
+func isGGUFModel(model string) bool { return strings.HasSuffix(strings.ToLower(model), ".gguf") }
+
+func placedNode() bool { return preseed.Placed() }
+
+// hfRepoCachedLocally: the node's HF cache already holds a snapshot of the
+// repo (preseeded earlier, the controller briefly unreachable now).
+func hfRepoCachedLocally(model string) bool {
+	snaps := filepath.Join(resolveEnv(hfCacheSource), "hub", preseed.RepoCacheDir(model), "snapshots")
+	entries, err := os.ReadDir(snaps)
+	return err == nil && len(entries) > 0
+}
+
+// ModelNotStagedError: a placed node could not get the model from the
+// controller's store and will not download it from the internet.
+type ModelNotStagedError struct{ Backend, Model string }
+
+func (e *ModelNotStagedError) Error() string {
+	return fmt.Sprintf("model_cache_miss: %s needs %s, which is not in the controller's model store, and a placed node never downloads weights "+
+		"from huggingface.co. Stage it on the controller (run the model once there, or `HF_HOME=$HF_CACHE_DIR huggingface-cli download %s` on the controller), "+
+		"then check `noo cluster verify` (model cache row) and that this node's NOO_MODEL_CACHE_URL is https://<controller>:8443",
+		e.Backend, e.Model, e.Model)
 }

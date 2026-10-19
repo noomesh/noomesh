@@ -304,6 +304,10 @@ async def _graph_context_for(
     return {"hypotheses": hypotheses, "seed_entities": seeds}, None
 
 
+#: The tiers a shared room (group chat / space) may draw on: shared knowledge only.
+SHARED_ROOM_ROLES = ("company", "system")
+
+
 @worker_handler("worker.rag.context")
 async def _rag_context(request: dict) -> Any:
     """Lightweight retrieval-only RAG for context injection (no LLM synthesis).
@@ -365,15 +369,21 @@ async def _rag_context(request: dict) -> Any:
     # the header, if any, is NOT used here — an internal loop carrying
     # `kb:unrestricted` must not make an end-user's injected context
     # corpus-wide.
-    roles = _resolve_kb_roles(
-        {
-            "_requester": {"sub": user_id, "scopes": ["read"]},
-            bus_principal.PRINCIPAL_KEY: bus_principal.Principal(
-                sub=user_id, kind="user", role="user", scopes=["read"]
-            ),
-        },
-        grants=grants,
-    )
+    resolve_params: dict = {
+        "_requester": {"sub": user_id, "scopes": ["read"]},
+        bus_principal.PRINCIPAL_KEY: bus_principal.Principal(
+            sub=user_id, kind="user", role="user", scopes=["read"]
+        ),
+    }
+    if request.get("shared_room") is True:
+        # A turn in a group chat or shared space: the reply is posted to the
+        # whole room, so it may only draw on what the whole room may read.
+        # The gateway sets this flag; it can only NARROW (an explicit `roles`
+        # is clamped to the caller's own set by the resolver), so a forged
+        # flag costs the forger context, never gains any. Own-user tier,
+        # granted team tiers and the legacy tiers are dropped.
+        resolve_params["roles"] = list(SHARED_ROOM_ROLES)
+    roles = _resolve_kb_roles(resolve_params, grants=grants)
 
     try:
         # Use retriever.retrieve() — does embed → pages → chunks → evidence

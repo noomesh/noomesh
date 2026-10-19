@@ -98,6 +98,50 @@ pub async fn request_with_timeout(
 
     let value: Value = serde_json::from_slice(&response.payload)?;
 
+    reply_result(subject, value)
+}
+
+/// A worker refused the request on purpose: a policy or request-validity
+/// decision, not an outage. Carried as the `Err` payload so a route can
+/// answer a 4xx (retrying will never help) instead of the 503 that means
+/// "try again later". Only a worker that sends the structured `error_kind`
+/// field produces this; an older worker sends none and keeps today's 503.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRefusal {
+    pub kind: RefusalKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// `policy_refusal`: the request is not permitted (path confinement).
+    Policy,
+    /// `invalid_request`: the request is malformed or names something absent.
+    Invalid,
+}
+
+impl RefusalKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "policy_refusal" => Some(Self::Policy),
+            "invalid_request" => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkerRefusal {}
+
+/// Turn a decoded worker reply into the caller's `Result`. Split from
+/// [`request_with_timeout`] so the success:false contract is testable without
+/// a bus.
+pub(crate) fn reply_result(subject: &str, value: Value) -> Result<Value> {
     // Check for worker-level errors. The worker pool's catch-all fallback
     // reports failures as {"success": false, "data": {"error": ...}} — the
     // error nested under `data` — so any success:false reply is an error,
@@ -110,7 +154,17 @@ pub async fn request_with_timeout(
             .and_then(|e| e.as_str())
             .or_else(|| value.get("data").and_then(|d| d.get("error")).and_then(|e| e.as_str()))
             .unwrap_or("worker reported success=false with no error message");
-        return Err(anyhow::anyhow!("Worker error on {subject}: {err}"));
+        let message = format!("Worker error on {subject}: {err}");
+        // A structured kind (never message text) marks a deliberate refusal.
+        let kind = value
+            .get("error_kind")
+            .or_else(|| value.get("data").and_then(|d| d.get("error_kind")))
+            .and_then(|k| k.as_str())
+            .and_then(RefusalKind::parse);
+        if let Some(kind) = kind {
+            return Err(anyhow::Error::new(WorkerRefusal { kind, message }));
+        }
+        return Err(anyhow::anyhow!(message));
     }
 
     Ok(value)

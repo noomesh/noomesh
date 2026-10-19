@@ -737,6 +737,7 @@ fn parse_labels(content: &str, labels: &[String], multi: bool) -> Option<Vec<Val
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(consumer): Extension<Consumer>,
+    headers: axum::http::HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
@@ -745,7 +746,7 @@ async fn chat_completions(
         return forbidden(&state, &consumer, EP, "chat", started);
     }
     let (_, actor) = super::inference::bind_identity(None, None, Some(&consumer), None, "external");
-    match raw_chat::chat_completions(&state, &mut body, "external", actor).await {
+    match raw_chat::chat_completions(&state, &mut body, "external", actor, &raw_chat::pin_headers(&headers)).await {
         Ok(Outcome::Stream { resp, served, usage, guard }) => {
             // Usage isn't available without parsing the SSE stream — audit the
             // envelope with null units (documented behaviour).
@@ -852,7 +853,8 @@ async fn do_chat_nonstream(
     }
     let mut chat_body = input.clone();
     chat_body["stream"] = json!(false);
-    match raw_chat::chat_completions(state, &mut chat_body, "external", actor).await? {
+    // A `node` field in `input` pins the node, as on the streaming route.
+    match raw_chat::chat_completions(state, &mut chat_body, "external", actor, &raw_chat::PinHeaders::default()).await? {
         Outcome::Json { data, served } => {
             let units = data.get("usage").cloned();
             Ok((data, units, served))

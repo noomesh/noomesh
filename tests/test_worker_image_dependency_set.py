@@ -56,6 +56,20 @@ def _installed_extras(dockerfile: str) -> set[str]:
     return found
 
 
+LOCK_REF = "docker/core-lock/requirements.txt"
+
+
+def _image_reqs(dockerfile: str) -> list[Requirement]:
+    """What the image installs: its hash lock when it installs from one
+    (deps-core, `--require-hashes`), else the extras closure from pyproject."""
+    text = (ROOT / dockerfile).read_text()
+    if LOCK_REF in text:
+        names = re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==", (ROOT / LOCK_REF).read_text(), re.M)
+        assert names, f"{LOCK_REF} names no pinned package"
+        return [Requirement(n) for n in names]
+    return _closure(_installed_extras(dockerfile))
+
+
 def _provides_greenlet(reqs: list[Requirement]) -> bool:
     for r in reqs:
         if r.name == "greenlet":
@@ -81,7 +95,7 @@ def test_each_image_install_line_was_parsed() -> None:
 
 def test_every_image_that_installs_noomesh_gets_greenlet() -> None:
     for df in INSTALLERS:
-        reqs = _closure(_installed_extras(df))
+        reqs = _image_reqs(df)
         if not any(r.name == "sqlalchemy" for r in reqs):
             continue  # image has no SQLAlchemy at all
         assert _provides_greenlet(reqs), (
@@ -92,7 +106,7 @@ def test_every_image_that_installs_noomesh_gets_greenlet() -> None:
 
 def test_worker_image_closure_has_sqlalchemy_asyncio() -> None:
     """The worker FROMs deps-core: pin that the db tier is in it at all."""
-    reqs = _closure(_installed_extras("docker/Dockerfile.deps-core"))
+    reqs = _image_reqs("docker/Dockerfile.deps-core")
     assert any(r.name == "sqlalchemy" for r in reqs), "deps-core lost its db tier"
     assert _provides_greenlet(reqs)
 

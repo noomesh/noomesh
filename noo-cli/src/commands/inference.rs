@@ -7,8 +7,8 @@ use crate::http::post_json;
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-/// `noo inference run <prompt> [-m MODEL] [-b BACKEND] [--node ID]
-///  [--max-tokens N] [--temperature F]`
+/// `noo inference run <prompt> [-m MODEL] [-b BACKEND] [--node ID
+///  [--strict-node]] [--max-tokens N] [--temperature F]`
 /// POST /api/inference — same contract as the Python inference_cli command.
 pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut prompt: Option<String> = None;
@@ -21,6 +21,7 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             "--backend" | "-b" => body["backend"] = iter.next().ok_or(Unhandled)?.as_str().into(),
             "--user" | "-u" => user = Some(iter.next().ok_or(Unhandled)?.to_string()),
             "--node" | "-n" => body["node"] = iter.next().ok_or(Unhandled)?.as_str().into(),
+            "--strict-node" => body["node_strict"] = true.into(),
             "--max-tokens" => {
                 body["max_tokens"] =
                     iter.next().and_then(|v| v.parse::<u64>().ok()).ok_or(Unhandled)?.into()
@@ -67,6 +68,12 @@ pub fn inference_run(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         .or_else(|| resp["response"].as_str())
         .or_else(|| resp["text"].as_str())
         .unwrap_or_default();
+    // `-n` is a preference: say when another node answered.
+    if let Some(node) = resp["data"]["requested_node"].as_str() {
+        let model = resp["data"]["model"].as_str().unwrap_or("another model");
+        let why = resp["data"]["node_unavailable"].as_str().unwrap_or("unavailable");
+        ui::warned(&format!("answered by {model} — {node} could not: {why}"));
+    }
     println!("{text}");
     Ok(0)
 }

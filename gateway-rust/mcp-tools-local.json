@@ -726,81 +726,6 @@
       "aliases": {},
       "auth": "cluster",
       "body_field": "",
-      "description": "Approve a pending exec approval request.",
-      "had_custom_format": false,
-      "input_schema": {
-        "description": "Approve a pending exec approval request.",
-        "properties": {
-          "request_id": {
-            "description": "ID of the approval request to approve",
-            "title": "Request Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id"
-        ],
-        "title": "PaiApprovalApprove",
-        "type": "object"
-      },
-      "method": "POST",
-      "name": "noo_approval_approve",
-      "path": "/api/approval/{request_id}/approve",
-      "risk_level": "medium",
-      "tags": [
-        "approval",
-        "security"
-      ],
-      "timeout_secs": 30
-    },
-    {
-      "aliases": {},
-      "auth": "cluster",
-      "body_field": "",
-      "description": "Deny a pending exec approval request.",
-      "had_custom_format": false,
-      "input_schema": {
-        "description": "Deny a pending exec approval request.",
-        "properties": {
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Reason for denying the request",
-            "title": "Reason"
-          },
-          "request_id": {
-            "description": "ID of the approval request to deny",
-            "title": "Request Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id"
-        ],
-        "title": "PaiApprovalDeny",
-        "type": "object"
-      },
-      "method": "POST",
-      "name": "noo_approval_deny",
-      "path": "/api/approval/{request_id}/deny",
-      "risk_level": "medium",
-      "tags": [
-        "approval",
-        "security"
-      ],
-      "timeout_secs": 30
-    },
-    {
-      "aliases": {},
-      "auth": "cluster",
-      "body_field": "",
       "description": "List pending exec approval requests waiting for human review.",
       "had_custom_format": true,
       "input_schema": {
@@ -3001,8 +2926,14 @@
               }
             ],
             "default": null,
-            "description": "Pin to a specific cluster node by id (e.g. 'host9') \u2014 sends the prompt to the model running ON that node instead of auto-routing. Use when the user addresses a particular node ('ask host9 ...').",
+            "description": "Prefer a specific cluster node by id (e.g. 'host9') \u2014 sends the prompt to the model running ON that node first; if it cannot answer, the mesh does and the result says so. Use when the user addresses a particular node ('ask host9 ...').",
             "title": "Node"
+          },
+          "node_strict": {
+            "default": false,
+            "description": "With node: answer from that node ONLY, never another (locality or privacy). Fails when the node cannot answer.",
+            "title": "Node Strict",
+            "type": "boolean"
           },
           "prompt": {
             "description": "The prompt to send for inference",

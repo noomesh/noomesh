@@ -108,6 +108,10 @@ type Reporter struct {
 	// broken. nil = this agent has no messaging at all.
 	busStatus func() any
 
+	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
+	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
+	gpuContention func() any
+
 	// Capabilities as reported at registration, echoed on EVERY heartbeat.
 	//
 	// These used to be sent once, at Register, and the controller kept them
@@ -238,6 +242,17 @@ func (r *Reporter) SetHostdState(f func() map[string]any) { r.hostdState = f }
 // heartbeat as `log_ship`.
 func (r *Reporter) SetLogShipState(f func() map[string]any) { r.logShipState = f }
 
+// SetGPUContention installs the shared-GPU yield reporter, echoed on
+// registration and every heartbeat as `gpu_contention`.
+func (r *Reporter) SetGPUContention(f func() any) { r.gpuContention = f }
+
+func (r *Reporter) gpuContentionReport() any {
+	if r.gpuContention == nil {
+		return nil
+	}
+	return r.gpuContention()
+}
+
 // SetBusStatus installs the NATS status provider whose value is echoed on
 // every heartbeat as `nats_status`.
 func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
@@ -305,6 +320,9 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 	payload["model_presence"] = modelpresence.Report()
 	if ms := r.modelStats(); len(ms) > 0 {
 		payload["model_stats"] = ms
+	}
+	if gc := r.gpuContentionReport(); gc != nil {
+		payload["gpu_contention"] = gc
 	}
 	setDialableAddress(payload, hostIP, selfURL)
 
@@ -614,6 +632,14 @@ func (r *Reporter) SendHeartbeat() {
 		payload["model_stats"] = ms
 	}
 
+	// Shared-GPU contention (internal/gpuyield): is something outside
+	// noomesh using the GPU, and are our GPU backends paused for it. The
+	// node stays online while yielded — this is how the controller learns
+	// WHY its backend is gone. Omitted only when the yield is not wired.
+	if gc := r.gpuContentionReport(); gc != nil {
+		payload["gpu_contention"] = gc
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		r.noteOutcome(clk, fmt.Errorf("heartbeat marshal failed: %w", err))
@@ -717,8 +743,7 @@ func (r *Reporter) Run(ctx context.Context) {
 
 func (r *Reporter) setAuthHeader(req *http.Request) {
 	if r.cfg.ClusterSecret != "" {
-		token := auth.CreateClusterToken(r.cfg.NodeID, r.cfg.ClusterSecret)
-		req.Header.Set("Authorization", "Bearer "+token)
+		auth.SetClusterAuth(req, r.cfg.NodeID, r.cfg.ClusterSecret)
 	}
 }
 
@@ -941,3 +966,8 @@ func servedCertNotAfter(certPath string) int64 {
 	})
 	return servedCertExpiry
 }
+
+// UsableHostIP returns ip when it is an address the controller could dial
+// (not loopback, unspecified, link-local or multicast), else "". The API
+// listener uses it to decide whether it knows where to bind.
+func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }

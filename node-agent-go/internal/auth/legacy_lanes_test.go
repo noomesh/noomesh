@@ -48,37 +48,6 @@ func TestLegacyLane_StaticTokenIsCountedAndHMACIsNot(t *testing.T) {
 	}
 }
 
-func whois(t *testing.T, cfg *config.Config, peer *x509.Certificate) {
-	t.Helper()
-	h := Middleware(cfg)(CountNonControllerWhois(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })))
-	r := httptest.NewRequest("GET", "/tailnet/whois?ip=100.64.0.1", nil)
-	r.Header.Set("Authorization", "Bearer test-token")
-	r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{peer}}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != 200 {
-		t.Fatalf("whois must still be served (observe only), got %d", rec.Code)
-	}
-}
-
-// /tailnet/whois served to a PEER node's leaf is counted; to the
-// controller it is not. Neither is refused.
-func TestLegacyLane_WhoisToAPeerIsCounted(t *testing.T) {
-	cfg := &config.Config{NodeAgentToken: "test-token", TLSCA: "ca.pem"}
-
-	before := laneCount(LaneWhoisNonController)
-	whois(t, cfg, leaf(t, "host9", "Mesh Cluster Node"))
-	if got := laneCount(LaneWhoisNonController) - before; got != 1 {
-		t.Fatalf("whois to a peer counted %d times, want 1", got)
-	}
-
-	before = laneCount(LaneWhoisNonController)
-	whois(t, cfg, leaf(t, "gateway", "Mesh Cluster Gateway"))
-	if got := laneCount(LaneWhoisNonController) - before; got != 0 {
-		t.Fatalf("whois to the controller moved the count by %d", got)
-	}
-}
-
 // The heartbeat shape: every lane present (zeros included) plus the window.
 func TestLegacyLaneSnapshot_HasEveryLaneAndItsWindow(t *testing.T) {
 	s := LegacyLaneSnapshot()

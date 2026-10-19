@@ -1302,7 +1302,7 @@ fn short_name(d: &Value) -> String {
 /// promote --yes'` — the last `ssh` spawn left in this crate, missed by
 /// tests/test_no_controller_ssh.py because that guard greps for
 /// `Command::new("ssh")` and this one went through `spawn_inherited`. It also
-/// assumed a repo checkout at ~/pai-assistant that enrolment stopped
+/// assumed a repo checkout at ~/pai-assistant that enrollment stopped
 /// creating. The controller\u{2192}node SSH lane was removed 2026-09-11; the
 /// promotion is now an explicit step the operator runs ON the target, and
 /// `--promoted` is how they tell this command they have done it.
@@ -1466,7 +1466,7 @@ pub fn cluster_set_primary(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     //    controller has no SSH key, no container mounts one, and every mesh
     //    rail runs through a node-agent that a standby controller's Postgres
     //    does not sit behind. Refusing is the honest outcome — the previous
-    //    behaviour (ssh into ~/pai-assistant) broke the day enrolment
+    //    behaviour (ssh into ~/pai-assistant) broke the day enrollment
     //    stopped leaving a checkout there, and reported the role moved.
     if !promoted {
         let ip = target_ip.as_deref().unwrap_or("<target-ip>");

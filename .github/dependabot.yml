@@ -36,6 +36,24 @@ updates:
         update-types:
           - minor
           - patch
+  # The hash-locked install set the shipped image uses
+  # (docker/core-lock/requirements.txt, installed with --require-hashes). Dependabot
+  # bumps the pins here; regenerate the hashes with the command in the file's
+  # header before merging a bump (a pin without matching hashes fails the image
+  # build, which is the point).
+  - package-ecosystem: pip
+    directory: "/docker/core-lock"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      pip-lock-minor-patch:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: pip
     directory: "/packages/noo-gateway-client"
     target-branch: dev

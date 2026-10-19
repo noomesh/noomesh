@@ -38,6 +38,8 @@ ENV NODE_ID=auto CONTROLLER_URL=https://gateway:8080 NODE_TIER=4 GPU_MODEL="" HE
 EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s \
     CMD ["/usr/local/bin/noo-node-agent", "-healthcheck"]
+# Root ON PURPOSE, as in Dockerfile.node-agent-go (Docker socket, host mounts,
+# the 0600 node key): the opt-in containerised agent lane on ARM edge nodes.
 USER 0
 ENTRYPOINT []
 CMD ["sh", "-c", "[ -x /opt/inject-ca.sh ] && . /opt/inject-ca.sh; exec noo-node-agent"]

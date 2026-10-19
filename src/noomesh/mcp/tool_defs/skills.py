@@ -156,33 +156,10 @@ class PaiApprovalStats(ToolDef):
     tags: ClassVar[List[str]] = ["approval", "security"]
 
 
-@register
-class PaiApprovalApprove(ToolDef):
-    """Approve a pending exec approval request."""
-
-    name: ClassVar[str] = "noo_approval_approve"
-    description: ClassVar[str] = __doc__
-    method: ClassVar[HttpMethod] = HttpMethod.POST
-    path: ClassVar[str] = "/api/approval/{request_id}/approve"
-    tags: ClassVar[List[str]] = ["approval", "security"]
-    risk_level: ClassVar[RiskLevel] = RiskLevel.MEDIUM
-
-    request_id: str = Field(description="ID of the approval request to approve")
-
-
-@register
-class PaiApprovalDeny(ToolDef):
-    """Deny a pending exec approval request."""
-
-    name: ClassVar[str] = "noo_approval_deny"
-    description: ClassVar[str] = __doc__
-    method: ClassVar[HttpMethod] = HttpMethod.POST
-    path: ClassVar[str] = "/api/approval/{request_id}/deny"
-    tags: ClassVar[List[str]] = ["approval", "security"]
-    risk_level: ClassVar[RiskLevel] = RiskLevel.MEDIUM
-
-    request_id: str = Field(description="ID of the approval request to deny")
-    reason: Optional[str] = Field(default=None, description="Reason for denying the request")
+# noo_approval_approve / noo_approval_deny are deliberately NOT tools. An approval
+# decision is a human's: a model that could call them could approve its own
+# High-risk call. Humans decide in the dashboard, with `noo approval`, or from a
+# linked channel; the routes also refuse any agent, harness or MCP-door credential.
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -235,6 +235,20 @@ def _audit_principal_refusal(subject: str, exc: Exception) -> None:
         pass
 
 
+def error_reply(e: Exception) -> dict:
+    """The bus reply for a handler that raised.
+
+    A handler that REFUSED on purpose names the kind (structured, never
+    message text) so the gateway can answer a 4xx rather than a 503. An old
+    gateway ignores the extra key; an old worker never sends it.
+    """
+    response = {"success": False, "error": str(e)}
+    kind = getattr(e, "error_kind", None)
+    if isinstance(kind, str):
+        response["error_kind"] = kind
+    return response
+
+
 async def _handle_request(msg) -> None:
     """Inner request handler — parses, dispatches to the registered
     handler, publishes the reply. Always awaited from one of the
@@ -285,7 +299,7 @@ async def _handle_request(msg) -> None:
         response = {"success": True, "data": result}
     except Exception as e:
         log.warning("worker.handler_error", subject=subject, error=str(e))
-        response = {"success": False, "error": str(e)}
+        response = error_reply(e)
 
     if msg.reply:
         await msg.respond(json.dumps(response).encode())

@@ -842,7 +842,9 @@ jobs:
         run: echo "retagged-from:${RC_TAG}@${RC_COMMIT}" | tee digests/retagged-from
 
       # Third-party images the stack runs straight from their upstream
-      # registry by a FIXED compose tag (today: ollama). Their index digest is
+      # registry by a FIXED compose tag (ollama, nats, nginx, redis, loki,
+      # prometheus, alertmanager, grafana, node-exporter, TEI, vLLM; the DHI
+      # ones resolve from the ghcr.io/noomesh/dhi mirror). Their index digest is
       # resolved from that tag NOW and becomes an ordinary `<name>@sha256:`
       # row, so `noo upgrade --stack` pulls them by digest and skips them when
       # unchanged (2026-10-15: `ollama/ollama:latest` re-pulled 91.6 s on
@@ -852,8 +854,12 @@ jobs:
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
           DHI_TOKEN: ${{ secrets.DHI_TOKEN }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          # The DHI mirror under ghcr.io/noomesh/dhi (packages: read on this job).
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin \
+            || echo "::warning::ghcr.io login failed - resolving the DHI mirror anonymously"
           # Authenticated Hub reads when the account is configured (higher
           # limit); anonymous otherwise: this is a handful of manifest reads.
           if [ -n "${DHI_TOKEN:-}" ] && [ -n "${DHI_USERNAME:-}" ]; then
@@ -861,6 +867,10 @@ jobs:
               || echo "::warning::docker.io login failed - resolving anonymously"
           fi
           python3 scripts/stack-lock-third-party.py rows --out digests
+          # The newest mesh migration this release's gateway knows, read from
+          # the checked-out source in a step that holds no signing seed; the
+          # signing step only copies it into the lock (see "Assemble + sign").
+          scripts/mesh-migration-head.sh > mesh-migration-head.txt
 
       # THE ONE JOB THAT MUST NOT BE COMPROMISED, and until 2026-09-04 it was
       # the softest. Signing needs a CLI with the `security release-sign` verb
@@ -946,7 +956,18 @@ jobs:
         run: |
           set -eu
           [ -n "${NOO_RELEASE_SIGNING_SEED:-}" ] || { echo "::error::NOO_RELEASE_SIGNING_SEED is not set — refusing an unsigned lock"; exit 1; }
-          cat digests/* | sort > "stack-$TAG.lock"
+          # The first line binds the lock to THIS tag inside the signed
+          # bytes: `noo upgrade --stack` refuses a lock whose line is not the
+          # tag it fetched, so a validly signed lock of an older release
+          # replayed under a newer tag is caught (lib-dist.sh reads it too).
+          # The second line is the newest mesh migration this release's
+          # gateway knows. `noo upgrade --stack` refuses a rollback TO this
+          # release when the database is stamped beyond it (the gateway would
+          # refuse to start). Inside the signed bytes, so a mirror cannot
+          # understate it.
+          head="$(cat mesh-migration-head.txt)"
+          case "$head" in [0-9][0-9][0-9]_*) ;; *) echo "::error::mesh-migration-head.txt is not a revision id: $head"; exit 1 ;; esac
+          { echo "# stack $TAG"; echo "# mesh-migration-head $head"; cat digests/* | sort; } > "stack-$TAG.lock"
           echo "== stack-$TAG.lock =="; cat "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-sign "stack-$TAG.lock"
           ./noo-x86_64-unknown-linux-gnu security release-verify "stack-$TAG.lock"

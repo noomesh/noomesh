@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -59,6 +60,11 @@ type Server struct {
 	// reported as "unavailable", never as connected.
 	busStatus func() BusStatus
 
+	// DetectBindIP answers "what address does the controller reach this node
+	// on" (heartbeat.DetectHostIP). nil = unknown, which binds every
+	// interface. Set by the agent before ListenAndServe.
+	DetectBindIP func() string
+
 	// mcp is the external-MCP supervisor: tool calls
 	// from the controller land on it, and /health lists what is live. nil
 	// until the agent installs it; a call then answers 503, never a panic.
@@ -69,6 +75,10 @@ type Server struct {
 	// the controller treats as unknown, the same skew contract as
 	// `available`.
 	gpuWatch func() any
+	// gpuHold / gpuRelease drive the shared-GPU yield's operator hold
+	// (internal/gpuyield). nil = not wired; the routes then answer 503.
+	gpuHold    func(ctx context.Context, reason string) any
+	gpuRelease func() any
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
 
@@ -136,6 +146,12 @@ func (s *Server) SetBusStatus(f func() BusStatus) { s.busStatus = f }
 
 // SetGPUWatch installs the GPU watchdog state provider (GPU nodes only).
 func (s *Server) SetGPUWatch(f func() any) { s.gpuWatch = f }
+
+// SetGPUHold installs the shared-GPU hold/release operations
+// (`noo cluster gpu hold|release`, via the gateway).
+func (s *Server) SetGPUHold(hold func(ctx context.Context, reason string) any, release func() any) {
+	s.gpuHold, s.gpuRelease = hold, release
+}
 
 // SetDiskReclaim installs the node disk-reclaim state provider.
 func (s *Server) SetDiskReclaim(f func() any) { s.diskReclaim = f }
@@ -227,12 +243,15 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("POST /pull", ctrlMW(http.HandlerFunc(s.handlePull)))
 	s.mux.Handle("POST /clean", ctrlMW(http.HandlerFunc(s.handleClean)))
 	s.mux.Handle("GET /gpu", ctrlMW(http.HandlerFunc(s.handleGPUMetrics)))
-	// Tailnet identity plane: whois + dialback for
-	// tailnet-native enrollment — only meaningful on the controller's
-	// self-agent, but harmless everywhere (authMW-gated, CGNAT-restricted).
-	// Counted when served to a non-controller leaf — the
-	// evidence for moving it behind ctrlMW.
-	s.mux.Handle("GET /tailnet/whois", leafMW(auth.CountNonControllerWhois(http.HandlerFunc(s.handleTailnetWhois))))
+	s.mux.Handle("POST /gpu/hold", ctrlMW(http.HandlerFunc(s.handleGPUHold)))
+	s.mux.Handle("POST /gpu/release", ctrlMW(http.HandlerFunc(s.handleGPURelease)))
+	// Tailnet identity plane: whois + dialback for tailnet-native
+	// enrollment — only meaningful on the controller's self-agent. Both are
+	// the controller's: whois answers "who is this tailnet IP" for any IP
+	// it is asked about, which a peer node holding the fleet secret must not
+	// be able to enumerate (it was leaf-or-token only, counted as the
+	// whois_non_controller lane until nothing but the controller used it).
+	s.mux.Handle("GET /tailnet/whois", ctrlMW(http.HandlerFunc(s.handleTailnetWhois)))
 	s.mux.Handle("POST /tailnet/dialback", ctrlMW(http.HandlerFunc(s.handleTailnetDialback)))
 	s.mux.Handle("GET /metrics", metricsMW(http.HandlerFunc(s.handlePrometheusMetrics)))
 	s.mux.Handle("GET /logs/containers", ctrlMW(http.HandlerFunc(s.handleListLogContainers)))
@@ -338,17 +357,58 @@ func (s *Server) ListenAndServe() error {
 	if port == 0 {
 		port = 8081
 	}
-	addr := fmt.Sprintf(":%d", port)
-	server := &http.Server{
-		Addr:      addr,
-		Handler:   s.mux,
-		ErrorLog:  log.New(quietTLSLogger{}, "", 0),
-		TLSConfig: tlsCfg,
+	for {
+		detected := ""
+		if s.DetectBindIP != nil {
+			detected = s.DetectBindIP()
+		}
+		plan, err := PlanBind(s.cfg.AgentBind, detected)
+		if err != nil {
+			return err
+		}
+		lns, err := listenAll(plan.Hosts, port)
+		if err != nil {
+			return err
+		}
+		server := &http.Server{
+			Handler:   s.mux,
+			ErrorLog:  log.New(quietTLSLogger{}, "", 0),
+			TLSConfig: tlsCfg,
+		}
+		slog.Info("control API starting with TLS", "port", port, "bind", plan.Why, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
+		errc := make(chan error, len(lns))
+		for _, ln := range lns {
+			// Cert/key are already loaded into TLSConfig.Certificates.
+			go func(ln net.Listener) { errc <- server.ServeTLS(ln, "", "") }(ln)
+		}
+		if plan.Derived == "" {
+			return <-errc
+		}
+		// The derived address can move (DHCP, tailscale coming up after the
+		// agent). Follow it: a listener bound to a stale address would leave
+		// the node unreachable until someone restarts the agent.
+		moved := false
+		tick := time.NewTicker(bindRecheck)
+		for !moved {
+			select {
+			case err := <-errc:
+				tick.Stop()
+				_ = server.Close()
+				return err
+			case <-tick.C:
+				if now := s.DetectBindIP(); now != "" && now != plan.Derived {
+					slog.Warn("control API: the controller-reachable address changed; rebinding", "was", plan.Derived, "now", now)
+					moved = true
+				}
+			}
+		}
+		tick.Stop()
+		_ = server.Close()
 	}
-	slog.Info("control API starting with TLS", "addr", addr, "cert", s.cfg.TLSCert, "client_auth", "RequireAndVerifyClientCert")
-	// Cert/key are already loaded into TLSConfig.Certificates.
-	return server.ListenAndServeTLS("", "")
 }
+
+// bindRecheck is how often a derived bind address is re-detected.
+const bindRecheck = 60 * time.Second
 
 // ListenAndServeTLS starts with an externally provided TLS config.
 func (s *Server) ListenAndServeWithTLS(tlsCfg *tls.Config) error {

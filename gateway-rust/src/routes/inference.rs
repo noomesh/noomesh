@@ -164,10 +164,14 @@ struct InferenceRequest {
     /// Optional user ID for user-specific model preferences.
     #[serde(default)]
     user_id: Option<String>,
-    /// Pin to a specific node by node_id (bypasses model-based routing).
-    /// Used by `noo inference run --node <id>` for end-to-end liveness checks.
+    /// The node to try first (a preference: the pool answers when it
+    /// cannot, flagged `fallback`). `noo inference run --node <id>`.
     #[serde(default)]
     node: Option<String>,
+    /// Keep the request on `node` alone (no fallback into the pool), for
+    /// locality or privacy; `X-Noo-Node-Strict` does the same.
+    #[serde(default)]
+    node_strict: Option<bool>,
     /// `false` = raw model call: no coordinator, no context
     /// layers, no conversation row — the prompt is the only message, sent
     /// through the same resolver/proxy/accounting as `/v1/chat/completions`.
@@ -271,6 +275,7 @@ async fn native_inference(
     actor: Option<Extension<crate::auth::AuthActor>>,
     cluster: Option<Extension<crate::auth::ClusterNode>>,
     consumer: Option<Extension<Consumer>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InferenceRequest>,
 ) -> impl IntoResponse {
     let conversation_id = req.conversation_id
@@ -300,13 +305,24 @@ async fn native_inference(
     }
 
     // Node-pinned path: bypass coordinator + cache, proxy directly to a backend
-    // on the named node. Used for `noo inference run --node <id>` liveness checks.
+    // on the named node. Used for `noo inference run --node <id>`.
+    //
+    // A node is a PREFERENCE (operator, 2026-10-19): when it cannot answer,
+    // the request goes to the pool on the raw path below (context-free,
+    // like the pin) and the answer carries `fallback: true` and the node
+    // that was asked for. `node_strict` / `X-Noo-Node-Strict` keeps it on
+    // that node — locality or privacy — with the refusals below. A name
+    // that is no node of this mesh is a 404 either way.
     //
     // Leniency: small local models routinely put the node id in `model`
     // ("model": "host9") even when the tool schema says `node`. A model
     // string that exactly matches a live node id is unambiguous — real
     // model names look like "org/name" or "*.gguf" — so treat it as a pin.
-    let mut node_pin = req.node.clone();
+    // `X-Noo-Node` is the same pin as the body's `node` (the header wins),
+    // as on `/v1/chat/completions` and `/api/external/chat/completions`.
+    let pin = super::raw_chat::pin_headers(&headers);
+    let strict = pin.strict.or(req.node_strict).unwrap_or(false);
+    let mut node_pin = pin.node.clone().or_else(|| req.node.clone());
     let mut node_from_model = false;
     if node_pin.is_none() {
         if let Some(m) = req.model.as_deref() {
@@ -317,60 +333,77 @@ async fn native_inference(
             }
         }
     }
+    // The preferred node could not answer and the pin is not strict:
+    // (node, why). The pool answers on the raw path below.
+    let mut unmet: Option<(String, String)> = None;
     if let Some(node_id) = node_pin.as_deref() {
         // Resolve the node's inference backend INCLUDING the controller (self).
         // gossip.alive_peers() excludes self, so `--node HOST3` (the controller)
         // used to 404 even though it runs vllm/embedding locally.
         // node_chat_backend() reads the mesh_nodes KV (every node).
-        let (backend_type, model_name, base_url) = match node_chat_backend(&state, node_id).await {
-            NodeChat::Serves(bt, m, url) => (bt, m, url),
+        match node_chat_backend(&state, node_id).await {
+            NodeChat::Unknown => return (StatusCode::NOT_FOUND, Json(json!({
+                "success": false,
+                "error": format!("node '{}' not found or has no inference backend", node_id),
+            }))).into_response(),
             // Refused BEFORE dispatch: the node is there, it just serves no chat.
-            NodeChat::NoChat(msg) => return (NO_CHAT_STATUS, Json(json!({
+            NodeChat::NoChat(msg) if strict => return (NO_CHAT_STATUS, Json(json!({
                 "success": false,
                 "error": msg,
                 "code": "node_serves_no_chat",
                 "node": node_id,
             }))).into_response(),
-            NodeChat::Unknown => return (StatusCode::NOT_FOUND, Json(json!({
-                "success": false,
-                "error": format!("node '{}' not found or has no inference backend", node_id),
-            }))).into_response(),
-        };
+            NodeChat::NoChat(msg) => unmet = Some((node_id.to_string(), msg)),
+            NodeChat::Serves(backend_type, model_name, base_url) => {
+                // When the pin came from the model field, that value is a node id,
+                // not a model — use the backend's actual model name.
+                let model = if node_from_model { model_name } else { req.model.clone().unwrap_or(model_name) };
 
-        // When the pin came from the model field, that value is a node id,
-        // not a model — use the backend's actual model name.
-        let model = if node_from_model { model_name } else { req.model.unwrap_or(model_name) };
-
-        let started = std::time::Instant::now();
-        match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt).await {
-            Ok(text) => (StatusCode::OK, Json(json!({
-                "success": true,
-                "data": {
-                    "response": text,
-                    "node": node_id,
-                    "backend": backend_type,
-                    "model": model,
-                    "latency_ms": started.elapsed().as_millis(),
-                    "engine": "rust",
-                    "pinned": true,
-                },
-            }))).into_response(),
-            Err(e) if backend_cannot_chat(&e) => (NO_CHAT_STATUS, Json(json!({
-                "success": false,
-                "error": no_chat_refusal(node_id, &[(backend_type.clone(), model.clone())], &[]),
-                "code": "node_serves_no_chat",
-                "node": node_id,
-                "backend": backend_type,
-                "detail": e,
-            }))).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({
-                "success": false,
-                "error": e,
-                "node": node_id,
-                "backend": backend_type,
-            }))).into_response(),
+                let started = std::time::Instant::now();
+                match chat_completion_on_node(&backend_type, &model, &base_url, &req.prompt).await {
+                    Ok(text) => return (StatusCode::OK, Json(json!({
+                        "success": true,
+                        "data": {
+                            "response": text,
+                            "node": node_id,
+                            "backend": backend_type,
+                            "model": model,
+                            "latency_ms": started.elapsed().as_millis(),
+                            "engine": "rust",
+                            "pinned": true,
+                            "fallback": false,
+                        },
+                    }))).into_response(),
+                    Err(e) if strict && backend_cannot_chat(&e) => return (NO_CHAT_STATUS, Json(json!({
+                        "success": false,
+                        "error": no_chat_refusal(node_id, &[(backend_type.clone(), model.clone())], &[]),
+                        "code": "node_serves_no_chat",
+                        "node": node_id,
+                        "backend": backend_type,
+                        "detail": e,
+                    }))).into_response(),
+                    Err(e) if strict => return (StatusCode::BAD_GATEWAY, Json(json!({
+                        "success": false,
+                        "error": e,
+                        "node": node_id,
+                        "backend": backend_type,
+                    }))).into_response(),
+                    Err(e) => {
+                        if !backend_cannot_chat(&e) {
+                            // Rank it last for the pool too, as a stalled
+                            // raw-chat candidate is.
+                            crate::coordinator::classes::note_stall(&base_url, &backend_type);
+                        }
+                        unmet = Some((node_id.to_string(), e));
+                    }
+                }
+            }
         }
-    } else if req.context == Some(false) {
+        if let Some((n, why)) = &unmet {
+            tracing::warn!(node = %n, reason = %why, "inference_node_preference_unmet_pool_answers");
+        }
+    }
+    if unmet.is_some() || req.context == Some(false) {
         // Raw model call as this user. Auth lane is the
         // route's own (a user-door JWT opens it); the `chat` consumer scope
         // gates the `/v1/*` surface, not this one.
@@ -383,7 +416,8 @@ async fn native_inference(
             "api",
         );
         let mut body = json!({
-            "model": req.model.clone().unwrap_or_default(),
+            // A node id sent as `model` is not a model.
+            "model": if node_from_model { String::new() } else { req.model.clone().unwrap_or_default() },
             "messages": [{"role": "user", "content": req.prompt}],
         });
         if let Some(m) = req.max_tokens { body["max_tokens"] = json!(m); }
@@ -392,25 +426,30 @@ async fn native_inference(
         // Same class resolution and failover as `/v1/chat/completions`. This
         // is an operator surface (a user-door JWT opens it), so the error
         // carries the detail, not the general wording.
-        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor).await {
+        // A node pin reaches here only when the node could not answer and
+        // was not strict (`unmet`): the pool answers and says so.
+        match super::raw_chat::chat_completions(&state, &mut body, "api", usage_actor, &super::raw_chat::PinHeaders::default()).await {
             Ok(super::raw_chat::Outcome::Json { data, served }) => {
                 let text = data.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or("");
                 let (p, c) = crate::usage::usage_from_frame(&data).unwrap_or((0, 0));
-                (StatusCode::OK, Json(json!({
-                    "success": true,
-                    "data": {
-                        "response": text,
-                        "conversation_id": null,
-                        "model": served.model,
-                        "backend": served.backend_type,
-                        "class": served.class,
-                        "fallback": served.fallback,
-                        "elapsed_seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
-                        "usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c},
-                        "context": false,
-                        "engine": "rust",
-                    },
-                }))).into_response()
+                let mut out = json!({
+                    "response": text,
+                    "conversation_id": null,
+                    "model": served.model,
+                    "backend": served.backend_type,
+                    "class": served.class,
+                    "fallback": served.fallback,
+                    "elapsed_seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                    "usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c},
+                    "context": false,
+                    "engine": "rust",
+                });
+                if let Some((n, why)) = &unmet {
+                    out["fallback"] = json!(true);
+                    out["requested_node"] = json!(n);
+                    out["node_unavailable"] = json!(why);
+                }
+                (StatusCode::OK, Json(json!({"success": true, "data": out}))).into_response()
             }
             Ok(super::raw_chat::Outcome::Stream { .. }) => (StatusCode::BAD_REQUEST, Json(json!({
                 "success": false, "error": "stream is not supported on this route; use POST /api/inference/stream",
@@ -686,7 +725,7 @@ pub(crate) fn pick_chat_backend(
     let mut skipped = Vec::new();
     for bt in ["vllm", "ollama", "llamacpp"] {
         let Some(m) = running.get(bt).and_then(|m| m.as_str()).filter(|m| !m.is_empty()) else { continue };
-        if non_chat.contains(&(node_id.to_string(), bt.to_string())) {
+        if non_chat.contains(&(node_id.to_string(), bt.to_string())) || crate::coordinator::classes::is_embedding_model_name(m) {
             skipped.push((bt.to_string(), m.to_string()));
             continue;
         }
@@ -888,6 +927,7 @@ async fn openai_chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(consumer): Extension<Consumer>,
     cluster: Option<Extension<crate::auth::ClusterNode>>,
+    headers: axum::http::HeaderMap,
     Json(mut body): Json<Value>,
 ) -> axum::response::Response {
     // Per-consumer scope gate: a key scoped only to e.g. "embeddings" must not
@@ -906,7 +946,7 @@ async fn openai_chat_completions(
         "v1",
     );
     let requested = body.get("model").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-    match super::raw_chat::chat_completions(&state, &mut body, "v1", usage_actor).await {
+    match super::raw_chat::chat_completions(&state, &mut body, "v1", usage_actor, &super::raw_chat::pin_headers(&headers)).await {
         Ok(super::raw_chat::Outcome::Stream { resp, served, usage, guard }) => {
             tracing::info!(model_requested = %requested, class = %served.class, model_actual = %served.model, backend = %served.backend_type, stream = true, "openai_chat_completions_proxy");
             super::raw_chat::stream_response(*resp, &served, usage, guard)
@@ -952,7 +992,7 @@ async fn v1_responses(
         "v1",
     );
     use super::raw_chat::{self, Outcome};
-    let (class, cands) = match raw_chat::resolve_candidates(&state, requested_model_hint(&body)).await {
+    let (class, cands) = match raw_chat::resolve_candidates(&state, requested_model_hint(&body), None, false).await {
         Ok(r) => r,
         Err(e) => return e.into_response("v1"),
     };
@@ -1559,7 +1599,7 @@ mod catalogue_tests {
             }],
             aliases: vec![("quick".into(), "fast".into())],
         };
-        build_table(&nodes, &[], &decl, "google/gemma-4-12B-it-qat-w4a16-ct", "vllm")
+        build_table(&nodes, &[], &decl)
     }
 
     /// `/v1/responses` proxies natively to EVERY directly-reached vLLM of the

@@ -84,6 +84,12 @@ addons`); `--dry-run` writes nothing and ends `dry run complete — nothing
 was changed`. In `--ci` mode, existing postgres/redis/nats data makes the
 wizard **refuse** (exit 2) rather than onboard on top of it.
 
+Two skips leave security work undone, and the closing summary lists what
+was not applied. `--skip-security` forgoes secret minting, the admin
+account and the PKI/mTLS enrollment. `--skip-services` forgoes the stack
+start, the service keys and the hardened posture profile. `noo security
+scan` reports what each left behind.
+
 ### Check the host after setup
 
 ```sh
@@ -336,12 +342,12 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 ### `noo kiosk` — The unattended display's host seat: cage + Chromium showing /kiosk.html
 | Command | Arguments | What it does |
 |---|---|---|
-| `noo kiosk enroll` | `<blob> [--controller <https://…>] [--dry-run]` | Enrol this display as a kiosk seat (never a node); its CLI + assets then ride the rail |
+| `noo kiosk enroll` | `<blob> [--controller <https://…>] [--dry-run]` | Enroll this display as a kiosk seat (never a node); its CLI + assets then ride the rail |
 | `noo kiosk invite` | `<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]` | Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands |
 | `noo kiosk labels` | `on\|off\|status` | Controller: entity names on the kiosk graph (kiosk.graph_labels; audited, no restart) |
 | `noo kiosk reload` | — | Reload the page on the display and report the console build either side |
 | `noo kiosk seat-sync` | — | Hidden: the seat's sync tick, run by noo-seat-sync.timer as root (internal) |
-| `noo kiosk seat-token` | `<seat-name> [--ttl <1h\|30m\|secs>]` | Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>` |
+| `noo kiosk seat-token` | `<seat-name> [--ttl <1h\|30m\|secs>] [--controller <https://…>]` | Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>` |
 | `noo kiosk serve` | `[--port <n>]` | Hidden: the display's local proxy, run by kiosk-serve.service (internal) |
 | `noo kiosk setup` | `--mode dedicated\|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health\|graph] [--rotate <secs>] [--poll <secs>] [--quality lean\|full] [--browser <bin>] [--dry-run] [-y\|--yes]` | Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog |
 | `noo kiosk status` | — | Report the seat: units, mint, expiry, heartbeat, graph labels (no privilege needed) |

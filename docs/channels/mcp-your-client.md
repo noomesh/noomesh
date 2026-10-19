@@ -76,7 +76,7 @@ noo security service-key self-status    # do I have one? when was it last used?
 noo security service-key self-revoke    # kill it
 ```
 
-Changes reach the gateway within 60 s (the key cache TTL).
+Changes reach the gateway within 5 s (the key cache TTL); disabling or demoting the account takes effect at once. A key with no per-key `--rpm` is still metered on the MCP doors (600 requests per minute per key by default; the Redis counter falls back to a per-process one if Redis is down).
 
 You need a per-user CLI credential for these — `noo auth login <you>` first.
 The shared cluster credential is refused here on purpose: a self key is
@@ -169,7 +169,7 @@ noo security service-key issue alice-ops --scopes mcp:operator --user alice --no
 ```
 
 The bound account must hold the `admin` role, and that is re-checked on every
-call: demote or disable the account and the key stops within 60 s. Revoke one
+call: demote or disable the account and the key stops at once (the key cache itself is 5 s). Revoke one
 person with `noo security service-key revoke alice-ops` and nobody else is
 affected. There is no shared credential any more: `NOO_MCP_TOKEN` was retired
 on 2026-09-30 and the door refuses it. **If your client entry (for example
@@ -274,7 +274,7 @@ a key act with more authority than any human account.
 | Symptom | Cause |
 |---|---|
 | `401` | no bearer presented (operator door: also an unknown key or the retired `NOO_MCP_TOKEN`) |
-| `403 unknown or revoked key` | user door: key wrong, revoked or rotated out by a later `self` issue (allow up to 60 s after a change) |
+| `403 unknown or revoked key` | user door: key wrong, revoked or rotated out by a later `self` issue (allow up to 5 s after a change) |
 | `403 key lacks the 'mcp' scope` | an operator-issued key without `--scopes mcp` |
 | `403 this key is not bound to a user` | machine key, or the bound account is disabled — reissue with `--user` |
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | the direct `:8080` URL presents the cluster CA and this client does not trust it. For a **Node** client (Claude Code included) `noo security trust-ca` alone does nothing — Node ignores the OS store. Set `NODE_EXTRA_CA_CERTS` to the CA file, or use the `tailscale serve` URL on 443, which needs no CA |

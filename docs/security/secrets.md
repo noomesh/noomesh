@@ -614,6 +614,16 @@ written before then carry hash **v1** (bare hex), which covered only
 Editing a row without the key is detectable; that is the whole point, so
 the key is its own secret:
 
+- **The gateway does not start without it.** A missing or blank
+  `NOO_AUDIT_HMAC_KEY` is a boot refusal (exit 2, naming the fix), not a
+  gateway that serves while every audit row is refused. It cannot strand an
+  upgrade: `noo upgrade --stack` mints the key into `secrets/env.sops` before
+  anything else moves, and `noo stack start|restart|rebuild` mints it first if
+  it is still absent (an existing key is never rotated). An install with no
+  encrypted store is refused with the command that moves it onto one, and the
+  key is never written to plaintext `.env`. `noo security scan` reports a
+  missing key as CRITICAL and `noo cluster verify` fails its `audit key` row
+  (read locally, so it answers even when the gateway is down).
 - **It is the only signing key.** The gateway, the worker and the two
   knowledge add-ons (every process that writes audit rows) receive it as a
   file. A process without it REFUSES to write the row and logs
@@ -692,11 +702,97 @@ would need the previous value to sign a checkpoint, and nothing keeps it.
 Rows signed under the old value stop verifying. Rotate it deliberately,
 after a verify, and record when.
 
-The hash is per row, not a `prev_hash` chain: four processes write
-concurrently, so it detects an EDITED row (since v2, a re-timed or copied
-one too) and a row signed with the wrong key, not a row deleted from the
-middle of an epoch. The checkpoint's link
-does catch deletion of the derived-key epoch's newest rows.
+### The hash chain: deleted and reordered rows
+
+The per-row hash shows an EDITED row, not one that is simply gone. Since
+the chain landed every row is also **linked** to the one before it:
+`chain_seq` is a gapless counter and `chain_hash` is
+`HMAC(NOO_AUDIT_HMAC_KEY, seq, the previous row's chain_hash, this row's
+entry_hash)`. Delete a middle row and the sequence skips and the next
+row's link no longer follows; swap two rows and both fail. `noo security
+audit verify` reports the first break and names the row after the gap.
+
+- **One sealing writer, no sealer task.** All four writers (the gateway
+  and the three Python containers) take the same transaction-scoped
+  Postgres advisory lock, read the newest chained row, pick a time no
+  earlier than its, sign, insert and commit. The lock is released by
+  commit or rollback, so a crashed writer cannot wedge the log. The link is
+  made at insert because the application role cannot update a row later
+  (below).
+- **Where it starts.** On the first boot after the upgrade the gateway
+  appends one `audit_chain_genesis` row (seq 1). Its signed `resource`
+  carries the count of every earlier row and a keyed digest over their ids
+  and hashes. Rows before it are not re-written; deleting or swapping one
+  of them changes the digest, which the verify recomputes. A row written
+  unchained by an old-image container within 15 minutes of the genesis is a
+  warning; later, it fails.
+- **Partitions and retention.** `chain_seq` runs across monthly partitions.
+  Before the retention job drops a month it writes a signed, chained
+  `audit_retention_checkpoint` row naming the dropped `from..through` seq
+  range and the `chain_hash` of the last dropped row; the verify reads
+  a gap that exactly such a checkpoint covers as retention, not tampering,
+  and says how many rows retention removed. The job stops if it cannot
+  write the checkpoint, and the database's drop function refuses a
+  partition whose chained rows have none (so a retention job from an old
+  worker image retains rather than drops).
+- **What it cannot show.** Cutting off the NEWEST rows leaves a shorter,
+  valid chain. `verify` prints the chain head (`seq` and `chain_hash`):
+  record it where the database owner cannot write (a ticket, a signed
+  message) and compare it later. The verifier holds the key the writers
+  hold, so the chain proves the log is intact, not who held the key.
+- **No key, no judgement.** Without `NOO_AUDIT_HMAC_KEY` the verify reports
+  the chain as *not checked*. Rows that exist with none chained yet (the
+  genesis failed or the gateway has not restarted) fail the verify and say so.
+
+### The application role is INSERT-only
+
+The gateway and the Python writers connect as `noo_app`. Since the chain
+landed that role holds INSERT and SELECT on `noo_security_audit` and
+**no UPDATE, DELETE or TRUNCATE**, on the table and on every partition.
+The owner (`noo`, which runs migrations) is unchanged and creates
+partitions through `noo_ensure_audit_partition`, which revokes the same on
+each new one (default privileges would otherwise give the app role full
+DML on it). The routine `GRANT ... ON ALL TABLES` that runs on every
+migration pass would undo the revoke, so the gateway re-asserts it as the
+last step of each pass. Retention still runs as the owner through the
+`SECURITY DEFINER` function `noo_drop_audit_partition`.
+
+What this does not cover: an attacker holding the OWNER or a superuser
+credential can still change the table, and `noo_app` can still call the
+drop function for a month older than the current one. Neither can forge a
+chain link or a checkpoint without the audit key, so the first leaves a
+break and the second leaves a gap with no signed checkpoint, which the verify
+reports as deleted rows. If the gateway still connects as the superuser
+(`DATABASE_URL` names `noo`, not `noo_app`), the restriction has no effect:
+check the user in the gateway's `DATABASE_URL`.
+
+### Reading the log, and where a row came from
+
+`noo security audit list` (`GET /api/security/audit/list`, Operator and
+above) lists rows newest first with filters for time, event type and actor.
+Every row written through the gateway's audit helper records `source_ip`
+(the same rule as the login rows: `X-Forwarded-For` / `X-Real-IP` count only
+from a trusted proxy, otherwise the socket peer) and, for an event inside an
+agent turn, `conversation_id`, in `details`. A row written from a background
+task or a websocket session, which has no request in scope, carries neither
+rather than a guessed value.
+
+### Audit retention
+
+Audit rows live in monthly partitions. The weekly `audit_log_rotate`
+heartbeat task (seeded at gateway boot, enabled, `created_by system`) exports
+every partition older than the retention window (12 months by default,
+`retention_months` on the task, 1 to 120) to
+`/data/audit-archive/noo_security_audit_YYYY_MM.jsonl` on the persistent
+`noo-data` volume, one JSON object per row with every column (so the archive
+can still be verified against the key), checks the file against the row
+count, and only then drops the partition. An export that cannot be verified
+drops nothing and fails the run; the current and future months are never
+dropped. Only the `local_dir` backend is implemented in the gateway; with any
+other `backend` the partitions are kept and the task fails, so the gap is
+visible. `archive_dir` must stay under `/data/`. The task defaults to a dry
+run if its `dry_run` is removed; the seeded row applies. Disable it with
+`noo heartbeat toggle audit_log_rotate --off`, or tune it with the task's config.
 
 ## A service that holds its own gateway key
 

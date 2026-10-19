@@ -117,6 +117,8 @@ services:
       # the libraries built on it honour these.
       - HF_HUB_DISABLE_TELEMETRY=1
       - DO_NOT_TRACK=1
+      # onnxruntime's own Microsoft 1DS telemetry (docs/security/telemetry.md).
+      - ORT_DISABLE_TELEMETRY=1
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - WHISPER_DEVICE=${WHISPER_DEVICE:-auto}
       - WHISPER_MODEL_DIR=/models
@@ -179,6 +181,8 @@ services:
       # the libraries built on it honour these.
       - HF_HUB_DISABLE_TELEMETRY=1
       - DO_NOT_TRACK=1
+      # onnxruntime's own Microsoft 1DS telemetry (docs/security/telemetry.md).
+      - ORT_DISABLE_TELEMETRY=1
       - PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
       - PIPER_USE_CUDA=${PIPER_USE_CUDA:-0}
       - PIPER_VOICE_DIR=/voices

@@ -11,7 +11,7 @@
 //! a key pair that exists for this one purpose (`noo security pki
 //! issue-sso-key`; onboard issues it). JWT auth in Grafana is stateless:
 //! no Grafana session cookie is created, the token IS the session, and it
-//! lasts `NOO_GRAFANA_SESSION_TTL` minutes (15 by default, 60 at most).
+//! lasts `NOO_GRAFANA_SESSION_TTL` minutes (5 by default, 60 at most).
 //!
 //! What this handler decides, and from where:
 //!
@@ -244,7 +244,7 @@ async fn viewer_gate(key: &jsonwebtoken::EncodingKey) -> Result<(), String> {
 /// dashboards only) as `grafana_role`. Every 403 on this route has a body
 /// naming why and which tiers open Grafana. The token is ES256 with the dedicated
 /// SSO key (`${NOO_PKI_DIR}/sso/grafana.key`), `aud = noo-grafana`, no
-/// `kid`, and lives `NOO_GRAFANA_SESSION_TTL` minutes (15 default, 60
+/// `kid`, and lives `NOO_GRAFANA_SESSION_TTL` minutes (5 default, 60
 /// max); the gateway itself refuses it. 503 with the fix when
 /// `NOO_GRAFANA_URL` or the key is absent. One audit row per mint
 /// (`grafana_session_issued`). Exchanged, harness, kiosk and add-on

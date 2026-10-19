@@ -3,7 +3,7 @@
 
 [package]
 name = "noo-cli"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "pai — Rust front-door CLI for Mesh. Native fast paths for agent-hot commands; everything else passes through to the Python CLI."
@@ -38,6 +38,14 @@ time = { version = "0.3", features = ["formatting"] }
 # coordinator backend/model + watched-folder/workspace edits (yaml.dump parity).
 bcrypt = "0.15"
 serde_yaml = "0.9"
+# Kiosk seats (kiosk_seat.rs `seat_agent`) trust the platform's public roots
+# PLUS the pinned cluster CA, so a seat reaches the controller through the
+# `tailscale serve` front door (public cert) or the gateway port (cluster
+# CA). Both crates are already in the lockfile (rustls-platform-verifier's
+# Linux store loader; webpki-root-certs is the fallback when a box has no
+# CA store at all).
+rustls-native-certs = "0.8"
+webpki-root-certs = "1"
 # `onboard --tui` — the native full-screen onboarding frontend (replaces the
 # Python Textual wizard for the TUI path). ratatui 0.30 is the current stable
 # line; crossterm 0.29 is the matching backend/event source (the same version

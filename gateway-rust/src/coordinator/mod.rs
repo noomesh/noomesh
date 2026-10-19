@@ -75,12 +75,32 @@ pub(crate) use backend::{is_node_agent_url, with_backend_hint_url, warn_if_node_
 // them via `use super::*` (private to this module tree).
 use backend::with_backend_hint;
 pub(crate) use backend::is_cloud_model;
-use context::{dedup_context_lines, record_layer_chars, time_layer};
+use context::{attach_retrieved_data, dedup_context_lines, record_layer_chars, time_layer};
 use session::{build_history_summary};
 
 pub use cloud::{cloud_gate, cloud_gate_body, cloud_gate_refusal};
 #[cfg(test)]
 pub use cloud::CloudGateClosed;
+
+tokio::task_local! {
+    /// Set by a channel pipeline for a turn in a group chat or shared space.
+    static SHARED_ROOM: bool;
+}
+
+/// Run `fut` (a whole coordinator turn) as a turn in a SHARED ROOM when
+/// `shared` is true. The reply is posted to everyone in the room, so the
+/// turn draws only on shared knowledge: no personal memory, no cross-channel
+/// activity, no temporal (per-user) facts, and knowledge retrieval limited
+/// to the `company` and `system` tiers. It also never dispatches to a node
+/// harness, whose context calls would not carry this flag.
+pub async fn with_shared_room<F: std::future::Future>(shared: bool, fut: F) -> F::Output {
+    SHARED_ROOM.scope(shared, fut).await
+}
+
+/// Whether the current turn is a shared-room turn (false outside one).
+pub(crate) fn in_shared_room() -> bool {
+    SHARED_ROOM.try_with(|s| *s).unwrap_or(false)
+}
 
 /// Run a cloud-model completion (Anthropic / OpenAI / Gemini).
 ///

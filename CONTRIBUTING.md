@@ -25,6 +25,13 @@ pre-commit install         # run the checks on every commit; or by hand: `pre-co
 python3 -m pytest -q
 ```
 
+Contributors keep the unpinned `pip install -e ".[dev,web,cache]"` above. The
+shipped image (`docker/Dockerfile.deps-core`) does not: it installs from the
+hash-locked `docker/core-lock/requirements.txt` with `--require-hashes`. After you
+change a dependency in `pyproject.toml`, regenerate that file with the command
+in its header and commit both together; `tests/test_python_lock_guard.py`
+fails when the lock and the Dockerfile's extras drift apart.
+
 The editable install provides the Python CLI as `noo-py`; the `noo`
 binary passes the few non-native commands through to it.
 

@@ -78,6 +78,7 @@ echo "NOO_BUS_KEY_TRELLION_INTEL=i"
 echo "NOO_BROWSER_KEY=b"
 echo "GRAFANA_PASSWORD=g"
 echo "REDIS_PASSWORD=r"
+echo "NOO_AUDIT_HMAC_KEY=k"
 %s
 exit 0
 """

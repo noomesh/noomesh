@@ -97,6 +97,29 @@ pub(super) fn worker_unavailable(e: impl std::fmt::Display, path: Option<&str>) 
     (StatusCode::SERVICE_UNAVAILABLE, Json(body))
 }
 
+/// The answer for a failed worker request. A worker that REFUSED on purpose
+/// and said so with the structured `error_kind` field (see
+/// [`crate::worker_client::WorkerRefusal`]) is a client error: 403 for a
+/// policy refusal (the request is not permitted; the gateway already answers
+/// 403 for its own confinement, e.g. the ops tool-route gate), 422 for an
+/// invalid request. Retrying can never succeed, so it must not be a 5xx.
+/// Everything else (timeout, no responder, an old worker that sends no kind)
+/// stays 503 via [`worker_unavailable`].
+pub(super) fn worker_failed(e: &anyhow::Error, path: Option<&str>) -> StatusJson {
+    use crate::worker_client::{RefusalKind, WorkerRefusal};
+    if let Some(r) = e.downcast_ref::<WorkerRefusal>() {
+        let status = match r.kind {
+            RefusalKind::Policy => StatusCode::FORBIDDEN,
+            RefusalKind::Invalid => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        // The worker's text is the refusal itself, without the transport
+        // prefix `Worker error on <subject>: `.
+        let text = r.message.split_once(": ").map(|(_, t)| t).unwrap_or(&r.message);
+        return (status, Json(json!({"error": text})));
+    }
+    worker_unavailable(e, path)
+}
+
 /// Create a GET handler that delegates to a Python worker via NATS.
 pub fn delegate_get(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Option<axum::Extension<RequesterCtx>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = StatusJson> + Send>> + Clone {
     move |State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<RequesterCtx>>| {
@@ -132,6 +155,43 @@ pub fn delegate_post(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REFUSAL: &str = "refusing '/etc/passwd': it is outside the directories noomesh may ingest from. allowed roots: /data/ingest/working";
+
+    #[test]
+    fn a_structured_policy_refusal_is_403_with_the_text() {
+        let reply = json!({"success": false, "error": REFUSAL, "error_kind": "policy_refusal"});
+        let e = crate::worker_client::reply_result("worker.rag.ingest", reply).expect_err("must be an error");
+        let (status, Json(body)) = worker_failed(&e, None);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], REFUSAL, "the refusal text, not a 'Worker unavailable' wrapper");
+        let reply = json!({"success": false, "error": "no such file: 'x'", "error_kind": "invalid_request"});
+        let e = crate::worker_client::reply_result("worker.rag.ingest", reply).unwrap_err();
+        assert_eq!(worker_failed(&e, None).0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn an_old_worker_without_a_kind_keeps_503() {
+        let reply = json!({"success": false, "error": REFUSAL});
+        let e = crate::worker_client::reply_result("worker.rag.ingest", reply).unwrap_err();
+        let (status, Json(body)) = worker_failed(&e, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("allowed roots"), "{body}");
+        // an unrecognised kind is not trusted either
+        let reply = json!({"success": false, "error": "x", "error_kind": "bogus"});
+        let e = crate::worker_client::reply_result("worker.rag.ingest", reply).unwrap_err();
+        assert_eq!(worker_failed(&e, None).0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn an_unreachable_worker_is_503() {
+        for msg in ["Worker timeout on worker.rag.ingest", "NATS request failed: no responders"] {
+            let e = anyhow::anyhow!(msg);
+            let (status, Json(body)) = worker_failed(&e, None);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{msg}");
+            assert!(body["error"].as_str().unwrap().starts_with("Worker unavailable: "), "{body}");
+        }
+    }
 
     #[test]
     fn worker_ok_maps_statuses() {
