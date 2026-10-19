@@ -219,6 +219,12 @@ impl HarnessRuntime for RemoteRuntime {
         self.max_context_tokens
     }
 
+    fn credential_expires_at(&self) -> Option<u64> {
+        // Read from the token itself, so a task's renewed token (checkpoint)
+        // moves the horizon with it.
+        jwt_exp_unverified(&self.token)
+    }
+
     fn max_session_messages(&self) -> usize {
         self.max_session_messages
     }
@@ -416,6 +422,20 @@ impl HarnessRuntime for RemoteRuntime {
     }
 }
 
+/// The `exp` claim of a JWT, read WITHOUT verifying it. Used only to know
+/// when the harness's own turn token stops working on the rail (the gateway
+/// verifies it on every call; nothing here trusts the claim for access).
+/// `None` for anything that is not a three-part token with a numeric `exp`.
+pub(crate) fn jwt_exp_unverified(token: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let mut parts = token.split('.');
+    let (_header, payload, _sig) = (parts.next()?, parts.next()?, parts.next()?);
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?;
+    exp.as_u64().or_else(|| exp.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +553,171 @@ mod tests {
         // A cloud model is never silently answered by the pinned node model.
         let e = rt.resolve_backend_for_model(Some("claude-sonnet-4-5")).await.unwrap_err();
         assert!(e.to_string().contains("run on the controller"), "{e}");
+    }
+
+    // ── the loop over the rail: cut streams and the turn deadline ──────
+
+    /// Records every event the loop sends to its client.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, Value)>>);
+
+    impl crate::websocket::TurnSink for Recorder {
+        async fn send_event(&self, event_type: &str, data: Value) -> bool {
+            self.0.lock().unwrap().push((event_type.to_string(), data));
+            true
+        }
+    }
+
+    impl Recorder {
+        fn events(&self) -> Vec<(String, Value)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A model endpoint whose every answer is one content frame and then a
+    /// broken body (the connection drops mid-stream). Counts its calls.
+    async fn cutting_model(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+        use axum::body::Body;
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let frames = futures::stream::unfold(0u8, |i| async move {
+                        match i {
+                            0 => {
+                                let chunk = serde_json::json!({"choices": [{"index": 0, "delta": {"content": "partial answer"}}]});
+                                Some((Ok::<String, std::io::Error>(format!("data: {chunk}\n\n")), 1))
+                            }
+                            1 => {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                Some((Err(std::io::Error::other("the backend died mid-answer")), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(frames))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn openai_at(url: &str) -> ResolvedBackend {
+        ResolvedBackend { url: url.into(), model: "gemma4:12b".into(), backend_type: "openai".into(), api_format: "openai".into() }
+    }
+
+    /// `role` -> `content` of every `session_save` the rail saw, in order.
+    fn saves(seen: &Arc<Mutex<Vec<(String, Value)>>>) -> Vec<(String, String)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, op)| op["op"] == "session_save")
+            .map(|(_, op)| (op["role"].as_str().unwrap_or("").to_string(), op["content"].as_str().unwrap_or("").to_string()))
+            .collect()
+    }
+
+    /// 2026-10-17: a stream cut mid-answer came back as `stream_complete`
+    /// with empty content, and the stall guard nudged the model into another
+    /// five-minute call. A cut is an error for the iteration: the client
+    /// gets an `error` naming the cut, what arrived is kept and saved, and
+    /// the model is NOT called again.
+    #[tokio::test]
+    async fn a_cut_stream_is_an_error_and_is_not_nudged() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model = cutting_model(calls.clone()).await;
+        let rt = RemoteRuntime::connect(&gw, "tok-123", reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
+        let sink = Recorder::default();
+
+        let result = super::super::run_streaming_on(&sink, &rt, "what is up", "c1", 5, None, Some("alice"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "a cut stream is not retried by a nudge");
+        let events = sink.events();
+        let err = events.iter().find(|(k, _)| k == "error").map(|(_, v)| v.clone()).expect("an error event");
+        assert!(err.as_str().unwrap_or("").starts_with("the model stream was cut after "), "{err}");
+        assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some("partial answer")), "the partial answer reached the client: {events:?}");
+        assert!(
+            !events.iter().any(|(k, v)| k == "metadata" && v.get("auto_continue").is_some()),
+            "no stall nudge after a cut: {events:?}"
+        );
+        assert_eq!(result.response, "partial answer");
+        let saved = saves(&seen);
+        assert_eq!(saved.first(), Some(&("user".to_string(), "what is up".to_string())), "the user's message is saved first: {saved:?}");
+        assert!(saved.contains(&("assistant".to_string(), "partial answer".to_string())), "{saved:?}");
+    }
+
+    /// A harness token whose life (less the relay's 60 s) is already over:
+    /// the loop does not start a model call it cannot finish. It saves the
+    /// user's message and a note while the token is still good, and
+    /// returns at once.
+    #[tokio::test]
+    async fn the_deadline_stop_saves_the_message_and_a_note_and_returns_in_time() {
+        use base64::Engine as _;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gw = fake_gateway(seen.clone()).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model = cutting_model(calls.clone()).await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": now + 30, "harness": "node:mcmini"}).to_string());
+        let token = format!("e30.{payload}.sig");
+        assert_eq!(jwt_exp_unverified(&token), Some(now + 30));
+        let rt = RemoteRuntime::connect(&gw, &token, reqwest::Client::new()).await.unwrap().pin_backend(openai_at(&model));
+        assert_eq!(rt.credential_expires_at(), Some(now + 30));
+        let sink = Recorder::default();
+
+        let started = std::time::Instant::now();
+        let result = super::super::run_streaming_on(&sink, &rt, "a long question", "c1", 5, None, Some("alice"), true)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(20), "returned before the token ran out: {:?}", started.elapsed());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no model call it could not finish");
+        assert_eq!(result.response, super::super::agent_loop::DEADLINE_NOTE);
+        let saved = saves(&seen);
+        assert_eq!(
+            saved,
+            vec![
+                ("user".to_string(), "a long question".to_string()),
+                ("assistant".to_string(), super::super::agent_loop::DEADLINE_NOTE.to_string()),
+            ]
+        );
+        let events = sink.events();
+        assert!(events.iter().any(|(k, v)| k == "metadata" && v["deadline_stop"] == true), "{events:?}");
+        assert!(events.iter().any(|(k, v)| k == "content" && v.as_str() == Some(super::super::agent_loop::DEADLINE_NOTE)), "{events:?}");
+    }
+
+    #[test]
+    fn the_token_expiry_reads_only_a_well_formed_exp() {
+        use base64::Engine as _;
+        let enc = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        assert_eq!(jwt_exp_unverified(&format!("h.{}.s", enc(serde_json::json!({"exp": 1700000000u64})))), Some(1700000000));
+        assert_eq!(jwt_exp_unverified(&format!("h.{}.s", enc(serde_json::json!({"sub": "x"})))), None);
+        assert_eq!(jwt_exp_unverified(&format!("h.{}.s", enc(serde_json::json!({"exp": "soon"})))), None);
+        assert_eq!(jwt_exp_unverified("tok-123"), None);
+        assert_eq!(jwt_exp_unverified("a.!!!.c"), None);
+    }
+
+    /// The pure rule: past the end always stops; with time left, only a
+    /// LATER call that cannot fit stops.
+    #[test]
+    fn the_deadline_rule() {
+        use super::super::agent_loop::deadline_stop;
+        let t0 = std::time::Instant::now();
+        let budget = Duration::from_secs(240);
+        assert!(deadline_stop(1, t0 + Duration::from_secs(10), t0, budget), "past the end stops even the first call");
+        assert!(!deadline_stop(1, t0, t0 + Duration::from_secs(60), budget), "the first call runs while there is any time");
+        assert!(deadline_stop(2, t0, t0 + Duration::from_secs(60), budget), "a later call that cannot fit stops");
+        assert!(!deadline_stop(4, t0, t0 + Duration::from_secs(600), budget));
     }
 }

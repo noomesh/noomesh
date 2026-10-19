@@ -29,12 +29,18 @@
 //!   (`json`, `timeout`, `header`, `body`) and a `send()` that picks the
 //!   transport.
 //! - [`NodeLink::stream`]: a call whose response body is read incrementally
-//!   (SSE inference, log tails, the container proxy). Identical today; kept
-//!   separate so a later phase can give streams an idle timeout instead of a
-//!   total one.
+//!   (SSE inference, log tails, the container proxy). Goes out on
+//!   [`crate::tls::cluster_stream_client`]: no total timeout, an idle bound
+//!   (`NOO_BACKEND_STREAM_IDLE_SECS`) between reads instead. A slow model
+//!   that keeps sending is never cut; a silent one is, and the reader says
+//!   so with [`stream_cut_message`].
 //! - [`NodeLink::url`]: for the few callers that must hand an address to
 //!   something else (a backend URL kept in coordinator state).
 //! - [`is_agent_url`]: the one definition of "this URL is a node agent".
+//!
+//! openapi-drift: not-gateway-routes — this module only DIALS node agents and
+//! model endpoints; it mounts nothing on the gateway's listener, and its
+//! `.route(...)` calls are test servers standing in for a model endpoint.
 
 use reqwest::Method;
 use serde_json::{json, Value};
@@ -270,14 +276,14 @@ impl NodeLink {
         }
     }
 
-    /// A call whose response body is read incrementally. Same client, same
-    /// credential, same (total) timeout as [`NodeLink::request`] today. No
-    /// call site holds a node link and streams yet (the SSE paths hold a
-    /// backend URL and use [`backend_stream`]); this is the entry for the
-    /// ones that will.
+    /// A call whose response body is read incrementally: the same
+    /// credential as [`NodeLink::request`], on the stream client (no total
+    /// timeout, an idle bound between reads). No call site holds a node link
+    /// and streams yet (the SSE paths hold a backend URL and use
+    /// [`backend_stream`]); this is the entry for the ones that will.
     #[allow(dead_code)]
     pub fn stream(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
-        self.build(method, path)
+        self.build_on(&crate::tls::cluster_stream_client(), method, path)
     }
 
     /// [`NodeLink::request`] on a caller-chosen client: for a caller that
@@ -430,13 +436,18 @@ pub fn backend_request_on(
     crate::coordinator::with_backend_hint_url(client.request(method, url), url, backend_type)
 }
 
-/// [`backend_request`] for a response read incrementally (SSE).
+/// [`backend_request`] for a response read incrementally (SSE), on
+/// [`crate::tls::cluster_stream_client`]: no total timeout, the stream idle
+/// bound between reads. Do not add a per-request `.timeout()` to what this
+/// returns unless a total bound is really meant: it would cut a slow
+/// model's stream at that bound again.
 pub fn backend_stream(method: Method, url: &str, backend_type: &str) -> reqwest::RequestBuilder {
-    backend_stream_on(&crate::tls::cluster_client(), method, url, backend_type)
+    backend_stream_on(&crate::tls::cluster_stream_client(), method, url, backend_type)
 }
 
-/// [`backend_stream`] on a caller-chosen client. Identical to
-/// [`backend_request_on`] today; the seam for a stream-specific timeout.
+/// [`backend_stream`] on a caller-chosen client (the harness translator's
+/// stream client, the failover lane, a test double). The caller picks a
+/// client without a total timeout for a stream.
 pub fn backend_stream_on(
     client: &reqwest::Client,
     method: Method,
@@ -453,6 +464,32 @@ pub(crate) fn no_address_message(node_id: &str) -> String {
         "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
          Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
     )
+}
+
+/// What a reader says when a streamed model response breaks before it
+/// ended: "the model stream was cut after Ns: <cause>". `elapsed` is how
+/// long the call had been running. The cause walks the error's sources,
+/// because reqwest's own text for a body failure is only "error decoding
+/// response body", which is what the 2026-10-17 harness log carried and is
+/// no help to anyone; an idle timeout is named as such.
+pub fn stream_cut_message(elapsed: std::time::Duration, err: &reqwest::Error) -> String {
+    let mut cause = err.to_string();
+    let mut src = std::error::Error::source(err);
+    while let Some(e) = src {
+        let t = e.to_string();
+        if !t.is_empty() && !cause.contains(&t) {
+            cause.push_str(": ");
+            cause.push_str(&t);
+        }
+        src = std::error::Error::source(e);
+    }
+    if err.is_timeout() {
+        cause.push_str(&format!(
+            " (no data for {}s, NOO_BACKEND_STREAM_IDLE_SECS)",
+            crate::tls::stream_idle().as_secs()
+        ));
+    }
+    format!("the model stream was cut after {}s: {cause}", elapsed.as_secs())
 }
 
 #[cfg(test)]
@@ -603,5 +640,95 @@ mod tests {
             .unwrap();
         assert_eq!(built.url().as_str(), "https://10.0.0.5:8081/pull");
         assert_eq!(built.timeout(), Some(&std::time::Duration::from_secs(2700)));
+    }
+
+    // ── streams: an idle bound, never a total one ──────────────────────
+
+    /// The stream client is built with no total timeout and the idle bound;
+    /// the unary client keeps its total. reqwest does not expose either on
+    /// a built client, so the values the clients are built FROM are pinned.
+    #[test]
+    fn the_stream_client_has_an_idle_bound_and_no_total() {
+        let s = crate::tls::ClientTimeouts::cluster_stream();
+        assert_eq!(s.total, None, "a total timeout cuts a slow model's stream mid-answer");
+        assert_eq!(s.read_idle, Some(crate::tls::stream_idle()));
+        assert_eq!(crate::tls::ClientTimeouts::external_stream().total, None);
+        let u = crate::tls::ClientTimeouts::cluster();
+        assert!(u.total.is_some(), "unary calls keep their whole-request bound");
+        assert_eq!(u.read_idle, None);
+        assert_eq!(s.connect, u.connect, "same connect budget as the unary client");
+        assert_eq!(crate::tls::DEFAULT_STREAM_IDLE_SECS, 300, "the value docs/reference/env.md documents");
+    }
+
+    /// A model endpoint that sends `chunks` SSE frames, sleeping `gaps[i]`
+    /// before frame i. Returns its URL.
+    async fn sse_server(gaps: Vec<std::time::Duration>) -> String {
+        use axum::{body::Body, routing::get, Router};
+        let app = Router::new().route(
+            "/sse",
+            get(move || {
+                let gaps = gaps.clone();
+                async move {
+                    let frames = futures::stream::unfold(0usize, move |i| {
+                        let gaps = gaps.clone();
+                        async move {
+                            let gap = *gaps.get(i)?;
+                            tokio::time::sleep(gap).await;
+                            Some((Ok::<_, std::convert::Infallible>(format!("data: {i}\n\n")), i + 1))
+                        }
+                    });
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(frames))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/sse")
+    }
+
+    /// Read the whole body; `Err` is the cut-stream message.
+    async fn read_all(client: &reqwest::Client, url: &str) -> Result<String, String> {
+        use futures::StreamExt;
+        let started = std::time::Instant::now();
+        let resp = client.get(url).send().await.map_err(|e| stream_cut_message(started.elapsed(), &e))?;
+        let mut body = resp.bytes_stream();
+        let mut out = String::new();
+        while let Some(item) = body.next().await {
+            match item {
+                Ok(b) => out.push_str(&String::from_utf8_lossy(&b)),
+                Err(e) => return Err(stream_cut_message(started.elapsed(), &e)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Five seconds of frames a second apart pass a 2 s idle bound: the
+    /// stream is longer than the bound and is not cut, because it never
+    /// goes silent for that long.
+    #[tokio::test]
+    async fn a_stream_longer_than_the_idle_bound_is_not_cut_while_it_sends() {
+        let one = std::time::Duration::from_secs(1);
+        let url = sse_server(vec![one; 5]).await;
+        let client = crate::tls::plain_client(crate::tls::ClientTimeouts::stream_with_idle(std::time::Duration::from_secs(2)));
+        let body = read_all(&client, &url).await.expect("a live stream is not cut");
+        for i in 0..5 {
+            assert!(body.contains(&format!("data: {i}")), "frame {i} missing: {body}");
+        }
+    }
+
+    /// Three seconds of silence after the first frame breaks a 2 s idle
+    /// bound, and the reader names it as a cut stream.
+    #[tokio::test]
+    async fn a_silent_stream_is_cut_at_the_idle_bound() {
+        let url = sse_server(vec![std::time::Duration::ZERO, std::time::Duration::from_secs(3), std::time::Duration::ZERO]).await;
+        let client = crate::tls::plain_client(crate::tls::ClientTimeouts::stream_with_idle(std::time::Duration::from_secs(2)));
+        let started = std::time::Instant::now();
+        let err = read_all(&client, &url).await.expect_err("silence past the idle bound is a cut");
+        assert!(err.starts_with("the model stream was cut after "), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "cut at the idle bound, not after the gap: {:?}", started.elapsed());
     }
 }

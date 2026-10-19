@@ -15,8 +15,10 @@
 //!    platforms need ON THE CONTROLLER, refuses anything whose sha256 is not
 //!    the pinned one, and keeps it in the controller's asset cache;
 //! 3. `noo cluster provision <node>` puts it in the node's signed bundle as
-//!    `vendor-cli` beside a manifest, when the node's
-//!    harness placement names that kind; never downloading during a restage;
+//!    `vendor-cli` beside a manifest, when the node's harness placement
+//!    names that kind or its `vendor_kinds` (`noo cluster vendor install`)
+//!    lists it — one slot per CLI ([`VENDOR_SLOTS`]); never downloading
+//!    during a restage;
 //! 4. the node's applier verifies the sha256 again, unpacks it under
 //!    `/opt/noo/vendor` (`~/noomesh/vendor` on a Mac) and writes a wrapper
 //!    named for the CLI on the harness's PATH.
@@ -187,46 +189,124 @@ pub(crate) fn manifest_text(fields: &[(&str, Option<&str>)]) -> String {
     s
 }
 
-/// What a vendor CLI adds to a node's bundle. A pure decision over the
-/// table, the node's desired kind and platform, and the controller's staged
-/// set (`staged` returns the verified bytes of a cached file, or None).
+/// The `vendor_kinds` a node's config row lists (`noo cluster vendor
+/// install`, `noo cluster set-config --vendor-kinds`): the kinds whose CLI
+/// the node carries whatever its harness placement names. `desired` is
+/// `/api/cluster/nodes/<node>/desired-config`; an older gateway sends none.
+pub(crate) fn node_vendor_kinds(desired: &Value) -> Vec<String> {
+    desired["node"]["vendor_kinds"].as_array().map(|a| {
+        a.iter().filter_map(|k| k.as_str()).map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
+    }).unwrap_or_default()
+}
+
+/// The kinds whose CLI a node's bundle carries: the harness placement's
+/// kind and the node's `vendor_kinds`, deduplicated, in name order (so a
+/// CLI keeps its slot when the placement moves between kinds). `noo` never
+/// needs a CLI and is left out; a kind with no distribution (a manual
+/// install) is left to [`vendor_bundle_files`], which carries nothing for it.
+pub(crate) fn bundle_vendor_kinds(placement: Option<&str>, vendor_kinds: &[String]) -> Vec<String> {
+    placement.into_iter().map(str::to_string).chain(vendor_kinds.iter().cloned())
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty() && k != "noo")
+        .collect::<BTreeSet<String>>()
+        .into_iter().collect()
+}
+
+/// The bundle kinds the vendor CLIs ride in, one (payload, manifest) pair
+/// per CLI. Slot 1 keeps the names every applier since E1e knows, so a
+/// bundle carrying ONE CLI is byte-for-byte the layout it always was; the
+/// next slots are new kinds, which a Mac applier older than
+/// [`VENDOR_SLOTS_MAC_FLOOR`] would refuse the whole bundle on (the Linux
+/// applier rides every bundle and self-updates first). Each slot is
+/// verified on its own: the manifest's sha256 against its own payload.
+pub(crate) const VENDOR_SLOTS: [(&str, &str); 3] = [
+    ("vendor-cli", "vendor-cli-manifest"),
+    ("vendor-cli-2", "vendor-cli-2-manifest"),
+    ("vendor-cli-3", "vendor-cli-3-manifest"),
+];
+
+/// How much of a bundle the vendor CLIs may take, in MiB: the gateway's
+/// rail body cap (`routes::bootstrap::MAX_RAIL_BODY`, 768) less room for
+/// the rest of the bundle (the harness and agent binaries, ~100).
+/// tests/test_rail_body_cap_fits_a_bundle.py holds the two together.
+pub(crate) const VENDOR_BUNDLE_BUDGET_MB: usize = 560;
+
+/// Why CLIs of these sizes (kind, bytes) cannot ride one bundle, or None.
+fn budget_refusal(sizes: &[(&str, usize)]) -> Option<String> {
+    let bytes: usize = sizes.iter().map(|(_, b)| b).sum();
+    (bytes > VENDOR_BUNDLE_BUDGET_MB * 1024 * 1024).then(|| format!(
+        "this node would carry {} MB of vendor CLIs ({}), past the {VENDOR_BUNDLE_BUDGET_MB} MB a bundle leaves for them \
+         under the rail's body cap — drop one from its vendor_kinds",
+        bytes / (1024 * 1024),
+        sizes.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")
+    ))
+}
+
+/// What the vendor CLIs add to a node's bundle. A pure decision over the
+/// table, the kinds the node carries ([`bundle_vendor_kinds`]), its
+/// platform, and the controller's staged set (`staged` returns the verified
+/// bytes of a cached file, or None).
 ///
-/// `Ok(vec![])`: nothing to carry (no harness placement, `noo`, or a kind
-/// that is a manual install). `Err`: the kind needs an artefact the
-/// controller has not staged, or cannot be staged for this platform — the
-/// restage is refused, because a node placed on a CLI it does not have
-/// would only be refused by its agent.
+/// `Ok(vec![])`: nothing to carry (no kinds, `noo`, or only manual
+/// installs). `Err`: a kind needs an artefact the controller has not
+/// staged, or cannot be staged for this platform — the restage is refused,
+/// because a node placed on a CLI it does not have would only be refused by
+/// its agent. Every kind is judged before the answer, so one refusal names
+/// everything missing.
 pub(crate) fn vendor_bundle_files(
     table: &Table,
-    desired_kind: Option<&str>,
+    kinds: &[String],
     os: &str,
     arch: &str,
     staged: &dyn Fn(&Need) -> Option<Vec<u8>>,
 ) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
-    let Some(kind) = desired_kind else { return Ok(Vec::new()) };
-    let needs = match needs_for(table, kind, os, arch) {
-        Ok(Some(n)) => n,
-        Ok(None) => return Ok(Vec::new()),
-        Err(e) => return Err(format!("the harness placement names {kind}, which cannot be staged for {os}/{arch}: {e}")),
-    };
-    let missing: Vec<String> = needs.iter().filter(|n| staged(n).is_none())
-        .map(|n| format!("{} {}", n.name, n.version)).collect();
-    if !missing.is_empty() {
+    let mut carried: Vec<(&str, Need)> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for kind in kinds {
+        let needs = match needs_for(table, kind, os, arch) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(e) => {
+                problems.push(format!("this node carries {kind} (its harness placement or vendor_kinds), which cannot be staged for {os}/{arch}: {e}"));
+                continue;
+            }
+        };
+        let missing: Vec<String> = needs.iter().filter(|n| staged(n).is_none())
+            .map(|n| format!("{} {}", n.name, n.version)).collect();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "this node carries {kind} (its harness placement or vendor_kinds), and the controller has not staged {} for {os}/{arch} — \
+                 run `noo cluster vendor stage {kind}` first (the restage never downloads)",
+                missing.join(" + ")
+            ));
+            continue;
+        }
+        carried.extend(needs.into_iter().map(|n| (kind.as_str(), n)));
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+    if carried.len() > VENDOR_SLOTS.len() {
         return Err(format!(
-            "the harness placement names {kind}, and the controller has not staged {} for {os}/{arch} — \
-             run `noo cluster vendor stage {kind}` first (the restage never downloads)",
-            missing.join(" + ")
+            "this node would carry {} vendor CLIs ({}), and a bundle has {} slots — drop one from its vendor_kinds",
+            carried.len(),
+            carried.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", "),
+            VENDOR_SLOTS.len()
         ));
     }
-    let table_row = table.kinds.iter().find(|k| k.kind == kind).and_then(|k| k.distribution.as_ref());
-    let dist = table_row.expect("needs_for found a distribution");
-    let cli = &needs[0];
-    Ok(vec![
-        ("vendor-cli", staged(cli).unwrap_or_default()),
-        (
-            "vendor-cli-manifest",
+    let sizes: Vec<(&str, usize)> = carried.iter().map(|(k, n)| (*k, staged(n).map_or(0, |b| b.len()))).collect();
+    if let Some(e) = budget_refusal(&sizes) {
+        return Err(e);
+    }
+    let mut out = Vec::new();
+    for ((kind, cli), (slot, slot_manifest)) in carried.iter().zip(VENDOR_SLOTS) {
+        let dist = table.kinds.iter().find(|k| k.kind == *kind).and_then(|k| k.distribution.as_ref())
+            .expect("needs_for found a distribution");
+        out.push((slot, staged(cli).unwrap_or_default()));
+        out.push((
+            slot_manifest,
             manifest_text(&[
-                ("kind", Some(kind)),
+                ("kind", Some(*kind)),
                 ("name", Some(&cli.name)),
                 ("version", Some(&cli.version)),
                 ("sha256", Some(&cli.sha256)),
@@ -235,8 +315,9 @@ pub(crate) fn vendor_bundle_files(
                 ("entry", Some(&dist.entry)),
             ])
             .into_bytes(),
-        ),
-    ])
+        ));
+    }
+    Ok(out)
 }
 
 /// The Mac applier learned the vendor kinds in this release; an older Mac
@@ -247,6 +328,17 @@ pub(crate) const VENDOR_KINDS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 5);
 
 pub(crate) fn applier_knows_vendor_kinds(darwin: bool, app_version: &str) -> bool {
     !darwin || super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= VENDOR_KINDS_MAC_FLOOR)
+}
+
+/// The first Mac applier that knows slots 2 and up ([`VENDOR_SLOTS`]).
+/// An older one (0.6.5 – this floor) gets slot 1 only — the harness
+/// placement's CLI, the layout it already applies — and the restage says
+/// so. FLOOR: the release after 0.6.7; if that number ships without this
+/// change, bump it.
+pub(crate) const VENDOR_SLOTS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 8);
+
+pub(crate) fn applier_knows_vendor_slots(darwin: bool, app_version: &str) -> bool {
+    !darwin || super::node_leaves::cli_version_triple(app_version).is_none_or(|v| v >= VENDOR_SLOTS_MAC_FLOOR)
 }
 
 // ── the wrapper ───────────────────────────────────────────────────────────
@@ -455,6 +547,38 @@ pub(crate) fn node_need_cell(table: &Table, kind: Option<&str>, platform: Option
     }
 }
 
+/// One node's line in `status` over every kind its bundle carries
+/// ([`bundle_vendor_kinds`]): the cells joined, whether all are ready, and
+/// the kinds still to stage.
+pub(crate) fn node_carry_cell(
+    table: &Table,
+    placed: Option<&str>,
+    vendor_kinds: &[String],
+    platform: Option<(&str, &str)>,
+    staged: &dyn Fn(&Need) -> bool,
+) -> (String, bool, Vec<String>) {
+    let kinds = bundle_vendor_kinds(placed, vendor_kinds);
+    if kinds.is_empty() {
+        let (c, ok) = node_need_cell(table, placed, platform, staged);
+        return (c, ok, Vec::new());
+    }
+    let mut cells = Vec::new();
+    let mut pending = Vec::new();
+    for k in &kinds {
+        let (c, ok) = node_need_cell(table, Some(k), platform, staged);
+        if !ok {
+            pending.push(k.clone());
+        }
+        cells.push(c);
+    }
+    (cells.join("; "), pending.is_empty(), pending)
+}
+
+/// The `vendor_kinds` cell: the list, or a dash for none.
+fn vendor_kinds_cell(kinds: &[String]) -> String {
+    if kinds.is_empty() { ui::dash().to_string() } else { kinds.join(", ") }
+}
+
 /// `noo cluster vendor status`
 pub fn cluster_vendor_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
@@ -519,13 +643,20 @@ pub fn cluster_vendor_status(g: &Globals, args: &[String]) -> Result<i32, Unhand
         let Some(id) = n["id"].as_str() else { continue };
         let desired = crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(id)), true, 10);
         let kind = desired.as_ref().and_then(desired_harness_kind);
+        let extra = desired.as_ref().map(node_vendor_kinds).unwrap_or_default();
         let plat = node_platform(n);
-        let (cell, ok) = node_need_cell(&table, kind.as_deref(), plat, &staged_fn);
-        if !ok {
-            if let Some(k) = &kind { need_stage.insert(k.clone()); }
-        }
-        node_rows.push(vec![id.to_string(), plat.map(|(o, a)| format!("{o}-{a}")).unwrap_or_else(|| "?".into()), cell.clone()]);
-        node_json.push(json!({"node": id, "kind": kind, "platform": plat.map(|(o, a)| format!("{o}-{a}")), "needs": cell, "ready": ok}));
+        let (cell, ok, pending) = node_carry_cell(&table, kind.as_deref(), &extra, plat, &staged_fn);
+        need_stage.extend(pending);
+        node_rows.push(vec![
+            id.to_string(),
+            plat.map(|(o, a)| format!("{o}-{a}")).unwrap_or_else(|| "?".into()),
+            kind.clone().unwrap_or_else(|| ui::dash().to_string()),
+            vendor_kinds_cell(&extra),
+            cell.clone(),
+        ]);
+        node_json.push(json!({"node": id, "kind": kind, "vendor_kinds": extra,
+            "carries": bundle_vendor_kinds(kind.as_deref(), &extra),
+            "platform": plat.map(|(o, a)| format!("{o}-{a}")), "needs": cell, "ready": ok}));
     }
     if g.json {
         println!("{}", json!({"cache": dir.display().to_string(), "artefacts": artefacts, "nodes": node_json, "manual": manual}));
@@ -544,11 +675,79 @@ pub fn cluster_vendor_status(g: &Globals, args: &[String]) -> Result<i32, Unhand
     if node_rows.is_empty() {
         println!("{}", ui::muted("no enrolled node listed (is the gateway up?)"));
     } else {
-        print!("{}", ui::table(&[Col::left("node"), Col::left("platform"), Col::left("harness needs")], &node_rows));
+        print!("{}", ui::table(&[Col::left("node"), Col::left("platform"), Col::left("placed kind"), Col::left("vendor_kinds"), Col::left("bundle carries")], &node_rows));
     }
     let cmds: Vec<String> = need_stage.iter().map(|k| format!("noo cluster vendor stage {k}")).collect();
     let mut guide: Vec<(&str, &str)> = cmds.iter().map(|c| (c.as_str(), "fetch and verify what a placed node still needs")).collect();
     guide.push(("noo cluster provision <node>", "restage a node so its bundle carries the staged CLI"));
+    guide.push(("noo cluster vendor install <node> <kind>...", "carry a CLI whatever the node's placement names"));
+    ui::guide(&guide);
+    Ok(0)
+}
+
+/// `--vendor-kinds` / `vendor install` values: `none` (clears), else kind
+/// names, comma-separated. Each must be a kind in the table that runs a
+/// vendor CLI; `noo` runs none. Deduplicated, in name order.
+pub(crate) fn parse_vendor_kinds(v: &str, table: &Table) -> Result<Vec<String>, String> {
+    if v.trim() == "none" {
+        return Ok(Vec::new());
+    }
+    let vendor: Vec<&str> = table.kinds.iter().filter(|k| k.cli.is_some()).map(|k| k.kind.as_str()).collect();
+    let mut out = BTreeSet::new();
+    for k in v.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        if !vendor.contains(&k) {
+            return Err(format!(
+                "'{k}' is not a harness kind that runs a vendor CLI (one of {}, or `none`)",
+                vendor.join(", ")
+            ));
+        }
+        out.insert(k.to_string());
+    }
+    if out.is_empty() {
+        return Err("name at least one kind, or `none`".into());
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// `noo cluster vendor install <node> <kind>...` — add kinds to the node's
+/// `vendor_kinds` (what is already there stays), so its bundle carries those
+/// CLIs whatever its harness placement names. It only records the wish: the
+/// CLI lands on the node with the next restage, which this verb does NOT
+/// run (a restage is the operator's call).
+pub fn cluster_vendor_install(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [node, kinds @ ..] = args else { return Err(Unhandled) };
+    if node.starts_with('-') || kinds.is_empty() || kinds.iter().any(|k| k.starts_with('-')) {
+        return Err(Unhandled);
+    }
+    let table = harness_kinds::shipped();
+    let asked = match parse_vendor_kinds(&kinds.join(","), &table) {
+        Ok(k) if !k.is_empty() => k,
+        Ok(_) => fail(g.json, ExitCode::Usage, "bad_vendor_kinds", "`none` clears: use `noo cluster set-config <node> --vendor-kinds none`", None),
+        Err(e) => fail(g.json, ExitCode::Usage, "bad_vendor_kinds", &e, None),
+    };
+    let path = format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node));
+    let before = node_vendor_kinds(&crate::http::get_json(g, &path, true, 10));
+    let after: Vec<String> = before.iter().chain(asked.iter()).cloned().collect::<BTreeSet<String>>().into_iter().collect();
+    let resp = crate::http::put_json(
+        g,
+        &format!("/api/cluster/nodes/{}/config", super::urlencode(node)),
+        &json!({"vendor_kinds": after}),
+        true,
+        10,
+    );
+    let stage: Vec<String> = asked.iter().map(|k| format!("noo cluster vendor stage {k}")).collect();
+    let restage = format!("noo cluster provision {node}");
+    if g.json {
+        let mut next = stage.clone();
+        next.push(restage);
+        println!("{}", json!({"status": "ok", "node": node, "vendor_kinds": after, "was": before, "next": next, "gateway": resp}));
+        return Ok(0);
+    }
+    ui::done(&format!("{node}: vendor_kinds = {} (was: {})", vendor_kinds_cell(&after), vendor_kinds_cell(&before)));
+    println!("{}", ui::muted("recorded only: nothing reaches the node until it is restaged"));
+    let mut guide: Vec<(&str, &str)> = stage.iter().map(|c| (c.as_str(), "fetch and verify it on this controller (a no-op when already staged)")).collect();
+    guide.push((restage.as_str(), "restage the node so its bundle carries the CLIs"));
+    guide.push(("noo cluster vendor status", "what each node carries, and what is still to stage"));
     ui::guide(&guide);
     Ok(0)
 }
@@ -560,7 +759,7 @@ pub fn cluster_vendor_usage(g: &Globals, _args: &[String]) -> Result<i32, Unhand
         ExitCode::Usage,
         "usage",
         "noo cluster vendor needs a subaction",
-        Some("stage <kind>|--all [--os linux|macos] [--arch x86_64|aarch64]   fetch and verify vendor CLIs on the controller; status   what is staged and who needs it"),
+        Some("stage <kind>|--all [--os linux|macos] [--arch x86_64|aarch64]   fetch and verify vendor CLIs on the controller; status   what is staged and who needs it; install <node> <kind>...   carry CLIs on a node whatever its placement names"),
     );
 }
 
@@ -663,7 +862,7 @@ mod tests {
 
     #[test]
     fn bundle_carries_the_cli_and_its_manifest() {
-        let f = vendor_bundle_files(&t(), Some("copilot"), "linux", "x86_64", &all_staged).unwrap();
+        let f = vendor_bundle_files(&t(), &ks(&["copilot"]), "linux", "x86_64", &all_staged).unwrap();
         let kinds: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
         assert_eq!(kinds, ["vendor-cli", "vendor-cli-manifest"]);
         assert_eq!(f[0].1, b"bytes-of-copilot-0.0.339-any.tgz");
@@ -678,7 +877,7 @@ mod tests {
 
     #[test]
     fn a_binary_kind_carries_its_manifest_too() {
-        let f = vendor_bundle_files(&t(), Some("codex"), "macos", "aarch64", &all_staged).unwrap();
+        let f = vendor_bundle_files(&t(), &ks(&["codex"]), "macos", "aarch64", &all_staged).unwrap();
         assert_eq!(f.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["vendor-cli", "vendor-cli-manifest"]);
         let m: Value = serde_json::from_slice(&f[1].1).unwrap();
         assert_eq!(m["format"], "binary");
@@ -688,17 +887,100 @@ mod tests {
     #[test]
     fn nothing_to_carry_for_noo_manual_or_no_placement() {
         for k in [None, Some("noo"), Some("manual")] {
-            assert!(vendor_bundle_files(&t(), k, "linux", "x86_64", &all_staged).unwrap().is_empty(), "{k:?}");
+            let kinds = bundle_vendor_kinds(k, &[]);
+            assert!(vendor_bundle_files(&t(), &kinds, "linux", "x86_64", &all_staged).unwrap().is_empty(), "{k:?}");
         }
     }
 
     #[test]
     fn an_unstaged_artefact_refuses_the_restage_and_names_the_stage_command() {
         let none = |_: &Need| None;
-        let e = vendor_bundle_files(&t(), Some("copilot"), "linux", "x86_64", &none).unwrap_err();
+        let e = vendor_bundle_files(&t(), &ks(&["copilot"]), "linux", "x86_64", &none).unwrap_err();
         assert!(e.contains("run `noo cluster vendor stage copilot` first") && e.contains("copilot 0.0.339"), "{e}");
-        let e = vendor_bundle_files(&t(), Some("codex"), "linux", "aarch64", &all_staged).unwrap_err();
+        let e = vendor_bundle_files(&t(), &ks(&["codex"]), "linux", "aarch64", &all_staged).unwrap_err();
         assert!(e.contains("cannot be staged for linux/aarch64"), "{e}");
+        // Two kinds unstaged: ONE refusal names both stage commands.
+        let e = vendor_bundle_files(&t(), &ks(&["codex", "copilot"]), "linux", "x86_64", &none).unwrap_err();
+        assert!(e.contains("vendor stage codex") && e.contains("vendor stage copilot"), "{e}");
+    }
+
+    fn ks(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bundle_carries_the_placed_kind_and_the_vendor_kinds_once_each() {
+        // Union, dedup, name order; noo never needs a CLI.
+        assert_eq!(bundle_vendor_kinds(Some("copilot"), &ks(&["codex", "copilot"])), ["codex", "copilot"]);
+        assert_eq!(bundle_vendor_kinds(Some("noo"), &ks(&["copilot"])), ["copilot"]);
+        assert_eq!(bundle_vendor_kinds(Some("noo"), &[]), Vec::<String>::new());
+        assert_eq!(bundle_vendor_kinds(None, &ks(&[" codex ", "noo", ""])), ["codex"]);
+        assert_eq!(bundle_vendor_kinds(Some("copilot"), &[]), ["copilot"]);
+        // The placement moving between kinds keeps each CLI in its slot.
+        assert_eq!(bundle_vendor_kinds(Some("codex"), &ks(&["codex", "copilot"])),
+                   bundle_vendor_kinds(Some("copilot"), &ks(&["codex", "copilot"])));
+        let d = json!({"node": {"vendor_kinds": ["copilot", " ", "codex"]}});
+        assert_eq!(node_vendor_kinds(&d), ["copilot", "codex"]);
+        assert!(node_vendor_kinds(&json!({"node": {}})).is_empty(), "an older gateway sends none");
+    }
+
+    #[test]
+    fn two_clis_ride_in_two_slots_each_with_its_own_manifest() {
+        let f = vendor_bundle_files(&t(), &ks(&["codex", "copilot", "manual"]), "linux", "x86_64", &all_staged).unwrap();
+        let names: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
+        assert_eq!(names, ["vendor-cli", "vendor-cli-manifest", "vendor-cli-2", "vendor-cli-2-manifest"], "manual carries nothing");
+        let m1: Value = serde_json::from_slice(&f[1].1).unwrap();
+        let m2: Value = serde_json::from_slice(&f[3].1).unwrap();
+        assert_eq!((m1["kind"].as_str(), m2["kind"].as_str()), (Some("codex"), Some("copilot")));
+        assert_eq!(f[2].1, b"bytes-of-copilot-0.0.339-any.tgz");
+        // Slot 1 alone is the layout every applier since E1e reads.
+        assert_eq!(VENDOR_SLOTS[0], ("vendor-cli", "vendor-cli-manifest"));
+        for (p, m) in VENDOR_SLOTS {
+            assert_eq!(m, format!("{p}-manifest"), "the appliers find a slot's manifest as <slot>-manifest");
+        }
+    }
+
+    #[test]
+    fn vendor_clis_past_the_bundle_budget_are_refused() {
+        let half = VENDOR_BUNDLE_BUDGET_MB * 1024 * 1024 / 2 + 1;
+        let e = budget_refusal(&[("codex", half), ("copilot", half)]).unwrap();
+        assert!(e.contains("drop one from its vendor_kinds") && e.contains("codex, copilot"), "{e}");
+        assert!(budget_refusal(&[("codex", half)]).is_none());
+        assert!(budget_refusal(&[]).is_none());
+    }
+
+    #[test]
+    fn the_mac_slot_floor_keeps_older_macs_on_one_cli() {
+        assert!(applier_knows_vendor_slots(false, "noo-cli-v0.6.5"));
+        assert!(!applier_knows_vendor_slots(true, "noo-cli-v0.6.7+abc"));
+        assert!(applier_knows_vendor_slots(true, "noo-cli-v0.6.8"));
+        assert!(applier_knows_vendor_slots(true, ""), "unknown version: assume it can");
+    }
+
+    #[test]
+    fn vendor_kinds_values_name_vendor_kinds_or_none() {
+        let t = t();
+        assert_eq!(parse_vendor_kinds("copilot,codex,copilot", &t).unwrap(), ["codex", "copilot"]);
+        assert_eq!(parse_vendor_kinds(" codex ", &t).unwrap(), ["codex"]);
+        assert!(parse_vendor_kinds("none", &t).unwrap().is_empty());
+        assert!(parse_vendor_kinds("noo", &t).unwrap_err().contains("not a harness kind that runs a vendor CLI"));
+        assert!(parse_vendor_kinds("nope", &t).is_err());
+        assert!(parse_vendor_kinds(",", &t).is_err());
+        // A manual install is still a vendor kind: recorded, carried as nothing.
+        assert_eq!(parse_vendor_kinds("manual", &t).unwrap(), ["manual"]);
+    }
+
+    #[test]
+    fn a_node_line_covers_every_kind_it_carries() {
+        let t = t();
+        let only = |n: &Need| n.name == "copilot";
+        let (c, ok, pending) = node_carry_cell(&t, Some("copilot"), &ks(&["codex"]), Some(("linux", "x86_64")), &only);
+        assert!(!ok && pending == ["codex"], "{c}");
+        assert!(c.contains("codex: ") && c.contains("copilot: copilot 0.0.339 — Ready"), "{c}");
+        let (c, ok, pending) = node_carry_cell(&t, None, &[], None, &only);
+        assert!(ok && pending.is_empty() && c == "no harness placement", "{c}");
+        let (c, ok, _) = node_carry_cell(&t, Some("noo"), &[], Some(("linux", "x86_64")), &only);
+        assert!(ok && c == "noo: nothing to stage", "{c}");
     }
 
     #[test]

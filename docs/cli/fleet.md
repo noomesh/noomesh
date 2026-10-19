@@ -588,7 +588,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
 | `noo cluster assign` | `<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low\|medium\|high\|<n>] [--dry-run] [--async]` | Pin a task to the least-loaded node and run it; --dry-run prints the choice only |
-| `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default]` | Update a node's stored config row with only the given fields |
+| `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>\|none]` | Update a node's stored config row with only the given fields |
 | `noo cluster clear-cooldowns` | — | Clear backend auto-start cooldown backoff on every node |
 | `noo cluster add-companion` | `<node> [-p\|--platform <p>] [--hostname <host>] [--ip <ip>] [-s\|--sensors <a,b>] [-b\|--backends <a,b>] [--battery <n>] [-n\|--network <type>] [--npu-tops <n>] [--app-version <v>]` | Register a Tier-5 companion device with the gateway and send a first heartbeat |
 | `noo cluster add-monitor` | `<node> [--hostname <host>] [--ip <ip>] [-s\|--services <a,b>]` | Register a Tier-6 monitor node with the gateway and send an initial heartbeat |
@@ -614,7 +614,8 @@ other direction: the other stack never calls noomesh.
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
 | `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
 | `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
-| `noo cluster vendor` | — | Print vendor subcommand usage (stage, status) |
+| `noo cluster vendor install` | `<node> <kind>...` | Carry these vendor CLIs on a node whatever its placement names; restage to deliver |
+| `noo cluster vendor` | — | Print vendor subcommand usage (stage, status, install) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |

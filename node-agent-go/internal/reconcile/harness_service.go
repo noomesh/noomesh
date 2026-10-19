@@ -65,7 +65,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 			if r.harnessStartedKind == "" {
 				// Running before this agent knew its kind (agent restart):
 				// adopt the desired kind rather than bounce a live harness.
-				r.harnessStartedKind = desiredKind
+				r.setHarnessStartedKind(desiredKind)
 			}
 			if harnessKindDecision(r.harnessStartedKind, desiredKind) == "restart" {
 				slog.Info("reconcile.restarting_backend", "backend", "harness",
@@ -76,7 +76,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 					refusals.Record("backend_start", harnessRefusalTarget, err.Error())
 					return
 				}
-				r.harnessStartedKind = desiredKind
+				r.setHarnessStartedKind(desiredKind)
 			}
 			refusals.Clear("backend_start", harnessRefusalTarget)
 		case hostsvc.Absent:
@@ -90,7 +90,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 				refusals.Record("backend_start", harnessRefusalTarget, err.Error())
 				return
 			}
-			r.harnessStartedKind = desiredKind
+			r.setHarnessStartedKind(desiredKind)
 			// Deliberately NOT followed by a "did it come up?" check: the
 			// unit is Type=simple with Restart=always and no start limit,
 			// so `is-active` cycles and a point-in-time look would pass
@@ -102,7 +102,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		}
 	case "stopped":
 		if r.stopHarness(ctx, state) {
-			r.harnessStartedKind = ""
+			r.setHarnessStartedKind("")
 		}
 	}
 }
@@ -237,6 +237,26 @@ func (r *Reconciler) stopHarness(ctx context.Context, state hostsvc.State) bool 
 		return false
 	}
 	return true
+}
+
+// setHarnessStartedKind records the kind the harness was started with (""
+// = not running). Written only from the reconcile loop, under harnessMu so
+// the heartbeat may read it (HarnessRunningKind).
+func (r *Reconciler) setHarnessStartedKind(k string) {
+	r.harnessMu.Lock()
+	r.harnessStartedKind = k
+	r.harnessMu.Unlock()
+}
+
+// HarnessRunningKind is the kind the harness was started with (or first
+// seen running with), "" when this agent has not started or adopted one.
+// The heartbeat reports it as host_services.harness.kind while the
+// harness runs, so `noo cluster show` and the eval readiness check can
+// see WHICH loop is live, not only that one is.
+func (r *Reconciler) HarnessRunningKind() string {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return r.harnessStartedKind
 }
 
 // HarnessState is what the heartbeat reports.

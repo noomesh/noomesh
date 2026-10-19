@@ -66,6 +66,9 @@ type Agent struct {
 	// harness is the host service this node regulates; the
 	// reconciler drives it and the heartbeat reports it.
 	harness hostsvc.Service
+	// harnessKind is the reconciler's HarnessRunningKind, set once the
+	// reconciler exists; nil before (the heartbeat then reports no kind).
+	harnessKind func() string
 }
 
 // runningBackends is what this node is ACTUALLY serving, from both runtimes.
@@ -327,6 +330,7 @@ func (a *Agent) Run() error {
 	// helper containers, backends via StartBackendSDK). See
 	// DESIRED_STATE_CONFIG.md.
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
+	a.harnessKind = rec.HarnessRunningKind
 	a.server.SetMCP(rec.MCP())
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
@@ -679,12 +683,27 @@ func (a *Agent) hostServices() map[string]any {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	return map[string]any{
-		"harness": map[string]any{
-			"state":   string(a.harness.State(ctx)),
-			"runtime": a.harness.Runtime(),
-		},
+	kind := ""
+	if a.harnessKind != nil {
+		kind = a.harnessKind()
 	}
+	return hostServicesReport(a.harness.State(ctx), a.harness.Runtime(), kind)
+}
+
+// hostServicesReport is the heartbeat's host_services: the harness's state
+// and runtime and, while it runs, the KIND it was started with — so the
+// controller sees which loop is live, not only that one is. A harness that
+// is not running reports no kind (it runs none), and an unknown kind is
+// omitted rather than guessed.
+func hostServicesReport(state hostsvc.State, runtime, kind string) map[string]any {
+	h := map[string]any{
+		"state":   string(state),
+		"runtime": runtime,
+	}
+	if state == hostsvc.Running && kind != "" {
+		h["kind"] = kind
+	}
+	return map[string]any{"harness": h}
 }
 
 // hostdStatus is the confined-root daemon's own heartbeat, relayed up.

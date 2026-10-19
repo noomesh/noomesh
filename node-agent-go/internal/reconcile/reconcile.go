@@ -117,6 +117,8 @@ type Reconciler struct {
 	// harnessStartedKind is the kind the harness was last started with (or
 	// first seen running with, after an agent restart); "" = unknown/not
 	// running. A change in the desired kind restarts it (harnessKindDecision).
+	// Written under harnessMu (setHarnessStartedKind), read by the
+	// heartbeat through HarnessRunningKind.
 	harnessStartedKind string
 	// harnessDesired is the last desired harness placement the controller
 	// answered with, for GET /harness/placement. Guarded by harnessMu.

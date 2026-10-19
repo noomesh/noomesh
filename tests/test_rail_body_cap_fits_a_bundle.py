@@ -68,6 +68,19 @@ def test_the_cap_clears_a_vendor_cli_bundle_and_fits_the_database() -> None:
     assert cap_mb < POSTGRES_FIELD_LIMIT_MB, "a staged bundle is one bytea; Postgres refuses one over 1 GB"
 
 
+def test_the_vendor_cli_budget_leaves_room_under_the_cap() -> None:
+    """Several vendor CLIs ride one bundle (vendor_kinds); noo-cli refuses a
+    restage whose CLIs pass VENDOR_BUNDLE_BUDGET_MB, which must leave the
+    rest of the largest bundle room under the cap."""
+    text = (REPO / "noo-cli/src/commands/cluster_vendor.rs").read_text()
+    m = re.search(r"const VENDOR_BUNDLE_BUDGET_MB: usize = (\d+);", text)
+    assert m, "cluster_vendor.rs: no VENDOR_BUNDLE_BUDGET_MB"
+    budget = int(m.group(1))
+    cap_mb = _cap_bytes() // (1024 * 1024)
+    assert budget >= LARGEST_EXPECTED_VENDOR_BUNDLE_MB, "one vendor CLI must still fit"
+    assert budget + LARGEST_OBSERVED_BUNDLE_MB < cap_mb, (budget, cap_mb)
+
+
 def test_both_rail_upload_routes_use_the_named_cap() -> None:
     """A literal on one route and the constant on the other is how they drift."""
     text = BOOTSTRAP.read_text()

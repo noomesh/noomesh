@@ -1828,6 +1828,7 @@ const TEXT_KINDS: &[&str] = &[
     "agent-env", "harness-env", "nats-creds", "fleet-secrets", "host-telemetry", "teardown",
     "cli-user", "signing-pub", "ca.crt", "node.crt", "node.key", "agent-plist", "run-agent",
     "harness-plist", "run-harness", "restart-backends", "vendor-cli-manifest",
+    "vendor-cli-2-manifest", "vendor-cli-3-manifest",
 ];
 
 /// Where a ROOT apply keeps its trust anchors (`ca.crt`, `signing.pub`):
@@ -2401,9 +2402,10 @@ const KNOWN_KINDS: &[&str] = &[
     "svc-vllm.crt", "svc-vllm.key", "svc-llamacpp.crt", "svc-llamacpp.key",
     "svc-ollama.crt", "svc-ollama.key", "svc-tei.crt", "svc-tei.key",
     "svc-reranker.crt", "svc-reranker.key",
-    // The vendor CLI a harness kind runs, with its manifest (i83 E1e;
-    // `cluster_vendor`).
+    // The vendor CLIs a node carries, each with its manifest (i83 E1e;
+    // `cluster_vendor::VENDOR_SLOTS`).
     "vendor-cli", "vendor-cli-manifest",
+    "vendor-cli-2", "vendor-cli-2-manifest", "vendor-cli-3", "vendor-cli-3-manifest",
 ];
 
 /// The HTTPS agent for the poller: trusts ONLY the cluster CA pinned at

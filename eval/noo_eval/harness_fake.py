@@ -84,6 +84,11 @@ class FakeHarnessGateway:
                                                                   "NOO_HARNESS_LOG": "info"}}
         self.running_kind = original_kind
         self.down_beats = 0           # heartbeats the harness reports stopped after a kind change
+        # What the heartbeat says the harness RUNS (host_services.harness.kind):
+        # None = the kind it was started with; "" = says none (an older
+        # agent); any other string = stuck on that kind (a harness that
+        # never picked up the new placement).
+        self.report_kind: Optional[str] = None
         self.beat = 0
         self.tasks: dict[str, dict] = {}
         self.usage: dict[str, list[int]] = {"llamacpp": [9000, 800, 12]}
@@ -110,9 +115,14 @@ class FakeHarnessGateway:
         else:
             state = "running"
             self.running_kind = kind
+        harness = {"state": state, "runtime": "systemd"}
+        if state == "running":
+            reported = self.running_kind if self.report_kind is None else self.report_kind
+            if reported:
+                harness["kind"] = reported
         return {"id": self.node, "hostname": self.node, "status": "online",
                 "last_heartbeat": f"beat-{self.beat}",
-                "host_services": {"harness": {"state": state, "runtime": "systemd"}},
+                "host_services": {"harness": harness},
                 "reconcile_refusals": refusals}
 
     # ── tasks ──

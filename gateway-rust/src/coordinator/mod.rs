@@ -38,6 +38,7 @@ pub(crate) mod responses_wire;
 mod runtime;
 mod session;
 mod summary;
+pub(crate) mod thinking;
 
 // Public API — preserves the pre-split `crate::coordinator::X` paths.
 // (`allow(unused_imports)`: some re-exports are reachable-but-unreferenced

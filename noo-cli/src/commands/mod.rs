@@ -195,7 +195,7 @@ pub use secrets_remove::secrets_remove;
 pub use secrets_reveal::secrets_reveal;
 // ── Fleet secret convergence (WP-FS): the missing push half of a rotation.
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
-pub use cluster_vendor::{cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
+pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
 pub use cluster_verify::cluster_verify;

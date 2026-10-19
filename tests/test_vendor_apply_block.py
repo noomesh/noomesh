@@ -115,6 +115,59 @@ def test_a_native_cli_installs_with_a_wrapper_and_is_idempotent(tmp_path: Path) 
     assert not list((tmp_path / "usr/local/bin").glob(".*.next"))
 
 
+def test_two_clis_in_one_bundle_each_install_from_their_own_slot(tmp_path: Path) -> None:
+    """A node can carry chosen vendor CLIs whatever its placement names: the
+    bundle carries one slot per CLI, each verified against its own manifest."""
+    cop = tgz({"copilot": ELF})
+    cod = tgz({"bin/codex": ELF + b"codex"})
+    d = stage(tmp_path, {
+        "vendor-cli": cod, "vendor-cli-manifest": cli_manifest(cod, "codex", "0.46.0", "bin/codex"),
+        "vendor-cli-2": cop, "vendor-cli-2-manifest": cli_manifest(cop, "copilot", "1.0.0", "copilot"),
+    })
+    r = run(tmp_path, d)
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "opt/noo/vendor/codex/0.46.0/bin/codex").read_bytes() == ELF + b"codex"
+    assert (tmp_path / "opt/noo/vendor/copilot/1.0.0/copilot").read_bytes() == ELF
+    assert "/codex/0.46.0/bin/codex" in (tmp_path / "usr/local/bin/codex").read_text()
+    assert "/copilot/1.0.0/copilot" in (tmp_path / "usr/local/bin/copilot").read_text()
+    assert "applied: vendor-cli vendor-cli-2\n" in r.stdout
+    assert "vendor-cli: codex 0.46.0 installed" in r.stdout
+    assert "vendor-cli-2: copilot 1.0.0 installed" in r.stdout
+    assert f"vendor-cli={hashlib.sha256(cod).hexdigest()}" in r.stdout
+    assert f"vendor-cli-2={hashlib.sha256(cop).hexdigest()}" in r.stdout
+    # Again: both unchanged, each said so.
+    r = run(tmp_path, d)
+    assert r.returncode == 0, r.stderr
+    assert "applied: vendor-cli=unchanged vendor-cli-2=unchanged\n" in r.stdout
+    # A later bundle carrying only slot 2 leaves codex installed (nothing
+    # uninstalls), and slot 2 alone is applied.
+    d = stage(tmp_path, {"vendor-cli-2": cop, "vendor-cli-2-manifest": cli_manifest(cop, "copilot", "1.0.0", "copilot")})
+    r = run(tmp_path, d)
+    assert r.returncode == 0, r.stderr
+    assert "applied: vendor-cli-2=unchanged\n" in r.stdout
+    assert (tmp_path / "usr/local/bin/codex").exists()
+
+
+def test_a_tampered_second_slot_refuses_the_bundle_before_anything(tmp_path: Path) -> None:
+    good = tgz({"copilot": ELF})
+    bad = tgz({"bin/codex": ELF})
+    d = stage(tmp_path, {
+        "vendor-cli": good, "vendor-cli-manifest": cli_manifest(good, "copilot", "1.0.0", "copilot"),
+        "vendor-cli-2": bad + b"x", "vendor-cli-2-manifest": cli_manifest(bad, "codex", "0.46.0", "bin/codex"),
+    })
+    r = run(tmp_path, d)
+    assert r.returncode == 65 and "REFUSED vendor-cli-2" in r.stderr and "does not hash" in r.stderr, r.stderr
+    assert not (tmp_path / "opt").exists(), "the check runs before slot 1 installs"
+    # Slot 2 without its manifest, and two slots carrying the same CLI.
+    r = run(tmp_path, stage(tmp_path, {"vendor-cli-2": ELF}), "check")
+    assert r.returncode == 65 and "REFUSED vendor-cli-2" in r.stderr and "must ride together" in r.stderr
+    r = run(tmp_path, stage(tmp_path, {
+        "vendor-cli": good, "vendor-cli-manifest": cli_manifest(good, "copilot", "1.0.0", "copilot"),
+        "vendor-cli-3": good, "vendor-cli-3-manifest": cli_manifest(good, "copilot", "1.0.0", "copilot"),
+    }), "check")
+    assert r.returncode == 65 and "a second slot carries copilot" in r.stderr, r.stderr
+
+
 def test_a_new_version_replaces_the_wrapper_and_prunes_the_old(tmp_path: Path) -> None:
     a1 = tgz({"bin/codex": ELF})
     d = stage(tmp_path, {"vendor-cli": a1, "vendor-cli-manifest": cli_manifest(a1, "codex", "0.1.0", "bin/codex")})
