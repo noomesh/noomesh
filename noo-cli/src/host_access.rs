@@ -138,7 +138,20 @@ pub(crate) fn login_with_ticket(g: &Globals, account: &str, purpose: &str) -> Re
 /// The SQL that makes `account` a working admin with `bcrypt_hash` as its
 /// password: created when the row is missing, and otherwise re-enabled,
 /// unlocked and given back the admin tier. One transaction.
-pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
+///
+/// The same transaction ENDS the account's sessions, because a password reset
+/// that leaves yesterday's bearer working is not a reset: it revokes every
+/// refresh token and writes the durable "not before" floor the gateway reads
+/// (`gateway-rust/src/session_floor.rs`, table `noo_session_floors`, migration
+/// 095). The floor is `now + 1` like an operator account change, and lives
+/// `floor_ttl_secs` (one access-token lifetime plus margin). A running gateway
+/// adopts it within its Postgres re-read interval (5 s); one that is down
+/// loads it at boot. This path deliberately does not call the gateway: the
+/// reset must work with no login, no secret and the gateway down. The table is
+/// created here too (`IF NOT EXISTS`, the same columns as migration 095), so a
+/// new CLI against a gateway that has not yet migrated still resets instead of
+/// failing the whole transaction; the migration is then a no-op.
+pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str, floor_ttl_secs: i64) -> String {
     let (u, h) = (quote(account), quote(bcrypt_hash));
     format!(
         "{SEARCH_PATH}BEGIN;\n\
@@ -150,8 +163,23 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
          scopes = CASE WHEN COALESCE(noo_users.scopes, '[]'::jsonb) @> '[\"admin\"]'::jsonb \
          THEN noo_users.scopes ELSE '{ADMIN_SCOPES}'::jsonb END, \
          role = 'admin';\n\
+         CREATE TABLE IF NOT EXISTS noo_session_floors (account text PRIMARY KEY, floor bigint NOT NULL, expires_at timestamptz NOT NULL);\n\
+         UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = {u} AND revoked_at IS NULL;\n\
+         INSERT INTO noo_session_floors (account, floor, expires_at) \
+         VALUES ({u}, extract(epoch FROM now())::bigint + 1, now() + interval '{floor_ttl_secs} seconds') \
+         ON CONFLICT (account) DO UPDATE SET \
+         floor = GREATEST(noo_session_floors.floor, EXCLUDED.floor), \
+         expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at);\n\
          COMMIT;\n"
     )
+}
+
+/// How long a floor row stays: the gateway's `session_floor::floor_ttl_secs`
+/// (the longest access token, never under 15 minutes, plus 5 minutes). Read
+/// from the same env var; an unreadable value falls back to the default.
+pub(crate) fn floor_ttl_secs() -> i64 {
+    let mins = std::env::var("NOO_TOKEN_EXPIRE_MINUTES").ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(15);
+    mins.max(15) * 60 + 300
 }
 
 /// Write `account`'s new password straight into the gateway's database.
@@ -160,7 +188,7 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
 pub(crate) fn reset_admin(db: &HostDb, account: &str, password: &str) -> Result<(), String> {
     validate_account(account)?;
     let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| format!("bcrypt: {e}"))?;
-    db.run(&reset_admin_sql(account, &hash))
+    db.run(&reset_admin_sql(account, &hash, floor_ttl_secs()))
 }
 
 #[cfg(test)]
@@ -187,7 +215,7 @@ mod tests {
 
     #[test]
     fn the_reset_recreates_reenables_and_unlocks_the_admin() {
-        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv");
+        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv", 1200);
         for needle in [
             "INSERT INTO noo_users",
             "ON CONFLICT (username) DO UPDATE",
@@ -201,6 +229,44 @@ mod tests {
         ] {
             assert!(sql.contains(needle), "missing {needle}: {sql}");
         }
+    }
+
+    /// A reset must end the account's sessions: the refresh chain is revoked
+    /// and the durable floor is raised, in the SAME transaction as the new
+    /// password (all or nothing), so the next gateway read honours it.
+    #[test]
+    fn the_reset_ends_the_accounts_sessions_in_the_same_transaction() {
+        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv", 1200);
+        let begin = sql.find("BEGIN;").unwrap();
+        let commit = sql.find("COMMIT;").unwrap();
+        for needle in [
+            "UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = 'admin'",
+            "CREATE TABLE IF NOT EXISTS noo_session_floors (account text PRIMARY KEY",
+            "INSERT INTO noo_session_floors (account, floor, expires_at)",
+            "VALUES ('admin', extract(epoch FROM now())::bigint + 1, now() + interval '1200 seconds')",
+            "GREATEST(noo_session_floors.floor, EXCLUDED.floor)",
+        ] {
+            let at = sql.find(needle).unwrap_or_else(|| panic!("missing {needle}: {sql}"));
+            assert!(begin < at && at < commit, "{needle} must sit inside the transaction");
+        }
+    }
+
+    #[test]
+    fn the_floor_row_lives_one_token_lifetime_and_never_under_the_default() {
+        assert!(floor_ttl_secs() >= 15 * 60 + 300);
+    }
+
+    /// The gateway reads these columns; a rename on one side strands the floor.
+    #[test]
+    fn the_floor_table_matches_the_gateways_migration() {
+        let mig = include_str!("../../gateway-rust/src/mesh_migrate.rs");
+        let m = mig.split("revision: SESSION_FLOORS_REVISION").nth(1).expect("migration 095");
+        for col in ["noo_session_floors", "account", "floor", "expires_at"] {
+            assert!(m.contains(col), "migration 095 lacks {col}");
+        }
+        let gw = include_str!("../../gateway-rust/src/session_floor.rs");
+        assert!(gw.contains("FROM noo_session_floors WHERE account = $1 AND expires_at > now()"));
+        assert!(gw.contains("fn floor_ttl_secs() -> i64 {\n    crate::auth_refresh::default_access_minutes().max(15) * 60 + 300"));
     }
 
     /// The SQL is built by quoting, and the name is checked first: an

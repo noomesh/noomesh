@@ -2011,6 +2011,25 @@ CREATE TABLE IF NOT EXISTS noo_embedding_spaces (
     updated_at  timestamptz NOT NULL DEFAULT now()
 )
 "#,
+}, Migration {
+    revision: SESSION_FLOORS_REVISION,
+    down_revision: Some(EMBEDDING_SPACES_REVISION),
+    // The per-account "not before" floor (`session_floor.rs`), made durable.
+    // Redis held it alone, so a floor written by another gateway instance, or
+    // before a restart, was invisible while Redis was down. One row per
+    // account: the highest floor (unix seconds) and when it stops mattering
+    // (one access-token lifetime past the raise; after that no token that
+    // predates it can still be valid). `noo security admin-password reset`
+    // writes the same row from the host. Additive; nothing reads it until the
+    // new gateway does, and an old gateway ignores it.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_session_floors (
+    account    text        PRIMARY KEY,
+    floor      bigint      NOT NULL,
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS noo_session_floors_expires_idx ON noo_session_floors (expires_at)
+"#,
 }];
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
@@ -2024,6 +2043,9 @@ pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
 pub const EMBEDDING_SPACES_REVISION: &str = "097_embedding_spaces";
+
+/// The durable session floor table (`session_floor.rs`).
+pub const SESSION_FLOORS_REVISION: &str = "098_session_floors";
 
 /// The kiosk-seat revision (i77).
 pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
@@ -2861,14 +2883,13 @@ mod tests {
         assert!(cluster.contains("harness_profile = CASE WHEN"), "the upsert must write harness_profile");
     }
 
-    /// i145: the embedding-space table is the chain head, sits on the
+    /// i145: the embedding-space table sits on the
     /// harness-profile revision, and is empty (the gateway seeds it at boot).
     #[test]
     fn embedding_spaces_revision_creates_the_table_and_seeds_nothing() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "097_embedding_spaces");
         assert_eq!(m.down_revision, Some(HARNESS_PROFILE_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_embedding_spaces"));
         assert!(!m.sql.contains("INSERT"), "a migration cannot read the fleet's embed model; the boot seed does");
         assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
@@ -2884,6 +2905,17 @@ mod tests {
         let cluster = include_str!("routes/cluster.rs");
         assert!(cluster.contains("usage_profile, vendor_kinds"), "desired-config must read vendor_kinds");
         assert!(cluster.contains("vendor_kinds = CASE WHEN"), "the upsert must write vendor_kinds");
+    }
+
+    /// 098 is the durable session floor; the CLI's reset writes the same
+    /// table and columns, so a rename on either side must fail a test.
+    #[test]
+    fn session_floors_revision_sits_on_embedding_spaces_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SESSION_FLOORS_REVISION).expect("098 must be in the chain");
+        assert_eq!(m.down_revision, Some(EMBEDDING_SPACES_REVISION));
+        for needle in ["noo_session_floors", "account    text        PRIMARY KEY", "floor      bigint", "expires_at timestamptz"] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
     }
 
     /// 092 adds the chain columns and makes the app role INSERT-only, and the
