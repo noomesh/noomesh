@@ -430,7 +430,7 @@ pub(super) async fn rag_ingest_core(
     delegation::attach_requester(&mut body, ctx);
     match state.memory().kb_ingest(&body).await {
         Ok(response) => delegation::worker_ok(response),
-        Err(e) => delegation::worker_unavailable(e, None),
+        Err(e) => delegation::worker_failed(&e, None),
     }
 }
 

@@ -66,7 +66,21 @@ _MAX_PATHLIKE = 4096
 
 
 class IngestRefused(ValueError):
-    """The source may not be ingested. The message names the fix."""
+    """The source may not be ingested. The message names the fix.
+
+    ``error_kind`` is the structured signal the worker pool puts on the bus
+    reply so the gateway answers a 4xx instead of a 503 (retrying a refusal
+    can never succeed): ``invalid_request`` here, ``policy_refusal`` for
+    :class:`IngestPolicyRefused`.
+    """
+
+    error_kind = "invalid_request"
+
+
+class IngestPolicyRefused(IngestRefused):
+    """The source is not PERMITTED (outside the allowed roots, or a URL)."""
+
+    error_kind = "policy_refusal"
 
 
 @dataclass(frozen=True)
@@ -196,7 +210,7 @@ def classify(source: str, text: str, roots: list[Path] | None = None) -> Resolve
         raise IngestRefused("Provide 'source' or 'text'")
 
     if _URL_RE.match(stripped):
-        raise IngestRefused(
+        raise IngestPolicyRefused(
             f"ingest does not fetch URLs ({stripped.split('://', 1)[0]}://...). "
             "Fetch the page with a web tool and send its content as `text` "
             "(with `source_uri` set to the URL if you want it recorded)."
@@ -215,7 +229,7 @@ def classify(source: str, text: str, roots: list[Path] | None = None) -> Resolve
         probe = os.path.dirname(re.split(r"[*?\[]", expanded, maxsplit=1)[0] + "x") or "/"
     p = Path(probe)
     if not path_allowed(p, roots):
-        raise IngestRefused(
+        raise IngestPolicyRefused(
             f"refusing '{stripped}': it is outside the directories noomesh may ingest "
             f"from (or is one the service keeps private). {roots_hint(roots)}"
         )

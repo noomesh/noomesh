@@ -239,3 +239,32 @@ async def test_backend_without_explicit_entry_points_never_opens_text_as_path(mo
     with pytest.raises(ValueError):
         await rag_worker._rag_ingest({"text": str(secret), "title": "t"})
     assert rag.calls == []
+
+
+# i136: the gateway answers a refusal with a 4xx only when the worker says,
+# structurally, that it was a refusal. A bare ValueError says nothing.
+def test_the_bus_reply_carries_the_refusal_kind(tmp_path):
+    from noomesh.gateway.worker_pool import error_reply
+
+    with pytest.raises(ic.IngestRefused) as outside:
+        ic.classify("/etc/passwd", None, roots=[tmp_path])
+    reply = error_reply(outside.value)
+    assert reply["success"] is False
+    assert reply["error_kind"] == "policy_refusal"
+    assert "refusing '/etc/passwd'" in reply["error"]
+
+    with pytest.raises(ic.IngestRefused) as missing:
+        ic.classify(str(tmp_path / "nope.txt"), None, roots=[tmp_path])
+    assert "no such file" in str(missing.value)
+    assert error_reply(missing.value)["error_kind"] == "invalid_request"
+
+    with pytest.raises(ic.IngestRefused) as url:
+        ic.classify("https://example.com/x", None, roots=[tmp_path])
+    assert error_reply(url.value)["error_kind"] == "policy_refusal"
+
+
+def test_an_unclassified_failure_has_no_kind():
+    from noomesh.gateway.worker_pool import error_reply
+
+    assert error_reply(RuntimeError("db down")) == {"success": False, "error": "db down"}
+    assert "error_kind" not in error_reply(ValueError("plain"))
