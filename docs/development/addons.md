@@ -74,7 +74,7 @@ example-addon/
      "base_url_env": "NOO_EXAMPLE_ADDON_URL",
      "base_url_default": "https://noo-example-addon:8090",
      "routes": [
-       { "name": "status", "method": "GET", "path": "/api/example-addon/status" }
+       { "name": "status", "method": "GET", "path": "/api/example-addon/status", "min_role": "operator" }
      ]
    }
    ```
@@ -146,11 +146,12 @@ switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
   "base_url_default": "https://noo-yourthing:8090",
   "timeout_secs": 60,
   "routes": [
-    { "name": "status", "method": "GET", "path": "/api/yourthing/status" },
-    { "name": "list", "method": "GET", "path": "/api/yourthing/items", "query": true },
+    { "name": "status", "method": "GET", "path": "/api/yourthing/status", "min_role": "user" },
+    { "name": "list", "method": "GET", "path": "/api/yourthing/items", "query": true,
+      "min_role": "operator", "scopes": ["yourthing:read_items"] },
     { "name": "detail", "method": "GET", "path": "/api/yourthing/items/{item_id}",
-      "params": { "item_id": "uuid" } },
-    { "name": "run", "method": "POST", "path": "/api/yourthing/run" },
+      "params": { "item_id": "uuid" }, "min_role": "operator" },
+    { "name": "run", "method": "POST", "path": "/api/yourthing/run", "min_role": "operator" },
     { "name": "internal_tick", "method": "POST", "path": "/api/yourthing/tick",
       "internal": true }
   ]
@@ -166,6 +167,8 @@ switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
 | `query` | Pass the caller's query string through. |
 | `internal` | Callable from gateway code, **not mounted** on the public API. |
 | `timeout_secs` | Per route (1–600); falls back to the manifest's. |
+| `min_role` | `user`, `operator` or `admin`: the lowest role that may call this public route. **Absent means `operator`**, for every method. Any other value refuses the whole manifest. A `POST` cannot be `user`. |
+| `scopes` | Optional, `GET` only: add-on scopes written `<yourname>:<word>` that also open the route to an account holding `read` plus the scope, below `min_role`. Always namespaced, so a manifest can never name a core scope (`graph`, `ingest`, …). |
 | `note` | Free text for whoever reads the file. |
 
 Any other field is refused.
@@ -181,9 +184,9 @@ being up first, and an image upgrade rewrites the file.
 
 ### What the gateway checks
 
-The gateway still decides what it exposes. A manifest declares paths and an
-upstream, never who may call them, and the gateway refuses the whole add-on
-when any of these fails:
+The gateway still decides what it exposes. A manifest declares paths, an
+upstream and the permission each route needs, and the gateway refuses the whole
+add-on when any of these fails:
 
 - `version` is 1 and `addon` is the add-on it was delivered for;
 - the upstream is your own service: `base_url_env` is `NOO_<NAME>_URL` and
@@ -197,10 +200,42 @@ when any of these fails:
   pieces and the gateway's own scheduled calls) are `internal`;
 - a public `POST` is one the front door already refuses a User-tier caller,
   so a manifest cannot place a write where a User is admitted;
+- `min_role` is `user`, `operator` or `admin` (never anything else, never read
+  as `user`), a `POST` is not `user`, and `scopes` are `<name>:<word>` on a
+  `GET`;
 - no public route collides with a core route.
 
-Scopes are the gateway's: the global auth middleware runs in front of every
-mounted route exactly as it does for core routes.
+### Who may call a route
+
+Add-on routes are scoped by permission like every core route, with the same
+tiers (User, Operator, Admin). The gateway enforces `min_role` before it
+forwards anything, for every method: the global auth middleware runs in front
+of every mounted route exactly as it does for core routes, and the add-on
+receiver checks again (which also covers `admin` routes and aliases). A caller
+is allowed when its role is at least `min_role`, or, on a `GET` that lists
+`scopes`, when it holds `read` plus one of them. A refusal is a `403` naming the
+role needed, before your service is dialled.
+
+Choose the role by what the route returns. Anything that describes the whole
+installation (reflection text, genomes, rewards, policy state, fleet-wide
+counts) is `operator`. `user` is for what is per-account and safe for any
+signed-in person. Writes are `operator` or `admin` and a scope never widens
+them.
+
+**Absent `min_role` is `operator`.** An add-on that does not say who may read a
+route (an older release, a third-party add-on) is readable by Operators and
+Admins only. Before this field a manifest's `GET` routes were readable by any
+User-tier token; that is the one behaviour this narrows, and only for Users.
+Declare `"min_role": "user"` on a route a User should keep.
+
+Add-on scopes are checked against the scopes in the caller's token. Granting
+one to an account is a separate step the issuer must support for that word;
+until it does, `min_role` is the whole control.
+
+Rolling: the gateway rolls first. A gateway that predates `min_role` refuses an
+unknown manifest field outright (unknown keys fail the whole manifest), so an
+add-on image that declares `min_role` must not meet an older gateway; a new
+gateway with an older add-on image treats every route as `operator`.
 
 ### When it is missing or wrong
 

@@ -2744,7 +2744,9 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return user_may_read(path);
+        // An add-on's GET is scoped by the route's own `min_role`/`scopes`
+        // (addon_proxy), not waved through with the allow-list.
+        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, path);
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
@@ -2918,9 +2920,10 @@ pub const USER_READ_PREFIXES: &[&str] = &[
     "/v1/models/",
 ];
 
-/// Whether a `User`-tier token may GET `path`: the allow-list above, plus the
-/// GET routes of mounted add-on manifests (validated at load; they are the
-/// add-on's own surface and were reachable before this list existed).
+/// Whether a `User`-tier token may GET `path` by the allow-list above. An
+/// add-on's mounted GET routes are NOT here: each declares its own `min_role`
+/// and `scopes`, which `scope_allows_for` asks `addon_proxy::mounted_get_allows`
+/// (absent means Operator, so a User reads none an add-on did not vouch for).
 pub fn user_may_read(path: &str) -> bool {
     USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
@@ -2932,7 +2935,6 @@ pub fn user_may_read(path: &str) -> bool {
                 path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/'))
             }
         })
-        || crate::addon_proxy::is_mounted_get_route(path)
 }
 
 /// Metric READS: Operator and Admin only. The metrics describe the whole

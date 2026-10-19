@@ -20,9 +20,9 @@
 //! used, not a fetch from the add-on, so nothing at boot depends on the
 //! network or on the add-on being up first.
 //!
-//! The gateway still decides what it exposes. The manifest declares paths and
-//! an upstream, nothing about who may call them, and [`validate`] refuses
-//! anything else:
+//! The gateway still decides what it exposes. The manifest declares paths, an
+//! upstream and the PERMISSION each public route needs (`min_role`, `scopes`:
+//! see "Who may call a route" below), and [`validate`] refuses anything else:
 //!
 //! - version 1, `addon` = the add-on it was delivered for;
 //! - the upstream is that add-on's own service: `base_url_env` is
@@ -60,7 +60,37 @@
 //! - `query` — pass the caller's query string through.
 //! - `internal` — callable from gateway code via [`call`], NOT mounted.
 //! - `timeout_secs` — per route, defaulting to the manifest's.
+//! - `min_role` — `user` | `operator` | `admin`; absent means `operator`.
+//! - `scopes` — add-on scopes (`<addon>:<word>`) that also open a GET route.
 //! - `note` — free text, ignored.
+//!
+//! ## Who may call a route
+//!
+//! Add-on routes are scoped by permission like every core route. Each public
+//! route carries `min_role`, enforced here BEFORE anything is forwarded, for
+//! every method, from the same [`crate::auth::Role`] tiers core uses (a
+//! requester's role is the one `Claims::resolved_role` derived at validation):
+//!
+//! - the requester's role is at least `min_role`; or
+//! - a GET route lists `scopes` and the requester holds `read` plus one of
+//!   them (an additive grant to a person's `read`, exactly the shape of core's
+//!   `graph` scope: never a credential on its own).
+//!
+//! An ABSENT `min_role` is `operator`, for every method. An add-on that has
+//! not said who may read a route (an older one, a third-party one) therefore
+//! shows it to Operators and Admins only; a User never sees a route nobody
+//! vouched for. An unknown role word refuses the whole manifest at load
+//! ([`validate`]); it is never read as `user`. Writes keep their existing
+//! rule and are never widened: a POST is `operator` or `admin`, and takes no
+//! scopes (the tier gate refuses a User's writes before a scope is asked).
+//!
+//! The tier gate in `auth.rs` asks [`mounted_get_allows`] for a User's GET so
+//! it answers at the front door; [`serve`] asks [`RouteSpec::permits`] again,
+//! which also covers `admin` routes (Operators pass the front door) and every
+//! alias. A requester with no `RequesterCtx` is a machine credential (cluster
+//! HMAC, service key) that the front door already admitted as trusted; it is
+//! not narrowed here. Gateway code that calls a route by NAME (`internal`)
+//! has no requester and no role: the gateway decided to make that call.
 //!
 //! ## The contract every mounted route keeps
 //!
@@ -154,6 +184,16 @@ pub struct RouteSpec {
     pub internal: bool,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// The lowest role that may call this public route: `user`, `operator` or
+    /// `admin`. Absent means `operator` (see "Who may call a route"). Kept as
+    /// the manifest's own word so an unknown value is refused by
+    /// [`validate`] with a sentence, not a serde variant error.
+    #[serde(default)]
+    pub min_role: Option<String>,
+    /// Add-on scopes (`<addon>:<word>`) that also open this GET route to a
+    /// requester holding `read` plus the scope, below `min_role`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// Free text for whoever reads the manifest. Ignored by the code.
     #[serde(default)]
     pub note: Option<String>,
@@ -161,6 +201,37 @@ pub struct RouteSpec {
 
 fn default_timeout() -> u64 {
     300
+}
+
+/// The role a manifest word names; `None` for anything else.
+fn parse_role(word: &str) -> Option<crate::auth::Role> {
+    match word {
+        "user" => Some(crate::auth::Role::User),
+        "operator" => Some(crate::auth::Role::Operator),
+        "admin" => Some(crate::auth::Role::Admin),
+        _ => None,
+    }
+}
+
+impl RouteSpec {
+    /// The role this route needs. Absent is `operator`; an unknown word (which
+    /// [`validate`] refuses at load, so only a hand-built spec can hold one)
+    /// is `admin`, so a bad value can only ever shut a route, never open it.
+    pub fn required_role(&self) -> crate::auth::Role {
+        match self.min_role.as_deref() {
+            None => crate::auth::Role::Operator,
+            Some(w) => parse_role(w).unwrap_or(crate::auth::Role::Admin),
+        }
+    }
+
+    /// May a requester of `role` holding `held` scopes call this route?
+    pub fn permits(&self, role: crate::auth::Role, held: &[String]) -> bool {
+        if role >= self.required_role() {
+            return true;
+        }
+        let has = |s: &str| held.iter().any(|h| h == s);
+        has("read") && self.scopes.iter().any(|s| has(s))
+    }
 }
 
 impl AddonManifest {
@@ -268,6 +339,15 @@ fn check_upstream(m: &AddonManifest, addon: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `<addon>:<word>`: namespaced, so no add-on can declare a core scope.
+fn scope_ok(s: &str) -> bool {
+    let Some((addon, word)) = s.split_once(':') else { return false };
+    let plain = |t: &str| {
+        !t.is_empty() && t.len() <= 32 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    };
+    plain(addon) && plain(word) && !word.contains(':')
+}
+
 fn check_route(r: &RouteSpec) -> Result<(), String> {
     let ctx = format!("route {:?}", r.name);
     if !name_ok(&r.name) {
@@ -284,6 +364,36 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
     for (p, format) in &r.params {
         if format != "uuid" && format != "string" {
             return Err(format!("{ctx}: param {p:?} has format {format:?} — uuid or string"));
+        }
+    }
+    if let Some(word) = r.min_role.as_deref() {
+        let Some(role) = parse_role(word) else {
+            return Err(format!(
+                "{ctx}: min_role {word:?} is not a role — use \"user\", \"operator\" or \"admin\" \
+                 (an unknown value is refused, never read as user)"
+            ));
+        };
+        if r.method == "POST" && role == crate::auth::Role::User {
+            return Err(format!(
+                "{ctx}: a POST cannot be min_role \"user\" — writes are operator or admin, the \
+                 front door refuses a User's writes and a manifest does not widen that"
+            ));
+        }
+    }
+    if !r.scopes.is_empty() {
+        if r.method != "GET" {
+            return Err(format!("{ctx}: scopes open a GET route only — a scope never widens a write"));
+        }
+        if r.scopes.len() > 8 {
+            return Err(format!("{ctx}: at most 8 scopes per route"));
+        }
+        for sc in &r.scopes {
+            if !scope_ok(sc) {
+                return Err(format!(
+                    "{ctx}: scope {sc:?} must be `<addon>:<word>` ([a-z0-9_] words), so it can \
+                     never be a core scope (read, write, admin, graph, ingest, …)"
+                ));
+            }
         }
     }
     let declared: HashSet<&str> = r.params.keys().map(String::as_str).collect();
@@ -346,6 +456,14 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
             ));
         }
         check_route(r)?;
+        for sc in &r.scopes {
+            if sc.split(':').next() != Some(addon) {
+                return Err(format!(
+                    "route {:?}: scope {sc:?} must start with `{addon}:` — an add-on names only its own scopes",
+                    r.name
+                ));
+            }
+        }
         if !names.insert(r.name.as_str()) {
             return Err(format!("route name {:?} appears twice", r.name));
         }
@@ -472,23 +590,40 @@ pub fn manifests() -> Vec<AddonManifest> {
         .collect()
 }
 
-/// Is `path` a mounted, public GET route of some loaded add-on manifest
-/// (`{param}` segments match any single segment)? The tier gate asks this so
-/// narrowing a User's GETs to an allow-list does not close the add-ons' own
-/// read surface.
-pub fn is_mounted_get_route(path: &str) -> bool {
-    manifests_get_match(&manifests(), path)
+/// May a requester of `role` holding `scopes` GET `path` through a loaded
+/// add-on manifest? The tier gate asks this for a User-tier GET, so an
+/// add-on's read surface is scoped by its own `min_role`/`scopes` instead of
+/// being waved through. False when no mounted route matches. When more than
+/// one pattern matches a path (a static route beside a `{param}` one), ALL of
+/// them must permit: the stricter reading, never the wider.
+pub fn mounted_get_allows(scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
+    get_allows(&manifests(), scopes, role, path)
 }
 
+fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
+    let hits = matching_get_routes(manifests, path);
+    !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
+}
+
+#[cfg(test)]
 fn manifests_get_match(manifests: &[AddonManifest], path: &str) -> bool {
+    !matching_get_routes(manifests, path).is_empty()
+}
+
+fn matching_get_routes<'a>(manifests: &'a [AddonManifest], path: &str) -> Vec<&'a RouteSpec> {
     let segs: Vec<&str> = path.split('/').collect();
-    manifests.iter().flat_map(|m| m.routes.iter()).filter(|r| !r.internal && r.method == "GET").any(|r| {
-        std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| {
-            let p: Vec<&str> = pat.split('/').collect();
-            p.len() == segs.len()
-                && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+    manifests
+        .iter()
+        .flat_map(|m| m.routes.iter())
+        .filter(|r| !r.internal && r.method == "GET")
+        .filter(|r| {
+            std::iter::once(&r.path).chain(r.aliases.iter()).any(|pat| {
+                let p: Vec<&str> = pat.split('/').collect();
+                p.len() == segs.len()
+                    && p.iter().zip(&segs).all(|(a, b)| (a.starts_with('{') && !b.is_empty()) || a == b)
+            })
         })
-    })
+        .collect()
 }
 
 // ── Mounting ─────────────────────────────────────────────────────────────
@@ -589,6 +724,12 @@ async fn serve(
     body: Option<Value>,
     requester: Option<&crate::auth::RequesterCtx>,
 ) -> Response {
+    // Permission first, before a param is parsed or anything is forwarded.
+    if let Some(r) = requester {
+        if !spec.permits(r.role, &r.scopes) {
+            return forbidden(manifest, spec);
+        }
+    }
     // Substitute path params, validating each against its declared format so
     // a malformed id is a clean 400 here rather than whatever the upstream
     // makes of it.
@@ -608,6 +749,29 @@ async fn serve(
         }
     }
     forward(manifest, spec, &path, body, requester).await
+}
+
+fn forbidden(manifest: &AddonManifest, spec: &RouteSpec) -> Response {
+    let need = spec.required_role().as_str();
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "detail": format!(
+                "{} {} needs the {need} role{}",
+                spec.method,
+                spec.path,
+                if spec.scopes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (or `read` plus one of: {})", spec.scopes.join(", "))
+                }
+            ),
+            "addon": manifest.addon,
+            "required_role": need,
+            "scopes": spec.scopes,
+        })),
+    )
+        .into_response()
 }
 
 fn bad_request(msg: String) -> Response {
@@ -952,13 +1116,14 @@ pub(crate) mod tests {
             "timeout_secs": 300,
             "routes": [
                 {"name": "sample_status", "method": "GET", "path": "/api/sample/status",
-                 "aliases": ["/api/sample-alt/status"]},
-                {"name": "sample_items", "method": "GET", "path": "/api/sample/items", "query": true},
+                 "aliases": ["/api/sample-alt/status"], "min_role": "user"},
+                {"name": "sample_items", "method": "GET", "path": "/api/sample/items", "query": true,
+                 "min_role": "operator", "scopes": ["evolve:read_items"]},
                 {"name": "sample_item", "method": "GET", "path": "/api/sample/items/{item_id}",
-                 "params": {"item_id": "uuid"}},
-                {"name": "sample_run", "method": "POST", "path": "/api/sample/run"},
+                 "params": {"item_id": "uuid"}, "min_role": "admin"},
+                {"name": "sample_run", "method": "POST", "path": "/api/sample/run", "min_role": "operator"},
                 {"name": "sample_rollback", "method": "POST", "path": "/api/sample/rollback",
-                 "timeout_secs": 30},
+                 "timeout_secs": 30, "min_role": "admin"},
                 {"name": "meta_loop_dispatch", "method": "POST", "path": "/api/sample/dispatch",
                  "internal": true, "timeout_secs": 120},
                 {"name": "console_piece", "method": "GET", "path": "/console-piece",
@@ -1370,6 +1535,8 @@ mod user_read_route_tests {
                     query: false,
                     internal: *internal,
                     timeout_secs: None,
+                    min_role: None,
+                    scopes: vec![],
                     note: None,
                 })
                 .collect(),
@@ -1391,5 +1558,173 @@ mod user_read_route_tests {
         assert!(!manifests_get_match(&m, "/api/evolve/start"), "POST routes are not read routes");
         assert!(!manifests_get_match(&m, "/api/evolve/hidden"), "internal routes are not mounted");
         assert!(!manifests_get_match(&m, "/api/other"));
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use crate::auth::Role;
+
+    fn route(method: &str, min_role: Option<&str>, scopes: &[&str]) -> RouteSpec {
+        serde_json::from_value(json!({
+            "name": "r", "method": method, "path": "/api/x/r",
+            "min_role": min_role, "scopes": scopes,
+        }))
+        .unwrap()
+    }
+    fn held(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+    const ROLES: [Role; 3] = [Role::User, Role::Operator, Role::Admin];
+
+    /// requester role x route role: allowed exactly when role >= route role.
+    #[test]
+    fn the_role_matrix_mirrors_the_core_tiers() {
+        for method in ["GET", "POST"] {
+            for (word, need) in [("user", Role::User), ("operator", Role::Operator), ("admin", Role::Admin)] {
+                if method == "POST" && need == Role::User {
+                    continue; // refused at load, see below
+                }
+                let r = route(method, Some(word), &[]);
+                for have in ROLES {
+                    assert_eq!(
+                        r.permits(have, &held(&["read"])),
+                        have >= need,
+                        "{method} min_role={word}, requester {have:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An absent field is Operator for every method: a User never reads a
+    /// route nobody vouched for, an Operator and an Admin keep theirs.
+    #[test]
+    fn an_absent_min_role_is_operator_for_every_method() {
+        for method in ["GET", "POST"] {
+            let r = route(method, None, &[]);
+            assert_eq!(r.required_role(), Role::Operator);
+            assert!(!r.permits(Role::User, &held(&["read"])), "{method}: a User is refused");
+            assert!(r.permits(Role::Operator, &held(&["read", "write"])));
+            assert!(r.permits(Role::Admin, &held(&["read", "write", "admin"])));
+        }
+    }
+
+    /// An unknown word is refused at load with the reason, never read as user;
+    /// a hand-built spec holding one fails closed (admin).
+    #[test]
+    fn an_unknown_role_refuses_the_manifest_and_never_defaults_to_user() {
+        for bad in ["superuser", "User", "", "viewer", "root"] {
+            let mut v = tests::sample_json();
+            v["routes"][0]["min_role"] = json!(bad);
+            let m: AddonManifest = serde_json::from_value(v).unwrap();
+            let e = validate(&m, "evolve").expect_err(bad);
+            assert!(e.contains("min_role") && e.contains("not a role") && e.contains("never read as user"), "{e}");
+        }
+        let r = route("GET", Some("superuser"), &[]);
+        assert_eq!(r.required_role(), Role::Admin);
+        assert!(!r.permits(Role::Operator, &held(&["read", "write"])));
+    }
+
+    #[test]
+    fn a_granted_scope_opens_a_get_for_a_user_who_also_holds_read() {
+        let r = route("GET", Some("operator"), &["evolve:read_items"]);
+        assert!(r.permits(Role::User, &held(&["read", "evolve:read_items"])));
+        assert!(!r.permits(Role::User, &held(&["evolve:read_items"])), "a scope is an addition to read, never a credential");
+        assert!(!r.permits(Role::User, &held(&["read", "graph"])), "another scope opens nothing here");
+        assert!(!r.permits(Role::User, &held(&["read"])));
+    }
+
+    #[test]
+    fn scopes_are_namespaced_and_never_widen_a_write() {
+        for bad in ["graph", "read", "admin", "ingest", "other:x", ":x", "evolve:", "evolve:a:b", "evolve:Bad"] {
+            let mut v = tests::sample_json();
+            v["routes"][1]["scopes"] = json!([bad]);
+            let m: AddonManifest = serde_json::from_value(v).unwrap();
+            assert!(validate(&m, "evolve").is_err(), "scope {bad:?} must be refused");
+        }
+        let mut v = tests::sample_json();
+        v["routes"][3]["scopes"] = json!(["evolve:run"]);
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("GET route only"));
+        let mut v = tests::sample_json();
+        v["routes"][3]["min_role"] = json!("user");
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(validate(&m, "evolve").unwrap_err().contains("POST cannot be min_role"));
+    }
+
+    /// The shipped-shape fixture: every public route says who may call it.
+    /// (The evolve repo carries the same guard over its real manifest.)
+    #[test]
+    fn every_public_route_in_the_fixture_declares_a_role() {
+        let m = tests::sample();
+        for r in m.routes.iter().filter(|r| !r.internal) {
+            assert!(r.min_role.is_some(), "route {:?} declares no min_role", r.name);
+        }
+        validate(&m, "evolve").unwrap();
+    }
+
+    /// The front door's view of an add-on GET (what `scope_allows` asks).
+    #[test]
+    fn the_front_door_scopes_an_addon_get_by_the_routes_own_role() {
+        let m = [tests::sample()];
+        let user = held(&["read"]);
+        assert!(get_allows(&m, &user, Role::User, "/api/sample/status"), "min_role user");
+        assert!(get_allows(&m, &user, Role::User, "/api/sample-alt/status"), "an alias is the same route");
+        assert!(!get_allows(&m, &user, Role::User, "/api/sample/items"), "operator route");
+        assert!(get_allows(&m, &held(&["read", "evolve:read_items"]), Role::User, "/api/sample/items"));
+        let id = "/api/sample/items/00000000-0000-0000-0000-000000000001";
+        assert!(!get_allows(&m, &user, Role::User, id));
+        assert!(get_allows(&m, &held(&["read", "write"]), Role::Operator, "/api/sample/items"));
+        assert!(!get_allows(&m, &held(&["read", "write"]), Role::Operator, id), "admin route: not an Operator");
+        assert!(get_allows(&m, &held(&["read", "write", "admin"]), Role::Admin, id));
+        assert!(!get_allows(&m, &user, Role::User, "/api/sample/run"), "a POST path is no read route");
+        assert!(!get_allows(&m, &user, Role::User, "/api/unmounted"));
+    }
+
+    #[test]
+    fn overlapping_patterns_must_all_permit() {
+        let mut m = tests::sample();
+        m.routes.push(route_named("static_one", "/api/sample/items/mine", "operator"));
+        m.routes.push(route_named("param_one", "/api/sample/things/{id}", "user"));
+        m.routes.push(route_named("static_two", "/api/sample/things/secret", "operator"));
+        let m = [m];
+        assert!(!get_allows(&m, &held(&["read"]), Role::User, "/api/sample/things/secret"));
+        assert!(get_allows(&m, &held(&["read"]), Role::User, "/api/sample/things/abc"));
+    }
+
+    fn route_named(name: &str, path: &str, role: &str) -> RouteSpec {
+        let mut r = route("GET", Some(role), &[]);
+        r.name = name.into();
+        r.path = path.into();
+        r
+    }
+
+    /// The handler refuses before it forwards; a permitted caller goes on (to
+    /// the add-on gate, which answers 503 while evolve is off in tests).
+    #[tokio::test]
+    async fn serve_refuses_a_short_role_before_forwarding() {
+        let m = tests::sample();
+        let spec = m.route("sample_items").unwrap().clone();
+        let user = crate::auth::RequesterCtx {
+            sub: "alice".into(), scopes: held(&["read"]), role: Role::User, harness: None, act: None,
+        };
+        let resp = serve(&m, &spec, HashMap::new(), None, None, Some(&user)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["required_role"], "operator");
+
+        let admin_route = m.route("sample_item").unwrap().clone();
+        let op = crate::auth::RequesterCtx { role: Role::Operator, ..user.clone() };
+        let mut p = HashMap::new();
+        p.insert("item_id".to_string(), "00000000-0000-0000-0000-000000000001".to_string());
+        let resp = serve(&m, &admin_route, p, None, None, Some(&op)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "an Operator is short of an admin route");
+
+        let ok = crate::auth::RequesterCtx { role: Role::Operator, ..user };
+        let resp = serve(&m, &spec, HashMap::new(), None, None, Some(&ok)).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
