@@ -35,8 +35,13 @@ EXPOSE 9400
 HEALTHCHECK --interval=30s --timeout=5s \
     CMD ["python3", "-c", "import os,ssl,urllib.request; ctx=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA']); ctx.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY']); urllib.request.urlopen('https://localhost:9400/health',context=ctx,timeout=5)"]
 
-# Root ON PURPOSE: NVML needs the NVIDIA container runtime's device nodes and
-# the service leaf key is 0600 owned by the operator (noo-cli pki.rs
-# KeyReader::ContainerRoot). No DHI base exists for a CUDA runtime, so the
+# NON-ROOT (i132): uid 65532, the uid the PKI key table hands
+# `services/nvidia-exporter/service.key` to (noo-cli pki.rs
+# SERVICE_KEY_READERS, KeyReader::ContainerUid; `noo upgrade --stack` regrants
+# the key before the container is recreated). NVML needs only the NVIDIA
+# container runtime's /dev/nvidia* nodes, which the toolkit creates 0666, and
+# the exporter writes nothing. No DHI base exists for a CUDA runtime, so the
 # base stays the NVIDIA one, pinned by tag through the mirror.
+RUN groupadd --gid 65532 nonroot && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+USER nonroot
 CMD ["python3", "/app/exporter.py"]

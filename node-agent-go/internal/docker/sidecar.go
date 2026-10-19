@@ -68,6 +68,10 @@ printf '%s\n' "$STUNNEL_CONF" > /tmp/stunnel.conf
 exec stunnel /tmp/stunnel.conf
 `
 
+// sidecarUser is the user the agent-started door runs as: root, explicitly,
+// whatever the image's USER says (see startSidecar).
+const sidecarUser = "0"
+
 // SidecarLabel marks a sidecar container with the backend it fronts.
 const SidecarLabel = "noo.sidecar-for"
 
@@ -167,7 +171,13 @@ func (c *Client) startSidecar(ctx context.Context, backend, image, networkName, 
 		caps = append(caps, "NET_BIND_SERVICE")
 	}
 	cfg := &container.Config{
-		Image:      image,
+		Image: image,
+		// Root ON PURPOSE (and spelled out): the published stunnel image ends
+		// `USER 65532` since i132, but this door reads the node's root-owned
+		// 0600 leaf under /etc/noo/pki through the DAC_OVERRIDE cap below, and
+		// the alpine fallback's entrypoint runs `apk add`. Without this, a
+		// node pulling the new image would start a door that cannot read its key.
+		User:       sidecarUser,
 		Env:        []string{"STUNNEL_CONF=" + conf},
 		Entrypoint: []string{"sh", "-c"},
 		Cmd:        []string{stunnelSidecarScript},

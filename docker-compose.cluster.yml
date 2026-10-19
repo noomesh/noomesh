@@ -1475,6 +1475,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-llamacpp
+    user: nonroot
     profiles: ["llamacpp", "cpu"]
     volumes:
       - ./docker/stunnel-llamacpp.conf:/etc/stunnel/stunnel.conf:ro
@@ -1643,6 +1644,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed-cpu
+    user: nonroot
     profiles: ["embed-cpu"]
     volumes:
       - ./docker/stunnel-ollama-embed-cpu.conf:/etc/stunnel/stunnel.conf:ro
@@ -1692,6 +1694,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama-embed
+    user: nonroot
     profiles: ["standalone"]
     volumes:
       - ./docker/stunnel-ollama-embed.conf:/etc/stunnel/stunnel.conf:ro
@@ -1776,6 +1779,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-ollama
+    user: nonroot
     profiles: ["ollama", "gpu-tier2"]
     volumes:
       - ./docker/stunnel-ollama.conf:/etc/stunnel/stunnel.conf:ro
@@ -1796,6 +1800,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei
+    user: nonroot
     profiles: ["tei-compose"]  # opt-in only (paired with noo-tei)
     volumes:
       - ./docker/stunnel-tei.conf:/etc/stunnel/stunnel.conf:ro
@@ -1816,6 +1821,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-tei-gpu
+    user: nonroot
     # Gated with tei-gpu — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
     volumes:
@@ -1875,6 +1881,7 @@ services:
     image: noomesh/stunnel:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-stunnel-reranker
+    user: nonroot
     # Gated with reranker — see above. Only needed for the compose path.
     profiles: ["tei-compose"]
     volumes:
@@ -2404,6 +2411,7 @@ services:
     image: noomesh/nvidia-exporter:latest
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-nvidia-exporter
+    user: nonroot
     profiles: ["controller", "standalone", "gpu-tier1", "gpu-tier2"]
     ports:
       - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_NVIDIA_EXPORTER:-9400}:9400"  # H-N5 — GPU exporter reachable by controller scrape over tailnet only

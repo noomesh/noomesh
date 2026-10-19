@@ -143,8 +143,8 @@ def _rust_code(src: str) -> str:
 
 
 def test_the_key_reader_table_has_the_row():
-    assert re.search(rf'\("{LEAF}", KeyReader::ContainerRoot\)', PKI.read_text()), (
-        "pki.rs SERVICE_KEY_READERS has no ollama-embed row (stunnel reads the key as root)"
+    assert re.search(rf'\("{LEAF}", KeyReader::ContainerUid\(65532\)\)', PKI.read_text()), (
+        "pki.rs SERVICE_KEY_READERS has no ollama-embed row (the stunnel door runs as uid 65532, i132)"
     )
 
 

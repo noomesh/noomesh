@@ -687,3 +687,27 @@ func TestLlamacppImageFallsBackToUpstreamWithNoPinAndNoLocalBuild(t *testing.T) 
 		t.Errorf("no pin, no local build should fall back to upstream, got %q", got)
 	}
 }
+
+// The agent-started door runs as root EXPLICITLY (i132): the published
+// stunnel image ends `USER 65532`, but the node's leaf under /etc/noo/pki is
+// root-owned 0600 and read through DAC_OVERRIDE, and the alpine fallback's
+// entrypoint runs `apk add`. A node that pulled the new image without this
+// would start a door that cannot read its own key.
+func TestSidecarRunsAsRootWhateverTheImageUserSays(t *testing.T) {
+	if sidecarUser != "0" {
+		t.Fatalf("sidecarUser = %q, want \"0\"", sidecarUser)
+	}
+	src, err := os.ReadFile("sidecar.go")
+	if err != nil {
+		t.Skip("source not readable from the test dir")
+	}
+	body := string(src)
+	i := strings.Index(body, "cfg := &container.Config{")
+	if i < 0 {
+		t.Fatal("startSidecar's container.Config not found")
+	}
+	cfg := body[i : i+strings.Index(body[i:], "}\n")]
+	if !strings.Contains(cfg, "User:") || !strings.Contains(cfg, "sidecarUser") {
+		t.Errorf("startSidecar does not set User: sidecarUser on the door's container config:\n%s", cfg)
+	}
+}
