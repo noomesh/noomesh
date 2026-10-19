@@ -186,6 +186,10 @@ pub struct ControlCounts {
     pub https_other: u64,
     /// Idempotent reads that fell back to HTTPS after a bus failure.
     pub fallbacks: u64,
+    /// Calls and streams carried over the node-held tunnel (i131 phase 2).
+    pub tunnel: u64,
+    /// Tunnel streams that were cut by a dropped tunnel or a reset.
+    pub tunnel_aborts: u64,
 }
 
 static COUNTS: OnceLock<Mutex<HashMap<String, ControlCounts>>> = OnceLock::new();
@@ -209,6 +213,12 @@ pub(crate) fn note_https(key: &str, is_control: bool) {
 pub(crate) fn note_fallback(key: &str) {
     bump(key, |c| c.fallbacks += 1);
 }
+pub(crate) fn note_tunnel(key: &str) {
+    bump(key, |c| c.tunnel += 1);
+}
+pub(crate) fn note_tunnel_abort(key: &str) {
+    bump(key, |c| c.tunnel_aborts += 1);
+}
 
 /// A snapshot of the counters, by node id (or agent URL host for a link that
 /// was not resolved by node id).
@@ -225,6 +235,9 @@ pub fn counts_json(node: &str) -> Value {
         "https_control": c.https_control,
         "https_other": c.https_other,
         "fallbacks": c.fallbacks,
+        "tunnel": c.tunnel,
+        "tunnel_aborts": c.tunnel_aborts,
+        "tunnel_live": crate::tunnel::hub().live(node).is_some(),
     })
 }
 
@@ -370,6 +383,24 @@ fn leaf_signer() -> Result<Arc<LeafSigner>, String> {
     let s = Arc::new(LeafSigner::load()?);
     *g = Some(s.clone());
     Ok(s)
+}
+
+/// Sign `msg` with the controller leaf: `(alg, signature b64, cert b64)`.
+/// The tunnel handshake signs its challenge with this (the same key that
+/// signs control envelopes, for the same reason: it is the fact the node
+/// already checks to believe "this is the controller").
+pub(crate) fn sign_detached(msg: &[u8]) -> Result<(&'static str, String, String), String> {
+    let signer = leaf_signer()?;
+    let sig = signer.sign(msg)?;
+    Ok((signer.alg(), base64::engine::general_purpose::STANDARD.encode(sig), signer.cert_b64().to_string()))
+}
+
+/// [`sign_detached`] with a key and certificate given as PEM, for tests.
+#[cfg(test)]
+pub(crate) fn sign_detached_with_pem(msg: &[u8], key_pem: &[u8], cert_pem: &[u8]) -> Result<(&'static str, String, String), String> {
+    let signer = LeafSigner::from_pem(key_pem, cert_pem)?;
+    let sig = signer.sign(msg)?;
+    Ok((signer.alg(), base64::engine::general_purpose::STANDARD.encode(sig), signer.cert_b64().to_string()))
 }
 
 // ── a bus call ──────────────────────────────────────────────────────────
@@ -746,7 +777,14 @@ mod tests {
         note_https("cnt-node", false);
         note_fallback("cnt-node");
         let c = counts().get("cnt-node").copied().unwrap();
-        assert_eq!(c, ControlCounts { bus: 2, https_control: 1, https_other: 1, fallbacks: 1 });
-        assert_eq!(counts_json("never-called"), json!({"bus": 0, "https_control": 0, "https_other": 0, "fallbacks": 0}));
+        assert_eq!(c, ControlCounts { bus: 2, https_control: 1, https_other: 1, fallbacks: 1, tunnel: 0, tunnel_aborts: 0 });
+        note_tunnel("cnt-node");
+        note_tunnel_abort("cnt-node");
+        let c = counts().get("cnt-node").copied().unwrap();
+        assert_eq!((c.tunnel, c.tunnel_aborts), (1, 1));
+        assert_eq!(
+            counts_json("never-called"),
+            json!({"bus": 0, "https_control": 0, "https_other": 0, "fallbacks": 0, "tunnel": 0, "tunnel_aborts": 0, "tunnel_live": false})
+        );
     }
 }

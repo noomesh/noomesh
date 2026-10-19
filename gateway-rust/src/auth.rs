@@ -177,6 +177,11 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/agents/threads"),
     ("GET", "/api/agents/keys/*"),
     ("PUT", "/api/agents/keys/*"),
+    // The node-held tunnel (i131 phase 2): a node opens it as ITSELF. The
+    // handler additionally requires the TLS client certificate to name the
+    // same node as this token's actor and a controller-verified challenge
+    // response (`tunnel.rs`).
+    ("GET", "/api/node/tunnel"),
 ];
 
 /// Is `method path` on the node allow-list for `actor`? `{self}` segments
