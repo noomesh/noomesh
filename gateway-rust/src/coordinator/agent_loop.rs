@@ -1958,10 +1958,12 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // FETCHED (temporal facts, knowledge base, memory, other channels, video
     // recall) is third-party-authored and travels as a delimited data block
     // in the user's message instead - see `context::build_data_frame`.
-    if let Some(ref c) = abc_ctx { push_layer("", c); }
+    // Operator text stays: shipped runbooks and core skills. Summaries and
+    // recall (built from messages), evolved skills and device reports are
+    // framed below - see `context::split_skills_by_origin`.
     if let Some(ref c) = runbook_ctx { push_layer("", c); }
-    if let Some(ref c) = skills_ctx { push_layer("", c); }
-    if let Some(ref c) = companion_ctx { push_layer("", c); }
+    let (core_skills, evolved_skills) = super::context::split_skills_by_origin(skills_ctx.as_deref());
+    if let Some(ref c) = core_skills { push_layer("", c); }
 
     // Dedup redundant lines across layers (same fact surfacing in Layer B
     // summary and Layer C recall, etc.) Labels and blank lines preserved.
@@ -1986,6 +1988,9 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
+            ("Earlier in this conversation (outline, summary, recall)", abc_ctx.as_deref()),
+            ("Skills written at runtime (evolved)", evolved_skills.as_deref()),
+            ("Companion devices", companion_ctx.as_deref()),
         ],
     );
     if let Some(f) = data_frame.as_deref() {
@@ -3113,10 +3118,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // FETCHED (temporal facts, knowledge base, memory, other channels, video
     // recall) is third-party-authored and travels as a delimited data block
     // in the user's message instead - see `context::build_data_frame`.
-    if let Some(ref c) = abc_ctx { push_layer("", c); }
+    // Operator text stays: shipped runbooks and core skills. Summaries and
+    // recall (built from messages), evolved skills and device reports are
+    // framed below - see `context::split_skills_by_origin`.
     if let Some(ref c) = runbook_ctx { push_layer("", c); }
-    if let Some(ref c) = skills_ctx { push_layer("", c); }
-    if let Some(ref c) = companion_ctx { push_layer("", c); }
+    let (core_skills, evolved_skills) = super::context::split_skills_by_origin(skills_ctx.as_deref());
+    if let Some(ref c) = core_skills { push_layer("", c); }
 
     let deduped = dedup_context_lines(&extra_context);
     record_layer_chars(rt.metrics(), "total_pre_dedup", &extra_context).await;
@@ -3139,6 +3146,9 @@ async fn run_inner_bound<R: HarnessRuntime>(
             ("Memory", mem_ctx.as_deref()),
             ("Other channels", channel_ctx.as_deref()),
             ("Video recall", video_ctx.as_deref()),
+            ("Earlier in this conversation (outline, summary, recall)", abc_ctx.as_deref()),
+            ("Skills written at runtime (evolved)", evolved_skills.as_deref()),
+            ("Companion devices", companion_ctx.as_deref()),
         ],
     );
     if let Some(f) = data_frame.as_deref() {
