@@ -1875,7 +1875,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
- "webpki-roots 0.26.11",
+ "webpki-roots 1.0.10",
  "x25519-dalek",
  "x509-cert",
  "x509-parser",
