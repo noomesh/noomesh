@@ -232,6 +232,18 @@
   "/api/v1/settings/user-dirs": [
    "apps/web/src/features/files/FilesPanel.tsx"
   ],
+  "/api/voice/status": [
+   "apps/web/src/features/chat/voice/voiceApi.ts"
+  ],
+  "/api/voice/synthesize": [
+   "apps/web/src/features/chat/voice/voiceApi.ts"
+  ],
+  "/api/voice/transcribe": [
+   "apps/web/src/features/chat/voice/voiceApi.ts"
+  ],
+  "/api/voice/voices": [
+   "apps/web/src/features/chat/voice/voiceApi.ts"
+  ],
   "/auth/me": [
    "packages/api/src/authApi.ts"
   ],
@@ -242,6 +254,8 @@
    "apps/web/src/features/addons/slots.ts",
    "apps/web/src/features/addons/useConsolePieces.ts",
    "apps/web/src/features/brain-map/useBrainStatus.ts",
+   "apps/web/src/features/chat/voice/useVoice.ts",
+   "apps/web/src/features/chat/voice/voiceApi.ts",
    "apps/web/src/features/observability/useObservability.ts",
    "apps/web/src/kiosk/store.ts",
    "apps/web/src/kiosk/useKiosk.ts"
@@ -306,6 +320,8 @@
   "/api/cluster/cli-asset/{name}",
   "/api/cluster/delete-tailscale-device",
   "/api/cluster/discover",
+  "/api/cluster/embedding-spaces",
+  "/api/cluster/embedding-spaces/{space}",
   "/api/cluster/enroll-tailnet",
   "/api/cluster/maintenance",
   "/api/cluster/mint-join-key",
@@ -315,10 +331,14 @@
   "/api/cluster/nodes/{id}/forget",
   "/api/cluster/nodes/{id}/heartbeat",
   "/api/cluster/nodes/{id}/register",
+  "/api/cluster/nodes/{node_id}/bench",
   "/api/cluster/nodes/{node_id}/clean",
   "/api/cluster/nodes/{node_id}/config",
+  "/api/cluster/nodes/{node_id}/control-probe",
   "/api/cluster/nodes/{node_id}/desired-config",
   "/api/cluster/nodes/{node_id}/fit",
+  "/api/cluster/nodes/{node_id}/gpu/hold",
+  "/api/cluster/nodes/{node_id}/gpu/release",
   "/api/cluster/nodes/{node_id}/logs",
   "/api/cluster/nodes/{node_id}/maintenance",
   "/api/cluster/nodes/{node_id}/placements/{backend}",
@@ -329,6 +349,13 @@
   "/api/cluster/provision-bundle/{node}",
   "/api/cluster/provision-bundle/{node}/status",
   "/api/cluster/replication-status",
+  "/api/cluster/seat-enroll",
+  "/api/cluster/seat-tokens",
+  "/api/cluster/seat-tokens/{id}/revoke",
+  "/api/cluster/seats",
+  "/api/cluster/seats/{seat}/bundle",
+  "/api/cluster/seats/{seat}/status",
+  "/api/cluster/self-node",
   "/api/cluster/suggest-placement",
   "/api/coding/task",
   "/api/coding/tasks",
@@ -424,6 +451,7 @@
   "/api/prompt-skills/{name}/fitness",
   "/api/prompt-skills/{name}/retire",
   "/api/security/audit-history",
+  "/api/security/audit/list",
   "/api/security/audit/stats",
   "/api/security/audit/verify",
   "/api/security/bootstrap-tokens/{id}/revoke",
@@ -478,6 +506,9 @@
   "/api/tasks/inference",
   "/api/tasks/submit",
   "/api/tasks/{id}",
+  "/api/tasks/{id}/answer",
+  "/api/tasks/{id}/ask",
+  "/api/tasks/{id}/resubmit",
   "/api/tasks/{id}/stop",
   "/api/temporal/adaptations",
   "/api/temporal/agent-self",
@@ -498,9 +529,11 @@
   "/api/tools/browser/status",
   "/api/tools/nodes/{node_id}",
   "/api/tools/registry/raw",
+  "/api/usage/me",
   "/api/users/disable",
   "/api/users/proposals",
   "/api/users/propose",
+  "/api/users/{username}/allowance",
   "/api/v1/admin/walks",
   "/api/v1/device/{action}",
   "/api/v1/docs/held",
@@ -558,11 +591,7 @@
   "/api/v1/walks/stats",
   "/api/v1/walks/{id}",
   "/api/version",
-  "/api/voice/status",
-  "/api/voice/synthesize",
-  "/api/voice/transcribe",
   "/api/voice/transcribe/detailed",
-  "/api/voice/voices",
   "/api/workflows",
   "/api/workflows/run",
   "/auth/logout",
@@ -577,6 +606,10 @@
   "/bootstrap/deenroll",
   "/bootstrap/fetch",
   "/bootstrap/prep",
+  "/bootstrap/seat/{seat}/applied",
+  "/bootstrap/seat/{seat}/bundle",
+  "/bootstrap/seat/{seat}/fetched",
+  "/bootstrap/seat/{seat}/heartbeat",
   "/dashboard",
   "/favicon.ico",
   "/kiosk",
