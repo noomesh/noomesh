@@ -198,3 +198,51 @@ func TestChatPlacementOfPicksTheRunningChatEngine(t *testing.T) {
 		t.Error("cleared")
 	}
 }
+
+// The harness tells Claude Code its model's real window from this (i147):
+// the chat ollama's own OLLAMA_CONTEXT_LENGTH, else the profile's default,
+// else 0; never a window for a chat backend that is not ollama.
+func TestChatContextWindowIsTheOllamaContextTheAgentSets(t *testing.T) {
+	prof := &harnessprofile.Profile{OllamaContext: 32768}
+	chat := placement{Backend: "ollama", Model: "gemma4:12b", Role: "chat", DesiredState: "running"}
+	r := &Reconciler{}
+
+	r.recordChatPlacement([]placement{chat})
+	if got := r.ChatContextWindow(prof); got != 32768 {
+		t.Errorf("profile default: got %d", got)
+	}
+	if got := r.ChatContextWindow(nil); got != 0 {
+		t.Errorf("no profile, no placement value: got %d", got)
+	}
+
+	own := chat
+	own.Env = map[string]string{"OLLAMA_CONTEXT_LENGTH": " 65536 "}
+	r.recordChatPlacement([]placement{own})
+	if got := r.ChatContextWindow(prof); got != 65536 {
+		t.Errorf("the placement's own value wins: got %d", got)
+	}
+
+	// Several ollama roles share one daemon: the merged env decides.
+	embed := placement{Backend: "ollama", Model: "harrier", Role: "embed", DesiredState: "running",
+		Env: map[string]string{"OLLAMA_CONTEXT_LENGTH": "16384"}}
+	r.recordChatPlacement([]placement{chat, embed})
+	if got := r.ChatContextWindow(prof); got != 16384 {
+		t.Errorf("another role's value reaches the shared daemon: got %d", got)
+	}
+
+	bad := chat
+	bad.Env = map[string]string{"OLLAMA_CONTEXT_LENGTH": "lots"}
+	r.recordChatPlacement([]placement{bad})
+	if got := r.ChatContextWindow(prof); got != 0 {
+		t.Errorf("an unreadable value is not a window: got %d", got)
+	}
+
+	r.recordChatPlacement([]placement{{Backend: "vllm", Model: "gemma", DesiredState: "running"}})
+	if got := r.ChatContextWindow(prof); got != 0 {
+		t.Errorf("vllm: the ollama default is not its window: got %d", got)
+	}
+	r.recordChatPlacement(nil)
+	if got := r.ChatContextWindow(prof); got != 0 {
+		t.Errorf("no chat placement: got %d", got)
+	}
+}

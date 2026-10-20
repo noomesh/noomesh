@@ -136,11 +136,25 @@ func TestFilterBodyForBackend(t *testing.T) {
 		},
 		// ollama-target: strip vllm + llamacpp extras, keep ollama extras
 		{
-			name:        "ollama strips stream_options + n_predict",
-			in:          `{"model":"x","messages":[],"stream_options":{},"n_predict":256,"keep_alive":"5m"}`,
+			name:        "ollama strips n_predict, keeps keep_alive",
+			in:          `{"model":"x","messages":[],"n_predict":256,"keep_alive":"5m"}`,
 			backendType: "ollama",
-			mustNotHave: []string{"stream_options", "n_predict"},
+			mustNotHave: []string{"n_predict"},
 			mustHave:    []string{"keep_alive", "model"},
+		},
+		// stream_options is portable: the translator's usage chunk
+		// depends on it reaching every backend (i147).
+		{
+			name:        "ollama keeps stream_options",
+			in:          `{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":true}}`,
+			backendType: "ollama",
+			mustHave:    []string{"stream_options"},
+		},
+		{
+			name:        "llamacpp keeps stream_options",
+			in:          `{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":true}}`,
+			backendType: "llamacpp",
+			mustHave:    []string{"stream_options"},
 		},
 		// Unknown backend: pass through
 		{

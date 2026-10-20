@@ -45,7 +45,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,6 +120,25 @@ impl PromptSwitch {
     }
 }
 
+/// The model's context window the driver tells a CLI that takes one
+/// (`launch.context_window_env`, noomesh-internal i147). Shared like
+/// [`PromptSwitch`]: the harness sets it from the node agent's
+/// `model_context` at start and on every placement re-read; a run reads it
+/// when its environment is built. 0 = unknown, and the variable is not set.
+#[derive(Debug, Clone, Default)]
+pub struct ContextWindow(Arc<AtomicU64>);
+
+impl ContextWindow {
+    /// Set the window (`None` = unknown); returns the previous one.
+    pub fn set(&self, tokens: Option<u64>) -> Option<u64> {
+        Some(self.0.swap(tokens.unwrap_or(0), Ordering::Relaxed)).filter(|n| *n > 0)
+    }
+
+    pub fn get(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Relaxed)).filter(|n| *n > 0)
+    }
+}
+
 /// Whether a run gets noomesh's tools. Production always wires the user door
 /// ([`McpWiring::Door`]); `noo-gateway harness probe` runs a CLI with NO MCP
 /// server and no gateway at all ([`McpWiring::None`]): no door key is
@@ -145,6 +164,8 @@ pub struct DriverCtx {
     /// full or slim, from the node's harness profile (or the probe's
     /// `--prompt`); only a kind with a `launch_slim` is affected.
     pub prompt: PromptSwitch,
+    /// The model's context window, for `launch.context_window_env`.
+    pub context_window: ContextWindow,
     pub pinned: ResolvedBackend,
     /// Where per-task workspaces go (`NOO_HARNESS_WORKDIR`).
     pub workdir_root: PathBuf,
@@ -187,6 +208,7 @@ impl DriverCtx {
             launch,
             launch_slim,
             prompt: PromptSwitch::default(),
+            context_window: ContextWindow::default(),
             pinned,
             workdir_root,
             keep_workdir: set("NOO_HARNESS_KEEP_WORKDIR").is_some_and(|v| v.trim() == "1"),
@@ -644,6 +666,9 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
         if let Some(v) = l.ca_env.as_deref().filter(|v| !v.is_empty()) {
             env.insert(v.to_string(), ca.clone());
         }
+    }
+    if let (Some(k), Some(n)) = (l.context_window_env.as_deref().filter(|k| !k.is_empty()), ctx.context_window.get()) {
+        env.insert(k.to_string(), n.to_string());
     }
     for (k, v) in &ctx.kind.lane {
         env.insert(k.clone(), v.clone());
@@ -1487,6 +1512,23 @@ mod tests {
         // endpoint itself.
         let base = seen.lines().find_map(|l| l.strip_prefix("FAKE_BASE_URL=")).expect("FAKE_BASE_URL set");
         assert!(base.starts_with("http://127.0.0.1:") && base.ends_with("/v1") && !base.contains(":8085"), "{base}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The model's window reaches a CLI that takes one, only once known,
+    /// and is read per run (a re-read placement changes the next run).
+    #[test]
+    fn the_context_window_is_set_only_when_known_and_the_kind_takes_one() {
+        let root = scratch("ctxwin");
+        let k = kind(&["fake"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-ctxwin", false).unwrap();
+        ctx.context_window.set(Some(32768));
+        assert!(!build_env(&ctx, &ws, "http://127.0.0.1:1/").contains_key("FAKE_MAX_CONTEXT"), "the kind names no variable");
+        ctx.launch.context_window_env = Some("FAKE_MAX_CONTEXT".into());
+        assert_eq!(build_env(&ctx, &ws, "http://127.0.0.1:1/")["FAKE_MAX_CONTEXT"], "32768");
+        assert_eq!(ctx.context_window.set(None), Some(32768));
+        assert!(!build_env(&ctx, &ws, "http://127.0.0.1:1/").contains_key("FAKE_MAX_CONTEXT"), "unknown: left to the CLI");
         let _ = std::fs::remove_dir_all(root);
     }
 

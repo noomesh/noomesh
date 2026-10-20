@@ -55,6 +55,14 @@ func TestHarnessPlacementRouteAnswersPlacedAndUnplaced(t *testing.T) {
 	if strings.TrimSpace(body) != `{"kind":"copilot","env":{"NOO_HARNESS_KIND":"copilot"},"desired_state":"running","placed":true}` {
 		t.Fatalf("body: %s", body)
 	}
+	// The chat backend's window rides along when the agent knows it (i147).
+	windowed := placementServer(t, func() HarnessPlacement {
+		return HarnessPlacement{Kind: "claude-code", DesiredState: "running", Placed: true, ModelContext: 32768}
+	})
+	rec = getPlacement(windowed, own, "127.0.0.1:5000", "")
+	if body := strings.ReplaceAll(rec.Body.String(), " ", ""); strings.TrimSpace(body) != `{"kind":"claude-code","env":{},"desired_state":"running","placed":true,"model_context":32768}` {
+		t.Fatalf("model_context body: %s", body)
+	}
 	unplaced := placementServer(t, func() HarnessPlacement { return HarnessPlacement{} })
 	rec = getPlacement(unplaced, own, "127.0.0.1:5000", "")
 	if rec.Code != 404 || strings.ReplaceAll(rec.Body.String(), " ", "") != `{"placed":false}` {
