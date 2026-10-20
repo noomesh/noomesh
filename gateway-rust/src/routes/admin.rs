@@ -693,7 +693,11 @@ async fn security_audit_verify(
     let report = crate::audit_integrity::verify_db(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("cannot read noo_security_audit: {e}")))?;
-    Ok(Json(serde_json::to_value(report).map_err(|e| AppError::Internal(e.to_string()))?))
+    let mut v = serde_json::to_value(report).map_err(|e| AppError::Internal(e.to_string()))?;
+    // Rows held while the database was away, and rows lost, since this
+    // gateway started: the `audit log` verify row reads them.
+    v["spool"] = serde_json::to_value(crate::audit_spool::view()).unwrap_or_default();
+    Ok(Json(v))
 }
 
 // ═══════════════════════════════════════════════════════════════

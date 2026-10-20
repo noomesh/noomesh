@@ -1514,9 +1514,29 @@ async fn audit_insert(
              row was NOT recorded — run `noo upgrade --stack`, which mints it when absent and \
              recreates the stack"
         );
+        crate::audit_spool::note_lost();
         return;
     };
-    write_audit_row(db, &key, event_type, severity, actor, resource, outcome, details, None).await;
+    // The database being away (a Postgres restart during a roll) is not a
+    // reason to lose the row: it waits in `audit_spool` and is written as
+    // soon as the database answers, stamped with when it happened.
+    if write_audit_row_outcome(db, &key, event_type, severity, actor, resource, outcome, details, None).await
+        == crate::audit_spool::Outcome::Transient
+    {
+        let held = crate::audit_spool::enqueue(crate::audit_spool::Pending::Security {
+            event_type: event_type.to_string(),
+            severity: severity.to_string(),
+            actor: actor.to_string(),
+            resource: resource.to_string(),
+            outcome: outcome.to_string(),
+            details: crate::audit_spool::stamp_queued_at(details),
+        });
+        if held {
+            tracing::warn!(event_type, actor, "audit_write_queued: the database is away; this security audit row is held and will be written when it answers");
+        } else {
+            tracing::error!(event_type, actor, "audit_write_lost: the database is away and the audit queue is full; this security audit row was NOT recorded");
+        }
+    }
 }
 
 /// Sign one row with hash v2 under `key` and insert it. Returns whether the
@@ -1547,18 +1567,50 @@ pub(crate) async fn write_audit_row(
     details: &str,
     prev_hash: Option<&str>,
 ) -> bool {
+    // Not queued: these callers act on the answer now (a required view
+    // refuses, a boot row is retried at the next boot).
+    match write_audit_row_outcome(db, key, event_type, severity, actor, resource, outcome, details, prev_hash).await {
+        crate::audit_spool::Outcome::Landed => true,
+        crate::audit_spool::Outcome::Transient => {
+            tracing::error!(event_type, actor, "audit_write_lost: the database is away; this security audit row was NOT recorded");
+            crate::audit_spool::note_lost();
+            false
+        }
+        crate::audit_spool::Outcome::Lost => false,
+    }
+}
+
+/// [`write_audit_row`], saying WHY a row did not land: `Transient` (the
+/// database is away; the caller may hold the row for `audit_spool`) or
+/// `Lost` (it would fail again). Only `Lost` logs `audit_write_lost` here; a
+/// `Transient` row is the caller's to queue or report.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_audit_row_outcome(
+    db: &sqlx::PgPool,
+    key: &[u8],
+    event_type: &str,
+    severity: &str,
+    actor: &str,
+    resource: &str,
+    outcome: &str,
+    details: &str,
+    prev_hash: Option<&str>,
+) -> crate::audit_spool::Outcome {
+    use crate::audit_spool::{is_transient, Outcome};
     let details = match sqlx::query_scalar::<_, String>("SELECT $1::jsonb::text")
         .bind(details)
         .fetch_one(db)
         .await
     {
         Ok(d) => d,
+        Err(e) if is_transient(&e) => return Outcome::Transient,
         Err(e) => {
             tracing::error!(
                 event_type, actor, error = %e,
                 "audit_write_lost: a security audit row was NOT recorded (its details are not jsonb)"
             );
-            return false;
+            crate::audit_spool::note_lost();
+            return Outcome::Lost;
         }
     };
     // The chain is always linked under the CURRENT audit key, even for the one
@@ -1578,20 +1630,23 @@ pub(crate) async fn write_audit_row(
     // predecessor's. A missing monthly partition is healed once, as before.
     for attempt in 0..2 {
         match crate::audit_chain::write_row(db, key, chain_key.as_deref(), &row).await {
-            Ok(_) => return true,
+            Ok(_) => return Outcome::Landed,
             Err(e) if attempt == 0 && is_missing_partition(&e) => {
                 crate::audit_partition::ensure_for_heal(db).await;
             }
+            Err(e) if is_transient(&e) => return Outcome::Transient,
             Err(e) => {
                 tracing::error!(
                     event_type, actor, error = %e,
                     "audit_write_lost: a security audit row was NOT recorded"
                 );
-                return false;
+                crate::audit_spool::note_lost();
+                return Outcome::Lost;
             }
         }
     }
-    false
+    crate::audit_spool::note_lost();
+    Outcome::Lost
 }
 
 /// Now, as `timestamptz` will store it: whole microseconds.

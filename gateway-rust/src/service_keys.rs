@@ -400,8 +400,30 @@ pub async fn revoke_door_key(db: &PgPool, id: &str, user: &str) -> anyhow::Resul
     Ok(n > 0)
 }
 
+/// One `noo_external_requests` row, as [`record_external_request`] takes it
+/// and `audit_spool` holds it while the database is away.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalRequestRow {
+    pub id: uuid::Uuid,
+    /// When the request happened, so a row written after a database outage
+    /// keeps its own time rather than the column default (now).
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub consumer: String,
+    pub endpoint: &'static str,
+    pub kind: Option<String>,
+    pub model: Option<String>,
+    pub backend: Option<String>,
+    pub units: Option<Value>,
+    pub status: u16,
+    pub latency_ms: i64,
+    pub trace_id: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Insert one audit/usage row into `noo_external_requests`. Designed to be
-/// `tokio::spawn`-ed so it never blocks the response.
+/// `tokio::spawn`-ed so it never blocks the response. A row the database
+/// cannot take because it is away is held by `audit_spool` and written when
+/// it answers; the row's `id` is fixed here, so a retry cannot duplicate it.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_external_request(
     db: PgPool,
@@ -416,26 +438,51 @@ pub async fn record_external_request(
     trace_id: Option<String>,
     error: Option<String>,
 ) {
+    let row = ExternalRequestRow {
+        id: uuid::Uuid::new_v4(),
+        ts: chrono::Utc::now(),
+        consumer, endpoint, kind, model, backend, units, status, latency_ms, trace_id, error,
+    };
+    if insert_external_request(&db, &row).await == crate::audit_spool::Outcome::Transient {
+        if crate::audit_spool::enqueue(crate::audit_spool::Pending::External(row)) {
+            tracing::warn!("external audit insert queued: the database is away; the row is held and will be written when it answers");
+        } else {
+            tracing::error!("external audit insert LOST: the database is away and the audit queue is full");
+        }
+    }
+}
+
+/// Write one [`ExternalRequestRow`]. `Lost` is logged and counted here; a
+/// `Transient` outcome is the caller's to queue.
+pub(crate) async fn insert_external_request(db: &PgPool, r: &ExternalRequestRow) -> crate::audit_spool::Outcome {
     let res = sqlx::query(
         "INSERT INTO noo_external_requests \
-           (id, consumer, endpoint, kind, model, backend, units, status_code, latency_ms, trace_id, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+           (id, ts, consumer, endpoint, kind, model, backend, units, status_code, latency_ms, trace_id, error) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         ON CONFLICT (id) DO NOTHING",
     )
-    .bind(uuid::Uuid::new_v4())
-    .bind(consumer)
-    .bind(endpoint)
-    .bind(kind)
-    .bind(model)
-    .bind(backend)
-    .bind(units)
-    .bind(status as i32)
-    .bind(latency_ms as i32)
-    .bind(trace_id)
-    .bind(error)
-    .execute(&db)
+    .bind(r.id)
+    .bind(r.ts)
+    .bind(&r.consumer)
+    .bind(r.endpoint)
+    .bind(&r.kind)
+    .bind(&r.model)
+    .bind(&r.backend)
+    .bind(&r.units)
+    .bind(r.status as i32)
+    .bind(r.latency_ms as i32)
+    .bind(&r.trace_id)
+    .bind(&r.error)
+    .execute(db)
     .await;
-    if let Err(e) = res {
-        tracing::warn!("external audit insert failed: {e}");
+    match res {
+        Ok(_) => crate::audit_spool::Outcome::Landed,
+        Err(e) if crate::audit_spool::is_transient(&e) => crate::audit_spool::Outcome::Transient,
+        Err(e) => {
+            tracing::warn!("external audit insert failed: {e}");
+            crate::audit_spool::note_lost();
+            crate::audit_spool::Outcome::Lost
+        }
     }
 }
 

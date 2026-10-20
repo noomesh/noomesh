@@ -4111,6 +4111,30 @@ pub(crate) fn audit_log_check(v: &Value) -> Check {
             Some("noo security audit verify".into()),
         );
     }
+    // The gateway's audit spool (rows held while the database was away). A
+    // lost row is a gap the chain cannot show: it was never written.
+    let sp = |k: &str| v["spool"][k].as_u64().unwrap_or(0);
+    if sp("lost_total") > 0 {
+        return warn(
+            NAME,
+            format!(
+                "{verified}; {} audit row(s) LOST since the gateway started (never written: the database \
+                 refused them for good, or was away with the queue full); {} written back after an outage",
+                sp("lost_total"), sp("retried_total")
+            ),
+            Some("docker logs noo-gateway 2>&1 | grep -E 'audit_write_lost|external audit insert'".into()),
+        );
+    }
+    if sp("queued_now") > 0 {
+        return warn(
+            NAME,
+            format!("{verified}; {} audit row(s) are queued right now, waiting for the database", sp("queued_now")),
+            Some("noo cluster verify --wait   # the queue drains within seconds of the database answering".into()),
+        );
+    }
+    if sp("retried_total") > 0 {
+        return ok(NAME, format!("{verified}; {} row(s) written back after a database outage, none lost", sp("retried_total")));
+    }
     ok(NAME, verified)
 }
 
@@ -8109,6 +8133,29 @@ mod tests {
             "roll_window": []
         }));
         assert_eq!(empty.verdict, Verdict::Ok);
+    }
+
+    /// The gateway's audit spool: a row lost while the database was away is
+    /// a gap the chain cannot show, so it warns even on a chain that verifies;
+    /// rows written back after an outage are named on an OK row.
+    #[test]
+    fn audit_log_row_reads_the_spool() {
+        let base = |spool: Value| serde_json::json!({
+            "verdict": "ok", "key_present": true, "ok": 12, "breaks": [], "problems": [],
+            "roll_window": [], "spool": spool
+        });
+        let lost = audit_log_check(&base(serde_json::json!({"queued_now": 0, "retried_total": 5, "lost_total": 2})));
+        assert_eq!(lost.verdict, Verdict::Warn);
+        assert!(lost.detail.contains("2 audit row(s) LOST") && lost.detail.contains("5 written back"), "{}", lost.detail);
+        let waiting = audit_log_check(&base(serde_json::json!({"queued_now": 3, "retried_total": 0, "lost_total": 0})));
+        assert_eq!(waiting.verdict, Verdict::Warn);
+        assert!(waiting.detail.contains("3 audit row(s) are queued right now"), "{}", waiting.detail);
+        let recovered = audit_log_check(&base(serde_json::json!({"queued_now": 0, "retried_total": 4, "lost_total": 0})));
+        assert_eq!(recovered.verdict, Verdict::Ok);
+        assert!(recovered.detail.contains("4 row(s) written back after a database outage, none lost"), "{}", recovered.detail);
+        // An older gateway sends no spool at all: no claim either way.
+        let old = audit_log_check(&serde_json::json!({"verdict": "ok", "key_present": true, "ok": 12, "breaks": [], "problems": [], "roll_window": []}));
+        assert_eq!(old.verdict, Verdict::Ok);
     }
 }
 
