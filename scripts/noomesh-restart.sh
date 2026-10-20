@@ -42,6 +42,7 @@ source "$_LIBDIR/lib-addons.sh"
 load_config || echo "warning: config load reported problems (continuing)" >&2
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$_LIBDIR/lib-created-guard.sh"
+source "$_LIBDIR/lib-stuck-container.sh"
 # Refuse an `up` whose bind-mount sources are missing or the wrong type.
 source "$_LIBDIR/lib-bind-sources.sh"
 # Refuse ANY restart while an enabled system lacks its credentials: even a
@@ -261,12 +262,14 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         restart_require_lock || exit 1
         # shellcheck disable=SC2086
         check_bind_sources --no-deps $ACTIVE_SVCS || exit 1
-        docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE
+        noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --no-build --force-recreate $GPU_SCALE $AGENT_SCALE || _up_rc=$?
+        if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
         # The guard only heals services this invocation manages; a Created
         # container outside that set (a stale leftover, or the scaled-out
         # exporter) is removed, not started.
         NOO_CREATED_GUARD_SERVICES="$(printf '%s\n' "$ACTIVE_SVCS" | tr '\n' ' ')" \
             noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
+        [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
     else
         docker compose $COMPOSE_FILES $PROFILE_ARGS restart || {
             _rc=$?

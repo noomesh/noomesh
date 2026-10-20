@@ -1336,9 +1336,14 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // Same binary as this process — see mesh.rs::run_script for why
     // (`NOO_CLI_BIN`, resolved by the launcher's `noo_bin` helper).
     let cli_bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    // The launcher names a container it could not stop in this file
+    // (lib-stuck-container.sh), see LAUNCHER_EXIT_STACK_PARTIAL.
+    let stuck_report = std::env::temp_dir().join(format!("noo-launch-stuck-{}", std::process::id()));
+    let _ = std::fs::remove_file(&stuck_report);
     let launch = || std::process::Command::new("bash")
         .arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
         .env("NOO_IMAGE_TAG", &tag)
+        .env("NOO_STUCK_REPORT", &stuck_report)
         .env("NOO_CLI_BIN", &cli_bin)
         .current_dir(&root)
         .status();
@@ -1346,7 +1351,9 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     // One automatic retry: the first rail walk died on a GHCR blob timeout
     // over IPv6 (host8, 2026-09-03) — a transient the second attempt sails
     // through, and compose resumes the pull rather than restarting it.
-    if matches!(&status, Ok(s) if !s.success()) {
+    // Not for the partial-stack exit: a stuck container needs a reboot, and
+    // a second `up` cannot help.
+    if matches!(&status, Ok(s) if !s.success() && s.code() != Some(LAUNCHER_EXIT_STACK_PARTIAL)) {
         ui::warned("launcher failed — retrying once in 5s (transient registry errors are common)");
         std::thread::sleep(Duration::from_secs(5));
         status = launch();
@@ -1464,6 +1471,13 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             // it): nothing the roll does changes what the signed lock says, so
             // there is no second pass here. The run is joined by the caller.
             Ok((0, staging.take()))
+        }
+        Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL) => {
+            let report = std::fs::read_to_string(&stuck_report).unwrap_or_default();
+            let _ = std::fs::remove_file(&stuck_report);
+            ui::close_failed(&stuck_stack_message(&report, &tag), Some("noo upgrade --stack   # after the reboot"));
+            if let Some(st) = staging.take() { st.finish(g); }
+            Ok((1, None))
         }
         Ok(s) => {
             ui::close_failed(&format!("launcher exited with {} twice; the pin IS moved to {tag}", s.code().unwrap_or(-1)), Some("noo stack logs"));
@@ -1590,6 +1604,20 @@ fn keyless_in_store_of(required: &[(String, String)], set: &dyn Fn(&str) -> bool
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// The launcher's "stack is up except one stuck service" exit
+/// (`NOO_EXIT_STACK_PARTIAL` in scripts/lib-stuck-container.sh).
+const LAUNCHER_EXIT_STACK_PARTIAL: i32 = 75;
+
+/// The failure line for [`LAUNCHER_EXIT_STACK_PARTIAL`]. `report` is the
+/// launcher's `NOO_STUCK_REPORT` file: service name, container id, per line.
+fn stuck_stack_message(report: &str, tag: &str) -> String {
+    let mut svcs: Vec<&str> = report.lines().step_by(2).map(str::trim).filter(|l| !l.is_empty()).collect();
+    svcs.dedup();
+    let which = if svcs.is_empty() { "one service".to_string() } else { svcs.join(", ") };
+    format!("stack up except {which}; its container will not exit, so reboot this host to clear it, then `noo upgrade --stack` \
+             (the pin IS moved to {tag})")
 }
 
 /// Ask the running gateway which consumers lack an active key. Returns
@@ -4614,9 +4642,9 @@ mod tests {
         assert!(spawn < launcher, "staging must start before the launcher runs, to overlap it");
         // Inside upgrade_stack only the two failure paths join (launcher
         // failure; spawn error, whose fail() exits the process), each after the launcher.
-        assert_eq!(body.matches("st.finish(g)").count(), 2, "join only on launcher failure and spawn error");
+        assert_eq!(body.matches("st.finish(g)").count(), 3, "join only on launcher failure (generic and partial-stack) and spawn error");
         assert!(launcher < at("st.finish(g)"), "joined after the launcher returns");
-        let success = &body[at("Ok(s) if s.success() => {")..at("Ok(s) => {")];
+        let success = &body[at("Ok(s) if s.success() => {")..at("Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL)")];
         assert!(!success.contains("finish("), "the success arm hands the run back, it does not join");
         assert!(success.contains("Ok((0, staging.take()))"), "the live run is returned to the caller on success");
         assert!(!body.contains("stage_after_roll") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
@@ -5557,6 +5585,22 @@ mod keyless_tests {
         assert!(!down);
         assert_eq!(db.as_deref(), Some(&worker[..]), "no active key for worker in the listing");
         assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::Missing(worker.clone()));
+    }
+
+    #[test]
+    fn the_partial_stack_exit_is_named_and_not_retried() {
+        use super::{stuck_stack_message, LAUNCHER_EXIT_STACK_PARTIAL};
+        assert_eq!(LAUNCHER_EXIT_STACK_PARTIAL, 75);
+        let sh = include_str!("../../../scripts/lib-stuck-container.sh");
+        assert!(sh.contains("NOO_EXIT_STACK_PARTIAL=75"), "the Rust and shell codes must agree");
+        let m = stuck_stack_message("ollama-embed\nc5bba1c9\n", "v0.6.7");
+        assert!(m.starts_with("stack up except ollama-embed;") && m.contains("reboot") && m.contains("`noo upgrade --stack`"), "{m}");
+        assert!(stuck_stack_message("", "v0.6.7").starts_with("stack up except one service;"));
+        let src = include_str!("upgrade.rs");
+        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let retry = body.find("launcher failed").unwrap();
+        assert!(body[..retry].rfind("LAUNCHER_EXIT_STACK_PARTIAL").is_some_and(|i| retry - i < 300), "no retry for 75");
+        assert!(body.contains("Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL)"), "its own arm, before the generic failure");
     }
 
     #[test]
