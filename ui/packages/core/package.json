@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@metis/api": "*",
-    "@tanstack/react-query": "^5.104.2"
+    "@tanstack/react-query": "^5.104.3"
   },
   "peerDependencies": {
     "react": ">=18"

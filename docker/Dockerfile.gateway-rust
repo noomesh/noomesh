@@ -127,6 +127,9 @@ COPY tests/fixtures/own_image_cases.json /tests/fixtures/own_image_cases.json
 # The harness kinds table (src/harness_kinds.rs include_str!s it as
 # ../../config/harness-kinds.json); the node agent embeds a copy of it.
 COPY config/harness-kinds.json /config/harness-kinds.json
+# The harness profile defaults per tier (src/harness_profile.rs include_str!s
+# it as ../../config/harness-profiles.json).
+COPY config/harness-profiles.json /config/harness-profiles.json
 # The provisioned Grafana dashboards: src/routes/grafana_ds.rs include_str!s
 # each one as ../../../configs/grafana/dashboards/… and builds the read-only
 # tier's query allow-list from them. One line per file;
@@ -282,29 +285,17 @@ WORKDIR /app
 # removed in this change so the code stops describing a directory that is
 # not there.
 #
-# What DID need extracting is the dashboard, which lives under the Python
-# tree in the build context but has nothing to do with Python. Two separate
-# things, and the second one is easy to miss:
-#
-#   /app/static                      — assets (paths::STATIC_DIR)
-#   /app/src/noomesh/gateway/*.html — the pages themselves
-#                                       (paths::GATEWAY_HTML_DIR)
-#
-# The HTML sits at a /app/src path even though the Python tree is gone. That
-# is deliberate: routes/ui.rs resolves GATEWAY_HTML_DIR, and compose
-# bind-mounts ./src/noomesh/gateway/index.html over exactly that path for
-# live editing in dev. Moving it would silently break that overlay.
-#
-# Nearly shipped as a 404: index.html is NOT in static/, so ui.rs's fallback
-# to STATIC_DIR does not cover it. Dev hid this completely — the bind mount
-# supplies the file — so it would have surfaced only on a --dist install,
-# as a dashboard that returns "Page not found: index.html".
+# What DID need extracting is the static assets (`/app/static`,
+# paths::STATIC_DIR): the API contract the dashboard's reference view reads.
+# The dashboard itself is the UI artifact under /var/www. The last page
+# served from /app/src (`/ui/basic`, an inline-script chat page with no
+# login) is retired: it was the one reason the CSP allowed inline scripts.
 #
 # TWO trees, two jobs:
 #
 #   /app/static — in-tree files the artifact does not carry and never will:
 #     openapi.json (the API contract, served to the dashboard's reference
-#     view) and the /ui/basic fallback page. Kept as a directory COPY so the
+#     view). Kept as a directory COPY so the
 #     compose dev overlay still has something to mount over.
 #   /var/www — the UI artifact's /dist, wholesale: index.html + assets/.
 #
@@ -313,10 +304,6 @@ WORKDIR /app
 # one value — and a reader would reasonably assume the other value still
 # works.
 COPY src/noomesh/gateway/static /app/static
-# The /ui/basic fallback page. Standalone (no css/js of its own), which is
-# why it outlived the console it shipped beside: it is what you load when
-# the dashboard bundle will not.
-COPY src/noomesh/gateway/ui.html /app/src/noomesh/gateway/ui.html
 COPY --from=ui /dist /var/www
 
 COPY docker/mcp-servers.json /app/.mcp.json

@@ -176,12 +176,15 @@ def test_the_node_agent_control_api_has_no_plaintext_listener() -> None:
 
 
 def test_the_gateway_dials_node_agents_over_https_only() -> None:
-    """The four sites that build a `{proto}://{ip}:8081` URL no longer switch
-    on NOO_TLS_CA: a node agent has no plaintext listener to dial."""
-    hits = 0
-    for rel in ("gateway-rust/src/coordinator/backend.rs", "gateway-rust/src/routes/admin.rs", "gateway-rust/src/routes/cluster.rs"):
-        code = _code((ROOT / rel).read_text(), "//")
-        for m in re.finditer(r'let proto = ([^;]+);\s*(?://[^\n]*)?\n[^\n]*format!\("\{proto\}://[^"]*:8081', code):
-            hits += 1
-            assert m.group(1).strip() == '"https"', f"{rel}: a node-agent URL can still be http: {m.group(0).strip()}"
-    assert hits >= 3, f"expected the node-agent URL sites, found {hits} — the parse found too little"
+    """Every `{scheme}://{ip}:<agent port>` URL is built in `node_link.rs`
+    (`tests/test_node_link_is_the_only_node_door.py` keeps the others out), and
+    none of them switches on NOO_TLS_CA: a node agent has no plaintext listener
+    to dial. The controller-local fallback in admin.rs stays https as well."""
+    link = _code((ROOT / "gateway-rust/src/node_link.rs").read_text(), "//").split("#[cfg(test)]")[0]
+    built = re.findall(r'format!\("(\w+)://\{ip\}:\{AGENT_PORT\}"\)', link)
+    assert len(built) >= 2, f"expected the for_node and for_ip URL builders, found {len(built)} — the parse found too little"
+    assert set(built) == {"https"}, f"a node-agent URL can still be http: {built}"
+    assert 'format!("http://' not in link
+    admin = _code((ROOT / "gateway-rust/src/routes/admin.rs").read_text(), "//")
+    m = re.search(r'let proto = ([^;]+);\s*(?://[^\n]*)?\n[^\n]*format!\("\{proto\}://node-agent', admin)
+    assert m and m.group(1).strip() == '"https"', "the local agent fallback can be http"

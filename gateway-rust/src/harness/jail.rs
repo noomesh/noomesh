@@ -52,9 +52,11 @@
 //! ## macOS: `sandbox-exec`
 //!
 //! `/usr/bin/sandbox-exec -p <profile> <cli> …`, the profile from
-//! [`macos_profile`]: everything allowed by default, then the whole of
-//! `~/noomesh` (pki, birth key, env files, secrets) and the data root
-//! denied, then the CLI's own trees and the task's workspace allowed again.
+//! [`macos_profile`]: everything allowed by default, then the user's whole
+//! real home (on a Mac the harness runs as the operator: `~/.ssh`,
+//! `~/Documents`, keychains), `~/noomesh` (pki, birth key, env files,
+//! secrets) and the data root denied, then the CLI's own trees and the
+//! task's workspace allowed again.
 //! No `sandbox-exec` is a refusal.
 //!
 //! The profile also closes other processes: `(deny process-info*)` then
@@ -376,11 +378,25 @@ fn sbpl_str(p: &Path) -> Result<String, Refusal> {
 /// The `sandbox-exec` profile for a CLI on a Mac node whose noomesh tree is
 /// `<home>/noomesh`. SBPL: the LAST matching rule wins, so the denies come
 /// after `allow default` and the re-allows after the denies.
+///
+/// `home` is the REAL home of the user the harness runs as — on a Mac, the
+/// operator's own account. The whole of it is denied (`~/.ssh`,
+/// `~/Documents`, keychains, browser profiles), and only what the CLI must
+/// reach under it is allowed again below: `~/noomesh/vendor` and
+/// `~/noomesh/bin`, the CA file, the extra read-only files, and the task's
+/// workspace/HOME/TMP when the driver put them there (by default they are
+/// under the system temp dir, `/var/folders/…`, outside home). Metadata of
+/// the two directories on the way down (`~` and `~/noomesh`) is readable so
+/// a runtime resolving its own path can `stat` them; their listings are not.
 pub fn macos_profile(home: &Path, spec: &JailSpec) -> Result<String, Refusal> {
     let base = home.join("noomesh");
     let mut p = String::from("(version 1)\n(allow default)\n");
+    // The user's real home: everything a same-uid process could otherwise
+    // read on the operator's own account.
+    p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(home)?));
     // Everything the node keeps: pki (node pair, birth key), the agent's
-    // and harness's env files, secrets, the bundle state.
+    // and harness's env files, secrets, the bundle state. Inside home, so
+    // already denied; named so a later edit to the home rule cannot open it.
     p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(&base)?));
     // Named again, each: a later edit that re-allows part of the tree must
     // not reach these (the secret dirs hold the env files' values).
@@ -404,6 +420,9 @@ pub fn macos_profile(home: &Path, spec: &JailSpec) -> Result<String, Refusal> {
     if let Some(d) = &spec.data_root {
         p.push_str(&format!("(deny file-read* file-write* (subpath {}))\n", sbpl_str(d)?));
     }
+    // Path resolution down to the CLI: `stat` of home and ~/noomesh, never
+    // a listing or a read of anything in them.
+    p.push_str(&format!("(allow file-read-metadata (literal {}) (literal {}))\n", sbpl_str(home)?, sbpl_str(&base)?));
     // The CLI itself: the staged vendor tree and its wrapper.
     p.push_str(&format!("(allow file-read* (subpath {}) (subpath {}))\n", sbpl_str(&base.join("vendor"))?, sbpl_str(&base.join("bin"))?));
     if let Some(ca) = &spec.ca_file {
@@ -618,6 +637,12 @@ pub struct SelfTestPlan {
     /// `/etc/noo/pki` — the node pair and the harness's own copy — the
     /// secret dirs and the env files; macOS: [`macos_must_hide`]).
     pub must_hide: Vec<PathBuf>,
+    /// macOS: a file planted in the user's REAL home
+    /// (`~/.noo-jail-selftest-<id>`), which must be unreadable in the jail
+    /// — the operator's own files (`~/.ssh`, `~/Documents`) are only as
+    /// closed as this one. Removed after the test. None on Linux, where the
+    /// jail is an allow-list that names no home at all.
+    pub home_plant: Option<PathBuf>,
 }
 
 impl SelfTestPlan {
@@ -633,7 +658,8 @@ impl SelfTestPlan {
             let base = home.join("noomesh");
             let plant_dir = base.join("secrets").join(format!(".jail-selftest-{id}"));
             let must_hide = macos_must_hide(&home);
-            Ok(Self { scratch, plant_dir, must_hide })
+            let home_plant = Some(home.join(format!(".noo-jail-selftest-{id}")));
+            Ok(Self { scratch, plant_dir, must_hide, home_plant })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -646,7 +672,7 @@ impl SelfTestPlan {
                 .iter()
                 .map(PathBuf::from)
                 .collect();
-            Ok(Self { scratch, plant_dir, must_hide })
+            Ok(Self { scratch, plant_dir, must_hide, home_plant: None })
         }
     }
 }
@@ -700,6 +726,9 @@ pub async fn run_self_test(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &P
     let _ = std::fs::remove_dir_all(&plan.scratch);
     // Only the planted file and the directory made for it.
     let _ = std::fs::remove_dir_all(&plan.plant_dir);
+    if let Some(f) = &plan.home_plant {
+        let _ = std::fs::remove_file(f);
+    }
     let (proved, unproved) = match out {
         Ok(r) => r?,
         Err(_) => return Err(Refusal::new(format!("jail self-test did not finish in {}s", SELF_TEST_BUDGET.as_secs()))),
@@ -763,6 +792,18 @@ async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Pat
     if std::fs::read_to_string(&secret).ok().as_deref() != Some(secret_value.as_str()) {
         return Err(Refusal::new("jail self-test: the planted secret is not readable even outside the jail"));
     }
+    // The planted home file (macOS): the operator's own files, by proxy.
+    let home_value = format!("NOO-SELFTEST-HOME-{tag}");
+    if let Some(f) = &plan.home_plant {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(f)
+            .and_then(|mut h| h.write_all(home_value.as_bytes()))
+            .map_err(|e| io("plant the home file", e))?;
+        if std::fs::read_to_string(f).ok().as_deref() != Some(home_value.as_str()) {
+            return Err(Refusal::new("jail self-test: the planted home file is not readable even outside the jail"));
+        }
+    }
     // A sibling: a plain, dumpable, unjailed process of this user, holding
     // a canary in its environment — what a co-resident agent or another
     // task's process looks like to the jailed CLI.
@@ -776,7 +817,7 @@ async fn self_test_inner(plan: &SelfTestPlan, widen: &dyn Fn(&mut JailSpec, &Pat
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| io("start the canary process", e))?;
-    let out = self_test_jailed(plan, widen, &work, &home, &tmp, &secret, &secret_value, sibling.id(), &canary).await;
+    let out = self_test_jailed(plan, widen, &work, &home, &tmp, &secret, &secret_value, sibling.id(), &canary, &home_value).await;
     let _ = sibling.kill();
     let _ = sibling.wait();
     out
@@ -793,6 +834,7 @@ async fn self_test_jailed(
     secret_value: &str,
     sibling: u32,
     canary: &str,
+    home_value: &str,
 ) -> Result<(Vec<String>, Vec<String>), Refusal> {
     let mut proved = Vec::new();
     let mut unproved = Vec::new();
@@ -816,6 +858,9 @@ async fn self_test_jailed(
     script.push_str(&format!("echo @@secret-begin; cat {} 2>/dev/null; echo; echo @@secret-end\n", shell_quote(secret)?));
     script.push_str(&format!("echo @@sibling-begin; {} 2>/dev/null; echo; echo @@sibling-end\n", read_env_of(sibling)));
     script.push_str(&format!("echo @@parent-begin; {} 2>/dev/null; echo; echo @@parent-end\n", read_env_of(me)));
+    if let Some(f) = &plan.home_plant {
+        script.push_str(&format!("echo @@home-begin; cat {} 2>/dev/null; echo; echo @@home-end\n", shell_quote(f)?));
+    }
     let hide: Vec<&PathBuf> = plan.must_hide.iter().filter(|p| p.exists()).collect();
     for (i, p) in hide.iter().enumerate() {
         let q = shell_quote(p)?;
@@ -876,6 +921,13 @@ async fn self_test_jailed(
         return leak(format!("the harness's own environment was readable inside the jail ({name}=…)"));
     }
     proved.push("harness environment unreadable".into());
+    if let Some(f) = &plan.home_plant {
+        let Some(s) = section(&text, "home") else { return leak("the home check did not report".into()) };
+        if s.contains(home_value) {
+            return leak(format!("a file in the user's home ({}) was readable inside the jail", f.display()));
+        }
+        proved.push(format!("planted file in the user's home ({}) unreadable", f.display()));
+    }
     for (i, p) in hide.iter().enumerate() {
         let Some(s) = section(&text, &format!("hide{i}")) else { return leak(format!("the {} check did not report", p.display())) };
         if !s.trim().is_empty() {
@@ -1042,12 +1094,14 @@ mod tests {
         assert_eq!(
             p,
             "(version 1)\n(allow default)\n\
+             (deny file-read* file-write* (subpath \"/Users/op\"))\n\
              (deny file-read* file-write* (subpath \"/Users/op/noomesh\"))\n\
              (deny file-read* file-write* (literal \"/Users/op/noomesh/harness.env\") (literal \"/Users/op/noomesh/agent.env\") (subpath \"/Users/op/noomesh/pki\") (subpath \"/Users/op/noomesh/secrets\") (subpath \"/Users/op/noomesh/harness-secrets\"))\n\
              (deny process-info*)\n\
              (allow process-info* (target self))\n\
              (deny sysctl-read (sysctl-name \"kern.procargs2\") (sysctl-name \"kern.procargs\"))\n\
              (deny file-read* file-write* (subpath \"/Users/op/noo-data\"))\n\
+             (allow file-read-metadata (literal \"/Users/op\") (literal \"/Users/op/noomesh\"))\n\
              (allow file-read* (subpath \"/Users/op/noomesh/vendor\") (subpath \"/Users/op/noomesh/bin\"))\n\
              (allow file-read* (literal \"/Users/op/noomesh/pki/ca.crt\"))\n\
              (allow file-read* (literal \"/var/folders/x/noo-harness/t1/noomesh-mcp.json\"))\n\
@@ -1078,9 +1132,32 @@ mod tests {
         assert!(lines[named].starts_with("(deny "), "{p}");
         assert!(at("(allow default)") < whole && whole <= named);
         for secret in ["/Users/op/noomesh/secrets/NATS_NODE_PASSWORD", "/Users/op/noomesh/harness-secrets/NOO_CLUSTER_SECRET", "/Users/op/noomesh/pki/node.key"] {
-            for l in lines.iter().filter(|l| l.starts_with("(allow file-")) {
+            // `stat` of a literal directory is not a read of what is in it.
+            for l in lines.iter().filter(|l| l.starts_with("(allow file-") && !l.starts_with("(allow file-read-metadata (literal ")) {
                 for path in l.split('"').skip(1).step_by(2) {
                     assert!(!Path::new(secret).starts_with(path), "{l} re-allows {secret}");
+                }
+            }
+        }
+        // The real home is denied first, before every re-allow, and the
+        // only re-allows under it are the CLI's trees, the CA file and
+        // `stat` of the two directories on the way down.
+        let home_deny = at("(deny file-read* file-write* (subpath \"/Users/op\"))");
+        assert!(at("(allow default)") < home_deny && home_deny < whole, "{p}");
+        for l in lines.iter().filter(|l| l.starts_with("(allow file-")) {
+            assert!(lines.iter().position(|x| x == l).unwrap() > home_deny, "{l} sits before the home deny");
+            for path in l.split('"').skip(1).step_by(2) {
+                if Path::new(path).starts_with("/Users/op") {
+                    let ok = l.starts_with("(allow file-read-metadata (literal ")
+                        || ["/Users/op/noomesh/vendor", "/Users/op/noomesh/bin", "/Users/op/noomesh/pki/ca.crt"].contains(&path);
+                    assert!(ok, "{l} re-allows {path} under the real home");
+                }
+            }
+        }
+        for private in ["/Users/op/.ssh/id_ed25519", "/Users/op/Documents/x", "/Users/op/Library/Keychains/login.keychain-db"] {
+            for l in lines.iter().filter(|l| l.starts_with("(allow file-read* ") || l.starts_with("(allow file-read* file-write* ")) {
+                for path in l.split('"').skip(1).step_by(2) {
+                    assert!(!Path::new(private).starts_with(path), "{l} re-allows {private}");
                 }
             }
         }

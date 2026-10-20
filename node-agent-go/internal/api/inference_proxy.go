@@ -50,6 +50,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 )
 
 // Per-backend TLS env-var names. When set to a truthy value, node-agent
@@ -133,6 +134,13 @@ func withBackendDial(t *http.Transport) *http.Transport {
 }
 
 func httpsTransport(cfg *config.Config) *http.Transport {
+	return httpsTransportWithFirstByte(cfg, backendFirstByteTimeout())
+}
+
+// httpsTransportWithFirstByte is httpsTransport with the response-header
+// bound named by the caller (the proxy reads it once per request, so its
+// error log names the bound that request actually had).
+func httpsTransportWithFirstByte(cfg *config.Config, firstByte time.Duration) *http.Transport {
 	pool, caPath := clusterCAPool(cfg)
 	if pool == nil {
 		caMissingWarn.Do(func() {
@@ -168,7 +176,7 @@ func httpsTransport(cfg *config.Config) *http.Transport {
 	return withBackendDial(&http.Transport{
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: backendFirstByteTimeout(),
+		ResponseHeaderTimeout: firstByte,
 		TLSClientConfig:       tlsConfig,
 	})
 }
@@ -199,6 +207,7 @@ var portableOpenAIKeys = map[string]bool{
 	"top_p":                 true,
 	"n":                     true,
 	"stream":                true,
+	"stream_options":        true, // include_usage: the harness translator meters streams by it (i147)
 	"stop":                  true,
 	"max_tokens":            true,
 	"max_completion_tokens": true,
@@ -233,7 +242,6 @@ var portableOpenAIKeys = map[string]bool{
 var backendExtraKeys = map[string]map[string]bool{
 	"vllm": {
 		"chat_template_kwargs":    true,
-		"stream_options":          true,
 		"guided_choice":           true,
 		"guided_grammar":          true,
 		"guided_json":             true,
@@ -245,12 +253,21 @@ var backendExtraKeys = map[string]map[string]bool{
 		"repetition_penalty":      true,
 		"min_tokens":              true,
 		"skip_special_tokens":     true,
+		// low|medium|high only (a Responses reasoning.effort, i153); vLLM
+		// refuses none, so thinking-off uses chat_template_kwargs.
+		"reasoning_effort": true,
 	},
 	"ollama": {
 		"format":     true, // ollama's JSON mode
 		"keep_alive": true, // model-unload control
 		"options":    true, // nested option dict (top_k, top_p, etc.)
 		"raw":        true,
+		// Reasoning control: Ollama's OpenAI layer maps reasoning.effort
+		// (and reasoning_effort) onto think, and the harness's thinking-off
+		// sends all three (coordinator::thinking::disable_on_wire).
+		"reasoning":        true,
+		"reasoning_effort": true,
+		"think":            true,
 	},
 	"llamacpp": {
 		"n_predict":      true, // alias for max_tokens
@@ -265,6 +282,9 @@ var backendExtraKeys = map[string]map[string]bool{
 		"mirostat_eta":   true,
 		"grammar":        true,
 		"cache_prompt":   true,
+		// llama-server under --jinja (every agent-started one) hands these
+		// to the chat template: enable_thinking=false is thinking-off.
+		"chat_template_kwargs": true,
 	},
 }
 
@@ -417,38 +437,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// mismatches across backends without hardcoding "vllm vs others".
 	body = filterBodyForBackend(body, backendType)
 
-	// Where to dial. A NATIVE backend is on loopback, not on the docker
-	// network — `noo-ollama` does not resolve on a Mac, and this hardcoded
-	// name is the one line that stood between a running native ollama and a
-	// working request.
-	//
-	// Loopback deliberately: the backend is never exposed on the LAN, and the
-	// gateway already addresses a placement by the AGENT's URL, so every
-	// caller reaches it through this authenticated proxy.
-	// The running containers' own declaration wins over this agent's env
-	// flag (dockerpkg.BackendDialURL): the controller's compose vLLM
-	// requires TLS + a client certificate whatever NOO_VLLM_TLS says here,
-	// and its llama.cpp is dialled at the stunnel sidecar when that runs.
-	targetURL := fmt.Sprintf("%s://noo-%s:%d", backendScheme(backendType), backendType, port)
-	if s.docker != nil {
-		targetURL = s.docker.BackendDialURL(backendType)
-	}
-	scheme := "http"
-	if strings.HasPrefix(targetURL, "https://") {
-		scheme = "https"
-	}
-	if _, isNative := native[backendType]; isNative {
-		if base, ok := s.native.Endpoint(backendType); ok {
-			// The scheme follows the URL we actually dial. A native ollama
-			// on loopback is plaintext (http, bare transport); the
-			// controller's self-node lane is its stunnel-ollama-embed door
-			// (https://127.0.0.1:11434, verify = 2), which httpsTransport
-			// dials with the node leaf. This line used to force "http" for
-			// every native endpoint, so an https lane would have been
-			// dialled with a transport that presents nothing.
-			targetURL, scheme = base, nativeDialScheme(base)
-		}
-	}
+	targetURL, scheme := s.inferenceTarget(backendType, port, native)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "bad_backend_url", err.Error())
@@ -466,13 +455,14 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// backendFirstByteTimeout, not 60 s: see its comment.
 	// The proxy (and so its transport) is built per request: keep-alive
 	// would only park the connection until IdleConnTimeout, never reuse it.
-	if scheme == "https" {
-		proxy.Transport = oneShot(httpsTransport(s.cfg))
-	} else {
-		proxy.Transport = oneShot(withBackendDial(&http.Transport{
-			ResponseHeaderTimeout: backendFirstByteTimeout(),
-		}))
-	}
+	//
+	// Built per request is also what makes the bound LIVE: the harness
+	// profile's first_byte_secs (desired-config) changes what
+	// backendFirstByteTimeout answers, and the next request's transport is
+	// built with the new value. No agent restart, no transport to rebuild;
+	// a request already in flight keeps the bound it started with.
+	firstByte := backendFirstByteTimeout()
+	proxy.Transport = s.inferenceTransport(scheme, firstByte)
 	// Surface upstream errors as OpenAI-shape JSON instead of the default
 	// plain text "Bad Gateway".
 	//
@@ -485,7 +475,7 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
 		slog.Warn("inference proxy could not complete the upstream request",
 			"backend", backendType, "target", targetURL, "error", err,
-			"first_byte_timeout_seconds", int(backendFirstByteTimeout().Seconds()))
+			"first_byte_timeout_seconds", int(firstByte.Seconds()))
 		jsonError(rw, http.StatusBadGateway, "backend_unreachable", err.Error())
 	}
 
@@ -501,6 +491,57 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	r.Host = target.Host
 
 	proxy.ServeHTTP(w, r)
+}
+
+// inferenceTarget is where the proxy dials a local backend and with which
+// transport scheme. The bench (POST /bench) dials the chat backend through
+// this same resolution, so it measures the path a real request takes.
+func (s *Server) inferenceTarget(backendType string, port int, native map[string]string) (targetURL, scheme string) {
+	// Where to dial. A NATIVE backend is on loopback, not on the docker
+	// network — `noo-ollama` does not resolve on a Mac, and this hardcoded
+	// name is the one line that stood between a running native ollama and a
+	// working request.
+	//
+	// Loopback deliberately: the backend is never exposed on the LAN, and the
+	// gateway already addresses a placement by the AGENT's URL, so every
+	// caller reaches it through this authenticated proxy.
+	// The running containers' own declaration wins over this agent's env
+	// flag (dockerpkg.BackendDialURL): the controller's compose vLLM
+	// requires TLS + a client certificate whatever NOO_VLLM_TLS says here,
+	// and its llama.cpp is dialled at the stunnel sidecar when that runs.
+	targetURL = fmt.Sprintf("%s://noo-%s:%d", backendScheme(backendType), backendType, port)
+	if s.docker != nil {
+		targetURL = s.docker.BackendDialURL(backendType)
+	}
+	scheme = "http"
+	if strings.HasPrefix(targetURL, "https://") {
+		scheme = "https"
+	}
+	if _, isNative := native[backendType]; isNative {
+		if base, ok := s.native.Endpoint(backendType); ok {
+			// The scheme follows the URL we actually dial. A native ollama
+			// on loopback is plaintext (http, bare transport); the
+			// controller's self-node lane is its stunnel-ollama-embed door
+			// (https://127.0.0.1:11434, verify = 2), which httpsTransport
+			// dials with the node leaf. This line used to force "http" for
+			// every native endpoint, so an https lane would have been
+			// dialled with a transport that presents nothing.
+			targetURL, scheme = base, nativeDialScheme(base)
+		}
+	}
+	return targetURL, scheme
+}
+
+// inferenceTransport is the per-request transport to a local backend:
+// the node-leaf mTLS transport for https, the bridge dialer otherwise, both
+// one-shot and both bounded by firstByte for the response headers.
+func (s *Server) inferenceTransport(scheme string, firstByte time.Duration) *http.Transport {
+	if scheme == "https" {
+		return oneShot(httpsTransportWithFirstByte(s.cfg, firstByte))
+	}
+	return oneShot(withBackendDial(&http.Transport{
+		ResponseHeaderTimeout: firstByte,
+	}))
 }
 
 // nativeDialScheme is the transport choice for an adopted lane's endpoint:
@@ -582,31 +623,62 @@ const defaultBackendFirstByteTimeout = 290 * time.Second
 // the version/help fast path must read nothing.
 const backendFirstByteTimeoutEnv = "NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS"
 
-var backendFirstByteTimeout = sync.OnceValue(func() time.Duration {
-	return resolveBackendFirstByteTimeout(os.Getenv(backendFirstByteTimeoutEnv))
+// backendFirstByteEnvOverride is the env override, read (and logged) once.
+var backendFirstByteEnvOverride = sync.OnceValues(func() (time.Duration, bool) {
+	return parseFirstByteOverride(os.Getenv(backendFirstByteTimeoutEnv))
 })
 
-// resolveBackendFirstByteTimeout parses the override. Anything unparseable
-// or non-positive keeps the default rather than disabling the bound: an
-// operator typo must not turn a hung backend into a pinned connection.
-func resolveBackendFirstByteTimeout(raw string) time.Duration {
+// backendFirstByteTimeout is the bound in force NOW, evaluated on every
+// call (every proxied request builds its transport with it):
+//
+//	NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS  the operator's override on this box
+//	> harness profile first_byte_secs    desired-config, changes live
+//	> 290 s                              defaultBackendFirstByteTimeout
+//
+// The env wins because it is the one value set ON the box: an operator who
+// set it there meant this box, whatever the controller resolves.
+func backendFirstByteTimeout() time.Duration {
+	d, set := backendFirstByteEnvOverride()
+	return firstByteTimeoutFor(d, set, harnessprofile.Current())
+}
+
+// firstByteTimeoutFor is the pure precedence behind backendFirstByteTimeout.
+func firstByteTimeoutFor(envD time.Duration, envSet bool, prof *harnessprofile.Profile) time.Duration {
+	if envSet && envD > 0 {
+		return envD
+	}
+	if prof != nil && prof.FirstByteSecs > 0 {
+		return time.Duration(prof.FirstByteSecs) * time.Second
+	}
+	return defaultBackendFirstByteTimeout
+}
+
+// parseFirstByteOverride parses the env override: ("", false) when unset.
+// Anything unparseable or non-positive is NOT an override (logged): an
+// operator typo must not turn a hung backend into a pinned connection, so
+// the bound falls through to the profile or the default instead.
+func parseFirstByteOverride(raw string) (time.Duration, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return defaultBackendFirstByteTimeout
+		return 0, false
 	}
 	secs, err := strconv.Atoi(raw)
 	if err != nil || secs <= 0 {
-		slog.Warn("ignoring an unusable first-byte timeout override; keeping the default",
+		slog.Warn("ignoring an unusable first-byte timeout override; the profile or the default applies",
 			"env", backendFirstByteTimeoutEnv, "value", raw,
 			"default_seconds", int(defaultBackendFirstByteTimeout.Seconds()))
-		return defaultBackendFirstByteTimeout
+		return 0, false
 	}
-	if d := time.Duration(secs) * time.Second; d != defaultBackendFirstByteTimeout {
-		slog.Info("backend first-byte timeout overridden",
-			"env", backendFirstByteTimeoutEnv, "seconds", secs)
-		return d
-	}
-	return defaultBackendFirstByteTimeout
+	slog.Info("backend first-byte timeout overridden on this box",
+		"env", backendFirstByteTimeoutEnv, "seconds", secs)
+	return time.Duration(secs) * time.Second, true
+}
+
+// resolveBackendFirstByteTimeout is the env value alone with no profile:
+// the override when usable, else the default.
+func resolveBackendFirstByteTimeout(raw string) time.Duration {
+	d, set := parseFirstByteOverride(raw)
+	return firstByteTimeoutFor(d, set, nil)
 }
 
 // localRerankTargets returns candidate reranker endpoints in probe order.

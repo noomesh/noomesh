@@ -29,15 +29,20 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "class", "list"], "", "Show the model classes consumers may send as `model`, with candidate placement and health"),
         (&["cluster", "class", "set"], "<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]", "Declare a model class: failover order, or --pool to share the load; --degraded ones last"),
         (&["cluster", "class", "unset"], "<class>", "Forget a declared model class and its aliases; the derived class of its model takes over"),
+        (&["cluster", "prefer"], "[<purpose> <model|class> | <purpose> --clear]", "Show or set which model a stack purpose (knowledge, graph) tries first"),
+        (&["cluster", "embedding-space", "list"], "", "Show each embedding space, its model and the nodes serving it"),
+        (&["cluster", "embedding-space", "set"], "<space> <model> [--dims <n>]", "Declare an embedding space: a purpose bound to one embedding model"),
+        (&["cluster", "embedding-space", "unset"], "<space>", "Forget an embedding space; the default (knowledge) cannot be removed"),
         (&["cluster", "logs"], "[<node>] [<service>] [-b|--backend <backend>] [-n|--tail <n>]", "Tail logs for a noo-* container or host service (harness, agent) on one node or all"),
         (&["cluster", "restart-agent"], "<node>", "Ask the gateway to restart a node's node-agent"),
         (&["cluster", "maintenance"], "<node> on --reason <text> [--until <duration>] | <node> off | list", "Mute a known-down node's operator alerts (operator-only); the daily summary still lists it"),
         (&["cluster", "gpu", "hold"], "<node> [--reason <text>]", "Pause a node's GPU backends and keep them paused, to free its GPU (operator-only)"),
         (&["cluster", "gpu", "release"], "<node>", "End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only)"),
+        (&["cluster", "profile"], "<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]", "Show a node's harness profile with each value's source; set overrides; bench its model"),
         (&["cluster", "up"], "<backend> <model> [--node <node>] [--replicas <n>]", "Start a backend with a model via the imperative start route (prefer place)"),
         (&["cluster", "init-secret"], "", "Generate and print a fresh random cluster secret locally (no gateway call)"),
         (&["cluster", "assign"], "<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low|medium|high|<n>] [--dry-run] [--async]", "Pin a task to the least-loaded node and run it; --dry-run prints the choice only"),
-        (&["cluster", "set-config"], "<node> [--usage shared|dedicated|default] [--harness auto|manual|off] [--loop-budget <n>|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default]", "Update a node's stored config row with only the given fields"),
+        (&["cluster", "set-config"], "<node> [--usage shared|dedicated|default] [--harness auto|manual|off] [--loop-budget <n>|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>|none]", "Update a node's stored config row with only the given fields"),
         (&["cluster", "clear-cooldowns"], "", "Clear backend auto-start cooldown backoff on every node"),
         (&["cluster", "add-companion"], "<node> [-p|--platform <p>] [--hostname <host>] [--ip <ip>] [-s|--sensors <a,b>] [-b|--backends <a,b>] [--battery <n>] [-n|--network <type>] [--npu-tops <n>] [--app-version <v>]", "Register a Tier-5 companion device with the gateway and send a first heartbeat"),
         (&["cluster", "add-monitor"], "<node> [--hostname <host>] [--ip <ip>] [-s|--services <a,b>]", "Register a Tier-6 monitor node with the gateway and send an initial heartbeat"),
@@ -63,7 +68,8 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "host-telemetry"], "", "Print host-telemetry subcommand usage (apply)"),
         (&["cluster", "vendor", "stage"], "<kind> | --all [--os linux|macos] [--arch x86_64|aarch64]", "Fetch a harness kind's vendor CLI on the controller, checked against its pin"),
         (&["cluster", "vendor", "status"], "", "List staged vendor CLIs per platform, and which nodes need which"),
-        (&["cluster", "vendor"], "", "Print vendor subcommand usage (stage, status)"),
+        (&["cluster", "vendor", "install"], "<node> <kind>...", "Carry these vendor CLIs on a node whatever its placement names; restage to deliver"),
+        (&["cluster", "vendor"], "", "Print vendor subcommand usage (stage, status, install)"),
         (&["cluster", "push-secrets"], "[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y|--yes]", "Stage fleet-wide secrets from env.sops as a bundle each node collects"),
         (&["cluster", "nats-users", "render"], "[--rotate] [--dry-run] [-y|--yes]", "Mint per-principal NATS passwords from the gateway registry and render users.conf"),
         (&["cluster", "nats-creds", "rotate"], "<node|gateway|worker|trellion|trellion_intel>... [--mint-only] [--restart] [-y|--yes]", "Rotate a bus credential: nodes deliver over the rail; others re-render + recreate"),
@@ -450,5 +456,8 @@ mod tests {
         assert!(syntax.contains("[--on cpu|gpu]") && desc.contains("RAM"), "{syntax} / {desc}");
         let (syntax, _) = super::lookup(&["cluster", "set-config"]).expect("set-config");
         assert!(syntax.contains("[--usage shared|dedicated|default]"), "{syntax}");
+        assert!(syntax.contains("[--vendor-kinds <kind,kind>|none]"), "{syntax}");
+        let (syntax, _) = super::lookup(&["cluster", "vendor", "install"]).expect("vendor install");
+        assert_eq!(syntax, "<node> <kind>...");
     }
 }

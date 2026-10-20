@@ -14,7 +14,6 @@ exactly what the worker_pool handlers call.
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -25,31 +24,27 @@ _singleton: Optional["_OrchestratorFacade"] = None
 
 
 def _resolve_llm():
-    """Resolve an LLM client for the current cluster state (worker context).
+    """The orchestrator's LLM: the gateway's ``/v1/chat/completions``.
 
-    Order: primary vLLM via PAGEINDEX_LLM_URL (the same endpoint the RAG
-    pipeline uses — TLS-aware, docker-network name) → config Ollama fallback.
-    Mirrors app.py's ``_resolve_llm_client`` intent without depending on the
-    in-process node registry, which is not populated in the worker.
+    Mesh-routed with failover, ``model: default`` (any live chat node). It
+    used to dial ``PAGEINDEX_LLM_URL`` (the controller's own vLLM) with
+    ``VLLM_MODEL``: one node, no fallback (i145). ``None`` only when the
+    client cannot be built; AgentOrchestrator then falls back to config Ollama.
     """
+    from .. import llm_purposes
+    from ..cluster.cluster_auth import internal_gateway_headers
     from ..config import get_config
-    from ..factory import build_llm_client
+    from ..llm.openai_compat import OpenAICompatClient
 
-    cfg = get_config()
-    vllm_url = os.environ.get("PAGEINDEX_LLM_URL", "")
-    if vllm_url:
-        bcfg = cfg.cluster.backends.get("vllm") if cfg.cluster and cfg.cluster.backends else None
-        model = (bcfg.model if bcfg else "") or os.environ.get("VLLM_MODEL", "")
-        if model:
-            try:
-                return build_llm_client(
-                    base_url=vllm_url,
-                    model=model,
-                    backend_type="vllm",
-                    options=cfg.ollama.options,
-                )
-            except Exception as e:
-                logger.warning("orchestrator_vllm_resolve_failed", error=str(e))
+    try:
+        return OpenAICompatClient(
+            base_url=llm_purposes.gateway_url(),
+            model="default",
+            options=get_config().ollama.options,
+            headers=internal_gateway_headers("orchestrator"),
+        )
+    except Exception as e:
+        logger.warning("orchestrator_llm_resolve_failed", error=str(e))
     return None  # AgentOrchestrator falls back to config Ollama
 
 

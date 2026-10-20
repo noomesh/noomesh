@@ -34,9 +34,19 @@
 //!
 //! Nothing streams mid-run in this cut: a turn gets one `content` event with
 //! the answer, then `harness_result` (sent by the caller).
+//!
+//! A kind may carry a slim launch (`launch_slim`, Claude Code only): the
+//! driver runs it instead of `launch` while the node's harness profile says
+//! `claude_prompt = slim` ([`PromptSwitch`], re-read with the placement
+//! every minute). It replaces Claude Code's own system prompt with
+//! [`SLIM_SYSTEM_PROMPT`], written into the task's HOME for the run, and
+//! offers only the file tools beside noomesh's MCP tools: a small model
+//! prefills a twelfth of the full request.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,6 +54,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
 use crate::coordinator::{CoordinatorResult, HarnessOp, RemoteRuntime, ResolvedBackend, TaskRuntime, TurnRequest, UsageStats};
+use crate::harness::profile::ClaudePrompt;
 use crate::harness::translator::{Translator, UsageTotals};
 use crate::harness_kinds::{HarnessKind, Launch};
 use crate::tasks::TaskRequest;
@@ -74,6 +85,59 @@ pub const MCP_CODEX_TOML: &str = "config-file:codex-toml";
 /// The model provider id the Codex config names (`openai`, `ollama` and
 /// `lmstudio` are Codex's reserved ids).
 pub const CODEX_PROVIDER: &str = "noomesh";
+/// The placeholder in a launch command for the system prompt file the driver
+/// writes (`launch.system_prompt_file`).
+pub const SYSTEM_PROMPT_PLACEHOLDER: &str = "{system_prompt_file}";
+
+/// The system prompt of a slim launch (`launch_slim`), in place of the CLI's
+/// own: what this run is, which tools it has, how it ends. Short on purpose
+/// — every character is prefill a small model pays before its first token.
+/// The task prompt ([`task_prompt`]) still carries the objective and the
+/// full set of end lines.
+pub const SLIM_SYSTEM_PROMPT: &str = "You are a noomesh harness worker: a headless agent run once for one task on a noomesh node. Nobody watches this run and nobody can answer a question during it.
+Tools: noomesh's MCP tools (mcp__noomesh__*: knowledge base, memory, agent messages) and Read, Write and Edit for files in the current directory. There is no shell.
+Be brief: no preamble, no restating the task. Call a tool only when the task needs it.
+End your answer with exactly one line:
+NOO_RESULT: <one-line summary> when the task is done, or
+NOO_FAILED: <why> when it cannot be done.
+";
+
+/// Which launch the driver runs for a kind that has a slim one: shared
+/// between the harness (which sets it from the node's harness profile, at
+/// start and on every placement re-read) and every [`DriverCtx`] clone. A
+/// run reads it once, when it starts; a run in progress is never switched.
+#[derive(Debug, Clone, Default)]
+pub struct PromptSwitch(Arc<AtomicBool>);
+
+impl PromptSwitch {
+    /// Set the variant; returns the previous one.
+    pub fn set(&self, p: ClaudePrompt) -> ClaudePrompt {
+        if self.0.swap(p == ClaudePrompt::Slim, Ordering::Relaxed) { ClaudePrompt::Slim } else { ClaudePrompt::Full }
+    }
+
+    pub fn get(&self) -> ClaudePrompt {
+        if self.0.load(Ordering::Relaxed) { ClaudePrompt::Slim } else { ClaudePrompt::Full }
+    }
+}
+
+/// The model's context window the driver tells a CLI that takes one
+/// (`launch.context_window_env`, noomesh-internal i147). Shared like
+/// [`PromptSwitch`]: the harness sets it from the node agent's
+/// `model_context` at start and on every placement re-read; a run reads it
+/// when its environment is built. 0 = unknown, and the variable is not set.
+#[derive(Debug, Clone, Default)]
+pub struct ContextWindow(Arc<AtomicU64>);
+
+impl ContextWindow {
+    /// Set the window (`None` = unknown); returns the previous one.
+    pub fn set(&self, tokens: Option<u64>) -> Option<u64> {
+        Some(self.0.swap(tokens.unwrap_or(0), Ordering::Relaxed)).filter(|n| *n > 0)
+    }
+
+    pub fn get(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Relaxed)).filter(|n| *n > 0)
+    }
+}
 
 /// Whether a run gets noomesh's tools. Production always wires the user door
 /// ([`McpWiring::Door`]); `noo-gateway harness probe` runs a CLI with NO MCP
@@ -92,7 +156,16 @@ pub struct DriverCtx {
     pub node: String,
     pub gateway: String,
     pub kind: HarnessKind,
+    /// The launch a run uses: the kind's `launch`, or (in the context
+    /// [`DriverCtx::run_ctx`] hands a run) its `launch_slim`.
     pub launch: Launch,
+    /// The kind's validated `launch_slim`, when it has one.
+    pub launch_slim: Option<Launch>,
+    /// full or slim, from the node's harness profile (or the probe's
+    /// `--prompt`); only a kind with a `launch_slim` is affected.
+    pub prompt: PromptSwitch,
+    /// The model's context window, for `launch.context_window_env`.
+    pub context_window: ContextWindow,
     pub pinned: ResolvedBackend,
     /// Where per-task workspaces go (`NOO_HARNESS_WORKDIR`).
     pub workdir_root: PathBuf,
@@ -124,6 +197,7 @@ impl DriverCtx {
 
     pub fn new(node: &str, gateway: &str, kind: &HarnessKind, pinned: ResolvedBackend, get: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let launch = validate_kind(kind)?;
+        let launch_slim = validate_slim(kind)?;
         let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let workdir_root = set("NOO_HARNESS_WORKDIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("noo-harness"));
         let timeout = Duration::from_secs(set("NOO_HARNESS_TURN_TIMEOUT_SECS").and_then(|v| v.trim().parse().ok()).filter(|s| *s > 0).unwrap_or(900));
@@ -132,6 +206,9 @@ impl DriverCtx {
             gateway: gateway.trim_end_matches('/').to_string(),
             kind: kind.clone(),
             launch,
+            launch_slim,
+            prompt: PromptSwitch::default(),
+            context_window: ContextWindow::default(),
             pinned,
             workdir_root,
             keep_workdir: set("NOO_HARNESS_KEEP_WORKDIR").is_some_and(|v| v.trim() == "1"),
@@ -142,37 +219,90 @@ impl DriverCtx {
             jail_probe: crate::harness::jail::gate,
         })
     }
+
+    /// The variant the next run uses: slim only when the switch says slim
+    /// AND the kind has a slim launch; every other kind runs `launch`.
+    pub fn variant(&self) -> ClaudePrompt {
+        match (self.prompt.get(), &self.launch_slim) {
+            (ClaudePrompt::Slim, Some(_)) => ClaudePrompt::Slim,
+            _ => ClaudePrompt::Full,
+        }
+    }
+
+    /// The variant one run uses and its context: this one, or a copy whose
+    /// `launch` is the slim launch ([`variant`](Self::variant)). The switch
+    /// is read once, here.
+    pub fn run_ctx(&self) -> (ClaudePrompt, std::borrow::Cow<'_, DriverCtx>) {
+        match (self.variant(), &self.launch_slim) {
+            (ClaudePrompt::Slim, Some(slim)) => {
+                let mut c = self.clone();
+                c.launch = slim.clone();
+                (ClaudePrompt::Slim, std::borrow::Cow::Owned(c))
+            }
+            _ => (ClaudePrompt::Full, std::borrow::Cow::Borrowed(self)),
+        }
+    }
 }
 
-/// The launch recipe of a kind this driver can run, or why not.
+/// The launch recipe of a kind this driver can run, or why not. A kind's
+/// `launch_slim`, when present, must validate too ([`validate_slim`]).
 pub fn validate_kind(kind: &HarnessKind) -> Result<Launch> {
     if kind.kind == "noo" {
         bail!("kind noo runs the native loop, not the driver");
     }
     let launch = kind.launch.clone().ok_or_else(|| anyhow!("kind {} has no launch recipe", kind.kind))?;
+    validate_launch(&kind.kind, "launch", &launch)?;
+    validate_slim(kind)?;
+    Ok(launch)
+}
+
+/// A kind's `launch_slim`, validated like `launch`; `None` when it has none.
+pub fn validate_slim(kind: &HarnessKind) -> Result<Option<Launch>> {
+    match &kind.launch_slim {
+        Some(l) => {
+            validate_launch(&kind.kind, "launch_slim", l)?;
+            Ok(Some(l.clone()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A system prompt file name is a plain file name: it is joined to the
+/// task's HOME and must not climb out of it.
+fn plain_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn validate_launch(kind: &str, which: &str, launch: &Launch) -> Result<()> {
     if launch.command.is_empty() {
-        bail!("kind {}: launch.command is empty", kind.kind);
+        bail!("kind {kind}: {which}.command is empty");
     }
     let mut fields: Vec<&str> = vec![&launch.model_url_env, &launch.model_env, &launch.mcp, &launch.model_url_suffix];
     fields.extend(launch.command.iter().map(String::as_str));
     if let Some(v) = fields.iter().find(|v| v.starts_with("unverified:")) {
-        bail!("kind {}: its launch recipe is not verified yet ({v})", kind.kind);
+        bail!("kind {kind}: its {which} recipe is not verified yet ({v})");
+    }
+    let names_file = launch.command.iter().any(|a| a.contains(SYSTEM_PROMPT_PLACEHOLDER));
+    match launch.system_prompt_file.as_deref() {
+        Some(f) if !plain_file_name(f) => bail!("kind {kind}: {which}.system_prompt_file {f:?} is not a plain file name"),
+        None if names_file => bail!("kind {kind}: {which}.command names {SYSTEM_PROMPT_PLACEHOLDER} but no system_prompt_file is declared"),
+        _ => {}
     }
     match launch.mcp.as_str() {
         MCP_CONFIG_FILE => {
             if launch.model_url_env.trim().is_empty() || launch.model_env.trim().is_empty() {
-                bail!("kind {}: launch names no model variables", kind.kind);
+                bail!("kind {kind}: {which} names no model variables");
             }
         }
         // The config file carries the model; a home is where it goes.
         MCP_CODEX_TOML => {
             if launch.home_env.as_deref().is_none_or(|h| h.trim().is_empty()) {
-                bail!("kind {}: {MCP_CODEX_TOML} needs launch.home_env, the directory its config.toml goes in", kind.kind);
+                bail!("kind {kind}: {MCP_CODEX_TOML} needs {which}.home_env, the directory its config.toml goes in");
             }
         }
-        other => bail!("kind {}: MCP wiring {other:?} is not one this driver implements ({MCP_CONFIG_FILE:?}, {MCP_CODEX_TOML:?})", kind.kind),
+        other => bail!("kind {kind}: MCP wiring {other:?} is not one this driver implements ({MCP_CONFIG_FILE:?}, {MCP_CODEX_TOML:?})"),
     }
-    Ok(launch)
+    Ok(())
 }
 
 // ── the rail, as the driver needs it ────────────────────────────────────
@@ -332,7 +462,23 @@ impl Workspace {
             McpWiring::Door { gateway, key } => Some((gateway, key)),
             McpWiring::None => None,
         };
-        write_private(&path, codex_config(&base, &ctx.pinned.model, door).as_bytes())?;
+        let config = codex_config(&base, &ctx.pinned.model, door, ctx.context_window.get());
+        write_private(&path, config.as_bytes())?;
+        Ok(Some(path))
+    }
+
+    /// Where a launch's system prompt file goes: `launch.system_prompt_file`
+    /// inside the task's HOME; `None` when the launch declares none.
+    pub fn system_prompt_path(&self, launch: &Launch) -> Option<PathBuf> {
+        launch.system_prompt_file.as_deref().filter(|f| plain_file_name(f)).map(|f| self.home.join(f))
+    }
+
+    /// Write [`SLIM_SYSTEM_PROMPT`] where the launch says, 0600; its path is
+    /// `{system_prompt_file}` in the command. Removed after each run (and
+    /// with the workspace). `None` when the launch declares no file.
+    pub fn write_system_prompt(&self, launch: &Launch) -> Result<Option<PathBuf>> {
+        let Some(path) = self.system_prompt_path(launch) else { return Ok(None) };
+        write_private(&path, SLIM_SYSTEM_PROMPT.as_bytes())?;
         Ok(Some(path))
     }
 
@@ -389,6 +535,13 @@ fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
+/// Whether a launch tells its CLI the model's context window: a
+/// `context_window_env` (Claude Code), or Codex's `config.toml`, which the
+/// driver writes with `model_context_window` (noomesh-internal i147).
+pub fn takes_context_window(l: &Launch) -> bool {
+    l.context_window_env.as_deref().is_some_and(|k| !k.is_empty()) || l.mcp == MCP_CODEX_TOML
+}
+
 /// Codex CLI's `config.toml` for one run (`config-file:codex-toml`).
 ///
 /// - The loopback translator is the model provider (`wire_api =
@@ -410,9 +563,13 @@ fn toml_str(s: &str) -> String {
 ///   feedback, the OpenTelemetry exporters (metrics default to Statsig),
 ///   the update check, saved history, hosted web search.
 ///
+/// - `model_context_window` when the node agent knows the model's window
+///   (`model_context`, noomesh-internal i147): Codex sizes its compaction
+///   by it, and a model it does not know otherwise gets its own guess.
+///
 /// `door` is the user door's `(gateway, key)`; `None` writes no
 /// `[mcp_servers]` table at all (`harness probe`'s no-MCP run).
-pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> String {
+pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>, context_window: Option<u64>) -> String {
     let mcp = match door {
         Some((gateway, key)) => {
             let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
@@ -428,10 +585,12 @@ pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> 
         }
         None => String::new(),
     };
+    let window = context_window.map(|n| format!("model_context_window = {n}\n")).unwrap_or_default();
     format!(
         "# Written by the noomesh harness for one run; removed when it ends.\n\
          model = {model}\n\
          model_provider = {provider}\n\
+         {window}\
          approval_policy = \"never\"\n\
          sandbox_mode = \"danger-full-access\"\n\
          web_search = \"disabled\"\n\
@@ -522,6 +681,9 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
             env.insert(v.to_string(), ca.clone());
         }
     }
+    if let (Some(k), Some(n)) = (l.context_window_env.as_deref().filter(|k| !k.is_empty()), ctx.context_window.get()) {
+        env.insert(k.to_string(), n.to_string());
+    }
     for (k, v) in &ctx.kind.lane {
         env.insert(k.clone(), v.clone());
     }
@@ -530,6 +692,29 @@ pub fn build_env(ctx: &DriverCtx, ws: &Workspace, translator_url: &str) -> BTree
     }
     env.retain(|k, _| !is_forbidden(k));
     env
+}
+
+/// `launch.command` with `{system_prompt_file}` filled in — BEFORE the
+/// prompt goes in, so a prompt that spells the placeholder is left as typed.
+/// With no file the argument naming it is dropped with the flag before it
+/// (`--system-prompt-file {system_prompt_file}`), as for `{mcp_config}`.
+pub fn with_system_prompt(command: &[String], system_prompt: Option<&Path>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(command.len());
+    for a in command {
+        if a.contains(SYSTEM_PROMPT_PLACEHOLDER) {
+            match system_prompt {
+                Some(p) => out.push(a.replace(SYSTEM_PROMPT_PLACEHOLDER, &p.display().to_string())),
+                None => {
+                    if !a.starts_with('-') && out.last().is_some_and(|p| p.starts_with('-') && !p.contains('=')) {
+                        out.pop();
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
 }
 
 /// `launch.command` with `{prompt}` and `{mcp_config}` filled in.
@@ -787,6 +972,9 @@ pub fn task_prompt(req: &TaskRequest, loop_no: u32, last_note: Option<&str>, cla
 /// Translator up, door key minted, CLI run, usage reported, key revoked,
 /// translator down — in that order whatever the CLI did.
 async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt: &str, task_id: Option<&str>) -> Result<(RunOutput, UsageTotals)> {
+    // full or slim, decided once for this run.
+    let (variant, chosen) = ctx.run_ctx();
+    let ctx: &DriverCtx = &chosen;
     let translator = Translator::start(ctx.pinned.clone()).await.context("starting the wire translator")?;
     let key = match rail.door_key().await {
         Ok(k) => k,
@@ -797,14 +985,18 @@ async fn invoke<R: DriverRail>(ctx: &DriverCtx, rail: &R, ws: &Workspace, prompt
     };
     let run = async {
         let mcp = ws.write_cli_config(ctx, translator.base_url(), &key.key)?;
+        let system_prompt = ws.write_system_prompt(&ctx.launch)?;
         let env = build_env(ctx, ws, translator.base_url());
-        let argv = fill_command(&ctx.launch.command, prompt, &mcp);
+        let argv = fill_command(&with_system_prompt(&ctx.launch.command, system_prompt.as_deref()), prompt, &mcp);
         let timeout = effective_timeout(ctx.timeout, key.expires_at, chrono::Utc::now());
-        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
+        tracing::info!(kind = %ctx.kind.kind, cli = %argv[0], prompt = variant.name(), task = task_id.unwrap_or(""), timeout_secs = timeout.as_secs(), "harness driver: running the CLI");
         spawn_cli(&argv, &env, &ws.work, timeout, &ws.jail_spec(ctx, &mcp)).await
     }
     .await;
     let _ = std::fs::remove_file(ws.mcp_path());
+    if let Some(p) = ws.system_prompt_path(&ctx.launch) {
+        let _ = std::fs::remove_file(p);
+    }
     let _ = std::fs::remove_file(ws.codex_config_path(ctx.kind.cli.as_deref().unwrap_or(&ctx.kind.kind)));
     let usage = translator.usage();
     rail.report_usage(&usage, &ctx.pinned.model, &ctx.kind.kind, task_id).await;
@@ -1337,6 +1529,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The model's window reaches a CLI that takes one, only once known,
+    /// and is read per run (a re-read placement changes the next run).
+    #[test]
+    fn the_context_window_is_set_only_when_known_and_the_kind_takes_one() {
+        let root = scratch("ctxwin");
+        let k = kind(&["fake"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "30");
+        let ws = Workspace::create(&root, "t-ctxwin", false).unwrap();
+        ctx.context_window.set(Some(32768));
+        assert!(!build_env(&ctx, &ws, "http://127.0.0.1:1/").contains_key("FAKE_MAX_CONTEXT"), "the kind names no variable");
+        ctx.launch.context_window_env = Some("FAKE_MAX_CONTEXT".into());
+        assert_eq!(build_env(&ctx, &ws, "http://127.0.0.1:1/")["FAKE_MAX_CONTEXT"], "32768");
+        assert_eq!(ctx.context_window.set(None), Some(32768));
+        assert!(!build_env(&ctx, &ws, "http://127.0.0.1:1/").contains_key("FAKE_MAX_CONTEXT"), "unknown: left to the CLI");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// PINNED: lane and telemetry_off are merged LAST, telemetry after lane,
     /// and a forbidden name never survives, whoever set it.
     #[test]
@@ -1484,6 +1693,7 @@ mod tests {
         let root = scratch("codex");
         let k = codex_kind(&["codex", "exec", "{prompt}"]);
         let ctx = ctx_for(&k, &root, "30");
+        ctx.context_window.set(Some(32768));
         let ws = Workspace::create(&root, "t-codex", false).unwrap();
         let p = ws.write_cli_config(&ctx, "http://127.0.0.1:41234/", "noo-sk-door-1").unwrap();
         assert_eq!(p, ws.home.join(".codex").join("config.toml"));
@@ -1497,6 +1707,7 @@ mod tests {
         for line in [
             "model = \"gemma-4\"",
             "model_provider = \"noomesh\"",
+            "model_context_window = 32768",
             "approval_policy = \"never\"",
             "sandbox_mode = \"danger-full-access\"",
             "web_search = \"disabled\"",
@@ -1575,9 +1786,27 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("base_url = \"http://127.0.0.1:41234/v1\"") && text.contains("[analytics]"), "{text}");
         assert!(!text.contains("mcp_servers") && !text.contains("Bearer"), "{text}");
-        assert!(codex_config("b", "m", Some(("https://g", "k"))).contains("[mcp_servers.noomesh]"));
+        assert!(codex_config("b", "m", Some(("https://g", "k")), None).contains("[mcp_servers.noomesh]"));
+        assert!(!text.contains("model_context_window"), "no window when the agent knows none: {text}");
+        let with = codex_config("b", "m", None, Some(32768));
+        assert!(with.contains("\nmodel_context_window = 32768\napproval_policy"), "{with}");
         ws.finish();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Claude Code takes the window by variable, Codex in its config.toml;
+    /// a kind with neither (Copilot CLI) is told nothing (i147).
+    #[test]
+    fn a_launch_takes_a_window_by_variable_or_codex_config() {
+        let mut k = codex_kind(&["codex", "exec", "{prompt}"]);
+        assert!(takes_context_window(k.launch.as_ref().unwrap()));
+        let l = k.launch.as_mut().unwrap();
+        l.mcp = MCP_CONFIG_FILE.into();
+        assert!(!takes_context_window(l));
+        l.context_window_env = Some(String::new());
+        assert!(!takes_context_window(l), "an empty variable name is none");
+        l.context_window_env = Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into());
+        assert!(takes_context_window(l));
     }
 
     #[tokio::test]
@@ -1595,6 +1824,112 @@ mod tests {
         assert!(validate_kind(&k).unwrap_err().to_string().contains("home_env"));
         k.launch.as_mut().unwrap().mcp = "config-file:yaml".into();
         assert!(validate_kind(&k).is_err());
+    }
+
+    /// A fake kind with a full launch and a slim one; `slim_file` is the
+    /// slim launch's `system_prompt_file`.
+    fn slim_kind(full: &[&str], slim: &[&str], slim_file: Option<&str>) -> HarnessKind {
+        let mut k = kind(full, &[], &[]);
+        let mut l = k.launch.clone().unwrap();
+        l.command = slim.iter().map(|a| a.to_string()).collect();
+        l.system_prompt_file = slim_file.map(str::to_string);
+        k.launch_slim = Some(l);
+        k
+    }
+
+    /// PINNED: the slim launch runs only when the profile says slim AND the
+    /// kind has one; a kind without one runs its launch whatever the switch.
+    #[test]
+    fn the_driver_picks_launch_slim_only_for_slim_and_only_when_present() {
+        let root = scratch("variant");
+        let k = slim_kind(&["full-cli", "{prompt}"], &["full-cli", "--slim", "{system_prompt_file}", "{prompt}"], Some("sys.txt"));
+        let ctx = ctx_for(&k, &root, "30");
+        assert_eq!(ctx.variant(), ClaudePrompt::Full, "full until the profile says otherwise");
+        let (v, run) = ctx.run_ctx();
+        assert_eq!((v, run.launch.command.len()), (ClaudePrompt::Full, 2));
+        assert_eq!(ctx.prompt.set(ClaudePrompt::Slim), ClaudePrompt::Full);
+        let (v, run) = ctx.run_ctx();
+        assert_eq!(v, ClaudePrompt::Slim);
+        assert_eq!(run.launch.command[1], "--slim");
+        assert_eq!(ctx.launch.command.len(), 2, "the context itself keeps the full launch");
+        // The switch is shared by every clone (the harness keeps one).
+        let other = ctx.clone();
+        other.prompt.set(ClaudePrompt::Full);
+        assert_eq!(ctx.variant(), ClaudePrompt::Full);
+
+        let plain = kind(&["plain-cli", "{prompt}"], &[], &[]);
+        let ctx = ctx_for(&plain, &root, "30");
+        ctx.prompt.set(ClaudePrompt::Slim);
+        let (v, run) = ctx.run_ctx();
+        assert_eq!((v, run.launch.command[0].as_str()), (ClaudePrompt::Full, "plain-cli"), "no launch_slim: always the launch");
+
+        // The shipped claude-code row: slim swaps in its own command.
+        let cc = crate::harness_kinds::get("claude-code").unwrap();
+        let ctx = DriverCtx::new("n", "https://g", cc, pinned(), &|_| None).unwrap();
+        ctx.prompt.set(ClaudePrompt::Slim);
+        let (_, run) = ctx.run_ctx();
+        assert!(run.launch.command.iter().any(|a| a == "--system-prompt-file"));
+        assert!(!ctx.launch.command.iter().any(|a| a == "--system-prompt-file"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_launch_naming_a_system_prompt_file_must_declare_a_plain_one() {
+        let k = slim_kind(&["c", "{prompt}"], &["c", "--system-prompt-file", "{system_prompt_file}"], None);
+        assert!(validate_kind(&k).unwrap_err().to_string().contains("no system_prompt_file"), "a slim launch is validated with the kind");
+        for bad in ["../escape", "a/b", "..", ""] {
+            let k = slim_kind(&["c", "{prompt}"], &["c", "{system_prompt_file}"], Some(bad));
+            assert!(validate_kind(&k).unwrap_err().to_string().contains("not a plain file name"), "{bad:?}");
+        }
+        assert!(validate_kind(&slim_kind(&["c", "{prompt}"], &["c", "{system_prompt_file}"], Some("noomesh-system-prompt.txt"))).is_ok());
+        // No file: the placeholder goes with its flag; a file: it is filled
+        // in before the prompt, so a prompt spelling it stays as typed.
+        let cmd: Vec<String> = ["c", "-p", "{prompt}", "--system-prompt-file", "{system_prompt_file}", "--x"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(with_system_prompt(&cmd, None), ["c", "-p", "{prompt}", "--x"]);
+        let filled = fill_command(&with_system_prompt(&cmd, Some(Path::new("/h/sys.txt"))), "say {system_prompt_file}", Path::new("/m.json"));
+        assert_eq!(filled, ["c", "-p", "say {system_prompt_file}", "--system-prompt-file", "/h/sys.txt", "--x"]);
+    }
+
+    /// PINNED: a slim run gets the system prompt as a 0600 file in its own
+    /// HOME, named on its command line; the file is gone after the run, and
+    /// with the workspace.
+    #[tokio::test]
+    async fn a_slim_run_reads_its_system_prompt_file_from_the_task_home_and_it_is_removed() {
+        let root = scratch("slimrun");
+        let script = r#"ls -l "$0" | cut -c1-10; case "$0" in "$HOME"/*) echo in-home;; esac; head -c 40 "$0"; echo; echo NOO_RESULT: ok"#;
+        let k = slim_kind(&["sh", "-c", "echo NOO_FAILED: ran the full launch"], &["sh", "-c", script, "{system_prompt_file}", "{prompt}"], Some("noomesh-system-prompt.txt"));
+        let mut ctx = ctx_for(&k, &root, "30");
+        ctx.keep_workdir = true;
+        ctx.prompt.set(ClaudePrompt::Slim);
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-slim", 1)).await.unwrap(), "done");
+        {
+            let c = rail.calls.lock().unwrap();
+            let seen = &c.saved[1].1;
+            assert!(seen.starts_with("-rw-------"), "0600: {seen}");
+            assert!(seen.contains("in-home"), "inside the task HOME: {seen}");
+            assert!(seen.contains(&SLIM_SYSTEM_PROMPT[..40]), "{seen}");
+        }
+        let home = root.join("t-slim/home");
+        assert!(home.is_dir() && !home.join("noomesh-system-prompt.txt").exists(), "removed when the run ends");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Without --keep the whole workspace (and so the file) goes.
+        let root = scratch("slimrun2");
+        let ctx = ctx_for(&k, &root, "30");
+        ctx.prompt.set(ClaudePrompt::Slim);
+        let mut rail = FakeRail::new();
+        assert_eq!(run_task_on(&ctx, &mut rail, &task("t-slim2", 1)).await.unwrap(), "done");
+        assert!(!root.join("t-slim2").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_slim_system_prompt_is_short_and_names_the_end_lines() {
+        assert!(SLIM_SYSTEM_PROMPT.len() < 1024, "{} chars: every one is prefill", SLIM_SYSTEM_PROMPT.len());
+        for must in [RESULT_MARK, FAILED_MARK, "mcp__noomesh", "Read", "Write", "Edit"] {
+            assert!(SLIM_SYSTEM_PROMPT.contains(must), "{must}");
+        }
     }
 
     #[tokio::test]

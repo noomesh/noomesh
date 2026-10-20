@@ -50,9 +50,14 @@ binary itself: in its signed bundle, from the controller.
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)
    puts the staged CLI in the bundle of every node whose
-   harness placement names that kind. If it is not staged, the restage for
-   that node is refused with the `noo cluster vendor stage` command to run:
-   a restage never downloads.
+   harness placement names that kind, and of every node whose
+   `vendor_kinds` lists it. `noo cluster vendor install <node> <kind>...`
+   adds kinds to that list (`noo cluster set-config <node> --vendor-kinds
+   <kind,kind>|none` sets it), so a node carries those CLIs whatever its
+   placement names and can move between kinds without a restage. Each CLI
+   rides in its own bundle slot, verified on its own. If one is not staged,
+   the restage for that node is refused with the `noo cluster vendor stage`
+   command to run: a restage never downloads.
 4. **Placement.** The node's applier checks the sha256 again, unpacks the
    CLI under `/opt/noo/vendor/<cli>/<version>/` (`~/noomesh/vendor/` on a
    Mac) and writes a small wrapper named for the CLI at
@@ -106,6 +111,176 @@ that harness only when one is placed there and the node's agent reports it
 running. Without one, the controller runs the turn in process, as it
 always has, and a task's `why` says which of the two is missing.
 
+### Slow node models
+
+A reasoning model on a slow node can spend several minutes on one model
+call, mostly thinking (gemma4:12b on an M4 Mac mini took 3 to 4.5 minutes
+per call). Three things keep such a turn from being lost:
+
+- **Streams time out on silence, not on length.** A streamed answer has no
+  total time limit; it is cut only when no byte arrives for
+  `NOO_BACKEND_STREAM_IDLE_SECS` (default 300 s, which also covers the wait
+  for the first token). A cut stream ends the turn with an error that says
+  so, `the model stream was cut after Ns: <cause>`, and keeps whatever had
+  already arrived. It is not treated as an empty answer, so the model is not
+  nudged into another long call.
+- **The turn stops at its deadline and saves first.** Your message is saved
+  when the turn starts. The loop does not start another model call that
+  cannot finish before `NOO_HARNESS_TURN_TIMEOUT_SECS` (default 900 s), and
+  it ends a call still running at the deadline. It then saves the answer so
+  far, or a note that the model did not finish, while the turn's credential
+  is still valid.
+- **Reasoning can be switched off per node.** Place the harness with
+  `--env NOO_HARNESS_THINKING=off` and every model call on that node asks the
+  model not to reason, for the `noo` loop and for a foreign kind's CLI
+  alike. `on` forces reasoning; `auto`, the default, leaves it to the caller.
+  The harness re-reads the placement every minute, so no restart is needed.
+
+```sh
+noo cluster place <node> harness auto --env NOO_HARNESS_THINKING=off
+```
+
+Both variables are described in
+[../reference/env.md](../reference/env.md). Each node also gets defaults for
+them from its harness profile, below.
+
+## Harness profiles
+
+Each node has a harness profile: six settings that decide how a harness
+behaves on that node's hardware. The controller resolves it from three
+sources and sends it to the node with the rest of its desired config:
+
+1. a **per-node override**, which you set;
+2. a **measured** value, from a bench of the node's chat model
+   (`first_byte_secs` only);
+3. the **tier default**, from the node's derived tier.
+
+For each field the first source that has a value wins. The tier defaults
+live in `config/harness-profiles.json`, which is built into the gateway and
+the `noo` CLI. A node whose tier cannot be derived, or whose tier is not in
+the table, gets the tier 3 row.
+
+| Field | Tier 1 (controller-class CUDA) | Tier 2 (discrete GPU, Apple Silicon, Jetson) | Tier 3 (CPU worker) | Tier 4 (edge, SBC) | What it controls | Applied by |
+|---|---|---|---|---|---|---|
+| `first_byte_secs` | 290 | 600 | 900 | 900 | how long the node's inference proxy waits for a model's first byte (a cold load plus the prompt's prefill) | node agent, live, no restart |
+| `stream_idle_secs` | 300 | 300 | 600 | 600 | how long a streamed answer may go silent before it counts as cut | harness |
+| `thinking` | `auto` | `off` | `off` | `off` | whether model calls reason: `on`, `off`, or `auto` (the caller decides) | harness |
+| `ollama_context` | 32768 | 32768 | 16384 | 8192 | the context length the node's ollama runs with when its placement sets no `OLLAMA_CONTEXT_LENGTH` | node agent |
+| `claude_prompt` | `full` | `slim` | `slim` | `slim` | which Claude Code launch the harness uses: the full system prompt, or a slim one for small models | harness |
+| `foreign_kinds` | claude-code, codex, copilot | claude-code, codex, copilot | codex, copilot | none | the foreign harness kinds this node may run (`noo` is always allowed); the agent refuses a placement of any other kind | node agent |
+
+For the harness, the profile is a default and not a ceiling: a value in the
+harness process env wins, then the harness placement's env
+(`--env NOO_HARNESS_THINKING=off`), then the profile, then the built-in
+default. For the node agent, the profile replaces
+`NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS`, which still applies on a box whose
+desired config carries no profile.
+
+### See a node's profile
+
+```sh
+noo cluster profile <node>          # each field, its value and where it came from
+noo cluster profile <node> --json   # the resolved profile as the node receives it
+```
+
+Each row names its source: `tier N`, `override (tier N: <default>)`, or
+`measured from <model> at <time>`. The last block shows the node's bench, if
+one has run, and whether it applies.
+
+### Override a field
+
+```sh
+noo cluster profile <node> --set thinking=on
+noo cluster profile <node> --set first_byte_secs=1200 stream_idle_secs=900
+noo cluster profile <node> --set foreign_kinds=codex,copilot   # none: no foreign kind
+noo cluster profile <node> --clear thinking                    # back to measured / tier
+noo cluster profile <node> --clear-all
+```
+
+The gateway checks every value: `first_byte_secs` and `stream_idle_secs` are
+whole seconds from 1 to 7200, `ollama_context` is whole tokens from 1 to
+1048576, `thinking` is `on`, `off` or `auto`, `claude_prompt` is `full` or
+`slim`, and `foreign_kinds` names foreign kinds from
+`config/harness-kinds.json`. A value outside these rules is refused with the
+reason, and nothing is written. Overrides are stored in the node's config
+(`noo_node_config.harness_profile`) and reach the node on its next
+desired-config poll.
+
+### Bench the node's model
+
+```sh
+noo cluster profile <node> --bench
+```
+
+The controller asks the node agent to load the node's chat model and time a
+reference prompt. The agent keeps the result and reports it on every
+heartbeat as `model_bench`: load time, prefill and decode speed in tokens per
+second, prompt size, and when it ran. The command prints those numbers and
+then the re-resolved profile. A bench can take several minutes on a CPU
+worker. The controller waits up to 900 s, and the agent stops at 600 s.
+
+From a bench the controller works out a first-byte wait for a 30,000-token
+prompt:
+
+```
+first_byte_secs = ceil((load_secs + 30000 / prefill_tps) × 1.5)
+```
+
+The result is never lower than the tier default and never higher than 1800
+s. It applies only while the bench is of the model the node's chat placement
+runs. After you place a different model, the bench is shown but not used
+until you bench again. An override of `first_byte_secs` always wins over the
+measured value. The other five fields are never measured.
+
+If the bench cannot run, the command says why: the node has no chat backend,
+a bench is already running, the chat backend failed, or the bench ran past
+the agent's budget (then set `first_byte_secs` by hand).
+
+The node's harness profile fills in what the env and the placement leave
+unset. The gateway resolves it per node from the node's tier, a measured
+model speed and per-node overrides (the noo CLI's cluster profile
+command), and the
+harness reads it from its node agent: `thinking` (after
+`NOO_HARNESS_THINKING` in the harness's env and in the placement),
+`stream_idle_secs` (after `NOO_BACKEND_STREAM_IDLE_SECS`; fixed when the
+harness starts, so a change waits for a restart) and `claude_prompt`
+(below; re-read every minute).
+
+### Slim Claude Code for small models
+
+Claude Code's own system prompt and its 20 built-in tool definitions make
+its first request large. A small model must prefill all of it before its
+first token. On an M4 Mac mini with gemma4:12b on Ollama, that first token
+took longer than 290 s. With `claude_prompt=slim` in the node's profile
+(the default for tiers 2 to 4), the harness runs the kind's `launch_slim`
+instead of `launch`. The slim launch keeps every flag of the full one and
+adds these:
+
+- `--system-prompt-file`: a 550-character noomesh prompt replaces Claude
+  Code's own. The prompt says what the run is, names the tools, and asks for
+  the `NOO_RESULT:` / `NOO_FAILED:` line. The driver writes it into the
+  task's HOME (mode 0600) and removes it after the run.
+- `--tools Read,Write,Edit`: only the file tools, beside noomesh's MCP
+  tools. No shell, no subagents, no web, no scheduling, no worktrees.
+- `--disable-slash-commands`: no skills.
+
+Measured against a recording mock model, Claude Code 2.1.292 sent this as
+its first request, with no MCP servers:
+
+| launch | tools | system prompt | request | about |
+|---|---|---|---|---|
+| full | 20 | 5,979 chars, plus 9,540 chars of context messages | 62,981 bytes | 15,700 tokens |
+| slim | 3 | 686 chars, plus 1,124 chars of context messages | 5,597 bytes | 1,400 tokens |
+
+The token figures are bytes divided by 4. noomesh's MCP tools are added to
+both launches the same way.
+
+To choose the launch for one node, set the override with
+`noo cluster profile <node> --set claude_prompt=full` (or `slim`), and
+`noo cluster profile <node> --clear claude_prompt` to go back to the tier
+default. To compare the two launches on a node, pass
+`--prompt full|slim` to the probe below.
+
 ## Probe a kind before placing it
 
 `noo-gateway harness probe` runs a kind's real vendor CLI once per test,
@@ -148,8 +323,11 @@ sudo noo-gateway harness probe --kind codex --run-as nobody --json
 ```
 
 Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
-`--test reply|file|both` (default `both`), `--timeout <secs>` (default
-300), `--keep` (keep the workspace and print its path) and `--json`. For
+`--test reply|file|both` (default `both`), `--prompt full|slim` (Claude
+Code's full or slim launch; default: the node's profile in real mode, else
+full), `--context-tokens <n>` (the context window a CLI that takes one,
+Claude Code or Codex, is told; default: the node agent's `model_context` in real
+mode, else the CLI's own), `--timeout <secs>` (default 300), `--keep` (keep the workspace and print its path) and `--json`. For
 each test the report gives the CLI version, PASS or FAIL with the first
 concrete reason, the exit code, seconds, whether it timed out, every
 translator route the CLI hit (method, path, status), token usage, and the
@@ -196,7 +374,7 @@ eval harness in `eval/` runs the same task set under each kind, in turn, on
 one node, and reports a row per kind. A scenario with a `harness_compare:`
 block does it; `eval/scenarios/harness-compare-awolf.yaml` is the sample
 (three tasks: a one-word reply, a question that needs a mesh tool, and a
-two-step delegation, under `noo`, `copilot` and `claude-code`).
+two-step delegation, under `noo`, `copilot`, `claude-code` and `codex`).
 
 **It changes the node's harness placement while it runs.** For each kind it
 sets `NOO_HARNESS_KIND` on the node's `harness` placement (keeping the rest

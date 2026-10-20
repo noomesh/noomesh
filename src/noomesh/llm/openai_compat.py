@@ -67,11 +67,14 @@ class OpenAICompatClient:
         model: str = "default",
         options: Optional[Dict[str, Any]] = None,
         timeout: float = 120.0,
+        headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.options = options or {}
-        self.http = httpx.Client(timeout=timeout, verify=ssl_verify(), cert=client_cert())
+        # `headers`: the gateway's key when base_url is the gateway (a backend
+        # ignores it).
+        self.http = httpx.Client(timeout=timeout, verify=ssl_verify(), cert=client_cert(), headers=headers)
 
     def _url(self) -> str:
         return f"{self.base_url}/v1/chat/completions"

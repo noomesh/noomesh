@@ -167,6 +167,15 @@ fi
 # very first applier-only pass and after a failed first apply; in that case the
 # report is skipped with a note rather than sent unauthenticated. `provision
 # --wait` gates the applier phase on fetched_at, not on this report.
+# The bearer form this node signs: `v1` only when the agent env pins it
+# (NOO_CLUSTER_TOKEN_SIGN=v1, for a node rolled before its controller),
+# `v2` otherwise. Same stripping as node_bearer.
+node_sign_form() {
+    _f="$(sed -n 's/^NOO_CLUSTER_TOKEN_SIGN=//p' /etc/noo-node-agent.env 2>/dev/null | tail -1 \
+        | tr -d '\015' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
+    case "$_f" in v1|V1) echo v1 ;; *) echo v2 ;; esac
+}
+
 node_bearer() {
     _env=/etc/noo-node-agent.env
     [ -r "$_env" ] || return 1
@@ -318,43 +327,30 @@ report_post() {
     _errf="${TMP:-/tmp}/report.err"
     _path="/bootstrap/bundle/$NODE/applied"
     _body="{\"sha\":\"$SUM\",\"rc\":$_r,\"msg\":\"$_m\"}"
-    _form=v2
-    while :; do
-        # Substitute the bearer placeholder with a token for THIS request.
-        _n=$#; _i=0; _used=0
-        while [ "$_i" -lt "$_n" ]; do
-            _a="$1"; shift
-            case "$_a" in
-                "authorization: Bearer @NODE_BEARER@")
-                    _used=1
-                    _a="authorization: Bearer $(NOO_BEARER_FORM=$_form node_bearer POST "$_path" "$_body")" ;;
-            esac
-            set -- "$@" "$_a"
-            _i=$((_i + 1))
-        done
-        if REPORT_CODE="$(curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \
-            -w '%{http_code}' \
-            -H 'content-type: application/json' \
-            -H "x-noo-content-sha256: $(printf '%s' "$_body" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//')" \
-            "$@" \
-            -d "$_body" \
-            "$URL/bootstrap/bundle/$NODE/applied" 2>"$_errf")"; then :; else REPORT_CODE=000; fi
-        # A controller that predates v2 answers 401 to it: say the same thing
-        # once in the legacy form rather than lose the report. The placeholder
-        # was replaced in place, so rebuild it for the second pass.
-        if [ "$REPORT_CODE" = 401 ] && [ "$_form" = v2 ] && [ "$_used" = 1 ]; then
-            _form=v1
-            _n=$#; _i=0
-            while [ "$_i" -lt "$_n" ]; do
-                _a="$1"; shift
-                case "$_a" in "authorization: Bearer v2:"*) _a="authorization: Bearer @NODE_BEARER@" ;; esac
-                set -- "$@" "$_a"
-                _i=$((_i + 1))
-            done
-            continue
-        fi
-        break
+    # v2 always, unless this node pins the old form for a controller that
+    # predates v2 (NOO_CLUSTER_TOKEN_SIGN=v1 in the agent env, the same pin
+    # the agent itself honours). There is no v1 retry after a 401: a v2
+    # refusal is reported as the 401 it is, never re-sent on the replayable
+    # form (that retry was the only v1 this script ever sent).
+    _form="$(node_sign_form)"
+    # Substitute the bearer placeholder with a token for THIS request.
+    _n=$#; _i=0
+    while [ "$_i" -lt "$_n" ]; do
+        _a="$1"; shift
+        case "$_a" in
+            "authorization: Bearer @NODE_BEARER@")
+                _a="authorization: Bearer $(NOO_BEARER_FORM=$_form node_bearer POST "$_path" "$_body")" ;;
+        esac
+        set -- "$@" "$_a"
+        _i=$((_i + 1))
     done
+    if REPORT_CODE="$(curl -sS $TLS --connect-timeout 10 --max-time 20 -o /dev/null \
+        -w '%{http_code}' \
+        -H 'content-type: application/json' \
+        -H "x-noo-content-sha256: $(printf '%s' "$_body" | openssl dgst -sha256 -hex 2>/dev/null | sed 's/.*= *//')" \
+        "$@" \
+        -d "$_body" \
+        "$URL/bootstrap/bundle/$NODE/applied" 2>"$_errf")"; then :; else REPORT_CODE=000; fi
     case "$REPORT_CODE" in [0-9][0-9][0-9]) ;; *) REPORT_CODE=000 ;; esac
     REPORT_ERR="$(head -c 200 "$_errf" 2>/dev/null | tr '\n\r\t' '   ' || true)"
     case "$REPORT_CODE" in 2??) return 0 ;; esac

@@ -546,11 +546,11 @@ services:
       # External-inference reranker (off unless set — see EXTERNAL_INFERENCE_CONTRACT.md)
       - PAGEINDEX_EMBEDDING_BACKEND=${PAGEINDEX_EMBEDDING_BACKEND:-}
       - PAGEINDEX_EMBEDDING_MODEL=${PAGEINDEX_EMBEDDING_MODEL:-}
-      - PAGEINDEX_LLM_URL=${PAGEINDEX_LLM_URL:-https://noo-vllm:8000}
-      # `default` = the gateway's chat-default class: every live chat node,
-      # ranked per request (2026-10-17). An exact model name here pinned
-      # every caller of it to the nodes serving that one model.
-      - PAGEINDEX_LLM_MODEL=${PAGEINDEX_LLM_MODEL:-default}
+      # No PAGEINDEX_LLM_URL / PAGEINDEX_LLM_MODEL (i145): the worker's LLM
+      # calls go through the gateway as a purpose (`knowledge`, `graph`) and
+      # which model serves it is a preference in the DB (`noo cluster class
+      # set … --alias knowledge`). A value left in .env does nothing; the
+      # launcher warns (scripts/retired-env-keys).
       # STT provider (generic layer — gateway-rust/src/stt_client.rs).
       # Off-unless-set passthroughs: the compiled default already points at
       # the opt-in `whisper` compose service (https://noo-whisper:8000, mTLS,
@@ -771,9 +771,9 @@ services:
       # REMOVED with the Python source tree:
       #   ./src:/app/src:ro
       #     overlaid a directory the image no longer creates. Nothing in the
-      #     gateway imports noomesh; the only thing that had to survive is
-      #     index.html, which keeps its own mount above (routes/ui.rs reads it
-      #     from paths::GATEWAY_HTML_DIR).
+      #     gateway imports noomesh; the dashboard is the UI artifact under
+      #     /var/www, and the last page read from /app/src (`/ui/basic`) is
+      #     retired.
       #   ${TRELLION_PATH}/src/trellion:/opt/python/cpython-3.12.13-.../trellion
       #     DEAD LONG BEFORE THIS CHANGE, and silently. The target is the
       #     deps-base interpreter's site-packages; this image's interpreter has

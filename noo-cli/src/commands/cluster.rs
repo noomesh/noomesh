@@ -534,8 +534,9 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // the screen.
     let desired = crate::http::get_json_try(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(node)), true, 10).ok();
     if let Some(d) = desired.as_ref().filter(|d| d["node"].is_object()) {
-        println!("{}", ui::kv(&[("usage", usage_cell(&d["node"]))]));
+        println!("{}", ui::kv(&[("usage", usage_cell(&d["node"])), ("vendor CLIs", vendor_kinds_row(&d["node"]))]));
     }
+    println!("{}", ui::kv(&[("harness", harness_show_cell(n))]));
     print!("{}", role_capabilities_section_with(n, desired.as_ref().map(|d| &d["placements"])));
 
     ui::guide(&[
@@ -588,6 +589,31 @@ pub(crate) fn target_cell(p: &serde_json::Value) -> String {
         Some(t) => t.to_string(),
         None if p["env"]["N_GPU_LAYERS"].as_str() == Some("0") => format!("cpu {}", ui::muted("(N_GPU_LAYERS=0)")),
         None => ui::muted("-").to_string(),
+    }
+}
+
+/// The `vendor CLIs` row of `noo cluster desired`: the node's
+/// `vendor_kinds`, carried besides its harness placement's CLI.
+pub(crate) fn vendor_kinds_row(node_cfg: &serde_json::Value) -> String {
+    match node_cfg["vendor_kinds"].as_array() {
+        None => ui::muted("not reported (an older gateway)").to_string(),
+        Some(a) if a.is_empty() => "the harness placement's only".to_string(),
+        Some(a) => format!(
+            "{} {}",
+            a.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(", "),
+            ui::muted("(besides the placement's; `noo cluster vendor install`)")
+        ),
+    }
+}
+
+/// The harness row of `noo cluster show`: the state the node reports and,
+/// while running, the kind it is running (`host_services.harness.kind`).
+pub(crate) fn harness_show_cell(n: &serde_json::Value) -> String {
+    let h = &n["host_services"]["harness"];
+    match (h["state"].as_str().filter(|s| !s.is_empty()), h["kind"].as_str().filter(|k| !k.is_empty())) {
+        (None, _) => ui::muted("not reported").to_string(),
+        (Some(st), Some(k)) => format!("{st} (kind {k})"),
+        (Some(st), None) => st.to_string(),
     }
 }
 
@@ -696,6 +722,7 @@ pub fn cluster_desired(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             },
         ));
         rows.push(("usage", usage_cell(n)));
+        rows.push(("vendor CLIs", vendor_kinds_row(n)));
         rows.push((
             "harness",
             match n["harness_policy"].as_str().unwrap_or("manual") {
@@ -957,7 +984,10 @@ fn refusal_for(node_live: &serde_json::Value, target: &str) -> Option<String> {
 fn harness_cell(n: &serde_json::Value) -> String {
     match n["host_services"]["harness"]["state"].as_str() {
         None | Some("") => ui::muted(ui::dash()),
-        Some("running") => ui::state("running"),
+        Some("running") => match n["host_services"]["harness"]["kind"].as_str().filter(|k| !k.is_empty()) {
+            Some(k) => format!("{} {k}", ui::state("running")),
+            None => ui::state("running"),
+        },
         Some("stopped") => ui::warn("stopped"),
         Some("absent") => ui::muted("absent"),
         Some(other) => ui::state(other),
@@ -1430,7 +1460,7 @@ mod placement_env_tests {
         assert_eq!(other_role_for_same_model(&legacy, "ollama", "harrier"), None);
     }
 
-    use super::{capabilities_cell, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell};
+    use super::{capabilities_cell, current_env_for, merge_placement_env, other_role_for_same_model, parse_env_change, render_fit, role_capabilities_section, role_capabilities_section_with, target_cell, usage_cell, memory_limit_line, mem_cell, harness_cell, harness_show_cell, vendor_kinds_row};
     use serde_json::json;
 
     #[test]
@@ -1496,6 +1526,19 @@ mod placement_env_tests {
             "models": [{"model": "Mystery.gguf", "role": "chat", "target": "gpu", "weights_gb": null, "weights_source": "unknown", "kv_gb": 0.0, "overhead_gb": 0.6, "total_gb": 0.6, "source": "estimated"}]});
         let out = render_fit("host3", &unknown);
         assert!(out.contains("can't judge") && !out.contains("tight"), "{out}");
+    }
+
+    #[test]
+    fn desired_and_show_render_vendor_kinds_and_the_running_kind() {
+        use serde_json::json;
+        assert!(vendor_kinds_row(&json!({"vendor_kinds": ["codex", "copilot"]})).starts_with("codex, copilot "));
+        assert_eq!(vendor_kinds_row(&json!({"vendor_kinds": []})), "the harness placement's only");
+        assert!(vendor_kinds_row(&json!({})).contains("older gateway"));
+        let n = json!({"host_services": {"harness": {"state": "running", "kind": "copilot"}}});
+        assert_eq!(harness_show_cell(&n), "running (kind copilot)");
+        assert!(harness_cell(&n).ends_with(" copilot"));
+        assert_eq!(harness_show_cell(&json!({"host_services": {"harness": {"state": "stopped"}}})), "stopped");
+        assert!(harness_show_cell(&json!({})).contains("not reported"));
     }
 
     #[test]
@@ -2632,6 +2675,16 @@ pub fn cluster_set_config(g: &Globals, args: &[String]) -> Result<i32, Unhandled
                     _ => fail(g.json, ExitCode::Usage, "bad_usage_profile", "--usage must be shared, dedicated or default", None),
                 };
             }
+            // The vendor CLIs this node carries whatever its harness
+            // placement names (`noo cluster vendor install` adds to it);
+            // `none` clears. Delivered by the next restage.
+            "--vendor-kinds" => {
+                let v = next!();
+                match super::cluster_vendor::parse_vendor_kinds(&v, &crate::harness_kinds::shipped()) {
+                    Ok(k) => body.insert("vendor_kinds".into(), serde_json::json!(k)),
+                    Err(e) => fail(g.json, ExitCode::Usage, "bad_vendor_kinds", &e, None),
+                };
+            }
             t if t.starts_with('-') => return Err(Unhandled),
             t if node.is_none() => node = Some(t.to_string()),
             _ => return Err(Unhandled),
@@ -2658,6 +2711,7 @@ pub fn cluster_set_config(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     }
     // Asked BEFORE the body is handed to the request, which consumes it.
     let needs_bundle = ["data_root", "models_dir"].iter().any(|k| body.contains_key(*k));
+    let vendor_change = body.contains_key("vendor_kinds");
     let resp = put_json(
         g,
         &format!("/api/cluster/nodes/{}/config", super::urlencode(&node)),
@@ -2676,7 +2730,15 @@ pub fn cluster_set_config(g: &Globals, args: &[String]) -> Result<i32, Unhandled
     // sent the operator away believing a change had landed, and what actually
     // happened was `reconcile.models_dir_refused` on the node naming the old
     // roots (host3, 2026-09-12).
-    if needs_bundle {
+    if vendor_change && !needs_bundle {
+        // Like a path: the CLIs reach the node in its bundle, never on a
+        // reconcile.
+        ui::done(&format!("{node}: config updated — vendor CLIs reach the node with its next restage"));
+        ui::guide(&[
+            ("noo cluster vendor status", "what the node will carry, and what is still to stage"),
+            (&format!("noo cluster provision {node}"), "restage so its bundle carries them"),
+        ]);
+    } else if needs_bundle {
         ui::done(&format!("{node}: config updated — a path change needs a BUNDLE, not a reconcile"));
         ui::guide(&[(
             &format!("noo cluster provision {node} --wait"),

@@ -6,10 +6,10 @@
 Its graph extraction and answer synthesis go through the gateway's
 `/v1/chat/completions`, which resolves the backend over the mesh like every
 chat channel and carries the node credential trellion lacks. Two things pin
-that: compose points trellion's `PAGEINDEX_LLM_URL` at the gateway (the same
-shape as its embedder URL), and the gateway proxy passes the body's `model`
-to the resolver as the exact-match hint, so `PAGEINDEX_LLM_MODEL` placed on
-a node steers extraction to it while chat keeps its own model elsewhere.
+that: the worker pool hands trellion the gateway address and the `knowledge`
+purpose (i145: no PAGEINDEX_LLM_* in compose), and the gateway proxy passes
+the body's `model` to the class resolver, where the purpose is a DB
+preference (the mesh when undeclared).
 """
 from __future__ import annotations
 
@@ -30,13 +30,33 @@ def _trellion_env() -> dict[str, str]:
     return env
 
 
-def test_trellion_llm_url_is_the_gateway_not_the_worker_pointer() -> None:
+def test_no_service_picks_its_llm_from_env() -> None:
+    """i145: the purpose names the model, the DB says which; compose restates neither."""
+    from tests._compose_projection import raw_services_union
     env = _trellion_env()
-    assert env["PAGEINDEX_LLM_URL"] == "${NOO_TRELLION_LLM_URL:-https://gateway:8080}"
     assert env["PAGEINDEX_EMBEDDING_URL"] == "${NOO_TRELLION_EMBEDDING_URL:-https://gateway:8080}"
-    assert "${PAGEINDEX_LLM_URL" not in env["PAGEINDEX_LLM_URL"], (
-        "a worker-side backend URL must never leak into trellion's env — it is container-relative"
-    )
+    for name, svc in raw_services_union().items():
+        e = svc.get("environment") or {}
+        keys = [item.split("=", 1)[0] for item in e] if isinstance(e, list) else list(e)
+        for var in ("PAGEINDEX_LLM_URL", "PAGEINDEX_LLM_MODEL"):
+            assert var not in keys, f"{name} sets {var}: an LLM choice belongs in the DB as a purpose preference"
+
+
+def test_worker_llm_callers_send_a_purpose_to_the_gateway() -> None:
+    pool = (ROOT / "src/noomesh/gateway/worker_pool.py").read_text()
+    assert "llm_model = llm_purposes.KNOWLEDGE" in pool and "llm_url = llm_purposes.gateway_url()" in pool
+    graph = (ROOT / "src/noomesh/workers/graph.py").read_text()
+    assert '"model": llm_purposes.GRAPH' in graph and '"llm_url": llm_purposes.gateway_url()' in graph
+    orch = (ROOT / "src/noomesh/agents/orchestrator.py").read_text()
+    assert "base_url=llm_purposes.gateway_url()" in orch
+    for src, name in ((pool, "worker_pool"), (graph, "graph"), (orch, "orchestrator")):
+        assert 'getenv("PAGEINDEX_LLM' not in src and 'environ.get("PAGEINDEX_LLM' not in src, name
+        assert "noo-vllm:8000" not in src and 'os.getenv("VLLM_MODEL"' not in src, name
+    rs = (ROOT / "gateway-rust/src/coordinator/classes.rs").read_text()
+    m = re.search(r"pub const PURPOSE_ALIASES: \[&str; \d+\] = \[([^\]]*)\]", rs)
+    assert m, "PURPOSE_ALIASES not found in classes.rs"
+    from noomesh import llm_purposes
+    assert {llm_purposes.KNOWLEDGE, llm_purposes.GRAPH} == set(re.findall(r'"([^"]+)"', m.group(1)))
 
 
 def test_v1_chat_completions_routes_on_the_requested_model() -> None:

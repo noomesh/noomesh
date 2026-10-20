@@ -708,9 +708,21 @@ pub(crate) struct StreamedResponse {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// The stream broke before it ended (a body error, the idle bound):
+    /// [`crate::node_link::stream_cut_message`]. What arrived before the cut
+    /// is still in the fields above. A cut is a backend error for the
+    /// iteration, never an empty answer to nudge.
+    pub cut: Option<String>,
+    /// `until` passed while the answer was still arriving.
+    pub deadline_hit: bool,
 }
 
-pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Result<StreamedResponse, String> {
+/// Accumulate a streamed answer. `started` is when the call was sent (for
+/// the cut message); `until` is when the turn must stop. A mid-stream
+/// failure ends the read and is reported in [`StreamedResponse::cut`], and
+/// `until` passing in [`StreamedResponse::deadline_hit`], each with whatever
+/// arrived before it.
+pub(crate) async fn collect_streaming_response(resp: reqwest::Response, started: Instant, until: Instant) -> Result<StreamedResponse, String> {
     use futures::StreamExt;
 
     let mut full_content = String::new();
@@ -736,9 +748,27 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
     let mut reasoning_filter = super::gemma_channel::ChannelFilter::reasoning();
     let mut content_filter = super::gemma_channel::ChannelFilter::content();
 
+    let mut cut: Option<String> = None;
+    let mut deadline_hit = false;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("SSE stream error: {e}"))?;
+    loop {
+        let next = match tokio::time::timeout_at(tokio::time::Instant::from_std(until), stream.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                deadline_hit = true;
+                break;
+            }
+        };
+        let Some(chunk) = next else { break };
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let why = crate::node_link::stream_cut_message(started.elapsed(), &e);
+                tracing::error!(error = %why, "SSE stream error");
+                cut = Some(why);
+                break;
+            }
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(line_end) = buf.find('\n') {
@@ -891,6 +921,8 @@ pub(crate) async fn collect_streaming_response(resp: reqwest::Response) -> Resul
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cut,
+        deadline_hit,
     })
 }
 
@@ -1447,7 +1479,10 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
     enable_thinking: bool,
     until: Instant,
 ) -> Result<reqwest::Response> {
-    let client = crate::tls::cluster_client();
+    // NOO_HARNESS_THINKING: `on`/`off` override the caller's choice for
+    // every call on this node; `off` also sets each wire's own switch.
+    let thinking = super::thinking::thinking_mode();
+    let enable_thinking = super::thinking::effective_enable_thinking(thinking, enable_thinking);
     for attempt in 1..=MAX_LLM_BACKEND_ATTEMPTS {
         // The whole call, streamed body included, ends with the turn — not
         // at the client's fixed backend timeout, which cut a slow answer
@@ -1457,14 +1492,32 @@ async fn send_llm_with_fallback<R: HarnessRuntime>(
             anyhow::bail!("this turn reached its time limit before the model answered");
         }
         let stream = force_stream || super::backend::wire_format(backend) == "openai";
-        let (url, body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
+        let (url, mut body) = build_llm_request(backend, messages, tools, stream, enable_thinking);
+        if thinking == super::thinking::ThinkingMode::Off {
+            super::thinking::disable_on_wire(
+                &mut body,
+                super::backend::wire_format(backend),
+                &backend.backend_type,
+                super::backend::is_cloud_backend(backend),
+            );
+        }
         if super::backend::is_cloud_backend(backend) {
             match send_cloud_attempt(backend, &url, &body, attempt).await? {
                 Some(resp) => return Ok(resp),
                 None => continue,
             }
         }
-        let failure = match with_backend_hint(client.post(&url).json(&body).timeout(remaining), backend).send().await {
+        // A streamed answer goes out on the stream client (no total
+        // timeout, an idle bound between reads): a slow node's reasoning
+        // must not be cut at NOO_BACKEND_TIMEOUT_SECS while it is still
+        // arriving. A whole-body answer keeps the total bound.
+        let req = if stream {
+            crate::node_link::backend_stream_on(&crate::tls::cluster_stream_client(), reqwest::Method::POST, &url, &backend.backend_type)
+        } else {
+            crate::node_link::backend_request(reqwest::Method::POST, &url, &backend.backend_type)
+        };
+        // The turn deadline, not the client's fixed backend timeout (#177).
+        let failure = match req.json(&body).timeout(remaining).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -1590,10 +1643,15 @@ async fn send_cloud_attempt(
     attempt: usize,
 ) -> Result<Option<reqwest::Response>> {
     let label = super::cloud::provider_label(&backend.backend_type);
-    let req = super::cloud::with_provider_auth(
-        crate::tls::external_client().post(url).json(body),
-        &backend.backend_type,
-    )?;
+    // A streamed provider answer gets the stream client: the unary
+    // client's 120 s total cut a long cloud stream exactly as the cluster
+    // client's 300 s cut a node's.
+    let client = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        crate::tls::external_stream_client()
+    } else {
+        crate::tls::external_client()
+    };
+    let req = super::cloud::with_provider_auth(client.post(url).json(body), &backend.backend_type)?;
     let last = attempt >= MAX_LLM_BACKEND_ATTEMPTS;
     let retry_after = match req.send().await {
         Ok(resp) => {
@@ -1969,9 +2027,29 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
     // forever on a model that can't recover.
     let mut nudge_history: Vec<&'static str> = Vec::new();
 
+    // The person's message is saved now, not after the loop: a turn that
+    // ends badly (the deadline, a rail token that ran out) must not lose it.
+    save_user_message_early(rt, conversation_id, prompt, user_id).await;
+    // When this turn must stop calling the model (turn deadline, or the
+    // harness token's life less the relay's margin).
+    let ends_at = turn_ends_at(rt, start);
+    let mut deadline_stopped = false;
+
     let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
-    let turn_ends = turn_cutoff(Instant::now());
+    // #177's per-call cutoff, never later than this turn's end (deadline or
+    // the harness token's life): one clock for the call and the loop.
+    let turn_ends = turn_cutoff(Instant::now()).min(ends_at);
     for iteration in 1..=max_iterations {
+        if deadline_stop(iteration, Instant::now(), ends_at, model_call_budget()) {
+            deadline_stopped = true;
+            tracing::warn!(
+                iteration,
+                remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
+                "loop.turn_deadline_stop"
+            );
+            let _ = writer.send_event("metadata", json!({"deadline_stop": true, "iteration": iteration})).await;
+            break;
+        }
         result.iterations = iteration;
         let iter_start = Instant::now();
 
@@ -2035,17 +2113,40 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         let mut anthropic_sse = (super::backend::wire_format(&backend) == "anthropic")
             .then(super::anthropic_wire::SseTranslator::new);
         let mut stream_failed = false;
-        // The transport broke mid-stream (a timeout, a dropped connection):
-        // what arrived is all there will be.
-        let mut stream_broke: Option<String> = None;
 
+        // A body error mid-stream (the idle bound, a reset) is a CUT, kept
+        // apart from a stream that ended: what arrived is kept and shown,
+        // and the iteration ends as a backend error, never as an empty
+        // answer the stall guard would nudge. The read is also bounded by
+        // the turn's end, so a call that would overrun it stops in time to
+        // save.
+        let mut stream_cut: Option<String> = None;
+        let mut hit_deadline = false;
         use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = match tokio::time::timeout_at(tokio::time::Instant::from_std(ends_at), stream.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    hit_deadline = true;
+                    break;
+                }
+            };
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(error = %e, "SSE stream error");
-                    stream_broke = Some(if e.is_timeout() { "the turn's time limit".to_string() } else { e.to_string() });
+                    if e.is_timeout() && Instant::now() + Duration::from_secs(2) >= turn_ends {
+                        // The per-call timeout is the turn's end, not a
+                        // silent model: report it as the deadline.
+                        hit_deadline = true;
+                    } else {
+                        let why = crate::node_link::stream_cut_message(iter_start.elapsed(), &e);
+                        tracing::error!(error = %why, backend = %backend.url, "SSE stream error");
+                        if e.is_timeout() {
+                            super::classes::note_stall(&backend.url, &backend.backend_type);
+                        }
+                        stream_cut = Some(why);
+                    }
                     break;
                 }
             };
@@ -2258,22 +2359,23 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
 
         usage.total_latency_ms += iter_start.elapsed().as_millis() as u64;
 
-        // A broken stream is not an empty answer. Nudging it ("write the
-        // answer now") started another full-length call on a model that was
-        // still thinking when it was cut (2026-10-17: four 5-minute calls,
-        // each cut mid-thought, then a 401 on save). With no answer text,
-        // say what happened and end the turn; with some, keep it as the
-        // answer and run none of its tool calls, which may be cut too.
-        if let Some(why) = stream_broke {
-            if full_content.trim().is_empty() {
-                tracing::warn!(iteration, reasoning_chars = full_reasoning.chars().count(), reason = %why, "loop.stream_broke_before_answer");
-                let _ = writer.send_event("error", json!(format!(
-                    "The model's answer was cut off before it was written ({why}). Send it again, or ask for something shorter."
-                ))).await;
-                break;
+        if stream_cut.is_some() || hit_deadline {
+            // What arrived was already streamed to the client above; it is
+            // the answer so far.
+            if !strip_think_blocks(&full_content).trim().is_empty() {
+                result.response = full_content.clone();
             }
-            tracing::warn!(iteration, chars = full_content.chars().count(), dropped_tool_calls = tool_calls_json.len(), reason = %why, "loop.stream_broke_partial_answer_kept");
-            tool_calls_json.clear();
+            match stream_cut {
+                Some(why) => {
+                    let _ = writer.send_event("error", json!(why)).await;
+                }
+                None => {
+                    deadline_stopped = true;
+                    tracing::warn!(iteration, "loop.turn_deadline_stop (mid-stream)");
+                    let _ = writer.send_event("metadata", json!({"deadline_stop": true, "iteration": iteration})).await;
+                }
+            }
+            break;
         }
 
         // Reconstruct the full message for session history
@@ -2634,13 +2736,15 @@ async fn run_streaming_on_bound<R: HarnessRuntime, S: crate::websocket::TurnSink
         };
     }
 
-    // 6. Persist conversation (with think-block stripping)
-    let clean_response = strip_think_blocks(&result.response);
-
-    if let Err(e) = rt.save_message(conversation_id, "user", prompt, None, user_id,
-    ).await {
-        tracing::warn!(error = %e, "Failed to save user message");
+    if deadline_stopped {
+        let (response, shown) = with_deadline_note(&result.response);
+        result.response = response;
+        let _ = writer.send_event("content", json!(shown)).await;
     }
+
+    // 6. Persist conversation (with think-block stripping). The user's
+    // message was saved at the start of the turn.
+    let clean_response = strip_think_blocks(&result.response);
     if !clean_response.is_empty() {
         let metadata = json!({
             "model": result.model,
@@ -3072,9 +3176,25 @@ async fn run_inner_bound<R: HarnessRuntime>(
     // loop — see the empty-response return below.
     let mut llm_failure: Option<anyhow::Error> = None;
 
+    // Saved now, not after the loop (see the streaming loop).
+    save_user_message_early(rt, conversation_id, prompt, user_id).await;
+    let ends_at = turn_ends_at(rt, start);
+    let mut deadline_stopped = false;
+
     let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
-    let turn_ends = turn_cutoff(Instant::now());
+    // #177's per-call cutoff, never later than this turn's end (deadline or
+    // the harness token's life): one clock for the call and the loop.
+    let turn_ends = turn_cutoff(Instant::now()).min(ends_at);
     for iteration in 1..=max_iterations {
+        if deadline_stop(iteration, Instant::now(), ends_at, model_call_budget()) {
+            deadline_stopped = true;
+            tracing::warn!(
+                iteration,
+                remaining_secs = ends_at.saturating_duration_since(Instant::now()).as_secs(),
+                "loop.turn_deadline_stop (non-streaming)"
+            );
+            break;
+        }
         result.iterations = iteration;
         let iter_start = Instant::now();
 
@@ -3105,7 +3225,7 @@ async fn run_inner_bound<R: HarnessRuntime>(
         let use_streaming = super::backend::wire_format(&backend) == "openai";
 
         let (assistant_msg, content, mut tool_calls) = if use_streaming {
-            let streamed = match collect_streaming_response(resp).await {
+            let streamed = match collect_streaming_response(resp, iter_start, ends_at).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "SSE collection failed");
@@ -3113,6 +3233,25 @@ async fn run_inner_bound<R: HarnessRuntime>(
                     break;
                 }
             };
+            if streamed.cut.is_some() || streamed.deadline_hit {
+                // A cut stream is a backend error for this iteration, and a
+                // deadline mid-answer ends the turn: either way what arrived
+                // is the answer so far, and nothing is nudged.
+                usage.prompt_tokens += streamed.prompt_tokens as u32;
+                usage.completion_tokens += streamed.completion_tokens as u32;
+                usage.total_tokens += streamed.total_tokens as u32;
+                if !strip_think_blocks(&streamed.content).trim().is_empty() {
+                    result.response = streamed.content.clone();
+                }
+                match streamed.cut {
+                    Some(why) => llm_failure = Some(anyhow::anyhow!(why)),
+                    None => {
+                        deadline_stopped = true;
+                        tracing::warn!(iteration, "loop.turn_deadline_stop (non-streaming, mid-stream)");
+                    }
+                }
+                break;
+            }
 
             usage.prompt_tokens += streamed.prompt_tokens as u32;
             usage.completion_tokens += streamed.completion_tokens as u32;
@@ -3415,14 +3554,12 @@ async fn run_inner_bound<R: HarnessRuntime>(
         };
     }
 
-    // Persist conversation
-    let clean_response = strip_think_blocks(&result.response);
-
-    if let Err(e) =
-        rt.save_message(conversation_id, "user", prompt, None, user_id).await
-    {
-        tracing::warn!(error = %e, "Failed to save user message");
+    if deadline_stopped {
+        result.response = with_deadline_note(&result.response).0;
     }
+
+    // Persist conversation. The user's message was saved at the start.
+    let clean_response = strip_think_blocks(&result.response);
     if !clean_response.is_empty() {
         let metadata = json!({
             "model": result.model,
@@ -3515,6 +3652,81 @@ fn backend_error_message(status: u16, body: &str) -> String {
         reason.push('…');
     }
     format!("Backend error: {status}: {reason}")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// The turn's clock: stop calling the model in time to save
+// ═══════════════════════════════════════════════════════════════
+
+/// What a turn the deadline stopped answers when it has nothing else.
+pub(crate) const DEADLINE_NOTE: &str =
+    "The model did not finish within the turn deadline. Ask again, or ask for something shorter.";
+
+/// Seconds a harness token outlives the gateway's relay of its turn: the
+/// gateway mints it for `turn_deadline() + 60` and stops listening at
+/// `turn_deadline()` (`dispatch::try_dispatch`). The loop aims at the relay's
+/// end, so its result is still heard and the saves still authorised.
+const TOKEN_OUTLIVES_RELAY_SECS: u64 = 60;
+
+/// When this turn must stop calling the model: `start` + the turn deadline
+/// (`NOO_HARNESS_TURN_TIMEOUT_SECS`), or, for a turn running on a credential
+/// that expires (a node harness), that expiry less the relay margin,
+/// whichever is sooner.
+fn turn_ends_at<R: HarnessRuntime>(rt: &R, start: Instant) -> Instant {
+    // checked_add: an absurd NOO_HARNESS_TURN_TIMEOUT_SECS or `exp` must
+    // not panic the turn; a year is "no bound" for a turn.
+    let far = Duration::from_secs(365 * 86_400);
+    let by_clock = start
+        .checked_add(super::turn_deadline())
+        .unwrap_or_else(|| start + far);
+    let Some(exp) = rt.credential_expires_at() else {
+        return by_clock;
+    };
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let left = exp.saturating_sub(now_unix).saturating_sub(TOKEN_OUTLIVES_RELAY_SECS);
+    match Instant::now().checked_add(Duration::from_secs(left)) {
+        Some(by_token) => by_clock.min(by_token),
+        None => by_clock,
+    }
+}
+
+/// What one more model call is expected to need: two stream idle bounds,
+/// at most five minutes.
+fn model_call_budget() -> Duration {
+    (crate::tls::stream_idle() * 2).min(Duration::from_secs(300))
+}
+
+/// Stop before model call `iteration`? Always once `ends_at` has passed;
+/// from the second call on, also when less than `budget` is left: a call
+/// that cannot finish would only run the turn's token out before its work
+/// is saved. The first call always runs while there is any time at all.
+pub(crate) fn deadline_stop(iteration: u32, now: Instant, ends_at: Instant, budget: Duration) -> bool {
+    let remaining = ends_at.saturating_duration_since(now);
+    remaining.is_zero() || (iteration > 1 && remaining < budget)
+}
+
+/// The response a deadline-stopped turn ends with, and the text to show
+/// the client in addition to what it already saw: the note alone when
+/// there is no visible answer, else the answer with the note under it.
+fn with_deadline_note(response: &str) -> (String, String) {
+    if strip_think_blocks(response).trim().is_empty() {
+        (DEADLINE_NOTE.to_string(), DEADLINE_NOTE.to_string())
+    } else {
+        let tail = format!("\n\n_({DEADLINE_NOTE})_");
+        (format!("{response}{tail}"), tail)
+    }
+}
+
+/// Save the person's message as the turn starts. It used to be saved with
+/// the answer after the loop, and a harness turn that overran its token
+/// (2026-10-17, mcmini) lost both: every rail call after `exp` was a 401.
+async fn save_user_message_early<R: HarnessRuntime>(rt: &R, conversation_id: &str, prompt: &str, user_id: Option<&str>) {
+    if let Err(e) = rt.save_message(conversation_id, "user", prompt, None, user_id).await {
+        tracing::warn!(error = %e, "Failed to save user message");
+    }
 }
 
 #[cfg(test)]

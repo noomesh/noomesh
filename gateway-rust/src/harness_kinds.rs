@@ -38,6 +38,12 @@ pub struct HarnessKind {
     pub lane: BTreeMap<String, String>,
     /// How the driver invokes the CLI (`None` for `noo`).
     pub launch: Option<Launch>,
+    /// The slim variant of `launch` (same shape), for a node whose harness
+    /// profile says `claude_prompt = slim`: a short system prompt and only
+    /// the file tools beside noomesh's MCP tools. `None` = the kind has no
+    /// slim variant and always runs `launch` (only claude-code has one).
+    #[serde(default)]
+    pub launch_slim: Option<Launch>,
     /// Vendor telemetry switches the runner must launch it with.
     pub telemetry_off: BTreeMap<String, String>,
     /// Where the controller stages the vendor CLI from (i83 E1e); `None` =
@@ -171,6 +177,18 @@ pub struct Launch {
     /// it to the cluster CA so the CLI can reach the user door.
     #[serde(default)]
     pub ca_env: Option<String>,
+    /// A file name (no directory) inside the task's HOME that the driver
+    /// writes its slim system prompt into, mode 0600, and passes as
+    /// `{system_prompt_file}` in `command`; `None` = no such file.
+    #[serde(default)]
+    pub system_prompt_file: Option<String>,
+    /// The variable that tells the CLI its model's context window, in
+    /// tokens; the driver sets it from the node agent's `model_context`
+    /// and leaves it unset when that is unknown (noomesh-internal i147:
+    /// Claude Code otherwise assumes 200k for a model it does not know and
+    /// never compacts in time on a 32k node).
+    #[serde(default)]
+    pub context_window_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +279,40 @@ mod tests {
             fields.extend(l.command.iter());
             assert!(!fields.iter().any(|v| v.starts_with("unverified:")), "{} launch is unverified: {fields:?}", k.kind);
         }
+    }
+
+    /// Only claude-code ships a slim launch; it is the full launch's shape
+    /// with a replaced system prompt and the built-in tools cut to the file
+    /// tools, and it keeps every lane flag of the full one.
+    #[test]
+    fn the_slim_launch_parses_and_only_claude_code_has_one() {
+        for k in all() {
+            if k.kind != "claude-code" {
+                assert!(k.launch_slim.is_none(), "{} has a launch_slim", k.kind);
+                continue;
+            }
+            let full = k.launch.as_ref().unwrap();
+            let slim = k.launch_slim.as_ref().expect("claude-code has a launch_slim");
+            assert_eq!(slim.command[0], k.cli.clone().unwrap());
+            for p in ["{prompt}", "{mcp_config}", "{system_prompt_file}"] {
+                assert!(slim.command.iter().any(|a| a.contains(p)), "launch_slim has no {p}");
+            }
+            assert!(!full.command.iter().any(|a| a.contains("{system_prompt_file}")), "the full launch keeps Claude Code's own prompt");
+            let after = |flag: &str| slim.command.iter().position(|a| a == flag).map(|i| slim.command[i + 1].clone());
+            assert_eq!(after("--tools").as_deref(), Some("Read,Write,Edit"), "only the file tools, no shell");
+            assert_eq!(after("--system-prompt-file").as_deref(), Some("{system_prompt_file}"));
+            assert_eq!(slim.system_prompt_file.as_deref(), Some("noomesh-system-prompt.txt"));
+            for flag in ["--strict-mcp-config", "--no-session-persistence", "--permission-prompts", "--allowedTools", "--permission-mode"] {
+                assert!(slim.command.iter().any(|a| a == flag), "launch_slim drops {flag}");
+            }
+            assert_eq!((&slim.model_url_env, &slim.model_env, &slim.mcp), (&full.model_url_env, &full.model_env, &full.mcp));
+            assert_eq!((&slim.api_key_env, &slim.home_env, &slim.model_alias_envs), (&full.api_key_env, &full.home_env, &full.model_alias_envs));
+            // The variable Claude Code's own warning names (i147).
+            assert_eq!(full.context_window_env.as_deref(), Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+            assert_eq!(slim.context_window_env, full.context_window_env);
+        }
+        let t: Table = serde_json::from_str(FIXTURE).unwrap();
+        assert!(t.kinds.iter().all(|k| k.launch_slim.is_none()), "a row without launch_slim parses");
     }
 
     #[test]

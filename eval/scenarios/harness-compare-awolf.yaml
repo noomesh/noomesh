@@ -15,12 +15,12 @@
 # A task with `kinds: [...]` runs only under those kinds (the others show as skipped).
 name: Harness compare on awolf
 description: >
-  noo vs copilot vs claude-code on one node: a trivial reply, a question that
-  needs a mesh tool, and a two-step delegation. Pass rate, loops, wall time
-  and tokens per kind.
+  noo vs copilot vs claude-code vs codex on one node: a trivial reply, a
+  question that needs a mesh tool, and a two-step delegation. Pass rate,
+  loops, wall time and tokens per kind.
 harness_compare:
   node: awolf
-  kinds: [noo, copilot, claude-code]
+  kinds: [noo, copilot, claude-code, codex]
   task_timeout_s: 600     # per task, unless the task sets timeout_s
   poll_s: 5
   settle_s: 20            # minimum wait after a kind change before trusting "running"

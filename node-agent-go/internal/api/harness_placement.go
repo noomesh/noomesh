@@ -19,6 +19,20 @@ type HarnessPlacement struct {
 	Env          map[string]string `json:"env"`
 	DesiredState string            `json:"desired_state"`
 	Placed       bool              `json:"placed"`
+	// Profile is the node's resolved harness profile exactly as the
+	// controller sent it in desired-config (stream_idle_secs, thinking,
+	// claude_prompt, ...: the harness applies those), omitted when the node
+	// has none. It holds no secret: the controller's resolution is numbers,
+	// enums and kind names.
+	Profile json.RawMessage `json:"profile,omitempty"`
+	// ModelContext is the context window, in tokens, the node's chat
+	// backend runs with: as far as the agent sets it (Ollama's
+	// OLLAMA_CONTEXT_LENGTH: the placement's, else the profile's default),
+	// else as the running backend reports it (vLLM's max_model_len,
+	// llama-server's per-slot n_ctx: liveChatContext), omitted when
+	// unknown. The harness tells a foreign CLI its real window with it
+	// (Claude Code assumes 200k for a model it does not know).
+	ModelContext int `json:"model_context,omitempty"`
 }
 
 // SetHarnessPlacement installs the provider of the node's desired harness
@@ -34,6 +48,9 @@ func (s *Server) handleHarnessPlacement(w http.ResponseWriter, r *http.Request) 
 		if hp := s.harnessPlacement(); hp.Placed {
 			if hp.Env == nil {
 				hp.Env = map[string]string{}
+			}
+			if hp.ModelContext == 0 {
+				hp.ModelContext = s.liveChatContext(r.Context())
 			}
 			_ = json.NewEncoder(w).Encode(hp)
 			return

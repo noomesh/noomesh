@@ -5774,21 +5774,6 @@
         }
       }
     },
-    "/ui/basic": {
-      "get": {
-        "tags": [
-          "ui"
-        ],
-        "summary": "Basic UI",
-        "description": "[native] Serves the basic (legacy) HTML UI.",
-        "operationId": "serve_basic_ui",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        }
-      }
-    },
     "/upload": {
       "post": {
         "tags": [
@@ -18720,6 +18705,196 @@
             }
           }
         },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/control-probe": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get control probe",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/control-probe",
+        "operationId": "control_probe",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/nodes/{node_id}/bench": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create bench",
+        "description": "[native] Measure a node's chat model: the gateway asks the node agent's `POST /bench`, which loads the model, times a reference prefill and decode, keeps the result and reports it as `model_bench` on every heartbeat after. The answer is that `model_bench` object (`{model, backend, load_secs, prefill_tps, decode_tps, prompt_tokens, at}`); the node's resolved harness profile (`desired-config`) derives its `first_byte_secs` from it. Operator only; audited. Up to 900 s.",
+        "operationId": "node_bench",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get embedding spaces",
+        "description": "[native] GET /api/cluster/embedding-spaces \u2014 every space, its model and its pool.",
+        "operationId": "embedding_spaces_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces/{space}": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update embedding spaces",
+        "description": "[native] PUT /api/cluster/embedding-spaces/{space} \u2014 declare a space (`{model, dims?}`). A new space is fine; an existing one keeps its model (changing it is a re-embed, refused with 409), and may have `dims` filled in.",
+        "operationId": "embedding_space_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete embedding spaces",
+        "description": "[native] DELETE /api/cluster/embedding-spaces/{space} \u2014 forget a space. The default space cannot be removed: every unqualified embed means it.",
+        "operationId": "embedding_space_delete",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/model-aliases/{alias}": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update model aliases",
+        "description": "[native] PUT /api/cluster/model-aliases/{alias} \u2014 point one alias (a purpose such as `knowledge`, or any other) at a class or a served model: `{class}`. That target is tried first and the mesh answers behind it (i145 phase D, `noo cluster prefer`). A target nothing serves is accepted with a note.",
+        "operationId": "model_alias_put",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete model aliases",
+        "description": "[native] DELETE /api/cluster/model-aliases/{alias} \u2014 forget one alias. A purpose then means `chat-default` (the whole mesh) again.",
+        "operationId": "model_alias_delete",
         "responses": {
           "200": {
             "description": "OK",

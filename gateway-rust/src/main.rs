@@ -64,6 +64,7 @@ mod birth_proof;
 mod bus;
 mod bus_principal;
 mod harness_kinds;
+mod harness_profile;
 mod harness;
 mod harness_main;
 mod tasks;
@@ -78,6 +79,8 @@ mod coordinator;
 mod config_mount;
 mod dependency_watchdog;
 mod node_agent_auth;
+mod node_link;
+mod node_rpc;
 mod maintenance;
 mod node_reachability;
 mod model_presence;
@@ -92,6 +95,7 @@ mod egress;
 mod dlq_drain;
 mod drive;
 mod embedding_client;
+mod embedding_spaces;
 mod google_auth;
 mod host_daemon;
 mod mcp_external;
@@ -114,6 +118,7 @@ mod audit_partition;
 mod audit_integrity;
 mod audit_chain;
 mod audit_context;
+mod audit_spool;
 mod autonomy_audit;
 mod autonomy_evaluators;
 mod held_column;
@@ -464,6 +469,9 @@ async fn main() -> Result<()> {
     // Keep the behavioral-flag (noo_settings) override cache warm so admin UI
     // toggles take effect within ~15s (no restart) for Rust-read flags.
     crate::settings::spawn_refresh(state.db.clone());
+    // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
+    // the space cache warm the same way.
+    crate::embedding_spaces::spawn_refresh(state.db.clone());
 
     // Re-assert the NATS KV buckets periodically. A NATS server that comes
     // back with a fresh JetStream store (what a container recreate does)
@@ -566,6 +574,9 @@ async fn main() -> Result<()> {
     // audit insert runs. Mirrors gateway/audit_archive.py::ensure_current_and_next
     // (Python lifespan was dead in prod; this restores it).
     audit_partition::ensure_current_and_next(&state).await;
+    // Audit rows the database could not take while it was away are held
+    // and written back as soon as it answers (audit_spool).
+    audit_spool::spawn_drainer(state.db.clone());
     // The retention job (export then drop) as a seeded weekly heartbeat task.
     audit_partition::seed_rotation_task(&state.db).await;
     // The audit key's one-time hand-over row (or genesis row), before any

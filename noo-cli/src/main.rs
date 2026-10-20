@@ -58,6 +58,7 @@ mod credentials;
 mod entitlement;
 mod entitlement_terms;
 mod harness_kinds;
+mod harness_profiles;
 mod registry;
 mod release_fetch;
 mod release_sig;
@@ -259,6 +260,10 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "class", "list"], commands::cluster_class_list),
     (&["cluster", "class", "set"], commands::cluster_class_set),
     (&["cluster", "class", "unset"], commands::cluster_class_unset),
+    (&["cluster", "prefer"], commands::cluster_prefer),
+    (&["cluster", "embedding-space", "list"], commands::cluster_embedding_space_list),
+    (&["cluster", "embedding-space", "set"], commands::cluster_embedding_space_set),
+    (&["cluster", "embedding-space", "unset"], commands::cluster_embedding_space_unset),
     // `cluster exec`/`logs` spawn ssh with inherited stdio (fixes the
     // Python versions' swallowed stdout) and propagate the remote rc.
     (&["cluster", "logs"], commands::cluster_logs),
@@ -266,6 +271,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    // A node's harness profile: resolved per field (override > measured >
+    // tier default), its overrides, and its chat-model bench.
+    (&["cluster", "profile"], commands::cluster_profile),
     (&["cluster", "up"], commands::cluster_up),
     // Batch 3: HTTP/local control + SSH provisioning-adjacent commands.
     (&["cluster", "init-secret"], commands::cluster_init_secret),
@@ -327,6 +335,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // node never fetches them. Group stub after the subactions.
     (&["cluster", "vendor", "stage"], commands::cluster_vendor_stage),
     (&["cluster", "vendor", "status"], commands::cluster_vendor_status),
+    (&["cluster", "vendor", "install"], commands::cluster_vendor_install),
     (&["cluster", "vendor"], commands::cluster_vendor_usage),
     // Move ONE node's agent out of its container. The node is
     // a required positional rather than a --host-process flag on

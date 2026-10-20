@@ -13,8 +13,9 @@ wall time and its numbers are the same every time.
 The canned kinds differ on purpose, so the report has something to show:
 ``noo`` is quick and writes no usage row (as today), ``copilot`` cannot
 delegate, ``claude-code`` passes everything at a higher token cost, and
-``codex`` is refused by the node (its wire has no backend). EVERY value a
-fixture run reports is SYNTHETIC.
+``codex`` passes everything between the two. A test that needs a refused
+kind passes its own ``profiles``. EVERY value a fixture run reports is
+SYNTHETIC.
 """
 from __future__ import annotations
 
@@ -58,8 +59,7 @@ PROFILES: dict[str, KindProfile] = {
     "copilot": KindProfile(polls=3, loops=2, prompt_per_task=1800, completion_per_task=220,
                            fails={"delegate": "noo_task_delegate was not offered to this harness\n(trace)"}),
     "claude-code": KindProfile(polls=4, loops=2, prompt_per_task=5200, completion_per_task=410),
-    "codex": KindProfile(refused="harness kind codex: its wire (openai-responses) is not served by "
-                                 "any running chat backend on this node"),
+    "codex": KindProfile(polls=3, loops=2, prompt_per_task=3400, completion_per_task=300),
 }
 
 # objective substring -> the result a passing run answers with
@@ -84,6 +84,11 @@ class FakeHarnessGateway:
                                                                   "NOO_HARNESS_LOG": "info"}}
         self.running_kind = original_kind
         self.down_beats = 0           # heartbeats the harness reports stopped after a kind change
+        # What the heartbeat says the harness RUNS (host_services.harness.kind):
+        # None = the kind it was started with; "" = says none (an older
+        # agent); any other string = stuck on that kind (a harness that
+        # never picked up the new placement).
+        self.report_kind: Optional[str] = None
         self.beat = 0
         self.tasks: dict[str, dict] = {}
         self.usage: dict[str, list[int]] = {"llamacpp": [9000, 800, 12]}
@@ -110,9 +115,14 @@ class FakeHarnessGateway:
         else:
             state = "running"
             self.running_kind = kind
+        harness = {"state": state, "runtime": "systemd"}
+        if state == "running":
+            reported = self.running_kind if self.report_kind is None else self.report_kind
+            if reported:
+                harness["kind"] = reported
         return {"id": self.node, "hostname": self.node, "status": "online",
                 "last_heartbeat": f"beat-{self.beat}",
-                "host_services": {"harness": {"state": state, "runtime": "systemd"}},
+                "host_services": {"harness": harness},
                 "reconcile_refusals": refusals}
 
     # ── tasks ──

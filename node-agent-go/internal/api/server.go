@@ -86,6 +86,9 @@ type Server struct {
 	// GET /harness/placement. nil until the agent installs it.
 	harnessPlacement func() HarnessPlacement
 
+	// POST /bench: the last result, the in-flight flag, the chat placement.
+	benchState
+
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
 }
@@ -245,6 +248,10 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("GET /gpu", ctrlMW(http.HandlerFunc(s.handleGPUMetrics)))
 	s.mux.Handle("POST /gpu/hold", ctrlMW(http.HandlerFunc(s.handleGPUHold)))
 	s.mux.Handle("POST /gpu/release", ctrlMW(http.HandlerFunc(s.handleGPURelease)))
+	// Benchmarks the running chat model (load, prefill, decode) for the
+	// controller's harness profile. A command (it occupies the GPU for up
+	// to 600 s), so the controller's, never a peer's or the harness's.
+	s.mux.Handle("POST /bench", ctrlMW(http.HandlerFunc(s.handleBench)))
 	// Tailnet identity plane: whois + dialback for tailnet-native
 	// enrollment — only meaningful on the controller's self-agent. Both are
 	// the controller's: whois answers "who is this tailnet IP" for any IP

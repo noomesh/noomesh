@@ -56,6 +56,14 @@ pub(crate) trait HarnessRuntime: Sync {
     async fn preferred_skills(&self) -> Vec<String>;
     /// Per-layer latency and size counters.
     fn metrics(&self) -> &Arc<crate::metrics::MetricsState>;
+    /// When the credential this turn runs on expires (Unix seconds), when
+    /// it runs on one: a node harness's per-turn token. The loop stops
+    /// calling the model early enough to save the turn while the token is
+    /// still good. `None` (the gateway's own runtime): the turn deadline
+    /// alone bounds it.
+    fn credential_expires_at(&self) -> Option<u64> {
+        None
+    }
 
     // ── the model ──────────────────────────────────────────────────────
 

@@ -69,15 +69,152 @@ fn backend_timeout() -> std::time::Duration {
 /// bound — an unbounded client turns one hung backend into a leaked
 /// connection per request — so every rejection keeps the default.
 fn resolve_backend_timeout_secs(raw: &str) -> Result<u64, &'static str> {
+    resolve_positive_secs(raw, DEFAULT_BACKEND_TIMEOUT_SECS)
+}
+
+/// Blank = `default`; otherwise a positive whole number of seconds, or an
+/// error the caller logs before keeping the default.
+fn resolve_positive_secs(raw: &str, default: u64) -> Result<u64, &'static str> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Ok(DEFAULT_BACKEND_TIMEOUT_SECS);
+        return Ok(default);
     }
     match raw.parse::<u64>() {
         Ok(0) => Err("zero would disable the timeout"),
         Ok(secs) => Ok(secs),
         Err(_) => Err("not a whole number of seconds"),
     }
+}
+
+/// Env var overriding how long a STREAMED response may go silent.
+pub const STREAM_IDLE_ENV: &str = "NOO_BACKEND_STREAM_IDLE_SECS";
+
+/// The default idle bound on a streamed response (SSE inference). 300 s,
+/// the patience the old WHOLE-request bound gave the first byte: reqwest's
+/// read timeout also covers the wait for headers, i.e. a cold model load +
+/// prompt prefill, which has taken over a minute on these nodes. It no longer
+/// bounds the whole answer; a stream that keeps producing is never cut.
+pub const DEFAULT_STREAM_IDLE_SECS: u64 = 300;
+
+/// How long a streamed response may go without a byte before it counts as
+/// cut: `NOO_BACKEND_STREAM_IDLE_SECS`, default 120 s, parsed like
+/// [`BACKEND_TIMEOUT_ENV`] (blank or unusable = the default, said once).
+///
+/// A stream has NO total bound. [`backend_timeout`] is a whole-request
+/// timeout, and on a streamed body it cut a slow node's answer at exactly
+/// 300 s while tokens were still arriving (mcmini, gemma4:12b reasoning for
+/// 3-4.5 min per call, 2026-10-17). A stream is alive while bytes arrive;
+/// what ends it is silence.
+///
+/// In reqwest 0.12 the read timeout also bounds the wait for the response
+/// HEADERS, and a backend sends nothing until its first token: so this is
+/// also the budget for model load + prompt prefill. Raise it on a node whose
+/// prefill is slower than that.
+pub fn stream_idle() -> std::time::Duration {
+    let secs = *STREAM_IDLE_SECS.get_or_init(|| {
+        let raw = std::env::var(STREAM_IDLE_ENV).unwrap_or_default();
+        match resolve_positive_secs(&raw, DEFAULT_STREAM_IDLE_SECS) {
+            Ok(secs) => {
+                if secs != DEFAULT_STREAM_IDLE_SECS {
+                    tracing::info!(env = STREAM_IDLE_ENV, seconds = secs, "stream idle timeout overridden");
+                }
+                secs
+            }
+            Err(why) => {
+                tracing::warn!(
+                    env = STREAM_IDLE_ENV, value = %raw, %why,
+                    default_seconds = DEFAULT_STREAM_IDLE_SECS,
+                    "ignoring an unusable stream idle timeout override; keeping the default"
+                );
+                DEFAULT_STREAM_IDLE_SECS
+            }
+        }
+    });
+    std::time::Duration::from_secs(secs)
+}
+
+/// The stream idle bound in force for this PROCESS: set once, on the first
+/// [`stream_idle`] read or by [`set_stream_idle_override`], whichever comes
+/// first, and never changed after (the stream clients bake it in).
+static STREAM_IDLE_SECS: OnceLock<u64> = OnceLock::new();
+
+/// Fix the stream idle bound for this process before anything reads it.
+///
+/// For `noo-gateway harness`: its node's harness profile carries
+/// `stream_idle_secs`, which applies when `NOO_BACKEND_STREAM_IDLE_SECS` is
+/// not set (process env > profile > [`DEFAULT_STREAM_IDLE_SECS`]). The
+/// harness calls this ONCE at start, after reading its placement and before
+/// it builds a stream client or starts a translator. Process-wide: every
+/// stream client this process builds, and every later [`stream_idle`] read,
+/// gets the value. Returns `false` (and changes nothing) when the bound was
+/// already fixed, i.e. something read it first; zero is refused likewise.
+pub fn set_stream_idle_override(idle: std::time::Duration) -> bool {
+    let secs = idle.as_secs();
+    if secs == 0 {
+        return false;
+    }
+    let set = STREAM_IDLE_SECS.set(secs).is_ok();
+    if set {
+        tracing::info!(seconds = secs, "stream idle timeout set from the harness profile");
+    }
+    set
+}
+
+/// The timeouts a client is built with. reqwest does not expose them on a
+/// built `Client`, so each shared client is built FROM one of these, and
+/// the tests assert on the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    /// Whole request, body included (`ClientBuilder::timeout`). `None` on
+    /// a stream client.
+    pub total: Option<std::time::Duration>,
+    /// Longest gap between reads (`ClientBuilder::read_timeout`).
+    pub read_idle: Option<std::time::Duration>,
+    pub connect: std::time::Duration,
+}
+
+impl ClientTimeouts {
+    /// The shared unary cluster client's: total [`backend_timeout`], 10 s connect.
+    pub fn cluster() -> Self {
+        Self { total: Some(backend_timeout()), read_idle: None, connect: std::time::Duration::from_secs(10) }
+    }
+
+    /// The cluster STREAM client's: no total, [`stream_idle`] between reads.
+    pub fn cluster_stream() -> Self {
+        Self::stream_with_idle(stream_idle())
+    }
+
+    /// A stream client's timeouts with a caller-chosen idle (tests).
+    pub fn stream_with_idle(idle: std::time::Duration) -> Self {
+        Self { total: None, read_idle: Some(idle), connect: std::time::Duration::from_secs(10) }
+    }
+
+    /// The public-internet unary client's (cloud providers, channels).
+    pub fn external() -> Self {
+        Self { total: Some(std::time::Duration::from_secs(120)), read_idle: None, connect: std::time::Duration::from_secs(10) }
+    }
+
+    /// The public-internet STREAM client's (a cloud provider's SSE).
+    pub fn external_stream() -> Self {
+        Self::cluster_stream()
+    }
+
+    /// Put these timeouts on a builder.
+    pub fn apply(self, mut b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        if let Some(t) = self.total {
+            b = b.timeout(t);
+        }
+        if let Some(r) = self.read_idle {
+            b = b.read_timeout(r);
+        }
+        b.connect_timeout(self.connect)
+    }
+}
+
+/// A plain (system-trust, no client identity) client with `t`. For tests
+/// and the fallback when the cluster TLS material cannot be loaded.
+pub fn plain_client(t: ClientTimeouts) -> reqwest::Client {
+    t.apply(reqwest::Client::builder()).build().unwrap_or_default()
 }
 
 /// Shared intra-cluster client: cluster CA + mTLS identity, one connection
@@ -96,11 +233,25 @@ pub fn cluster_client() -> reqwest::Client {
         .get_or_init(|| {
             build_https_client().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "cluster TLS client build failed; falling back to default client");
-                reqwest::Client::builder()
-                    .timeout(backend_timeout())
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default()
+                plain_client(ClientTimeouts::cluster())
+            })
+        })
+        .clone()
+}
+
+/// The cluster client for a response read INCREMENTALLY (SSE inference):
+/// same trust, same identity, same connect timeout as [`cluster_client`],
+/// but no total timeout, only [`stream_idle`] between reads. A model that
+/// reasons for five minutes while tokens keep arriving is not cut; one that
+/// goes silent for the idle bound is, with a body error the reader reports
+/// as a cut stream.
+pub fn cluster_stream_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            build_https_client_with(ClientTimeouts::cluster_stream()).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "cluster TLS stream client build failed; falling back to default client");
+                plain_client(ClientTimeouts::cluster_stream())
             })
         })
         .clone()
@@ -111,15 +262,15 @@ pub fn cluster_client() -> reqwest::Client {
 /// identity to external hosts.
 pub fn external_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default()
-        })
-        .clone()
+    CLIENT.get_or_init(|| plain_client(ClientTimeouts::external())).clone()
+}
+
+/// [`external_client`] for a cloud provider's STREAMED answer: no total
+/// timeout (the unary client's 120 s cut a long cloud stream the same way
+/// the cluster client cut a node's), [`stream_idle`] between reads.
+pub fn external_stream_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| plain_client(ClientTimeouts::external_stream())).clone()
 }
 
 /// Shared client for HTTPS self-calls to this gateway.
@@ -204,7 +355,7 @@ pub fn certificate_from_pem(pem: &[u8]) -> Result<reqwest::Certificate> {
 /// Uses the lower-level rustls API to ensure EC P-384 client certs
 /// are properly configured and presented during TLS handshake.
 pub fn build_https_client() -> Result<reqwest::Client> {
-    build_https_client_with(std::time::Duration::from_secs(10))
+    build_https_client_with(ClientTimeouts::cluster())
 }
 
 /// The cluster client with a SHORT connect timeout, for the raw-path
@@ -216,13 +367,10 @@ pub fn failover_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            build_https_client_with(std::time::Duration::from_secs(FAILOVER_CONNECT_SECS)).unwrap_or_else(|e| {
+            let t = ClientTimeouts { connect: std::time::Duration::from_secs(FAILOVER_CONNECT_SECS), ..ClientTimeouts::cluster() };
+            build_https_client_with(t).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failover TLS client build failed; falling back to default client");
-                reqwest::Client::builder()
-                    .timeout(backend_timeout())
-                    .connect_timeout(std::time::Duration::from_secs(FAILOVER_CONNECT_SECS))
-                    .build()
-                    .unwrap_or_default()
+                plain_client(t)
             })
         })
         .clone()
@@ -231,7 +379,7 @@ pub fn failover_client() -> reqwest::Client {
 /// Per-attempt connect budget on the failover lane.
 pub const FAILOVER_CONNECT_SECS: u64 = 5;
 
-fn build_https_client_with(connect_timeout: std::time::Duration) -> Result<reqwest::Client> {
+fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> {
     let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
@@ -289,19 +437,13 @@ fn build_https_client_with(connect_timeout: std::time::Duration) -> Result<reqwe
             config_builder.with_no_client_auth()
         };
 
-        let builder = reqwest::Client::builder()
-            .timeout(backend_timeout())
-            .connect_timeout(connect_timeout)
-            .use_preconfigured_tls(tls_config);
+        let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls(tls_config);
 
         Ok(builder.build()?)
     } else {
         // No custom TLS — use defaults
         tracing::info!("TLS: using system trust store (no cluster CA)");
-        Ok(reqwest::Client::builder()
-            .timeout(backend_timeout())
-            .connect_timeout(connect_timeout)
-            .build()?)
+        Ok(timeouts.apply(reqwest::Client::builder()).build()?)
     }
 }
 
@@ -815,6 +957,25 @@ mod door_tests {
             assert!(D.client(&plain).is_err(), "{plain} must not get a client");
         }
         assert!(D.classify("https://").is_err());
+    }
+}
+
+#[cfg(test)]
+mod stream_idle_override_tests {
+    use super::{set_stream_idle_override, stream_idle, DEFAULT_STREAM_IDLE_SECS};
+    use std::time::Duration;
+
+    /// The harness fixes the bound once; nothing changes it after, and zero
+    /// is never a bound. Process-wide, so this sets only the default value:
+    /// another test in this binary may have read it first.
+    #[test]
+    fn the_stream_idle_override_is_set_once_and_never_zero() {
+        assert!(!set_stream_idle_override(Duration::ZERO), "zero would disable the bound");
+        let _ = set_stream_idle_override(Duration::from_secs(DEFAULT_STREAM_IDLE_SECS));
+        let fixed = stream_idle();
+        assert!(fixed > Duration::ZERO);
+        assert!(!set_stream_idle_override(Duration::from_secs(1)), "already fixed: refused");
+        assert_eq!(stream_idle(), fixed, "never changed once fixed");
     }
 }
 

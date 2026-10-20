@@ -80,7 +80,7 @@ def test_the_sample_scenario_loads():
     scn = Scenario.load(SAMPLE)
     hc = scn.harness_compare
     assert hc is not None and hc.node == "awolf"
-    assert hc.kinds == ["noo", "copilot", "claude-code"]
+    assert hc.kinds == ["noo", "copilot", "claude-code", "codex"]
     assert [t.name for t in hc.task_sets[0].tasks] == ["reply-ok", "mesh-nodes", "delegate"]
     assert not scn.workloads, "a compare scenario drives no load"
 
@@ -124,10 +124,11 @@ def test_a_node_with_no_harness_placement_gets_the_one_the_run_made_removed():
 
 
 def test_a_refused_kind_is_a_row_and_the_next_kind_still_runs():
-    fake = FakeHarnessGateway()
+    not_installed = 'harness kind "codex": its runner is present but the "codex" command is not installed on this node'
+    fake = FakeHarnessGateway(profiles={**PROFILES, "codex": KindProfile(refused=not_installed)})
     hc = _run(_spec(kinds=["codex", "noo"]), fake)
     codex = next(k for k in hc.kind_runs if k.kind == "codex")
-    assert not codex.ready and "node refused" in codex.error and "openai-responses" in codex.error
+    assert not codex.ready and "node refused" in codex.error and "not installed" in codex.error
     rows = {r["harness_kind"]: r for r in hcmp.summarize(hc)}
     assert rows["codex"]["passed"] == 0 and rows["codex"]["total"] == 2
     assert all("node refused" in f for f in rows["codex"]["failures"])
@@ -146,6 +147,28 @@ def test_a_kind_that_never_runs_times_out_instead_of_hanging():
     k = hc.kind_runs[0]
     assert not k.ready and "not running 60s after" in k.error and "stopped" in k.error
     assert hc.restored
+
+
+def test_ready_needs_the_node_to_report_the_placed_kind_running():
+    """``running`` alone is not ready: a harness still running the previous
+    kind (or one that fell back to ``noo``) would be measured as this one."""
+    fake = FakeHarnessGateway(original_kind="noo")
+    fake.report_kind = "noo"            # stuck: the node keeps running noo
+    hc = _run(_spec(kinds=["copilot"], ready_timeout_s=60), fake)
+    k = hc.kind_runs[0]
+    assert not k.ready and "not running 60s after placing copilot" in k.error, k.error
+    assert "running kind: noo" in k.error, k.error
+    assert all(r.state == "not run" for r in hc.runs), "no task runs under the wrong kind"
+    # An agent that reports no kind never qualifies either, and says why.
+    fake = FakeHarnessGateway(original_kind="noo")
+    fake.report_kind = ""
+    k = _run(_spec(kinds=["noo"], ready_timeout_s=60), fake).kind_runs[0]
+    assert not k.ready and "an agent older than the kind report" in k.error, k.error
+    # The node's own report is what is read.
+    n = fake._node()
+    assert hcmp.harness_running_kind(n) == "" and hcmp.harness_running_kind(None) == ""
+    fake.report_kind = None
+    assert hcmp.harness_running_kind(fake._node()) == "noo"
 
 
 def test_a_task_the_controller_ran_in_process_does_not_count_for_the_kind():
@@ -210,13 +233,13 @@ def test_the_fixture_run_writes_the_html_report_and_its_json_twin(tmp_path):
     assert out.is_file() and twin.is_file()
     page = out.read_text()
     assert "harness_kind" in page and "SYNTHETIC FIXTURE" in page
-    assert ">noo, claude-code<" in page, "a tie for the best pass rate names both kinds"
-    for kind in ("noo", "copilot", "claude-code"):
+    assert ">noo, claude-code, codex<" in page, "a tie for the best pass rate names every tied kind"
+    for kind in ("noo", "copilot", "claude-code", "codex"):
         assert f"<b>{kind}</b>" in page
     doc = json.loads(twin.read_text())
-    assert [r["harness_kind"] for r in doc["summary"]] == ["noo", "copilot", "claude-code"]
+    assert [r["harness_kind"] for r in doc["summary"]] == ["noo", "copilot", "claude-code", "codex"]
     assert {r["task_set"] for r in doc["summary"]} == {"basics"}
-    assert len(doc["runs"]) == 9 and doc["restored"] is True
+    assert len(doc["runs"]) == 12 and doc["restored"] is True
     copilot = next(r for r in doc["summary"] if r["harness_kind"] == "copilot")
     assert copilot["passed"] == 2 and copilot["failures"][0].startswith("delegate:")
 

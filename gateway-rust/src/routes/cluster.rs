@@ -95,6 +95,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/model-classes", get(model_classes_get))
         .route("/api/cluster/model-classes/{class}", put(model_class_put))
         .route("/api/cluster/model-classes/{class}", delete(model_class_delete))
+        .route("/api/cluster/model-aliases/{alias}", put(model_alias_put))
+        .route("/api/cluster/model-aliases/{alias}", delete(model_alias_delete))
+        .route("/api/cluster/embedding-spaces", get(embedding_spaces_get))
+        .route("/api/cluster/embedding-spaces/{space}", put(embedding_space_put))
+        .route("/api/cluster/embedding-spaces/{space}", delete(embedding_space_delete))
         // Operator-only mute for a known-down node's alerts (maintenance.rs).
         .route(
             "/api/cluster/nodes/{node_id}/maintenance",
@@ -102,11 +107,15 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/cluster/maintenance", get(crate::maintenance::maintenance_list))
         .route("/api/cluster/nodes/{node_id}/restart-agent", post(restart_node_agent))
+        // "control over bus" verify row: one health round trip over NATS.
+        .route("/api/cluster/nodes/{node_id}/control-probe", get(control_probe))
         .route("/api/cluster/nodes/{node_id}/pull", post(pull_node_artifact))
         .route("/api/cluster/nodes/{node_id}/clean", post(clean_node))
         // Shared-GPU operator hold (node agent `internal/gpuyield`).
         .route("/api/cluster/nodes/{node_id}/gpu/hold", post(gpu_hold))
         .route("/api/cluster/nodes/{node_id}/gpu/release", post(gpu_release))
+        // Measure the node's chat model (harness profile: first_byte_secs).
+        .route("/api/cluster/nodes/{node_id}/bench", post(node_bench))
         // ── Native Rust [ported from workers/cluster.py 2026-07-18] ──
         .route("/api/cluster/mint-join-key", post(mint_join_key))
         .route("/api/cluster/delete-tailscale-device", post(delete_tailscale_device))
@@ -183,6 +192,9 @@ pub(super) async fn cluster_status(State(state): State<Arc<AppState>>) -> AppJso
                 // node CAN host, this is what it IS hosting right now.
                 "running_backends": n.get("running_backends").cloned().unwrap_or(Value::Null),
                 "self_node": n.get("self_node").cloned().unwrap_or(Value::Null),
+                // How the controller can reach this agent (Null = a node
+                // known only from the table, never beat since this field).
+                "control_transports": n.get("control_transports").cloned().unwrap_or(Value::Null),
             })
         })
         .collect();
@@ -334,6 +346,12 @@ async fn node_heartbeat(
     // a new heartbeat field is dropped by default, and the row would have
     // read every node as "agent predates the shipper".
     carry_reported(&mut data, &body, "log_ship");
+    // The node's measured model speed (`POST /bench` on the agent,
+    // `noo cluster profile <node> --bench`): `{model, backend, load_secs,
+    // prefill_tps, decode_tps, prompt_tokens, at}`. Absent until a bench has
+    // run; the agent reports its last one on every beat after. desired-config
+    // resolves `harness_profile.first_byte_secs` from it.
+    carry_reported(&mut data, &body, "model_bench");
     // The agent's posture: whether its control API requires a client
     // certificate. A running agent on the mTLS-only build always says true;
     // an older build can say false, and `noo cluster verify` fails it.
@@ -357,6 +375,10 @@ async fn node_heartbeat(
     // back to a build that does not say must get the bearer again, not
     // inherit the record's old `true`.
     data[crate::node_agent_auth::CAPABILITY] = json!(crate::node_agent_auth::reported(&body));
+    // The control transports the agent offers (https listener / NATS RPC /
+    // tunnel). Written every beat; an agent that does not say is an older
+    // one and reads as the HTTPS listener only.
+    data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     // Which image the node's backend-door sidecars run on
     // B: "published", or "fallback-alpine" — stunnel installed from the
     // alpine mirror at every sidecar start. `noo cluster verify <node>`
@@ -912,6 +934,8 @@ async fn node_register_body(
     carry_reported(&mut data, &body, "data_roots");
     // And the legacy-lane counts.
     carry_reported(&mut data, &body, "legacy_lanes");
+    // And the last model bench (the harness profile's measured speed).
+    carry_reported(&mut data, &body, "model_bench");
     // Same for the sidecar image report and the backend
     // container start times + health.
     carry_reported(&mut data, &body, "stunnel_image");
@@ -925,6 +949,10 @@ async fn node_register_body(
     // false when the registration does not say, and noted at once so the
     // first call after a registration already uses the right credential.
     data[crate::node_agent_auth::CAPABILITY] = json!(crate::node_agent_auth::reported(&body));
+    // The control transports the agent offers (https listener / NATS RPC /
+    // tunnel). Written every beat; an agent that does not say is an older
+    // one and reads as the HTTPS listener only.
+    data[crate::node_link::TRANSPORTS_FIELD] = crate::node_link::reported_transports(&body);
     crate::node_agent_auth::note(node_id, &data);
 
     // Write full registration to NATS KV
@@ -1405,8 +1433,16 @@ fn node_stats(nodes: &[Value], offline_merge_error: Option<&str>) -> Value {
 
 /// List all cluster nodes — dashboard-expected format.
 pub(crate) async fn cluster_nodes(State(state): State<Arc<AppState>>) -> AppJson {
-    let (nodes, offline_merge_error) = collect_cluster_nodes(&state).await;
+    let (mut nodes, offline_merge_error) = collect_cluster_nodes(&state).await;
     let stats = node_stats(&nodes, offline_merge_error.as_deref());
+    // Control calls by transport since this gateway started, per node: the
+    // number the "outbound-only" gate (i131 phase 3) reads. Zeros for a node
+    // this gateway has not called.
+    for n in nodes.iter_mut() {
+        if let Some(id) = n.get("id").and_then(Value::as_str).map(str::to_string) {
+            n["control_calls"] = crate::node_rpc::counts_json(&id);
+        }
+    }
 
     Json(json!({
         "nodes": nodes,
@@ -1586,14 +1622,11 @@ pub(super) async fn cluster_gpu_metrics(State(state): State<Arc<AppState>>) -> A
         Err(_) => {
             // Fallback: proxy to node agents' /gpu endpoint
             let agents = all_node_agents(&state).await;
-            let client2 = build_node_agent_client();
             let mut all_gpus = Vec::new();
             for (node_id, agent_url, hostname) in &agents {
-                let url = format!("{}/gpu", agent_url);
-                let mut req = client2.get(&url).timeout(std::time::Duration::from_secs(3));
-                if let Some((ref k, ref v)) = crate::node_agent_auth::header_for(&url) {
-                    req = req.header(k.as_str(), v.as_str());
-                }
+                let req = crate::node_link::NodeLink::for_base(agent_url)
+                    .request(reqwest::Method::GET, "/gpu")
+                    .timeout(std::time::Duration::from_secs(3));
                 if let Ok(resp) = req.send().await {
                     if let Ok(data) = resp.json::<Value>().await {
                         if data.get("available").and_then(|v| v.as_bool()) == Some(true) {
@@ -1827,60 +1860,12 @@ fn parse_prometheus_labels(label_str: &str) -> std::collections::HashMap<String,
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
-/// Look up a node's agent URL from NATS KV `mesh_nodes`.
-///
-/// Returns the `agent_url` field if present, otherwise constructs
-/// `{proto}://{ip_address}:8081` using the node's IP. Errors with 404
-/// if the node is not found in the KV store. A node that IS registered but
-/// carries neither field gets a different 404 text naming the real
-/// cause (see `no_address_message`) instead of "not found".
-pub(crate) async fn get_node_agent_url(state: &AppState, node_id: &str) -> Result<String, AppError> {
-    let mut known = false;
-    if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
-        if let Ok(Some(entry)) = kv.get(node_id).await {
-            known = true;
-            if let Ok(data) = serde_json::from_slice::<Value>(&entry) {
-                if let Some(url) = data.get("agent_url").and_then(|v| v.as_str()) {
-                    if !url.is_empty() {
-                        return Ok(url.to_string());
-                    }
-                }
-                if let Some(ip) = data.get("ip_address").and_then(|v| v.as_str()) {
-                    if !ip.is_empty() {
-                        let proto = "https"; // node agents are mTLS-only
-                        return Ok(format!("{proto}://{ip}:8081"));
-                    }
-                }
-            }
-        }
-    }
-    if known {
-        return Err(AppError::NotFound(no_address_message(node_id)));
-    }
-    Err(AppError::NotFound(format!("Node '{node_id}' not found in mesh_nodes")))
-}
-
-/// The node is in `mesh_nodes` but registered without `agent_url` or
-/// `ip_address`, so the gateway has nowhere to send the call.
-fn no_address_message(node_id: &str) -> String {
-    format!(
-        "Node '{node_id}' is registered but has no reachable address (no agent_url or ip_address in mesh_nodes). \
-         Set NODE_IP in the node's agent env and restart the agent, or re-register the node (`noo cluster provision {node_id}`)."
-    )
-}
-
-/// Build a reqwest Client suitable for node-agent HTTP calls.
-///
-/// Uses the TLS-aware client builder when cluster CA is configured,
-/// falling back to a plain client with 30s timeout.
-pub(crate) fn build_node_agent_client() -> reqwest::Client {
-    crate::tls::cluster_client()
-}
-
-// Outbound node-agent auth lives in `crate::node_agent_auth::header_for`,
-// which decides PER AGENT: no bearer for an agent that
-// reports `controller_leaf_only`, the legacy bearer below for one that has
-// not said.
+// The agent address, the client and the credential for every controller ->
+// node call live in `crate::node_link` (`NodeLink::for_node`); the
+// credential decision itself is `crate::node_agent_auth`.
+// The per-agent bearer decision is `crate::node_agent_auth::header_for`: no
+// bearer for an agent that reports `controller_leaf_only`, the legacy bearer
+// below for one that has not said.
 
 /// The credential choice, with no environment in it so it can be tested.
 ///
@@ -1983,16 +1968,12 @@ pub(crate) async fn restart_agent_via_rail(
     state: &AppState,
     node_id: &str,
 ) -> Result<(), String> {
-    let agent_url = get_node_agent_url(state, node_id)
+    let link = crate::node_link::NodeLink::for_node(state, node_id)
         .await
         .map_err(|e| e.to_string())?;
-    tracing::info!(node_id = %node_id, url = %agent_url, "restarting node agent");
+    tracing::info!(node_id = %node_id, url = %link.base(), "restarting node agent");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/restart"));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let req = link.request(reqwest::Method::POST, "/restart");
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => Ok(()),
@@ -2006,6 +1987,26 @@ pub(crate) async fn restart_agent_via_rail(
             Err(format!("Failed to contact node agent: {e}"))
         }
     }
+}
+
+/// GET /api/cluster/nodes/{node_id}/control-probe
+///
+/// One `health` round trip over the bus, for `noo cluster verify`'s "control
+/// over bus" row. Never falls back to HTTPS: the point is to learn whether
+/// the BUS works. A node that does not advertise `nats_rpc` answers
+/// `checked: false` (the row reads NOT CHECKED, never ok).
+async fn control_probe(
+    State(state): State<Arc<AppState>>,
+    caller: Option<axum::Extension<crate::auth::ClusterNode>>,
+    requester: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> AppResult {
+    super::operator_read_guard(&requester)?;
+    if caller.is_some() {
+        return Err(AppError::Forbidden("a node may not probe the controller's control paths".into()));
+    }
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
+    Ok(Json(link.probe_bus().await))
 }
 
 /// Proxy an artifact pull to a node's `/pull` endpoint.
@@ -2037,17 +2038,13 @@ async fn pull_node_artifact(
             )));
         }
     }
-    let agent_url = get_node_agent_url(&state, &node_id).await?;
-    tracing::info!(node_id = %node_id, url = %agent_url, body = %body, "proxying artifact pull");
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
+    tracing::info!(node_id = %node_id, url = %link.base(), body = %body, "proxying artifact pull");
 
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/pull"))
+    let req = link
+        .request(reqwest::Method::POST, "/pull")
         .timeout(std::time::Duration::from_secs(2700))
         .json(&body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.send().await {
         Ok(resp) => {
@@ -2100,18 +2097,14 @@ async fn clean_node(
     Path(node_id): Path<String>,
     body: Option<Json<CleanRequest>>,
 ) -> AppResult {
-    let agent_url = get_node_agent_url(&state, &node_id).await?;
+    let link = crate::node_link::NodeLink::for_node(&state, &node_id).await?;
     let (remove_folder, deep) = body.map(|b| (b.remove_folder, b.deep)).unwrap_or((false, false));
 
-    tracing::info!(node_id = %node_id, url = %agent_url, remove_folder, deep, "cleaning node");
+    tracing::info!(node_id = %node_id, url = %link.base(), remove_folder, deep, "cleaning node");
 
-    let client = build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/clean"))
+    let req = link
+        .request(reqwest::Method::POST, "/clean")
         .json(&json!({"remove_folder": remove_folder, "deep": deep}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2182,12 +2175,8 @@ async fn gpu_hold_op(
     payload: Value,
 ) -> AppResult {
     let actor = gpu_hold_actor(&ctx)?;
-    let agent_url = get_node_agent_url(state, node_id).await?;
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/gpu/{op}")).json(&payload);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
+    let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload);
     let outcome = req.send().await;
     let (ok, result) = match outcome {
         Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
@@ -2207,6 +2196,91 @@ async fn gpu_hold_op(
     let mut out = result?;
     out["node"] = json!(node_id);
     Ok(Json(out))
+}
+
+/// How long the gateway waits on a node's bench: a cold load of a large
+/// model on a CPU worker plus a 30k-token prefill can take many minutes.
+const NODE_BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Measure a node's chat model: the gateway asks the node agent's
+/// `POST /bench`, which loads the model, times a reference prefill and
+/// decode, keeps the result and reports it as `model_bench` on every
+/// heartbeat after. The answer is that `model_bench` object (`{model,
+/// backend, load_secs, prefill_tps, decode_tps, prompt_tokens, at}`); the
+/// node's resolved harness profile (`desired-config`) derives its
+/// `first_byte_secs` from it. Operator only; audited. Up to 900 s.
+///
+/// POST /api/cluster/nodes/{node_id}/bench
+async fn node_bench(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path(node_id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let actor = match ctx {
+        Some(axum::Extension(ref r)) if r.role >= crate::auth::Role::Operator => r.sub.clone(),
+        _ => return AppError::Forbidden("operator role required to bench a node".into()).into_response(),
+    };
+    let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
+        Ok(l) => l,
+        Err(e) => return e.into_response(),
+    };
+    let started = std::time::Instant::now();
+    let outcome = link
+        .request(reqwest::Method::POST, "/bench")
+        .timeout(NODE_BENCH_TIMEOUT)
+        .send()
+        .await;
+    let (ok, response, detail) = match outcome {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(body) => {
+                let detail = body.clone();
+                (true, Json(body).into_response(), detail)
+            }
+            Err(e) => {
+                let body = json!({"error": format!("node agent {node_id} answered /bench with a body that is not JSON: {e}")});
+                (false, (axum::http::StatusCode::BAD_GATEWAY, Json(body.clone())).into_response(), body)
+            }
+        },
+        Ok(resp) => {
+            // The agent's own refusal (no chat model to bench, a bench
+            // already running, an older agent with no /bench), passed
+            // through with its status so the CLI can say which.
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let text = resp.text().await.unwrap_or_default();
+            let body = serde_json::from_str::<Value>(&text)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({"error": format!("node agent {node_id} returned {}: {}", status.as_u16(), text.trim())}));
+            (false, (status, Json(body.clone())).into_response(), body)
+        }
+        Err(e) => {
+            let body = json!({"error": format!("could not reach the node agent on {node_id} for /bench: {e}")});
+            (false, (axum::http::StatusCode::BAD_GATEWAY, Json(body.clone())).into_response(), body)
+        }
+    };
+    // Put the bench on the node record now, so the very next desired-config
+    // (the CLI's re-resolved profile, the agent's next poll) reads it; the
+    // agent reports it on every heartbeat after, which keeps it there.
+    if ok && crate::harness_profile::ModelBench::from_record(&json!({"model_bench": detail.clone()})).is_some() {
+        if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
+            if let Ok(Some(entry)) = kv.get(&node_id).await {
+                if let Ok(mut record) = serde_json::from_slice::<Value>(&entry) {
+                    record["model_bench"] = detail.clone();
+                    let _ = kv.put(&node_id, serde_json::to_vec(&record).unwrap_or_default().into()).await;
+                }
+            }
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    tracing::info!(node_id = %node_id, ok, actor = %actor, secs, "node_bench");
+    crate::routes::core::audit_event(
+        &state.db, "node_bench", "info", &actor,
+        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
+        json!({"node": node_id, "secs": secs, "result": detail}),
+    ).await;
+    response
 }
 
 /// GET /api/cluster/proposals/{id}
@@ -2569,6 +2643,14 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
 /// (`VLLM_IMAGE` ...), else the compose-rendered `NOO_BACKEND_IMAGE_<X>`,
 /// which carries the digest-pinned ref from the signed stack lock
 /// (`tag@sha256:...`, docker-compose.cluster.yml). Blank values are absent.
+///
+/// A FLOATING ref (`:latest`, or no tag, and no digest) is never sent, from
+/// either variable: it can change under the node with no check, and a
+/// 0.6.7+ agent refuses it anyway. Compose renders `VLLM_IMAGE` into the
+/// locked variable too, so an operator's `VLLM_IMAGE=vllm/vllm-openai:latest`
+/// used to replace the lock's digest-pinned ref outright (awolf ran
+/// `:latest` from a 0.6.6 agent, 2026-10-20). It is skipped, logged, and the
+/// next candidate (or the node's own versioned default) is used.
 pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let (operator, locked) = match backend {
         "vllm" => ("VLLM_IMAGE", "NOO_BACKEND_IMAGE_VLLM"),
@@ -2584,9 +2666,36 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
     [operator, locked]
         .iter()
         .filter(|k| !k.is_empty())
-        .filter_map(|k| get(k))
-        .map(|v| v.trim().to_string())
-        .find(|v| !v.is_empty())
+        .filter_map(|k| get(k).map(|v| (*k, v.trim().to_string())))
+        .filter(|(_, v)| !v.is_empty())
+        .find(|(k, v)| {
+            if is_floating_image_ref(v) {
+                if crate::legacy_lanes::log_due(&format!("floating_backend_image|{k}"), std::time::Duration::from_secs(3600)) {
+                    tracing::warn!(
+                        var = %k, image = %v, backend,
+                        "backend image: refusing to send a floating ref (no digest, tag latest or none) — set it to \
+                         `repo:version@sha256:…`, or unset it to use the signed stack lock's pinned ref"
+                    );
+                }
+                return false;
+            }
+            true
+        })
+        .map(|(_, v)| v)
+}
+
+/// `:latest` or no tag, and no `@sha256:` digest. A registry host with a
+/// port (`host:5000/repo`) is not a tag.
+pub(crate) fn is_floating_image_ref(r: &str) -> bool {
+    let r = r.trim();
+    if r.contains("@sha256:") {
+        return false;
+    }
+    let last = r.rsplit('/').next().unwrap_or(r);
+    match last.rsplit_once(':') {
+        Some((_, tag)) => tag.is_empty() || tag == "latest",
+        None => true,
+    }
 }
 
 /// POST /api/cluster/backends/start — Start a backend on a node.
@@ -2627,7 +2736,7 @@ pub(crate) async fn start_backend_core(
 
     // Find target node
     let (node_id, agent_url, ip_address) = if let Some(nid) = node_id {
-        let url = get_node_agent_url(state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
         // Get IP from KV
         let ip = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
             if let Ok(Some(entry)) = kv.get(nid).await {
@@ -2672,7 +2781,6 @@ pub(crate) async fn start_backend_core(
     // run the same vLLM tag / parser the controller uses, regardless of
     // what their local .env says. Empty/missing fields fall through to
     // the worker's env (backwards compat for hand-started backends).
-    let client = build_node_agent_client();
     let mut start_body = json!({"backend": backend, "model": model});
     if backend == "vllm" {
         start_body["gpu_count"] = json!(1);
@@ -2700,10 +2808,9 @@ pub(crate) async fn start_backend_core(
             }
         }
     }
-    let mut req = client.post(format!("{agent_url}/start")).json(&start_body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
+        .json(&start_body);
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2782,16 +2889,13 @@ pub(crate) async fn stop_backend_core(
     node_id: &str,
     backend: &str,
 ) -> Result<Value, AppError> {
-    let agent_url = get_node_agent_url(state, node_id).await?;
+    let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
 
     tracing::info!(node_id = %node_id, backend = %backend, "stopping backend");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/stop"))
+    let req = link
+        .request(reqwest::Method::POST, "/stop")
         .json(&json!({"backend": backend}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -2981,7 +3085,7 @@ async fn models_cache(
     }
 
     let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = get_node_agent_url(&state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
         (nid.clone(), url)
     } else {
         let agents = all_node_agents(&state).await;
@@ -3003,12 +3107,9 @@ async fn models_cache(
 
     tracing::info!(node_id = %node_id, model = %model, "caching model");
 
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/start"))
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": "ollama", "model": model}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -3060,7 +3161,7 @@ pub(crate) async fn models_pull(
 
     // Resolve target node
     let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = get_node_agent_url(&state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
         (nid.clone(), url)
     } else {
         // Auto-select: pick first available node from NATS KV
@@ -3088,12 +3189,9 @@ pub(crate) async fn models_pull(
     tracing::info!(node_id = %node_id, backend = %backend, model = %model, "pulling model");
 
     // Send start request to node agent (triggers pull + start in background)
-    let client = build_node_agent_client();
-    let mut req = client.post(format!("{agent_url}/start"))
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": backend, "model": model}));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     match req.timeout(std::time::Duration::from_secs(30)).send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -3174,9 +3272,9 @@ async fn desired_config_get(
         }
     }
     #[allow(clippy::type_complexity)]
-    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>)> =
+    let node: Option<(Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<Value>, String, Option<i32>, Option<String>, Vec<String>, Value)> =
         sqlx::query_as(
-            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile \
+            "SELECT ip_address, ssh_user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile \
              FROM noo_node_config WHERE node_id = $1",
         )
         .bind(&node_id)
@@ -3259,8 +3357,38 @@ async fn desired_config_get(
     );
     let placement_json = apply_harness_policy(&harness_policy, placement_json);
 
+    // The harness profile, RESOLVED (`harness_profile::resolve`): per field
+    // override > measured > tier default. The tier is the one the node's
+    // live facts derive (as `collect_cluster_nodes` derives it), the
+    // measured speed the record's `model_bench`, applied only when it is of
+    // the model the node's chat backend runs now.
+    let harness_profile = {
+        let record: Value = match state.js.get_key_value("mesh_nodes").await {
+            Ok(kv) => match kv.get(&node_id).await {
+                Ok(Some(e)) => serde_json::from_slice::<Value>(&e).unwrap_or_else(|_| json!({})),
+                _ => json!({}),
+            },
+            Err(_) => json!({}),
+        };
+        let derived_tier = crate::node_tier::derive(&crate::node_tier::facts_from_capabilities(
+            record.get("capabilities").unwrap_or(&json!({})),
+        ))
+        .tier()
+        .and_then(|t| u8::try_from(t).ok());
+        let bench = crate::harness_profile::ModelBench::from_record(&record);
+        let running_chat = crate::harness_profile::running_chat_model(
+            &record,
+            &placement_json,
+            bench.as_ref().and_then(|b| b.backend.as_deref()),
+            bench.as_ref().map(|b| b.model.as_str()),
+        );
+        let overrides = node.as_ref().map(|n| n.12.clone()).unwrap_or_else(|| json!({}));
+        let resolved = crate::harness_profile::resolve(derived_tier, &overrides, bench.as_ref(), running_chat.as_deref());
+        serde_json::to_value(&resolved).unwrap_or(Value::Null)
+    };
+
     let node_json = match node {
-        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile)) => json!({
+        Some((ip, user, tier, data_root, models_dir, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile_overrides)) => json!({
             "node_id": node_id,
             "ip_address": ip,
             "ssh_user": user,
@@ -3275,6 +3403,13 @@ async fn desired_config_get(
             "usage_profile": usage_profile,
             "usage_profile_effective": usage_effective,
             "usage_profile_source": usage_source,
+            // The vendor CLIs this node's bundle carries besides its
+            // harness placement's (`noo cluster vendor install`).
+            "vendor_kinds": vendor_kinds,
+            // The STORED per-node harness profile overrides (`noo cluster
+            // profile <node> --set`), as written. What the node applies is
+            // the resolved `harness_profile` at the top level.
+            "harness_profile_overrides": harness_profile_overrides,
         }),
         None => json!(null),
     };
@@ -3283,6 +3418,12 @@ async fn desired_config_get(
         "node": node_json,
         "placements": placement_json,
         "mcp_servers": mcp_json,
+        // The resolved harness profile (config/harness-profiles.json):
+        // `{tier, first_byte_secs, stream_idle_secs, thinking,
+        // ollama_context, claude_prompt, foreign_kinds, sources, bench}`.
+        // The agent applies first_byte_secs, ollama_context and
+        // foreign_kinds, and hands the whole object to its harness.
+        "harness_profile": harness_profile,
         // The fleet's node disk-reclaim gate (disk_watermark location): the
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
@@ -3319,6 +3460,44 @@ struct NodeConfigBody {
     /// default: dedicated on the controller, shared elsewhere).
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     usage_profile: Option<Option<Value>>,
+    /// The harness kinds whose vendor CLI this node carries whatever its
+    /// placement names (`noo cluster vendor install`). Omitted = keep;
+    /// `[]` or `null` = none.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    vendor_kinds: Option<Option<Value>>,
+    /// The per-node harness profile overrides (`noo cluster profile <node>
+    /// --set k=v`): any subset of the fields in
+    /// config/harness-profiles.json, the whole object replaced. Omitted =
+    /// keep; `{}` or `null` = clear (the node resolves to its tier
+    /// defaults and measured speed). Validated by
+    /// `harness_profile::validate_overrides`.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    harness_profile: Option<Option<Value>>,
+}
+
+/// Judge a `vendor_kinds` value: kinds from the harness-kinds table that
+/// run a vendor CLI (`noo` runs none), at most eight, deduplicated in name
+/// order. `null` is none.
+pub(crate) fn validate_vendor_kinds(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or("vendor_kinds must be a list of harness kind names")?;
+    let mut out = std::collections::BTreeSet::new();
+    for k in arr {
+        let k = k.as_str().map(str::trim).ok_or("vendor_kinds must be a list of harness kind names")?;
+        match crate::harness_kinds::get(k) {
+            Some(row) if row.cli.is_some() => {
+                out.insert(k.to_string());
+            }
+            _ => {
+                let vendor: Vec<&str> = crate::harness_kinds::all().iter().filter(|r| r.cli.is_some()).map(|r| r.kind.as_str()).collect();
+                return Err(format!("'{k}' is not a harness kind that runs a vendor CLI (one of {})", vendor.join(", ")));
+            }
+        }
+    }
+    if out.len() > 8 {
+        return Err("vendor_kinds names at most 8 kinds".into());
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// `Option<Option<T>>` so the handler can tell "field absent" (keep) from
@@ -3334,8 +3513,8 @@ where
 /// column/value arity is pinned by a test — the 2026-09-11 cut listed
 /// twelve columns and supplied eleven values, which no compiler sees.
 const NODE_CONFIG_UPSERT: &str =
-        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, NOW()) \
+        "INSERT INTO noo_node_config (node_id, ip_address, ssh_user, tier, data_root, models_dir, notes, gpu_model, vram_gb, companion_policy, harness_policy, default_loop_budget, usage_profile, vendor_kinds, harness_profile, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($12, $13), $14, $16, $18, $20, NOW()) \
          ON CONFLICT (node_id) DO UPDATE SET \
            ip_address = COALESCE($2, noo_node_config.ip_address), \
            ssh_user   = COALESCE($3, noo_node_config.ssh_user), \
@@ -3349,6 +3528,8 @@ const NODE_CONFIG_UPSERT: &str =
            harness_policy = COALESCE($12, noo_node_config.harness_policy), \
            default_loop_budget = CASE WHEN $15 THEN $14 ELSE noo_node_config.default_loop_budget END, \
            usage_profile = CASE WHEN $17 THEN $16 ELSE noo_node_config.usage_profile END, \
+           vendor_kinds = CASE WHEN $19 THEN $18 ELSE noo_node_config.vendor_kinds END, \
+           harness_profile = CASE WHEN $21 THEN $20 ELSE noo_node_config.harness_profile END, \
            updated_at = NOW()";
 /// PUT /api/cluster/nodes/{node_id}/config — upsert the node config row.
 /// COALESCE keeps existing values for fields omitted from the body.
@@ -3384,6 +3565,20 @@ async fn node_config_put(
             _ => return Err(AppError::BadRequest("usage_profile must be 'shared', 'dedicated' or null".into())),
         },
     };
+    // Absent → keep ($18 empty, $19 false); present → set ($19 true).
+    let (vendor_value, vendor_set): (Vec<String>, bool) = match &body.vendor_kinds {
+        None => (Vec::new(), false),
+        Some(v) => (validate_vendor_kinds(v.as_ref()).map_err(AppError::BadRequest)?, true),
+    };
+    // Absent → keep ($20 `{}`, $21 false: an INSERT starts with none);
+    // `null`/`{}` → clear; an object → validated, then replaces the stored one.
+    let (profile_value, profile_set): (Value, bool) = match &body.harness_profile {
+        None => (json!({}), false),
+        Some(v) => (
+            crate::harness_profile::validate_overrides(v.as_ref().unwrap_or(&Value::Null)).map_err(AppError::BadRequest)?,
+            true,
+        ),
+    };
     let (policy_value, policy_set) = match &body.companion_policy {
         None => (None, false),
         Some(None) => (None, true),
@@ -3414,6 +3609,10 @@ async fn node_config_put(
     .bind(budget_set)
     .bind(usage_value)
     .bind(usage_set)
+    .bind(vendor_value)
+    .bind(vendor_set)
+    .bind(profile_value)
+    .bind(profile_set)
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Internal(format!("node_config upsert: {e}")))?;
@@ -3734,6 +3933,15 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
+    // i145: every embedding node serves its space's model, so vectors stay
+    // comparable. A model no space uses is refused with the way to add one.
+    if role == "embed" && desired == "running" {
+        if let Some(m) = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            if let Some(why) = crate::embedding_spaces::placement_refusal(&crate::embedding_spaces::all(), m) {
+                return Err(AppError::Conflict(why));
+            }
+        }
+    }
     // A harness placement may name its KIND in env (followup
     // 1233): `noo` (this gateway's loop, the default) or a foreign kind
     // from config/harness-kinds.json. The node agent enforces what each
@@ -4012,7 +4220,7 @@ async fn model_classes_get(State(state): State<Arc<AppState>>) -> AppResult {
             })
         })
         .collect();
-    let aliases: Vec<Value> = table.aliases.iter().map(|(a, c)| json!({"alias": a, "class": c, "builtin": crate::coordinator::classes::BUILTIN_ALIASES.contains(&a.as_str())})).collect();
+    let aliases: Vec<Value> = table.aliases.iter().map(|(a, c)| json!({"alias": a, "class": c, "builtin": crate::coordinator::classes::BUILTIN_ALIASES.contains(&a.as_str()), "purpose": crate::coordinator::classes::PURPOSE_ALIASES.iter().any(|p| p.eq_ignore_ascii_case(a))})).collect();
     Ok(Json(json!({"classes": classes, "aliases": aliases})))
 }
 
@@ -4231,6 +4439,199 @@ async fn model_class_delete(
         json!({"class": class, "deleted": n}),
     ).await;
     Ok(Json(json!({"ok": true, "class": class, "deleted": n})))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelAliasBody {
+    class: String,
+}
+
+/// PUT /api/cluster/model-aliases/{alias} — point one alias (a purpose such
+/// as `knowledge`, or any other) at a class or a served model: `{class}`.
+/// That target is tried first and the mesh answers behind it (i145 phase D,
+/// `noo cluster prefer`). A target nothing serves is accepted with a note.
+async fn model_alias_put(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+    Json(body): Json<ModelAliasBody>,
+) -> AppResult {
+    use crate::coordinator::classes;
+    let alias = alias.trim().to_ascii_lowercase();
+    let class = body.class.trim().to_string();
+    classes::valid_name(&alias).map_err(AppError::BadRequest)?;
+    classes::valid_model(&class).map_err(AppError::BadRequest)?;
+    let table = classes::load_table(&state)
+        .await
+        .map_err(|e| AppError::Unavailable(format!("model classes unavailable: {e}")))?;
+    if let Some(why) = classes::alias_refusal(&table, &alias, &class) {
+        return Err(AppError::Conflict(why));
+    }
+    classes::save_alias(&state.db, &alias, &class)
+        .await
+        .map_err(|e| AppError::Internal(format!("model alias write: {e}")))?;
+    let served = table.class(&class).is_some();
+    tracing::info!(alias = %alias, class = %class, served, "model_alias_declared");
+    crate::routes::core::audit_event(
+        &state.db, "model_alias_declared", "info", "gateway",
+        &format!("alias:{alias}"), "ok", json!({"alias": alias, "class": class, "served": served}),
+    ).await;
+    let mut out = json!({"ok": true, "alias": alias, "class": class, "served": served});
+    if !served {
+        out["note"] = json!(format!("nothing serves '{class}' right now: requests for '{alias}' go to any live chat node until something does"));
+    }
+    Ok(Json(out))
+}
+
+/// DELETE /api/cluster/model-aliases/{alias} — forget one alias. A purpose
+/// then means `chat-default` (the whole mesh) again.
+async fn model_alias_delete(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+) -> AppResult {
+    let alias = alias.trim().to_ascii_lowercase();
+    if !crate::coordinator::classes::delete_alias(&state.db, &alias)
+        .await
+        .map_err(|e| AppError::Internal(format!("model alias delete: {e}")))?
+    {
+        return Err(AppError::NotFound(format!("no declared alias '{alias}'")));
+    }
+    tracing::info!(alias = %alias, "model_alias_removed");
+    crate::routes::core::audit_event(
+        &state.db, "model_alias_removed", "info", "gateway",
+        &format!("alias:{alias}"), "ok", json!({"alias": alias}),
+    ).await;
+    Ok(Json(json!({"ok": true, "alias": alias})))
+}
+
+// ── embedding spaces (i145) ──────────────────────────────────────────
+
+/// One space's pool for GET: every role=embed placement on its model, and
+/// whether that node advertises `embed` right now. Placements on a model no
+/// space uses are listed apart (`unmatched`): they serve nobody.
+pub(crate) fn embedding_space_view(
+    spaces: &[crate::embedding_spaces::Space],
+    placements: &[(String, String, Option<String>, String)],
+    advertising: &[String],
+) -> Value {
+    use crate::embedding_spaces::same_model;
+    let node = |(n, b, m, d): &(String, String, Option<String>, String)| {
+        json!({
+            "node": n, "backend": b, "model": m, "desired_state": d,
+            "advertising": advertising.iter().any(|a| a.eq_ignore_ascii_case(n)),
+        })
+    };
+    let out: Vec<Value> = spaces
+        .iter()
+        .map(|s| {
+            let pool: Vec<Value> = placements
+                .iter()
+                .filter(|p| p.2.as_deref().is_some_and(|m| same_model(m, &s.model)))
+                .map(node)
+                .collect();
+            let live = pool.iter().filter(|n| n["advertising"] == json!(true) && n["desired_state"] == json!("running")).count();
+            json!({
+                "space": s.space, "model": s.model, "dims": s.dims,
+                "default": s.space == crate::embedding_spaces::DEFAULT_SPACE,
+                "pool": pool, "live": live,
+            })
+        })
+        .collect();
+    let unmatched: Vec<Value> = placements
+        .iter()
+        .filter(|p| !spaces.iter().any(|s| p.2.as_deref().is_some_and(|m| same_model(m, &s.model))))
+        .map(node)
+        .collect();
+    json!({"spaces": out, "unmatched": unmatched})
+}
+
+/// GET /api/cluster/embedding-spaces — every space, its model and its pool.
+async fn embedding_spaces_get(State(state): State<Arc<AppState>>) -> AppResult {
+    let spaces = crate::embedding_spaces::load(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    let placements = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT node_id, backend, model, desired_state FROM noo_backend_placements WHERE role = 'embed' ORDER BY node_id, backend",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("embed placements read: {e}")))?;
+    let advertising: Vec<String> = state.gossip.find_peers_by_capability("embed", 256).into_iter().map(|p| p.node_id).collect();
+    Ok(Json(embedding_space_view(&spaces, &placements, &advertising)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbeddingSpaceBody {
+    model: String,
+    dims: Option<u64>,
+}
+
+/// PUT /api/cluster/embedding-spaces/{space} — declare a space (`{model,
+/// dims?}`). A new space is fine; an existing one keeps its model (changing
+/// it is a re-embed, refused with 409), and may have `dims` filled in.
+async fn embedding_space_put(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+    Json(body): Json<EmbeddingSpaceBody>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    es::valid_space_name(&space).map_err(AppError::BadRequest)?;
+    let model = body.model.trim().to_string();
+    crate::coordinator::classes::valid_model(&model).map_err(AppError::BadRequest)?;
+    let spaces = es::load(&state.db).await.map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    let existing = spaces.iter().find(|s| s.space == space);
+    if let Some(why) = es::change_refusal(existing, &model) {
+        return Err(AppError::Conflict(why));
+    }
+    if let Some(other) = spaces.iter().find(|s| s.space != space && es::same_model(&s.model, &model)) {
+        return Err(AppError::Conflict(format!(
+            "space '{}' already embeds with '{model}': one model, one space, so a node on it serves exactly one",
+            other.space
+        )));
+    }
+    let dims = body.dims.filter(|d| *d > 0).or(existing.and_then(|e| e.dims));
+    if let (Some(e), Some(d)) = (existing.and_then(|e| e.dims), body.dims.filter(|d| *d > 0)) {
+        if e != d {
+            return Err(AppError::Conflict(format!("space '{space}' has {e}-dim vectors; {d} would be another model's width")));
+        }
+    }
+    let rec = es::Space { space: space.clone(), model: existing.map(|e| e.model.clone()).unwrap_or(model), dims };
+    es::upsert(&state.db, &rec, "operator").await.map_err(|e| AppError::Internal(format!("embedding space write: {e}")))?;
+    if let Ok(all) = es::load(&state.db).await {
+        es::set_cache(all);
+    }
+    tracing::info!(space = %rec.space, model = %rec.model, dims = ?rec.dims, created = existing.is_none(), "embedding_space_declared");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_space_declared", "info", "gateway",
+        &format!("embedding_space:{}", rec.space), "ok",
+        json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})))
+}
+
+/// DELETE /api/cluster/embedding-spaces/{space} — forget a space. The
+/// default space cannot be removed: every unqualified embed means it.
+async fn embedding_space_delete(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    if space == es::DEFAULT_SPACE {
+        return Err(AppError::Conflict(format!("'{space}' is the default embedding space; every unqualified embed uses it")));
+    }
+    if !es::delete(&state.db, &space).await.map_err(|e| AppError::Internal(format!("embedding space delete: {e}")))? {
+        return Err(AppError::NotFound(format!("no embedding space '{space}'")));
+    }
+    if let Ok(all) = es::load(&state.db).await {
+        es::set_cache(all);
+    }
+    tracing::info!(space = %space, "embedding_space_removed");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_space_removed", "info", "gateway",
+        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": space})))
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -5718,6 +6119,22 @@ mod heartbeat_carry_tests {
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
     }
 
+    /// The bench route is operator-only, audited, one NodeLink call with its
+    /// own 900 s timeout, and the bench rides both record writers.
+    #[test]
+    fn node_bench_is_operator_only_audited_and_generous() {
+        assert_eq!(NODE_BENCH_TIMEOUT, std::time::Duration::from_secs(900));
+        let src = include_str!("cluster.rs").split("fn node_bench_is_operator_only_audited_and_generous").next().unwrap();
+        let h = src.split("async fn node_bench(").nth(1).expect("node_bench").split("\nasync fn ").next().unwrap();
+        assert!(h.contains("r.role >= crate::auth::Role::Operator"), "the operator gate");
+        assert!(h.contains(".request(reqwest::Method::POST, \"/bench\")"));
+        assert!(h.contains(".timeout(NODE_BENCH_TIMEOUT)"));
+        assert!(h.contains("audit_event("), "a bench must be audited");
+        assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/bench\", post(node_bench))"));
+        assert_eq!(src.matches("carry_reported(&mut data, &body, \"model_bench\");").count(), 2, "heartbeat and registration");
+        assert!(src.contains("\"harness_profile\": harness_profile,"), "desired-config carries the resolved profile");
+    }
+
     /// `stunnel_image` rides the record from both
     /// writers, or `cluster verify <node>` cannot see a node on the
     /// alpine + apk sidecar fallback. Source pins, as above.
@@ -5745,6 +6162,33 @@ mod heartbeat_carry_tests {
 #[cfg(test)]
 mod honesty_tests {
     use super::*;
+
+    /// i145: a space's pool is the embed placements on its model; one on a
+    /// model no space uses is listed apart, not silently in a pool.
+    #[test]
+    fn an_embedding_spaces_pool_is_the_placements_on_its_model() {
+        use crate::embedding_spaces::Space;
+        let spaces = vec![
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024) },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None },
+        ];
+        let p = |n: &str, m: &str, d: &str| (n.to_string(), "ollama".to_string(), Some(m.to_string()), d.to_string());
+        let placements = vec![
+            p("host2", "harrier:latest", "running"),
+            p("host6", "harrier", "stopped"),
+            p("awolf", "nomic-embed-code", "running"),
+            p("host9", "bge-m3", "running"),
+        ];
+        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()]);
+        let k = &v["spaces"][0];
+        assert_eq!(k["space"], "knowledge");
+        assert_eq!(k["default"], true);
+        assert_eq!(k["pool"].as_array().unwrap().len(), 2);
+        assert_eq!(k["live"], 1, "host6 is stopped: in the pool, not live");
+        assert_eq!(v["spaces"][1]["pool"][0]["node"], "awolf");
+        assert_eq!(v["spaces"][1]["live"], 1);
+        assert_eq!(v["unmatched"][0]["node"], "host9");
+    }
 
     // "The system must not lie" audit. Both helpers below exist so the
     // never-fabricate rules are testable without an AppState (repo
@@ -5893,6 +6337,27 @@ mod arch_tests {
 #[cfg(test)]
 mod node_config_upsert_tests {
     use super::NODE_CONFIG_UPSERT;
+
+    #[test]
+    fn vendor_kinds_name_vendor_cli_kinds_only() {
+        use serde_json::json;
+        let v = |x: serde_json::Value| super::validate_vendor_kinds(Some(&x));
+        // The shipped table's foreign kinds all run a CLI.
+        let foreign: Vec<&str> = crate::harness_kinds::all().iter().filter(|r| r.cli.is_some()).map(|r| r.kind.as_str()).collect();
+        assert!(!foreign.is_empty(), "the shipped table has a vendor kind");
+        let mut want: Vec<String> = foreign.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        let mut twice: Vec<&str> = foreign.clone();
+        twice.extend(foreign.iter());
+        assert_eq!(v(json!(twice)).unwrap(), want, "deduplicated, name order");
+        assert!(v(json!([])).unwrap().is_empty());
+        assert!(super::validate_vendor_kinds(None).unwrap().is_empty());
+        assert!(v(serde_json::Value::Null).unwrap().is_empty(), "null clears");
+        assert!(v(json!(["noo"])).unwrap_err().contains("runs a vendor CLI"), "noo runs no CLI");
+        assert!(v(json!(["nope"])).is_err());
+        assert!(v(json!("copilot")).is_err(), "a list, not a string");
+        assert!(v(json!([1])).is_err());
+    }
 
     /// PINNED: every column named in the INSERT gets exactly one value.
     #[test]
@@ -6616,11 +7081,35 @@ mod backend_image_ref_tests {
         assert_eq!(backend_image_ref("llamacpp", &with(&[("LLAMACPP_IMAGE", "a/b:2")])).as_deref(), Some("a/b:2"));
         assert_eq!(backend_image_ref("llamacpp", &with(&[("NOO_BACKEND_IMAGE_LLAMACPP", "a/b:2")])), None);
     }
+
+    /// A floating override is never forwarded: `VLLM_IMAGE=…:latest` used to
+    /// replace the lock's pinned ref (and compose renders it into the locked
+    /// variable too, so both are skipped and the node keeps its own default).
+    #[test]
+    fn a_floating_ref_is_never_sent() {
+        let over = with(&[("VLLM_IMAGE", "vllm/vllm-openai:latest"), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &over).as_deref(), Some(PINNED), "the lock's ref, not the floating override");
+        let both = with(&[("VLLM_IMAGE", "vllm/vllm-openai:latest"), ("NOO_BACKEND_IMAGE_VLLM", "vllm/vllm-openai:latest")]);
+        assert_eq!(backend_image_ref("vllm", &both), None, "nothing floating is sent; the node uses its versioned default");
+        assert_eq!(backend_image_ref("ollama", &with(&[("OLLAMA_IMAGE", "ollama/ollama")])), None, "no tag is floating");
+        // A version tag without a digest is not floating (a rail node verifies the staged tar).
+        assert_eq!(backend_image_ref("vllm", &with(&[("VLLM_IMAGE", "vllm/vllm-openai:v0.29.0")])).as_deref(), Some("vllm/vllm-openai:v0.29.0"));
+    }
+
+    #[test]
+    fn floating_means_latest_or_untagged_without_a_digest() {
+        for f in ["vllm/vllm-openai:latest", "vllm/vllm-openai", "ollama/ollama", "registry:5000/x/y", "registry:5000/x/y:latest", "x:"] {
+            assert!(super::is_floating_image_ref(f), "{f}");
+        }
+        for p in ["vllm/vllm-openai:v0.25.0", "registry:5000/x/y:1.2", PINNED, "vllm/vllm-openai:latest@sha256:00", "ghcr.io/noomesh/llamacpp:v0.6.7"] {
+            assert!(!super::is_floating_image_ref(p), "{p}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod no_address_tests {
-    use super::no_address_message;
+    use crate::node_link::no_address_message;
 
     #[test]
     fn a_known_node_without_an_address_is_not_called_not_found() {

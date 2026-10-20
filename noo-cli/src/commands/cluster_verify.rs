@@ -112,6 +112,39 @@ pub(crate) fn self_agent_lane_check(
     }
 }
 
+/// The `control over bus` row. The verdicts, in order:
+/// - the node does not advertise `control_transports.nats_rpc` (an older
+///   agent, or one whose subscription the controller's NATS file refused):
+///   NOT CHECKED, never ok. Control calls use HTTPS.
+/// - it advertises it and the gateway's round-trip `health` over NATS
+///   answered: ok, with the round trip time.
+/// - it advertises it and the round trip failed: FAIL. The node says it
+///   listens and nothing answers, which is the shape of a silently denied
+///   publish (NATS refuses those without telling the sender).
+/// - it advertises it but no probe result reached us (an older gateway, or
+///   the probe call failed): NOT CHECKED.
+pub(crate) fn control_bus_row(id: &str, n: &Value) -> Check {
+    const NAME: &str = "control over bus";
+    let advertised = n["control_transports"]["nats_rpc"].as_bool();
+    let https_only = "control calls use HTTPS :8081 for this node";
+    match advertised {
+        None => warn(NAME, format!("NOT CHECKED — the agent does not report control_transports (older agent); {https_only}"),
+            Some(format!("noo cluster provision {id} --wait"))),
+        Some(false) => warn(NAME, format!("NOT CHECKED — the node does not advertise nats_rpc; {https_only}"),
+            Some("noo cluster nats-users render   # if the controller's NATS file predates control over the bus; the node re-subscribes within a minute".to_string())),
+        Some(true) => {
+            let p = &n["bus_control_probe"];
+            match (p["checked"].as_bool(), p["ok"].as_bool()) {
+                (Some(true), Some(true)) => ok(NAME, format!("health round trip over NATS in {} ms", p["rtt_ms"].as_u64().unwrap_or(0))),
+                (Some(true), _) => fail(NAME, p["detail"].as_str().unwrap_or("the round trip failed").to_string(),
+                    format!("noo cluster nats-users render   # re-render the grants; then noo cluster restart-agent {id}")),
+                _ => warn(NAME, format!("NOT CHECKED — {}", p["detail"].as_str().unwrap_or("the gateway did not run the round-trip probe (older gateway)")),
+                    None),
+            }
+        }
+    }
+}
+
 /// A heartbeat older than this is a node the controller is not hearing.
 pub(crate) const HEARTBEAT_MAX_AGE_SECS: i64 = 120;
 /// Right after `noo cluster provision <node> --wait`, a field the restarted
@@ -187,6 +220,10 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     } else {
         out.push(ok("bus", "connected on its own principal"));
     }
+
+    // 2b. Control over the bus (i131): the small control calls ride NATS on a
+    //     connection the node holds outbound instead of the :8081 listener.
+    out.push(control_bus_row(id, n));
 
     // 3. Agent version pairs with the controller's release.
     match n["app_version"].as_str().and_then(agent_version_tag) {
@@ -269,6 +306,12 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //       backend container lacks the switches that keep its vendor from
     //       phoning home (vLLM's stats.vllm.ai report above all).
     out.push(vendor_telemetry_check(n));
+
+    // 6c-images. Backend images: no running backend container was created
+    //            from a floating ref (`:latest` or untagged, no digest) — the
+    //            model server sees every prompt, and a ref that can move is
+    //            unchecked.
+    out.push(backend_images_check(n));
 
     // 6c'. The data root: the declaration, the root the
     //      agent resolves, and what its containers mount all say one thing.
@@ -437,6 +480,55 @@ pub(crate) fn stunnel_image_check(n: &Value) -> Option<Check> {
         )),
         other => Some(warn("sidecar image", format!("agent reports an unknown stunnel_image {other:?}"), None)),
     }
+}
+
+/// The `backend images` row. The agent reports, per running backend
+/// container, the ref it was created from (`backend_containers.<b>.image`)
+/// and whether that ref can move under it (`image_floating`: no digest, tag
+/// `latest` or none, not a rail-only image of ours). A floating one FAILs:
+/// a current agent refuses to create such a container, so one running is a
+/// leftover from an older agent (awolf's `noo-vllm` on
+/// `vllm/vllm-openai:latest`, 2026-10-20). An entry without the key is an
+/// agent that predates the report: WARN, never a claimed pass.
+pub(crate) fn backend_images_check(n: &Value) -> Check {
+    const NAME: &str = "backend images";
+    let id = n["id"].as_str().unwrap_or("?");
+    let Some(bc) = n["backend_containers"].as_object().filter(|m| !m.is_empty()) else {
+        return ok(NAME, "no backend container running");
+    };
+    let mut floating = Vec::new();
+    let mut unreported = Vec::new();
+    let mut fixed = Vec::new();
+    for (b, e) in bc {
+        if e["runtime"].as_str() == Some("native") || e["managed"].as_bool() == Some(false) {
+            continue; // a native process has no image
+        }
+        let ctr = e["container"].as_str().unwrap_or(b.as_str());
+        match (e["image"].as_str(), e["image_floating"].as_bool()) {
+            (Some(img), Some(true)) => floating.push(format!("{ctr} runs {img}")),
+            (Some(img), Some(false)) => fixed.push(format!("{b} {img}")),
+            _ => unreported.push(b.as_str()),
+        }
+    }
+    if !floating.is_empty() {
+        return fail(
+            NAME,
+            format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
+            format!("noo cluster provision {id} --wait   # a current agent recreates the backend from the stack lock's pinned ref; \
+                     if the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, unset it or pin repo:version@sha256:…"),
+        );
+    }
+    if !unreported.is_empty() {
+        return warn(
+            NAME,
+            format!("the agent does not report the image of {} — older agent, not proven", unreported.join(", ")),
+            Some(format!("noo cluster provision {id} --wait")),
+        );
+    }
+    if fixed.is_empty() {
+        return ok(NAME, "no backend container running");
+    }
+    ok(NAME, format!("pinned or versioned: {}", fixed.join(", ")))
 }
 
 /// The `vendor telemetry` row (docs/security/telemetry.md). The agent reports,
@@ -857,7 +949,19 @@ fn with_harness_wanted(g: &Globals, n: &Value) -> Value {
         (Some(d), Some(arch)) => crate::commands::image_stage::unstaged_for(&d["placements"], arch),
         _ => Vec::new(),
     };
+    // Control over the bus: a node that advertises it gets one health round
+    // trip over NATS, run by the gateway (the only principal that may send).
+    // Nothing is asked of a node that does not advertise, so its row reads
+    // NOT CHECKED rather than being failed for something it never claimed.
+    let bus_probe = if n["control_transports"]["nats_rpc"].as_bool() == Some(true) {
+        get_json_opt(g, &format!("/api/cluster/nodes/{}/control-probe", crate::commands::urlencode(&id)), true, 15)
+    } else {
+        None
+    };
     if let Some(obj) = n.as_object_mut() {
+        if let Some(p) = bus_probe {
+            obj.insert("bus_control_probe".into(), p);
+        }
         if !unstaged.is_empty() {
             obj.insert("unstaged_images".into(), serde_json::json!(unstaged));
         }
@@ -1541,6 +1645,48 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
     }
     if nodes.len() == 1 {
         return warn(NAME, format!("{detail} — one node carries every unpinned request (no fallback)"), Some("noo cluster place <node> <backend> <model>".into()));
+    }
+    ok(NAME, detail)
+}
+
+/// The `embedding spaces` row (i145): each space, its one model and how many
+/// nodes serve it. `x` when the default space (`knowledge`) has no live node
+/// (every unqualified embed fails); `!` when another space has none, or an
+/// embed node serves a model no space uses (it serves nobody).
+pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
+    const NAME: &str = "embedding spaces";
+    let Some(body) = body else {
+        return warn(NAME, "not read", Some("noo cluster embedding-space list".into()));
+    };
+    let empty = Vec::new();
+    let spaces = body["spaces"].as_array().unwrap_or(&empty);
+    if spaces.is_empty() {
+        return warn(NAME, "none recorded yet: the gateway seeds `knowledge` at start", Some("noo cluster embedding-space list".into()));
+    }
+    let listed: Vec<String> = spaces
+        .iter()
+        .map(|s| format!("{}={} ({} live)", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"), s["live"].as_u64().unwrap_or(0)))
+        .collect();
+    let detail = listed.join(", ");
+    let dead: Vec<&Value> = spaces.iter().filter(|s| s["live"].as_u64().unwrap_or(0) == 0).collect();
+    if dead.iter().any(|s| s["default"].as_bool() == Some(true)) {
+        return fail(NAME, format!("{detail} — the default space has no live node: every unqualified embed fails"), "noo cluster embedding-space list");
+    }
+    let unmatched: Vec<String> = body["unmatched"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|n| format!("{}={}", n["node"].as_str().unwrap_or("?"), n["model"].as_str().unwrap_or("?")))
+        .collect();
+    if !dead.is_empty() || !unmatched.is_empty() {
+        let mut why: Vec<String> = Vec::new();
+        if !dead.is_empty() {
+            why.push(format!("no live node for {}", dead.iter().filter_map(|s| s["space"].as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if !unmatched.is_empty() {
+            why.push(format!("serving no space: {}", unmatched.join(", ")));
+        }
+        return warn(NAME, format!("{detail} — {}", why.join("; ")), Some("noo cluster embedding-space list".into()));
     }
     ok(NAME, detail)
 }
@@ -3182,14 +3328,18 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
             Some("noo upgrade --stack".into()));
     };
     let window = now_unix - start;
-    let mut used = Vec::new();
-    let mut parts = Vec::new();
+    // A lane both sides count (`cluster_hmac_v1`) is named with its side in
+    // the verdict: the gateway's count is callers signing v1 TO it, a node's
+    // is v1 tokens that node admitted, and they need different fixes.
+    let both = |lane: &str| GATEWAY_LEGACY_LANES.contains(&lane) && NODE_LEGACY_LANES.contains(&lane);
+    let mut used: Vec<String> = Vec::new();
+    let mut gateway_parts = Vec::new();
     for lane in GATEWAY_LEGACY_LANES {
         let (n, who) = lane_breakdown(g.lanes.get(*lane).map(Vec::as_slice).unwrap_or(&[]));
         if n > 0 {
-            used.push(*lane);
+            used.push(if both(lane) { format!("{lane} (gateway admitted)") } else { lane.to_string() });
         }
-        parts.push(format!("{lane} {n}{who}"));
+        gateway_parts.push(format!("{lane} {n}{who}"));
     }
     let comparators: Vec<String> = GATEWAY_LANE_COMPARATORS
         .iter()
@@ -3224,12 +3374,13 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
             }
         }
     }
+    let mut node_parts = Vec::new();
     for (lane, total, who) in &node_totals {
         if *total > 0 {
-            used.push(NODE_LEGACY_LANES.iter().find(|l| **l == lane).copied().unwrap_or("node lane"));
+            used.push(if both(lane) { format!("{lane} (nodes admitted)") } else { lane.clone() });
         }
         let who = if who.is_empty() { String::new() } else { format!(" ({})", who.join(", ")) };
-        parts.push(format!("{lane} {total}{who}"));
+        node_parts.push(format!("{lane} {total}{who}"));
     }
 
     let node_window = match shortest_node_window {
@@ -3240,8 +3391,8 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let caveat = if young { " — under 7 days, not yet retirement evidence" } else { "" };
     let unrep = if unreported.is_empty() { String::new() } else { format!("; not reporting: {}", unreported.join(", ")) };
     let detail = format!(
-        "uses since gateway start {} ago{node_window}{caveat}: {} [comparators: {}]{unrep}",
-        age_str(window), parts.join(", "), comparators.join(", ")
+        "uses since gateway start {} ago{node_window}{caveat}: gateway admitted (by caller): {}; nodes admitted (by node): {} [comparators: {}]{unrep}",
+        age_str(window), gateway_parts.join(", "), node_parts.join(", "), comparators.join(", ")
     );
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
@@ -4015,6 +4166,30 @@ pub(crate) fn audit_log_check(v: &Value) -> Check {
             Some("noo security audit verify".into()),
         );
     }
+    // The gateway's audit spool (rows held while the database was away). A
+    // lost row is a gap the chain cannot show: it was never written.
+    let sp = |k: &str| v["spool"][k].as_u64().unwrap_or(0);
+    if sp("lost_total") > 0 {
+        return warn(
+            NAME,
+            format!(
+                "{verified}; {} audit row(s) LOST since the gateway started (never written: the database \
+                 refused them for good, or was away with the queue full); {} written back after an outage",
+                sp("lost_total"), sp("retried_total")
+            ),
+            Some("docker logs noo-gateway 2>&1 | grep -E 'audit_write_lost|external audit insert'".into()),
+        );
+    }
+    if sp("queued_now") > 0 {
+        return warn(
+            NAME,
+            format!("{verified}; {} audit row(s) are queued right now, waiting for the database", sp("queued_now")),
+            Some("noo cluster verify --wait   # the queue drains within seconds of the database answering".into()),
+        );
+    }
+    if sp("retried_total") > 0 {
+        return ok(NAME, format!("{verified}; {} row(s) written back after a database outage, none lost", sp("retried_total")));
+    }
     ok(NAME, verified)
 }
 
@@ -4513,6 +4688,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         checks.push(model_classes_check(model_classes.as_ref()));
         // Where an unpinned chat goes: chat-default's live candidates.
         checks.push(default_chat_check(model_classes.as_ref()));
+        let spaces = get_json_opt(g, "/api/cluster/embedding-spaces", true, 15);
+        checks.push(embedding_spaces_check(spaces.as_ref()));
         // The gateway's own Redis connection (authenticated /health: the
         // anonymous body carries no dependency map).
         checks.push(gateway_redis_check(get_json_opt(g, "/health", true, 10).as_ref()));
@@ -4869,6 +5046,29 @@ mod tests {
         assert_eq!(c.verdict, super::Verdict::Ok);
         assert!(c.detail.contains("1 derived"), "{}", c.detail);
         assert_eq!(model_classes_check(None).verdict, super::Verdict::Warn);
+    }
+
+    /// i145: a dead default space fails, a dead other space or a stray
+    /// embedder warns.
+    #[test]
+    fn embedding_spaces_row_fails_on_a_dead_default_and_warns_on_the_rest() {
+        let j = |v: serde_json::Value| v;
+        let good = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 2}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&good));
+        assert_eq!(c.verdict, super::Verdict::Ok);
+        assert!(c.detail.contains("knowledge=harrier (2 live)"), "{}", c.detail);
+        let dead_default = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]}));
+        assert_eq!(embedding_spaces_check(Some(&dead_default)).verdict, super::Verdict::Fail);
+        let dead_code = j(serde_json::json!({"spaces": [
+            {"space": "knowledge", "model": "harrier", "default": true, "live": 1},
+            {"space": "code", "model": "nomic-embed-code", "default": false, "live": 0}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&dead_code));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("no live node for code"), "{}", c.detail);
+        let stray = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 1}],
+            "unmatched": [{"node": "host9", "model": "bge-m3"}]}));
+        assert!(embedding_spaces_check(Some(&stray)).detail.contains("serving no space: host9=bge-m3"));
+        assert_eq!(embedding_spaces_check(None).verdict, super::Verdict::Warn);
     }
 
     /// The `default chat` row lists the live candidates in routing order,
@@ -5417,13 +5617,75 @@ mod tests {
         assert!(host_checks("host2", &Value::Null, false).is_empty(), "a dead hostd already fails its own row");
     }
 
+    // ── control over bus (i131 phase 1) ───────────────────────────────
+
+    fn with_transports(now: i64, t: Value) -> Value {
+        let mut n = healthy(now);
+        n["control_transports"] = t;
+        n
+    }
+
+    #[test]
+    fn control_over_bus_is_not_checked_for_a_node_that_does_not_advertise_it() {
+        let now = 1_800_000_000;
+        // No field at all: an older agent.
+        let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").expect("the row is always present");
+        assert_eq!(r.verdict, Verdict::Warn, "{}", r.detail);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // Reports transports, nats_rpc false: the same, with the render remedy.
+        let n = with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": false, "tunnel": false}));
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED") && r.detail.contains("HTTPS"), "{}", r.detail);
+        assert!(r.remedy.as_deref().unwrap().contains("nats-users render"));
+        // Never ok for a node that did not advertise it, whatever a probe field says.
+        let mut n = n;
+        n["bus_control_probe"] = serde_json::json!({"checked": true, "ok": true, "rtt_ms": 3});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        assert_eq!(verdict(&c, "control over bus"), Verdict::Warn, "a verdict from a probe nobody asked for is not a pass");
+    }
+
+    #[test]
+    fn control_over_bus_passes_only_on_a_round_trip_and_fails_when_the_node_claims_it_and_nothing_answers() {
+        let now = 1_800_000_000;
+        let adv = || with_transports(now, serde_json::json!({"https_listener": true, "nats_rpc": true, "tunnel": false}));
+        // Round trip answered.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": true, "rtt_ms": 7});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Ok);
+        assert!(r.detail.contains("7 ms"), "{}", r.detail);
+        // Claims it, no answer: a FAIL with the render remedy.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": true, "ok": false, "detail": "no answer over the bus (timeout) although the node advertises nats_rpc"});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert!(r.detail.contains("timeout") && r.remedy.as_deref().unwrap().contains("nats-users render"));
+        // Claims it, no probe result reached us (older gateway, or the call failed): not a pass.
+        let c = node_checks(&adv(), "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.starts_with("NOT CHECKED"), "{}", r.detail);
+        // The gateway could not try (its own bus down): NOT CHECKED, with its reason.
+        let mut n = adv();
+        n["bus_control_probe"] = serde_json::json!({"advertised": true, "checked": false, "ok": false, "detail": "the gateway's own bus connection is down"});
+        let c = node_checks(&n, "v0.2.70", "0.5.57", now, Some(true));
+        let r = c.iter().find(|c| c.name == "control over bus").unwrap();
+        assert_eq!(r.verdict, Verdict::Warn);
+        assert!(r.detail.contains("gateway's own bus"), "{}", r.detail);
+    }
+
     #[test]
     fn a_healthy_node_passes_every_invariant() {
         let now = 1_800_000_000;
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 19, "thirteen node invariants (the log shipper, peer identity, backend doors, vendor telemetry and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 21, "fifteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
@@ -7046,6 +7308,31 @@ mod tests {
         assert_eq!(stunnel_image_check(&serde_json::json!({"id": "x", "stunnel_image": "weird"})).unwrap().verdict, Verdict::Warn);
     }
 
+    /// A backend container created from a floating ref FAILs, naming it; a
+    /// pinned or versioned one is OK; an agent that does not report is WARN;
+    /// a native Mac ollama has no image and is not judged.
+    #[test]
+    fn backend_images_row_fails_on_a_floating_ref() {
+        let n = serde_json::json!({"id": "awolf", "backend_containers": {
+            "vllm": {"running": true, "container": "noo-vllm", "image": "vllm/vllm-openai:latest", "image_floating": true}}});
+        let c = backend_images_check(&n);
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("noo-vllm runs vllm/vllm-openai:latest"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster provision awolf --wait"), "{c:?}");
+
+        let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
+            "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
+            "ollama": {"managed": true, "runtime": "native", "running": true}}});
+        let c = backend_images_check(&pinned);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.contains("vllm vllm/vllm-openai:v0.29.0"), "{}", c.detail);
+
+        let old = serde_json::json!({"id": "host3", "backend_containers": {"vllm": {"running": true}}});
+        assert_eq!(backend_images_check(&old).verdict, Verdict::Warn);
+        assert_eq!(backend_images_check(&serde_json::json!({"id": "x"})).verdict, Verdict::Ok);
+        assert_eq!(backend_images_check(&serde_json::json!({"id": "x", "backend_containers": {}})).verdict, Verdict::Ok);
+    }
+
     // docs/security/telemetry.md: a running backend lacking a switch FAILs,
     // naming it; an agent that does not report is never a pass.
     #[test]
@@ -7694,6 +7981,26 @@ mod tests {
         assert!(c.detail.contains("static_token 7 (host3 7)") && c.detail.contains("whois_non_controller 2 (host9 2)"), "{}", c.detail);
     }
 
+    /// `cluster_hmac_v1` is counted on both sides. The 0.6.7 roll printed it
+    /// twice with no side named, and "(pop-os 46, …)" read as the nodes'
+    /// count when it was the gateway's: the verdict and the detail say which.
+    #[test]
+    fn the_v1_lane_says_which_side_admitted_it() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1",route_class="cluster"} 46"#,
+        ]);
+        let fleet = vec![lane_node("host3", now, Some(serde_json::json!({ "since_unix": now - 3600, "cluster_hmac_v1": 2 })))];
+        let c = legacy_lanes_check(Some(&text), &fleet, now);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("in use: cluster_hmac_v1 (gateway admitted), cluster_hmac_v1 (nodes admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("gateway admitted (by caller): ") && c.detail.contains("cluster_hmac_v1 46 (pop-os 46)"), "{}", c.detail);
+        assert!(c.detail.contains("nodes admitted (by node): static_token 0, whois_non_controller 0, cluster_hmac_v1 2 (host3 2)"), "{}", c.detail);
+
+        let gateway_only = legacy_lanes_check(Some(&text), &[], now);
+        assert!(gateway_only.detail.contains("in use: cluster_hmac_v1 (gateway admitted) —"), "{}", gateway_only.detail);
+    }
+
     /// A zero nobody measured is not a zero: an online node with no report,
     /// a gateway with no window, or unreadable metrics are all WARN.
     #[test]
@@ -7906,6 +8213,29 @@ mod tests {
             "roll_window": []
         }));
         assert_eq!(empty.verdict, Verdict::Ok);
+    }
+
+    /// The gateway's audit spool: a row lost while the database was away is
+    /// a gap the chain cannot show, so it warns even on a chain that verifies;
+    /// rows written back after an outage are named on an OK row.
+    #[test]
+    fn audit_log_row_reads_the_spool() {
+        let base = |spool: Value| serde_json::json!({
+            "verdict": "ok", "key_present": true, "ok": 12, "breaks": [], "problems": [],
+            "roll_window": [], "spool": spool
+        });
+        let lost = audit_log_check(&base(serde_json::json!({"queued_now": 0, "retried_total": 5, "lost_total": 2})));
+        assert_eq!(lost.verdict, Verdict::Warn);
+        assert!(lost.detail.contains("2 audit row(s) LOST") && lost.detail.contains("5 written back"), "{}", lost.detail);
+        let waiting = audit_log_check(&base(serde_json::json!({"queued_now": 3, "retried_total": 0, "lost_total": 0})));
+        assert_eq!(waiting.verdict, Verdict::Warn);
+        assert!(waiting.detail.contains("3 audit row(s) are queued right now"), "{}", waiting.detail);
+        let recovered = audit_log_check(&base(serde_json::json!({"queued_now": 0, "retried_total": 4, "lost_total": 0})));
+        assert_eq!(recovered.verdict, Verdict::Ok);
+        assert!(recovered.detail.contains("4 row(s) written back after a database outage, none lost"), "{}", recovered.detail);
+        // An older gateway sends no spool at all: no claim either way.
+        let old = audit_log_check(&serde_json::json!({"verdict": "ok", "key_present": true, "ok": 12, "breaks": [], "problems": [], "roll_window": []}));
+        assert_eq!(old.verdict, Verdict::Ok);
     }
 }
 

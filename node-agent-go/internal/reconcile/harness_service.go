@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
@@ -34,7 +35,8 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		// starts: a foreign runner is not shipped, and a kind the node's
 		// chat backend cannot serve would take turns it cannot answer.
 		// Both are refusals at placement time, not failures at turn time.
-		if why := harnessKindRefusal(p, all, r.runnerInstalled, r.cliInstalled); why != "" {
+		if why := harnessKindRefusalProfiled(p, all, r.runnerInstalled, r.cliInstalled,
+			harnessprofile.Current(), r.nodeName()); why != "" {
 			slog.Error("reconcile.harness_kind_refused", "detail", why)
 			refusals.Record("backend_start", harnessRefusalTarget, why)
 			return
@@ -65,7 +67,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 			if r.harnessStartedKind == "" {
 				// Running before this agent knew its kind (agent restart):
 				// adopt the desired kind rather than bounce a live harness.
-				r.harnessStartedKind = desiredKind
+				r.setHarnessStartedKind(desiredKind)
 			}
 			if harnessKindDecision(r.harnessStartedKind, desiredKind) == "restart" {
 				slog.Info("reconcile.restarting_backend", "backend", "harness",
@@ -76,7 +78,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 					refusals.Record("backend_start", harnessRefusalTarget, err.Error())
 					return
 				}
-				r.harnessStartedKind = desiredKind
+				r.setHarnessStartedKind(desiredKind)
 			}
 			refusals.Clear("backend_start", harnessRefusalTarget)
 		case hostsvc.Absent:
@@ -90,7 +92,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 				refusals.Record("backend_start", harnessRefusalTarget, err.Error())
 				return
 			}
-			r.harnessStartedKind = desiredKind
+			r.setHarnessStartedKind(desiredKind)
 			// Deliberately NOT followed by a "did it come up?" check: the
 			// unit is Type=simple with Restart=always and no start limit,
 			// so `is-active` cycles and a point-in-time look would pass
@@ -102,7 +104,7 @@ func (r *Reconciler) convergeHarness(ctx context.Context, p placement, all []pla
 		}
 	case "stopped":
 		if r.stopHarness(ctx, state) {
-			r.harnessStartedKind = ""
+			r.setHarnessStartedKind("")
 		}
 	}
 }
@@ -239,6 +241,26 @@ func (r *Reconciler) stopHarness(ctx context.Context, state hostsvc.State) bool 
 	return true
 }
 
+// setHarnessStartedKind records the kind the harness was started with (""
+// = not running). Written only from the reconcile loop, under harnessMu so
+// the heartbeat may read it (HarnessRunningKind).
+func (r *Reconciler) setHarnessStartedKind(k string) {
+	r.harnessMu.Lock()
+	r.harnessStartedKind = k
+	r.harnessMu.Unlock()
+}
+
+// HarnessRunningKind is the kind the harness was started with (or first
+// seen running with), "" when this agent has not started or adopted one.
+// The heartbeat reports it as host_services.harness.kind while the
+// harness runs, so `noo cluster show` and the eval readiness check can
+// see WHICH loop is live, not only that one is.
+func (r *Reconciler) HarnessRunningKind() string {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return r.harnessStartedKind
+}
+
 // HarnessState is what the heartbeat reports.
 func (r *Reconciler) HarnessState(ctx context.Context) hostsvc.State {
 	if r.harness == nil {
@@ -285,6 +307,39 @@ func (r *Reconciler) crashLooping(ctx context.Context) string {
 // installed is the runner check and cliInstalled the vendor-CLI check (nil
 // skips either).
 func harnessKindRefusal(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool) string {
+	return harnessKindRefusalProfiled(p, all, installed, cliInstalled, nil, "")
+}
+
+// harnessKindRefusalProfiled is harnessKindRefusal plus the node's harness
+// profile: after every check above passes, a FOREIGN kind (one with a vendor
+// CLI) that the profile does not list in foreign_kinds is refused, naming the
+// tier and the command that offers it. No profile (nil) adds no refusal, so a
+// node on a pre-profile controller behaves exactly as before. `noo` is never
+// refused by the profile. node names the node in the fix ("<node>" if empty).
+func harnessKindRefusalProfiled(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool, prof *harnessprofile.Profile, node string) string {
+	if why := harnessKindRefusalBase(p, all, installed, cliInstalled); why != "" {
+		return why
+	}
+	return profileKindRefusal(desiredHarnessKind(p), prof, node)
+}
+
+// profileKindRefusal is the profile's half of the refusal (see
+// harnessKindRefusalProfiled).
+func profileKindRefusal(kind string, prof *harnessprofile.Profile, node string) string {
+	if prof == nil {
+		return ""
+	}
+	k, known := harnessKindByName(kind)
+	if !known || k.CLI == nil || prof.Offers(kind) {
+		return ""
+	}
+	if node == "" {
+		node = "<node>"
+	}
+	return fmt.Sprintf("harness kind %q: this node's profile (tier %d) does not offer it; set it with `noo cluster profile %s --set foreign_kinds=…`", kind, prof.Tier, node)
+}
+
+func harnessKindRefusalBase(p placement, all []placement, installed func(runner string) bool, cliInstalled func(cli string) bool) string {
 	kind := strings.TrimSpace(p.Env["NOO_HARNESS_KIND"])
 	if kind == "" {
 		kind = "noo"
@@ -312,4 +367,12 @@ func harnessKindRefusal(p placement, all []placement, installed func(runner stri
 		return fmt.Sprintf("harness kind %q: its runner is present but the %q command is not installed on this node", kind, *k.CLI)
 	}
 	return ""
+}
+
+// nodeName is this node's id for messages, "" when unknown.
+func (r *Reconciler) nodeName() string {
+	if r.cfg == nil {
+		return ""
+	}
+	return r.cfg.NodeID
 }

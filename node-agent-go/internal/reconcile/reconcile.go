@@ -40,6 +40,7 @@ import (
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -90,6 +91,10 @@ type desiredConfig struct {
 	// The controller's node reclaim policy (disk_watermark location). A
 	// pre-policy gateway omits it; nil means "do not act".
 	DiskReclaim *diskreclaim.Policy `json:"disk_reclaim"`
+	// The node's resolved harness profile (tier default, override,
+	// measured). A pre-profile gateway omits it; absent means "no
+	// profile", which is exactly the behaviour before profiles existed.
+	HarnessProfile json.RawMessage `json:"harness_profile"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -117,11 +122,21 @@ type Reconciler struct {
 	// harnessStartedKind is the kind the harness was last started with (or
 	// first seen running with, after an agent restart); "" = unknown/not
 	// running. A change in the desired kind restarts it (harnessKindDecision).
+	// Written under harnessMu (setHarnessStartedKind), read by the
+	// heartbeat through HarnessRunningKind.
 	harnessStartedKind string
 	// harnessDesired is the last desired harness placement the controller
 	// answered with, for GET /harness/placement. Guarded by harnessMu.
 	harnessMu      sync.RWMutex
 	harnessDesired *placement
+	// chatDesired is the last desired chat placement (POST /bench benches
+	// it). Guarded by harnessMu.
+	chatDesired *placement
+	// chatOllamaEnv is the env of the ollama daemon serving chat (the
+	// chat row's, merged with the other running ollama roles as the
+	// daemon gets it), nil when chat is not on ollama; for
+	// ChatContextWindow. Guarded by harnessMu.
+	chatOllamaEnv map[string]string
 	// harness is the ONE host service this node regulates:
 	// started and stopped per placement through the applier's sudoers
 	// grant, never a container and never a child of this process.
@@ -273,6 +288,10 @@ func (r *Reconciler) Once(ctx context.Context) {
 		slog.Warn("reconcile.fetch_failed", "error", err)
 		return
 	}
+	// Before the empty-state return below: the profile is the node's, not a
+	// placement's (the inference proxy reads first_byte_secs from it).
+	applyHarnessProfile(desired.HarnessProfile)
+	r.recordChatPlacement(desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
 	if r.onReclaimPolicy != nil {
@@ -378,6 +397,10 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// merge into one daemon spec - see multirole.go).
 	r.recordHarnessPlacement(desired.Placements)
 	effective, envWarnings := effectivePlacements(desired.Placements)
+	// The profile's ollama context default joins the ollama placement's env
+	// BEFORE its spec hash is taken, so a changed default recreates the
+	// container like any placement env edit.
+	effective = withProfileOllamaContext(effective, harnessprofile.Current())
 	r.surfaceEnvConflicts(envWarnings)
 	ollamaRows := runningOllama(desired.Placements)
 	// The shared-GPU yield sizes what the GPU backends need from these.
@@ -435,12 +458,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 					// its plist (OllamaGuard.Tuning); only when several
 					// roles share the daemon - a lone placement's env is
 					// left as it has always been.
-					if len(ollamaRows) > 1 {
-						env, _ := mergeOllamaEnv(ollamaRows)
-						backendrt.SetOllamaTuning(buildPlacementEnv(placement{Backend: "ollama", Env: env}))
-					} else {
-						backendrt.SetOllamaTuning(nil)
-					}
+					backendrt.SetOllamaTuning(nativeOllamaTuning(ollamaRows, harnessprofile.Current()))
 				}
 				continue
 			}
@@ -901,6 +919,12 @@ var placementEnvExact = map[string]struct{}{
 	// ollama.
 	"OLLAMA_MODEL": {}, "OLLAMA_HOST": {}, "OLLAMA_NUM_PARALLEL": {},
 	"OLLAMA_KEEP_ALIVE": {}, "OLLAMA_MAX_LOADED_MODELS": {},
+	// The daemon-wide default context window for chat models. Embed
+	// requests send their own options.num_ctx, so raising it leaves an
+	// embedder sharing the same ollama alone. A vendor CLI harness needs it:
+	// Claude Code's system prompt overflows ollama's 4096 default and the
+	// model answers a truncated prompt (mcmini probe, 2026-10-19).
+	"OLLAMA_CONTEXT_LENGTH": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
 }

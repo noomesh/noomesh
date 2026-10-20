@@ -748,8 +748,11 @@ async def _init_python_services(messaging) -> None:
                 "PAGEINDEX_EMBEDDING_BACKEND", lambda c: c.services.embedding_backend, "gateway")
             embedding_model = _env_or_yaml(
                 "PAGEINDEX_EMBEDDING_MODEL", lambda c: c.services.embedding_model, "")
-            llm_url = os.getenv("PAGEINDEX_LLM_URL", "")
-            llm_model = os.getenv("PAGEINDEX_LLM_MODEL", "")
+            # Through the gateway, as the `knowledge` purpose (i145): which
+            # model answers is a preference in the DB, not an env value.
+            from .. import llm_purposes
+            llm_url = llm_purposes.gateway_url()
+            llm_model = llm_purposes.KNOWLEDGE
 
             if dsn:
                 rag = PageIndexRAG(
@@ -757,8 +760,8 @@ async def _init_python_services(messaging) -> None:
                     embedding_url=embedding_url,
                     embedding_backend=embedding_backend,
                     embedding_model=embedding_model or None,
-                    llm_url=llm_url or None,
-                    llm_model=llm_model or None,
+                    llm_url=llm_url,
+                    llm_model=llm_model,
                 )
                 await rag.startup()
                 services.pageindex_rag = rag

@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+#
+# contributor-review: a REQUIRED check on `dev` (add it to the "noomesh CI
+# gates" ruleset). It replaces the blanket "1 approving review" rule with a
+# trust-boundary rule:
+#
+#   * internal PR  = the head branch lives in THIS repository. Pushing there
+#     needs write access, so the author is already trusted: the check passes.
+#   * external PR  = from a fork (or the fork was deleted). The check passes
+#     only while a maintainer (admin / maintain / write on this repo) has an
+#     APPROVED review that is on the CURRENT head SHA. A push after approval
+#     makes the check fail again until a fresh approval arrives.
+#   * merge_group  = the queue only admits PRs that were already green, so the
+#     job passes; the required check must report on the merge-group commit or
+#     the queue stalls.
+#
+# `author_association` is logged for the audit trail and NEVER grants a pass.
+#
+# Security: `pull_request` / `pull_request_review`, never `pull_request_target`.
+# There is NO checkout and no PR code is executed: the job only reads the
+# GitHub API with a read-only token, no secrets. On a fork both events get a
+# read-only token, which is all reading reviews needs. The logic is inline
+# (a `shell: python` step) precisely because nothing may be checked out;
+# tests/test_ci_contributor_review.py extracts it and unit-tests decide().
+#
+# Two runs on one head SHA (a failed `pull_request` run, then a passing
+# `pull_request_review` run after approval): both report a check named
+# `contributor-review` on the PR head commit; the required-check evaluation
+# uses the most recent result per check name on that SHA, so the later pass
+# supersedes the earlier fail (and a later dismissal re-fails it).
+name: contributor-review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  contributor-review:
+    name: contributor-review
+    runs-on: ubuntu-latest
+    steps:
+    - name: Merge group (already admitted)
+      if: github.event_name == 'merge_group'
+      run: echo "merge group - the queue only admits PRs that already passed contributor-review"
+
+    - name: Decide internal vs external
+      if: github.event_name != 'merge_group'
+      shell: python {0}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+      run: |
+        import json, os, sys, urllib.error, urllib.request
+
+        WRITERS = {"admin", "maintain", "write"}
+        MESSAGE = ("external contribution: a maintainer must approve the "
+                   "current head before it can be queued")
+
+
+        def is_internal(head_repo, repo):
+            # same-repo branch only; a deleted fork (None/"") is external
+            return bool(head_repo) and head_repo == repo
+
+
+        def latest_states(reviews):
+            """login -> (state, commit_id) of each user's latest decisive review."""
+            out = {}
+            for r in reviews:  # API order is chronological
+                user = (r.get("user") or {}).get("login")
+                if user and r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                    out[user] = (r["state"], r.get("commit_id"))
+            return out
+
+
+        def decide(head_repo, repo, head_sha, reviews, can_write):
+            """Return (ok, reason). can_write(login) -> bool via the permission API."""
+            if is_internal(head_repo, repo):
+                return True, "internal: head branch is in " + repo
+            for user, (state, commit) in sorted(latest_states(reviews).items()):
+                if state == "APPROVED" and commit == head_sha and can_write(user):
+                    return True, "external: approved on current head by maintainer " + user
+            return False, MESSAGE
+
+
+        def api(path):
+            req = urllib.request.Request(
+                "https://api.github.com" + path,
+                headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                         "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+
+
+        def all_reviews(repo, number):
+            page, out = 1, []
+            while True:
+                chunk = api(f"/repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}")
+                out += chunk
+                if len(chunk) < 100:
+                    return out
+                page += 1
+
+
+        def can_write(repo, user):
+            try:
+                p = api(f"/repos/{repo}/collaborators/{user}/permission")
+            except urllib.error.HTTPError as e:  # fail closed
+                print(f"::warning::permission lookup for {user} failed: HTTP {e.code}")
+                return False
+            return p.get("permission") in WRITERS or p.get("role_name") in WRITERS
+
+
+        def main():
+            e = os.environ
+            print(f"author={e.get('PR_AUTHOR')} author_association={e.get('AUTHOR_ASSOCIATION')} "
+                  f"head_repo={e.get('HEAD_REPO') or '<deleted>'} head_sha={e['HEAD_SHA']}")
+            reviews = [] if is_internal(e.get("HEAD_REPO"), e["REPO"]) else all_reviews(e["REPO"], e["PR_NUMBER"])
+            ok, reason = decide(e.get("HEAD_REPO"), e["REPO"], e["HEAD_SHA"], reviews,
+                                lambda u: can_write(e["REPO"], u))
+            if ok:
+                print("PASS: " + reason)
+                return 0
+            print("::error::" + reason)
+            return 1
+
+
+        if __name__ == "__main__":
+            sys.exit(main())

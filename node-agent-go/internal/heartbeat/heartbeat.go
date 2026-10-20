@@ -77,6 +77,11 @@ type Reporter struct {
 	// nil = this agent build does not report it, and the key is omitted.
 	hostState func() map[string]any
 
+	// modelBench is the last POST /bench result (api.Server.LastBench),
+	// sent as `model_bench` beside host_services. nil provider, or a nil
+	// answer (no bench has run), omits the key: absent until a bench runs.
+	modelBench func() any
+
 	// hostdState reports the confined-root daemon's liveness and the op
 	// names it advertises. `noo-apply` already reads that heartbeat FILE on
 	// the node to decide whether a swap took; nothing carried it up, so the
@@ -107,6 +112,10 @@ type Reporter struct {
 	// indistinguishable from the gateway's own gossip subscriber being
 	// broken. nil = this agent has no messaging at all.
 	busStatus func() any
+
+	// natsRPC reports whether control over the bus is live on this node
+	// (subscription accepted by the server, no later refusal). nil = false.
+	natsRPC func() bool
 
 	// gpuContention is the shared-GPU yield's report (internal/gpuyield),
 	// sent as `gpu_contention`. nil = not wired; the key is then omitted.
@@ -235,6 +244,9 @@ func (r *Reporter) dataRoots() map[string]any {
 // SetHostState installs the host-service reporter (harness state, runtime).
 func (r *Reporter) SetHostState(f func() map[string]any) { r.hostState = f }
 
+// SetModelBench installs the last-bench reporter, sent as `model_bench`.
+func (r *Reporter) SetModelBench(f func() any) { r.modelBench = f }
+
 // SetHostdState installs the confined-root daemon reporter.
 func (r *Reporter) SetHostdState(f func() map[string]any) { r.hostdState = f }
 
@@ -256,6 +268,11 @@ func (r *Reporter) gpuContentionReport() any {
 // SetBusStatus installs the NATS status provider whose value is echoed on
 // every heartbeat as `nats_status`.
 func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
+
+// SetNatsRPC installs the probe behind control_transports.nats_rpc. The
+// agent passes ctrlrpc.Service.Ready, so the field is true only while the
+// node can actually answer a control call on the bus.
+func (r *Reporter) SetNatsRPC(f func() bool) { r.natsRPC = f }
 
 // natsStatus returns the value to send. nil when no provider is installed —
 // a heartbeat that omits the field means "this agent build does not report
@@ -289,6 +306,10 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 		// This agent admits the controller's leaf with no bearer. The gateway stops sending NOO_NODE_AGENT_TOKEN to this node
 		// only once it reads true here or on a heartbeat.
 		"controller_leaf_only": auth.ControllerLeafOnly(r.cfg),
+		// Which control transports this agent offers. Only the HTTPS
+		// listener exists today; the others are reserved for the
+		// node-initiated control plane. Absent = an older agent = listener only.
+		"control_transports": r.controlTransports(),
 		// The door leaves this node holds. The controller
 		// rebuilds the node record on registration; sending them here keeps
 		// the report from vanishing until the next beat.
@@ -544,6 +565,15 @@ func (r *Reporter) SendHeartbeat() {
 	}
 	clk.mark("host_services")
 
+	// The last measured model speed (POST /bench), beside host_services:
+	// the controller resolves a measured first_byte_secs from it. Omitted
+	// until a bench has run on this agent (kept in memory only).
+	if r.modelBench != nil {
+		if mb := r.modelBench(); mb != nil {
+			payload["model_bench"] = mb
+		}
+	}
+
 	// The confined-root daemon that performs privileged ops for this
 	// unprivileged agent. Omitted when unreported.
 	if r.hostdState != nil {
@@ -572,6 +602,7 @@ func (r *Reporter) SendHeartbeat() {
 	// gateway drops NOO_NODE_AGENT_TOKEN for this node. An agent that omits
 	// it keeps receiving the bearer — both roll orders stay safe.
 	payload["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
+	payload["control_transports"] = r.controlTransports()
 
 	// The backend door leaves this node HOLDS under $NOO_PKI_DIR/services/
 	// per door service, the leaf's DNS SANs and NotAfter.
@@ -971,3 +1002,13 @@ func servedCertNotAfter(certPath string) int64 {
 // (not loopback, unspecified, link-local or multicast), else "". The API
 // listener uses it to decide whether it knows where to bind.
 func UsableHostIP(ip string) string { return usableHostIP([]string{ip}) }
+
+// controlTransports reports how the controller can reach this agent. The
+// HTTPS listener is always offered; "nats_rpc" is true only while control
+// over the bus is live (the subscription was accepted by the server and no
+// permission refusal has been seen since); "tunnel" stays false until the
+// node-held tunnel ships.
+func (r *Reporter) controlTransports() map[string]bool {
+	rpc := r.natsRPC != nil && r.natsRPC()
+	return map[string]bool{"https_listener": true, "nats_rpc": rpc, "tunnel": false}
+}
