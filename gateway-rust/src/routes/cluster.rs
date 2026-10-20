@@ -4715,6 +4715,16 @@ async fn embedding_space_delete(
 ) -> AppResult {
     use crate::embedding_spaces as es;
     let space = space.trim().to_ascii_lowercase();
+    if crate::embedding_spaces::load(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?
+        .iter()
+        .any(|s| s.space == space && s.migration.is_some())
+    {
+        return Err(AppError::Conflict(format!(
+            "cancel the migration first: noo cluster embedding-space migrate {space} --cancel"
+        )));
+    }
     if space == es::DEFAULT_SPACE {
         return Err(AppError::Conflict(format!("'{space}' is the default embedding space; every unqualified embed uses it")));
     }
@@ -4749,14 +4759,14 @@ async fn refresh_embedding_spaces(state: &AppState) {
 /// re-embedding a space into another model (i150). The gateway PROBES the
 /// new model (one short text across the mesh nodes declaring it, its own
 /// balancer, no static endpoints); the answer's width must equal the
-/// space's, because trellion's `vector(N)` columns are fixed. 409 on every
-/// refusal: a running migration, a model another space has, nothing able to
-/// embed with it, a different width.
+/// space's, because trellion's `vector(N)` columns are fixed. 409 on a
+/// running migration, a model another space has, or a different width. When
+/// no node serves the model yet: 202 and the migration waits as `pending`.
 async fn embedding_space_migration_start(
     State(state): State<Arc<AppState>>,
     Path(space): Path<String>,
     Json(body): Json<EmbeddingMigrationBody>,
-) -> AppResult {
+) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
     use crate::embedding_spaces as es;
     let space = space.trim().to_ascii_lowercase();
     let model = body.model.trim().to_string();
@@ -4766,38 +4776,36 @@ async fn embedding_space_migration_start(
         return Err(AppError::Conflict(why));
     }
     let want = spaces.iter().find(|s| s.space == space).and_then(|s| s.dims);
-    let probe = crate::embedding_client::EmbeddingEndpoint::embed_model_over_mesh(
-        &state,
-        &model,
-        0,
-        &crate::embedding_client::EmbedBalancer::new(),
-        &["dimension probe".to_string()],
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map_err(|e| {
-        AppError::Conflict(format!(
-            "nothing can embed with '{model}': no node declaring it answered the probe ({e}). \
-             Run '{model}' on at least one role=embed node first"
-        ))
-    })?;
-    let got = probe.first().map_or(0, Vec::len) as u64;
-    if got == 0 {
-        return Err(AppError::Conflict(format!("'{model}' answered an empty vector")));
-    }
-    if let Some(why) = es::dims_refusal(want, got) {
-        return Err(AppError::Conflict(why));
-    }
-    if !es::start_migration(&state.db, &space, &model, got).await.map_err(|e| AppError::Internal(format!("migration write: {e}")))? {
+    // Nothing serving the model yet is not a refusal: the migration waits as
+    // `pending` and starts itself when a node does (`advance_pending`).
+    let next_dims = match es::probe_decision(want, es::probe_width(&state, &model).await) {
+        es::ProbeDecision::Filling { next_dims } => Some(next_dims),
+        es::ProbeDecision::Pending => None,
+        es::ProbeDecision::WrongWidth(why) => return Err(AppError::Conflict(why)),
+    };
+    if !es::start_migration(&state.db, &space, &model, next_dims).await.map_err(|e| AppError::Internal(format!("migration write: {e}")))? {
         return Err(AppError::Conflict(format!("space '{space}' started another migration first")));
     }
     refresh_embedding_spaces(&state).await;
-    tracing::info!(space = %space, next_model = %model, next_dims = got, "embedding_migration_started");
+    let st = if next_dims.is_some() { es::MIGRATION_FILLING } else { es::MIGRATION_PENDING };
+    tracing::info!(space = %space, next_model = %model, next_dims = ?next_dims, state = st, "embedding_migration_started");
     crate::routes::core::audit_event(
         &state.db, "embedding_migration_started", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": model, "next_dims": got}),
+        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": model, "next_dims": next_dims, "state": st}),
     ).await;
-    Ok(Json(json!({"ok": true, "space": space, "next_model": model, "next_dims": got, "state": es::MIGRATION_FILLING})))
+    if next_dims.is_some() {
+        return Ok((axum::http::StatusCode::OK, Json(json!({"ok": true, "space": space, "next_model": model, "next_dims": next_dims, "state": st}))));
+    }
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true, "space": space, "next_model": model, "next_dims": null, "state": st,
+            "message": format!(
+                "no node serves '{model}' yet; the migration is pending and starts on its own once one does: \
+                 noo cluster place <node> ollama {model} --role embed"
+            ),
+        })),
+    ))
 }
 
 /// POST /api/cluster/embedding-spaces/{space}/migration/complete -- the

@@ -265,6 +265,9 @@ async fn do_embeddings(
             .migration
             .as_ref()
             .ok_or_else(|| conflict(format!("embedding space '{}' has no migration: '{}@next' means its next model", s.space, s.space)))?;
+        if let Some(why) = crate::embedding_spaces::trellion_refusal(m) {
+            return Err(conflict(why));
+        }
         let v = crate::embedding_client::EmbeddingEndpoint::embed_model_over_mesh(
             state,
             &m.next_model,
@@ -342,6 +345,9 @@ async fn embedding_migration_report(
             .find(|s| s.space == space)
             .ok_or_else(|| bad_request(&format!("no embedding space '{space}'")))?;
         let m = s.migration.as_ref().ok_or_else(|| conflict(format!("space '{space}' has no migration")))?;
+        if let Some(why) = es::trellion_refusal(m) {
+            return Err(conflict(why));
+        }
         if !es::same_model(&m.next_model, &body.next_model) {
             return Err(conflict(format!("space '{space}' is migrating to '{}', not '{}'", m.next_model, body.next_model)));
         }
