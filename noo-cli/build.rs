@@ -64,6 +64,8 @@ const STANDALONE_FILES: &[&str] = &[
     // line (finding #28). The embedded_launchers_have_their_libs test now
     // pins the class: every lib a launcher sources must be embedded.
     "scripts/lib-created-guard.sh",
+    // `docker compose up` isolates one unkillable container (exit 75).
+    "scripts/lib-stuck-container.sh",
     // Every launcher `compose up` is preceded by its bind-source check
     // (2026-09-29, grafana.pub made a directory by Docker).
     "scripts/lib-bind-sources.sh",

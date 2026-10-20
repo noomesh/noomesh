@@ -493,6 +493,7 @@ else
 fi
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$SCRIPT_DIR/lib-created-guard.sh"
+source "$SCRIPT_DIR/lib-stuck-container.sh"
 # Refuse an `up` whose bind-mount sources are missing or the wrong type
 # (Docker would invent root-owned directories for them — 2026-09-29).
 source "$SCRIPT_DIR/lib-bind-sources.sh"
@@ -923,13 +924,18 @@ require_compose_v2 || exit 1
     check_bind_sources --no-deps $_bind_skip $ACTIVE_SVCS || exit 1
     # Start all services with profile(s)
     # --force-recreate handles re-provisioning where stale containers may exist
-    docker compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE
+    # An unkillable leftover container (lib-stuck-container.sh) must not
+    # abort the whole `up`: everything else is started and the launcher
+    # exits $NOO_EXIT_STACK_PARTIAL (75) after the guard below has run.
+    noo_compose_up_isolating_stuck compose $COMPOSE_FILES $PROFILE_ARGS up -d --force-recreate $BUILD_FLAG $GPU_SCALE $AGENT_SCALE || _up_rc=$?
+    if [ "${_up_rc:-0}" -ne 0 ] && [ "${_up_rc:-0}" -ne "$NOO_EXIT_STACK_PARTIAL" ]; then exit "$_up_rc"; fi
     # $ACTIVE_SVCS (computed above) is the service set THIS invocation
     # manages — tell the guard so a stale, out-of-profile Created
     # container (e.g. noo-ollama left by an earlier `noo models switch`
     # while running the `standalone` profile) is removed, not `docker
     # start`-ed as if it were the wedge this guard exists for.
     NOO_CREATED_GUARD_SERVICES="$ACTIVE_SVCS" noo_created_guard $(docker compose $COMPOSE_FILES $PROFILE_ARGS ps -aq)
+    [ "${_up_rc:-0}" -eq "$NOO_EXIT_STACK_PARTIAL" ] && exit "$NOO_EXIT_STACK_PARTIAL"
 
     # Opt-out enforcement: stop a leftover trellion from a previous
     # enabled run — `up` above ignores unselected profiles entirely.

@@ -54,7 +54,8 @@ EXEMPT = {
     "bootstrap-standby.sh": "standby-postgres bootstrap on another host; not a stack launcher (no noo_bin, own COMPOSE_ARGS)",
 }
 
-UP_LINE = re.compile(r"^\s*docker compose\b.*\bup\b")
+# lib-stuck-container.sh wraps the full-stack `up` (docker compose, same args).
+UP_LINE = re.compile(r"^\s*(?:docker compose\b|noo_compose_up_isolating_stuck compose\b).*\bup\b")
 CHECK_LINE = re.compile(r"^\s*check_bind_sources\b.*\|\|\s*exit 1\s*$")
 
 
