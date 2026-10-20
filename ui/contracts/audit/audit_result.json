@@ -456,6 +456,8 @@
   "/api/proactive/status",
   "/api/prompt-skills",
   "/api/prompt-skills/evolve",
+  "/api/prompt-skills/proposals",
+  "/api/prompt-skills/proposals/{id}/decide",
   "/api/prompt-skills/{name}",
   "/api/prompt-skills/{name}/fitness",
   "/api/prompt-skills/{name}/retire",
