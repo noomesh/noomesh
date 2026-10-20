@@ -259,6 +259,12 @@ var backendExtraKeys = map[string]map[string]bool{
 		"keep_alive": true, // model-unload control
 		"options":    true, // nested option dict (top_k, top_p, etc.)
 		"raw":        true,
+		// Reasoning control: Ollama's OpenAI layer maps reasoning.effort
+		// (and reasoning_effort) onto think, and the harness's thinking-off
+		// sends all three (coordinator::thinking::disable_on_wire).
+		"reasoning":        true,
+		"reasoning_effort": true,
+		"think":            true,
 	},
 	"llamacpp": {
 		"n_predict":      true, // alias for max_tokens
@@ -273,6 +279,9 @@ var backendExtraKeys = map[string]map[string]bool{
 		"mirostat_eta":   true,
 		"grammar":        true,
 		"cache_prompt":   true,
+		// llama-server under --jinja (every agent-started one) hands these
+		// to the chat template: enable_thinking=false is thinking-off.
+		"chat_template_kwargs": true,
 	},
 }
 

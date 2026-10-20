@@ -122,11 +122,34 @@ func TestFilterBodyForBackend(t *testing.T) {
 		},
 		// llamacpp-target: strip vllm extras, keep llamacpp extras
 		{
-			name:        "llamacpp strips chat_template_kwargs",
-			in:          `{"model":"x","messages":[],"chat_template_kwargs":{}}`,
+			name:        "llamacpp strips guided_json",
+			in:          `{"model":"x","messages":[],"guided_json":{}}`,
 			backendType: "llamacpp",
-			mustNotHave: []string{"chat_template_kwargs"},
+			mustNotHave: []string{"guided_json"},
 			mustHave:    []string{"model", "messages"},
+		},
+		// The harness's thinking-off (disable_on_wire) reaches every engine
+		// behind the agent: each keeps the field it reads.
+		{
+			name:        "vllm keeps the chat template's thinking switch",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"think":false}`,
+			backendType: "vllm",
+			mustHave:    []string{"chat_template_kwargs"},
+			mustNotHave: []string{"think"},
+		},
+		{
+			name:        "llamacpp keeps the chat template's thinking switch",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"think":false}`,
+			backendType: "llamacpp",
+			mustHave:    []string{"chat_template_kwargs"},
+			mustNotHave: []string{"think"},
+		},
+		{
+			name:        "ollama keeps its reasoning fields",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"reasoning_effort":"low","think":false}`,
+			backendType: "ollama",
+			mustHave:    []string{"reasoning", "reasoning_effort", "think"},
+			mustNotHave: []string{"chat_template_kwargs"},
 		},
 		{
 			name:        "llamacpp keeps n_predict",
