@@ -31,6 +31,17 @@ on:
     # staging and main receive promotion merge PRs: they must be checked like
     # any other PR.
     branches: [ main, staging, develop, dev ]
+  # GitHub's merge queue on `dev`: the queue builds a merge group (the PR(s)
+  # rebased onto dev's tip, on a gh-readonly-queue/dev/* branch) and waits for
+  # the REQUIRED checks below to pass on it before fast-forwarding dev. Without
+  # this trigger the required checks never report on the group and the queue
+  # times out. A merge group is built by GitHub from PRs that already passed
+  # (and, for forks, were already approved), so nothing here needs a gate of its
+  # own; it is not a `pull_request` event, so the fork-only clauses further down
+  # (`event_name != 'pull_request' || head.repo == repository`) are true for it,
+  # exactly as for a push.
+  merge_group:
+    types: [checks_requested]
 
 # THE ONE SWITCH for trellion being public. 'false' until trellion and
 # trellion-protocols are public: test-core then deselects the tests that import
@@ -115,7 +126,11 @@ jobs:
     - id: diff
       name: Does this change touch anything but documentation?
       env:
-        BASE: ${{ github.event.pull_request.base.sha }}
+        # A pull request diffs against its base; a merge group has no PR, so it
+        # diffs the group's own base_sha (dev's tip when the group was built)
+        # against the checked-out group head. A push has neither: BASE is empty
+        # and everything runs (the integration point is never narrowed).
+        BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
       run: |
         set -eu
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
@@ -447,16 +462,24 @@ jobs:
     # cache, builds on top of it and tars it back up, which can run out of disk
     # inside the cache save. Remove the preinstalled toolchains this job never
     # uses. continue-on-error so a slow or failed delete is never a red job.
+    # The delete takes 1-2 minutes, so it runs in the BACKGROUND (a detached
+    # session) while the image pull and cache restore proceed, and "Wait for
+    # disk cleanup" joins it before the first compile: the compile is the first
+    # thing that needs the space, and the wait is usually already over.
     - name: Free hosted-runner disk
       if: needs.scope.outputs.gateway == 'true' && runner.environment == 'github-hosted'
       continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
         df -h /
+        rm -f "$RUNNER_TEMP/free-disk.done"
         # -n: never prompt. A runner without passwordless sudo leaves the disk as is.
         big="/usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL"
-        sudo -n rm -rf $big || { echo "::notice::could not free hosted-runner disk (no passwordless sudo?) — continuing"; }
-        df -h /
+        FREE_DISK_DONE="$RUNNER_TEMP/free-disk.done" BIG="$big" setsid nohup bash -c '
+          sudo -n rm -rf $BIG || echo "::notice::could not free hosted-runner disk (no passwordless sudo?) — continuing"
+          touch "$FREE_DISK_DONE"
+        ' >/dev/null 2>&1 &
+        echo "disk cleanup started in the background"
 
     # No host toolchain: every cargo invocation below runs in a rust container
     # via scripts/cargo-docker.sh. Docker is the only host dependency.
@@ -464,9 +487,13 @@ jobs:
     # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
     # The rustc version is in the key so a toolchain bump rebuilds, and a source
     # hash ends it so a dev push that changed the crate saves a fresh target while
-    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
-    # PR-scoped save is visible to that PR alone and evicts useful entries from
-    # the repo's cache budget.
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev and
+    # main: a PR-scoped save is visible to that PR alone and evicts useful
+    # entries from the repo's cache budget. main matters for the merge queue: a
+    # merge group runs on a gh-readonly-queue/dev/* ref, which (unlike a PR on
+    # dev) cannot read dev's caches, only its own and the DEFAULT branch's
+    # (main). Without a main entry every queue run would compile the dependency
+    # tree cold; the release promotion's push to main now seeds it.
     # `.sqlx` is in the source hash, but a restored target is still never trusted
     # for the macros: that is the `cargo clean -p` step below.
     # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
@@ -536,9 +563,20 @@ jobs:
           ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-${{ hashFiles('gateway-rust/Cargo.lock') }}-
           ${{ runner.os }}-cargo-gw-rustc${{ steps.rustc.outputs.id }}-
 
+    - name: Wait for disk cleanup
+      if: needs.scope.outputs.gateway == 'true' && runner.environment == 'github-hosted'
+      continue-on-error: true
+      run: |
+        for _ in $(seq 1 90); do
+          [ -e "$RUNNER_TEMP/free-disk.done" ] && break
+          sleep 2
+        done
+        [ -e "$RUNNER_TEMP/free-disk.done" ] || echo "::notice::disk cleanup still running after 180s — continuing"
+        df -h /
+
     # `sqlx::query!` is a macro, and cargo's freshness check only tracks SOURCE
     # files — editing `.sqlx/` does not dirty the crate. With a restored
-    # `target/`, `cargo check` is then a no-op and cache drift sails through.
+    # `target/`, a compile is then a no-op and cache drift sails through.
     # Measured locally: deleting a cached query "passed" in 0.9s against a warm
     # target, and failed with exit 101 the moment the crate was forced to
     # rebuild. Cleaning just this package (not its dependencies, which dominate
@@ -565,24 +603,19 @@ jobs:
       # so the drift guard below still fires on a stale cache.
       run: CARGO_DOCKER_SHARED_TARGET=1 CARGO_DOCKER_CRATE="$PWD/gateway-rust" CARGO_DOCKER_COMPONENTS=clippy scripts/cargo-docker.sh clippy --all-targets --locked -- -D warnings
 
-    # SQLX_OFFLINE makes `sqlx::query!` type-check against the committed
-    # `.sqlx/` cache instead of a live database. This is also the SOURCE↔CACHE
-    # drift check: sqlx fails the build when a `query!` in the source has no
-    # cached entry, so a developer who edits SQL without re-running
-    # `scripts/sqlx-prepare.sh` cannot merge.
-    #
-    # It does NOT catch CACHE↔SCHEMA drift — a migration that drops a column
-    # still passes here, because the stale cache is self-consistent. That is the
-    # `sqlx-drift` job below.
-    - name: cargo check
-      if: needs.scope.outputs.gateway == 'true'
-      env:
-        SQLX_OFFLINE: "true"
-      run: CARGO_DOCKER_CRATE="$PWD/gateway-rust" scripts/cargo-docker.sh check --locked --tests
+    # `cargo check --locked --tests` used to run here as a separate step. It is
+    # gone because the clippy step above is a strict superset: `clippy
+    # --all-targets` compiles every target INCLUDING `#[cfg(test)]` code, expands
+    # the `sqlx::query!` macros against the committed `.sqlx/` cache
+    # (SQLX_OFFLINE; this is the SOURCE<->CACHE drift check: sqlx fails the
+    # build when a `query!` has no cached entry) and fails on any compile
+    # error, with -D warnings on top. Run separately, check rebuilt the crate a
+    # second time (~75 s of rust-gateway's ~9 min). Nothing the check caught is
+    # uncaught. CACHE<->SCHEMA drift is the `sqlx-drift` job, as before.
 
-    # `cargo check` does not build `#[cfg(test)]` code and never runs it, so the
-    # crate's unit tests need their own step (and `--tests` above, so a test
-    # that fails to COMPILE cannot merge). They are pure unit tests — no
+    # The crate's unit tests need their own step (clippy above compiled the
+    # test targets, so a test that fails to COMPILE cannot merge; this step
+    # RUNS them). They are pure unit tests — no
     # database, no network — and run in seconds against the warm target.
     # SQLX_OFFLINE for the same reason as the check above.
     - name: cargo test
@@ -596,7 +629,7 @@ jobs:
     # and top-level outputs go; dependency artifacts stay. A target still over
     # the cap is dropped whole (scripts/ci-prune-cargo-target.sh).
     - name: Prune cargo target before the cache save
-      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: scripts/ci-prune-cargo-target.sh gateway-rust 4
@@ -604,7 +637,7 @@ jobs:
     # continue-on-error: a cache save is an optimisation, never a check; a full
     # runner disk inside the tar must not turn a green run red.
     - name: Save cargo cache (dev pushes only)
-      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      if: needs.scope.outputs.gateway == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
@@ -806,9 +839,13 @@ jobs:
     # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
     # The rustc version is in the key so a toolchain bump rebuilds, and a source
     # hash ends it so a dev push that changed the crate saves a fresh target while
-    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
-    # PR-scoped save is visible to that PR alone and evicts useful entries from
-    # the repo's cache budget.
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev and
+    # main: a PR-scoped save is visible to that PR alone and evicts useful
+    # entries from the repo's cache budget. main matters for the merge queue: a
+    # merge group runs on a gh-readonly-queue/dev/* ref, which (unlike a PR on
+    # dev) cannot read dev's caches, only its own and the DEFAULT branch's
+    # (main). Without a main entry every queue run would compile the dependency
+    # tree cold; the release promotion's push to main now seeds it.
     # Host toolchain here (this job runs cargo on the hosted runner, not in
     # cargo-docker), so the id is the runner image's rustc.
     # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
@@ -1010,9 +1047,13 @@ jobs:
     # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
     # The rustc version is in the key so a toolchain bump rebuilds, and a source
     # hash ends it so a dev push that changed the crate saves a fresh target while
-    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
-    # PR-scoped save is visible to that PR alone and evicts useful entries from
-    # the repo's cache budget.
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev and
+    # main: a PR-scoped save is visible to that PR alone and evicts useful
+    # entries from the repo's cache budget. main matters for the merge queue: a
+    # merge group runs on a gh-readonly-queue/dev/* ref, which (unlike a PR on
+    # dev) cannot read dev's caches, only its own and the DEFAULT branch's
+    # (main). Without a main entry every queue run would compile the dependency
+    # tree cold; the release promotion's push to main now seeds it.
     # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
     # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
     # docker.io with a warning, never a failure. Per-job DOCKER_CONFIG first: a
@@ -1163,7 +1204,7 @@ jobs:
     # and top-level outputs go; dependency artifacts stay. A target still over
     # the cap is dropped whole (scripts/ci-prune-cargo-target.sh).
     - name: Prune cargo target before the cache save
-      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: scripts/ci-prune-cargo-target.sh noo-cli 5
@@ -1171,7 +1212,7 @@ jobs:
     # continue-on-error: a cache save is an optimisation, never a check; a full
     # runner disk inside the tar must not turn a green run red.
     - name: Save cargo cache (dev pushes only)
-      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && steps.cargo-cache.outputs.cache-hit != 'true'
+      if: needs.scope.outputs.cli == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && steps.cargo-cache.outputs.cache-hit != 'true'
       continue-on-error: true
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
       with:
@@ -1213,9 +1254,13 @@ jobs:
     # ── cargo cache: keyed by TOOLCHAIN + Cargo.lock, saved from dev pushes ──
     # The rustc version is in the key so a toolchain bump rebuilds, and a source
     # hash ends it so a dev push that changed the crate saves a fresh target while
-    # restore-keys still find the nearest one. Saved ONLY from pushes to dev: a
-    # PR-scoped save is visible to that PR alone and evicts useful entries from
-    # the repo's cache budget.
+    # restore-keys still find the nearest one. Saved ONLY from pushes to dev and
+    # main: a PR-scoped save is visible to that PR alone and evicts useful
+    # entries from the repo's cache budget. main matters for the merge queue: a
+    # merge group runs on a gh-readonly-queue/dev/* ref, which (unlike a PR on
+    # dev) cannot read dev's caches, only its own and the DEFAULT branch's
+    # (main). Without a main entry every queue run would compile the dependency
+    # tree cold; the release promotion's push to main now seeds it.
     # RESTORE-ONLY here: noo-cli (same key, superset of this build) saves it.
     # rust:1-bookworm from the GHCR mirror (.github/hub-mirror.txt): runners share
     # IPs and Docker Hub rate-limits anonymous pulls per IP. A mirror miss answers
