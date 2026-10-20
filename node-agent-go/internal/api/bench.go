@@ -355,6 +355,8 @@ type benchState struct {
 	chatPlacement func() (ChatPlacement, bool)
 	// benchResolve overrides resolveBenchTarget (tests).
 	benchResolve func(context.Context) (benchTarget, error)
+	// windowResolve overrides resolveBenchTarget for liveChatContext (tests).
+	windowResolve func(context.Context) (benchTarget, error)
 	// benchNow overrides time.Now (tests).
 	benchNow func() time.Time
 }

@@ -445,11 +445,14 @@ command that names `{system_prompt_file}` without declaring the file is
 refused at start, and so is a file name that is not a plain name.
 
 `model_context` in the agent's `/harness/placement` answer is the context
-window the node's chat backend runs with, as far as the agent sets it:
-today Ollama's `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else
-the profile's `ollama_context` default. It is absent when the agent does not
-know (another backend, nothing set, an older agent), and then the CLI keeps
-its own default. Without it Claude Code assumes a 200k window for a model it
+window the node's chat backend runs with. For Ollama it is what the agent
+sets: `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else the
+profile's `ollama_context` default. For vLLM and llama.cpp the agent asks the
+running backend (vLLM's `max_model_len` from `GET /v1/models`, llama-server's
+per-slot `n_ctx` from `GET /props`, which is `--ctx-size` divided across its
+parallel slots), bounded at 2 seconds. It is absent when the agent does not
+know (another backend, nothing set, the backend not answering, an older
+agent), and then the CLI keeps its own default. Without it Claude Code assumes a 200k window for a model it
 does not know, so on a 32k node it never compacts before Ollama truncates
 the prompt. The driver reads the window once per run, and the harness
 re-reads the placement every minute.
