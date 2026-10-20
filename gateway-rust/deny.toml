@@ -26,11 +26,4 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration to rustls-pki-types pending" },
     # Unmaintained, not vulnerable: serde_yaml's libyaml port.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (serde_yaml); migration pending" },
-    # webpki-roots 0.26.11 is a re-export shim that depends only on
-    # webpki-roots 1.0.10, which carries the patched root data. The shim is
-    # pulled only by tokio-websockets 0.10 (via async-nats 0.49/0.50, which pins
-    # tokio-websockets ^0.10); our direct dependency is on 1.x. This ignores
-    # ONLY -0381; -0382/-0383 are not ignored. Remove when async-nats moves to
-    # a tokio-websockets that depends on webpki-roots 1.x (>= 0.12).
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 is a re-export shim of webpki-roots 1.0.10 (patched data), pulled only by tokio-websockets via async-nats; remove when they move to 1.x" },
 ]
