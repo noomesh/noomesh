@@ -765,7 +765,7 @@ async fn main() -> Result<()> {
     // each request's extensions so the rate limiter can key on the real client
     // IP (see middleware::extract_client_ip) instead of one shared "unknown"
     // bucket.
-    axum_server::bind(addr.parse()?)
+    axum_server::bind(addr.parse::<std::net::SocketAddr>()?)
         .acceptor(acceptor)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;

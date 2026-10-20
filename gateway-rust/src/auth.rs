@@ -5952,6 +5952,48 @@ mod tests {
         assert!(verify_token(&mk(Some(JWT_ISSUER), Some("other-service")), secret).is_err());
         assert!(verify_token(&mk(Some("evil"), Some(JWT_AUDIENCE)), secret).is_err());
     }
+
+    /// PINNED (jsonwebtoken 11 port): the verifier accepts HS256 only on the
+    /// secret path, refuses every other algorithm including `none`, refuses an
+    /// expired token past the default 60s leeway, and still tolerates a few
+    /// seconds of clock skew. A bump that changed any default fails here.
+    #[test]
+    fn jwt_pins_algorithm_expiry_and_leeway() {
+        use base64::Engine as _;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let secret = "test-secret-jwt11";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let claims = |exp: u64| serde_json::json!({
+            "sub": "alice", "scopes": ["read"], "exp": exp,
+            "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
+        });
+        let sign = |alg: Algorithm, exp: u64| encode(
+            &Header::new(alg), &claims(exp), &EncodingKey::from_secret(secret.as_bytes())).unwrap();
+
+        // Baseline: HS256, unexpired.
+        assert!(verify_token(&sign(Algorithm::HS256, now + 3600), secret).is_ok());
+        // Other HMAC algorithms signed with the same secret are refused.
+        for alg in [Algorithm::HS384, Algorithm::HS512] {
+            let e = verify_token(&sign(alg, now + 3600), secret).unwrap_err();
+            assert!(e.contains("unsupported algorithm"), "{alg:?}: {e}");
+        }
+        // `alg: none` (unsigned) is refused, with or without an empty signature.
+        let b64 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let body = b64(&claims(now + 3600).to_string());
+        let head = b64(r#"{"alg":"none","typ":"JWT"}"#);
+        assert!(verify_token(&format!("{head}.{body}."), secret).is_err());
+        assert!(verify_token(&format!("{head}.{body}"), secret).is_err());
+        // A tampered signature is refused.
+        let good = sign(Algorithm::HS256, now + 3600);
+        let tampered = format!("{}x", &good[..good.len() - 1]);
+        assert!(verify_token(&tampered, secret).is_err());
+        // Expiry: well past the 60s default leeway is refused; a few seconds
+        // of skew is tolerated, exactly as before the port.
+        assert!(verify_token(&sign(Algorithm::HS256, now - 3600), secret).is_err());
+        assert!(verify_token(&sign(Algorithm::HS256, now - 10), secret).is_ok());
+        assert!(verify_token(&sign(Algorithm::HS256, now - 120), secret).is_err());
+    }
 }
 
 #[cfg(test)]
