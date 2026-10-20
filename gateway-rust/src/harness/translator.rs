@@ -381,6 +381,9 @@ enum Reply {
 async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, String)> {
     sh.pin_model(&mut body);
     let stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    // The harness's switch, or the request asking for no reasoning itself
+    // (a Responses `reasoning.effort` of none/minimal, i153).
+    let no_reasoning = sh.thinking == crate::coordinator::thinking::ThinkingMode::Off || crate::coordinator::thinking::asks_no_reasoning(&body);
     let (url, wire_body) = match sh.wire {
         Wire::OpenAi => {
             if stream {
@@ -396,7 +399,7 @@ async fn complete(sh: &Arc<Shared>, mut body: Value) -> Result<Reply, (u16, Stri
         Wire::Ollama => (sh.url("/api/chat"), ollama::request(&body)),
     };
     let mut wire_body = wire_body;
-    if sh.thinking == crate::coordinator::thinking::ThinkingMode::Off {
+    if no_reasoning {
         let wire = match sh.wire {
             Wire::OpenAi => "openai",
             Wire::Ollama => "ollama",
@@ -624,6 +627,7 @@ async fn responses(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
     }
     let names = ToolNames::from_request(&body);
     let chat = responses_wire::request_body_from_responses(&body);
+    let metadata = responses_wire::metadata_of(&body);
     let model = sh.upstream.model.clone();
     match complete(&sh, chat).await {
         Err((status, msg)) => upstream_error(status, &msg),
@@ -635,10 +639,10 @@ async fn responses(State(sh): State<Arc<Shared>>, bytes: Bytes) -> Response {
                 (p, c)
             });
             let fr = choice.get("finish_reason").and_then(|f| f.as_str());
-            Json(responses_wire::response_from_chat(&msg, fr, usage, &model, &names)).into_response()
+            Json(responses_wire::response_from_chat(&msg, fr, usage, &model, &names, &metadata)).into_response()
         }
         Ok(Reply::Chunks(rx)) => {
-            let t = ChatToResponsesSse::new(&model, names);
+            let t = ChatToResponsesSse::new(&model, names).with_metadata(metadata);
             let events = futures::stream::unfold(Some((rx, t)), |state| async move {
                 let (mut rx, mut t) = state?;
                 loop {
@@ -1379,6 +1383,12 @@ mod tests {
         c.post(&url).json(&ask(false)).send().await.unwrap().text().await.unwrap();
         let up = m.last();
         assert!(up.get("reasoning").is_none() && up.get("chat_template_kwargs").is_none(), "auto adds nothing: {up}");
+        // A Responses request asking for no reasoning gets every engine's
+        // switch even in auto (i153).
+        let url = format!("{}/v1/responses", a.base_url());
+        c.post(&url).json(&json!({"model": "x", "input": "hi", "reasoning": {"effort": "minimal"}})).send().await.unwrap().text().await.unwrap();
+        let up = m.last();
+        assert_eq!(up["chat_template_kwargs"]["enable_thinking"], false, "{up}");
         a.shutdown().await;
     }
 }

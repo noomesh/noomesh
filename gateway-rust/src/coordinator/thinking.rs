@@ -92,6 +92,17 @@ pub fn effective_enable_thinking(mode: ThinkingMode, requested: bool) -> bool {
     }
 }
 
+/// Whether an OpenAI chat body asks for no reasoning itself: `reasoning:
+/// {effort: "none"}` (what a Responses `reasoning.effort` of none or minimal
+/// becomes, `responses_wire`), or `reasoning_effort` none/minimal. Its
+/// caller then sets every engine's field with [`disable_on_wire`], since
+/// the one the client sent reaches only some engines (noomesh-internal
+/// i153).
+pub fn asks_no_reasoning(body: &Value) -> bool {
+    let off = |v: Option<&Value>| v.and_then(Value::as_str).is_some_and(|e| e.eq_ignore_ascii_case("none") || e.eq_ignore_ascii_case("minimal"));
+    off(body.pointer("/reasoning/effort")) || off(body.get("reasoning_effort"))
+}
+
 /// Set every "do not reason" field `wire` understands on a request body
 /// already built for that wire. `wire` is the protocol on the wire
 /// (`backend::wire_format`: `openai`, `ollama`, `llamacpp`, `anthropic`);
@@ -136,6 +147,15 @@ pub fn disable_on_wire(body: &mut Value, wire: &str, backend_type: &str, cloud: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_asks_for_no_reasoning_by_either_field() {
+        assert!(asks_no_reasoning(&json!({"reasoning": {"effort": "none"}})));
+        assert!(asks_no_reasoning(&json!({"reasoning_effort": "Minimal"})));
+        assert!(!asks_no_reasoning(&json!({"reasoning_effort": "low"})));
+        assert!(!asks_no_reasoning(&json!({"reasoning": {"effort": "high"}})));
+        assert!(!asks_no_reasoning(&json!({"messages": []})));
+    }
 
     #[test]
     fn the_setting_parses_strictly_and_a_typo_is_auto() {
