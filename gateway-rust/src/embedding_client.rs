@@ -417,7 +417,7 @@ impl EmbeddingEndpoint {
         let mesh = crate::routes::external::mesh_targets(state, "embed", "embed", 5).await;
         let mut cands: Vec<Candidate> = Vec::with_capacity(mesh.len());
         for t in mesh {
-            let declared = crate::model_presence::node_role_model(state, &t.node_id, "embed").await;
+            let declared = crate::model_presence::node_role_models(state, &t.node_id, "embed").await;
             cands.push(Candidate::Mesh(t, declared));
         }
         ep.embed_over(balancer, cands, texts, timeout).await

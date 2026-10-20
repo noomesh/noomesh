@@ -6430,8 +6430,8 @@ mod honesty_tests {
     fn a_node_with_two_embed_rows_is_in_both_spaces_pools() {
         use crate::embedding_spaces::Space;
         let spaces = vec![
-            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024) },
-            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None },
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024), migration: None },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
         ];
         let p = |m: &str| ("awolf".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
         let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()]);

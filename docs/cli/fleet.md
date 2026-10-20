@@ -368,7 +368,13 @@ pending and is shown as the reason. trellion acts only on `filling` and
 When every table reports done == total (and trellion has reported in the last
 10 minutes), `migrate knowledge --complete` begins the cutover: trellion swaps
 the new vectors into place table by table and reports `cutover_done`, and only
-then does the space's model change, in one step. `migrate knowledge --cancel`
+then does the space's model change, in one step. Rows trellion cannot embed
+again (no stored source text, e.g. concept centroids, or a row the embedder
+rejects on its own) are counted as `unsourced`: they lose their vector at the
+cutover rather than keep one from the old model, and `embedding-space list`
+says how many; whatever owns them regenerates them on its next run. Rows
+written under an old model later (a writer racing the cutover) are found and
+re-embedded by trellion's stale sweep. `migrate knowledge --cancel`
 abandons a `pending` or `filling` migration and leaves the live vectors untouched; once the
 cutover has begun it cannot be cancelled. A space with a migration cannot be unset until it is cancelled.
 
