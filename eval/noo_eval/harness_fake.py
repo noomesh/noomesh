@@ -13,8 +13,9 @@ wall time and its numbers are the same every time.
 The canned kinds differ on purpose, so the report has something to show:
 ``noo`` is quick and writes no usage row (as today), ``copilot`` cannot
 delegate, ``claude-code`` passes everything at a higher token cost, and
-``codex`` is refused by the node (its wire has no backend). EVERY value a
-fixture run reports is SYNTHETIC.
+``codex`` passes everything between the two. A test that needs a refused
+kind passes its own ``profiles``. EVERY value a fixture run reports is
+SYNTHETIC.
 """
 from __future__ import annotations
 
@@ -58,8 +59,7 @@ PROFILES: dict[str, KindProfile] = {
     "copilot": KindProfile(polls=3, loops=2, prompt_per_task=1800, completion_per_task=220,
                            fails={"delegate": "noo_task_delegate was not offered to this harness\n(trace)"}),
     "claude-code": KindProfile(polls=4, loops=2, prompt_per_task=5200, completion_per_task=410),
-    "codex": KindProfile(refused="harness kind codex: its wire (openai-responses) is not served by "
-                                 "any running chat backend on this node"),
+    "codex": KindProfile(polls=3, loops=2, prompt_per_task=3400, completion_per_task=300),
 }
 
 # objective substring -> the result a passing run answers with
