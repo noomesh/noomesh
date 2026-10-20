@@ -352,20 +352,25 @@ embed model, so a second replaces the first. Remove one embed model with
 
 **Re-embedding a space into a new model.** `noo cluster embedding-space migrate
 knowledge bge-m3` starts it. The gateway first probes the new model (one short
-text, over the nodes that run it) and refuses unless something answers and the
-vector width equals the space's: trellion's vector columns are `vector(1024)`,
+text, over the nodes that run it) and refuses if the vector width differs from
+the space's: trellion's vector columns are `vector(1024)`,
 and a model of a different width needs the columns retyped, which is not
 built. While the migration is `filling`, nothing changes for readers or
 writers: trellion embeds every stored row again with the new model
 (`knowledge@next`) into a second column beside the live one, and reports
-progress, which `embedding-space list` and `noo cluster verify` show. A model
-placed for a migration (`--role embed`) is allowed on a node while it runs.
+progress, which `embedding-space list` and `noo cluster verify` show. If no node serves
+the model yet the migration is `pending` (the command answers 202): place the
+model with `noo cluster place <node> ollama <model> --role embed` (allowed
+because a migration names it) and the gateway re-probes about every 15 seconds
+and starts the migration by itself; a width mismatch found then keeps it
+pending and is shown as the reason. trellion acts only on `filling` and
+`cutover`.
 When every table reports done == total (and trellion has reported in the last
 10 minutes), `migrate knowledge --complete` begins the cutover: trellion swaps
 the new vectors into place table by table and reports `cutover_done`, and only
 then does the space's model change, in one step. `migrate knowledge --cancel`
-abandons a `filling` migration and leaves the live vectors untouched; once the
-cutover has begun it cannot be cancelled.
+abandons a `pending` or `filling` migration and leaves the live vectors untouched; once the
+cutover has begun it cannot be cancelled. A space with a migration cannot be unset until it is cancelled.
 
 ### Get a model onto the fleet
 

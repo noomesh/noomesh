@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
     crate::settings::spawn_refresh(state.db.clone());
     // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
     // the space cache warm the same way.
-    crate::embedding_spaces::spawn_refresh(state.db.clone());
+    crate::embedding_spaces::spawn_refresh(state.clone());
 
     // Re-assert the NATS KV buckets periodically. A NATS server that comes
     // back with a fresh JetStream store (what a container recreate does)

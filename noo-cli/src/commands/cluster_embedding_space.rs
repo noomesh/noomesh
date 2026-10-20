@@ -73,6 +73,10 @@ pub(crate) struct SpaceRows {
 pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<String> {
     let next = m["next_model"].as_str()?;
     let state = m["state"].as_str().unwrap_or("?");
+    if state == "pending" {
+        let err = m["progress"]["error"].as_str().map(|e| format!(" ({e})")).unwrap_or_default();
+        return Some(format!("{space}: re-embedding into {next} pending — waiting for a node serving {next}{err}"));
+    }
     let (mut done, mut total) = (0u64, 0u64);
     if let Some(t) = m["progress"]["tables"].as_object() {
         for p in t.values() {
@@ -206,6 +210,14 @@ pub fn cluster_embedding_space_migrate(g: &Globals, args: &[String]) -> Result<i
                 println!("{resp}");
                 return Ok(0);
             }
+            if resp["state"].as_str() == Some("pending") {
+                ui::warned(&format!("{space}: no node serves {model} yet — the re-embed is pending and starts by itself once one does"));
+                ui::guide(&[
+                    ("noo cluster place <node> ollama <model> --role embed", "puts the new model on a node"),
+                    ("noo cluster embedding-space migrate <space> --cancel", "abandons the pending re-embed"),
+                ]);
+                return Ok(0);
+            }
             ui::done(&format!(
                 "{space}: re-embedding into {model} ({} dims) started — trellion embeds every row beside the live vectors",
                 resp["next_dims"].as_u64().unwrap_or(0)
@@ -255,6 +267,10 @@ mod tests {
         let fresh = serde_json::json!({"next_model": "x", "state": "filling", "progress": null});
         assert!(migration_line("k", &fresh).unwrap().contains("no report from trellion yet"));
         assert_eq!(migration_line("k", &serde_json::Value::Null), None);
+        let pending = serde_json::json!({"next_model": "x", "state": "pending", "progress": null});
+        assert_eq!(migration_line("k", &pending).unwrap(), "k: re-embedding into x pending — waiting for a node serving x");
+        let wrong = serde_json::json!({"next_model": "x", "state": "pending", "progress": {"error": "width 768"}});
+        assert!(migration_line("k", &wrong).unwrap().ends_with("(width 768)"));
     }
 
     #[test]
