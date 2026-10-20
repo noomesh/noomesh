@@ -135,36 +135,20 @@ def test_healthcheck_uses_the_binarys_own_probe() -> None:
     )
 
 
-def test_dashboard_html_is_copied() -> None:
-    """The pages live at GATEWAY_HTML_DIR, which is under /app/src.
+def test_the_retired_html_dir_is_gone() -> None:
+    """/ui/basic was the last page served from GATEWAY_HTML_DIR; it is retired.
 
-    Dropping `COPY src ./src` nearly took the dashboard with it. index.html is
-    NOT in static/, so routes/ui.rs's fallback to STATIC_DIR does not cover
-    it, and dev cannot notice: compose bind-mounts the file over that exact
-    path. It would have surfaced only on a --dist install, as
-    "Page not found: index.html".
+    The console (index.html, kiosk.html) is built into /app/static, which
+    routes/ui.rs serves. Nothing reads /app/src/noomesh/gateway any more, so
+    the constant is gone and no COPY may put HTML back there.
     """
-    stage = _runtime_stage()
-    copies = [i for i in _instructions(stage) if i.startswith("COPY ")]
-    assert any("src/noomesh/gateway/" in c and ".html" in c for c in copies), (
-        "no COPY for the dashboard HTML. routes/ui.rs reads them from "
-        "paths::GATEWAY_HTML_DIR (/app/src/noomesh/gateway); without a COPY "
-        "the dashboard 404s on any install that does not bind-mount them."
+    paths_rs = (REPO / "gateway-rust" / "src" / "paths.rs").read_text()
+    assert "GATEWAY_HTML_DIR" not in paths_rs, "the retired HTML dir is back in paths.rs"
+    copies = [i for i in _instructions(_runtime_stage()) if i.startswith("COPY ")]
+    assert not any("src/noomesh/gateway/" in c and ".html" in c for c in copies), (
+        "an HTML page is copied to the retired dir:\n  " + "\n  ".join(copies)
     )
     assert any("/app/static" in c for c in copies), "static assets are not copied"
-
-
-def test_gateway_html_dir_matches_the_copy_destination() -> None:
-    """paths.rs and the Dockerfile must agree on where the pages land."""
-    paths_rs = (REPO / "gateway-rust" / "src" / "paths.rs").read_text()
-    m = re.search(r'GATEWAY_HTML_DIR:\s*&str\s*=\s*"([^"]+)"', paths_rs)
-    assert m, "GATEWAY_HTML_DIR not found in paths.rs"
-    dest = m.group(1).rstrip("/")
-    copies = [i for i in _instructions(_runtime_stage()) if i.startswith("COPY ")]
-    assert any(dest in c for c in copies), (
-        f"GATEWAY_HTML_DIR is {dest!r} but no COPY targets it:\n  "
-        + "\n  ".join(copies)
-    )
 
 
 def test_python_source_tree_is_not_copied() -> None:

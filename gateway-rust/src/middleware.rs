@@ -2341,10 +2341,11 @@ mod csp_default_tests {
     /// must not come back.
     #[test]
     fn every_served_page_loads_script_from_a_file() {
-        for (name, html) in [
-            ("index.html", include_str!("../../ui/apps/web/index.html")),
-            ("kiosk.html", include_str!("../../ui/apps/web/kiosk.html")),
-        ] {
+        // Read, not include_str!: the console source is not in the image's
+        // builder stage, and an embed outside src/ must be (test_rust_build_context_complete).
+        let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/apps/web");
+        for name in ["index.html", "kiosk.html"] {
+            let html = std::fs::read_to_string(web.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             for tag in html.split("<script").skip(1) {
                 let open = tag.split('>').next().unwrap_or("");
                 assert!(open.contains(" src="), "{name}: an inline <script> would be refused by script-src 'self': <script{open}>");
