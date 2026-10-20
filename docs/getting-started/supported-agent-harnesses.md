@@ -326,7 +326,7 @@ Other flags: `--cli <absolute path>` (default: the kind's `cli` on PATH),
 `--test reply|file|both` (default `both`), `--prompt full|slim` (Claude
 Code's full or slim launch; default: the node's profile in real mode, else
 full), `--context-tokens <n>` (the context window a CLI that takes one,
-Claude Code, is told; default: the node agent's `model_context` in real
+Claude Code or Codex, is told; default: the node agent's `model_context` in real
 mode, else the CLI's own), `--timeout <secs>` (default 300), `--keep` (keep the workspace and print its path) and `--json`. For
 each test the report gives the CLI version, PASS or FAIL with the first
 concrete reason, the exit code, seconds, whether it timed out, every
