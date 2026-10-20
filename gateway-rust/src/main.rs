@@ -118,6 +118,7 @@ mod audit_partition;
 mod audit_integrity;
 mod audit_chain;
 mod audit_context;
+mod audit_spool;
 mod autonomy_audit;
 mod autonomy_evaluators;
 mod held_column;
@@ -573,6 +574,9 @@ async fn main() -> Result<()> {
     // audit insert runs. Mirrors gateway/audit_archive.py::ensure_current_and_next
     // (Python lifespan was dead in prod; this restores it).
     audit_partition::ensure_current_and_next(&state).await;
+    // Audit rows the database could not take while it was away are held
+    // and written back as soon as it answers (audit_spool).
+    audit_spool::spawn_drainer(state.db.clone());
     // The retention job (export then drop) as a seeded weekly heartbeat task.
     audit_partition::seed_rotation_task(&state.db).await;
     // The audit key's one-time hand-over row (or genesis row), before any
