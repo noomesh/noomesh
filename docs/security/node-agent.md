@@ -734,6 +734,24 @@ that does not name its door, an expiring leaf, a plaintext door
 controller. An agent that does not send `backend_containers` leaves the
 row exactly as it was.
 
+### Backend images
+
+Each entry also carries the ref the container was created from (`image`)
+and whether that ref can move under it (`image_floating`: no `@sha256`
+digest, tag `latest` or none, and not one of our rail-only images). The
+agent refuses to *create* a backend from a floating ref, but a container an
+older agent made before that refusal keeps running on one. The `backend
+images` row fails and names it, with `noo cluster provision <node> --wait`
+as the remedy: a current agent recreates it from the stack lock's pinned
+ref.
+
+The controller never sends a floating ref either. An operator
+`VLLM_IMAGE`, `VLLM2_IMAGE` or `OLLAMA_IMAGE` set to `:latest` (or with no
+tag) is skipped with a warning. Compose renders `VLLM_IMAGE` into the
+locked variable too, so in that case the node uses its own versioned
+default. Pin an override as `repo:version@sha256:…`, or unset it to use the
+lock.
+
 ---
 
 ## Harness profile

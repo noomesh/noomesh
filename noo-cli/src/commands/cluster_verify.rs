@@ -307,6 +307,12 @@ pub(crate) fn node_checks(n: &Value, controller_tag: &str, cli_version: &str, no
     //       phoning home (vLLM's stats.vllm.ai report above all).
     out.push(vendor_telemetry_check(n));
 
+    // 6c-images. Backend images: no running backend container was created
+    //            from a floating ref (`:latest` or untagged, no digest) — the
+    //            model server sees every prompt, and a ref that can move is
+    //            unchecked.
+    out.push(backend_images_check(n));
+
     // 6c'. The data root: the declaration, the root the
     //      agent resolves, and what its containers mount all say one thing.
     out.push(data_root_row(n));
@@ -474,6 +480,55 @@ pub(crate) fn stunnel_image_check(n: &Value) -> Option<Check> {
         )),
         other => Some(warn("sidecar image", format!("agent reports an unknown stunnel_image {other:?}"), None)),
     }
+}
+
+/// The `backend images` row. The agent reports, per running backend
+/// container, the ref it was created from (`backend_containers.<b>.image`)
+/// and whether that ref can move under it (`image_floating`: no digest, tag
+/// `latest` or none, not a rail-only image of ours). A floating one FAILs:
+/// a current agent refuses to create such a container, so one running is a
+/// leftover from an older agent (awolf's `noo-vllm` on
+/// `vllm/vllm-openai:latest`, 2026-10-20). An entry without the key is an
+/// agent that predates the report: WARN, never a claimed pass.
+pub(crate) fn backend_images_check(n: &Value) -> Check {
+    const NAME: &str = "backend images";
+    let id = n["id"].as_str().unwrap_or("?");
+    let Some(bc) = n["backend_containers"].as_object().filter(|m| !m.is_empty()) else {
+        return ok(NAME, "no backend container running");
+    };
+    let mut floating = Vec::new();
+    let mut unreported = Vec::new();
+    let mut fixed = Vec::new();
+    for (b, e) in bc {
+        if e["runtime"].as_str() == Some("native") || e["managed"].as_bool() == Some(false) {
+            continue; // a native process has no image
+        }
+        let ctr = e["container"].as_str().unwrap_or(b.as_str());
+        match (e["image"].as_str(), e["image_floating"].as_bool()) {
+            (Some(img), Some(true)) => floating.push(format!("{ctr} runs {img}")),
+            (Some(img), Some(false)) => fixed.push(format!("{b} {img}")),
+            _ => unreported.push(b.as_str()),
+        }
+    }
+    if !floating.is_empty() {
+        return fail(
+            NAME,
+            format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
+            format!("noo cluster provision {id} --wait   # a current agent recreates the backend from the stack lock's pinned ref; \
+                     if the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, unset it or pin repo:version@sha256:…"),
+        );
+    }
+    if !unreported.is_empty() {
+        return warn(
+            NAME,
+            format!("the agent does not report the image of {} — older agent, not proven", unreported.join(", ")),
+            Some(format!("noo cluster provision {id} --wait")),
+        );
+    }
+    if fixed.is_empty() {
+        return ok(NAME, "no backend container running");
+    }
+    ok(NAME, format!("pinned or versioned: {}", fixed.join(", ")))
 }
 
 /// The `vendor telemetry` row (docs/security/telemetry.md). The agent reports,
@@ -5606,7 +5661,7 @@ mod tests {
         let c = node_checks(&healthy(now), "v0.2.70", "0.5.57", now, Some(true));
         let failed: Vec<_> = c.iter().filter(|c| c.verdict == Verdict::Fail).map(|c| c.name).collect();
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(c.len(), 20, "fourteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
+        assert_eq!(c.len(), 21, "fifteen node invariants (the log shipper, peer identity, control over bus, backend doors, vendor telemetry, backend images and data root among them) plus six host-fact rows (boot partition and host telemetry among them), each judged");
     }
 
     /// The door refusals ride the heartbeat as `backend_tls` (refused to
@@ -7227,6 +7282,31 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok);
         assert!(stunnel_image_check(&serde_json::json!({"id": "host3"})).is_none());
         assert_eq!(stunnel_image_check(&serde_json::json!({"id": "x", "stunnel_image": "weird"})).unwrap().verdict, Verdict::Warn);
+    }
+
+    /// A backend container created from a floating ref FAILs, naming it; a
+    /// pinned or versioned one is OK; an agent that does not report is WARN;
+    /// a native Mac ollama has no image and is not judged.
+    #[test]
+    fn backend_images_row_fails_on_a_floating_ref() {
+        let n = serde_json::json!({"id": "awolf", "backend_containers": {
+            "vllm": {"running": true, "container": "noo-vllm", "image": "vllm/vllm-openai:latest", "image_floating": true}}});
+        let c = backend_images_check(&n);
+        assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
+        assert!(c.detail.contains("noo-vllm runs vllm/vllm-openai:latest"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster provision awolf --wait"), "{c:?}");
+
+        let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
+            "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
+            "ollama": {"managed": true, "runtime": "native", "running": true}}});
+        let c = backend_images_check(&pinned);
+        assert_eq!(c.verdict, Verdict::Ok, "{c:?}");
+        assert!(c.detail.contains("vllm vllm/vllm-openai:v0.29.0"), "{}", c.detail);
+
+        let old = serde_json::json!({"id": "host3", "backend_containers": {"vllm": {"running": true}}});
+        assert_eq!(backend_images_check(&old).verdict, Verdict::Warn);
+        assert_eq!(backend_images_check(&serde_json::json!({"id": "x"})).verdict, Verdict::Ok);
+        assert_eq!(backend_images_check(&serde_json::json!({"id": "x", "backend_containers": {}})).verdict, Verdict::Ok);
     }
 
     // docs/security/telemetry.md: a running backend lacking a switch FAILs,
