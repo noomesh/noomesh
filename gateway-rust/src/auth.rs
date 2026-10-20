@@ -2322,7 +2322,6 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     "/kiosk.html",
     "/favicon.ico", // browser auto-fetched
     "/docs",        // human-readable API docs
-    "/ui/basic",    // simpler fallback UI shell
     // Bootstrap-token enrollment. (`/bootstrap-node.sh`, the
     // retired pre-token lane, was listed here until 2026-09-27.) Public
     // because the enrolling host has no credential of ANY kind

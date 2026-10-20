@@ -3078,26 +3078,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ui/basic": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Basic UI
-         * @description [native] Serves the basic (legacy) HTML UI.
-         */
-        get: operations["serve_basic_ui"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/upload": {
         parameters: {
             query?: never;
@@ -14146,24 +14126,6 @@ export interface operations {
         };
     };
     serve_favicon: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    serve_basic_ui: {
         parameters: {
             query?: never;
             header?: never;

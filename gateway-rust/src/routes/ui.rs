@@ -43,7 +43,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/kiosk", get(serve_kiosk))
         .route("/kiosk.html", get(serve_kiosk))
         .route("/favicon.ico", get(serve_favicon))
-        .route("/ui/basic", get(serve_html("ui.html")))
         // Runbooks: loaded into state at boot since the port, but the route
         // serving them was lost with the Python gateway — every card in the
         // dashboard Docs tab dead-ended on 401 (task #14). Authenticated
@@ -251,27 +250,6 @@ async fn runbook_get(
             })),
         )
             .into_response(),
-    }
-}
-
-/// Create a handler for a specific HTML file.
-fn serve_html(filename: &'static str) -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> + Clone {
-    move || Box::pin(async move { serve_html_file(filename).await })
-}
-
-async fn serve_html_file(filename: &str) -> axum::response::Response {
-    use crate::paths;
-    let path = format!("{}/{filename}", paths::GATEWAY_HTML_DIR);
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => axum::response::Html(content).into_response(),
-        Err(_) => {
-            // Fallback: try static directory
-            let fallback = format!("{}/{filename}", paths::STATIC_DIR);
-            match tokio::fs::read_to_string(&fallback).await {
-                Ok(content) => axum::response::Html(content).into_response(),
-                Err(_) => (StatusCode::NOT_FOUND, format!("Page not found: {filename}")).into_response(),
-            }
-        }
     }
 }
 

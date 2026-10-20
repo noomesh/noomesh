@@ -5774,21 +5774,6 @@
         }
       }
     },
-    "/ui/basic": {
-      "get": {
-        "tags": [
-          "ui"
-        ],
-        "summary": "Basic UI",
-        "description": "[native] Serves the basic (legacy) HTML UI.",
-        "operationId": "serve_basic_ui",
-        "responses": {
-          "200": {
-            "description": "OK"
-          }
-        }
-      }
-    },
     "/upload": {
       "post": {
         "tags": [

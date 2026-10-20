@@ -67,7 +67,7 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 
 Public, no credential: `/auth/*`, `/api/auth/*`, `/assets/*`,
 `/.well-known/*`, `/`, `/dashboard`, `/kiosk`, `/kiosk.html`,
-`/favicon.ico`, `/docs`, `/ui/basic`, and the enrollment endpoints a node
+`/favicon.ico`, `/docs`, and the enrollment endpoints a node
 uses before it has credentials: `/bootstrap`, `/bootstrap/prep`, `/apply`,
 `/deenroll`, `/fetch`, `/ca.crt`, `/bootstrap/cli/*`, `GET
 /bootstrap/bundle/*`, `/api/cluster/bootstrap` and
@@ -846,8 +846,7 @@ corridor screen): each handler re-shapes a general route's own output
 
 ## Dashboard
 
-`GET /` (alias `/dashboard`) serves the web UI, `/ui/basic` a simpler
-shell, `/kiosk` (alias `/kiosk.html`) the kiosk page. `/assets/*` (versioned mesh-UI artifact assets) is public; `/static/*`
+`GET /` (alias `/dashboard`) serves the web UI, `/kiosk` (alias `/kiosk.html`) the kiosk page. `/assets/*` (versioned mesh-UI artifact assets) is public; `/static/*`
 is **not** — only the exact path `/static/openapi.public.json` is public
 there, everything else under `/static/` requires the same credential as
 any other route. Every action the UI takes is one of the authenticated

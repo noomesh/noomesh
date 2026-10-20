@@ -771,9 +771,9 @@ services:
       # REMOVED with the Python source tree:
       #   ./src:/app/src:ro
       #     overlaid a directory the image no longer creates. Nothing in the
-      #     gateway imports noomesh; the only thing that had to survive is
-      #     index.html, which keeps its own mount above (routes/ui.rs reads it
-      #     from paths::GATEWAY_HTML_DIR).
+      #     gateway imports noomesh; the dashboard is the UI artifact under
+      #     /var/www, and the last page read from /app/src (`/ui/basic`) is
+      #     retired.
       #   ${TRELLION_PATH}/src/trellion:/opt/python/cpython-3.12.13-.../trellion
       #     DEAD LONG BEFORE THIS CHANGE, and silently. The target is the
       #     deps-base interpreter's site-packages; this image's interpreter has
