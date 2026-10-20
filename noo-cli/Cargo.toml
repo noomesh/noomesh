@@ -36,7 +36,7 @@ time = { version = "0.3", features = ["formatting"] }
 # admin password into secrets/admin_password.txt exactly like Python's
 # step_security (bcrypt.hashpw). serde_yaml round-trips noomesh.yaml for the
 # coordinator backend/model + watched-folder/workspace edits (yaml.dump parity).
-bcrypt = "0.15"
+bcrypt = "0.19"
 serde_yaml = "0.9"
 # Kiosk seats (kiosk_seat.rs `seat_agent`) trust the platform's public roots
 # PLUS the pinned cluster CA, so a seat reaches the controller through the
