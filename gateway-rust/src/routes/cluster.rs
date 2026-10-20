@@ -100,6 +100,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/embedding-spaces", get(embedding_spaces_get))
         .route("/api/cluster/embedding-spaces/{space}", put(embedding_space_put))
         .route("/api/cluster/embedding-spaces/{space}", delete(embedding_space_delete))
+        .route(
+            "/api/cluster/embedding-spaces/{space}/migration",
+            post(embedding_space_migration_start).delete(embedding_space_migration_cancel),
+        )
+        .route("/api/cluster/embedding-spaces/{space}/migration/complete", post(embedding_space_migration_complete))
         // Operator-only mute for a known-down node's alerts (maintenance.rs).
         .route(
             "/api/cluster/nodes/{node_id}/maintenance",
@@ -4607,16 +4612,28 @@ pub(crate) fn embedding_space_view(
                 .map(node)
                 .collect();
             let live = pool.iter().filter(|n| n["advertising"] == json!(true) && n["desired_state"] == json!("running")).count();
+            // i150: while migrating, the nodes that already hold the next model.
+            let next_pool: Vec<Value> = match &s.migration {
+                Some(m) => placements.iter().filter(|p| p.2.as_deref().is_some_and(|x| same_model(x, &m.next_model))).map(node).collect(),
+                None => Vec::new(),
+            };
             json!({
                 "space": s.space, "model": s.model, "dims": s.dims,
                 "default": s.space == crate::embedding_spaces::DEFAULT_SPACE,
                 "pool": pool, "live": live,
+                "migration": s.migration, "next_pool": next_pool,
             })
         })
         .collect();
     let unmatched: Vec<Value> = placements
         .iter()
-        .filter(|p| !spaces.iter().any(|s| p.2.as_deref().is_some_and(|m| same_model(m, &s.model))))
+        .filter(|p| {
+            !spaces.iter().any(|s| {
+                p.2.as_deref().is_some_and(|m| {
+                    same_model(m, &s.model) || s.migration.as_ref().is_some_and(|g| same_model(m, &g.next_model))
+                })
+            })
+        })
         .map(node)
         .collect();
     json!({"spaces": out, "unmatched": unmatched})
@@ -4661,7 +4678,10 @@ async fn embedding_space_put(
     if let Some(why) = es::change_refusal(existing, &model) {
         return Err(AppError::Conflict(why));
     }
-    if let Some(other) = spaces.iter().find(|s| s.space != space && es::same_model(&s.model, &model)) {
+    if let Some(other) = spaces.iter().find(|s| {
+        s.space != space
+            && (es::same_model(&s.model, &model) || s.migration.as_ref().is_some_and(|m| es::same_model(&m.next_model, &model)))
+    }) {
         return Err(AppError::Conflict(format!(
             "space '{}' already embeds with '{model}': one model, one space",
             other.space
@@ -4673,7 +4693,7 @@ async fn embedding_space_put(
             return Err(AppError::Conflict(format!("space '{space}' has {e}-dim vectors; {d} would be another model's width")));
         }
     }
-    let rec = es::Space { space: space.clone(), model: existing.map(|e| e.model.clone()).unwrap_or(model), dims };
+    let rec = es::Space { space: space.clone(), model: existing.map(|e| e.model.clone()).unwrap_or(model), dims, migration: None };
     es::upsert(&state.db, &rec, "operator").await.map_err(|e| AppError::Internal(format!("embedding space write: {e}")))?;
     if let Ok(all) = es::load(&state.db).await {
         es::set_cache(all);
@@ -4707,6 +4727,134 @@ async fn embedding_space_delete(
     tracing::info!(space = %space, "embedding_space_removed");
     crate::routes::core::audit_event(
         &state.db, "embedding_space_removed", "info", "gateway",
+        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": space})))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbeddingMigrationBody {
+    model: String,
+}
+
+/// Reload the cache after a migration write, so this gateway answers from
+/// the new state at once instead of in up to 15 s.
+async fn refresh_embedding_spaces(state: &AppState) {
+    if let Ok(all) = crate::embedding_spaces::load(&state.db).await {
+        crate::embedding_spaces::set_cache(all);
+    }
+}
+
+/// POST /api/cluster/embedding-spaces/{space}/migration `{model}` -- start
+/// re-embedding a space into another model (i150). The gateway PROBES the
+/// new model (one short text across the mesh nodes declaring it, its own
+/// balancer, no static endpoints); the answer's width must equal the
+/// space's, because trellion's `vector(N)` columns are fixed. 409 on every
+/// refusal: a running migration, a model another space has, nothing able to
+/// embed with it, a different width.
+async fn embedding_space_migration_start(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+    Json(body): Json<EmbeddingMigrationBody>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    let model = body.model.trim().to_string();
+    crate::coordinator::classes::valid_model(&model).map_err(AppError::BadRequest)?;
+    let spaces = es::load(&state.db).await.map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    if let Some(why) = es::start_refusal(&spaces, &space, &model) {
+        return Err(AppError::Conflict(why));
+    }
+    let want = spaces.iter().find(|s| s.space == space).and_then(|s| s.dims);
+    let probe = crate::embedding_client::EmbeddingEndpoint::embed_model_over_mesh(
+        &state,
+        &model,
+        0,
+        &crate::embedding_client::EmbedBalancer::new(),
+        &["dimension probe".to_string()],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|e| {
+        AppError::Conflict(format!(
+            "nothing can embed with '{model}': no node declaring it answered the probe ({e}). \
+             Run '{model}' on at least one role=embed node first"
+        ))
+    })?;
+    let got = probe.first().map_or(0, Vec::len) as u64;
+    if got == 0 {
+        return Err(AppError::Conflict(format!("'{model}' answered an empty vector")));
+    }
+    if let Some(why) = es::dims_refusal(want, got) {
+        return Err(AppError::Conflict(why));
+    }
+    if !es::start_migration(&state.db, &space, &model, got).await.map_err(|e| AppError::Internal(format!("migration write: {e}")))? {
+        return Err(AppError::Conflict(format!("space '{space}' started another migration first")));
+    }
+    refresh_embedding_spaces(&state).await;
+    tracing::info!(space = %space, next_model = %model, next_dims = got, "embedding_migration_started");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_migration_started", "info", "gateway",
+        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": model, "next_dims": got}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": space, "next_model": model, "next_dims": got, "state": es::MIGRATION_FILLING})))
+}
+
+/// POST /api/cluster/embedding-spaces/{space}/migration/complete -- the
+/// operator's go: refused unless trellion reported (fresh, about this model)
+/// every table fully re-embedded. Moves the migration to `cutover`; trellion
+/// swaps its columns and its `cutover_done` report flips the space's model.
+async fn embedding_space_migration_complete(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    let spaces = es::load(&state.db).await.map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    let Some(s) = spaces.iter().find(|s| s.space == space) else {
+        return Err(AppError::NotFound(format!("no embedding space '{space}'")));
+    };
+    if let Some(why) = es::complete_refusal(s, chrono::Utc::now()) {
+        return Err(AppError::Conflict(why));
+    }
+    let next = s.migration.as_ref().map(|m| m.next_model.clone()).unwrap_or_default();
+    if !es::begin_cutover(&state.db, &space, &next).await.map_err(|e| AppError::Internal(format!("migration write: {e}")))? {
+        return Err(AppError::Conflict(format!("space '{space}' changed under this request; retry")));
+    }
+    refresh_embedding_spaces(&state).await;
+    tracing::info!(space = %space, next_model = %next, "embedding_migration_cutover");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_migration_cutover", "info", "gateway",
+        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": next}),
+    ).await;
+    Ok(Json(json!({"ok": true, "space": space, "next_model": next, "state": es::MIGRATION_CUTOVER})))
+}
+
+/// DELETE /api/cluster/embedding-spaces/{space}/migration -- cancel while
+/// filling. Once the cutover has begun trellion is swapping columns, so the
+/// model must follow: 409.
+async fn embedding_space_migration_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(space): Path<String>,
+) -> AppResult {
+    use crate::embedding_spaces as es;
+    let space = space.trim().to_ascii_lowercase();
+    let spaces = es::load(&state.db).await.map_err(|e| AppError::Internal(format!("embedding spaces read: {e}")))?;
+    match spaces.iter().find(|s| s.space == space).map(|s| s.migration.as_ref().map(|m| m.state.clone())) {
+        None => return Err(AppError::NotFound(format!("no embedding space '{space}'"))),
+        Some(None) => return Err(AppError::NotFound(format!("space '{space}' has no migration"))),
+        Some(Some(st)) if st == es::MIGRATION_CUTOVER => {
+            return Err(AppError::Conflict(format!("space '{space}': the swap is under way and cannot be cancelled; it finishes when trellion reports cutover_done")));
+        }
+        Some(Some(_)) => {}
+    }
+    if !es::cancel_migration(&state.db, &space).await.map_err(|e| AppError::Internal(format!("migration write: {e}")))? {
+        return Err(AppError::Conflict(format!("space '{space}' changed under this request; retry")));
+    }
+    refresh_embedding_spaces(&state).await;
+    tracing::info!(space = %space, "embedding_migration_cancelled");
+    crate::routes::core::audit_event(
+        &state.db, "embedding_migration_cancelled", "info", "gateway",
         &format!("embedding_space:{space}"), "ok", json!({"space": space}),
     ).await;
     Ok(Json(json!({"ok": true, "space": space})))
@@ -6247,8 +6395,8 @@ mod honesty_tests {
     fn an_embedding_spaces_pool_is_the_placements_on_its_model() {
         use crate::embedding_spaces::Space;
         let spaces = vec![
-            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024) },
-            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None },
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024), migration: None },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
         ];
         let p = |n: &str, m: &str, d: &str| (n.to_string(), "ollama".to_string(), Some(m.to_string()), d.to_string());
         let placements = vec![

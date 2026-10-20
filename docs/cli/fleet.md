@@ -341,7 +341,7 @@ the pool and never sends them to a node on another model, and a reply that
 names another model is discarded and the next node tried. Callers send the
 space as `model` on `/api/external/embeddings` (`knowledge` when absent).
 An embed placement on a model no space uses is refused; a space's model does
-not change by setting (that is a re-embed: declare a new space instead).
+not change by setting: that is a re-embed (below), or declare a new space.
 A node may serve several spaces: place each model as its own embed row
 (`noo cluster place gpu-2 ollama harrier --role embed`, then the code model
 the same way) and the node joins each space's pool. Placing a second embed
@@ -349,6 +349,23 @@ model on ollama adds a row; chat and rerank placements still replace the
 role's one row, and a backend other than ollama (TEI, llama.cpp) holds one
 embed model, so a second replaces the first. Remove one embed model with
 `noo cluster unplace gpu-2 ollama --role embed --model nomic-embed-code`.
+
+**Re-embedding a space into a new model.** `noo cluster embedding-space migrate
+knowledge bge-m3` starts it. The gateway first probes the new model (one short
+text, over the nodes that run it) and refuses unless something answers and the
+vector width equals the space's: trellion's vector columns are `vector(1024)`,
+and a model of a different width needs the columns retyped, which is not
+built. While the migration is `filling`, nothing changes for readers or
+writers: trellion embeds every stored row again with the new model
+(`knowledge@next`) into a second column beside the live one, and reports
+progress, which `embedding-space list` and `noo cluster verify` show. A model
+placed for a migration (`--role embed`) is allowed on a node while it runs.
+When every table reports done == total (and trellion has reported in the last
+10 minutes), `migrate knowledge --complete` begins the cutover: trellion swaps
+the new vectors into place table by table and reports `cutover_done`, and only
+then does the space's model change, in one step. `migrate knowledge --cancel`
+abandons a `filling` migration and leaves the live vectors untouched; once the
+cutover has begun it cannot be cancelled.
 
 ### Get a model onto the fleet
 
@@ -634,6 +651,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster embedding-space list` | — | Show each embedding space, its model and the nodes serving it |
 | `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
 | `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
+| `noo cluster embedding-space migrate` | `<space> <model> \| <space> --complete \| <space> --cancel` | Re-embed a space into a new model: start, complete or cancel |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |

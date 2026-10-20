@@ -398,6 +398,31 @@ impl EmbeddingEndpoint {
         self.embed_over(&BALANCER, cands, texts, timeout).await
     }
 
+    /// Embed with an EXPLICIT model over the mesh pool only (i150): no static
+    /// endpoints, because those carry the primary's model and the static URL
+    /// would be sent a model it does not run. For a space's `next_model`
+    /// (migration probe and `<space>@next` embeds). `dims` 0 = learn the
+    /// width into `balancer`, so pass a balancer that has only seen this
+    /// model (a fresh one for the probe, [`NEXT_BALANCER`] with explicit dims
+    /// for `@next`).
+    pub(crate) async fn embed_model_over_mesh(
+        state: &crate::state::AppState,
+        model: &str,
+        dims: u64,
+        balancer: &EmbedBalancer,
+        texts: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f64>>, EmbedError> {
+        let ep = EmbeddingEndpoint { model: model.to_string(), dims, ..resolve() };
+        let mesh = crate::routes::external::mesh_targets(state, "embed", "embed", 5).await;
+        let mut cands: Vec<Candidate> = Vec::with_capacity(mesh.len());
+        for t in mesh {
+            let declared = crate::model_presence::node_role_model(state, &t.node_id, "embed").await;
+            cands.push(Candidate::Mesh(t, declared));
+        }
+        ep.embed_over(balancer, cands, texts, timeout).await
+    }
+
     /// The static endpoints this install declares: the resolved primary
     /// (`PAGEINDEX_EMBEDDING_URL`) plus every URL in
     /// `PAGEINDEX_EMBEDDING_EXTRA_URLS` / `services.embedding_extra_urls`
@@ -760,6 +785,11 @@ impl Drop for AdmitGuard<'_> {
 }
 
 static BALANCER: LazyLock<EmbedBalancer> = LazyLock::new(EmbedBalancer::new);
+
+/// Spreading state for `<space>@next` embeds (i150): kept apart from
+/// [`BALANCER`] so the next model's targets, cooldowns and width never mix
+/// with the live space's.
+pub(crate) static NEXT_BALANCER: LazyLock<EmbedBalancer> = LazyLock::new(EmbedBalancer::new);
 
 /// Decrements the in-flight count when the attempt ends (success, error or
 /// the request future being dropped).

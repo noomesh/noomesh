@@ -2133,7 +2133,27 @@ BEGIN
     END IF;
 END $$
 "#,
+}, Migration {
+    revision: EMBEDDING_SPACE_MIGRATION_REVISION,
+    down_revision: Some(EMBED_PLACEMENT_MODEL_REVISION),
+    // Re-embedding a space into another model (i150). All NULL = no
+    // migration. `migration_state` is NULL | 'filling' | 'cutover';
+    // `migration_progress` is trellion's last report; the gateway holds the
+    // state, trellion does the work.
+    sql: r#"
+ALTER TABLE noo_embedding_spaces
+    ADD COLUMN IF NOT EXISTS next_model text,
+    ADD COLUMN IF NOT EXISTS next_dims integer,
+    ADD COLUMN IF NOT EXISTS migration_state text,
+    ADD COLUMN IF NOT EXISTS migration_progress jsonb,
+    ADD COLUMN IF NOT EXISTS migration_started_at timestamptz,
+    ADD COLUMN IF NOT EXISTS migration_reported_at timestamptz
+"#,
 }];
+
+/// The embedding-space migration revision (i150). A constant so a renumber
+/// at rebase is one line.
+pub const EMBEDDING_SPACE_MIGRATION_REVISION: &str = "101_embedding_space_migration";
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
 /// line.
@@ -3010,16 +3030,15 @@ mod tests {
         assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
     }
 
-    /// i150 E1: the embed-placement key is the chain head, sits on the
-    /// prompt-skill proposals revision, and widens the unique index with the model
+    /// i150 E1: the embed-placement key sits on the prompt-skill proposals
+    /// revision, and widens the unique index with the model
     /// for embed rows only.
     #[test]
-    fn embed_placement_model_revision_is_the_head_and_keys_embed_rows_by_model() {
+    fn embed_placement_model_revision_keys_embed_rows_by_model() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBED_PLACEMENT_MODEL_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "100_embed_placement_model");
         assert!(m.revision.len() <= 32, "alembic_version.version_num is varchar(32)");
         assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBED_PLACEMENT_MODEL_REVISION), "the chain head");
         assert!(m.sql.contains("DROP INDEX IF EXISTS uq_placement_node_backend_role;"));
         assert!(m.sql.contains(
             "(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"
@@ -3028,6 +3047,28 @@ mod tests {
         // The upsert's ON CONFLICT must name the identical expression.
         assert!(include_str!("routes/cluster.rs")
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
+    }
+
+    /// i150: the migration columns are the chain head, on 098, all nullable
+    /// (no row changes), and `embedding_spaces::load` reads every one.
+    #[test]
+    fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "101_embedding_space_migration");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some("098_embed_placement_model"));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
+        for col in [
+            "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
+            "migration_started_at timestamptz", "migration_reported_at timestamptz",
+        ] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(!m.sql.contains("NOT NULL") && !m.sql.contains("UPDATE"), "existing spaces stay un-migrating");
+        let spaces = include_str!("embedding_spaces.rs");
+        for col in ["next_model", "next_dims", "migration_state", "migration_progress", "migration_started_at", "migration_reported_at"] {
+            assert!(spaces.contains(col), "{col} must be read/written by embedding_spaces");
+        }
     }
 
     /// The vendor-kinds revision sits on the audit chain and adds what

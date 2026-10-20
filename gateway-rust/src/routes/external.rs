@@ -33,10 +33,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -52,6 +52,7 @@ use super::raw_chat::{self, Outcome, RawChatError};
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/external/embeddings", post(embeddings))
+        .route("/api/external/embedding-spaces/{space}/migration", put(embedding_migration_report))
         .route("/api/external/rerank", post(rerank))
         .route("/api/external/classify", post(classify))
         .route("/api/external/chat/completions", post(chat_completions))
@@ -170,6 +171,11 @@ fn bad_request(msg: &str) -> ExtFail {
     ExtFail::bad_request(msg)
 }
 
+/// A refusal about the state of a record (409); the message IS the public one.
+fn conflict(msg: impl Into<String>) -> ExtFail {
+    ExtFail::conflict(msg)
+}
+
 fn upstream(status: StatusCode, detail: impl Into<String>) -> ExtFail {
     ExtFail::new(status, if status.is_server_error() { "backend_unavailable" } else { "backend_error" }, detail)
 }
@@ -247,16 +253,37 @@ async fn do_embeddings(
     // Truncate each to 1500 chars (matches the query-side embed in memory.rs).
     let truncated: Vec<String> = inputs.iter().map(|s| s.chars().take(1500).collect()).collect();
 
-    let endpoint = crate::embedding_client::resolve_space(space).map_err(|e| bad_request(&e))?;
-    let model = endpoint.model.clone();
-
-    let embeddings = endpoint
-        .embed_with_mesh(state, &truncated, std::time::Duration::from_secs(30))
+    // The detail of an embed failure (which may name the embedder's URL)
+    // goes to the audit row and the log under the reference; the consumer
+    // sees the general wording for the status.
+    let (model, embeddings) = if let Some(name) = crate::embedding_spaces::parse_next(space) {
+        // `<space>@next` (i150): the space's NEXT model during a migration,
+        // over the mesh nodes declaring it. trellion's re-embed worker.
+        let spaces = crate::embedding_spaces::all();
+        let s = crate::embedding_spaces::resolve(&spaces, Some(name)).map_err(|e| bad_request(&e))?;
+        let m = s
+            .migration
+            .as_ref()
+            .ok_or_else(|| conflict(format!("embedding space '{}' has no migration: '{}@next' means its next model", s.space, s.space)))?;
+        let v = crate::embedding_client::EmbeddingEndpoint::embed_model_over_mesh(
+            state,
+            &m.next_model,
+            m.next_dims.unwrap_or(0),
+            &crate::embedding_client::NEXT_BALANCER,
+            &truncated,
+            std::time::Duration::from_secs(30),
+        )
         .await
-        // The detail (which may name the embedder's URL) goes to the audit
-        // row and the log under the reference; the consumer sees the general
-        // wording for the status.
         .map_err(embed_error_to_ext)?;
+        (m.next_model.clone(), v)
+    } else {
+        let endpoint = crate::embedding_client::resolve_space(space).map_err(|e| bad_request(&e))?;
+        let v = endpoint
+            .embed_with_mesh(state, &truncated, std::time::Duration::from_secs(30))
+            .await
+            .map_err(embed_error_to_ext)?;
+        (endpoint.model.clone(), v)
+    };
 
     let out: Vec<Value> = embeddings
         .iter()
@@ -272,6 +299,78 @@ async fn do_embeddings(
         "usage": {"prompt_tokens": 0, "total_tokens": 0}
     });
     Ok((resp, n, model))
+}
+
+/// One table in trellion's re-embed report.
+#[derive(Debug, Deserialize)]
+struct TableProgress {
+    done: u64,
+    total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationReport {
+    next_model: String,
+    tables: std::collections::BTreeMap<String, TableProgress>,
+    #[serde(default)]
+    cutover_done: bool,
+}
+
+/// PUT /api/external/embedding-spaces/{space}/migration (i150) -- trellion's
+/// re-embed worker reports progress with its consumer key. Stores the report
+/// and its time; in `cutover`, `cutover_done: true` swaps the space to its
+/// next model in one UPDATE. 409 when the space has no migration or the
+/// report is about another model.
+async fn embedding_migration_report(
+    State(state): State<Arc<AppState>>,
+    Extension(consumer): Extension<Consumer>,
+    Path(space): Path<String>,
+    Json(body): Json<MigrationReport>,
+) -> Response {
+    use crate::embedding_spaces as es;
+    let started = Instant::now();
+    const EP: &str = "/api/external/embedding-spaces/{space}/migration";
+    if !consumer.has_scope("embeddings") {
+        return forbidden(&state, &consumer, EP, "embeddings", started);
+    }
+    let res: Result<Value, ExtFail> = async {
+        let err = |what: &str, e: sqlx::Error| ExtFail::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{what}: {e}"));
+        let space = space.trim().to_ascii_lowercase();
+        let spaces = es::load(&state.db).await.map_err(|e| err("embedding spaces read", e))?;
+        let s = spaces
+            .iter()
+            .find(|s| s.space == space)
+            .ok_or_else(|| bad_request(&format!("no embedding space '{space}'")))?;
+        let m = s.migration.as_ref().ok_or_else(|| conflict(format!("space '{space}' has no migration")))?;
+        if !es::same_model(&m.next_model, &body.next_model) {
+            return Err(conflict(format!("space '{space}' is migrating to '{}', not '{}'", m.next_model, body.next_model)));
+        }
+        let progress = json!({"next_model": m.next_model, "tables": body.tables.iter()
+            .map(|(t, p)| (t.clone(), json!({"done": p.done, "total": p.total}))).collect::<serde_json::Map<_, _>>()});
+        let ok = match es::progress_action(m, body.cutover_done) {
+            es::ProgressAction::Store => es::store_progress(&state.db, &space, &m.next_model, &progress).await,
+            es::ProgressAction::Flip => es::flip_to_next(&state.db, &space, &m.next_model).await,
+        }
+        .map_err(|e| err("embedding migration write", e))?;
+        if !ok {
+            return Err(conflict(format!("space '{space}' changed under this report; retry")));
+        }
+        if es::progress_action(m, body.cutover_done) == es::ProgressAction::Flip {
+            tracing::info!(space = %space, model = %m.next_model, "embedding_migration_finished");
+        }
+        let all = es::load(&state.db).await.map_err(|e| err("embedding spaces read", e))?;
+        let view = all.iter().find(|s| s.space == space).and_then(|s| serde_json::to_value(s).ok()).unwrap_or(Value::Null);
+        es::set_cache(all);
+        Ok(view)
+    }
+    .await;
+    match res {
+        Ok(view) => {
+            audit(&state, &consumer.name, EP, Some("embedding_migration"), Some(&body.next_model), None, None, 200, started, None);
+            (StatusCode::OK, Json(view)).into_response()
+        }
+        Err(e) => refuse(&state, &consumer.name, EP, Some("embedding_migration"), Some(&body.next_model), None, started, e),
+    }
 }
 
 // ──────────────────────────── rerank ────────────────────────────

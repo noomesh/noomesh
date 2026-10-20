@@ -124,6 +124,13 @@ impl RawChatError {
         Self { public: Some(msg.clone()), ..Self::new(StatusCode::BAD_REQUEST, "bad_request", msg) }
     }
 
+    /// A refusal about the state of a record (409): the message IS the
+    /// public one.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self { public: Some(msg.clone()), ..Self::new(StatusCode::CONFLICT, "conflict", msg) }
+    }
+
     /// From a legacy resolver error: 404 for a pin nothing serves, else 503.
     pub fn from_resolve(e: &anyhow::Error) -> Self {
         let status = coordinator::resolve_failure_status(e, 503);

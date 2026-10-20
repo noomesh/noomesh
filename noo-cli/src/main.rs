@@ -267,6 +267,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "embedding-space", "list"], commands::cluster_embedding_space_list),
     (&["cluster", "embedding-space", "set"], commands::cluster_embedding_space_set),
     (&["cluster", "embedding-space", "unset"], commands::cluster_embedding_space_unset),
+    (&["cluster", "embedding-space", "migrate"], commands::cluster_embedding_space_migrate),
     // `cluster exec`/`logs` spawn ssh with inherited stdio (fixes the
     // Python versions' swallowed stdout) and propagate the remote rc.
     (&["cluster", "logs"], commands::cluster_logs),
