@@ -1114,23 +1114,19 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     //    Two sources, both required: the store must hold each required
     //    NOO_SVC_KEY_* (what compose delivers), and the running gateway must
     //    list an active key for each consumer (what it will accept). A
-    //    gateway that cannot be asked fails CLOSED: refused unless
+    //    gateway that ANSWERS but cannot be read fails CLOSED: refused unless
     //    --skip-gateway-key-check, which skips only that listing — the store
-    //    check stays. (The listing exposes no key prefix or fingerprint, so
+    //    check stays. A gateway that does NOT ANSWER (down) takes the same
+    //    store-only path automatically, with the warning. (The listing exposes no key prefix or fingerprint, so
     //    the store's key cannot be compared with the row; an active row per
     //    consumer is what can be shown.)
     let required = required_consumers();
     let store_short = keyless_in_store(&root, &required);
-    let db_short = match crate::http::get_json_try(g, "/api/security/service-keys", true, 10) {
-        Ok(listing) if listing["keys"].as_array().is_some() => Some(keyless_of(&required, &listing)),
-        _ => None,
-    };
-    match pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check) {
+    let (db_short, gw_down) = read_gateway_key_shortfall(g, &required);
+    match pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check, gw_down) {
         PreRollKeys::Go => {}
         PreRollKeys::GoUnverified => if !g.json {
-            ui::warned("--skip-gateway-key-check: could not read the service-key list from the running gateway, so only the \
-                        store was checked — after the roll, `noo cluster verify --controller` (row `service keys`) \
-                        must show every consumer on its own key");
+            ui::warned(&unverified_keys_warning(skip_gw_key_check));
         },
         PreRollKeys::Missing(names) => fail(g.json, ExitCode::Generic, "service_keys_missing",
             &format!("{} hold(s) no gateway key of its own — this release refuses the shared-secret fallback \
@@ -1596,19 +1592,45 @@ fn keyless_in_store_of(required: &[(String, String)], set: &dyn Fn(&str) -> bool
         .collect()
 }
 
+/// Ask the running gateway which consumers lack an active key. Returns
+/// `(shortfall, gateway_down)`: `(Some(_), false)` when the list was read;
+/// `(None, true)` when NOTHING answered (see [`crate::http::ProbeFail::Down`]);
+/// `(None, false)` when something answered and the list is unusable.
+fn read_gateway_key_shortfall(g: &Globals, required: &[(String, String)]) -> (Option<Vec<String>>, bool) {
+    match crate::http::get_json_probe(g, "/api/security/service-keys", true, 10) {
+        Ok(listing) if listing["keys"].as_array().is_some() => (Some(keyless_of(required, &listing)), false),
+        Ok(_) => (None, false),
+        Err(crate::http::ProbeFail::Down(_)) => (None, true),
+        Err(crate::http::ProbeFail::Unreadable(_)) => (None, false),
+    }
+}
+
+/// The `!` line printed when the roll proceeds on the store check alone.
+fn unverified_keys_warning(by_flag: bool) -> String {
+    format!("{}: could not read the service-key list from the running gateway, so only the \
+             store was checked — after the roll, `noo cluster verify --controller` (row `service keys`) \
+             must show every consumer on its own key",
+        if by_flag { "--skip-gateway-key-check" } else { "the gateway is down" })
+}
+
 /// The pre-roll decision.
 #[derive(Debug, PartialEq, Eq)]
 enum PreRollKeys {
     Go,
-    /// `--skip-gateway-key-check` and the gateway could not be asked: the
-    /// store check passed.
+    /// `--skip-gateway-key-check`, or nothing answered at all (the stack is
+    /// down, so there is no list to read): the store check passed.
     GoUnverified,
     Missing(Vec<String>),
-    /// The gateway could not be asked and there is no `--skip-gateway-key-check`.
+    /// The gateway ANSWERED but its list could not be read (401/403, 5xx, bad
+    /// body, TLS failure) and there is no `--skip-gateway-key-check`.
     Unverifiable,
 }
 
-fn pre_roll_key_verdict(store_short: &[String], db_short: Option<&[String]>, skip_gw_key_check: bool) -> PreRollKeys {
+/// `gw_down`: nothing answered (connection refused / no route), which is not
+/// the same as a gateway that answered and could not be read: a down stack
+/// has no list to show, and the refusal's fix (`noo auth login`) cannot
+/// work against it, so it falls back to the store check as the flag does.
+fn pre_roll_key_verdict(store_short: &[String], db_short: Option<&[String]>, skip_gw_key_check: bool, gw_down: bool) -> PreRollKeys {
     let mut missing: Vec<String> = store_short.to_vec();
     for n in db_short.unwrap_or_default() {
         if !missing.contains(n) {
@@ -1621,6 +1643,7 @@ fn pre_roll_key_verdict(store_short: &[String], db_short: Option<&[String]>, ski
     match (db_short, skip_gw_key_check) {
         (Some(_), _) => PreRollKeys::Go,
         (None, true) => PreRollKeys::GoUnverified,
+        (None, false) if gw_down => PreRollKeys::GoUnverified,
         (None, false) => PreRollKeys::Unverifiable,
     }
 }
@@ -5465,19 +5488,75 @@ mod keyless_tests {
     fn an_unverifiable_gateway_refuses_unless_forced_and_the_store_always_counts() {
         use super::{pre_roll_key_verdict, PreRollKeys};
         let none: Vec<String> = vec![];
-        assert_eq!(pre_roll_key_verdict(&none, Some(&none), false), PreRollKeys::Go);
-        assert_eq!(pre_roll_key_verdict(&none, None, false), PreRollKeys::Unverifiable);
-        assert_eq!(pre_roll_key_verdict(&none, None, true), PreRollKeys::GoUnverified);
+        assert_eq!(pre_roll_key_verdict(&none, Some(&none), false, false), PreRollKeys::Go);
+        assert_eq!(pre_roll_key_verdict(&none, None, false, false), PreRollKeys::Unverifiable);
+        assert_eq!(pre_roll_key_verdict(&none, None, true, false), PreRollKeys::GoUnverified);
         let worker = vec!["worker".to_string()];
-        assert_eq!(pre_roll_key_verdict(&worker, None, true), PreRollKeys::Missing(worker.clone()), "the skip keeps the store check");
+        assert_eq!(pre_roll_key_verdict(&worker, None, true, false), PreRollKeys::Missing(worker.clone()), "the skip keeps the store check");
         let src = include_str!("upgrade.rs");
         let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        assert!(body.contains("pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check)"),
+        assert!(body.contains("pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check, gw_down)"),
             "the pre-roll check must be steered by its own flag, not --force");
-        assert_eq!(pre_roll_key_verdict(&worker, Some(&none), false), PreRollKeys::Missing(worker.clone()),
+        assert_eq!(pre_roll_key_verdict(&worker, Some(&none), false, false), PreRollKeys::Missing(worker.clone()),
             "an active DB row is not enough: compose delivers from the store");
-        let both = pre_roll_key_verdict(&worker, Some(&["trellion".to_string(), "worker".to_string()]), false);
+        let both = pre_roll_key_verdict(&worker, Some(&["trellion".to_string(), "worker".to_string()]), false, false);
         assert_eq!(both, PreRollKeys::Missing(vec!["worker".into(), "trellion".into()]));
+    }
+
+    /// A gateway that answers on `addr` once with `status` and `body`.
+    fn one_shot_gateway(status: u16, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            // The probe may retry after a 401 refresh attempt: serve a few.
+            for _ in 0..3 {
+                let Ok((mut c, _)) = l.accept() else { return };
+                let mut buf = [0u8; 2048];
+                let _ = c.read(&mut buf);
+                let _ = write!(c, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        url
+    }
+
+    fn probe_globals(url: String) -> crate::Globals {
+        crate::Globals { json: false, verbose: false, gateway_override: Some(url), timeout_secs: Some(5), token: Some("t".into()), quiet: false }
+    }
+
+    /// Down is not unreadable: a closed port falls back to the store check
+    /// (with the warning that names the post-roll row), the store check
+    /// still counts, and an answering gateway that cannot be read refuses.
+    #[test]
+    fn a_down_gateway_falls_back_to_the_store_check_but_an_unreadable_one_refuses() {
+        use super::{pre_roll_key_verdict, read_gateway_key_shortfall, unverified_keys_warning, PreRollKeys};
+        let req = vec![("worker".to_string(), "svc:worker".to_string())];
+        let none: Vec<String> = vec![];
+        let worker = vec!["worker".to_string()];
+
+        // Closed port: bind, learn the port, drop the listener.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(format!("http://127.0.0.1:{port}")), &req);
+        assert_eq!((db.as_ref(), down), (None, true), "connection refused means nothing answered");
+        assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::GoUnverified, "store check passed: go, with the warning");
+        assert_eq!(pre_roll_key_verdict(&worker, db.as_deref(), false, down), PreRollKeys::Missing(worker.clone()),
+            "the store check RAN: a keyless store still refuses with the gateway down");
+        let w = unverified_keys_warning(false);
+        assert!(w.contains("the gateway is down") && w.contains("noo cluster verify --controller") && w.contains("`service keys`"), "{w}");
+        assert!(unverified_keys_warning(true).starts_with("--skip-gateway-key-check"));
+
+        // Answers 401 / 500 / garbage: unreadable, refuses.
+        for (st, body) in [(401u16, "{}"), (403, "{}"), (500, "{}"), (200, "not json")] {
+            let (db, down) = read_gateway_key_shortfall(&probe_globals(one_shot_gateway(st, body)), &req);
+            assert_eq!((db.as_ref(), down), (None, false), "{st} {body}");
+            assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::Unverifiable, "{st}");
+        }
+
+        // Answers 200 with the list: today's full check.
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(one_shot_gateway(200, r#"{"keys":[]}"#)), &req);
+        assert!(!down);
+        assert_eq!(db.as_deref(), Some(&worker[..]), "no active key for worker in the listing");
+        assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::Missing(worker.clone()));
     }
 
     #[test]
