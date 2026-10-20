@@ -3273,14 +3273,18 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
             Some("noo upgrade --stack".into()));
     };
     let window = now_unix - start;
-    let mut used = Vec::new();
-    let mut parts = Vec::new();
+    // A lane both sides count (`cluster_hmac_v1`) is named with its side in
+    // the verdict: the gateway's count is callers signing v1 TO it, a node's
+    // is v1 tokens that node admitted, and they need different fixes.
+    let both = |lane: &str| GATEWAY_LEGACY_LANES.contains(&lane) && NODE_LEGACY_LANES.contains(&lane);
+    let mut used: Vec<String> = Vec::new();
+    let mut gateway_parts = Vec::new();
     for lane in GATEWAY_LEGACY_LANES {
         let (n, who) = lane_breakdown(g.lanes.get(*lane).map(Vec::as_slice).unwrap_or(&[]));
         if n > 0 {
-            used.push(*lane);
+            used.push(if both(lane) { format!("{lane} (gateway admitted)") } else { lane.to_string() });
         }
-        parts.push(format!("{lane} {n}{who}"));
+        gateway_parts.push(format!("{lane} {n}{who}"));
     }
     let comparators: Vec<String> = GATEWAY_LANE_COMPARATORS
         .iter()
@@ -3315,12 +3319,13 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
             }
         }
     }
+    let mut node_parts = Vec::new();
     for (lane, total, who) in &node_totals {
         if *total > 0 {
-            used.push(NODE_LEGACY_LANES.iter().find(|l| **l == lane).copied().unwrap_or("node lane"));
+            used.push(if both(lane) { format!("{lane} (nodes admitted)") } else { lane.clone() });
         }
         let who = if who.is_empty() { String::new() } else { format!(" ({})", who.join(", ")) };
-        parts.push(format!("{lane} {total}{who}"));
+        node_parts.push(format!("{lane} {total}{who}"));
     }
 
     let node_window = match shortest_node_window {
@@ -3331,8 +3336,8 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let caveat = if young { " — under 7 days, not yet retirement evidence" } else { "" };
     let unrep = if unreported.is_empty() { String::new() } else { format!("; not reporting: {}", unreported.join(", ")) };
     let detail = format!(
-        "uses since gateway start {} ago{node_window}{caveat}: {} [comparators: {}]{unrep}",
-        age_str(window), parts.join(", "), comparators.join(", ")
+        "uses since gateway start {} ago{node_window}{caveat}: gateway admitted (by caller): {}; nodes admitted (by node): {} [comparators: {}]{unrep}",
+        age_str(window), gateway_parts.join(", "), node_parts.join(", "), comparators.join(", ")
     );
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
@@ -7870,6 +7875,26 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("in use: static_token, whois_non_controller"), "{}", c.detail);
         assert!(c.detail.contains("static_token 7 (host3 7)") && c.detail.contains("whois_non_controller 2 (host9 2)"), "{}", c.detail);
+    }
+
+    /// `cluster_hmac_v1` is counted on both sides. The 0.6.7 roll printed it
+    /// twice with no side named, and "(pop-os 46, …)" read as the nodes'
+    /// count when it was the gateway's: the verdict and the detail say which.
+    #[test]
+    fn the_v1_lane_says_which_side_admitted_it() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1",route_class="cluster"} 46"#,
+        ]);
+        let fleet = vec![lane_node("host3", now, Some(serde_json::json!({ "since_unix": now - 3600, "cluster_hmac_v1": 2 })))];
+        let c = legacy_lanes_check(Some(&text), &fleet, now);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("in use: cluster_hmac_v1 (gateway admitted), cluster_hmac_v1 (nodes admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("gateway admitted (by caller): ") && c.detail.contains("cluster_hmac_v1 46 (pop-os 46)"), "{}", c.detail);
+        assert!(c.detail.contains("nodes admitted (by node): static_token 0, whois_non_controller 0, cluster_hmac_v1 2 (host3 2)"), "{}", c.detail);
+
+        let gateway_only = legacy_lanes_check(Some(&text), &[], now);
+        assert!(gateway_only.detail.contains("in use: cluster_hmac_v1 (gateway admitted) —"), "{}", gateway_only.detail);
     }
 
     /// A zero nobody measured is not a zero: an online node with no report,

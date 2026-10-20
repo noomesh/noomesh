@@ -2032,6 +2032,15 @@ pub fn verify_cluster_token(token: &str) -> bool {
     verify_cluster_token_inner(token, &secret, now)
 }
 
+/// Seconds between a verified v1 token's timestamp and now (signed: a
+/// negative age is a caller clock ahead of this one). `None` when the token
+/// does not parse.
+fn v1_token_age_secs(token: &str) -> Option<i64> {
+    let ts: i64 = token.split(':').nth(1)?.parse().ok()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(now - ts)
+}
+
 /// Replay window; matches the node-agent generator's 5-minute freshness.
 const CLUSTER_MAX_TOKEN_AGE_SECS: u64 = 300;
 
@@ -3357,6 +3366,20 @@ pub async fn require_any_auth(
         } else {
             let u = crate::legacy_lanes::hmac_v1_use(&actor, &path);
             crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            // What the lane log cannot say: which request, and whether a v2
+            // signer touched it. The Go and shell v2 signers always send the
+            // body-hash header, so a v1 token WITH it was replaced after
+            // signing; without it, the caller signed v1 itself.
+            if crate::legacy_lanes::log_due(&format!("hmac_v1_detail|{actor}"), crate::legacy_lanes::HMAC_V1_DETAIL_LOG_EVERY) {
+                let headers = request.headers();
+                tracing::info!(
+                    actor = %actor, method = %request.method(), path = %path,
+                    body_sha_header = headers.contains_key(crate::cluster_token_v2::BODY_SHA_HEADER),
+                    token_age_secs = v1_token_age_secs(&t),
+                    user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
+                    "cluster token v1 admitted: the request it came on"
+                );
+            }
             if !crate::cluster_token_v2::v1_allowed() {
                 tracing::warn!(actor = %actor, path = %path, "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2");
                 return Ok(v1_refusal());

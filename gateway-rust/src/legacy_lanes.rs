@@ -309,6 +309,9 @@ pub const NODE_NO_CERT_LOG_EVERY: Duration = Duration::from_secs(3600);
 pub const HMAC_NON_INFERENCE_LOG_EVERY: Duration = Duration::from_secs(600);
 /// How often the v1-token INFO repeats per caller.
 pub const HMAC_V1_LOG_EVERY: Duration = Duration::from_secs(3600);
+/// How often the v1 request detail (method, path, body-hash header, token
+/// age) repeats per caller: often enough to catch an intermittent sender.
+pub const HMAC_V1_DETAIL_LOG_EVERY: Duration = Duration::from_secs(300);
 /// How often the old-CLI refusal WARN repeats per (caller, route class).
 pub const CLI_REFUSED_LOG_EVERY: Duration = Duration::from_secs(600);
 
