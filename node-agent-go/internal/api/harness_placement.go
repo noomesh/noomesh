@@ -26,10 +26,12 @@ type HarnessPlacement struct {
 	// enums and kind names.
 	Profile json.RawMessage `json:"profile,omitempty"`
 	// ModelContext is the context window, in tokens, the node's chat
-	// backend runs with as far as the agent sets it (Ollama's
+	// backend runs with: as far as the agent sets it (Ollama's
 	// OLLAMA_CONTEXT_LENGTH: the placement's, else the profile's default),
-	// omitted when unknown. The harness tells a foreign CLI its real window
-	// with it (Claude Code assumes 200k for a model it does not know).
+	// else as the running backend reports it (vLLM's max_model_len,
+	// llama-server's per-slot n_ctx: liveChatContext), omitted when
+	// unknown. The harness tells a foreign CLI its real window with it
+	// (Claude Code assumes 200k for a model it does not know).
 	ModelContext int `json:"model_context,omitempty"`
 }
 
@@ -46,6 +48,9 @@ func (s *Server) handleHarnessPlacement(w http.ResponseWriter, r *http.Request) 
 		if hp := s.harnessPlacement(); hp.Placed {
 			if hp.Env == nil {
 				hp.Env = map[string]string{}
+			}
+			if hp.ModelContext == 0 {
+				hp.ModelContext = s.liveChatContext(r.Context())
 			}
 			_ = json.NewEncoder(w).Encode(hp)
 			return
