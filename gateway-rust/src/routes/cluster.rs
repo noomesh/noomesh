@@ -2643,6 +2643,14 @@ pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
 /// (`VLLM_IMAGE` ...), else the compose-rendered `NOO_BACKEND_IMAGE_<X>`,
 /// which carries the digest-pinned ref from the signed stack lock
 /// (`tag@sha256:...`, docker-compose.cluster.yml). Blank values are absent.
+///
+/// A FLOATING ref (`:latest`, or no tag, and no digest) is never sent, from
+/// either variable: it can change under the node with no check, and a
+/// 0.6.7+ agent refuses it anyway. Compose renders `VLLM_IMAGE` into the
+/// locked variable too, so an operator's `VLLM_IMAGE=vllm/vllm-openai:latest`
+/// used to replace the lock's digest-pinned ref outright (awolf ran
+/// `:latest` from a 0.6.6 agent, 2026-10-20). It is skipped, logged, and the
+/// next candidate (or the node's own versioned default) is used.
 pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let (operator, locked) = match backend {
         "vllm" => ("VLLM_IMAGE", "NOO_BACKEND_IMAGE_VLLM"),
@@ -2658,9 +2666,36 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
     [operator, locked]
         .iter()
         .filter(|k| !k.is_empty())
-        .filter_map(|k| get(k))
-        .map(|v| v.trim().to_string())
-        .find(|v| !v.is_empty())
+        .filter_map(|k| get(k).map(|v| (*k, v.trim().to_string())))
+        .filter(|(_, v)| !v.is_empty())
+        .find(|(k, v)| {
+            if is_floating_image_ref(v) {
+                if crate::legacy_lanes::log_due(&format!("floating_backend_image|{k}"), std::time::Duration::from_secs(3600)) {
+                    tracing::warn!(
+                        var = %k, image = %v, backend,
+                        "backend image: refusing to send a floating ref (no digest, tag latest or none) — set it to \
+                         `repo:version@sha256:…`, or unset it to use the signed stack lock's pinned ref"
+                    );
+                }
+                return false;
+            }
+            true
+        })
+        .map(|(_, v)| v)
+}
+
+/// `:latest` or no tag, and no `@sha256:` digest. A registry host with a
+/// port (`host:5000/repo`) is not a tag.
+pub(crate) fn is_floating_image_ref(r: &str) -> bool {
+    let r = r.trim();
+    if r.contains("@sha256:") {
+        return false;
+    }
+    let last = r.rsplit('/').next().unwrap_or(r);
+    match last.rsplit_once(':') {
+        Some((_, tag)) => tag.is_empty() || tag == "latest",
+        None => true,
+    }
 }
 
 /// POST /api/cluster/backends/start — Start a backend on a node.
@@ -7045,6 +7080,30 @@ mod backend_image_ref_tests {
         // llamacpp / embedding forward only an operator override
         assert_eq!(backend_image_ref("llamacpp", &with(&[("LLAMACPP_IMAGE", "a/b:2")])).as_deref(), Some("a/b:2"));
         assert_eq!(backend_image_ref("llamacpp", &with(&[("NOO_BACKEND_IMAGE_LLAMACPP", "a/b:2")])), None);
+    }
+
+    /// A floating override is never forwarded: `VLLM_IMAGE=…:latest` used to
+    /// replace the lock's pinned ref (and compose renders it into the locked
+    /// variable too, so both are skipped and the node keeps its own default).
+    #[test]
+    fn a_floating_ref_is_never_sent() {
+        let over = with(&[("VLLM_IMAGE", "vllm/vllm-openai:latest"), ("NOO_BACKEND_IMAGE_VLLM", PINNED)]);
+        assert_eq!(backend_image_ref("vllm", &over).as_deref(), Some(PINNED), "the lock's ref, not the floating override");
+        let both = with(&[("VLLM_IMAGE", "vllm/vllm-openai:latest"), ("NOO_BACKEND_IMAGE_VLLM", "vllm/vllm-openai:latest")]);
+        assert_eq!(backend_image_ref("vllm", &both), None, "nothing floating is sent; the node uses its versioned default");
+        assert_eq!(backend_image_ref("ollama", &with(&[("OLLAMA_IMAGE", "ollama/ollama")])), None, "no tag is floating");
+        // A version tag without a digest is not floating (a rail node verifies the staged tar).
+        assert_eq!(backend_image_ref("vllm", &with(&[("VLLM_IMAGE", "vllm/vllm-openai:v0.29.0")])).as_deref(), Some("vllm/vllm-openai:v0.29.0"));
+    }
+
+    #[test]
+    fn floating_means_latest_or_untagged_without_a_digest() {
+        for f in ["vllm/vllm-openai:latest", "vllm/vllm-openai", "ollama/ollama", "registry:5000/x/y", "registry:5000/x/y:latest", "x:"] {
+            assert!(super::is_floating_image_ref(f), "{f}");
+        }
+        for p in ["vllm/vllm-openai:v0.25.0", "registry:5000/x/y:1.2", PINNED, "vllm/vllm-openai:latest@sha256:00", "ghcr.io/noomesh/llamacpp:v0.6.7"] {
+            assert!(!super::is_floating_image_ref(p), "{p}");
+        }
     }
 }
 

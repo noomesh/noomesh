@@ -121,11 +121,24 @@ func (c *Client) BackendContainersBeside(adopted map[string]bool) map[string]any
 			}
 			life["telemetry_missing"] = TelemetryMissing(key, env)
 			life["container"] = name
+			// The ref the container was CREATED from, and whether it can move
+			// under it (no digest, tag latest or none, not one of our rail
+			// images). A container an older agent made before the floating-
+			// ref refusal keeps running on it; `noo cluster verify` names it.
+			if res.Container.Config != nil {
+				life["image"], life["image_floating"] = imageFacts(res.Container.Config.Image)
+			}
 			out[key] = life
 		}
 	}
 	markOrphans(out, sidecars, adopted)
 	return out
+}
+
+// imageFacts is the heartbeat's `image` / `image_floating` for one backend
+// container's `Config.Image`.
+func imageFacts(img string) (string, bool) {
+	return img, isFloatingRef(img) && !isOwnImage(img)
 }
 
 // stunnelBackendKey is the backend a stunnel sidecar fronts ("noo-stunnel-
