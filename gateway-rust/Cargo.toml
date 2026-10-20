@@ -13,7 +13,7 @@ description = "Mesh Gateway — Rust implementation"
 axum = { version = "0.8", features = ["ws", "json", "multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 rand = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 # Intelligent-tier entitlement verification (entitlement.rs). Already in the
 # lock via nkeys, so this adds no new code to the trust boundary.
 ed25519-dalek = "2"
@@ -65,7 +65,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Auth
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto", "use_pem"] }
 hmac = "0.13"
 sha2 = "0.11"
 bcrypt = "0.17"
@@ -79,8 +79,8 @@ serde_yaml = "0.9"
 # TLS
 rustls = "0.23"
 tokio-rustls = "0.26"
-x509-parser = "0.16"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+x509-parser = "0.18"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls-pemfile = "2"
 # Mozilla root bundle (TLS_SERVER_ROOTS) used as the fallback trust store in
 # src/tls.rs. 1.x is required: < 1.0.10 trusts distrusted emSign roots
