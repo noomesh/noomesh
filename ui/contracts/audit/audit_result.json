@@ -628,7 +628,6 @@
   "/metrics",
   "/tools/list",
   "/tools/select",
-  "/ui/basic",
   "/upload",
   "/upload/{file_id}",
   "/v1/chat/completions",
