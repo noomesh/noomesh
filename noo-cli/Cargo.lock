@@ -1324,7 +1324,7 @@ dependencies = [
 name = "noo-cli"
 version = "0.6.8"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "crossterm",
  "ed25519-dalek",

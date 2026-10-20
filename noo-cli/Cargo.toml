@@ -19,7 +19,7 @@ sha2 = "0.11.1"
 hex = "0.4"
 # Provision bundles are gzipped before CMS encryption (provision.rs gzip_bundle).
 flate2 = "1"
-base64 = "0.22"
+base64 = "0.23"
 # Intelligent-tier entitlement tokens (entitlement.rs): sign + verify.
 ed25519-dalek = "3"
 serde = { version = "1", features = ["derive"] }
