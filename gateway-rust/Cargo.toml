@@ -75,7 +75,7 @@ serde_yaml = "0.9"
 rustls = "0.23"
 tokio-rustls = "0.26"
 x509-parser = "0.16"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls-pemfile = "2"
 # Mozilla root bundle (TLS_SERVER_ROOTS) used as the fallback trust store in
 # src/tls.rs. 1.x is required: < 1.0.10 trusts distrusted emSign roots
