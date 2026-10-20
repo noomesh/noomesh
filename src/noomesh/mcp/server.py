@@ -40,31 +40,47 @@ logger = structlog.get_logger("noo_mcp_server")
 def _build_server():
     """Create and configure the MCP Server with PAI tools."""
     from mcp.server import Server
-    from mcp.types import TextContent, Tool
+    from mcp.types import (
+        CallToolRequestParams,
+        CallToolResult,
+        ListToolsResult,
+        TextContent,
+        Tool,
+    )
 
+    from ._sdk import invalid_arguments
     from .tool_models import get_enabled_tools, handle_tool_call
 
-    server = Server("mesh")
+    # mcp 2.x: handlers are constructor arguments `(ctx, params) -> Result`,
+    # not decorators (`@server.list_tools()` / `@server.call_tool()` are gone).
+    async def list_tools(ctx, params) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name=t["name"],
+                    description=t["description"],
+                    input_schema=t["input_schema"],
+                )
+                for t in get_enabled_tools()
+            ]
+        )
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name=t["name"],
-                description=t["description"],
-                inputSchema=t["input_schema"],
-            )
-            for t in get_enabled_tools()
-        ]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
+    async def call_tool(ctx, params: CallToolRequestParams) -> CallToolResult:
+        name = params.name
+        bad = invalid_arguments(
+            next((x["input_schema"] for x in get_enabled_tools() if x["name"] == name), None),
+            params.arguments,
+        )
+        if bad is not None:
+            return bad
         try:
-            result = await handle_tool_call(name, arguments or {})
-            return [TextContent(type="text", text=result)]
+            result = await handle_tool_call(name, params.arguments or {})
+            return CallToolResult(content=[TextContent(type="text", text=result)])
         except Exception as exc:
             logger.warning("tool_call_error: %s — %s", name, exc)
-            return [TextContent(type="text", text=f"Error: {exc}")]
+            return CallToolResult(content=[TextContent(type="text", text=f"Error: {exc}")])
+
+    server = Server("mesh", on_list_tools=list_tools, on_call_tool=call_tool)
 
     return server
 
@@ -85,53 +101,25 @@ async def _run_stdio(server) -> None:
         )
 
 
-async def _run_http(server, port: int) -> None:
-    """Run the MCP server over Streamable HTTP.
+def _build_http_app(server):
+    """The Streamable HTTP ASGI app for `server`, served at ``/mcp``.
 
-    Uses a raw ASGI handler instead of Starlette to avoid depending on
-    the private ``Request._send`` attribute and to prevent double-response
-    issues (the MCP transport manages the HTTP response lifecycle itself).
+    mcp 2.x builds this itself (`Server.streamable_http_app`), including the
+    session manager and its lifespan, and serves both protocol eras: the
+    legacy ``initialize`` handshake and the stateless 2026-07-28 revision. The
+    1.x code drove a bare ``StreamableHTTPServerTransport`` from a hand-rolled
+    ASGI function; that constructor and ``connect(scope, receive, send)`` are
+    gone. The bind host is 0.0.0.0, so the SDK's localhost-only DNS-rebinding
+    guard is not auto-enabled, exactly as before.
     """
-    try:
-        from mcp.server.streamable_http import StreamableHTTPServerTransport
-    except ImportError:
-        logger.error(
-            "Streamable HTTP transport not available in this mcp SDK version. "
-            "Try upgrading: pip install 'mcp>=1.0.0'"
-        )
-        sys.exit(1)
+    return server.streamable_http_app(streamable_http_path="/mcp", host="0.0.0.0")
 
+
+async def _run_http(server, port: int) -> None:
+    """Run the MCP server over Streamable HTTP."""
     import uvicorn
 
-    transport = StreamableHTTPServerTransport("/mcp")
-
-    async def mcp_asgi_app(scope, receive, send):
-        if scope["type"] == "lifespan":
-            while True:
-                msg = await receive()
-                if msg["type"] == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
-                elif msg["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    return
-            return
-
-        if scope["type"] != "http" or scope.get("path") != "/mcp":
-            await send({
-                "type": "http.response.start",
-                "status": 404,
-                "headers": [(b"content-type", b"text/plain")],
-            })
-            await send({"type": "http.response.body", "body": b"Not found"})
-            return
-
-        try:
-            async with transport.connect(scope, receive, send) as (read, write):
-                await server.run(read, write, server.create_initialization_options())
-        except Exception:
-            logger.exception("mcp_http_request_error")
-
-    config = uvicorn.Config(mcp_asgi_app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(_build_http_app(server), host="0.0.0.0", port=port, log_level="info")
     uvi = uvicorn.Server(config)
     logger.info("Starting MCP HTTP server on port %d", port)
     await uvi.serve()

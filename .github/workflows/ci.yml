@@ -356,9 +356,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ "$TRELLION_PUBLIC" = "true" ]; then
-          pip install -e ".[trellion,dev,web,cache,db]"
+          pip install -e ".[trellion,dev,web,cache,db,mcp]"
         else
-          pip install -e ".[dev,web,cache,db]"
+          pip install -e ".[dev,web,cache,db,mcp]"
         fi
         # tests/test_whisper_server_decode.py runs the REAL faster-whisper
         # decode_audio against the PyAV the whisper image pins — read from

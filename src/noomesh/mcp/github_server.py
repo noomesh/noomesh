@@ -333,28 +333,45 @@ async def list_repo_files(args: dict) -> str:
 
 def _build_server():
     from mcp.server import Server
-    from mcp.types import TextContent, Tool
+    from mcp.types import (
+        CallToolRequestParams,
+        CallToolResult,
+        ListToolsResult,
+        TextContent,
+        Tool,
+    )
 
-    server = Server("noo-github")
+    from ._sdk import invalid_arguments
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(name=t["name"], description=t["description"], inputSchema=t["input_schema"])
-            for t in TOOLS
-        ]
+    # mcp 2.x: handlers are constructor arguments `(ctx, params) -> Result`,
+    # not decorators (`@server.list_tools()` / `@server.call_tool()` are gone).
+    async def list_tools(ctx, params) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(name=t["name"], description=t["description"], input_schema=t["input_schema"])
+                for t in TOOLS
+            ]
+        )
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
+    async def call_tool(ctx, params: CallToolRequestParams) -> CallToolResult:
+        name = params.name
         handler = _HANDLERS.get(name)
         if not handler:
-            return [TextContent(type="text", text=f"Error: unknown tool '{name}'")]
+            return CallToolResult(content=[TextContent(type="text", text=f"Error: unknown tool '{name}'")])
+        bad = invalid_arguments(
+            next((x["input_schema"] for x in TOOLS if x["name"] == name), None),
+            params.arguments,
+        )
+        if bad is not None:
+            return bad
         try:
-            result = await handler(arguments or {})
-            return [TextContent(type="text", text=result)]
+            result = await handler(params.arguments or {})
+            return CallToolResult(content=[TextContent(type="text", text=result)])
         except Exception as exc:
             logger.warning("tool error: %s — %s", name, exc)
-            return [TextContent(type="text", text=f"Error: {exc}")]
+            return CallToolResult(content=[TextContent(type="text", text=f"Error: {exc}")])
+
+    server = Server("noo-github", on_list_tools=list_tools, on_call_tool=call_tool)
 
     return server
 
