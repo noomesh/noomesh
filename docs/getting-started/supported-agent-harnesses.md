@@ -374,7 +374,7 @@ eval harness in `eval/` runs the same task set under each kind, in turn, on
 one node, and reports a row per kind. A scenario with a `harness_compare:`
 block does it; `eval/scenarios/harness-compare-awolf.yaml` is the sample
 (three tasks: a one-word reply, a question that needs a mesh tool, and a
-two-step delegation, under `noo`, `copilot` and `claude-code`).
+two-step delegation, under `noo`, `copilot`, `claude-code` and `codex`).
 
 **It changes the node's harness placement while it runs.** For each kind it
 sets `NOO_HARNESS_KIND` on the node's `harness` placement (keeping the rest
