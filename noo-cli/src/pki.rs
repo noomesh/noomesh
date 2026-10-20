@@ -3415,3 +3415,15 @@ mod controller_node_names_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod sha1_kat_tests {
+    /// sha1 0.10 -> 0.11: the key identifier digest is byte-identical
+    /// (FIPS 180 test vectors), so existing certs' SKI/AKI chains hold.
+    #[test]
+    fn sha1_of_matches_fips_vectors() {
+        let hex = |b: Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(super::sha1_of(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(hex(super::sha1_of(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+}

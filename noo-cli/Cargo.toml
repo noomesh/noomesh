@@ -19,7 +19,7 @@ sha2 = "0.11.1"
 hex = "0.4"
 # Provision bundles are gzipped before CMS encryption (provision.rs gzip_bundle).
 flate2 = "1"
-base64 = "0.22"
+base64 = "0.23"
 # Intelligent-tier entitlement tokens (entitlement.rs): sign + verify.
 ed25519-dalek = "3"
 serde = { version = "1", features = ["derive"] }
@@ -29,14 +29,14 @@ libc = "0.2"
 # parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 x509-parser = "0.18"
-sha1 = "0.10"
+sha1 = "0.11"
 # "formatting" also serves `config export-effective`'s generated_at stamp.
 time = { version = "0.3", features = ["formatting"] }
 # `onboard` — the setup wizard (zero-Python bootstrap). bcrypt hashes the
 # admin password into secrets/admin_password.txt exactly like Python's
 # step_security (bcrypt.hashpw). serde_yaml round-trips noomesh.yaml for the
 # coordinator backend/model + watched-folder/workspace edits (yaml.dump parity).
-bcrypt = "0.15"
+bcrypt = "0.19"
 serde_yaml = "0.9"
 # Kiosk seats (kiosk_seat.rs `seat_agent`) trust the platform's public roots
 # PLUS the pinned cluster CA, so a seat reaches the controller through the
@@ -52,7 +52,7 @@ webpki-root-certs = "1"
 # ratatui 0.30's crossterm feature links, so no duplicate-crate mismatch).
 ratatui = "0.30"
 crossterm = "0.29"
-rustyline = "15"
+rustyline = "18"
 
 # tests/recovery_rehearsal.rs serves a TLS mock gateway that asks for a
 # client certificate (the operator's). Same rustls + ring the

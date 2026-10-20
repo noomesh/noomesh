@@ -324,3 +324,48 @@ mod tests {
         assert!(core.contains("auth_refresh::hash_token(ticket.trim())"), "the gateway hashes the ticket as sha256 hex");
     }
 }
+
+/// bcrypt crate-upgrade guards (0.15 -> 0.19): hashes written by the old
+/// crate must keep verifying, the cost factors must not drift, and the
+/// >72-byte behaviour is pinned rather than left to the crate's defaults.
+#[cfg(test)]
+mod bcrypt_compat_tests {
+    // Produced by bcrypt 0.15.1 `hash("correct horse battery staple", cost)`.
+    const OLD_COST_11: &str = "$2b$11$r/NlN7sum.DHEUCYEdhb9uK5hVow8WKi9vIno9HNXaqfvQGp.ZZTC";
+    const OLD_DEFAULT_COST: &str = "$2b$12$Esqeyv21p38BucQWsUKBn.nTByoyFKs2RERJFClQEgk8hwExmHx/K";
+    // bcrypt 0.15.1 `hash("x" * 80, 6)`: the old crate truncated at 72 bytes.
+    const OLD_LONG_COST_6: &str = "$2b$06$SSuCX5bo/IF9BiOaNUCp3uqm.r..iG03zNsNx/bvCJdnOXIhhgBTy";
+    const PW: &str = "correct horse battery staple";
+
+    #[test]
+    fn hashes_made_by_bcrypt_0_15_still_verify_and_wrong_passwords_fail() {
+        for h in [OLD_COST_11, OLD_DEFAULT_COST] {
+            assert!(bcrypt::verify(PW, h).unwrap(), "old hash must verify: {h}");
+            assert!(!bcrypt::verify("correct horse battery stapl3", h).unwrap());
+            assert!(!bcrypt::verify("", h).unwrap());
+        }
+    }
+
+    #[test]
+    fn cost_factors_are_unchanged() {
+        // reset_admin uses DEFAULT_COST (12 in 0.15); NATS users use 11.
+        assert_eq!(bcrypt::DEFAULT_COST, 12);
+        let h = bcrypt::hash(PW, bcrypt::DEFAULT_COST).unwrap();
+        assert!(h.starts_with("$2b$12$"), "{h}");
+        assert!(crate::commands::nats_users::nats_bcrypt(PW).unwrap().starts_with("$2b$11$"));
+        assert!(bcrypt::verify(PW, &h).unwrap());
+    }
+
+    #[test]
+    fn over_72_bytes_behaviour_matches_the_old_crate() {
+        // Unchanged from 0.15: `hash` truncates at 72 bytes (an old hash of
+        // 80 bytes verifies against the first 72 and no more). The CLI does
+        // not add a length rule here; see followup i74.
+        let long = "x".repeat(80);
+        assert!(bcrypt::verify(&long, OLD_LONG_COST_6).unwrap());
+        assert!(bcrypt::verify("x".repeat(72), OLD_LONG_COST_6).unwrap());
+        assert!(!bcrypt::verify("x".repeat(71), OLD_LONG_COST_6).unwrap());
+        // The non-truncating API refuses: that is what a hard rule would use.
+        assert!(bcrypt::non_truncating_hash(&long, 4).is_err());
+    }
+}
