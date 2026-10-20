@@ -207,6 +207,7 @@ var portableOpenAIKeys = map[string]bool{
 	"top_p":                 true,
 	"n":                     true,
 	"stream":                true,
+	"stream_options":        true, // include_usage: the harness translator meters streams by it (i147)
 	"stop":                  true,
 	"max_tokens":            true,
 	"max_completion_tokens": true,
@@ -241,7 +242,6 @@ var portableOpenAIKeys = map[string]bool{
 var backendExtraKeys = map[string]map[string]bool{
 	"vllm": {
 		"chat_template_kwargs":    true,
-		"stream_options":          true,
 		"guided_choice":           true,
 		"guided_grammar":          true,
 		"guided_json":             true,

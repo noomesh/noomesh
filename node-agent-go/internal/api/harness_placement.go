@@ -25,6 +25,12 @@ type HarnessPlacement struct {
 	// has none. It holds no secret: the controller's resolution is numbers,
 	// enums and kind names.
 	Profile json.RawMessage `json:"profile,omitempty"`
+	// ModelContext is the context window, in tokens, the node's chat
+	// backend runs with as far as the agent sets it (Ollama's
+	// OLLAMA_CONTEXT_LENGTH: the placement's, else the profile's default),
+	// omitted when unknown. The harness tells a foreign CLI its real window
+	// with it (Claude Code assumes 200k for a model it does not know).
+	ModelContext int `json:"model_context,omitempty"`
 }
 
 // SetHarnessPlacement installs the provider of the node's desired harness

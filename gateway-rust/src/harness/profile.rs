@@ -23,6 +23,12 @@
 //!
 //! `first_byte_secs`, `ollama_context` and `foreign_kinds` are the node
 //! agent's; they are parsed so a report can show them, not applied here.
+//!
+//! Beside `profile`, the placement answer may carry `model_context`: the
+//! context window the node's chat backend runs with, as far as the agent
+//! sets it (Ollama's `OLLAMA_CONTEXT_LENGTH`, the placement's own or the
+//! profile's `ollama_context` default). The driver tells a CLI that takes
+//! one (`launch.context_window_env`) that window ([`resolve_context_window`]).
 
 use serde_json::Value;
 
@@ -147,10 +153,39 @@ pub fn resolve_claude_prompt(explicit: Option<ClaudePrompt>, profile: Option<&Ha
     }
 }
 
+/// `model_context` of a placement answer: a positive whole number of
+/// tokens, else `None` (an older agent, or one that does not know).
+pub fn model_context_of(placement: &Value) -> Option<u64> {
+    placement.get("model_context").and_then(Value::as_u64).filter(|n| *n > 0)
+}
+
+/// The window a CLI with a `launch.context_window_env` is told, and where it
+/// came from: an explicit value (the probe's `--context-tokens`), else the
+/// node agent's `model_context`, else `None`: the variable stays unset and
+/// the CLI keeps its own default.
+pub fn resolve_context_window(explicit: Option<u64>, agent: Option<u64>) -> (Option<u64>, &'static str) {
+    match (explicit, agent) {
+        (Some(n), _) => (Some(n), "flag"),
+        (None, Some(n)) => (Some(n), "agent"),
+        (None, None) => (None, "default"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_model_context_is_the_agents_and_a_flag_beats_it() {
+        assert_eq!(model_context_of(&json!({"kind": "claude-code", "model_context": 32768})), Some(32768));
+        for absent in [json!({"kind": "claude-code"}), json!({"model_context": 0}), json!({"model_context": "32k"}), json!({"model_context": -1})] {
+            assert_eq!(model_context_of(&absent), None, "{absent}");
+        }
+        assert_eq!(resolve_context_window(Some(8192), Some(32768)), (Some(8192), "flag"));
+        assert_eq!(resolve_context_window(None, Some(32768)), (Some(32768), "agent"));
+        assert_eq!(resolve_context_window(None, None), (None, "default"));
+    }
 
     #[test]
     fn the_profile_parses_from_a_placement_answer() {

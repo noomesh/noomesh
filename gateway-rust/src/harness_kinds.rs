@@ -182,6 +182,13 @@ pub struct Launch {
     /// `{system_prompt_file}` in `command`; `None` = no such file.
     #[serde(default)]
     pub system_prompt_file: Option<String>,
+    /// The variable that tells the CLI its model's context window, in
+    /// tokens; the driver sets it from the node agent's `model_context`
+    /// and leaves it unset when that is unknown (noomesh-internal i147:
+    /// Claude Code otherwise assumes 200k for a model it does not know and
+    /// never compacts in time on a 32k node).
+    #[serde(default)]
+    pub context_window_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +307,9 @@ mod tests {
             }
             assert_eq!((&slim.model_url_env, &slim.model_env, &slim.mcp), (&full.model_url_env, &full.model_env, &full.mcp));
             assert_eq!((&slim.api_key_env, &slim.home_env, &slim.model_alias_envs), (&full.api_key_env, &full.home_env, &full.model_alias_envs));
+            // The variable Claude Code's own warning names (i147).
+            assert_eq!(full.context_window_env.as_deref(), Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+            assert_eq!(slim.context_window_env, full.context_window_env);
         }
         let t: Table = serde_json::from_str(FIXTURE).unwrap();
         assert!(t.kinds.iter().all(|k| k.launch_slim.is_none()), "a row without launch_slim parses");

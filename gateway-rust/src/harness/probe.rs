@@ -44,7 +44,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
 use super::driver::{self, build_env, fill_command_without_mcp, spawn_cli_as, with_system_prompt, DriverCtx, McpWiring, RunAs, RunOutput, Verdict, Workspace};
-use super::profile::{resolve_claude_prompt, ClaudePrompt, HarnessProfile};
+use super::profile::{model_context_of, resolve_claude_prompt, resolve_context_window, ClaudePrompt, HarnessProfile};
 use super::probe_mock::{MockCall, MockModel, Script, PROBE_FILE, PROBE_WORD};
 use super::translator::{RouteHit, Translator, UsageTotals};
 use crate::coordinator::{self, ResolvedBackend};
@@ -59,14 +59,17 @@ pub const FILE_PROMPT: &str = "Create a file named probe.txt in the current dire
 
 pub const USAGE: &str = "usage: noo-gateway harness probe --kind <copilot|claude-code|codex> [--cli <path>] [--mock-model]
        [--model-url <url>] [--model <name>] [--backend <vllm|llamacpp|ollama|openai>]
-       [--test <reply|file|both>] [--prompt <full|slim>] [--timeout <secs>] [--run-as <user>] [--keep] [--json]
+       [--test <reply|file|both>] [--prompt <full|slim>] [--context-tokens <n>] [--timeout <secs>]
+       [--run-as <user>] [--keep] [--json]
 
 Runs the kind's vendor CLI once per test, as the harness driver does, against the
 node's model (NOO_HARNESS_MODEL_URL/MODEL/BACKEND, else /etc/noo-harness.env) or,
 with --mock-model, a scripted in-process model. No MCP, no gateway, no service or
 placement change; the workspace is a temp dir, removed unless --keep. As root the
 CLI runs as --run-as (default nobody), never as uid 0. --prompt picks Claude Code's full
-or slim launch (default: the node's harness profile in real mode, else full). Exit 0
+or slim launch (default: the node's harness profile in real mode, else full).
+--context-tokens tells a CLI that takes one (Claude Code) its model's context window
+(default: the node agent's model_context in real mode, else the CLI's own). Exit 0
 only if every test passed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -110,6 +113,9 @@ pub struct ProbeArgs {
     pub tests: Vec<ProbeTest>,
     /// `--prompt`: `None` = the node's profile in real mode, else full.
     pub prompt: Option<ClaudePrompt>,
+    /// `--context-tokens`: `None` = the node agent's `model_context` in
+    /// real mode, else unset.
+    pub context_tokens: Option<u64>,
     pub timeout: u64,
     pub run_as: Option<String>,
     pub keep: bool,
@@ -127,6 +133,7 @@ pub fn parse_args(args: &[String]) -> Result<ProbeArgs, String> {
         backend: None,
         tests: vec![ProbeTest::Reply, ProbeTest::File],
         prompt: None,
+        context_tokens: None,
         timeout: 300,
         run_as: None,
         keep: false,
@@ -171,6 +178,9 @@ pub fn parse_args(args: &[String]) -> Result<ProbeArgs, String> {
             "--prompt" => {
                 let v = value("--prompt")?;
                 a.prompt = Some(ClaudePrompt::parse(&v).ok_or_else(|| format!("--prompt must be full or slim, got {v:?}"))?);
+            }
+            "--context-tokens" => {
+                a.context_tokens = Some(value("--context-tokens")?.parse().ok().filter(|n| *n > 0).ok_or("--context-tokens must be a positive number of tokens")?)
             }
             "--timeout" => a.timeout = value("--timeout")?.parse().ok().filter(|s| *s > 0).ok_or("--timeout must be a positive number of seconds")?,
             "--run-as" => a.run_as = Some(value("--run-as")?),
@@ -326,6 +336,11 @@ pub struct Report {
     /// where the choice came from (`flag`, `profile`, `default`).
     pub prompt: ClaudePrompt,
     pub prompt_source: &'static str,
+    /// The context window the CLI was told (`None` = not set: the kind
+    /// takes none, or it is unknown) and where it came from (`flag`,
+    /// `agent`, `default`).
+    pub context_window: Option<u64>,
+    pub context_source: &'static str,
     pub env_file: Option<String>,
     pub run_as: Option<RunAsUser>,
     pub tests: Vec<TestReport>,
@@ -397,6 +412,9 @@ pub struct Plan {
     /// Which launch runs (only a kind with a `launch_slim` is affected), and why.
     pub prompt: ClaudePrompt,
     pub prompt_source: &'static str,
+    /// The window for `launch.context_window_env`, and why.
+    pub context_window: Option<u64>,
+    pub context_source: &'static str,
 }
 
 fn ctx_for(plan: &Plan, pinned: ResolvedBackend, base: &Path) -> Result<DriverCtx> {
@@ -406,6 +424,7 @@ fn ctx_for(plan: &Plan, pinned: ResolvedBackend, base: &Path) -> Result<DriverCt
     // The gateway is never called: no MCP, no rail.
     let ctx = DriverCtx::new("probe", "http://127.0.0.1:9", &plan.kind, pinned, &|k| e.get(k).cloned())?;
     ctx.prompt.set(plan.prompt);
+    ctx.context_window.set(plan.context_window);
     Ok(ctx)
 }
 
@@ -567,6 +586,8 @@ pub async fn run_plan(plan: &Plan) -> Result<Report> {
         model_url,
         prompt: if plan.kind.launch_slim.is_some() { plan.prompt } else { ClaudePrompt::Full },
         prompt_source: plan.prompt_source,
+        context_window: plan.kind.launch.as_ref().and_then(|l| l.context_window_env.as_ref()).and(plan.context_window),
+        context_source: plan.context_source,
         env_file: plan.env_file.clone(),
         run_as: plan.run_as.clone(),
         pass: !tests.is_empty() && tests.iter().all(|t| t.pass),
@@ -582,6 +603,9 @@ fn print_human(r: &Report) {
     println!("harness probe: kind {} ({} model {} via {})", r.kind, r.mode, r.model, r.model_url);
     println!("  cli: {} — {}", r.cli, r.cli_version.as_deref().unwrap_or("version unknown"));
     println!("  launch: {} ({})", r.prompt.name(), r.prompt_source);
+    if let Some(n) = r.context_window {
+        println!("  context window: {n} tokens ({})", r.context_source);
+    }
     if let Some(u) = &r.run_as {
         println!("  run as: {} (uid {})", u.user, u.uid);
     }
@@ -689,20 +713,27 @@ async fn prepare_and_run(a: &ProbeArgs) -> Result<Report> {
         crate::node_agent_auth::watch_own_agent(crate::tls::cluster_client(), u.url.clone()).await;
     }
     let parent_env: BTreeMap<String, String> = ["PATH", "LANG", "NOO_TLS_CA"].iter().filter_map(|k| get(k).map(|v| (k.to_string(), v))).collect();
-    // Without --prompt, real mode runs what the node's profile says; only
-    // asked of a node agent, and only for a kind with a slim launch.
-    let profile = match upstream.as_ref().filter(|u| a.prompt.is_none() && kind.launch_slim.is_some() && coordinator::is_node_agent_url(&u.url)) {
+    // Without --prompt, real mode runs what the node's profile says, and
+    // without --context-tokens it tells the CLI the agent's model_context;
+    // only asked of a node agent, and only for a kind that has a use for it.
+    let wants_profile = a.prompt.is_none() && kind.launch_slim.is_some();
+    let wants_window = a.context_tokens.is_none() && kind.launch.as_ref().is_some_and(|l| l.context_window_env.is_some());
+    let placement = match upstream.as_ref().filter(|u| (wants_profile || wants_window) && coordinator::is_node_agent_url(&u.url)) {
         Some(u) => match crate::harness_main::fetch_placement(&crate::tls::cluster_client(), &u.url).await {
-            Ok(p) => p.as_ref().and_then(HarnessProfile::from_placement),
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!(error = %e, "probe: could not read the node's harness profile; running the full launch");
+                tracing::warn!(error = %e, "probe: could not read the node's placement; the full launch and the CLI's own window");
                 None
             }
         },
         None => None,
     };
+    let profile = placement.as_ref().and_then(HarnessProfile::from_placement);
     let (prompt, prompt_source) = resolve_claude_prompt(a.prompt, profile.as_ref());
-    let plan = Plan { kind, cli, upstream, tests: a.tests.clone(), timeout: Duration::from_secs(a.timeout), run_as, keep: a.keep, env_file, parent_env, prompt, prompt_source };
+    let (context_window, context_source) = resolve_context_window(a.context_tokens, placement.as_ref().and_then(model_context_of));
+    let plan = Plan {
+        kind, cli, upstream, tests: a.tests.clone(), timeout: Duration::from_secs(a.timeout), run_as, keep: a.keep, env_file, parent_env, prompt, prompt_source, context_window, context_source,
+    };
     run_plan(&plan).await
 }
 
@@ -752,6 +783,17 @@ mod tests {
         assert!(e.contains("--prompt must be full or slim"), "{e}");
         assert!(parse_args(&args(&["--kind", "claude-code", "--prompt"])).unwrap_err().contains("needs a value"));
         assert!(USAGE.contains("--prompt <full|slim>"));
+    }
+
+    #[test]
+    fn the_context_tokens_flag_is_a_positive_number() {
+        assert_eq!(parse_args(&args(&["--kind", "claude-code"])).unwrap().context_tokens, None, "default: the agent's, else the CLI's");
+        assert_eq!(parse_args(&args(&["--kind", "claude-code", "--context-tokens", "32768"])).unwrap().context_tokens, Some(32768));
+        for bad in ["0", "-1", "32k"] {
+            let e = parse_args(&args(&["--kind", "claude-code", "--context-tokens", bad])).unwrap_err();
+            assert!(e.contains("--context-tokens must be"), "{bad}: {e}");
+        }
+        assert!(USAGE.contains("--context-tokens <n>"));
     }
 
     #[test]
@@ -854,7 +896,28 @@ mod tests {
             parent_env: [("PATH".to_string(), std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))].into_iter().collect(),
             prompt: ClaudePrompt::Full,
             prompt_source: "default",
+            context_window: None,
+            context_source: "default",
         }
+    }
+
+    /// The window reaches a CLI that takes one, and the report says so
+    /// (i147); a kind that takes none is told nothing.
+    #[tokio::test]
+    async fn the_probe_tells_the_cli_its_context_window() {
+        let script = r#"[ "$FAKE_MAX_CONTEXT" = 4096 ] || { echo "NOO_FAILED: window ${FAKE_MAX_CONTEXT:-unset}"; exit 0; }; case "$0" in *probe.txt*) printf noomesh > probe.txt; echo "NOO_RESULT: done";; *) echo "NOO_RESULT: ok";; esac"#;
+        let mut k = fake_kind(script);
+        k.launch.as_mut().unwrap().context_window_env = Some("FAKE_MAX_CONTEXT".into());
+        let mut p = plan(k.clone(), false);
+        (p.context_window, p.context_source) = (Some(4096), "flag");
+        let r = run_plan(&p).await.unwrap();
+        assert!(r.pass, "{r:#?}");
+        assert_eq!((r.context_window, r.context_source), (Some(4096), "flag"));
+        let r = run_plan(&plan(k, false)).await.unwrap();
+        assert_eq!(r.tests[0].verdict.as_deref(), Some("NOO_FAILED: window unset"), "{r:#?}");
+        let mut p = plan(fake_kind(r#"echo "NOO_RESULT: ok""#), false);
+        p.context_window = Some(4096);
+        assert_eq!(run_plan(&p).await.unwrap().context_window, None, "a kind with no variable is told nothing");
     }
 
     /// `--prompt slim` runs the kind's slim launch with its system prompt

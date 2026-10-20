@@ -118,9 +118,50 @@ func (r *Reconciler) recordChatPlacement(all []placement) {
 	defer r.harnessMu.Unlock()
 	if !ok {
 		r.chatDesired = nil
+		r.chatOllamaEnv = nil
 		return
 	}
 	r.chatDesired = &p
+	r.chatOllamaEnv = nil
+	if p.Backend == "ollama" {
+		r.chatOllamaEnv = map[string]string{}
+		for k, v := range p.Env {
+			r.chatOllamaEnv[k] = v
+		}
+		if rows := runningOllama(all); len(rows) > 1 {
+			r.chatOllamaEnv, _ = mergeOllamaEnv(rows)
+		}
+	}
+}
+
+// ChatContextWindow is the context window, in tokens, that the node's chat
+// backend runs with as far as the agent sets it, for GET /harness/placement
+// (`model_context`): the harness tells a foreign CLI its model's real window
+// (noomesh-internal i147). Today that is Ollama's OLLAMA_CONTEXT_LENGTH: the
+// placement's own value, else the profile's ollama_context default the agent
+// injects. 0 = not known (another backend, or nothing sets it).
+func (r *Reconciler) ChatContextWindow(prof *harnessprofile.Profile) int {
+	r.harnessMu.RLock()
+	defer r.harnessMu.RUnlock()
+	return ollamaContextOf(r.chatOllamaEnv, prof)
+}
+
+// ollamaContextOf is the OLLAMA_CONTEXT_LENGTH an ollama with env runs
+// with: its own value, else the profile's default; 0 when neither is a
+// positive whole number or env is nil (chat is not on ollama).
+func ollamaContextOf(env map[string]string, prof *harnessprofile.Profile) int {
+	if env == nil {
+		return 0
+	}
+	v := strings.TrimSpace(env[ollamaContextKey])
+	if v == "" {
+		v = profileOllamaContext(env, prof)
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // ChatPlacement is the desired chat placement's backend and model, for

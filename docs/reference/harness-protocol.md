@@ -404,7 +404,10 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    `TMPDIR`, the translator's URL and the pinned model under the kind's
    variable names (none for Codex), a placeholder provider key,
    `NODE_EXTRA_CA_CERTS` (the cluster CA, also under `launch.ca_env`, which
-   is `CODEX_CA_CERTIFICATE` for Codex), then the kind's `lane`, then its
+   is `CODEX_CA_CERTIFICATE` for Codex), the model's context window under
+   `launch.context_window_env` (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` for Claude
+   Code) when the node agent's `/harness/placement` answer carries
+   `model_context`, then the kind's `lane`, then its
    `telemetry_off`, last. No
    `NATS_*` and no `NOO_*` variable reaches the CLI: not the bus pair, not
    the node-agent bearer, not the turn token.
@@ -440,6 +443,16 @@ system prompt there (mode 0600) and passes the path as
 `{system_prompt_file}` in `command`. It removes the file after the run. A
 command that names `{system_prompt_file}` without declaring the file is
 refused at start, and so is a file name that is not a plain name.
+
+`model_context` in the agent's `/harness/placement` answer is the context
+window the node's chat backend runs with, as far as the agent sets it:
+today Ollama's `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else
+the profile's `ollama_context` default. It is absent when the agent does not
+know (another backend, nothing set, an older agent), and then the CLI keeps
+its own default. Without it Claude Code assumes a 200k window for a model it
+does not know, so on a 32k node it never compacts before Ollama truncates
+the prompt. The driver reads the window once per run, and the harness
+re-reads the placement every minute.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`

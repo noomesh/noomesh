@@ -238,6 +238,13 @@ pub async fn run() -> Result<()> {
         if ctx.launch_slim.is_some() {
             tracing::info!("harness: claude_prompt={} source={variant_source}", variant.name());
         }
+        // The model's real window for a CLI that takes one (i147): the
+        // node agent's `model_context`, else the CLI's own default.
+        if let Some(var) = ctx.launch.context_window_env.as_deref() {
+            let (window, window_source) = crate::harness::profile::resolve_context_window(None, model_context_of(&placement));
+            ctx.context_window.set(window);
+            tracing::info!("harness: {var}={} source={window_source}", window.map_or("unset".into(), |n| n.to_string()));
+        }
         Some(Arc::new(ctx))
     };
     // A placement or profile change does not restart the harness (only a
@@ -249,6 +256,7 @@ pub async fn run() -> Result<()> {
         let client = client.clone();
         let model_url = model_url.clone();
         let switch = driver.as_ref().filter(|d| d.launch_slim.is_some()).map(|d| d.prompt.clone());
+        let window = driver.as_ref().filter(|d| d.launch.context_window_env.is_some()).map(|d| d.context_window.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.tick().await;
@@ -269,6 +277,12 @@ pub async fn run() -> Result<()> {
                     let (variant, src) = crate::harness::profile::resolve_claude_prompt(None, profile.as_ref());
                     if sw.set(variant) != variant {
                         tracing::info!("harness: claude_prompt={} source={src} (changed; from the next run)", variant.name());
+                    }
+                }
+                if let Some(w) = &window {
+                    let (now, src) = crate::harness::profile::resolve_context_window(None, model_context_of(&placement));
+                    if w.set(now) != now {
+                        tracing::info!("harness: context window={} source={src} (changed; from the next run)", now.map_or("unset".into(), |n| n.to_string()));
                     }
                 }
                 let placement_idle = placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(|p| placement_env(p, crate::tls::STREAM_IDLE_ENV));
@@ -516,6 +530,11 @@ async fn read_placement(model_url: &str, client: &reqwest::Client) -> Result<Opt
 /// The harness profile in a placement read, if the agent sent one.
 fn profile_of(placement: &Result<Option<serde_json::Value>>) -> Option<crate::harness::profile::HarnessProfile> {
     placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(crate::harness::profile::HarnessProfile::from_placement)
+}
+
+/// `model_context` in a placement read, if the agent sent one.
+fn model_context_of(placement: &Result<Option<serde_json::Value>>) -> Option<u64> {
+    placement.as_ref().ok().and_then(|p| p.as_ref()).and_then(crate::harness::profile::model_context_of)
 }
 
 /// `env.NOO_HARNESS_THINKING` of a placement answer, when set.
