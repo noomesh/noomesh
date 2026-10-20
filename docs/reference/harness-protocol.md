@@ -396,7 +396,9 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    `CODEX_HOME` (`home/.codex/`). Codex takes its model URL from no
    variable, so that file names the translator as a provider
    (`base_url = <translator>/v1`, `wire_api = "responses"`) and the pinned
-   model, adds the user door as a streamable-HTTP MCP server, sets
+   model (with `model_context_window` when the agent reports
+   `model_context`, below), adds the user door as a streamable-HTTP MCP
+   server, sets
    `approval_policy = "never"` with `sandbox_mode = "danger-full-access"` (the harness's Landlock jail is the sandbox; Codex's own bubblewrap cannot run inside it),
    and switches Codex's reporting off
    ([../security/telemetry.md](../security/telemetry.md#agent-harnesses)).
@@ -452,10 +454,13 @@ running backend (vLLM's `max_model_len` from `GET /v1/models`, llama-server's
 per-slot `n_ctx` from `GET /props`, which is `--ctx-size` divided across its
 parallel slots), bounded at 2 seconds. It is absent when the agent does not
 know (another backend, nothing set, the backend not answering, an older
-agent), and then the CLI keeps its own default. Without it Claude Code assumes a 200k window for a model it
-does not know, so on a 32k node it never compacts before Ollama truncates
-the prompt. The driver reads the window once per run, and the harness
-re-reads the placement every minute.
+agent), and then the CLI keeps its own default. Claude Code gets it as
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` (`launch.context_window_env`), Codex as
+`model_context_window` in its `config.toml`; Copilot CLI has no setting for
+it. Without it Claude Code assumes a 200k window for a model it does not
+know, so on a 32k node it never compacts before Ollama truncates the
+prompt. The driver reads the window once per run, and the harness re-reads
+the placement every minute.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`

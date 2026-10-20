@@ -462,7 +462,8 @@ impl Workspace {
             McpWiring::Door { gateway, key } => Some((gateway, key)),
             McpWiring::None => None,
         };
-        write_private(&path, codex_config(&base, &ctx.pinned.model, door).as_bytes())?;
+        let config = codex_config(&base, &ctx.pinned.model, door, ctx.context_window.get());
+        write_private(&path, config.as_bytes())?;
         Ok(Some(path))
     }
 
@@ -534,6 +535,13 @@ fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
+/// Whether a launch tells its CLI the model's context window: a
+/// `context_window_env` (Claude Code), or Codex's `config.toml`, which the
+/// driver writes with `model_context_window` (noomesh-internal i147).
+pub fn takes_context_window(l: &Launch) -> bool {
+    l.context_window_env.as_deref().is_some_and(|k| !k.is_empty()) || l.mcp == MCP_CODEX_TOML
+}
+
 /// Codex CLI's `config.toml` for one run (`config-file:codex-toml`).
 ///
 /// - The loopback translator is the model provider (`wire_api =
@@ -555,9 +563,13 @@ fn toml_str(s: &str) -> String {
 ///   feedback, the OpenTelemetry exporters (metrics default to Statsig),
 ///   the update check, saved history, hosted web search.
 ///
+/// - `model_context_window` when the node agent knows the model's window
+///   (`model_context`, noomesh-internal i147): Codex sizes its compaction
+///   by it, and a model it does not know otherwise gets its own guess.
+///
 /// `door` is the user door's `(gateway, key)`; `None` writes no
 /// `[mcp_servers]` table at all (`harness probe`'s no-MCP run).
-pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> String {
+pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>, context_window: Option<u64>) -> String {
     let mcp = match door {
         Some((gateway, key)) => {
             let mcp_url = format!("{}/mcp/user", gateway.trim_end_matches('/'));
@@ -573,10 +585,12 @@ pub fn codex_config(base_url: &str, model: &str, door: Option<(&str, &str)>) -> 
         }
         None => String::new(),
     };
+    let window = context_window.map(|n| format!("model_context_window = {n}\n")).unwrap_or_default();
     format!(
         "# Written by the noomesh harness for one run; removed when it ends.\n\
          model = {model}\n\
          model_provider = {provider}\n\
+         {window}\
          approval_policy = \"never\"\n\
          sandbox_mode = \"danger-full-access\"\n\
          web_search = \"disabled\"\n\
@@ -1679,6 +1693,7 @@ mod tests {
         let root = scratch("codex");
         let k = codex_kind(&["codex", "exec", "{prompt}"]);
         let ctx = ctx_for(&k, &root, "30");
+        ctx.context_window.set(Some(32768));
         let ws = Workspace::create(&root, "t-codex", false).unwrap();
         let p = ws.write_cli_config(&ctx, "http://127.0.0.1:41234/", "noo-sk-door-1").unwrap();
         assert_eq!(p, ws.home.join(".codex").join("config.toml"));
@@ -1692,6 +1707,7 @@ mod tests {
         for line in [
             "model = \"gemma-4\"",
             "model_provider = \"noomesh\"",
+            "model_context_window = 32768",
             "approval_policy = \"never\"",
             "sandbox_mode = \"danger-full-access\"",
             "web_search = \"disabled\"",
@@ -1770,9 +1786,27 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("base_url = \"http://127.0.0.1:41234/v1\"") && text.contains("[analytics]"), "{text}");
         assert!(!text.contains("mcp_servers") && !text.contains("Bearer"), "{text}");
-        assert!(codex_config("b", "m", Some(("https://g", "k"))).contains("[mcp_servers.noomesh]"));
+        assert!(codex_config("b", "m", Some(("https://g", "k")), None).contains("[mcp_servers.noomesh]"));
+        assert!(!text.contains("model_context_window"), "no window when the agent knows none: {text}");
+        let with = codex_config("b", "m", None, Some(32768));
+        assert!(with.contains("\nmodel_context_window = 32768\napproval_policy"), "{with}");
         ws.finish();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Claude Code takes the window by variable, Codex in its config.toml;
+    /// a kind with neither (Copilot CLI) is told nothing (i147).
+    #[test]
+    fn a_launch_takes_a_window_by_variable_or_codex_config() {
+        let mut k = codex_kind(&["codex", "exec", "{prompt}"]);
+        assert!(takes_context_window(k.launch.as_ref().unwrap()));
+        let l = k.launch.as_mut().unwrap();
+        l.mcp = MCP_CONFIG_FILE.into();
+        assert!(!takes_context_window(l));
+        l.context_window_env = Some(String::new());
+        assert!(!takes_context_window(l), "an empty variable name is none");
+        l.context_window_env = Some("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into());
+        assert!(takes_context_window(l));
     }
 
     #[tokio::test]

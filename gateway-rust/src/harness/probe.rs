@@ -586,7 +586,7 @@ pub async fn run_plan(plan: &Plan) -> Result<Report> {
         model_url,
         prompt: if plan.kind.launch_slim.is_some() { plan.prompt } else { ClaudePrompt::Full },
         prompt_source: plan.prompt_source,
-        context_window: plan.kind.launch.as_ref().and_then(|l| l.context_window_env.as_ref()).and(plan.context_window),
+        context_window: plan.context_window.filter(|_| plan.kind.launch.as_ref().is_some_and(driver::takes_context_window)),
         context_source: plan.context_source,
         env_file: plan.env_file.clone(),
         run_as: plan.run_as.clone(),
@@ -717,7 +717,7 @@ async fn prepare_and_run(a: &ProbeArgs) -> Result<Report> {
     // without --context-tokens it tells the CLI the agent's model_context;
     // only asked of a node agent, and only for a kind that has a use for it.
     let wants_profile = a.prompt.is_none() && kind.launch_slim.is_some();
-    let wants_window = a.context_tokens.is_none() && kind.launch.as_ref().is_some_and(|l| l.context_window_env.is_some());
+    let wants_window = a.context_tokens.is_none() && kind.launch.as_ref().is_some_and(driver::takes_context_window);
     let placement = match upstream.as_ref().filter(|u| (wants_profile || wants_window) && coordinator::is_node_agent_url(&u.url)) {
         Some(u) => match crate::harness_main::fetch_placement(&crate::tls::cluster_client(), &u.url).await {
             Ok(p) => p,
