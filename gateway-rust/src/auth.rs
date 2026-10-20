@@ -6351,3 +6351,72 @@ mod user_read_allowlist_tests {
         assert!(body[floor..first_branch].contains("StatusCode::UNAUTHORIZED"));
     }
 }
+
+/// A token on the v2 wire form is decided as v2 — admitted, or a 401 — and
+/// never reaches the v1 verifier or the `cluster_hmac_v1` count. The 0.6.7
+/// roll counted v1 on agents' heartbeats with no agent-side fallback, and
+/// "the gateway read a v2 token as v1" was the first suspect; these pin
+/// that it cannot.
+#[cfg(test)]
+mod v2_never_counts_as_v1_tests {
+    use super::*;
+
+    const SECRET: &str = "fleet-secret-for-tests";
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_signed_v2_token_never_verifies_as_v1() {
+        for actor in ["host2", "pop-os", "mcmini", "1800000000", "v2", "a"] {
+            for (method, uri, body) in [("POST", "/api/cluster/nodes/x/heartbeat", &b"{}"[..]), ("GET", "/api/cluster/nodes/x/desired-config", &b""[..])] {
+                let tok = crate::cluster_token_v2::sign(SECRET, method, uri, body, actor, NOW, "00112233445566778899aabbccddeeff").unwrap();
+                assert!(crate::cluster_token_v2::is_v2(&tok), "{tok}");
+                assert!(!verify_cluster_token_inner(&tok, SECRET, NOW), "a v2 token passed the v1 verifier: {tok}");
+            }
+        }
+    }
+
+    /// The one string that is both: a v1 token whose actor is literally
+    /// `v2`. It takes the v2 branch (prefix), does not parse as v2, and is
+    /// a 401 — it is not counted as v1 either.
+    #[test]
+    fn a_v1_token_with_the_v2_prefix_is_refused_not_counted() {
+        let v1 = crate::routes::cluster::mint_cluster_token("v2", SECRET, NOW).unwrap();
+        assert!(verify_cluster_token_inner(&v1, SECRET, NOW), "precondition: it is a valid v1 token");
+        assert!(crate::cluster_token_v2::is_v2(&v1), "precondition: it carries the v2 prefix");
+        assert!(crate::cluster_token_v2::parse(&v1).is_none(), "it must not parse as v2, so admit refuses it");
+    }
+
+    /// Structural: in `require_any_auth`, a v2-prefixed token goes to
+    /// `admit_cluster_token_v2` and a failure there RETURNS (no fall-through
+    /// to the v1 path), and the only `cluster_hmac_v1` count is the branch
+    /// where the token did not arrive as v2.
+    #[test]
+    fn the_middleware_decides_a_v2_token_and_counts_v1_only_off_the_v2_path() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let v2 = body.find("if crate::cluster_token_v2::is_v2(&t) {").expect("the v2 branch");
+        let admit = body[v2..].find("admit_cluster_token_v2(").expect("admit") + v2;
+        let arm = &body[admit..admit + 400];
+        assert!(arm.contains("from_v2 = true") && arm.contains("Err(status) => return Err(status)"),
+            "a v2 token must be admitted (from_v2) or refused, never handed on: {arm}");
+        // The call as production writes it (`crate::` and an argument); this
+        // test's own needles carry neither, so they are not counted.
+        let call = ["crate::legacy_lanes::hmac_v1_use(", "&actor"].concat();
+        assert_eq!(src.matches(call.as_str()).count(), 1, "one v1 counting site");
+        let count = body.find("legacy_lanes::hmac_v1_use(").expect("the v1 count");
+        let gate = body[..count].rfind("if from_v2 {").expect("the from_v2 split");
+        assert!(body[gate..count].contains("} else {"), "the v1 count must be the not-from-v2 branch");
+    }
+
+    /// A gateway that has just started has no Redis connection yet: a fresh
+    /// v2 token is still admitted (the local nonce set), and a replay is
+    /// still refused — neither outcome is "not v2".
+    #[tokio::test]
+    async fn at_startup_with_no_redis_a_v2_token_is_still_decided() {
+        let n = "0123456789abcdef0123456789abcdef";
+        let t = crate::cluster_token_v2::sign(SECRET, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", "host7", NOW, n).unwrap();
+        let go = || crate::cluster_token_v2::verify_and_spend(None, SECRET, &t, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", NOW + 1);
+        assert_eq!(go().await.as_deref(), Some("host7"));
+        assert_eq!(go().await, None, "the replay is refused without Redis");
+    }
+}
