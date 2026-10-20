@@ -354,7 +354,9 @@ struct ContextReq {
 /// loop boundary. Distinct from `answer`, which needs a pending question.
 async fn tasks_context(State(state): State<Arc<AppState>>, ctx: Option<Extension<RequesterCtx>>, adt: Option<Extension<AddonDelegation>>, Path(id): Path<String>, Json(req): Json<ContextReq>) -> Result<Response, AppError> {
     use crate::task_context::ContextOutcome;
-    let task = owned(&state, &ctx, &adt, &id).await?;
+    // Context speaks for the owner, like an answer: an operator reads and
+    // stops anyone's task but does not tell it what its owner meant.
+    let task = owner_only(&state, &ctx, &adt, &id).await?;
     if req.revision < 1 {
         return Err(AppError::BadRequest("revision must be an integer >= 1".into()));
     }
@@ -434,7 +436,7 @@ mod owner_tests {
     #[test]
     fn the_budget_ways_out_are_owner_only() {
         let src = include_str!("tasks.rs");
-        for f in ["async fn tasks_resubmit(", "async fn tasks_ask(", "async fn tasks_answer("] {
+        for f in ["async fn tasks_resubmit(", "async fn tasks_ask(", "async fn tasks_answer(", "async fn tasks_context("] {
             let body = &src[src.find(f).expect(f)..];
             let body = &body[..body.find("\n}\n").unwrap()];
             assert!(body.contains("owner_only(&state, &ctx, &adt, &id)"), "{f} must check the owner");

@@ -637,7 +637,7 @@ mod tests {
             conversation_id: "c".into(), thread_id: "thr".into(), channel: "task".into(), model: None, loops: 3,
             loop_budget: 20, last_checkpoint: None, last_note: None, result: None, error: None, created_at: String::new(),
             updated_at: String::new(), parent_id: None, role: None, budget_default: false, stale: false,
-            token_budget: budget, tokens_spent: spent, budget_state: budget_state.map(str::to_string), remaining: None,
+            token_budget: budget, tokens_spent: spent, budget_state: budget_state.map(str::to_string), remaining: None, created_via: None,
         }
     }
 

@@ -453,12 +453,6 @@ pub async fn stop_via(db: &sqlx::PgPool, owner: &str, via: &str) -> Result<Vec<S
     Ok(stopped)
 }
 
-// STUB: replaced by part D (it emits `revoked {reason}`, stops, then emits the final state event).
-/// Stop a task, recording why. The single stop path.
-pub async fn stop_with(db: &sqlx::PgPool, id: &str, _reason: &str) -> Result<bool> {
-    stop(db, id).await
-}
-
 /// How long an `Idempotency-Key` is remembered.
 pub const IDEMPOTENCY_HOURS: i32 = 24;
 
