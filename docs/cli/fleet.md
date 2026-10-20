@@ -614,7 +614,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
-| `noo cluster embedding-space list` | | Show each embedding space, its model and the nodes serving it |
+| `noo cluster embedding-space list` | — | Show each embedding space, its model and the nodes serving it |
 | `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
 | `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
