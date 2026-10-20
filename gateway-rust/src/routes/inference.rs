@@ -1020,6 +1020,10 @@ async fn v1_responses(
     let template = body.clone();
     let outcome = raw_chat::send_with_failover(&state, &class, &cands, stream, "v1", usage_actor, |cand| {
         let mut chat_body = shim::responses_to_chat_request(&template, &cand.model);
+        // reasoning.effort none/minimal: every engine's own switch (i153).
+        if crate::coordinator::thinking::asks_no_reasoning(&chat_body) {
+            crate::coordinator::thinking::disable_on_wire(&mut chat_body, "openai", &cand.backend, false);
+        }
         if stream {
             chat_body["stream_options"] = json!({"include_usage": true});
         }

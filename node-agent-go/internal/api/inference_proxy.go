@@ -253,6 +253,9 @@ var backendExtraKeys = map[string]map[string]bool{
 		"repetition_penalty":      true,
 		"min_tokens":              true,
 		"skip_special_tokens":     true,
+		// low|medium|high only (a Responses reasoning.effort, i153); vLLM
+		// refuses none, so thinking-off uses chat_template_kwargs.
+		"reasoning_effort": true,
 	},
 	"ollama": {
 		"format":     true, // ollama's JSON mode

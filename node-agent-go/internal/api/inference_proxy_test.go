@@ -179,6 +179,13 @@ func TestFilterBodyForBackend(t *testing.T) {
 			backendType: "llamacpp",
 			mustHave:    []string{"stream_options"},
 		},
+		// A Responses reasoning.effort of low|medium|high (i153).
+		{
+			name:        "vllm keeps reasoning_effort",
+			in:          `{"model":"x","messages":[],"reasoning_effort":"high"}`,
+			backendType: "vllm",
+			mustHave:    []string{"reasoning_effort"},
+		},
 		// Unknown backend: pass through
 		{
 			name:        "unknown backend passes body through unchanged",

@@ -359,8 +359,12 @@ freeform `custom` tools (as a function with one string argument `input`)
 and the tools inside a `namespace` (as `<namespace>__<name>`) go to the
 backend; hosted tools such as `web_search` do not. On the way back each call
 is returned under the name, namespace and item type the CLI declared.
-Request fields with no chat equivalent (`store`, `include`, `reasoning`,
-`prompt_cache_key`, ...) are dropped.
+`reasoning.effort` carries over: `none` or `minimal` turns reasoning off
+with every engine's own switch (as the profile's `thinking: off` does), and
+`low`, `medium` or `high` becomes chat's `reasoning_effort`, which vLLM and
+Ollama read. The request's `metadata` is echoed on the response. Request
+fields with no chat equivalent (`store`, `include`, `prompt_cache_key`, ...)
+are dropped.
 
 The translator counts every model call: the reply's usage, or, for a
 stream, its final usage chunk or Ollama's closing object. A reply without

@@ -69,6 +69,8 @@ const HANDLED: &[&str] = &[
     "top_p",
     "text",
     "previous_response_id",
+    "reasoning",
+    "metadata",
 ];
 
 fn now_secs() -> u64 {
@@ -148,9 +150,9 @@ impl ToolNames {
 // ── request: Responses -> chat ──────────────────────────────────────────
 
 /// The request fields this translation drops (non-null ones), for a log
-/// line. `store`, `include`, `reasoning`, `prompt_cache_key`, `metadata`,
-/// `client_metadata`, `service_tier` and the like have no chat equivalent
-/// and are harmless to drop.
+/// line. `store`, `include`, `prompt_cache_key`, `client_metadata`,
+/// `service_tier` and the like have no chat equivalent and are harmless to
+/// drop (noomesh-internal i153 tracks the ones worth mapping).
 pub(crate) fn dropped_fields(body: &Value) -> Vec<String> {
     body.as_object()
         .map(|o| o.iter().filter(|(k, v)| !v.is_null() && !HANDLED.contains(&k.as_str())).map(|(k, _)| k.clone()).collect())
@@ -300,6 +302,11 @@ fn push_call(messages: &mut Vec<Value>, call: Value) {
 /// - `max_output_tokens`, `temperature`, `top_p`, `tool_choice`,
 ///   `parallel_tool_calls`, `stream` and a JSON-schema `text.format` carry
 ///   over. `model` is the client's; the caller pins its own.
+/// - `reasoning.effort` (i153): `none` or `minimal` becomes `reasoning:
+///   {effort: "none"}`, which [`super::thinking::asks_no_reasoning`] reads
+///   and the caller turns into every engine's "do not reason" field
+///   (`thinking::disable_on_wire`); `low`, `medium` and `high` become chat's
+///   `reasoning_effort`.
 pub(crate) fn request_body_from_responses(body: &Value) -> Value {
     let mut system: Vec<String> = Vec::new();
     if let Some(i) = body.get("instructions").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
@@ -416,7 +423,22 @@ pub(crate) fn request_body_from_responses(body: &Value) -> Value {
         }
         out.insert("response_format".into(), json!({"type": "json_schema", "json_schema": schema}));
     }
+    match body.pointer("/reasoning/effort").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
+        Some("none" | "minimal") => {
+            out.insert("reasoning".into(), json!({"effort": "none"}));
+        }
+        Some(e @ ("low" | "medium" | "high")) => {
+            out.insert("reasoning_effort".into(), json!(e));
+        }
+        _ => {}
+    }
     Value::Object(out)
+}
+
+/// The request's `metadata`, echoed on the Responses object (`{}` when it
+/// sent none, as OpenAI answers).
+pub(crate) fn metadata_of(request: &Value) -> Value {
+    request.get("metadata").filter(|m| m.is_object()).cloned().unwrap_or_else(|| json!({}))
 }
 
 // ── response: chat -> Responses ─────────────────────────────────────────
@@ -444,7 +466,8 @@ fn status_for(finish_reason: Option<&str>) -> (&'static str, Value) {
     }
 }
 
-fn response_object(id: &str, model: &str, created_at: u64, status: &str, incomplete: Value, output: Vec<Value>, usage: Option<(u64, u64)>) -> Value {
+#[allow(clippy::too_many_arguments)]
+fn response_object(id: &str, model: &str, created_at: u64, status: &str, incomplete: Value, output: Vec<Value>, usage: Option<(u64, u64)>, metadata: &Value) -> Value {
     json!({
         "id": id,
         "object": "response",
@@ -458,6 +481,7 @@ fn response_object(id: &str, model: &str, created_at: u64, status: &str, incompl
         "tool_choice": "auto",
         "tools": [],
         "usage": usage_json(usage),
+        "metadata": metadata,
     })
 }
 
@@ -505,8 +529,9 @@ fn reasoning_of(v: &Value) -> Option<&str> {
 }
 
 /// An OpenAI assistant message (`choices[0].message`), its finish reason
-/// and the reply's usage (prompt, completion) -> a Responses object.
-pub(crate) fn response_from_chat(message: &Value, finish_reason: Option<&str>, usage: Option<(u64, u64)>, model: &str, names: &ToolNames) -> Value {
+/// and the reply's usage (prompt, completion) -> a Responses object, with
+/// the request's `metadata` ([`metadata_of`]).
+pub(crate) fn response_from_chat(message: &Value, finish_reason: Option<&str>, usage: Option<(u64, u64)>, model: &str, names: &ToolNames, metadata: &Value) -> Value {
     let mut output = Vec::new();
     if let Some(r) = reasoning_of(message) {
         output.push(reasoning_item(&new_id("rs"), r, true));
@@ -526,7 +551,7 @@ pub(crate) fn response_from_chat(message: &Value, finish_reason: Option<&str>, u
         output.push(call_item(&new_id("fc"), &call_id, str_of(f, "name"), &args, "completed", names));
     }
     let (status, incomplete) = status_for(finish_reason);
-    response_object(&new_id("resp"), model, now_secs(), status, incomplete, output, usage)
+    response_object(&new_id("resp"), model, now_secs(), status, incomplete, output, usage, metadata)
 }
 
 // ── the stream ──────────────────────────────────────────────────────────
@@ -568,6 +593,8 @@ pub(crate) struct ChatToResponsesSse {
     calls: HashMap<u64, usize>,
     finish_reason: Option<String>,
     usage: Option<(u64, u64)>,
+    /// The request's `metadata`, on every response snapshot.
+    metadata: Value,
 }
 
 impl ChatToResponsesSse {
@@ -584,7 +611,14 @@ impl ChatToResponsesSse {
             calls: HashMap::new(),
             finish_reason: None,
             usage: None,
+            metadata: json!({}),
         }
+    }
+
+    /// Echo the request's `metadata` ([`metadata_of`]) on every snapshot.
+    pub(crate) fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     fn ev(&mut self, out: &mut Vec<(String, Value)>, name: &str, mut data: Value) {
@@ -595,7 +629,7 @@ impl ChatToResponsesSse {
     }
 
     fn snapshot(&self, status: &str, incomplete: Value, output: Vec<Value>, usage: Option<(u64, u64)>) -> Value {
-        response_object(&self.resp_id, &self.model, self.created_at, status, incomplete, output, usage)
+        response_object(&self.resp_id, &self.model, self.created_at, status, incomplete, output, usage, &self.metadata)
     }
 
     fn start(&mut self, out: &mut Vec<(String, Value)>) {
@@ -906,7 +940,7 @@ mod tests {
         }
         let mut dropped = dropped_fields(&codex_request());
         dropped.sort();
-        assert_eq!(dropped, ["include", "prompt_cache_key", "reasoning", "store"]);
+        assert_eq!(dropped, ["include", "prompt_cache_key", "store"]);
     }
 
     #[test]
@@ -944,7 +978,7 @@ mod tests {
             {"id": "call_9", "type": "function", "function": {"name": "mcp__noomesh__rag_query", "arguments": "{\"q\":1}"}},
             {"id": "", "type": "function", "function": {"name": "apply_patch", "arguments": "{\"input\":\"*** Begin Patch\"}"}},
         ]});
-        let r = response_from_chat(&msg, Some("tool_calls"), Some((10, 5)), "qwen", &names);
+        let r = response_from_chat(&msg, Some("tool_calls"), Some((10, 5)), "qwen", &names, &json!({}));
         assert_eq!((r["object"].as_str(), r["status"].as_str(), r["model"].as_str()), (Some("response"), Some("completed"), Some("qwen")));
         assert!(r["id"].as_str().unwrap().starts_with("resp_"));
         let out = r["output"].as_array().unwrap();
@@ -957,10 +991,44 @@ mod tests {
         assert!(out[3]["call_id"].as_str().unwrap().starts_with("call_"), "a missing call id is minted");
         assert_eq!(r["usage"], json!({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 15}));
 
-        let r = response_from_chat(&json!({"role": "assistant", "content": "cut"}), Some("length"), None, "m", &ToolNames::default());
+        let r = response_from_chat(&json!({"role": "assistant", "content": "cut"}), Some("length"), None, "m", &ToolNames::default(), &json!({}));
         assert_eq!(r["status"], "incomplete");
         assert_eq!(r["incomplete_details"]["reason"], "max_output_tokens");
         assert!(r["usage"].is_null());
+    }
+
+    /// reasoning.effort (i153): none/minimal ask for no reasoning, low to
+    /// high become chat's reasoning_effort; metadata is echoed on the whole
+    /// reply and on every streamed snapshot.
+    #[test]
+    fn reasoning_effort_maps_and_metadata_is_echoed() {
+        use crate::coordinator::thinking::asks_no_reasoning;
+        let chat = |e: &str| request_body_from_responses(&json!({"input": "hi", "reasoning": {"effort": e}}));
+        for e in ["none", "minimal", "MINIMAL"] {
+            let c = chat(e);
+            assert_eq!(c["reasoning"], json!({"effort": "none"}), "{e}: {c}");
+            assert!(c.get("reasoning_effort").is_none() && asks_no_reasoning(&c), "{e}: {c}");
+        }
+        for e in ["low", "medium", "high"] {
+            let c = chat(e);
+            assert_eq!(c["reasoning_effort"], e, "{c}");
+            assert!(c.get("reasoning").is_none() && !asks_no_reasoning(&c), "{e}: {c}");
+        }
+        let c = request_body_from_responses(&json!({"input": "hi", "reasoning": {"summary": "auto"}}));
+        assert!(c.get("reasoning").is_none() && c.get("reasoning_effort").is_none(), "no effort, nothing set: {c}");
+
+        let req = json!({"input": "hi", "metadata": {"ticket": "T-1"}});
+        assert_eq!(metadata_of(&json!({"input": "hi"})), json!({}));
+        let r = response_from_chat(&json!({"role": "assistant", "content": "ok"}), Some("stop"), None, "m", &ToolNames::default(), &metadata_of(&req));
+        assert_eq!(r["metadata"], json!({"ticket": "T-1"}));
+        let mut t = ChatToResponsesSse::new("m", ToolNames::default()).with_metadata(metadata_of(&req));
+        let mut ev = t.on_chunk(&json!({"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}));
+        ev.extend(t.finish());
+        let snapshots: Vec<_> = ev.iter().filter(|(_, d)| d.get("response").is_some()).collect();
+        assert!(snapshots.iter().any(|(n, _)| n == "response.completed"), "{ev:?}");
+        for (name, data) in snapshots {
+            assert_eq!(data["response"]["metadata"], json!({"ticket": "T-1"}), "{name}");
+        }
     }
 
     fn names_of(ev: &[(String, Value)]) -> Vec<&str> {
