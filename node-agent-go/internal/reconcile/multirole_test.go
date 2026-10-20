@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
@@ -154,9 +153,65 @@ func TestEnsureOllamaModels_BothRolesReported(t *testing.T) {
 }
 
 func TestPresenceKey(t *testing.T) {
-	if !strings.HasPrefix(presenceKey("ollama", embedHarrier(), chatGemma()), "ollama#embed") ||
-		presenceKey("ollama", chatGemma(), chatGemma()) != "ollama" {
+	all := []placement{chatGemma(), embedHarrier()}
+	if presenceKey("ollama", embedHarrier(), chatGemma(), all) != "ollama#embed" ||
+		presenceKey("ollama", chatGemma(), chatGemma(), all) != "ollama" {
 		t.Error("presence keys wrong")
+	}
+}
+
+func embedNomicCode() placement {
+	return placement{Backend: "ollama", Model: "nomic-embed-code", Role: "embed", DesiredState: "running",
+		Image: "other", Port: 9999}
+}
+
+// A node serving two embedding spaces: every running row has its OWN key,
+// the first embed keeps "ollama#embed", and Retain keeps all of them.
+func TestPresenceKey_UniquePerEmbedModel(t *testing.T) {
+	rows := runningOllama([]placement{embedNomicCode(), chatGemma(), embedHarrier()})
+	primary := rows[0]
+	got := map[string]string{}
+	for _, p := range rows {
+		k := presenceKey(p.Backend, p, primary, rows)
+		if prev, dup := got[k]; dup {
+			t.Fatalf("key %q shared by %s and %s", k, prev, p.Model)
+		}
+		got[k] = p.Model
+	}
+	want := map[string]string{
+		"ollama":                        "gemma4:26b-a4b-it-qat",
+		"ollama#embed":                  "harrier",
+		"ollama#embed@nomic-embed-code": "nomic-embed-code",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("keys = %v, want %v", got, want)
+	}
+}
+
+// Two embed rows and no chat: the primary (first by model) is the bare
+// backend; the other still gets a distinct key.
+func TestPresenceKey_TwoEmbedsNoChat(t *testing.T) {
+	rows := runningOllama([]placement{embedNomicCode(), embedHarrier()})
+	keys := map[string]bool{}
+	for _, p := range rows {
+		keys[presenceKey(p.Backend, p, rows[0], rows)] = true
+	}
+	if len(keys) != 2 || !keys["ollama"] {
+		t.Errorf("keys = %v, want two distinct, primary bare", keys)
+	}
+}
+
+// Two embed placements on one node are BOTH published as targets, primary
+// (first by model) first.
+func TestResolveEmbedTargets_TwoEmbeds(t *testing.T) {
+	got := resolveEmbedTargets([]placement{chatGemma(), embedNomicCode(), embedHarrier()})
+	if len(got) != 2 || got[0].Model != "harrier" || got[1].Model != "nomic-embed-code" {
+		t.Fatalf("targets = %+v, want harrier then nomic-embed-code", got)
+	}
+	stopped := embedNomicCode()
+	stopped.DesiredState = "stopped"
+	if got := resolveEmbedTargets([]placement{embedHarrier(), stopped}); len(got) != 1 {
+		t.Errorf("a stopped embed row must not be a target: %+v", got)
 	}
 }
 

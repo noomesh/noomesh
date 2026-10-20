@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -640,7 +641,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	if len(ollamaRows) > 0 {
 		primary := ollamaRows[0]
 		for _, p := range ollamaRows {
-			keep[presenceKey(p.Backend, p, primary)] = true
+			keep[presenceKey(p.Backend, p, primary, ollamaRows)] = true
 		}
 	}
 	modelpresence.Retain(keep)
@@ -1174,17 +1175,46 @@ func resolveEmbedTarget(placements []placement) embedtarget.Target {
 	return embedtarget.Target{}
 }
 
-// publishEmbedTarget records the node's declared embedder and logs when it
-// changes. (No on-demand gossip hook exists: the announcer re-derives
+// resolveEmbedTargets is every embedder this node is DECLARED to serve, one
+// per running role=embed row (a node may serve several embedding spaces),
+// ordered by model so the primary is stable. resolveEmbedTarget's rules apply
+// to each row.
+func resolveEmbedTargets(placements []placement) []embedtarget.Target {
+	var embeds []placement
+	for _, p := range placements {
+		if p.Role == "embed" {
+			embeds = append(embeds, p)
+		}
+	}
+	sort.SliceStable(embeds, func(i, j int) bool { return embeds[i].Model < embeds[j].Model })
+	var out []embedtarget.Target
+	for _, p := range embeds {
+		if t := resolveEmbedTarget([]placement{p}); t != (embedtarget.Target{}) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// publishEmbedTarget records the node's declared embedders and logs when
+// they change. (No on-demand gossip hook exists: the announcer re-derives
 // capabilities from embedtarget each of its own intervals.)
 func (r *Reconciler) publishEmbedTarget(placements []placement) {
-	prev := embedtarget.Get()
-	next := resolveEmbedTarget(placements)
-	embedtarget.Set(next)
-	if prev != next {
+	prev := embedtarget.All()
+	next := resolveEmbedTargets(placements)
+	embedtarget.SetAll(next)
+	if !slices.Equal(prev, next) {
+		old, cur := embedtarget.Target{}, embedtarget.Target{}
+		if len(prev) > 0 {
+			old = prev[0]
+		}
+		if len(next) > 0 {
+			cur = next[0]
+		}
 		slog.Info("reconcile.embed_target_changed",
-			"from_backend", prev.Backend, "from_model", prev.Model,
-			"to_backend", next.Backend, "to_model", next.Model)
+			"from_backend", old.Backend, "from_model", old.Model,
+			"to_backend", cur.Backend, "to_model", cur.Model,
+			"targets", len(next))
 	}
 }
 

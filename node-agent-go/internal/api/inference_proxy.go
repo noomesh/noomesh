@@ -898,7 +898,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 // sidecar with a client certificate, or a pre-door container plain until
 // the reconciler recreates it). Override with NOO_LOCAL_EMBED_URL if the
 // embedder is exposed under a different service name/port.
-func (s *Server) localEmbedURL() string {
+func (s *Server) localEmbedURL(t embedtarget.Target) string {
 	if u := strings.TrimSpace(os.Getenv("NOO_LOCAL_EMBED_URL")); u != "" {
 		return strings.TrimRight(u, "/")
 	}
@@ -909,7 +909,6 @@ func (s *Server) localEmbedURL() string {
 	// harrier-on-ollama at 1024 dims — wrong answers, no error. Container
 	// names cannot disambiguate this (ollama serves chat on some nodes and
 	// embeddings on others), so role is the only sound signal.
-	t := embedtarget.Get()
 	if t.Backend != "" {
 		return strings.TrimRight(s.docker.BackendDialURL(t.Backend), "/")
 	}
@@ -929,8 +928,8 @@ func (s *Server) localEmbedURL() string {
 // placement is declared yet). The scheme is the endpoint's own: plaintext
 // loopback ollama, or the self-node's https door (backendClient picks the
 // transport from it).
-func (s *Server) nativeEmbedURL() (string, bool) {
-	backend := embedtarget.Get().Backend
+func (s *Server) nativeEmbedURL(t embedtarget.Target) (string, bool) {
+	backend := t.Backend
 	if backend == "" || s.native == nil {
 		return "", false
 	}
@@ -1006,9 +1005,10 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// lane's own endpoint wins. Before this, every embed request to a Mac
 	// whose embed placement was live answered 503 no_local_embedder while
 	// ollama served the model fine.
-	base, native := s.nativeEmbedURL()
+	tgt := embedTargetFor(body)
+	base, native := s.nativeEmbedURL(tgt)
 	if !native {
-		base = s.localEmbedURL()
+		base = s.localEmbedURL(tgt)
 	}
 
 	// Guard: precise 503 when no embedding container is here (stale gossip).
@@ -1047,11 +1047,11 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// ollama serves many and rejects a request without one — that mismatch
 	// is why a correctly-routed /embed still answered "404 page not found"
 	// (ollama's own 404, copied straight through to the caller).
-	body = ensureEmbedModel(body, embedtarget.Get().Model)
+	body = ensureEmbedModel(body, tgt.Model)
 	// `options` is an ollama knob (the gateway sends num_ctx on every
 	// embed). TEI and other OpenAI-compatible engines have no such field;
 	// keep it from reaching them.
-	if embedtarget.Get().Backend != backendOllama {
+	if tgt.Backend != backendOllama {
 		body = stripEmbedOptions(body)
 		body = stripEmbedKeepAlive(body)
 	}
@@ -1062,7 +1062,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// Skipped for ollama when the caller sent `options` (the gateway sends
 	// num_ctx on every embed): ollama's /v1/embeddings drops them, so the
 	// native /api/embed below is the only route that honours them.
-	if !embedNativeFirst(embedtarget.Get().Backend, body) {
+	if !embedNativeFirst(tgt.Backend, body) {
 		resp, err := post(base+"/v1/embeddings", body)
 		if err != nil {
 			jsonError(w, http.StatusBadGateway, "embedder_unreachable", err.Error())
@@ -1101,7 +1101,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// Native fallback, driven by the dialect registry rather than a chain
 	// of per-engine branches. The backend type comes from the role=embed
 	// placement, so adding an engine is a table entry, not another `if`.
-	d, ok := embedDialects[embedtarget.Get().Backend]
+	d, ok := embedDialects[tgt.Backend]
 	if !ok {
 		// Unknown/undeclared engine: TEI's dialect is the historical
 		// default and the only one every existing deployment has spoken.
@@ -1110,7 +1110,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 
 	model := in.Model
 	if model == "" {
-		model = embedtarget.Get().Model
+		model = tgt.Model
 	}
 
 	nativeReq, err := d.encode(inputs, model, embedOptions(body))
@@ -1118,7 +1118,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "encode_failed", err.Error())
 		return
 	}
-	if embedtarget.Get().Backend == backendOllama {
+	if tgt.Backend == backendOllama {
 		nativeReq = withEmbedKeepAlive(nativeReq, embedKeepAlive(body))
 	}
 	nresp, err := post(base+d.path, nativeReq)
@@ -1138,7 +1138,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		// node-agent has no /embed route" when the route was fine and the
 		// DIALECT was wrong.
 		slog.Warn("embed.native_dialect_failed",
-			"backend", embedtarget.Get().Backend,
+			"backend", tgt.Backend,
 			"path", d.path,
 			"status", nresp.StatusCode)
 		w.Header().Set("Content-Type", "application/json")
@@ -1152,7 +1152,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if model == "" {
-		model = embedtarget.Get().Backend
+		model = tgt.Backend
 	}
 	writeOpenAIEmbeddings(w, vectors, model)
 }
@@ -1203,6 +1203,23 @@ func embedContainerFromURL(base string) string {
 		return ""
 	}
 	return u.Hostname()
+}
+
+// embedTargetFor picks the declared embedder a request is for: the one whose
+// model the body names, else the primary (first) target. A node serving
+// several embedding spaces carries one target per model; a body naming a
+// model this node does not declare is not an error here -- the primary
+// answers as it always did, and the backend itself rejects a model it lacks.
+func embedTargetFor(body []byte) embedtarget.Target {
+	var in struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &in); err == nil {
+		if t, ok := embedtarget.For(in.Model); ok {
+			return t
+		}
+	}
+	return embedtarget.Get()
 }
 
 // ensureEmbedModel injects `model` into an embeddings body that omits it.

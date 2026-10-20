@@ -342,8 +342,13 @@ names another model is discarded and the next node tried. Callers send the
 space as `model` on `/api/external/embeddings` (`knowledge` when absent).
 An embed placement on a model no space uses is refused; a space's model does
 not change by setting (that is a re-embed: declare a new space instead).
-One node agent serves one embed model today, so a node belongs to one
-space's pool.
+A node may serve several spaces: place each model as its own embed row
+(`noo cluster place gpu-2 ollama harrier --role embed`, then the code model
+the same way) and the node joins each space's pool. Placing a second embed
+model on ollama adds a row; chat and rerank placements still replace the
+role's one row, and a backend other than ollama (TEI, llama.cpp) holds one
+embed model, so a second replaces the first. Remove one embed model with
+`noo cluster unplace gpu-2 ollama --role embed --model nomic-embed-code`.
 
 ### Get a model onto the fleet
 
@@ -620,7 +625,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
-| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
+| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement (a role, or one embed model); a container is left running, the harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |

@@ -2112,6 +2112,27 @@ CREATE TABLE IF NOT EXISTS noo_task_event_delivery (
     undelivered_at   timestamptz
 )
 "#,
+}, Migration {
+    revision: EMBED_PLACEMENT_MODEL_REVISION,
+    down_revision: Some(ADDON_DELEGATION_REVISION),
+    // i150 E1: a node may serve several embedding spaces, so the placement
+    // key gains the MODEL for role=embed rows only. chat/rerank/etc. keep
+    // one row per (node, backend, role) (the model slot is the constant ''),
+    // embed gets one row per model. Placing a second embed model ADDS a row;
+    // it no longer replaces the first. No row is rewritten or dropped: every
+    // old triple is unique, so it is trivially unique under the wider key.
+    // `ON CONFLICT` in routes::cluster::PLACEMENT_UPSERT names the same
+    // expression. Guarded by to_regclass like 087.
+    sql: r#"
+DO $$
+BEGIN
+    IF to_regclass('noo_backend_placements') IS NOT NULL THEN
+        DROP INDEX IF EXISTS uq_placement_node_backend_role;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_placement_node_backend_role_model
+            ON noo_backend_placements (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END));
+    END IF;
+END $$
+"#,
 }];
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
@@ -2121,6 +2142,10 @@ pub const HARNESS_PROFILE_REVISION: &str = "096_harness_profile";
 /// The node vendor-kinds revision. A constant so a renumber at rebase is
 /// one line.
 pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
+
+/// Embed placements keyed by model (i150 E1). A constant so a renumber at
+/// rebase is one line.
+pub const EMBED_PLACEMENT_MODEL_REVISION: &str = "100_embed_placement_model";
 
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
@@ -2983,6 +3008,26 @@ mod tests {
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_embedding_spaces"));
         assert!(!m.sql.contains("INSERT"), "a migration cannot read the fleet's embed model; the boot seed does");
         assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
+    }
+
+    /// i150 E1: the embed-placement key is the chain head, sits on the
+    /// prompt-skill proposals revision, and widens the unique index with the model
+    /// for embed rows only.
+    #[test]
+    fn embed_placement_model_revision_is_the_head_and_keys_embed_rows_by_model() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBED_PLACEMENT_MODEL_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "100_embed_placement_model");
+        assert!(m.revision.len() <= 32, "alembic_version.version_num is varchar(32)");
+        assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBED_PLACEMENT_MODEL_REVISION), "the chain head");
+        assert!(m.sql.contains("DROP INDEX IF EXISTS uq_placement_node_backend_role;"));
+        assert!(m.sql.contains(
+            "(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"
+        ));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
+        // The upsert's ON CONFLICT must name the identical expression.
+        assert!(include_str!("routes/cluster.rs")
+            .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
     /// The vendor-kinds revision sits on the audit chain and adds what
