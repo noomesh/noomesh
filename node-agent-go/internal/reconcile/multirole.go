@@ -65,10 +65,24 @@ func primaryPlacement(ps []placement) placement {
 
 // presenceKey is the modelpresence key for p among its backend's running
 // placements: the primary keeps the bare backend name (the single-placement
-// wire shape), every other role is "<backend>#<role>".
-func presenceKey(backend string, p, primary placement) string {
+// wire shape), every other role is "<backend>#<role>". A node may serve
+// several embed models; the first non-primary embed row (in `ordered`, the
+// orderPlacements order) keeps "<backend>#embed" and each further embed model
+// is "<backend>#embed@<model>", so every running row has its own key.
+func presenceKey(backend string, p, primary placement, ordered []placement) string {
 	if roleOf(p) == roleOf(primary) && p.Model == primary.Model {
 		return backend
+	}
+	if roleOf(p) == "embed" {
+		for _, q := range ordered {
+			if roleOf(q) != "embed" || (roleOf(primary) == "embed" && q.Model == primary.Model) {
+				continue
+			}
+			if q.Model != p.Model {
+				return backend + "#embed@" + p.Model
+			}
+			break
+		}
 	}
 	return backend + "#" + roleOf(p)
 }
@@ -276,7 +290,7 @@ func (r *Reconciler) ensureOllamaModels(
 	}
 	primary := ordered[0]
 	for _, p := range ordered {
-		key := presenceKey(p.Backend, p, primary)
+		key := presenceKey(p.Backend, p, primary, ordered)
 		keep[key] = true
 		r.ensureOllamaModel(node, key, p, has, pull)
 	}

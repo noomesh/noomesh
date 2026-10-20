@@ -3692,7 +3692,9 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
     Ok(r.to_string())
 }
 
-/// The placement upsert, keyed (node, backend, ROLE). A const so the
+/// The placement upsert, keyed (node, backend, ROLE) -- and, for role=embed
+/// only, the MODEL (a node may serve several embedding spaces: one embed row
+/// per model; migration 098). A const so the
 /// column/value arity is test-pinned and the DB test runs the real text.
 ///
 /// When the MODEL changes, env does not carry over from the previous model
@@ -3704,7 +3706,7 @@ pub(crate) fn resolve_role(backend: &str, role: Option<&str>) -> Result<String, 
 pub(crate) const PLACEMENT_UPSERT: &str =
     "INSERT INTO noo_backend_placements (node_id, backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes, updated_at) \
      VALUES ($1, $2, $3, $4, $5, COALESCE($6, false), COALESCE($7, '{}'::jsonb), $8, $9, $10, $11, NOW()) \
-     ON CONFLICT (node_id, backend, role) DO UPDATE SET \
+     ON CONFLICT (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END)) DO UPDATE SET \
        env   = CASE WHEN $3::text IS NOT NULL AND $3::text IS DISTINCT FROM noo_backend_placements.model \
                     THEN COALESCE($7, '{}'::jsonb) ELSE COALESCE($7, noo_backend_placements.env) END, \
        target = CASE WHEN $10::text IS NOT NULL THEN $10::text \
@@ -3778,13 +3780,25 @@ fn spec_of(sp: &StoredPlacement) -> Option<crate::placement_fit::Spec> {
     })
 }
 
+/// Whether `e` occupies the slot (backend, role, model): the unique key of
+/// `noo_backend_placements`. The model is part of the key for role=embed only
+/// (migration 098); `None` there matches any embed row on the backend.
+pub(crate) fn same_placement_slot(e: &StoredPlacement, backend: &str, role: &str, model: Option<&str>) -> bool {
+    e.backend == backend
+        && e.role == role
+        && (role != "embed" || model.is_none_or(|m| e.model.as_deref() == Some(m)))
+}
+
 /// Running placements on a node that hold memory (the harness is a host
 /// service, not a model).
-pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &str)>, new: Option<&StoredPlacement>) -> Vec<crate::placement_fit::Spec> {
+///
+/// `replacing` is the (backend, role, model) slot the new row takes over; the
+/// model only matters for role=embed, where each model is its own row.
+pub(crate) fn fit_specs(existing: &[StoredPlacement], replacing: Option<(&str, &str, Option<&str>)>, new: Option<&StoredPlacement>) -> Vec<crate::placement_fit::Spec> {
     let mut specs: Vec<crate::placement_fit::Spec> = existing
         .iter()
         .filter(|e| e.desired_state == "running" && e.backend != "harness")
-        .filter(|e| replacing.map(|(b, r)| !(e.backend == b && e.role == r)).unwrap_or(true))
+        .filter(|e| replacing.map(|(b, r, m)| !same_placement_slot(e, b, r, m)).unwrap_or(true))
         .filter_map(spec_of)
         .collect();
     if let Some(n) = new.filter(|n| n.desired_state == "running" && n.backend != "harness") {
@@ -3925,7 +3939,7 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 async fn placement_put(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
-    Json(body): Json<PlacementBody>,
+    Json(mut body): Json<PlacementBody>,
 ) -> AppResult {
     let desired = body.desired_state.clone().unwrap_or_else(|| "running".into());
     if !matches!(desired.as_str(), "running" | "stopped") {
@@ -3936,6 +3950,28 @@ async fn placement_put(
     // The harness placement: backend `harness` is always role
     // `harness` and nothing else may claim that role.
     let role = resolve_role(&backend, body.role.as_deref()).map_err(AppError::BadRequest)?;
+    // i150 E1: a node may serve several embedding spaces, so an embed row is
+    // keyed by its model too. A body that names none (a bare stop/start, a
+    // tuning edit) can only mean "the" embed row there is exactly one of.
+    if role == "embed" {
+        let named = body.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+        body.model = match named {
+            Some(m) => Some(m),
+            None => {
+                let existing = stored_placements(&state, &node_id).await?;
+                let models: Vec<String> = existing
+                    .iter()
+                    .filter(|e| e.backend == backend && e.role == "embed")
+                    .filter_map(|e| e.model.clone().filter(|m| !m.is_empty()))
+                    .collect();
+                match models.as_slice() {
+                    [one] => Some(one.clone()),
+                    [] => return Err(AppError::BadRequest(format!("an embed placement names its model: pass model=<model> ({backend} on {node_id} has none)"))),
+                    many => return Err(AppError::Conflict(format!("{backend} on {node_id} embeds with several models ({}): name one with model=<model>", many.join(", ")))),
+                }
+            }
+        };
+    }
     // i145: every embedding node serves its space's model, so vectors stay
     // comparable. A model no space uses is refused with the way to add one.
     if role == "embed" && desired == "running" {
@@ -3974,7 +4010,7 @@ async fn placement_put(
     let mut memory_limit: Option<(u64, String)> = None;
     if desired == "running" && backend != "harness" {
         let existing = stored_placements(&state, &node_id).await?;
-        let mine = existing.iter().find(|e| e.backend == backend && e.role == role);
+        let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, body.model.as_deref()));
         let (model, env) = effective_after_upsert(mine, body.model.as_deref(), body.env.as_ref());
         let ptarget = effective_target_after_upsert(mine, body.model.as_deref(), target);
         let proposed = StoredPlacement { backend: backend.clone(), role: role.clone(), model, env, desired_state: "running".into(), target: ptarget };
@@ -3982,7 +4018,7 @@ async fn placement_put(
             let mut node = node_fit_facts(&state, &node_id).await;
             with_size_hint(&mut node, proposed.model.as_deref(), body.model_size_bytes);
             let embed_ctx = crate::embedding_client::EMBED_NUM_CTX;
-            let after = crate::placement_fit::evaluate(&node, &fit_specs(&existing, Some((&backend, &role)), Some(&proposed)), embed_ctx);
+            let after = crate::placement_fit::evaluate(&node, &fit_specs(&existing, Some((&backend, &role, body.model.as_deref())), Some(&proposed)), embed_ctx);
             let before = crate::placement_fit::evaluate(&node, &fit_specs(&existing, None, None), embed_ctx);
             // Refuse only a placement that is over budget AND makes it worse:
             // an edit to a node that was already over (a tuning change) is not
@@ -3996,7 +4032,7 @@ async fn placement_put(
             fit_warnings.extend(after.warnings.iter().cloned());
             // The llama.cpp container's memory limit, from this placement's row.
             if backend == "llamacpp" {
-                if let Some(r) = after.rows.iter().find(|r| r.backend == backend && r.role == role) {
+                if let Some(r) = after.rows.iter().find(|r| r.backend == backend && r.role == role && body.model.as_deref().is_none_or(|m| r.model == m)) {
                     let known = r.weights_gb.is_some() || r.source == "measured";
                     memory_limit = crate::placement_fit::llamacpp_memory_limit(&node, r.total_gb, known, r.target);
                 }
@@ -4035,6 +4071,22 @@ async fn placement_put(
     .await
     .ok();
 
+    // Only ollama hosts several models in one daemon (the node agent honours
+    // just the primary row of any other backend), so a second embed model on
+    // TEI/llamacpp REPLACES the first, as it always did, instead of adding a
+    // row the node could not serve.
+    if role == "embed" && desired == "running" && backend != "ollama" {
+        sqlx::query(
+            "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model IS DISTINCT FROM $3",
+        )
+        .bind(&node_id)
+        .bind(&backend)
+        .bind(&body.model)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("placement replace: {e}")))?;
+    }
+
     sqlx::query(PLACEMENT_UPSERT)
         .bind(&node_id)
         .bind(&backend)
@@ -4063,39 +4115,62 @@ async fn placement_put(
 #[derive(Deserialize)]
 struct PlacementRoleQuery {
     role: Option<String>,
+    /// With `role=embed`: which embed model to remove (a node may serve several).
+    model: Option<String>,
 }
 
-/// DELETE /api/cluster/nodes/{node_id}/placements/{backend}[?role=<role>|all]
+/// DELETE /api/cluster/nodes/{node_id}/placements/{backend}[?role=<role>|all][&model=<model>]
 ///
 /// With `role`, removes that role's placement only. Without one it keeps the
 /// old meaning when it is unambiguous - the backend has exactly one placement,
 /// whatever its role - and is a 409 naming the roles when it has several
-/// (`role=all` removes them all).
+/// (`role=all` removes them all). A node may serve several embed models (one
+/// row each): `model` names which one `role=embed` removes, and an embed
+/// removal that leaves the choice open between several models is a 409
+/// naming them.
 async fn placement_delete(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
     Query(q): Query<PlacementRoleQuery>,
 ) -> AppResult {
-    let roles: Vec<String> = sqlx::query_scalar(
-        "SELECT role FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 ORDER BY role",
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT role, model FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 ORDER BY role, model",
     )
     .bind(&node_id)
     .bind(&backend)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Internal(format!("placement lookup: {e}")))?;
-    let target: Option<&str> = match q.role.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    let mut roles: Vec<String> = rows.iter().map(|(r, _)| r.clone()).collect();
+    roles.dedup();
+    let model = q.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let target: Option<String> = match q.role.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         Some("all") => None,
-        Some(r) => Some(r),
+        Some(r) => Some(r.to_string()),
         None if roles.len() > 1 => {
             return Err(AppError::Conflict(format!(
                 "{backend} on {node_id} has several role placements ({}): name one with role=<role>, or role=all to remove them all",
                 roles.join(", ")
             )))
         }
-        None => None,
+        // One role: the old unambiguous meaning, unless that role is embed
+        // with several models (then the model must be named below).
+        None => roles.first().filter(|r| r.as_str() == "embed").cloned(),
     };
-    let res = match target {
+    if target.as_deref() == Some("embed") && model.is_none() {
+        let models: Vec<&str> = rows.iter().filter(|(r, _)| r == "embed").filter_map(|(_, m)| m.as_deref()).collect();
+        if models.len() > 1 {
+            return Err(AppError::Conflict(format!(
+                "{backend} on {node_id} embeds with several models ({}): name one with model=<model>",
+                models.join(", ")
+            )));
+        }
+    }
+    let res = match target.as_deref() {
+        Some("embed") if model.is_some() => sqlx::query(
+            "DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = 'embed' AND model = $3",
+        )
+        .bind(&node_id).bind(&backend).bind(model).execute(&state.db).await,
         Some(r) => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2 AND role = $3")
             .bind(&node_id).bind(&backend).bind(r).execute(&state.db).await,
         None => sqlx::query("DELETE FROM noo_backend_placements WHERE node_id = $1 AND backend = $2")
@@ -4142,17 +4217,17 @@ async fn placement_fit_post(
             let role = resolve_role(&w.backend, w.role.as_deref()).map_err(AppError::BadRequest)?;
             let target = w.target.as_deref().map(str::trim).filter(|t| !t.is_empty());
             validate_target(&w.backend, target, &node).map_err(AppError::BadRequest)?;
-            let mine = existing.iter().find(|e| e.backend == w.backend && e.role == role);
+            let mine = existing.iter().find(|e| same_placement_slot(e, &w.backend, &role, Some(&w.model)));
             let (model, env) = effective_after_upsert(mine, Some(&w.model), w.env.as_ref());
             let target = effective_target_after_upsert(mine, Some(&w.model), target);
             with_size_hint(&mut node, Some(&w.model), w.model_size_bytes);
-            (Some((w.backend.clone(), role.clone())), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target }))
+            (Some((w.backend.clone(), role.clone(), Some(w.model.clone()))), Some(StoredPlacement { backend: w.backend.clone(), role, model, env, desired_state: "running".into(), target }))
         }
         None => (None, None),
     };
     let report = crate::placement_fit::evaluate(
         &node,
-        &fit_specs(&existing, replacing.as_ref().map(|(b, r)| (b.as_str(), r.as_str())), proposed.as_ref()),
+        &fit_specs(&existing, replacing.as_ref().map(|(b, r, m)| (b.as_str(), r.as_str(), m.as_deref())), proposed.as_ref()),
         crate::embedding_client::EMBED_NUM_CTX,
     );
     let mut out = report.to_json();
@@ -4588,7 +4663,7 @@ async fn embedding_space_put(
     }
     if let Some(other) = spaces.iter().find(|s| s.space != space && es::same_model(&s.model, &model)) {
         return Err(AppError::Conflict(format!(
-            "space '{}' already embeds with '{model}': one model, one space, so a node on it serves exactly one",
+            "space '{}' already embeds with '{model}': one model, one space",
             other.space
         )));
     }
@@ -5364,7 +5439,7 @@ native process)".into());
                 Some(w) => {
                     let backend = w["backend"].as_str().unwrap_or(&plan.backend).to_string();
                     let role = resolve_role(&backend, w["role"].as_str()).map_err(AppError::BadRequest)?;
-                    let mine = existing.iter().find(|e| e.backend == backend && e.role == role);
+                    let mine = existing.iter().find(|e| same_placement_slot(e, &backend, &role, w["model"].as_str()));
                     let (model, env) = effective_after_upsert(mine, w["model"].as_str(), w.get("env").filter(|e| e.is_object()));
                     let target = effective_target_after_upsert(mine, w["model"].as_str(), w["target"].as_str());
                     Some(StoredPlacement { backend, role, model, env, desired_state: "running".into(), target })
@@ -5372,10 +5447,10 @@ native process)".into());
                 None => None,
             };
             let node = node_fit_facts(&state, node_id).await;
-            let replacing = proposed.as_ref().map(|p| (p.backend.clone(), p.role.clone()));
+            let replacing = proposed.as_ref().map(|p| (p.backend.clone(), p.role.clone(), p.model.clone()));
             Some(crate::placement_fit::evaluate(
                 &node,
-                &fit_specs(&existing, replacing.as_ref().map(|(b, r)| (b.as_str(), r.as_str())), proposed.as_ref()),
+                &fit_specs(&existing, replacing.as_ref().map(|(b, r, m)| (b.as_str(), r.as_str(), m.as_deref())), proposed.as_ref()),
                 crate::embedding_client::EMBED_NUM_CTX,
             ).to_json())
         }
@@ -6193,6 +6268,25 @@ mod honesty_tests {
         assert_eq!(v["unmatched"][0]["node"], "host9");
     }
 
+    /// i150: one node serving two spaces has two embed rows; it is in both
+    /// pools, once each.
+    #[test]
+    fn a_node_with_two_embed_rows_is_in_both_spaces_pools() {
+        use crate::embedding_spaces::Space;
+        let spaces = vec![
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024) },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None },
+        ];
+        let p = |m: &str| ("awolf".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
+        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()]);
+        for i in 0..2 {
+            assert_eq!(v["spaces"][i]["pool"].as_array().unwrap().len(), 1, "{v}");
+            assert_eq!(v["spaces"][i]["pool"][0]["node"], "awolf");
+            assert_eq!(v["spaces"][i]["live"], 1);
+        }
+        assert!(v["unmatched"].as_array().unwrap().is_empty());
+    }
+
     // "The system must not lie" audit. Both helpers below exist so the
     // never-fabricate rules are testable without an AppState (repo
     // convention — no DB-backed route harness exists).
@@ -6873,14 +6967,49 @@ mod placement_role_tests {
             stored("harness", "harness", "auto", json!({})),
         ];
         let new = stored("ollama", "embed", "bge-m3", json!({}));
-        let specs = fit_specs(&existing, Some(("ollama", "embed")), Some(&new));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("harrier"))), Some(&new));
         let names: Vec<_> = specs.iter().map(|s| format!("{}/{}", s.role, s.model)).collect();
         assert_eq!(names, vec!["chat/gemma4:26b-a4b-it-qat", "embed/bge-m3"], "harness holds no model memory");
     }
 
     #[test]
+    fn the_fit_set_keeps_other_embed_models_when_one_is_added_or_replaced() {
+        let existing = vec![
+            stored("ollama", "embed", "harrier", json!({})),
+            stored("ollama", "embed", "nomic-embed-code", json!({})),
+        ];
+        // Re-placing nomic replaces only nomic.
+        let new = stored("ollama", "embed", "nomic-embed-code", json!({}));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("nomic-embed-code"))), Some(&new));
+        assert_eq!(specs.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(), vec!["harrier", "nomic-embed-code"]);
+        // Placing a third replaces neither.
+        let third = stored("ollama", "embed", "bge-m3", json!({}));
+        let specs = fit_specs(&existing, Some(("ollama", "embed", Some("bge-m3"))), Some(&third));
+        assert_eq!(specs.len(), 3);
+        // A chat slot ignores the model: chat is one row per backend.
+        let chat = vec![stored("ollama", "chat", "a", json!({}))];
+        let newer = stored("ollama", "chat", "b", json!({}));
+        let specs = fit_specs(&chat, Some(("ollama", "chat", Some("b"))), Some(&newer));
+        assert_eq!(specs.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn placement_slot_is_keyed_by_model_for_embed_only() {
+        let h = stored("ollama", "embed", "harrier", json!({}));
+        assert!(same_placement_slot(&h, "ollama", "embed", Some("harrier")));
+        assert!(!same_placement_slot(&h, "ollama", "embed", Some("bge-m3")));
+        assert!(same_placement_slot(&h, "ollama", "embed", None), "no model names any embed row");
+        let c = stored("ollama", "chat", "a", json!({}));
+        assert!(same_placement_slot(&c, "ollama", "chat", Some("other")), "chat is one row per backend");
+        assert!(!same_placement_slot(&c, "vllm", "chat", None));
+    }
+
+    #[test]
     fn the_upsert_text_is_keyed_by_role_and_resets_env_on_a_model_change() {
-        assert!(PLACEMENT_UPSERT.contains("ON CONFLICT (node_id, backend, role)"));
+        assert!(
+            PLACEMENT_UPSERT.contains("ON CONFLICT (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END)) DO UPDATE"),
+            "the conflict target must be migration 098's index expression: embed rows are keyed by model"
+        );
         assert!(!PLACEMENT_UPSERT.contains("role  = COALESCE"), "role is the key, never inherited");
         // 11 binds, $1..$11 ($10 = the hardware target, $11 = the memory limit).
         assert!(PLACEMENT_UPSERT.contains("$11") && !PLACEMENT_UPSERT.contains("$12"));
@@ -6919,7 +7048,7 @@ mod placement_role_tests {
     }
 
     async fn rows(db: &sqlx::PgPool) -> Vec<(String, String, Option<String>, Value)> {
-        sqlx::query_as("SELECT backend, role, model, env FROM noo_backend_placements WHERE node_id = 'host6' ORDER BY role")
+        sqlx::query_as("SELECT backend, role, model, env FROM noo_backend_placements WHERE node_id = 'host6' ORDER BY role, model")
             .fetch_all(db).await.unwrap()
     }
 
@@ -6952,12 +7081,21 @@ mod placement_role_tests {
         assert_eq!((r[1].1.as_str(), r[1].3.clone()), ("embed", json!({"OLLAMA_NUM_PARALLEL": "4"})));
         assert_eq!(r[0].3, json!({}));
 
-        // Same role, NEW model, no env: the env resets. Same model, no env: it is kept.
+        // i150: a NEW embed model is a second row (a second space on this node), and the first
+        // is untouched. Same model, no env: env is kept.
         upsert(&db, "ollama", Some("bge-m3"), None, "embed").await;
-        assert_eq!(rows(&db).await[1].3, json!({}), "a model change resets env");
+        let r = rows(&db).await;
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert_eq!((r[1].2.as_deref(), r[1].3.clone()), (Some("bge-m3"), json!({})));
+        assert_eq!((r[2].2.as_deref(), r[2].3.clone()), (Some("harrier"), json!({"OLLAMA_NUM_PARALLEL": "4"})));
         upsert(&db, "ollama", Some("bge-m3"), Some(json!({"OLLAMA_NUM_PARALLEL": "2"})), "embed").await;
         upsert(&db, "ollama", Some("bge-m3"), None, "embed").await;
         assert_eq!(rows(&db).await[1].3, json!({"OLLAMA_NUM_PARALLEL": "2"}), "same model keeps env");
+        // chat (one row per backend+role) still REPLACES: a new chat model resets env.
+        upsert(&db, "ollama", Some("gemma4:12b"), None, "chat").await;
+        let r = rows(&db).await;
+        assert_eq!(r.len(), 3, "a new chat model replaces, never adds");
+        assert_eq!((r[0].1.as_str(), r[0].2.as_deref(), r[0].3.clone()), ("chat", Some("gemma4:12b"), json!({})));
 
         // The non-chat set: this ollama has a chat row, so it stays a chat target.
         let nc = crate::repo::cluster::placements_non_chat(&db).await.unwrap();
@@ -7008,14 +7146,27 @@ mod placement_role_tests {
             ("host8".into(), "chat".into(), Some("qwen".into())),
         ], "NULL and blank roles become chat; no row lost");
 
-        // And now the second role lands beside the first.
-        sqlx::query(PLACEMENT_UPSERT)
-            .bind("host6").bind("ollama").bind(Some("harrier".to_string())).bind(None::<String>).bind(None::<i32>)
-            .bind(None::<bool>).bind(None::<Value>).bind("running").bind("embed").bind(None::<String>).bind(None::<i64>)
-            .execute(&db).await.expect("second role after 087");
-        assert_eq!(rows(&db).await.len(), 2);
         // Re-running is harmless.
         sqlx::raw_sql(mig.sql).execute(&db).await.expect("087 is idempotent");
+
+        // 098 widens the key with the model for embed rows (the upsert's ON CONFLICT names it).
+        let m098 = crate::mesh_migrate::MIGRATIONS.iter().find(|m| m.revision == crate::mesh_migrate::EMBED_PLACEMENT_MODEL_REVISION).expect("embed placement model revision");
+        sqlx::raw_sql(m098.sql).execute(&db).await.expect("098");
+        sqlx::raw_sql(m098.sql).execute(&db).await.expect("098 is idempotent");
+
+        // And now the second role lands beside the first.
+        upsert(&db, "ollama", Some("harrier"), None, "embed").await;
+        assert_eq!(rows(&db).await.len(), 2);
+        // A second embed MODEL on the same (node, backend) is its own row; chat is still one row.
+        upsert(&db, "ollama", Some("nomic-embed-code"), None, "embed").await;
+        upsert(&db, "ollama", Some("gemma4:12b"), None, "chat").await;
+        let r = rows(&db).await;
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert_eq!(
+            r.iter().map(|x| (x.1.as_str(), x.2.as_deref())).collect::<Vec<_>>(),
+            vec![("chat", Some("gemma4:12b")), ("embed", Some("harrier")), ("embed", Some("nomic-embed-code"))],
+            "chat replaced in place; both embed models kept"
+        );
         drop_db(&admin, db, "mrp_migrate_test").await;
     }
 }

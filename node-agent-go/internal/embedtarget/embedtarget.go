@@ -18,7 +18,10 @@
 // the role=embed target here each tick and the proxy reads it.
 package embedtarget
 
-import "sync/atomic"
+import (
+	"strings"
+	"sync/atomic"
+)
 
 // Target is the resolved embed backend for this node.
 type Target struct {
@@ -41,18 +44,63 @@ type Target struct {
 	Model string
 }
 
-var current atomic.Value // Target
+var current atomic.Value // []Target
 
-// Set records the embed target for this node. Called by the reconciler on
-// every tick, so it converges after a placement edit without restarting
-// the agent.
+// Set records a single embed target for this node (the zero Target clears
+// it). Kept for callers that only ever name one embedder; the reconciler
+// uses SetAll because a node may serve several embedding spaces.
 func Set(t Target) {
-	current.Store(t)
+	if t == (Target{}) {
+		SetAll(nil)
+		return
+	}
+	SetAll([]Target{t})
 }
 
-// Get returns the recorded target. A zero Target (empty BaseURL) means
-// desired state has not declared an embedder (or has not been fetched yet).
+// SetAll records every embed target this node is declared to serve, primary
+// first (one per embed model: a node can serve several embedding spaces).
+// Called by the reconciler on every tick, so it converges after a placement
+// edit without restarting the agent.
+func SetAll(ts []Target) {
+	current.Store(append([]Target(nil), ts...))
+}
+
+// All returns every recorded target, primary first. The slice is a copy.
+func All() []Target {
+	ts, _ := current.Load().([]Target)
+	return append([]Target(nil), ts...)
+}
+
+// Get returns the primary (first) recorded target. A zero Target (empty
+// BaseURL) means desired state has not declared an embedder (or has not
+// been fetched yet).
 func Get() Target {
-	t, _ := current.Load().(Target)
-	return t
+	ts, _ := current.Load().([]Target)
+	if len(ts) == 0 {
+		return Target{}
+	}
+	return ts[0]
+}
+
+// For returns the target serving model, matched exactly but case-insensitively,
+// and tolerating ollama's implicit ":latest" tag on either side (a placement
+// naming "harrier" serves a request for "harrier:latest" and vice versa).
+// ok=false when no recorded target serves that model; callers fall back to
+// Get() for a request that names no model or an unknown one.
+func For(model string) (Target, bool) {
+	want := normalizeModel(model)
+	if want == "" {
+		return Target{}, false
+	}
+	ts, _ := current.Load().([]Target)
+	for _, t := range ts {
+		if normalizeModel(t.Model) == want {
+			return t, true
+		}
+	}
+	return Target{}, false
+}
+
+func normalizeModel(m string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(m)), ":latest")
 }
