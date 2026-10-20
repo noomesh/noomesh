@@ -2951,7 +2951,7 @@ mod tests {
         }
     }
 
-    /// 096 is the prompt-skill promotion table the gateway reads at boot.
+    /// 099 is the prompt-skill promotion table the gateway reads at boot.
     #[test]
     fn prompt_skill_proposals_revision_sits_on_the_session_floors_and_names_the_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == PROMPT_SKILL_PROPOSALS_REVISION).expect("099 must be in the chain");
