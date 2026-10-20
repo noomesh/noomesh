@@ -1699,8 +1699,13 @@ pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
         .iter()
         .map(|n| format!("{}={}", n["node"].as_str().unwrap_or("?"), n["model"].as_str().unwrap_or("?")))
         .collect();
-    if !dead.is_empty() || !unmatched.is_empty() {
+    let migrating: Vec<String> = spaces
+        .iter()
+        .filter_map(|s| crate::commands::cluster_embedding_space::migration_line(s["space"].as_str().unwrap_or("?"), &s["migration"]))
+        .collect();
+    if !dead.is_empty() || !unmatched.is_empty() || !migrating.is_empty() {
         let mut why: Vec<String> = Vec::new();
+        why.extend(migrating);
         if !dead.is_empty() {
             why.push(format!("no live node for {}", dead.iter().filter_map(|s| s["space"].as_str()).collect::<Vec<_>>().join(", ")));
         }
@@ -5160,6 +5165,12 @@ mod tests {
             "unmatched": [{"node": "host9", "model": "bge-m3"}]}));
         assert!(embedding_spaces_check(Some(&stray)).detail.contains("serving no space: host9=bge-m3"));
         assert_eq!(embedding_spaces_check(None).verdict, super::Verdict::Warn);
+        // A re-embed under way is a warning that names it, never a failure.
+        let moving = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 1,
+            "migration": {"next_model": "bge-m3", "state": "filling", "progress": null}}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&moving));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("re-embedding into bge-m3"), "{}", c.detail);
     }
 
     /// The `default chat` row lists the live candidates in routing order,

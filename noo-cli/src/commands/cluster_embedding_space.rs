@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo cluster embedding-space {list|set|unset}` — embedding spaces (i145).
+//! `noo cluster embedding-space {list|set|unset|migrate}` — embedding spaces (i145).
 //!
 //! A space is a purpose bound to ONE embedding model: `knowledge` (seeded
 //! with the model the fleet already serves), and e.g. a `code` space with
@@ -10,9 +10,9 @@
 //! and never across models, because vectors from two models are not
 //! comparable. Callers name the space as `model` on
 //! `/api/external/embeddings`. A space's model does not change by setting
-//! (that is a re-embed); a new purpose is a new space.
+//! (that is a re-embed: `migrate`); a new purpose is a new space.
 
-use crate::http::{delete_json, get_json, put_json};
+use crate::http::{delete_json, get_json, post_json, put_json};
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
@@ -28,7 +28,7 @@ pub fn cluster_embedding_space_list(g: &Globals, args: &[String]) -> Result<i32,
         return Ok(0);
     }
     println!("{}", ui::header("embedding spaces", Some("one model per space; callers send the space as `model`")));
-    let SpaceRows { rows, no_live: empty_spaces, unmatched } = space_rows(&body);
+    let SpaceRows { rows, no_live: empty_spaces, unmatched, migrations } = space_rows(&body);
     if rows.is_empty() {
         println!("{}", ui::muted("no embedding space recorded yet — the gateway seeds `knowledge` on its next start"));
         return Ok(0);
@@ -37,6 +37,9 @@ pub fn cluster_embedding_space_list(g: &Globals, args: &[String]) -> Result<i32,
         "{}",
         ui::table(&[Col::left("space"), Col::left("model"), Col::right("dims"), Col::left("node"), Col::left("state")], &rows)
     );
+    for line in &migrations {
+        println!("{}", ui::status_line(Glyph::Step, line));
+    }
     for s in &empty_spaces {
         println!("{}", ui::status_line(Glyph::Warn, &format!("{s}: no node is serving it — its embeds fail until one is placed")));
     }
@@ -61,6 +64,24 @@ pub(crate) struct SpaceRows {
     pub rows: Vec<Vec<String>>,
     pub no_live: Vec<String>,
     pub unmatched: Vec<(String, String)>,
+    /// One line per space with a re-embed under way (`migration_line`).
+    pub migrations: Vec<String>,
+}
+
+/// `knowledge: re-embedding into bge-m3 (filling, 120/300 rows)` for one
+/// space's `migration` object; `None` when there is none.
+pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<String> {
+    let next = m["next_model"].as_str()?;
+    let state = m["state"].as_str().unwrap_or("?");
+    let (mut done, mut total) = (0u64, 0u64);
+    if let Some(t) = m["progress"]["tables"].as_object() {
+        for p in t.values() {
+            done += p["done"].as_u64().unwrap_or(0);
+            total += p["total"].as_u64().unwrap_or(0);
+        }
+    }
+    let progress = if m["progress"].is_null() { "no report from trellion yet".to_string() } else { format!("{done}/{total} rows") };
+    Some(format!("{space}: re-embedding into {next} ({state}, {progress})"))
 }
 
 pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
@@ -68,12 +89,14 @@ pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
     let dash = ui::dash();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut no_live: Vec<String> = Vec::new();
+    let mut migrations: Vec<String> = Vec::new();
     for s in body["spaces"].as_array().unwrap_or(&empty) {
         let name = s["space"].as_str().unwrap_or("?");
         let label = if s["default"].as_bool() == Some(true) { format!("{name} (default)") } else { name.to_string() };
         let model = s["model"].as_str().unwrap_or("?");
         let dims = s["dims"].as_u64().map(|d| d.to_string()).unwrap_or_else(|| dash.to_string());
         let pool = s["pool"].as_array().unwrap_or(&empty);
+        migrations.extend(migration_line(name, &s["migration"]));
         if s["live"].as_u64().unwrap_or(0) == 0 {
             no_live.push(name.to_string());
         }
@@ -105,7 +128,7 @@ pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
         .iter()
         .map(|n| (n["node"].as_str().unwrap_or("?").to_string(), n["model"].as_str().unwrap_or("?").to_string()))
         .collect();
-    SpaceRows { rows, no_live, unmatched }
+    SpaceRows { rows, no_live, unmatched, migrations }
 }
 
 /// `noo cluster embedding-space set <space> <model> [--dims <n>]`
@@ -162,9 +185,77 @@ pub fn cluster_embedding_space_unset(g: &Globals, args: &[String]) -> Result<i32
     Ok(0)
 }
 
+/// `noo cluster embedding-space migrate <space> <model> | --complete | --cancel`
+pub fn cluster_embedding_space_migrate(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut positional: Vec<&String> = Vec::new();
+    let (mut complete, mut cancel) = (false, false);
+    for tok in args {
+        match tok.as_str() {
+            "--complete" => complete = true,
+            "--cancel" => cancel = true,
+            t if t.starts_with('-') => return Err(Unhandled),
+            _ => positional.push(tok),
+        }
+    }
+    let base = |space: &str| format!("/api/cluster/embedding-spaces/{}/migration", super::urlencode(space));
+    match (&positional[..], complete, cancel) {
+        ([space, model], false, false) => {
+            // The gateway probes the new model first: allow for its timeout.
+            let resp = post_json(g, &base(space), &serde_json::json!({"model": model}), true, 60);
+            if g.json {
+                println!("{resp}");
+                return Ok(0);
+            }
+            ui::done(&format!(
+                "{space}: re-embedding into {model} ({} dims) started — trellion embeds every row beside the live vectors",
+                resp["next_dims"].as_u64().unwrap_or(0)
+            ));
+            ui::guide(&[
+                ("noo cluster embedding-space list", "shows trellion's progress per space"),
+                ("noo cluster embedding-space migrate <space> --complete", "swaps the space once every row is re-embedded"),
+                ("noo cluster embedding-space migrate <space> --cancel", "abandons the re-embed; the live vectors are untouched"),
+            ]);
+        }
+        ([space], true, false) => {
+            let resp = post_json(g, &format!("{}/complete", base(space)), &serde_json::json!({}), true, 30);
+            if g.json {
+                println!("{resp}");
+                return Ok(0);
+            }
+            ui::done(&format!("{space}: cutover begun — trellion swaps its vectors, then the space's model follows"));
+        }
+        ([space], false, true) => {
+            let resp = delete_json(g, &base(space), true, 15);
+            if g.json {
+                println!("{resp}");
+                return Ok(0);
+            }
+            ui::done(&format!("{space}: re-embed cancelled — the space keeps its model; trellion clears the staged vectors"));
+        }
+        _ => return Err(Unhandled),
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::space_rows;
+    use super::{migration_line, space_rows};
+
+    #[test]
+    fn list_shows_a_migration_line_with_progress() {
+        let body = serde_json::json!({
+            "spaces": [{"space": "knowledge", "model": "harrier", "dims": 1024, "default": true, "live": 1, "pool": [],
+                "migration": {"next_model": "bge-m3", "next_dims": 1024, "state": "filling",
+                    "progress": {"next_model": "bge-m3", "tables": {"a": {"done": 100, "total": 150}, "b": {"done": 20, "total": 150}}}}},
+                {"space": "code", "model": "c", "dims": null, "default": false, "live": 1, "pool": [], "migration": null}],
+            "unmatched": []
+        });
+        let r = space_rows(&body);
+        assert_eq!(r.migrations, ["knowledge: re-embedding into bge-m3 (filling, 120/300 rows)"]);
+        let fresh = serde_json::json!({"next_model": "x", "state": "filling", "progress": null});
+        assert!(migration_line("k", &fresh).unwrap().contains("no report from trellion yet"));
+        assert_eq!(migration_line("k", &serde_json::Value::Null), None);
+    }
 
     #[test]
     fn rows_flag_a_space_with_no_live_node_and_an_unmatched_embedder() {
@@ -177,7 +268,7 @@ mod tests {
             ],
             "unmatched": [{"node": "host9", "backend": "ollama", "model": "bge-m3"}]
         });
-        let super::SpaceRows { rows, no_live, unmatched } = space_rows(&body);
+        let super::SpaceRows { rows, no_live, unmatched, .. } = space_rows(&body);
         assert_eq!(rows.len(), 3, "two pool rows for knowledge, one placeholder for code");
         assert!(rows[0][0].contains("knowledge (default)"));
         assert_eq!(rows[1][0], "", "the space name prints once");

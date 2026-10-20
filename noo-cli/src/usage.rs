@@ -33,6 +33,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "embedding-space", "list"], "", "Show each embedding space, its model and the nodes serving it"),
         (&["cluster", "embedding-space", "set"], "<space> <model> [--dims <n>]", "Declare an embedding space: a purpose bound to one embedding model"),
         (&["cluster", "embedding-space", "unset"], "<space>", "Forget an embedding space; the default (knowledge) cannot be removed"),
+        (&["cluster", "embedding-space", "migrate"], "<space> <model> | <space> --complete | <space> --cancel", "Re-embed a space into a new model: start, complete or cancel"),
         (&["cluster", "logs"], "[<node>] [<service>] [-b|--backend <backend>] [-n|--tail <n>]", "Tail logs for a noo-* container or host service (harness, agent) on one node or all"),
         (&["cluster", "restart-agent"], "<node>", "Ask the gateway to restart a node's node-agent"),
         (&["cluster", "maintenance"], "<node> on --reason <text> [--until <duration>] | <node> off | list", "Mute a known-down node's operator alerts (operator-only); the daily summary still lists it"),
