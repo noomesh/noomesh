@@ -98,28 +98,17 @@ func SignV2(method, requestURI string, body []byte, actor, secret string, at tim
 }
 
 // SetClusterAuth sets the Authorization header on an outbound request to the
-// controller: a v2 token bound to this request's method, target and body, or
-// the v1 token when the body cannot be re-read or v1 is pinned. Call it AFTER
-// the body is attached (http.NewRequest sets GetBody for bytes/strings
-// readers).
+// controller: a v2 token bound to this request's method, target and body. The
+// v1 token goes out only when v1 is pinned (NOO_CLUSTER_TOKEN_SIGN=v1) or the
+// request cannot be signed at all (the body fails to read, no randomness). A
+// body with no GetBody (a stream) is read here, bounded, and put back as
+// bytes so it can be hashed. Call it AFTER the body is attached.
 func SetClusterAuth(req *http.Request, nodeID, secret string) {
 	if secret == "" {
 		return
 	}
 	if !SignV1Only() {
-		var body []byte
-		ok := true
-		if req.Body != nil && req.Body != http.NoBody {
-			if req.GetBody == nil {
-				ok = false
-			} else if rc, err := req.GetBody(); err != nil {
-				ok = false
-			} else {
-				body, err = io.ReadAll(rc)
-				_ = rc.Close()
-				ok = err == nil
-			}
-		}
+		body, ok := signableBody(req)
 		if ok {
 			nonce := make([]byte, 16)
 			if _, err := rand.Read(nonce); err == nil {
@@ -137,6 +126,43 @@ func SetClusterAuth(req *http.Request, nodeID, secret string) {
 		slog.Warn("cluster token: request not signable as v2, sending v1", "method", req.Method, "path", req.URL.Path)
 	}
 	req.Header.Set("Authorization", "Bearer "+CreateClusterToken(nodeID, secret))
+}
+
+// signableBody returns the bytes a v2 token is signed over. A body that can
+// be re-read (GetBody) is read from a copy; one that cannot is read once,
+// up to maxSignedBody, and replaced by those bytes (with a GetBody), so the
+// request still sends exactly what was signed. false: the body failed to
+// read, or is larger than a verifier accepts — the caller then has nothing
+// a v2 token can describe.
+func signableBody(req *http.Request) ([]byte, bool) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return nil, true
+	}
+	if req.GetBody != nil {
+		rc, err := req.GetBody()
+		if err != nil {
+			return nil, false
+		}
+		defer rc.Close()
+		b, err := io.ReadAll(rc)
+		return b, err == nil
+	}
+	orig := req.Body
+	b, err := io.ReadAll(io.LimitReader(orig, maxSignedBody+1))
+	if err != nil || len(b) > maxSignedBody {
+		// Too large (or broken) to sign: send it unchanged, what was read
+		// first and the rest after.
+		req.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(b), orig), orig}
+		return nil, false
+	}
+	_ = orig.Close()
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+	req.ContentLength = int64(len(b))
+	return b, true
 }
 
 // IsV2Token reports whether a bearer is in the v2 wire form.

@@ -88,13 +88,29 @@ def test_every_shell_token_has_a_fresh_nonce(tmp_path):
     assert a.split(":")[3] != b.split(":")[3], "a reused nonce is a replay the gateway would refuse"
 
 
-def test_the_shell_legacy_form_is_only_the_retry(tmp_path):
+def test_the_shell_legacy_form_is_only_the_pin(tmp_path):
     tok = _run_bearer(tmp_path, "v1", "POST", "/x", "{}")
     node, ts, sig = tok.split(":")
     assert node == "host2" and not tok.startswith("v2:")
     assert sig == hmac.new(b"s3cret", f"host2:{ts}".encode(), hashlib.sha256).hexdigest()
     src = FETCH.read_text()
-    assert 'REPORT_CODE" = 401 ] && [ "$_form" = v2 ]' in src, "the v1 retry must be gated on a 401 to a v2 attempt"
+    body = re.search(r"^report_post\(\) \{\n(.*?)^\}", src, re.S | re.M).group(1)
+    # No v1 retry after a 401: that retry was the controller's
+    # cluster_hmac_v1 count of one per node per applied bundle.
+    assert "_form=v1" not in body and "continue" not in body, "report_post must not re-send a refused v2 report as v1"
+    assert '_form="$(node_sign_form)"' in body, "the form comes from the agent env pin, nothing else"
+
+
+def test_the_shell_signs_v1_only_when_the_agent_env_pins_it(tmp_path):
+    src = FETCH.read_text()
+    fn = re.search(r"^node_sign_form\(\) \{\n.*?^\}\n", src, re.S | re.M).group(0)
+    for content, want in [("", "v2"), ("NOO_CLUSTER_TOKEN_SIGN=v2\n", "v2"),
+                          ("NOO_CLUSTER_TOKEN_SIGN=v1\n", "v1"), ("NOO_CLUSTER_TOKEN_SIGN=\"v1\"\r\n", "v1")]:
+        env = tmp_path / "agent.env"
+        env.write_text(content)
+        out = subprocess.run(["/bin/sh", "-c", fn.replace("/etc/noo-node-agent.env", str(env)) + "node_sign_form\n"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        assert out == want, (content, out)
 
 
 def test_the_shell_report_mints_per_attempt_and_sends_the_body_hash():
