@@ -75,7 +75,10 @@ tokio-rustls = "0.26"
 x509-parser = "0.16"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls-pemfile = "2"
-webpki-roots = "0.26"
+# Mozilla root bundle (TLS_SERVER_ROOTS) used as the fallback trust store in
+# src/tls.rs. 1.x is required: < 1.0.10 trusts distrusted emSign roots
+# (RUSTSEC-2026-0381).
+webpki-roots = "1"
 # X.509 parsing for the cert-expiry heartbeat actions. rustls-pemfile decodes
 # PEM but exposes no certificate fields, so `notAfter` was unreachable — the
 # reason those actions stayed in Python.
