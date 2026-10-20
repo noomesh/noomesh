@@ -69,7 +69,9 @@ pub(crate) struct SpaceRows {
 }
 
 /// `knowledge: re-embedding into bge-m3 (filling, 120/300 rows)` for one
-/// space's `migration` object; `None` when there is none.
+/// space's `migration` object; `None` when there is none. Rows trellion has
+/// no source text for (`unsourced`) lose their vector at the cutover, so the
+/// line says how many.
 pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<String> {
     let next = m["next_model"].as_str()?;
     let state = m["state"].as_str().unwrap_or("?");
@@ -77,14 +79,21 @@ pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<Strin
         let err = m["progress"]["error"].as_str().map(|e| format!(" ({e})")).unwrap_or_default();
         return Some(format!("{space}: re-embedding into {next} pending — waiting for a node serving {next}{err}"));
     }
-    let (mut done, mut total) = (0u64, 0u64);
+    let (mut done, mut total, mut unsourced) = (0u64, 0u64, 0u64);
     if let Some(t) = m["progress"]["tables"].as_object() {
         for p in t.values() {
             done += p["done"].as_u64().unwrap_or(0);
             total += p["total"].as_u64().unwrap_or(0);
+            unsourced += p["unsourced"].as_u64().unwrap_or(0);
         }
     }
-    let progress = if m["progress"].is_null() { "no report from trellion yet".to_string() } else { format!("{done}/{total} rows") };
+    let progress = if m["progress"].is_null() {
+        "no report from trellion yet".to_string()
+    } else if unsourced > 0 {
+        format!("{done}/{total} rows; {unsourced} with no source text lose their vector at the cutover")
+    } else {
+        format!("{done}/{total} rows")
+    };
     Some(format!("{space}: re-embedding into {next} ({state}, {progress})"))
 }
 
@@ -271,6 +280,12 @@ mod tests {
         assert_eq!(migration_line("k", &pending).unwrap(), "k: re-embedding into x pending — waiting for a node serving x");
         let wrong = serde_json::json!({"next_model": "x", "state": "pending", "progress": {"error": "width 768"}});
         assert!(migration_line("k", &wrong).unwrap().ends_with("(width 768)"));
+        let lossy = serde_json::json!({"next_model": "x", "state": "filling",
+            "progress": {"tables": {"concepts": {"done": 0, "total": 0, "unsourced": 12}, "pages": {"done": 5, "total": 9}}}});
+        assert_eq!(
+            migration_line("k", &lossy).unwrap(),
+            "k: re-embedding into x (filling, 5/9 rows; 12 with no source text lose their vector at the cutover)"
+        );
     }
 
     #[test]
