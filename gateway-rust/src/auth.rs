@@ -3279,7 +3279,6 @@ pub async fn require_any_auth(
             // delegation on, and only while the account is enabled and no
             // lower than the token's role. Handlers key their isolation on the
             // extension: the add-on sees its own tasks for this person.
-            let mut addon_adt = false;
             if let Some(addon) = crate::addon_delegation::addon_of(&claims) {
                 crate::addon_delegation::confine(&claims, request.method().as_str(), &path)?;
                 if !crate::addon_registry::get(addon).is_some_and(|e| e.delegates_tasks() && e.operator_enabled()) {
@@ -3292,7 +3291,6 @@ pub async fn require_any_auth(
                     return Err(StatusCode::UNAUTHORIZED);
                 }
                 request.extensions_mut().insert(crate::addon_delegation::AddonDelegation { addon: addon.to_string() });
-                addon_adt = true;
             }
             if claims.scopes.iter().any(|s| s == "peer") {
                 let on_peer_surface = path.starts_with("/api/agents/peer")
@@ -3357,11 +3355,9 @@ pub async fn require_any_auth(
             // App-layer RBAC: User-tier callers see everything (GET) but can
             // only mutate the chat/query surface. Operator and above pass
             // (role claim or the legacy write/admin scopes — dual-accept).
-            // (An add-on delegated token is already confined to the task routes
-            // above, and those handlers isolate it to its own tasks: the tier
-            // gate, which keeps a User off task writes, is the person's own
-            // door, not this one.)
-            if !addon_adt && !scope_allows(&claims, request.method(), &path) {
+            // An add-on delegated token passes this gate exactly as its
+            // person would: it never opens a route the person cannot.
+            if !scope_allows(&claims, request.method(), &path) {
                 return Err(StatusCode::FORBIDDEN);
             }
             // Attribute privileged actions (config/admin/delete) to the caller
