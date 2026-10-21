@@ -31,6 +31,9 @@ on:
     # staging and main receive promotion merge PRs: they must be checked like
     # any other PR.
     branches: [ main, staging, develop, dev ]
+    # `labeled`: adding the `full-ci` label re-runs the PR with the Rust
+    # builds on (see "Defer the Rust builds" in the scope job).
+    types: [ opened, synchronize, reopened, labeled ]
   # GitHub's merge queue on `dev`: the queue builds a merge group (the PR(s)
   # rebased onto dev's tip, on a gh-readonly-queue/dev/* branch) and waits for
   # the REQUIRED checks below to pass on it before fast-forwarding dev. Without
@@ -119,6 +122,7 @@ jobs:
       sqlx: ${{ steps.diff.outputs.sqlx }}
       ui: ${{ steps.diff.outputs.ui }}
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
+      deferred: ${{ steps.diff.outputs.deferred }}
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
       with:
@@ -131,6 +135,10 @@ jobs:
         # against the checked-out group head. A push has neither: BASE is empty
         # and everything runs (the integration point is never narrowed).
         BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        # Read by "Defer the Rust builds to the merge queue" below.
+        EVENT: ${{ github.event_name }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
       run: |
         set -eu
         # ── llamacpp: its OWN inputs, on every event ─────────────────────
@@ -230,6 +238,28 @@ jobs:
         # switch is computed at the top of this step, independently, so no
         # future narrowing here can turn the llama-server build back into a
         # tag-time surprise.
+        # ── Defer the Rust builds to the merge queue ─────────────────────
+        # A PR into dev cannot merge except through the merge queue, and the
+        # queue runs this whole workflow again on the merge group, Rust builds
+        # included, before dev moves. Building the same Rust on the PR as well
+        # is a second full build per change that decides nothing the queue
+        # does not decide again. So on a PR into dev the three Rust jobs and
+        # standalone-smoke report green without building; the queue is where
+        # they build, once, on exactly what will land.
+        #
+        # Only PRs into dev: staging and main take promotion PRs that merge
+        # without a queue, so they keep every build. Pushes and merge groups
+        # are never deferred. The `full-ci` label opts a PR back in for early
+        # feedback. Every NON-Rust check (preflight, the Python suite and its
+        # parity guards, go-node-agent, the console, openapi-drift) still runs
+        # on the PR as before.
+        deferred=false
+        if [ "${EVENT:-}" = pull_request ] && [ "${PR_BASE_REF:-}" = dev ] && [ "${FULL_CI:-}" != true ]; then
+          deferred=true
+          gateway=false; cli=false; sqlx=false
+          echo "pull request into dev — Rust builds deferred to the merge queue (label full-ci to build here)"
+        fi
+        echo "deferred=$deferred" >> "$GITHUB_OUTPUT"
         echo "gateway=$gateway" >> "$GITHUB_OUTPUT"
         echo "cli=$cli" >> "$GITHUB_OUTPUT"
         echo "sqlx=$sqlx" >> "$GITHUB_OUTPUT"
@@ -1241,7 +1271,7 @@ jobs:
     # inside the cache save. Remove the preinstalled toolchains this job never
     # uses. continue-on-error so a slow or failed delete is never a red job.
     - name: Free hosted-runner disk
-      if: needs.scope.outputs.code == 'true' && runner.environment == 'github-hosted'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true' && runner.environment == 'github-hosted'
       continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
@@ -1313,11 +1343,11 @@ jobs:
         echo "CARGO_DOCKER_IMAGE=$ref" >> "$GITHUB_ENV"
     - name: Rust toolchain id (cache key)
       id: rustc
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: echo "id=$(docker run --rm "${CARGO_DOCKER_IMAGE:-rust:1-bookworm}" rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
     - name: Restore cargo cache
       id: cargo-cache
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830   # v4
       with:
         path: |
@@ -1330,11 +1360,11 @@ jobs:
           ${{ runner.os }}-cargo-paicli-rustc${{ steps.rustc.outputs.id }}-
 
     - name: Build linux-gnu release binary
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: CARGO_DOCKER_CRATE="$PWD/noo-cli" scripts/cargo-docker.sh build --release --locked
 
     - name: Native surface in a no-Python container
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
@@ -1362,7 +1392,7 @@ jobs:
     # (Pick from the PY_ONLY list in noo-cli/src/passthrough.rs.) The retired
     # `tui` gets its own assertion: native pointer, exit 1, no Python involved.
     - name: PY_ONLY message contract
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
@@ -1390,7 +1420,7 @@ jobs:
     # observe. Runs on a throwaway `alpine` project in ~15s; it needs Docker
     # and nothing else, no stack and no controller.
     - name: Rotation rehearsal (add-on profile skip)
-      if: needs.scope.outputs.code == 'true'
+      if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: scripts/test-rotation-rehearsal.sh
 
   build:
