@@ -29,6 +29,8 @@
 // auto-resumes; `release` hands the node back to the automatic policy. That
 // is how the operator hands the GPU to a stack that refuses to start while
 // the GPU is occupied (pai-voice): hold, start it, later stop it, release.
+// A hold is an owned lease (operation id, owner, generation) and, by
+// default, drains the GPU backends before it stops them: see lease.go.
 package gpuyield
 
 import (
@@ -54,6 +56,10 @@ const (
 	StateShared  = "shared"  // foreign use present, our backends still fit and run
 	StateYielded = "yielded" // automatic: our GPU backends are paused for foreign work
 	StateHeld    = "held"    // operator hold: paused, no auto-resume until release
+	// StateDraining: a hold in mode drain is waiting for the GPU backends'
+	// requests in flight to finish; nothing new is admitted, nothing is
+	// stopped yet. Ends in held, or the hold is aborted (needs_attention).
+	StateDraining = "draining"
 )
 
 // Methods reported in gpu_contention.method.
@@ -152,16 +158,23 @@ type Contention struct {
 	Reason string `json:"reason,omitempty"`
 	// Policy: "auto" | "off" (NOO_GPU_YIELD=off).
 	Policy string `json:"policy"`
+	// Generation counts accepted holds on this node (persisted; never
+	// reset). A release must quote the generation its hold was given.
+	Generation uint64 `json:"generation"`
+	// Lease is the current hold's owner and ids while held or draining.
+	Lease *Lease `json:"lease,omitempty"`
 }
 
 // persisted is what survives an agent restart, so a restarted agent does
 // not race its own reconciler into starting a backend it had paused.
 type persisted struct {
-	State   string            `json:"state"`
-	Since   time.Time         `json:"since"`
-	Reason  string            `json:"reason"`
-	Stopped map[string]string `json:"stopped"` // backend -> container id we stopped
-	Paused  []string          `json:"paused"`
+	State      string            `json:"state"`
+	Since      time.Time         `json:"since"`
+	Reason     string            `json:"reason"`
+	Stopped    map[string]string `json:"stopped"` // backend -> container id we stopped
+	Paused     []string          `json:"paused"`
+	Generation uint64            `json:"generation"`
+	Lease      *Lease            `json:"lease,omitempty"`
 }
 
 // Controller runs the policy.
@@ -200,6 +213,18 @@ type Controller struct {
 	// docker (a Mac running a native ollama) warns once per cause, not
 	// once per tick.
 	listErr string
+
+	// The hold lease (lease.go).
+	generation uint64
+	lease      *Lease
+	// transition: a hold or release is in progress; a second one is
+	// refused (ErrTransition) rather than interleaved.
+	transition bool
+	// drainer closes admission and waits for in-flight requests on a drain
+	// hold; nil = no proxy on this agent, a drain is idle at once.
+	drainer Drainer
+	// drainTimeout bounds a drain whose request named none.
+	drainTimeout time.Duration
 }
 
 // New builds a controller. stateDir may be "" (no persistence).
@@ -209,6 +234,7 @@ func New(cfg Config, probe Probe, d Docker, stateDir string) *Controller {
 		state: StateFree, method: MethodNotMeasured,
 		stopped: map[string]string{}, paused: map[string]bool{},
 		gpuSet: map[string]bool{}, measured: map[string]int{},
+		drainTimeout: DefaultDrainTimeout,
 	}
 	c.since = c.now()
 	if stateDir != "" {
@@ -241,7 +267,7 @@ func (c *Controller) Holds(backend string) bool {
 	if !c.isGPUBackendLocked(backend) {
 		return false
 	}
-	if c.state == StateYielded || c.state == StateHeld {
+	if c.state == StateYielded || c.state == StateHeld || c.state == StateDraining {
 		return true
 	}
 	return c.cfg.Enabled && !c.pressureAt.IsZero()
@@ -289,6 +315,7 @@ func (c *Controller) Report() Contention {
 		Orphan: append([]string(nil), c.orphans...), TotalMB: c.last.TotalMB,
 		Method: c.method, Since: c.since.UTC().Format(time.RFC3339),
 		PausedBackends: sortedKeys(c.paused), NeedMB: c.needMB, Reason: c.reason, Policy: "auto",
+		Generation: c.generation, Lease: c.lease.clone(),
 	}
 	if c.last.Measured {
 		r.FreeMB = c.last.TotalMB - c.last.UsedMB
@@ -416,6 +443,10 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 	case StateHeld:
 		// Operator hold: report, never auto-resume.
 		return c.enforceLocked(backends)
+	case StateDraining:
+		// A hold waiting for the backends to go idle: the tick only
+		// reports; Hold stops them once they are.
+		return act
 	case StateYielded:
 		if !c.cfg.Enabled {
 			return c.resumeLocked("NOO_GPU_YIELD=off")
@@ -776,51 +807,12 @@ func (c *Controller) stillPlacedLocked(backend string) bool {
 	return false
 }
 
-// Hold pauses the GPU backends now and keeps them paused until Release.
-func (c *Controller) Hold(ctx context.Context, reason string) Contention {
-	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	backends, err := c.docker.GPUBackendContainers(lctx)
-	cancel()
-	if err != nil {
-		slog.Warn("gpuyield: hold could not list GPU backends", "error", err)
-	}
-	c.mu.Lock()
-	c.refreshGPUSetLocked(backends)
-	if reason == "" {
-		reason = "operator hold"
-	}
-	slog.Warn("gpuyield: operator GPU hold", "reason", reason)
-	act := c.pauseLocked(backends, StateHeld, reason)
-	c.mu.Unlock()
-	c.execute(ctx, act)
-	return c.Report()
-}
-
-// Release ends an operator hold: the node returns to the automatic policy,
-// which resumes once the GPU has stayed clear for the resume window.
-func (c *Controller) Release() Contention {
-	c.mu.Lock()
-	if c.state == StateHeld {
-		slog.Info("gpuyield: operator GPU hold released; automatic policy resumes when the GPU is free")
-		c.state = StateYielded
-		c.since = c.now()
-		c.reason = "hold released; resuming when the GPU is free"
-		c.clearAt = time.Time{}
-		if len(c.paused) == 0 {
-			c.state = StateFree
-			c.reason = ""
-		}
-		c.saveLocked()
-	}
-	c.mu.Unlock()
-	return c.Report()
-}
-
 func (c *Controller) saveLocked() {
 	if c.path == "" {
 		return
 	}
-	p := persisted{State: c.state, Since: c.since, Reason: c.reason, Stopped: c.stopped, Paused: sortedKeys(c.paused)}
+	p := persisted{State: c.state, Since: c.since, Reason: c.reason, Stopped: c.stopped, Paused: sortedKeys(c.paused),
+		Generation: c.generation, Lease: c.lease}
 	b, _ := json.Marshal(p)
 	tmp := c.path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
@@ -839,10 +831,22 @@ func (c *Controller) load() {
 	if json.Unmarshal(b, &p) != nil {
 		return
 	}
+	// The generation outlives every state: a release quoting a hold from
+	// before the restart must still be told apart from a fresh one.
+	c.generation = p.Generation
+	if p.State == StateDraining {
+		// A drain that the restart cut short: nothing was stopped, so
+		// nothing is restored; the caller saw its hold fail or time out.
+		slog.Warn("gpuyield: a draining hold did not survive the agent restart; not held", "lease", p.Lease)
+		return
+	}
 	if p.State != StateYielded && p.State != StateHeld {
 		return
 	}
 	c.state, c.since, c.reason = p.State, p.Since, p.Reason
+	if p.State == StateHeld {
+		c.lease = p.Lease
+	}
 	for k, v := range p.Stopped {
 		c.stopped[k] = v
 	}

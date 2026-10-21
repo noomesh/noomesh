@@ -491,6 +491,34 @@ aggregate reader counts bytes; its pass-through forwards them; the harness
 and the vendor-CLI translator skip lines that are not `data:`).
 noomesh-internal i159, parts A and B.
 
+**A GPU hold is an owned lease, and it drains first.** `POST /gpu/hold`
+(controller-only) carries `{reason, owner, operation_id, mode, timeout_secs,
+force}` and `POST /gpu/release` carries `{operation_id, generation, force,
+resume}` (`internal/gpuyield`, `lease.go`). The agent persists the lease
+(`owner`, `operation_id`, the node's monotonic `generation`) and reports it
+in `gpu_contention.lease`; a release must quote the operation id and
+generation it was given (compare-and-set) or it is `409 held_by_other` with
+the current lease, so a stale retry can never end another operation's hold.
+`force` takes over or ends any hold and the gateway audits it as a force; a
+body with no operation id is a legacy call from an older CLI, treated as a
+force and audited `legacy`. One hold or release runs per node at a time
+(`409 transition_in_progress`, in the gateway and in the agent). In mode
+`drain` (the default) the hold closes admission on the GPU backends first
+(`occupancy.SetDraining`: a new request is answered `503 backend_draining`
+with `X-Noo-Busy: draining` at once, never queued; the gateway serves it
+elsewhere and raises no alert), waits until `in_flight` is 0 on each of
+them up to `timeout_secs` (default 120, cap 900), then stops them as before.
+A drain that times out aborts the hold: admission reopens, the state is
+restored, nothing was stopped, and the answer is `409 drain_timeout`
+(`status: needs_attention`, the counts still in flight). A request in
+flight is never cut by a drain hold; `immediate` (the old behaviour, a 30 s
+grace then kill) is for emergencies and is labelled so in the lease. The
+gateway marks the node's lanes out of routing before it asks the agent
+(`classes::set_node_draining`) and keeps the paused lanes out until the
+release, so the heartbeat's `paused_backends` never has to catch up. A
+drain cut short by an agent restart is not restored as a hold; the
+generation is.
+
 **How a host agent reaches a door.** The agent is a host process
 (systemd on Linux, launchd on macOS); container names do not resolve on
 the host. Every door dial goes through the host-mode dialer

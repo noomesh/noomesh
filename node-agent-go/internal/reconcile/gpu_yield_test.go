@@ -45,7 +45,7 @@ func TestReconcileDoesNotStartAPausedGPUBackend(t *testing.T) {
 	if gpuHeld(placement{Backend: "vllm"}) {
 		t.Fatal("nothing paused yet: vllm must start")
 	}
-	c.Hold(context.Background(), "voice")
+	c.Hold(context.Background(), gpuyield.HoldRequest{Reason: "voice", OperationID: "op-1"})
 	if !gpuHeld(placement{Backend: "vllm"}) {
 		t.Fatal("held: reconcile must not start vllm")
 	}

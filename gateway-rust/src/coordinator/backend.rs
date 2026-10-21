@@ -218,6 +218,7 @@ pub(crate) fn is_retryable_llm_http_error(status: u16, body: &str) -> bool {
     // candidate may have room. raw_chat tells busy from dead itself.
     body.contains("backend_unreachable")
         || body.contains("backend_busy")
+        || body.contains("backend_draining")
         || body.contains("node_agent_proxy_error")
         || body.contains("connection refused")
         || body.contains("timed out")
@@ -1560,6 +1561,10 @@ mod tests {
     fn retries_node_agent_backend_busy_503() {
         let body = r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 0 queued); retry or try another node","type":"node_agent_proxy_error"}}"#;
         assert!(is_retryable_llm_http_error(503, body));
+        // A backend closed for a GPU hold's drain (i163 part C): the next
+        // candidate serves.
+        let draining = r#"{"error":{"code":"backend_draining","message":"ollama is draining for a GPU hold (1 still in flight); try another node","type":"node_agent_proxy_error"}}"#;
+        assert!(is_retryable_llm_http_error(503, draining));
     }
 
     #[test]

@@ -5,6 +5,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/logring"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
 	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
@@ -532,30 +534,109 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// handleGPUHold pauses this node's GPU backends and keeps them paused until
-// a release (operator hold, internal/gpuyield). Body: {"reason": "..."}.
-// Controller-only: the gateway calls it for `noo cluster gpu hold`.
+// handleGPUHold pauses the node's GPU backends for the caller's operation
+// and keeps them paused until a release (operator hold, internal/gpuyield;
+// an owned lease that drains first, lease.go). Body:
+// {reason, owner, operation_id, mode: drain|immediate, timeout_secs, force}.
+// A body with no operation_id is a legacy hold: immediate and a force.
+// 409 held_by_other names the current lease; 409 transition_in_progress
+// while another hold/release runs; 409 drain_timeout (status
+// needs_attention) when the backends did not go idle: nothing was stopped.
 func (s *Server) handleGPUHold(w http.ResponseWriter, r *http.Request) {
 	if s.gpuHold == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "gpu yield not running on this agent"})
 		return
 	}
 	var body struct {
-		Reason string `json:"reason"`
+		Reason      string `json:"reason"`
+		Owner       string `json:"owner"`
+		OperationID string `json:"operation_id"`
+		Workload    string `json:"workload"`
+		Mode        string `json:"mode"`
+		TimeoutSecs int    `json:"timeout_secs"`
+		Force       bool   `json:"force"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
-	reason := strings.TrimSpace(body.Reason)
-	if len(reason) > 200 {
-		reason = reason[:200]
+	req := gpuyield.HoldRequest{
+		Reason:      clipField(body.Reason, 200),
+		Owner:       clipField(body.Owner, 200),
+		OperationID: clipField(body.OperationID, 64),
+		Workload:    clipField(body.Workload, 120),
+		Mode:        strings.TrimSpace(body.Mode),
+		Timeout:     time.Duration(body.TimeoutSecs) * time.Second,
+		Force:       body.Force,
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "held", "gpu_contention": s.gpuHold(r.Context(), reason)})
+	gc, err := s.gpuHold(r.Context(), req)
+	if err != nil {
+		writeGPUHoldError(w, "hold", err, gc)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "held", "gpu_contention": gc})
 }
 
-// handleGPURelease ends an operator hold: back to the automatic policy.
+// handleGPURelease ends the hold the body names: {operation_id, generation,
+// force, resume: "now"}. The ids must match the lease (compare-and-set) or
+// the release is 409 held_by_other with the current lease; force ends any
+// hold (a body with neither ids nor force is a legacy release = force).
 func (s *Server) handleGPURelease(w http.ResponseWriter, r *http.Request) {
 	if s.gpuRelease == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "gpu yield not running on this agent"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "released", "gpu_contention": s.gpuRelease()})
+	var body struct {
+		OperationID string `json:"operation_id"`
+		Generation  uint64 `json:"generation"`
+		Force       bool   `json:"force"`
+		Resume      string `json:"resume"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	req := gpuyield.ReleaseRequest{
+		OperationID: clipField(body.OperationID, 64),
+		Generation:  body.Generation,
+		Force:       body.Force || strings.TrimSpace(body.OperationID) == "",
+		ResumeNow:   strings.EqualFold(strings.TrimSpace(body.Resume), "now"),
+	}
+	gc, err := s.gpuRelease(r.Context(), req)
+	if err != nil {
+		writeGPUHoldError(w, "release", err, gc)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "released", "gpu_contention": gc})
+}
+
+func clipField(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		s = s[:n]
+	}
+	return s
+}
+
+// writeGPUHoldError maps a lease error to its status and a machine-readable
+// code, with the node's gpu_contention beside it so the caller sees the
+// current lease.
+func writeGPUHoldError(w http.ResponseWriter, op string, err error, gc gpuyield.Contention) {
+	var held *gpuyield.ErrHeld
+	var drain *gpuyield.ErrDrainTimeout
+	out := map[string]any{"status": "refused", "op": op, "detail": err.Error(), "gpu_contention": gc}
+	switch {
+	case errors.As(err, &held):
+		out["error"] = "held_by_other"
+		out["current"] = held.Current
+		writeJSON(w, http.StatusConflict, out)
+	case errors.As(err, &drain):
+		out["status"] = "needs_attention"
+		out["error"] = "drain_timeout"
+		out["in_flight"] = drain.Remaining
+		writeJSON(w, http.StatusConflict, out)
+	case errors.Is(err, gpuyield.ErrTransition):
+		out["error"] = "transition_in_progress"
+		writeJSON(w, http.StatusConflict, out)
+	case errors.Is(err, gpuyield.ErrNotHeld):
+		out["error"] = "not_held"
+		writeJSON(w, http.StatusConflict, out)
+	default:
+		out["error"] = "bad_request"
+		writeJSON(w, http.StatusBadRequest, out)
+	}
 }

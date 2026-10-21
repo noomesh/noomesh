@@ -313,3 +313,47 @@ func TestOllamaChatGoesThroughAdmissionToo(t *testing.T) {
 		t.Fatalf("released after the stream: %+v", e)
 	}
 }
+
+// A GPU hold's drain (internal/gpuyield, mode drain) closes admission: a
+// new request is refused at once with 503 backend_draining and
+// `X-Noo-Busy: draining`, whether or not it asked to be rejected; nothing
+// is queued, so in_flight only falls.
+func TestADrainingBackendRefusesNewRequestsAtOnce(t *testing.T) {
+	occupancy.Reset()
+	t.Cleanup(occupancy.Reset)
+	occupancy.SetSlots(map[string]int{"ollama": 4})
+	hold, _ := occupancy.Admit(context.Background(), "ollama")
+	defer hold()
+	occupancy.SetDraining([]string{"ollama"}, true)
+
+	srv := httptest.NewServer(admittedProxy(t, "http://127.0.0.1:1", true, time.Second, time.Second, 0))
+	defer srv.Close()
+	started := time.Now()
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"backend_draining"`) {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	if resp.Header.Get("X-Noo-Busy") != "draining" || resp.Header.Get("Retry-After") == "" || resp.Header.Get("X-Noo-In-Flight") != "1" {
+		t.Fatalf("draining headers: %v", resp.Header)
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatal("refused at once, not after the bound")
+	}
+	if e := occupancy.Report()["ollama"]; e.InFlight != 1 || e.Queued != 0 {
+		t.Fatalf("a refused request never counted: %+v", e)
+	}
+	occupancy.SetDraining([]string{"ollama"}, false)
+	resp2, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusServiceUnavailable {
+		t.Fatal("reopened: the request reaches the backend (and fails on the dead upstream, not on admission)")
+	}
+}

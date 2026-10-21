@@ -411,9 +411,11 @@ pub const BUSY_REJECT: &str = "reject";
 pub const BUSY_RETRY_AFTER_SECS: u64 = 5;
 
 /// A node agent's "every slot is taken" answer (admission.go): a 503 whose
-/// body names `backend_busy`. Not a stall, not a dead backend: load.
+/// body names `backend_busy`. Not a stall, not a dead backend: load. A
+/// backend closed for a GPU hold's drain (`backend_draining`) is the same
+/// to this loop: move on, no alert.
 pub(crate) fn is_busy_reply(status: u16, body: &str) -> bool {
-    status == 503 && body.contains("backend_busy")
+    status == 503 && (body.contains("backend_busy") || body.contains("backend_draining"))
 }
 
 /// The failure text for a busy candidate: what the agent said (it names
@@ -1312,6 +1314,7 @@ mod tests {
         assert!(is_busy_reply(503, r#"{"error":{"code":"backend_busy","message":"m"}}"#));
         assert!(!is_busy_reply(502, r#"{"error":{"code":"backend_busy"}}"#));
         assert!(!is_busy_reply(503, r#"{"error":{"code":"backend_unreachable"}}"#));
+        assert!(is_busy_reply(503, r#"{"error":{"code":"backend_draining","message":"ollama is draining for a GPU hold"}}"#), "draining is moved on from like busy");
         let c = cand("mcmini", "ollama", "m", "http://x");
         let t = busy_text(r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 1 queued)"}}"#, &c);
         assert_eq!(t, "busy: mcmini/ollama has every slot taken (every slot on ollama is taken (2 in flight of 2, 1 queued))");

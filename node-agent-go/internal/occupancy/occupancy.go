@@ -41,6 +41,10 @@ var (
 	inFlight = map[string]int{}
 	queue    = map[string][]uint64{}
 	ticket   uint64
+	// draining: backends whose admission is closed for a GPU hold's drain
+	// (gpuyield): a new request is refused at once, never queued, so
+	// in_flight can only fall and WaitIdle ends.
+	draining = map[string]bool{}
 )
 
 // SetSlots replaces the declared slots per backend (the reconciler's view
@@ -143,6 +147,66 @@ func dequeue(backend string, t uint64) {
 	cond.Broadcast()
 }
 
+// SetDraining closes (on) or reopens (off) admission on the named backends.
+// While closed the proxy answers 503 backend_draining instead of admitting
+// or queueing; requests already in flight run to their end.
+func SetDraining(backends []string, on bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, b := range backends {
+		if on {
+			draining[b] = true
+		} else {
+			delete(draining, b)
+		}
+	}
+	cond.Broadcast()
+}
+
+// Draining reports whether the backend's admission is closed.
+func Draining(backend string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return draining[backend]
+}
+
+// InFlight is how many admitted requests the backend still has running.
+func InFlight(backend string) int {
+	mu.Lock()
+	defer mu.Unlock()
+	return inFlight[backend]
+}
+
+// WaitIdle blocks until no request is in flight on any of the backends, or
+// ctx ends. It returns whether they went idle and, when not, what was still
+// running per backend (only the non-zero ones). Nothing is cancelled: a
+// request in flight finishes on its own.
+func WaitIdle(ctx context.Context, backends []string) (idle bool, remaining map[string]int) {
+	mu.Lock()
+	defer mu.Unlock()
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		cond.Broadcast()
+		mu.Unlock()
+	})
+	defer stop()
+	for {
+		remaining = map[string]int{}
+		for _, b := range backends {
+			if inFlight[b] > 0 {
+				remaining[b] = inFlight[b]
+			}
+		}
+		if len(remaining) == 0 {
+			return true, nil
+		}
+		if ctx.Err() != nil {
+			return false, remaining
+		}
+		cond.Wait()
+	}
+}
+
 // Report is every backend with a declared slot count, a request in flight,
 // or a request waiting.
 func Report() map[string]Entry {
@@ -187,5 +251,6 @@ func Reset() {
 	slots = map[string]int{}
 	inFlight = map[string]int{}
 	queue = map[string][]uint64{}
+	draining = map[string]bool{}
 	cond.Broadcast()
 }

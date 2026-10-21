@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"log"
 	"log/slog"
 	"net"
@@ -77,8 +78,8 @@ type Server struct {
 	gpuWatch func() any
 	// gpuHold / gpuRelease drive the shared-GPU yield's operator hold
 	// (internal/gpuyield). nil = not wired; the routes then answer 503.
-	gpuHold    func(ctx context.Context, reason string) any
-	gpuRelease func() any
+	gpuHold    func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error)
+	gpuRelease func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
 
@@ -152,7 +153,8 @@ func (s *Server) SetGPUWatch(f func() any) { s.gpuWatch = f }
 
 // SetGPUHold installs the shared-GPU hold/release operations
 // (`noo cluster gpu hold|release`, via the gateway).
-func (s *Server) SetGPUHold(hold func(ctx context.Context, reason string) any, release func() any) {
+func (s *Server) SetGPUHold(hold func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error),
+	release func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)) {
 	s.gpuHold, s.gpuRelease = hold, release
 }
 

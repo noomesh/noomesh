@@ -309,10 +309,8 @@ func (a *Agent) Run() error {
 	gy := gpuyield.New(gpuyield.ConfigFromEnv(os.Getenv), gpuyield.NewSMIProbe(), a.docker, a.cfg.StateDir)
 	gpuyield.SetDefault(gy)
 	a.hb.SetGPUContention(func() any { return gy.Report() })
-	a.server.SetGPUHold(
-		func(ctx context.Context, reason string) any { return gy.Hold(ctx, reason) },
-		func() any { return gy.Release() },
-	)
+	gy.SetDrainer(occupancyDrainer{})
+	a.server.SetGPUHold(gy.Hold, gy.Release)
 	go a.hb.Run(ctx)
 
 	// 4a. GPU watchdog — only where a GPU is actually detected.
@@ -895,4 +893,14 @@ func meshBackendInfos(backends map[string]string, selfURL, scheme string) map[st
 		result[bt] = messaging.BackendInfo{Model: model, URL: url, APIFormat: "openai"}
 	}
 	return result
+}
+
+// occupancyDrainer is the GPU hold's admission hook: a drain closes the
+// inference proxy's admission on the GPU backends and waits for what is
+// in flight to finish (internal/occupancy).
+type occupancyDrainer struct{}
+
+func (occupancyDrainer) SetDraining(backends []string, on bool) { occupancy.SetDraining(backends, on) }
+func (occupancyDrainer) WaitIdle(ctx context.Context, backends []string) (bool, map[string]int) {
+	return occupancy.WaitIdle(ctx, backends)
 }
