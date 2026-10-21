@@ -5,9 +5,15 @@
 # package `dhi/<name>` = ghcr.io/noomesh/dhi/<name>. Names below are written
 # without the prefix.
 #
-# The dhi.io hardened bases are DHI Community images and stay public, so there
-# is no visibility requirement on these packages; the list is the declaration
-# the mirror lanes, the Dockerfiles and the tests agree on.
+# Visibility (checked 2026-10-21 with the GitHub packages API): the runtime
+# images (redis, grafana, loki, prometheus, alertmanager, node-exporter,
+# python) and the derived deps-core, deps-base and static-ffmpeg are PUBLIC, so
+# an add-on repo (trellion-evolve builds FROM dhi/python) pulls them with no
+# credential. The BUILD bases golang, rust, uv and alpine-base stay PRIVATE and
+# are pulled with a credential by this repo's own lanes only. Making a package
+# public or private is an org-level setting, not something these files enforce;
+# this list is the declaration the mirror lanes, the Dockerfiles and the tests
+# agree on.
 #
 #   mirror   a dhi.io mirror made by mirror-images.yml.
 #   derived  built by the release on top of DHI bases (deps-core, deps-base) or

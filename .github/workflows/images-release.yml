@@ -53,8 +53,9 @@ env:
   OWNER: noomesh   # un-nested: ghcr.io/noomesh/<image>; packages CREATED by this repo (see publish-web.yml)
   # DHI-derived images (dhi.io mirrors + deps-core / deps-base / static-ffmpeg
   # layered on them) live under the prefix ghcr.io/noomesh/dhi/<name>, apart
-  # from the stack images at ghcr.io/noomesh/<name>. The hardened bases are
-  # public (DHI Community), so there is no visibility requirement on them.
+  # from the stack images at ghcr.io/noomesh/<name>. The runtime images,
+  # python and the derived deps images are public; the golang/rust/uv/alpine-base
+  # build bases stay private (see scripts/dhi-images.txt).
   # DHI_OWNER is the path under $REGISTRY, i.e. DHI_REGISTRY=ghcr.io/noomesh/dhi.
   DHI_OWNER: noomesh/dhi
   PLATFORMS: linux/amd64,linux/arm64
