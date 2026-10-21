@@ -153,6 +153,11 @@ noo health --json                            # "addons" reads enabled for it
   you enable it without a verified lock, nothing loads quietly: `noo health`
   reads `unhealthy`, and the gateway log says "has no verified lock for this
   stack ... Run `noo addons upgrade yourthing`".
+- To try an add-on before it ships, trust its developer's temporary key with
+  `noo addons trust-key yourthing <pubkey> --registry <root> --dev --expires 14d`
+  (30 days at most). It works on this mesh until it expires, `noo addons list`
+  marks it DEV with the expiry, and `noo addons untrust-key yourthing --dev`
+  removes it. See "Development keys" in docs/development/addons.md.
 
 Limits of the third-party path today: the lock and the images are fetched
 **anonymously** from the registry you named, so a private registry is not

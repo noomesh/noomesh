@@ -1899,7 +1899,17 @@ async fn health(
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (code, Json(health_body(status, peers, deps, addons, ctx.is_some())))
+    let mut body = health_body(status, peers, deps, addons, ctx.is_some());
+    // Add-ons only a temporary development key vouches for (i163 part A):
+    // `addons.<name>` keeps its enum word (`enabled`; `unhealthy` once the
+    // key expires) so every client still reads it, and this sibling map says
+    // `dev (expires <date>)`. Absent when there is none.
+    if ctx.is_some() {
+        if let Some(dev) = crate::addons::health_dev_map() {
+            body["addons_dev"] = dev;
+        }
+    }
+    (code, Json(body))
 }
 
 /// The health body, by whether the caller presented a credential.

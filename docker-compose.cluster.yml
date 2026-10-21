@@ -465,6 +465,7 @@ services:
       # the stack this gateway was started for. Empty = a launcher from before
       # the hand-off; the gateway then loads only the add-ons it already knew.
       - NOO_ADDONS_VERIFIED=${NOO_ADDONS_VERIFIED:-}
+      - NOO_ADDONS_DEV=${NOO_ADDONS_DEV:-}
       - NOO_STACK_TAG=${NOO_IMAGE_TAG:-}
       # Agent-message review key: seals every
       # agent-to-agent body on the bus/in the table; operators review

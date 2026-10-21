@@ -184,6 +184,45 @@ operator trusts your signing key with `noo addons trust-key <name> <pubkey>
 --registry <root>` (the CLI ships no key for you), and your images must sit
 under that registry root and be pullable anonymously.
 
+**Development keys.** To develop and test an add-on on your own mesh before it
+ships in a release, the operator can trust a temporary development key instead
+of your release key:
+
+```bash
+noo addons trust-key yourthing <dev-pubkey> --registry <root> --dev --expires 14d
+noo addons enable yourthing --lock ./addon-lock.json
+```
+
+- `--expires` is required with `--dev` (a whole number of `d`, `h` or `m`, at
+  most `30d`) and refused without it. The key is stored under
+  `addon_trust.yourthing.dev_keys` with `dev: true` and an absolute UTC
+  `expires_at`, never among the release `keys`. Trusting it again renews it.
+- It is scoped to that one add-on name on this mesh. No entitlement, flag or
+  release can carry it: an anchor read from JSON never holds a development key.
+- A key is never both: trusting a key without `--dev` that is a development key
+  for any add-on is refused, and the reverse.
+- A lock that only the development key signed verifies until `expires_at`. After
+  that the launcher refuses it exactly like an untrusted key, naming the expiry
+  and the renew command, and a gateway that is still running stops serving the
+  add-on's routes and reports it `unhealthy` with the reason.
+- While it is live, `/health` keeps `addons.yourthing: "enabled"` and adds
+  `addons_dev.yourthing: "dev (expires <date>)"`; `noo addons list` shows it
+  under "third-party" as `DEV until <date>` (`DEV EXPIRED <date>` after), and
+  `noo addons verify` says `signed by DEV key`.
+- It never ships. Your release verifies the lock with
+  `noo security addon-lock verify ... --key <release key>`, which refuses a
+  `--key` that is a development key and a lock that only a development key
+  signed (it knows the keys given with `--dev-key` and every development key in
+  the install's noomesh.yaml). The stack release records image digests only and
+  never reads an add-on key. Shipping means re-signing with your release key;
+  nothing about the development key carries over.
+- `noo addons untrust-key yourthing --dev` removes the add-on's development keys
+  (`untrust-key yourthing <pubkey> --dev` removes one).
+
+Enrolling a development key is a local operator action on the controller: the
+CLI edits the install's noomesh.yaml, and the gateway accepts a write of the
+`addon_trust` section only from an admin.
+
 **Upgrading.** An install that upgrades keeps its enabled add-ons working on the
 first boot: the new launcher already verified every composed licensed add-on's
 pin before the gateway started. If the gateway is started by an older launcher
