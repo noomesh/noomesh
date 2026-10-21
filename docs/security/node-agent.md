@@ -446,6 +446,20 @@ inventory and the inference proxy alike). An https `OLLAMA_URL` with
 `NOO_TLS_CA`/`NOO_TLS_CERT`/`NOO_TLS_KEY` unset or unreadable is an error the
 lane reports on every call, never a bare client.
 
+**Chat to an Ollama goes over its native `/api/chat`.** The inference
+proxy answers `POST /v1/chat/completions` for an `ollama` backend by
+translating the request to `/api/chat` and the reply back to OpenAI chat
+(`internal/api/ollama_chat.go`): messages and tools, a tool call's
+arguments (a string on OpenAI's wire, an object on Ollama's), sampling
+fields to `options`, reasoning control to `think`, and the reply's
+`thinking` as `reasoning`. Ollama's own OpenAI-compatible layer holds a
+tool-carrying stream until the whole answer exists (84 s to the first byte
+against 2 s natively, measured on an M4 with gemma4:12b), and every
+harness call carries tools; natively each token streams as it is made, so
+the gateway's and the harness's stream idle bounds see progress rather
+than silence. `/v1/completions` and `/v1/embeddings` are reverse-proxied
+as before.
+
 **How a host agent reaches a door.** The agent is a host process
 (systemd on Linux, launchd on macOS); container names do not resolve on
 the host. Every door dial goes through the host-mode dialer
