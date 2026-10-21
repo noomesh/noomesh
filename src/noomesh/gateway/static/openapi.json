@@ -19109,6 +19109,129 @@
           }
         }
       }
+    },
+    "/api/cluster/embedding-spaces/{space}/migration": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create migration",
+        "description": "[native] POST /api/cluster/embedding-spaces/{space}/migration `{model}` -- start re-embedding a space into another model (i150). The gateway PROBES the new model (one short text across the mesh nodes declaring it, its own balancer, no static endpoints); the answer's width must equal the space's, because trellion's `vector(N)` columns are fixed. 409 on a running migration, a model another space has, or a different width. When no node serves the model yet: 202 and the migration waits as `pending`.",
+        "operationId": "embedding_space_migration_start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete migration",
+        "description": "[native] DELETE /api/cluster/embedding-spaces/{space}/migration -- cancel while filling. Once the cutover has begun trellion is swapping columns, so the model must follow: 409.",
+        "operationId": "embedding_space_migration_cancel",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces/{space}/migration/complete": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create complete",
+        "description": "[native] POST /api/cluster/embedding-spaces/{space}/migration/complete -- the operator's go: refused unless trellion reported (fresh, about this model) every table fully re-embedded. Moves the migration to `cutover`; trellion swaps its columns and its `cutover_done` report flips the space's model.",
+        "operationId": "embedding_space_migration_complete",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/external/embedding-spaces/{space}/migration": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update migration",
+        "description": "[native] PUT /api/external/embedding-spaces/{space}/migration (i150) -- trellion's re-embed worker reports progress with its consumer key. Stores the report and its time; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. 409 when the space has no migration or the report is about another model.",
+        "operationId": "embedding_migration_report",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

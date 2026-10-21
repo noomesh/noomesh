@@ -3030,7 +3030,7 @@ mod tests {
         assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
     }
 
-    /// i150 E1: the embed-placement key sits on the prompt-skill proposals
+    /// i150 E1: the embed-placement key sits on the add-on delegation
     /// revision, and widens the unique index with the model
     /// for embed rows only.
     #[test]
@@ -3038,7 +3038,7 @@ mod tests {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBED_PLACEMENT_MODEL_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "101_embed_placement_model");
         assert!(m.revision.len() <= 32, "alembic_version.version_num is varchar(32)");
-        assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
+        assert_eq!(m.down_revision, Some(ADDON_DELEGATION_REVISION));
         assert!(m.sql.contains("DROP INDEX IF EXISTS uq_placement_node_backend_role;"));
         assert!(m.sql.contains(
             "(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"
