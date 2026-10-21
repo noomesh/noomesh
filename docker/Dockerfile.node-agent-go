@@ -46,6 +46,10 @@ RUN go mod download
 
 # Build static binary — no CGO, so no libc dependency at runtime
 COPY node-agent-go/ ./
+# GOTOOLCHAIN=local: the image's Go, not go.mod's toolchain line, builds this.
+# Refuse an image older than that line (a stale mirror would ship an unpatched
+# binary without a word).
+RUN sh ./require-toolchain.sh
 RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
     -ldflags="-s -w -X github.com/noomesh/noomesh/node-agent-go/internal/version.Version=${NODE_AGENT_VERSION} -X github.com/noomesh/noomesh/node-agent-go/internal/version.Commit=${NODE_AGENT_COMMIT}" \
     -o /noo-node-agent \

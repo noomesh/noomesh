@@ -19,9 +19,12 @@ this test passes again.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
@@ -97,4 +100,57 @@ def test_no_unlisted_golang_image_site():
         f"golang image named in {sorted(sites - set(BUILD_SITES))}; add to BUILD_SITES"
         if sites - set(BUILD_SITES)
         else f"BUILD_SITES is stale: {sorted(set(BUILD_SITES) - sites)}"
+    )
+
+
+# The patch level: the image tag above is floating (golang:1.26), so which
+# 1.26.x a release gets is whatever the mirror last pulled. go.mod's
+# `toolchain` line names the patch release CI's govulncheck passes on, and
+# each build site refuses an image older than it (0.6.8-rc.1's darwin agent
+# shipped go1.26.9 after GO-2026-6809 was fixed in 1.26.10).
+
+GUARD = REPO / "node-agent-go" / "require-toolchain.sh"
+
+
+def test_every_build_site_checks_the_patch_level_before_building():
+    for rel in BUILD_SITES:
+        code = [l for l in (REPO / rel).read_text().splitlines() if not l.lstrip().startswith("#")]
+        text = "\n".join(code)
+        guard = text.find("require-toolchain.sh")
+        build = text.find("go build")
+        assert guard != -1, f"{rel} does not run require-toolchain.sh"
+        assert guard < build, f"{rel} runs go build before require-toolchain.sh"
+
+
+def _run_guard(tmp_path: Path, go_version: str, toolchain: str | None) -> subprocess.CompletedProcess:
+    mod = "module x\n\ngo 1.26.0\n" + (f"toolchain go{toolchain}\n" if toolchain else "")
+    (tmp_path / "go.mod").write_text(mod)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "go"
+    fake.write_text(f'#!/bin/sh\n[ "$1 $2" = "env GOVERSION" ] && echo go{go_version}\n')
+    fake.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+    return subprocess.run(["sh", str(GUARD)], cwd=tmp_path, env=env, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize(
+    ("have", "want", "ok"),
+    [
+        ("1.26.9", "1.26.10", False),  # the rc.1 case: sort -V, not string order
+        ("1.26.10", "1.26.10", True),
+        ("1.26.11", "1.26.10", True),
+        ("1.27.0", "1.26.10", True),
+        ("1.26.10", None, False),  # no toolchain line: nothing to hold a build to
+    ],
+)
+def test_the_guard_refuses_an_older_go(tmp_path, have, want, ok):
+    r = _run_guard(tmp_path, have, want)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    assert f"go {have}" in r.stdout, "the build log names the Go it used"
+
+
+def test_go_mod_names_a_patch_release():
+    assert re.search(r"^toolchain go\d+\.\d+\.\d+\s*$", GO_MOD.read_text(), re.M), (
+        "node-agent-go/go.mod needs a `toolchain goX.Y.Z` line; the build sites hold to it"
     )
