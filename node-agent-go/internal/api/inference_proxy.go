@@ -444,6 +444,15 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An ollama answers chat on its NATIVE /api/chat, translated here both
+	// ways: its OpenAI-compatible layer holds a tool-carrying stream until
+	// the whole answer exists, and every harness call carries tools
+	// (ollama_chat.go, noomesh-internal i159).
+	if backendType == "ollama" && r.URL.Path == "/v1/chat/completions" {
+		s.proxyOllamaChat(w, r, body, targetURL, scheme, backendFirstByteTimeout())
+		return
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	// Disable buffering so SSE / streaming responses pass through with
 	// per-token latency intact.
