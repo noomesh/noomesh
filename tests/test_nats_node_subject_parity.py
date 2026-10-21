@@ -150,6 +150,13 @@ def _published_subjects() -> dict[str, str]:
         "node_reply_prefix no longer builds <root>.<node token>"
     )
     found["{NODE_REPLY_ROOT}.{tok}.>"] = "gateway-rust/src/harness_main.rs (msg.reply)"
+    # i131 phase 1: the control-bus service publishes a long op's progress on
+    # `node.<id>.evt.<op_id>`. Read the literal prefix from the Go source so
+    # renaming it fails this test instead of quietly passing it.
+    svc = (AGENT / "internal/ctrlrpc/service.go").read_text()
+    m = re.search(r'func \(s \*Service\) evtPrefix\(\) string \{ return "([^"]+)" \+ s\.nodeID \+ "([^"]+)" \}', svc)
+    assert m, "ctrlrpc evtPrefix no longer builds literal + node id + literal"
+    found[f"{m.group(1)}{ID}{m.group(2)}>"] = "node-agent-go/internal/ctrlrpc/service.go"
     return found
 
 

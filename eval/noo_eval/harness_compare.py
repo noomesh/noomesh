@@ -14,7 +14,11 @@ in order:
    (``harness_node_explained``) is not exposed on a route of its own, so
    readiness is read off the node record: at least ``settle_s`` after the
    placement, on a heartbeat newer than the one seen at placement time,
-   ``host_services.harness.state == running`` and no ``harness`` refusal.
+   ``host_services.harness.state == running``, ``host_services.harness.kind``
+   naming the kind just placed (the agent reports the kind the harness was
+   started with — without it a harness still running the PREVIOUS kind, or
+   one that fell back to ``noo``, would be measured as this one), and no
+   ``harness`` refusal.
    The gateway's verdict still arrives per task: ``POST /api/tasks``
    answers ``dispatched`` and ``why``, and with ``require_dispatch`` a task
    the controller ran in process fails (it measured the controller, not
@@ -123,6 +127,12 @@ def harness_state(n: Optional[dict]) -> str:
     return (((n or {}).get("host_services") or {}).get("harness") or {}).get("state") or ""
 
 
+def harness_running_kind(n: Optional[dict]) -> str:
+    """The kind the node says its harness is RUNNING (``host_services.harness.kind``);
+    empty when it says none (stopped, or an agent too old to report it)."""
+    return (((n or {}).get("host_services") or {}).get("harness") or {}).get("kind") or ""
+
+
 def harness_refusal(n: Optional[dict]) -> str:
     for r in (n or {}).get("reconcile_refusals") or []:
         if r.get("target") == "harness":
@@ -203,23 +213,25 @@ class Comparer:
                 return kr
             kr.placed = True
             t0 = self.clock()
-            state = ""
+            state = running = ""
             while True:
                 n = await node_record(self.ops, node)
                 elapsed = self.clock() - t0
                 state = harness_state(n)
+                running = harness_running_kind(n)
                 fresh = hb0 is None or (n or {}).get("last_heartbeat") != hb0
                 if elapsed >= self.spec.settle_s and fresh:
                     refused = harness_refusal(n)
                     if refused:
                         kr.error = f"node refused the {kind} harness: {first_line(refused)}"
                         return kr
-                    if state == "running":
+                    if state == "running" and running == kind:
                         kr.ready, kr.ready_s = True, round(elapsed, 1)
                         return kr
                 if elapsed >= self.spec.ready_timeout_s:
                     kr.error = (f"harness not running {self.spec.ready_timeout_s:.0f}s after placing {kind} "
-                                f"(last reported state: {state or 'unreported'})")
+                                f"(last reported state: {state or 'unreported'}, running kind: "
+                                f"{running or 'unreported — an agent older than the kind report never qualifies'})")
                     return kr
                 await self.sleep(self.spec.poll_s)
         except httpx.HTTPError as e:

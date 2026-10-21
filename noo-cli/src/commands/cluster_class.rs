@@ -238,7 +238,13 @@ fn alias_rows(aliases: &[serde_json::Value]) -> String {
                 format!(
                     "→ {}{}",
                     a["class"].as_str().unwrap_or("?"),
-                    if a["builtin"].as_bool().unwrap_or(false) { "  (built in)" } else { "" }
+                    if a["builtin"].as_bool().unwrap_or(false) {
+                        "  (built in)"
+                    } else if a["purpose"].as_bool().unwrap_or(false) {
+                        "  (purpose)"
+                    } else {
+                        ""
+                    }
                 ),
             )
         })
@@ -261,9 +267,114 @@ pub fn cluster_class_unset(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     Ok(0)
 }
 
+/// `noo cluster prefer [<purpose> <model|class> | <purpose> --clear]` —
+/// the purpose preferences (i145): which model a stack purpose (`knowledge`,
+/// `graph`) tries first. Bare, it lists them; with a target it points the
+/// purpose's alias there (the mesh still answers behind it); `--clear` puts
+/// the purpose back on every live chat node.
+pub fn cluster_prefer(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    match args {
+        [] => prefer_list(g),
+        [purpose, flag] if flag == "--clear" => {
+            let resp = delete_json(g, &format!("/api/cluster/model-aliases/{}", super::urlencode(purpose)), true, 15);
+            if g.json {
+                println!("{resp}");
+                return Ok(0);
+            }
+            ui::done(&format!("{purpose}: no preference — any live chat node answers"));
+            Ok(0)
+        }
+        [purpose, target] if !purpose.starts_with('-') && !target.starts_with('-') => {
+            let resp = put_json(
+                g,
+                &format!("/api/cluster/model-aliases/{}", super::urlencode(purpose)),
+                &serde_json::json!({"class": target}),
+                true,
+                15,
+            );
+            if g.json {
+                println!("{resp}");
+                return Ok(0);
+            }
+            ui::done(&format!("{purpose}: prefers {target} — the mesh answers behind it; routing picks it up within 30 s"));
+            if let Some(note) = resp["note"].as_str() {
+                println!("{}", ui::status_line(Glyph::Warn, note));
+            }
+            ui::guide(&[("noo cluster prefer", "lists every purpose and what it prefers")]);
+            Ok(0)
+        }
+        _ => Err(Unhandled),
+    }
+}
+
+fn prefer_list(g: &Globals) -> Result<i32, Unhandled> {
+    let body = get_json(g, "/api/cluster/model-classes", true, 15);
+    if g.json {
+        let purposes: Vec<&serde_json::Value> =
+            body["aliases"].as_array().map(|a| a.iter().filter(|x| x["purpose"].as_bool() == Some(true)).collect()).unwrap_or_default();
+        println!("{}", serde_json::json!({"purposes": purposes}));
+        return Ok(0);
+    }
+    println!("{}", ui::header("model preferences", Some("what each stack purpose tries first; the mesh answers behind it")));
+    let rows = prefer_rows(&body);
+    if rows.is_empty() {
+        println!("{}", ui::muted("this gateway reports no purposes (it predates them)"));
+        return Ok(0);
+    }
+    print!("{}", ui::kv_verbatim(&rows.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>()));
+    ui::guide(&[
+        ("noo cluster prefer <purpose> <model|class>", "prefers a model for one purpose"),
+        ("noo cluster embedding-space list", "shows the embedding models (one per space, never a fallback)"),
+    ]);
+    Ok(0)
+}
+
+/// `(purpose, "→ target (state)")` for every purpose alias.
+pub(crate) fn prefer_rows(body: &serde_json::Value) -> Vec<(String, String)> {
+    let empty = Vec::new();
+    let classes = body["classes"].as_array().unwrap_or(&empty);
+    let served = |name: &str| classes.iter().any(|c| c["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)));
+    body["aliases"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|a| a["purpose"].as_bool() == Some(true))
+        .map(|a| {
+            let p = a["alias"].as_str().unwrap_or("?").to_string();
+            let c = a["class"].as_str().unwrap_or("?");
+            let v = if c == "chat-default" {
+                "→ chat-default (no preference: any live chat node)".to_string()
+            } else if served(c) {
+                format!("→ {c}, then the mesh")
+            } else {
+                format!("→ {c} (nothing serves it now: the mesh answers)")
+            };
+            (p, v)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{alias_rows, chat_default_line, class_source, parse_candidate, set_body};
+    use super::{alias_rows, chat_default_line, class_source, parse_candidate, prefer_rows, set_body};
+
+    #[test]
+    fn prefer_rows_say_what_each_purpose_tries_first() {
+        let body = serde_json::json!({
+            "classes": [{"name": "chat-default"}, {"name": "gemma4:26b"}],
+            "aliases": [
+                {"alias": "default", "class": "chat-default", "builtin": true, "purpose": false},
+                {"alias": "knowledge", "class": "gemma4:26b", "builtin": false, "purpose": true},
+                {"alias": "graph", "class": "chat-default", "builtin": false, "purpose": true},
+                {"alias": "big", "class": "qwen3:32b", "builtin": false, "purpose": true}
+            ]
+        });
+        let rows = prefer_rows(&body);
+        assert_eq!(rows.len(), 3, "only purposes: {rows:?}");
+        assert_eq!(rows[0], ("knowledge".to_string(), "→ gemma4:26b, then the mesh".to_string()));
+        assert!(rows[1].1.contains("no preference"));
+        assert!(rows[2].1.contains("nothing serves it now"));
+    }
 
     #[test]
     fn chat_default_says_dynamic_or_declared() {
@@ -286,8 +397,10 @@ mod tests {
             serde_json::json!({"alias": "default", "class": "chat-default", "builtin": true}),
             serde_json::json!({"alias": "auto", "class": "chat-default", "builtin": true}),
             serde_json::json!({"alias": "gemma4:12b-Any", "class": "chat-default", "builtin": false}),
+            serde_json::json!({"alias": "knowledge", "class": "chat-default", "builtin": false, "purpose": true}),
         ];
         let out = alias_rows(&aliases);
+        assert!(out.lines().any(|l| l.contains("knowledge") && l.contains("(purpose)")), "{out}");
         let keys: Vec<&str> = out.lines().map(|l| l.split_whitespace().next().unwrap_or("")).collect();
         // Strip any styling escape the key may carry.
         let plain: Vec<String> = keys.iter().map(|k| {
@@ -298,7 +411,7 @@ mod tests {
             }
             s
         }).collect();
-        assert_eq!(plain, ["default", "auto", "gemma4:12b-Any"], "{out}");
+        assert_eq!(plain, ["default", "auto", "gemma4:12b-Any", "knowledge"], "{out}");
         assert!(!out.contains("Default") && !out.contains("Auto"), "{out}");
         assert!(out.contains("→ chat-default  (built in)"), "{out}");
     }

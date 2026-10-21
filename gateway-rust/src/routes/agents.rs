@@ -538,14 +538,10 @@ async fn skills_run(
     );
 
     // 4. POST to node-agent /api/skills/run
-    let client = super::cluster::build_node_agent_client();
-    let mut req = client
-        .post(format!("{agent_url}/api/skills/run"))
+    let req = crate::node_link::NodeLink::for_base(&agent_url)
+        .request(reqwest::Method::POST, "/api/skills/run")
         .json(&payload)
         .timeout(std::time::Duration::from_secs(timeout + 30));
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&agent_url) {
-        req = req.header(&k, &v);
-    }
 
     let t0 = std::time::Instant::now();
 
@@ -645,7 +641,7 @@ async fn resolve_skill_node(
     needs_gpu: bool,
 ) -> Result<(String, String), AppError> {
     if let Some(nid) = node_id {
-        let url = super::cluster::get_node_agent_url(state, nid).await?;
+        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
         return Ok((nid.to_string(), url));
     }
 

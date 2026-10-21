@@ -501,22 +501,15 @@ async fn token_tailnet(
         return bad("proof_port must be non-zero");
     }
 
-    let agent_base = match super::bootstrap::self_agent_base() {
-        Ok(b) => b,
+    let link = match crate::node_link::NodeLink::self_agent() {
+        Ok(l) => l,
         Err(e) => return internal(e),
     };
-    let client = super::cluster::build_node_agent_client();
-    let auth = crate::node_agent_auth::header_for_self(&agent_base);
-    let with_auth = |rb: reqwest::RequestBuilder| match &auth {
-        Some((k, v)) => rb.header(k.as_str(), v.as_str()),
-        None => rb,
-    };
+    let agent_base = link.base().to_string();
 
     // 1. whois: the tag, and the name we will mint under.
-    let who: Value = match with_auth(client.get(format!(
-        "{agent_base}/tailnet/whois?ip={}",
-        body.tailnet_ip
-    )))
+    let who: Value = match link
+        .request(reqwest::Method::GET, &format!("/tailnet/whois?ip={}", body.tailnet_ip))
     .send()
     .await
     {
@@ -570,7 +563,8 @@ async fn token_tailnet(
     };
 
     // 2. dialback: prove the caller OWNS the address it claimed.
-    let db_resp: Value = match with_auth(client.post(format!("{agent_base}/tailnet/dialback")))
+    let db_resp: Value = match link
+        .request(reqwest::Method::POST, "/tailnet/dialback")
         .json(&json!({
             "ip": body.tailnet_ip,
             "port": body.proof_port,

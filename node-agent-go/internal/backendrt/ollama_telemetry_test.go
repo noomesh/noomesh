@@ -306,6 +306,7 @@ func TestConvergeAppliesPlacementTuningToThePlist(t *testing.T) {
 			"OLLAMA_NUM_PARALLEL":      "4",
 			"OLLAMA_MAX_LOADED_MODELS": "2",
 			"OLLAMA_KEEP_ALIVE":        "-1",
+			"OLLAMA_CONTEXT_LENGTH":    "32768",
 			"OLLAMA_HOST":              "0.0.0.0", // not honoured
 		}
 	}
@@ -318,6 +319,7 @@ func TestConvergeAppliesPlacementTuningToThePlist(t *testing.T) {
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_NUM_PARALLEL -string 4 " + plist,
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_MAX_LOADED_MODELS -string 2 " + plist,
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_KEEP_ALIVE -string -1 " + plist,
+		plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 32768 " + plist,
 		"launchctl bootout gui/501 " + plist,
 		"launchctl bootstrap gui/501 " + plist,
 	} {
@@ -347,5 +349,42 @@ func TestConvergeWithoutAPlistRecordsThePlacementEnvLimit(t *testing.T) {
 	rs := refusals.List()
 	if len(rs) != 1 || rs[0].Scope != "placement_env" || !strings.Contains(rs[0].Reason, "cannot set") {
 		t.Fatalf("refusals = %+v", rs)
+	}
+}
+
+// The harness profile's ollama_context reaches a brew-managed ollama as
+// OLLAMA_CONTEXT_LENGTH tuning (reconcile.nativeOllamaTuning). A CHANGED
+// value (a new tier default or override) converges like any placement env
+// edit: the plist key is replaced and the job is booted out and back once.
+func TestConvergeRewritesAChangedProfileContextAndRestartsOnce(t *testing.T) {
+	f := &fakeMac{env: map[string]string{"OLLAMA_NO_CLOUD": "1", "OLLAMA_CONTEXT_LENGTH": "16384"}, procEnv: procWith, loaded: "gui"}
+	g := guard(f, newBrew)
+	ctx := "32768"
+	g.Tuning = func() map[string]string { return map[string]string{"OLLAMA_CONTEXT_LENGTH": ctx} }
+	plist := "/Users/m/Library/LaunchAgents/sh.brew.ollama.plist"
+	managed, restarted, err := g.Converge()
+	if err != nil || !managed || !restarted {
+		t.Fatalf("managed=%v restarted=%v err=%v", managed, restarted, err)
+	}
+	for _, want := range []string{
+		plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 32768 " + plist,
+		"launchctl bootout gui/501 " + plist,
+		"launchctl bootstrap gui/501 " + plist,
+	} {
+		if !f.had(want) {
+			t.Errorf("missing command %q in %v", want, f.cmds)
+		}
+	}
+	// Converged: the next tick changes nothing.
+	f.cmds = nil
+	if _, restarted, _ := g.Converge(); restarted || f.had("-replace") {
+		t.Errorf("idempotent run changed things: %v", f.cmds)
+	}
+	// The profile moves again: one more rewrite and restart.
+	ctx = "8192"
+	f.cmds = nil
+	if _, restarted, _ := g.Converge(); !restarted ||
+		!f.had(plutilBin+" -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 8192 "+plist) {
+		t.Errorf("a changed default must converge: restarted=%v %v", restarted, f.cmds)
 	}
 }

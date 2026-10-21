@@ -4,6 +4,7 @@
 package docker
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +109,25 @@ func TestStunnelBackendKey(t *testing.T) {
 	} {
 		if got := stunnelBackendKey(name); got != want {
 			t.Errorf("%s: got %q want %q", name, got, want)
+		}
+	}
+}
+
+// A container an older agent created from `vllm/vllm-openai:latest` (awolf,
+// 2026-10-20, before the floating-ref refusal) is reported as floating; a
+// pinned, versioned or rail-own ref is not.
+func TestImageFactsFlagsAFloatingThirdPartyRef(t *testing.T) {
+	cases := map[string]bool{
+		"vllm/vllm-openai:latest":  true,
+		"ollama/ollama":            true,
+		"vllm/vllm-openai:v0.29.0": false,
+		"vllm/vllm-openai:latest@sha256:" + strings.Repeat("a", 64): false,
+		"pai-assistant/llamacpp:latest":                             false, // our own local build: rail-only, exempt
+	}
+	for img, want := range cases {
+		ref, floating := imageFacts(img)
+		if ref != img || floating != want {
+			t.Errorf("imageFacts(%q) = (%q, %v), want floating=%v", img, ref, floating, want)
 		}
 	}
 }

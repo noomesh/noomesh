@@ -80,7 +80,7 @@ The node agent sets all of this from the placement.
 | `NATS_NODE_USER`, `NATS_NODE_PASSWORD` | the node's bus principal; the password may arrive as `NATS_NODE_PASSWORD_FILE`, never both |
 | `NOO_HARNESS_MODEL_URL`, `NOO_HARNESS_MODEL`, `NOO_HARNESS_BACKEND` | the model endpoint, its name, its backend type (default `openai`) |
 | `NOO_HARNESS_MAX_TURNS` | concurrent turns and tasks (default 8) |
-| `NOO_HARNESS_KIND` | the loop kind (a kind from `config/harness-kinds.json`). Not in the shipped env file: when unset, the reference harness asks its node agent, `GET /harness/placement` on the model endpoint's agent (`{"kind", "env", "desired_state", "placed"}`), and runs `noo` when the agent answers 404, `placed: false`, or not at all. It runs its own loop for `noo` and the foreign-CLI driver (section 9) for any other kind |
+| `NOO_HARNESS_KIND` | the loop kind (a kind from `config/harness-kinds.json`). Not in the shipped env file: when unset, the reference harness asks its node agent, `GET /harness/placement` on the model endpoint's agent (`{"kind", "env", "desired_state", "placed"}`), and runs `noo` when the agent answers 404 or `placed: false`. Any other answer (unreachable, 401/403, 5xx, a body that does not parse) is asked again a few times, then the harness exits non-zero with `harness: cannot learn this node's harness kind from its agent: <cause>; refusing to guess` — it never guesses `noo` under a placement it could not read. The node agent reports the kind it started the harness with as `host_services.harness.kind` while it runs. It runs its own loop for `noo` and the foreign-CLI driver (section 9) for any other kind |
 | `NOO_HARNESS_TURN_TIMEOUT_SECS` | a foreign CLI's wall-clock limit per invocation (default 900) |
 | `NOO_HARNESS_WORKDIR` | where the driver makes each task's workspace (default: the process temp dir, which the shipped unit makes private) |
 | `NOO_HARNESS_KEEP_WORKDIR` | `1` keeps a task's workspace after it ends, for debugging |
@@ -147,6 +147,7 @@ the fields below. Failure is a non-2xx status and, usually, a body
 | Status | When |
 |---|---|
 | 400 | an unresolvable backend, a failed cloud run, an alert kind outside the allowed set, a `usage` report naming an undeclared harness kind |
+| 401 | the token expired, or its account is now disabled, absent, or holds a lower role than the token: the account is re-read on every call, cached at most 10 s, so disabling a person or lowering their role stops a running turn within that bound rather than at the token's expiry. A role raised mid-turn takes effect at the next mint (checkpoint renewal or the next dispatch) |
 | 403 | not a node-harness token (even an admin token is refused); `task_checkpoint` for a task that is not this turn's; the closed cloud gate on `cloud_run`, whose body is the cloud-gate body (`code: cloud_providers_disabled`) |
 | 500 | a session write failed |
 
@@ -358,8 +359,12 @@ freeform `custom` tools (as a function with one string argument `input`)
 and the tools inside a `namespace` (as `<namespace>__<name>`) go to the
 backend; hosted tools such as `web_search` do not. On the way back each call
 is returned under the name, namespace and item type the CLI declared.
-Request fields with no chat equivalent (`store`, `include`, `reasoning`,
-`prompt_cache_key`, ...) are dropped.
+`reasoning.effort` carries over: `none` or `minimal` turns reasoning off
+with every engine's own switch (as the profile's `thinking: off` does), and
+`low`, `medium` or `high` becomes chat's `reasoning_effort`, which vLLM and
+Ollama read. The request's `metadata` is echoed on the response. Request
+fields with no chat equivalent (`store`, `include`, `prompt_cache_key`, ...)
+are dropped.
 
 The translator counts every model call: the reply's usage, or, for a
 stream, its final usage chunk or Ollama's closing object. A reply without
@@ -395,7 +400,9 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    `CODEX_HOME` (`home/.codex/`). Codex takes its model URL from no
    variable, so that file names the translator as a provider
    (`base_url = <translator>/v1`, `wire_api = "responses"`) and the pinned
-   model, adds the user door as a streamable-HTTP MCP server, sets
+   model (with `model_context_window` when the agent reports
+   `model_context`, below), adds the user door as a streamable-HTTP MCP
+   server, sets
    `approval_policy = "never"` with `sandbox_mode = "danger-full-access"` (the harness's Landlock jail is the sandbox; Codex's own bubblewrap cannot run inside it),
    and switches Codex's reporting off
    ([../security/telemetry.md](../security/telemetry.md#agent-harnesses)).
@@ -403,7 +410,10 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
    `TMPDIR`, the translator's URL and the pinned model under the kind's
    variable names (none for Codex), a placeholder provider key,
    `NODE_EXTRA_CA_CERTS` (the cluster CA, also under `launch.ca_env`, which
-   is `CODEX_CA_CERTIFICATE` for Codex), then the kind's `lane`, then its
+   is `CODEX_CA_CERTIFICATE` for Codex), the model's context window under
+   `launch.context_window_env` (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` for Claude
+   Code) when the node agent's `/harness/placement` answer carries
+   `model_context`, then the kind's `lane`, then its
    `telemetry_off`, last. No
    `NATS_*` and no `NOO_*` variable reaches the CLI: not the bus pair, not
    the node-agent bearer, not the turn token.
@@ -428,6 +438,33 @@ is ONE invocation of the vendor's headless CLI (`cli` and `launch` in
 A turn sends one `content` event with the answer, then `harness_result`.
 A kind whose `launch` still carries an `unverified:` value is refused at
 start.
+
+A kind may also declare `launch_slim`, with the same fields as `launch`.
+Only claude-code has one. The driver runs it instead of `launch` while the
+node's harness profile (`profile.claude_prompt` in the agent's
+`/harness/placement` answer) says `slim`. It reads the choice once per run
+and re-reads the placement every minute. `launch_slim.system_prompt_file`
+names a file in the task's HOME. Before the run, the driver writes its slim
+system prompt there (mode 0600) and passes the path as
+`{system_prompt_file}` in `command`. It removes the file after the run. A
+command that names `{system_prompt_file}` without declaring the file is
+refused at start, and so is a file name that is not a plain name.
+
+`model_context` in the agent's `/harness/placement` answer is the context
+window the node's chat backend runs with. For Ollama it is what the agent
+sets: `OLLAMA_CONTEXT_LENGTH`, the placement's own value or else the
+profile's `ollama_context` default. For vLLM and llama.cpp the agent asks the
+running backend (vLLM's `max_model_len` from `GET /v1/models`, llama-server's
+per-slot `n_ctx` from `GET /props`, which is `--ctx-size` divided across its
+parallel slots), bounded at 2 seconds. It is absent when the agent does not
+know (another backend, nothing set, the backend not answering, an older
+agent), and then the CLI keeps its own default. Claude Code gets it as
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` (`launch.context_window_env`), Codex as
+`model_context_window` in its `config.toml`; Copilot CLI has no setting for
+it. Without it Claude Code assumes a 200k window for a model it does not
+know, so on a 32k node it never compacts before Ollama truncates the
+prompt. The driver reads the window once per run, and the harness re-reads
+the placement every minute.
 
 `noo-gateway harness probe --kind <kind>` runs steps 1, 3, 4 and 5 once,
 with no door key and no MCP wiring. That means no `{mcp_config}`

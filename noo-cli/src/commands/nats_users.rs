@@ -347,6 +347,24 @@ pub(crate) const WORKER_REPLY_INBOX: &str = "_INBOX_gw.worker.>";
 /// cannot be addressed to one node's prefix and stays on `allow_responses`.
 pub(crate) const NODE_REPLY_ROOT: &str = "_INBOX_gw.node";
 
+/// Control over the bus (i131 phase 1): the controller sends a node's small
+/// control calls to `node.<id>.rpc.<op>`, the node answers on the reply inbox
+/// it was given (its own `NODE_REPLY_ROOT` prefix, a static grant that
+/// survives a reload) and publishes long-op progress on `node.<id>.evt.<op_id>`.
+///
+/// Who may do what, and why the subject permission is only the FIRST gate
+/// (a refused publish returns nil to the sender; the node also verifies a
+/// signed envelope, `node-agent-go/internal/ctrlrpc`):
+///   - a node SUBSCRIBES `node.<its id>.rpc.>` and nothing wider, so it can
+///     hear no other node's control traffic;
+///   - a node PUBLISHES `node.<its id>.evt.>` (progress) and its reply
+///     prefix, never `node.*.rpc.>`: it cannot command a peer;
+///   - the gateway holds `>`/`>` and is the only principal that publishes
+///     `node.*.rpc.>`; the worker and every add-on carry an explicit deny so
+///     a future widening of their allow list cannot reach it.
+/// Must equal the Go agent's `ctrlrpc` subjects (`node.<id>.rpc.` / `.evt.`).
+pub(crate) const NODE_RPC_DENY: &str = "node.*.rpc.>";
+
 /// The gateway's own inbox prefix; every remote principal's reply prefix is
 /// one token under it. Must equal `nats_credentials::INBOX_PREFIX`.
 pub(crate) const GATEWAY_INBOX: &str = "_INBOX_gw";
@@ -473,7 +491,7 @@ fn perms_for(role: Role, id: &str, addons_rendered: &[&str]) -> String {
         Role::Worker => format!(
             "{ind}publish: {{\n\
              {ind}  allow: [\"events.cluster.*\", \"events.job.cancel\", \"agent.collab.>\", \"agent.msg.>\", \"$JS.API.STREAM.INFO.*\", \"{WORKER_REPLY_INBOX}\"{worker_addon_replies}]\n\
-             {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\"]\n\
+             {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\", \"{NODE_RPC_DENY}\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
              {ind}  allow: [\"worker.>\", \"_INBOX_worker.>\", \"agent.msg.direct.*\", \"agent.peer.*.task.*\"]\n\
@@ -491,7 +509,7 @@ fn perms_for(role: Role, id: &str, addons_rendered: &[&str]) -> String {
         Role::Addon => format!(
             "{ind}publish: {{\n\
              {ind}  allow: [\"$JS.API.STREAM.INFO.*\", \"{addon_reply}\"]\n\
-             {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\", \"worker.>\"]\n\
+             {ind}  deny: [\"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"$KV.>\", \"tasks.>\", \"worker.>\", \"{NODE_RPC_DENY}\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
              {ind}  allow: [{addon_subjects}, \"_INBOX_{id}.>\"]\n\
@@ -516,11 +534,11 @@ fn perms_for(role: Role, id: &str, addons_rendered: &[&str]) -> String {
         // That was #1218.
         Role::Node => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.STREAM.NAMES\", \"{NODE_REPLY_ROOT}.{tok}.>\"]\n\
-             {ind}  deny: [\"tasks.>\", \"worker.>\", \"$KV.>\", \"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.CONSUMER.DELETE.>\"]\n\
+             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.STREAM.NAMES\", \"{NODE_REPLY_ROOT}.{tok}.>\", \"node.{id}.evt.>\"]\n\
+             {ind}  deny: [\"tasks.>\", \"worker.>\", \"$KV.>\", \"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"{NODE_RPC_DENY}\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
-             {ind}  allow: [\"_INBOX_node_{tok}.>\", \"mesh.inference.discover\", \"harness.run.{id}\", \"harness.task.{id}\"]\n\
+             {ind}  allow: [\"_INBOX_node_{tok}.>\", \"mesh.inference.discover\", \"harness.run.{id}\", \"harness.task.{id}\", \"node.{id}.rpc.>\"]\n\
              {ind}  deny: [\"tasks.>\", \"worker.>\", \"$KV.>\", \"_INBOX.>\"]\n\
              {ind}}}\n\
              {ind}allow_responses: {{ max: 1, expires: \"{RESPONSE_EXPIRES}\" }}\n"
@@ -1918,6 +1936,112 @@ mod tests {
             for s in a.subjects {
                 assert!(!subscribe.contains(&format!("\"{s}\"")), "{w}");
             }
+        }
+    }
+
+    // ── control over the bus (i131 phase 1) ───────────────────────────
+
+    /// NATS subject matching: `*` is one token, `>` the rest (one or more).
+    fn subject_matches(pattern: &str, subject: &str) -> bool {
+        let p: Vec<&str> = pattern.split('.').collect();
+        let s: Vec<&str> = subject.split('.').collect();
+        for (i, tok) in p.iter().enumerate() {
+            if *tok == ">" {
+                return s.len() > i;
+            }
+            match s.get(i) {
+                Some(x) if *tok == "*" || tok == x => {}
+                _ => return false,
+            }
+        }
+        p.len() == s.len()
+    }
+
+    /// May `user` PUBLISH / SUBSCRIBE `subject` under the rendered file? Deny
+    /// wins over allow, as in nats-server.
+    fn permits(text: &str, user: &str, publish: bool, subject: &str) -> bool {
+        let b = block(text, user);
+        let (pubsec, subsec) = b.split_once("subscribe:").unwrap();
+        let sec = if publish { pubsec } else { subsec };
+        let allowed = list_after(sec, "allow:").iter().any(|a| subject_matches(a, subject));
+        let denied = list_after(sec, "deny:").iter().any(|d| subject_matches(d, subject));
+        allowed && !denied
+    }
+
+    #[test]
+    fn subject_matching_is_nats_matching() {
+        assert!(subject_matches("node.host9.rpc.>", "node.host9.rpc.stop"));
+        assert!(subject_matches("node.host9.rpc.>", "node.host9.rpc.skills.run"));
+        assert!(!subject_matches("node.host9.rpc.>", "node.host9.rpc"));
+        assert!(!subject_matches("node.host9.rpc.>", "node.host8.rpc.stop"));
+        assert!(subject_matches("node.*.rpc.>", "node.host8.rpc.stop"));
+        assert!(subject_matches(">", "anything.at.all"));
+        assert!(!subject_matches("node.*.evt.>", "node.host8.rpc.stop"));
+    }
+
+    /// A node hears ITS OWN control traffic and no other node's; it publishes
+    /// its own progress and replies; and nothing but the gateway publishes
+    /// `node.*.rpc.>` (the first gate; the signed envelope is the second).
+    #[test]
+    fn only_the_gateway_publishes_node_rpc_and_a_node_hears_only_its_own() {
+        let text = render_users_conf(&with_addons());
+        let rpc9 = "node.host9.rpc.stop";
+        let rpc9_dotted = "node.host9.rpc.skills.run";
+        let rpc8 = "node.host8.rpc.stop";
+
+        // The gateway sends to any node.
+        assert!(permits(&text, "gateway", true, rpc9) && permits(&text, "gateway", true, rpc8));
+
+        // Nobody else sends to any node: not the worker, not an add-on, and
+        // not a node (including a node with a stolen valid envelope).
+        for user in ["worker", "trellion", "trellion_intel", "node-host9", "node-host8"] {
+            for subj in [rpc9, rpc9_dotted, rpc8] {
+                assert!(!permits(&text, user, true, subj), "{user} may publish {subj}:\n{}", block(&text, user));
+            }
+        }
+        // ...by an explicit deny, so a later widening of an allow list
+        // (`worker.>` -> `>`) still cannot reach it.
+        for user in ["worker", "trellion", "trellion_intel", "node-host9", "node-host8"] {
+            let b = block(&text, user);
+            let pubsec = b.split_once("subscribe:").unwrap().0;
+            assert!(list_after(pubsec, "deny:").contains(&NODE_RPC_DENY), "{user} has no explicit deny of {NODE_RPC_DENY}:\n{b}");
+        }
+
+        // A node subscribes to its own rpc subjects only.
+        assert!(permits(&text, "node-host9", false, rpc9) && permits(&text, "node-host9", false, rpc9_dotted));
+        assert!(!permits(&text, "node-host9", false, rpc8), "host9 may hear host8's control traffic");
+        assert!(!permits(&text, "node-host8", false, rpc9), "host8 may hear host9's control traffic");
+        assert!(!permits(&text, "node-host9", false, "node.*.rpc.>"), "a wildcard subscription must not be granted");
+        for user in ["worker", "trellion", "trellion_intel"] {
+            assert!(!permits(&text, user, false, rpc9), "{user} may hear node control traffic");
+        }
+
+        // Progress: a node publishes its own event stream and nobody else's.
+        assert!(permits(&text, "node-host9", true, "node.host9.evt.op-0123456789"));
+        assert!(!permits(&text, "node-host9", true, "node.host8.evt.op-0123456789"));
+        assert!(!permits(&text, "node-host8", true, "node.host9.evt.op-0123456789"));
+
+        // Replies ride the node's static reply prefix (survives a reload),
+        // the same grant its harness replies use, and only its own.
+        assert!(permits(&text, "node-host9", true, "_INBOX_gw.node.host9.AbCd123"));
+        assert!(!permits(&text, "node-host9", true, "_INBOX_gw.node.host8.AbCd123"));
+    }
+
+    /// The strings node-agent-go/internal/ctrlrpc/service_test.go grants its
+    /// embedded server (which really enforces them) are the ones rendered here.
+    #[test]
+    fn node_rpc_grants_match_the_go_service_test() {
+        let text = render_users_conf(&sample());
+        let b = block(&text, "node-host9");
+        let (pubsec, subsec) = b.split_once("subscribe:").unwrap();
+        assert!(list_after(subsec, "allow:").contains(&"node.host9.rpc.>"), "{b}");
+        assert!(list_after(pubsec, "allow:").contains(&"node.host9.evt.>"), "{b}");
+        assert!(list_after(pubsec, "allow:").contains(&"_INBOX_gw.node.host9.>"), "{b}");
+        assert!(list_after(pubsec, "deny:").contains(&"node.*.rpc.>"), "{b}");
+        let go = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../node-agent-go/internal/ctrlrpc/service_test.go"))
+            .expect("the Go service test is part of this tree");
+        for needle in ["\"node.\"+id+\".rpc.>\"", "\"node.\"+id+\".evt.>\"", "\"_INBOX_gw.node.\" + id + \".>\"", "\"node.*.rpc.>\""] {
+            assert!(go.contains(needle), "service_test.go no longer grants {needle}");
         }
     }
 

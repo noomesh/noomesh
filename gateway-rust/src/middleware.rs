@@ -1666,14 +1666,17 @@ mod refusal_storm_tests {
 /// was checked against the built console (`ui/apps/web`: one same-origin
 /// module bundle per entry, no inline `<script>` in `index.html` or
 /// `kiosk.html`, no `eval`, no third-party origin, no iframe — Grafana opens
-/// in its own tab — same-origin `fetch`/SSE plus the `/ws/*` sockets) and the
-/// gateway's one inline-script page (`/ui/basic`, hence `'unsafe-inline'` in
-/// `script-src`; inline `style=` attributes in the console need it in
-/// `style-src` too). `frame-ancestors 'none'` stays alongside
-/// `X-Frame-Options: DENY`.
+/// in its own tab — same-origin `fetch`/SSE plus the `/ws/*` sockets, which
+/// `'self'` covers for `wss:` on this origin). `script-src` is `'self'` only:
+/// the one inline-script page (`/ui/basic`) is retired, so an injected
+/// `<script>` cannot run. `connect-src` is `'self'` only: `ws: wss:` allowed a
+/// socket to ANY host. `style-src` keeps `'unsafe-inline'`: Radix's dialog
+/// scroll lock injects a `<style>` element (React `style={{}}` props are set
+/// through the CSSOM and need nothing); a nonce-based style policy would let
+/// it go. `frame-ancestors 'none'` stays alongside `X-Frame-Options: DENY`.
 pub const DEFAULT_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
-     style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; \
-     connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; \
+     style-src 'self' 'unsafe-inline'; script-src 'self'; \
+     connect-src 'self'; font-src 'self' data:; object-src 'none'; \
      frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 
 /// What `NOO_CSP` asks for.
@@ -2318,12 +2321,42 @@ mod csp_default_tests {
         assert!(DEFAULT_CSP.contains("frame-ancestors 'none'"));
         assert!(DEFAULT_CSP.contains("default-src 'self'"));
         assert!(DEFAULT_CSP.contains("object-src 'none'"));
-        // sockets and same-origin fetch; no third-party origin
-        assert!(DEFAULT_CSP.contains("connect-src 'self' ws: wss:"));
+        // sockets and fetch to this origin only; no third-party origin, and
+        // no `ws:`/`wss:` scheme source (that allowed a socket to any host)
+        assert!(DEFAULT_CSP.contains("connect-src 'self';"));
+        assert!(!DEFAULT_CSP.contains("ws:"), "{DEFAULT_CSP}");
+        // no inline script anywhere: an injected <script> must not run
+        assert!(DEFAULT_CSP.contains("script-src 'self';"));
+        let script = DEFAULT_CSP.split(';').find(|d| d.trim().starts_with("script-src")).unwrap();
+        assert!(!script.contains("unsafe-inline"), "{script}");
         assert!(!DEFAULT_CSP.contains("http://") && !DEFAULT_CSP.contains("https://"));
         assert!(!DEFAULT_CSP.contains("unsafe-eval"));
         assert!(DEFAULT_CSP.is_ascii(), "must be a valid header value");
         assert!(axum::http::HeaderValue::from_str(DEFAULT_CSP).is_ok());
+    }
+
+    /// `script-src 'self'` holds only while every page the gateway serves
+    /// loads its script from a file: the console's two entries may carry no
+    /// inline `<script>` and no `on…=` handler, and the retired inline page
+    /// must not come back.
+    #[test]
+    fn every_served_page_loads_script_from_a_file() {
+        // Read, not include_str!: the console source is not in the image's
+        // builder stage, and an embed outside src/ must be (test_rust_build_context_complete).
+        let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/apps/web");
+        for name in ["index.html", "kiosk.html"] {
+            let html = std::fs::read_to_string(web.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for tag in html.split("<script").skip(1) {
+                let open = tag.split('>').next().unwrap_or("");
+                assert!(open.contains(" src="), "{name}: an inline <script> would be refused by script-src 'self': <script{open}>");
+            }
+            let lower = html.to_ascii_lowercase();
+            for h in [" onload=", " onclick=", " onerror=", " onsubmit=", " onchange=", " oninput="] {
+                assert!(!lower.contains(h), "{name}: inline handler{h}");
+            }
+        }
+        let ui = include_str!("routes/ui.rs");
+        assert!(!ui.contains("\"/ui/basic\""), "the inline-script page is retired");
     }
 
     /// The handler reads the choice, and the framing header stays alongside.

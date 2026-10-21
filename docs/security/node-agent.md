@@ -37,6 +37,8 @@ an allow-list.
 | Place an external MCP server | `streamable_http` only — a URL the node dials out to. **A stdio server cannot be placed at all**; those are declared on the node |
 | Call a tool on a placed MCP server, read logs, read metrics, run inference, clean disk, restart the agent | Controller identity required — see [Who is the controller](#who-is-the-controller) |
 | Preseed a model weight from the controller's store | Only against a **digest the controller states in its artifact manifest** |
+| Benchmark the running chat model (`POST /bench`) | Controller identity required, one bench at a time, 600 s in all — see [Harness profile](#harness-profile) |
+| Set the node's harness profile (desired-config `harness_profile`) | Numbers and enums the agent applies to its own bounds; the env on the box still wins — see [Harness profile](#harness-profile) |
 
 ### The controller MAY NOT
 
@@ -196,6 +198,93 @@ disk layout and free space — is behind the bearer.
 
 ---
 
+## Control over the bus
+
+Small controller-to-node control calls no longer need the node's inbound
+`:8081` listener. A node that holds an outbound NATS connection answers them
+as NATS request/reply on `node.<id>.rpc.<op>` (followup i131, phase 1). The
+ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `clean`,
+`cleanup` (`images` | `logs`), `logs` (a container tail, or the container
+list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
+handler the HTTPS route runs** (`internal/api/rpc.go` builds the request the
+route would have received and calls that handler), so status, headers and
+body are the HTTPS answer; `TestEveryOpAnswersWhatItsHTTPSRouteAnswers` pins
+it. Streaming and bulk stay on HTTPS until the tunnel (phase 2): inference
+SSE, embeddings, the container proxy, device blobs, `/metrics`, logs over one
+bus message (the node answers `413` with `Noo-Overflow` and the gateway reads
+the same logs over HTTPS). There is no `tools` op: the agent has no such route.
+
+`pull` and `skills.run` can take minutes. The node acks at once (`202`,
+`Noo-Async: 1`) and publishes a keepalive every 10 s, then the result, on
+`node.<id>.evt.<op_id>`; the gateway chooses the `op_id`, subscribes first,
+and treats 45 s of silence as the node being gone. `start` already returns at
+once over HTTPS; over the bus its eventual outcome is also published on its
+event stream.
+
+### Two gates, and why there are two
+
+1. **The bus.** nats-server permissions (`noo cluster nats-users render`): a
+   node may *subscribe* only `node.<its id>.rpc.>`, may *publish* only
+   `node.<its id>.evt.>` and its reply inbox, and no principal but the gateway
+   may publish `node.*.rpc.>` (the worker, every add-on and every node carry
+   an explicit deny). This gate is silent when it refuses, because NATS
+   returns success to a denied publisher, so it is never the only one.
+2. **The envelope.** Every message carries `{op, node, ts, nonce, arg, query,
+   op_id, timeout_s, body_sha256}` signed by the controller's leaf key (the
+   gateway's own `NOO_TLS_KEY`), with that leaf attached. The node verifies
+   the chain to the cluster CA, that the leaf carries the controller
+   organization (the test `ControllerOnly` applies to a TLS peer), the
+   signature over the whole message including a hash of the body, a 300 s
+   window, and an unseen nonce. The nonce set is bounded (16 384); if it is
+   full of unexpired entries the node refuses rather than forget one. A
+   refused message gets a `403` naming the reason and never reaches a handler.
+
+**Why the leaf and not the fleet signing key.** The signing key that verifies
+rail manifests is deliberately not on the gateway (`scripts/noo-apply.sh`: a
+gateway compromise must not be able to sign code). Using it here would put it
+there. The controller leaf is the identity nodes already trust for `:8081`, so
+this adds no new trust and removes none: a holder of the leaf can do over the
+bus exactly what it can do over HTTPS today, and nothing the signing key
+guards.
+
+### When the bus is not available
+
+| Situation | What happens |
+|---|---|
+| Old node (no `nats_rpc`) | HTTPS, as before |
+| New node, controller NATS file from before this change (the subscription is denied) | The node detects the refusal (it flushes after subscribing and reads the server's async permission error), logs it with the remedy, does **not** advertise `nats_rpc`, and retries every minute; control stays on HTTPS |
+| A grant dropped later, or a reply/event publish denied | Any permission violation naming this node's subjects withdraws `nats_rpc` at the next heartbeat |
+| Gateway's bus is down | Routing, not a retry: nothing was sent, so the call goes over HTTPS |
+| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
+| Bus call fails on `start`, `stop`, `restart`, `clean`, `cleanup`, `pull`, `skills.run`, `mcp.call` | The node is reported unreachable, as the HTTPS path reports it. **Never retried over HTTPS**: the node may have run it |
+
+`NOO_CONTROL_OVER_BUS=0` on the gateway sends everything over HTTPS again.
+`GET /api/cluster/nodes` carries `control_calls` per node (`bus`,
+`https_control`, `https_other`, `fallbacks`, since the gateway started): the
+number the later "outbound-only" gate reads. `noo cluster verify` has a
+`control over bus` row per node: a `health` round trip over NATS, **NOT
+CHECKED** (a warning, never ok) for a node that does not advertise `nats_rpc`,
+**FAIL** for a node that advertises it and does not answer.
+
+### Roll order
+
+1. Upgrade the controller (gateway, CLI) first. Nothing changes: no node
+   advertises `nats_rpc` yet.
+2. `noo cluster nats-users render` on the controller (a stack roll re-renders it too). This writes the new
+   grants and reloads NATS; the `rpc`/`evt` grants are static, so they survive
+   the reload. Node credentials do **not** change and need no re-delivery over
+   the rail: only the controller-side permission file is new.
+3. Upgrade the nodes (`noo upgrade --nodes`, the rail). A new node subscribes,
+   proves the subscription, and starts advertising on its next heartbeat. A
+   node upgraded **before** step 2 simply keeps taking control over HTTPS and
+   picks up the bus within a minute of the render.
+4. `noo cluster verify`: every node shows `control over bus` green.
+
+Rollback: set `NOO_CONTROL_OVER_BUS=0` on the gateway (no node change), or
+roll a node back (it stops subscribing and stops advertising).
+
+---
+
 ## Declared host roots
 
 A node declares where its data lives in its own environment. The controller
@@ -234,10 +323,13 @@ nothing else:
   `N_CTX` `N_THREADS` `N_BATCH` `N_PARALLEL` `GPU_MEMORY_UTILIZATION`
   `TENSOR_PARALLEL_SIZE` `GPU_COUNT` `OLLAMA_MODEL` `OLLAMA_HOST`
   `OLLAMA_NUM_PARALLEL` `OLLAMA_KEEP_ALIVE` `OLLAMA_MAX_LOADED_MODELS`
-  `LOG_LEVEL` `RUST_LOG`
+  `OLLAMA_CONTEXT_LENGTH` `LOG_LEVEL` `RUST_LOG`
   (embed placements: `--env OLLAMA_NUM_PARALLEL=4` is the declared way to raise
-  an ollama embedder's concurrency; the context window is NOT a placement
-  setting, the gateway sends `options.num_ctx` on each embed request)
+  an ollama embedder's concurrency; an EMBEDDER's context window is not a
+  placement setting, the gateway sends `options.num_ctx` on each embed
+  request; `OLLAMA_CONTEXT_LENGTH` sets the daemon-wide default for CHAT
+  models, which a vendor CLI harness needs: e.g. `--env
+  OLLAMA_CONTEXT_LENGTH=32768`)
 - prefixes: `VLLM_` `LLAMA_ARG_` `TEI_` `RERANK_`
 
 Refused, by construction: `LD_*` and `PATH` (the dynamic loader reads them
@@ -642,7 +734,88 @@ that does not name its door, an expiring leaf, a plaintext door
 controller. An agent that does not send `backend_containers` leaves the
 row exactly as it was.
 
+### Backend images
+
+Each entry also carries the ref the container was created from (`image`)
+and whether that ref can move under it (`image_floating`: no `@sha256`
+digest, tag `latest` or none, and not one of our rail-only images). The
+agent refuses to *create* a backend from a floating ref, but a container an
+older agent made before that refusal keeps running on one. The `backend
+images` row fails and names it, with `noo cluster provision <node> --wait`
+as the remedy: a current agent recreates it from the stack lock's pinned
+ref.
+
+The controller never sends a floating ref either. An operator
+`VLLM_IMAGE`, `VLLM2_IMAGE` or `OLLAMA_IMAGE` set to `:latest` (or with no
+tag) is skipped with a warning. Compose renders `VLLM_IMAGE` into the
+locked variable too, so in that case the node uses its own versioned
+default. Pin an override as `repo:version@sha256:…`, or unset it to use the
+lock.
+
 ---
+
+## Harness profile
+
+The controller resolves a per-node **harness profile** (a tier default,
+refined by a per-node override and by a measured model speed) and sends it in
+desired-config as `harness_profile`. The agent keeps the last good one: a
+fetch that fails, or a profile that does not parse, keeps it; a desired-config
+with no `harness_profile` clears it, and no profile is exactly the behaviour
+from before profiles. The agent applies four of its fields:
+
+- **`first_byte_secs`** is the inference proxy's wait for a backend's
+  response headers. Precedence: `NOO_BACKEND_FIRST_BYTE_TIMEOUT_SECS` on the
+  box (the operator's override, read once) > the profile > 290 s. It is
+  live: the proxy builds its transport per request, and each build reads the
+  bound in force, so a profile change applies to the next request with no
+  agent restart (a request already in flight keeps the bound it started
+  with). An unusable env value is not an override; the profile or the
+  default applies.
+- **`ollama_context`** is the default `OLLAMA_CONTEXT_LENGTH` for this node's
+  ollama when the ollama placement's env does not set the key; a placement
+  that sets it is never touched. On Linux it joins the container env before
+  the spec hash is taken, so a changed default recreates the container like
+  any placement env edit. On macOS it reaches a brew-managed ollama through
+  the plist tuning, and the guard rewrites the key and boots the job out and
+  back once, as for its other tuning keys (it never removes a key, so
+  clearing the profile leaves the last value in the plist).
+- **`foreign_kinds`** lists the foreign harness kinds this node offers. After
+  the kind checks above (wire, table, runner, vendor CLI), a foreign kind the
+  profile does not list is refused (`backend_start` / `harness`) with:
+  harness kind "claude-code": this node's profile (tier 3) does not offer it;
+  set it with noo cluster profile &lt;node&gt; --set foreign_kinds=… (the
+  node's id in place of &lt;node&gt;). `noo` is never refused by the profile,
+  and with no profile there is no new refusal.
+- The whole resolved object is passed to the node's own harness as `profile`
+  in `GET /harness/placement` (omitted when there is none); the harness reads
+  `stream_idle_secs`, `thinking` and `claude_prompt` from it. The profile
+  carries numbers, enums and kind names, never a secret, and the placement
+  env beside it keeps its secret-looking-key filter.
+
+`POST /bench` measures the running chat model for the measured
+`first_byte_secs`. It is a controller-only route (`ctrlMW`, the class of
+`/restart` and `/gpu/hold`; a peer node, a service leaf and the node's own
+harness are refused): a bench occupies the GPU, so it is a command. It
+benches the desired placement with role chat (409 when there is none, or its
+backend is not running; 409 while another bench runs), dialled exactly as the
+inference proxy dials it (same door, TLS and client certificate; the header
+wait is the bench budget, not the first-byte bound it measures):
+
+1. `load_secs`: time to the first token of a streamed one-token completion,
+   **as found**: a model already loaded gives a warm number, one that is not
+   gives its cold load.
+2. A deterministic ~8192-token prompt (one leading nonce line so a prefix
+   cache cannot answer it) streamed with `max_tokens` 64 and
+   `stream_options.include_usage`: `prefill_tps` = prompt tokens / time to
+   first token, `decode_tps` = tokens after the first / the time after it.
+   Token counts come from the backend's `usage`; without one the prompt is
+   counted at chars/4 and the completion by content chunks.
+
+The whole bench is bounded at 600 s (504 on expiry, 502 on a backend error).
+The answer is the heartbeat's `model_bench`
+(`{"model","backend","load_secs","prefill_tps","decode_tps","prompt_tokens","at"}`),
+kept in memory and sent beside `host_services` on every heartbeat after; it
+is absent until a bench has run on this agent process.
 
 ## When a node refuses
 
@@ -798,8 +971,12 @@ contains, one of those.
   the data root, names `~/noomesh/pki`, `~/noomesh/secrets`,
   `~/noomesh/harness-secrets` and both env files in a deny of their own,
   then re-allows the CLI's own `~/noomesh/vendor` and `~/noomesh/bin`, the
-  CA file, and the task's directories. No `sandbox-exec` means a refusal,
-  the same as on Linux.
+  CA file, and the task's directories. On a Mac the harness runs as the
+  operator's own user, so the profile first denies that user's whole real
+  home (`~/.ssh`, `~/Documents`, keychains), re-allowing under it only
+  those same paths and a `stat` of `~` and `~/noomesh`; the self-test
+  plants a file in the real home and proves it unreadable. No
+  `sandbox-exec` means a refusal, the same as on Linux.
 - **Other processes on a Mac.** macOS has no Landlock, and the harness and
   the agent run as the same user as the CLI, so a plain process could read
   their arguments and environment with `sysctl(KERN_PROCARGS2)` (what

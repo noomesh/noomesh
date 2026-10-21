@@ -73,7 +73,7 @@ fi
 CA="$PKI/ca.crt"
 [ -f "$CA" ] || { echo "noo-apply: no trusted CA at $CA — enroll this node first" >&2; exit 78; }
 
-KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest"
+KNOWN_KINDS="ca.crt node.crt node.key agent-env agent-unit agent-binary teardown applier hostd-binary restart-backends host-telemetry cli-binary cli-user fetcher nats-creds fleet-secrets signing-pub harness-binary harness-env harness-unit svc-vllm.crt svc-vllm.key svc-llamacpp.crt svc-llamacpp.key svc-ollama.crt svc-ollama.key svc-tei.crt svc-tei.key svc-reranker.crt svc-reranker.key vendor-cli vendor-cli-manifest vendor-cli-2 vendor-cli-2-manifest vendor-cli-3 vendor-cli-3-manifest"
 
 # ── 0. The tar's SHAPE, before a single byte is extracted ────
 # This applier runs as root and writes into the extraction directory. A
@@ -449,7 +449,7 @@ unit_payload_ok() {
 # a directive or key hidden behind either would reach pid 1 unchecked. Every
 # text kind is held to this, including the merges (nats-creds,
 # fleet-secrets), whose lines land in an EnvironmentFile.
-TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest"
+TEXT_KINDS="agent-env harness-env nats-creds fleet-secrets host-telemetry teardown cli-user signing-pub ca.crt node.crt node.key agent-unit harness-unit restart-backends vendor-cli-manifest vendor-cli-2-manifest vendor-cli-3-manifest"
 text_payload_ok() {
     if ! LC_ALL=C tr -d '\r\000' < "$1" | cmp -s - "$1"; then
         _shape_refuse "$2" "carries a carriage return or NUL byte"
@@ -513,12 +513,13 @@ config_unchanged() {
 }
 # END config_unchanged
 # BEGIN vendor_install
-# The vendor CLI a harness kind runs (i83 E1e). The controller fetched it,
+# The vendor CLIs a node carries (i83 E1e). The controller fetched each,
 # verified it against the sha256 pinned in
 # config/harness-kinds.json (`noo cluster vendor stage`), and the bundle
-# carries it as `vendor-cli` with a manifest (`vendor-cli-manifest`, JSON
-# with one key per line, every value a plain string or null — read here with
-# sed). This node never fetches it. Installed under
+# carries each in its own slot (VENDOR_SLOTS: `vendor-cli`, `vendor-cli-2`,
+# …) with its own manifest (`<slot>-manifest`, JSON with one key per line,
+# every value a plain string or null — read here with sed). Every slot is
+# verified and installed on its own. This node never fetches them. Installed under
 # $VENDOR_ROOT/<name>/<version>/, and the CLI gets a root-owned 0755 wrapper at
 # $VENDOR_BIN/<name>, which is on the PATH of both the agent (its
 # cliOnPath check) and the noo-harness unit (systemd's default PATH). The
@@ -528,6 +529,8 @@ VENDOR_ROOT=/opt/noo/vendor
 VENDOR_BIN=/usr/local/bin
 VENDOR_OWN=1   # chown root:root; the block's test runs unprivileged with 0
 VENDOR_MARK="# noomesh vendor wrapper:"
+# The slots, as noo-cli's cluster_vendor::VENDOR_SLOTS names them.
+VENDOR_SLOTS="vendor-cli vendor-cli-2 vendor-cli-3"
 
 # vendor_get MANIFEST KEY — "KEY": "value" on its own line → value; empty for
 # null or absent.
@@ -546,7 +549,7 @@ _vendor_refuse() {
     return 65
 }
 # vendor_manifest_ok MANIFEST KIND — the manifest's every value is one this
-# block may interpolate into a path or a script; KIND is vendor-cli.
+# block may interpolate into a path or a script; KIND is the slot.
 # 0, or 65 with the reason.
 vendor_manifest_ok() {
     _vm_n="$(vendor_get "$1" name)"; _vm_v="$(vendor_get "$1" version)"
@@ -655,33 +658,42 @@ vendor_prune() {
         [ "$_vp_used" = 1 ] || rm -rf "$_vp_d"
     done
 }
-# vendor_apply DIR — the whole step over a bundle's files/ directory: the CLI
-# and its wrapper, then pruning. Appends to $applied and records binary shas
-# like the binary kinds above; prints one `vendor-cli: …` line for the report.
-vendor_apply() {
-    [ -f "$1/vendor-cli" ] || return 0
-    _va_m="$1/vendor-cli-manifest"
+# vendor_apply_slot DIR SLOT — one slot: the CLI and its wrapper, then
+# pruning. Appends to $applied and records the binary sha like the binary
+# kinds above; prints one `<slot>: …` line for the report.
+vendor_apply_slot() {
+    _va_m="$1/$2-manifest"
     _va_n="$(vendor_get "$_va_m" name)"; _va_v="$(vendor_get "$_va_m" version)"; _va_e="$(vendor_get "$_va_m" entry)"
-    vendor_install "$1/vendor-cli" "$_va_m" vendor-cli || return $?
+    vendor_install "$1/$2" "$_va_m" "$2" || return $?
     _va_cli="$_vi_outcome"
     _va_w="$(mktemp)"
     vendor_wrapper "$_va_n" "$_va_v" "$_va_e" > "$_va_w"
     vendor_write_wrapper "$_va_n" "$_va_w"; rm -f "$_va_w"
     vendor_prune "$_va_n" "$_va_v"
     if [ "$_va_cli" = unchanged ] && [ "$_vw_outcome" = unchanged ]; then
-        applied="$applied vendor-cli=unchanged"
-        echo "vendor-cli: $_va_n $_va_v unchanged — already installed, nothing to do"
+        applied="$applied $2=unchanged"
+        echo "$2: $_va_n $_va_v unchanged — already installed, nothing to do"
     else
-        applied="$applied vendor-cli"
-        echo "vendor-cli: $_va_n $_va_v installed ($VENDOR_ROOT/$_va_n/$_va_v, wrapper $VENDOR_BIN/$_va_n)"
+        applied="$applied $2"
+        echo "$2: $_va_n $_va_v installed ($VENDOR_ROOT/$_va_n/$_va_v, wrapper $VENDOR_BIN/$_va_n)"
     fi
-    note_binary_sha vendor-cli "$1/vendor-cli"
+    note_binary_sha "$2" "$1/$2"
+    return 0
+}
+# vendor_apply DIR — every slot the bundle carries, in order.
+vendor_apply() {
+    for _vs in $VENDOR_SLOTS; do
+        [ -f "$1/$_vs" ] || continue
+        vendor_apply_slot "$1" "$_vs" || return $?
+    done
     return 0
 }
 # vendor_check DIR — before anything installs: each vendor payload rides with
-# its manifest, the manifest is well-formed, and the payload hashes to it.
+# its manifest, the manifest is well-formed, the payload hashes to it, and
+# no two slots install the same CLI.
 vendor_check() {
-    for _vc_k in vendor-cli; do
+    _vc_names=" "
+    for _vc_k in $VENDOR_SLOTS; do
         [ -f "$1/$_vc_k" ] || [ -f "$1/$_vc_k-manifest" ] || continue
         [ -f "$1/$_vc_k" ] && [ -f "$1/$_vc_k-manifest" ] \
             || { _vendor_refuse "$_vc_k" "the payload and its manifest must ride together"; return 65; }
@@ -689,6 +701,11 @@ vendor_check() {
         _vc_s="$(vendor_get "$1/$_vc_k-manifest" sha256)"
         [ "$(sha256sum "$1/$_vc_k" | awk '{print $1}')" = "$_vc_s" ] \
             || { _vendor_refuse "$_vc_k" "the payload does not hash to its manifest's sha256"; return 65; }
+        _vc_n="$(vendor_get "$1/$_vc_k-manifest" name)"
+        case "$_vc_names" in
+            *" $_vc_n "*) _vendor_refuse "$_vc_k" "a second slot carries $_vc_n"; return 65 ;;
+        esac
+        _vc_names="$_vc_names$_vc_n "
     done
     return 0
 }
@@ -1793,12 +1810,10 @@ if getent group noo-harness >/dev/null 2>&1; then
     done
 fi
 
-# vendor-cli — see vendor_install. No harness restart: the
-# harness execs the CLI through its wrapper per turn, and the agent's
-# vendor-CLI check reads the PATH on each reconcile.
-if [ -f "$WORK/files/vendor-cli" ]; then
-    vendor_apply "$WORK/files" || exit $?
-fi
+# vendor-cli — see vendor_install: every slot the bundle carries. No
+# harness restart: the harness execs the CLI through its wrapper per turn,
+# and the agent's vendor-CLI check reads the PATH on each reconcile.
+vendor_apply "$WORK/files" || exit $?
 
 [ -n "$applied" ] || { echo "noo-apply: signed bundle contained nothing to apply" >&2; exit 65; }
 

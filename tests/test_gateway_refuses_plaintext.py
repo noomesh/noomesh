@@ -180,7 +180,9 @@ def test_the_scheme_sites_that_used_to_follow_the_env_are_unconditional() -> Non
         # adapter in process the earlier change, so it builds no scheme.
         "src/noomesh/gateway/helpers.py": 'return f"https://127.0.0.1:{port}"',
         "src/noomesh/cli_utils.py": 'return "https://localhost:8080"',
-        "src/noomesh/workers/graph.py": '"https://noo-vllm:8000"',
+        # workers/graph.py left this list (i145): it calls the gateway through
+        # llm_purposes, which builds the one https address.
+        "src/noomesh/llm_purposes.py": 'or "https://gateway:8080"',
         "src/noomesh/_providers/backend_resolver.py": 'return f"https://{ip}:{port}"',
         "src/noomesh/cluster/messaging.py": '"tls://localhost:4222"',
         "src/noomesh/secrets.py": '"rediss://localhost:6379"',
@@ -229,10 +231,10 @@ def test_browser_session_is_reached_through_the_node_agent_not_a_plain_node_url(
     if this fails."""
     code = _code_only(UI_ROUTES, UI_ROUTES.read_text())
     assert 'format!("http://' not in code, "ui.rs builds a plaintext http:// URL again"
-    assert "{}/api/containers/{container_name}/proxy" in code, (
+    assert "/api/containers/{container_name}/proxy" in code, (
         "the browser session URL no longer goes via the agent's proxy route — the parse found no route"
     )
-    assert "browser_proxy_base(&agent_url" in code
+    assert "browser_proxy_path(&container_name)" in code and "link.url(&proxy_path)" in code
     agent = (ROOT / "node-agent-go/internal/docker/containers.go").read_text()
     assert "network.PortBinding{HostIP: managedPublishIP}" in agent, (
         "managed container ports are published without the loopback HostIP"

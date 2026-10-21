@@ -26,10 +26,12 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/backendrt"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/containerdial"
+	"github.com/noomesh/noomesh/node-agent-go/internal/ctrlrpc"
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuwatch"
 	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
+	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
 	"github.com/noomesh/noomesh/node-agent-go/internal/heartbeat"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostd"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
@@ -53,6 +55,7 @@ type Agent struct {
 	hb     *heartbeat.Reporter
 	server *api.Server
 	mesh   *messaging.MeshResponder
+	ctrl   *ctrlrpc.Service
 	gossip *messaging.GossipAnnouncer
 
 	// native probes backends served outside Docker (darwin/Metal). nil off
@@ -64,6 +67,9 @@ type Agent struct {
 	// harness is the host service this node regulates; the
 	// reconciler drives it and the heartbeat reports it.
 	harness hostsvc.Service
+	// harnessKind is the reconciler's HarnessRunningKind, set once the
+	// reconciler exists; nil before (the heartbeat then reports no kind).
+	harnessKind func() string
 }
 
 // runningBackends is what this node is ACTUALLY serving, from both runtimes.
@@ -325,10 +331,21 @@ func (a *Agent) Run() error {
 	// helper containers, backends via StartBackendSDK). See
 	// DESIRED_STATE_CONFIG.md.
 	rec := reconcile.New(a.cfg, a.docker, a.http, a.harness)
+	a.harnessKind = rec.HarnessRunningKind
 	a.server.SetMCP(rec.MCP())
+	a.server.SetChatPlacement(func() (api.ChatPlacement, bool) {
+		b, m, ok := rec.ChatPlacement()
+		return api.ChatPlacement{Backend: b, Model: m}, ok
+	})
 	a.server.SetHarnessPlacement(func() api.HarnessPlacement {
 		kind, env, ds, placed := rec.HarnessPlacementView()
-		return api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		hp := api.HarnessPlacement{Kind: kind, Env: env, DesiredState: ds, Placed: placed}
+		prof := harnessprofile.Current()
+		if prof != nil {
+			hp.Profile = prof.Raw
+		}
+		hp.ModelContext = rec.ChatContextWindow(prof)
+		return hp
 	})
 
 	// 4b'. Node disk reclaim: the controller's ladder cannot reach this
@@ -368,6 +385,24 @@ func (a *Agent) Run() error {
 	// Cleanup
 	a.shutdown()
 	return nil
+}
+
+// startControlBus wires the control-over-the-bus service. Never fatal.
+func (a *Agent) startControlBus(ctx context.Context) {
+	caPEM, err := os.ReadFile(a.cfg.TLSCA)
+	if a.cfg.TLSCA == "" || err != nil {
+		slog.Warn("control over the bus not enabled: the cluster CA (NOO_TLS_CA) is unreadable, so control envelopes cannot be verified; control stays on HTTPS",
+			"path", a.cfg.TLSCA, "error", err)
+		return
+	}
+	v, err := ctrlrpc.NewVerifier(a.cfg.NodeID, caPEM)
+	if err != nil {
+		slog.Warn("control over the bus not enabled; control stays on HTTPS", "error", err)
+		return
+	}
+	a.ctrl = ctrlrpc.NewService(a.nats, a.cfg.NodeID, v, a.server)
+	a.hb.SetNatsRPC(a.ctrl.Ready)
+	a.ctrl.Start(ctx)
 }
 
 func (a *Agent) startMessaging(ctx context.Context) {
@@ -418,6 +453,13 @@ func (a *Agent) startMessaging(ctx context.Context) {
 	})
 	a.hb.SetDataMounts(a.docker.ManagedDataMounts)
 	a.hb.SetHostState(a.hostServices)
+	a.hb.SetModelBench(func() any {
+		// A nil *ModelBench must reach the heartbeat as a nil interface.
+		if b := a.server.LastBench(); b != nil {
+			return b
+		}
+		return nil
+	})
 	a.hb.SetHostdState(a.hostdStatus)
 	a.hb.SetBackendContainers(a.backendContainers)
 	a.hb.SetOllamaDoor(func() string { return a.docker.BackendDialURL("ollama") })
@@ -439,6 +481,14 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		slog.Error("job subscription failed", "error", err)
 	}
 	go a.jobs.EnsureBound(ctx)
+
+	// Control over the bus (followup i131 phase 1): answer the controller's
+	// small control calls on node.<id>.rpc.> through the same handlers the
+	// HTTPS API uses. Advertised (control_transports.nats_rpc) only while the
+	// server has accepted the subscription; with no CA to verify envelopes
+	// against, or an older controller NATS file that denies the subject, the
+	// node stays on HTTPS and says why in the log.
+	a.startControlBus(ctx)
 
 	// Start mesh responder
 	scheme := a.cfg.Scheme()
@@ -651,12 +701,27 @@ func (a *Agent) hostServices() map[string]any {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	return map[string]any{
-		"harness": map[string]any{
-			"state":   string(a.harness.State(ctx)),
-			"runtime": a.harness.Runtime(),
-		},
+	kind := ""
+	if a.harnessKind != nil {
+		kind = a.harnessKind()
 	}
+	return hostServicesReport(a.harness.State(ctx), a.harness.Runtime(), kind)
+}
+
+// hostServicesReport is the heartbeat's host_services: the harness's state
+// and runtime and, while it runs, the KIND it was started with — so the
+// controller sees which loop is live, not only that one is. A harness that
+// is not running reports no kind (it runs none), and an unknown kind is
+// omitted rather than guessed.
+func hostServicesReport(state hostsvc.State, runtime, kind string) map[string]any {
+	h := map[string]any{
+		"state":   string(state),
+		"runtime": runtime,
+	}
+	if state == hostsvc.Running && kind != "" {
+		h["kind"] = kind
+	}
+	return map[string]any{"harness": h}
 }
 
 // hostdStatus is the confined-root daemon's own heartbeat, relayed up.

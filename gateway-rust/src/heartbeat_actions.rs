@@ -4223,13 +4223,9 @@ fn node_scan_line(counted: &str, unscanned: &[String]) -> String {
 /// succeed. The error names the status and the agent's own `detail`, so a
 /// ControllerOnly 403 reads as one.
 async fn node_agent_post(agent_url: &str, path: &str, body: &Value) -> Result<Value, String> {
-    let url = format!("{}{path}", agent_url.trim_end_matches('/'));
-    let mut req = crate::routes::cluster::build_node_agent_client()
-        .post(&url)
+    let req = crate::node_link::NodeLink::for_base(agent_url)
+        .request(reqwest::Method::POST, path)
         .json(body);
-    if let Some((k, v)) = crate::node_agent_auth::header_for(&url) {
-        req = req.header(&k, &v);
-    }
     let resp = req.send().await.map_err(|e| format!("unreachable: {e}"))?;
     let status = resp.status();
     if !status.is_success() {

@@ -43,7 +43,7 @@ pub fn chat_to_response(chat: &Value, model: &str, request: &Value) -> Value {
         let (p, c, _) = crate::coordinator::anthropic_wire::usage_tokens(u);
         (p, c)
     });
-    wire::response_from_chat(&msg, fr, usage, model, &ToolNames::from_request(request))
+    wire::response_from_chat(&msg, fr, usage, model, &ToolNames::from_request(request), &wire::metadata_of(request))
 }
 
 /// Turns a chat-completions SSE byte stream into the Responses event
@@ -56,7 +56,7 @@ pub struct StreamTranslator {
 
 impl StreamTranslator {
     pub fn new(model: &str, request: &Value) -> Self {
-        Self { inner: ChatToResponsesSse::new(model, ToolNames::from_request(request)), carry: String::new() }
+        Self { inner: ChatToResponsesSse::new(model, ToolNames::from_request(request)).with_metadata(wire::metadata_of(request)), carry: String::new() }
     }
 
     fn line(&mut self, line: &str, out: &mut String) {

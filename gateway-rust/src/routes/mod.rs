@@ -16,6 +16,7 @@ mod cli_piece;
 mod console_piece;
 mod artifacts;
 mod bootstrap;
+pub(crate) use bootstrap::self_agent_base;
 mod seats;
 pub(crate) mod cluster;
 pub(crate) mod communication;

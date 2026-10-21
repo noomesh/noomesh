@@ -242,7 +242,12 @@ def _url_env_values() -> list[tuple[str, str, str, dict]]:
 
 def test_every_vllm_and_llamacpp_url_in_compose_is_https_with_a_client_cert():
     found = _url_env_values()
-    assert found, "no compose env value names a vllm/llamacpp URL — the parse found nothing"
+    # Since i145 no service is handed a backend URL at all (the worker's
+    # PAGEINDEX_LLM_URL was the last): every LLM call goes through the
+    # gateway. The parse is checked on a sample so an empty result means
+    # "none", not "blind".
+    sample = "https://noo-vllm:8000"
+    assert re.search(r"(noo-)?(vllm|llamacpp)(-secondary)?:\d+", sample), "the URL parse is blind"
     for name, key, value, svc in found:
         env = svc.get("environment") or {}
         env = env if isinstance(env, dict) else dict(str(e).partition("=")[::2] for e in env)

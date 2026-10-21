@@ -291,7 +291,7 @@ pub(crate) fn controller_url() -> String {
 /// Base URL of the controller's SELF-AGENT — the host process beside
 /// tailscaled that performs tailnet whois and dialback on the gateway's
 /// behalf. `NOO_SELF_AGENT_URL` overrides; otherwise it derives from the
-/// controller's own URL (the host tailscale address) on port 8081.
+/// controller's own URL (the host tailscale address) on the agent port.
 ///
 /// A localhost controller URL would aim the probe INSIDE this container,
 /// where there is no tailscaled, so that is refused with guidance rather
@@ -314,7 +314,7 @@ pub(crate) fn self_agent_base() -> Result<String, String> {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            format!("https://{host}:8081")
+            format!("https://{host}:{}", crate::node_link::AGENT_PORT)
         });
     if agent_base.contains("localhost") || agent_base.contains("127.0.0.1") {
         return Err(
@@ -1049,19 +1049,12 @@ async fn enroll_tailnet(
         return Err(AppError::BadRequest("proof_port required".into()));
     }
 
-    let agent_base = self_agent_base().map_err(AppError::Internal)?;
-    let client = crate::routes::cluster::build_node_agent_client();
-    let auth = crate::node_agent_auth::header_for_self(&agent_base);
-    let with_auth = |rb: reqwest::RequestBuilder| match &auth {
-        Some((k, v)) => rb.header(k.as_str(), v.as_str()),
-        None => rb,
-    };
+    let link = crate::node_link::NodeLink::self_agent().map_err(AppError::Internal)?;
+    let agent_base = link.base().to_string();
 
     // 1. whois: tag + tailnet-authoritative name.
-    let who: Value = with_auth(client.get(format!(
-        "{agent_base}/tailnet/whois?ip={}",
-        body.tailnet_ip
-    )))
+    let who: Value = link
+        .request(reqwest::Method::GET, &format!("/tailnet/whois?ip={}", body.tailnet_ip))
     .send()
     .await
     .map_err(|e| {
@@ -1107,7 +1100,8 @@ async fn enroll_tailnet(
         .ok_or_else(|| AppError::Internal("self-agent whois returned no name".into()))?;
 
     // 2. dialback: prove the caller OWNS the claimed address.
-    let db_resp: Value = with_auth(client.post(format!("{agent_base}/tailnet/dialback")))
+    let db_resp: Value = link
+        .request(reqwest::Method::POST, "/tailnet/dialback")
         .json(&json!({
             "ip": body.tailnet_ip,
             "port": body.proof_port,

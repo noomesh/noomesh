@@ -122,11 +122,34 @@ func TestFilterBodyForBackend(t *testing.T) {
 		},
 		// llamacpp-target: strip vllm extras, keep llamacpp extras
 		{
-			name:        "llamacpp strips chat_template_kwargs",
-			in:          `{"model":"x","messages":[],"chat_template_kwargs":{}}`,
+			name:        "llamacpp strips guided_json",
+			in:          `{"model":"x","messages":[],"guided_json":{}}`,
 			backendType: "llamacpp",
-			mustNotHave: []string{"chat_template_kwargs"},
+			mustNotHave: []string{"guided_json"},
 			mustHave:    []string{"model", "messages"},
+		},
+		// The harness's thinking-off (disable_on_wire) reaches every engine
+		// behind the agent: each keeps the field it reads.
+		{
+			name:        "vllm keeps the chat template's thinking switch",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"think":false}`,
+			backendType: "vllm",
+			mustHave:    []string{"chat_template_kwargs"},
+			mustNotHave: []string{"think"},
+		},
+		{
+			name:        "llamacpp keeps the chat template's thinking switch",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"think":false}`,
+			backendType: "llamacpp",
+			mustHave:    []string{"chat_template_kwargs"},
+			mustNotHave: []string{"think"},
+		},
+		{
+			name:        "ollama keeps its reasoning fields",
+			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"reasoning_effort":"low","think":false}`,
+			backendType: "ollama",
+			mustHave:    []string{"reasoning", "reasoning_effort", "think"},
+			mustNotHave: []string{"chat_template_kwargs"},
 		},
 		{
 			name:        "llamacpp keeps n_predict",
@@ -136,11 +159,32 @@ func TestFilterBodyForBackend(t *testing.T) {
 		},
 		// ollama-target: strip vllm + llamacpp extras, keep ollama extras
 		{
-			name:        "ollama strips stream_options + n_predict",
-			in:          `{"model":"x","messages":[],"stream_options":{},"n_predict":256,"keep_alive":"5m"}`,
+			name:        "ollama strips n_predict, keeps keep_alive",
+			in:          `{"model":"x","messages":[],"n_predict":256,"keep_alive":"5m"}`,
 			backendType: "ollama",
-			mustNotHave: []string{"stream_options", "n_predict"},
+			mustNotHave: []string{"n_predict"},
 			mustHave:    []string{"keep_alive", "model"},
+		},
+		// stream_options is portable: the translator's usage chunk
+		// depends on it reaching every backend (i147).
+		{
+			name:        "ollama keeps stream_options",
+			in:          `{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":true}}`,
+			backendType: "ollama",
+			mustHave:    []string{"stream_options"},
+		},
+		{
+			name:        "llamacpp keeps stream_options",
+			in:          `{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":true}}`,
+			backendType: "llamacpp",
+			mustHave:    []string{"stream_options"},
+		},
+		// A Responses reasoning.effort of low|medium|high (i153).
+		{
+			name:        "vllm keeps reasoning_effort",
+			in:          `{"model":"x","messages":[],"reasoning_effort":"high"}`,
+			backendType: "vllm",
+			mustHave:    []string{"reasoning_effort"},
 		},
 		// Unknown backend: pass through
 		{

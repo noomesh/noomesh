@@ -203,6 +203,19 @@ prints `chat-default: dynamic (all live chat nodes)` or `declared`, and
 candidates in order (`!` when only CPU candidates or one node remain, `x`
 when none).
 
+**Purposes.** Stack services name a purpose instead of a model:
+trellion's answers and ingestion send `knowledge`, conversation
+extraction sends `graph`. `class list` shows them as `(purpose)` aliases.
+Undeclared, a purpose means `chat-default` (any live chat node) and is not
+a fallback. To prefer a model for one, point the purpose at it; the mesh
+still answers behind it when that model cannot:
+
+```sh
+noo cluster prefer                          # every purpose and what it prefers
+noo cluster prefer knowledge gemma4:26b     # a served model (or a class) first
+noo cluster prefer knowledge --clear        # back to any live chat node
+```
+
 To prefer one node for a request, name it: a `node` field in the body or an
 `X-Noo-Node` header on `/v1/chat/completions`,
 `/api/external/chat/completions` or `/api/inference` (`noo inference run
@@ -268,10 +281,10 @@ Which harness runs on a node is part of the placement: `--kind noo`
 (the default, this gateway's own loop), `claude-code`, `copilot` or
 `codex` (declared in `config/harness-kinds.json`). The
 node agent checks the kind against the node's chat backend before
-starting anything — Claude Code and Copilot CLI run on every node
-backend (the harness translates their wire to the node's), as does our own
-loop; Codex CLI needs OpenAI's Responses API, which has no translator yet —
-and refuses a foreign kind until its vendor CLI is installed on the node
+starting anything — Claude Code, Copilot CLI and Codex CLI run on every
+node backend (the harness translates their wire to the node's), as does
+our own loop — and refuses a foreign kind until its vendor CLI is
+installed on the node
 (the runner is the same `noo-gateway` for every kind), so the placement
 reports compatibility at once.
 
@@ -306,6 +319,29 @@ Let the planner pick nodes when you only care that a model runs somewhere:
 and needs `--apply` to act; `auto-place <model>...` plans a set across
 the fleet; `reconcile-models` does the same for `NOO_DESIRED_MODELS` minus
 what is already running.
+
+### Embedding spaces: one model per purpose
+
+```sh
+noo cluster embedding-space list
+noo cluster embedding-space set code nomic-embed-code
+noo cluster place gpu-2 ollama nomic-embed-code --role embed
+```
+
+Vectors from two embedding models cannot be compared, so embeddings never
+fall back across models the way chat falls back across the mesh. The unit
+is an **embedding space**: a purpose bound to one model. `knowledge`
+(documents, memory, recall) exists from the first start, seeded with the
+model the fleet already serves; add others, such as a `code` space with a
+code embedder, beside it. A space's pool is every node whose role=embed
+placement serves its model: the gateway spreads that space's requests across
+the pool and never sends them to a node on another model, and a reply that
+names another model is discarded and the next node tried. Callers send the
+space as `model` on `/api/external/embeddings` (`knowledge` when absent).
+An embed placement on a model no space uses is refused; a space's model does
+not change by setting (that is a re-embed: declare a new space instead).
+One node agent serves one embed model today, so a node belongs to one
+space's pool.
 
 ### Get a model onto the fleet
 
@@ -544,6 +580,12 @@ other direction: the other stack never calls noomesh.
 `yielded` or `held`.
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
+- `noo cluster verify host3` has a `control over bus` row: one `health` round
+  trip over NATS. It is a warning reading `NOT CHECKED` (never ok) for a node
+  that does not advertise `nats_rpc`, which keeps taking control calls over
+  HTTPS :8081; a node that advertises it and does not answer FAILS, with
+  `noo cluster nats-users render` as the first remedy. See
+  [Control over the bus](../security/node-agent.md#control-over-the-bus).
 - `noo cluster verify host3` has a `gpu` row: `+ free`, or
   `! yielded: vllm paused (foreign 11.2 GB, memory-accounting)`. Yielded and
   held are warnings, not failures, because the node is working as designed.
@@ -574,15 +616,20 @@ other direction: the other stack never calls noomesh.
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
 | `noo cluster class unset` | `<class>` | Forget a declared model class and its aliases; the derived class of its model takes over |
+| `noo cluster prefer` | `[<purpose> <model\|class> \| <purpose> --clear]` | Show or set which model a stack purpose (knowledge, graph) tries first |
+| `noo cluster embedding-space list` | — | Show each embedding space, its model and the nodes serving it |
+| `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
+| `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
 | `noo cluster gpu hold` | `<node> [--reason <text>]` | Pause a node's GPU backends and keep them paused, to free its GPU (operator-only) |
 | `noo cluster gpu release` | `<node>` | End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only) |
+| `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
 | `noo cluster assign` | `<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low\|medium\|high\|<n>] [--dry-run] [--async]` | Pin a task to the least-loaded node and run it; --dry-run prints the choice only |
-| `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default]` | Update a node's stored config row with only the given fields |
+| `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>\|none]` | Update a node's stored config row with only the given fields |
 | `noo cluster clear-cooldowns` | — | Clear backend auto-start cooldown backoff on every node |
 | `noo cluster add-companion` | `<node> [-p\|--platform <p>] [--hostname <host>] [--ip <ip>] [-s\|--sensors <a,b>] [-b\|--backends <a,b>] [--battery <n>] [-n\|--network <type>] [--npu-tops <n>] [--app-version <v>]` | Register a Tier-5 companion device with the gateway and send a first heartbeat |
 | `noo cluster add-monitor` | `<node> [--hostname <host>] [--ip <ip>] [-s\|--services <a,b>]` | Register a Tier-6 monitor node with the gateway and send an initial heartbeat |
@@ -608,7 +655,8 @@ other direction: the other stack never calls noomesh.
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
 | `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
 | `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
-| `noo cluster vendor` | — | Print vendor subcommand usage (stage, status) |
+| `noo cluster vendor install` | `<node> <kind>...` | Carry these vendor CLIs on a node whatever its placement names; restage to deliver |
+| `noo cluster vendor` | — | Print vendor subcommand usage (stage, status, install) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |

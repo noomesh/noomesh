@@ -54,6 +54,7 @@ var gatewayCalledRoutes = append([]struct{ method, path string }{
 	{"POST", "/api/device/screenshot"},
 	{"POST", "/gpu/hold"},
 	{"POST", "/gpu/release"},
+	{"POST", "/bench"},
 }, workRoutes...)
 
 func TestGatewayRoutesAdmitTheControllerLeafWithoutABearer(t *testing.T) {

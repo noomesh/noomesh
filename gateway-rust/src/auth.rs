@@ -973,22 +973,29 @@ pub fn mint_grafana_jwt_with(
 /// tokens going dead has to be small enough to describe in a sentence.
 const DELEGATED_SUBJECT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-static DELEGATED_SUBJECTS: OnceLock<RwLock<HashMap<String, (bool, Instant)>>> = OnceLock::new();
+static DELEGATED_SUBJECTS: OnceLock<RwLock<HashMap<String, (Option<Role>, Instant)>>> = OnceLock::new();
 
 /// Is the subject of a DELEGATED token still an enabled account?
 ///
-/// Only exchanged tokens (the ones carrying `act`) are
-/// checked, and that narrowness is the design. An ordinary JWT is
-/// stateless by choice and stays that way; an exchanged one is minted on
-/// demand for an account somebody else controls, so "stop this agent" has
-/// to mean something before the token expires. Revoking the provisioning
-/// key stops the next mint; THIS is what makes the one already in flight
-/// stop working.
+/// Only exchanged tokens (the ones carrying `act`) and node-harness
+/// tokens are checked, and that narrowness is the design. An ordinary JWT
+/// is stateless by choice and stays that way; an exchanged one is minted
+/// on demand for an account somebody else controls, so "stop this agent"
+/// has to mean something before the token expires. Revoking the
+/// provisioning key stops the next mint; THIS is what makes the one
+/// already in flight stop working.
 ///
 /// One indexed lookup by username, cached for [`DELEGATED_SUBJECT_TTL`],
 /// and only on agent traffic. A missing account reads as disabled: an
 /// account erased out from under a live token must not keep working.
 pub async fn delegated_subject_enabled(db: &sqlx::PgPool, subject: &str) -> bool {
+    live_account_role(db, subject).await.is_some()
+}
+
+/// The account's role as the database holds it NOW, or `None` when it is
+/// disabled, absent, holds a role this build cannot read, or the database
+/// cannot answer. Shares [`delegated_subject_enabled`]'s cache and bound.
+pub async fn live_account_role(db: &sqlx::PgPool, subject: &str) -> Option<Role> {
     // A connection subject is checked against its OWNER: the account is
     // the row in `noo_users`, and disabling the person must stop every
     // connection they hold. Without this the lookup would search for
@@ -997,36 +1004,46 @@ pub async fn delegated_subject_enabled(db: &sqlx::PgPool, subject: &str) -> bool
     let subject = account_of(subject);
     let cache = DELEGATED_SUBJECTS.get_or_init(|| RwLock::new(HashMap::new()));
     if let Ok(map) = cache.read() {
-        if let Some((ok, at)) = map.get(subject) {
+        if let Some((live, at)) = map.get(subject) {
             if at.elapsed() < DELEGATED_SUBJECT_TTL {
-                return *ok;
+                return *live;
             }
         }
     }
-    let row: Result<Option<(bool,)>, _> =
-        sqlx::query_as("SELECT COALESCE(disabled, false) FROM noo_users WHERE username = $1")
+    let row: Result<Option<(bool, String)>, _> =
+        sqlx::query_as("SELECT COALESCE(disabled, false), role FROM noo_users WHERE username = $1")
             .bind(subject)
             .fetch_optional(db)
             .await;
-    let enabled = match row {
-        Ok(Some((disabled,))) => !disabled,
-        // No such account — fail closed.
-        Ok(None) => false,
+    let live = match row {
+        Ok(Some((false, role))) => role.parse::<Role>().ok(),
+        // Disabled, or no such account — fail closed.
+        Ok(_) => None,
         // A database that cannot answer must not be read as "enabled":
         // that would turn a DB blip into a window where a killed agent
         // works again. Not cached, so it re-asks on the next request.
         Err(e) => {
             tracing::warn!(subject = %subject, error = %e, "delegated subject check failed; refusing");
-            return false;
+            return None;
         }
     };
     if let Ok(mut map) = cache.write() {
         if map.len() > 10_000 {
             map.clear();
         }
-        map.insert(subject.to_string(), (enabled, Instant::now()));
+        map.insert(subject.to_string(), (live, Instant::now()));
     }
-    enabled
+    live
+}
+
+/// Does a node-harness token still speak for its account? Only while the
+/// account is enabled AND the token's role is no higher than the account's
+/// live role: a downgrade or a disable reaches a turn already running
+/// within [`DELEGATED_SUBJECT_TTL`], not at the token's exp (the turn
+/// deadline plus a minute). An upgrade is not propagated; it waits for the
+/// next mint (checkpoint renewal or the next dispatch).
+pub(crate) fn rail_token_admitted(token_role: Role, live: Option<Role>) -> bool {
+    live.is_some_and(|l| token_role <= l)
 }
 
 /// Which service-key scope, if any, opens a token-exchange route.
@@ -2015,6 +2032,15 @@ pub fn verify_cluster_token(token: &str) -> bool {
     verify_cluster_token_inner(token, &secret, now)
 }
 
+/// Seconds between a verified v1 token's timestamp and now (signed: a
+/// negative age is a caller clock ahead of this one). `None` when the token
+/// does not parse.
+fn v1_token_age_secs(token: &str) -> Option<i64> {
+    let ts: i64 = token.split(':').nth(1)?.parse().ok()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(now - ts)
+}
+
 /// Replay window; matches the node-agent generator's 5-minute freshness.
 const CLUSTER_MAX_TOKEN_AGE_SECS: u64 = 300;
 
@@ -2296,7 +2322,6 @@ pub const PUBLIC_PATHS_EXACT: &[&str] = &[
     "/kiosk.html",
     "/favicon.ico", // browser auto-fetched
     "/docs",        // human-readable API docs
-    "/ui/basic",    // simpler fallback UI shell
     // Bootstrap-token enrollment. (`/bootstrap-node.sh`, the
     // retired pre-token lane, was listed here until 2026-09-27.) Public
     // because the enrolling host has no credential of ANY kind
@@ -3177,6 +3202,14 @@ pub async fn require_any_auth(
             // for. It is a user token in every other respect; the rail's
             // handlers take the conversation from the claim, not the body.
             if let Some(turn) = harness_turn_for(&claims, &path)? {
+                // The account behind the turn is re-read on every rail
+                // call: disabling the person, or lowering their role,
+                // stops a turn already running (i143 decision 4).
+                let live = live_account_role(&state.db, &claims.sub).await;
+                if !rail_token_admitted(claims.resolved_role(), live) {
+                    tracing::warn!(sub = %claims.sub, node = %turn.node, live = ?live, "harness token refused: account disabled, absent or below the token's role");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
                 request.extensions_mut().insert(turn);
             }
             // A worker-delegated token reaches the tool
@@ -3332,6 +3365,20 @@ pub async fn require_any_auth(
         } else {
             let u = crate::legacy_lanes::hmac_v1_use(&actor, &path);
             crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            // What the lane log cannot say: which request, and whether a v2
+            // signer touched it. The Go and shell v2 signers always send the
+            // body-hash header, so a v1 token WITH it was replaced after
+            // signing; without it, the caller signed v1 itself.
+            if crate::legacy_lanes::log_due(&format!("hmac_v1_detail|{actor}"), crate::legacy_lanes::HMAC_V1_DETAIL_LOG_EVERY) {
+                let headers = request.headers();
+                tracing::info!(
+                    actor = %actor, method = %request.method(), path = %path,
+                    body_sha_header = headers.contains_key(crate::cluster_token_v2::BODY_SHA_HEADER),
+                    token_age_secs = v1_token_age_secs(&t),
+                    user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
+                    "cluster token v1 admitted: the request it came on"
+                );
+            }
             if !crate::cluster_token_v2::v1_allowed() {
                 tracing::warn!(actor = %actor, path = %path, "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2");
                 return Ok(v1_refusal());
@@ -5816,6 +5863,30 @@ mod harness_rail_tests {
     }
 
     #[test]
+    fn a_harness_token_needs_an_enabled_account_at_or_above_its_role() {
+        assert!(rail_token_admitted(Role::User, Some(Role::User)));
+        assert!(rail_token_admitted(Role::User, Some(Role::Admin)), "an upgrade does not refuse; it waits for the next mint");
+        assert!(rail_token_admitted(Role::Operator, Some(Role::Operator)));
+        assert!(!rail_token_admitted(Role::Operator, Some(Role::User)), "a downgrade stops the running turn");
+        assert!(!rail_token_admitted(Role::Admin, Some(Role::Operator)));
+        assert!(!rail_token_admitted(Role::User, None), "disabled or absent");
+    }
+
+    /// The live-account check sits on the harness branch itself, before the
+    /// turn is attached: a turn the check refuses never reaches the rail.
+    #[test]
+    fn the_harness_branch_rechecks_the_live_account() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
+        let check = body[branch..].find("live_account_role(&state.db, &claims.sub)").expect("live check") + branch;
+        let attach = body[branch..].find("request.extensions_mut().insert(turn)").expect("attach") + branch;
+        assert!(check < attach);
+        assert!(body[check..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
+        assert!(body[check..attach].contains("StatusCode::UNAUTHORIZED"));
+    }
+
+    #[test]
     fn other_tokens_are_untouched_by_the_rule() {
         assert_eq!(harness_turn_for(&claims(None, None), "/api/inference").unwrap(), None);
         assert_eq!(harness_turn_for(&claims(Some("mcp-external:laptop"), None), "/api/harness/call").unwrap(), None);
@@ -6277,5 +6348,74 @@ mod user_read_allowlist_tests {
         let first_branch = body.find("harness_turn_for(&claims, &path)").expect("harness branch");
         assert!(verify < floor && floor < first_branch, "floor must precede every other use of the claims");
         assert!(body[floor..first_branch].contains("StatusCode::UNAUTHORIZED"));
+    }
+}
+
+/// A token on the v2 wire form is decided as v2 — admitted, or a 401 — and
+/// never reaches the v1 verifier or the `cluster_hmac_v1` count. The 0.6.7
+/// roll counted v1 on agents' heartbeats with no agent-side fallback, and
+/// "the gateway read a v2 token as v1" was the first suspect; these pin
+/// that it cannot.
+#[cfg(test)]
+mod v2_never_counts_as_v1_tests {
+    use super::*;
+
+    const SECRET: &str = "fleet-secret-for-tests";
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_signed_v2_token_never_verifies_as_v1() {
+        for actor in ["host2", "pop-os", "mcmini", "1800000000", "v2", "a"] {
+            for (method, uri, body) in [("POST", "/api/cluster/nodes/x/heartbeat", &b"{}"[..]), ("GET", "/api/cluster/nodes/x/desired-config", &b""[..])] {
+                let tok = crate::cluster_token_v2::sign(SECRET, method, uri, body, actor, NOW, "00112233445566778899aabbccddeeff").unwrap();
+                assert!(crate::cluster_token_v2::is_v2(&tok), "{tok}");
+                assert!(!verify_cluster_token_inner(&tok, SECRET, NOW), "a v2 token passed the v1 verifier: {tok}");
+            }
+        }
+    }
+
+    /// The one string that is both: a v1 token whose actor is literally
+    /// `v2`. It takes the v2 branch (prefix), does not parse as v2, and is
+    /// a 401 — it is not counted as v1 either.
+    #[test]
+    fn a_v1_token_with_the_v2_prefix_is_refused_not_counted() {
+        let v1 = crate::routes::cluster::mint_cluster_token("v2", SECRET, NOW).unwrap();
+        assert!(verify_cluster_token_inner(&v1, SECRET, NOW), "precondition: it is a valid v1 token");
+        assert!(crate::cluster_token_v2::is_v2(&v1), "precondition: it carries the v2 prefix");
+        assert!(crate::cluster_token_v2::parse(&v1).is_none(), "it must not parse as v2, so admit refuses it");
+    }
+
+    /// Structural: in `require_any_auth`, a v2-prefixed token goes to
+    /// `admit_cluster_token_v2` and a failure there RETURNS (no fall-through
+    /// to the v1 path), and the only `cluster_hmac_v1` count is the branch
+    /// where the token did not arrive as v2.
+    #[test]
+    fn the_middleware_decides_a_v2_token_and_counts_v1_only_off_the_v2_path() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let v2 = body.find("if crate::cluster_token_v2::is_v2(&t) {").expect("the v2 branch");
+        let admit = body[v2..].find("admit_cluster_token_v2(").expect("admit") + v2;
+        let arm = &body[admit..admit + 400];
+        assert!(arm.contains("from_v2 = true") && arm.contains("Err(status) => return Err(status)"),
+            "a v2 token must be admitted (from_v2) or refused, never handed on: {arm}");
+        // The call as production writes it (`crate::` and an argument); this
+        // test's own needles carry neither, so they are not counted.
+        let call = ["crate::legacy_lanes::hmac_v1_use(", "&actor"].concat();
+        assert_eq!(src.matches(call.as_str()).count(), 1, "one v1 counting site");
+        let count = body.find("legacy_lanes::hmac_v1_use(").expect("the v1 count");
+        let gate = body[..count].rfind("if from_v2 {").expect("the from_v2 split");
+        assert!(body[gate..count].contains("} else {"), "the v1 count must be the not-from-v2 branch");
+    }
+
+    /// A gateway that has just started has no Redis connection yet: a fresh
+    /// v2 token is still admitted (the local nonce set), and a replay is
+    /// still refused — neither outcome is "not v2".
+    #[tokio::test]
+    async fn at_startup_with_no_redis_a_v2_token_is_still_decided() {
+        let n = "0123456789abcdef0123456789abcdef";
+        let t = crate::cluster_token_v2::sign(SECRET, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", "host7", NOW, n).unwrap();
+        let go = || crate::cluster_token_v2::verify_and_spend(None, SECRET, &t, "POST", "/api/cluster/nodes/host7/heartbeat", b"{\"a\":1}", NOW + 1);
+        assert_eq!(go().await.as_deref(), Some("host7"));
+        assert_eq!(go().await, None, "the replay is refused without Redis");
     }
 }

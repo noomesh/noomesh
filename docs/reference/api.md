@@ -67,7 +67,7 @@ the gateway refuses JWTs rather than accepting the well-known default. The
 
 Public, no credential: `/auth/*`, `/api/auth/*`, `/assets/*`,
 `/.well-known/*`, `/`, `/dashboard`, `/kiosk`, `/kiosk.html`,
-`/favicon.ico`, `/docs`, `/ui/basic`, and the enrollment endpoints a node
+`/favicon.ico`, `/docs`, and the enrollment endpoints a node
 uses before it has credentials: `/bootstrap`, `/bootstrap/prep`, `/apply`,
 `/deenroll`, `/fetch`, `/ca.crt`, `/bootstrap/cli/*`, `GET
 /bootstrap/bundle/*`, `/api/cluster/bootstrap` and
@@ -189,9 +189,11 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | GET | `/v1/models`, `/v1/models/{model_id}` | the **catalogue**: every class and alias a consumer may send as `model`, `owned_by: "noomesh"`, with `noo: {class, candidates, healthy}`; `/v1/models/{id}` is `404 model_not_found` for an id that is no class, alias or served model. Still the dashboard's readiness probe: `503` until the first `chat-default` candidate answers its own model list |
 | GET | `/api/tags`, `/api/version` | Ollama-compatible discovery so Ollama clients can point at the gateway |
 | POST | `/api/tasks/inference` | submit inference as a scheduler job |
-| POST | `/api/external/chat/completions`, `/api/external/inference`, `/api/external/embeddings`, `/api/external/rerank`, `/api/external/classify` | the service-key surface for external consumers; `chat/completions` (and `inference` with `kind: chat`) is the same class-routed path as `/v1/chat/completions` and honours `model` the same way |
+| POST | `/api/external/chat/completions`, `/api/external/inference`, `/api/external/embeddings`, `/api/external/rerank`, `/api/external/classify` | the service-key surface for external consumers; `chat/completions` (and `inference` with `kind: chat`) is the same class-routed path as `/v1/chat/completions` and honours `model` the same way. On `embeddings` (and `inference` with `kind: embedding`), `model` names an **embedding space** (`knowledge` when absent or `default`; a space's model name also selects it); an unknown one is 400 naming the spaces, never another model's vectors. `capabilities.embedding.spaces` lists them. On `rerank`, `model` is a preference: rerankers serving it go first, every other reranker after, then the LLM reranker; the answer's `noo` block says `served_by`, `model`, `fallback` and `requested_model` |
 | GET | `/api/external/models`, `/api/external/capabilities`, `/api/external/usage` | the catalogue (same handler as `/v1/models`), what a consumer may call (`chat.models` and `classify.models` list the same ids), and its metered usage |
 | GET, PUT, DELETE | `/api/cluster/model-classes`, `/api/cluster/model-classes/{class}` | operator: the live class table with every candidate's placement and health; declare / forget a class (`noo cluster class`) |
+| PUT, DELETE | `/api/cluster/model-aliases/{alias}` | operator: point one alias (a purpose such as `knowledge`) at a class or served model `{class}`, tried first with the mesh behind it; a target nothing serves is accepted with a `note`; an alias may not hide a class or model of the same name (409). DELETE puts a purpose back on `chat-default` (`noo cluster prefer`) |
+| GET, PUT, DELETE | `/api/cluster/embedding-spaces`, `/api/cluster/embedding-spaces/{space}` | operator: each embedding space (one model per purpose), its pool of role=embed placements and which advertise `embed`, plus placements on a model no space uses; declare a space `{model, dims?}` (changing an existing space's model is a 409: that is a re-embed); forget one (not `knowledge`) (`noo cluster embedding-space`) |
 
 ### Model classes, failover and what the answer says
 
@@ -845,8 +847,7 @@ corridor screen): each handler re-shapes a general route's own output
 
 ## Dashboard
 
-`GET /` (alias `/dashboard`) serves the web UI, `/ui/basic` a simpler
-shell, `/kiosk` (alias `/kiosk.html`) the kiosk page. `/assets/*` (versioned mesh-UI artifact assets) is public; `/static/*`
+`GET /` (alias `/dashboard`) serves the web UI, `/kiosk` (alias `/kiosk.html`) the kiosk page. `/assets/*` (versioned mesh-UI artifact assets) is public; `/static/*`
 is **not** — only the exact path `/static/openapi.public.json` is public
 there, everything else under `/static/` requires the same credential as
 any other route. Every action the UI takes is one of the authenticated

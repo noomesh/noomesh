@@ -705,6 +705,67 @@ pub fn get_json_try(
     Err(detail)
 }
 
+/// Why a probing GET failed: nothing answered, or something did and the
+/// answer was no use. The split `noo upgrade`'s pre-roll key check needs: a
+/// stack that is DOWN cannot be asked (fall back to the store check), while
+/// a gateway that answers 401/5xx/garbage has told us something (refuse).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProbeFail {
+    /// Nothing answered: connection refused, connect/DNS timeout, DNS
+    /// failure, no route. Classified from `ureq::Error`, never from text.
+    /// A TLS failure is NOT here: a handshake means a listener answered.
+    Down(String),
+    /// Something answered (or the transport failed after connecting): any
+    /// non-2xx status, an unparseable body, a TLS failure, a slow answer.
+    Unreadable(String),
+}
+
+/// True when `e` proves that no listener answered at all.
+pub(crate) fn nothing_answered(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind as K;
+    match e {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            K::ConnectionRefused | K::NetworkUnreachable | K::HostUnreachable | K::AddrNotAvailable | K::NotFound
+        ),
+        _ => false,
+    }
+}
+
+/// GET `path` and return the parsed 2xx JSON body, or say WHICH kind of
+/// failure it was ([`ProbeFail`]). Same auth/trust/timeouts as
+/// [`get_json_try`].
+pub fn get_json_probe(
+    g: &Globals,
+    path: &str,
+    with_auth: bool,
+    default_timeout: u64,
+) -> Result<serde_json::Value, ProbeFail> {
+    let base = crate::envfile::gateway_url(&g.gateway_override);
+    let url = format!("{base}{path}");
+    let agent = agent(g, &base, default_timeout);
+    let mut resp = send_with_retry(g, with_auth, |b| {
+        let mut req = agent.get(&url);
+        if let Some(b) = b {
+            req = req.header("Authorization", b);
+        }
+        req.call()
+    })
+    .map_err(|e| {
+        let line = describe_send_error(&base, &e, effective_timeout(g, default_timeout));
+        if nothing_answered(&e) { ProbeFail::Down(line) } else { ProbeFail::Unreadable(line) }
+    })?;
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    if (200..=299).contains(&status) {
+        return serde_json::from_str(&text)
+            .map_err(|_| ProbeFail::Unreadable(format!("gateway returned non-JSON body from {path}")));
+    }
+    Err(ProbeFail::Unreadable(format!("gateway answered HTTP {status} for {path}")))
+}
+
 /// POST `body` as JSON to `path`; returns the parsed JSON response.
 pub fn post_json(
     g: &Globals,

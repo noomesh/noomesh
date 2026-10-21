@@ -192,3 +192,64 @@ func TestSetClusterAuth_FallsBackToV1WhenPinned(t *testing.T) {
 		t.Fatal("pinned v1 signer sent v2")
 	}
 }
+
+// A body with no GetBody (a pipe, a gzip writer, a caller's own reader) used
+// to go out on the v1 token. It is read, signed v2, and sent as the bytes
+// that were signed: the verifier admits it and the handler sees the body.
+func TestSetClusterAuth_StreamBodyIsBufferedAndSignedV2(t *testing.T) {
+	resetNoncesForTest()
+	pr, pw := io.Pipe()
+	go func() { _, _ = pw.Write([]byte(`{"streamed":true}`)); _ = pw.Close() }()
+	req, err := http.NewRequest("POST", "http://controller/api/cluster/nodes/host2/logs", pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.GetBody != nil {
+		t.Fatal("precondition: a pipe body has no GetBody")
+	}
+	SetClusterAuth(req, "host2", v2Secret)
+	tok := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+	if !IsV2Token(tok) {
+		t.Fatalf("a stream body was not signed v2: %q", tok)
+	}
+	if req.ContentLength != int64(len(`{"streamed":true}`)) || req.GetBody == nil {
+		t.Fatalf("the buffered body must be re-readable with its length: len=%d", req.ContentLength)
+	}
+	n := 0
+	rec := httptest.NewRecorder()
+	in := httptest.NewRequest("POST", "/api/cluster/nodes/host2/logs", req.Body)
+	in.Header = req.Header.Clone()
+	v2Handler(t, &n).ServeHTTP(rec, in)
+	if rec.Code != 200 || n != 1 || rec.Body.String() != `{"streamed":true}` {
+		t.Fatalf("verifier must admit the buffered body: code=%d served=%d body=%q", rec.Code, n, rec.Body.String())
+	}
+}
+
+// Every outbound call shape the agent makes (no body, bytes, strings, a
+// stream) signs v2 when nothing pins v1, so a 0.6.8 agent adds nothing to
+// the controller's cluster_hmac_v1 lane.
+func TestSetClusterAuth_EveryBodyShapeSignsV2(t *testing.T) {
+	bodies := map[string]func() io.Reader{
+		"nil":     func() io.Reader { return nil },
+		"bytes":   func() io.Reader { return strings.NewReader("x") }, // NewRequest: GetBody
+		"strings": func() io.Reader { return strings.NewReader(`{"a":1}`) },
+		"stream": func() io.Reader {
+			pr, pw := io.Pipe()
+			go func() { _, _ = pw.Write([]byte("chunk")); _ = pw.Close() }()
+			return pr
+		},
+	}
+	for name, mk := range bodies {
+		req, err := http.NewRequest("POST", "http://controller/api/cluster/nodes/host2/heartbeat", mk())
+		if err != nil {
+			t.Fatal(err)
+		}
+		SetClusterAuth(req, "host2", v2Secret)
+		if tok := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "); !IsV2Token(tok) {
+			t.Errorf("%s body: signed %q, want v2", name, tok)
+		}
+		if req.Header.Get(BodySHAHeader) == "" {
+			t.Errorf("%s body: no %s header", name, BodySHAHeader)
+		}
+	}
+}

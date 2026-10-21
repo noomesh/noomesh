@@ -442,7 +442,14 @@ where
             body["stream_options"] = json!({"include_usage": true});
         }
         let url = format!("{}{}", cand.url.trim_end_matches('/'), path);
-        let req = coordinator::with_backend_hint_url(client.post(&url).json(&body).timeout(remaining), &url, &cand.backend);
+        // `aggregate` reads the backend's SSE too: both are incremental reads.
+        let req = if stream || aggregate {
+            crate::node_link::backend_stream_on(client, reqwest::Method::POST, &url, &cand.backend)
+        } else {
+            crate::node_link::backend_request_on(client, reqwest::Method::POST, &url, &cand.backend)
+        }
+        .json(&body)
+        .timeout(remaining);
         let window_start = Instant::now();
         // The stall windows exist to move on to a better candidate. With
         // nothing left to move on to, cutting this one off only turns a slow

@@ -978,15 +978,17 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
             None => nnote(&format!("no harness in this bundle: no gateway asset for {os}/{arch}")),
         }
     }
-    // ── the vendor CLI the harness placement needs (i83 E1e) ──────────
+    // ── the vendor CLIs the node carries (i83 E1e) ────────────────────
     // A harness kind that runs a vendor CLI (Copilot CLI, Claude Code,
     // Codex) needs it on the node's PATH, and the node never fetches it:
     // `noo cluster vendor stage <kind>` fetched and verified it on this
-    // controller, and the bundle carries it. The desired kind is the
-    // harness placement's NOO_HARNESS_KIND, read from the same
-    // desired-config the node agent converges to. Not staged = the restage
-    // is refused: a restage never downloads, and a node placed on a CLI it
-    // does not have would only be refused by its agent.
+    // controller, and the bundle carries it. The kinds: the harness
+    // placement's NOO_HARNESS_KIND (read from the same desired-config the
+    // node agent converges to) and the node's `vendor_kinds`
+    // (`noo cluster vendor install`), so a node can switch kinds without a
+    // restage. Not staged = the restage is refused: a restage never
+    // downloads, and a node placed on a CLI it does not have would only be
+    // refused by its agent.
     if self_node {
         // The controller's gateway runs turns in process; no node harness here.
     } else if !super::cluster_vendor::applier_knows_vendor_kinds(darwin, &node_app_version) {
@@ -997,37 +999,57 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
     } else {
         let desired = crate::http::get_json_opt(
             g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(&node)), true, 10);
-        let kind = desired.as_ref().and_then(super::cluster_vendor::desired_harness_kind);
+        let placed = desired.as_ref().and_then(super::cluster_vendor::desired_harness_kind);
+        let mut extra = desired.as_ref().map(super::cluster_vendor::node_vendor_kinds).unwrap_or_default();
+        // A Mac applier older than the slot floor reads ONE vendor CLI
+        // (`vendor-cli`) and refuses a bundle naming `vendor-cli-2`: it gets
+        // the placement's CLI alone, the layout it already applies.
+        if !extra.is_empty() && !super::cluster_vendor::applier_knows_vendor_slots(darwin, &node_app_version) {
+            nnote(&format!(
+                "vendor_kinds ({}) not carried: {node} reports {node_app_version}, whose applier takes one vendor CLI \
+                 per bundle — only the harness placement's. It carries the newer CLI; the next restage carries them.",
+                extra.join(", ")
+            ));
+            extra.clear();
+        }
+        let kinds = super::cluster_vendor::bundle_vendor_kinds(placed.as_deref(), &extra);
         let f = record.as_ref().and_then(|r| r.facts.clone()).unwrap_or_else(|| serde_json::json!({}));
         let os = f.get("os").and_then(|v| v.as_str()).unwrap_or(if darwin { "macos" } else { "linux" });
         let arch = f.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
         let table = crate::harness_kinds::shipped();
-        let wants_vendor = kind.as_deref().is_some_and(|k| {
-            table.kinds.iter().any(|r| r.kind == k && r.distribution.is_some())
+        // A kind the table declares with no distribution is a manual
+        // install: nothing to carry. An unknown one is judged (refused) below.
+        let wants_vendor = kinds.iter().any(|k| {
+            table.kinds.iter().find(|r| r.kind == *k).is_none_or(|r| r.distribution.is_some())
         });
         if wants_vendor {
             let Some((os, arch)) = crate::harness_kinds::normalize_platform(os, arch) else {
                 scrub(&work);
                 fail(g.json, ExitCode::Generic, "vendor_platform",
-                    &format!("{node}'s harness placement names {} but its platform {os}/{arch} is not one vendor CLIs are staged for",
-                        kind.as_deref().unwrap_or("?")), None);
+                    &format!("{node} carries {} but its platform {os}/{arch} is not one vendor CLIs are staged for",
+                        kinds.join(", ")), None);
             };
             let dir = super::cluster_vendor::vendor_cache_dir(&root);
-            match super::cluster_vendor::vendor_bundle_files(&table, kind.as_deref(), os, arch,
+            match super::cluster_vendor::vendor_bundle_files(&table, &kinds, os, arch,
                 &|n| super::cluster_vendor::read_staged(&dir, n))
             {
                 Ok(vf) => {
                     let size: usize = vf.iter().filter(|(k, _)| !k.ends_with("-manifest")).map(|(_, b)| b.len()).sum();
-                    nnote(&format!("bundle carries the {} vendor CLI ({})",
-                        kind.as_deref().unwrap_or("?"),
+                    nnote(&format!("bundle carries {} vendor CLI(s): {} ({})",
+                        vf.len() / 2,
+                        kinds.join(", "),
                         human_bytes(size)));
                     files.extend(vf);
                 }
                 Err(e) => {
                     scrub(&work);
+                    let stage = match kinds.as_slice() {
+                        [one] => format!("noo cluster vendor stage {one}"),
+                        _ => "noo cluster vendor stage --all".to_string(),
+                    };
                     fail_guided(g, ExitCode::Generic, "vendor_not_staged", &e,
-                        &format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
-                        &[(&format!("noo cluster vendor stage {}", kind.as_deref().unwrap_or("<kind>")),
+                        &stage,
+                        &[(&stage,
                            "fetch the pinned CLI (and runtime) on this controller and verify its sha256"),
                           ("noo cluster vendor status", "what is staged and which nodes need it"),
                           (&format!("noo cluster provision {node}"), "restage once it is staged")]);
@@ -1957,13 +1979,16 @@ fn drop_proven_binaries(
         files.retain(|(k, _)| *k != kind && !(kind == "cli-binary" && *k == "cli-user"));
         notes.push(format!("{kind}: unchanged since last apply, not carried (the node reported running these exact bytes)"));
     }
-    // The vendor CLI goes with its manifest.
-    let vendor: Vec<(&str, String)> = files.iter()
-        .filter(|(k, _)| *k == "vendor-cli")
-        .map(|(k, b)| (*k, sha256_hex(b))).collect();
-    if !vendor.is_empty() && vendor.iter().all(|(k, sha)| node_runs_asset(status, k, sha)) {
-        files.retain(|(k, _)| !k.starts_with("vendor-"));
-        notes.push("vendor CLI: unchanged since last apply, not carried (the node reported running these exact bytes)".into());
+    // Each vendor CLI goes with its own manifest, slot by slot: the
+    // appliers judge every slot on its own, so one proven CLI can stay
+    // home while another rides.
+    for (cli, manifest) in super::cluster_vendor::VENDOR_SLOTS {
+        let Some(sha) = files.iter().find(|(k, _)| *k == cli).map(|(_, b)| sha256_hex(b)) else { continue };
+        if !node_runs_asset(status, cli, &sha) {
+            continue;
+        }
+        files.retain(|(k, _)| *k != cli && *k != manifest);
+        notes.push(format!("vendor CLI: unchanged since last apply, not carried ({cli}; the node reported running these exact bytes)"));
     }
     notes
 }
@@ -5221,6 +5246,15 @@ mod local_lane_tests {
         let mut f = mk();
         drop_proven_binaries(&mut f, Some(&other), false, false);
         assert_eq!(f.len(), 3);
+        // Two slots: only the proven one stays home, with its own manifest.
+        let mut f: Vec<(&'static str, Vec<u8>)> = vec![
+            ("vendor-cli", b"cli".to_vec()), ("vendor-cli-manifest", b"{}".to_vec()),
+            ("vendor-cli-2", b"cli2".to_vec()), ("vendor-cli-2-manifest", b"{}".to_vec()),
+        ];
+        let one = st(0, "s", "s", &format!("applied: vendor-cli-2=unchanged binary-sha: vendor-cli-2={} vendor-cli={}",
+            sha256_hex(b"cli2"), sha256_hex(b"stale")));
+        drop_proven_binaries(&mut f, Some(&one), false, false);
+        assert_eq!(names(&f), ["vendor-cli", "vendor-cli-manifest"]);
     }
 
     #[test]

@@ -1969,7 +1969,61 @@ BEGIN
     END IF;
 END $grant$;
 "#, audit_append_only_sql!()),
+}, Migration {
+    revision: NODE_VENDOR_KINDS_REVISION,
+    down_revision: Some(AUDIT_CHAIN_REVISION),
+    // i83: the vendor CLIs a node carries whatever its harness placement
+    // names (`noo cluster vendor install`, `set-config --vendor-kinds`). The
+    // provision bundle carries the placement's kind's CLI and these, so a
+    // node can switch kinds without a restage. NOT NULL DEFAULT '{}': every
+    // existing row carries exactly what it did (the placement's CLI only).
+    sql: r#"
+ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS vendor_kinds text[] NOT NULL DEFAULT '{}'
+"#,
+}, Migration {
+    revision: HARNESS_PROFILE_REVISION,
+    down_revision: Some(NODE_VENDOR_KINDS_REVISION),
+    // The per-node harness profile OVERRIDES (`noo cluster profile <node>
+    // --set k=v`): any subset of the fields in config/harness-profiles.json,
+    // validated by `harness_profile::validate_overrides` on write. The
+    // resolved profile (override > measured > tier default) is computed on
+    // read, never stored. NOT NULL DEFAULT '{}': every existing row resolves
+    // to its tier defaults.
+    sql: r#"
+ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS harness_profile jsonb NOT NULL DEFAULT '{}'
+"#,
+}, Migration {
+    revision: EMBEDDING_SPACES_REVISION,
+    down_revision: Some(HARNESS_PROFILE_REVISION),
+    // Embedding spaces (i145): one embedding model per named purpose.
+    // Vectors from two models are not comparable, so the gateway routes a
+    // space's requests only to nodes advertising its model and never falls
+    // back across models. `dims` NULL = learn the width from the first
+    // answer. Seeded at boot (`embedding_spaces::spawn_refresh`) with
+    // `knowledge` = the model the role=embed placements declare; empty here
+    // because a migration cannot read the fleet.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_embedding_spaces (
+    space       text        PRIMARY KEY,
+    model       text        NOT NULL,
+    dims        integer,
+    updated_by  text        NOT NULL DEFAULT 'operator',
+    updated_at  timestamptz NOT NULL DEFAULT now()
+)
+"#,
 }];
+
+/// The harness-profile revision. A constant so a renumber at rebase is one
+/// line.
+pub const HARNESS_PROFILE_REVISION: &str = "096_harness_profile";
+
+/// The node vendor-kinds revision. A constant so a renumber at rebase is
+/// one line.
+pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
+
+/// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
+/// renumber at rebase is one line.
+pub const EMBEDDING_SPACES_REVISION: &str = "097_embedding_spaces";
 
 /// The kiosk-seat revision (i77).
 pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
@@ -2792,6 +2846,44 @@ mod tests {
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_token_allowances"));
         assert!(m.sql.contains("ALTER TABLE noo_token_usage ADD COLUMN IF NOT EXISTS task_id text"));
         assert!(include_str!("usage.rs").contains("harness_kind, task_id)"), "usage::insert must write task_id");
+    }
+
+    /// The harness-profile revision sits on the vendor-kinds revision and
+    /// adds what `routes::cluster` reads and writes.
+    #[test]
+    fn harness_profile_revision_sits_on_vendor_kinds_and_adds_the_column() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == HARNESS_PROFILE_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "096_harness_profile");
+        assert_eq!(m.down_revision, Some(NODE_VENDOR_KINDS_REVISION));
+        assert!(m.sql.contains("ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS harness_profile jsonb NOT NULL DEFAULT '{}'"));
+        let cluster = include_str!("routes/cluster.rs");
+        assert!(cluster.contains("vendor_kinds, harness_profile"), "desired-config must read harness_profile");
+        assert!(cluster.contains("harness_profile = CASE WHEN"), "the upsert must write harness_profile");
+    }
+
+    /// i145: the embedding-space table is the chain head, sits on the
+    /// harness-profile revision, and is empty (the gateway seeds it at boot).
+    #[test]
+    fn embedding_spaces_revision_creates_the_table_and_seeds_nothing() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACES_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "097_embedding_spaces");
+        assert_eq!(m.down_revision, Some(HARNESS_PROFILE_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACES_REVISION), "the chain head");
+        assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_embedding_spaces"));
+        assert!(!m.sql.contains("INSERT"), "a migration cannot read the fleet's embed model; the boot seed does");
+        assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
+    }
+
+    /// The vendor-kinds revision sits on the audit chain and adds what
+    /// `routes::cluster` reads and writes.
+    #[test]
+    fn node_vendor_kinds_revision_sits_on_the_audit_chain_and_adds_the_column() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == NODE_VENDOR_KINDS_REVISION).expect("must be in the chain");
+        assert_eq!(m.down_revision, Some(AUDIT_CHAIN_REVISION));
+        assert!(m.sql.contains("ALTER TABLE noo_node_config ADD COLUMN IF NOT EXISTS vendor_kinds text[] NOT NULL DEFAULT '{}'"));
+        let cluster = include_str!("routes/cluster.rs");
+        assert!(cluster.contains("usage_profile, vendor_kinds"), "desired-config must read vendor_kinds");
+        assert!(cluster.contains("vendor_kinds = CASE WHEN"), "the upsert must write vendor_kinds");
     }
 
     /// 092 adds the chain columns and makes the app role INSERT-only, and the

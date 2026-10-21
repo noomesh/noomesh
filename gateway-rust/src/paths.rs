@@ -20,9 +20,6 @@ pub const CONFIG_YAML_CANDIDATES: &[&str] = &["/app/noomesh.yaml", "noomesh.yaml
 /// config/tools.json — tool schemas + NATS subjects.
 pub const TOOLS_JSON_CANDIDATES: &[&str] = &["/app/config/tools.json", "config/tools.json"];
 
-/// Primary HTML template directory (gateway source tree).
-pub const GATEWAY_HTML_DIR: &str = "/app/src/noomesh/gateway";
-
 /// Fallback static file directory.
 pub const STATIC_DIR: &str = "/app/static";
 

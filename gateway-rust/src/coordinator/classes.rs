@@ -106,6 +106,16 @@ pub const CHAT_DEFAULT: &str = "chat-default";
 /// catalogue can show them as ids a consumer may send.
 pub const BUILTIN_ALIASES: [&str; 2] = ["default", "auto"];
 
+/// Purpose aliases (proposal i145): the fixed names a caller sends instead
+/// of a model name, so which model serves that purpose is a preference in
+/// the DB, not a value in the caller's env. trellion's answers and page
+/// extraction send `knowledge`; the worker's conversation (temporal)
+/// extraction sends `graph`. Undeclared, each one means [`CHAT_DEFAULT`]
+/// (the whole mesh) and is NOT a fallback: no preference was unmet. Unlike
+/// the built-ins they may be declared (`noo cluster class set <class> …
+/// --alias knowledge`), and the declaration wins.
+pub const PURPOSE_ALIASES: [&str; 2] = ["knowledge", "graph"];
+
 /// The node agent's heartbeat cadence (node-agent-go `config.HeartbeatInterval`
 /// default, seconds). A record older than twice this is a node the gateway
 /// is not hearing from; its candidates sort after the ones it is.
@@ -554,7 +564,7 @@ fn health_of(n: &NodeFacts) -> (bool, String) {
 
 fn url_for(n: &NodeFacts, backend: &str) -> String {
     if !n.ip.is_empty() {
-        format!("https://{}:8081", n.ip)
+        crate::node_link::NodeLink::for_ip(&n.ip).base().to_string()
     } else {
         let port = crate::config::backend_port(backend).unwrap_or(0);
         super::backend::local_backend_url(backend, port)
@@ -709,6 +719,11 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
     for (a, c) in &decl.aliases {
         if !aliases.iter().any(|(x, _)| x == a) {
             aliases.push((a.clone(), c.clone()));
+        }
+    }
+    for p in PURPOSE_ALIASES {
+        if !aliases.iter().any(|(x, _)| x.eq_ignore_ascii_case(p)) {
+            aliases.push((p.to_string(), CHAT_DEFAULT.to_string()));
         }
     }
     let mut node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
@@ -1438,6 +1453,43 @@ pub async fn delete_class(db: &sqlx::PgPool, name: &str) -> Result<u64, sqlx::Er
     Ok(res.rows_affected())
 }
 
+/// Point one alias at a class (declared, or a served model's derived
+/// class): the purpose-preference write (i145 phase D,
+/// `noo cluster prefer`). Replaces whatever the alias pointed at.
+pub async fn save_alias(db: &sqlx::PgPool, alias: &str, class: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO noo_model_aliases (alias, class, updated_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (alias) DO UPDATE SET class = EXCLUDED.class, updated_at = NOW()",
+    )
+    .bind(alias)
+    .bind(class)
+    .execute(db)
+    .await?;
+    invalidate_cache();
+    Ok(())
+}
+
+/// Forget one alias. A purpose alias then means `chat-default` again.
+pub async fn delete_alias(db: &sqlx::PgPool, alias: &str) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM noo_model_aliases WHERE lower(alias) = lower($1)").bind(alias).execute(db).await?;
+    invalidate_cache();
+    Ok(res.rows_affected() > 0)
+}
+
+/// What an alias write may not do: shadow a class or served model by the
+/// same name (a request naming it must keep meaning it), or point at itself.
+/// `None` = allowed. A target nothing serves is allowed: it is a preference
+/// the mesh answers for until something serves it.
+pub fn alias_refusal(table: &ClassTable, alias: &str, class: &str) -> Option<String> {
+    if alias.eq_ignore_ascii_case(class) {
+        return Some(format!("'{alias}' cannot be an alias of itself"));
+    }
+    if table.class(alias).is_some() {
+        return Some(format!("'{alias}' is already a class or a served model; an alias by that name would hide it"));
+    }
+    None
+}
+
 // ── the public catalogue shape ───────────────────────────────────────────
 
 /// The OpenAI `/v1/models` list for a table: every class and alias as an id
@@ -1994,6 +2046,44 @@ mod tests {
         for alias in BUILTIN_ALIASES {
             assert_eq!(first_node(&select_with(&t, Some(alias), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
         }
+    }
+
+    /// i145: a caller sends a purpose, the DB says what it means. Undeclared,
+    /// a purpose is the whole mesh and NOT a fallback; declared, it is that
+    /// preference first and the mesh behind it.
+    #[test]
+    fn a_purpose_alias_is_the_mesh_until_declared_and_then_a_preference() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        for p in PURPOSE_ALIASES {
+            let sel = select_with(&t, Some(p), None, false, &|_| false, &idle, &fresh).unwrap();
+            assert_eq!(sel.class, CHAT_DEFAULT, "{p}");
+            assert_eq!(sel.label, "chat-default(dynamic)", "{p}");
+            assert!(sel.candidates.iter().all(|c| !c.rank.starts_with("fallback,")), "{p}: no preference was unmet: {:?}", sel.candidates);
+        }
+        assert!(t.ids().iter().any(|i| i == "knowledge") && t.ids().iter().any(|i| i == "graph"), "{:?}", t.ids());
+        // Declared: `knowledge` prefers pop-os's model, mcmini stays behind it.
+        let decl = Declarations { classes: vec![], aliases: vec![("knowledge".into(), "gemma4:e2b-it-qat".into())] };
+        let t = build_table(&incident(), &[], &decl);
+        let sel = select_with(&t, Some("knowledge"), None, false, &|_| false, &idle, &fresh).unwrap();
+        let order: Vec<&str> = sel.candidates.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(order, ["pop-os", "mcmini"], "{:?}", sel.candidates);
+        assert!(sel.candidates[1].rank.starts_with("fallback,"), "{:?}", sel.candidates[1]);
+        // `graph` is still undeclared: the mesh, best node first.
+        assert_eq!(first_node(&select_with(&t, Some("graph"), None, false, &|_| false, &idle, &fresh).unwrap()), "mcmini");
+        // Purposes are declarable (the built-ins are not).
+        assert!(valid_name("knowledge").is_ok());
+    }
+
+    /// i145 phase D: `noo cluster prefer` may point a purpose at a served
+    /// model or a class, but no alias may hide a class or model by its name.
+    #[test]
+    fn an_alias_may_not_shadow_a_class_or_served_model() {
+        let t = build_table(&incident(), &[], &Declarations::default());
+        assert_eq!(alias_refusal(&t, "knowledge", "gemma4:12b"), None);
+        assert_eq!(alias_refusal(&t, "knowledge", "not-served-yet"), None, "a preference the mesh answers for until served");
+        assert!(alias_refusal(&t, "gemma4:12b", CHAT_DEFAULT).is_some(), "a served model's name stays the model");
+        assert!(alias_refusal(&t, CHAT_DEFAULT, "gemma4:12b").is_some());
+        assert!(alias_refusal(&t, "x", "x").is_some());
     }
 
     #[test]

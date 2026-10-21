@@ -27,9 +27,11 @@ pub mod cluster_vendor;
 pub mod node_vendor;
 pub mod cluster_push_secrets;
 pub mod cluster_gpu;
+pub mod cluster_profile;
 pub mod cluster_verify;
 pub mod image_stage;
 pub mod cluster_class;
+pub mod cluster_embedding_space;
 pub mod cluster_tune;
 pub mod db;
 pub mod entitlement;
@@ -195,11 +197,13 @@ pub use secrets_remove::secrets_remove;
 pub use secrets_reveal::secrets_reveal;
 // ── Fleet secret convergence (WP-FS): the missing push half of a rotation.
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
-pub use cluster_vendor::{cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
+pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
+pub use cluster_profile::cluster_profile;
 pub use cluster_verify::cluster_verify;
-pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset};
+pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset, cluster_prefer};
+pub use cluster_embedding_space::{cluster_embedding_space_list, cluster_embedding_space_set, cluster_embedding_space_unset};
 pub use security_local::{
     secrets_absorb_files,
     cluster_teardown_node, pki_issue_node, pki_push_nodes, pki_rotate_all, security_generate_secret, security_scan, security_trust_ca,
