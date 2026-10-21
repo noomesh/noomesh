@@ -69,7 +69,11 @@
 //!
 //! ## What a route can say
 //!
-//! - `method` (`GET` | `POST`), `path` — mounted verbatim, forwarded verbatim.
+//! - `method` (`GET` | `POST` | `PUT` | `PATCH` | `DELETE` | `WS`), `path` —
+//!   mounted verbatim, forwarded verbatim. Every method but `GET` (and `WS`)
+//!   is a write and keeps the `POST` rule below. `WS` is a WebSocket route ([`crate::addon_ws`]): its path lives
+//!   under `/ws/addons/<addon>/`, and `max_message_bytes`, `idle_timeout_secs`
+//!   and `max_connections_per_user` bound it (WS routes only).
 //! - `aliases` — extra gateway paths that reach the same upstream route.
 //! - `params` — `{"cycle_id": "uuid"}` (`uuid` | `string`). A malformed uuid
 //!   is rejected HERE with a 400, so garbage never reaches the upstream URL.
@@ -108,6 +112,24 @@
 //! not narrowed here. Gateway code that calls a route by NAME (`internal`)
 //! has no requester and no role: the gateway decided to make that call.
 //!
+//! ## WebSocket routes and the add-on's UI
+//!
+//! A `WS` route is authenticated by the front door exactly like the
+//! gateway's own `/ws/*` sockets (`?token=` on a real handshake, or the
+//! `Authorization` header), checked against `min_role` BEFORE anything is
+//! dialled, then dialled as `wss://` with the same per-request identity
+//! headers, and only then upgraded; frames are piped both ways
+//! ([`crate::addon_ws`]).
+//!
+//! The top-level `ui` key serves the add-on's own web UI at
+//! `/addons/<addon>/ui/…`, a gateway-owned namespace no core route uses:
+//! GET/HEAD only, `min_role` enforced, path traversal refused, response
+//! headers sanitised and a gateway CSP added ([`crate::addon_ui`]).
+//!
+//! A gateway from before these keys refuses a manifest that uses them
+//! (unknown method, unknown key), so an add-on that declares them ships with
+//! a `supports_stack` starting at the release that reads them.
+//!
 //! ## The contract every mounted route keeps
 //!
 //! Upstream status and JSON body pass through verbatim; a non-JSON body is
@@ -123,7 +145,7 @@ use axum::{
     extract::{Path, RawQuery},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -195,6 +217,59 @@ pub struct AddonManifest {
     /// manifest: it is reachable by the gateway, not through the front door.
     #[serde(default)]
     pub task_events: Option<TaskEventsSpec>,
+    /// The add-on's own web UI, served at `/addons/<addon>/ui/…`
+    /// ([`crate::addon_ui`]). Absent: the add-on serves no UI.
+    #[serde(default)]
+    pub ui: Option<UiSpec>,
+}
+
+/// The manifest's `ui` key: `{"upstream_path": "/ui", "min_role": "user"}`.
+///
+/// `/addons/<addon>/ui/<rest>` is fetched from `<upstream><upstream_path>/<rest>`.
+/// The gateway path is fixed (the add-on cannot choose where its UI is
+/// mounted), so it can never shadow a core path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSpec {
+    /// Where the add-on serves its UI on its own side: a plain path, no
+    /// `{param}`. Default `/`: the gateway strips `/addons/<addon>/ui` and
+    /// forwards the rest as it is (a UI built for a directory mount, with
+    /// relative asset, API and socket paths, needs nothing else).
+    #[serde(default = "default_ui_upstream")]
+    pub upstream_path: String,
+    /// The lowest role that may load the UI. Absent means `operator`, as on
+    /// a route.
+    #[serde(default)]
+    pub min_role: Option<String>,
+    /// A label the console may show on its link. Plain text, at most 64
+    /// characters.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Per request (1–600); falls back to the manifest's.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Free text, ignored.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+fn default_ui_upstream() -> String {
+    "/".into()
+}
+
+impl UiSpec {
+    /// Absent is `operator`; an unknown word (refused at load) is `admin`.
+    pub fn required_role(&self) -> crate::auth::Role {
+        match self.min_role.as_deref() {
+            None => crate::auth::Role::Operator,
+            Some(w) => parse_role(w).unwrap_or(crate::auth::Role::Admin),
+        }
+    }
+
+    /// May a requester of `role` load this UI? A UI takes no scopes.
+    pub fn permits(&self, role: crate::auth::Role) -> bool {
+        role >= self.required_role()
+    }
 }
 
 /// The manifest's `task_events` route: `{"method": "POST", "path": "/..."}`.
@@ -249,6 +324,18 @@ pub struct RouteSpec {
     /// nothing by itself: see `AddonEntry::route_receives_delegation`.
     #[serde(default)]
     pub receives_delegation: bool,
+    /// `WS` routes only: the largest message (and frame) accepted in either
+    /// direction, in bytes. Default 1 MiB, at most 16 MiB.
+    #[serde(default)]
+    pub max_message_bytes: Option<usize>,
+    /// `WS` routes only: a socket with no frame in either direction for this
+    /// long is closed (1001). Default 300, 1–3600.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// `WS` routes only: how many sockets one account may hold open on this
+    /// route at once. Default 4, 1–64.
+    #[serde(default)]
+    pub max_connections_per_user: Option<u32>,
     /// Free text for whoever reads the manifest. Ignored by the code.
     #[serde(default)]
     pub note: Option<String>,
@@ -407,14 +494,84 @@ fn scope_ok(s: &str) -> bool {
     plain_addon(addon) && plain(word) && !word.contains(':')
 }
 
+/// Where every `WS` route of `addon` lives: `/ws/addons/<addon>/`. Under
+/// `/ws/` so a browser may hand its token over as `?token=` on the handshake
+/// (the front door accepts it nowhere else), and under the add-on's own name
+/// so it can never shadow a core socket (`/ws/agent`, `/ws/collab`, …).
+pub fn ws_prefix(addon: &str) -> String {
+    format!("/ws/addons/{addon}/")
+}
+
+/// The WS-only knobs are within range, and absent on any other method.
+fn check_ws_limits(r: &RouteSpec, ctx: &str) -> Result<(), String> {
+    let declared = r.max_message_bytes.is_some() || r.idle_timeout_secs.is_some() || r.max_connections_per_user.is_some();
+    if r.method != METHOD_WS {
+        if declared {
+            return Err(format!(
+                "{ctx}: max_message_bytes, idle_timeout_secs and max_connections_per_user apply to a \"WS\" route only"
+            ));
+        }
+        return Ok(());
+    }
+    if r.internal {
+        return Err(format!(
+            "{ctx}: a WS route cannot be internal — the gateway never opens a socket to an add-on by name"
+        ));
+    }
+    if let Some(n) = r.max_message_bytes {
+        if n == 0 || n > crate::addon_ws::MAX_MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "{ctx}: max_message_bytes {n} outside 1..={}",
+                crate::addon_ws::MAX_MAX_MESSAGE_BYTES
+            ));
+        }
+    }
+    if let Some(t) = r.idle_timeout_secs {
+        if t == 0 || t > crate::addon_ws::MAX_IDLE_TIMEOUT_SECS {
+            return Err(format!(
+                "{ctx}: idle_timeout_secs {t} outside 1..={}",
+                crate::addon_ws::MAX_IDLE_TIMEOUT_SECS
+            ));
+        }
+    }
+    if let Some(c) = r.max_connections_per_user {
+        if c == 0 || c > crate::addon_ws::MAX_CONNECTIONS_PER_USER {
+            return Err(format!(
+                "{ctx}: max_connections_per_user {c} outside 1..={}",
+                crate::addon_ws::MAX_CONNECTIONS_PER_USER
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The method word of a WebSocket route.
+pub const METHOD_WS: &str = "WS";
+
+/// The HTTP methods a route may declare, uppercase exactly. Every one but
+/// `GET` is a WRITE: it follows the rule a `POST` always has (operator or
+/// admin unless `owner_scoped`, no scopes, never where the front door admits a
+/// User).
+pub const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+/// Is this manifest method a write (`POST`, `PUT`, `PATCH`, `DELETE`)?
+pub fn is_write_method(method: &str) -> bool {
+    method != "GET" && method != METHOD_WS && HTTP_METHODS.contains(&method)
+}
+
 fn check_route(r: &RouteSpec) -> Result<(), String> {
     let ctx = format!("route {:?}", r.name);
     if !name_ok(&r.name) {
         return Err(format!("{ctx}: names are [a-z][a-z0-9_]{{0,63}}"));
     }
-    if r.method != "GET" && r.method != "POST" {
-        return Err(format!("{ctx}: method {:?} — only GET and POST", r.method));
+    if !HTTP_METHODS.contains(&r.method.as_str()) && r.method != METHOD_WS {
+        return Err(format!(
+            "{ctx}: method {:?} — only GET, POST, PUT, PATCH and DELETE, or WS for a WebSocket \
+             route (PUT/PATCH/DELETE/WS need a gateway from the release that reads them)",
+            r.method
+        ));
     }
+    check_ws_limits(r, &ctx)?;
     if let Some(t) = r.timeout_secs {
         if t == 0 || t > MAX_TIMEOUT_SECS {
             return Err(format!("{ctx}: timeout_secs {t} outside 1..={MAX_TIMEOUT_SECS}"));
@@ -432,22 +589,25 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
                  (an unknown value is refused, never read as user)"
             ));
         };
-        if r.method == "POST" && role == crate::auth::Role::User && !r.owner_scoped {
+        if is_write_method(&r.method) && role == crate::auth::Role::User && !r.owner_scoped {
             return Err(format!(
-                "{ctx}: a POST cannot be min_role \"user\" — writes are operator or admin, the \
+                "{ctx}: a {} cannot be min_role \"user\" — writes are operator or admin, the \
                  front door refuses a User's writes and a manifest does not widen that. A route \
                  whose add-on keeps every row to the calling account may declare \
-                 \"owner_scoped\": true (see \"Who may call a route\" in docs/development/addons.md)"
+                 \"owner_scoped\": true (see \"Who may call a route\" in docs/development/addons.md)",
+                r.method
             ));
         }
     }
     if r.owner_scoped {
-        if r.method != "POST" || r.internal {
-            return Err(format!("{ctx}: owner_scoped applies to a public POST route only"));
+        if !is_write_method(&r.method) || r.internal {
+            return Err(format!(
+                "{ctx}: owner_scoped applies to a public write route (POST, PUT, PATCH, DELETE) only"
+            ));
         }
         if r.min_role.as_deref() != Some("user") {
             return Err(format!(
-                "{ctx}: owner_scoped is the opt-in for min_role \"user\" on a POST; on any other \
+                "{ctx}: owner_scoped is the opt-in for min_role \"user\" on a write; on any other \
                  role it means nothing — remove it"
             ));
         }
@@ -480,6 +640,15 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
         if r.internal {
             continue;
         }
+        if r.method == METHOD_WS {
+            // The add-on's own `/ws/addons/<addon>/` is checked by
+            // `validate`, which knows the add-on; nothing below applies to a
+            // socket (the handshake is a GET the handler gates itself).
+            if !path.starts_with("/ws/addons/") {
+                return Err(format!("{ctx}: a WS path {path:?} must live under /ws/addons/<addon>/"));
+            }
+            continue;
+        }
         if !path.starts_with("/api/") {
             return Err(format!("{ctx}: public path {path:?} must live under /api/"));
         }
@@ -487,7 +656,7 @@ fn check_route(r: &RouteSpec) -> Result<(), String> {
             return Err(format!("{ctx}: public path {path:?} is inside the gateway's own {p} namespace"));
         }
         if r.method != "GET" && !r.owner_scoped {
-            let method = axum::http::Method::from_bytes(r.method.as_bytes()).expect("GET or POST");
+            let method = axum::http::Method::from_bytes(r.method.as_bytes()).expect("a validated HTTP method");
             if user_tier_could_call(&method, path) {
                 return Err(format!(
                     "{ctx}: {} {path:?} would be callable by a User-tier caller — an add-on \
@@ -518,10 +687,13 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
     if m.timeout_secs == 0 || m.timeout_secs > MAX_TIMEOUT_SECS {
         return Err(format!("timeout_secs {} outside 1..={MAX_TIMEOUT_SECS}", m.timeout_secs));
     }
-    if m.routes.is_empty() {
+    if m.routes.is_empty() && m.ui.is_none() {
         return Err("it declares no routes".into());
     }
     check_delegation(m)?;
+    if let Some(ui) = m.ui.as_ref() {
+        check_ui(ui)?;
+    }
     let mut names = HashSet::new();
     let mut mounted = HashSet::new();
     for r in &m.routes {
@@ -532,6 +704,18 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
             ));
         }
         check_route(r)?;
+        if r.method == METHOD_WS {
+            let want = ws_prefix(addon);
+            for path in std::iter::once(&r.path).chain(r.aliases.iter()) {
+                if !path.starts_with(&want) || path.len() == want.len() {
+                    return Err(format!(
+                        "route {:?}: WS path {path:?} must live under {want} (the add-on's own \
+                         socket namespace) with at least one segment after it",
+                        r.name
+                    ));
+                }
+            }
+        }
         for sc in &r.scopes {
             if sc.split(':').next() != Some(addon) {
                 return Err(format!(
@@ -549,6 +733,35 @@ pub fn validate(m: &AddonManifest, addon: &str) -> Result<(), String> {
                     return Err(format!("{} {path:?} is declared twice", r.method));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The `ui` key is acceptable: a plain upstream path, a known role, a sane
+/// timeout and a short plain title.
+fn check_ui(ui: &UiSpec) -> Result<(), String> {
+    if ui.upstream_path == "/" {
+        // The default: the add-on serves its UI from its root.
+    } else if !path_shape(&ui.upstream_path).map_err(|e| format!("ui.upstream_path: {e}"))?.is_empty() {
+        return Err(format!("ui.upstream_path {:?} takes no {{param}} segments", ui.upstream_path));
+    }
+    if let Some(word) = ui.min_role.as_deref() {
+        if parse_role(word).is_none() {
+            return Err(format!(
+                "ui.min_role {word:?} is not a role — use \"user\", \"operator\" or \"admin\" \
+                 (an unknown value is refused, never read as user)"
+            ));
+        }
+    }
+    if let Some(t) = ui.timeout_secs {
+        if t == 0 || t > MAX_TIMEOUT_SECS {
+            return Err(format!("ui.timeout_secs {t} outside 1..={MAX_TIMEOUT_SECS}"));
+        }
+    }
+    if let Some(title) = ui.title.as_deref() {
+        if title.trim().is_empty() || title.chars().count() > 64 || title.chars().any(|c| c.is_control() || c == '<' || c == '>') {
+            return Err(format!("ui.title {title:?} must be 1–64 plain characters (no control characters, no `<` `>`)"));
         }
     }
     Ok(())
@@ -803,6 +1016,14 @@ fn owner_scoped_allows(
 }
 
 fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
+    // An add-on's UI (`/addons/<addon>/ui/…`) is scoped by its `ui.min_role`.
+    if let Some(addon) = crate::addon_ui::ui_addon_of(path) {
+        return manifests
+            .iter()
+            .find(|m| m.addon == addon)
+            .and_then(|m| m.ui.as_ref())
+            .is_some_and(|ui| ui.permits(role));
+    }
     let hits = matching_routes(manifests, "GET", path);
     !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
 }
@@ -908,11 +1129,14 @@ fn method_router(
             }
         }
     };
-    // `validate` admits GET and POST only.
-    if spec.method == "POST" {
-        post(handler)
-    } else {
-        get(handler)
+    // `validate` admits HTTP_METHODS and WS only.
+    match spec.method.as_str() {
+        METHOD_WS => crate::addon_ws::method_router(manifest, spec),
+        "POST" => post(handler),
+        "PUT" => put(handler),
+        "PATCH" => patch(handler),
+        "DELETE" => delete(handler),
+        _ => get(handler),
     }
 }
 
@@ -940,19 +1164,10 @@ async fn serve(
             return forbidden(manifest, spec);
         }
     }
-    // Substitute path params, validating each against its declared format so
-    // a malformed id is a clean 400 here rather than whatever the upstream
-    // makes of it.
-    let mut path = spec.path.clone();
-    for (name, format) in &spec.params {
-        let Some(value) = params.get(name) else {
-            return bad_request(format!("missing path parameter `{name}`"));
-        };
-        if format == "uuid" && uuid::Uuid::parse_str(value).is_err() {
-            return bad_request(format!("Invalid {name}: {value}"));
-        }
-        path = path.replace(&format!("{{{name}}}"), value);
-    }
+    let mut path = match fill_path(spec, &params) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     if spec.query {
         if let Some(q) = query.filter(|q| !q.is_empty()) {
             path = format!("{path}?{q}");
@@ -961,7 +1176,24 @@ async fn serve(
     forward(manifest, spec, &path, body, requester).await
 }
 
-fn forbidden(manifest: &AddonManifest, spec: &RouteSpec) -> Response {
+/// Substitute path params, validating each against its declared format so a
+/// malformed id is a clean 400 here rather than whatever the upstream makes
+/// of it.
+pub(crate) fn fill_path(spec: &RouteSpec, params: &HashMap<String, String>) -> Result<String, Response> {
+    let mut path = spec.path.clone();
+    for (name, format) in &spec.params {
+        let Some(value) = params.get(name) else {
+            return Err(bad_request(format!("missing path parameter `{name}`")));
+        };
+        if format == "uuid" && uuid::Uuid::parse_str(value).is_err() {
+            return Err(bad_request(format!("Invalid {name}: {value}")));
+        }
+        path = path.replace(&format!("{{{name}}}"), value);
+    }
+    Ok(path)
+}
+
+pub(crate) fn forbidden(manifest: &AddonManifest, spec: &RouteSpec) -> Response {
     let need = spec.required_role().as_str();
     (
         StatusCode::FORBIDDEN,
@@ -1078,7 +1310,7 @@ async fn forward(
 /// mTLS (the gateway presents its leaf through [`crate::tls::cluster_client`]
 /// and verifies the add-on's against the cluster CA); there is no plain door
 /// to dial and no downgrade.
-fn plaintext_refusal(addon: &str, env: &str, base: &str) -> Option<String> {
+pub(crate) fn plaintext_refusal(addon: &str, env: &str, base: &str) -> Option<String> {
     if base.trim_start().to_ascii_lowercase().starts_with("https://") {
         return None;
     }
@@ -1093,7 +1325,7 @@ fn plaintext_refusal(addon: &str, env: &str, base: &str) -> Option<String> {
 /// on. Read from the whole error chain: reqwest's own Display is only the top
 /// frame ("error sending request"), and the fact that matters — rustls saw
 /// plain HTTP where a ServerHello should be — is several `source()`s down.
-fn classify_send_error(chain: &str, is_timeout: bool) -> &'static str {
+pub(crate) fn classify_send_error(chain: &str, is_timeout: bool) -> &'static str {
     let c = chain.to_ascii_lowercase();
     if c.contains("invalidcontenttype")
         || c.contains("corrupt message")
@@ -1187,7 +1419,7 @@ pub const REQUESTER_SCOPES: &str = "x-noo-requester-scopes";
 /// call. A username is checked at signup and cannot hold a control character;
 /// skipping keeps a hypothetical one from turning an authorization detail into
 /// a 500, and the add-on then sees "no requester", which is the closed answer.
-fn caller_headers(requester: Option<&crate::auth::RequesterCtx>) -> Vec<(&'static str, String)> {
+pub(crate) fn caller_headers(requester: Option<&crate::auth::RequesterCtx>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if let Some(t) = crate::addon_auth::token() {
         out.push((CALLER_HEADER, format!("Bearer {t}")));
@@ -1212,7 +1444,7 @@ pub(crate) fn mints_delegation(requester: Option<&crate::auth::RequesterCtx>, ro
 
 /// The container name an operator would `docker logs`. Kept alongside the
 /// add-on name so an unreachable-error names something they can act on.
-fn container_of(addon: &str) -> String {
+pub(crate) fn container_of(addon: &str) -> String {
     format!("noo-{addon}")
 }
 
@@ -1420,6 +1652,12 @@ pub(crate) mod tests {
                  "internal": true, "timeout_secs": 5}
             ]
         })
+    }
+
+    /// The front door's add-on GET decision over given manifests (for tests
+    /// in sibling modules).
+    pub(crate) fn get_allows_for_test(m: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
+        get_allows(m, scopes, role, path)
     }
 
     pub(crate) fn sample() -> AddonManifest {
@@ -1804,8 +2042,9 @@ pub(crate) mod tests {
         refused_with(|v| v["version"] = json!(2), "version");
         refused_with(|v| v["routes"][0]["name"] = json!("Bad-Name"), "names");
         refused_with(|v| v["routes"][1]["name"] = json!("sample_status"), "twice");
-        refused_with(|v| v["routes"][0]["method"] = json!("DELETE"), "only GET and POST");
-        refused_with(|v| v["routes"][0]["method"] = json!("get"), "only GET and POST");
+        refused_with(|v| v["routes"][0]["method"] = json!("OPTIONS"), "only GET, POST, PUT, PATCH and DELETE");
+        refused_with(|v| v["routes"][0]["method"] = json!("get"), "only GET, POST, PUT, PATCH and DELETE");
+        refused_with(|v| v["routes"][0]["method"] = json!("delete"), "only GET, POST, PUT, PATCH and DELETE");
         refused_with(|v| v["routes"][0]["timeout_secs"] = json!(0), "timeout");
         refused_with(|v| v["timeout_secs"] = json!(100000), "timeout");
         refused_with(|v| v["routes"] = json!([]), "no routes");
@@ -1954,6 +2193,7 @@ mod user_read_route_tests {
             timeout_secs: 30,
             delegate: None,
             task_events: None,
+            ui: None,
             routes: routes
                 .iter()
                 .map(|(m, p, internal)| RouteSpec {
@@ -1969,6 +2209,9 @@ mod user_read_route_tests {
                     scopes: vec![],
                     owner_scoped: false,
                     receives_delegation: false,
+                    max_message_bytes: None,
+                    idle_timeout_secs: None,
+                    max_connections_per_user: None,
                     note: None,
                 })
                 .collect(),
@@ -2114,6 +2357,89 @@ mod permission_tests {
             let m: AddonManifest = serde_json::from_value(v).unwrap();
             assert!(validate(&m, "evolve").unwrap_err().contains("owner_scoped"), "route {idx}");
         }
+    }
+
+    /// PUT, PATCH and DELETE are writes with the POST rule: accepted at
+    /// operator/admin, refused at user unless owner_scoped, never scoped, and
+    /// mounted with their own method.
+    #[test]
+    fn put_patch_and_delete_are_writes_with_the_post_rule() {
+        for method in ["PUT", "PATCH", "DELETE"] {
+            let mut v = tests::sample_json();
+            v["routes"].as_array_mut().unwrap().push(json!({
+                "name": "sample_write", "method": method, "path": "/api/sample/things/{thing_id}",
+                "params": {"thing_id": "uuid"}, "min_role": "operator"
+            }));
+            let m: AddonManifest = serde_json::from_value(v.clone()).unwrap();
+            validate(&m, "evolve").unwrap_or_else(|e| panic!("{method} at operator: {e}"));
+            let _ = addon_router(&m); // mounts without panicking
+
+            let mut user = v.clone();
+            user["routes"][8]["min_role"] = json!("user");
+            let m: AddonManifest = serde_json::from_value(user.clone()).unwrap();
+            let e = validate(&m, "evolve").unwrap_err();
+            assert!(e.contains(&format!("a {method} cannot be min_role")) && e.contains("owner_scoped"), "{e}");
+
+            user["routes"][8]["owner_scoped"] = json!(true);
+            let m: AddonManifest = serde_json::from_value(user).unwrap();
+            validate(&m, "evolve").unwrap_or_else(|e| panic!("{method} owner_scoped user: {e}"));
+            let meth = axum::http::Method::from_bytes(method.as_bytes()).unwrap();
+            let id = "/api/sample/things/00000000-0000-0000-0000-000000000001";
+            assert!(owner_scoped_allows(&[m.clone()], &meth, &held(&["read"]), Role::User, id));
+            assert!(!owner_scoped_allows(&[m], &axum::http::Method::POST, &held(&["read"]), Role::User, id), "method must match");
+
+            let mut scoped = v.clone();
+            scoped["routes"][8]["scopes"] = json!(["evolve:things"]);
+            let m: AddonManifest = serde_json::from_value(scoped).unwrap();
+            assert!(validate(&m, "evolve").unwrap_err().contains("GET route only"), "{method}: a scope never widens a write");
+
+            let mut chat = v;
+            chat["routes"][8]["path"] = json!("/api/conversations/{thing_id}");
+            let m: AddonManifest = serde_json::from_value(chat).unwrap();
+            if let Err(e) = validate(&m, "evolve") {
+                assert!(e.contains("User-tier") || e.contains("namespace"), "{method}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn ws_routes_live_in_the_addons_socket_namespace_with_bounded_limits() {
+        let ok = json!({"name": "s", "method": "WS", "path": "/ws/addons/evolve/stream", "min_role": "user"});
+        let with = |r: Value| {
+            let mut v = tests::sample_json();
+            v["routes"].as_array_mut().unwrap().push(r);
+            serde_json::from_value::<AddonManifest>(v).map_err(|e| e.to_string()).and_then(|m| validate(&m, "evolve"))
+        };
+        with(ok.clone()).expect("a user WS route in its namespace");
+        for (edit, needle) in [
+            (json!({"path": "/api/sample/stream"}), "/ws/addons/"),
+            (json!({"path": "/ws/addons/other/stream"}), "/ws/addons/evolve/"),
+            (json!({"path": "/ws/collab"}), "/ws/addons/"),
+            (json!({"internal": true}), "cannot be internal"),
+            (json!({"scopes": ["evolve:x"]}), "GET route only"),
+            (json!({"max_message_bytes": 0}), "max_message_bytes"),
+            (json!({"max_message_bytes": 17 * 1024 * 1024}), "max_message_bytes"),
+            (json!({"idle_timeout_secs": 0}), "idle_timeout_secs"),
+            (json!({"idle_timeout_secs": 3601}), "idle_timeout_secs"),
+            (json!({"max_connections_per_user": 0}), "max_connections_per_user"),
+            (json!({"max_connections_per_user": 65}), "max_connections_per_user"),
+            (json!({"owner_scoped": true}), "owner_scoped"),
+        ] {
+            let mut r = ok.clone();
+            for (k, val) in edit.as_object().unwrap() {
+                r[k] = val.clone();
+            }
+            let e = with(r).expect_err(&edit.to_string());
+            assert!(e.contains(needle), "{edit}: {e}");
+        }
+        // The WS knobs mean nothing on an HTTP route: refused, not ignored.
+        let e = with(json!({"name": "g", "method": "GET", "path": "/api/sample/g", "max_message_bytes": 10})).unwrap_err();
+        assert!(e.contains("WS"), "{e}");
+        // A WS route is never a GET read for the tier gate.
+        let mut v = tests::sample_json();
+        v["routes"].as_array_mut().unwrap().push(ok);
+        let m: AddonManifest = serde_json::from_value(v).unwrap();
+        assert!(!get_allows(&[m], &held(&["read"]), Role::User, "/ws/addons/evolve/stream"));
     }
 
     #[test]

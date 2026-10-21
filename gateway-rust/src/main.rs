@@ -115,6 +115,8 @@ mod addons;
 mod addon_decls;
 mod addon_proxy;
 mod addon_workloads;
+mod addon_ui;
+mod addon_ws;
 mod addon_delegation;
 mod addon_registry;
 mod google_drive;
