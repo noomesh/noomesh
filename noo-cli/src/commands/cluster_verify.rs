@@ -1673,7 +1673,9 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
 /// The `embedding spaces` row (i145): each space, its one model and how many
 /// nodes serve it. `x` when the default space (`knowledge`) has no live node
 /// (every unqualified embed fails); `!` when another space has none, or an
-/// embed node serves a model no space uses (it serves nobody).
+/// embed node serves a model no space uses (it serves nobody). A static
+/// endpoint that answered the gateway's probe embed (`static_live`, the
+/// compose embedder on a fresh install) serves the space like a node.
 pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     const NAME: &str = "embedding spaces";
     let Some(body) = body else {
@@ -1686,10 +1688,17 @@ pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     }
     let listed: Vec<String> = spaces
         .iter()
-        .map(|s| format!("{}={} ({} live)", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"), s["live"].as_u64().unwrap_or(0)))
+        .map(|s| {
+            let (live, st) = (s["live"].as_u64().unwrap_or(0), s["static_live"].as_u64().unwrap_or(0));
+            let served = if st > 0 { format!("{live} live + {st} static") } else { format!("{live} live") };
+            format!("{}={} ({served})", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"))
+        })
         .collect();
     let detail = listed.join(", ");
-    let dead: Vec<&Value> = spaces.iter().filter(|s| s["live"].as_u64().unwrap_or(0) == 0).collect();
+    let dead: Vec<&Value> = spaces
+        .iter()
+        .filter(|s| s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0)
+        .collect();
     if dead.iter().any(|s| s["default"].as_bool() == Some(true)) {
         return fail(NAME, format!("{detail} — the default space has no live node: every unqualified embed fails"), "noo cluster embedding-space list");
     }
@@ -5155,6 +5164,11 @@ mod tests {
         assert!(c.detail.contains("knowledge=harrier (2 live)"), "{}", c.detail);
         let dead_default = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]}));
         assert_eq!(embedding_spaces_check(Some(&dead_default)).verdict, super::Verdict::Fail);
+        // F1: a fresh install's compose embedder answers for the default space.
+        let compose_only = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0, "static_live": 1}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&compose_only));
+        assert_eq!(c.verdict, super::Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("knowledge=harrier (0 live + 1 static)"), "{}", c.detail);
         let dead_code = j(serde_json::json!({"spaces": [
             {"space": "knowledge", "model": "harrier", "default": true, "live": 1},
             {"space": "code", "model": "nomic-embed-code", "default": false, "live": 0}], "unmatched": []}));
