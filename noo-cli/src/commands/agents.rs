@@ -609,3 +609,119 @@ pub fn agents_messages(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     print_message_rows(rows);
     Ok(0)
 }
+
+// ─── agent-mail archive ──────────────────────────────────────────────────
+//
+// The archive lives on the controller's data volume and its bodies are
+// sealed with a key only the gateway holds, so both verbs are gateway
+// routes (`/api/agents/archive`, operator-only). The CLI only formats.
+
+/// `noo agents archive list` — GET /api/agents/archive.
+pub fn agents_archive_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    if !args.is_empty() {
+        return Err(Unhandled);
+    }
+    let body = get_json(g, "/api/agents/archive", true, 60);
+    if g.json {
+        println!("{body}");
+        return Ok(0);
+    }
+    let empty = Vec::new();
+    let files = body["files"].as_array().unwrap_or(&empty);
+    if files.is_empty() {
+        println!("{}", ui::muted(&format!("no archived agent mail under {}", body["dir"].as_str().unwrap_or("?"))));
+        return Ok(0);
+    }
+    println!(
+        "{}",
+        ui::header("agent mail archive", Some(&format!("{} file(s), {} message(s)", files.len(), body["total_rows"].as_u64().unwrap_or(0))))
+    );
+    let rows: Vec<Vec<String>> = files
+        .iter()
+        .map(|f| {
+            vec![
+                f["month"].as_str().unwrap_or("?").to_string(),
+                f["rows"].as_u64().unwrap_or(0).to_string(),
+                f["bytes"].as_u64().unwrap_or(0).to_string(),
+                f["file"].as_str().unwrap_or("?").to_string(),
+            ]
+        })
+        .collect();
+    print!("{}", ui::table(&[Col::left("month"), Col::right("messages"), Col::right("bytes"), Col::left("file")], &rows));
+    Ok(0)
+}
+
+/// `noo agents archive export <month|file> [--decrypt] [--out <path>]` —
+/// GET /api/agents/archive/{month}. JSONL, one archived row per line,
+/// bodies still sealed. `--decrypt` asks the gateway to open them with the
+/// cluster key (operator-only, audited by name and month); decrypted rows
+/// are written ONLY to `--out` (mode 0600), never to stdout or `--json`.
+pub fn agents_archive_export(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let mut target: Option<&str> = None;
+    let mut decrypt = false;
+    let mut out: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--decrypt" => decrypt = true,
+            "--out" | "-o" => out = Some(it.next().ok_or(Unhandled)?.as_str()),
+            s if !s.starts_with('-') && target.is_none() => target = Some(s),
+            _ => return Err(Unhandled),
+        }
+    }
+    let target = target.ok_or(Unhandled)?;
+    if decrypt && out.is_none() {
+        crate::output::fail(
+            g.json,
+            crate::output::ExitCode::Usage,
+            "decrypt_needs_out",
+            "--decrypt writes plaintext, so it needs --out <path> (it is never printed)",
+            None,
+        );
+    }
+    // A file argument names a month: the gateway rebuilds the path from it.
+    let month = std::path::Path::new(target).file_name().and_then(|n| n.to_str()).unwrap_or(target);
+    let path = format!("/api/agents/archive/{}{}", super::urlencode(month), if decrypt { "?decrypt=true" } else { "" });
+    let body = get_json(g, &path, true, 300);
+    let empty = Vec::new();
+    let rows = body["rows"].as_array().unwrap_or(&empty);
+    let mut text = String::new();
+    for r in rows {
+        text.push_str(&r.to_string());
+        text.push('\n');
+    }
+    match out {
+        Some(p) => {
+            use std::io::Write as _;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let res = opts.open(p).and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()));
+            if let Err(e) = res {
+                crate::output::fail(g.json, crate::output::ExitCode::Generic, "write_failed", &format!("cannot write {p}: {e}"), None);
+            }
+            if g.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"month": body["month"], "file": body["file"], "count": rows.len(), "decrypted": decrypt, "opened": body["opened"], "out": p})
+                );
+            } else {
+                println!(
+                    "{}",
+                    ui::ok(&format!(
+                        "wrote {} message(s) for {} to {p}{}",
+                        rows.len(),
+                        body["month"].as_str().unwrap_or("?"),
+                        if decrypt { format!(" ({} body(ies) opened; recorded in the audit log)", body["opened"].as_u64().unwrap_or(0)) } else { " (bodies still sealed)".into() }
+                    ))
+                );
+            }
+        }
+        None => print!("{text}"),
+    }
+    Ok(0)
+}

@@ -113,6 +113,19 @@ shred -u ~/noo-backups/age-key_*.txt   # then destroy the plaintext
 
 `restore-drill.sh` fails while any plaintext `age-key_*.txt` remains.
 
+### The cold-storage archive is in the backup
+
+Retention archives expired audit partitions and agent mail under
+`/data/audit-archive` on the gateway's volume and then deletes them from
+Postgres, so the dump above does not contain them. `backup-controller.sh`
+therefore also writes `archive_<ts>.tar.enc` (the whole directory, AES-256 with
+`NOO_BACKUP_PASSPHRASE`, a full snapshot each time; the newest three are always
+kept and older ones age out with the dumps). It is copied offsite with the
+dump and carried by `noo-backup-export.sh`. A run that cannot back it up fails.
+Restore: `openssl enc -d -aes-256-cbc -pbkdf2 -in archive_<ts>.tar.enc | tar -x`
+and copy the files back into `/data/audit-archive`. The agent-mail bodies in it
+are sealed with `NOO_AGENT_REVIEW_KEY`; keep that key as safe as the age key.
+
 ### Getting a copy off the machine
 
 Everything above — the dumps, the Postgres volume, the encrypted age key —

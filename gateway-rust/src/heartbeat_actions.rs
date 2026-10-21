@@ -2296,29 +2296,53 @@ async fn action_heartbeat_retention(
 /// skips objects it does not own (a hand-made `noo_token_usage_backup`,
 /// or a future sub-partition scheme) instead of parsing garbage into a
 /// month it then drops.
-/// `agent_messages_retention` — delete `noo_agent_messages` rows older than
-/// `days` (default 90; the design). **Defaults to a dry run** like the other
-/// retention actions; `dry_run: false` applies. No staging: the record is a
-/// trace of sealed bodies, and 90 days of it is what review needs.
+/// `agent_messages_retention` — archive, then delete, `noo_agent_messages`
+/// rows older than `days` (default 90; the design). **Defaults to a dry
+/// run** like the other retention actions; `dry_run: false` applies.
+///
+/// Archive-then-delete (`agent_mail_archive`): every expiring row goes, with
+/// its body still sealed, into `<archive_dir>/noo_agent_messages_YYYY_MM.jsonl.gz`
+/// (the audit archive's directory), is read back from disk, and only then is
+/// deleted by id. Any failure deletes nothing for that month and RAISES.
 async fn action_agent_messages_retention(
     state: &std::sync::Arc<crate::state::AppState>,
     config: &Value,
 ) -> Result<String, String> {
     let days = config.get("days").and_then(|v| v.as_i64()).unwrap_or(crate::repo::agent_messages::RETENTION_DAYS).max(1);
     let dry_run = config.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
-    let expired = crate::repo::agent_messages::count_expired(&state.db, days)
-        .await
-        .map_err(|e| format!("agent_messages_retention: count failed: {e}"))?;
+    let dir = config
+        .get("archive_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(crate::agent_mail_archive::DEFAULT_ARCHIVE_DIR);
+    if let Some(why) = crate::agent_mail_archive::archive_dir_problem(dir) {
+        return Err(format!("agent_messages_retention: {why}"));
+    }
     if dry_run {
+        let plan = crate::agent_mail_archive::plan(&state.db, days)
+            .await
+            .map_err(|e| format!("agent_messages_retention: count failed: {e}"))?;
+        let expired: i64 = plan.iter().map(|(_, n)| n).sum();
+        let months = plan.iter().map(|(m, n)| format!("{m}: {n}")).collect::<Vec<_>>().join(", ");
         return Ok(format!(
-            "Agent messages retention (DRY RUN): {expired} message(s) older than {days}d would be deleted. \
-             Set `dry_run: false` in this task's config to apply."
+            "Agent messages retention (DRY RUN): {expired} message(s) older than {days}d would be archived \
+             (sealed) to {dir} and then deleted{}. Set `dry_run: false` in this task's config to apply.",
+            if months.is_empty() { String::new() } else { format!(" [{months}]") }
         ));
     }
-    let n = crate::repo::agent_messages::delete_expired(&state.db, days)
+    let out = crate::agent_mail_archive::archive_then_delete(&state.db, days, std::path::Path::new(dir))
         .await
-        .map_err(|e| format!("agent_messages_retention: delete failed: {e}"))?;
-    Ok(format!("Agent messages retention: deleted {n} message(s) older than {days}d."))
+        .map_err(|e| format!("agent_messages_retention: {e}"))?;
+    let summary = format!(
+        "Agent messages retention: archived {} new message(s) ({} verified in {} file(s) under {dir}), deleted {} older than {days}d",
+        out.archived,
+        out.verified,
+        out.files.len(),
+        out.deleted
+    );
+    if !out.errors.is_empty() {
+        return Err(format!("{summary}; {} FAILED (nothing deleted for those): {}", out.errors.len(), out.errors.join(" | ")));
+    }
+    Ok(format!("{summary}."))
 }
 
 fn parse_usage_partition(name: &str) -> Option<(i32, i32)> {

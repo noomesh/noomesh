@@ -910,6 +910,44 @@ visible. `archive_dir` must stay under `/data/`. The task defaults to a dry
 run if its `dry_run` is removed; the seeded row applies. Disable it with
 `noo heartbeat toggle audit_log_rotate --off`, or tune it with the task's config.
 
+### Agent mail retention and archive
+
+Agent-to-agent messages (`noo_agent_messages`) are kept 90 days in Postgres
+(`days` on the weekly `agent_messages_retention` task, seeded enabled and
+applying). Past that window a message is ARCHIVED before it is deleted, so the
+record can still be used later (an evaluation set, a fine-tune):
+
+- **Where.** `/data/audit-archive/noo_agent_messages_YYYY_MM.jsonl.gz`, one gzip
+  JSONL file per UTC month of `received_at`, in the same directory and on the
+  same `noo-data` volume as the audit archive (`archive_dir` on the task, under
+  `/data/`). Each line is the whole row, every column.
+- **Still sealed.** The body is stored exactly as the table holds it
+  (`enc: "sealed"` or `"e2e"`, `body: {"ct": ...}`, `enc_meta`). The archive
+  holds no plaintext and the gateway needs no key to write it.
+- **Archive, verify, then delete.** The month's file is written to a temp file,
+  fsynced, read back from disk, and renamed into place; only then are exactly
+  the archived ids deleted. A failed export (unwritable directory, disk full, an
+  unreadable existing file, a count mismatch) deletes nothing for that month,
+  leaves any existing archive untouched, and fails the run so it is visible.
+  A run that crashes between the export and the delete is safe to repeat: the
+  merge de-duplicates by message id, so each id appears in the archive once.
+- **Backed up.** `scripts/backup-controller.sh` writes the whole archive
+  directory (audit partitions, chain heads, agent mail) to
+  `archive_<ts>.tar.enc`, encrypted with `NOO_BACKUP_PASSPHRASE`, and it goes
+  wherever `NOO_BACKUP_OFFSITE` sends the dump. Archived rows no longer exist
+  in Postgres, so the dump does not contain them: this file is their backup. A
+  run that cannot back the archive up fails.
+- **Reading it back (operator only).** `noo agents archive list` shows the
+  files, months and row counts; `noo agents archive export 2026-03 --out m.jsonl`
+  writes a month as JSONL with bodies still sealed. `--decrypt` asks the
+  gateway to open the bodies with the cluster review key (`NOO_AGENT_REVIEW_KEY`,
+  which never leaves the gateway) and write the plaintext to `--out` only (mode
+  0600, never the terminal). Each decrypt writes an `agent_archive_decrypt`
+  audit row naming who opened which month, BEFORE any plaintext is produced; if
+  the row cannot be written the decrypt is refused. A non-operator is refused
+  and the refusal is audited too. If the cluster has no review key, nothing
+  can be opened.
+
 ## A service that holds its own gateway key
 
 The controller's own services used to sign their gateway calls with

@@ -324,8 +324,9 @@ pub async fn threads(db: &PgPool, agent: Option<&str>, limit: i64) -> Result<Vec
 
 
 /// Default retention for the message record ( piece,
-/// shipped with phase 4). Sealed bodies are still bytes on disk; the
-/// record is a trace, not an archive.
+/// shipped with phase 4). Sealed bodies are still bytes on disk. Past this
+/// window a row is archived (still sealed) to cold storage by
+/// `agent_mail_archive` before it is deleted.
 pub const RETENTION_DAYS: i64 = 90;
 
 pub async fn count_expired(db: &PgPool, days: i64) -> Result<i64, sqlx::Error> {
@@ -335,9 +336,13 @@ pub async fn count_expired(db: &PgPool, days: i64) -> Result<i64, sqlx::Error> {
         .await
 }
 
-pub async fn delete_expired(db: &PgPool, days: i64) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM noo_agent_messages WHERE received_at < now() - make_interval(days => $1::int)")
-        .bind(days as i32)
+/// Delete exactly these messages. Retention calls it with the ids it has
+/// just archived and verified, never with the age predicate, so a row that
+/// was not archived cannot be deleted by it. Read receipts go with them (FK
+/// cascade).
+pub async fn delete_ids(db: &PgPool, ids: &[String]) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM noo_agent_messages WHERE id = ANY($1)")
+        .bind(ids)
         .execute(db)
         .await?;
     Ok(res.rows_affected())
