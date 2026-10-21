@@ -788,7 +788,7 @@ pub(crate) fn render_sync_service(cfg: &SeatConfig) -> String {
 pub(crate) fn render_polkit_rule(user: &str) -> String {
     let units = SEAT_RESTARTABLE_UNITS.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ");
     format!(
-        "// Written by `noo kiosk enroll`. The seat user's sync may start/stop/restart the\n\
+        "// Written by noo kiosk enroll. The seat user's sync may start/stop/restart the\n\
          // kiosk units, and nothing else.\n\
          polkit.addRule(function(action, subject) {{\n\
          \x20   if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
