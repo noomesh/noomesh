@@ -469,6 +469,28 @@ the gateway's and the harness's stream idle bounds see progress rather
 than silence. `/v1/completions` and `/v1/embeddings` are reverse-proxied
 as before.
 
+**A full backend is busy, not wedged.** The proxy counts each inference
+request against the backend's declared slots (`internal/occupancy`: Ollama's
+`OLLAMA_NUM_PARALLEL`, llama.cpp's `N_PARALLEL`, vLLM's `VLLM_MAX_NUM_SEQS`,
+read from the placement env the reconciler started it with; undeclared =
+unknown = counted, never queued here). When every slot is taken a request
+is not left to sit silently in the engine's own queue: with `X-Noo-Busy:
+reject` it gets `503 backend_busy` at once with `Retry-After` and
+`X-Noo-Queue` (how many wait ahead), so a caller with another candidate goes
+there; otherwise it waits its turn, first come first served, up to the
+first-byte bound, and a STREAMING request gets its SSE headers at once and a
+`: queued` / `: keep-alive` comment every 5 s while it waits. An admitted
+stream whose engine stays silent for 10 s (a long prefill) gets its headers
+and keep-alives the same way, so the gateway's 30 s windows see a live
+connection; an engine that refuses faster than that keeps its own status
+code, and a refusal that arrives after the headers went out is carried as an
+SSE error event. Every response names `X-Noo-In-Flight` and `X-Noo-Slots`,
+and each backend's heartbeat entry carries `in_flight`, `slots`, `queued`.
+SSE comment lines are ignored by every consumer on the path (the gateway's
+aggregate reader counts bytes; its pass-through forwards them; the harness
+and the vendor-CLI translator skip lines that are not `data:`).
+noomesh-internal i159, parts A and B.
+
 **How a host agent reaches a door.** The agent is a host process
 (systemd on Linux, launchd on macOS); container names do not resolve on
 the host. Every door dial goes through the host-mode dialer

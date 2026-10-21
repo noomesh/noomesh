@@ -39,6 +39,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 	"github.com/noomesh/noomesh/node-agent-go/internal/messaging"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/reconcile"
 )
 
@@ -827,6 +828,7 @@ func (a *Agent) backendContainers() map[string]any {
 		m = a.docker.BackendContainersBeside(adopted)
 	}
 	if a.ollama == nil {
+		occupancy.Annotate(m)
 		return m
 	}
 	if m == nil {
@@ -836,6 +838,8 @@ func (a *Agent) backendContainers() map[string]any {
 		_, running := adoptedRunning["ollama"]
 		m["ollama"] = a.ollama.Report(running)
 	}
+	// in_flight / slots / queued per backend (the proxy's admission).
+	occupancy.Annotate(m)
 	return m
 }
 
