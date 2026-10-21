@@ -326,6 +326,26 @@ about escaping in the password field — libpq needs `\\` and `\:`, sqlx takes
 the rest of the line verbatim — so each body is written for the driver that
 reads it.
 
+**A declared system's flag and passwords travel in one file.** The gateway
+has no `env_file`, so a variable reaches it only if compose names it.
+trellion's and evolve's role passwords have their own lines; a system core
+does not name (any other entry under `systems:` in `noomesh.yaml`) cannot.
+For those the launcher writes ONE secret, `noo_systems_secrets`
+(`_systems_secrets_body` in `scripts/lib-secrets.sh`, called from
+`derive_file_secrets`): `KEY=VALUE` lines, `0400` to the gateway's uid, on the
+same tmpfs as every other secret file. It holds, for each declared system, its
+`enabled_when` flag (from `.env`, where `noo systems enable` sets it) and its
+`password_env` / `ddl_password_env` values (from `secrets/env.sops`). A variable
+a compose secret already delivers by name is not repeated, and a variable with
+no value is left out. Values are written verbatim (no quoting), so a value
+with a newline is refused with a warning that names the variable, never the
+value. The gateway gets one pointer, `NOO_SYSTEMS_SECRETS_FILE`, and the broker
+reads each name from its own environment first and from this file second.
+Adding a system needs no compose line and no gateway change. The launcher
+learns the declared systems from `noo config launch-render systems` (the CLI's
+own `systems:` parser). An older `noo` without that section prints a warning
+when `systems:` is present, and the launch goes on.
+
 **A role's password is not the only thing that opens it.** Every login to
 `noo`, `noo_app`, `noo_trellion` and `noo_trellion_ddl` also needs the client
 leaf issued for that role (CN = the role: `gateway/pg/<role>.*`,

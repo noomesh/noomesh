@@ -69,6 +69,8 @@ pub(crate) const TIER1: &[&str] = &[
     "NOO_EVOLVE_DDL_PASSWORD",
     "NOO_TRELLION_DB_PASSWORD",
     "NOO_TRELLION_DDL_PASSWORD",
+    // Declared systems' flags and passwords, one KEY=VALUE file (gateway).
+    "NOO_SYSTEMS_SECRETS",
     "NATS_GATEWAY_PASSWORD",
     "NATS_WORKER_PASSWORD",
     // An add-on's own bus password (noo-trellion, noo-trellion-intel).

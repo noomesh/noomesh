@@ -230,6 +230,10 @@ services:
       - { source: noo_evolve_ddl_password, target: noo_evolve_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
       - { source: noo_trellion_db_password, target: noo_trellion_db_password, uid: "65532", gid: "65532", mode: 0400 }
       - { source: noo_trellion_ddl_password, target: noo_trellion_ddl_password, uid: "65532", gid: "65532", mode: 0400 }
+      # Every declared system's flag and role passwords that no line here
+      # names (a system core does not know): ONE KEY=VALUE file the launcher
+      # builds from the declared systems (lib-secrets.sh _systems_secrets_body).
+      - { source: noo_systems_secrets, target: noo_systems_secrets, uid: "65532", gid: "65532", mode: 0400 }
       - { source: nats_gateway_password, target: nats_gateway_password, uid: "65532", gid: "65532", mode: 0400 }
       - { source: pgpass_gateway, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
       # Tier-2 provider and channel credentials — the
@@ -313,6 +317,13 @@ services:
       # manifest never reads these at all.
       - NOO_TRELLION_DDL_PASSWORD_FILE=${NOO_TRELLION_DDL_PASSWORD:+/run/secrets/noo_trellion_ddl_password}
       - NOO_EVOLVE_DDL_PASSWORD_FILE=${NOO_EVOLVE_DDL_PASSWORD:+/run/secrets/noo_evolve_ddl_password}
+      # Every OTHER declared system — one core does not name, so no line
+      # above can carry it. The launcher writes its `enabled_when` flag and
+      # its two role passwords into ONE file (KEY=VALUE lines); the broker
+      # reads a name from this container's env first, then from that file
+      # (system_provision.rs `SYSTEMS_SECRETS`). A new system needs no line
+      # here. Empty when no such system is declared: no pointer, no file read.
+      - NOO_SYSTEMS_SECRETS_FILE=${NOO_SYSTEMS_SECRETS:+/run/secrets/noo_systems_secrets}
       # The flag the BROKER gates on. `systems:` entries name an
       # `enabled_when` var, and `intent_declared()` reads it from THIS
       # container's environment — not from `.env` on the host, which compose
@@ -3199,6 +3210,11 @@ secrets:
   noo_trellion_ddl_password:
     file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_trellion_ddl_password
     x-noo-source: NOO_TRELLION_DDL_PASSWORD
+  # DERIVED by the launcher (derive_file_secrets → _systems_secrets_body),
+  # like the pgpass bodies: KEY=VALUE lines for the declared systems.
+  noo_systems_secrets:
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_systems_secrets
+    x-noo-source: NOO_SYSTEMS_SECRETS
   nats_gateway_password:
     file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_gateway_password
     x-noo-source: NATS_GATEWAY_PASSWORD

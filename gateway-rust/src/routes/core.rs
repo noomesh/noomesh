@@ -1855,6 +1855,21 @@ async fn health(
     }));
     if !redis_ok && !redis_optional { all_ok = false; }
 
+    // Declared systems the broker skipped at boot because a role password
+    // was missing (system_provision.rs `missing_credential_is_fatal`: a
+    // runtime-declared system no longer stops the gateway). Reported only
+    // when there is one, `optional` so it never moves `status` or the code:
+    // the gateway serves everything else, and the ERROR log names the
+    // variable. `noo health` shows it as a down dependency.
+    let unprovisioned = crate::system_provision::unprovisioned();
+    if !unprovisioned.is_empty() {
+        deps.insert("systems".into(), json!({
+            "healthy": false,
+            "optional": true,
+            "unprovisioned": unprovisioned,
+        }));
+    }
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
