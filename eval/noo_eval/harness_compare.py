@@ -337,9 +337,15 @@ class Comparer:
     async def run(self) -> HarnessCompare:
         spec = self.spec
         self.original = await read_harness_placement(self.ops, spec.node)
+        auto = bool(self.original and self.original.get("synthesized"))
+        if auto:
+            # The node's `auto` harness policy made this placement; none is
+            # stored. Writing it back would store one and pin the node, so the
+            # run treats it as absent and removes its own at the end.
+            self.original = None
         self.out.original_kind = kind_of(self.original)
         self.log(f"[noo-eval] harness-compare on {spec.node}: kinds {', '.join(spec.kinds)} "
-                 f"(original: {self.out.original_kind or 'no harness placement'})")
+                 f"(original: {self.out.original_kind or ('the auto policy' if auto else 'no harness placement')})")
         try:
             for kind in spec.kinds:
                 kr = await self.place(kind)
