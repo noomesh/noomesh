@@ -7092,7 +7092,7 @@ mod backend_image_ref_tests {
             }
         }
         let compose = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.cluster.yml")).unwrap();
-        for (var, backend) in [("NOO_BACKEND_IMAGE_OLLAMA", "ollama"), ("NOO_BACKEND_IMAGE_VLLM", "vllm")] {
+        for var in ["NOO_BACKEND_IMAGE_OLLAMA", "NOO_BACKEND_IMAGE_VLLM"] {
             let line = compose.lines().find_map(|l| l.trim().strip_prefix(&format!("- {var}="))).unwrap_or_else(|| panic!("{var} not in compose"));
             env.insert(var.into(), interpolate(line, &env));
         }
