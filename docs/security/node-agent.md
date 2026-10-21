@@ -329,7 +329,8 @@ nothing else:
   `N_CTX` `N_THREADS` `N_BATCH` `N_PARALLEL` `GPU_MEMORY_UTILIZATION`
   `TENSOR_PARALLEL_SIZE` `GPU_COUNT` `OLLAMA_MODEL` `OLLAMA_HOST`
   `OLLAMA_NUM_PARALLEL` `OLLAMA_KEEP_ALIVE` `OLLAMA_MAX_LOADED_MODELS`
-  `OLLAMA_CONTEXT_LENGTH` `LOG_LEVEL` `RUST_LOG`
+  `OLLAMA_CONTEXT_LENGTH` `OLLAMA_FLASH_ATTENTION` `OLLAMA_KV_CACHE_TYPE`
+  `LOG_LEVEL` `RUST_LOG`
   (embed placements: `--env OLLAMA_NUM_PARALLEL=4` is the declared way to raise
   an ollama embedder's concurrency; an EMBEDDER's context window is not a
   placement setting, the gateway sends `options.num_ctx` on each embed

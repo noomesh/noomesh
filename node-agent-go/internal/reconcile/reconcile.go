@@ -460,10 +460,12 @@ func (r *Reconciler) Once(ctx context.Context) {
 						hcancel()
 					}
 					r.native.SetHeldModels(held...)
-					// A launchd-managed ollama gets the merged env through
-					// its plist (OllamaGuard.Tuning); only when several
-					// roles share the daemon - a lone placement's env is
-					// left as it has always been.
+					// A launchd-managed ollama gets the placement env
+					// through its plist (OllamaGuard.Tuning): the merged
+					// env when several roles share the daemon, a lone
+					// placement's own allow-listed env otherwise. A native
+					// ollama is not a container, so this is the only way
+					// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
 					backendrt.SetOllamaTuning(nativeOllamaTuning(ollamaRows, harnessprofile.Current()))
 				}
 				continue
@@ -933,6 +935,10 @@ var placementEnvExact = map[string]struct{}{
 	// Claude Code's system prompt overflows ollama's 4096 default and the
 	// model answers a truncated prompt (mcmini probe, 2026-10-19).
 	"OLLAMA_CONTEXT_LENGTH": {},
+	// Attention kernel and KV-cache quantisation. On a unified-memory Mac
+	// these are the difference between a 32k context that fits and one
+	// that swaps (mcmini, 2026-10-21: flash attention + q8_0 cache).
+	"OLLAMA_FLASH_ATTENTION": {}, "OLLAMA_KV_CACHE_TYPE": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
 }
