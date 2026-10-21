@@ -182,7 +182,7 @@ def test_the_parse_found_what_it_claims_to_check() -> None:
     assert "test-core" in _jobs_running_pytest(wf)
 
 
-def _classify(changed: list[str]) -> dict[str, str]:
+def _classify(changed: list[str], **env: str) -> dict[str, str]:
     """Run the REAL classifier from ci.yml against a fixture file list.
 
     Reading a shell script and believing it is how the `grep -qv` bug got in
@@ -214,6 +214,7 @@ def _classify(changed: list[str]) -> dict[str, str]:
                 "BASE": "fixture",
                 "FIXTURE": "\n".join(changed),
                 "GITHUB_OUTPUT": out.name,
+                **env,
             },
             check=True,
             capture_output=True,
@@ -228,7 +229,8 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     """What the rule actually does, per diff shape."""
     docs = _classify(["docs/a.md", "internal/b.md"])
     assert docs == {"code": "false", "gateway": "false", "cli": "false",
-                    "sqlx": "false", "ui": "false", "llamacpp": "false"}
+                    "sqlx": "false", "ui": "false", "llamacpp": "false",
+                    "deferred": "false"}
 
     cli = _classify(["noo-cli/src/main.rs"])
     assert cli["cli"] == "true" and cli["gateway"] == "false" and cli["sqlx"] == "false"
@@ -281,6 +283,46 @@ def test_the_classifier_narrows_and_fails_open() -> None:
     # bug got backwards.
     mixed = _classify(["docs/a.md", "noo-cli/src/main.rs"])
     assert mixed["code"] == "true" and mixed["cli"] == "true"
+
+
+
+def test_a_pr_into_dev_defers_the_rust_builds_to_the_queue() -> None:
+    """One full Rust build per change, in the merge queue, not two.
+
+    A PR into dev merges only through the queue, which re-runs every check
+    on the merge group. So the PR itself skips the Rust builds; everything
+    else, above all the Python parity guards, still runs on it.
+    """
+    rust = ["gateway-rust/src/x.rs", "noo-cli/src/main.rs"]
+    pr = _classify(rust, EVENT="pull_request", PR_BASE_REF="dev", FULL_CI="false")
+    assert pr["deferred"] == "true"
+    assert pr["gateway"] == pr["cli"] == pr["sqlx"] == "false", pr
+    assert pr["code"] == "true", "deferral must not turn the change into docs-only"
+    assert pr["ui"] == "true", "the console job is not Rust; it still runs on the PR"
+
+    # The label opts back in; a promotion PR into staging/main never defers
+    # (no queue there); a merge group or push never defers (EVENT differs).
+    for env in (
+        dict(EVENT="pull_request", PR_BASE_REF="dev", FULL_CI="true"),
+        dict(EVENT="pull_request", PR_BASE_REF="staging", FULL_CI="false"),
+        dict(EVENT="pull_request", PR_BASE_REF="main", FULL_CI="false"),
+        dict(EVENT="merge_group", PR_BASE_REF="", FULL_CI="false"),
+    ):
+        got = _classify(rust, **env)
+        assert got["deferred"] == "false", env
+        assert got["gateway"] == got["cli"] == got["sqlx"] == "true", (env, got)
+
+
+def test_standalone_smoke_builds_only_when_not_deferred() -> None:
+    """standalone-smoke compiles noo-cli, so it defers with the Rust jobs."""
+    text = CI.read_text()
+    start = text.index("\n  standalone-smoke:\n")
+    end = text.index("\n  build:\n")
+    block = text[start:end]
+    gated = re.findall(r"if: needs\.scope\.outputs\.code == 'true'(.*)", block)
+    assert gated, "no code-gated step in standalone-smoke — this guard parsed the wrong block"
+    for rest in gated:
+        assert "needs.scope.outputs.deferred != 'true'" in rest, rest
 
 
 # ---------------------------------------------------------------------------
