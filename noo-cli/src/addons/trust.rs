@@ -22,6 +22,38 @@
 //! (the gateway refuses a lesser role writing it). An add-on in `ADDON_ROWS`
 //! can never be given keys here: the entitlement is its only trust root.
 //!
+//! ## Development keys (i163 part A)
+//!
+//! `noo addons trust-key <name> <pubkey> --registry <root> --dev --expires 14d`
+//! trusts a TEMPORARY key, for developing an add-on on this mesh before it
+//! ships. It is stored beside the release keys, never among them:
+//!
+//! ```yaml
+//! addon_trust:
+//!   pai-voice:
+//!     registry: ghcr.io/vendor/pai-voice
+//!     keys: []
+//!     dev_keys:
+//!       - key: <64 hex>
+//!         dev: true
+//!         expires_at: "2026-11-04T12:00:00Z"
+//! ```
+//!
+//! - scoped: one add-on name, this mesh only (it lives in this noomesh.yaml
+//!   and in no entitlement; `TrustAnchor::dev` is never read from JSON);
+//! - expiring: `--expires` is required, at most [`DEV_MAX_SECS`] (30 days),
+//!   stored as an absolute UTC instant; after it the lock is refused like an
+//!   untrusted one (`addon_lock::AddonLockError::DevKeyExpired`), naming the
+//!   expiry and the renew command;
+//! - never both: a key trusted as a release key for any add-on cannot be
+//!   trusted as a development key, and the reverse;
+//! - removed by `noo addons untrust-key <name> --dev` (all of the add-on's
+//!   development keys) or `untrust-key <name> <pubkey> --dev` (one).
+//!
+//! Enrolling one is a local operator action on the controller: the CLI edits
+//! the install's noomesh.yaml, which only the host's operator can write, and
+//! the gateway accepts a write of this section only from an admin.
+//!
 //! A lock for a trusted name is then handled exactly like a built-in
 //! add-on's: signature against the trusted keys, `supports_stack` listing
 //! this stack, bundle files held to their signed hashes, images pulled by
@@ -43,10 +75,14 @@ use std::path::Path;
 use serde_yaml::{Mapping, Value};
 
 use super::lock_fetch::Fetched;
-use crate::addon_lock::{self, AddonLock, TrustAnchor};
+use crate::addon_lock::{self, AddonLock, DevKey, TrustAnchor};
 
 /// The noomesh.yaml section holding operator-trusted keys.
 pub const TRUST_SECTION: &str = "addon_trust";
+/// The key under `addon_trust.<name>` holding its development keys.
+pub const DEV_KEYS: &str = "dev_keys";
+/// The longest a development key may be trusted for: 30 days.
+pub const DEV_MAX_SECS: i64 = 30 * 86_400;
 /// The noomesh.yaml section holding per-add-on delegation switches.
 pub const DELEGATION_SECTION: &str = "addon_delegation";
 
@@ -86,9 +122,80 @@ pub fn read(text: &str) -> Result<BTreeMap<String, TrustAnchor>, String> {
             .map(|s| s.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
         let registry = v.get("registry").and_then(Value::as_str).unwrap_or("").to_string();
-        out.insert(name.to_string(), TrustAnchor { keys, registry, pull: None });
+        let dev = read_dev_keys(name, v)?;
+        out.insert(name.to_string(), TrustAnchor { keys, registry, pull: None, dev });
     }
     Ok(out)
+}
+
+/// `addon_trust.<name>.dev_keys`: each record `{key, dev: true, expires_at}`.
+/// A record that cannot be read is an error, never a key silently trusted or
+/// silently dropped.
+fn read_dev_keys(name: &str, entry: &Value) -> Result<Vec<DevKey>, String> {
+    let Some(seq) = entry.get(DEV_KEYS) else { return Ok(Vec::new()) };
+    if seq.is_null() {
+        return Ok(Vec::new());
+    }
+    let seq = seq
+        .as_sequence()
+        .ok_or_else(|| format!("{TRUST_SECTION}.{name}.{DEV_KEYS} must be a list of {{key, dev: true, expires_at}}"))?;
+    let mut out = Vec::new();
+    for r in seq {
+        let key = r.get("key").and_then(Value::as_str).map(|k| k.trim().to_ascii_lowercase());
+        let stamp = r.get("expires_at").and_then(Value::as_str);
+        let at = stamp.and_then(crate::commands::cluster_verify::parse_rfc3339_unix);
+        match (key, at, r.get("dev").and_then(Value::as_bool)) {
+            (Some(key), Some(expires_at), Some(true)) if crate::entitlement::pubkey_from_hex(&key).is_ok() => {
+                out.push(DevKey { key, expires_at })
+            }
+            _ => {
+                return Err(format!(
+                    "{TRUST_SECTION}.{name}.{DEV_KEYS} has a record that is not {{key: <64 hex>, dev: true, \
+                     expires_at: <YYYY-MM-DDTHH:MM:SSZ>}}; fix it with `noo addons untrust-key {name} --dev`"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every development key in a noomesh.yaml TEXT, for every add-on (the
+/// release-side guard refuses any of them, whoever they were trusted for).
+pub fn all_dev_keys(text: &str) -> Result<Vec<DevKey>, String> {
+    Ok(read(text)?.into_values().flat_map(|a| a.dev).collect())
+}
+
+/// Parse `--expires`: a whole number with a unit (`14d`, `36h`, `90m`),
+/// above zero and at most [`DEV_MAX_SECS`]. Returns seconds.
+pub fn parse_dev_ttl(s: &str) -> Result<i64, String> {
+    let t = s.trim();
+    let unit_ok = t.chars().last().is_some_and(|c| matches!(c, 'd' | 'h' | 'm'));
+    let secs = if unit_ok { crate::commands::cluster_provision::parse_ttl_seconds(t) } else { None };
+    match secs {
+        Some(n) if n > 0 && n <= DEV_MAX_SECS => Ok(n),
+        Some(n) if n > DEV_MAX_SECS => Err(format!(
+            "--expires {t} is longer than a development key may live (30d at most); renew it before it expires instead"
+        )),
+        _ => Err(format!("--expires {t:?} is not a duration like 14d, 36h or 90m")),
+    }
+}
+
+/// Is `key` (lowercase hex) trusted as a release key or a development key
+/// for any add-on in `sec`? Returns the add-on name.
+fn key_holder(sec: &Mapping, key: &str, dev: bool) -> Option<String> {
+    for (n, v) in sec {
+        let list = if dev { v.get(DEV_KEYS) } else { v.get("keys") };
+        let hit = list.and_then(Value::as_sequence).is_some_and(|s| {
+            s.iter().any(|x| {
+                let k = if dev { x.get("key").and_then(Value::as_str) } else { x.as_str() };
+                k.map(|k| k.trim().to_ascii_lowercase()).as_deref() == Some(key)
+            })
+        });
+        if hit {
+            return Some(n.as_str().unwrap_or("?").to_string());
+        }
+    }
+    None
 }
 
 /// The trust anchor the operator gave `name`, from this install's noomesh.yaml.
@@ -186,6 +293,12 @@ pub fn add_key(text: &str, name: &str, key: &str, registry: Option<&str>) -> Res
     let key = key.trim().to_ascii_lowercase();
     crate::entitlement::pubkey_from_hex(&key).map_err(|e| format!("`{key}` is not an ed25519 public key (64 hex characters): {e}"))?;
     let mut sec = section_mapping(text, TRUST_SECTION)?;
+    if let Some(holder) = key_holder(&sec, &key, true) {
+        return Err(format!(
+            "{key} is trusted as a DEVELOPMENT key for {holder}; a key is never both a development and a release key. \
+             Remove it first (`noo addons untrust-key {holder} {key} --dev`), and sign releases with the add-on's release key"
+        ));
+    }
     let k = Value::String(name.to_string());
     let mut entry = sec.get(&k).and_then(Value::as_mapping).cloned().unwrap_or_default();
     let mut keys: Vec<Value> = entry.get("keys").and_then(Value::as_sequence).cloned().unwrap_or_default();
@@ -225,12 +338,110 @@ pub fn remove_key(text: &str, name: &str, key: &str) -> Result<String, String> {
     let before = keys.len();
     keys.retain(|x| x.as_str().map(str::to_ascii_lowercase).as_deref() != Some(key.as_str()));
     if keys.len() == before {
+        if key_holder(&sec, &key, true).is_some() {
+            return Err(format!("{key} is a development key for {name}: `noo addons untrust-key {name} {key} --dev` removes it"));
+        }
         return Err(format!("{key} is not a trusted key for {name}"));
     }
-    if keys.is_empty() {
+    let dev_left = entry.get(DEV_KEYS).and_then(Value::as_sequence).is_some_and(|s| !s.is_empty());
+    if keys.is_empty() && !dev_left {
         sec.remove(&k);
     } else {
         entry.insert(Value::String("keys".into()), Value::Sequence(keys));
+        sec.insert(k, Value::Mapping(entry));
+    }
+    let value = (!sec.is_empty()).then(|| Value::Mapping(sec));
+    Ok(replace_section(text, TRUST_SECTION, value.as_ref()))
+}
+
+/// `text` with `key` trusted for `name` as a DEVELOPMENT key until
+/// `now + ttl_secs` (i163 part A). Trusting the same key again renews it
+/// (the new expiry replaces the old). A first key of any kind needs
+/// `registry`. Refused: a built-in add-on, a key already trusted as a
+/// release key for any add-on, a lifetime outside (0, 30 days].
+pub fn add_dev_key(text: &str, name: &str, key: &str, registry: Option<&str>, ttl_secs: i64, now: i64) -> Result<String, String> {
+    if !name_ok(name) {
+        return Err(format!("`{name}` is not an add-on name (lowercase letters, digits, `-` and `_`, starting with a letter)"));
+    }
+    if is_builtin(name) {
+        return Err(format!(
+            "{name} ships with the stack: its signing keys come from the installed entitlement, and it has no \
+             development lane here"
+        ));
+    }
+    if ttl_secs <= 0 || ttl_secs > DEV_MAX_SECS {
+        return Err("a development key lives more than 0 seconds and at most 30d".into());
+    }
+    let key = key.trim().to_ascii_lowercase();
+    crate::entitlement::pubkey_from_hex(&key).map_err(|e| format!("`{key}` is not an ed25519 public key (64 hex characters): {e}"))?;
+    let mut sec = section_mapping(text, TRUST_SECTION)?;
+    if let Some(holder) = key_holder(&sec, &key, false) {
+        return Err(format!(
+            "{key} is trusted as a RELEASE key for {holder}; a key is never both a release and a development key. \
+             Generate a separate key for development"
+        ));
+    }
+    let k = Value::String(name.to_string());
+    let mut entry = sec.get(&k).and_then(Value::as_mapping).cloned().unwrap_or_default();
+    let have = entry.get("registry").and_then(Value::as_str).map(str::to_string);
+    let registry = match (registry.map(str::trim).filter(|r| !r.is_empty()), have) {
+        (Some(r), _) => r.to_string(),
+        (None, Some(h)) => h,
+        (None, None) => {
+            return Err(format!(
+                "the first key trusted for {name} needs the registry its images come from: \
+                 noo addons trust-key {name} <pubkey> --registry <host/path> --dev --expires 14d"
+            ))
+        }
+    };
+    if !addon_lock::valid_registry_root(&registry) {
+        return Err(format!("registry {registry:?} is not a registry root (host/path, no scheme, tag or digest)"));
+    }
+    let mut dev: Vec<Value> = entry.get(DEV_KEYS).and_then(Value::as_sequence).cloned().unwrap_or_default();
+    dev.retain(|r| r.get("key").and_then(Value::as_str).map(|x| x.trim().to_ascii_lowercase()).as_deref() != Some(key.as_str()));
+    let mut rec = Mapping::new();
+    rec.insert(Value::String("key".into()), Value::String(key));
+    rec.insert(Value::String("dev".into()), Value::Bool(true));
+    rec.insert(Value::String("expires_at".into()), Value::String(addon_lock::utc_rfc3339(now + ttl_secs)));
+    dev.push(Value::Mapping(rec));
+    entry.insert(Value::String("registry".into()), Value::String(registry));
+    if entry.get("keys").is_none() {
+        entry.insert(Value::String("keys".into()), Value::Sequence(Vec::new()));
+    }
+    entry.insert(Value::String(DEV_KEYS.into()), Value::Sequence(dev));
+    sec.insert(k, Value::Mapping(entry));
+    Ok(replace_section(text, TRUST_SECTION, Some(&Value::Mapping(sec))))
+}
+
+/// `text` without `name`'s development key `key`, or without all of them
+/// when `key` is `None`. The entry goes when it holds no key of either kind.
+pub fn remove_dev_key(text: &str, name: &str, key: Option<&str>) -> Result<String, String> {
+    let mut sec = section_mapping(text, TRUST_SECTION)?;
+    let k = Value::String(name.to_string());
+    let Some(mut entry) = sec.get(&k).and_then(Value::as_mapping).cloned() else {
+        return Err(format!("no key is trusted for {name}"));
+    };
+    let mut dev: Vec<Value> = entry.get(DEV_KEYS).and_then(Value::as_sequence).cloned().unwrap_or_default();
+    let before = dev.len();
+    match key.map(|x| x.trim().to_ascii_lowercase()) {
+        Some(want) => dev.retain(|r| r.get("key").and_then(Value::as_str).map(|x| x.trim().to_ascii_lowercase()).as_deref() != Some(want.as_str())),
+        None => dev.clear(),
+    }
+    if dev.len() == before {
+        return Err(match key {
+            Some(x) => format!("{x} is not a development key for {name}"),
+            None => format!("{name} has no development key"),
+        });
+    }
+    let release_left = entry.get("keys").and_then(Value::as_sequence).is_some_and(|s| !s.is_empty());
+    if dev.is_empty() && !release_left {
+        sec.remove(&k);
+    } else {
+        if dev.is_empty() {
+            entry.remove(DEV_KEYS);
+        } else {
+            entry.insert(Value::String(DEV_KEYS.into()), Value::Sequence(dev));
+        }
         sec.insert(k, Value::Mapping(entry));
     }
     let value = (!sec.is_empty()).then(|| Value::Mapping(sec));
@@ -450,5 +661,159 @@ mod tests {
     fn a_supplied_lock_with_a_missing_bundle_file_or_plain_http_is_refused() {
         assert!(fetch_supplied("http://example.com/lock.json").unwrap_err().contains("https"));
         assert!(fetch_supplied("/nonexistent/lock.json").unwrap_err().contains("cannot read"));
+    }
+
+    // ── development keys (i163 part A) ──────────────────────────────────
+
+    const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn a_dev_key_is_stored_beside_the_release_keys_with_an_absolute_expiry() {
+        let t = "addons:\n  pai-voice: true\n";
+        let added = add_dev_key(t, "pai-voice", &pk().to_uppercase(), Some(ROOT), 14 * 86_400, NOW).unwrap();
+        let v: Value = serde_yaml::from_str(&added).unwrap();
+        let rec = &v[TRUST_SECTION]["pai-voice"][DEV_KEYS][0];
+        assert_eq!(rec["key"].as_str(), Some(pk().as_str()));
+        assert_eq!(rec["dev"].as_bool(), Some(true));
+        assert_eq!(rec["expires_at"].as_str(), Some(addon_lock::utc_rfc3339(NOW + 14 * 86_400).as_str()));
+        assert_eq!(v[TRUST_SECTION]["pai-voice"]["keys"].as_sequence().map(Vec::len), Some(0), "never among the release keys");
+        let m = read(&added).unwrap();
+        assert!(m["pai-voice"].keys.is_empty());
+        assert_eq!(m["pai-voice"].dev, vec![DevKey { key: pk(), expires_at: NOW + 14 * 86_400 }]);
+        assert_eq!(trusted_names(&added), vec!["pai-voice".to_string()], "a dev-only add-on is a trusted name");
+        assert_eq!(all_dev_keys(&added).unwrap().len(), 1);
+        // Trusting it again renews it: one record, the new expiry.
+        let renewed = add_dev_key(&added, "pai-voice", &pk(), None, 86_400, NOW + 10).unwrap();
+        assert_eq!(read(&renewed).unwrap()["pai-voice"].dev, vec![DevKey { key: pk(), expires_at: NOW + 10 + 86_400 }]);
+    }
+
+    #[test]
+    fn a_key_is_never_both_dev_and_release() {
+        let t = "addons:\n  pai-voice: true\n";
+        let dev = add_dev_key(t, "pai-voice", &pk(), Some(ROOT), 86_400, NOW).unwrap();
+        let e = add_key(&dev, "pai-voice", &pk(), None).unwrap_err();
+        assert!(e.contains("DEVELOPMENT") && e.contains("untrust-key"), "{e}");
+        // Across add-ons too: a dev key for one is no release key for another.
+        let e = add_key(&dev, "other-addon", &pk(), Some(ROOT)).unwrap_err();
+        assert!(e.contains("DEVELOPMENT"), "{e}");
+        let rel = add_key(t, "pai-voice", &pk(), Some(ROOT)).unwrap();
+        let e = add_dev_key(&rel, "pai-voice", &pk(), None, 86_400, NOW).unwrap_err();
+        assert!(e.contains("RELEASE"), "{e}");
+        let e = add_dev_key(&rel, "other-addon", &pk(), Some(ROOT), 86_400, NOW).unwrap_err();
+        assert!(e.contains("RELEASE"), "{e}");
+        // A release key and a different dev key sit side by side.
+        let both = add_dev_key(&rel, "pai-voice", &pk2(), None, 86_400, NOW).unwrap();
+        let a = &read(&both).unwrap()["pai-voice"];
+        assert_eq!((a.keys.clone(), a.dev.len()), (vec![pk()], 1));
+    }
+
+    #[test]
+    fn a_dev_key_refuses_what_it_cannot_stand_behind() {
+        let t = "addons:\n  pai-voice: true\n";
+        assert!(add_dev_key(t, "pai-voice", &pk(), None, 86_400, NOW).unwrap_err().contains("--registry"));
+        assert!(add_dev_key(t, "evolve", &pk(), Some(ROOT), 86_400, NOW).unwrap_err().contains("entitlement"));
+        assert!(add_dev_key(t, "pai-voice", "zz", Some(ROOT), 86_400, NOW).unwrap_err().contains("ed25519"));
+        assert!(add_dev_key(t, "pai-voice", &pk(), Some(ROOT), DEV_MAX_SECS + 1, NOW).is_err());
+        assert!(add_dev_key(t, "pai-voice", &pk(), Some(ROOT), 0, NOW).is_err());
+        assert!(add_dev_key(t, "pai-voice", &pk(), Some(ROOT), DEV_MAX_SECS, NOW).is_ok(), "30 days exactly is allowed");
+    }
+
+    #[test]
+    fn dev_ttl_parsing() {
+        assert_eq!(parse_dev_ttl("14d"), Ok(14 * 86_400));
+        assert_eq!(parse_dev_ttl("36h"), Ok(36 * 3600));
+        assert_eq!(parse_dev_ttl("90m"), Ok(90 * 60));
+        assert_eq!(parse_dev_ttl("30d"), Ok(DEV_MAX_SECS));
+        assert!(parse_dev_ttl("31d").unwrap_err().contains("30d"));
+        assert!(parse_dev_ttl("721h").is_err());
+        for bad in ["", "14", "0d", "-1d", "d", "2w", "1.5d", "forever"] {
+            assert!(parse_dev_ttl(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn untrust_dev_removes_one_or_all_and_keeps_the_release_keys() {
+        let t = "# mine\naddons:\n  pai-voice: true\n";
+        let rel = add_key(t, "pai-voice", &pk(), Some(ROOT)).unwrap();
+        let one = add_dev_key(&rel, "pai-voice", &pk2(), None, 86_400, NOW).unwrap();
+        let k3 = release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(&"12".repeat(32)).unwrap());
+        let two = add_dev_key(&one, "pai-voice", &k3, None, 86_400, NOW).unwrap();
+        // One by key.
+        let left = remove_dev_key(&two, "pai-voice", Some(&k3)).unwrap();
+        assert_eq!(read(&left).unwrap()["pai-voice"].dev.len(), 1);
+        // All of them; the release key stays, and so does the entry.
+        let none = remove_dev_key(&two, "pai-voice", None).unwrap();
+        let a = &read(&none).unwrap()["pai-voice"];
+        assert_eq!((a.keys.clone(), a.dev.len()), (vec![pk()], 0));
+        assert!(!none.contains(DEV_KEYS) && none.contains("# mine"), "{none}");
+        assert!(remove_dev_key(&none, "pai-voice", None).unwrap_err().contains("no development key"));
+        // A release key is not removed by --dev, and a dev key not without it.
+        assert!(remove_dev_key(&one, "pai-voice", Some(&pk())).is_err());
+        assert!(remove_key(&one, "pai-voice", &pk2()).unwrap_err().contains("--dev"));
+        // Removing the last release key keeps an entry that still has a dev key.
+        let dev_only = remove_key(&one, "pai-voice", &pk()).unwrap();
+        let a = &read(&dev_only).unwrap()["pai-voice"];
+        assert_eq!((a.keys.len(), a.dev.len()), (0, 1));
+        // And the last dev key of a dev-only entry takes the entry with it.
+        let gone = remove_dev_key(&dev_only, "pai-voice", None).unwrap();
+        assert!(!gone.contains(TRUST_SECTION), "{gone}");
+    }
+
+    #[test]
+    fn an_unreadable_dev_record_is_an_error_never_a_silent_trust() {
+        for rec in [
+            "{key: zz, dev: true, expires_at: '2026-11-04T12:00:00Z'}".to_string(),
+            format!("{{key: {}, dev: true, expires_at: soon}}", pk()),
+            format!("{{key: {}, expires_at: '2026-11-04T12:00:00Z'}}", pk()),
+            format!("{{key: {}, dev: false, expires_at: '2026-11-04T12:00:00Z'}}", pk()),
+        ] {
+            let t = format!("addon_trust:\n  pai-voice:\n    registry: {ROOT}\n    keys: []\n    dev_keys:\n      - {rec}\n");
+            assert!(read(&t).unwrap_err().contains("dev_keys"), "{rec}");
+        }
+    }
+
+    fn dev_anchor(expires_at: i64) -> TrustAnchor {
+        TrustAnchor { keys: vec![], dev: vec![DevKey { key: pk(), expires_at }], ..anchor() }
+    }
+
+    #[test]
+    fn a_dev_signed_lock_pins_and_the_launcher_reports_it_as_dev() {
+        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
+        let later = addon_lock::now_unix() + 86_400;
+        let v = resolve::check(&f, &dev_anchor(later), &want("v0.6.0")).expect("a live dev key verifies");
+        assert_eq!(v.dev_expires_at, Some(later));
+        let root = std::env::temp_dir().join(format!("noo-trust-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        resolve::record(&root, "pai-voice", &v, &f, "v0.6.0", None).unwrap();
+        let names = vec!["pai-voice".to_string()];
+        let lines = crate::commands::addon_pins::launch_lines(&root, "v0.6.0", &names, &|_| Ok(dev_anchor(later)));
+        assert_eq!(lines[0], "verified pai-voice 1.2.0 v0.6.0", "{lines:?}");
+        assert_eq!(lines[1], format!("dev pai-voice {later}"), "{lines:?}");
+        assert!(lines[2].starts_with("pin pai-voice NOO_ADDON_IMAGE_"), "{lines:?}");
+        // Renewed: the verdict carries the new expiry; the pin is not rewritten.
+        let renewed = later + 3600;
+        let lines = crate::commands::addon_pins::launch_lines(&root, "v0.6.0", &names, &|_| Ok(dev_anchor(renewed)));
+        assert_eq!(lines[1], format!("dev pai-voice {renewed}"), "{lines:?}");
+        // Expired: refused like an untrusted key, naming the expiry and the renew command.
+        let past = addon_lock::now_unix() - 60;
+        let lines = crate::commands::addon_pins::launch_lines(&root, "v0.6.0", &names, &|_| Ok(dev_anchor(past)));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("refuse pai-voice "), "{lines:?}");
+        assert!(lines[0].contains("expired") && lines[0].contains(&addon_lock::utc_minute(past)), "{lines:?}");
+        assert!(lines[0].contains("noo addons trust-key pai-voice <pubkey> --dev --expires"), "{lines:?}");
+        // A release-signed lock never emits a dev line.
+        let lines = crate::commands::addon_pins::launch_lines(&root, "v0.6.0", &names, &|_| Ok(TrustAnchor { dev: vec![], ..anchor() }));
+        assert!(lines.iter().all(|l| !l.starts_with("dev ")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_expired_dev_key_refuses_the_lock_at_resolve_with_the_renew_command() {
+        let f = signed_bundle(&third_party_lock(&["v0.6.0"]));
+        let past = addon_lock::now_unix() - 1;
+        let r = resolve::check(&f, &dev_anchor(past), &want("v0.6.0")).expect_err("expired");
+        let why = r.why("pai-voice");
+        assert!(why.contains("expired") && why.contains("--dev --expires"), "{why}");
     }
 }

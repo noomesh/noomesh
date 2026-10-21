@@ -62,6 +62,11 @@ pub struct Pin {
     /// CLI that predates it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pulled_from: Option<String>,
+    /// Set when the lock verified only against a development key (i163 part
+    /// A): that key's expiry, unix seconds. Never written to `addons.lock`:
+    /// it is decided on every verification against the keys trusted then.
+    #[serde(skip)]
+    pub dev_expires_at: Option<i64>,
 }
 
 impl Pin {
@@ -73,6 +78,7 @@ impl Pin {
             key_index: v.key_index,
             lock_sha256: sha256_hex(lock_bytes),
             pulled_from,
+            dev_expires_at: v.dev_expires_at,
         }
     }
 
@@ -373,6 +379,7 @@ mod tests {
             key_index: 0,
             lock_sha256: sha256_hex(b"{}"),
             pulled_from: None,
+            dev_expires_at: None,
         }
     }
 

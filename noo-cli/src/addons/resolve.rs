@@ -110,6 +110,7 @@ impl Refusal {
                 "{addon}'s lock is not signed by a key you trust for it ({e}). If you trust its signer, add the \
                  key: `noo addons trust-key {addon} <pubkey> --registry <root>`"
             ),
+            Refusal::Lock(addon_lock::AddonLockError::DevKeyExpired { key, expires_at }) => dev_expired(addon, key, *expires_at),
             Refusal::Lock(e) => format!("{addon}'s lock refused: {e}"),
             Refusal::Untrusted(e) => e.clone(),
             Refusal::Supplied(e) => format!("the lock supplied for {addon} could not be read: {e}"),
@@ -201,6 +202,19 @@ pub fn unbundled(addon: &str, tag: &str) -> String {
     )
 }
 
+/// The refusal for a lock whose only signer is an expired development key
+/// (i163 part A): the same refusal as an untrusted key, naming the expiry
+/// and both ways out.
+pub fn dev_expired(addon: &str, key: &str, expires_at: i64) -> String {
+    format!(
+        "{addon}'s lock is signed only by a development key ({}…) that expired {}, so it is refused like an \
+         untrusted key. Renew it: `noo addons trust-key {addon} <pubkey> --dev --expires 14d`, or ship the add-on \
+         signed by its release key",
+        &key[..12.min(key.len())],
+        addon_lock::utc_minute(expires_at)
+    )
+}
+
 /// A v1-only lock (no `files`) is refused: there is no overlay to compose.
 /// Called where a lock is about to be acted on (enable, upgrade, `--check`).
 pub fn require_bundle(v: &VerifiedLock, tag: &str) -> Result<(), Refusal> {
@@ -265,7 +279,7 @@ pub fn third_party(addon: &str) -> bool {
 pub fn installed_anchor(addon: &str) -> Result<TrustAnchor, Refusal> {
     if third_party(addon) {
         return match super::trust::trusted_anchor(addon) {
-            Ok(Some(a)) if !a.keys.is_empty() => Ok(a),
+            Ok(Some(a)) if !a.keys.is_empty() || !a.dev.is_empty() => Ok(a),
             Ok(_) => Err(Refusal::Untrusted(format!(
                 "no key is trusted for {addon}, so its lock cannot be verified. If you trust its signer: \
                  `noo addons trust-key {addon} <pubkey> --registry <root>`"
@@ -401,11 +415,17 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
         return Err(format!("{addon} is pinned for stack {}, and this stack runs {tag}", pin.stack));
     }
     let (lock, sig) = pins::cached_lock(root, addon, &pin)?;
-    let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| format!("{addon}'s cached lock no longer verifies: {e}"))?;
+    let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| match e {
+        AddonLockError::DevKeyExpired { key, expires_at } => dev_expired(addon, &key, expires_at),
+        e => format!("{addon}'s cached lock no longer verifies: {e}"),
+    })?;
     if !v.lock.supports(tag) {
         return Err(format!("{addon} {}'s lock does not list stack {tag}", v.lock.version));
     }
-    if v.lock.images != pin.images || v.lock.version != pin.version || v.key_index != pin.key_index {
+    // A development key's index counts on from the release keys, so trusting
+    // another release key moves it; the signature itself was just re-checked.
+    let key_moved = v.dev_expires_at.is_none() && v.key_index != pin.key_index;
+    if v.lock.images != pin.images || v.lock.version != pin.version || key_moved {
         return Err(format!("{addon}'s pin does not match its signed lock ({} was edited)", pins::PINS_FILE));
     }
     // `pulled_from` is not signed content: it must be the pull root the
@@ -421,6 +441,10 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
     if v.lock.files.is_empty() {
         return Err(unbundled(addon, tag));
     }
+    // Not stored: whether a development key vouches for this pin is decided
+    // now, against the keys trusted now (a renewal moves the expiry).
+    let mut pin = pin;
+    pin.dev_expires_at = v.dev_expires_at;
     let found = pins::materialised_files(root, addon, v.lock.files.keys());
     addon_lock::verify_files(&v.lock, &found).map_err(|e| {
         format!(
@@ -753,7 +777,7 @@ pub(crate) mod tests {
 
     pub(crate) fn anchor() -> TrustAnchor {
         let pk = release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(&seed()).unwrap());
-        TrustAnchor { keys: vec![pk], registry: ROOT.into(), pull: None }
+        TrustAnchor { keys: vec![pk], registry: ROOT.into(), pull: None, dev: vec![] }
     }
 
     pub(crate) fn digest(c: char) -> String {
@@ -811,7 +835,7 @@ pub(crate) mod tests {
     #[test]
     fn a_lock_the_registry_does_not_have_yet_says_so_and_names_the_way_back() {
         let reg = super::lock_fetch::fake::serve(|_| Default::default());
-        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")), pull: None };
+        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")), pull: None, dev: vec![] };
         let client = lock_fetch::Client::plain_http_for_tests(None);
         let e = fetch_and_check(&client, &anchor, &want(None, None)).unwrap_err();
         assert!(is_not_published(&e) && !e.is_auth(), "{e:?}");
@@ -922,7 +946,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pulls_only_what_is_missing_by_digest() {
-        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0 };
+        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0, dev_expires_at: None };
         let mut d = FakeDocker::default();
         let cred = Credential { user: "u".into(), token: "t".into() };
         let mut asked = 0;
@@ -944,7 +968,7 @@ pub(crate) mod tests {
     fn the_proxy_route_pulls_the_signed_digest_from_the_pull_host() {
         let mut l = lock("1.2.0", &["v0.6.0"], None);
         l.images.insert("trellion-intel-worker".into(), format!("{ROOT}/worker@{}", digest('4')));
-        let v = VerifiedLock { lock: l, key_index: 0 };
+        let v = VerifiedLock { lock: l, key_index: 0, dev_expires_at: None };
         let route = lock_fetch::Route::Proxy { root: "addons.noomesh.ai/example/intel".into(), registry: ROOT.into() };
         let mut d = FakeDocker::default();
         let mut asked = 0;

@@ -214,6 +214,10 @@ _addon_composed_names() {
 # Dist also exports NOO_ADDONS_VERIFIED, from the `verified <addon> <version>
 # <stack>` lines: `name=version@stack,...`, or `none`. Dev exports `dev`. The
 # gateway's add-on registry registers an add-on only when it is named there.
+# Beside it, NOO_ADDONS_DEV, from the `dev <addon> <unix>` lines:
+# `name=<unix expiry>,...` for the add-ons only a temporary development key
+# vouches for (i163 part A); the gateway reports them as dev and refuses them
+# once that instant passes. Unset when there are none.
 #
 # Dev (not dist): each variable the composed overlays read is set to the dev
 # build's name, `${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE_TAG:-latest}`.
@@ -226,11 +230,11 @@ _ADDON_PINS=()
 _DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
-    local _verified=() _pinned=() _legacy_cli=0 _p
+    local _verified=() _pinned=() _dev=() _legacy_cli=0 _p
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
     # The registry verdict is set here and nowhere else: a value inherited from
     # the shell or an .env line is dropped, like the image variables above.
-    unset NOO_ADDONS_VERIFIED
+    unset NOO_ADDONS_VERIFIED NOO_ADDONS_DEV
     _ADDON_PINS=()
     _args="$(addon_compose_overlay_args 2>/dev/null)"
     # shellcheck disable=SC2086
@@ -278,6 +282,13 @@ require_addon_pins() {
                     *[!-A-Za-z0-9._+\ ]*|"") echo "REFUSING: noo addons launch-pins sent an unreadable verdict for ${_addon}: ${_rest}" >&2; fail=1 ;;
                     *) _verified+=("${_addon}=${_rest%% *}@${_rest#* }") ;;
                 esac ;;
+            dev)
+                # `dev <addon> <unix>`: only a development key vouches for this
+                # add-on, until <unix>. Handed to the gateway beside the verdict.
+                case "$_rest" in
+                    *[!0-9]*|"") echo "REFUSING: noo addons launch-pins sent an unreadable dev expiry for ${_addon}: ${_rest}" >&2; fail=1 ;;
+                    *) _dev+=("${_addon}=${_rest}") ;;
+                esac ;;
             pin)
                 _pinned+=("$_addon")
                 _var="${_rest%% *}"; _ref="${_rest#* }"
@@ -322,6 +333,12 @@ PINS
         echo "WARNING: this noo CLI does not report verified add-on locks; the gateway loads only the add-ons it already knew. Run: noo upgrade" >&2
     elif [ -n "$_vstr" ]; then
         export NOO_ADDONS_VERIFIED="$_vstr"
+        # Only for add-ons the verdict names: a dev line alone vouches for nothing.
+        local _dstr="" _d
+        for _d in ${_dev[@]+"${_dev[@]}"}; do
+            case ",${_vstr}," in *",${_d%%=*}="*) _dstr="${_dstr:+${_dstr},}${_d}" ;; esac
+        done
+        [ -z "$_dstr" ] || export NOO_ADDONS_DEV="$_dstr"
     else
         export NOO_ADDONS_VERIFIED=none
     fi

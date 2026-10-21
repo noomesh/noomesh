@@ -241,6 +241,9 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
         R::Untrusted(_) | R::Lock(crate::addon_lock::AddonLockError::BadSignature(_)) if crate::addons::resolve::third_party(addon) => {
             format!("noo addons trust-key {addon} <pubkey> --registry <root>")
         }
+        R::Lock(crate::addon_lock::AddonLockError::DevKeyExpired { .. }) => {
+            format!("noo addons trust-key {addon} <pubkey> --dev --expires 14d")
+        }
         R::Supplied(_) => format!("noo addons enable {addon} --lock <path|https-url>"),
         R::Store(_) => "noo security secrets audit".into(),
         R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),

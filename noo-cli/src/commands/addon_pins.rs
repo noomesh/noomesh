@@ -13,11 +13,14 @@
 //!   checks each pinned image is local, and compares running containers with
 //!   the pins.
 //! - `launch-pins <tag> [<name>…]` (hidden) is the launcher's reader: one
-//!   `verified <addon> <version> <stack>` line then one
-//!   `pin <addon> <VAR> <ref>` line per image, or one
-//!   `refuse <addon> <why>` line, per add-on. The launcher hands the
-//!   `verified` lines to the gateway's add-on registry
-//!   (`NOO_ADDONS_VERIFIED`, gateway-rust/src/addon_registry.rs).
+//!   `verified <addon> <version> <stack>` line, then `dev <addon> <unix>`
+//!   when only a development key vouches for it (i163 part A; the unix
+//!   time is that key's expiry), then one `pin <addon> <VAR> <ref>` line per
+//!   image; or one `refuse <addon> <why>` line, per add-on. The launcher
+//!   hands the `verified` lines to the gateway's add-on registry
+//!   (`NOO_ADDONS_VERIFIED`, gateway-rust/src/addon_registry.rs) and the
+//!   `dev` lines beside them (`NOO_ADDONS_DEV`). A launcher that predates
+//!   `dev` lines skips them: it reads only the kinds it knows.
 //!
 //! Nothing here restarts anything: a new pin takes effect on the operator's
 //! next `noo stack restart --force`.
@@ -303,6 +306,7 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "addon": v.addon, "ok": v.problem.is_none(), "problem": v.problem, "notes": v.notes,
                 "version": v.pin.as_ref().map(|p| &p.version), "stack": v.pin.as_ref().map(|p| &p.stack),
                 "key_index": v.pin.as_ref().map(|p| p.key_index), "images": v.pin.as_ref().map(|p| &p.images),
+                "dev_expires_at": v.pin.as_ref().and_then(|p| p.dev_expires_at).map(crate::addon_lock::utc_rfc3339),
                 "pulled_from": v.pin.as_ref().and_then(|p| p.pulled_from.as_ref()),
             }))
             .collect();
@@ -318,8 +322,12 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         match (&v.problem, &v.pin) {
             (None, Some(p)) => {
                 let notes = if v.notes.is_empty() { String::new() } else { ui::muted(&format!("  ({})", v.notes.join("; "))) };
+                let signer = match p.dev_expires_at {
+                    Some(at) => format!("DEV key #{}, expires {}", p.key_index, crate::addon_lock::utc_minute(at)),
+                    None => format!("add-on key #{}", p.key_index),
+                };
                 println!("{}", ui::status_line(ui::Glyph::Ok, &format!(
-                    "{} {} @{} for {}, signed by add-on key #{}{notes}", v.addon, p.version, p.short_digest(), p.stack, p.key_index)));
+                    "{} {} @{} for {}, signed by {signer}{notes}", v.addon, p.version, p.short_digest(), p.stack)));
             }
             (Some(why), _) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {why}", v.addon))),
             (None, None) => {}
@@ -356,6 +364,9 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
                 // offline AND lists `tag`. Emitted before its `pin` lines so a
                 // launcher that stops at the first problem still saw it.
                 out.push(format!("verified {addon} {} {}", pin.version, pin.stack));
+                if let Some(at) = pin.dev_expires_at {
+                    out.push(format!("dev {addon} {at}"));
+                }
                 for (image, reference) in &pin.local_images() {
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
@@ -436,7 +447,7 @@ pub(crate) fn addon_image_env(
         match kind {
             // Not an image: the registry verdict (`launch_lines`). The wizard
             // composes the stack but starts no gateway of its own.
-            "verified" => {}
+            "verified" | "dev" => {}
             "pin" => {
                 let (var, reference) = rest.split_once(' ').unwrap_or((rest, ""));
                 if present(reference) {

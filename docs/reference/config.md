@@ -142,6 +142,9 @@ addon_delegation:
 `addon_trust.<name>` (`registry`, `keys`) holds the signing keys you trust for an
 add-on the stack does not ship; it is read by the CLI (`noo addons trust-key`,
 `untrust-key`) and is an admin-only config section like `addon_delegation`.
+`addon_trust.<name>.dev_keys` (`{key, dev: true, expires_at}` records, written by
+`trust-key ... --dev --expires <dur>`) holds temporary development keys for that
+add-on on this mesh only; each is refused after its UTC `expires_at`.
 `noo addons set <name> --delegate tasks|off` writes `addon_delegation.<name>.tasks`.
 
 ### `services` — endpoints (gateway + workers)

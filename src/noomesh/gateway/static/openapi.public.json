@@ -161,6 +161,14 @@
                           "unhealthy"
                         ]
                       }
+                    },
+                    "addons_dev": {
+                      "type": "object",
+                      "description": "Present only when some add-on is vouched for by a temporary development signing key rather than a release key (`noo addons trust-key <name> <pubkey> --dev --expires <dur>`): add-on name to `dev (expires YYYY-MM-DD HH:MM UTC)`. The add-on's `addons.<name>` word stays `enabled`; once the key expires it reads `unhealthy` and the add-on drops out of this map. Absent for an anonymous caller.",
+                      "additionalProperties": {
+                        "type": "string",
+                        "example": "dev (expires 2026-11-04 12:00 UTC)"
+                      }
                     }
                   }
                 }

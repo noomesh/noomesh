@@ -147,6 +147,12 @@ pub(crate) fn declared_map_at(path: &std::path::Path) -> Result<std::collections
     Ok(declared_in(&text))
 }
 
+/// This install's noomesh.yaml text; empty when it is absent or unreadable
+/// (`list` already failed on an unreadable file through `declared_map`).
+fn config_text() -> String {
+    std::fs::read_to_string(config_path()).unwrap_or_default()
+}
+
 /// The `addons:` map of a noomesh.yaml TEXT — the parse `declared_map` does,
 /// for a caller that already holds the file (the launcher's pre-`up` check
 /// reads the file the launcher names, not `repo_root()`'s). Unparseable or
@@ -348,7 +354,17 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 })
             })
             .collect();
-        println!("{}", json!({"addons": rows, "config": config_path().display().to_string()}));
+        let third: Vec<_> = third_party_rows(&config_text(), crate::addon_lock::now_unix())
+            .into_iter()
+            .map(|(n, d, signer)| {
+                let dev = signer.contains("DEV");
+                json!({
+                    "name": n, "declared": d, "effective": d == Some(true), "third_party": true,
+                    "signer": signer, "dev": dev, "pin": pins.get(&n),
+                })
+            })
+            .collect();
+        println!("{}", json!({"addons": rows, "third_party": third, "config": config_path().display().to_string()}));
         return Ok(0);
     }
 
@@ -402,6 +418,47 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &rows
         )
     );
+    // Third-party add-ons the operator trusts a key for: who signs them, and
+    // a DEV marker with the expiry when it is a development key (i163 A).
+    let third = third_party_rows(&config_text(), crate::addon_lock::now_unix());
+    if !third.is_empty() {
+        println!();
+        let rows: Vec<Vec<String>> = third
+            .iter()
+            .map(|(n, d, signer)| {
+                let declared_cell = match d {
+                    Some(true) => ui::good("true"),
+                    Some(false) => ui::bad("false"),
+                    None => ui::muted("not declared → false"),
+                };
+                let signer_cell = if signer.contains("EXPIRED") {
+                    ui::bad(signer)
+                } else if signer.contains("DEV") {
+                    ui::warn(signer)
+                } else {
+                    signer.clone()
+                };
+                let mut row = vec![n.clone(), declared_cell, signer_cell];
+                row.extend(crate::commands::addon_pins::pin_cells(pins.get(n)));
+                row
+            })
+            .collect();
+        print!(
+            "{}",
+            ui::table(
+                &[
+                    ui::Col::left("third-party"),
+                    ui::Col::left("declared"),
+                    ui::Col::left("signer"),
+                    ui::Col::left("version"),
+                    ui::Col::left("stack"),
+                    ui::Col::left("digest"),
+                    ui::Col::left("key"),
+                ],
+                &rows
+            )
+        );
+    }
     println!();
     ui::guide(&[
         ("noo addons enable <name>", "pins a licensed add-on's signed lock, then declares it on"),
@@ -644,9 +701,13 @@ fn edit_yaml(f: impl FnOnce(&str) -> Result<String, String>) -> Result<std::path
     Ok(path)
 }
 
-/// `noo addons trust-key <name> <pubkey> [--registry <root>]`
+/// `noo addons trust-key <name> <pubkey> [--registry <root>] [--dev --expires <dur>]`
+///
+/// `--dev` trusts a temporary DEVELOPMENT key (i163 part A): `--expires`
+/// is required with it (at most 30d) and refused without it. Enrolling one
+/// is a local operator action: it edits this install's noomesh.yaml.
 pub fn addons_trust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let (mut pos, mut registry) = (Vec::new(), None);
+    let (mut pos, mut registry, mut dev, mut expires) = (Vec::new(), None, false, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -654,19 +715,60 @@ pub fn addons_trust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
                 Some(v) if !v.starts_with('-') => registry = Some(v.as_str()),
                 _ => return Err(Unhandled),
             },
+            "--dev" => dev = true,
+            "--expires" => match it.next() {
+                Some(v) if !v.starts_with('-') => expires = Some(v.as_str()),
+                _ => return Err(Unhandled),
+            },
             s if s.starts_with('-') => return Err(Unhandled),
             _ => pos.push(a.as_str()),
         }
     }
     let [name, key] = pos[..] else { return Err(Unhandled) };
-    let path = match edit_yaml(|t| crate::addons::trust::add_key(t, name, key, registry)) {
+    let ttl = match (dev, expires) {
+        (false, None) => None,
+        (false, Some(_)) => fail(g.json, ExitCode::Usage, "trust_key",
+            "--expires applies to a development key only; a release key does not expire here",
+            Some("noo addons trust-key <name> <pubkey> --registry <host/path> --dev --expires 14d")),
+        (true, None) => fail(g.json, ExitCode::Usage, "trust_key",
+            "a development key needs --expires (at most 30d): it is temporary by design",
+            Some(&format!("noo addons trust-key {name} {key} --dev --expires 14d"))),
+        (true, Some(e)) => match crate::addons::trust::parse_dev_ttl(e) {
+            Ok(n) => Some(n),
+            Err(why) => fail(g.json, ExitCode::Usage, "trust_key", &why,
+                Some(&format!("noo addons trust-key {name} {key} --dev --expires 14d"))),
+        },
+    };
+    let now = crate::addon_lock::now_unix();
+    let edited = match ttl {
+        Some(ttl) => edit_yaml(|t| crate::addons::trust::add_dev_key(t, name, key, registry, ttl, now)),
+        None => edit_yaml(|t| crate::addons::trust::add_key(t, name, key, registry)),
+    };
+    let path = match edited {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Usage, "trust_key", &e, Some("noo addons trust-key <name> <pubkey> --registry <host/path>")),
     };
+    let key = key.to_ascii_lowercase();
+    let expires_at = ttl.map(|t| now + t);
     if g.json {
-        println!("{}", json!({"addon": name, "trusted_key": key.to_ascii_lowercase(), "config": path.display().to_string()}));
+        println!("{}", json!({
+            "addon": name, "trusted_key": key, "dev": dev,
+            "expires_at": expires_at.map(crate::addon_lock::utc_rfc3339),
+            "config": path.display().to_string(),
+        }));
+    } else if let Some(at) = expires_at {
+        ui::done(&format!(
+            "{name}: DEVELOPMENT key {key} trusted until {} ({})",
+            crate::addon_lock::utc_minute(at),
+            path.display()
+        ));
+        println!("{}", ui::note("this mesh only; a lock it signs is refused after that instant and never ships in a release"));
+        ui::guide(&[
+            ("noo addons enable <name>", "(add --lock <path|https-url> to hand it the lock) verifies the lock against this key, pins it, then declares it ON"),
+            ("noo addons untrust-key <name> --dev", "removes the add-on's development keys"),
+        ]);
     } else {
-        ui::done(&format!("{name}: signing key {} trusted ({})", key.to_ascii_lowercase(), path.display()));
+        ui::done(&format!("{name}: signing key {key} trusted ({})", path.display()));
         ui::guide(&[
             ("noo addons enable <name>", "(add --lock <path|https-url> to hand it the lock) verifies the add-on's signed lock against this key, pins it, then declares it ON"),
             ("noo addons untrust-key <name> <pubkey>", "removes the key again"),
@@ -675,20 +777,69 @@ pub fn addons_trust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     Ok(0)
 }
 
-/// `noo addons untrust-key <name> <pubkey>`
+/// `noo addons untrust-key <name> [<pubkey>] [--dev]`: a release key by its
+/// pubkey; with `--dev`, that development key, or all of the add-on's
+/// development keys when no pubkey is given.
 pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let [name, key] = args else { return Err(Unhandled) };
-    let path = match edit_yaml(|t| crate::addons::trust::remove_key(t, name, key)) {
+    let dev = args.iter().any(|a| a == "--dev");
+    if args.iter().any(|a| a.starts_with('-') && a != "--dev") {
+        return Err(Unhandled);
+    }
+    let pos: Vec<&str> = args.iter().filter(|a| *a != "--dev").map(String::as_str).collect();
+    let (name, key) = match (dev, &pos[..]) {
+        (_, [name, key]) => (*name, Some(*key)),
+        (true, [name]) => (*name, None),
+        _ => return Err(Unhandled),
+    };
+    let edited = if dev {
+        edit_yaml(|t| crate::addons::trust::remove_dev_key(t, name, key))
+    } else {
+        edit_yaml(|t| crate::addons::trust::remove_key(t, name, key.unwrap_or_default()))
+    };
+    let path = match edited {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Usage, "untrust_key", &e, Some("noo addons list")),
     };
+    let what = match (dev, key) {
+        (true, None) => "every development key".to_string(),
+        (true, Some(k)) => format!("development key {}", k.to_ascii_lowercase()),
+        (false, k) => format!("signing key {}", k.unwrap_or_default().to_ascii_lowercase()),
+    };
     if g.json {
-        println!("{}", json!({"addon": name, "removed_key": key.to_ascii_lowercase(), "config": path.display().to_string()}));
+        println!("{}", json!({
+            "addon": name, "dev": dev, "removed_key": key.map(str::to_ascii_lowercase),
+            "config": path.display().to_string(),
+        }));
     } else {
-        ui::done(&format!("{name}: signing key {} no longer trusted ({})", key.to_ascii_lowercase(), path.display()));
+        ui::done(&format!("{name}: {what} no longer trusted ({})", path.display()));
         println!("{}", ui::note("a pin made under it stays until `noo addons verify` or the next start re-checks it against the remaining keys"));
     }
     Ok(0)
+}
+
+/// `addons list` rows for third-party add-ons (trusted with `trust-key`):
+/// `(name, declared, signer)`. `signer` reads `release`, `DEV until <date>`,
+/// or `DEV EXPIRED <date>` (the launcher refuses it). Pure over the file text.
+pub(crate) fn third_party_rows(text: &str, now: i64) -> Vec<(String, Option<bool>, String)> {
+    let declared = declared_in(text);
+    let trust = crate::addons::trust::read(text).unwrap_or_default();
+    trust
+        .into_iter()
+        .filter(|(n, _)| row(n).is_none())
+        .map(|(n, a)| {
+            let live = a.dev.iter().filter(|d| d.expires_at > now).map(|d| d.expires_at).max();
+            let dead = a.dev.iter().map(|d| d.expires_at).max();
+            let signer = match (a.keys.is_empty(), live, dead) {
+                (true, Some(at), _) => format!("DEV until {}", crate::addon_lock::utc_minute(at)),
+                (true, None, Some(at)) => format!("DEV EXPIRED {}", crate::addon_lock::utc_minute(at)),
+                (false, Some(at), _) => format!("release + DEV until {}", crate::addon_lock::utc_minute(at)),
+                (false, None, Some(at)) => format!("release (DEV expired {})", crate::addon_lock::utc_minute(at)),
+                _ => "release".to_string(),
+            };
+            let d = declared.get(&n).copied();
+            (n, d, signer)
+        })
+        .collect()
 }
 
 /// `noo addons set <name> --delegate tasks|off`
@@ -936,5 +1087,26 @@ compose_env:
             );
         }
         assert!(seen >= 4, "only found {seen} gateway add-ons — the parse is wrong, not the table");
+    }
+
+    #[test]
+    fn list_marks_a_dev_signed_third_party_addon_with_its_expiry() {
+        let pk = |seed: &str| crate::release_sig::pubkey_hex(&crate::release_sig::signing_key_from_seed_hex(seed).unwrap());
+        let now = 1_790_000_000;
+        let root = "ghcr.io/vendor/x";
+        let t = "addons:\n  pai-voice: true\n";
+        let t = crate::addons::trust::add_dev_key(t, "pai-voice", &pk(&"ab".repeat(32)), Some(root), 86_400, now).unwrap();
+        let t = crate::addons::trust::add_key(&t, "other-addon", &pk(&"cd".repeat(32)), Some(root)).unwrap();
+        let rows = third_party_rows(&t, now);
+        let until = crate::addon_lock::utc_minute(now + 86_400);
+        assert_eq!(rows, vec![
+            ("other-addon".to_string(), None, "release".to_string()),
+            ("pai-voice".to_string(), Some(true), format!("DEV until {until}")),
+        ]);
+        // After the expiry it reads EXPIRED (the launcher refuses it).
+        let rows = third_party_rows(&t, now + 86_400);
+        assert_eq!(rows[1].2, format!("DEV EXPIRED {until}"));
+        // The add-ons the CLI ships are never listed here.
+        assert!(third_party_rows("addons:\n  evolve: true\n", now).is_empty());
     }
 }

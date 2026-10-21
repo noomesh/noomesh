@@ -185,6 +185,17 @@ pub fn health_names() -> Vec<String> {
     names
 }
 
+/// `/health` `addons_dev`: `{ "<name>": "dev (expires <date>)" }` for every
+/// add-on only a live development key vouches for (i163 part A), or `None`
+/// when there is none. `addons.<name>` itself stays a [`health_word`].
+pub fn health_dev_map() -> Option<serde_json::Value> {
+    let map: serde_json::Map<String, serde_json::Value> = health_names()
+        .into_iter()
+        .filter_map(|n| crate::addon_registry::dev_label(&n).map(|l| (n, serde_json::Value::String(l))))
+        .collect();
+    (!map.is_empty()).then_some(serde_json::Value::Object(map))
+}
+
 /// Is the named add-on usable (flag on AND licensed where required)?
 pub fn enabled(name: &str) -> bool {
     state(name) == AddonState::Enabled

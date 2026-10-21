@@ -42,6 +42,15 @@
 //! | `dev` | a source checkout: add-on images are built locally, nothing is signed |
 //! | unset or empty | a launcher from before this hand-off ([`Verification::LegacyLauncher`]) |
 //!
+//! Beside it, `NOO_ADDONS_DEV` (i163 part A): `name=<unix>,...` names the
+//! add-ons whose lock only a temporary DEVELOPMENT key vouches for, with
+//! that key's expiry. Such an add-on registers as [`Verification::DevKey`];
+//! `/health` reports it in `addons_dev` (`"dev (expires <date>)"`), and once
+//! the instant passes it reads `unhealthy` with the reason and its routes are
+//! refused, without waiting for a restart (the launcher refuses it at the
+//! next start). An entry for a name the verdict does not hold vouches for
+//! nothing; an unreadable value is a note, never a reason to trust more.
+//!
 //! The gateway reads the launcher's verdict; it does not verify the signature
 //! again. Why: the gateway container cannot see the install root
 //! (`addons.lock`, the cached locks and the entitlement are host files, and
@@ -102,6 +111,8 @@ use crate::config::AddonDelegationConfig;
 pub const VERIFIED_ENV: &str = "NOO_ADDONS_VERIFIED";
 /// The stack tag this gateway was started for (the launcher's `NOO_IMAGE_TAG`).
 pub const STACK_ENV: &str = "NOO_STACK_TAG";
+/// The add-ons only a development key vouches for, with its expiry (i163 A).
+pub const DEV_ENV: &str = "NOO_ADDONS_DEV";
 
 /// What an add-on name may be (it is joined into a path and an env var).
 pub const NAME_RULE: &str =
@@ -166,11 +177,62 @@ pub fn parse_reported(raw: Option<&str>) -> Reported {
     Reported::Verified(out)
 }
 
+/// Parse the value of [`DEV_ENV`]: `name=<unix seconds>,...`. Unset or empty
+/// is no development add-on. Pure.
+pub fn parse_dev(raw: Option<&str>) -> Result<BTreeMap<String, i64>, String> {
+    let v = raw.unwrap_or("").trim();
+    let mut out = BTreeMap::new();
+    if v.is_empty() {
+        return Ok(out);
+    }
+    for tok in v.split(',') {
+        let tok = tok.trim();
+        let parsed = tok
+            .split_once('=')
+            .and_then(|(name, at)| (name_ok(name) && !at.is_empty() && at.bytes().all(|b| b.is_ascii_digit())).then_some((name, at)))
+            .and_then(|(name, at)| at.parse::<i64>().ok().map(|at| (name.to_string(), at)));
+        match parsed {
+            Some((n, at)) => {
+                out.insert(n, at);
+            }
+            None => return Err(format!("{DEV_ENV} entry {tok:?} is not `<add-on>=<unix seconds>`")),
+        }
+    }
+    Ok(out)
+}
+
+/// `YYYY-MM-DD HH:MM UTC` for a unix time (the CLI prints expiries the same way).
+pub fn utc_minute(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| format!("unix {unix}"))
+}
+
+/// Seconds since the epoch, now.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn dev_expired_reason(name: &str, version: &str, expires_at: i64) -> String {
+    format!(
+        "add-on {name:?} {version} is vouched for only by a development key, which expired {}, so none \
+         of its routes are served. Renew it with `noo addons trust-key {name} <pubkey> --dev --expires 14d` \
+         and `noo stack restart --force`, or ship it signed by its release key",
+        utc_minute(expires_at)
+    )
+}
+
 /// How an add-on's lock was vouched for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verification {
     /// The launcher verified a signed lock at `version` for `stack`.
     Launcher { version: String, stack: String },
+    /// As [`Verification::Launcher`], but only a temporary development key
+    /// vouches for it, until `expires_at` (unix seconds; i163 part A).
+    DevKey { version: String, stack: String, expires_at: i64 },
     /// A source checkout (`dev`): images are built locally, nothing is signed.
     DevBuild,
     /// The launcher reported nothing (older than this hand-off) and the add-on
@@ -306,6 +368,25 @@ impl AddonEntry {
     pub fn verification(&self) -> &Verification {
         &self.verification
     }
+
+    /// The development key's expiry when only one vouches for this add-on.
+    pub fn dev_expires_at(&self) -> Option<i64> {
+        match &self.verification {
+            Verification::DevKey { expires_at, .. } => Some(*expires_at),
+            _ => None,
+        }
+    }
+
+    /// Why this add-on is refused at `now` because its development key
+    /// expired, if it is.
+    pub fn dev_expired_at(&self, now: i64) -> Option<String> {
+        match &self.verification {
+            Verification::DevKey { version, expires_at, .. } if now >= *expires_at => {
+                Some(dev_expired_reason(&self.name, version, *expires_at))
+            }
+            _ => None,
+        }
+    }
 }
 
 // ── The snapshot ─────────────────────────────────────────────────────────
@@ -335,6 +416,41 @@ impl Snapshot {
         &self.refused
     }
 
+    /// [`Snapshot::get`] at `now`: an add-on whose development key has
+    /// expired is no longer served.
+    pub fn get_at(&self, name: &str, now: i64) -> Option<Arc<AddonEntry>> {
+        self.get(name).filter(|e| e.dev_expired_at(now).is_none())
+    }
+
+    /// [`Snapshot::all`] at `now`, without expired development add-ons.
+    pub fn all_at(&self, now: i64) -> Vec<Arc<AddonEntry>> {
+        self.entries.values().filter(|e| e.dev_expired_at(now).is_none()).cloned().collect()
+    }
+
+    /// [`Snapshot::refusal`] at `now`: also an expired development key.
+    pub fn refusal_at(&self, name: &str, now: i64) -> Option<String> {
+        self.refusal(name).or_else(|| self.entries.get(name).and_then(|e| e.dev_expired_at(now)))
+    }
+
+    /// [`Snapshot::refusals`] at `now`, with every expired development add-on.
+    pub fn refusals_at(&self, now: i64) -> BTreeMap<String, String> {
+        let mut out = self.refused.clone();
+        for (n, e) in &self.entries {
+            if let Some(why) = e.dev_expired_at(now) {
+                out.insert(n.clone(), why);
+            }
+        }
+        out
+    }
+
+    /// `dev (expires <date>)` for an add-on only a live development key
+    /// vouches for at `now`; `None` otherwise.
+    pub fn dev_label_at(&self, name: &str, now: i64) -> Option<String> {
+        let e = self.entries.get(name)?;
+        let at = e.dev_expires_at()?;
+        (now < at).then(|| format!("dev (expires {})", utc_minute(at)))
+    }
+
     /// Operator-facing observations that are not refusals (a switch that
     /// names nothing).
     pub fn notes(&self) -> &[String] {
@@ -354,6 +470,10 @@ pub struct Inputs<'a> {
     pub reported: &'a Reported,
     /// The stack tag this gateway runs, when known.
     pub gateway_stack: Option<&'a str>,
+    /// [`DEV_ENV`], parsed: add-ons only a development key vouches for.
+    pub dev: &'a Result<BTreeMap<String, i64>, String>,
+    /// Unix seconds, now (a development key is judged against it).
+    pub now: i64,
 }
 
 /// Build a snapshot. `table_on` answers "is this compiled row switched on?"
@@ -401,7 +521,18 @@ pub fn build(inp: &Inputs, table_on: &dyn Fn(&str) -> bool) -> Snapshot {
                 continue;
             }
         };
-        match verify(name, row.is_some(), inp.reported, inp.gateway_stack) {
+        let verdict = verify(name, row.is_some(), inp.reported, inp.gateway_stack).and_then(|v| match (v, inp.dev) {
+            (Verification::Launcher { version, stack }, Ok(dev)) if dev.contains_key(name) => {
+                let expires_at = dev[name];
+                if inp.now >= expires_at {
+                    Err(dev_expired_reason(name, &version, expires_at))
+                } else {
+                    Ok(Verification::DevKey { version, stack, expires_at })
+                }
+            }
+            (v, _) => Ok(v),
+        });
+        match verdict {
             Ok(v) => {
                 let enabled = inp.delegation.get(name).is_some_and(|d| d.tasks);
                 if enabled && manifest.delegate.is_none() {
@@ -416,6 +547,9 @@ pub fn build(inp: &Inputs, table_on: &dyn Fn(&str) -> bool) -> Snapshot {
                 snap.refused.insert(name.to_string(), why);
             }
         }
+    }
+    if let Err(why) = inp.dev {
+        snap.notes.push(format!("{why}; no add-on is reported as dev-signed"));
     }
     for name in inp.delegation.iter().filter(|(_, d)| d.tasks).map(|(n, _)| n) {
         if !snap.entries.contains_key(name.as_str()) {
@@ -473,6 +607,7 @@ pub fn reload() -> Arc<Snapshot> {
     let cfg = crate::config::global();
     let reported = parse_reported(std::env::var(VERIFIED_ENV).ok().as_deref());
     let stack = std::env::var(STACK_ENV).ok();
+    let dev = parse_dev(std::env::var(DEV_ENV).ok().as_deref());
     let building = Building::enter();
     let snap = build(
         &Inputs {
@@ -481,6 +616,8 @@ pub fn reload() -> Arc<Snapshot> {
             delegation: &cfg.addon_delegation,
             reported: &reported,
             gateway_stack: stack.as_deref(),
+            dev: &dev,
+            now: now_unix(),
         },
         &|n| crate::addons::state(n) != crate::addons::AddonState::Disabled,
     );
@@ -515,24 +652,32 @@ pub fn reload() -> Arc<Snapshot> {
 }
 
 /// The registered add-on `name`, or `None`. Cheap: an `Arc` clone, no
-/// database, no await.
+/// database, no await. An add-on whose development key has expired since
+/// load is `None` here and refused in [`refusal`].
 pub fn get(name: &str) -> Option<Arc<AddonEntry>> {
-    current().get(name)
+    current().get_at(name, now_unix())
 }
 
 /// Every registered add-on, ordered by name.
 pub fn all() -> Vec<Arc<AddonEntry>> {
-    current().all()
+    current().all_at(now_unix())
 }
 
-/// Why `name` was refused at load, if it was.
+/// Why `name` was refused at load (or, for a development key, has expired
+/// since), if it was.
 pub fn refusal(name: &str) -> Option<String> {
-    current().refusal(name)
+    current().refusal_at(name, now_unix())
 }
 
-/// Every add-on refused at load, with why.
+/// Every add-on refused at load or expired since, with why.
 pub fn refusals() -> BTreeMap<String, String> {
-    current().refused.clone()
+    current().refusals_at(now_unix())
+}
+
+/// `dev (expires <date>)` for an add-on only a live development key vouches
+/// for; `None` for every other add-on (i163 part A; `/health` `addons_dev`).
+pub fn dev_label(name: &str) -> Option<String> {
+    current().dev_label_at(name, now_unix())
 }
 
 #[cfg(test)]
@@ -587,6 +732,20 @@ mod tests {
         reported: &Reported,
         table_on: &dyn Fn(&str) -> bool,
     ) -> Snapshot {
+        run_dev(dir, decl, deleg, reported, &Ok(BTreeMap::new()), NOW, table_on)
+    }
+
+    const NOW: i64 = 1_790_000_000;
+
+    fn run_dev(
+        dir: &FsPath,
+        decl: &[(&str, bool)],
+        deleg: &[(&str, bool)],
+        reported: &Reported,
+        dev: &Result<BTreeMap<String, i64>, String>,
+        now: i64,
+        table_on: &dyn Fn(&str) -> bool,
+    ) -> Snapshot {
         build(
             &Inputs {
                 dir,
@@ -594,6 +753,8 @@ mod tests {
                 delegation: &delegation(deleg),
                 reported,
                 gateway_stack: Some(STACK),
+                dev,
+                now,
             },
             table_on,
         )
@@ -851,6 +1012,63 @@ mod tests {
         assert!(!snap.get("pai-voice").unwrap().operator_enabled());
         let notes = snap.notes().join("\n");
         assert!(notes.contains("does not declare") && notes.contains("addon_delegation.ghost"), "{notes}");
+    }
+
+    // ── development keys (i163 part A) ───────────────────────────────────
+
+    #[test]
+    fn the_dev_variable_parses_and_a_bad_one_is_an_error() {
+        assert_eq!(parse_dev(None), Ok(BTreeMap::new()));
+        assert_eq!(parse_dev(Some(" ")), Ok(BTreeMap::new()));
+        let m = parse_dev(Some("pai-voice=1790003600,b=7")).unwrap();
+        assert_eq!((m["pai-voice"], m["b"]), (1_790_003_600, 7));
+        for bad in ["pai-voice", "pai-voice=", "pai-voice=soon", "pai-voice=-1", "../x=1", "a=1,,b=2"] {
+            assert!(parse_dev(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_dev_signed_addon_registers_as_dev_until_its_key_expires() {
+        let dir = scratch("devkey");
+        plant(&dir, "pai-voice", &third_party("pai-voice"));
+        let at = NOW + 3600;
+        let dev = Ok(BTreeMap::from([("pai-voice".to_string(), at)]));
+        let rep = verified(&[("pai-voice", "0.3.0", STACK)]);
+        let snap = run_dev(&dir, &[("pai-voice", true)], &[], &rep, &dev, NOW, &|_| false);
+        let e = snap.get("pai-voice").expect("registered while the key is live");
+        assert_eq!(e.verification(), &Verification::DevKey { version: "0.3.0".into(), stack: STACK.into(), expires_at: at });
+        assert_eq!(snap.dev_label_at("pai-voice", NOW), Some(format!("dev (expires {})", utc_minute(at))));
+        assert!(snap.get_at("pai-voice", NOW).is_some() && snap.refusal_at("pai-voice", NOW).is_none());
+        // Past the instant, while still running: no longer served, refused with the reason.
+        assert!(snap.get_at("pai-voice", at).is_none());
+        assert!(snap.all_at(at).is_empty());
+        assert_eq!(snap.dev_label_at("pai-voice", at), None);
+        let why = snap.refusal_at("pai-voice", at).expect("refused once expired");
+        assert!(why.contains("expired") && why.contains(&utc_minute(at)) && why.contains("--dev --expires"), "{why}");
+        assert!(snap.refusals_at(at).contains_key("pai-voice"));
+        // Already expired at load: refused outright.
+        let snap = run_dev(&dir, &[("pai-voice", true)], &[], &rep, &dev, at, &|_| false);
+        assert!(snap.get("pai-voice").is_none());
+        assert!(snap.refusal("pai-voice").is_some_and(|w| w.contains("development key")));
+    }
+
+    #[test]
+    fn a_dev_entry_never_vouches_by_itself_and_a_release_addon_is_not_dev() {
+        let dir = scratch("devstray");
+        plant(&dir, "pai-voice", &third_party("pai-voice"));
+        let dev = Ok(BTreeMap::from([("pai-voice".to_string(), NOW + 3600)]));
+        // Not in the verdict: refused exactly as without the dev entry.
+        let snap = run_dev(&dir, &[("pai-voice", true)], &[], &verified(&[]), &dev, NOW, &|_| false);
+        assert!(snap.get("pai-voice").is_none() && snap.refusal("pai-voice").is_some());
+        // In the verdict with no dev entry: a release verification, no label.
+        let snap = run(&dir, &[("pai-voice", true)], &[], &verified(&[("pai-voice", "0.3.0", STACK)]), &|_| false);
+        assert!(matches!(snap.get("pai-voice").unwrap().verification(), Verification::Launcher { .. }));
+        assert_eq!(snap.dev_label_at("pai-voice", NOW), None);
+        // An unreadable dev variable is a note and trusts nothing more.
+        let bad = Err("NOO_ADDONS_DEV entry \"x\" is not `<add-on>=<unix seconds>`".to_string());
+        let snap = run_dev(&dir, &[("pai-voice", true)], &[], &verified(&[("pai-voice", "0.3.0", STACK)]), &bad, NOW, &|_| false);
+        assert!(matches!(snap.get("pai-voice").unwrap().verification(), Verification::Launcher { .. }));
+        assert!(snap.notes().iter().any(|n| n.contains("NOO_ADDONS_DEV")), "{:?}", snap.notes());
     }
 
     // ── reads are cheap ──────────────────────────────────────────────────
