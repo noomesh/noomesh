@@ -517,9 +517,16 @@ noomesh** needs the GPU, the node agent does not stop. It stays online, gives
 the GPU back, says so, and takes it again on its own once the GPU is free.
 
 **What counts as foreign.** A GPU process is noomesh's when it runs in a
-container the agent manages (`noo-<backend>`); everything else (another
-compose stack, a game, a training script) is foreign. The agent only measures
-foreign work. It never signals, stops or reconfigures it.
+any noomesh container on the host: the agent's backends, the compose-managed
+controller stack (`noo-ollama-embed`, `noo-tei`, ...) and older leftovers.
+Containers are recognised by their labels (compose project `noomesh` or
+`pai-assistant`, `noo.managed-by`), with the `noo-` name as the fallback; a
+container recognised only by name is reported as `orphan`. Everything else
+(another compose stack, a game, a training script) is foreign. The agent only
+measures foreign work. It never signals, stops or reconfigures it. Memory it
+cannot attribute (docker unreachable, a process gone) is `unknown_mb`, is never
+counted as foreign and never yields; the method then reads
+`nvidia-smi-unattributed` and `reason` says so.
 
 **How it measures.** Every 15 s it reads `nvidia-smi` (`memory.used`,
 `memory.total` and the compute processes). When the process IDs resolve, each
@@ -572,7 +579,7 @@ other direction: the other stack never calls noomesh.
 **What the operator sees.** The heartbeat carries `gpu_contention`:
 
 ```json
-{"state": "yielded", "foreign_mb": 11468, "total_mb": 16376, "free_mb": 4908,
+{"state": "yielded", "foreign_mb": 11468, "noomesh_mb": 3754, "unknown_mb": 0, "total_mb": 16376, "free_mb": 4908,
  "method": "memory-accounting", "since": "2026-10-17T12:00:00Z",
  "paused_backends": ["vllm"], "need_mb": 14738,
  "reason": "foreign GPU use 11.2 GB > 2.0 GB threshold", "policy": "auto"}

@@ -24,6 +24,9 @@ type heldDocker struct{ starts int }
 func (*heldDocker) GPUBackendContainers(context.Context) ([]docker.GPUBackend, error) {
 	return []docker.GPUBackend{{Backend: "vllm", ID: "x", Running: true}}, nil
 }
+func (*heldDocker) NoomeshContainers(context.Context) ([]docker.NoomeshContainer, error) {
+	return nil, nil
+}
 func (*heldDocker) StopContainerGraceful(context.Context, string, int) error { return nil }
 func (d *heldDocker) StartContainer(context.Context, string) error           { d.starts++; return nil }
 

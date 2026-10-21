@@ -11,9 +11,11 @@
 // the only way to free host3's GPU was to stop the agent, and the node
 // vanished from the mesh (2026-10-16).
 //
-// Attribution. A GPU process is OURS when it runs in a container this agent
-// manages (`noo-<backend>`, matched by the container id in the process's
-// cgroup); everything else is foreign and is only ever measured — never
+// Attribution. A GPU process is OURS when it runs in ANY noomesh container on
+// the host (the agent's backends, the compose-managed controller stack such
+// as noo-ollama-embed, name-only orphans; matched by the container id in the
+// process's cgroup, see attribute); a process that cannot be attributed is
+// UNKNOWN and never yields; everything else is foreign and is only ever measured — never
 // signalled, stopped or reconfigured. Where nvidia-smi cannot name PIDs
 // (WSL2: "[Not Found]"), ours is the expected footprint of the GPU backends
 // running and foreign is the rest of memory.used ("memory-accounting").
@@ -36,6 +38,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,10 +58,16 @@ const (
 
 // Methods reported in gpu_contention.method.
 const (
-	MethodNVML        = "nvml" // reserved: a cgo build with NVML
-	MethodSMI         = "nvidia-smi"
-	MethodAccounting  = "memory-accounting"
-	MethodNotMeasured = "not-measured"
+	MethodNVML       = "nvml" // reserved: a cgo build with NVML
+	MethodSMI        = "nvidia-smi"
+	MethodAccounting = "memory-accounting"
+	// The *Unattributed methods: some GPU memory could not be assigned to
+	// noomesh or to someone else (no docker access, PID gone, PIDs hidden and
+	// a noomesh GPU container of unknown size). That memory is reported as
+	// unknown_mb and NEVER counted as foreign: the node does not yield on it.
+	MethodSMIUnattributed        = "nvidia-smi-unattributed"
+	MethodAccountingUnattributed = "memory-accounting-unattributed"
+	MethodNotMeasured            = "not-measured"
 )
 
 // PauseReason is what a paused backend is marked with.
@@ -74,6 +83,9 @@ type Docker interface {
 	GPUBackendContainers(ctx context.Context) ([]docker.GPUBackend, error)
 	StopContainerGraceful(ctx context.Context, id string, timeoutS int) error
 	StartContainer(ctx context.Context, id string) error
+	// NoomeshContainers is every container that is noomesh's on this host
+	// (stack, agent backends, orphans), for GPU attribution.
+	NoomeshContainers(ctx context.Context) ([]docker.NoomeshContainer, error)
 }
 
 // Config is the operator's knobs (env, read once at start).
@@ -118,8 +130,17 @@ type Placed struct {
 // Contention is the heartbeat's `gpu_contention`. Field names are a
 // contract with the gateway, the CLI and the router — keep them stable.
 type Contention struct {
-	State          string   `json:"state"`
-	ForeignMB      int      `json:"foreign_mb"`
+	State     string `json:"state"`
+	ForeignMB int    `json:"foreign_mb"`
+	// NoomeshMB: GPU memory held by noomesh's own containers (stack,
+	// backends, orphans). Never contention.
+	NoomeshMB int `json:"noomesh_mb"`
+	// UnknownMB: GPU memory whose owner could not be determined. Never
+	// counted as foreign, never yields.
+	UnknownMB int `json:"unknown_mb"`
+	// Orphan: noomesh containers holding the GPU that nothing current owns
+	// (no stack/agent label; recognised by name) — clean these up.
+	Orphan         []string `json:"orphan,omitempty"`
 	TotalMB        int      `json:"total_mb"`
 	FreeMB         int      `json:"free_mb"`
 	Method         string   `json:"method"`
@@ -159,6 +180,10 @@ type Controller struct {
 	method      string
 	last        Reading
 	foreignMB   int
+	noomeshMB   int
+	unknownMB   int
+	orphans     []string
+	unknownNote string
 	needMB      int
 	pressureAt  time.Time // first tick of the current pressure run
 	clearAt     time.Time // first tick of the current clear run
@@ -169,6 +194,8 @@ type Controller struct {
 	measured    map[string]int // backend -> last measured MiB (PID method)
 	onResume    func()
 	lastNoMeter bool
+	owned       []docker.NoomeshContainer // this tick's noomesh containers
+	ownedErr    error                     // non-nil: docker could not list them
 }
 
 // New builds a controller. stateDir may be "" (no persistence).
@@ -254,7 +281,8 @@ func (c *Controller) Report() Contention {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := Contention{
-		State: c.state, ForeignMB: c.foreignMB, TotalMB: c.last.TotalMB,
+		State: c.state, ForeignMB: c.foreignMB, NoomeshMB: c.noomeshMB, UnknownMB: c.unknownMB,
+		Orphan: append([]string(nil), c.orphans...), TotalMB: c.last.TotalMB,
 		Method: c.method, Since: c.since.UTC().Format(time.RFC3339),
 		PausedBackends: sortedKeys(c.paused), NeedMB: c.needMB, Reason: c.reason, Policy: "auto",
 	}
@@ -266,6 +294,9 @@ func (c *Controller) Report() Contention {
 	}
 	if !c.cfg.Enabled {
 		r.Policy = "off"
+	}
+	if r.Reason == "" && c.unknownMB > 0 {
+		r.Reason = c.unknownNote
 	}
 	return r
 }
@@ -296,7 +327,15 @@ func (c *Controller) Tick(ctx context.Context) {
 		backends = nil
 	}
 
+	octx, ocancel := context.WithTimeout(ctx, 20*time.Second)
+	owned, oerr := c.docker.NoomeshContainers(octx)
+	ocancel()
+	if oerr != nil {
+		slog.Warn("gpuyield: listing noomesh containers failed; GPU attribution unknown", "error", oerr)
+	}
+
 	c.mu.Lock()
+	c.owned, c.ownedErr = owned, oerr
 	act := c.decideLocked(r, backends)
 	c.mu.Unlock()
 	c.execute(ctx, act)
@@ -321,7 +360,7 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 		// Nothing to judge by. Never pause on no data; a node already
 		// paused stays paused (freeness cannot be confirmed either).
 		c.method = MethodNotMeasured
-		c.foreignMB = 0
+		c.foreignMB, c.noomeshMB, c.unknownMB, c.orphans = 0, 0, 0, nil
 		c.pressureAt, c.clearAt = time.Time{}, time.Time{}
 		if !c.lastNoMeter {
 			slog.Info("gpuyield: GPU memory not measurable on this node; yield inactive")
@@ -334,7 +373,9 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 	}
 	c.lastNoMeter = false
 
-	c.foreignMB, c.method = c.attribute(r, backends)
+	att := c.attribute(r, backends)
+	c.foreignMB, c.method = att.foreignMB, att.method
+	c.noomeshMB, c.unknownMB, c.orphans, c.unknownNote = att.noomeshMB, att.unknownMB, att.orphans, att.note
 	c.needMB = c.needLocked(r.TotalMB)
 	available := r.TotalMB - c.foreignMB
 	pressure, why := false, ""
@@ -358,6 +399,12 @@ func (c *Controller) decideLocked(r Reading, backends []docker.GPUBackend) (act 
 		if pressure {
 			c.clearAt = time.Time{}
 			c.reason = why
+			return c.enforceLocked(backends)
+		}
+		if c.unknownMB > 0 {
+			// Freeness cannot be confirmed while some GPU memory has no
+			// owner: stay paused rather than resume into a possible clash.
+			c.clearAt = time.Time{}
 			return c.enforceLocked(backends)
 		}
 		if c.clearAt.IsZero() {
@@ -437,25 +484,94 @@ func (c *Controller) execute(ctx context.Context, act actions) {
 	}
 }
 
-// attribute splits memory.used into ours and foreign.
-func (c *Controller) attribute(r Reading, backends []docker.GPUBackend) (int, string) {
+// attribution is one tick's split of memory.used.
+type attribution struct {
+	foreignMB, noomeshMB, unknownMB int
+	method                          string
+	orphans                         []string
+	note                            string
+}
+
+// containerIDRe finds a container id in a cgroup path ("docker-<64 hex>.scope"
+// on systemd hosts, "/docker/<64 hex>" on cgroupfs, "cri-containerd-" etc.).
+var containerIDRe = regexp.MustCompile(`[0-9a-f]{64}`)
+
+// attribute splits memory.used into noomesh's, foreign and unknown.
+//
+// Chosen design: PID -> cgroup -> container id -> "is that container
+// noomesh's" (labels first, `noo-` name as fallback; see
+// docker.ClassifyNoomesh). The cgroup file is world-readable, so the
+// unprivileged agent needs only the docker socket it already has. It covers
+// every noomesh container on the host, not just the backends this agent
+// starts: the compose-managed noo-ollama-embed / noo-tei / ... and
+// older-image orphans hold GPU memory too, and counting them as foreign made
+// a controller yield its own chat backend to its own embedder (pop-os,
+// 2026-10-21).
+//
+// Fail-safe: a process that cannot be attributed (cgroup unreadable or PID
+// gone, a container id with docker unable to say whose it is) is UNKNOWN,
+// not foreign. Unknown memory never feeds the yield decision. The cost: if a
+// foreign app starts while attribution is broken, the node does not yield to
+// it until attribution works again (the operator can still `noo cluster gpu
+// hold`). The alternative cost, pausing a healthy node on a guess, is a
+// self-inflicted outage on the very nodes with the least visibility.
+func (c *Controller) attribute(r Reading, backends []docker.GPUBackend) attribution {
 	running := map[string]docker.GPUBackend{}
 	for _, b := range backends {
 		if b.Running {
 			running[b.Backend] = b
 		}
 	}
+	// Owned container lookup by full id. Backends are noomesh's by
+	// definition even if the wider listing failed.
+	ownedByID := map[string]docker.NoomeshContainer{}
+	for _, o := range c.owned {
+		ownedByID[o.ID] = o
+	}
+	for _, b := range backends {
+		if _, ok := ownedByID[b.ID]; !ok {
+			ownedByID[b.ID] = docker.NoomeshContainer{ID: b.ID, Name: b.Name, Running: b.Running}
+		}
+	}
+	listOK := c.ownedErr == nil
+
 	if r.AppsResolved {
-		ours, oursByBackend := 0, map[string]int{}
+		var att attribution
+		oursByBackend := map[string]int{}
+		orphan := map[string]bool{}
+		var unknownPIDs []int
 		for _, a := range r.Apps {
 			cg := c.cgroupOf(a.PID)
-			for name, b := range running {
-				if cg != "" && strings.Contains(cg, b.ID) {
-					ours += a.UsedMB
-					oursByBackend[name] += a.UsedMB
-					break
-				}
+			if cg == "" {
+				att.unknownMB += a.UsedMB
+				unknownPIDs = append(unknownPIDs, a.PID)
+				continue
 			}
+			id := containerIDRe.FindString(cg)
+			if id == "" {
+				// Readable cgroup with no container in it: a host process.
+				att.foreignMB += a.UsedMB
+				continue
+			}
+			if o, ok := ownedByID[id]; ok {
+				att.noomeshMB += a.UsedMB
+				if o.Orphan {
+					orphan[o.Name] = true
+				}
+				for name, b := range running {
+					if b.ID == id {
+						oursByBackend[name] += a.UsedMB
+					}
+				}
+				continue
+			}
+			if !listOK {
+				// A container, and docker cannot say whose.
+				att.unknownMB += a.UsedMB
+				unknownPIDs = append(unknownPIDs, a.PID)
+				continue
+			}
+			att.foreignMB += a.UsedMB // someone else's container (pai-voice, ...)
 		}
 		// PIDs are trusted only if they can see our own processes: a running
 		// GPU backend with no attributed process means this driver does not
@@ -471,14 +587,57 @@ func (c *Controller) attribute(r Reading, backends []docker.GPUBackend) (int, st
 			for k, v := range oursByBackend {
 				c.measured[k] = v
 			}
-			return clampMB(r.UsedMB - ours), MethodSMI
+			att.method = MethodSMI
+			att.orphans = sortedKeys(orphan)
+			if att.unknownMB > 0 {
+				att.method = MethodSMIUnattributed
+				att.note = fmt.Sprintf("GPU attribution unknown for %s (pids %v, docker listing ok=%t): not counted as foreign, not yielding on it",
+					gb(att.unknownMB), unknownPIDs, listOK)
+			}
+			return att
 		}
 	}
+	// PIDs are not usable (WSL2 "[Not Found]", or a driver that hides
+	// container PIDs): ours is the expected footprint of the GPU backends
+	// running, the rest is foreign. That arithmetic is only sound if the
+	// backends are all the noomesh GPU use there is.
 	expected := 0
 	for name := range running {
 		expected += c.expectedLocked(name, r.TotalMB)
 	}
-	return clampMB(r.UsedMB - expected), MethodAccounting
+	rest := clampMB(r.UsedMB - expected)
+	att := attribution{method: MethodAccounting, noomeshMB: min(expected, r.UsedMB), foreignMB: rest}
+	var extra []string
+	for _, o := range c.owned {
+		if !o.Running || !o.GPU {
+			continue
+		}
+		known := false
+		for _, b := range running {
+			if b.ID == o.ID {
+				known = true
+			}
+		}
+		if !known {
+			extra = append(extra, o.Name)
+			if o.Orphan {
+				att.orphans = append(att.orphans, o.Name)
+			}
+		}
+	}
+	sort.Strings(att.orphans)
+	if !listOK || len(extra) > 0 {
+		// The remainder may be a noomesh container whose size we cannot
+		// know without PIDs (or docker could not even list them).
+		att.method = MethodAccountingUnattributed
+		att.unknownMB, att.foreignMB = rest, 0
+		why := "docker listing failed"
+		if listOK {
+			why = fmt.Sprintf("noomesh GPU container(s) %s hold GPU memory and per-process figures are unavailable", strings.Join(extra, ", "))
+		}
+		att.note = fmt.Sprintf("GPU attribution unknown for %s (%s): not counted as foreign, not yielding on it", gb(rest), why)
+	}
+	return att
 }
 
 // expectedLocked is a running backend's GPU footprint when it cannot be

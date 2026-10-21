@@ -22,14 +22,34 @@ type fakeProbe struct{ r Reading }
 func (f *fakeProbe) Read(context.Context) Reading { return f.r }
 
 type fakeDocker struct {
-	ctrs    []docker.GPUBackend
-	stops   []string
-	starts  []string
-	listErr error
+	owned    []docker.NoomeshContainer // extra noomesh containers (stack, orphans)
+	ownedErr error
+	ctrs     []docker.GPUBackend
+	stops    []string
+	starts   []string
+	listErr  error
 }
 
 func (f *fakeDocker) GPUBackendContainers(context.Context) ([]docker.GPUBackend, error) {
 	return append([]docker.GPUBackend(nil), f.ctrs...), f.listErr
+}
+
+func (f *fakeDocker) NoomeshContainers(context.Context) ([]docker.NoomeshContainer, error) {
+	if f.ownedErr != nil {
+		return nil, f.ownedErr
+	}
+	out := append([]docker.NoomeshContainer(nil), f.owned...)
+	have := map[string]bool{}
+	for _, o := range out {
+		have[o.ID] = true
+	}
+	for _, b := range f.ctrs {
+		if have[b.ID] {
+			continue
+		}
+		out = append(out, docker.NoomeshContainer{ID: b.ID, Name: b.Name, Running: b.Running, GPU: true})
+	}
+	return out, nil
 }
 
 func (f *fakeDocker) StopContainerGraceful(_ context.Context, id string, _ int) error {
