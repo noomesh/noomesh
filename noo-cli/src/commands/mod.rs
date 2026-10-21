@@ -95,7 +95,7 @@ pub mod workflow;
 pub mod tasks;
 
 pub use agents::{
-    agents_collaborate, agents_inbox, agents_list, agents_messages, agents_peer_card, agents_peer_dispatch, agents_peer_list,
+    agents_archive_export, agents_archive_list, agents_collaborate, agents_inbox, agents_list, agents_messages, agents_peer_card, agents_peer_dispatch, agents_peer_list,
     agents_presence, agents_send, agents_thread,
 };
 pub use auth::{auth_login, auth_logout, auth_status};

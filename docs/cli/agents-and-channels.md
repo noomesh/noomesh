@@ -67,6 +67,29 @@ register themselves; `agents peer list -c` shows the connected ones,
 `agents peer card` prints this gateway's own AgentCard, and `agents peer
 dispatch <agent-id> "<task>"` fires a task and returns its id.
 
+### Read archived agent mail
+
+Mail older than 90 days leaves Postgres for cold storage (see
+[Agent mail retention and archive](../security/secrets.md#agent-mail-retention-and-archive)).
+The archive is operator-only and is read through the gateway, because the files
+live on the controller's data volume and the key that opens the bodies never
+leaves it:
+
+```sh
+noo agents archive list
+noo agents archive export 2026-03 --out mail-2026-03.jsonl            # bodies still sealed
+noo agents archive export 2026-03 --decrypt --out mail-2026-03.plain.jsonl
+```
+
+`list` prints each month's file, message count and size. `export` takes a
+`YYYY-MM` month or an archive file name and writes one JSON object per line
+(every column) to `--out`, or to stdout when `--out` is absent and `--decrypt`
+is not given. `--decrypt` opens the sealed bodies with the cluster review key,
+requires `--out` (plaintext is never printed, not even with `--json`), writes
+the file mode 0600, and records an `agent_archive_decrypt` audit row naming you
+and the month. `noo agent archive …` is accepted as a spelling of
+`noo agents archive …`.
+
 ### Check the channels and send a test message
 
 ```sh
@@ -206,6 +229,8 @@ or have the person log in and run `noo security service-key self`
 | `noo agents thread` | `<thread-id>` | Every message in a thread, oldest first |
 | `noo agents presence` | `[--owner <account>]` | Live MCP windows under an account, each by the name mail can address |
 | `noo agents messages` | `[--agent <id>] [--from <id>] [--to <id>] [--user <u>] [--node <n>] [--harness <h>] [--kind <k>] [--since <rfc3339>] [--limit <n>] [--threads]` | Review agent traffic by agent, user, node or harness (operator); --threads lists threads |
+| `noo agents archive list` | — | List the archived agent-mail files (month, messages, size); operator |
+| `noo agents archive export` | `<YYYY-MM\|file> [--decrypt] [--out <path>]` | Write an archived month as JSONL, sealed; --decrypt opens it (audited, needs --out) |
 | `noo agents collaborate` | `<task> [-r <roles-csv>]` | Run a multi-agent collaboration on a task and print each role's output (300s) |
 | `noo agents peer dispatch` | `<agent-id> <task> [-r <role>]` | Dispatch a task to an A2A peer agent and print the task id |
 

@@ -119,6 +119,7 @@ mod google_drive;
 mod agent_activities;
 mod agent_meta_loop;
 mod audit_partition;
+mod agent_mail_archive;
 mod audit_integrity;
 mod audit_chain;
 mod audit_head_export;

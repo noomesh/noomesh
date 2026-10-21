@@ -19232,6 +19232,52 @@
           }
         }
       }
+    },
+    "/api/agents/archive": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get archive",
+        "description": "[native] GET /api/agents/archive \u2014 the agent-mail archive files (operator-only).",
+        "operationId": "archive_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/archive/{month}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get archive",
+        "description": "[native] GET /api/agents/archive/{month} \u2014 one month's rows (`YYYY-MM` or the file name). Bodies stay sealed unless `?decrypt=true`, which needs an operator AND the review key and is audited before any plaintext is produced.",
+        "operationId": "archive_export",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

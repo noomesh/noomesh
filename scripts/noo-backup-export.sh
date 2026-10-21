@@ -47,12 +47,16 @@ done
 # that matters most: without it every encrypted secret is unrecoverable, so it
 # goes in every export regardless of --all.
 mapfile -t DUMPS < <(ls -t "$BACKUP_DIR"/pg_*.sql.gz.enc 2>/dev/null || true)
+mapfile -t ARCHIVES < <(ls -t "$BACKUP_DIR"/archive_*.tar.enc 2>/dev/null || true)
 mapfile -t AGEKEYS < <(ls -t "$BACKUP_DIR"/age-key_*.enc 2>/dev/null || true)
 [ "${#DUMPS[@]}" -gt 0 ] || { say "ERROR: no encrypted dumps in $BACKUP_DIR — nothing to export"; exit 1; }
 
 FILES=()
 if [ "$ALL" -eq 1 ]; then FILES+=("${DUMPS[@]}"); else FILES+=("${DUMPS[0]}"); fi
 [ "${#AGEKEYS[@]}" -gt 0 ] && FILES+=("${AGEKEYS[0]}")
+# The newest cold-storage snapshot (expired audit partitions + agent mail):
+# rows that were deleted from Postgres after archiving, so the dump lacks them.
+if [ "${#ARCHIVES[@]}" -gt 0 ]; then FILES+=("${ARCHIVES[0]}"); fi
 # The roles file beside each exported dump: without it the dump does not
 # restore on a clean server. Older dumps have none; that is fine.
 for d in "${FILES[@]}"; do
@@ -109,7 +113,7 @@ for f in "${FILES[@]}"; do cp -- "$f" "$STAGE/"; done
     done
     echo
     echo "TO RESTORE you also need, and they are deliberately NOT in here:"
-    echo "  NOO_BACKUP_PASSPHRASE      opens pg_*.sql.gz.enc and pgroles_*.sql.enc"
+    echo "  NOO_BACKUP_PASSPHRASE      opens pg_*.sql.gz.enc, pgroles_*.sql.enc and archive_*.tar.enc"
     echo "  NOO_AGE_BACKUP_PASSPHRASE  opens age-key_*.enc  (a DIFFERENT value)"
     echo "Both live in your password manager. An archive carrying the"
     echo "ciphertext and its key together is a plaintext backup with extra steps."

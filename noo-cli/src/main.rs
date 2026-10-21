@@ -443,6 +443,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["agents", "thread"], commands::agents_thread),
     (&["agents", "presence"], commands::agents_presence),
     (&["agents", "messages"], commands::agents_messages),
+    (&["agents", "archive", "list"], commands::agents_archive_list),
+    (&["agents", "archive", "export"], commands::agents_archive_export),
+    // `noo agent archive …`: the singular the operator spec names; same handlers.
+    (&["agent", "archive", "list"], commands::agents_archive_list),
+    (&["agent", "archive", "export"], commands::agents_archive_export),
     (&["tasks", "create"], commands::tasks_create),
     (&["tasks", "list"], commands::tasks_list),
     (&["tasks", "show"], commands::tasks_show),
@@ -745,6 +750,9 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
 ///     install.
 const HIDDEN_NO_USAGE: &[&[&str]] = &[
     &["tui"],
+    // The singular spelling of `agents archive`.
+    &["agent", "archive", "list"],
+    &["agent", "archive", "export"],
     // Plumbing and retired `cluster` verbs: dispatch only.
     &["node", "fetch"],
     &["cluster", "clean-node"],

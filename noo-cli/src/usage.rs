@@ -327,6 +327,8 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["agents", "thread"], "<thread-id>", "Every message in a thread, oldest first"),
     (&["agents", "presence"], "[--owner <account>]", "Live MCP windows under an account, each by the name mail can address"),
     (&["agents", "messages"], "[--agent <id>] [--from <id>] [--to <id>] [--user <u>] [--node <n>] [--harness <h>] [--kind <k>] [--since <rfc3339>] [--limit <n>] [--threads]", "Review agent traffic by agent, user, node or harness (operator); --threads lists threads"),
+    (&["agents", "archive", "list"], "", "List the archived agent-mail files (month, messages, size); operator"),
+    (&["agents", "archive", "export"], "<YYYY-MM|file> [--decrypt] [--out <path>]", "Write an archived month as JSONL, sealed; --decrypt opens it (audited, needs --out)"),
     (&["tasks", "create"], "<objective> [--model <m>] [--budget <loops>] [-t|--token-budget <tokens>]", "Give the agent an objective to loop on until done (needs `noo auth login`)"),
     (&["tasks", "list"], "[--state <s>] [--user <u>] [-n <limit>]", "List tasks: yours, or everyone's as an operator"),
     (&["tasks", "show"], "<id>", "One task: state, loops, last note, result"),
