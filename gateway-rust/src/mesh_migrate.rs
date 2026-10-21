@@ -3049,14 +3049,14 @@ mod tests {
             .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
     }
 
-    /// i150: the migration columns are the chain head, on 098, all nullable
+    /// i150: the migration columns are the chain head, on the embed-placement revision, all nullable
     /// (no row changes), and `embedding_spaces::load` reads every one.
     #[test]
     fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "101_embedding_space_migration");
         assert!(m.revision.len() <= 32);
-        assert_eq!(m.down_revision, Some("098_embed_placement_model"));
+        assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
         assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
         for col in [
             "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",

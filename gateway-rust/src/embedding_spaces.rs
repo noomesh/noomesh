@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn a_migrations_next_model_may_be_placed() {
         let (s, _) = migrating("filling", None, None);
-        assert_eq!(placement_refusal(&[s.clone()], "BGE-M3:latest"), None);
+        assert_eq!(placement_refusal(std::slice::from_ref(&s), "BGE-M3:latest"), None);
         assert!(placement_refusal(&[s], "other").is_some());
     }
 
@@ -749,7 +749,7 @@ mod tests {
         assert!(start_refusal(&s, "knowledge", "Harrier:latest").unwrap().contains("already embeds"));
         assert!(start_refusal(&s, "knowledge", "nomic-embed-code").unwrap().contains("space 'code'"));
         let (m, _) = migrating("filling", None, None);
-        assert!(start_refusal(&[m.clone()], "knowledge", "other").unwrap().contains("already migrating"));
+        assert!(start_refusal(std::slice::from_ref(&m), "knowledge", "other").unwrap().contains("already migrating"));
         // Another space's NEXT model is taken too.
         let both = vec![m, sp("code", "c")];
         assert!(start_refusal(&both, "code", "bge-m3").unwrap().contains("space 'knowledge'"));
