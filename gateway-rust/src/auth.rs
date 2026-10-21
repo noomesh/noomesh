@@ -1901,7 +1901,11 @@ pub(crate) const HANDLER_VERIFIED_WS_ROUTES: &[&str] =
 
 /// A genuine handshake to a route in [`HANDLER_VERIFIED_WS_ROUTES`].
 fn defers_to_ws_handler(request: &Request) -> bool {
-    HANDLER_VERIFIED_WS_ROUTES.contains(&request.uri().path())
+    (HANDLER_VERIFIED_WS_ROUTES.contains(&request.uri().path())
+        // An add-on socket handshake carrying a single-use `ticket=`: the
+        // handler (`addon_ws::serve_ws`) redeems it and answers 401 when it
+        // does not redeem. Only reached when no bearer was presented.
+        || crate::addon_ws::is_ticket_handshake(request.uri().path(), request.uri().query()))
         && has_websocket_upgrade_header(request)
 }
 
@@ -1919,8 +1923,15 @@ fn defers_to_ws_handler(request: &Request) -> bool {
 /// omits it is not a WebSocket and would be refused by the upgrade extractor
 /// three layers down anyway.
 fn query_token_allowed(request: &Request) -> bool {
-    is_ws_path(request.uri().path()) && has_websocket_upgrade_header(request)
+    // Add-on sockets take a single-use ticket instead (`addon_ws`): a bearer
+    // in an add-on socket URL is never a credential.
+    is_ws_path(request.uri().path())
+        && !request.uri().path().starts_with(ADDON_WS_PREFIX)
+        && has_websocket_upgrade_header(request)
 }
+
+/// Every add-on WebSocket route lives under here (`addon_proxy::ws_prefix`).
+const ADDON_WS_PREFIX: &str = "/ws/addons/";
 
 /// The `token` query parameter, if present.
 fn query_param_token(query: &str) -> Option<String> {
@@ -1979,6 +1990,12 @@ fn bearer_token(request: &Request) -> Option<String> {
         .and_then(|v| v.strip_prefix("Bearer "))
     {
         return Some(t.to_string());
+    }
+    // An add-on UI page load: the path-scoped cookie the console set with
+    // `POST /api/addons/<addon>/ui-session`, on a GET/HEAD under
+    // `/addons/<addon>/ui` only (`addon_ui::cookie_token`).
+    if let Some(t) = crate::addon_ui::cookie_token(request.method(), request.uri().path(), request.headers()) {
+        return Some(t);
     }
     let token = request.uri().query().and_then(query_param_token)?;
     if query_token_allowed(request) {
@@ -2851,6 +2868,12 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     // account and refuses a disabled one with a body. Without this the gate
     // answers a User with a bare 403 before the handler ever runs.
     if path == GRAFANA_SESSION_PATH {
+        return true;
+    }
+    // Opening an add-on's UI or socket as oneself. Exact shapes, POST only;
+    // the handlers apply the UI's / the socket's own `min_role` and refuse a
+    // delegated credential (`addon_ui::ui_session`, `addon_ws::ws_ticket`).
+    if *method == Method::POST && (crate::addon_ui::is_ui_session_path(path) || crate::addon_ws::is_ws_ticket_path(path)) {
         return true;
     }
     // Additive and last: a caller without `ingest` is unaffected, and a

@@ -27,9 +27,10 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace", "add-extensio
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-# The reserved-workload WebSocket relay (routes/reservations.rs): the same
-# tokio-tungstenite axum's `ws` feature pins, default features only; the
-# TLS hop is tokio-rustls over the cluster's rustls config (tls.rs).
+# WebSocket CLIENT, default features only: the reserved-workload relay
+# (routes/reservations.rs) and add-on WS routes (addon_ws.rs). The same
+# tokio-tungstenite axum's `ws` feature pins; the TLS hop is tokio-rustls
+# over the cluster's rustls config (tls.rs).
 tokio-tungstenite = "0.29"
 futures = "0.3"
 

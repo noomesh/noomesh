@@ -460,6 +460,34 @@ pub fn cluster_rustls_config() -> Result<Option<std::sync::Arc<rustls::ClientCon
     Ok(Some(std::sync::Arc::new(tls_config)))
 }
 
+/// The rustls config the gateway dials an add-on's WebSocket with
+/// (`addon_ws`): the SAME trust and identity as [`cluster_client`]
+/// ([`cluster_rustls_config`]: cluster CA, the gateway's leaf as client
+/// certificate), ALPN pinned to `http/1.1` because a WebSocket handshake is
+/// an HTTP/1.1 upgrade. Built once, like the shared clients; `None` when the
+/// cluster TLS material cannot be loaded, which the caller turns into a
+/// refusal (an add-on door is mTLS, there is no plain one to fall back to).
+pub fn cluster_ws_tls_config() -> Option<std::sync::Arc<rustls::ClientConfig>> {
+    static CONFIG: OnceLock<Option<std::sync::Arc<rustls::ClientConfig>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| match cluster_rustls_config() {
+            Ok(Some(c)) => {
+                let mut c = (*c).clone();
+                c.alpn_protocols = vec![b"http/1.1".to_vec()];
+                Some(std::sync::Arc::new(c))
+            }
+            Ok(None) => {
+                tracing::warn!("add-on WebSocket TLS: no cluster TLS material (NOO_TLS_CA/CERT/KEY); add-on sockets are refused");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "add-on WebSocket TLS: cluster TLS config build failed; add-on sockets are refused");
+                None
+            }
+        })
+        .clone()
+}
+
 /// The three env vars the listener cannot start without.
 pub const SERVER_MATERIAL_ENV: [&str; 3] = ["NOO_TLS_CERT", "NOO_TLS_KEY", "NOO_TLS_CA"];
 

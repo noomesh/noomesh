@@ -253,17 +253,27 @@ to a name it did not know.
 | Field | Meaning |
 |---|---|
 | `name` | Stable key. Gateway code calls a route by this, never by its path. |
-| `method` | `GET` or `POST`. |
+| `method` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, or `WS` (a WebSocket route, see "WebSocket routes"). Every method but `GET` and `WS` is a **write** and follows the `POST` rule: `operator` or `admin` unless `owner_scoped`, no `scopes`, never where the front door admits a User. `PUT`/`PATCH`/`DELETE`/`WS` need a gateway from the release that reads them. |
 | `aliases` | Extra gateway paths reaching the same route — for a path that shipped under more than one spelling. |
 | `params` | `{"id": "uuid"}` (`uuid` or `string`). A malformed uuid is a 400 from the gateway; garbage never reaches your URL. |
 | `query` | Pass the caller's query string through. |
 | `internal` | Callable from gateway code, **not mounted** on the public API. |
 | `timeout_secs` | Per route (1–600); falls back to the manifest's. |
-| `min_role` | `user`, `operator` or `admin`: the lowest role that may call this public route. **Absent means `operator`**, for every method. Any other value refuses the whole manifest. A `POST` cannot be `user`. |
+| `min_role` | `user`, `operator` or `admin`: the lowest role that may call this public route. **Absent means `operator`**, for every method. Any other value refuses the whole manifest. A write (`POST`, `PUT`, `PATCH`, `DELETE`) cannot be `user` unless `owner_scoped`. |
 | `scopes` | Optional, `GET` only: add-on scopes written `<yourname>:<word>` that also open the route to an account holding `read` plus the scope, below `min_role`. Always namespaced, so a manifest can never name a core scope (`graph`, `ingest`, …). |
+| `owner_scoped` | A write at `min_role: "user"` whose add-on keeps every row to the calling account (see below). |
+| `max_message_bytes` | `WS` only: largest message (and frame) either way, bytes. Default 1048576 (1 MiB), at most 16 MiB. |
+| `idle_timeout_secs` | `WS` only: no frame either way for this long closes the socket (1001). Default 300, 1–3600. |
+| `max_connections_per_user` | `WS` only: sockets one account may hold open on this route. Default 4, 1–64; the next is a `429`. |
 | `note` | Free text for whoever reads the file. |
 
 Any other field is refused.
+
+A third **top-level** key serves your own web UI (see "Serving a UI"):
+
+| Key | Meaning |
+|---|---|
+| `ui` | `{"upstream_path": "/", "min_role": "user", "title": "Example"}`. The gateway serves `/addons/<name>/ui/<rest>` from `<your upstream><upstream_path>/<rest>`. `upstream_path` defaults to `/` (a plain path, no `{param}`); `min_role` as on a route (absent = `operator`); `title` is 1–64 plain characters for the console's link; `timeout_secs` 1–600. Any other field refuses the manifest. A manifest with a `ui` may declare no routes. |
 
 Two **top-level** keys (beside `routes`, not inside a route) prepare an add-on
 to act for a present person through that person's own tasks:
@@ -331,8 +341,11 @@ add-on when any of these fails:
   so a manifest cannot place a write where a User is admitted, unless the
   route declares `"owner_scoped": true` (see "Who may call a route");
 - `min_role` is `user`, `operator` or `admin` (never anything else, never read
-  as `user`), a `POST` is `user` only with `owner_scoped`, and `scopes` are `<name>:<word>` on a
-  `GET`;
+  as `user`), a write (`POST`, `PUT`, `PATCH`, `DELETE`) is `user` only with
+  `owner_scoped`, and `scopes` are `<name>:<word>` on a `GET`;
+- a `WS` route lives under `/ws/addons/<name>/`, is never `internal`, and its
+  limits are in range; the WS limits appear on no other method;
+- `ui.upstream_path` is a plain path and `ui.min_role` a known role;
 - `delegate` is `"tasks"` or absent; `task_events` appears only with
   `delegate`, is a `POST`, and names a path no public route of the manifest
   covers;
@@ -371,10 +384,11 @@ else.
 
 #### `owner_scoped`: a User's own writes
 
-The default is: declare it, or it is Operator. A `POST` cannot be
-`min_role: "user"`, because the front door refuses a User's writes.
+The default is: declare it, or it is Operator. A write (`POST`, `PUT`, `PATCH`,
+`DELETE`) cannot be `min_role: "user"`, because the front door refuses a User's
+writes.
 
-A route may opt out with `"owner_scoped": true`, and only a `POST` at
+A route may opt out with `"owner_scoped": true`, and only a write at
 `"min_role": "user"` may (the flag on any other shape is refused at load, not
 ignored). It means the add-on **promises to read and write only rows owned by
 the account the gateway forwards**, for example a person's own voice sessions,
@@ -428,6 +442,118 @@ A route marked `internal` is reachable from gateway code and from nowhere
 else. Use it for anything that should not be triggerable by a caller with API
 access: a route only the gateway's own scheduled work calls (`internal_tick`
 in the manifest above) is the typical case.
+
+### WebSocket routes
+
+```json
+{ "name": "audio_stream", "method": "WS", "path": "/ws/addons/example-addon/stream",
+  "min_role": "user", "query": true,
+  "max_message_bytes": 1048576, "idle_timeout_secs": 300, "max_connections_per_user": 2 }
+```
+
+A `WS` route is a WebSocket the gateway terminates for the client and opens
+again to you. In order, for every handshake:
+
+1. **Credential.** A browser cannot set `Authorization` on a WebSocket, and a
+   token in a URL ends up in access logs, so an add-on socket takes a
+   **ticket**, never `?token=` (the gateway ignores `?token=` under
+   `/ws/addons/`). Your page, holding the signed-in person's access token,
+   calls `POST /api/addons/<name>/ws-ticket` with `Authorization: Bearer
+   <token>` and gets `{"ticket": "...", "param": "ticket", "expires_in": 30}`.
+   It then opens `wss://<gateway>/ws/addons/<name>/stream?ticket=<ticket>`
+   within 30 seconds. A ticket is random, bound to that person and that
+   add-on, and consumed by the first handshake that presents it (valid or
+   not); mint one per connection. A non-browser client may instead send
+   `Authorization: Bearer` on the handshake.
+2. **Permission.** The route's `min_role` is checked against the person
+   (`403` naming the role), then the per-account cap (`429`), all before you
+   are dialled.
+3. **Dial, then upgrade.** The gateway opens `wss://noo-<name>[:port]<path>`
+   with the cluster CA and its own client certificate (same door as your
+   HTTP routes), the gateway bearer and the `X-Noo-Requester-*` headers it
+   **sets** (see "Step 3b"), and the delegated task token when the route has
+   `receives_delegation`. The query is passed on only with `"query": true`,
+   always without `ticket` and `token`. Subprotocols the client asked for
+   (`Sec-WebSocket-Protocol`, plain tokens only) are passed on and the one you
+   select is echoed to the client. Only when you answered `101` is the client
+   upgraded; if you refuse (`4xx`) the client gets your status, if you are
+   down it gets a `503` with the reason.
+4. **Frames.** Text, binary, ping, pong and close are piped both ways; a close
+   code you send reaches the client when it is a sendable one (1000–1003,
+   1007–1014, 3000–4999). Each direction awaits the other side's write before
+   reading the next frame, so a slow reader slows its writer and nothing
+   buffers without bound. Oversize: `1009` to the sender. Idle: `1001` to both.
+   The person's access token expiring, or a logout or session revocation,
+   closes the client with `4401` (the console's convention: refresh, mint a
+   new ticket, reconnect) and you with `1001`.
+
+Serve your socket on your mTLS listener at the same path as the manifest
+(`/ws/addons/<name>/…`), read the account from `X-Noo-Requester-Sub` exactly
+as on an HTTP route, and keep a User's stream to that account. A gateway
+older than this release refuses a manifest with a `WS` route (unknown method),
+so ship it with a `supports_stack` that starts at this release.
+
+### Serving a UI
+
+```json
+"ui": { "min_role": "user", "title": "Example add-on" }
+```
+
+The gateway serves your UI at `/addons/<name>/ui/`, a namespace no core route
+uses, so it can shadow nothing. It strips `/addons/<name>/ui` and fetches the
+rest from your upstream under `upstream_path` (default `/`), GET and HEAD
+only; it does **not** rewrite your HTML. Build the UI for a directory mount:
+every asset, API and socket path relative, or absolute to the gateway's own
+paths:
+
+| From the UI | Goes to |
+|---|---|
+| `./app.js`, `assets/x.wasm` | `/addons/<name>/ui/…`, your upstream under `upstream_path` |
+| `/api/<your routes>` | your manifest's HTTP routes, with `Authorization: Bearer` |
+| `/ws/addons/<name>/…?ticket=…` | your `WS` routes (ticket above) |
+
+**Opening it.** A page load carries no `Authorization` header, so the console
+first calls `POST /api/addons/<name>/ui-session` (Bearer). The gateway checks
+`ui.min_role` and sets a cookie `noo_addon_ui`: HttpOnly, Secure,
+SameSite=Strict, `Path=/addons/<name>/ui`, expiring with the access token. The
+gateway reads it only on a GET/HEAD under that path; anywhere else it is not a
+credential. Then the console links to `/addons/<name>/ui/`. When the cookie
+expires, assets answer `401`; call `ui-session` again.
+
+**What the gateway does to the response.**
+
+- Status and body pass through, streamed.
+- Response headers are an allow-list: `Content-Type`, `Content-Length`,
+  `Content-Encoding`, `Content-Language`, `Content-Range`,
+  `Content-Disposition`, `Accept-Ranges`, `Cache-Control`, `ETag`,
+  `Last-Modified`, `Expires`, `Vary`, `Content-Security-Policy`. Everything
+  else is dropped, notably `Set-Cookie`, CORS headers, HSTS,
+  `Clear-Site-Data`, `Service-Worker-Allowed`, `X-Frame-Options`, `Refresh`
+  and `Link`. A `Location` survives only when it stays inside your UI (your
+  own `<upstream_path>/…` is rewritten to the gateway path).
+- The gateway's Content-Security-Policy is always added: `default-src 'self';
+  script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
+  img-src 'self' data: blob:; media-src 'self' blob: mediastream:; font-src
+  'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none';
+  base-uri 'none'; form-action 'self'; frame-ancestors 'self'`. Your own CSP is
+  kept beside it; the browser enforces both, so yours can only narrow it. No
+  third-party script, no fetch or socket to another host, no framing except
+  by the console.
+- `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
+  `Cross-Origin-Resource-Policy: same-origin`, and `Cache-Control: private,
+  no-cache` when you sent none.
+- Request headers passed to you: only `Accept`, `Accept-Language`,
+  `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range`, plus the
+  identity headers the gateway sets. Never the cookie.
+- Refused with `400`: a `.` or `..` segment, an empty segment, any `%`
+  (percent-encoding is refused, not decoded), or a character outside
+  `[A-Za-z0-9._~@+-]`. Refused with `403`: a service-worker script fetch.
+
+**Trust.** The UI runs on the gateway's origin, so its scripts act with the
+signed-in person's authority (that is how they reach your API and sockets).
+Enabling an add-on with a UI trusts its code with that, which is why the lock
+is signed and launcher-verified before anything is mounted, and why the CSP
+keeps everything on this origin.
 
 ## Step 2b — claim a subject prefix (NATS add-ons)
 
