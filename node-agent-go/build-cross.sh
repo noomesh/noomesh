@@ -97,7 +97,7 @@ docker run --rm \
   -e GOCACHE=/tmp/.gocache \
   -e GOMODCACHE=/tmp/.gomodcache \
   "${IMAGE}" \
-  /bin/sh -c "go mod download && go build -ldflags='${LDFLAGS}' -o ${OUT} ${CMD_PKG}"
+  /bin/sh -c "sh ./require-toolchain.sh && go mod download && go build -ldflags='${LDFLAGS}' -o ${OUT} ${CMD_PKG}"
 
 ls -lh "${OUT}"
 echo "[build-cross] OK → ${OUT}"
