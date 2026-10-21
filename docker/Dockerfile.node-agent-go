@@ -31,7 +31,11 @@ ARG HUB_MIRROR=ghcr.io/noomesh/mirror
 ARG DHI_REGISTRY=dhi.io
 FROM --platform=$BUILDPLATFORM ${DHI_REGISTRY}/golang:1.26-debian13-dev AS builder
 
-ENV GOTOOLCHAIN=local
+# GOTOOLCHAIN=auto (the image says local): Go uses the image's toolchain when
+# it satisfies go.mod's `toolchain` line, and otherwise downloads that release
+# from proxy.golang.org, verified by sum.golang.org (GOSUMDB at its default).
+# The mirror can lag a Go patch release by weeks; the patch must not.
+ENV GOTOOLCHAIN=auto
 ARG TARGETARCH
 # Build stamp so `noo cluster status` / heartbeats show each node's binary
 # (parity with node-agent-go/Dockerfile; passed by build-cross / image build).
@@ -46,9 +50,9 @@ RUN go mod download
 
 # Build static binary — no CGO, so no libc dependency at runtime
 COPY node-agent-go/ ./
-# GOTOOLCHAIN=local: the image's Go, not go.mod's toolchain line, builds this.
-# Refuse an image older than that line (a stale mirror would ship an unpatched
-# binary without a word).
+# The final gate, after toolchain selection: refuse a Go older than go.mod's
+# toolchain line, and print which one builds ("toolchain: local DHI goX" or
+# "toolchain: downloaded goX (sumdb-verified, …)").
 RUN sh ./require-toolchain.sh
 RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
     -ldflags="-s -w -X github.com/noomesh/noomesh/node-agent-go/internal/version.Version=${NODE_AGENT_VERSION} -X github.com/noomesh/noomesh/node-agent-go/internal/version.Commit=${NODE_AGENT_COMMIT}" \
