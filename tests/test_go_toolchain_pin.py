@@ -5,9 +5,10 @@
 
 CI's go-node-agent job uses setup-go with go-version-file, which downloads
 whatever toolchain go.mod's `go` directive names, so a dependency bump that
-raises the directive passes CI. The release lanes do not: they build inside
-the mirrored DHI golang image with GOTOOLCHAIN=local, and a directive above
-the image's Go fails there. That is how 0.6.3-rc.2 broke: a Dependabot
+raises the directive passes CI. The release lanes build inside the mirrored
+DHI golang image of the directive's major.minor (GOTOOLCHAIN=auto fetches a
+newer patch release, but the image line is still the one that is mirrored
+and scanned), and a directive above the image's Go broke them once. That is how 0.6.3-rc.2 broke: a Dependabot
 group bump (nats-server v2.15.1, x/crypto, x/sys, x/time) raised `go 1.25.0`
 to `go 1.26.0` while every builder stayed on golang:1.25.
 
@@ -69,8 +70,7 @@ def test_every_build_site_uses_the_go_mod_toolchain():
     for rel in BUILD_SITES:
         assert _site_versions(rel) == {want}, (
             f"{rel} builds with golang {sorted(_site_versions(rel))} but "
-            f"node-agent-go/go.mod says go {want}; the release builds with "
-            "GOTOOLCHAIN=local, so these must match (bump both deliberately)"
+            f"node-agent-go/go.mod says go {want}; these must match (bump both deliberately)"
         )
 
 
@@ -104,10 +104,12 @@ def test_no_unlisted_golang_image_site():
 
 
 # The patch level: the image tag above is floating (golang:1.26), so which
-# 1.26.x a release gets is whatever the mirror last pulled. go.mod's
-# `toolchain` line names the patch release CI's govulncheck passes on, and
-# each build site refuses an image older than it (0.6.8-rc.1's darwin agent
-# shipped go1.26.9 after GO-2026-6809 was fixed in 1.26.10).
+# 1.26.x it holds is whatever the mirror last pulled. go.mod's `toolchain`
+# line names the patch release CI's govulncheck passes on (0.6.8-rc.1's
+# darwin agent shipped go1.26.9 after GO-2026-6809 was fixed in 1.26.10).
+# Each build site runs GOTOOLCHAIN=auto, so Go downloads that release when
+# the image is older, verified by the checksum database; the guard then
+# refuses anything older and prints which toolchain builds.
 
 GUARD = REPO / "node-agent-go" / "require-toolchain.sh"
 
@@ -122,15 +124,45 @@ def test_every_build_site_checks_the_patch_level_before_building():
         assert guard < build, f"{rel} runs go build before require-toolchain.sh"
 
 
-def _run_guard(tmp_path: Path, go_version: str, toolchain: str | None) -> subprocess.CompletedProcess:
+# Lines a build site runs (comments dropped), joined.
+def _code(rel: str) -> str:
+    return "\n".join(l for l in (REPO / rel).read_text().splitlines() if not l.lstrip().startswith("#"))
+
+
+def test_every_build_site_selects_the_toolchain_with_verification_on():
+    for rel in BUILD_SITES:
+        code = _code(rel)
+        assert re.search(r"GOTOOLCHAIN=auto\b", code), f"{rel} must build with GOTOOLCHAIN=auto"
+        assert "GOTOOLCHAIN=local" not in code, f"{rel} pins GOTOOLCHAIN=local: a stale image ships an unpatched Go"
+        for off in ("GOSUMDB=", "GONOSUMDB", "GONOSUMCHECK", "GOINSECURE", "-insecure", "GOPROXY=off", "GOPROXY=direct"):
+            assert off not in code, f"{rel} sets {off}: a downloaded toolchain must be verified by sum.golang.org"
+    # build-cross runs as the caller's uid: GOPATH (the sumdb cache) must be
+    # writable or every toolchain download fails to verify.
+    assert re.search(r"-e GOPATH=/tmp/", _code("node-agent-go/build-cross.sh"))
+
+
+def _run_guard(
+    tmp_path: Path, go_version: str, toolchain: str | None, image: str | None = None, sumdb: str = "sum.golang.org",
+    extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     mod = "module x\n\ngo 1.26.0\n" + (f"toolchain go{toolchain}\n" if toolchain else "")
     (tmp_path / "go.mod").write_text(mod)
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake = bindir / "go"
-    fake.write_text(f'#!/bin/sh\n[ "$1 $2" = "env GOVERSION" ] && echo go{go_version}\n')
+    # `go env GOVERSION` is the selected toolchain; with GOTOOLCHAIN=local it
+    # is the image's own. Other `go env X` answer from FAKE_<X>.
+    fake.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = env ] || exit 2\n'
+        'if [ "$2" = GOVERSION ]; then\n'
+        f'  if [ "${{GOTOOLCHAIN:-}}" = local ]; then echo go{image or go_version}; else echo go{go_version}; fi; exit 0\n'
+        "fi\n"
+        'eval "echo \\${FAKE_$2:-}"\n'
+    )
     fake.chmod(0o755)
-    env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+    env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "FAKE_GOSUMDB": sumdb, **(extra or {})}
+    env.pop("GOTOOLCHAIN", None)
     return subprocess.run(["sh", str(GUARD)], cwd=tmp_path, env=env, capture_output=True, text=True)
 
 
@@ -148,6 +180,30 @@ def test_the_guard_refuses_an_older_go(tmp_path, have, want, ok):
     r = _run_guard(tmp_path, have, want)
     assert (r.returncode == 0) is ok, r.stdout + r.stderr
     assert f"go {have}" in r.stdout, "the build log names the Go it used"
+
+
+def test_the_guard_says_which_toolchain_builds(tmp_path):
+    r = _run_guard(tmp_path, "1.26.10", "1.26.10")
+    assert r.returncode == 0 and "toolchain: local DHI go1.26.10" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize(
+    ("sumdb", "extra", "ok"),
+    [
+        ("sum.golang.org", {}, True),
+        ("off", {}, False),
+        ("sum.golang.org", {"FAKE_GONOSUMDB": "golang.org/toolchain"}, False),
+        ("sum.golang.org", {"FAKE_GOINSECURE": "*"}, False),
+        ("sum.golang.org", {"FAKE_GOFLAGS": "-mod=mod -insecure"}, False),
+        ("sum.golang.org", {"FAKE_GOFLAGS": "-mod=mod"}, True),
+    ],
+)
+def test_a_downloaded_toolchain_is_accepted_only_verified(tmp_path, sumdb, extra, ok):
+    # The mirror's 1.26.9 image; Go selected (downloaded) 1.26.10.
+    r = _run_guard(tmp_path, "1.26.10", "1.26.10", image="1.26.9", sumdb=sumdb, extra=extra)
+    assert (r.returncode == 0) is ok, r.stdout + r.stderr
+    if ok:
+        assert "toolchain: downloaded go1.26.10 (sumdb-verified, sum.golang.org)" in r.stdout, r.stdout
 
 
 def test_go_mod_names_a_patch_release():
