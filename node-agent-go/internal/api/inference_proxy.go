@@ -444,12 +444,29 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Restore the body we consumed for hint detection (now possibly
+	// vllm-key-stripped) BEFORE admission: once a queued stream's headers
+	// go out, net/http reads the request's body fields on another
+	// goroutine, so the request is not touched after this point.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+
+	// A slot on the backend, or a busy answer (admission.go): a full
+	// engine is reported as busy, never left silent to be read as wedged.
+	firstByte := backendFirstByteTimeout()
+	adm := s.admit(w, r, backendType, body, firstByte)
+	if adm == nil {
+		return
+	}
+	defer adm.done()
+	w = adm.w
+
 	// An ollama answers chat on its NATIVE /api/chat, translated here both
 	// ways: its OpenAI-compatible layer holds a tool-carrying stream until
 	// the whole answer exists, and every harness call carries tools
 	// (ollama_chat.go, noomesh-internal i159).
 	if backendType == "ollama" && r.URL.Path == "/v1/chat/completions" {
-		s.proxyOllamaChat(w, r, body, targetURL, scheme, backendFirstByteTimeout())
+		s.proxyOllamaChat(w, r, body, targetURL, scheme, firstByte)
 		return
 	}
 
@@ -470,7 +487,6 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// backendFirstByteTimeout answers, and the next request's transport is
 	// built with the new value. No agent restart, no transport to rebuild;
 	// a request already in flight keeps the bound it started with.
-	firstByte := backendFirstByteTimeout()
 	proxy.Transport = s.inferenceTransport(scheme, firstByte)
 	// Surface upstream errors as OpenAI-shape JSON instead of the default
 	// plain text "Bad Gateway".
@@ -488,10 +504,6 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(rw, http.StatusBadGateway, "backend_unreachable", err.Error())
 	}
 
-	// Restore the body we consumed for hint detection (now possibly
-	// vllm-key-stripped).
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
 	r.Header.Set("X-Forwarded-By", "noo-node-agent-inference-proxy")
 	// Strip the hint header before forwarding — backends would reject it.
 	r.Header.Del("X-Noo-Backend")

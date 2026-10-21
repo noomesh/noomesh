@@ -45,6 +45,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
+	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
 
@@ -307,6 +308,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 		// Nothing is placed: nothing is held, tuned, or in conflict.
 		modelpresence.Retain(map[string]bool{})
 		gpuyield.PublishPlacements(nil)
+		occupancy.SetSlots(nil)
 		backendrt.SetOllamaTuning(nil)
 		r.surfaceEnvConflicts(nil)
 		if r.mcp != nil {
@@ -411,6 +413,8 @@ func (r *Reconciler) Once(ctx context.Context) {
 	ollamaRows := runningOllama(desired.Placements)
 	// The shared-GPU yield sizes what the GPU backends need from these.
 	gpuyield.PublishPlacements(gpuPlacements(effective))
+	// The proxy's admission counts requests against these (occupancy).
+	occupancy.SetSlots(backendSlots(effective))
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop below (which then finds them local).
 	r.prefetchImages(ctx, effective, running, specLabels, floating, native)
