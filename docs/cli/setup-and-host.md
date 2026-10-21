@@ -349,7 +349,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo kiosk invite` | `<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]` | Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands |
 | `noo kiosk labels` | `on\|off\|status` | Controller: entity names on the kiosk graph (kiosk.graph_labels; audited, no restart) |
 | `noo kiosk reload` | — | Reload the page on the display and report the console build either side |
-| `noo kiosk seat-sync` | `[--migrate [--print]]` | Hidden: the seat's sync tick, run by noo-seat-sync.timer as the seat user (internal); --migrate moves an old root-layout seat (run under sudo once) |
+| `noo kiosk seat-sync` | `[--migrate [--print]]` | Hidden: the seat's sync tick (internal); --migrate moves an old root seat, run once |
 | `noo kiosk seat-token` | `<seat-name> [--ttl <1h\|30m\|secs>] [--controller <https://…>]` | Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>` |
 | `noo kiosk serve` | `[--port <n>]` | Hidden: the display's local proxy, run by kiosk-serve.service (internal) |
 | `noo kiosk setup` | `--mode dedicated\|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health\|graph] [--rotate <secs>] [--poll <secs>] [--quality lean\|full] [--browser <bin>] [--dry-run] [-y\|--yes]` | Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog |
