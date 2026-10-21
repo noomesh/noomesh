@@ -84,20 +84,29 @@ echo "[build-cross] binary: ${BINARY}  target: ${GOOS}/${GOARCH}  image: ${IMAGE
 # another container just to delete the files. scripts/cargo-docker.sh carries
 # the same flag for the same reason (CLAUDE.md documents that incident).
 #
-# GOCACHE/GOMODCACHE must move too: as a non-root uid the default /.cache and
-# /go are unwritable, and `go build` fails outright rather than degrading.
+# GOCACHE/GOMODCACHE/GOPATH must move too: as a non-root uid the default
+# /.cache and /go are unwritable, and `go build` fails outright rather than
+# degrading. GOPATH holds the checksum database's cache (pkg/sumdb), which a
+# toolchain download needs to verify against sum.golang.org.
+#
+# GOTOOLCHAIN=auto (the image says local): the image's Go builds when it
+# satisfies go.mod's `toolchain` line; otherwise Go downloads that release
+# from proxy.golang.org, verified by sum.golang.org (GOSUMDB left at its
+# default; -mod=mod does not touch verification). require-toolchain.sh runs
+# after that selection and prints which one builds.
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$(pwd):/build" -w /build \
   -e GOOS="${GOOS}" \
   -e GOARCH="${GOARCH}" \
   -e CGO_ENABLED=0 \
-  -e GOTOOLCHAIN=local \
+  -e GOTOOLCHAIN=auto \
   -e GOFLAGS=-mod=mod \
   -e GOCACHE=/tmp/.gocache \
   -e GOMODCACHE=/tmp/.gomodcache \
+  -e GOPATH=/tmp/.gopath \
   "${IMAGE}" \
-  /bin/sh -c "go mod download && go build -ldflags='${LDFLAGS}' -o ${OUT} ${CMD_PKG}"
+  /bin/sh -c "sh ./require-toolchain.sh && go mod download && go build -ldflags='${LDFLAGS}' -o ${OUT} ${CMD_PKG}"
 
 ls -lh "${OUT}"
 echo "[build-cross] OK → ${OUT}"

@@ -497,6 +497,7 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         return ok(NAME, "no backend container running");
     };
     let mut floating = Vec::new();
+    let mut floating_ctrs = Vec::new();
     let mut unreported = Vec::new();
     let mut fixed = Vec::new();
     for (b, e) in bc {
@@ -505,7 +506,10 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         }
         let ctr = e["container"].as_str().unwrap_or(b.as_str());
         match (e["image"].as_str(), e["image_floating"].as_bool()) {
-            (Some(img), Some(true)) => floating.push(format!("{ctr} runs {img}")),
+            (Some(img), Some(true)) => {
+                floating.push(format!("{ctr} runs {img}"));
+                floating_ctrs.push(ctr.to_string());
+            }
             (Some(img), Some(false)) => fixed.push(format!("{b} {img}")),
             _ => unreported.push(b.as_str()),
         }
@@ -514,8 +518,13 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         return fail(
             NAME,
             format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
-            format!("noo cluster provision {id} --wait   # a current agent recreates the backend from the stack lock's pinned ref; \
-                     if the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, unset it or pin repo:version@sha256:…"),
+            // What works (0.6.8 live, aserve + robopi): the agent never
+            // replaces a RUNNING container, so a provision that leaves the
+            // binaries alone changed nothing. Removed, it is recreated from
+            // the ref desired-config carries: the signed lock's digest.
+            format!("docker rm -f {}   # on {id}: the agent recreates it from the stack lock's pinned ref within a minute \
+                     (it never replaces a running container itself). If the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, \
+                     unset it or pin repo:version@sha256:… first", floating_ctrs.join(" ")),
         );
     }
     if !unreported.is_empty() {
@@ -7318,7 +7327,9 @@ mod tests {
         let c = backend_images_check(&n);
         assert_eq!(c.verdict, Verdict::Fail, "{c:?}");
         assert!(c.detail.contains("noo-vllm runs vllm/vllm-openai:latest"), "{}", c.detail);
-        assert!(c.remedy.as_deref().unwrap_or("").starts_with("noo cluster provision awolf --wait"), "{c:?}");
+        // 0.6.8 live: a provision changed nothing; removing the container is
+        // what makes the agent recreate it from the lock's pinned ref.
+        assert!(c.remedy.as_deref().unwrap_or("").starts_with("docker rm -f noo-vllm   # on awolf"), "{c:?}");
 
         let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
             "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
