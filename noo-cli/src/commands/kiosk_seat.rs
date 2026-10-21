@@ -28,14 +28,18 @@
 //!    either door works.
 //! 2. seat: `noo kiosk enroll <blob>` pins the CA, generates the birth key,
 //!    redeems the token at `/api/cluster/seat-enroll`, then asks for sudo
-//!    ONCE to install `/etc/noo-seat`, the root copy of the CLI the timer runs
-//!    (`/usr/local/libexec/noo-seat/noo`) and `noo-seat-sync.{service,timer}`.
-//!    Nothing after this needs sudo.
+//!    ONCE to install what truly needs root and is STATIC: `/etc/noo-seat` (trust
+//!    anchors + config; the birth key readable by the seat user),
+//!    `noo-seat-sync.{service,timer}` (the service runs as the seat user),
+//!    `/usr/local/bin/noo-kiosk-*` symlinks into the user's tree and one
+//!    polkit rule letting that user restart the kiosk units. The seat's own
+//!    copy of the CLI lives in `~/.local/libexec/noo-seat/`. Nothing after
+//!    this needs sudo, and nothing recurring runs as root.
 //! 3. controller: `noo upgrade --nodes` / `--all` (or `--seats`) stages each
 //!    seat's bundle — signed with the fleet signing key exactly like a node
 //!    bundle, gzipped, CMS-encrypted to the seat's birth cert — then waits
 //!    for every seat together and prints a verify block per seat.
-//! 4. seat: `noo-seat-sync.timer` (root, every minute) runs
+//! 4. seat: `noo-seat-sync.timer` (the seat user, every minute) runs
 //!    `noo kiosk seat-sync`: a signed heartbeat, a signed fetch, decrypt,
 //!    verify, apply inside the allow-list, restart `kiosk-serve` / reload the
 //!    display as needed, a signed apply report, and a closing heartbeat.
@@ -53,11 +57,13 @@ use crate::{Globals, Unhandled};
 
 /// The seat's root-owned home: birth key + cert, CA, signing anchor, config.
 pub(crate) const SEAT_DIR: &str = "/etc/noo-seat";
-/// Applier state (last applied sha, last console build) and staging.
-pub(crate) const SEAT_STATE_DIR: &str = "/var/lib/noo-seat";
-/// The root copy of `noo` the timer runs. Root-owned so a user-writable
-/// binary is never executed as root; replaced only from a verified bundle.
-pub(crate) const SEAT_APPLIER_BIN: &str = "/usr/local/libexec/noo-seat/noo";
+/// The pre-0.6.10 layout, kept ONLY so `seat-sync --migrate` can move a seat
+/// off it: a root timer ran a root copy of `noo` here, with its state below.
+pub(crate) const LEGACY_STATE_DIR: &str = "/var/lib/noo-seat";
+pub(crate) const LEGACY_APPLIER_BIN: &str = "/usr/local/libexec/noo-seat/noo";
+const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/49-noo-seat.rules";
+/// The system units a seat's sync may restart (polkit grants exactly these).
+const SEAT_RESTARTABLE_UNITS: [&str; 4] = ["kiosk.service", "kiosk-serve.service", "kiosk-watchdog.service", "kiosk-watchdog.timer"];
 pub(crate) const SEAT_SYNC_SERVICE: &str = "/etc/systemd/system/noo-seat-sync.service";
 pub(crate) const SEAT_SYNC_TIMER: &str = "/etc/systemd/system/noo-seat-sync.timer";
 const BLOB_PREFIX: &str = "noo-seat1.";
@@ -168,6 +174,24 @@ impl SeatConfig {
         Path::new(&self.cli_home).join(".local/bin/noo")
     }
 
+    /// The seat's own copy of `noo` — what the timer runs. USER-owned: the
+    /// sync runs as the seat user, so nothing root executes is user-writable
+    /// and nothing user-run needs root to be replaced.
+    pub(crate) fn applier_path(&self) -> PathBuf {
+        Path::new(&self.cli_home).join(".local/libexec/noo-seat/noo")
+    }
+
+    /// Where the user-run kiosk scripts (`launch`, `cdp`, `serve`) live; the
+    /// root-installed `/usr/local/bin/noo-kiosk-*` names are symlinks here.
+    pub(crate) fn kiosk_dir(&self) -> PathBuf {
+        Path::new(&self.cli_home).join(".local/libexec/noo-seat/kiosk")
+    }
+
+    /// Applier state (last applied sha, last console build) and staging.
+    pub(crate) fn state_dir(&self) -> PathBuf {
+        Path::new(&self.cli_home).join(".local/state/noo-seat")
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !valid_seat_name(&self.seat) {
             return Err(format!("seat name {:?} is invalid", self.seat));
@@ -192,25 +216,26 @@ impl SeatConfig {
 
 // ═══ the allow-list ═══════════════════════════════════════════════════
 
+/// Where `noo-kiosk-*` are INVOKED from (root-installed symlinks into
+/// [`SeatConfig::kiosk_dir`]); never written by the seat.
 const KIOSK_BIN: &str = "/usr/local/bin";
-const UNIT_DIR: &str = "/etc/systemd/system";
 
 /// Where one kind lands on the seat. `Err` for any kind outside
 /// [`SEAT_KINDS`] — the applier refuses the whole bundle on it.
 pub(crate) fn seat_targets(kind: &str, cfg: &SeatConfig) -> Result<Vec<PathBuf>, String> {
-    let p = |s: String| PathBuf::from(s);
     Ok(match kind {
-        // The user's CLI, and the root copy the timer runs: the same bytes.
-        "cli-binary" => vec![cfg.cli_path(), p(SEAT_APPLIER_BIN.into())],
-        "kiosk-launch" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-launch"))],
-        "kiosk-cdp" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-cdp"))],
-        "kiosk-watchdog" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-watchdog"))],
-        "kiosk-serve" => vec![p(format!("{KIOSK_BIN}/noo-kiosk-serve"))],
-        "unit-kiosk" => vec![p(format!("{UNIT_DIR}/kiosk.service"))],
-        "unit-kiosk-serve" => vec![p(format!("{UNIT_DIR}/kiosk-serve.service"))],
-        "unit-kiosk-watchdog" => vec![p(format!("{UNIT_DIR}/kiosk-watchdog.service"))],
-        "unit-kiosk-watchdog-timer" => vec![p(format!("{UNIT_DIR}/kiosk-watchdog.timer"))],
-        "signing-pub" => vec![p(format!("{SEAT_DIR}/signing.pub"))],
+        // The user's CLI, and the seat's own user-owned copy the timer runs.
+        "cli-binary" => vec![cfg.cli_path(), cfg.applier_path()],
+        "kiosk-launch" | "kiosk-cdp" | "kiosk-serve" => vec![cfg.kiosk_dir().join(format!("noo-{kind}"))],
+        // ROOT-installed at enroll/setup and never written by the seat: the
+        // watchdog runs as root (executing a user-writable script as root
+        // would be an escalation), the units are static system units whose
+        // text a user-run sync cannot — and must not — rewrite, and the
+        // signing anchor is root-owned so a compromised seat user cannot
+        // re-point what the seat trusts. Carried in the bundle, verified,
+        // not applied.
+        "kiosk-watchdog" | "unit-kiosk" | "unit-kiosk-serve" | "unit-kiosk-watchdog" | "unit-kiosk-watchdog-timer"
+        | "signing-pub" => vec![],
         // Read, never written.
         "seat-meta" => vec![],
         other => return Err(format!(
@@ -230,14 +255,10 @@ pub(crate) fn seat_path_allowed(p: &Path, cfg: &SeatConfig) -> bool {
     let s = p.to_string_lossy();
     let mut allowed: Vec<String> = vec![
         cfg.cli_path().to_string_lossy().into_owned(),
-        SEAT_APPLIER_BIN.into(),
-        format!("{SEAT_DIR}/signing.pub"),
+        cfg.applier_path().to_string_lossy().into_owned(),
     ];
-    for n in ["launch", "cdp", "watchdog", "serve"] {
-        allowed.push(format!("{KIOSK_BIN}/noo-kiosk-{n}"));
-    }
-    for u in ["kiosk.service", "kiosk-serve.service", "kiosk-watchdog.service", "kiosk-watchdog.timer"] {
-        allowed.push(format!("{UNIT_DIR}/{u}"));
+    for n in ["launch", "cdp", "serve"] {
+        allowed.push(cfg.kiosk_dir().join(format!("noo-kiosk-{n}")).to_string_lossy().into_owned());
     }
     allowed.iter().any(|a| a == s.as_ref())
 }
@@ -736,13 +757,15 @@ fn kiosk_json(env: &BTreeMap<String, String>) -> Value {
     })
 }
 
-/// The systemd units the enroll step installs. Root, oneshot, every minute.
-pub(crate) fn render_sync_service() -> String {
+/// The systemd units the enroll step installs. Runs AS the seat user,
+/// oneshot, every minute: nothing recurring holds root.
+pub(crate) fn render_sync_service(cfg: &SeatConfig) -> String {
     format!(
         "# Written by `noo kiosk enroll <blob>`. The seat's rail: a signed heartbeat,\n\
-         # a signed fetch, and an apply that may write ONLY the seat user's\n\
-         # ~/.local/bin/noo, {applier}, {dir}/signing.pub,\n\
-         # /usr/local/bin/noo-kiosk-* and the kiosk units. It holds no fleet credential and never will.\n\
+         # a signed fetch, and an apply that runs as {user}, never root, and may\n\
+         # write ONLY {cli}, {applier}\n\
+         # and {kdir}/noo-kiosk-{{launch,cdp,serve}}.\n\
+         # It holds no fleet credential and never will.\n\
          [Unit]\n\
          Description=noomesh kiosk seat sync (CLI + kiosk assets over the rail; seat-scoped)\n\
          After=network-online.target\n\
@@ -750,11 +773,30 @@ pub(crate) fn render_sync_service() -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
+         User={user}\n\
          ExecStart={applier} kiosk seat-sync\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
          TimeoutStartSec=15min\n",
-        applier = SEAT_APPLIER_BIN, dir = SEAT_DIR,
+        user = cfg.cli_user, cli = cfg.cli_path().display(), applier = cfg.applier_path().display(),
+        kdir = cfg.kiosk_dir().display(),
+    )
+}
+
+/// The polkit rule that lets the seat user restart exactly the kiosk units
+/// (no sudo in the sync). Nothing else: not other units, not other users.
+pub(crate) fn render_polkit_rule(user: &str) -> String {
+    let units = SEAT_RESTARTABLE_UNITS.iter().map(|u| format!("\"{u}\"")).collect::<Vec<_>>().join(", ");
+    format!(
+        "// Written by `noo kiosk enroll`. The seat user's sync may start/stop/restart the\n\
+         // kiosk units, and nothing else.\n\
+         polkit.addRule(function(action, subject) {{\n\
+         \x20   if (action.id == \"org.freedesktop.systemd1.manage-units\" &&\n\
+         \x20       subject.user == \"{user}\" &&\n\
+         \x20       [{units}].indexOf(action.lookup(\"unit\")) >= 0) {{\n\
+         \x20       return polkit.Result.YES;\n\
+         \x20   }}\n\
+         }});\n",
     )
 }
 
@@ -776,32 +818,69 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The ONE root step of enrollment, as a script: printed in full before it
-/// runs, so the operator sees exactly what sudo is asked to do. `work` holds
-/// the files it installs (birth key + cert, CA, signing anchor, config,
-/// units); `exe` is this `noo`.
-pub(crate) fn seat_install_script(work: &Path, exe: &Path) -> String {
+/// The ONE root step of enrollment (and of migrating an old seat), as a
+/// script: printed in full before it runs, so the operator sees exactly what
+/// sudo is asked to do. `work` holds the files it installs; `exe` is this
+/// `noo`. Everything root does here is STATIC: root-owned trust anchors and
+/// config, two systemd units, symlinks, one polkit rule. The user-owned
+/// pieces are made by `runuser`, so no directory above them is root-owned
+/// with a user-writable child.
+pub(crate) fn seat_install_script(work: &Path, exe: &Path, cfg: &SeatConfig, group: &str, migrate: bool) -> String {
     let w = |f: &str| shq(&work.join(f).to_string_lossy());
-    format!(
+    let (user, grp) = (shq(&cfg.cli_user), shq(group));
+    let (applier, kdir, state) = (shq(&cfg.applier_path().to_string_lossy()), shq(&cfg.kiosk_dir().to_string_lossy()), shq(&cfg.state_dir().to_string_lossy()));
+    let mut out = format!(
         "set -eu\n\
-         install -d -m 0755 -o root -g root {dir}\n\
-         install -m 0600 -o root -g root {key} {dir}/birth.key\n\
+         as_user() {{ runuser -u {user} -- \"$@\"; }}\n"
+    );
+    if migrate {
+        // Stop the old root timer first so no root tick runs while the layout moves.
+        out.push_str("systemctl disable --now noo-seat-sync.timer || true\nsystemctl stop noo-seat-sync.service || true\n");
+    }
+    out.push_str(&format!(
+        "install -d -m 0755 -o root -g root {dir}\n\
+         install -m 0640 -o root -g {grp} {key} {dir}/birth.key\n\
          install -m 0644 -o root -g root {crt} {dir}/birth.crt\n\
          install -m 0644 -o root -g root {ca} {dir}/ca.crt\n\
          install -m 0644 -o root -g root {sp} {dir}/signing.pub\n\
-         install -m 0644 -o root -g root {cfg} {dir}/seat.json\n\
-         install -d -m 0700 -o root -g root {state}\n\
-         install -D -m 0755 -o root -g root {exe} {applier}\n\
-         install -m 0644 -o root -g root {svc} {svc_dst}\n\
-         install -m 0644 -o root -g root {tmr} {tmr_dst}\n\
-         systemctl daemon-reload\n\
-         systemctl enable --now noo-seat-sync.timer\n",
-        dir = SEAT_DIR, state = SEAT_STATE_DIR, applier = SEAT_APPLIER_BIN,
-        key = w("birth.key"), crt = w("birth.crt"), ca = w("ca.crt"), sp = w("signing.pub"), cfg = w("seat.json"),
-        exe = shq(&exe.to_string_lossy()),
+         install -m 0644 -o root -g root {cfgf} {dir}/seat.json\n\
+         as_user mkdir -p {kdir} {state}\n\
+         as_user chmod 0700 {state}\n\
+         as_user sh -c 'install -m 0755 \"$1\" \"$2.new\" && mv -f \"$2.new\" \"$2\"' sh {exe} {applier}\n\
+         for n in launch cdp serve; do\n\
+         \x20 b=/usr/local/bin/noo-kiosk-$n\n\
+         \x20 if [ -f \"$b\" ] && [ ! -L \"$b\" ]; then as_user cp -f \"$b\" {kdir}/noo-kiosk-$n; fi\n\
+         \x20 if [ -f {kdir}/noo-kiosk-$n ]; then ln -sfn {kdir}/noo-kiosk-$n \"$b\"; fi\n\
+         done\n\
+         if [ -d /etc/polkit-1/rules.d ]; then install -m 0644 -o root -g root {rule} {polkit}; fi\n",
+        dir = SEAT_DIR, key = w("birth.key"), crt = w("birth.crt"), ca = w("ca.crt"), sp = w("signing.pub"), cfgf = w("seat.json"),
+        exe = shq(&exe.to_string_lossy()), rule = w("49-noo-seat.rules"), polkit = POLKIT_RULE,
+    ));
+    if migrate {
+        out.push_str(&format!(
+            "if [ -f {legacy}/state.json ]; then install -m 0600 -o {user} -g {grp} {legacy}/state.json {state}/state.json; fi\n",
+            legacy = LEGACY_STATE_DIR,
+        ));
+    }
+    out.push_str(&format!(
+        "install -m 0644 -o root -g root {svc} {svc_dst}\n\
+         install -m 0644 -o root -g root {tmr} {tmr_dst}\n",
         svc = w("noo-seat-sync.service"), svc_dst = SEAT_SYNC_SERVICE,
         tmr = w("noo-seat-sync.timer"), tmr_dst = SEAT_SYNC_TIMER,
-    )
+    ));
+    if migrate {
+        out.push_str(&format!(
+            "rm -f {LEGACY_APPLIER_BIN}\nrmdir /usr/local/libexec/noo-seat 2>/dev/null || true\nrm -rf {LEGACY_STATE_DIR}\n"
+        ));
+    }
+    out.push_str("systemctl daemon-reload\nsystemctl enable --now noo-seat-sync.timer\n");
+    out
+}
+
+fn user_group(user: &str) -> String {
+    Command::new("id").args(["-gn", user]).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|g| !g.is_empty())
+        .unwrap_or_else(|| user.to_string())
 }
 
 fn user_home(user: &str) -> Option<String> {
@@ -900,7 +979,7 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if dry_run {
         cleanup(&work);
         println!("{}", ui::note("dry run: would redeem the token, then run this once under sudo:"));
-        for l in seat_install_script(Path::new("<workdir>"), &exe).lines() {
+        for l in seat_install_script(Path::new("<workdir>"), &exe, &cfg, &user_group(&me), false).lines() {
             println!("  {l}");
         }
         return Ok(0);
@@ -935,8 +1014,9 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("ca.crt", ca_pem.clone()),
         ("signing.pub", b.sigpub.clone().into_bytes()),
         ("seat.json", serde_json::to_vec_pretty(&cfg).unwrap_or_default()),
-        ("noo-seat-sync.service", render_sync_service().into_bytes()),
+        ("noo-seat-sync.service", render_sync_service(&cfg).into_bytes()),
         ("noo-seat-sync.timer", render_sync_timer().as_bytes().to_vec()),
+        ("49-noo-seat.rules", render_polkit_rule(&cfg.cli_user).into_bytes()),
     ];
     for (f, bytes) in writes {
         if let Err(e) = std::fs::write(work.join(f), bytes) {
@@ -944,7 +1024,7 @@ pub fn kiosk_enroll(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             fail(g.json, ExitCode::Generic, "workdir", &format!("{f}: {e}"), None);
         }
     }
-    let script = seat_install_script(&work, &exe);
+    let script = seat_install_script(&work, &exe, &cfg, &user_group(&me), false);
     println!();
     println!("{}", ui::warn("one sudo, now, to install the seat's rail (nothing after this needs sudo):"));
     for l in script.lines() {
@@ -1020,28 +1100,32 @@ struct SeatState {
     display: Option<String>,
 }
 
-fn state_path() -> PathBuf {
-    Path::new(SEAT_STATE_DIR).join("state.json")
+fn read_state(cfg: &SeatConfig) -> SeatState {
+    std::fs::read(cfg.state_dir().join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-fn read_state() -> SeatState {
-    std::fs::read(state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+fn write_state(cfg: &SeatConfig, s: &SeatState) {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(cfg.state_dir());
+    let _ = std::fs::write(cfg.state_dir().join("state.json"), serde_json::to_vec_pretty(s).unwrap_or_default());
 }
 
-fn write_state(s: &SeatState) {
-    let _ = std::fs::create_dir_all(SEAT_STATE_DIR);
-    let _ = std::fs::write(state_path(), serde_json::to_vec_pretty(s).unwrap_or_default());
+/// `"user"` once the sync runs as the seat user; `"legacy-root"` while the
+/// old root timer is still in charge (needs the one-time migration).
+fn layout_word() -> &'static str {
+    if unsafe { libc::geteuid() } == 0 { "legacy-root" } else { "user" }
 }
 
 /// The heartbeat body. What `noo upgrade` and `noo cluster verify` judge.
 fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
-    let applier_sha = std::fs::read(SEAT_APPLIER_BIN).ok().map(|b| sha256_hex(&b));
+    let applier_sha = std::fs::read(cfg.applier_path()).or_else(|_| std::fs::read(LEGACY_APPLIER_BIN)).ok().map(|b| sha256_hex(&b));
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
         .filter(|b| !b.is_empty() && b != "null");
     let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
     json!({
         "cli_version": env!("CARGO_PKG_VERSION"),
+        "layout": layout_word(),
         "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
         "kiosk_serve": unit_state("kiosk-serve.service"),
         "kiosk_display": unit_state("kiosk.service"),
@@ -1053,67 +1137,15 @@ fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
     })
 }
 
-/// The shell the seat user runs to replace their own CLI. It reads the new
-/// bytes on stdin (a plain pipe: never `/dev/stdin`, which a setuid'd child
-/// cannot reopen — that was the live "install: Permission denied"), stages
-/// them in a temp file in the SAME directory (so the user owns it and the
-/// rename is atomic), fsyncs, sets the mode and renames over the target. On
-/// any failure the temp file is removed and the old target is untouched; the
-/// target is never unlinked first (GNU `install` does exactly that).
-pub(crate) const USER_WRITE_SH: &str = "set -eu\n\
-dst=$1\n\
-d=${dst%/*}\n\
-mkdir -p \"$d\"\n\
-t=$(mktemp \"$d/.noo-seat.XXXXXX\")\n\
-trap 'rm -f \"$t\"' EXIT\n\
-dd of=\"$t\" conv=fsync 2>/dev/null\n\
-chmod 0755 \"$t\"\n\
-mv -f \"$t\" \"$dst\"\n\
-trap - EXIT\n";
-
-/// The production "install as user": `runuser -u <user> -- sh -c USER_WRITE_SH`.
-/// Written AS the user, not as root plus chown: the root applier then never
-/// follows a link the user planted in their own home, and the file is born
-/// with the right owner. A child that fails (or exits before reading all of
-/// stdin) is a clear error carrying its stderr, never SIGPIPE.
-fn install_as_user(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String> {
-    let mut cmd = Command::new("runuser");
-    cmd.args(["-u", &cfg.cli_user, "--", "sh", "-c", USER_WRITE_SH, "noo-seat-write"]).arg(dst);
-    run_writer(cmd, dst, &cfg.cli_user, bytes)
-}
-
-/// Spawn the writer child, feed it `bytes`, and turn ANY failure into an
-/// error string (spawn, early exit, non-zero status with its stderr).
-pub(crate) fn run_writer(mut cmd: Command, dst: &Path, user: &str, bytes: &[u8]) -> Result<(), String> {
-    let mut child = cmd
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn().map_err(|e| format!("spawning the writer: {e}"))?;
-    let mut sin = child.stdin.take().ok_or("writer: no stdin")?;
-    // `main` leaves SIGPIPE at its default; a child that died early would
-    // kill this process (status 13) if written to bare. This helper ignores
-    // it and lets the child's exit status be the verdict.
-    let werr = crate::child_stdin::write_child_stdin(&mut sin, bytes);
-    drop(sin);
-    let out = child.wait_with_output().map_err(|e| format!("waiting on the writer: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("installing {} as {} failed ({}): {}", dst.display(), user, out.status,
-            err.trim().chars().take(300).collect::<String>()));
-    }
-    werr.map_err(|e| format!("write {}: {e}", dst.display()))
-}
-
-/// Atomic root-owned write: temp file in the same directory, fsync, mode,
-/// rename. A running binary is replaced, not overwritten; on any failure the
-/// old file stays.
-pub(crate) fn install_root_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+/// Atomic write as the current user (the sync runs as the seat user): temp
+/// file in the same directory (same owner, same filesystem), fsync, mode,
+/// rename. Never unlinks the target first, so on any failure the old file
+/// stays; a running binary is replaced, not overwritten.
+pub(crate) fn install_atomic(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     let dir = dst.parent().ok_or("no parent")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o755).create(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let tmp = dir.join(format!(".{}.noo-seat-{}", dst.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let r = (|| {
@@ -1135,29 +1167,23 @@ fn install_file(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String
     if !seat_path_allowed(dst, cfg) {
         return Err(format!("REFUSED — {} is outside the seat applier's allow-list", dst.display()));
     }
-    if dst == cfg.cli_path() {
-        return install_as_user(dst, bytes, cfg);
-    }
-    let mode = if dst.starts_with(UNIT_DIR) || dst.ends_with("signing.pub") { 0o644 } else { 0o755 };
-    install_root_file(dst, bytes, mode)
+    install_atomic(dst, bytes, 0o755)
 }
 
 /// An injected file writer: `(destination, bytes)`.
 pub(crate) type Writer<'a> = &'a dyn Fn(&Path, &[u8]) -> Result<(), String>;
 
-/// Apply a verified plan. ROOT targets first (still root, temp+rename), the
-/// user's CLI LAST, so a user-side failure can never leave the root side
-/// half-written, and the user's CLI is written only after the seat copy it
-/// mirrors. `allowed` is the second allow-list guard; the two installers are
-/// injected so tests can run on a temp tree as one user.
+/// Apply a verified plan. The seat's own copy and the kiosk scripts first,
+/// the user's CLI LAST: it is written only after the seat copy it mirrors.
+/// `allowed` is the second allow-list guard; the writer is injected so tests
+/// can run on a temp tree.
 /// Returns the kinds that changed; an error names what already changed.
 pub(crate) fn apply_plan(
     plan: &[(String, PathBuf)],
     cli_path: &Path,
     read_bytes: &dyn Fn(&str) -> Result<Vec<u8>, String>,
     allowed: &dyn Fn(&Path) -> bool,
-    install_root: Writer,
-    install_user: Writer,
+    install: Writer,
 ) -> Result<Vec<String>, String> {
     let mut ordered: Vec<&(String, PathBuf)> = plan.iter().filter(|(_, d)| d != cli_path).collect();
     ordered.extend(plan.iter().filter(|(_, d)| d == cli_path));
@@ -1174,8 +1200,7 @@ pub(crate) fn apply_plan(
         if std::fs::read(dst).ok().as_deref() == Some(&bytes[..]) {
             continue;
         }
-        let r = if dst == cli_path { install_user(dst, &bytes) } else { install_root(dst, &bytes) };
-        r.map_err(|e| format!("{e} (already changed: {})", changed.join(",")))?;
+        install(dst, &bytes).map_err(|e| format!("{e} (already changed: {})", changed.join(",")))?;
         if !changed.contains(kind) {
             changed.push(kind.clone());
         }
@@ -1184,12 +1209,12 @@ pub(crate) fn apply_plan(
 }
 
 /// Recovery: the user's CLI is missing (a 0.6.7 seat deleted it) but the
-/// seat copy exists — restore it from that copy, atomically, as the user.
+/// seat copy exists — restore it from that copy, atomically.
 /// Returns whether it restored. Never removes anything.
 pub(crate) fn restore_user_cli(
     cli_path: &Path,
     seat_copy: &Path,
-    install_user: Writer,
+    install: Writer,
 ) -> Result<bool, String> {
     // `exists()` follows links, so a dangling link at the path counts as missing.
     if cli_path.exists() {
@@ -1199,7 +1224,7 @@ pub(crate) fn restore_user_cli(
         Ok(b) if !b.is_empty() => b,
         _ => return Ok(false),
     };
-    install_user(cli_path, &bytes).map_err(|e| format!("restoring {}: {e}", cli_path.display()))?;
+    install(cli_path, &bytes).map_err(|e| format!("restoring {}: {e}", cli_path.display()))?;
     Ok(true)
 }
 
@@ -1240,7 +1265,11 @@ pub(crate) fn display_action(changed: &[String], console_moved: bool) -> &'stati
 
 /// Decrypt, unwrap, extract, verify and apply one blob. Returns the outcome.
 fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<ApplyOutcome, String> {
-    let stage = private_dir(Path::new(SEAT_STATE_DIR), "stage")?;
+    let stage = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(cfg.state_dir()).map_err(|e| format!("state dir: {e}"))?;
+        private_dir(&cfg.state_dir(), "stage")?
+    };
     let r = (|| {
         let enc = stage.join("bundle.der");
         std::fs::write(&enc, blob).map_err(|e| e.to_string())?;
@@ -1273,11 +1302,10 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             &|kind| std::fs::read(ex.join("files").join(kind)).map_err(|e| e.to_string()),
             &|p| seat_path_allowed(p, cfg),
             &|d, b| install_file(d, b, cfg),
-            &|d, b| install_file(d, b, cfg),
         )?;
         // A seat whose CLI was removed by the old applier: put it back from
         // the seat copy that was just applied (or was already current).
-        if restore_user_cli(&cli_path, Path::new(SEAT_APPLIER_BIN), &|d, b| install_file(d, b, cfg))?
+        if restore_user_cli(&cli_path, &cfg.applier_path(), &|d, b| install_file(d, b, cfg))?
             && !changed.iter().any(|k| k == "cli-binary")
         {
             changed.push("cli-binary".into());
@@ -1286,10 +1314,9 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
             .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
         let console = meta["console_build"].as_str().unwrap_or("").to_string();
         let console_moved = !console.is_empty() && state.console_build.as_deref() != Some(console.as_str());
-        let units_changed = changed.iter().filter(|k| k.starts_with("unit-")).count();
-        if units_changed > 0 {
-            let _ = Command::new("systemctl").arg("daemon-reload").status();
-        }
+        // Units are root-installed and static: the seat never writes one, so
+        // there is never a daemon-reload to do.
+        let units_changed = 0usize;
         let mut o = ApplyOutcome {
             cli: if changed.iter().any(|k| k == "cli-binary") { "updated" } else { "unchanged" },
             scripts: changed.iter().filter(|k| k.starts_with("kiosk-")).count(),
@@ -1329,9 +1356,12 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
 
 /// `noo kiosk seat-sync` — the seat timer's one tick (root; hidden).
 pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    if !args.is_empty() {
-        return Err(Unhandled);
-    }
+    let migrate = match args {
+        [] => None,
+        [a] if a == "--migrate" => Some(false),
+        [a, b] if a == "--migrate" && b == "--print" => Some(true),
+        _ => return Err(Unhandled),
+    };
     let say = |m: &str| eprintln!("noo-seat-sync: {m}");
     let cfg: SeatConfig = match std::fs::read(Path::new(SEAT_DIR).join("seat.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
         Some(c) => c,
@@ -1340,6 +1370,9 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     if let Err(e) = cfg.validate() {
         say(&e);
         return Ok(78);
+    }
+    if let Some(print_only) = migrate {
+        return Ok(seat_migrate(&cfg, print_only));
     }
     let key = Path::new(SEAT_DIR).join("birth.key");
     let ca = match std::fs::read(Path::new(SEAT_DIR).join("ca.crt")) {
@@ -1352,7 +1385,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     };
     let base = cfg.controller_url.trim_end_matches('/').to_string();
     let seat = cfg.seat.clone();
-    let mut state = read_state();
+    let mut state = read_state(&cfg);
     let post_signed = |path: &str, tag: &str, sha: &str, body: Vec<u8>| -> Result<u16, String> {
         let proof = sign_proof(&key, tag, &seat, sha)?;
         let r = agent.post(&format!("{base}{path}"))
@@ -1373,10 +1406,19 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             Err(e) => say(&format!("heartbeat: {e}")),
         }
     };
+    // An old seat's root timer runs the new binary here after a rail update:
+    // it only reports (the heartbeat above carries layout=legacy-root) and
+    // tells the operator the ONE migration command. It never applies as root.
+    if layout_word() == "legacy-root" {
+        say(&format!(
+            "this seat still runs the pre-0.6.10 root layout; migrate it once, on this box: \
+             sudo {LEGACY_APPLIER_BIN} kiosk seat-sync --migrate"));
+        return Ok(0);
+    }
     // Recovery first: a missing user CLI is restored from the seat copy even
     // when no new bundle is waiting.
-    match restore_user_cli(&cfg.cli_path(), Path::new(SEAT_APPLIER_BIN), &|d, b| install_file(d, b, &cfg)) {
-        Ok(true) => say(&format!("restored {} from {}", cfg.cli_path().display(), SEAT_APPLIER_BIN)),
+    match restore_user_cli(&cfg.cli_path(), &cfg.applier_path(), &|d, b| install_file(d, b, &cfg)) {
+        Ok(true) => say(&format!("restored {} from {}", cfg.cli_path().display(), cfg.applier_path().display())),
         Ok(false) => {}
         Err(e) => say(&e),
     }
@@ -1419,7 +1461,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             // root side is already current, so only what failed re-runs).
             if rc == 0 {
                 state.last_applied_sha = Some(sha);
-                write_state(&state);
+                write_state(&cfg, &state);
             }
         }
         Ok(st) => say(&format!("apply report answered HTTP {st}")),
@@ -1427,6 +1469,68 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     }
     heartbeat(&state);
     Ok(if rc == 0 { 0 } else { 1 })
+}
+
+/// `noo kiosk seat-sync --migrate [--print]` — move an already-enrolled seat
+/// from the root layout (root timer, root copy under /usr/local/libexec) to
+/// the user layout. ONE explicit command, run by the operator under sudo on
+/// the box. Root, offline: no network, no bundle.
+///
+/// Why a command and not an automatic last root tick: that tick would be a
+/// root process, fed by the network, rewriting its own unit, the polkit
+/// policy and `/usr/local/bin` symlinks on its own authority. The command
+/// prints exactly what it runs, is run by a person who typed `sudo`, and
+/// until it runs the old layout keeps working (the root timer keeps
+/// reporting; nothing is applied as root by the new binary).
+fn seat_migrate(cfg: &SeatConfig, print_only: bool) -> i32 {
+    let say = |m: &str| eprintln!("noo-seat-sync: {m}");
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(LEGACY_APPLIER_BIN));
+    let group = user_group(&cfg.cli_user);
+    let work = Path::new("<workdir>");
+    if print_only {
+        for l in seat_install_script(work, &exe, cfg, &group, true).lines() {
+            println!("{l}");
+        }
+        return 0;
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        say(&format!("run it as root: sudo {} kiosk seat-sync --migrate   (--print shows the script)", exe.display()));
+        return 1;
+    }
+    let work = match private_dir(&std::env::temp_dir(), "noo-seat-migrate") {
+        Ok(w) => w,
+        Err(e) => { say(&e); return 1; }
+    };
+    let files: [(&str, Vec<u8>); 7] = [
+        ("birth.key", std::fs::read(Path::new(SEAT_DIR).join("birth.key")).unwrap_or_default()),
+        ("birth.crt", std::fs::read(Path::new(SEAT_DIR).join("birth.crt")).unwrap_or_default()),
+        ("ca.crt", std::fs::read(Path::new(SEAT_DIR).join("ca.crt")).unwrap_or_default()),
+        ("signing.pub", std::fs::read(Path::new(SEAT_DIR).join("signing.pub")).unwrap_or_default()),
+        ("seat.json", serde_json::to_vec_pretty(cfg).unwrap_or_default()),
+        ("noo-seat-sync.service", render_sync_service(cfg).into_bytes()),
+        ("noo-seat-sync.timer", render_sync_timer().as_bytes().to_vec()),
+    ];
+    let mut ok = files.iter().take(5).all(|(_, b)| !b.is_empty());
+    for (f, b) in files.iter() {
+        ok &= std::fs::write(work.join(f), b).is_ok();
+    }
+    ok &= std::fs::write(work.join("49-noo-seat.rules"), render_polkit_rule(&cfg.cli_user)).is_ok();
+    let rc = if ok {
+        let script = seat_install_script(&work, &exe, cfg, &group, true);
+        println!("{script}");
+        let sp = work.join("migrate.sh");
+        let _ = std::fs::write(&sp, &script);
+        let st = Command::new("sh").arg(&sp).status();
+        if st.map(|s| s.success()).unwrap_or(false) { 0 } else { say("the migration script did not complete (the old layout is intact until its last step)"); 1 }
+    } else {
+        say("the seat's /etc/noo-seat files could not be read; re-enroll instead (`noo kiosk enroll <blob>`)");
+        1
+    };
+    let _ = std::fs::remove_dir_all(&work);
+    if rc == 0 {
+        println!("seat migrated: noo-seat-sync now runs as {}; nothing recurring holds root", cfg.cli_user);
+    }
+    rc
 }
 
 // ═══ the controller's view: upgrade + verify ══════════════════════════
@@ -1456,6 +1560,10 @@ pub(crate) fn report_word<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
 /// controller's console build, last apply ok. Pure over the record (the
 /// `/api/cluster/seats` row or the `/status` answer), so every verdict is
 /// pinned by a test. Shared by `noo upgrade` and `noo cluster verify`.
+fn hb_layout(seat: &Value) -> Option<&str> {
+    seat["heartbeat"]["layout"].as_str()
+}
+
 pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &str, now: i64) -> Vec<super::cluster_verify::Check> {
     use super::cluster_verify::Verdict;
     let name = seat["seat_name"].as_str().or_else(|| seat["seat"].as_str()).unwrap_or("?");
@@ -1502,6 +1610,10 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         check("display", Verdict::Ok, format!("console {build} = controller{}{quality}",
             if display.is_empty() { String::new() } else { format!(" (last apply: display {display})") }), None)
     });
+    if hb_layout(seat) == Some("legacy-root") {
+        out.push(check("seat layout", Verdict::Warn, "still on the root layout (root timer, root-owned copy): no updates apply until migrated".into(),
+            Some(format!("on {name}: sudo {LEGACY_APPLIER_BIN} kiosk seat-sync --migrate"))));
+    }
     let staged = seat["staged_sha"].as_str().or_else(|| seat["sha256"].as_str());
     if let Some(staged) = staged {
         let applied = seat["applied_sha"].as_str();
@@ -1664,9 +1776,8 @@ mod tests {
         }
         let paths: Vec<String> = plan.iter().map(|(_, p)| p.to_string_lossy().into_owned()).collect();
         assert!(paths.contains(&"/home/alex/.local/bin/noo".to_string()));
-        assert!(paths.contains(&SEAT_APPLIER_BIN.to_string()));
-        assert!(paths.contains(&"/usr/local/bin/noo-kiosk-serve".to_string()));
-        assert!(paths.contains(&"/etc/systemd/system/kiosk-serve.service".to_string()));
+        assert!(paths.contains(&"/home/alex/.local/libexec/noo-seat/noo".to_string()));
+        assert!(paths.contains(&"/home/alex/.local/libexec/noo-seat/kiosk/noo-kiosk-serve".to_string()));
     }
 
     /// The applier's scope: node kinds and any path outside the list refuse
@@ -1850,116 +1961,113 @@ mod tests {
 
     #[test]
     fn the_install_script_is_the_one_root_step() {
-        let s = seat_install_script(Path::new("/tmp/w"), Path::new("/home/alex/.local/bin/noo"));
-        assert!(s.contains("install -m 0600 -o root -g root '/tmp/w/birth.key' /etc/noo-seat/birth.key"));
-        assert!(s.contains(SEAT_APPLIER_BIN));
+        let c = cfg();
+        let s = seat_install_script(Path::new("/tmp/w"), Path::new("/home/alex/.local/bin/noo"), &c, "alex", false);
+        assert!(s.contains("install -m 0640 -o root -g 'alex' '/tmp/w/birth.key' /etc/noo-seat/birth.key"));
+        assert!(s.contains("install -m 0644 -o root -g root '/tmp/w/signing.pub' /etc/noo-seat/signing.pub"));
+        // The seat's copy and kiosk scripts are made AS the user, never by root.
+        assert!(s.contains("as_user sh -c 'install -m 0755") && s.contains("/home/alex/.local/libexec/noo-seat/noo"));
         assert!(s.contains("systemctl enable --now noo-seat-sync.timer"));
-        // Nothing node-shaped is installed by a seat's enrollment.
-        for n in ["noo-node-agent", "noo-hostd", "noo-apply", "noo-fetch", "sudoers", "/etc/noo/"] {
+        assert!(s.contains("/etc/polkit-1/rules.d"));
+        // Nothing node-shaped is installed by a seat's enrollment, and no root copy of the CLI.
+        for n in ["noo-node-agent", "noo-hostd", "noo-apply", "noo-fetch", "sudoers", "/etc/noo/", "/usr/local/libexec"] {
             assert!(!s.contains(n), "{n}");
         }
-        assert!(render_sync_service().contains("ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"));
     }
 
     // ── safe apply: atomic, ordered, allow-listed, recoverable ─────────
 
-    /// A scratch tree shaped like a seat: a seat dir, a bin dir and a user
-    /// `~/.local/bin`, all under one temp root.
-    struct Tree { root: PathBuf }
+    /// A scratch tree shaped like a seat's user layout, all under one temp
+    /// root: `~/.local/bin`, `~/.local/libexec/noo-seat[/kiosk]`.
+    struct Tree { root: PathBuf, cfg: SeatConfig }
     impl Tree {
         fn new(tag: &str) -> Tree {
             let root = std::env::temp_dir().join(format!("noo-seat-apply-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            for d in ["libexec/noo-seat", "bin", "home/alex/.local/bin"] {
-                std::fs::create_dir_all(root.join(d)).unwrap();
+            let home = root.join("home/alex");
+            for d in [".local/bin", ".local/libexec/noo-seat/kiosk"] {
+                std::fs::create_dir_all(home.join(d)).unwrap();
             }
-            Tree { root }
+            let cfg = SeatConfig { cli_home: home.to_string_lossy().into_owned(), ..cfg() };
+            Tree { root, cfg }
         }
-        fn cli(&self) -> PathBuf { self.root.join("home/alex/.local/bin/noo") }
-        fn seat(&self) -> PathBuf { self.root.join("libexec/noo-seat/noo") }
-        fn launch(&self) -> PathBuf { self.root.join("bin/noo-kiosk-serve") }
+        fn cli(&self) -> PathBuf { self.cfg.cli_path() }
+        fn seat(&self) -> PathBuf { self.cfg.applier_path() }
+        fn serve(&self) -> PathBuf { self.cfg.kiosk_dir().join("noo-kiosk-serve") }
         fn plan(&self) -> Vec<(String, PathBuf)> {
             // The real plan puts the user's CLI FIRST; apply_plan reorders.
-            vec![("cli-binary".into(), self.cli()), ("cli-binary".into(), self.seat()), ("kiosk-serve".into(), self.launch())]
+            vec![("cli-binary".into(), self.cli()), ("cli-binary".into(), self.seat()), ("kiosk-serve".into(), self.serve())]
         }
-        fn allowed(&self, p: &Path) -> bool {
-            p == self.cli() || p == self.seat() || p == self.launch()
-        }
+        fn allowed(&self, p: &Path) -> bool { seat_path_allowed(p, &self.cfg) }
+        fn write(&self, p: &Path, b: &[u8]) -> Result<(), String> { install_file(p, b, &self.cfg) }
     }
     impl Drop for Tree {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(self.root.join("home/alex/.local/bin"), std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(self.cfg.cli_path().parent().unwrap(), std::fs::Permissions::from_mode(0o755));
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
-    /// The production user-write script, run as the current user (a test
-    /// cannot `runuser`); same script, same stdin pipe, same SIGPIPE handling.
-    fn user_script(dst: &Path, bytes: &[u8]) -> Result<(), String> {
-        let mut c = Command::new("sh");
-        c.args(["-c", USER_WRITE_SH, "noo-seat-write"]).arg(dst);
-        run_writer(c, dst, "alex", bytes)
-    }
-
-    fn run_apply(t: &Tree, root_w: Writer, user_w: Writer) -> Result<Vec<String>, String> {
-        apply_plan(&t.plan(), &t.cli(), &|k| Ok(format!("new-{k}").into_bytes()), &|p| t.allowed(p), root_w, user_w)
+    fn run_apply(t: &Tree, w: Writer) -> Result<Vec<String>, String> {
+        apply_plan(&t.plan(), &t.cli(), &|k| Ok(format!("new-{k}").into_bytes()), &|p| t.allowed(p), w)
     }
 
     #[test]
-    fn the_root_side_is_written_before_the_user_side_and_the_cli_is_replaced() {
+    fn the_seat_copy_is_written_before_the_user_cli_and_both_are_replaced() {
         let t = Tree::new("order");
         std::fs::write(t.cli(), b"old").unwrap();
         std::fs::write(t.seat(), b"old").unwrap();
         let log = std::cell::RefCell::new(Vec::<String>::new());
-        let changed = run_apply(&t,
-            &|d, b| { log.borrow_mut().push(format!("root:{}", d.file_name().unwrap().to_string_lossy())); install_root_file(d, b, 0o755) },
-            &|d, b| { log.borrow_mut().push("user".into()); assert!(d.exists(), "the CLI must exist when the user write starts"); user_script(d, b) },
-        ).unwrap();
-        assert_eq!(*log.borrow(), vec!["root:noo".to_string(), "root:noo-kiosk-serve".into(), "user".into()]);
+        let changed = run_apply(&t, &|d, b| {
+            log.borrow_mut().push(d.file_name().unwrap().to_string_lossy().into_owned());
+            assert!(d != t.cli() || d.exists(), "the CLI must exist when its write starts");
+            t.write(d, b)
+        }).unwrap();
+        assert_eq!(*log.borrow(), vec!["noo".to_string(), "noo-kiosk-serve".into(), "noo".into()]);
         assert_eq!(changed, vec!["cli-binary".to_string(), "kiosk-serve".into()]);
         assert_eq!(std::fs::read(t.cli()).unwrap(), b"new-cli-binary");
         assert_eq!(std::fs::read(t.seat()).unwrap(), b"new-cli-binary");
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(t.cli()).unwrap().permissions().mode() & 0o777, 0o755);
-        // No temp file is left in either directory.
         for d in [t.cli().parent().unwrap().to_path_buf(), t.seat().parent().unwrap().to_path_buf()] {
             let names: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-            assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+            assert!(names.iter().all(|n| !n.starts_with('.')), "a temp file was left: {names:?}");
         }
     }
 
     #[test]
-    fn a_failed_user_write_keeps_the_old_cli_and_reports_it() {
+    fn a_failed_write_keeps_the_old_cli_and_reports_it() {
         let t = Tree::new("userfail");
         std::fs::write(t.cli(), b"old-cli").unwrap();
         std::fs::write(t.seat(), b"old").unwrap();
-        // The user's installer fails (as the live `install` did).
-        let e = run_apply(&t, &|d, b| install_root_file(d, b, 0o755), &|_, _| Err("install: Permission denied".into())).unwrap_err();
+        let e = run_apply(&t, &|d, b| if d == t.cli() { Err("rename: Permission denied".into()) } else { t.write(d, b) }).unwrap_err();
         assert!(e.contains("Permission denied") && e.contains("already changed"), "{e}");
         assert_eq!(std::fs::read(t.cli()).unwrap(), b"old-cli", "the user's CLI is untouched");
-        assert_eq!(std::fs::read(t.seat()).unwrap(), b"new-cli-binary", "the root side landed first");
+        assert_eq!(std::fs::read(t.seat()).unwrap(), b"new-cli-binary", "the seat copy landed first");
     }
 
     #[test]
-    fn the_real_user_script_never_unlinks_first_and_keeps_the_old_file_on_failure() {
+    fn the_atomic_write_never_unlinks_first_and_keeps_the_old_file_on_failure() {
         use std::os::unix::fs::PermissionsExt as _;
-        let t = Tree::new("script");
+        let t = Tree::new("atomic");
         std::fs::write(t.cli(), b"old-cli").unwrap();
         // The directory refuses new entries (the temp file cannot be made):
-        // the script fails, and the old file is still there, byte for byte.
+        // the write fails, and the old file is still there, byte for byte.
         let dir = t.cli().parent().unwrap().to_path_buf();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let r = user_script(&t.cli(), b"new-cli");
+        let r = t.write(&t.cli(), b"new-cli");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         if unsafe { libc::geteuid() } != 0 {
             assert!(r.is_err(), "{r:?}");
         }
         assert_eq!(std::fs::read(t.cli()).unwrap(), if r.is_err() { b"old-cli".to_vec() } else { b"new-cli".to_vec() });
         // A dangling symlink at the target is replaced by a regular file, not followed.
-        let t2 = Tree::new("script-link");
+        let t2 = Tree::new("atomic-link");
+        std::fs::remove_dir(t2.cli().parent().unwrap()).unwrap();
+        std::fs::create_dir_all(t2.cli().parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(t2.root.join("nowhere"), t2.cli()).unwrap();
-        user_script(&t2.cli(), b"fresh").unwrap();
+        t2.write(&t2.cli(), b"fresh").unwrap();
         assert_eq!(std::fs::read(t2.cli()).unwrap(), b"fresh");
         assert!(!t2.cli().symlink_metadata().unwrap().file_type().is_symlink());
     }
@@ -1981,7 +2089,7 @@ mod tests {
         });
         for i in 0..40 {
             let body = format!("{}-{i}", if i % 2 == 0 { "new-cli" } else { "old-cli" }).repeat(50_000);
-            user_script(&t.cli(), body.as_bytes()).unwrap();
+            t.write(&t.cli(), body.as_bytes()).unwrap();
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         watcher.join().unwrap();
@@ -1992,33 +2100,36 @@ mod tests {
     fn nothing_outside_the_allow_list_is_written() {
         let t = Tree::new("allow");
         let outside = t.root.join("etc-passwd");
-        let plan = vec![("kiosk-serve".to_string(), t.launch()), ("kiosk-cdp".to_string(), outside.clone())];
+        let plan = vec![("kiosk-serve".to_string(), t.serve()), ("kiosk-cdp".to_string(), outside.clone())];
         let wrote = std::cell::RefCell::new(Vec::<PathBuf>::new());
         let e = apply_plan(&plan, &t.cli(), &|_| Ok(b"x".to_vec()), &|p| t.allowed(p),
-            &|d, _| { wrote.borrow_mut().push(d.to_path_buf()); Ok(()) }, &|_, _| Ok(())).unwrap_err();
+            &|d, _| { wrote.borrow_mut().push(d.to_path_buf()); Ok(()) }).unwrap_err();
         assert!(e.contains("REFUSED") && e.contains("allow-list"), "{e}");
-        assert!(!wrote.borrow().contains(&outside));
-        assert!(!outside.exists());
-        // The production guard refuses a path no kind maps to, in the real layout.
+        assert!(!wrote.borrow().contains(&outside) && !outside.exists());
+        // The production guard refuses everything root-owned and everything else.
         let c = cfg();
         for p in ["/etc/passwd", "/home/alex/.bashrc", "/home/alex/.local/bin/other", "/home/alex/.local/bin/../../.bashrc",
-                  "/usr/local/bin/sudo", "/etc/systemd/system/other.service", "/etc/sudoers.d/noo"] {
+                  "/usr/local/bin/noo-kiosk-serve", "/usr/local/bin/noo-kiosk-watchdog", "/usr/local/libexec/noo-seat/noo",
+                  "/etc/systemd/system/kiosk.service", "/etc/noo-seat/signing.pub", "/etc/polkit-1/rules.d/49-noo-seat.rules",
+                  "/home/alex/.local/libexec/noo-seat/kiosk/noo-kiosk-watchdog"] {
+            assert!(!seat_path_allowed(Path::new(p), &c), "{p}");
             assert!(install_file(Path::new(p), b"x", &c).unwrap_err().contains("REFUSED"), "{p}");
         }
     }
 
     #[test]
-    fn a_failing_child_is_an_error_not_a_panic_or_a_signal() {
-        // A child that exits before reading a single byte, with a payload far
-        // bigger than the pipe buffer: the write hits a closed pipe.
-        let mut c = Command::new("sh");
-        c.args(["-c", "echo 'install: Permission denied' >&2; exit 3"]);
-        let big = vec![7u8; 8 * 1024 * 1024];
-        let e = run_writer(c, Path::new("/x/noo"), "alex", &big).unwrap_err();
-        assert!(e.contains("Permission denied") && e.contains("as alex failed"), "{e}");
-        // A writer that cannot even start is also an error line.
-        let e = run_writer(Command::new("/nonexistent/runuser"), Path::new("/x/noo"), "alex", b"x").unwrap_err();
-        assert!(e.contains("spawning the writer"), "{e}");
+    fn no_root_owned_write_target_remains_in_the_allow_list() {
+        let c = cfg();
+        let kinds: Vec<String> = SEAT_KINDS.iter().map(|k| k.to_string()).collect();
+        let plan = plan_seat_apply(&kinds, &c).unwrap();
+        assert!(!plan.is_empty());
+        for (kind, dst) in &plan {
+            assert!(dst.starts_with(&c.cli_home), "{kind}: {} is outside the seat user's home", dst.display());
+        }
+        // The kinds that used to land in root-owned places are carried, verified, not applied.
+        for k in ["kiosk-watchdog", "unit-kiosk", "unit-kiosk-serve", "unit-kiosk-watchdog", "unit-kiosk-watchdog-timer", "signing-pub"] {
+            assert!(seat_targets(k, &c).unwrap().is_empty(), "{k}");
+        }
     }
 
     #[test]
@@ -2026,49 +2137,89 @@ mod tests {
         let t = Tree::new("restore");
         std::fs::write(t.seat(), b"seat-copy").unwrap();
         // The live state: only a dangling `pai` link is left where the CLI was.
-        std::os::unix::fs::symlink(t.cli(), t.root.join("home/alex/.local/bin/pai")).unwrap();
+        std::os::unix::fs::symlink(t.cli(), t.cli().parent().unwrap().join("pai")).unwrap();
         assert!(!t.cli().exists());
-        assert!(restore_user_cli(&t.cli(), &t.seat(), &user_script).unwrap());
+        assert!(restore_user_cli(&t.cli(), &t.seat(), &|d, b| t.write(d, b)).unwrap());
         assert_eq!(std::fs::read(t.cli()).unwrap(), b"seat-copy");
-        // The link now resolves.
-        assert!(t.root.join("home/alex/.local/bin/pai").exists());
+        assert!(t.cli().parent().unwrap().join("pai").exists(), "the link resolves again");
         // Present: untouched. No seat copy: nothing invented, nothing removed.
         std::fs::write(t.cli(), b"mine").unwrap();
-        assert!(!restore_user_cli(&t.cli(), &t.seat(), &user_script).unwrap());
+        assert!(!restore_user_cli(&t.cli(), &t.seat(), &|d, b| t.write(d, b)).unwrap());
         assert_eq!(std::fs::read(t.cli()).unwrap(), b"mine");
         let t2 = Tree::new("restore-none");
-        assert!(!restore_user_cli(&t2.cli(), &t2.seat(), &user_script).unwrap());
+        assert!(!restore_user_cli(&t2.cli(), &t2.seat(), &|d, b| t2.write(d, b)).unwrap());
         assert!(!t2.cli().exists());
-        // A failing restore is an error, and a plan that finds the CLI missing writes it.
         assert!(restore_user_cli(&t2.cli(), &t.seat(), &|_, _| Err("boom".into())).unwrap_err().contains("boom"));
-        let changed = run_apply(&t2, &|d, b| install_root_file(d, b, 0o755), &user_script).unwrap();
+        // A plan that finds the CLI missing writes it.
+        let changed = run_apply(&t2, &|d, b| t2.write(d, b)).unwrap();
         assert!(changed.contains(&"cli-binary".to_string()));
         assert_eq!(std::fs::read(t2.cli()).unwrap(), b"new-cli-binary");
     }
 
     #[test]
-    fn the_sync_unit_text_matches_the_allow_list_comment() {
-        let u = render_sync_service();
-        let comment: String = u.lines().take_while(|l| l.starts_with('#')).collect::<Vec<_>>().join(" ");
-        let comment = comment.replace("# ", "");
+    fn the_sync_unit_runs_as_the_seat_user_and_its_comment_matches_the_allow_list() {
         let c = cfg();
-        // Every allow-listed path is covered by a class the comment names.
-        let kinds: Vec<String> = SEAT_KINDS.iter().map(|k| k.to_string()).collect();
-        for (_, dst) in plan_seat_apply(&kinds, &c).unwrap() {
-            let s = dst.to_string_lossy().into_owned();
-            let named = if dst == c.cli_path() { comment.contains("~/.local/bin/noo") }
-                else if s.starts_with("/usr/local/bin/noo-kiosk-") { comment.contains("/usr/local/bin/noo-kiosk-*") }
-                else if s.starts_with("/etc/systemd/system/kiosk") { comment.contains("kiosk units") }
-                else { comment.contains(&s) };
-            assert!(named, "{s} is allow-listed but the unit comment does not name it:\n{comment}");
-        }
-        // And every path the comment names is something the applier really writes.
-        assert!(comment.contains(SEAT_APPLIER_BIN) && seat_path_allowed(Path::new(SEAT_APPLIER_BIN), &c));
-        // The privilege boundary: root, hardened, no User=.
-        assert!(!u.lines().any(|l| l.starts_with("User=")), "the sync runs as root so it can write the root side");
-        for need in ["Type=oneshot", "NoNewPrivileges=yes", "PrivateTmp=yes", "ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"] {
+        let u = render_sync_service(&c);
+        assert!(u.lines().any(|l| l == "User=alex"), "the recurring sync must not be root:\n{u}");
+        assert!(u.lines().any(|l| l == "ExecStart=/home/alex/.local/libexec/noo-seat/noo kiosk seat-sync"), "{u}");
+        for need in ["Type=oneshot", "NoNewPrivileges=yes", "PrivateTmp=yes"] {
             assert!(u.lines().any(|l| l == need), "{need}");
         }
+        let comment: String = u.lines().take_while(|l| l.starts_with('#')).collect::<Vec<_>>().join(" ").replace("# ", "");
+        for (kind, dst) in plan_seat_apply(&SEAT_KINDS.iter().map(|k| k.to_string()).collect::<Vec<_>>(), &c).unwrap() {
+            let s = dst.to_string_lossy().into_owned();
+            let named = if kind.starts_with("kiosk-") { comment.contains("/home/alex/.local/libexec/noo-seat/kiosk/noo-kiosk-{launch,cdp,serve}") } else { comment.contains(&s) };
+            assert!(named, "{s} is allow-listed but the unit comment does not name it:\n{comment}");
+        }
+        assert!(comment.contains("never root"));
+    }
+
+    #[test]
+    fn the_polkit_rule_grants_the_seat_user_exactly_the_kiosk_units() {
+        let r = render_polkit_rule("alex");
+        assert!(r.contains("subject.user == \"alex\"") && r.contains("org.freedesktop.systemd1.manage-units"));
+        for u in SEAT_RESTARTABLE_UNITS {
+            assert!(r.contains(&format!("\"{u}\"")), "{u}");
+        }
+        assert_eq!(r.matches(".service\"").count() + r.matches(".timer\"").count(), SEAT_RESTARTABLE_UNITS.len());
+    }
+
+    #[test]
+    fn the_migration_is_one_explicit_root_script_that_moves_everything_and_removes_the_old_layout() {
+        let c = cfg();
+        let m = seat_install_script(Path::new("/tmp/w"), Path::new(LEGACY_APPLIER_BIN), &c, "alex", true);
+        // Stops the old root timer first, then moves state, installs the user copy, removes the root copy.
+        let i = |needle: &str| m.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{m}"));
+        assert!(i("disable --now noo-seat-sync.timer") < i("install -d -m 0755 -o root"));
+        assert!(m.contains("/var/lib/noo-seat/state.json"));
+        assert!(m.contains("/home/alex/.local/libexec/noo-seat/noo"));
+        assert!(i("install -m 0644 -o root -g root '/tmp/w/noo-seat-sync.service'") < i("rm -f /usr/local/libexec/noo-seat/noo"));
+        assert!(i("rm -f /usr/local/libexec/noo-seat/noo") < i("enable --now noo-seat-sync.timer"));
+        // The birth key stays root-owned, readable only by root and the seat user's group.
+        assert!(m.contains("install -m 0640 -o root -g 'alex' '/tmp/w/birth.key' /etc/noo-seat/birth.key"));
+        // Kiosk scripts the box already has are copied into the user tree before a symlink replaces them.
+        assert!(i("cp -f \"$b\"") < i("ln -sfn"));
+        // The enroll flavour has neither the stop nor the removal.
+        let e = seat_install_script(Path::new("/tmp/w"), Path::new("/home/alex/.local/bin/noo"), &c, "alex", false);
+        assert!(!e.contains("disable --now") && !e.contains("rm -f") && !e.contains("rm -rf"));
+        // Neither touches the user's own CLI: the sync restores/updates that as the user.
+        assert!(!m.contains("/home/alex/.local/bin/noo") && !e.contains("'/home/alex/.local/bin/noo'\n"));
+    }
+
+    #[test]
+    fn a_legacy_root_seat_is_flagged_by_verify_with_the_one_command() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let old = json!({"seat_name": "lobby", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.10", "layout": "legacy-root", "user_cli_current": true, "kiosk_serve": "active", "console_build": "stack-v0.6.10"}});
+        let c = seat_checks(&old, "0.6.10", "stack-v0.6.10", now);
+        let l = c.iter().find(|c| c.name == "seat layout").expect("a layout check");
+        assert_eq!(l.verdict, Verdict::Warn);
+        assert!(l.remedy.as_deref().unwrap().contains("sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate"));
+        let mut ok = old.clone();
+        ok["heartbeat"]["layout"] = json!("user");
+        assert!(seat_checks(&ok, "0.6.10", "stack-v0.6.10", now).iter().all(|c| c.name != "seat layout"));
     }
 
     #[test]
@@ -2079,11 +2230,11 @@ mod tests {
         let bad = json!({"seat_name": "lobby", "last_seen": seen,
             "heartbeat": {"cli_version": "0.6.5", "user_cli_current": true, "kiosk_serve": "active", "console_build": "stack-v0.6.5"},
             "staged_sha": "a", "applied_sha": "a", "apply_rc": 65,
-            "apply_msg": "apply failed: installing /home/alex/.local/bin/noo as alex failed (exit status: 1): Permission denied"});
+            "apply_msg": "apply failed: rename onto /home/alex/.local/bin/noo: Permission denied"});
         let c = seat_checks(&bad, "0.6.5", "stack-v0.6.5", now);
         let b = c.iter().find(|c| c.name == "seat bundle").unwrap();
         assert_eq!(b.verdict, Verdict::Fail);
-        assert!(b.detail.starts_with("apply failed: installing"), "{}", b.detail);
+        assert!(b.detail.starts_with("apply failed: rename"), "{}", b.detail);
         assert!(!b.detail.contains("apply failed: apply failed"));
     }
 

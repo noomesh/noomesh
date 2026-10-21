@@ -719,7 +719,7 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["autonomy", "locations"],
     &["ops"],
     &["kiosk", "serve"],
-    // The seat's timer runs it (noo-seat-sync.service, root); nobody types it.
+    // The seat's timer runs it (noo-seat-sync.service, as the seat user); nobody types it.
     &["kiosk", "seat-sync"],
     &["tools", "select"],
     // Aliases and retired verbs: they still work, but are not offered.

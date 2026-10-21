@@ -63,13 +63,24 @@ This:
 2. generates the seat's birth key pair (RSA-4096);
 3. redeems the token at the controller (it burns on first use);
 4. asks for `sudo` **once**, printing the exact script first, to install:
-   - `/etc/noo-seat/` (root): `birth.key` (0600), `birth.crt`, `ca.crt`,
-     `signing.pub`, `seat.json` (seat name, controller URL, the seat user and
-     home);
-   - `/var/lib/noo-seat/` (root, 0700): the sync timer's state;
-   - `/usr/local/libexec/noo-seat/noo`: a root-owned copy of this `noo`, which
-     the timer runs, so a binary the seat user can write is never run as root;
-   - `noo-seat-sync.service` and `noo-seat-sync.timer`, enabled now.
+   - `/etc/noo-seat/` (root): `birth.key` (0640, group = the seat user's, so
+     the sync can sign), `birth.crt`, `ca.crt`, `signing.pub`, `seat.json`
+     (seat name, controller URL, the seat user and home). The trust anchors
+     stay root-owned;
+   - the seat user's own tree, made as that user: `~/.local/libexec/noo-seat/noo`
+     (the copy the timer runs), `~/.local/libexec/noo-seat/kiosk/` and
+     `~/.local/state/noo-seat/`;
+   - `/usr/local/bin/noo-kiosk-{launch,cdp,serve}` as symlinks into that tree
+     (the kiosk units keep their `ExecStart` paths);
+   - `noo-seat-sync.service` (`User=` the seat user) and `noo-seat-sync.timer`,
+     enabled now;
+   - a polkit rule letting the seat user restart exactly `kiosk.service`,
+     `kiosk-serve.service` and `kiosk-watchdog.{service,timer}`.
+
+Nothing recurring runs as root. The kiosk display unit stays a system unit
+(it needs `PAMName`, a VT and `Conflicts=getty`, which a user unit cannot
+have), and so does the root watchdog; their text and the watchdog script are
+installed by `noo kiosk setup` and are not rewritten by the sync.
 
 Nothing after this step needs `sudo`. Add `--controller <url>` when the seat
 reaches the controller at a different address from the one in the paste.
@@ -109,11 +120,31 @@ and applies it. The applier writes only:
 
 | path | written as |
 |---|---|
-| `~/.local/bin/noo` of the seat user | that user (via `runuser`) |
-| `/usr/local/libexec/noo-seat/noo` | root |
-| `/usr/local/bin/noo-kiosk-{launch,cdp,watchdog,serve}` | root |
-| `/etc/systemd/system/{kiosk,kiosk-serve,kiosk-watchdog}.service`, `kiosk-watchdog.timer` | root |
-| `/etc/noo-seat/signing.pub` | root |
+| `~/.local/bin/noo` of the seat user | that user |
+| `~/.local/libexec/noo-seat/noo` | that user |
+| `~/.local/libexec/noo-seat/kiosk/noo-kiosk-{launch,cdp,serve}` | that user |
+
+Every write is a temp file in the same directory, `fsync`, then `rename`, so a
+failure leaves the old file in place; `~/.local/bin/noo` is never removed. If
+it is found missing, the next tick restores it from the seat copy. Units, the
+watchdog script and `signing.pub` are carried in the bundle and verified, but
+not applied: they are root-owned and the sync is not root.
+
+A failed apply shows in `noo cluster verify` as `seat bundle: apply failed:
+<reason>` and is retried on the next tick.
+
+**Seats enrolled before 0.6.10** still run a root timer and a root copy of
+`noo`. The first rail update puts the new binary there, and it only reports
+`seat layout` in verify, with the one command to run on that box:
+
+```
+sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate   # --print shows the script
+```
+
+It moves the state and the copy into the user's tree, rewrites the sync unit
+to `User=`, adds the symlinks and the polkit rule, and removes the root copy.
+It is a command you run, not an automatic root tick, because that tick would
+be a network-fed root process rewriting its own unit and policy.
 
 A bundle that names any other file, or a kind outside that list, is refused
 whole, before anything is written. A node bundle is never accepted by a seat,
