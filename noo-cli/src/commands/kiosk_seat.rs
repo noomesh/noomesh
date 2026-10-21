@@ -741,8 +741,8 @@ pub(crate) fn render_sync_service() -> String {
     format!(
         "# Written by `noo kiosk enroll <blob>`. The seat's rail: a signed heartbeat,\n\
          # a signed fetch, and an apply that may write ONLY the seat user's\n\
-         # ~/.local/bin/noo, {applier}, /usr/local/bin/noo-kiosk-* and the\n\
-         # kiosk units. It holds no fleet credential and never will.\n\
+         # ~/.local/bin/noo, {applier}, {dir}/signing.pub,\n\
+         # /usr/local/bin/noo-kiosk-* and the kiosk units. It holds no fleet credential and never will.\n\
          [Unit]\n\
          Description=noomesh kiosk seat sync (CLI + kiosk assets over the rail; seat-scoped)\n\
          After=network-online.target\n\
@@ -754,7 +754,7 @@ pub(crate) fn render_sync_service() -> String {
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
          TimeoutStartSec=15min\n",
-        applier = SEAT_APPLIER_BIN,
+        applier = SEAT_APPLIER_BIN, dir = SEAT_DIR,
     )
 }
 
@@ -1053,42 +1053,154 @@ fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
     })
 }
 
-/// Write one planned file. Root paths: a temp file in the same root-owned
-/// directory, then rename (atomic, and a running binary is replaced, not
-/// overwritten). The user's CLI: written AS the user (`runuser`), so the root
-/// applier never follows a link the user planted in their own home.
-fn install_file(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String> {
-    if !seat_path_allowed(dst, cfg) {
-        return Err(format!("REFUSED — {} is outside the seat applier's allow-list", dst.display()));
+/// The shell the seat user runs to replace their own CLI. It reads the new
+/// bytes on stdin (a plain pipe: never `/dev/stdin`, which a setuid'd child
+/// cannot reopen — that was the live "install: Permission denied"), stages
+/// them in a temp file in the SAME directory (so the user owns it and the
+/// rename is atomic), fsyncs, sets the mode and renames over the target. On
+/// any failure the temp file is removed and the old target is untouched; the
+/// target is never unlinked first (GNU `install` does exactly that).
+pub(crate) const USER_WRITE_SH: &str = "set -eu\n\
+dst=$1\n\
+d=${dst%/*}\n\
+mkdir -p \"$d\"\n\
+t=$(mktemp \"$d/.noo-seat.XXXXXX\")\n\
+trap 'rm -f \"$t\"' EXIT\n\
+dd of=\"$t\" conv=fsync 2>/dev/null\n\
+chmod 0755 \"$t\"\n\
+mv -f \"$t\" \"$dst\"\n\
+trap - EXIT\n";
+
+/// The production "install as user": `runuser -u <user> -- sh -c USER_WRITE_SH`.
+/// Written AS the user, not as root plus chown: the root applier then never
+/// follows a link the user planted in their own home, and the file is born
+/// with the right owner. A child that fails (or exits before reading all of
+/// stdin) is a clear error carrying its stderr, never SIGPIPE.
+fn install_as_user(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String> {
+    let mut cmd = Command::new("runuser");
+    cmd.args(["-u", &cfg.cli_user, "--", "sh", "-c", USER_WRITE_SH, "noo-seat-write"]).arg(dst);
+    run_writer(cmd, dst, &cfg.cli_user, bytes)
+}
+
+/// Spawn the writer child, feed it `bytes`, and turn ANY failure into an
+/// error string (spawn, early exit, non-zero status with its stderr).
+pub(crate) fn run_writer(mut cmd: Command, dst: &Path, user: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut child = cmd
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("spawning the writer: {e}"))?;
+    let mut sin = child.stdin.take().ok_or("writer: no stdin")?;
+    // `main` leaves SIGPIPE at its default; a child that died early would
+    // kill this process (status 13) if written to bare. This helper ignores
+    // it and lets the child's exit status be the verdict.
+    let werr = crate::child_stdin::write_child_stdin(&mut sin, bytes);
+    drop(sin);
+    let out = child.wait_with_output().map_err(|e| format!("waiting on the writer: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("installing {} as {} failed ({}): {}", dst.display(), user, out.status,
+            err.trim().chars().take(300).collect::<String>()));
     }
-    let mode = if dst.starts_with(UNIT_DIR) || dst.ends_with("signing.pub") { 0o644 } else { 0o755 };
-    if dst == cfg.cli_path() {
-        use std::io::Write as _;
-        let mut child = Command::new("runuser")
-            .args(["-u", &cfg.cli_user, "--", "install", "-D", "-m", "0755", "/dev/stdin"])
-            .arg(dst)
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .stdin(std::process::Stdio::piped())
-            .spawn().map_err(|e| format!("runuser: {e}"))?;
-        let mut sin = child.stdin.take().ok_or("runuser: no stdin")?;
-        sin.write_all(bytes).map_err(|e| format!("write {}: {e}", dst.display()))?;
-        drop(sin);
-        let st = child.wait().map_err(|e| e.to_string())?;
-        return if st.success() { Ok(()) } else { Err(format!("installing {} as {} exited {st}", dst.display(), cfg.cli_user)) };
-    }
+    werr.map_err(|e| format!("write {}: {e}", dst.display()))
+}
+
+/// Atomic root-owned write: temp file in the same directory, fsync, mode,
+/// rename. A running binary is replaced, not overwritten; on any failure the
+/// old file stays.
+pub(crate) fn install_root_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     let dir = dst.parent().ok_or("no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let tmp = dir.join(format!(".{}.noo-seat-{}", dst.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    {
-        use std::io::Write as _;
+    let r = (|| {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.write_all(bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, dst).map_err(|e| format!("rename onto {}: {e}", dst.display()))
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, dst).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("rename onto {}: {e}", dst.display()) })
+    r
+}
+
+/// Write one planned file (production wiring of [`apply_plan`]).
+fn install_file(dst: &Path, bytes: &[u8], cfg: &SeatConfig) -> Result<(), String> {
+    if !seat_path_allowed(dst, cfg) {
+        return Err(format!("REFUSED — {} is outside the seat applier's allow-list", dst.display()));
+    }
+    if dst == cfg.cli_path() {
+        return install_as_user(dst, bytes, cfg);
+    }
+    let mode = if dst.starts_with(UNIT_DIR) || dst.ends_with("signing.pub") { 0o644 } else { 0o755 };
+    install_root_file(dst, bytes, mode)
+}
+
+/// An injected file writer: `(destination, bytes)`.
+pub(crate) type Writer<'a> = &'a dyn Fn(&Path, &[u8]) -> Result<(), String>;
+
+/// Apply a verified plan. ROOT targets first (still root, temp+rename), the
+/// user's CLI LAST, so a user-side failure can never leave the root side
+/// half-written, and the user's CLI is written only after the seat copy it
+/// mirrors. `allowed` is the second allow-list guard; the two installers are
+/// injected so tests can run on a temp tree as one user.
+/// Returns the kinds that changed; an error names what already changed.
+pub(crate) fn apply_plan(
+    plan: &[(String, PathBuf)],
+    cli_path: &Path,
+    read_bytes: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    allowed: &dyn Fn(&Path) -> bool,
+    install_root: Writer,
+    install_user: Writer,
+) -> Result<Vec<String>, String> {
+    let mut ordered: Vec<&(String, PathBuf)> = plan.iter().filter(|(_, d)| d != cli_path).collect();
+    ordered.extend(plan.iter().filter(|(_, d)| d == cli_path));
+    let mut changed: Vec<String> = Vec::new();
+    for (kind, dst) in ordered {
+        if !allowed(dst) {
+            return Err(format!("REFUSED — {} is outside the seat applier's allow-list", dst.display()));
+        }
+        let mut bytes = read_bytes(kind)?;
+        if kind == "kiosk-launch" {
+            let installed = std::fs::read_to_string(dst).ok();
+            bytes = carry_browser_line(&String::from_utf8_lossy(&bytes), installed.as_deref()).into_bytes();
+        }
+        if std::fs::read(dst).ok().as_deref() == Some(&bytes[..]) {
+            continue;
+        }
+        let r = if dst == cli_path { install_user(dst, &bytes) } else { install_root(dst, &bytes) };
+        r.map_err(|e| format!("{e} (already changed: {})", changed.join(",")))?;
+        if !changed.contains(kind) {
+            changed.push(kind.clone());
+        }
+    }
+    Ok(changed)
+}
+
+/// Recovery: the user's CLI is missing (a 0.6.7 seat deleted it) but the
+/// seat copy exists — restore it from that copy, atomically, as the user.
+/// Returns whether it restored. Never removes anything.
+pub(crate) fn restore_user_cli(
+    cli_path: &Path,
+    seat_copy: &Path,
+    install_user: Writer,
+) -> Result<bool, String> {
+    // `exists()` follows links, so a dangling link at the path counts as missing.
+    if cli_path.exists() {
+        return Ok(false);
+    }
+    let bytes = match std::fs::read(seat_copy) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(false),
+    };
+    install_user(cli_path, &bytes).map_err(|e| format!("restoring {}: {e}", cli_path.display()))?;
+    Ok(true)
 }
 
 /// What changed, and what the applier did about it — the apply report's
@@ -1155,20 +1267,20 @@ fn apply_blob(blob: &[u8], cfg: &SeatConfig, state: &mut SeatState) -> Result<Ap
         let plan = verify_seat_stage(&ex, &Path::new(SEAT_DIR).join("signing.pub"), cfg, now_unix())?;
         // Apply. Everything verified; any write failure stops here and is
         // reported, with what was already written named in the message.
-        let mut changed: Vec<String> = Vec::new();
-        for (kind, dst) in &plan {
-            let mut bytes = std::fs::read(ex.join("files").join(kind)).map_err(|e| e.to_string())?;
-            if kind == "kiosk-launch" {
-                let installed = std::fs::read_to_string(dst).ok();
-                bytes = carry_browser_line(&String::from_utf8_lossy(&bytes), installed.as_deref()).into_bytes();
-            }
-            if std::fs::read(dst).ok().as_deref() == Some(&bytes[..]) {
-                continue;
-            }
-            install_file(dst, &bytes, cfg).map_err(|e| format!("{e} (already changed: {})", changed.join(",")))?;
-            if !changed.contains(kind) {
-                changed.push(kind.clone());
-            }
+        let cli_path = cfg.cli_path();
+        let mut changed = apply_plan(
+            &plan, &cli_path,
+            &|kind| std::fs::read(ex.join("files").join(kind)).map_err(|e| e.to_string()),
+            &|p| seat_path_allowed(p, cfg),
+            &|d, b| install_file(d, b, cfg),
+            &|d, b| install_file(d, b, cfg),
+        )?;
+        // A seat whose CLI was removed by the old applier: put it back from
+        // the seat copy that was just applied (or was already current).
+        if restore_user_cli(&cli_path, Path::new(SEAT_APPLIER_BIN), &|d, b| install_file(d, b, cfg))?
+            && !changed.iter().any(|k| k == "cli-binary")
+        {
+            changed.push("cli-binary".into());
         }
         let meta: Value = std::fs::read(ex.join("files/seat-meta")).ok()
             .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
@@ -1261,6 +1373,13 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             Err(e) => say(&format!("heartbeat: {e}")),
         }
     };
+    // Recovery first: a missing user CLI is restored from the seat copy even
+    // when no new bundle is waiting.
+    match restore_user_cli(&cfg.cli_path(), Path::new(SEAT_APPLIER_BIN), &|d, b| install_file(d, b, &cfg)) {
+        Ok(true) => say(&format!("restored {} from {}", cfg.cli_path().display(), SEAT_APPLIER_BIN)),
+        Ok(false) => {}
+        Err(e) => say(&e),
+    }
     heartbeat(&state);
     // Fetch (signed GET).
     let proof = match sign_proof(&key, "get", &seat, "-") {
@@ -1288,7 +1407,7 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     let _ = post_signed(&format!("/bootstrap/seat/{seat}/fetched"), "fetch", &sha, json!({"sha": sha}).to_string().into_bytes());
     let (rc, msg) = match apply_blob(&blob, &cfg, &mut state) {
         Ok(o) => (0, o.line()),
-        Err(e) => (65, e),
+        Err(e) => (65, if e.starts_with("apply failed") { e } else { format!("apply failed: {e}") }),
     };
     say(&format!("apply rc={rc}: {msg}"));
     match post_signed(&format!("/bootstrap/seat/{seat}/applied"), "apply", &sha,
@@ -1296,8 +1415,12 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         Ok(200) => {
             // Recorded only once the controller has the report: a lost report
             // means the next tick applies (idempotently) and reports again.
-            state.last_applied_sha = Some(sha);
-            write_state(&state);
+            // A FAILED apply is not recorded: the next tick retries it (the
+            // root side is already current, so only what failed re-runs).
+            if rc == 0 {
+                state.last_applied_sha = Some(sha);
+                write_state(&state);
+            }
         }
         Ok(st) => say(&format!("apply report answered HTTP {st}")),
         Err(e) => say(&format!("apply report: {e}")),
@@ -1385,8 +1508,8 @@ pub(crate) fn seat_checks(seat: &Value, controller_cli: &str, controller_tag: &s
         let rc = seat["apply_rc"].as_i64();
         out.push(match (applied == Some(staged), rc) {
             (true, Some(0)) => check("seat bundle", Verdict::Ok, "the staged bundle applied (exit 0)".into(), None),
-            (true, Some(rc)) => check("seat bundle", Verdict::Fail,
-                format!("the seat refused its bundle (exit {rc}): {}", seat["apply_msg"].as_str().unwrap_or("")),
+            (true, Some(_)) => check("seat bundle", Verdict::Fail,
+                format!("apply failed: {}", seat["apply_msg"].as_str().unwrap_or("").trim_start_matches("apply failed: ")),
                 Some("noo upgrade --seats".into())),
             _ => check("seat bundle", Verdict::Warn, "staged, not applied yet".into(), Some(format!("on {name}: journalctl -u noo-seat-sync -n 30"))),
         });
@@ -1457,8 +1580,8 @@ pub(crate) fn upgrade_seats(g: &Globals) -> i32 {
                 println!("{}", ui::item(&format!("seat {n}")));
                 match &end {
                     super::provision::ApplyEnd::Applied { rc: 0, .. } => {}
-                    super::provision::ApplyEnd::Applied { rc, msg } => println!("{}", ui::sub(&ui::status_line(Glyph::Err,
-                        &format!("the seat refused its bundle (exit {rc}): {}", msg.chars().take(300).collect::<String>())))),
+                    super::provision::ApplyEnd::Applied { rc: _, msg } => println!("{}", ui::sub(&ui::status_line(Glyph::Err,
+                        &format!("apply failed: {}", msg.trim_start_matches("apply failed: ").chars().take(300).collect::<String>())))),
                     other => println!("{}", ui::sub(&ui::status_line(Glyph::Err, &format!("{other:?} within 10m")))),
                 }
                 for c in &checks {
@@ -1736,6 +1859,232 @@ mod tests {
             assert!(!s.contains(n), "{n}");
         }
         assert!(render_sync_service().contains("ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"));
+    }
+
+    // ── safe apply: atomic, ordered, allow-listed, recoverable ─────────
+
+    /// A scratch tree shaped like a seat: a seat dir, a bin dir and a user
+    /// `~/.local/bin`, all under one temp root.
+    struct Tree { root: PathBuf }
+    impl Tree {
+        fn new(tag: &str) -> Tree {
+            let root = std::env::temp_dir().join(format!("noo-seat-apply-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for d in ["libexec/noo-seat", "bin", "home/alex/.local/bin"] {
+                std::fs::create_dir_all(root.join(d)).unwrap();
+            }
+            Tree { root }
+        }
+        fn cli(&self) -> PathBuf { self.root.join("home/alex/.local/bin/noo") }
+        fn seat(&self) -> PathBuf { self.root.join("libexec/noo-seat/noo") }
+        fn launch(&self) -> PathBuf { self.root.join("bin/noo-kiosk-serve") }
+        fn plan(&self) -> Vec<(String, PathBuf)> {
+            // The real plan puts the user's CLI FIRST; apply_plan reorders.
+            vec![("cli-binary".into(), self.cli()), ("cli-binary".into(), self.seat()), ("kiosk-serve".into(), self.launch())]
+        }
+        fn allowed(&self, p: &Path) -> bool {
+            p == self.cli() || p == self.seat() || p == self.launch()
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(self.root.join("home/alex/.local/bin"), std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The production user-write script, run as the current user (a test
+    /// cannot `runuser`); same script, same stdin pipe, same SIGPIPE handling.
+    fn user_script(dst: &Path, bytes: &[u8]) -> Result<(), String> {
+        let mut c = Command::new("sh");
+        c.args(["-c", USER_WRITE_SH, "noo-seat-write"]).arg(dst);
+        run_writer(c, dst, "alex", bytes)
+    }
+
+    fn run_apply(t: &Tree, root_w: Writer, user_w: Writer) -> Result<Vec<String>, String> {
+        apply_plan(&t.plan(), &t.cli(), &|k| Ok(format!("new-{k}").into_bytes()), &|p| t.allowed(p), root_w, user_w)
+    }
+
+    #[test]
+    fn the_root_side_is_written_before_the_user_side_and_the_cli_is_replaced() {
+        let t = Tree::new("order");
+        std::fs::write(t.cli(), b"old").unwrap();
+        std::fs::write(t.seat(), b"old").unwrap();
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let changed = run_apply(&t,
+            &|d, b| { log.borrow_mut().push(format!("root:{}", d.file_name().unwrap().to_string_lossy())); install_root_file(d, b, 0o755) },
+            &|d, b| { log.borrow_mut().push("user".into()); assert!(d.exists(), "the CLI must exist when the user write starts"); user_script(d, b) },
+        ).unwrap();
+        assert_eq!(*log.borrow(), vec!["root:noo".to_string(), "root:noo-kiosk-serve".into(), "user".into()]);
+        assert_eq!(changed, vec!["cli-binary".to_string(), "kiosk-serve".into()]);
+        assert_eq!(std::fs::read(t.cli()).unwrap(), b"new-cli-binary");
+        assert_eq!(std::fs::read(t.seat()).unwrap(), b"new-cli-binary");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(t.cli()).unwrap().permissions().mode() & 0o777, 0o755);
+        // No temp file is left in either directory.
+        for d in [t.cli().parent().unwrap().to_path_buf(), t.seat().parent().unwrap().to_path_buf()] {
+            let names: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_user_write_keeps_the_old_cli_and_reports_it() {
+        let t = Tree::new("userfail");
+        std::fs::write(t.cli(), b"old-cli").unwrap();
+        std::fs::write(t.seat(), b"old").unwrap();
+        // The user's installer fails (as the live `install` did).
+        let e = run_apply(&t, &|d, b| install_root_file(d, b, 0o755), &|_, _| Err("install: Permission denied".into())).unwrap_err();
+        assert!(e.contains("Permission denied") && e.contains("already changed"), "{e}");
+        assert_eq!(std::fs::read(t.cli()).unwrap(), b"old-cli", "the user's CLI is untouched");
+        assert_eq!(std::fs::read(t.seat()).unwrap(), b"new-cli-binary", "the root side landed first");
+    }
+
+    #[test]
+    fn the_real_user_script_never_unlinks_first_and_keeps_the_old_file_on_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = Tree::new("script");
+        std::fs::write(t.cli(), b"old-cli").unwrap();
+        // The directory refuses new entries (the temp file cannot be made):
+        // the script fails, and the old file is still there, byte for byte.
+        let dir = t.cli().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = user_script(&t.cli(), b"new-cli");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(r.is_err(), "{r:?}");
+        }
+        assert_eq!(std::fs::read(t.cli()).unwrap(), if r.is_err() { b"old-cli".to_vec() } else { b"new-cli".to_vec() });
+        // A dangling symlink at the target is replaced by a regular file, not followed.
+        let t2 = Tree::new("script-link");
+        std::os::unix::fs::symlink(t2.root.join("nowhere"), t2.cli()).unwrap();
+        user_script(&t2.cli(), b"fresh").unwrap();
+        assert_eq!(std::fs::read(t2.cli()).unwrap(), b"fresh");
+        assert!(!t2.cli().symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn the_user_cli_is_never_missing_while_it_is_replaced() {
+        let t = Tree::new("never-missing");
+        std::fs::write(t.cli(), b"old-cli").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let missing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cli, st, mi) = (t.cli(), stop.clone(), missing.clone());
+        let watcher = std::thread::spawn(move || {
+            while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::read(&cli) {
+                    Ok(b) if b.starts_with(b"old-cli") || b.starts_with(b"new-cli") => {}
+                    _ => { mi.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
+            }
+        });
+        for i in 0..40 {
+            let body = format!("{}-{i}", if i % 2 == 0 { "new-cli" } else { "old-cli" }).repeat(50_000);
+            user_script(&t.cli(), body.as_bytes()).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap();
+        assert_eq!(missing.load(std::sync::atomic::Ordering::Relaxed), 0, "the CLI was missing or unreadable at some instant");
+    }
+
+    #[test]
+    fn nothing_outside_the_allow_list_is_written() {
+        let t = Tree::new("allow");
+        let outside = t.root.join("etc-passwd");
+        let plan = vec![("kiosk-serve".to_string(), t.launch()), ("kiosk-cdp".to_string(), outside.clone())];
+        let wrote = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let e = apply_plan(&plan, &t.cli(), &|_| Ok(b"x".to_vec()), &|p| t.allowed(p),
+            &|d, _| { wrote.borrow_mut().push(d.to_path_buf()); Ok(()) }, &|_, _| Ok(())).unwrap_err();
+        assert!(e.contains("REFUSED") && e.contains("allow-list"), "{e}");
+        assert!(!wrote.borrow().contains(&outside));
+        assert!(!outside.exists());
+        // The production guard refuses a path no kind maps to, in the real layout.
+        let c = cfg();
+        for p in ["/etc/passwd", "/home/alex/.bashrc", "/home/alex/.local/bin/other", "/home/alex/.local/bin/../../.bashrc",
+                  "/usr/local/bin/sudo", "/etc/systemd/system/other.service", "/etc/sudoers.d/noo"] {
+            assert!(install_file(Path::new(p), b"x", &c).unwrap_err().contains("REFUSED"), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_failing_child_is_an_error_not_a_panic_or_a_signal() {
+        // A child that exits before reading a single byte, with a payload far
+        // bigger than the pipe buffer: the write hits a closed pipe.
+        let mut c = Command::new("sh");
+        c.args(["-c", "echo 'install: Permission denied' >&2; exit 3"]);
+        let big = vec![7u8; 8 * 1024 * 1024];
+        let e = run_writer(c, Path::new("/x/noo"), "alex", &big).unwrap_err();
+        assert!(e.contains("Permission denied") && e.contains("as alex failed"), "{e}");
+        // A writer that cannot even start is also an error line.
+        let e = run_writer(Command::new("/nonexistent/runuser"), Path::new("/x/noo"), "alex", b"x").unwrap_err();
+        assert!(e.contains("spawning the writer"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_user_cli_is_restored_from_the_seat_copy_and_never_left_missing() {
+        let t = Tree::new("restore");
+        std::fs::write(t.seat(), b"seat-copy").unwrap();
+        // The live state: only a dangling `pai` link is left where the CLI was.
+        std::os::unix::fs::symlink(t.cli(), t.root.join("home/alex/.local/bin/pai")).unwrap();
+        assert!(!t.cli().exists());
+        assert!(restore_user_cli(&t.cli(), &t.seat(), &user_script).unwrap());
+        assert_eq!(std::fs::read(t.cli()).unwrap(), b"seat-copy");
+        // The link now resolves.
+        assert!(t.root.join("home/alex/.local/bin/pai").exists());
+        // Present: untouched. No seat copy: nothing invented, nothing removed.
+        std::fs::write(t.cli(), b"mine").unwrap();
+        assert!(!restore_user_cli(&t.cli(), &t.seat(), &user_script).unwrap());
+        assert_eq!(std::fs::read(t.cli()).unwrap(), b"mine");
+        let t2 = Tree::new("restore-none");
+        assert!(!restore_user_cli(&t2.cli(), &t2.seat(), &user_script).unwrap());
+        assert!(!t2.cli().exists());
+        // A failing restore is an error, and a plan that finds the CLI missing writes it.
+        assert!(restore_user_cli(&t2.cli(), &t.seat(), &|_, _| Err("boom".into())).unwrap_err().contains("boom"));
+        let changed = run_apply(&t2, &|d, b| install_root_file(d, b, 0o755), &user_script).unwrap();
+        assert!(changed.contains(&"cli-binary".to_string()));
+        assert_eq!(std::fs::read(t2.cli()).unwrap(), b"new-cli-binary");
+    }
+
+    #[test]
+    fn the_sync_unit_text_matches_the_allow_list_comment() {
+        let u = render_sync_service();
+        let comment: String = u.lines().take_while(|l| l.starts_with('#')).collect::<Vec<_>>().join(" ");
+        let comment = comment.replace("# ", "");
+        let c = cfg();
+        // Every allow-listed path is covered by a class the comment names.
+        let kinds: Vec<String> = SEAT_KINDS.iter().map(|k| k.to_string()).collect();
+        for (_, dst) in plan_seat_apply(&kinds, &c).unwrap() {
+            let s = dst.to_string_lossy().into_owned();
+            let named = if dst == c.cli_path() { comment.contains("~/.local/bin/noo") }
+                else if s.starts_with("/usr/local/bin/noo-kiosk-") { comment.contains("/usr/local/bin/noo-kiosk-*") }
+                else if s.starts_with("/etc/systemd/system/kiosk") { comment.contains("kiosk units") }
+                else { comment.contains(&s) };
+            assert!(named, "{s} is allow-listed but the unit comment does not name it:\n{comment}");
+        }
+        // And every path the comment names is something the applier really writes.
+        assert!(comment.contains(SEAT_APPLIER_BIN) && seat_path_allowed(Path::new(SEAT_APPLIER_BIN), &c));
+        // The privilege boundary: root, hardened, no User=.
+        assert!(!u.lines().any(|l| l.starts_with("User=")), "the sync runs as root so it can write the root side");
+        for need in ["Type=oneshot", "NoNewPrivileges=yes", "PrivateTmp=yes", "ExecStart=/usr/local/libexec/noo-seat/noo kiosk seat-sync"] {
+            assert!(u.lines().any(|l| l == need), "{need}");
+        }
+    }
+
+    #[test]
+    fn the_verify_block_names_a_failed_apply() {
+        use super::super::cluster_verify::Verdict;
+        let seen = "2025-10-09T08:53:10Z";
+        let now = super::super::cluster_verify::parse_rfc3339_unix(seen).unwrap() + 10;
+        let bad = json!({"seat_name": "lobby", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.5", "user_cli_current": true, "kiosk_serve": "active", "console_build": "stack-v0.6.5"},
+            "staged_sha": "a", "applied_sha": "a", "apply_rc": 65,
+            "apply_msg": "apply failed: installing /home/alex/.local/bin/noo as alex failed (exit status: 1): Permission denied"});
+        let c = seat_checks(&bad, "0.6.5", "stack-v0.6.5", now);
+        let b = c.iter().find(|c| c.name == "seat bundle").unwrap();
+        assert_eq!(b.verdict, Verdict::Fail);
+        assert!(b.detail.starts_with("apply failed: installing"), "{}", b.detail);
+        assert!(!b.detail.contains("apply failed: apply failed"));
     }
 
     // ── the seat's transport: token URL + trust union ──────────────────
