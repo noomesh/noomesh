@@ -2153,7 +2153,7 @@ ALTER TABLE noo_embedding_spaces
 
 /// The embedding-space migration revision (i150). A constant so a renumber
 /// at rebase is one line.
-pub const EMBEDDING_SPACE_MIGRATION_REVISION: &str = "101_embedding_space_migration";
+pub const EMBEDDING_SPACE_MIGRATION_REVISION: &str = "102_embedding_space_migration";
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
 /// line.
@@ -2165,7 +2165,7 @@ pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 
 /// Embed placements keyed by model (i150 E1). A constant so a renumber at
 /// rebase is one line.
-pub const EMBED_PLACEMENT_MODEL_REVISION: &str = "100_embed_placement_model";
+pub const EMBED_PLACEMENT_MODEL_REVISION: &str = "101_embed_placement_model";
 
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
@@ -3036,7 +3036,7 @@ mod tests {
     #[test]
     fn embed_placement_model_revision_keys_embed_rows_by_model() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBED_PLACEMENT_MODEL_REVISION).expect("must be in the chain");
-        assert_eq!(m.revision, "100_embed_placement_model");
+        assert_eq!(m.revision, "101_embed_placement_model");
         assert!(m.revision.len() <= 32, "alembic_version.version_num is varchar(32)");
         assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
         assert!(m.sql.contains("DROP INDEX IF EXISTS uq_placement_node_backend_role;"));
@@ -3054,7 +3054,7 @@ mod tests {
     #[test]
     fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
-        assert_eq!(m.revision, "101_embedding_space_migration");
+        assert_eq!(m.revision, "102_embedding_space_migration");
         assert!(m.revision.len() <= 32);
         assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
         assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
