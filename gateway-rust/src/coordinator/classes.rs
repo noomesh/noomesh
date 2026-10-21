@@ -1082,11 +1082,6 @@ fn node_refusal(table: &ClassTable, node: &str, hint: Option<&str>) -> Refusal {
     ))
 }
 
-// ── stall memory ─────────────────────────────────────────────────────────
-
-/// When each `(node-agent address, backend)` last stalled or timed out. The
-/// address is one per node (`https://<ip>:8081`), so this is per node and
-/// backend; both callers hold the address, not always the node id.
 // ── GPU holds in progress (routes/cluster.rs gpu_hold) ──────────────────
 //
 // A drain hold must route nothing new to the node BEFORE the agent stops
@@ -1137,6 +1132,11 @@ pub fn lane_held(node_id: &str, backend: &str) -> bool {
         .is_some_and(|g| g.get(node_id).is_some_and(|v| v.iter().any(|b| b == backend)))
 }
 
+// ── stall memory ─────────────────────────────────────────────────────────
+
+/// When each `(node-agent address, backend)` last stalled or timed out. The
+/// address is one per node (`https://<ip>:8081`), so this is per node and
+/// backend; both callers hold the address, not always the node id.
 static STALLS: OnceLock<Mutex<HashMap<(String, String), Instant>>> = OnceLock::new();
 
 fn stalls() -> &'static Mutex<HashMap<(String, String), Instant>> {
