@@ -163,6 +163,10 @@ type Contention struct {
 	Generation uint64 `json:"generation"`
 	// Lease is the current hold's owner and ids while held or draining.
 	Lease *Lease `json:"lease,omitempty"`
+	// GPUBackends are the backends that use the GPU (running, or placed on
+	// it): what a hold pauses. The gateway takes exactly these lanes out of
+	// routing while a hold drains, leaving the node's CPU lanes serving.
+	GPUBackends []string `json:"gpu_backends"`
 }
 
 // persisted is what survives an agent restart, so a restarted agent does
@@ -315,7 +319,7 @@ func (c *Controller) Report() Contention {
 		Orphan: append([]string(nil), c.orphans...), TotalMB: c.last.TotalMB,
 		Method: c.method, Since: c.since.UTC().Format(time.RFC3339),
 		PausedBackends: sortedKeys(c.paused), NeedMB: c.needMB, Reason: c.reason, Policy: "auto",
-		Generation: c.generation, Lease: c.lease.clone(),
+		Generation: c.generation, Lease: c.lease.clone(), GPUBackends: sortedKeys(c.gpuSet),
 	}
 	if c.last.Measured {
 		r.FreeMB = c.last.TotalMB - c.last.UsedMB

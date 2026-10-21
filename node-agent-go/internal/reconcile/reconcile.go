@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
 	"io"
 	"log/slog"
@@ -97,6 +98,10 @@ type desiredConfig struct {
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
 	HarnessProfile json.RawMessage `json:"harness_profile"`
+	// Add-on workloads this node may start and stop (the verified bundles'
+	// declarations; internal/addonwl, i163 part B). A pre-workload gateway
+	// omits the field: nothing is declared, the actuator refuses everything.
+	AddonWorkloads []addonwl.Decl `json:"addon_workloads"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -293,6 +298,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// Before the empty-state return below: the profile is the node's, not a
 	// placement's (the inference proxy reads first_byte_secs from it).
 	applyHarnessProfile(desired.HarnessProfile)
+	addonwl.SetDeclared(desired.AddonWorkloads)
 	r.recordChatPlacement(desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.

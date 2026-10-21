@@ -92,6 +92,9 @@ type Server struct {
 
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
+	// workloadOps overrides the docker client for the add-on workload
+	// actuator (tests only).
+	workloadOps workloadOps
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
@@ -279,6 +282,11 @@ func (s *Server) registerRoutes() {
 	// Reverse proxy into a managed container's loopback-published port (the
 	// only way in: the port is not bound on any other interface).
 	s.mux.Handle("/api/containers/{name}/proxy/{path...}", ctrlMW(http.HandlerFunc(s.handleContainerProxy)))
+	// The add-on workload actuator (internal/addonwl, i163 part B):
+	// controller-only, acts only on a declared, labelled container.
+	s.mux.Handle("GET /api/addon-workloads/{addon}/{workload}", ctrlMW(http.HandlerFunc(s.handleWorkloadStatus)))
+	s.mux.Handle("POST /api/addon-workloads/{addon}/{workload}/start", ctrlMW(http.HandlerFunc(s.handleWorkloadStart)))
+	s.mux.Handle("POST /api/addon-workloads/{addon}/{workload}/stop", ctrlMW(http.HandlerFunc(s.handleWorkloadStop)))
 
 	// The work routes are the controller's too.
 	//

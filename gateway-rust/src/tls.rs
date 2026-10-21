@@ -380,6 +380,24 @@ pub fn failover_client() -> reqwest::Client {
 pub const FAILOVER_CONNECT_SECS: u64 = 5;
 
 fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> {
+    match cluster_rustls_config()? {
+        Some(cfg) => {
+            let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls((*cfg).clone());
+            Ok(builder.build()?)
+        }
+        None => {
+            // No custom TLS — use defaults
+            tracing::info!("TLS: using system trust store (no cluster CA)");
+            Ok(timeouts.apply(reqwest::Client::builder()).build()?)
+        }
+    }
+}
+
+/// The cluster's rustls client config (the CA in `NOO_TLS_CA`, the mTLS
+/// identity in `NOO_TLS_CERT`/`NOO_TLS_KEY`), shared by every HTTPS client
+/// here and by the reserved-workload WebSocket relay. `None` when neither is
+/// configured (the system trust store applies).
+pub fn cluster_rustls_config() -> Result<Option<std::sync::Arc<rustls::ClientConfig>>> {
     let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
@@ -389,7 +407,9 @@ fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> 
     let has_identity = !cert_path.is_empty() && !key_path.is_empty()
         && Path::new(&cert_path).exists() && Path::new(&key_path).exists();
 
-    if has_ca || has_identity {
+    if !(has_ca || has_identity) {
+        return Ok(None);
+    }
         // Build root cert store
         let mut root_store = rustls::RootCertStore::empty();
 
@@ -437,14 +457,7 @@ fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> 
             config_builder.with_no_client_auth()
         };
 
-        let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls(tls_config);
-
-        Ok(builder.build()?)
-    } else {
-        // No custom TLS — use defaults
-        tracing::info!("TLS: using system trust store (no cluster CA)");
-        Ok(timeouts.apply(reqwest::Client::builder()).build()?)
-    }
+    Ok(Some(std::sync::Arc::new(tls_config)))
 }
 
 /// The three env vars the listener cannot start without.

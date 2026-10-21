@@ -32,6 +32,7 @@ mod intelligence;
 // shaped to what one screen draws.
 mod addon_token;
 mod kiosk;
+mod reservations;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
 mod monitoring;
@@ -270,6 +271,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(ui::router())
         .merge(core::router())
         .merge(cluster::router())
+        .merge(reservations::router())
         .merge(artifacts::router())
         .merge(bootstrap::router())
         .merge(seats::router())

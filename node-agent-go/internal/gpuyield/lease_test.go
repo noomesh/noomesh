@@ -91,6 +91,9 @@ func TestHoldIsAnOwnedLeaseWithAGeneration(t *testing.T) {
 	if r.Generation != 1 {
 		t.Fatalf("generation rides the report: %+v", r)
 	}
+	if len(r.GPUBackends) != 1 || r.GPUBackends[0] != "vllm" {
+		t.Fatalf("the report names the GPU lanes a hold pauses: %+v", r.GPUBackends)
+	}
 	// The same operation asking again is its own hold, not a conflict.
 	r2, err := c.Hold(context.Background(), HoldRequest{Reason: "voice", OperationID: "op-1"})
 	if err != nil || r2.Lease.Generation != 1 {

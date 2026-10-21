@@ -2265,7 +2265,26 @@ impl Drop for GpuTransition {
     }
 }
 
-async fn gpu_hold_op(
+/// The node's KV record (`mesh_nodes`), as the heartbeat last wrote it.
+pub(crate) async fn node_record(state: &AppState, node_id: &str) -> Option<Value> {
+    let kv = state.js.get_key_value("mesh_nodes").await.ok()?;
+    let entry = kv.get(node_id).await.ok()??;
+    serde_json::from_slice::<Value>(&entry).ok()
+}
+
+/// The lanes a hold will pause, as the node last reported them
+/// (`gpu_contention.gpu_backends`, agents from 0.6.10); empty when unknown.
+pub(crate) async fn reported_gpu_lanes(state: &AppState, node_id: &str) -> Vec<String> {
+    node_record(state, node_id)
+        .await
+        .as_ref()
+        .and_then(|r| r.pointer("/gpu_contention/gpu_backends"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+pub(crate) async fn gpu_hold_op(
     state: &AppState,
     actor: String,
     node_id: &str,
@@ -2275,10 +2294,19 @@ async fn gpu_hold_op(
 ) -> AppResult {
     let _slot = GpuTransition::take(node_id)?;
     let draining = op == "hold" && payload["mode"] == "drain";
+    // Which lanes leave routing while the hold drains: the GPU lanes the
+    // node reported, so its CPU lanes keep serving; a node that reports
+    // none (an older agent) loses every lane for the drain.
+    let mut drain_lanes: Vec<String> = Vec::new();
     if draining {
-        // Nothing new is routed to the node from this moment: before the
+        drain_lanes = reported_gpu_lanes(state, node_id).await;
+        // Nothing new is routed to those lanes from this moment: before the
         // agent closes admission, before anything stops.
-        crate::coordinator::classes::set_node_draining(node_id, true);
+        if drain_lanes.is_empty() {
+            crate::coordinator::classes::set_node_draining(node_id, true);
+        } else {
+            crate::coordinator::classes::set_lanes_paused(node_id, &drain_lanes);
+        }
     }
     let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
     let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload).timeout(wait);
@@ -2314,7 +2342,12 @@ async fn gpu_hold_op(
             crate::coordinator::classes::set_node_draining(node_id, false);
             crate::coordinator::classes::set_lanes_paused(node_id, &paused);
         }
-        ("hold", false) if draining => crate::coordinator::classes::set_node_draining(node_id, false),
+        ("hold", false) if draining => {
+            crate::coordinator::classes::set_node_draining(node_id, false);
+            if !drain_lanes.is_empty() {
+                crate::coordinator::classes::set_lanes_paused(node_id, &[]);
+            }
+        }
         ("release", true) => crate::coordinator::classes::set_lanes_paused(node_id, &[]),
         _ => {}
     }
@@ -3577,6 +3610,10 @@ async fn desired_config_get(
         // The agent applies first_byte_secs, ollama_context and
         // foreign_kinds, and hands the whole object to its harness.
         "harness_profile": harness_profile,
+        // Every verified add-on bundle's declared workloads (i163 part B):
+        // what the node's actuator may start and stop. The node acts only
+        // on a container that exists there with the declared labels.
+        "addon_workloads": crate::addon_workloads::for_nodes(),
         // The fleet's node disk-reclaim gate (disk_watermark location): the
         // agent queues its own ladder under it. Absent on older gateways.
         "disk_reclaim": crate::autonomy_evaluators::node_reclaim_policy(&state).await,
@@ -6529,8 +6566,9 @@ mod heartbeat_carry_tests {
         assert!(op.contains("audit_event("), "hold/release must be audited");
         assert!(op.contains("\"force\": payload[\"force\"]"), "the audit row says whether it was a force");
         let drain = op.find("set_node_draining(node_id, true)").expect("drain mark");
+        let lanes = op.find("set_lanes_paused(node_id, &drain_lanes)").expect("GPU-lane mark");
         let call = op.find("NodeLink::for_node(").expect("node call");
-        assert!(drain < call, "the node leaves routing before the agent is asked to stop anything");
+        assert!(drain < call && lanes < call, "the lanes leave routing before the agent is asked to stop anything");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
     }

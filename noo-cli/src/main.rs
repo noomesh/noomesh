@@ -275,6 +275,13 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    // Reservations: an add-on's declared workload takes a GPU out of the
+    // pool (drain, owned hold, start) and gives it back (drain, stop,
+    // release); the low-level `gpu hold|release` stay for emergencies.
+    (&["cluster", "reserve"], commands::cluster_reserve),
+    (&["cluster", "reservations"], commands::cluster_reservations),
+    (&["cluster", "release"], commands::cluster_release),
+    (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
     (&["cluster", "profile"], commands::cluster_profile),
