@@ -2774,18 +2774,50 @@ async fn action_cost_report(
 const ROUTINE_AUDIT_EVENTS: &[&str] =
     &["mcp_tool_call", "config_update", "auth_success", "auth_logout"];
 
+/// Risk level for a security-audit window. Proportionate, not a flat sum:
+/// a handful of failed logins in a day is normal background (typos, an
+/// expired token, a scanner), and the old "3 x threshold of anything" rule
+/// rated it HIGH (record: i160b). Now:
+///
+/// - `exec_denied` / `path_traversal` are attack-shaped: any is MEDIUM, a
+///   burst (>= `alert_threshold`) is HIGH.
+/// - auth failures need volume: MEDIUM at `2 x alert_threshold`, HIGH at
+///   `10 x alert_threshold` (50 by default).
+/// - every other non-routine event (rate limits, unknown types) is summed
+///   with the same volume bands as auth failures.
+///
+/// The level is the highest band any group reaches.
 fn security_risk_level(rows: &[(String, i64)], alert_threshold: i64) -> &'static str {
-    let signal: i64 = rows
-        .iter()
-        .filter(|(t, _)| !ROUTINE_AUDIT_EVENTS.contains(&t.as_str()))
-        .map(|(_, c)| *c)
-        .sum();
-    if signal >= alert_threshold * 3 {
-        "HIGH"
-    } else if signal >= alert_threshold {
-        "MEDIUM"
+    let thr = alert_threshold.max(1);
+    let (mut attack, mut auth, mut other) = (0i64, 0i64, 0i64);
+    for (ty, c) in rows {
+        match ty.as_str() {
+            "exec_denied" | "path_traversal" => attack += c,
+            "auth_failure" | "cluster_auth_failure" => auth += c,
+            routine if ROUTINE_AUDIT_EVENTS.contains(&routine) => {}
+            _ => other += c,
+        }
+    }
+    let volume = |n: i64| {
+        if n >= thr * 10 {
+            2
+        } else if n >= thr * 2 {
+            1
+        } else {
+            0
+        }
+    };
+    let attack_band = if attack >= thr {
+        2
+    } else if attack >= 1 {
+        1
     } else {
-        "LOW"
+        0
+    };
+    match attack_band.max(volume(auth)).max(volume(other)) {
+        2 => "HIGH",
+        1 => "MEDIUM",
+        _ => "LOW",
     }
 }
 
@@ -3012,7 +3044,25 @@ const CHEAP_ACTIONS: &[&str] = &[
     "security_audit",
     "agent_self_check",
     "graph_signals",
+    // Two SQL statements over a small table (count, delete) and a partition
+    // export: a healthy run on a quiet install is milliseconds.
+    "agent_messages_retention",
+    "audit_log_rotate",
 ];
+
+/// True when a result text is an action REPORTING that it did no work
+/// (skipped, nothing to do). `thought_experiment` returns these as
+/// `success` in single-digit milliseconds: it skips while a session is
+/// active, and returns early when the graph has too few connected entities
+/// or every sampled pair was rehearsed inside the revisit window. A fast run
+/// is only trusted when its own text says why; a fast run with a
+/// "complete" summary, or with no text, is still flagged.
+fn reports_noop(result_text: Option<&str>) -> bool {
+    let t = result_text.map(str::trim).unwrap_or("");
+    t.starts_with("Skipped:")
+        || t.starts_with("Thought experiment: not enough connected entities")
+        || t.starts_with("Thought experiment: no new queries this run")
+}
 
 /// Why a heartbeat run belongs in the self-check digest, or None.
 /// An error is `status = error` or a non-blank error field (an empty
@@ -3023,13 +3073,14 @@ fn classify_run_issue(
     status: &str,
     duration_ms: Option<i32>,
     error: Option<&str>,
+    result_text: Option<&str>,
 ) -> Option<String> {
     let err = error.map(str::trim).filter(|e| !e.is_empty());
     if status == "error" || err.is_some() {
         let e = err.unwrap_or("(no message)");
         return Some(format!("error: {}", e.chars().take(120).collect::<String>()));
     }
-    if status == "success" && !CHEAP_ACTIONS.contains(&action) {
+    if status == "success" && !CHEAP_ACTIONS.contains(&action) && !reports_noop(result_text) {
         if let Some(d) = duration_ms.filter(|d| *d < 1000) {
             return Some(format!("suspiciously fast: {d}ms (likely silent failure)"));
         }
@@ -3065,15 +3116,17 @@ async fn action_agent_self_check(
     let scan_id = uuid::Uuid::new_v4();
 
     // ── Section 1: recent heartbeat failures ──────────────────────────
-    let recent_failures: Vec<(String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>)> =
+    let recent_failures: Vec<(String, Option<String>, String, String, Option<i32>, chrono::DateTime<Utc>, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT task_id, task_name, action, status, duration_ms, started_at, error \
+            "SELECT task_id, task_name, action, status, duration_ms, started_at, error, result_text \
              FROM noo_heartbeat_runs \
              WHERE started_at > NOW() - ($1::int * INTERVAL '1 hour') \
                AND (status = 'error' \
                     OR COALESCE(BTRIM(error), '') <> '' \
                     OR (status = 'success' AND COALESCE(duration_ms, 0) < 1000 \
-                        AND NOT (action = ANY($2)))) \
+                        AND NOT (action = ANY($2)) \
+                        AND COALESCE(result_text, '') !~ \
+                            '^\\s*(Skipped:|Thought experiment: (not enough connected entities|no new queries this run))')) \
              ORDER BY started_at DESC \
              LIMIT 50",
         )
@@ -3171,10 +3224,10 @@ async fn action_agent_self_check(
             "## ⚠️ Heartbeat task issues (last {lookback_hours}h) — {} event(s)\n\n",
             recent_failures.len()
         ));
-        for (task_id, task_name, action, status, dur_ms, when, err) in &recent_failures {
+        for (task_id, task_name, action, status, dur_ms, when, err, text) in &recent_failures {
             let name = task_name.as_deref().unwrap_or(task_id);
             let when_s = when.format("%m-%d %H:%M");
-            let Some(detail) = classify_run_issue(action, status, *dur_ms, err.as_deref()) else {
+            let Some(detail) = classify_run_issue(action, status, *dur_ms, err.as_deref(), text.as_deref()) else {
                 continue;
             };
             out.push_str(&format!("- `{when_s}` **{name}** ({action}) — {detail}\n"));
@@ -3303,7 +3356,7 @@ async fn action_agent_self_check(
     let phase_findings = crate::agent_meta_loop::ScanFindings {
         recent_failures: recent_failures
             .iter()
-            .map(|(tid, tn, _action, _status, _dur, _when, err)| {
+            .map(|(tid, tn, _action, _status, _dur, _when, err, _text)| {
                 (tid.clone(), tn.clone(), err.clone())
             })
             .collect(),
@@ -4389,27 +4442,27 @@ mod sanitize_tests {
     #[test]
     fn self_check_does_not_flag_graph_signals_noop() {
         // Real history row: status=success, error "" (empty), 74ms.
-        assert_eq!(classify_run_issue("graph_signals", "success", Some(74), Some("")), None);
+        assert_eq!(classify_run_issue("graph_signals", "success", Some(74), Some(""), None), None);
         for a in ["cluster_health", "rag_reindex", "security_audit", "agent_self_check"] {
-            assert_eq!(classify_run_issue(a, "success", Some(74), None), None, "{a}");
+            assert_eq!(classify_run_issue(a, "success", Some(74), None, None), None, "{a}");
         }
     }
 
     #[test]
     fn self_check_still_flags_real_errors_and_fast_expensive_actions() {
-        let e = classify_run_issue("graph_signals", "error", Some(74), Some("boom")).unwrap();
+        let e = classify_run_issue("graph_signals", "error", Some(74), Some("boom"), None).unwrap();
         assert_eq!(e, "error: boom");
         // non-empty error field on a "success" row still shows
-        assert!(classify_run_issue("graph_signals", "success", Some(5000), Some("x")).is_some());
+        assert!(classify_run_issue("graph_signals", "success", Some(5000), Some("x"), None).is_some());
         // status error with empty message is still an error
         assert_eq!(
-            classify_run_issue("cluster_health", "error", None, Some("")).unwrap(),
+            classify_run_issue("cluster_health", "error", None, Some(""), None).unwrap(),
             "error: (no message)"
         );
         // silent-failure check stays for expensive actions
-        let f = classify_run_issue("research", "success", Some(74), Some("")).unwrap();
+        let f = classify_run_issue("research", "success", Some(74), Some(""), None).unwrap();
         assert_eq!(f, "suspiciously fast: 74ms (likely silent failure)");
-        assert_eq!(classify_run_issue("research", "success", Some(4000), None), None);
+        assert_eq!(classify_run_issue("research", "success", Some(4000), None, None), None);
     }
 
     #[test]
@@ -4420,10 +4473,67 @@ mod sanitize_tests {
         ];
         assert_eq!(security_risk_level(&rows, 5), "LOW");
         let mut bad = rows.clone();
-        bad.push(("exec_denied".to_string(), 5));
+        bad.push(("exec_denied".to_string(), 1));
         assert_eq!(security_risk_level(&bad, 5), "MEDIUM");
-        bad.push(("auth_failure".to_string(), 10));
-        assert_eq!(security_risk_level(&bad, 5), "HIGH");
+        bad.push(("exec_denied".to_string(), 4));
+        assert_eq!(security_risk_level(&bad, 5), "HIGH", "5 exec_denied is a burst");
+    }
+
+    #[test]
+    fn security_risk_is_proportionate_to_volume() {
+        let r = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(t, c)| (t.to_string(), *c)).collect()
+        };
+        // live numbers: 3 auth failures, no MCP traffic
+        assert_eq!(security_risk_level(&r(&[("auth_failure", 3)]), 5), "LOW");
+        assert_eq!(
+            security_risk_level(&r(&[("auth_failure", 3), ("rate_limit", 2)]), 5),
+            "LOW"
+        );
+        // meaningful volume, not yet a flood
+        assert_eq!(security_risk_level(&r(&[("auth_failure", 12)]), 5), "MEDIUM");
+        // a burst
+        assert_eq!(security_risk_level(&r(&[("auth_failure", 60)]), 5), "HIGH");
+        assert_eq!(
+            security_risk_level(&r(&[("auth_failure", 30), ("cluster_auth_failure", 20)]), 5),
+            "HIGH"
+        );
+        assert_eq!(security_risk_level(&r(&[("path_traversal", 5)]), 5), "HIGH");
+        assert_eq!(security_risk_level(&r(&[("path_traversal", 1)]), 5), "MEDIUM");
+        // unknown event types still count, with volume bands
+        assert_eq!(security_risk_level(&r(&[("some_new_event", 4)]), 5), "LOW");
+        assert_eq!(security_risk_level(&r(&[("some_new_event", 100)]), 5), "HIGH");
+        // a zero threshold must not make everything HIGH
+        assert_eq!(security_risk_level(&r(&[]), 0), "LOW");
+    }
+
+    #[test]
+    fn self_check_exempts_retention_and_rotation() {
+        for a in ["agent_messages_retention", "audit_log_rotate"] {
+            assert_eq!(classify_run_issue(a, "success", Some(8), None, None), None, "{a}");
+            assert!(classify_run_issue(a, "error", Some(8), Some("x"), None).is_some());
+        }
+    }
+
+    #[test]
+    fn fast_thought_experiment_is_trusted_only_when_it_says_it_did_nothing() {
+        for t in [
+            "Skipped: 1 active session(s) \u{2014} organic traversals being captured",
+            "Thought experiment: not enough connected entities in graph (2, need 3). Ingest more documents first.",
+            "Thought experiment: no new queries this run \u{2014} all sampled entity pairs were rehearsed within the revisit window.",
+        ] {
+            assert_eq!(
+                classify_run_issue("thought_experiment", "success", Some(8), None, Some(t)),
+                None,
+                "{t}"
+            );
+        }
+        // fast, claims to have run: still suspicious
+        let done = "Thought experiment complete: 5 queries run, 0 traversals captured, 0 entities discovered.";
+        assert!(classify_run_issue("thought_experiment", "success", Some(403), None, Some(done)).is_some());
+        // fast, no text at all: still suspicious
+        assert!(classify_run_issue("thought_experiment", "success", Some(8), None, None).is_some());
+        assert!(classify_run_issue("thought_experiment", "success", Some(8), None, Some("")).is_some());
     }
 
     #[test]
