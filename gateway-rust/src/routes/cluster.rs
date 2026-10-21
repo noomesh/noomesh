@@ -4591,10 +4591,17 @@ async fn model_alias_delete(
 /// One space's pool for GET: every role=embed placement on its model, and
 /// whether that node advertises `embed` right now. Placements on a model no
 /// space uses are listed apart (`unmatched`): they serve nobody.
+///
+/// `statics[i]` is space i's static endpoints (the compose embedder,
+/// `PAGEINDEX_EMBEDDING_URL` + extras) and whether each answered a probe
+/// embed with the space's model. They are peers of the mesh nodes in every
+/// embed, so `static_live` counts toward serving the space; `live` stays the
+/// node count.
 pub(crate) fn embedding_space_view(
     spaces: &[crate::embedding_spaces::Space],
     placements: &[(String, String, Option<String>, String)],
     advertising: &[String],
+    statics: &[Vec<(String, bool)>],
 ) -> Value {
     use crate::embedding_spaces::same_model;
     let node = |(n, b, m, d): &(String, String, Option<String>, String)| {
@@ -4605,13 +4612,17 @@ pub(crate) fn embedding_space_view(
     };
     let out: Vec<Value> = spaces
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let pool: Vec<Value> = placements
                 .iter()
                 .filter(|p| p.2.as_deref().is_some_and(|m| same_model(m, &s.model)))
                 .map(node)
                 .collect();
             let live = pool.iter().filter(|n| n["advertising"] == json!(true) && n["desired_state"] == json!("running")).count();
+            let st = statics.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let static_live = st.iter().filter(|(_, ok)| *ok).count();
+            let static_eps: Vec<Value> = st.iter().map(|(url, ok)| json!({"url": url, "live": ok})).collect();
             // i150: while migrating, the nodes that already hold the next model.
             let next_pool: Vec<Value> = match &s.migration {
                 Some(m) => placements.iter().filter(|p| p.2.as_deref().is_some_and(|x| same_model(x, &m.next_model))).map(node).collect(),
@@ -4621,6 +4632,7 @@ pub(crate) fn embedding_space_view(
                 "space": s.space, "model": s.model, "dims": s.dims,
                 "default": s.space == crate::embedding_spaces::DEFAULT_SPACE,
                 "pool": pool, "live": live,
+                "static": static_eps, "static_live": static_live,
                 "migration": s.migration, "next_pool": next_pool,
             })
         })
@@ -4651,7 +4663,21 @@ async fn embedding_spaces_get(State(state): State<Arc<AppState>>) -> AppResult {
     .await
     .map_err(|e| AppError::Internal(format!("embed placements read: {e}")))?;
     let advertising: Vec<String> = state.gossip.find_peers_by_capability("embed", 256).into_iter().map(|p| p.node_id).collect();
-    Ok(Json(embedding_space_view(&spaces, &placements, &advertising)))
+    // F1 (0.6.8 rehearsal): a fresh install embeds through the compose
+    // embedder alone, so a space served only by it must not read as dead.
+    // Each static endpoint is probed with one embed of the space's model:
+    // declared is not the same as answering.
+    let statics = futures::future::join_all(spaces.iter().map(|s| async move {
+        let eps = crate::embedding_client::resolve_space(Some(s.space.as_str())).map(|e| e.static_endpoints()).unwrap_or_default();
+        let mut out = Vec::with_capacity(eps.len());
+        for ep in eps {
+            let ok = ep.embed(&["ping".to_string()], std::time::Duration::from_secs(5)).await.is_ok();
+            out.push((ep.url.clone(), ok));
+        }
+        out
+    }))
+    .await;
+    Ok(Json(embedding_space_view(&spaces, &placements, &advertising, &statics)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6413,7 +6439,7 @@ mod honesty_tests {
             p("awolf", "nomic-embed-code", "running"),
             p("host9", "bge-m3", "running"),
         ];
-        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()]);
+        let v = embedding_space_view(&spaces, &placements, &["HOST2".to_string(), "awolf".to_string()], &[]);
         let k = &v["spaces"][0];
         assert_eq!(k["space"], "knowledge");
         assert_eq!(k["default"], true);
@@ -6434,13 +6460,34 @@ mod honesty_tests {
             Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
         ];
         let p = |m: &str| ("awolf".to_string(), "ollama".to_string(), Some(m.to_string()), "running".to_string());
-        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()]);
+        let v = embedding_space_view(&spaces, &[p("harrier"), p("nomic-embed-code")], &["awolf".to_string()], &[]);
         for i in 0..2 {
             assert_eq!(v["spaces"][i]["pool"].as_array().unwrap().len(), 1, "{v}");
             assert_eq!(v["spaces"][i]["pool"][0]["node"], "awolf");
             assert_eq!(v["spaces"][i]["live"], 1);
         }
         assert!(v["unmatched"].as_array().unwrap().is_empty());
+    }
+
+    /// F1: a space with no embed placement but an answering static endpoint
+    /// (the compose embedder on a fresh install) reports it; a static that
+    /// did not answer is listed and not counted.
+    #[test]
+    fn a_spaces_static_endpoints_are_reported_with_their_probe() {
+        use crate::embedding_spaces::Space;
+        let spaces = vec![
+            Space { space: "knowledge".into(), model: "harrier".into(), dims: Some(1024), migration: None },
+            Space { space: "code".into(), model: "nomic-embed-code".into(), dims: None, migration: None },
+        ];
+        let statics = vec![
+            vec![("https://stunnel-ollama-embed:11434".to_string(), true), ("http://cpu-embed:11434".to_string(), false)],
+            vec![("https://stunnel-ollama-embed:11434".to_string(), false)],
+        ];
+        let v = embedding_space_view(&spaces, &[], &[], &statics);
+        let k = &v["spaces"][0];
+        assert_eq!((k["live"].as_u64(), k["static_live"].as_u64()), (Some(0), Some(1)), "{v}");
+        assert_eq!(k["static"][1]["live"], false);
+        assert_eq!(v["spaces"][1]["static_live"], 0);
     }
 
     // "The system must not lie" audit. Both helpers below exist so the

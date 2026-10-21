@@ -109,15 +109,18 @@ pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
         let model = s["model"].as_str().unwrap_or("?");
         let dims = s["dims"].as_u64().map(|d| d.to_string()).unwrap_or_else(|| dash.to_string());
         let pool = s["pool"].as_array().unwrap_or(&empty);
+        // Static endpoints (the compose embedder) serve the space beside the
+        // nodes; the gateway probed each with one embed.
+        let statics = s["static"].as_array().unwrap_or(&empty);
         migrations.extend(migration_line(name, &s["migration"]));
-        if s["live"].as_u64().unwrap_or(0) == 0 {
+        if s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0 {
             no_live.push(name.to_string());
         }
-        if pool.is_empty() {
+        if pool.is_empty() && statics.is_empty() {
             rows.push(vec![label, model.into(), dims, dash.into(), ui::bad("no node")]);
             continue;
         }
-        for (i, n) in pool.iter().enumerate() {
+        let nodes = pool.iter().map(|n| {
             let node = format!("{}/{}", n["node"].as_str().unwrap_or("?"), n["backend"].as_str().unwrap_or("?"));
             let state = match (n["desired_state"].as_str(), n["advertising"].as_bool()) {
                 (Some("running"), Some(true)) => ui::good("serving"),
@@ -125,6 +128,13 @@ pub(crate) fn space_rows(body: &serde_json::Value) -> SpaceRows {
                 (Some(d), _) => ui::muted(d),
                 _ => ui::muted("?"),
             };
+            (node, state)
+        });
+        let stat = statics.iter().map(|e| {
+            let state = if e["live"].as_bool() == Some(true) { ui::good("serving") } else { ui::warn("not answering") };
+            (format!("static {}", e["url"].as_str().unwrap_or("?")), state)
+        });
+        for (i, (node, state)) in nodes.chain(stat).enumerate() {
             let first = i == 0;
             rows.push(vec![
                 if first { label.clone() } else { String::new() },
@@ -305,5 +315,20 @@ mod tests {
         assert_eq!(rows[1][0], "", "the space name prints once");
         assert_eq!(no_live, ["code"]);
         assert_eq!(unmatched, [("host9".to_string(), "bge-m3".to_string())]);
+    }
+
+    /// F1: a space served only by an answering static endpoint is not "no
+    /// node"; it prints the endpoint and is not flagged.
+    #[test]
+    fn a_static_endpoint_serves_a_space_in_list() {
+        let body = serde_json::json!({
+            "spaces": [{"space": "knowledge", "model": "harrier", "dims": 1024, "default": true, "live": 0, "pool": [],
+                        "static": [{"url": "https://stunnel-ollama-embed:11434", "live": true}], "static_live": 1}],
+            "unmatched": []
+        });
+        let super::SpaceRows { rows, no_live, .. } = space_rows(&body);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0][3].contains("static https://stunnel-ollama-embed:11434"), "{rows:?}");
+        assert!(no_live.is_empty());
     }
 }
