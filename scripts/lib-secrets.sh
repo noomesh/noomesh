@@ -240,7 +240,9 @@ _pgpass_body() {
 }
 
 # _declared_systems — every declared system, one line each:
-#   <name> <enabled_when var or -> <password_env> <ddl_password_env>
+#   <name> <enabled_when var or -> <password_env> <ddl_password_env> <addon>
+# <addon> is on/off for a system named after an add-on (`addons.<name>`
+# decides) and - for any other (its flag decides; no flag = always on).
 # The ONE place the launcher learns which systems exist. Today the source is
 # the `systems:` manifest in ./noomesh.yaml, read by `noo config launch-render
 # systems` (the CLI's own parser, the one `noo systems` and the pre-`up`
@@ -274,27 +276,51 @@ _declared_systems() {
     printf '%s\n' "$out"
 }
 
+# _flag_truthy VALUE — the shell truthiness the broker and `noo systems` use.
+_flag_truthy() {
+    local v
+    v="$(printf '%s' "$1" | tr -d ' \t' | tr '[:upper:]' '[:lower:]')"
+    case "$v" in 1|true|yes|on) return 0 ;; esac
+    return 1
+}
+
 # _systems_secrets_body [compose-file] — the body of the gateway's ONE
 # systems-secrets file (compose secret noo_systems_secrets, pointer
-# NOO_SYSTEMS_SECRETS_FILE): `KEY=VALUE` per line for each declared system's
-# `enabled_when` flag and its two role-password variables, the value from
-# this process's environment (the store's decrypt) or ./.env, exactly as
-# every other file-backed secret takes it. Skipped: a variable a compose
-# secret already delivers by name (`x-noo-source:`, e.g. trellion's and
-# evolve's passwords), one with no value, and a repeat. A name that is not an
-# env-var name, or a value with a newline (the format has no quoting), is
+# NOO_SYSTEMS_SECRETS_FILE): `KEY=VALUE` per line. For each declared system:
+#   - its `enabled_when` flag, always (from .env, where `noo systems enable`
+#     writes it, or the store), so the broker can tell "disabled" from
+#     "never told";
+#   - its two role passwords ONLY when the system is on — its add-on is on,
+#     or (not an add-on) its flag is truthy or it has none. A disabled
+#     system's passwords never reach the gateway.
+# Values come from this process's environment (the store's decrypt) or ./.env,
+# exactly as every other file-backed secret takes them. Skipped: a variable a
+# compose secret already delivers by name (`x-noo-source:`, e.g. trellion's
+# and evolve's passwords), one with no value, and a repeat. A name that is not
+# an env-var name, or a value with a newline (the format has no quoting), is
 # refused with a warning naming the VARIABLE — never the value.
 _systems_secrets_body() {
-    local compose="${1:-docker-compose.cluster.yml}" named name flag pw ddl k v body="" seen=" "
+    local compose="${1:-docker-compose.cluster.yml}" named name flag pw ddl addon on k v body="" seen=" "
     named=" $(file_secret_sources "$compose" | tr '\n' ' ') "
-    while read -r name flag pw ddl; do
+    while read -r name flag pw ddl addon; do
         [ -n "$name" ] || continue
+        case "$flag" in
+            -|"") on=1 ;;
+            *) on=0
+               if [[ "$flag" =~ ^[A-Z_][A-Z0-9_]*$ ]] && _flag_truthy "$(_secret_value "$flag")"; then on=1; fi ;;
+        esac
+        case "${addon:--}" in
+            on) on=1 ;;
+            off) on=0 ;;
+        esac
         for k in "$flag" "$pw" "$ddl"; do
             [ -n "$k" ] && [ "$k" != - ] || continue
             if ! [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
                 echo "WARNING: system $name names '$k', which is not an environment variable name — not delivered" >&2
                 continue
             fi
+            # Least privilege: a system that is off gets its flag, not its passwords.
+            [ "$k" = "$flag" ] || [ "$on" = 1 ] || continue
             case "$named$seen" in *" $k "*) continue ;; esac
             seen="$seen$k "
             v="$(_secret_value "$k")"
