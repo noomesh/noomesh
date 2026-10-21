@@ -2684,6 +2684,21 @@ pub(crate) fn backend_image_ref(backend: &str, get: &dyn Fn(&str) -> Option<Stri
         .map(|(_, v)| v)
 }
 
+/// The image a desired-config placement carries: the placement's own image
+/// when it names one, else [`backend_image_ref`] (the signed stack lock's
+/// digest-pinned ref, or an operator override that is not floating).
+///
+/// Until 0.6.9 desired-config sent the placement's column alone, which is
+/// null unless an operator set one, so the reconciler — how a node normally
+/// starts a backend — never received the lock's digest (only the manual
+/// `/start` route did). A node then fell back to its own versioned default
+/// with no digest, and a 0.6.8 agent refuses that: aserve and robopi could
+/// not recreate `noo-ollama` after its floating container was removed
+/// (`refusing image "ollama/ollama:0.40.5": it has no @sha256 digest`).
+pub(crate) fn placement_image(backend: &str, image: Option<String>, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    image.filter(|i| !i.trim().is_empty()).or_else(|| backend_image_ref(backend, get))
+}
+
 /// `:latest` or no tag, and no `@sha256:` digest. A registry host with a
 /// port (`host:5000/repo`) is not a tag.
 pub(crate) fn is_floating_image_ref(r: &str) -> bool {
@@ -3314,6 +3329,7 @@ async fn desired_config_get(
         .into_iter()
         .map(
             |(backend, model, image, port, tls, env, desired_state, role, target, memory_limit_bytes)| {
+                let image = placement_image(&backend, image, &|k: &str| std::env::var(k).ok());
                 json!({
                     "backend": backend,
                     "model": model,
@@ -7056,6 +7072,82 @@ mod backend_image_ref_tests {
     }
 
     const PINNED: &str = "vllm/vllm-openai:v0.25.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// desired-config (the reconciler's source) carries the lock's digest for
+    /// a placement with no image of its own — from the REAL 0.6.8 signed
+    /// lock rows, through the compose line that renders the gateway's env,
+    /// exactly as the launcher exports them (lib-dist.sh
+    /// dist_load_stack_lock: `<name>@sha256:…` → `NOO_IMAGE_DIGEST_<NAME>=@sha256:…`).
+    #[test]
+    fn desired_config_sends_the_lock_digest_from_a_real_lock() {
+        const LOCK: &str = "# stack v0.6.8\n\
+            ollama@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241\n\
+            source:trellion@bf4de8b20df97648a6ee1150cb073e738762dcc4\n\
+            vllm@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb\n";
+        let mut env: HashMap<String, String> = HashMap::new();
+        for line in LOCK.lines().filter(|l| !l.starts_with('#')) {
+            let Some((img, dig)) = line.split_once('@') else { continue };
+            if dig.starts_with("sha256:") && img.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                env.insert(format!("NOO_IMAGE_DIGEST_{}", img.to_uppercase().replace('-', "_")), format!("@{dig}"));
+            }
+        }
+        let compose = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.cluster.yml")).unwrap();
+        for (var, backend) in [("NOO_BACKEND_IMAGE_OLLAMA", "ollama"), ("NOO_BACKEND_IMAGE_VLLM", "vllm")] {
+            let line = compose.lines().find_map(|l| l.trim().strip_prefix(&format!("- {var}="))).unwrap_or_else(|| panic!("{var} not in compose"));
+            env.insert(var.into(), interpolate(line, &env));
+        }
+        let get = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            super::placement_image("ollama", None, &get).as_deref(),
+            Some("ollama/ollama:0.40.5@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241"),
+        );
+        let vllm = super::placement_image("vllm", Some(String::new()), &get).unwrap();
+        assert!(vllm.starts_with("vllm/vllm-openai:") && vllm.ends_with("@sha256:fc56161ee42a011aeee78b65d0a81b6683c7d04402fd40503d14d4d6c98f07cb"), "{vllm}");
+        // The operator's workaround: an override with a digest goes out as given.
+        let mut over = env.clone();
+        over.insert("OLLAMA_IMAGE".into(), "ollama/ollama:0.40.5@sha256:5d3a".into());
+        assert_eq!(super::placement_image("ollama", None, &|k: &str| over.get(k).cloned()).as_deref(), Some("ollama/ollama:0.40.5@sha256:5d3a"));
+        // A placement that names its own image keeps it.
+        assert_eq!(super::placement_image("ollama", Some("my/ollama:1@sha256:cc".into()), &get).as_deref(), Some("my/ollama:1@sha256:cc"));
+        // A backend the controller pins nothing for still sends nothing.
+        assert_eq!(super::placement_image("reranker", None, &get), None);
+    }
+
+    /// Structural: desired-config fills every placement's image through
+    /// `placement_image`, not the raw column.
+    #[test]
+    fn desired_config_fills_placement_images_from_the_lock() {
+        let src = include_str!("cluster.rs");
+        let body = src.split("async fn desired_config_get(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
+        assert!(body.contains("let image = placement_image(&backend, image, "), "desired-config must send placement_image(..), not the raw column");
+    }
+
+    /// `${A:-default}` (nested) as compose interpolates it, for the test above.
+    fn interpolate(s: &str, env: &HashMap<String, String>) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(i) = rest.find("${") {
+            out.push_str(&rest[..i]);
+            let body = &rest[i + 2..];
+            let (mut depth, mut end) = (1, 0);
+            for (j, c) in body.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => { depth -= 1; if depth == 0 { end = j; break; } }
+                    _ => {}
+                }
+            }
+            let inner = &body[..end];
+            let (name, default) = inner.split_once(":-").unwrap_or((inner, ""));
+            match env.get(name).filter(|v| !v.is_empty()) {
+                Some(v) => out.push_str(v),
+                None => out.push_str(&interpolate(default, env)),
+            }
+            rest = &body[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
 
     /// The controller sends the lock-pinned ref even when no operator override
     /// is set (until now it sent one only when VLLM_IMAGE was in its env).

@@ -749,9 +749,13 @@ and whether that ref can move under it (`image_floating`: no `@sha256`
 digest, tag `latest` or none, and not one of our rail-only images). The
 agent refuses to *create* a backend from a floating ref, but a container an
 older agent made before that refusal keeps running on one. The `backend
-images` row fails and names it, with `noo cluster provision <node> --wait`
-as the remedy: a current agent recreates it from the stack lock's pinned
-ref.
+images` row fails and names it. The agent never replaces a running
+container by itself, so the remedy is to remove it on the node (`docker rm -f
+noo-ollama`): the agent recreates it from the stack lock's pinned ref, which
+the controller sends in desired-config for every placement with no image of
+its own (from 0.6.9; before that only a manual `/start` carried it, and a
+recreate fell back to the node's versioned default with no digest, which the
+agent refuses).
 
 The controller never sends a floating ref either. An operator
 `VLLM_IMAGE`, `VLLM2_IMAGE` or `OLLAMA_IMAGE` set to `:latest` (or with no
