@@ -64,7 +64,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
     - name: No maintainer literals or real-shaped secrets in the tree
       run: |
         if [ -x scripts/leak-check.sh ]; then bash scripts/leak-check.sh; else echo "the leak gate is not present in this tree (migration tool, not shipped): SKIPPED, not failed"; fi
@@ -124,7 +124,7 @@ jobs:
       llamacpp: ${{ steps.diff.outputs.llamacpp }}
       deferred: ${{ steps.diff.outputs.deferred }}
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
       with:
         fetch-depth: 0
     - id: diff
@@ -307,7 +307,7 @@ jobs:
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
       with:
         persist-credentials: false
 
@@ -465,7 +465,7 @@ jobs:
         working-directory: node-agent-go
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
       with:
@@ -485,7 +485,7 @@ jobs:
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
     # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
@@ -687,7 +687,7 @@ jobs:
       run:
         working-directory: ui
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4
       with:
         node-version: 22
@@ -774,7 +774,7 @@ jobs:
     steps:
     # persist-credentials: false: no token header shadows anything git runs
     # from the workspace.
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
       with:
         persist-credentials: false
 
@@ -1056,7 +1056,7 @@ jobs:
         working-directory: noo-cli
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
     # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
@@ -1263,7 +1263,7 @@ jobs:
     if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.scope.result == 'success' }}
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     # ── Free hosted-runner disk (GitHub-hosted only) ───────────────────────
     # ubuntu-latest leaves ~14 GB free on /. This job restores a multi-GB cargo
@@ -1439,7 +1439,7 @@ jobs:
 
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     # The DHI org credentials: never on a fork pull request (GitHub withholds
     # secrets there, and the clause says so).
@@ -1531,7 +1531,7 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     - name: Nothing to compile
       if: needs.scope.outputs.llamacpp != 'true' || github.repository != 'noomesh/noomesh' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
@@ -1585,7 +1585,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
       - name: Check routes against the OpenAPI spec
         run: python3 scripts/check-openapi-drift.py
@@ -1607,7 +1607,7 @@ jobs:
     needs: preflight
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     # trivy-action's installer resolves the version by fetching the github.com
     # release PAGE anonymously; shared hosted-runner IPs get rate-limited there
@@ -1665,7 +1665,7 @@ jobs:
         crate: [gateway-rust, noo-cli]
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     - name: cargo-deny check advisories (${{ matrix.crate }})
       uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25   # v2.1.1
@@ -1684,7 +1684,7 @@ jobs:
         working-directory: node-agent-go
     steps:
 
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
 
     - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
       with:

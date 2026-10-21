@@ -95,7 +95,7 @@ jobs:
       rc_digests: ${{ steps.plan.outputs.rc_digests }}
     steps:
       - name: Checkout (full history)   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: The tag sits on its promotion branch
@@ -213,7 +213,7 @@ jobs:
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-core'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
       - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -307,7 +307,7 @@ jobs:
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-base'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
       - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -326,7 +326,7 @@ jobs:
       # checks the trellion repo out and passes it as a named build context so
       # buildx doesn't try to pull `trellion` as a docker image.
       - name: Checkout noo-trellion (deps-base build context)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: personifAI/trellion
           # The SHA release-line resolved from staging (-rc.N) / main (final),
@@ -377,7 +377,7 @@ jobs:
           echo "sha=${sha:-dev}" >> "$GITHUB_OUTPUT"
           echo "repo=${repo:-personifAI/trellion-protocols}" >> "$GITHUB_OUTPUT"
       - name: Checkout trellion-protocols (deps-base build context)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.protocols.outputs.repo }}
           ref: ${{ steps.protocols.outputs.sha }}
@@ -639,7 +639,7 @@ jobs:
             extra_args: ""
     steps:
       - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
@@ -796,7 +796,7 @@ jobs:
       # tag, which is the only thing in this job that did not arrive over the
       # network a moment ago.
       - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: digest-*
