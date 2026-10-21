@@ -274,6 +274,17 @@ fn now_unix() -> u64 {
 /// One GET, classified. The agent must have `http_status_as_error(false)`
 /// so the status and rate-limit headers are visible here.
 pub(crate) fn get_once(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Result<Vec<u8>, FetchError> {
+    get_once_watched(agent, url, token, &mut |_, _| true)
+}
+
+/// [`get_once`], reading the body in chunks: `seen(bytes so far,
+/// Content-Length)` runs after each one, and `false` abandons the read.
+pub(crate) fn get_once_watched(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+    seen: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) -> Result<Vec<u8>, FetchError> {
     let mut req = agent.get(url).header("User-Agent", "noo-cli");
     if let Some(t) = token {
         req = req.header("Authorization", &format!("Bearer {t}"));
@@ -287,12 +298,22 @@ pub(crate) fn get_once(agent: &ureq::Agent, url: &str, token: Option<&str>) -> R
         e.retry_after = retry_after;
         return Err(e);
     }
+    let total = header(&resp, "content-length").and_then(|v| v.parse::<u64>().ok());
+    let mut reader = resp.into_body().into_reader();
     let mut buf = Vec::new();
-    resp.into_body()
-        .into_reader()
-        .read_to_end(&mut buf)
-        .map_err(|e| FetchError::new(FetchClass::Network, format!("GET {url}: body cut off: {e}")))?;
-    Ok(buf)
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| FetchError::new(FetchClass::Network, format!("GET {url}: body cut off: {e}")))?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if !seen(buf.len() as u64, total) {
+            return Err(FetchError::new(FetchClass::Network, format!("GET {url}: abandoned after {} bytes", buf.len())));
+        }
+    }
 }
 
 /// [`get_once`] under a retry policy.

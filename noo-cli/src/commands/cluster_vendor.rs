@@ -27,12 +27,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::harness_kinds::{self, artifact_url, Format, Pinned, Table, Unpack};
 use crate::output::{fail, ExitCode};
+use crate::release_fetch::{self, FetchClass, FetchError};
 use crate::ui::{self, Col};
 use crate::{Globals, Unhandled};
 
@@ -487,7 +489,13 @@ pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandl
                     continue;
                 }
                 if !g.json { ui::step(&format!("fetching {} {} ({platform}) from {}", n.name, n.version, n.url)); }
-                let r = super::upgrade::http_get_bytes(&n.url, None).map_err(|e| e.summary())
+                let mut say = |got: u64, total: Option<u64>| if !g.json {
+                    println!("{}", ui::sub(&match total {
+                        Some(t) if t > 0 => format!("{} of {} ({}%)", human(got as usize), human(t as usize), got * 100 / t),
+                        _ => format!("{} so far", human(got as usize)),
+                    }));
+                };
+                let r = fetch_artifact(&n.url, &mut say).map_err(|e| e.summary())
                     .and_then(|b| verify_and_store(&path, &b, &n.url, &n.sha256).map(|_| b.len()));
                 match r {
                     Ok(len) => {
@@ -522,6 +530,90 @@ pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         }
     }
     Ok(if failed.is_empty() { 0 } else { 1 })
+}
+
+/// A vendor CLI is 150–250 MB, so the release fetch's whole-call cap
+/// (120s) refuses one on a slow link, four times over. A vendor download
+/// instead fails when no byte arrives for [`STALL`]: a dead socket ends,
+/// a slow one finishes. [`CEILING`] still ends a trickle.
+const STALL: Duration = Duration::from_secs(60);
+const CEILING: Duration = Duration::from_secs(60 * 60);
+/// How often a running download says how far it has got.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+fn vendor_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(STALL))
+        .timeout_global(Some(CEILING))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// Fetch one vendor artefact (no token: vendors publish them openly),
+/// retried like a release asset, each attempt under the stall watch.
+fn fetch_artifact(url: &str, say: &mut dyn FnMut(u64, Option<u64>)) -> Result<Vec<u8>, FetchError> {
+    release_fetch::with_retry(&release_fetch::DEFAULT_RETRY, &mut release_fetch::real_sleep, || {
+        let u = url.to_string();
+        watched(url, STALL, PROGRESS_EVERY, move |seen: &mut dyn FnMut(u64, Option<u64>) -> bool| {
+            release_fetch::get_once_watched(&vendor_agent(), &u, None, seen)
+        }, say)
+    })
+}
+
+/// Run `work` on its own thread and watch the bytes it reports: a gap of
+/// `stall` with no new byte is a `Network` failure (retried), and every
+/// `every` `say` hears how far it has got. A stalled worker is told to stop
+/// at its next chunk, so a retry does not race it for the link.
+fn watched(
+    url: &str,
+    stall: Duration,
+    every: Duration,
+    work: impl FnOnce(&mut dyn FnMut(u64, Option<u64>) -> bool) -> Result<Vec<u8>, FetchError> + Send + 'static,
+    say: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, FetchError> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    let got = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(u64::MAX));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    {
+        let (got, total, stop) = (got.clone(), total.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let r = work(&mut |n, t| {
+                got.store(n, Ordering::Relaxed);
+                total.store(t.unwrap_or(u64::MAX), Ordering::Relaxed);
+                !stop.load(Ordering::Relaxed)
+            });
+            let _ = tx.send(r);
+        });
+    }
+    let tick = (stall / 10).min(Duration::from_secs(1));
+    let (mut last, mut moved, mut said) = (0u64, Instant::now(), Instant::now());
+    loop {
+        match rx.recv_timeout(tick) {
+            Ok(r) => return r,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(FetchError::new(FetchClass::Other, format!("GET {url}: the download ended without a result")))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let n = got.load(Ordering::Relaxed);
+        if n != last {
+            (last, moved) = (n, Instant::now());
+        } else if moved.elapsed() >= stall {
+            stop.store(true, Ordering::Relaxed);
+            return Err(FetchError::new(FetchClass::Network, format!(
+                "GET {url}: stalled, no data for {}s after {}", stall.as_secs(), human(n as usize))));
+        }
+        if said.elapsed() >= every {
+            said = Instant::now();
+            let t = total.load(Ordering::Relaxed);
+            say(n, (t != u64::MAX).then_some(t));
+        }
+    }
 }
 
 fn human(n: usize) -> String {
@@ -816,6 +908,36 @@ mod tests {
         assert!(needs_for(&parse(&bad).unwrap(), "copilot", "linux", "x86_64").unwrap_err().contains("version"));
         let bad = FIXTURE.replace("\"cli\": \"codex\"", "\"cli\": \"noo-gateway\"");
         assert!(needs_for(&parse(&bad).unwrap(), "codex", "linux", "x86_64").is_err(), "a wrapper may not shadow a noo binary");
+    }
+
+    #[test]
+    fn a_download_that_stops_sending_fails_as_stalled_and_is_told_to_stop() {
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stopped.clone();
+        let e = watched("https://example.invalid/x.tgz", Duration::from_millis(300), Duration::from_secs(60), move |seen| {
+            seen(10, Some(100));
+            std::thread::sleep(Duration::from_millis(900));
+            s2.store(!seen(11, Some(100)), std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }, &mut |_, _| {}).unwrap_err();
+        assert_eq!(e.class, FetchClass::Network, "a stall is retried like any network failure");
+        assert!(e.detail.contains("stalled") && e.detail.contains("example.invalid"), "{}", e.detail);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "the stalled worker must be told to stop");
+    }
+
+    #[test]
+    fn a_slow_download_that_keeps_moving_finishes_and_reports_progress() {
+        let mut heard = Vec::new();
+        let r = watched("https://example.invalid/x.tgz", Duration::from_millis(400), Duration::from_millis(150), |seen| {
+            for i in 1..=10u64 {
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(seen(i * 10, Some(100)));
+            }
+            Ok(vec![7; 100])
+        }, &mut |got, total| heard.push((got, total))).unwrap();
+        assert_eq!(r.len(), 100, "1s in all, well past the 400ms stall bound, yet never 400ms without a byte");
+        assert!(!heard.is_empty() && heard.iter().all(|&(g, t)| g > 0 && t == Some(100)), "{heard:?}");
     }
 
     #[test]

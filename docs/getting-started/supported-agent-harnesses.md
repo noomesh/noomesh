@@ -46,6 +46,9 @@ binary itself: in its signed bundle, from the controller.
    artefact the fleet's platforms need, on the controller, and refuses one
    whose sha256 is not the pinned one, naming the URL and both digests and
    writing nothing. `--os` and `--arch` narrow it to one platform.
+   A CLI is 150–250 MB, so the fetch has no whole-download cap short of an
+   hour: it reports how far it has got every 30 seconds and fails (then
+   retries, four tries in all) only when no data arrives for 60 seconds.
    `noo cluster vendor status` lists what is staged and which nodes need
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)
