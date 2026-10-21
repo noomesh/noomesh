@@ -2735,8 +2735,7 @@ pub(crate) async fn start_backend_core(
     let model = model.to_string();
 
     // Find target node
-    let (node_id, agent_url, ip_address) = if let Some(nid) = node_id {
-        let url = crate::node_link::NodeLink::for_node(state, nid).await?.base().to_string();
+    let (node_id, ip_address) = if let Some(nid) = node_id {
         // Get IP from KV
         let ip = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
             if let Ok(Some(entry)) = kv.get(nid).await {
@@ -2745,7 +2744,7 @@ pub(crate) async fn start_backend_core(
                     .unwrap_or_default()
             } else { String::new() }
         } else { String::new() };
-        (nid.to_string(), url, ip)
+        (nid.to_string(), ip)
     } else {
         // Auto-select: find node with lowest load from NATS KV
         let agents = super::admin::all_node_agents(state).await;
@@ -2753,7 +2752,7 @@ pub(crate) async fn start_backend_core(
             return Err(AppError::NotFound("No nodes available".into()));
         }
         // Pick first available (already sorted or just use first)
-        let (nid, url, _hostname) = agents.into_iter().next().unwrap();
+        let (nid, _url, _hostname) = agents.into_iter().next().unwrap();
         let ip = if let Ok(kv) = state.js.get_key_value("mesh_nodes").await {
             if let Ok(Some(entry)) = kv.get(nid.as_str()).await {
                 serde_json::from_slice::<Value>(&entry).ok()
@@ -2761,7 +2760,7 @@ pub(crate) async fn start_backend_core(
                     .unwrap_or_default()
             } else { String::new() }
         } else { String::new() };
-        (nid, url, ip)
+        (nid, ip)
     };
 
     // Check cooldown
@@ -2808,7 +2807,9 @@ pub(crate) async fn start_backend_core(
             }
         }
     }
-    let req = crate::node_link::NodeLink::for_base(&agent_url)
+    // Resolved by id, so `/start` rides the bus when the node advertises
+    // it; an address alone would always go over HTTPS.
+    let req = crate::node_link::NodeLink::for_node(state, &node_id).await?
         .request(reqwest::Method::POST, "/start")
         .json(&start_body);
 
@@ -3084,9 +3085,8 @@ async fn models_cache(
         return Err(AppError::BadRequest("model is required".into()));
     }
 
-    let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
-        (nid.clone(), url)
+    let node_id = if let Some(ref nid) = body.node_id {
+        nid.clone()
     } else {
         let agents = all_node_agents(&state).await;
         if agents.is_empty() {
@@ -3102,12 +3102,14 @@ async fn models_cache(
                 a_load.partial_cmp(&b_load).unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap();
-        (best.0, best.1)
+        best.0
     };
 
     tracing::info!(node_id = %node_id, model = %model, "caching model");
 
-    let req = crate::node_link::NodeLink::for_base(&agent_url)
+    // Resolved by id, so `/start` rides the bus when the node advertises
+    // it; an address alone would always go over HTTPS.
+    let req = crate::node_link::NodeLink::for_node(&state, &node_id).await?
         .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": "ollama", "model": model}));
 
@@ -3160,9 +3162,8 @@ pub(crate) async fn models_pull(
     let backend = body.backend.unwrap_or_else(|| "ollama".into());
 
     // Resolve target node
-    let (node_id, agent_url) = if let Some(ref nid) = body.node_id {
-        let url = crate::node_link::NodeLink::for_node(&state, nid).await?.base().to_string();
-        (nid.clone(), url)
+    let node_id = if let Some(ref nid) = body.node_id {
+        nid.clone()
     } else {
         // Auto-select: pick first available node from NATS KV
         // (all_node_agents returns nodes sorted by KV iteration order;
@@ -3183,13 +3184,15 @@ pub(crate) async fn models_pull(
                 a_load.partial_cmp(&b_load).unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap(); // safe: agents is non-empty
-        (best.0, best.1)
+        best.0
     };
 
     tracing::info!(node_id = %node_id, backend = %backend, model = %model, "pulling model");
 
     // Send start request to node agent (triggers pull + start in background)
-    let req = crate::node_link::NodeLink::for_base(&agent_url)
+    // Resolved by id, so `/start` rides the bus when the node advertises
+    // it; an address alone would always go over HTTPS.
+    let req = crate::node_link::NodeLink::for_node(&state, &node_id).await?
         .request(reqwest::Method::POST, "/start")
         .json(&json!({"backend": backend, "model": model}));
 
@@ -7117,5 +7120,23 @@ mod no_address_tests {
         assert!(m.contains("gpu-box") && m.contains("no reachable address"), "{m}");
         assert!(m.contains("NODE_IP"), "{m}");
         assert!(!m.contains("not found"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod start_over_the_bus_tests {
+    /// `/start` is a bus op (`node-agent-go/internal/api/rpc.go`). A link
+    /// built from an address alone has no node id and never uses the bus,
+    /// so each `/start` caller must resolve its link by id. A source pin,
+    /// because the handlers need an AppState no unit test can build.
+    #[test]
+    fn every_start_caller_resolves_its_link_by_node_id() {
+        let src = include_str!("cluster.rs");
+        let src = src.split("mod start_over_the_bus_tests").next().unwrap();
+        for f in ["async fn start_backend_core(", "async fn models_cache(", "async fn models_pull("] {
+            let body = src.split(f).nth(1).expect(f).split("\n}\n").next().unwrap();
+            assert!(body.contains("NodeLink::for_node("), "{f} must resolve its link with for_node");
+            assert!(!body.contains("NodeLink::for_base("), "{f} sends /start by address: it never rides the bus");
+        }
     }
 }
