@@ -1071,7 +1071,7 @@ pub fn cluster_provision(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
                     scrub(&work);
                     let stage = match kinds.as_slice() {
                         [one] => format!("noo cluster vendor stage {one}"),
-                        _ => "noo cluster vendor stage --all".to_string(),
+                        _ => "noo cluster vendor stage".to_string(),
                     };
                     fail_guided(g, ExitCode::Generic, "vendor_not_staged", &e,
                         &stage,

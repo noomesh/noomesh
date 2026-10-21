@@ -67,7 +67,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
         (&["cluster", "restart-backends"], "<node> <noo-svc>... [-y|--yes|--force]", "Restart noo-* backend containers on a node via a rail-delivered bundle"),
         (&["cluster", "host-telemetry", "apply"], "[<node>...] [--all] [--include-controller] [-y|--yes]", "Switch off tailscaled's log upload on nodes over the pull rail, one at a time"),
         (&["cluster", "host-telemetry"], "", "Print host-telemetry subcommand usage (apply)"),
-        (&["cluster", "vendor", "stage"], "<kind> | --all [--os linux|macos] [--arch x86_64|aarch64]", "Fetch a harness kind's vendor CLI on the controller, checked against its pin"),
+        (&["cluster", "vendor", "stage"], "[<kind> [--fleet] | --all] [--os linux|macos] [--arch x86_64|aarch64]", "Fetch the vendor CLIs the nodes need on the controller, checked against their pins"),
         (&["cluster", "vendor", "status"], "", "List staged vendor CLIs per platform, and which nodes need which"),
         (&["cluster", "vendor", "install"], "<node> <kind>...", "Carry these vendor CLIs on a node whatever its placement names; restage to deliver"),
         (&["cluster", "vendor"], "", "Print vendor subcommand usage (stage, status, install)"),
