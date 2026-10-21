@@ -246,9 +246,21 @@ func (a *Agent) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle OS signals for graceful shutdown
+	// Handle OS signals for graceful shutdown. A signal cancels ctx at once,
+	// wherever Run is: everything before step 5 waits on ctx. A stop that
+	// arrived while the controller refused registration (a 401 loop) used to
+	// sit unread in sigCh until systemd's SIGKILL 30 s later.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	stopSig := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			stopSig <- sig
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	// 1. Start HTTP API server (in background so node is reachable during
 	//    registration). A listener that fails to come up is FATAL for the
@@ -276,13 +288,10 @@ func (a *Agent) Run() error {
 	hostIP := heartbeat.DetectHostIP(a.cfg)
 	slog.Info("registering with controller", "ip", hostIP)
 
-	for !a.hb.Register(caps, hostIP) {
-		slog.Warn("waiting for controller")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
+	if !registerUntil(ctx, func() bool { return a.hb.Register(caps, hostIP) }, 10*time.Second) {
+		slog.Info("shutting down before registration completed", "signal", <-stopSig)
+		a.shutdown()
+		return nil
 	}
 
 	// Publish registration event
@@ -377,7 +386,7 @@ func (a *Agent) Run() error {
 		cancel()
 		a.shutdown()
 		return fmt.Errorf("control API: %w", err)
-	case sig := <-sigCh:
+	case sig := <-stopSig:
 		slog.Info("shutting down", "signal", sig)
 	}
 	cancel()
@@ -385,6 +394,21 @@ func (a *Agent) Run() error {
 	// Cleanup
 	a.shutdown()
 	return nil
+}
+
+// registerUntil calls register every retry until it succeeds (true) or ctx
+// is cancelled (false). The wait between tries is the only place it blocks,
+// and it gives way to ctx, so a stop is answered within one register call.
+func registerUntil(ctx context.Context, register func() bool, retry time.Duration) bool {
+	for !register() {
+		slog.Warn("waiting for controller")
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(retry):
+		}
+	}
+	return true
 }
 
 // startControlBus wires the control-over-the-bus service. Never fatal.

@@ -105,7 +105,10 @@ noo security posture set NOO_CLUSTER_TOKEN_V1 0
 (on a release that introduces the key, add `NOO_CLUSTER_TOKEN_V1` to
 `compose_env:` first and set it after the roll; a gate cannot be set before
 the release that defines it). A v1 token is then answered `401
-cluster_token_v1_refused` with the fix in the body. A node agent honours the
+cluster_token_v1_refused` with the fix in the body, and counted as a refusal,
+not a use: under `cluster_hmac_v1_refused` (gateway and agents alike), so
+`cluster_hmac_v1` stays admissions only and the `legacy lanes` row names a
+refused caller in a warning of its own. A node agent honours the
 same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), and
 `noo cluster provision` renders it from the controller's posture, so after
 `posture set` the next bundle (`noo upgrade --nodes`, or `noo cluster provision

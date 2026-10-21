@@ -3303,6 +3303,11 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// A v1 cluster token REFUSED because `NOO_CLUSTER_TOKEN_V1=0` closed the
+/// gate — on the gateway (`/metrics`, by caller) and on each node (its
+/// `legacy_lanes`). Never part of `cluster_hmac_v1`, which is admissions
+/// only: every count is a caller whose calls all fail until it signs v2.
+pub(crate) const V1_REFUSED_LANE: &str = "cluster_hmac_v1_refused";
 /// The node-side lanes, as each agent reports them in `legacy_lanes`.
 pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller", "cluster_hmac_v1"];
 /// Below this window a zero is not yet retirement evidence
@@ -3404,6 +3409,7 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     // that used it, and the online ones that do not report at all.
     let mut node_totals: Vec<(String, u64, Vec<String>)> =
         NODE_LEGACY_LANES.iter().map(|l| (l.to_string(), 0, Vec::new())).collect();
+    let (mut node_v1_refused_n, mut node_v1_refused) = (0u64, Vec::new());
     let mut unreported = Vec::new();
     let mut shortest_node_window: Option<i64> = None;
     for n in fleet {
@@ -3419,6 +3425,10 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
         if let Some(since) = ll.get("since_unix").and_then(Value::as_i64) {
             let w = now_unix - since;
             shortest_node_window = Some(shortest_node_window.map_or(w, |s: i64| s.min(w)));
+        }
+        if let Some(c) = ll.get(V1_REFUSED_LANE).and_then(Value::as_u64).filter(|c| *c > 0) {
+            node_v1_refused_n += c;
+            node_v1_refused.push(format!("{id} {c}"));
         }
         for (lane, total, who) in node_totals.iter_mut() {
             let c = ll.get(lane.as_str()).and_then(Value::as_u64).unwrap_or(0);
@@ -3451,7 +3461,9 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}");
+    let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
@@ -3466,6 +3478,16 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
         return warn(NAME,
             format!("an old `noo` CLI signed with the controller secret and was REFUSED {refused} time(s){refused_who} — {detail}"),
             Some("noo upgrade --all   # on the box running the old CLI; the gateway refuses the CLI's shared-secret HMAC".into()));
+    }
+    if v1_refused > 0 {
+        return warn(NAME,
+            format!("a caller signed a v1 cluster token and the gateway REFUSED it {v1_refused} time(s){v1_who} (NOO_CLUSTER_TOKEN_V1=0) — {detail}"),
+            Some("noo upgrade --nodes   # the callers named above sign the old v1 form; every call they make fails until they sign v2".into()));
+    }
+    if node_v1_refused_n > 0 {
+        return warn(NAME,
+            format!("a node REFUSED a v1 cluster token {node_v1_refused_n} time(s){node_v1_who} (its NOO_CLUSTER_TOKEN_V1=0) — {detail}"),
+            Some("noo upgrade --all   # whoever calls that node still signs v1; the node's log names the actor".into()));
     }
     if !used.is_empty() {
         return warn(NAME, format!("in use: {} — {detail}", used.join(", ")),
@@ -8039,6 +8061,32 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert!(c.detail.contains("in use: static_token, whois_non_controller"), "{}", c.detail);
         assert!(c.detail.contains("static_token 7 (host3 7)") && c.detail.contains("whois_non_controller 2 (host9 2)"), "{}", c.detail);
+    }
+
+    /// 0.6.8 rehearsal (F2): v1 tokens REFUSED under `NOO_CLUSTER_TOKEN_V1=0`
+    /// read as `in use: cluster_hmac_v1 (gateway admitted)`. A refusal is its
+    /// own lane and its own warning, naming the caller, and never "admitted".
+    #[test]
+    fn a_refused_v1_token_is_a_refusal_not_an_admission() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1_refused",route_class="cluster"} 12"#,
+        ]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0, "cluster_hmac_v1": 0, "cluster_hmac_v1_refused": 0 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("the gateway REFUSED it 12 time(s) (pop-os 12)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:") && !c.detail.contains("(gateway admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("gateway admitted (by caller): ") && c.detail.contains("cluster_hmac_v1 0"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").contains("noo upgrade --nodes"), "{:?}", c.remedy);
+
+        // The node side: its own refusals, by node, apart from what it admitted.
+        let text = lane_metrics(now - 86_400, &[]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0, "cluster_hmac_v1": 0, "cluster_hmac_v1_refused": 5 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("a node REFUSED a v1 cluster token 5 time(s) (host3 5)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:") && !c.detail.contains("(nodes admitted)"), "{}", c.detail);
     }
 
     /// `cluster_hmac_v1` is counted on both sides. The 0.6.7 roll printed it

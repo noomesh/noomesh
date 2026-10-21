@@ -190,6 +190,8 @@ has a name.
 | `node_token_with_cert` | `node` (from the certificate) | the same with the node's certificate — the good case |
 | `addon_exchanged_token` | `caller`, `route_class` | an add-on on its own exchanged token — the good case |
 | `operator_client_cert` | `caller` (the operator's account), `route_class` | a posture write admitted on an operator client certificate and a token bound to it — the good case for the CLI's posture writes |
+| `cluster_hmac_v1` | `caller`, `route_class` | a fleet-secret HMAC admitted in the old v1 form (not bound to its request); `cluster_hmac_v2` (`caller`) is the good case |
+| `cluster_hmac_v1_refused` | `caller`, `route_class` | REFUSED, not admitted: a v1 cluster token after `NOO_CLUSTER_TOKEN_V1=0`. Every count is a caller whose calls all fail until it signs v2; each node agent reports its own under the same name in `legacy_lanes` |
 | `cli_shared_secret_refused` | `caller` (`cli`, `cli-posture`, `cli-onboard`, `cli-break-glass`), `route_class` | REFUSED, not admitted: a `noo` binary signed a request with the controller secret. Every count is an old CLI that needs `noo upgrade --all` |
 
 The `noo` CLI is on none of the admitted lanes. The CLI never
