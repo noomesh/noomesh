@@ -576,6 +576,26 @@ systems:
 provisioned; it is deliberately not "is the password set", because the CLI
 generates every role password unconditionally.
 
+**How a system's flag and passwords reach the gateway.** trellion and evolve
+are named in `docker-compose.cluster.yml`, so each of their role passwords has
+its own secret file. Any other system you declare here needs nothing in
+compose. `noo systems enable <name>` mints its two passwords into
+`secrets/env.sops` and sets its `enabled_when` flag in `.env`. On the next
+`noo stack start` the launcher writes all of them into the gateway's one
+`noo_systems_secrets` file (see
+[Secrets](../security/secrets.md#how-secrets-reach-a-container)). The broker
+reads a name from the gateway's environment first, then from that file.
+
+**A missing password does not stop the gateway** for a system core does not
+name. The broker logs an ERROR that names the system and the variable, skips
+that system (no role, no schema), and keeps booting. Authenticated `/health`
+then shows `dependencies.systems` as `healthy: false, optional: true`, with an
+`unprovisioned` map of each skipped system and its reason. `noo health`
+lists it as a down dependency, and `noo systems status` shows the credential
+missing from the store. trellion and evolve keep the old rule: without their
+passwords the gateway refuses to start, and the launcher refuses before `up`
+(`noo config launch-check system-credentials`).
+
 ### Other sections
 
 | Section | Read by | Keys |

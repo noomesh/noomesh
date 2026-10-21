@@ -55,6 +55,8 @@
 //!
 //! Tables keep living in `public` until phase B′ moves them.
 
+use std::collections::BTreeMap;
+
 use sqlx::PgPool;
 
 use crate::config::SystemConfig;
@@ -93,11 +95,90 @@ fn valid_identifier(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The variable whose FILE carries every declared system's enable flag and
+/// role passwords that no named compose line delivers.
+///
+/// The gateway container has no `env_file`: only variables compose names one
+/// by one reach it. That is right for the systems core knows (trellion,
+/// evolve — each has its own `_FILE` line), and it can never be right for a
+/// system core does not know: core never names an add-on's system, so its
+/// flag and passwords had no way in. The launcher (`lib-secrets.sh`
+/// `_systems_secrets_body`) writes ONE file for all of them — `KEY=VALUE`
+/// lines, 0400 to this container's uid — and compose mounts it with one
+/// pointer, `NOO_SYSTEMS_SECRETS_FILE`. A new system needs no compose line,
+/// no gateway change, and no entry in any list.
+pub const SYSTEMS_SECRETS: &str = "NOO_SYSTEMS_SECRETS";
+
+/// Parse the systems file: one `KEY=VALUE` per line, the value verbatim to the
+/// end of the line (no quoting — the launcher refuses a multi-line value
+/// rather than encode it). Blank lines, `#` lines, a line with no `=`, a key
+/// that is not an env-var name and an empty value are ignored. A later line
+/// for the same key wins (the launcher never writes two).
+pub(crate) fn parse_delivered(body: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in body.split('\n') {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let key_ok = !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if key_ok && !v.is_empty() {
+            out.insert(k.to_string(), v.to_string());
+        }
+    }
+    out
+}
+
+/// The systems file's contents, read once per reconcile. Not delivered
+/// (no declared system needs it, or an older compose) is empty. An unreadable
+/// file is logged and read as empty here; preflight refuses the same broken
+/// mount on its own (`NOO_SYSTEMS_SECRETS` is in `FILE_BACKED_SECRETS`).
+fn delivered() -> BTreeMap<String, String> {
+    match crate::config::secret_env::secret(SYSTEMS_SECRETS) {
+        Ok(Some(body)) => parse_delivered(&body),
+        Ok(None) => BTreeMap::new(),
+        Err(e) => {
+            tracing::error!(secret = SYSTEMS_SECRETS, error = %e, "systems secrets file unreadable");
+            BTreeMap::new()
+        }
+    }
+}
+
+/// A system's flag value: this process's environment first (a flag compose
+/// names explicitly), then the systems file. An empty env value counts as
+/// unset — compose's `${FLAG:-}` hands an empty string, not an absence.
+fn flag_value(
+    flag: &str,
+    get: impl Fn(&str) -> Option<String>,
+    delivered: &BTreeMap<String, String>,
+) -> Option<String> {
+    get(flag)
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| delivered.get(flag).cloned())
+}
+
+/// A system's role password: everything `secret_env` resolves for the name
+/// (`NAME_FILE`, `NOO_SECRET_NAME`, `NAME` — the named delivery trellion and
+/// evolve use) first, then the systems file. `Err` only for a named `_FILE`
+/// that cannot be read: a broken mount, not a missing credential.
+fn password_from(
+    var: &str,
+    get: impl Fn(&str) -> Option<String>,
+    delivered: &BTreeMap<String, String>,
+) -> Result<Option<String>, crate::config::secret_env::SecretError> {
+    if let Some(v) = crate::config::secret_env::secret_from(var, get)?.filter(|p| !p.trim().is_empty()) {
+        return Ok(Some(v));
+    }
+    Ok(delivered.get(var).filter(|p| !p.trim().is_empty()).cloned())
+}
+
 /// True when the operator has turned this system on.
 ///
 /// `None` means unconditional — trellion, which is mandatory since the
 /// container split and has no flag to check.
-fn intent_declared(name: &str, spec: &SystemConfig) -> bool {
+fn intent_declared(name: &str, spec: &SystemConfig, delivered: &BTreeMap<String, String>) -> bool {
     // A system whose name matches a declared add-on follows the add-on. This
     // used to be `enabled_when: NOO_PRO_ENABLED` — a THIRD place the same
     // fact was written down (after the flag itself and the launcher), and the
@@ -110,13 +191,61 @@ fn intent_declared(name: &str, spec: &SystemConfig) -> bool {
     if crate::addons::ADDONS.iter().any(|a| a.name == name) {
         return crate::addons::enabled(name);
     }
-    // A system that is NOT an add-on may still name a plain env flag.
+    // A system that is NOT an add-on may still name a plain env flag — read
+    // from this container's env, or from the systems file the launcher
+    // writes for exactly this case (the flag never reaches the env: no
+    // compose line names it).
     let Some(flag) = spec.enabled_when.as_deref() else {
         return true;
     };
-    std::env::var(flag)
+    flag_value(flag, |k| std::env::var(k).ok(), delivered)
         .map(|v| TRUE_VALUES.contains(&v.trim().to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Does a missing credential stop the gateway? Only for a system core itself
+/// declares (a row of `addons::ADDONS`: trellion, evolve). Those are
+/// delivered by named compose lines and checked before `up` by
+/// `noo config launch-check system-credentials`, so reaching here without
+/// one is a broken install — the fail-closed rule that has stood since the
+/// broker landed. Every other system is declared at runtime (an operator's
+/// manifest entry, later an add-on bundle): one of those missing a password
+/// must not take the gateway down with it, so it is logged at ERROR,
+/// reported on /health, and skipped.
+fn missing_credential_is_fatal(name: &str) -> bool {
+    crate::addons::ADDONS.iter().any(|a| a.name == name)
+}
+
+/// Systems the boot-time reconcile could not provision, by name, with the
+/// reason. Read by `/health` (`dependencies.systems`).
+static UNPROVISIONED: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// The systems the broker skipped because a credential was missing.
+pub fn unprovisioned() -> BTreeMap<String, String> {
+    UNPROVISIONED.lock().map(|m| m.clone()).unwrap_or_default()
+}
+
+/// Why `ensure_role` did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoleError {
+    /// The role must be created and its password is nowhere this process can
+    /// see. `var` is the variable; `message` the operator-facing sentence.
+    MissingCredential { var: String, message: String },
+    /// Anything else: a database error, an unreadable `_FILE`.
+    Other(String),
+}
+
+fn missing_credential(system: &str, role: &str, password_env: &str) -> RoleError {
+    RoleError::MissingCredential {
+        var: password_env.to_string(),
+        message: format!(
+            "system {system:?} is enabled but {password_env} is not set, so the \
+             {role:?} login role cannot be created. It will not be created with an \
+             invented password — that leaves a credential nobody knows and every \
+             operator assumes is in the store. Run `noo systems enable {system}`, \
+             which mints it."
+        ),
+    }
 }
 
 async fn role_exists(db: &PgPool, role: &str) -> Result<bool, sqlx::Error> {
@@ -147,23 +276,15 @@ async fn ensure_role(
     system: &str,
     role: &str,
     password_env: &str,
-) -> Result<bool, String> {
-    if role_exists(db, role).await.map_err(|e| e.to_string())? {
+    delivered: &BTreeMap<String, String>,
+) -> Result<bool, RoleError> {
+    if role_exists(db, role).await.map_err(|e| RoleError::Other(e.to_string()))? {
         return Ok(false);
     }
 
-    let password = crate::config::secret_env::secret(password_env)
-        .map_err(|e| e.to_string())?
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "system {system:?} is enabled but {password_env} is not set, so the \
-                 {role:?} login role cannot be created. It will not be created with an \
-                 invented password — that leaves a credential nobody knows and every \
-                 operator assumes is in the store. Run `noo systems enable {system}`, \
-                 which mints it."
-            )
-        })?;
+    let password = password_from(password_env, |k| std::env::var(k).ok(), delivered)
+        .map_err(|e| RoleError::Other(e.to_string()))?
+        .ok_or_else(|| missing_credential(system, role, password_env))?;
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE {role} {ROLE_ATTRS} PASSWORD '{}'",
@@ -171,7 +292,7 @@ async fn ensure_role(
     )))
     .execute(db)
     .await
-    .map_err(|e| format!("CREATE ROLE {role} failed: {e}"))?;
+    .map_err(|e| RoleError::Other(format!("CREATE ROLE {role} failed: {e}")))?;
     tracing::info!(system, role, "login role created");
     Ok(true)
 }
@@ -356,24 +477,32 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
 /// Called from the migration path with the PRIVILEGED pool — a runtime role
 /// cannot create roles or schemas, which is the entire point of the split.
 pub async fn run(db: &PgPool) -> Result<(), String> {
-    reconcile(db, &crate::config::global().systems).await
+    let skipped = reconcile(db, &crate::config::global().systems).await?;
+    if let Ok(mut m) = UNPROVISIONED.lock() {
+        *m = skipped;
+    }
+    Ok(())
 }
 
 /// The reconciler proper, taking the manifest explicitly so it can be tested
-/// against a real database without a config file on disk.
+/// against a real database without a config file on disk. Returns the
+/// systems it skipped for a missing credential (name → reason); [`run`]
+/// publishes them for `/health`.
 pub async fn reconcile(
     db: &PgPool,
-    systems: &std::collections::BTreeMap<String, SystemConfig>,
-) -> Result<(), String> {
+    systems: &BTreeMap<String, SystemConfig>,
+) -> Result<BTreeMap<String, String>, String> {
     if systems.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
 
+    let delivered = delivered();
     let mut provisioned = 0usize;
     let mut skipped = 0usize;
+    let mut unprovisioned = BTreeMap::new();
 
     for (name, spec) in systems {
-        if !intent_declared(name, spec) {
+        if !intent_declared(name, spec, &delivered) {
             // INFO, naming the system AND the flag. It was `debug!` with a
             // bare count in the summary, and that hid a real
             // misconfiguration: on 2026-08-05 evolve was skipped because
@@ -406,15 +535,37 @@ pub async fn reconcile(
 
         // The DDL role first: it owns the schema, so it has to exist before
         // the schema can be created AUTHORIZATION it.
-        ensure_role(db, name, &spec.ddl_role, &spec.ddl_password_env).await?;
-        ensure_role(db, name, &spec.role, &spec.password_env).await?;
+        let mut missing = None;
+        for (role, var) in [(&spec.ddl_role, &spec.ddl_password_env), (&spec.role, &spec.password_env)] {
+            match ensure_role(db, name, role, var, &delivered).await {
+                Ok(_) => {}
+                Err(RoleError::Other(e)) => return Err(e),
+                Err(RoleError::MissingCredential { message, .. }) if missing_credential_is_fatal(name) => {
+                    return Err(message)
+                }
+                Err(RoleError::MissingCredential { var, message }) => {
+                    tracing::error!(
+                        system = name,
+                        variable = %var,
+                        error = %message,
+                        "system NOT provisioned: a role password is missing — skipping this system, the gateway keeps booting"
+                    );
+                    missing = Some(var);
+                    break;
+                }
+            }
+        }
+        if let Some(var) = missing {
+            unprovisioned.insert(name.clone(), format!("{var} is not set"));
+            continue;
+        }
         ensure_schema(db, name, spec).await?;
         ensure_extensions(db, name, spec).await?;
         provisioned += 1;
     }
 
-    tracing::info!(provisioned, skipped, "systems reconciled");
-    Ok(())
+    tracing::info!(provisioned, skipped, unprovisioned = unprovisioned.len(), "systems reconciled");
+    Ok(unprovisioned)
 }
 
 #[cfg(test)]
@@ -436,7 +587,7 @@ mod tests {
     #[test]
     fn no_flag_means_unconditional() {
         // A system that is neither an add-on nor flagged provisions always.
-        assert!(intent_declared("somethingelse", &spec(None)));
+        assert!(intent_declared("somethingelse", &spec(None), &BTreeMap::new()));
     }
 
     #[test]
@@ -448,7 +599,7 @@ mod tests {
         // is ignored entirely, so the two cannot diverge.
         std::env::set_var("NOO_TEST_STALE_FLAG", "1");
         assert!(
-            !intent_declared("evolve", &spec(Some("NOO_TEST_STALE_FLAG"))),
+            !intent_declared("evolve", &spec(Some("NOO_TEST_STALE_FLAG")), &BTreeMap::new()),
             "evolve is opt-in and unstated here, so a stale truthy flag must not enable it"
         );
         std::env::remove_var("NOO_TEST_STALE_FLAG");
@@ -462,12 +613,12 @@ mod tests {
         std::env::set_var("NOO_EVOLVE_DB_PASSWORD", "present-on-every-install");
         std::env::remove_var("NOO_TEST_PRO_FLAG");
         assert!(
-            !intent_declared("somethingelse", &spec(Some("NOO_TEST_PRO_FLAG"))),
+            !intent_declared("somethingelse", &spec(Some("NOO_TEST_PRO_FLAG")), &BTreeMap::new()),
             "a set password must not stand in for a declared intent"
         );
 
         std::env::set_var("NOO_TEST_PRO_FLAG", "1");
-        assert!(intent_declared("somethingelse", &spec(Some("NOO_TEST_PRO_FLAG"))));
+        assert!(intent_declared("somethingelse", &spec(Some("NOO_TEST_PRO_FLAG")), &BTreeMap::new()));
         std::env::remove_var("NOO_TEST_PRO_FLAG");
         std::env::remove_var("NOO_EVOLVE_DB_PASSWORD");
     }
@@ -476,11 +627,11 @@ mod tests {
     fn flag_accepts_the_shell_truthy_set() {
         for v in ["1", "true", "TRUE", "yes", "on"] {
             std::env::set_var("NOO_TEST_TRUTHY", v);
-            assert!(intent_declared("somethingelse", &spec(Some("NOO_TEST_TRUTHY"))), "{v}");
+            assert!(intent_declared("somethingelse", &spec(Some("NOO_TEST_TRUTHY")), &BTreeMap::new()), "{v}");
         }
         for v in ["0", "false", "no", "off", ""] {
             std::env::set_var("NOO_TEST_TRUTHY", v);
-            assert!(!intent_declared("somethingelse", &spec(Some("NOO_TEST_TRUTHY"))), "{v}");
+            assert!(!intent_declared("somethingelse", &spec(Some("NOO_TEST_TRUTHY")), &BTreeMap::new()), "{v}");
         }
         std::env::remove_var("NOO_TEST_TRUTHY");
     }
@@ -513,6 +664,82 @@ mod tests {
         for negative in ["NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE", "NOBYPASSRLS"] {
             assert!(ROLE_ATTRS.contains(negative), "{negative} missing");
         }
+    }
+
+    // ── the systems file: a system core does not name ───────────────────
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: BTreeMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| m.get(k).cloned()
+    }
+
+    #[test]
+    fn the_systems_file_parses_key_value_lines_verbatim() {
+        let got = parse_delivered(
+            "NOO_EXAMPLE_ADDON_ENABLED=1\nNOO_EXAMPLE_ADDON_DB_PASSWORD=a=b c'\"\\\n\n# note\nnot a line\nlower=x\n9BAD=x\nNOO_EMPTY=\n",
+        );
+        assert_eq!(got.get("NOO_EXAMPLE_ADDON_ENABLED").map(String::as_str), Some("1"));
+        assert_eq!(
+            got.get("NOO_EXAMPLE_ADDON_DB_PASSWORD").map(String::as_str),
+            Some("a=b c'\"\\"),
+            "the value runs to the end of the line, untouched"
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn a_flag_only_the_systems_file_carries_enables_the_system() {
+        // The bug this file exists for: `noo systems enable example_addon` set
+        // the flag in .env, no compose line named it, and the broker read it
+        // as off. With the file the flag arrives.
+        let delivered = parse_delivered("NOO_TEST_EXAMPLE_ADDON_FLAG=1\n");
+        std::env::remove_var("NOO_TEST_EXAMPLE_ADDON_FLAG");
+        assert!(intent_declared("example_addon", &spec(Some("NOO_TEST_EXAMPLE_ADDON_FLAG")), &delivered));
+        assert!(!intent_declared("example_addon", &spec(Some("NOO_TEST_EXAMPLE_ADDON_FLAG")), &BTreeMap::new()));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_systems_file() {
+        let delivered = parse_delivered("FLAG=1\nPW=from-file\n");
+        // A flag compose names explicitly is the env's answer, including "off".
+        assert_eq!(flag_value("FLAG", lookup(&[("FLAG", "0")]), &delivered).as_deref(), Some("0"));
+        // compose's `${FLAG:-}` hands an EMPTY string: that is unset, not "off".
+        assert_eq!(flag_value("FLAG", lookup(&[("FLAG", "")]), &delivered).as_deref(), Some("1"));
+        assert_eq!(flag_value("FLAG", lookup(&[]), &delivered).as_deref(), Some("1"));
+        assert_eq!(flag_value("FLAG", lookup(&[]), &BTreeMap::new()), None);
+
+        // Passwords: the named delivery (plain, NOO_SECRET_, _FILE) first.
+        assert_eq!(password_from("PW", lookup(&[("PW", "from-env")]), &delivered).unwrap().as_deref(), Some("from-env"));
+        assert_eq!(
+            password_from("PW", lookup(&[("NOO_SECRET_PW", "from-prefix")]), &delivered).unwrap().as_deref(),
+            Some("from-prefix")
+        );
+        assert_eq!(password_from("PW", lookup(&[("PW", "  ")]), &delivered).unwrap().as_deref(), Some("from-file"));
+        assert_eq!(password_from("PW", lookup(&[]), &delivered).unwrap().as_deref(), Some("from-file"));
+        assert_eq!(password_from("PW", lookup(&[]), &BTreeMap::new()).unwrap(), None);
+        // A named `_FILE` that cannot be read is a broken mount: an error,
+        // never a quiet fall-through to the systems file.
+        let broken = lookup(&[("PW_FILE", "/nonexistent/system-provision-test/pw")]);
+        assert!(password_from("PW", broken, &delivered).is_err());
+    }
+
+    #[test]
+    fn a_missing_password_stops_the_gateway_only_for_a_system_core_declares() {
+        // trellion and evolve keep the fail-closed rule: named compose lines
+        // deliver their credentials and the launcher checks them before `up`.
+        for core in ["trellion", "evolve"] {
+            assert!(missing_credential_is_fatal(core), "{core}");
+        }
+        // A system declared at runtime is skipped, not fatal.
+        assert!(!missing_credential_is_fatal("example_addon"));
+        let RoleError::MissingCredential { var, message } =
+            missing_credential("example_addon", "noo_example_addon_ddl", "NOO_EXAMPLE_ADDON_DDL_PASSWORD")
+        else {
+            panic!("a missing password must be its own kind of error")
+        };
+        assert_eq!(var, "NOO_EXAMPLE_ADDON_DDL_PASSWORD");
+        assert!(message.contains("example_addon") && message.contains("NOO_EXAMPLE_ADDON_DDL_PASSWORD"), "{message}");
     }
 
     // ── against a real catalogue ─────────────────────────────────────────
@@ -870,7 +1097,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_without_a_credential_fails_loudly() {
+    async fn enabled_without_a_credential_is_reported_and_skipped_not_fatal() {
+        // A system core does not declare (not a row of addons::ADDONS) that
+        // is enabled with no password: it used to fail the whole reconcile,
+        // and mesh_migrate exits(1) on that — one runtime-declared system
+        // took the gateway down. Now it is skipped, named, and nothing is
+        // created for it. (trellion / evolve keep the fatal path:
+        // `a_missing_password_stops_the_gateway_only_for_a_system_core_declares`.)
         let Some(dsn) = dsn() else { return };
         let db = pool(&dsn).await;
         let tag = "nocred";
@@ -880,13 +1113,15 @@ mod tests {
         std::env::remove_var("BROKERTEST_PW_nocred");
         std::env::remove_var("BROKERTEST_DDLPW_nocred");
 
-        let err = reconcile(&db, &manifest(tag, Some("BROKERTEST_NOCRED_FLAG")))
+        let why = reconcile(&db, &manifest(tag, Some("BROKERTEST_NOCRED_FLAG")))
             .await
-            .expect_err("intent without a credential must not be silently skipped");
+            .expect("a runtime-declared system missing a credential must not fail the reconcile");
         assert!(
-            err.contains("BROKERTEST_DDLPW_nocred"),
-            "the error must name the missing variable, got: {err}"
+            why.get("tnocred").is_some_and(|r| r.contains("BROKERTEST_DDLPW_nocred")),
+            "the skip must name the system and the missing variable, got: {why:?}"
         );
+        assert!(!role_exists(&db, "brokertest_ddl_nocred").await.unwrap());
+        assert!(!schema_exists(&db, "brokertest_schema_nocred").await.unwrap());
 
         cleanup(&db, tag).await;
         std::env::remove_var("BROKERTEST_NOCRED_FLAG");

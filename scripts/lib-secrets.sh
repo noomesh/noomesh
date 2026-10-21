@@ -239,6 +239,79 @@ _pgpass_body() {
     printf '%s' "$body"
 }
 
+# _declared_systems — every declared system, one line each:
+#   <name> <enabled_when var or -> <password_env> <ddl_password_env>
+# The ONE place the launcher learns which systems exist. Today the source is
+# the `systems:` manifest in ./noomesh.yaml, read by `noo config launch-render
+# systems` (the CLI's own parser, the one `noo systems` and the pre-`up`
+# credential check use; no second YAML reader here). A further source (an
+# add-on bundle's system fragment) appends its lines here and nothing
+# downstream changes: not compose, not the gateway's lookup.
+_declared_systems() {
+    local nb="" rc=0 out
+    [ -f noomesh.yaml ] || return 0
+    if command -v noo_bin >/dev/null 2>&1; then
+        nb="$(noo_bin 2>/dev/null)" || nb=""
+    elif [ -n "${NOO_CLI_BIN:-}" ] && [ -x "$NOO_CLI_BIN" ]; then
+        nb="$NOO_CLI_BIN"
+    else
+        nb="$(command -v noo 2>/dev/null)" || nb=""
+    fi
+    if [ -n "$nb" ]; then
+        out="$("$nb" config launch-render systems noomesh.yaml 2>/dev/null)" || rc=$?
+    else
+        rc=127
+    fi
+    if [ "$rc" != 0 ]; then
+        # Silent only when nothing is declared: a manifest this launcher could
+        # not read is a system whose flag and passwords will not arrive.
+        if grep -qE '^systems:' noomesh.yaml; then
+            echo "WARNING: could not list the declared systems (noo config launch-render systems: exit $rc; an older noo?)." >&2
+            echo "         A system no compose line names will not receive its flag or passwords; the gateway skips it and says so." >&2
+        fi
+        return 0
+    fi
+    printf '%s\n' "$out"
+}
+
+# _systems_secrets_body [compose-file] — the body of the gateway's ONE
+# systems-secrets file (compose secret noo_systems_secrets, pointer
+# NOO_SYSTEMS_SECRETS_FILE): `KEY=VALUE` per line for each declared system's
+# `enabled_when` flag and its two role-password variables, the value from
+# this process's environment (the store's decrypt) or ./.env, exactly as
+# every other file-backed secret takes it. Skipped: a variable a compose
+# secret already delivers by name (`x-noo-source:`, e.g. trellion's and
+# evolve's passwords), one with no value, and a repeat. A name that is not an
+# env-var name, or a value with a newline (the format has no quoting), is
+# refused with a warning naming the VARIABLE — never the value.
+_systems_secrets_body() {
+    local compose="${1:-docker-compose.cluster.yml}" named name flag pw ddl k v body="" seen=" "
+    named=" $(file_secret_sources "$compose" | tr '\n' ' ') "
+    while read -r name flag pw ddl; do
+        [ -n "$name" ] || continue
+        for k in "$flag" "$pw" "$ddl"; do
+            [ -n "$k" ] && [ "$k" != - ] || continue
+            if ! [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+                echo "WARNING: system $name names '$k', which is not an environment variable name — not delivered" >&2
+                continue
+            fi
+            case "$named$seen" in *" $k "*) continue ;; esac
+            seen="$seen$k "
+            v="$(_secret_value "$k")"
+            [ -n "$v" ] || continue
+            case "$v" in
+                *$'\n'*)
+                    echo "WARNING: $k (system $name) holds a multi-line value, which the systems file cannot carry — not delivered" >&2
+                    continue ;;
+            esac
+            body="${body}${k}=${v}"$'\n'
+        done
+    done <<EOF
+$(_declared_systems)
+EOF
+    printf '%s' "$body"
+}
+
 # derive_file_secrets [compose-file] — make every file-backed secret's source
 # variable exist in this process, deriving the two pgpass bodies. Called by
 # `load_secrets`, so every launcher and noo-hostd (which runs through
@@ -262,6 +335,8 @@ derive_file_secrets() {
     NOO_PGPASS_TRELLION="$(_pgpass_body $NOO_PGPASS_ROLES_TRELLION)"
     # shellcheck disable=SC2086
     NOO_PGPASS_EVOLVE="$(_pgpass_body $NOO_PGPASS_ROLES_EVOLVE)"
+    export NOO_SYSTEMS_SECRETS
+    NOO_SYSTEMS_SECRETS="$(_systems_secrets_body "$compose")"
     for v in $(file_secret_sources "$compose"); do
         if [ -n "${!v+x}" ]; then
             export "${v?}"

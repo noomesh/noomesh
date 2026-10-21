@@ -231,6 +231,26 @@ pub fn render_override(text: &str) -> Result<String, String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// `systems`: the variable NAMES each declared system reads, one line per
+/// system — `<name> <enabled_when or -> <password_env> <ddl_password_env>` —
+/// for `lib-secrets.sh` `_declared_systems`, which builds the gateway's ONE
+/// systems-secrets file from them. Names only: the values stay in the
+/// launcher's shell. Parsed by `systems::parse_systems`, the same reader
+/// `noo systems` and the pre-`up` credential check use. Not a replacement
+/// for a python block, so it has no golden fixture.
+pub(crate) fn render_systems(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    for (name, e) in crate::commands::systems::parse_systems(text)? {
+        out.push_str(&format!(
+            "{name} {} {} {}\n",
+            e.enabled_when.as_deref().unwrap_or("-"),
+            e.password_env,
+            e.ddl_password_env
+        ));
+    }
+    Ok(out)
+}
+
 /// `noo config launch-render <section>`. Reads `<repo_root>/noomesh.yaml`;
 /// a missing file prints nothing and exits 0 for every section — same as
 /// the Python blocks it replaces, which each guarded on `-f noomesh.yaml`
@@ -263,9 +283,19 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
                 1
             }
         },
+        "systems" => match render_systems(&text) {
+            Ok(out) => {
+                print!("{out}");
+                0
+            }
+            Err(e) => {
+                eprintln!("noo config launch-render systems: {e}");
+                65
+            }
+        },
         other => {
             eprintln!(
-                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override)"
+                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems)"
             );
             64
         }
@@ -275,6 +305,20 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── systems ──────────────────────────────────────────────────────
+
+    #[test]
+    fn systems_renders_the_variable_names_never_values() {
+        let yaml = "systems:\n  example_addon:\n    role: noo_example_addon\n    ddl_role: noo_example_addon_ddl\n    schema: example_addon\n    enabled_when: NOO_EXAMPLE_ADDON_ENABLED\n    password_env: NOO_EXAMPLE_ADDON_DB_PASSWORD\n    ddl_password_env: NOO_EXAMPLE_ADDON_DDL_PASSWORD\n  trellion:\n    role: noo_trellion\n    ddl_role: noo_trellion_ddl\n    schema: trellion\n    password_env: NOO_TRELLION_DB_PASSWORD\n    ddl_password_env: NOO_TRELLION_DDL_PASSWORD\n";
+        assert_eq!(
+            render_systems(yaml).unwrap(),
+            "example_addon NOO_EXAMPLE_ADDON_ENABLED NOO_EXAMPLE_ADDON_DB_PASSWORD NOO_EXAMPLE_ADDON_DDL_PASSWORD\n\
+             trellion - NOO_TRELLION_DB_PASSWORD NOO_TRELLION_DDL_PASSWORD\n"
+        );
+        assert_eq!(render_systems("addons: {}\n").unwrap(), "");
+        assert!(render_systems("systems:\n  x:\n    role: r\n").is_err());
+    }
 
     // ── compose-env ──────────────────────────────────────────────────
 
