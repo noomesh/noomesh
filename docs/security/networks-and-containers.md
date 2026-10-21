@@ -121,7 +121,7 @@ agent sets `User: "0"` on them explicitly.
 
 | Service | `cap_drop` | `no-new-privileges` | Read-only root filesystem |
 |---|---|---|---|
-| `sandbox` | ALL (plus the few it adds back) | yes | yes |
+| `sandbox`, `sandbox-extra` | ALL, plus `SETUID`, `SETGID` and `KILL` for the launcher (below) | yes | yes (tmpfs `/tmp` 100m, `/run` 10m) |
 | `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
 | `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
 | `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
@@ -129,6 +129,37 @@ agent sets `User: "0"` on them explicitly.
 The gateway, the worker and trellion run as an unprivileged user, bind ports
 above 1024 and use no capability, so dropping all of them removes nothing they
 need.
+
+### The sandbox executor user
+
+The sandbox is the one service that runs code it does not trust, so the code
+and the server are two different uids. The container starts as root only for
+its first instruction: `setpriv` keeps `CAP_SETUID`, `CAP_SETGID` and
+`CAP_KILL` as ambient capabilities and execs uvicorn as `nonroot`; no root
+process remains. Each `python_exec` call is then launched through `setpriv`
+again into one of 64 executor uids (`sandbox-exec`, 65600 and up, one per
+concurrent call) with every capability cleared, in both isolation modes. What
+that buys, measured in the image on 2026-10-21:
+
+* the code cannot read the sandbox's own leaf key, which is `0640` and
+  nonroot's (`cat: Permission denied`), so it cannot present the sandbox's
+  identity to anything on `noo-sandbox`;
+* it cannot signal the server or another call (`kill: Operation not
+  permitted`), and `ptrace` across uids needs a capability it does not have;
+* it cannot return to either uid (`setresuid failed: Operation not
+  permitted`), and `no-new-privileges` stops a file capability from granting
+  anything at exec;
+* a call that times out is killed by process group and then by uid, which
+  reaches a snippet that left the group with `setsid()`; `RLIMIT_NPROC` is
+  the call's own, so a fork bomb in one call starves no other;
+* the scratch directory is made by the executor (0700) and removed as the
+  executor; the server never hands the code a directory it owns.
+
+A non-root process keeps no effective capability, so without this launcher
+the `cap_add` lines were inert and the code ran as the server. `/health`
+reports the executor under `executor`; a null uid means the image has no
+`sandbox-exec` user or the container was started without the launcher, and
+the code runs as the server's uid as it did before.
 
 ### Read-only root filesystem
 

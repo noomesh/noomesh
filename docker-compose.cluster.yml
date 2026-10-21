@@ -2607,7 +2607,34 @@ services:
     pull_policy: build
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-sandbox
     profiles: ["controller", "standalone"]
-    entrypoint: []
+    # The container starts as root ONLY to hand the server three
+    # capabilities: setpriv keeps CAP_SETUID, CAP_SETGID and CAP_KILL as
+    # ambient capabilities and execs uvicorn as `nonroot` (a name, not a
+    # number: Docker 27 resolves user strings by name). No root process
+    # remains. With those three the server runs every /exec call as an
+    # executor uid (`sandbox-exec`, 64 uids from 65600, one per concurrent
+    # call, declared in docker/Dockerfile.sandbox) with every capability
+    # cleared, and can still kill a call that forks past its own limits.
+    # The code therefore cannot read this container's leaf key (0640,
+    # nonroot's), signal the server or another call, or return to either
+    # uid. A non-root process keeps no effective capability, so without
+    # this launcher the two cap_add lines below were inert and the code
+    # ran as the server. See src/noomesh/sandbox/app.py `executor`.
+    user: root
+    # docker-init as PID 1: it reaps what a call leaves orphaned (the
+    # inner bwrap of every call, a process a snippet detached with
+    # setsid() before the timeout killed it). uvicorn as PID 1 never did,
+    # and each such zombie held a pid against the pids limit for the life
+    # of the container.
+    init: true
+    entrypoint: &sandbox-entrypoint
+      - setpriv
+      - --reuid=nonroot
+      - --regid=nonroot
+      - --clear-groups
+      - --inh-caps=+setuid,+setgid,+kill
+      - --ambient-caps=+setuid,+setgid,+kill
+      - --
     # mTLS doors phase 1 (i77): uvicorn terminates TLS itself and REQUIRES a
     # cluster-CA client certificate (--ssl-cert-reqs 2 = ssl.CERT_REQUIRED),
     # the same native listener vLLM runs — no stunnel sidecar, because the
@@ -2673,8 +2700,10 @@ services:
     cap_drop: &sandbox-cap-drop
       - ALL
     cap_add: &sandbox-cap-add
+      # Exactly what the entrypoint keeps for the server (see `user:`).
       - SETUID
       - SETGID
+      - KILL
     read_only: true
     # python_exec-only sizing again — the fu 49 claude runner (which needed
     # the bigger tmpfs + memory) was reverted by the 2026-08-11 design flip.
@@ -2731,7 +2760,9 @@ services:
     image: noomesh/sandbox:latest
     pull_policy: never
     profiles: ["controller", "standalone"]
-    entrypoint: []
+    user: root
+    init: true
+    entrypoint: *sandbox-entrypoint
     # The same mTLS listener and the same leaf: callers dial the `sandbox`
     # alias, which the leaf carries.
     command: *sandbox-command
