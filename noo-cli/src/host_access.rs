@@ -191,6 +191,11 @@ pub(crate) fn floor_ttl_secs() -> i64 {
 /// disabled account.
 pub(crate) fn reset_admin(db: &HostDb, account: &str, password: &str) -> Result<(), String> {
     validate_account(account)?;
+    // bcrypt 0.15 has no non-truncating API (and the later one refuses exactly
+    // 72 bytes, counting its NUL terminator), so enforce the 72-byte rule here.
+    if let Some(why) = crate::password_policy::too_long_for_bcrypt(password) {
+        return Err(why.to_string());
+    }
     let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| format!("bcrypt: {e}"))?;
     db.run(&reset_admin_sql(account, &hash, floor_ttl_secs()))
 }
@@ -198,6 +203,25 @@ pub(crate) fn reset_admin(db: &HostDb, account: &str, password: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_admin_refuses_over_72_bytes_before_touching_the_db() {
+        let db = HostDb::resolve();
+        for pw in ["x".repeat(73), "\u{20ac}".repeat(30)] {
+            let e = reset_admin(&db, "admin", &pw).unwrap_err();
+            assert_eq!(e, "Password is longer than 72 bytes; bcrypt would silently ignore the rest. Use 72 bytes or fewer.");
+        }
+    }
+
+    #[test]
+    fn an_old_hash_of_a_long_password_still_verifies() {
+        // Hashed before the rule, with the truncating API: only the first 72
+        // bytes counted. Verification is unchanged.
+        let long = "y".repeat(80);
+        let old = bcrypt::hash(&long, 4).unwrap();
+        assert!(bcrypt::verify(&long, &old).unwrap());
+        assert!(bcrypt::verify("y".repeat(72), &old).unwrap());
+    }
 
     #[test]
     fn a_ticket_row_carries_only_the_hash() {

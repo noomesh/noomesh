@@ -205,6 +205,15 @@ fn actor(ext: &Option<Extension<AuthActor>>) -> String {
 }
 
 fn hash_password(pw: &str) -> Result<String, AppError> {
+    // `check_new_password` refuses an over-long password first; this is the
+    // same rule at the hash itself. bcrypt's own `non_truncating_hash` is NOT
+    // used: it counts the NUL terminator bcrypt appends, so it refuses a
+    // password of exactly 72 bytes even though all 72 bytes are used. The 72
+    // byte rule is therefore enforced on the byte length, and `hash` then
+    // cannot drop anything of the password.
+    if let Some(why) = crate::password_policy::too_long_for_bcrypt(pw) {
+        return Err(AppError::BadRequest(why.to_string()));
+    }
     bcrypt::hash(pw, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("password hash failed: {e}")))
 }
@@ -5943,6 +5952,32 @@ mod session_end_tests {
         assert!(me.contains("session_floor::refuses("));
         assert!(!me.contains("still return from token claims"), "a deleted account must not be echoed as live identity");
         assert!(me.contains("User no longer exists"));
+    }
+
+    #[test]
+    fn hash_password_refuses_over_72_bytes_and_old_hashes_verify() {
+        // Exactly 72 bytes hashes and verifies.
+        let ok = "x".repeat(72);
+        let h = super::hash_password(&ok).unwrap();
+        assert!(bcrypt::verify(&ok, &h).unwrap());
+        // 73 bytes, and 30 non-ASCII characters (90 bytes), are a 400.
+        for pw in ["x".repeat(73), "\u{20ac}".repeat(30)] {
+            match super::hash_password(&pw) {
+                Err(crate::routes::AppError::BadRequest(m)) => assert_eq!(m, crate::password_policy::TOO_LONG_MSG),
+                other => panic!("expected BadRequest, got {:?}", other.map(|_| ())),
+            }
+            assert!(check_new_password_msg(&pw));
+        }
+        // A hash made before the rule (truncating API) of an 80-byte
+        // password still verifies; verification is untouched.
+        let long = "y".repeat(80);
+        let old = bcrypt::hash(&long, 4).unwrap();
+        assert!(bcrypt::verify(&long, &old).unwrap());
+    }
+
+    fn check_new_password_msg(pw: &str) -> bool {
+        matches!(super::check_new_password(pw, "admin"),
+            Err(crate::routes::AppError::BadRequest(m)) if m.contains("longer than 72 bytes"))
     }
 
     #[test]
