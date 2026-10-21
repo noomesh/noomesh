@@ -36,12 +36,13 @@ func (r *Reconciler) prefetchImages(
 	effective []placement,
 	running map[string]string,
 	specLabels map[string]string,
+	floating map[string]string,
 	native map[string]string,
 ) {
 	if r.docker == nil {
 		return
 	}
-	refs, n := imagesToPrefetch(effective, running, specLabels, native, r.driftRecreated)
+	refs, n := imagesToPrefetch(effective, running, specLabels, floating, native, r.driftRecreated)
 	if len(refs) == 0 {
 		return
 	}
@@ -55,6 +56,7 @@ func imagesToPrefetch(
 	effective []placement,
 	running map[string]string,
 	specLabels map[string]string,
+	floating map[string]string,
 	native map[string]string,
 	driftRecreated map[string]string,
 ) (refs []string, placements int) {
@@ -71,7 +73,7 @@ func imagesToPrefetch(
 			// Converged or stuck: the loop does not start it. Only a
 			// recreate falls through to a start (read-only use of the
 			// start loop's driftRecreated bookkeeping).
-			if decideSpecDrift(hasLabel, curHash, specHash(p), driftRecreated[p.Backend]) != driftRecreate {
+			if decideBackendDrift(hasLabel, curHash, specHash(p), driftRecreated[p.Backend], floating[p.Backend]) != driftRecreate {
 				continue
 			}
 		}

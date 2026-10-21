@@ -530,12 +530,16 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         return fail(
             NAME,
             format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
-            // What works (0.6.8 live, aserve + robopi): the agent never
-            // replaces a RUNNING container, so a provision that leaves the
-            // binaries alone changed nothing. Removed, it is recreated from
-            // the ref desired-config carries: the signed lock's digest.
+            // What works (0.6.8 live, aserve + robopi): an agent before
+            // 0.6.10 never replaces a RUNNING container, so a provision that
+            // left the binaries alone changed nothing; removed, it is
+            // recreated from the ref desired-config carries (the signed
+            // lock's digest, 0.6.9+ controller). A 0.6.10+ agent replaces it
+            // itself, so on one the row persists only when that start was
+            // refused.
             format!("docker rm -f {}   # on {id}: the agent recreates it from the stack lock's pinned ref within a minute \
-                     (it never replaces a running container itself). If the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, \
+                     (a 0.6.10+ agent does this itself on its next reconcile; if it is still listed, that start was refused: \
+                     see the agent's reconcile.start_failed). If the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, \
                      unset it or pin repo:version@sha256:… first", floating_ctrs.join(" ")),
         );
     }
@@ -7437,6 +7441,7 @@ mod tests {
         // 0.6.8 live: a provision changed nothing; removing the container is
         // what makes the agent recreate it from the lock's pinned ref.
         assert!(c.remedy.as_deref().unwrap_or("").starts_with("docker rm -f noo-vllm   # on awolf"), "{c:?}");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("a 0.6.10+ agent does this itself"), "{c:?}");
 
         let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
             "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
