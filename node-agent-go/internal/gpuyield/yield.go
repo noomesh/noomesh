@@ -196,6 +196,10 @@ type Controller struct {
 	lastNoMeter bool
 	owned       []docker.NoomeshContainer // this tick's noomesh containers
 	ownedErr    error                     // non-nil: docker could not list them
+	// listErr is the last GPU-backend listing failure, so a host with no
+	// docker (a Mac running a native ollama) warns once per cause, not
+	// once per tick.
+	listErr string
 }
 
 // New builds a controller. stateDir may be "" (no persistence).
@@ -316,14 +320,34 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
+// noteListErr logs a GPU-backend listing failure when it starts or changes,
+// and the recovery once; the same failure every tick is logged at debug.
+func (c *Controller) noteListErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		if c.listErr != "" {
+			slog.Info("gpuyield: listing GPU backend containers works again")
+		}
+		c.listErr = ""
+		return
+	}
+	if err.Error() == c.listErr {
+		slog.Debug("gpuyield: listing GPU backend containers still failing", "error", err)
+		return
+	}
+	c.listErr = err.Error()
+	slog.Warn("gpuyield: listing GPU backend containers failed (logged once per cause)", "error", err)
+}
+
 // Tick is one sample + decision.
 func (c *Controller) Tick(ctx context.Context) {
 	r := c.probe.Read(ctx)
 	lctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	backends, err := c.docker.GPUBackendContainers(lctx)
 	cancel()
+	c.noteListErr(err)
 	if err != nil {
-		slog.Warn("gpuyield: listing GPU backend containers failed", "error", err)
 		backends = nil
 	}
 
