@@ -757,6 +757,13 @@ its own (from 0.6.9; before that only a manual `/start` carried it, and a
 recreate fell back to the node's versioned default with no digest, which the
 agent refuses).
 
+From 0.6.10 the agent replaces it by itself: on its next reconcile, a
+running backend on a floating ref is drift, recreated once from the pinned
+ref through the normal start path. That path still honours a GPU yield or
+hold, still needs the placement, and leaves the old container running if
+the start is refused (a controller `OLLAMA_IMAGE` naming `:latest`, say);
+the row then stays, and the agent's `reconcile.start_failed` says why.
+
 The controller never sends a floating ref either. An operator
 `VLLM_IMAGE`, `VLLM2_IMAGE` or `OLLAMA_IMAGE` set to `:latest` (or with no
 tag) is skipped with a warning. Compose renders `VLLM_IMAGE` into the

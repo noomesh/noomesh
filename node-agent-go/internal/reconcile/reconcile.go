@@ -393,6 +393,11 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
 	specLabels := r.docker.BackendLabels(dockerpkg.SpecHashLabel)
+	// Backends still running on a floating ref (`:latest`, no tag) that an
+	// older agent created. The spec hash cannot see it — a placement with
+	// no image of its own hashes the same whichever ref the agent picked —
+	// so it is its own drift signal: recreated once from the pinned ref.
+	floating := r.docker.FloatingBackendImages()
 	// Multi-role placements: ONE effective placement per backend (a lone
 	// placement is passed through untouched; several running ollama rows
 	// merge into one daemon spec - see multirole.go).
@@ -408,7 +413,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	gpuyield.PublishPlacements(gpuPlacements(effective))
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop below (which then finds them local).
-	r.prefetchImages(ctx, effective, running, specLabels, native)
+	r.prefetchImages(ctx, effective, running, specLabels, floating, native)
 	for _, p := range effective {
 		if p.Backend == "harness" {
 			// Not a container: the host service, converged
@@ -488,7 +493,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 					r.ensureOllamaModels(r.cfg.NodeID, ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
 				}
 				curHash, hasLabel := specLabels[p.Backend]
-				switch decideSpecDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend]) {
+				switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], floating[p.Backend]) {
 				case driftConverged:
 					// Fully converged — clear any prior drift bookkeeping.
 					delete(r.driftRecreated, p.Backend)
@@ -503,13 +508,15 @@ func (r *Reconciler) Once(ctx context.Context) {
 						"note", "recreated once for this spec but label still absent/mismatched; not looping")
 					continue
 				case driftRecreate:
-					// Model matches but spec drifted (env/image/port/tls edit)
-					// or the container predates the label. Recreate to converge.
+					// Model matches but spec drifted (env/image/port/tls edit),
+					// the container predates the label, or it runs on a
+					// floating ref. Recreate to converge.
 					slog.Info("reconcile.spec_drift",
 						"backend", p.Backend,
 						"old_hash", shortHash(curHash),
 						"new_hash", shortHash(desiredHash),
-						"label_absent", !hasLabel)
+						"label_absent", !hasLabel,
+						"floating_image", floating[p.Backend])
 					r.driftRecreated[p.Backend] = desiredHash
 					// fall through to the shared start path (StartBackend
 					// removes the old container and recreates it labeled).
@@ -1079,6 +1086,23 @@ const (
 func decideSpecDrift(hasLabel bool, curHash, desiredHash, lastRecreated string) driftDecision {
 	if hasLabel && curHash == desiredHash {
 		return driftConverged
+	}
+	if lastRecreated == desiredHash {
+		return driftStuck
+	}
+	return driftRecreate
+}
+
+// decideBackendDrift is decideSpecDrift plus the floating-image signal:
+// floatingImage is the ref a running container was created from when it can
+// move under it ("" when pinned). A converged spec on a floating ref is still
+// drift, recreated ONCE for the desired hash like any other — a refusal at
+// start (the controller itself naming :latest) leaves the old container
+// running, and the stuck guard keeps it from looping.
+func decideBackendDrift(hasLabel bool, curHash, desiredHash, lastRecreated, floatingImage string) driftDecision {
+	d := decideSpecDrift(hasLabel, curHash, desiredHash, lastRecreated)
+	if d != driftConverged || floatingImage == "" {
+		return d
 	}
 	if lastRecreated == desiredHash {
 		return driftStuck

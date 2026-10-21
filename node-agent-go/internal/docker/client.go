@@ -668,6 +668,35 @@ func (c *Client) BackendLabels(label string) map[string]string {
 	return out
 }
 
+// FloatingBackendImages is, per running backend container, the ref it was
+// created from when that ref can move under it — the heartbeat's
+// `image_floating` judgement (imageFacts). A current agent refuses to create
+// such a container, so one running is a leftover from an older agent; the
+// reconciler recreates it from the pinned ref once, like a spec drift.
+func (c *Client) FloatingBackendImages() map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out := map[string]string{}
+	containers, err := c.listContainers(ctx, client.ContainerListOptions{})
+	if err != nil {
+		return out
+	}
+	for _, ctr := range containers {
+		if len(ctr.Names) == 0 {
+			continue
+		}
+		key := backendKeyFromName(strings.TrimPrefix(ctr.Names[0], "/"))
+		if key == "" {
+			continue
+		}
+		if img, floating := imageFacts(ctr.Image); floating {
+			out[key] = img
+		}
+	}
+	return out
+}
+
 // ContainerNames returns the names of all running containers.
 func (c *Client) ContainerNames() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
