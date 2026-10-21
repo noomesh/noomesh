@@ -21,6 +21,9 @@ import (
 // slots (internal/occupancy) and, when the backend is full, says so instead
 // of letting the request sit silently in the engine's own queue.
 //
+//   - a backend whose admission a GPU hold is draining (gpuyield, mode
+//     drain) answers `503 backend_draining` with `X-Noo-Busy: draining` at
+//     once: nothing new starts there, what runs finishes.
 //   - `X-Noo-Busy: reject` on the request: a full backend answers 503 at
 //     once, with `Retry-After` and `X-Noo-Queue` (how many wait ahead), so a
 //     caller with another candidate can go there.
@@ -85,6 +88,14 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request, backend string, b
 func admitWith(w http.ResponseWriter, r *http.Request, backend string, stream bool, bound, keepAlive, earlyAfter time.Duration) *admission {
 	busy, ahead := occupancy.Busy(backend)
 	setOccupancyHeaders(w, backend)
+	if occupancy.Draining(backend) {
+		w.Header().Set("Retry-After", strconv.Itoa(busyRetryAfter))
+		w.Header().Set("X-Noo-Busy", "draining")
+		jsonError(w, http.StatusServiceUnavailable, "backend_draining",
+			fmt.Sprintf("%s is draining for a GPU hold (%d still in flight); try another node",
+				backend, occupancy.InFlight(backend)))
+		return nil
+	}
 	if busy && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Noo-Busy")), "reject") {
 		w.Header().Set("Retry-After", strconv.Itoa(busyRetryAfter))
 		w.Header().Set("X-Noo-Queue", strconv.Itoa(ahead))

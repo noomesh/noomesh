@@ -589,16 +589,46 @@ side starts first keeps the GPU, and a stack that refuses to start on a busy
 GPU never gets it. An operator hold settles that:
 
 ```bash
-noo cluster gpu hold host3 --reason voice   # pauses host3's GPU backends now; no auto-resume
+noo cluster gpu hold host3 --reason voice   # drains, then pauses host3's GPU backends; no auto-resume
+#   ✓ host3: GPU held (voice) — vllm paused; it stays paused until you release it
+#   lease: operation 7c1e…, generation 4, drained first
 pai-voice-gpu enable                        # on host3: the voice stack now finds the GPU free
 # ... later
 pai-voice-gpu disable                       # the voice stack drains and frees the GPU
-noo cluster gpu release host3               # back to automatic: vLLM resumes once the GPU stays free
+noo cluster gpu release host3 --operation 7c1e… --generation 4   # back to automatic: vLLM resumes once the GPU stays free
 ```
 
 `hold` and `release` are operator-only and audited (`node_gpu_hold`,
 `node_gpu_release`). A hold survives an agent restart. Nothing flows in the
 other direction: the other stack never calls noomesh.
+
+**A hold drains first.** From the moment the gateway accepts the hold the
+node's lanes get no new request; the agent closes admission on its GPU
+backends (a request that still arrives is answered `503 backend_draining`
+at once and the gateway serves it elsewhere) and waits for every request in
+flight on them to finish, up to `--timeout` (default 120 s, max 900). Only
+then are the backends stopped. If something is still running at the
+timeout the hold is **not** applied: admission reopens, nothing was
+stopped, and the command fails with `drain_timeout` naming the backends and
+counts still busy. Nothing in flight is ever cut by a drain hold.
+`--immediate` is the old behaviour (stop after a 30 s grace, requests in
+flight included): for emergencies, and the output says what it did.
+
+**A hold is an owned lease.** Every hold carries an operation id (yours
+with `--operation`, else a fresh UUID) and is given the node's next
+`generation`; the output prints both and the exact `release` line. A
+release quotes them (compare-and-set): a release with the wrong pair, a
+stale retry, or a release of a node held by another operation is refused
+(`held_by_other`, naming the current lease) and changes nothing. A hold on
+a node another operation holds is refused the same way. `--force` on either
+takes over or ends any hold and is audited as a force; a bare
+`noo cluster gpu release <node>` is a force too (the operator's hand). One
+hold or release runs per node at a time (`transition_in_progress`).
+`release --now` restarts the paused backends at once instead of waiting
+for the GPU to stay clear for `NOO_GPU_RESUME_AFTER_S`.
+
+An older CLI's bare `hold` (no operation id) still works for an operator:
+it is immediate and a force, and the audit row says `legacy`.
 
 **Knobs** (operator overrides in `/etc/noo-node-agent.env`; restart the agent):
 
@@ -619,7 +649,10 @@ other direction: the other stack never calls noomesh.
 ```
 
 `state` is one of `free`, `shared` (foreign work beside running backends),
-`yielded` or `held`.
+`yielded`, `draining` (a hold waiting for requests in flight) or `held`.
+`generation` counts the node's accepted holds; while draining or held,
+`lease` carries `{owner, operation_id, generation, mode, reason, since,
+drain_started, drained_at}`.
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
 - `noo cluster verify host3` has a `control over bus` row: one `health` round
@@ -666,8 +699,8 @@ other direction: the other stack never calls noomesh.
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
-| `noo cluster gpu hold` | `<node> [--reason <text>]` | Pause a node's GPU backends and keep them paused, to free its GPU (operator-only) |
-| `noo cluster gpu release` | `<node>` | End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only) |
+| `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends and keep them paused, to free its GPU; an owned lease (operator-only) |
+| `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold you hold (or any, with --force): GPU backends resume once the GPU has stayed free, or now (operator-only) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |

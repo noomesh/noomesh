@@ -2130,39 +2130,105 @@ async fn clean_node(
     }
 }
 
-/// Operator hold on a node's GPU: pause its GPU backends now and keep them
-/// paused (no automatic resume) until a release. For handing the GPU to work
-/// outside noomesh that will not start while the GPU is occupied.
+/// Operator hold on a node's GPU: an owned lease. The node's GPU backends
+/// are drained (nothing new routed or admitted; what runs finishes) and then
+/// paused, and stay paused (no automatic resume) until a release that quotes
+/// the lease. For handing the GPU to work outside noomesh that will not
+/// start while the GPU is occupied (noomesh-internal i163 parts C and D).
 ///
-/// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?}`. Operator only; audited.
+/// POST /api/cluster/nodes/{node_id}/gpu/hold — body `{reason?, operation_id?,
+/// owner?, workload?, mode?: drain|immediate, timeout_secs?, force?}`. Operator only;
+/// audited (`node_gpu_hold`, with the lease and whether it was a force).
+///
+/// - `operation_id` names the caller's operation; the answer's
+///   `gpu_contention.lease` carries it with the node's `generation`, which
+///   the release must quote. **A body with no `operation_id` is a legacy
+///   hold** (an older CLI): mode immediate and a force, audited `legacy`.
+/// - `mode` defaults to `drain`: the node's lanes leave routing at once,
+///   the agent closes admission on its GPU backends and waits up to
+///   `timeout_secs` (default 120, max 900) for them to go idle before it
+///   stops them. A drain that times out aborts the hold (409
+///   `drain_timeout`, status `needs_attention`, the counts still in flight):
+///   nothing is stopped, nothing is cut. `immediate` is the old behaviour
+///   (stop after a 30 s grace, requests in flight included): for emergencies.
+/// - `force: true` takes over a hold owned by another operation (409
+///   `held_by_other` with the current lease otherwise). A takeover is the
+///   hand-over primitive: the backends stay paused throughout, the pool never
+///   gets the GPU in between. `workload` (`<addon>/<workload>`) names what
+///   the GPU went to; the reservation layer keys on it and `operation_id`.
+/// - One hold or release runs on a node at a time (409 `transition_in_progress`).
 async fn gpu_hold(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Path(node_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let reason = body
-        .as_ref()
-        .and_then(|Json(b)| b.get("reason").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(200)
-        .collect::<String>();
-    gpu_hold_op(&state, ctx, &node_id, "hold", json!({"reason": reason})).await
+    let actor = gpu_hold_actor(&ctx)?;
+    let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
+    let text = |k: &str, max: usize| -> String {
+        b.get(k).and_then(Value::as_str).unwrap_or("").trim().chars().take(max).collect()
+    };
+    let reason = text("reason", 200);
+    let operation_id = text("operation_id", 64);
+    let workload = text("workload", 120);
+    let legacy = operation_id.is_empty();
+    let mut owner = text("owner", 200);
+    if owner.is_empty() {
+        owner = actor.clone();
+    }
+    let mode = match text("mode", 16).as_str() {
+        "" if legacy => "immediate".to_string(),
+        "" => "drain".to_string(),
+        m @ ("drain" | "immediate") => m.to_string(),
+        other => return Err(AppError::BadRequest(format!("mode must be drain or immediate, not {other:?}"))),
+    };
+    let timeout_secs = b
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(GPU_DRAIN_TIMEOUT_DEFAULT_SECS)
+        .clamp(1, GPU_DRAIN_TIMEOUT_MAX_SECS);
+    let force = legacy || b.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let payload = json!({
+        "reason": reason, "operation_id": operation_id, "owner": owner, "workload": workload, "mode": mode,
+        "timeout_secs": timeout_secs, "force": force, "legacy": legacy,
+    });
+    let wait = std::time::Duration::from_secs(if mode == "drain" { timeout_secs + 60 } else { 90 });
+    gpu_hold_op(&state, actor, &node_id, "hold", payload, wait).await
 }
 
 /// End an operator GPU hold: the node returns to the automatic shared-GPU
-/// policy and resumes its GPU backends once the GPU has stayed free.
+/// policy and resumes its GPU backends once the GPU has stayed free (or at
+/// once with `resume: "now"`).
 ///
-/// POST /api/cluster/nodes/{node_id}/gpu/release. Operator only; audited.
+/// POST /api/cluster/nodes/{node_id}/gpu/release — body `{operation_id?,
+/// generation?, force?, resume?: "now"}`. Operator only; audited. The ids
+/// must match the lease (compare-and-set; 409 `held_by_other` with the
+/// current lease otherwise). `force: true` ends any hold. **A body with no
+/// `operation_id` is a legacy release** (an older CLI): a force, audited so.
 async fn gpu_release(
     State(state): State<Arc<AppState>>,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Path(node_id): Path<String>,
+    body: Option<Json<Value>>,
 ) -> AppResult {
-    gpu_hold_op(&state, ctx, &node_id, "release", json!({})).await
+    let actor = gpu_hold_actor(&ctx)?;
+    let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
+    let operation_id: String = b.get("operation_id").and_then(Value::as_str).unwrap_or("").trim().chars().take(64).collect();
+    let legacy = operation_id.is_empty();
+    let generation = b.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let force = legacy || b.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let resume_now = b.get("resume").and_then(Value::as_str).is_some_and(|r| r.eq_ignore_ascii_case("now"));
+    let payload = json!({
+        "operation_id": operation_id, "generation": generation, "force": force, "legacy": legacy,
+        "resume": if resume_now { "now" } else { "" },
+    });
+    gpu_hold_op(&state, actor, &node_id, "release", payload, std::time::Duration::from_secs(90)).await
 }
+
+/// A drain hold waits this long for the GPU backends to go idle unless the
+/// request says otherwise; the cap keeps a typo from parking a node.
+pub(crate) const GPU_DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 120;
+pub(crate) const GPU_DRAIN_TIMEOUT_MAX_SECS: u64 = 900;
 
 /// The operator gate for the GPU hold routes: role Operator or above.
 pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>) -> Result<String, AppError> {
@@ -2172,19 +2238,61 @@ pub(crate) fn gpu_hold_actor(ctx: &Option<axum::Extension<crate::auth::Requester
     }
 }
 
+/// The per-node transition lock: one hold or release in flight per node at
+/// a time, across every caller of this gateway (the agent refuses a second
+/// one too; this answers it before a node round-trip).
+static GPU_TRANSITIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+/// Holds the node's transition slot for as long as it lives.
+pub(crate) struct GpuTransition(String);
+
+impl GpuTransition {
+    pub(crate) fn take(node_id: &str) -> Result<Self, AppError> {
+        let set = GPU_TRANSITIONS.get_or_init(Default::default);
+        let mut g = set.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.insert(node_id.to_string()) {
+            return Err(AppError::Conflict(format!("a GPU hold or release on {node_id} is already in progress")));
+        }
+        Ok(Self(node_id.to_string()))
+    }
+}
+
+impl Drop for GpuTransition {
+    fn drop(&mut self) {
+        if let Some(set) = GPU_TRANSITIONS.get() {
+            set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        }
+    }
+}
+
 async fn gpu_hold_op(
     state: &AppState,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    actor: String,
     node_id: &str,
     op: &str,
     payload: Value,
+    wait: std::time::Duration,
 ) -> AppResult {
-    let actor = gpu_hold_actor(&ctx)?;
+    let _slot = GpuTransition::take(node_id)?;
+    let draining = op == "hold" && payload["mode"] == "drain";
+    if draining {
+        // Nothing new is routed to the node from this moment: before the
+        // agent closes admission, before anything stops.
+        crate::coordinator::classes::set_node_draining(node_id, true);
+    }
     let link = crate::node_link::NodeLink::for_node(state, node_id).await?;
-    let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload);
+    let req = link.request(reqwest::Method::POST, &format!("/gpu/{op}")).json(&payload).timeout(wait);
     let outcome = req.send().await;
     let (ok, result) = match outcome {
         Ok(resp) if resp.status().is_success() => (true, Ok(resp.json::<Value>().await.unwrap_or(json!({})))),
+        Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+            // The agent's refusal is the answer: a lease someone else holds,
+            // a drain that did not finish, a transition in progress.
+            let body = resp.json::<Value>().await.unwrap_or(json!({}));
+            let code = body.get("error").and_then(Value::as_str).unwrap_or("refused").to_string();
+            let detail = body.get("detail").and_then(Value::as_str).unwrap_or("").to_string();
+            (false, Err(AppError::Conflict(format!("{code}: {detail}"))))
+        }
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -2192,11 +2300,32 @@ async fn gpu_hold_op(
         }
         Err(e) => (false, Err(AppError::Internal(format!("Failed to contact node agent: {e}")))),
     };
-    tracing::info!(node_id = %node_id, op, ok, actor = %actor, "node_gpu_hold");
+    match (op, ok) {
+        ("hold", true) => {
+            // The hold is on: the agent reports the paused lanes; keep the
+            // node out of routing until the heartbeat carries them.
+            let paused: Vec<String> = result
+                .as_ref()
+                .ok()
+                .and_then(|v| v.pointer("/gpu_contention/paused_backends"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            crate::coordinator::classes::set_node_draining(node_id, false);
+            crate::coordinator::classes::set_lanes_paused(node_id, &paused);
+        }
+        ("hold", false) if draining => crate::coordinator::classes::set_node_draining(node_id, false),
+        ("release", true) => crate::coordinator::classes::set_lanes_paused(node_id, &[]),
+        _ => {}
+    }
+    tracing::info!(node_id = %node_id, op, ok, actor = %actor, force = payload["force"].as_bool().unwrap_or(false),
+        legacy = payload["legacy"].as_bool().unwrap_or(false), operation_id = %payload["operation_id"].as_str().unwrap_or(""), "node_gpu_hold");
+    let lease = result.as_ref().ok().and_then(|v| v.pointer("/gpu_contention/lease").cloned()).unwrap_or(Value::Null);
     crate::routes::core::audit_event(
         &state.db, &format!("node_gpu_{op}"), "info", &actor,
         &format!("node:{node_id}"), if ok { "ok" } else { "error" },
-        json!({"node": node_id, "op": op, "request": payload}),
+        json!({"node": node_id, "op": op, "request": payload, "lease": lease,
+               "force": payload["force"], "legacy": payload["legacy"]}),
     ).await;
     let mut out = result?;
     out["node"] = json!(node_id);
@@ -6387,12 +6516,36 @@ mod heartbeat_carry_tests {
         // The code above the tests only: this test's own literals would
         // otherwise satisfy every `contains` below.
         let src = include_str!("cluster.rs").split("fn gpu_hold_is_operator_only_and_audited").next().unwrap();
+        for name in ["async fn gpu_hold(", "async fn gpu_release("] {
+            let h = src.split(name).nth(1).expect(name).split("\nasync fn ").next().unwrap();
+            let gate = h.find("gpu_hold_actor(&ctx)?").expect("the operator gate");
+            let body = h.find("body.map(").expect("the body read");
+            assert!(gate < body, "{name}: the operator gate must run before the body is read");
+            assert!(h.contains("\"legacy\": legacy"), "{name}: a legacy call is audited as such");
+        }
         let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
             .split("\nasync fn ").next().unwrap();
-        assert!(op.contains("gpu_hold_actor(&ctx)?"), "the operator gate must run first");
+        assert!(op.contains("GpuTransition::take(node_id)?"), "one transition per node at a time");
         assert!(op.contains("audit_event("), "hold/release must be audited");
+        assert!(op.contains("\"force\": payload[\"force\"]"), "the audit row says whether it was a force");
+        let drain = op.find("set_node_draining(node_id, true)").expect("drain mark");
+        let call = op.find("NodeLink::for_node(").expect("node call");
+        assert!(drain < call, "the node leaves routing before the agent is asked to stop anything");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
+    }
+
+    /// One hold or release per node at a time; the slot frees when the
+    /// guard drops, and other nodes are not affected.
+    #[test]
+    fn gpu_transition_lock_is_per_node() {
+        let a = GpuTransition::take("lock-test-a").expect("free");
+        assert!(GpuTransition::take("lock-test-a").is_err(), "a second transition on the node is refused");
+        let _b = GpuTransition::take("lock-test-b").expect("another node is free");
+        drop(a);
+        let _a2 = GpuTransition::take("lock-test-a").expect("freed on drop");
+        assert_eq!(GPU_DRAIN_TIMEOUT_DEFAULT_SECS, 120);
+        assert_eq!(GPU_DRAIN_TIMEOUT_MAX_SECS, 900);
     }
 
     /// The bench route is operator-only, audited, one NodeLink call with its

@@ -337,7 +337,7 @@ func TestOperatorHoldPausesNowAndNeverAutoResumes(t *testing.T) {
 	c, p, d, clk := rig(t, nil)
 	p.r = pidReading(8000, 0)
 	c.Tick(context.Background())
-	r := c.Hold(context.Background(), "voice")
+	r, _ := c.Hold(context.Background(), HoldRequest{Reason: "voice", OperationID: "op-1"})
 	if r.State != StateHeld || r.Reason != "voice" || len(d.stops) != 1 {
 		t.Fatalf("hold must pause at once: %+v stops=%v", r, d.stops)
 	}
@@ -353,11 +353,11 @@ func TestReleaseThenResumeWhenFree(t *testing.T) {
 	c, p, d, clk := rig(t, nil)
 	p.r = pidReading(8000, 0)
 	c.Tick(context.Background())
-	c.Hold(context.Background(), "voice")
+	c.Hold(context.Background(), HoldRequest{Reason: "voice", OperationID: "op-1"})
 	// pai-voice enabled: 11 GiB foreign.
 	p.r = pidReading(0, 11264)
 	tickFor(c, clk, 5*time.Minute)
-	if r := c.Release(); r.State != StateYielded {
+	if r, _ := c.Release(context.Background(), ReleaseRequest{OperationID: "op-1", Generation: 1}); r.State != StateYielded {
 		t.Fatalf("release with the GPU busy → yielded (automatic policy): %+v", r)
 	}
 	tickFor(c, clk, 5*time.Minute)
@@ -377,7 +377,7 @@ func TestHoldSurvivesAgentRestart(t *testing.T) {
 	p := &fakeProbe{r: pidReading(8000, 0)}
 	d := &fakeDocker{ctrs: []docker.GPUBackend{{Backend: "vllm", ID: vllmID, Running: true}}}
 	c := New(ConfigFromEnv(env(nil)), p, d, dir)
-	c.Hold(context.Background(), "voice")
+	c.Hold(context.Background(), HoldRequest{Reason: "voice", OperationID: "op-1"})
 	c2 := New(ConfigFromEnv(env(nil)), p, d, dir)
 	if r := c2.Report(); r.State != StateHeld || r.Reason != "voice" || !c2.Holds("vllm") {
 		t.Fatalf("hold lost across restart: %+v", r)
@@ -424,7 +424,7 @@ func TestPausedBackendFoundRunningIsStoppedAgain(t *testing.T) {
 	c, p, d, clk := rig(t, nil)
 	p.r = pidReading(8000, 0)
 	c.Tick(context.Background())
-	c.Hold(context.Background(), "voice")
+	c.Hold(context.Background(), HoldRequest{Reason: "voice", OperationID: "op-1"})
 	d.ctrs[0].Running = true // a manual start, or a stop that did not take
 	clk.advance(15 * time.Second)
 	c.Tick(context.Background())

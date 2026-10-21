@@ -142,3 +142,57 @@ func TestAnnotateWritesOntoTheHeartbeatEntries(t *testing.T) {
 		t.Fatal("a non-map entry is left alone")
 	}
 }
+
+func TestWaitIdleEndsWhenTheLastRequestFinishesAndNamesWhatRemains(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+	SetSlots(map[string]int{"vllm": 2, "ollama": 1})
+	relA, _ := Admit(context.Background(), "vllm")
+	relB, _ := Admit(context.Background(), "vllm")
+	relC, _ := Admit(context.Background(), "ollama")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	idle, rem := WaitIdle(ctx, []string{"vllm", "ollama"})
+	if idle || rem["vllm"] != 2 || rem["ollama"] != 1 {
+		t.Fatalf("still running: idle=%v rem=%v", idle, rem)
+	}
+	done := make(chan bool, 1)
+	go func() {
+		idle, _ := WaitIdle(context.Background(), []string{"vllm", "ollama"})
+		done <- idle
+	}()
+	relA()
+	relB()
+	select {
+	case <-done:
+		t.Fatal("ollama still runs: must not be idle")
+	case <-time.After(20 * time.Millisecond):
+	}
+	relC()
+	select {
+	case idle := <-done:
+		if !idle {
+			t.Fatal("want idle")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitIdle never returned after the last release")
+	}
+}
+
+func TestDrainingClosesAdmissionAndReset(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+	SetDraining([]string{"vllm"}, true)
+	if !Draining("vllm") || Draining("ollama") {
+		t.Fatal("only the named backend drains")
+	}
+	SetDraining([]string{"vllm"}, false)
+	if Draining("vllm") {
+		t.Fatal("reopened")
+	}
+	SetDraining([]string{"vllm"}, true)
+	Reset()
+	if Draining("vllm") {
+		t.Fatal("Reset clears draining")
+	}
+}

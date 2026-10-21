@@ -391,7 +391,7 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let paused_phrase = if none_paused { "no GPU backend paused".to_string() } else { format!("{paused} paused") };
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
-    if method == "not-measured" && state != "held" && state != "yielded" {
+    if method == "not-measured" && state != "held" && state != "yielded" && state != "draining" {
         return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
     }
     let mut off = if gc["policy"].as_str() == Some("off") { " (yield off)".to_string() } else { String::new() };
@@ -413,10 +413,23 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
         "yielded" => warn("gpu",
             format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
-        "held" => warn("gpu",
-            format!("held by operator{}: {paused_phrase}",
-                gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
-            Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
+        "held" => {
+            // The lease's ids make the remedy an exact release; without a
+            // lease (an older agent) the bare release is the force it was.
+            let lease = &gc["lease"];
+            let ids = match (lease["operation_id"].as_str(), lease["generation"].as_u64()) {
+                (Some(op), Some(generation)) if !op.is_empty() => format!(" --operation {op} --generation {generation}"),
+                _ => String::new(),
+            };
+            warn("gpu",
+                format!("held by {}{}: {paused_phrase}",
+                    super::cluster_gpu::lease_holder(gc),
+                    gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
+                Some(format!("noo cluster gpu release {id}{ids}   # when the other work is done")))
+        }
+        "draining" => warn("gpu",
+            format!("hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
+            None),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
     })
 }
@@ -8803,6 +8816,17 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+        // An owned lease (i163 D): the holder is named and the remedy quotes
+        // the lease, so the operator's release is a compare-and-set.
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 4}}))).unwrap();
+        assert_eq!(c.detail, "held by rbwolf (voice): vllm paused");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3 --operation op-1 --generation 4   # when the other work is done"));
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("hold by rbwolf draining"), "{}", c.detail);
     }
 
     #[test]
