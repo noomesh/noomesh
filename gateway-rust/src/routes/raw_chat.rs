@@ -41,6 +41,21 @@
 //! `n > 1` and non-chat paths (`/v1/responses` native) keep the old
 //! single-shot call.
 //!
+//! ## Busy is not wedged
+//!
+//! A full engine (every slot taken) used to look exactly like a wedged one:
+//! the request sat in the engine's queue, no headers came, the window fired
+//! and the alert said "engine may be wedged". The node agent now counts
+//! requests against the backend's slots (noomesh-internal i159). A request
+//! to a candidate that is NOT the last carries `X-Noo-Busy: reject`, so a
+//! full backend answers `503 backend_busy` at once and the loop moves on
+//! to a candidate with room: no stall verdict, no restart hint, no
+//! failover alert (busy is load, not an incident). The last candidate is
+//! not asked to reject: the agent queues the request and keeps the stream
+//! alive with SSE comments, so a busy node is waited on, within the
+//! deadline. When every candidate was busy the answer is a
+//! `503 backend_busy`, not a 502.
+//!
 //! ## Errors on the external surface (phase 0)
 //!
 //! Every error this module returns carries two texts: `detail`, which may
@@ -387,6 +402,30 @@ fn stall_text(what: &str, secs: u64, cand: &Candidate) -> String {
     )
 }
 
+/// The request header that asks a node agent to answer `503 backend_busy`
+/// at once when every slot on the backend is taken, instead of queueing.
+pub const BUSY_HEADER: &str = "X-Noo-Busy";
+pub const BUSY_REJECT: &str = "reject";
+/// `Retry-After` on an every-candidate-busy answer: a slot frees in seconds,
+/// not minutes.
+pub const BUSY_RETRY_AFTER_SECS: u64 = 5;
+
+/// A node agent's "every slot is taken" answer (admission.go): a 503 whose
+/// body names `backend_busy`. Not a stall, not a dead backend: load.
+pub(crate) fn is_busy_reply(status: u16, body: &str) -> bool {
+    status == 503 && body.contains("backend_busy")
+}
+
+/// The failure text for a busy candidate: what the agent said (it names
+/// the counts), no restart hint, since nothing is wrong with the engine.
+fn busy_text(body: &str, cand: &Candidate) -> String {
+    let said = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| crate::text::clip(body, 200).to_string());
+    format!("busy: {}/{} has every slot taken ({said})", cand.node_id, cand.backend)
+}
+
 /// What a successful attempt hands back.
 pub(crate) enum CoreBody {
     Stream(Box<reqwest::Response>),
@@ -424,6 +463,8 @@ where
     let mut tried = 0usize;
     // Every failure so far was a stall: if so, the answer is a 504.
     let mut all_stalled = true;
+    // Every failure so far was a full backend: if so, the answer is a 503.
+    let mut all_busy = true;
 
     for (i, cand) in candidates.iter().enumerate() {
         if tried > 0 && !guard.may_retry(tried) {
@@ -436,6 +477,7 @@ where
         if remaining.is_zero() {
             last_failure = "overall deadline reached".into();
             all_stalled = false;
+            all_busy = false;
             break;
         }
         tried += 1;
@@ -470,12 +512,16 @@ where
         let first_token = if last { remaining } else { timeouts.first_token };
         let header = if last { remaining } else { timeouts.header };
         let header_limit = if aggregate { first_token } else { header };
+        // With another candidate to go to, a full backend should say so at
+        // once rather than queue us; the last one is waited on.
+        let req = if last { req } else { req.header(BUSY_HEADER, BUSY_REJECT) };
         let sent = if stream || aggregate {
             tokio::time::timeout(header_limit, req.send()).await
         } else {
             Ok(req.send().await)
         };
         let mut stalled = false;
+        let mut busy = false;
         let failure = match sent {
             Err(_) if aggregate => {
                 stalled = true;
@@ -531,26 +577,39 @@ where
                 let status = resp.status();
                 coordinator::warn_if_node_agent_outdated(status, &url);
                 let text = resp.text().await.unwrap_or_default();
-                if !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
-                    let st = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-                    return Err(RawChatError::upstream(st, &text, &cand.model, &cand.url));
+                if is_busy_reply(status.as_u16(), &text) {
+                    busy = true;
+                    busy_text(&text, cand)
+                } else {
+                    if !coordinator::is_retryable_llm_http_error(status.as_u16(), &text) {
+                        let st = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                        return Err(RawChatError::upstream(st, &text, &cand.model, &cand.url));
+                    }
+                    format!("HTTP {status}: {}", crate::text::clip(&text, 200))
                 }
-                format!("HTTP {status}: {}", crate::text::clip(&text, 200))
             }
         };
         all_stalled &= stalled;
+        all_busy &= busy;
         if stalled {
             // Demote it for the next requests too, not only this one.
             classes::note_stall(&cand.url, &cand.backend);
         }
 
-        tracing::error!(class, node = %cand.node_id, url = %cand.url, attempt = tried, failure = %failure, "raw_chat_candidate_failed");
+        if busy {
+            // Load, not an incident: an info line, no alert.
+            tracing::info!(class, node = %cand.node_id, url = %cand.url, attempt = tried, detail = %failure, "raw_chat_candidate_busy");
+        } else {
+            tracing::error!(class, node = %cand.node_id, url = %cand.url, attempt = tried, failure = %failure, "raw_chat_candidate_failed");
+        }
         failed.push((cand.url.clone(), cand.backend.clone()));
         last_failure = failure.clone();
 
         let next = candidates[i + 1..].iter().find(|c| !failed.iter().any(|(u, b)| u == &c.url && b == &c.backend));
         if let Some(next) = next {
-            if guard.may_retry(tried) {
+            if guard.may_retry(tried) && busy {
+                tracing::info!(class, busy_node = %cand.node_id, next_node = %next.node_id, next_model = %next.model, "raw_chat_busy_moved_on");
+            } else if guard.may_retry(tried) {
                 tracing::info!(class, failed_node = %cand.node_id, next_node = %next.node_id, next_model = %next.model, "raw_chat_failover");
                 on_failover(
                     cand.url.clone(),
@@ -564,6 +623,10 @@ where
         }
     }
 
+    if tried > 0 && all_busy {
+        let detail = format!("every candidate of class '{class}' is busy ({tried} tried of {}; last: {last_failure})", candidates.len());
+        return Err(RawChatError { retry_after: Some(BUSY_RETRY_AFTER_SECS), ..RawChatError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_busy", detail) });
+    }
     let detail = format!("every candidate of class '{class}' failed ({tried} tried of {}; last: {last_failure})", candidates.len());
     if tried > 0 && all_stalled {
         return Err(RawChatError::new(StatusCode::GATEWAY_TIMEOUT, "backend_timeout", detail));
@@ -1025,12 +1088,23 @@ mod tests {
         DiesMidAnswer,
         /// Say nothing for `wait` (a long prefill, a queue), then answer.
         LateStart { wait: Duration, text: &'static str },
+        /// The node agent's busy answer: every slot taken, 503 at once.
+        Busy,
     }
 
     struct FakeBackend {
         url: String,
         /// The request bodies it received.
         seen: Arc<Mutex<Vec<Value>>>,
+        /// The request heads it received (lower-cased), one per request.
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeBackend {
+        /// Did every request carry the busy-reject header?
+        fn asked_to_reject(&self) -> Vec<bool> {
+            self.heads.lock().unwrap().iter().map(|h| h.contains("x-noo-busy: reject")).collect()
+        }
     }
 
     fn chunk(s: &str) -> Vec<u8> {
@@ -1046,10 +1120,13 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen2 = seen.clone();
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let heads2 = heads.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
                 let seen = seen2.clone();
+                let heads = heads2.clone();
                 tokio::spawn(async move {
                     // Read the head, then the body by Content-Length.
                     let mut buf = Vec::new();
@@ -1065,6 +1142,7 @@ mod tests {
                         }
                     };
                     let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                    heads.lock().unwrap().push(head.clone());
                     let len: usize = head
                         .lines()
                         .find_map(|l| l.strip_prefix("content-length:"))
@@ -1124,11 +1202,19 @@ mod tests {
                             let _ = sock.write_all(&chunk(&delta("two "))).await;
                             tokio::time::sleep(Duration::from_secs(60)).await;
                         }
+                        Fake::Busy => {
+                            let body = r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 0 queued); retry or try another node","type":"node_agent_proxy_error"}}"#;
+                            let reply = format!(
+                                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nretry-after: 5\r\nx-noo-queue: 0\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        }
                     }
                 });
             }
         });
-        FakeBackend { url, seen }
+        FakeBackend { url, seen, heads }
     }
 
     fn cand(node: &str, backend: &str, model: &str, url: &str) -> Candidate {
@@ -1172,6 +1258,63 @@ mod tests {
             CoreBody::Json(v) => (ok.index, v),
             CoreBody::Stream(_) => panic!("a non-streaming call must come back as Json"),
         }
+    }
+
+    /// noomesh-internal i159: a full backend answers busy (the agent's
+    /// admission) when asked to, and the loop moves on without a stall
+    /// verdict, a restart hint or an alert.
+    #[tokio::test]
+    async fn a_busy_candidate_is_moved_on_from_without_an_alert() {
+        for stream in [false, true] {
+            let full = fake_backend(Fake::Busy).await;
+            let spare = fake_backend(Fake::Answer("from the spare")).await;
+            let cands = [cand("mcmini", "ollama", "m", &full.url), cand("pop-os", "ollama", "m", &spare.url)];
+            let started = Instant::now();
+            let (r, alerts) = run(&cands, stream, FAST).await;
+            let ok = r.unwrap_or_else(|e| panic!("stream={stream}: {} {}", e.status, e.detail));
+            assert_eq!(ok.index, 1, "the spare answered");
+            assert!(started.elapsed() < Duration::from_millis(200), "busy is answered at once, not at the window");
+            assert!(alerts.lock().unwrap().is_empty(), "busy is load, not an incident: {:?}", alerts.lock().unwrap());
+            assert_eq!(full.asked_to_reject(), vec![true], "not the last candidate: asked to reject when full");
+            assert_eq!(spare.asked_to_reject(), vec![false], "the last candidate is waited on, never asked to reject");
+            assert!(!classes::recently_stalled(&full.url, "ollama"), "busy is not a stall");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lone_candidate_is_never_asked_to_reject() {
+        let only = fake_backend(Fake::Answer("ok")).await;
+        let (r, _) = run(&[cand("mcmini", "ollama", "m", &only.url)], false, FAST).await;
+        assert_eq!(json_of(r).0, 0);
+        assert_eq!(only.asked_to_reject(), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn every_candidate_busy_is_a_503_backend_busy_not_a_502() {
+        let a = fake_backend(Fake::Busy).await;
+        let b = fake_backend(Fake::Busy).await;
+        let (r, alerts) = run(&[cand("a", "ollama", "m", &a.url), cand("b", "ollama", "m", &b.url)], false, FAST).await;
+        let e = r.err().expect("no candidate answered");
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.kind, "backend_busy");
+        assert_eq!(e.retry_after, Some(BUSY_RETRY_AFTER_SECS));
+        assert!(e.detail.contains("is busy") && e.detail.contains("every slot taken"), "{}", e.detail);
+        assert!(!e.detail.contains("wedged") && !e.detail.contains("restart-backends"), "no restart hint for load: {}", e.detail);
+        assert!(alerts.lock().unwrap().is_empty());
+        // A mixed run (one busy, one dead) is still the ordinary 502.
+        let dead = "http://127.0.0.1:1";
+        let (r, _) = run(&[cand("a", "ollama", "m", &a.url), cand("c", "ollama", "m", dead)], false, FAST).await;
+        assert_eq!(r.err().unwrap().status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn a_busy_reply_is_a_503_that_names_backend_busy() {
+        assert!(is_busy_reply(503, r#"{"error":{"code":"backend_busy","message":"m"}}"#));
+        assert!(!is_busy_reply(502, r#"{"error":{"code":"backend_busy"}}"#));
+        assert!(!is_busy_reply(503, r#"{"error":{"code":"backend_unreachable"}}"#));
+        let c = cand("mcmini", "ollama", "m", "http://x");
+        let t = busy_text(r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 1 queued)"}}"#, &c);
+        assert_eq!(t, "busy: mcmini/ollama has every slot taken (every slot on ollama is taken (2 in flight of 2, 1 queued))");
     }
 
     #[tokio::test]
