@@ -1701,11 +1701,13 @@ enum PreRollKeys {
     GoUnverified,
     Missing(Vec<String>),
     /// The gateway ANSWERED but its list could not be read (401/403, 5xx, bad
-    /// body, TLS failure) and there is no `--skip-gateway-key-check`.
+    /// body, a certificate this CLI refuses) and there is no
+    /// `--skip-gateway-key-check`.
     Unverifiable,
 }
 
-/// `gw_down`: nothing answered (connection refused / no route), which is not
+/// `gw_down`: nothing answered (refused, no route, reset or timed out before
+/// any HTTP response: [`crate::http::ProbeFail::Down`]), which is not
 /// the same as a gateway that answered and could not be read: a down stack
 /// has no list to show, and the refusal's fix (`noo auth login`) cannot
 /// work against it, so it falls back to the store check as the flag does.
@@ -5661,6 +5663,25 @@ mod keyless_tests {
         let w = unverified_keys_warning(false);
         assert!(w.contains("the gateway is down") && w.contains("noo cluster verify --controller") && w.contains("`service keys`"), "{w}");
         assert!(unverified_keys_warning(true).starts_with("--skip-gateway-key-check"));
+
+        // Crash-looping gateway (0.6.9 rehearsal B5.keycheck): it accepts and
+        // resets before any status line. Nothing answered, so the upgrade
+        // that would fix it goes ahead on the store check.
+        let crashing = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            std::thread::spawn(move || {
+                if let Ok((c, _)) = l.accept() {
+                    // Leave the request unread: the close goes out as RST.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    drop(c);
+                }
+            });
+            url
+        };
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(crashing), &req);
+        assert_eq!((db.as_ref(), down), (None, true), "a reset before any response means nothing answered");
+        assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::GoUnverified);
 
         // Answers 401 / 500 / garbage: unreadable, refuses.
         for (st, body) in [(401u16, "{}"), (403, "{}"), (500, "{}"), (200, "not json")] {
