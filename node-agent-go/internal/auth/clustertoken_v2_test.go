@@ -155,12 +155,18 @@ func TestV1_AcceptedAndCountedUntilTheGateCloses(t *testing.T) {
 	}
 
 	t.Setenv("NOO_CLUSTER_TOKEN_V1", "0")
+	admittedBefore, refusedBefore := laneHMACv1.Load(), laneHMACv1Refused.Load()
 	req = httptest.NewRequest("GET", "/x", nil)
 	req.Header.Set("Authorization", "Bearer "+CreateClusterToken("host2", v2Secret))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 403 || n != 1 || !strings.Contains(rec.Body.String(), "NOO_CLUSTER_TOKEN_V1") {
 		t.Fatalf("v1 after the gate closed: code=%d served=%d body=%s", rec.Code, n, rec.Body.String())
+	}
+	// A refusal is counted as a refusal, never as an admission.
+	if laneHMACv1.Load() != admittedBefore || laneHMACv1Refused.Load() != refusedBefore+1 {
+		t.Fatalf("refused v1 counted: admitted +%d, refused +%d (want +0, +1)",
+			laneHMACv1.Load()-admittedBefore, laneHMACv1Refused.Load()-refusedBefore)
 	}
 	// ...and v2 is untouched by the gate.
 	rec = httptest.NewRecorder()

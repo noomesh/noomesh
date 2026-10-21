@@ -51,7 +51,7 @@ func TestLegacyLane_StaticTokenIsCountedAndHMACIsNot(t *testing.T) {
 // The heartbeat shape: every lane present (zeros included) plus the window.
 func TestLegacyLaneSnapshot_HasEveryLaneAndItsWindow(t *testing.T) {
 	s := LegacyLaneSnapshot()
-	for _, k := range []string{"since_unix", LaneStaticToken, LaneWhoisNonController} {
+	for _, k := range []string{"since_unix", LaneStaticToken, LaneWhoisNonController, LaneHMACv1, LaneHMACv1Refused} {
 		if _, ok := s[k]; !ok {
 			t.Fatalf("legacy_lanes lacks %q: %v", k, s)
 		}

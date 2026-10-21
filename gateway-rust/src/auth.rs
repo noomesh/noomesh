@@ -3374,6 +3374,23 @@ pub async fn require_any_auth(
         // lane, counted by caller, and refused once the gate is closed.
         if from_v2 {
             crate::legacy_lanes::observe(&state.metrics, &[crate::legacy_lanes::hmac_v2_use(&actor)], &peer).await;
+        } else if !crate::cluster_token_v2::v1_allowed() {
+            // Gate closed: counted as a REFUSAL, its own lane, never as a
+            // use of `cluster_hmac_v1` — that lane is admissions only, and a
+            // refused caller (whose calls all fail) must not read as one.
+            let u = crate::legacy_lanes::hmac_v1_refused_use(&actor, &path);
+            crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            if crate::legacy_lanes::log_due(&format!("hmac_v1_refused_detail|{actor}"), crate::legacy_lanes::HMAC_V1_DETAIL_LOG_EVERY) {
+                let headers = request.headers();
+                tracing::warn!(
+                    actor = %actor, method = %request.method(), path = %path,
+                    body_sha_header = headers.contains_key(crate::cluster_token_v2::BODY_SHA_HEADER),
+                    token_age_secs = v1_token_age_secs(&t),
+                    user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
+                    "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2"
+                );
+            }
+            return Ok(v1_refusal());
         } else {
             let u = crate::legacy_lanes::hmac_v1_use(&actor, &path);
             crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
@@ -3390,10 +3407,6 @@ pub async fn require_any_auth(
                     user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
                     "cluster token v1 admitted: the request it came on"
                 );
-            }
-            if !crate::cluster_token_v2::v1_allowed() {
-                tracing::warn!(actor = %actor, path = %path, "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2");
-                return Ok(v1_refusal());
             }
         }
         // The fleet door refuses an add-on's actor too: the
@@ -6420,6 +6433,12 @@ mod v2_never_counts_as_v1_tests {
         let count = body.find("legacy_lanes::hmac_v1_use(").expect("the v1 count");
         let gate = body[..count].rfind("if from_v2 {").expect("the from_v2 split");
         assert!(body[gate..count].contains("} else {"), "the v1 count must be the not-from-v2 branch");
+        // A refusal (gate closed) is decided BEFORE the admitted count and
+        // is counted on its own lane, so `cluster_hmac_v1` is admissions only.
+        let refused = body.find("legacy_lanes::hmac_v1_refused_use(").expect("the v1 refusal count");
+        let closed = body[..refused].rfind("} else if !crate::cluster_token_v2::v1_allowed() {").expect("the closed-gate branch");
+        assert!(gate < closed && refused < count, "the closed-gate branch must come before the admitted count");
+        assert!(body[refused..count].contains("return Ok(v1_refusal());"), "the closed-gate branch must return the refusal");
     }
 
     /// A gateway that has just started has no Redis connection yet: a fresh
