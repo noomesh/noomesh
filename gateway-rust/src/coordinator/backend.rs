@@ -214,7 +214,10 @@ pub(crate) fn is_retryable_llm_http_error(status: u16, body: &str) -> bool {
         return false;
     }
     // Node-agent proxy dial failures + generic bad-gateway/timeout markers.
+    // `backend_busy` (every slot taken, i159) is retryable too: the next
+    // candidate may have room. raw_chat tells busy from dead itself.
     body.contains("backend_unreachable")
+        || body.contains("backend_busy")
         || body.contains("node_agent_proxy_error")
         || body.contains("connection refused")
         || body.contains("timed out")
@@ -1550,6 +1553,13 @@ mod tests {
     fn retries_node_agent_backend_unreachable_502() {
         let body = r#"{"error":{"code":"backend_unreachable","message":"dial tcp 172.19.0.5:8000: connect: connection refused","type":"node_agent_proxy_error"}}"#;
         assert!(is_retryable_llm_http_error(502, body));
+    }
+
+    /// The node agent's admission answer when every slot is taken (i159).
+    #[test]
+    fn retries_node_agent_backend_busy_503() {
+        let body = r#"{"error":{"code":"backend_busy","message":"every slot on ollama is taken (2 in flight of 2, 0 queued); retry or try another node","type":"node_agent_proxy_error"}}"#;
+        assert!(is_retryable_llm_http_error(503, body));
     }
 
     #[test]
