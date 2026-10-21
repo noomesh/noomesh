@@ -235,6 +235,32 @@ enum RoleError {
     Other(String),
 }
 
+impl RoleError {
+    fn into_message(self) -> String {
+        match self {
+            RoleError::MissingCredential { message, .. } | RoleError::Other(message) => message,
+        }
+    }
+}
+
+/// The first credential missing among the roles a reconcile must CREATE
+/// (`to_create`: role and password variable, for roles that do not exist
+/// yet), or `None` when every one is available. Checked for both roles before
+/// either is created. `Err` for an unreadable `_FILE` (a broken mount).
+fn first_missing(
+    system: &str,
+    to_create: &[(&str, &str)],
+    get: impl Fn(&str) -> Option<String>,
+    delivered: &BTreeMap<String, String>,
+) -> Result<Option<RoleError>, String> {
+    for (role, var) in to_create {
+        if password_from(var, &get, delivered).map_err(|e| e.to_string())?.is_none() {
+            return Ok(Some(missing_credential(system, role, var)));
+        }
+    }
+    Ok(None)
+}
+
 fn missing_credential(system: &str, role: &str, password_env: &str) -> RoleError {
     RoleError::MissingCredential {
         var: password_env.to_string(),
@@ -533,31 +559,39 @@ pub async fn reconcile(
             }
         }
 
-        // The DDL role first: it owns the schema, so it has to exist before
-        // the schema can be created AUTHORIZATION it.
-        let mut missing = None;
-        for (role, var) in [(&spec.ddl_role, &spec.ddl_password_env), (&spec.role, &spec.password_env)] {
-            match ensure_role(db, name, role, var, &delivered).await {
-                Ok(_) => {}
-                Err(RoleError::Other(e)) => return Err(e),
-                Err(RoleError::MissingCredential { message, .. }) if missing_credential_is_fatal(name) => {
-                    return Err(message)
-                }
-                Err(RoleError::MissingCredential { var, message }) => {
-                    tracing::error!(
-                        system = name,
-                        variable = %var,
-                        error = %message,
-                        "system NOT provisioned: a role password is missing — skipping this system, the gateway keeps booting"
-                    );
-                    missing = Some(var);
-                    break;
-                }
+        // Every credential this pass needs, checked BEFORE either role is
+        // created: a system whose runtime password is missing must not leave
+        // a half-made migration role behind (and a skipped system creates
+        // nothing at all). Only a role that does not exist yet needs one.
+        let roles = [(&spec.ddl_role, &spec.ddl_password_env), (&spec.role, &spec.password_env)];
+        let mut to_create: Vec<(&str, &str)> = Vec::new();
+        for (role, var) in roles {
+            if !role_exists(db, role).await.map_err(|e| e.to_string())? {
+                to_create.push((role.as_str(), var.as_str()));
             }
         }
-        if let Some(var) = missing {
-            unprovisioned.insert(name.clone(), format!("{var} is not set"));
-            continue;
+        match first_missing(name, &to_create, |k| std::env::var(k).ok(), &delivered)? {
+            None => {}
+            Some(RoleError::MissingCredential { message, .. }) if missing_credential_is_fatal(name) => {
+                return Err(message)
+            }
+            Some(RoleError::MissingCredential { var, message }) => {
+                tracing::error!(
+                    system = name,
+                    variable = %var,
+                    error = %message,
+                    "system NOT provisioned: a role password is missing — skipping this system, the gateway keeps booting"
+                );
+                unprovisioned.insert(name.clone(), format!("{var} is not set"));
+                continue;
+            }
+            Some(RoleError::Other(e)) => return Err(e),
+        }
+
+        // The DDL role first: it owns the schema, so it has to exist before
+        // the schema can be created AUTHORIZATION it.
+        for (role, var) in roles {
+            ensure_role(db, name, role, var, &delivered).await.map_err(RoleError::into_message)?;
         }
         ensure_schema(db, name, spec).await?;
         ensure_extensions(db, name, spec).await?;
@@ -722,6 +756,28 @@ mod tests {
         // never a quiet fall-through to the systems file.
         let broken = lookup(&[("PW_FILE", "/nonexistent/system-provision-test/pw")]);
         assert!(password_from("PW", broken, &delivered).is_err());
+    }
+
+    #[test]
+    fn both_passwords_are_checked_before_either_role_is_created() {
+        // The half-provisioned case: the DDL password is there, the runtime
+        // one is not. The old reconcile created the DDL role, THEN found the
+        // runtime password missing. Now the check covers both up front.
+        let delivered = parse_delivered("NOO_EX_DDL=d\n");
+        let both = [("noo_ex_ddl", "NOO_EX_DDL"), ("noo_ex", "NOO_EX_PW")];
+        let got = first_missing("example_addon", &both, lookup(&[]), &delivered).unwrap();
+        assert!(
+            matches!(&got, Some(RoleError::MissingCredential { var, .. }) if var == "NOO_EX_PW"),
+            "{got:?}"
+        );
+        // A role that already exists needs no password: only the ones to
+        // create are checked.
+        let ddl_only = [("noo_ex_ddl", "NOO_EX_DDL")];
+        assert_eq!(first_missing("example_addon", &ddl_only, lookup(&[]), &delivered).unwrap(), None);
+        assert_eq!(first_missing("example_addon", &[], lookup(&[]), &BTreeMap::new()).unwrap(), None);
+        // An unreadable `_FILE` is an error, not a missing credential.
+        let broken = lookup(&[("NOO_EX_PW_FILE", "/nonexistent/system-provision-test/pw")]);
+        assert!(first_missing("example_addon", &both, broken, &delivered).is_err());
     }
 
     #[test]
@@ -1125,5 +1181,34 @@ mod tests {
 
         cleanup(&db, tag).await;
         std::env::remove_var("BROKERTEST_NOCRED_FLAG");
+    }
+
+    #[tokio::test]
+    async fn a_missing_runtime_password_leaves_no_half_made_migration_role() {
+        // The DDL password is present, the runtime one is not. Both are
+        // checked before either role is created, so the system is skipped
+        // with nothing created — not left with a DDL role and no schema.
+        let Some(dsn) = dsn() else { return };
+        let db = pool(&dsn).await;
+        let tag = "halfcred";
+        cleanup(&db, tag).await;
+
+        std::env::set_var("BROKERTEST_HALFCRED_FLAG", "1");
+        std::env::set_var("BROKERTEST_DDLPW_halfcred", "ddl-present");
+        std::env::remove_var("BROKERTEST_PW_halfcred");
+
+        let why = reconcile(&db, &manifest(tag, Some("BROKERTEST_HALFCRED_FLAG")))
+            .await
+            .expect("a runtime-declared system missing a credential must not fail the reconcile");
+        assert!(
+            why.get("thalfcred").is_some_and(|r| r.contains("BROKERTEST_PW_halfcred")),
+            "got: {why:?}"
+        );
+        assert!(!role_exists(&db, "brokertest_ddl_halfcred").await.unwrap(), "a half-made migration role was left");
+        assert!(!role_exists(&db, "brokertest_role_halfcred").await.unwrap());
+
+        cleanup(&db, tag).await;
+        std::env::remove_var("BROKERTEST_HALFCRED_FLAG");
+        std::env::remove_var("BROKERTEST_DDLPW_halfcred");
     }
 }

@@ -333,9 +333,12 @@ does not name (any other entry under `systems:` in `noomesh.yaml`) cannot.
 For those the launcher writes ONE secret, `noo_systems_secrets`
 (`_systems_secrets_body` in `scripts/lib-secrets.sh`, called from
 `derive_file_secrets`): `KEY=VALUE` lines, `0400` to the gateway's uid, on the
-same tmpfs as every other secret file. It holds, for each declared system, its
-`enabled_when` flag (from `.env`, where `noo systems enable` sets it) and its
-`password_env` / `ddl_password_env` values (from `secrets/env.sops`). A variable
+same tmpfs as every other secret file. It holds each declared system's
+`enabled_when` flag (from `.env`, where `noo systems enable` sets it), so the
+broker can report a system as disabled. The `password_env` and `ddl_password_env`
+values (from `secrets/env.sops`) are included only for a system that is on:
+its add-on is enabled, or its flag is truthy, or it has no flag. A disabled
+system's passwords never reach the gateway. A variable
 a compose secret already delivers by name is not repeated, and a variable with
 no value is left out. Values are written verbatim (no quoting), so a value
 with a newline is refused with a warning that names the variable, never the
