@@ -519,6 +519,23 @@ release, so the heartbeat's `paused_backends` never has to catch up. A
 drain cut short by an agent restart is not restored as a hold; the
 generation is.
 
+**The add-on workload actuator.** `POST /api/addon-workloads/{addon}/{workload}/start|stop`
+and `GET /api/addon-workloads/{addon}/{workload}` (controller-only) act on
+ONE kind of container: one that a verified add-on bundle declared
+(desired-config `addon_workloads`: `{addon, name, container, gpu, need_mb}`,
+held in `internal/addonwl`) AND that carries the labels `noo.addon=<addon>`
+and `noo.workload=<workload>` AND has the declared name. The caller sends
+the two names and nothing else: no image, command, mount or env ever comes
+over this door; start means start the container the add-on's own compose
+created, stop is a graceful stop that keeps its spec. An undeclared workload
+is 404 `not_declared`, a declared one with no such container 404
+`no_container`, and a GPU workload is refused 409 `gpu_not_held` unless the
+node's GPU is under a hold (the reservation holds first, so the pool's
+backends are paused, never stopped under the worker). The container proxy
+(`/api/containers/{name}/proxy/…`) admits a declared workload container
+beside the ones the agent started itself, so the gateway's reserved-workload
+proxy reaches the worker's loopback port, WebSocket upgrades included.
+
 **How a host agent reaches a door.** The agent is a host process
 (systemd on Linux, launchd on macOS); container names do not resolve on
 the host. Every door dial goes through the host-mode dialer

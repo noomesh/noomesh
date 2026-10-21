@@ -19,6 +19,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -373,7 +374,14 @@ func (c *Client) ProxyTarget(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("inspect %s: %w", name, err)
 	}
-	if ins.Container.Config == nil || ins.Container.Config.Labels["noo.generic"] != "true" {
+	if ins.Container.Config == nil {
+		return "", fmt.Errorf("%s is not a managed container", name)
+	}
+	labels := ins.Container.Config.Labels
+	// A managed container, or a workload an add-on's verified bundle
+	// declared (labelled noo.addon/noo.workload, internal/addonwl): the
+	// gateway's workload proxy reaches a reserved worker through here.
+	if labels["noo.generic"] != "true" && !addonwl.DeclaredContainer(labels[LabelAddon], labels[LabelWorkload], name) {
 		return "", fmt.Errorf("%s is not a managed container", name)
 	}
 	if ins.Container.NetworkSettings == nil {

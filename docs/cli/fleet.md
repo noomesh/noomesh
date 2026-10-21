@@ -630,6 +630,45 @@ for the GPU to stay clear for `NOO_GPU_RESUME_AFTER_S`.
 An older CLI's bare `hold` (no operation id) still works for an operator:
 it is immediate and a force, and the audit row says `legacy`.
 
+### Reservations: a feature takes a GPU, the pool gets it back
+
+A feature that must continuously consume a piece of the mesh (voice while
+voice is on; an image or video worker with its model loaded) **reserves** a
+GPU. The workload is what an add-on's verified bundle declares
+(`<addon>/<workload>`: its container, whether it takes the GPU and how much,
+its own drain route); core never names one. `noo cluster gpu hold|release`
+stay as the low-level emergency tools underneath.
+
+```bash
+noo cluster workloads                              # what the installed add-ons declare
+noo cluster reserve pai-voice/voice-worker         # the mesh picks a node: any live node with enough free GPU memory
+noo cluster reserve pai-voice/voice-worker --node awolf   # or pin one
+noo cluster reservations                           # id, workload, holder, node, state, since
+noo cluster release <reservation-id>               # the GPU returns to the pool
+```
+
+Taking a reservation: an owned GPU hold in mode drain (the pool's requests
+in flight on that GPU finish, nothing is cut; its backends pause), then the
+node agent starts the declared container, then the command waits for it to
+run (and pass its healthcheck when it has one). A start that fails gives the
+GPU back at once; a container that is not ready in time keeps the
+reservation and the command says `needs_attention`. Releasing: the add-on's
+declared drain route runs first (its sessions end on its own terms), the
+container stops, and the hold is released by compare-and-set with an
+immediate resume. Only the holder releases, or an operator with `--force`
+(audited). `--hand-over <reservation-id>` moves a GPU from one workload to
+the next on the same node without the pool getting it in between.
+
+The reservation **is** the node's GPU lease: its id is the lease's operation
+id, so nothing is stored twice and `reservations` reads the nodes'
+heartbeats. While a workload is reserved, its add-on reaches it through
+`/api/addon-workloads/<addon>/<workload>/proxy/<path>` (requests and
+WebSockets; the add-on's own token for its own workloads, or an operator):
+the gateway resolves the reservation's node, the node agent proxies to the
+container's published loopback port. A relayed WebSocket closes with code
+4001 when the reservation ends. Nothing else on the node is reachable that
+way, and a workload that is not reserved answers 409.
+
 **Knobs** (operator overrides in `/etc/noo-node-agent.env`; restart the agent):
 
 | Variable | Default | Meaning |
@@ -701,6 +740,10 @@ drain_started, drained_at}`.
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
 | `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends, held as an owned lease until released (operator) |
 | `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold by its lease (or any with --force); backends resume when free, or now |
+| `noo cluster reserve` | `<addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]` | Reserve a GPU for an add-on workload: drain the pool there, pause it, start the workload |
+| `noo cluster reservations` | — | List the GPU reservations the nodes hold: id, workload, holder, node, state |
+| `noo cluster release` | `<reservation-id> [--force]` | Release a reservation: drain and stop the workload, give the GPU back (holder or --force) |
+| `noo cluster workloads` | — | List the workloads the installed add-ons declare (container, GPU need, drain route) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |

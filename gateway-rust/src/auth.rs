@@ -2769,6 +2769,12 @@ pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &
 /// `RequesterCtx.role` is `Claims::resolved_role` evaluated at validation, so
 /// the two entry points agree by construction.
 pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, path: &str) -> bool {
+    // An add-on's own token reaches the proxy to ITS OWN reserved workload
+    // (`addon_workloads::proxy_allows`); the handler then checks the
+    // reservation. Nothing else about the token changes.
+    if crate::addon_workloads::proxy_allows(&requester.sub, path) {
+        return true;
+    }
     scope_allows_for(&requester.scopes, requester.role, method, path)
 }
 
