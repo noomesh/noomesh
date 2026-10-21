@@ -394,12 +394,24 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     if method == "not-measured" && state != "held" && state != "yielded" {
         return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
     }
-    let off = if gc["policy"].as_str() == Some("off") { " (yield off)" } else { "" };
+    let mut off = if gc["policy"].as_str() == Some("off") { " (yield off)".to_string() } else { String::new() };
+    // Why: noomesh's own GPU use, and memory nobody could be blamed for, are
+    // reported apart from foreign (an older agent sends neither key).
+    if gc["noomesh_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+        off.push_str(&format!(", noomesh {:.1} GB", gb("noomesh_mb")));
+    }
+    if gc["unknown_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+        off.push_str(&format!(", unattributed {:.1} GB (not counted as foreign)", gb("unknown_mb")));
+    }
+    let orphans: Vec<&str> = gc["orphan"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if !orphans.is_empty() {
+        off.push_str(&format!(", orphan container {} holds the GPU — remove it", orphans.join(", ")));
+    }
     Some(match state {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
         "yielded" => warn("gpu",
-            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
         "held" => warn("gpu",
             format!("held by operator{}: {paused_phrase}",
@@ -8679,6 +8691,20 @@ mod gpu_contention_tests {
         assert_eq!(c.verdict, Verdict::Warn, "by design: never a failure");
         assert!(c.detail.starts_with("yielded: vllm paused (foreign 11.2 GB"), "{}", c.detail);
         assert!(c.remedy.is_none());
+    }
+
+    #[test]
+    fn the_row_separates_noomesh_foreign_unknown_and_orphan() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "nvidia-smi-unattributed", "foreign_mb": 0, "noomesh_mb": 3754,
+            "unknown_mb": 2048, "orphan": ["noo-ollama"], "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("noomesh 3.7 GB"), "{}", c.detail);
+        assert!(c.detail.contains("unattributed 2.0 GB"), "{}", c.detail);
+        assert!(c.detail.contains("orphan container noo-ollama"), "{}", c.detail);
+        let y = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "method": "nvidia-smi", "foreign_mb": 3400, "noomesh_mb": 3754, "paused_backends": ["ollama"]}))).unwrap();
+        assert!(y.detail.starts_with("yielded: ollama paused (foreign 3.3 GB, nvidia-smi, noomesh 3.7 GB)"), "{}", y.detail);
     }
 
     #[test]
