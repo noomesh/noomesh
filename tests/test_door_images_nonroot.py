@@ -89,11 +89,13 @@ def test_the_key_table_hands_the_key_to_that_uid(leaf):
 
 
 def test_no_first_party_image_in_the_table_still_reads_its_key_as_root_here():
-    """The root rows left are third-party images (nats, vllm, nginx, evolve);
-    none of the doors or exporters this repo builds may be one."""
+    """The root rows left are third-party images (nats, vllm, nginx);
+    none of the doors or exporters this repo builds may be one. evolve runs
+    as nonroot (65532) since evolve v0.1.4, so its key reader is that uid."""
     roots = {k for k, v in _readers().items() if v == "KeyReader::ContainerRoot"}
     assert not (roots & set(DOORS.values())), sorted(roots & set(DOORS.values()))
-    assert roots == {"nats", "vllm", "model-cache", "evolve"}, sorted(roots)
+    assert roots == {"nats", "vllm", "model-cache"}, sorted(roots)
+    assert _readers().get("evolve") == "KeyReader::ContainerUid(65532)", _readers().get("evolve")
 
 
 def test_the_node_agent_still_starts_its_doors_as_root():
