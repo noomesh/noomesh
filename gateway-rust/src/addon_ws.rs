@@ -1075,8 +1075,8 @@ mod tests {
         let c = try_take_slot(key.clone(), 2).expect("a dropped socket gives its slot back");
         drop((b, c));
         // Two sessions of one account share the cap.
-        let s1 = ctx("alice:session-1", Role::User, &[]);
-        let s2 = ctx("alice:session-2", Role::User, &[]);
+        let s1 = ctx("alice/session-1", Role::User, &[]);
+        let s2 = ctx("alice/session-2", Role::User, &[]);
         assert_eq!(slot_key("x", "r", Some(&s1)), slot_key("x", "r", Some(&s2)));
         assert_ne!(slot_key("x", "r", Some(&s1)), slot_key("x", "other", Some(&s1)));
     }
