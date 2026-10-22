@@ -1156,6 +1156,13 @@ pub fn kiosk_reload(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
+/// No seat here: no unit on disk, nothing published, no browser, no proxy
+/// socket. Any one of them present means a seat exists in SOME state and
+/// the full table is the right answer.
+fn seat_absent(unit_installed: bool, state_published: bool, cdp: bool, proxy_listening: bool) -> bool {
+    !unit_installed && !state_published && !cdp && !proxy_listening
+}
+
 pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
         return Err(Unhandled);
@@ -1213,6 +1220,26 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ))
     .as_deref()
         == Some("yes");
+    // A box with no seat at all — a controller, an operator's laptop — used
+    // to get the full table here: nineteen rows of "unknown (the proxy has
+    // published no state)" for a display that was never set up. Four
+    // independent signs of a seat, all absent, is "not installed", not
+    // nineteen unknowns. Each sign alone is not enough: a half-torn-down
+    // seat keeps its unit, a seat mid-setup has state before a browser.
+    let unit_installed = std::path::Path::new(&format!("{UNIT_DIR}/kiosk.service")).exists();
+    let seat_installed = !seat_absent(unit_installed, state.is_some(), cdp, proxy_listening);
+    if !seat_installed && !g.json {
+        println!("{}", ui::header("kiosk", None));
+        println!("{}", ui::kv(&[(
+            "seat",
+            ui::muted("not installed on this box (no kiosk.service unit, no published state, no proxy, no browser)").to_string(),
+        )]));
+        ui::guide(&[
+            ("noo kiosk setup", "install the seat ON the display box; a controller has no seat of its own"),
+            ("noo kiosk seat-token <name>", "on the controller: mint the paste a new display enrolls with"),
+        ]);
+        return Ok(0);
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let heartbeat = if cdp { sh_out("noo-kiosk-cdp heartbeat 2>/dev/null").and_then(|s| s.parse::<i64>().ok()) } else { None };
     // The graph's own measure of how slow the box is: smoothed ms of work
@@ -1244,6 +1271,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
     if g.json {
         println!("{}", json!({
+            "seat_installed": seat_installed,
             "kiosk_service": kiosk, "watchdog_timer": timer, "cdp": cdp,
             "proxy_service": proxy, "proxy_listening": proxy_listening, "proxy_port": port,
             "token_expires_at": expires, "heartbeat_ms": heartbeat, "graph_frame": frame,
@@ -3055,5 +3083,25 @@ mod tests {
         let first_write = body.find("// 1. the user").unwrap();
         assert!(confirm < first_write && first_write < disable, "the confirm must precede every write");
         assert!(parse_setup(&["--url".into(), "https://c.t.ts.net".into(), "--mode".into(), "shared".into(), "-y".into()]).unwrap().yes);
+    }
+}
+
+#[cfg(test)]
+mod seat_absent_tests {
+    use super::seat_absent;
+
+    #[test]
+    fn nothing_at_all_is_not_installed() {
+        assert!(seat_absent(false, false, false, false));
+    }
+
+    #[test]
+    fn any_single_sign_of_a_seat_keeps_the_full_table() {
+        // a torn-down seat that kept its unit; a seat mid-setup; a browser
+        // someone started by hand; a proxy still bound
+        assert!(!seat_absent(true, false, false, false));
+        assert!(!seat_absent(false, true, false, false));
+        assert!(!seat_absent(false, false, true, false));
+        assert!(!seat_absent(false, false, false, true));
     }
 }

@@ -168,25 +168,46 @@ pub fn config_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     Ok(0)
 }
 
-/// Search path for the local config YAML, mirroring the Python CLI's
-/// `config.resolve_config_path()` when no explicit path is given:
-/// `./noomesh.yaml` → `~/.config/mesh/config.yaml`
-/// → None. (The explicit `--config`/`$NOO_CONFIG` branch is handled by the
-/// caller, which — unlike Python's silent empty-config fallback — reports a
-/// missing explicit file as a clear local error.)
-fn discover_config_path() -> Option<PathBuf> {
-    if let Ok(cwd) = std::env::current_dir() {
-        // pai-assistant.yaml retired 2026-08-02 — see config.py. (Was a loop
-        // over a candidate list; clippy's single_element_loop has denied that
-        // since the list became one entry, which has kept `dev` red.)
-        let p = cwd.join("noomesh.yaml");
-        if p.exists() {
-            return Some(p);
+/// The places `noo config show` looks, in order, when no path is given:
+/// `./noomesh.yaml` → `<repo_root>/noomesh.yaml` → `~/.config/mesh/config.yaml`.
+/// `repo_root()` is the INSTALL: a standalone state home (`~/.noo`) when
+/// one exists, else the checkout. Until 2026-10-22 the install was not on
+/// the list (only cwd and the legacy `~/.config/mesh` path were), so
+/// `noo config show` run from the operator's home on a standalone
+/// controller printed `config path —` and `{}` for a box that carried a
+/// full noomesh.yaml. Pure so the ordering is testable.
+fn config_search_candidates(cwd: Option<PathBuf>, root: PathBuf, home: Option<String>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
         }
+    };
+    // pai-assistant.yaml retired 2026-08-02 — see config.py.
+    if let Some(c) = cwd {
+        push(c.join("noomesh.yaml"));
     }
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(home).join(".config").join("mesh").join("config.yaml");
-    p.exists().then_some(p)
+    push(root.join("noomesh.yaml"));
+    if let Some(h) = home {
+        push(PathBuf::from(h).join(".config").join("mesh").join("config.yaml"));
+    }
+    out
+}
+
+fn config_search_path() -> Vec<PathBuf> {
+    config_search_candidates(
+        std::env::current_dir().ok(),
+        crate::envfile::repo_root(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// The first candidate that is a file, else None. (The explicit
+/// `--config`/`$NOO_CONFIG` branch is handled by the caller, which — unlike
+/// Python's silent empty-config fallback — reports a missing explicit file
+/// as a clear local error.)
+fn discover_config_path() -> Option<PathBuf> {
+    config_search_path().into_iter().find(|p| p.is_file())
 }
 
 /// `noo config show [--config PATH]` — show the LOCAL configuration file.
@@ -266,6 +287,16 @@ pub fn config_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 .map(|p| serde_json::Value::String(p.display().to_string()))
                 .unwrap_or(serde_json::Value::Null),
         );
+        if resolved.is_none() {
+            // Say where we looked, so `{}` reads as "no file" and not as
+            // "an empty config".
+            obj.insert(
+                "searched".into(),
+                serde_json::Value::Array(
+                    config_search_path().iter().map(|p| serde_json::Value::String(p.display().to_string())).collect(),
+                ),
+            );
+        }
         if let Some(m) = data.as_object() {
             for (k, v) in m {
                 obj.insert(k.clone(), v.clone());
@@ -274,13 +305,21 @@ pub fn config_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", serde_json::Value::Object(obj));
         return Ok(0);
     }
-    print!(
-        "{}",
-        ui::kv(&[(
-            "config path",
-            resolved.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| ui::dash().into())
-        )])
-    );
+    let Some(path) = resolved.as_ref() else {
+        // No local file anywhere on the search path. The old output here was
+        // `config path —` followed by `{}`, which read as an empty config.
+        print!("{}", ui::kv(&[("config path", ui::warn("no noomesh.yaml found"))]));
+        println!("  searched:");
+        for p in config_search_path() {
+            println!("    {}", ui::muted(&p.display().to_string()));
+        }
+        ui::guide(&[
+            ("noo config export-effective", "the config the gateway is actually running (asks the gateway)"),
+            ("noo config show --config <path>", "a file somewhere else"),
+        ]);
+        return Ok(0);
+    };
+    print!("{}", ui::kv(&[("config path", path.display().to_string())]));
     // Parity with the Python CLI: human mode prints the config as pretty JSON.
     println!("{}", serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()));
     Ok(0)
@@ -390,4 +429,36 @@ pub fn config_export_effective(g: &Globals, args: &[String]) -> Result<i32, Unha
         None => println!("{rendered}"),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod search_path_tests {
+    use super::*;
+
+    #[test]
+    fn the_install_root_is_searched_between_cwd_and_the_legacy_path() {
+        let got = config_search_candidates(
+            Some(PathBuf::from("/home/op")),
+            PathBuf::from("/home/op/.noo"),
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/home/op/noomesh.yaml"),
+                PathBuf::from("/home/op/.noo/noomesh.yaml"),
+                PathBuf::from("/home/op/.config/mesh/config.yaml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cwd_that_is_the_install_is_listed_once() {
+        let got = config_search_candidates(
+            Some(PathBuf::from("/srv/noomesh")),
+            PathBuf::from("/srv/noomesh"),
+            None,
+        );
+        assert_eq!(got, vec![PathBuf::from("/srv/noomesh/noomesh.yaml")]);
+    }
 }
