@@ -783,6 +783,68 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
     Ok(after)
 }
 
+/// What a node's harness said to a dispatch, read from its reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessAnswer {
+    /// `{"ack": true}`; `already` when the harness had the task already.
+    Taken { already: bool },
+    /// `{"ack": false, "busy": true, "running": n, "capacity": N}`.
+    Busy { running: u64, capacity: u64 },
+    /// A reply that is neither (a refusal, or an unreadable one).
+    Refused,
+    /// No reply within the ack window.
+    Silent,
+}
+
+/// Read a harness's reply body (`None` = nothing came back).
+pub fn harness_answer(body: Option<&Value>) -> HarnessAnswer {
+    let Some(b) = body else { return HarnessAnswer::Silent };
+    if b.get("ack").and_then(Value::as_bool) == Some(true) {
+        return HarnessAnswer::Taken { already: b.get("already").and_then(Value::as_bool) == Some(true) };
+    }
+    if b.get("busy").and_then(Value::as_bool) == Some(true) {
+        return HarnessAnswer::Busy {
+            running: b.get("running").and_then(Value::as_u64).unwrap_or(0),
+            capacity: b.get("capacity").and_then(Value::as_u64).unwrap_or(0),
+        };
+    }
+    HarnessAnswer::Refused
+}
+
+/// Where a node-placed task goes after the harness's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The node's harness runs it.
+    Dispatched { already: bool },
+    /// The node's harness is busy: the task stays open on the node, queued.
+    Queued { why: String, running: u64, capacity: u64 },
+    /// The controller runs it, as a named fallback; `answered` says whether
+    /// the harness refused or said nothing at all.
+    Fallback { why: String, answered: bool },
+}
+
+/// The rule (noomesh-internal i176): taken → dispatched; busy → queued for
+/// that node, never the controller; a refusal or silence → the controller,
+/// named a fallback.
+pub fn place_after(node: &str, answer: &HarnessAnswer) -> Placement {
+    match answer {
+        HarnessAnswer::Taken { already } => Placement::Dispatched { already: *already },
+        HarnessAnswer::Busy { running, capacity } => Placement::Queued {
+            why: format!("node '{node}' has a harness and it is busy ({running} of {capacity} running); the task is queued for it"),
+            running: *running,
+            capacity: *capacity,
+        },
+        HarnessAnswer::Refused => Placement::Fallback {
+            why: format!("node '{node}' has a harness and it refused the task; running in process (fallback)"),
+            answered: true,
+        },
+        HarnessAnswer::Silent => Placement::Fallback {
+            why: format!("node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node; running in process (fallback)"),
+            answered: false,
+        },
+    }
+}
+
 /// Keep the task `open`, assigned to `node`, for the node's busy harness to
 /// take when a slot frees (its `harness.ready` hand-back lists open tasks
 /// on the node).
@@ -1001,12 +1063,13 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
                     state.nats.send_request(task_subject(&node), crate::coordinator::node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
                 )
                 .await;
-                let mut answered = false;
-                if let Ok(Ok(msg)) = ack {
-                    answered = true;
-                    let body: Value = serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
-                    if body.get("ack").and_then(|a| a.as_bool()) == Some(true) {
-                        if body.get("already").and_then(|a| a.as_bool()) == Some(true) {
+                let body = match ack {
+                    Ok(Ok(msg)) => Some(serde_json::from_slice::<Value>(&msg.payload).unwrap_or(Value::Null)),
+                    _ => None,
+                };
+                match place_after(&node, &harness_answer(body.as_ref())) {
+                    Placement::Dispatched { already } => {
+                        if already {
                             tracing::info!(task = %task.id, node = %node, "task_already_on_node");
                         } else {
                             tracing::info!(task = %task.id, node = %node, "task_dispatched");
@@ -1014,25 +1077,21 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
                         mark_running(&state.db, &task.id, Some(&node)).await?;
                         return Ok(Started::dispatched(node));
                     }
-                    if body.get("busy").and_then(|b| b.as_bool()) == Some(true) {
+                    Placement::Queued { why: q, running, capacity } => {
                         // Busy is not dead: the task waits for THIS node's
                         // harness, which hands it back when a slot frees.
-                        let running = body.get("running").and_then(Value::as_u64).unwrap_or(0);
-                        let capacity = body.get("capacity").and_then(Value::as_u64).unwrap_or(0);
                         mark_queued(&state.db, &task.id, &node).await?;
                         tracing::info!(task = %task.id, node = %node, running, capacity, "task_queued_for_node");
-                        return Ok(Started::queued(node.clone(), format!("node '{node}' has a harness and it is busy ({running} of {capacity} running); the task is queued for it")));
+                        return Ok(Started::queued(node.clone(), q));
+                    }
+                    Placement::Fallback { why: f, answered } => {
+                        // No ack at all (or a refusal): the dead case.
+                        // Running a node-placed task on the controller is
+                        // a fallback, said so in the record and at warn.
+                        why = f;
+                        tracing::warn!(task = %task.id, node = %node, answered, "task: harness did not take it; running in process (fallback)");
                     }
                 }
-                // No ack at all (or a refusal): the dead case. Running a
-                // node-placed task on the controller is a fallback, said
-                // so in the record and at warn in the log.
-                why = if answered {
-                    format!("node '{node}' has a harness and it refused the task; running in process (fallback)")
-                } else {
-                    format!("node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node; running in process (fallback)")
-                };
-                tracing::warn!(task = %task.id, node = %node, answered, "task: harness did not take it; running in process (fallback)");
             } else {
                 why = format!("no harness token could be minted for '{owner}' on node '{node}'");
             }
@@ -1371,6 +1430,43 @@ mod tests {
 
     /// PINNED: a runner stops on any terminal state and on the budget,
     /// and continues only while the task is live.
+    /// noomesh-internal i176, the decision itself: what each harness reply
+    /// does to a node-placed task.
+    #[test]
+    fn a_harness_reply_decides_where_a_task_goes() {
+        use serde_json::json;
+        let busy = json!({"ack": false, "busy": true, "node": "mcmini", "running": 8, "capacity": 8});
+        assert_eq!(harness_answer(Some(&busy)), HarnessAnswer::Busy { running: 8, capacity: 8 });
+        match place_after("mcmini", &harness_answer(Some(&busy))) {
+            Placement::Queued { why, running: 8, capacity: 8 } => {
+                assert!(why.contains("busy (8 of 8 running)") && why.contains("queued for it"), "{why}");
+                assert!(!why.contains("fallback") && !why.contains("in process"), "a busy node never means the controller: {why}");
+            }
+            other => panic!("busy must queue: {other:?}"),
+        }
+        let taken = json!({"ack": true, "node": "mcmini"});
+        assert_eq!(place_after("mcmini", &harness_answer(Some(&taken))), Placement::Dispatched { already: false });
+        let already = json!({"ack": true, "already": true, "node": "mcmini"});
+        assert_eq!(place_after("mcmini", &harness_answer(Some(&already))), Placement::Dispatched { already: true });
+        assert_eq!(harness_answer(None), HarnessAnswer::Silent);
+        match place_after("mcmini", &harness_answer(None)) {
+            Placement::Fallback { why, answered: false } => assert!(why.contains("did not answer within 3s") && why.ends_with("(fallback)"), "{why}"),
+            other => panic!("silence is the fallback: {other:?}"),
+        }
+        let refused = json!({"ack": false, "node": "mcmini"});
+        match place_after("mcmini", &harness_answer(Some(&refused))) {
+            Placement::Fallback { why, answered: true } => assert!(why.contains("refused") && why.ends_with("(fallback)"), "{why}"),
+            other => panic!("a refusal is the fallback: {other:?}"),
+        }
+        assert_eq!(harness_answer(Some(&json!("garbage"))), HarnessAnswer::Refused);
+        // The outcome the API shows for each.
+        let q = Started::queued("mcmini".into(), "busy");
+        assert!(q.queued && !q.dispatched);
+        assert!(Started::dispatched("mcmini".into()).dispatched);
+        let f = Started::here("pop-os".into(), "fallback");
+        assert!(!f.queued && !f.dispatched);
+    }
+
     /// noomesh-internal i176: a busy harness keeps the task on its node;
     /// only no answer at all runs it on the controller, and says so.
     #[test]
@@ -1380,14 +1476,13 @@ mod tests {
         assert!(!Started::dispatched("mcmini".into()).queued && !Started::here("pop-os".into(), "x").queued);
         let src = include_str!("tasks.rs").split("fn a_busy_node_queues_the_task_and_only_silence_falls_back").next().unwrap();
         let start = src.split("pub async fn start(").nth(1).unwrap().split("\nfn run_in_process(").next().unwrap();
-        let busy = start.find("get(\"busy\")").expect("the busy reply is read");
-        let after = &start[busy..];
-        let queued = after.find("mark_queued(").expect("a busy node queues the task");
-        let returned = after.find("return Ok(Started::queued(").expect("and returns queued");
-        let fallback = after.find("running in process (fallback)").expect("the fallback wording");
-        assert!(queued < returned && returned < fallback, "queued is returned before any fallback path: {queued} {returned} {fallback}");
-        assert!(start.contains("running in process (fallback)"), "the controller run is named a fallback");
-        assert!(start.contains("tracing::warn!(task = %task.id, node = %node, answered"), "and logged at warn");
+        let decide = start.find("place_after(&node, &harness_answer(").expect("the reply goes through the one rule");
+        let after = &start[decide..];
+        let queued = after.find("Placement::Queued {").expect("the queued arm");
+        assert!(after[queued..].find("mark_queued(").unwrap() < after[queued..].find("return Ok(Started::queued(").unwrap(), "queued: state set, then returned");
+        let fallback = after.find("Placement::Fallback {").expect("the fallback arm");
+        assert!(after[fallback..].contains("tracing::warn!(task = %task.id, node = %node, answered"), "the controller run is logged at warn");
+        assert!(!after[queued..fallback].contains("tracing::warn!"), "a queued task is not a warning");
         let unfinished = &src[src.find("async fn list_unfinished_on").unwrap()..];
         assert!(unfinished[..500].contains("t.state IN ('open','running','checkpointed')"), "a queued (open) task is handed back");
     }
