@@ -50,6 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cluster/reservations/{id}", get(reservation_get).delete(reservation_release))
         .route("/api/cluster/reservations/{id}/release", post(reservation_release))
         .route("/api/cluster/workloads", get(workloads_list))
+        .route("/api/addon-workloads/{addon}/{workload}/status", get(workload_status))
         .route("/api/addon-workloads/{addon}/{workload}/proxy/{*path}", any(workload_proxy))
 }
 
@@ -429,6 +430,33 @@ async fn reservation_release(
 
 async fn audit(state: &AppState, event: &str, actor: &str, node: &str, outcome: &str, details: Value) {
     super::core::audit_event(&state.db, event, "info", actor, &format!("node:{node}"), outcome, details).await;
+}
+
+/// `GET /api/addon-workloads/{addon}/{workload}/status`: how an add-on
+/// observes its own reservation without touching the worker. The add-on's
+/// own token or an operator; 404 when the workload is not declared.
+/// `{workload, reserved, reservation: {id, node, holder, state, since,
+/// generation} | null}`.
+async fn workload_status(
+    State(state): State<Arc<AppState>>,
+    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    Path((addon, workload)): Path<(String, String)>,
+) -> AppResult {
+    let Some(axum::Extension(r)) = ctx.as_ref() else {
+        return Err(AppError::Forbidden("a credential is required".into()));
+    };
+    let own = r.sub == format!("{}{addon}", crate::auth::ADDON_SUBJECT_PREFIX);
+    if !own && r.role < crate::auth::Role::Operator {
+        return Err(AppError::Forbidden(format!("only the add-on {addon} itself or an operator may read its workloads")));
+    }
+    let Some(decl) = crate::addon_workloads::lookup(&addon, &workload) else {
+        return Err(AppError::NotFound(format!("no verified add-on bundle declares workload {addon}/{workload}")));
+    };
+    let key = decl.key();
+    let res = all_reservations(&state).await.into_iter().find(|r| r["workload"] == key);
+    let reserved = res.as_ref().is_some_and(|r| r["state"] == "held");
+    Ok(Json(json!({"workload": key, "container": decl.container, "reserved": reserved,
+        "reservation": res.map(|r| json!({"id": r["id"], "node": r["node"], "holder": r["holder"], "state": r["state"], "since": r["since"], "generation": r["generation"]}))})))
 }
 
 // ── the workload proxy ───────────────────────────────────────────────────
