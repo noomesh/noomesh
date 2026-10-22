@@ -1180,7 +1180,7 @@ mod addon_ui_tests {
         assert_eq!(addon_ui_command(8451), vec!["serve", "--bg", "--https=8451", "https://127.0.0.1:8451"]);
         assert_eq!(addon_ui_off_command(8451), vec!["serve", "--https=8451", "off"]);
         let src = include_str!("tailnet_serve.rs");
-        let code = &src[src.find("// ── Add-on UI origins").unwrap()..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let code = &src[src.find("Add-on UI origins").unwrap()..src.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(!code.contains("\"policy\"") && !code.contains("\"reset\""), "serve config only, and never a reset");
     }
 
