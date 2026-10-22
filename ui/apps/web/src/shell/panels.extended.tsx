@@ -7,6 +7,7 @@ import { ProposalsPanel } from '@/features/proposals/ProposalsPanel';
 import { ChannelsPanel } from '@/features/channels/ChannelsPanel';
 import { FilesPanel } from '@/features/files/FilesPanel';
 import { ExplorerPanel } from '@/features/explorer/ExplorerPanel';
+import { AgentTrafficPanel } from '@/features/agent-traffic/AgentTrafficPanel';
 import { BrainMapPanel } from '@/features/brain-map/BrainMapPanel';
 
 /**
@@ -19,6 +20,7 @@ import { BrainMapPanel } from '@/features/brain-map/BrainMapPanel';
  */
 export const EXTENDED_PANELS: Record<string, ComponentType> = {
   jobs: JobsPanel,
+  traffic: AgentTrafficPanel,
   proposals: ProposalsPanel,
   channels: ChannelsPanel,
   files: FilesPanel,

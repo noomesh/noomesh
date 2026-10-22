@@ -3913,3 +3913,97 @@ body {
   border: 1px solid var(--line);
   border-radius: 4px;
 }
+
+/* agent traffic (operator) */
+.traffic-live {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.traffic-live-title,
+.traffic-dim {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.traffic-split {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 760px) {
+  .traffic-split {
+    grid-template-columns: 1fr;
+  }
+}
+.traffic-threads,
+.traffic-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.traffic-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px 11px;
+  cursor: pointer;
+}
+.traffic-thread.on {
+  border-color: var(--ink-2);
+}
+.traffic-thread-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.traffic-thread-who,
+.traffic-thread-meta,
+.traffic-ts {
+  font-size: 11px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.traffic-msg {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 9px 12px;
+}
+.traffic-msg-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.traffic-route {
+  font-weight: 600;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.traffic-body {
+  margin: 8px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.traffic-body.text {
+  font-family: inherit;
+  font-size: 13px;
+}
+.traffic-more {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--dim);
+  text-decoration: underline;
+  cursor: pointer;
+}
