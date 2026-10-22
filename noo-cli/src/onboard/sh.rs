@@ -174,6 +174,9 @@ fn bind_sources_refusal(ctx: &Ctx, args: &[&str]) -> Option<String> {
     // No systemd = no hostd to create the host spool: make it here, as the
     // user, rather than refuse (and rather than let Docker make it root-owned).
     crate::commands::bind_sources::ensure_hostd_spool(&cfg, &services, no_deps, crate::commands::bind_sources::systemd_present());
+    // The add-on declarations directories the launcher fills (i163): empty
+    // is normal, so make them as the user rather than refuse.
+    crate::commands::bind_sources::ensure_launcher_dirs(&cfg, &services, no_deps);
     let findings = crate::commands::bind_sources::check(&cfg, &services, no_deps, Some(&root));
     (!findings.is_empty()).then(|| crate::commands::bind_sources::refusal(&findings))
 }

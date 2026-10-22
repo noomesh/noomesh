@@ -80,6 +80,9 @@ pub enum Refusal {
     Untrusted(String),
     /// The lock handed over with `--lock` could not be read.
     Supplied(String),
+    /// The bundle's `system.json` or `workloads.json` breaks a rule
+    /// ([`super::decls`]). Signed content the gateway would refuse.
+    Decl(String),
 }
 
 impl Refusal {
@@ -131,6 +134,7 @@ impl Refusal {
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
             Refusal::Store(e) => format!("the encrypted store could not be read to resolve {addon}: {e}"),
             Refusal::Unbundled { tag } => unbundled(addon, tag),
+            Refusal::Decl(e) => format!("{addon}'s signed bundle is refused: {e}; the vendor must fix and re-sign it"),
         }
     }
 
@@ -228,6 +232,10 @@ pub fn require_bundle(v: &VerifiedLock, tag: &str) -> Result<(), Refusal> {
 pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<VerifiedLock, Refusal> {
     let v = addon_lock::verify(&fetched.lock, &fetched.sig, anchor, want.addon).map_err(Refusal::Lock)?;
     addon_lock::verify_files(&v.lock, &fetched.files).map_err(Refusal::Lock)?;
+    // The declarations beyond the overlay (system.json, workloads.json):
+    // signed, and still refused here when they break a rule, before anything
+    // is pinned, so the gateway never meets a bundle it would refuse.
+    super::decls::check_bundle(want.addon, &fetched.files).map_err(Refusal::Decl)?;
     if !v.lock.supports(want.stack_tag) {
         return Err(Refusal::NotForStack {
             tag: want.stack_tag.to_string(),
@@ -409,6 +417,19 @@ pub fn record(
 /// The offline check: the cached lock still verifies against `anchor`,
 /// lists `tag`, and is exactly what the pin says. Returns the pin.
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
+    offline_check_files(root, addon, tag, anchor).map(|(pin, _)| pin)
+}
+
+/// [`offline_check`], also returning the file names the verified lock lists
+/// (each verified against its materialised copy). The launcher copies a
+/// declaration file (`decls::DECL_FILES`) only when it is listed here, so an
+/// unsigned file left beside the bundle never reaches the gateway.
+pub fn offline_check_files(
+    root: &Path,
+    addon: &str,
+    tag: &str,
+    anchor: &TrustAnchor,
+) -> Result<(Pin, std::collections::BTreeSet<String>), String> {
     let all = pins::read(root)?;
     let pin = all.get(addon).cloned().ok_or_else(|| format!("{addon} has no pin in {}", pins::PINS_FILE))?;
     if pin.stack != tag {
@@ -452,7 +473,7 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
             pins::addon_dir(root, addon).display()
         )
     })?;
-    Ok(pin)
+    Ok((pin, v.lock.files.keys().cloned().collect()))
 }
 
 /// The production [`Docker`]. Its throwaway docker configs live under the
@@ -806,6 +827,54 @@ pub(crate) mod tests {
     /// image line is what the launcher reads).
     pub(crate) const OVERLAY: &str =
         "services:\n  trellion-intel:\n    image: ${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:x}\n";
+
+    /// A signed bundle of `l` for the fixture add-on `example-addon`,
+    /// carrying [`OVERLAY`] plus `extra` files (all signed).
+    pub(crate) fn signed_example_bundle(l: &AddonLock, extra: &[(&str, &[u8])]) -> Fetched {
+        let mut l = l.clone();
+        l.addon = "example-addon".into();
+        l.format = addon_lock::FORMAT_V2.into();
+        let mut files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        for (n, b) in extra {
+            files.insert((*n).to_string(), b.to_vec());
+        }
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        Fetched { lock: bytes, sig, files }
+    }
+
+    pub(crate) const EXAMPLE_SYSTEM: &str =
+        r#"{"schema":"example_addon","role":"noo_example_addon","ddl_role":"noo_example_addon_ddl","extensions":["pg_trgm"]}"#;
+    pub(crate) const EXAMPLE_WORKLOADS: &str = r#"{"workloads":[{"name":"worker","container":"noo-example-addon-worker","gpu":true,"need_mb":4096,"drain":{"route":"drain","timeout_secs":60}}]}"#;
+
+    #[test]
+    fn a_bundle_with_valid_declarations_passes_and_a_bad_one_is_refused_before_any_pin() {
+        let want = Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let good = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
+        );
+        assert!(check(&good, &anchor(), &want).is_ok());
+        // Signed, but naming a core role: the signature is not the only rule.
+        let bad = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", br#"{"schema":"example_addon","role":"noo_app","ddl_role":"noo_example_addon_ddl"}"#)],
+        );
+        match check(&bad, &anchor(), &want) {
+            Err(r @ Refusal::Decl(_)) => {
+                let why = r.why("example-addon");
+                assert!(why.contains("`role`") && why.contains("re-sign"), "{why}");
+            }
+            other => panic!("expected a declaration refusal, got {other:?}"),
+        }
+        // A drain route the bundle's own routes.json says is public.
+        let routes = br#"{"routes":[{"name":"drain","method":"POST","path":"/api/example-addon/drain"}]}"#;
+        let bad = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("workloads.json", EXAMPLE_WORKLOADS.as_bytes()), ("routes.json", routes)],
+        );
+        assert!(matches!(check(&bad, &anchor(), &want), Err(Refusal::Decl(e)) if e.contains("public route")));
+    }
 
     /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
     pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {

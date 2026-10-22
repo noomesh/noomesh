@@ -225,6 +225,11 @@ _addon_composed_names() {
 # REFUSE = return 1; both launchers `|| exit 1` before anything is pulled or
 # recreated.
 _ADDON_PINS=()
+# The `decl <addon> <file>` lines launch-pins printed (a declaration file the
+# verified lock lists: system.json, workloads.json), for
+# addon_decls_materialise below. An older noo prints none: nothing is handed
+# to the gateway, which then provisions no bundle system (the safe side).
+_ADDON_DECLS=()
 # The install root this launcher belongs to (scripts/..), fixed when the
 # library is sourced. launch-pins reads the pins under it, never the cwd.
 _DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
@@ -236,6 +241,7 @@ require_addon_pins() {
     # the shell or an .env line is dropped, like the image variables above.
     unset NOO_ADDONS_VERIFIED NOO_ADDONS_DEV
     _ADDON_PINS=()
+    _ADDON_DECLS=()
     _args="$(addon_compose_overlay_args 2>/dev/null)"
     # shellcheck disable=SC2086
     _vars="$(addon_image_vars $_args)"
@@ -307,6 +313,12 @@ require_addon_pins() {
                 fi
                 export "${_var}=${_ref}"
                 _ADDON_PINS+=("${_var}=${_ref}") ;;
+            decl)
+                # `decl <addon> <file>`: a declaration file its verified lock
+                # lists. Only the two names the gateway reads are kept.
+                case "$_rest" in
+                    system.json|workloads.json) _ADDON_DECLS+=("${_addon} ${_rest}") ;;
+                esac ;;
             refuse)
                 {
                     echo "REFUSING: the ${_addon} add-on is on and has no verified pin for ${_tag}:"
@@ -803,6 +815,98 @@ compose_active_services() {
         echo "WARNING: compose could not list the stack's services (continuing with none)" >&2
         compose_report_error "$_rc"
         COMPOSE_OUT=""
+    fi
+    return 0
+}
+
+# addon_decls_materialise — hand the gateway what each add-on's signed bundle
+# declares beyond its overlay (noomesh-internal i163 E/B): `system.json` (its
+# database system) and `workloads.json` (its managed workloads), copied into
+#   <install root>/.noo-addon-systems/<addon>/system.json
+#   <install root>/.noo-addon-workloads/<addon>/workloads.json
+# which docker-compose.cluster.yml mounts read-only into the gateway at
+# /opt/noo/addon-systems and /opt/noo/addon-workloads (gateway-rust/src/
+# addon_decls.rs validates them again and reads them only for an add-on its
+# registry registers).
+#
+# ONLY for add-ons switched on AND verified this start, from the verdict
+# require_addon_pins just computed (call it right after, never before):
+#   dist  each `decl <addon> <file>` launch-pins printed: the file is listed
+#         in the add-on's verified signed lock and was just held to its hash,
+#         so an unsigned file left in addons/<name>/ is never copied;
+#   dev   (NOO_ADDONS_VERIFIED=dev, a source checkout signs nothing) the files
+#         beside each composed add-on's overlay (addon_overlay: its
+#         development checkout, else its bundle);
+#   anything else (an older noo, `none`, unset) copies nothing.
+# Every other add-on's directory is removed, so a switched-off or unverified
+# add-on stops declaring on this start. The two directories keep their inode
+# (contents replaced, never the directory), so a gateway bind stays valid.
+#
+# lib-secrets.sh `_declared_systems` reads the systems directory: it is the
+# second source of declared systems (passwords NOO_<ID>_DB_PASSWORD /
+# NOO_<ID>_DDL_PASSWORD, minted by `noo addons enable`). load_secrets ran
+# before the verdict existed, so when the SET of systems changed here the
+# systems-secrets file is derived and written again.
+#
+# Fails (return 1) only when the directories cannot be written.
+addon_decls_materialise() {
+    local _root="${PROJECT_ROOT:-$_DIST_LIB_ROOT}" _sys _wl _before _after _plan="" _pair _a _f _src _n _d _keep=" "
+    _sys="$_root/.noo-addon-systems"
+    _wl="$_root/.noo-addon-workloads"
+    if ! mkdir -p "$_sys" "$_wl" || ! chmod 0755 "$_sys" "$_wl"; then
+        echo "REFUSING: could not create the add-on declaration directories under $_root (.noo-addon-systems, .noo-addon-workloads)." >&2
+        return 1
+    fi
+    _before="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
+    case "${NOO_ADDONS_VERIFIED:-}" in
+        dev)
+            for _n in $(addon_licensed_names 2>/dev/null); do
+                addon_on "$_n" 0 || continue
+                _src="$(addon_overlay "$_n" 2>/dev/null)"
+                [ -n "$_src" ] || continue
+                _d="$(dirname "$_src")"
+                for _f in system.json workloads.json; do
+                    [ -f "$_d/$_f" ] && _plan="${_plan}${_n} ${_f} ${_d}/${_f}"$'\n'
+                done
+            done ;;
+        ''|none) : ;;
+        *)
+            for _pair in ${_ADDON_DECLS[@]+"${_ADDON_DECLS[@]}"}; do
+                _a="${_pair%% *}"
+                _f="${_pair#* }"
+                case ",${NOO_ADDONS_VERIFIED}," in *",${_a}="*) : ;; *) continue ;; esac
+                if command -v addon_on >/dev/null 2>&1; then addon_on "$_a" 0 || continue; fi
+                _plan="${_plan}${_a} ${_f} ${_root}/addons/${_a}/${_f}"$'\n'
+            done ;;
+    esac
+    while read -r _a _f _src; do
+        [ -n "$_a" ] || continue
+        case "$_a" in [a-z]*) : ;; *) continue ;; esac
+        case "$_a" in *[!a-z0-9_-]*) continue ;; esac
+        case "$_f" in system.json) _d="$_sys/$_a" ;; workloads.json) _d="$_wl/$_a" ;; *) continue ;; esac
+        [ -f "$_src" ] && [ ! -L "$_src" ] || continue
+        case "$_keep" in *" $_f:$_a "*) : ;; *)
+            rm -rf "${_d:?}" && mkdir -p "$_d" && chmod 0755 "$_d" || return 1 ;;
+        esac
+        cp "$_src" "$_d/$_f.tmp.$$" && chmod 0644 "$_d/$_f.tmp.$$" && mv -f "$_d/$_f.tmp.$$" "$_d/$_f" || {
+            echo "REFUSING: could not copy ${_a}'s ${_f} into $_d." >&2
+            return 1
+        }
+        _keep="${_keep}${_f}:${_a} "
+    done <<PLAN
+$_plan
+PLAN
+    # Drop every add-on directory not copied above.
+    for _d in "$_sys"/* "$_wl"/*; do
+        [ -e "$_d" ] || continue
+        _n="$(basename "$_d")"
+        case "$_d" in "$_sys"/*) _f=system.json ;; *) _f=workloads.json ;; esac
+        case "$_keep" in *" $_f:$_n "*) : ;; *) rm -rf "${_d:?}" ;; esac
+    done
+    _after="$(cd "$_sys" && ls -1 2>/dev/null | sort | tr '\n' ' ')"
+    if [ "$_before" != "$_after" ] && command -v derive_file_secrets >/dev/null 2>&1 && command -v write_secret_files >/dev/null 2>&1; then
+        # The systems-secrets file must carry the new set's passwords.
+        derive_file_secrets && write_secret_files || return 1
     fi
     return 0
 }

@@ -332,7 +332,13 @@ pub(crate) fn credentials_stage(
 pub(crate) fn reconcile_credentials(root: &Path) -> Result<Vec<(String, Vec<String>)>, CredRefusal> {
     let path = root.join("noomesh.yaml");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(Vec::new()) };
-    let manifest = parse_systems(&text).map_err(|e| CredRefusal::Store(format!("{}: {e}", path.display())))?;
+    let mut manifest = parse_systems(&text).map_err(|e| CredRefusal::Store(format!("{}: {e}", path.display())))?;
+    // Plus the systems switched-on add-ons' signed bundles declare
+    // (`system.json`, i163 E); a noomesh.yaml entry of the same name wins.
+    let on = crate::commands::addons::declared_in(&text);
+    for (name, e) in crate::addons::decls::bundle_systems(root, &|a| on.get(a).copied() == Some(true)) {
+        manifest.entry(name).or_insert(e);
+    }
     let sops = root.join("secrets/env.sops");
     let store = if sops.is_file() {
         Some(secrets::SecretStore::load_sops(&sops).map_err(CredRefusal::Store)?)

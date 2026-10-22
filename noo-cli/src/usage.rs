@@ -377,6 +377,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["usage", "me"], "[-p|--period day|week|month] [-u|--user <user>]", "Show your token spend this period: node, cloud and harness apart, and your allowance"),
     (&["upgrade"], "[--check] [--version <X.Y.Z>] [--stack] [--nodes] [--seats|--no-seats] [--all] [--tag <vX.Y.Z>] [--controller] [--allow-unsigned] [--force] [--skip-gateway-key-check] [--allow-downgrade] [--stage2] [--channel <public|rollback|custom>] [--release-repo <owner/repo>] [--image-prefix <registry/path>] [--base-registry <registry/path>] [--yes]", "Self-update noo, optionally stack, nodes and kiosk seats; --channel moves release channel"),
     (&["addons", "list"], "", "Show every add-on: declared, effective and whether the licence grants it"),
+    (&["addons", "show"], "<name>", "Show one add-on's switch, pin, and the database and workloads its signed bundle declares"),
     (&["addons", "enable"], "<name> [--force] [--lock <path|https-url>]", "Pin an add-on's signed lock, mint its credentials and key, then declare it ON"),
     (&["addons", "trust-key"], "<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]", "Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key"),
     (&["addons", "untrust-key"], "<name> [<pubkey>] [--dev]", "Stop trusting a third-party add-on's signing key; --dev removes its dev key(s)"),

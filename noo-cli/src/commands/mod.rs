@@ -426,7 +426,7 @@ pub use entitlement_signer::*;
 pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
-pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_trust_key, addons_untrust_key};
+pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
 pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

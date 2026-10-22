@@ -503,11 +503,51 @@ async fn ensure_extensions(db: &PgPool, system: &str, spec: &SystemConfig) -> Re
 /// Called from the migration path with the PRIVILEGED pool — a runtime role
 /// cannot create roles or schemas, which is the entire point of the split.
 pub async fn run(db: &PgPool) -> Result<(), String> {
-    let skipped = reconcile(db, &crate::config::global().systems).await?;
+    let (systems, conflicts) = with_addon_systems(&crate::config::global().systems, crate::addon_registry::declared_systems());
+    for (name, why) in &conflicts {
+        tracing::warn!(system = %name, "{why}");
+    }
+    let skipped = reconcile(db, &systems).await?;
     if let Ok(mut m) = UNPROVISIONED.lock() {
         *m = skipped;
     }
     Ok(())
+}
+
+/// The systems to reconcile: the `systems:` manifest in `noomesh.yaml`, plus
+/// every system a REGISTERED add-on's signed bundle declares
+/// (`addon_registry::declared_systems`, i163 E: switched on, lock verified,
+/// `system.json` valid). Pure.
+///
+/// A name in both: `noomesh.yaml` wins and the bundle's entry is dropped,
+/// with a warning returned per name. Why not refuse: the `noomesh.yaml` entry
+/// is what this database was provisioned from until now (a hand-made entry
+/// from before bundles declared systems), so keeping it changes nothing that
+/// runs; refusing would take a working add-on's schema out of the reconcile
+/// over a line the operator can delete. The bundle's names are fixed by the
+/// add-on name, so the two can only differ in variable names or extensions,
+/// and the warning says how to converge (delete the `systems:` entry).
+pub(crate) fn with_addon_systems(
+    manifest: &BTreeMap<String, SystemConfig>,
+    bundle: BTreeMap<String, SystemConfig>,
+) -> (BTreeMap<String, SystemConfig>, Vec<(String, String)>) {
+    let mut out = manifest.clone();
+    let mut conflicts = Vec::new();
+    for (name, spec) in bundle {
+        if out.contains_key(&name) {
+            conflicts.push((
+                name.clone(),
+                format!(
+                    "system {name:?} is declared both in noomesh.yaml `systems:` and by the add-on's signed bundle \
+                     (system.json); the noomesh.yaml entry wins. Bundle-declared systems need no noomesh.yaml entry: \
+                     remove `systems.{name}` from noomesh.yaml to provision it from the bundle"
+                ),
+            ));
+            continue;
+        }
+        out.insert(name, spec);
+    }
+    (out, conflicts)
 }
 
 /// The reconciler proper, taking the manifest explicitly so it can be tested
@@ -720,6 +760,38 @@ mod tests {
             "the value runs to the end of the line, untouched"
         );
         assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn a_bundle_system_joins_the_manifest_and_noomesh_yaml_wins_a_clash() {
+        let bundle_spec = |id: &str| SystemConfig {
+            role: format!("noo_{id}"),
+            ddl_role: format!("noo_{id}_ddl"),
+            schema: id.to_string(),
+            enabled_when: None,
+            password_env: format!("NOO_{}_DB_PASSWORD", id.to_ascii_uppercase()),
+            ddl_password_env: format!("NOO_{}_DDL_PASSWORD", id.to_ascii_uppercase()),
+            extensions: vec!["pg_trgm".into()],
+        };
+        let manifest = BTreeMap::from([("evolve".to_string(), spec(None))]);
+        let bundle = BTreeMap::from([("example_addon".to_string(), bundle_spec("example_addon"))]);
+        let (merged, conflicts) = with_addon_systems(&manifest, bundle);
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["example_addon"].password_env, "NOO_EXAMPLE_ADDON_DB_PASSWORD");
+        assert!(intent_declared("example_addon", &merged["example_addon"], &BTreeMap::new()), "no flag: the registry gated it");
+        assert!(!missing_credential_is_fatal("example_addon"), "a bundle system missing a password is skipped, never fatal");
+
+        // Declared in both: noomesh.yaml's entry is kept, untouched, and the
+        // clash is reported by name.
+        let mut mine = bundle_spec("example_addon");
+        mine.password_env = "NOO_HAND_MADE_PASSWORD".into();
+        let manifest = BTreeMap::from([("example_addon".to_string(), mine)]);
+        let bundle = BTreeMap::from([("example_addon".to_string(), bundle_spec("example_addon"))]);
+        let (merged, conflicts) = with_addon_systems(&manifest, bundle);
+        assert_eq!(merged["example_addon"].password_env, "NOO_HAND_MADE_PASSWORD");
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].1.contains("noomesh.yaml entry wins"), "{}", conflicts[0].1);
     }
 
     #[test]

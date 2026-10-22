@@ -26,6 +26,14 @@
 //! reason is in the log and in [`refusal`] (so `/health` reads `unhealthy`),
 //! and it never loads silently.
 //!
+//! ## A registered add-on's database
+//!
+//! Its signed bundle may also declare a database system (`system.json`),
+//! delivered by the launcher for enabled + verified add-ons
+//! ([`crate::addon_decls`], i163 E). It is read here, for a registered
+//! add-on only, and an invalid one refuses the add-on like an invalid
+//! manifest. The systems broker reads [`declared_systems`].
+//!
 //! ## Where the verified lock comes from
 //!
 //! The CLI verifies a lock (`noo addons enable | upgrade`: `addon_lock::verify`
@@ -301,6 +309,7 @@ pub struct AddonEntry {
     manifest: AddonManifest,
     delegate_enabled: bool,
     verification: Verification,
+    system: Option<crate::addon_decls::AddonSystem>,
 }
 
 impl AddonEntry {
@@ -310,7 +319,18 @@ impl AddonEntry {
         delegate_enabled: bool,
         verification: Verification,
     ) -> Self {
-        Self { name: name.to_string(), manifest, delegate_enabled, verification }
+        Self { name: name.to_string(), manifest, delegate_enabled, verification, system: None }
+    }
+
+    /// Attach the database system its bundle declares.
+    pub(crate) fn with_system(mut self, system: Option<crate::addon_decls::AddonSystem>) -> Self {
+        self.system = system;
+        self
+    }
+
+    /// The database system its bundle declares (`system.json`), validated.
+    pub fn system(&self) -> Option<&crate::addon_decls::AddonSystem> {
+        self.system.as_ref()
     }
 
     /// The add-on's name (`addons.<name>`, `noo-<name>`).
@@ -462,6 +482,8 @@ impl Snapshot {
 pub struct Inputs<'a> {
     /// Where manifests are delivered: `<dir>/<name>/routes.json`.
     pub dir: &'a FsPath,
+    /// Where the launcher delivers `system.json`: `<dir>/<name>/system.json`.
+    pub systems_dir: &'a FsPath,
     /// `addons:` from `noomesh.yaml`.
     pub declared: &'a HashMap<String, bool>,
     /// `addon_delegation:` from `noomesh.yaml`.
@@ -541,7 +563,20 @@ pub fn build(inp: &Inputs, table_on: &dyn Fn(&str) -> bool) -> Snapshot {
                          `delegate: \"tasks\"`, so nothing is delegated"
                     ));
                 }
-                snap.entries.insert(name.to_string(), Arc::new(AddonEntry::new(name, manifest, enabled, v)));
+                // The database its bundle declares: read for a registered
+                // add-on only, and an invalid declaration refuses the whole
+                // add-on (never a partial surface).
+                let system = match crate::addon_decls::read_system(inp.systems_dir, name) {
+                    Ok(d) => d,
+                    Err(why) => {
+                        snap.refused.insert(name.to_string(), why);
+                        continue;
+                    }
+                };
+                snap.entries.insert(
+                    name.to_string(),
+                    Arc::new(AddonEntry::new(name, manifest, enabled, v).with_system(system)),
+                );
             }
             Err(why) => {
                 snap.refused.insert(name.to_string(), why);
@@ -612,6 +647,7 @@ pub fn reload() -> Arc<Snapshot> {
     let snap = build(
         &Inputs {
             dir: FsPath::new(crate::addon_proxy::ROUTES_DIR),
+            systems_dir: FsPath::new(crate::addon_decls::SYSTEMS_DIR),
             declared: &cfg.addons,
             delegation: &cfg.addon_delegation,
             reported: &reported,
@@ -629,6 +665,7 @@ pub fn reload() -> Arc<Snapshot> {
             verification = ?e.verification(),
             delegates_tasks = e.delegates_tasks(),
             operator_enabled = e.operator_enabled(),
+            system = e.system().map(|s| s.schema.as_str()).unwrap_or("-"),
             "add-on registered"
         );
         if matches!(e.verification(), Verification::LegacyLauncher) {
@@ -678,6 +715,25 @@ pub fn refusals() -> BTreeMap<String, String> {
 /// for; `None` for every other add-on (i163 part A; `/health` `addons_dev`).
 pub fn dev_label(name: &str) -> Option<String> {
     current().dev_label_at(name, now_unix())
+}
+
+impl Snapshot {
+    /// The database systems registered add-ons declare, by system name (the
+    /// add-on name with `-` as `_`), as `systems:` entries.
+    pub fn declared_systems(&self) -> BTreeMap<String, crate::config::SystemConfig> {
+        self.entries
+            .values()
+            .filter_map(|e| {
+                e.system().map(|s| (crate::addon_decls::system_id(e.name()), crate::addon_decls::to_system_config(e.name(), s)))
+            })
+            .collect()
+    }
+}
+
+/// The database systems registered add-ons declare (i163 E), for the
+/// systems broker. Keyed by system name.
+pub fn declared_systems() -> BTreeMap<String, crate::config::SystemConfig> {
+    current().declared_systems()
 }
 
 #[cfg(test)]
@@ -749,6 +805,7 @@ mod tests {
         build(
             &Inputs {
                 dir,
+                systems_dir: &dir.join(".no-systems"),
                 declared: &declared(decl),
                 delegation: &delegation(deleg),
                 reported,
@@ -1120,6 +1177,84 @@ mod tests {
                 out.push(p);
             }
         }
+    }
+
+    // ── bundle declaration: system.json (i163 E) ─────────────────────────
+
+    const EX: &str = "example-addon";
+
+    /// Plant `system.json` the way the launcher delivers it, and build.
+    fn run_decls(dir: &FsPath, system: Option<&Value>, decl: &[(&str, bool)], reported: &Reported) -> Snapshot {
+        let sys = dir.join("systems");
+        if let Some(s) = system {
+            std::fs::create_dir_all(sys.join(EX)).unwrap();
+            std::fs::write(sys.join(EX).join(crate::addon_decls::SYSTEM_FILE), s.to_string()).unwrap();
+        }
+        build(
+            &Inputs {
+                dir,
+                systems_dir: &sys,
+                declared: &declared(decl),
+                delegation: &delegation(&[]),
+                reported,
+                gateway_stack: Some(STACK),
+            },
+            &|_| false,
+        )
+    }
+
+    fn ex_system() -> Value {
+        json!({"schema": "example_addon", "role": "noo_example_addon", "ddl_role": "noo_example_addon_ddl"})
+    }
+
+    #[test]
+    fn a_registered_addon_contributes_its_system() {
+        let dir = scratch("decls-ok");
+        plant(&dir, EX, &third_party(EX));
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &verified(&[(EX, "0.1.0", STACK)]));
+        assert!(snap.refused.is_empty(), "{:?}", snap.refused);
+        let systems = snap.declared_systems();
+        let s = systems.get("example_addon").expect("its system is declared under the underscored name");
+        assert_eq!((s.role.as_str(), s.ddl_role.as_str()), ("noo_example_addon", "noo_example_addon_ddl"));
+        assert_eq!(s.password_env, "NOO_EXAMPLE_ADDON_DB_PASSWORD");
+        assert_eq!(s.enabled_when, None);
+        // A dev build registers too (a source checkout signs nothing).
+        let dir = scratch("decls-dev");
+        plant(&dir, EX, &third_party(EX));
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &Reported::Dev);
+        assert!(snap.declared_systems().contains_key("example_addon"));
+    }
+
+    #[test]
+    fn an_unverified_disabled_or_wrong_stack_addon_contributes_nothing() {
+        let dir = scratch("decls-unverified");
+        plant(&dir, EX, &third_party(EX));
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &verified(&[]));
+        assert!(snap.refusal(EX).is_some());
+        assert!(snap.declared_systems().is_empty());
+
+        let dir = scratch("decls-off");
+        plant(&dir, EX, &third_party(EX));
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, false)], &verified(&[(EX, "0.1.0", STACK)]));
+        assert!(snap.refusal(EX).is_none());
+        assert!(snap.declared_systems().is_empty());
+
+        let dir = scratch("decls-stack");
+        plant(&dir, EX, &third_party(EX));
+        let snap = run_decls(&dir, Some(&ex_system()), &[(EX, true)], &verified(&[(EX, "0.1.0", "v0.0.1")]));
+        assert!(snap.declared_systems().is_empty());
+    }
+
+    #[test]
+    fn an_invalid_system_refuses_the_whole_addon() {
+        let dir = scratch("decls-bad-system");
+        plant(&dir, EX, &third_party(EX));
+        let mut bad = ex_system();
+        bad["role"] = json!("noo_app");
+        let snap = run_decls(&dir, Some(&bad), &[(EX, true)], &verified(&[(EX, "0.1.0", STACK)]));
+        assert!(snap.get(EX).is_none(), "no routes for an add-on whose system.json is refused");
+        assert!(snap.refusal(EX).unwrap().contains("`role`"));
+        assert!(snap.declared_systems().is_empty());
     }
 
     #[test]
