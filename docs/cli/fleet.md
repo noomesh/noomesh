@@ -699,8 +699,8 @@ drain_started, drained_at}`.
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
-| `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends and keep them paused, to free its GPU; an owned lease (operator-only) |
-| `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold you hold (or any, with --force): GPU backends resume once the GPU has stayed free, or now (operator-only) |
+| `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends, held as an owned lease until released (operator) |
+| `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold by its lease (or any with --force); backends resume when free, or now |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
