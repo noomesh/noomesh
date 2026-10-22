@@ -1296,9 +1296,11 @@ mod tests {
 // and the only publisher of tasks.dispatch.*, so it declares them at boot,
 // the way it already declares AGENT_MESSAGES.
 
-/// The two job-plane streams, as the Python declaration defined them.
+/// The job-plane streams: `EVENTS` and `TASKS` as the Python declaration
+/// defined them, plus `WORK_EMBED` (i179), the work queue nodes PULL bulk
+/// embedding batches from. Nothing publishes to it yet.
 pub fn job_plane_stream_configs() -> Vec<async_nats::jetstream::stream::Config> {
-    use async_nats::jetstream::stream::{Config, StorageType};
+    use async_nats::jetstream::stream::{Config, DiscardPolicy, RetentionPolicy, StorageType};
     vec![
         Config {
             name: "EVENTS".to_string(),
@@ -1316,10 +1318,25 @@ pub fn job_plane_stream_configs() -> Vec<async_nats::jetstream::stream::Config> 
             storage: StorageType::File,
             ..Default::default()
         },
+        // `work.` not `tasks.`: TASKS owns `tasks.>` and JetStream rejects
+        // overlapping stream subjects. Not `worker.` either (denied to nodes).
+        // WorkQueue + DiscardPolicy::New: a full queue refuses the publish, so
+        // the submitter sees back-pressure instead of losing the oldest batch.
+        Config {
+            name: "WORK_EMBED".to_string(),
+            subjects: vec!["work.embed.>".to_string()],
+            description: Some("Bulk embedding batches pulled by nodes".to_string()),
+            retention: RetentionPolicy::WorkQueue,
+            max_age: std::time::Duration::from_secs(6 * 60 * 60),
+            max_messages: 100_000,
+            discard: DiscardPolicy::New,
+            storage: StorageType::File,
+            ..Default::default()
+        },
     ]
 }
 
-/// Create `EVENTS` and `TASKS` if they do not exist. Create-only, never
+/// Create `EVENTS`, `TASKS` and `WORK_EMBED` if they do not exist. Create-only, never
 /// update: a fleet that has carried these streams for months keeps whatever
 /// limits it has; this exists for the install that has none.
 pub async fn ensure_job_plane_streams(js: &async_nats::jetstream::Context) {
@@ -1341,10 +1358,10 @@ mod job_plane_stream_tests {
     use super::job_plane_stream_configs;
 
     #[test]
-    fn the_two_streams_match_the_python_declaration_they_replace() {
+    fn the_job_plane_streams_match_their_declaration() {
         let cfgs = job_plane_stream_configs();
         let names: Vec<&str> = cfgs.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["EVENTS", "TASKS"]);
+        assert_eq!(names, vec!["EVENTS", "TASKS", "WORK_EMBED"]);
         let tasks = &cfgs[1];
         assert_eq!(tasks.subjects, vec!["tasks.>".to_string()]);
         assert_eq!(tasks.max_age.as_secs(), 7 * 24 * 60 * 60);
@@ -1353,5 +1370,16 @@ mod job_plane_stream_tests {
         assert_eq!(events.max_age.as_secs(), 24 * 60 * 60);
         // tasks.dispatch.<node> — the scheduler's subject — must be covered
         assert!(tasks.subjects.iter().any(|s| s == "tasks.>"));
+        // i179: the pulled-work stream. Its subject must overlap neither
+        // `tasks.>` nor `events.>` (JetStream rejects overlap at create).
+        let embed = &cfgs[2];
+        assert_eq!(embed.subjects, vec!["work.embed.>".to_string()]);
+        assert!(matches!(embed.retention, async_nats::jetstream::stream::RetentionPolicy::WorkQueue));
+        assert!(matches!(embed.discard, async_nats::jetstream::stream::DiscardPolicy::New));
+        assert_eq!(embed.max_age.as_secs(), 6 * 60 * 60);
+        assert!(embed.max_messages > 0, "an unbounded work queue has no back-pressure");
+        for other in [&cfgs[0], &cfgs[1]] {
+            assert!(other.subjects.iter().all(|s| !s.starts_with("work.")));
+        }
     }
 }
