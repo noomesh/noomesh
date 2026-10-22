@@ -106,10 +106,7 @@ impl Credentials {
 
 /// Current unix time in seconds.
 pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::host_exec::now_unix().max(0) as u64
 }
 
 /// Where the credential file lives: `$NOO_CREDENTIALS_FILE`, else

@@ -372,17 +372,6 @@ fn is_wsl() -> bool {
         .unwrap_or(false)
 }
 
-fn which(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p).any(|dir| {
-                let c = dir.join(name);
-                c.is_file() || c.is_symlink()
-            })
-        })
-        .unwrap_or(false)
-}
-
 /// Feed the value to the tool on stdin. Returns whether it was accepted.
 fn clip_copy(tool: &ClipTool, value: &str) -> bool {
     let Some((prog, rest)) = tool.copy.split_first() else {
@@ -493,7 +482,7 @@ pub fn shred_file(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    if which("shred") {
+    if crate::host_exec::which("shred").is_some() {
         let ok = Command::new("shred")
             .arg("-u")
             .arg(path)

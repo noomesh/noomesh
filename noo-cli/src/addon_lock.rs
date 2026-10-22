@@ -155,13 +155,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Seconds since the epoch, now.
-pub fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+/// Seconds since the epoch, now (re-exported from the one owner).
+pub use crate::host_exec::now_unix;
 
 impl TrustAnchor {
     /// Where this add-on's lock and images are fetched from: `pull` when

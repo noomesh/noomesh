@@ -38,11 +38,7 @@ pub fn proactive_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         "{}",
         ui::header(
             "proactive agent",
-            Some(&format!(
-                "{}/{} rules enabled",
-                body["rules_enabled"].as_u64().unwrap_or(0),
-                body["rules_total"].as_u64().unwrap_or(0)
-            ))
+            Some(&rules_enabled_text(&body))
         )
     );
     print!(
@@ -60,6 +56,23 @@ pub fn proactive_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         ])
     );
     Ok(0)
+}
+
+/// "3/5 rules enabled", or "rules enabled: not reported" when the gateway
+/// sent either count as anything but a number (i191 D5: absent is not 0).
+fn rules_enabled_text(body: &serde_json::Value) -> String {
+    match (body["rules_enabled"].as_u64(), body["rules_total"].as_u64()) {
+        (Some(on), Some(total)) => format!("{on}/{total} rules enabled"),
+        _ => format!("rules enabled: {}", ui::state("not reported")),
+    }
+}
+
+/// "30s", or "not reported" for a rule that carries no cooldown figure.
+fn cooldown_cell(rule: &serde_json::Value) -> String {
+    match rule["cooldown_seconds"].as_u64() {
+        Some(n) => format!("{n}s"),
+        None => ui::state("not reported"),
+    }
 }
 
 /// `noo proactive rules` — GET /api/proactive/rules.
@@ -101,7 +114,7 @@ pub fn proactive_rules(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 truncate(&trigger, 30),
                 truncate(r["action_type"].as_str().unwrap_or(""), 14),
                 truncate(&channels, 20),
-                format!("{}s", r["cooldown_seconds"].as_u64().unwrap_or(0)),
+                cooldown_cell(r),
                 if on { "on".into() } else { ui::muted("off") },
             ]
         })
@@ -146,4 +159,19 @@ pub fn proactive_history(g: &Globals, args: &[String]) -> Result<i32, Unhandled>
         ui::failed(msg, Some("noo proactive status"));
     }
     Ok(crate::output::ExitCode::Generic as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_rule_counts_are_not_reported_not_zero() {
+        let t = rules_enabled_text(&serde_json::json!({"rules_total": 4}));
+        assert!(t.contains("Not reported") && !t.contains('0') && !t.contains("0/"), "{t}");
+        assert_eq!(rules_enabled_text(&serde_json::json!({"rules_enabled": 0, "rules_total": 4})), "0/4 rules enabled");
+        let c = cooldown_cell(&serde_json::json!({"id": "r1"}));
+        assert!(c.contains("Not reported") && !c.contains('0'), "{c}");
+        assert_eq!(cooldown_cell(&serde_json::json!({"cooldown_seconds": 30})), "30s");
+    }
 }

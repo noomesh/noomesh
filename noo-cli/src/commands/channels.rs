@@ -48,9 +48,9 @@ fn status_rows(channels: &serde_json::Map<String, serde_json::Value>) -> Vec<Vec
             let traffic = if stats.is_object() {
                 format!(
                     "{} received / {} sent / {} errors",
-                    stats["received"].as_u64().unwrap_or(0),
-                    stats["sent"].as_u64().unwrap_or(0),
-                    stats["errors"].as_u64().unwrap_or(0)
+                    ui::count(stats, "received"),
+                    ui::count(stats, "sent"),
+                    ui::count(stats, "errors")
                 )
             } else {
                 ui::muted("not tracked")
@@ -290,5 +290,14 @@ mod status_tests {
         let line = rows[0].join(" ");
         assert!(line.contains("not tracked"), "{line}");
         assert!(!line.contains("0 received"), "{line}");
+    }
+
+    #[test]
+    fn a_stats_object_missing_a_counter_says_not_reported_for_that_counter() {
+        let body = serde_json::json!({"channels": {
+            "telegram": {"configured": true, "stats": {"received": 5, "errors": 0}}}});
+        let rows = status_rows(body["channels"].as_object().unwrap());
+        let line = rows[0].join(" ");
+        assert!(line.contains("5 received / Not reported sent / 0 errors"), "{line}");
     }
 }

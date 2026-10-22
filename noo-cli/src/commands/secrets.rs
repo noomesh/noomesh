@@ -3580,11 +3580,9 @@ fn record_rotations(store: &Path, keys: &[String], now: u64) -> Result<(), Strin
     Ok(())
 }
 
+/// u64 view of the one clock (`host_exec::now_unix`); the age math here is unsigned.
 fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::host_exec::now_unix().max(0) as u64
 }
 
 /// The review interval the policy commits to.

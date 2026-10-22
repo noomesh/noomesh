@@ -542,7 +542,7 @@ fn run_toggle(_g: &Globals, args: &[String], enabling: bool) -> Result<i32, Unha
     // that grants the feature only produces a gateway that refuses
     // "unlicensed" — say so here, before minting anything.
     if let Some(feature) = licensed_feature(&name) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let now = crate::host_exec::now_unix();
         match crate::entitlement::installed_grants(feature, now) {
             Ok(ent) => ui::done(&format!("{name} is licensed to '{}' (feature `{feature}`)", ent.sub)),
             Err(why) => {

@@ -64,6 +64,15 @@ fn print_flat(body: &serde_json::Value) {
     print!("{}", ui::kv(&refs));
 }
 
+/// The `archived` row of `recall refresh`: "N conversations", or "not
+/// reported" when the gateway sent no count (i191 D5).
+fn archived_cell(archive: &serde_json::Value) -> String {
+    match &archive["archived"] {
+        serde_json::Value::Number(n) => format!("{n} conversations"),
+        _ => ui::count(archive, "archived"),
+    }
+}
+
 /// `noo recall videos` — GET /api/v1/recall/videos.
 pub fn recall_videos(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     if !args.is_empty() {
@@ -89,7 +98,7 @@ pub fn recall_videos(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             let size_mb = v["size_bytes"].as_f64().unwrap_or(0.0) / (1024.0 * 1024.0);
             vec![
                 truncate(v["path"].as_str().unwrap_or("?"), 60),
-                v["records"].as_u64().unwrap_or(0).to_string(),
+                ui::count(v, "records"),
                 format!("{size_mb:.1} MB"),
             ]
         })
@@ -145,7 +154,7 @@ pub fn recall_search(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 (i + 1).to_string(),
                 ui::muted(&format!("{:.3}", r["score"].as_f64().unwrap_or(0.0))),
                 ui::muted(&format!("{:.3}", r["prominence_score"].as_f64().unwrap_or(0.0))),
-                r["access_count"].as_u64().unwrap_or(0).to_string(),
+                ui::count(r, "access_count"),
                 truncate(r["record_type"].as_str().unwrap_or("?"), 14),
                 truncate(r["text_preview"].as_str().unwrap_or(""), 70),
             ]
@@ -193,7 +202,7 @@ pub fn recall_prominent(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
             vec![
                 (i + 1).to_string(),
                 ui::muted(&format!("{:.3}", r["prominence_score"].as_f64().unwrap_or(0.0))),
-                r["access_count"].as_u64().unwrap_or(0).to_string(),
+                ui::count(r, "access_count"),
                 ui::muted(&format!("{:.2}", r["avg_relevance"].as_f64().unwrap_or(0.0))),
                 if last.is_empty() { ui::warn("never") } else { ui::muted(&last.chars().take(10).collect::<String>()) },
                 truncate(r["record_type"].as_str().unwrap_or("?"), 12),
@@ -298,10 +307,10 @@ pub fn recall_lifecycle(g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
     print!(
         "{}",
         ui::kv(&[
-            ("prominence updated", data["prominence_updated"].as_u64().unwrap_or(0).to_string()),
-            ("pruned", data["pruned"].as_u64().unwrap_or(0).to_string()),
-            ("elevated", data["elevated"].as_u64().unwrap_or(0).to_string()),
-            ("compacted", data["compacted"].as_u64().unwrap_or(0).to_string()),
+            ("prominence updated", ui::count(&data, "prominence_updated")),
+            ("pruned", ui::count(&data, "pruned")),
+            ("elevated", ui::count(&data, "elevated")),
+            ("compacted", ui::count(&data, "compacted")),
         ])
     );
     if let Some(errors) = data["errors"].as_array().filter(|e| !e.is_empty()) {
@@ -339,7 +348,7 @@ fn lifecycle_preview(g: &Globals) -> Result<i32, Unhandled> {
         vec![
             (i + 1).to_string(),
             ui::muted(&format!("{:.3}", r["prominence"].as_f64().unwrap_or(0.0))),
-            r["access_count"].as_u64().unwrap_or(0).to_string(),
+            ui::count(r, "access_count"),
             date,
             truncate(r["record_type"].as_str().unwrap_or("?"), 14),
             truncate(r["text_preview"].as_str().unwrap_or(""), 50),
@@ -403,10 +412,10 @@ pub fn recall_refresh(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     print!(
         "{}",
         ui::kv(&[
-            ("archived", format!("{} conversations", archive["archived"].as_u64().unwrap_or(0))),
-            ("pruned", lifecycle["pruned"].as_u64().unwrap_or(0).to_string()),
-            ("elevated", lifecycle["elevated"].as_u64().unwrap_or(0).to_string()),
-            ("compacted", lifecycle["compacted"].as_u64().unwrap_or(0).to_string()),
+            ("archived", archived_cell(archive)),
+            ("pruned", ui::count(lifecycle, "pruned")),
+            ("elevated", ui::count(lifecycle, "elevated")),
+            ("compacted", ui::count(lifecycle, "compacted")),
         ])
     );
     ui::guide(&[
@@ -455,6 +464,17 @@ pub fn recall_test(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_rows_do_not_invent_zero_for_a_count_the_gateway_omitted() {
+        let archive = serde_json::json!({});
+        let cell = archived_cell(&archive);
+        assert!(cell.contains("Not reported") && !cell.contains('0'), "{cell}");
+        assert_eq!(archived_cell(&serde_json::json!({"archived": 0})), "0 conversations");
+        assert_eq!(archived_cell(&serde_json::json!({"archived": 12})), "12 conversations");
+        let hits = ui::count(&serde_json::json!({"text_preview": "x"}), "access_count");
+        assert!(hits.contains("Not reported") && !hits.contains('0'), "{hits}");
+    }
 
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

@@ -24,6 +24,7 @@
 //! rather than a bare 404 — same posture as the installer.
 
 use std::process::Command;
+use crate::host_exec::which;
 use crate::output::{fail, ExitCode};
 use crate::release_fetch::{self, FetchError};
 use crate::{Globals, Unhandled};
@@ -2162,7 +2163,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
     // for them only burns the wait window and fails the whole stage
     // (host8-ma, v0.2.93 roll). Skip them loudly, with the one command that
     // catches them up. Judged once, up front, from the registry.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::host_exec::now_unix();
     let read_records = || -> Vec<(String, Option<serde_json::Value>)> {
         names.iter().map(|n| (n.clone(), super::provision::live_node_record(g, n))).collect()
     };
@@ -2180,7 +2181,7 @@ fn upgrade_nodes(g: &Globals) -> Result<i32, Unhandled> {
         records, uptime, now,
         &mut |_| read_records(),
         &mut |secs| std::thread::sleep(std::time::Duration::from_secs(secs)),
-        &mut || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+        &mut || crate::host_exec::now_unix(),
         &mut |line| match (g.json, ui::stderr_is_tty()) {
             (true, _) => {}
             // One line counting down, not a new line every 5 s.
@@ -3542,12 +3543,6 @@ fn swap_binary(exe: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         format!("cannot replace {} ({e})", exe.display())
     })?;
     Ok(())
-}
-
-/// First `name` on PATH, if any.
-fn which(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// Would rolling from `prev` (the .env pin) to `tag` move the controller
