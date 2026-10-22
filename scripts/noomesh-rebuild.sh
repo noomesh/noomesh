@@ -302,6 +302,8 @@ COMPOSE_FILES="$(compose_file_args .)"
 # a rebuild is a dev start, so they get the dev build's names here
 # (lib-dist.sh require_addon_pins; DIST_MODE is never 1 in a rebuild).
 DIST_MODE=0 require_addon_pins || exit 1
+# The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
+addon_decls_materialise || exit 1
 
 while [[ $# -gt 0 ]]; do
     case $1 in

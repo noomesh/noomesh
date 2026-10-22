@@ -491,6 +491,10 @@ else
     # A dev start: composed add-on overlays run the dev build's names.
     DIST_MODE=0 require_addon_pins || exit 1
 fi
+# What the verified add-ons' signed bundles declare beyond their overlays
+# (system.json, workloads.json) goes to the gateway's read-only directories,
+# for exactly the add-ons the verdict above names (lib-dist.sh).
+addon_decls_materialise || exit 1
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$SCRIPT_DIR/lib-created-guard.sh"
 source "$SCRIPT_DIR/lib-stuck-container.sh"

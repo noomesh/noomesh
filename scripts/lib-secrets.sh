@@ -243,37 +243,63 @@ _pgpass_body() {
 #   <name> <enabled_when var or -> <password_env> <ddl_password_env> <addon>
 # <addon> is on/off for a system named after an add-on (`addons.<name>`
 # decides) and - for any other (its flag decides; no flag = always on).
-# The ONE place the launcher learns which systems exist. Today the source is
-# the `systems:` manifest in ./noomesh.yaml, read by `noo config launch-render
-# systems` (the CLI's own parser, the one `noo systems` and the pre-`up`
-# credential check use; no second YAML reader here). A further source (an
-# add-on bundle's system fragment) appends its lines here and nothing
-# downstream changes: not compose, not the gateway's lookup.
+# The ONE place the launcher learns which systems exist. Two sources:
+#   1. the `systems:` manifest in ./noomesh.yaml, read by `noo config
+#      launch-render systems` (the CLI's own parser, the one `noo systems`
+#      and the pre-`up` credential check use; no second YAML reader here);
+#   2. add-on bundles (i163 E): ./.noo-addon-systems/<addon>/system.json,
+#      which lib-dist.sh addon_decls_materialise writes ONLY for add-ons
+#      switched on whose signed lock the launcher verified, so each is `on`.
+#      The variable names are derived from the add-on name, never read from
+#      the file (`<id>` = the name with `-` as `_`): `<id> - NOO_<ID>_DB_PASSWORD
+#      NOO_<ID>_DDL_PASSWORD on`. A name source 1 already declared is skipped
+#      (noomesh.yaml wins, as in the gateway's broker).
+# Nothing downstream changes per source: not compose, not the gateway's lookup.
 _declared_systems() {
-    local nb="" rc=0 out
-    [ -f noomesh.yaml ] || return 0
-    if command -v noo_bin >/dev/null 2>&1; then
-        nb="$(noo_bin 2>/dev/null)" || nb=""
-    elif [ -n "${NOO_CLI_BIN:-}" ] && [ -x "$NOO_CLI_BIN" ]; then
-        nb="$NOO_CLI_BIN"
-    else
-        nb="$(command -v noo 2>/dev/null)" || nb=""
-    fi
-    if [ -n "$nb" ]; then
-        out="$("$nb" config launch-render systems noomesh.yaml 2>/dev/null)" || rc=$?
-    else
-        rc=127
-    fi
-    if [ "$rc" != 0 ]; then
-        # Silent only when nothing is declared: a manifest this launcher could
-        # not read is a system whose flag and passwords will not arrive.
-        if grep -qE '^systems:' noomesh.yaml; then
-            echo "WARNING: could not list the declared systems (noo config launch-render systems: exit $rc; an older noo?)." >&2
-            echo "         A system no compose line names will not receive its flag or passwords; the gateway skips it and says so." >&2
+    local nb="" rc=0 out="" d a id up seen=" " name
+    if [ -f noomesh.yaml ]; then
+        if command -v noo_bin >/dev/null 2>&1; then
+            nb="$(noo_bin 2>/dev/null)" || nb=""
+        elif [ -n "${NOO_CLI_BIN:-}" ] && [ -x "$NOO_CLI_BIN" ]; then
+            nb="$NOO_CLI_BIN"
+        else
+            nb="$(command -v noo 2>/dev/null)" || nb=""
         fi
-        return 0
+        if [ -n "$nb" ]; then
+            out="$("$nb" config launch-render systems noomesh.yaml 2>/dev/null)" || rc=$?
+        else
+            rc=127
+        fi
+        if [ "$rc" != 0 ]; then
+            out=""
+            # Silent only when nothing is declared: a manifest this launcher could
+            # not read is a system whose flag and passwords will not arrive.
+            if grep -qE '^systems:' noomesh.yaml; then
+                echo "WARNING: could not list the declared systems (noo config launch-render systems: exit $rc; an older noo?)." >&2
+                echo "         A system no compose line names will not receive its flag or passwords; the gateway skips it and says so." >&2
+            fi
+        fi
     fi
-    printf '%s\n' "$out"
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        while read -r name _; do
+            [ -n "$name" ] && seen="$seen$name "
+        done <<SYSTEMS
+$out
+SYSTEMS
+    fi
+    for d in .noo-addon-systems/*/; do
+        [ -f "${d}system.json" ] || continue
+        a="$(basename "$d")"
+        case "$a" in [a-z]*) : ;; *) continue ;; esac
+        case "$a" in *[!a-z0-9_-]*) continue ;; esac
+        id="$(printf '%s' "$a" | tr '-' '_')"
+        case "$seen" in *" $id "*) continue ;; esac
+        seen="$seen$id "
+        up="$(printf '%s' "$id" | tr 'a-z' 'A-Z')"
+        printf '%s - NOO_%s_DB_PASSWORD NOO_%s_DDL_PASSWORD on\n' "$id" "$up" "$up"
+    done
+    return 0
 }
 
 # _flag_truthy VALUE — the shell truthiness the broker and `noo systems` use.

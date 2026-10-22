@@ -210,6 +210,18 @@ pub(crate) fn enable(config: &Path, addon: &str, ops: &mut dyn EnableOps) -> Res
 
 // ── the live side ──────────────────────────────────────────────────────
 
+/// The database system `addon`'s materialised bundle declares
+/// (`<root>/addons/<addon>/system.json`), as a `systems:` entry. `None` when
+/// it declares none. A declaration that does not validate refuses the enable
+/// (it was validated when pinned; reaching this means it was edited).
+pub(crate) fn bundle_system(root: &Path, addon: &str) -> Result<Option<systems::SystemEntry>, Refusal> {
+    let d = crate::addons::decls::materialised(root, addon).map_err(|e| Refusal {
+        why: format!("{e}. Nothing was changed"),
+        fix: format!("noo addons upgrade {addon}   # re-materialises the signed bundle"),
+    })?;
+    Ok(d.system.map(|s| crate::addons::decls::system_entry(addon, &s)))
+}
+
 const TIMEOUT: u64 = 15;
 
 /// The production [`EnableOps`]: the systems manifest and sops store under
@@ -384,19 +396,34 @@ impl EnableOps for Live<'_> {
 
     fn mint_credentials(&mut self, addon: &str) -> Result<Vec<String>, Refusal> {
         let path = systems::manifest_path();
-        let Ok(text) = std::fs::read_to_string(&path) else { return Ok(Vec::new()) };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
         let manifest = systems::parse_systems(&text).map_err(|e| Refusal {
             why: format!("{}: {e}. Nothing was changed", path.display()),
             fix: "noo systems status".into(),
         })?;
-        let Some(entry) = manifest.get(addon) else { return Ok(Vec::new()) };
+        // A `systems:` entry in noomesh.yaml wins (the gateway does the
+        // same); otherwise the system the add-on's signed bundle declares
+        // (`system.json`, materialised by step 0 and validated there), whose
+        // password variables are derived from the add-on name (i163 E).
+        let (entry, from_bundle) = match manifest.get(addon) {
+            Some(e) => (e.clone(), false),
+            None => match bundle_system(&crate::envfile::repo_root(), addon)? {
+                Some(e) => (e, true),
+                None => return Ok(Vec::new()),
+            },
+        };
+        let entry = &entry;
         systems::mint_credentials(entry, &sops_path()).map(|(minted, _backup)| minted).map_err(|e| Refusal {
             why: format!(
                 "could not mint {}'s credentials ({}): {e}. The switch was not flipped",
                 addon,
                 systems::required_keys(entry).join(", ")
             ),
-            fix: format!("noo systems enable {addon}   # then: noo addons enable {addon}"),
+            fix: if from_bundle {
+                "noo security secrets audit   # the store must be writable; then re-run noo addons enable".to_string()
+            } else {
+                format!("noo systems enable {addon}   # then: noo addons enable {addon}")
+            },
         })
     }
 

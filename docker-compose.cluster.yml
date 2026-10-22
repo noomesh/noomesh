@@ -820,6 +820,15 @@ services:
       # (see node-agent-go/internal/hostd). The gateway drops JSON command
       # files here; the host daemon performs all docker/compose operations.
       - ./.noo-host-spool:/var/run/noo-spool:rw
+      # Add-on bundle declarations (i163 E/B): `<addon>/system.json` and
+      # `<addon>/workloads.json` from each add-on's SIGNED bundle, copied by
+      # the launcher (lib-addons.sh addon_decls_materialise) only for add-ons
+      # switched on whose lock it verified this start. Read-only, like the
+      # route manifests; gateway-rust/src/addon_decls.rs validates them again.
+      # The launcher (and `noo config launch-check bind-sources`) creates
+      # both directories as the operator, never Docker's root.
+      - ./.noo-addon-systems:/opt/noo/addon-systems:ro
+      - ./.noo-addon-workloads:/opt/noo/addon-workloads:ro
       # REMOVED 2026-09-11: `.:/app/project:ro` put the WHOLE checkout —
       # secrets/, pki/, .env — inside this container. Nothing read it:
       # the image WORKDIR is /app, no source references /app/project, and

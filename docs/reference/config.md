@@ -565,14 +565,16 @@ systems:
     password_env: NOO_TRELLION_DB_PASSWORD
     ddl_password_env: NOO_TRELLION_DDL_PASSWORD
     extensions: [vector, pg_trgm]     # installed by the broker (need superuser)
-  example_addon:
-    role: noo_example_addon
-    ddl_role: noo_example_addon_ddl
-    schema: example_addon
-    password_env: NOO_EXAMPLE_ADDON_DB_PASSWORD
-    ddl_password_env: NOO_EXAMPLE_ADDON_DDL_PASSWORD
-    # no enabled_when: a system named after an add-on follows the
-    # `addons:` map. Only a system that is NOT an add-on names an env flag.
+  example_system:
+    role: noo_example_system
+    ddl_role: noo_example_system_ddl
+    schema: example_system
+    password_env: NOO_EXAMPLE_SYSTEM_DB_PASSWORD
+    ddl_password_env: NOO_EXAMPLE_SYSTEM_DDL_PASSWORD
+    enabled_when: NOO_EXAMPLE_SYSTEM_ENABLED
+    # A system named after a built-in add-on (evolve) has no
+    # enabled_when: it follows the `addons:` map. A third-party add-on's
+    # system is never written here: its signed bundle declares it (below).
 ```
 
 `enabled_when` names the env flag that decides whether the system is
@@ -602,6 +604,29 @@ lists it as a down dependency, and `noo systems status` shows the credential
 missing from the store. trellion and evolve keep the old rule: without their
 passwords the gateway refuses to start, and the launcher refuses before `up`
 (`noo config launch-check system-credentials`).
+
+**Systems an add-on's bundle declares.** The `systems:` manifest is not the
+only source. An add-on declares its own database in its signed bundle
+(`system.json`, see
+[Declaring a database](../development/addons.md#declaring-a-database)), never
+in `noomesh.yaml`. The gateway provisions it exactly like a `systems:` entry,
+and only while the add-on is registered: switched on in `addons:`, its signed
+lock verified by the launcher for this stack, and its declarations valid. Its
+names are fixed by the add-on name (`<id>` = the name with `-` as `_`):
+schema `<id>`, roles `noo_<id>` and `noo_<id>_ddl`, passwords
+`NOO_<ID>_DB_PASSWORD` and `NOO_<ID>_DDL_PASSWORD`. `noo addons enable` (and
+`noo upgrade --stack`) mint the two passwords into `secrets/env.sops` when
+absent, and they reach the gateway through the same `noo_systems_secrets`
+file; there is no flag. A missing password follows the rule above (skipped,
+reported, the gateway keeps booting).
+
+If `noomesh.yaml` also has a `systems:` entry with the bundle's system name,
+the `noomesh.yaml` entry wins and the gateway logs a warning naming it: that
+entry is what the database was provisioned from so far, and keeping it changes
+nothing that runs. Remove the entry to let the bundle declare the system.
+
+`noo addons show <name>` prints the system (and workloads) an add-on's bundle
+declares.
 
 ### Other sections
 

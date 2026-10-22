@@ -22,6 +22,11 @@
 //!   `dev` lines beside them (`NOO_ADDONS_DEV`). A launcher that predates
 //!   `dev` lines skips them: it reads only the kinds it knows.
 //!
+//! `launch-pins` also prints one `decl <addon> <file>` line per bundle
+//! declaration file (`system.json`, `workloads.json`) a verified lock lists
+//! (i163 E/B). The launcher copies only those to the gateway (`lib-dist.sh`
+//! `addon_decls_materialise`); an older launcher ignores the kind.
+//!
 //! Nothing here restarts anything: a new pin takes effect on the operator's
 //! next `noo stack restart --force`.
 
@@ -356,9 +361,9 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
         if !seen.insert(addon.to_string()) {
             continue;
         }
-        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check(root, addon, tag, &a));
+        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_files(root, addon, tag, &a));
         match res {
-            Ok(pin) => {
+            Ok((pin, files)) => {
                 // The verdict the gateway's add-on registry reads
                 // (`NOO_ADDONS_VERIFIED`): this add-on's signed lock verified
                 // offline AND lists `tag`. Emitted before its `pin` lines so a
@@ -371,6 +376,14 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
                         None => out.push(format!("refuse {addon} its lock names image {image:?}, which has no variable name")),
+                    }
+                }
+                // The bundle declarations the launcher may hand the gateway:
+                // only files the verified lock lists (and offline_check just
+                // held to their signed hash).
+                for f in crate::addons::decls::DECL_FILES {
+                    if files.contains(*f) {
+                        out.push(format!("decl {addon} {f}"));
                     }
                 }
             }
@@ -456,6 +469,9 @@ pub(crate) fn addon_image_env(
                     refused.push((addon.to_string(), format!("its pinned image {reference} is not on this host"), fix));
                 }
             }
+            // A bundle declaration the launcher copies for the gateway; the
+            // wizard starts no gateway of its own.
+            "decl" => {}
             _ => refused.push((addon.to_string(), format!("no verified pin for {}: {rest}", input.tag), fix)),
         }
     }
@@ -532,6 +548,35 @@ mod tests {
         resolve::record(&d, "trellion_intel", &v, &f, "v0.6.0", None).unwrap();
         let r = v.lock.images["trellion-intel"].clone();
         (d, r)
+    }
+
+    #[test]
+    fn launch_lines_name_only_the_declaration_files_the_verified_lock_lists() {
+        use crate::addons::resolve::tests::{signed_example_bundle, EXAMPLE_SYSTEM, EXAMPLE_WORKLOADS};
+        let d = scratch("decl-lines");
+        let f = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
+        );
+        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        let names = vec!["example-addon".to_string()];
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines[0], "verified example-addon 1.0.0 v0.6.0", "{lines:?}");
+        let decls: Vec<&String> = lines.iter().filter(|l| l.starts_with("decl ")).collect();
+        assert_eq!(decls, ["decl example-addon system.json", "decl example-addon workloads.json"], "{lines:?}");
+
+        // A bundle that lists only its overlay: an unsigned system.json left
+        // beside it is never named.
+        let d = scratch("decl-unsigned");
+        let f = signed_example_bundle(&lock("1.0.0", &["v0.6.0"], None), &[]);
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("system.json"), EXAMPLE_SYSTEM).unwrap();
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert!(lines[0].starts_with("verified "), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("decl ")), "{lines:?}");
     }
 
     #[test]

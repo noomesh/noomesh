@@ -84,6 +84,8 @@ restart_require_lock() {
 # Licensed add-ons run only their signed, local pins for this tag (see
 # lib-dist.sh require_addon_pins); restart never pulls one either.
 require_addon_pins || exit 1
+# The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
+addon_decls_materialise || exit 1
 
 DEFAULT_PROFILE="controller"
 

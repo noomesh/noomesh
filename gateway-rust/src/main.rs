@@ -112,6 +112,7 @@ mod graph_prune;
 mod addon_auth;
 mod alert_digest;
 mod addons;
+mod addon_decls;
 mod addon_proxy;
 mod addon_workloads;
 mod addon_delegation;

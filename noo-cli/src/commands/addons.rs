@@ -460,12 +460,185 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         );
     }
     println!();
+    print_bundle_decls(&crate::envfile::repo_root());
     ui::guide(&[
+        ("noo addons show <name>", "the database and workloads an add-on's signed bundle declares"),
         ("noo addons enable <name>", "pins a licensed add-on's signed lock, then declares it on"),
         ("noo addons verify", "re-checks every pin against its signed lock and what runs"),
         ("noo stack restart", "applies it — the switch decides which containers run"),
     ]);
     Ok(0)
+}
+
+/// `list`'s "bundle declarations" section: each add-on whose materialised
+/// bundle declares a database or workloads (or fails to validate). Nothing
+/// is printed when none does. Its JSON form is `noo addons show <name> --json`.
+fn print_bundle_decls(root: &std::path::Path) {
+    let decls = bundle_decls(root);
+    let nothing = crate::addons::decls::Declared::default();
+    if decls.iter().any(|(_, d)| !matches!(d, Ok(x) if *x == nothing)) {
+        println!("{}", ui::section("bundle declarations"));
+        for (name, d) in &decls {
+            match d {
+                Ok(d) if *d == nothing => {}
+                Ok(d) => {
+                    let mut parts = Vec::new();
+                    if let Some(sys) = &d.system {
+                        parts.push(format!("database {}", sys.schema));
+                    }
+                    if !d.workloads.is_empty() {
+                        parts.push(format!(
+                            "workloads {}",
+                            d.workloads.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    println!("{}", ui::status_line(ui::Glyph::Bullet, &format!("{name}: {}", parts.join("; "))));
+                }
+                Err(e) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{name}: {e}"))),
+            }
+        }
+        println!();
+    }
+}
+
+// ── bundle declarations (i163 E/B) ──────────────────────────────────────
+
+/// Every add-on with a materialised bundle under `<root>/addons/`, with what
+/// it declares beyond its overlay (or why that does not validate).
+fn bundle_decls(root: &std::path::Path) -> Vec<(String, Result<crate::addons::decls::Declared, String>)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join(crate::addons::pins::ADDONS_DIR)) else { return out };
+    for e in rd.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+        if !crate::addons::trust::name_ok(&name) || !e.path().is_dir() {
+            continue;
+        }
+        out.push((name.clone(), crate::addons::decls::materialised(root, &name)));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn decl_json(d: &Result<crate::addons::decls::Declared, String>) -> serde_json::Value {
+    match d {
+        Err(e) => json!({"error": e}),
+        Ok(d) => json!({
+            "system": d.system.as_ref().map(|s| json!({
+                "schema": s.schema, "role": s.role, "ddl_role": s.ddl_role, "extensions": s.extensions,
+            })),
+            "workloads": d.workloads.iter().map(|w| json!({
+                "name": w.name, "container": w.container, "gpu": w.gpu, "need_mb": w.need_mb,
+                "drain": {"route": w.drain_route, "timeout_secs": w.drain_timeout_secs},
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// `noo addons show <name>`: one add-on's switch, pin, and what its signed
+/// bundle declares (database system, managed workloads). Reads the
+/// materialised bundle on this controller; changes nothing.
+pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [name] = args else { return Err(Unhandled) };
+    if name.starts_with('-') {
+        return Err(Unhandled);
+    }
+    let key = row(name).map_or(name.as_str(), |r| r.key);
+    if !crate::addons::trust::name_ok(key) {
+        fail(g.json, ExitCode::Usage, "unknown_addon", &format!("`{name}` is not an add-on name"), Some("noo addons list"));
+    }
+    let root = crate::envfile::repo_root();
+    let declared = declared_map().ok().and_then(|m| m.get(key).copied());
+    let default_on = row(key).is_some_and(|r| r.default_on);
+    let pin = crate::addons::pins::read(&root).unwrap_or_default().get(key).cloned();
+    let bundle_dir = crate::addons::pins::addon_dir(&root, key);
+    let has_bundle = bundle_dir.is_dir();
+    let decls = if has_bundle { crate::addons::decls::materialised(&root, key) } else { Ok(Default::default()) };
+    let (pw, ddl) = crate::addons::decls::password_envs(key);
+
+    if g.json {
+        println!(
+            "{}",
+            json!({
+                "addon": key,
+                "declared": declared,
+                "effective": resolve(declared, default_on),
+                "pin": pin.as_ref().map(|p| json!({"version": p.version, "stack": p.stack})),
+                "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
+                "declarations": decl_json(&decls),
+                "password_env": decls.as_ref().ok().and_then(|d| d.system.as_ref()).map(|_| json!([pw, ddl])),
+            })
+        );
+        return Ok(if decls.is_ok() { 0 } else { 1 });
+    }
+
+    println!("{}", ui::header(&format!("add-on {key}"), Some(&config_path().display().to_string())));
+    let eff = resolve(declared, default_on);
+    println!(
+        "{}",
+        ui::kv(&[
+            ("switch", match declared {
+                Some(true) => ui::good("on"),
+                Some(false) => ui::bad("off"),
+                None => ui::muted(&format!("not declared → {}", if eff { "on" } else { "off" })),
+            }),
+            ("pin", pin.as_ref().map_or_else(|| ui::muted("none"), |p| format!("{} for {}", p.version, p.stack))),
+            ("bundle", if has_bundle { bundle_dir.display().to_string() } else { ui::muted("none on this controller") }),
+        ])
+    );
+    let rc = match &decls {
+        Err(e) => {
+            println!("{}", ui::status_line(ui::Glyph::Err, e));
+            1
+        }
+        Ok(d) => {
+            println!("{}", ui::section("database"));
+            match &d.system {
+                None => println!("{}", ui::muted("  none declared")),
+                Some(sys) => println!(
+                    "{}",
+                    ui::kv(&[
+                        ("schema", sys.schema.clone()),
+                        ("runtime role", sys.role.clone()),
+                        ("migration role", sys.ddl_role.clone()),
+                        ("extensions", if sys.extensions.is_empty() { ui::muted("none") } else { sys.extensions.join(", ") }),
+                        ("passwords", format!("{pw}, {ddl} (names only; in the encrypted store)")),
+                    ])
+                ),
+            }
+            println!("{}", ui::section("workloads"));
+            if d.workloads.is_empty() {
+                println!("{}", ui::muted("  none declared"));
+            } else {
+                let rows: Vec<Vec<String>> = d
+                    .workloads
+                    .iter()
+                    .map(|w| {
+                        vec![
+                            w.name.clone(),
+                            w.container.clone(),
+                            if w.gpu { "gpu".into() } else { "cpu".into() },
+                            format!("{} MiB", w.need_mb),
+                            format!("{} ({}s)", w.drain_route, w.drain_timeout_secs),
+                        ]
+                    })
+                    .collect();
+                print!(
+                    "{}",
+                    ui::table(
+                        &[ui::Col::left("name"), ui::Col::left("container"), ui::Col::left("device"), ui::Col::left("needs"), ui::Col::left("drain")],
+                        &rows
+                    )
+                );
+            }
+            0
+        }
+    };
+    println!();
+    ui::guide(&[
+        ("noo addons verify", "re-checks the pin and the bundle files against the signed lock"),
+        ("noo stack restart --force", "hands the declarations to the gateway (switched on and verified only)"),
+    ]);
+    Ok(rc)
 }
 
 /// What `enable` does about the licence. `Ok(Some(feature))` = proceed but
@@ -990,6 +1163,29 @@ compose_env:
         assert_eq!(row("trellion_intel").unwrap().key, "trellion_intel");
         assert!(row("trellion-intelx").is_none());
         assert!(row("nope").is_none());
+    }
+
+    #[test]
+    fn show_and_list_read_the_declarations_of_each_materialised_bundle() {
+        let root = std::env::temp_dir().join(format!("noo-addons-decls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ex = root.join("addons").join("example-addon");
+        std::fs::create_dir_all(&ex).unwrap();
+        std::fs::write(ex.join("docker-compose.yml"), "services: {}\n").unwrap();
+        std::fs::write(ex.join("system.json"), r#"{"schema":"example_addon","role":"noo_example_addon","ddl_role":"noo_example_addon_ddl"}"#).unwrap();
+        std::fs::write(ex.join("workloads.json"), r#"{"workloads":[{"name":"worker","container":"noo-example-addon-worker","gpu":false,"need_mb":512,"drain":{"route":"drain","timeout_secs":30}}]}"#).unwrap();
+        let bad = root.join("addons").join("broken-addon");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("system.json"), r#"{"schema":"public","role":"noo_app","ddl_role":"noo"}"#).unwrap();
+        let got = bundle_decls(&root);
+        assert_eq!(got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["broken-addon", "example-addon"]);
+        assert!(got[0].1.is_err());
+        let j = decl_json(&got[1].1);
+        assert_eq!(j["system"]["schema"], "example_addon");
+        assert_eq!(j["workloads"][0]["container"], "noo-example-addon-worker");
+        assert_eq!(j["workloads"][0]["drain"]["timeout_secs"], 30);
+        assert!(decl_json(&got[0].1)["error"].as_str().unwrap().contains("`schema`"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn tmp(name: &str, body: &str) -> std::path::PathBuf {

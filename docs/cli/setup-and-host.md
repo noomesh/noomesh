@@ -333,6 +333,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
+| `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database and workloads its signed bundle declares |
 | `noo addons enable` | `<name> [--force] [--lock <path\|https-url>]` | Pin an add-on's signed lock, mint its credentials and key, then declare it ON |
 | `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]` | Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key |
 | `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |

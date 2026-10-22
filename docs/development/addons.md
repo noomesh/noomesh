@@ -49,6 +49,8 @@ because everything else is something only you can keep true.
 | 6 | MCP tool fragment | `mcp-tools-<addon>.json`, named by `NOO_MCP_EXTRA_MANIFEST` | optional — only if your add-on should appear as MCP tools |
 | 7 | Compose overlay | `docker-compose.<addon>.yml` with an explicit env allowlist | the launcher composes it when `addons.<name>` is declared on in `noomesh.yaml` |
 | 8 | Gateway client | e.g. `gateway_client.py` | everything in the gateway's domain routes back over HTTP, and only you know which calls you make |
+| 9 | Database declaration | `system.json` in your signed bundle | optional: your schema and roles, provisioned by the gateway (see [Declaring a database](#declaring-a-database)) |
+| 10 | Workload declaration | `workloads.json` in your signed bundle | optional: containers noomesh may start, stop and drain for you (see [Declaring workloads](#declaring-workloads)) |
 
 ## A minimal worked example: `example-addon`
 
@@ -882,7 +884,8 @@ no add-on registry.
 **The bundle.** A release also signs a second lock, `addon-bundle.json`, in
 the format `noo-addon-lock/2`: the same fields plus `files`, each file the
 add-on ships beside its images (its compose overlay, `docker-compose.yml`, at
-least) by name and `sha256:…`. One signature therefore covers the overlay too.
+least; `system.json` and `workloads.json` when it declares them) by name and
+`sha256:…`. One signature therefore covers the overlay and the declarations.
 Sign it with the same command and one `--file <name>=<path>` per file, then
 check it with `verify … --files-dir <dir>`. File names are one plain component
 (`[A-Za-z0-9._-]`).
@@ -1002,3 +1005,126 @@ leftover root overlay (`docker-compose.evolve.yml`,
 `docker-compose.trellion-intel.yml`), moving it aside as `.retired-<version>`
 if it was edited. Every add-on lock published for stack v0.6.2 and later is a
 bundle.
+
+## Declaring a database
+
+An add-on that owns tables declares its database system in its signed bundle,
+as a file named `system.json` listed in `files` like the overlay. It is never
+written in `noomesh.yaml`. The gateway's systems broker provisions it exactly
+like a `systems:` entry (see
+[the `systems` reference](../reference/config.md#systems--the-per-system-database-manifest-gateway-broker)):
+the schema owned by the migration role, a runtime role with no `CREATE`, the
+default privileges, and the extensions.
+
+```json
+{
+  "schema": "example_addon",
+  "role": "noo_example_addon",
+  "ddl_role": "noo_example_addon_ddl",
+  "extensions": ["pg_trgm"]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `schema` | exactly `<id>`, the add-on name with `-` as `_` (`example-addon` → `example_addon`) |
+| `role` | exactly `noo_<id>`: the runtime role (DML, no `CREATE`) |
+| `ddl_role` | exactly `noo_<id>_ddl`: owns the schema; run your migrations as it |
+| `extensions` | optional; each one of `vector`, `pg_trgm`, `pgcrypto`, `citext`, `btree_gin`, `btree_gist`, `hstore`, `unaccent`, `fuzzystrmatch` (the broker installs them as superuser, so the list is closed) |
+
+Any other value, any other field, or an add-on whose `<id>` would be a core
+name (`app`, `worker`, `gateway`, `admin`, `public`, `mesh`, `noo`, … or a
+`pg_` prefix) refuses the bundle. `noo addons enable | upgrade` refuses it
+before anything is pinned, and the gateway refuses the whole add-on (no routes)
+if one reaches it anyway.
+
+**Passwords are derived, never declared:** `NOO_<ID>_DB_PASSWORD` (runtime)
+and `NOO_<ID>_DDL_PASSWORD` (migrations). `noo addons enable <name>` mints
+both into the encrypted store when absent (never rotates), and `noo upgrade
+--stack` does the same for every add-on switched on. The launcher delivers
+them to the gateway in its one systems-secrets file. Your overlay delivers
+them to your own containers the usual way (`file: ${NOO_SECRET_RUNDIR}/<name>`
+with `x-noo-source: NOO_<ID>_DB_PASSWORD`).
+
+**When it is provisioned.** Only while the add-on is registered: switched on
+(`addons.<name>: true`), its signed lock verified by the launcher for this
+stack, and its manifest and declarations valid. On every `noo stack start |
+restart` the launcher copies `system.json` from the verified bundle to
+`.noo-addon-systems/<name>/system.json` in the install root, which the gateway
+mounts read-only at `/opt/noo/addon-systems/<name>/system.json`. A file the
+signed lock does not list is never copied. Switching the add-on off stops
+the declaration on the next start; like `noo systems disable`, that drops no
+role, schema or row.
+
+A `systems:` entry in `noomesh.yaml` with the same name wins, with a warning
+in the gateway log. A missing password skips the system (ERROR in the log,
+`dependencies.systems` on `/health`), and the gateway keeps booting.
+
+Your data-owning service runs on the controller, on the private database
+network, and connects as `noo_<id>` (migrations as `noo_<id>_ddl`) to the
+`noomesh` database with the cluster CA. Nodes never connect to Postgres.
+
+## Declaring workloads
+
+An add-on whose containers continuously consume a piece of the mesh (a voice,
+image or video worker with its model loaded on a GPU) declares them in its
+signed bundle as `workloads.json`. The gateway's add-on workload registry
+(`addon_workloads`) and the node agent's actuator consume it, and a
+reservation names a workload as `<addon>/<name>` (noomesh-internal i163 part B
+and the reservations layer).
+
+```json
+{
+  "workloads": [
+    {
+      "name": "worker",
+      "container": "noo-example-addon-worker",
+      "gpu": true,
+      "need_mb": 11264,
+      "drain": { "route": "drain", "timeout_secs": 120 }
+    }
+  ]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `name` | lowercase letters, digits and `-`, starting with a letter, at most 32; unique in the file; a reservation names it `<addon>/<name>` |
+| `container` | `noo-<addon>-<suffix>` (suffix: lowercase letters, digits, `-`; at most 63 characters in all); unique. The container must also carry the labels `noo.addon=<addon>` and `noo.workload=<name>` in your overlay |
+| `gpu` | `true` when the workload needs a GPU |
+| `need_mb` | memory it needs on that device, MiB, 1 to 262144 |
+| `drain.route` | the `name` of an `internal` route in your `routes.json`; noomesh calls it through the add-on proxy before stopping the workload |
+| `drain.timeout_secs` | 1 to 600 |
+
+Every field is required, unknown fields are refused, and at most 16 workloads
+may be declared. Nothing in the file names an image, a command or a mount: the
+node agent starts only the container your verified overlay already defines.
+
+The launcher copies the file from the verified bundle to
+`.noo-addon-workloads/<name>/workloads.json` in the install root (mounted
+read-only in the gateway at `/opt/noo/addon-workloads/<name>/workloads.json`),
+under the same rule as `system.json`: switched on, lock verified this start,
+and the file listed in the signed lock. `noo addons enable | upgrade` refuses a
+bundle whose `workloads.json` breaks a rule above (and checks `drain.route`
+when the bundle also ships `routes.json`); the gateway checks `drain.route`
+against the manifest it loaded. Nodes receive the registered add-ons'
+workloads in `desired-config` (`addon_workloads`) and act on nothing else.
+
+**Shipping it.** Add the files to the bundle when you sign it:
+
+```sh
+noo security addon-lock sign --out addon-bundle.json … \
+  --file docker-compose.yml=docker-compose.example-addon.yml \
+  --file system.json=deploy/system.json \
+  --file workloads.json=deploy/workloads.json
+```
+
+and push each as an `application/vnd.noomesh.addon-file.v1` layer next to the
+overlay. A CLI from before these files materialises them and ignores them; a
+gateway from before them never reads them. Ship them with a `supports_stack`
+that starts at the release that reads them. In a development checkout, put
+`system.json` and `workloads.json` beside your `docker-compose.<name>.yml`; a
+dev start copies them from there.
+
+`noo addons show <name>` prints what an add-on's bundle declares; `noo addons
+list` lists the add-ons that declare anything.
