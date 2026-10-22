@@ -146,6 +146,9 @@ pub(crate) trait TaskRuntime: HarnessRuntime {
     /// One finished loop's tokens, against the task and in the usage table
     /// with the task id and the backend that served it.
     async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()>;
+    /// A loop answered in text and called no tool (i171): finish the task
+    /// with that text, as `noo_task_done` would have. Returns the state after.
+    async fn finish_text(&mut self, task_id: &str, text: &str) -> Result<String>;
 }
 
 /// The gateway's own runtime: the loop running in the same process as
@@ -168,6 +171,10 @@ impl TaskRuntime for InProcessRuntime<'_> {
 
     async fn budget_check(&mut self, task_id: &str) -> Result<crate::task_budget::BudgetCheck> {
         crate::task_budget::check(self.state, task_id).await
+    }
+
+    async fn finish_text(&mut self, task_id: &str, text: &str) -> Result<String> {
+        crate::tasks::finish_text(self.state, task_id, text).await
     }
 
     async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()> {

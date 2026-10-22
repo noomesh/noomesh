@@ -87,7 +87,11 @@ pub enum HarnessOp {
     /// A foreign CLI's verdict on its task (`harness::driver`): the
     /// `noo_task_done` a native loop calls as a tool, for a loop the gateway
     /// cannot see into.
-    TaskDone { task_id: String, result: String, #[serde(default)] failed: bool },
+    ///
+    /// `text_answer` (i171): a NATIVE loop's answer given in text with no
+    /// tool call, sent by the runner on the model's behalf; the gateway then
+    /// applies the native evidence mark. Absent from older runners: false.
+    TaskDone { task_id: String, result: String, #[serde(default)] failed: bool, #[serde(default)] text_answer: bool },
     // a foreign CLI's way back in
     /// Mint the short-lived user-door key a foreign CLI reaches noomesh's
     /// tools with: bound to the token's person, expiring with the turn.
@@ -214,7 +218,7 @@ mod tests {
             HarnessOp::ExecuteTool { call: ToolCall { id: "1".into(), name: "web_search".into(), arguments: json!({"query": "x"}) } },
             HarnessOp::MaybeSummary { backend: ResolvedBackend { url: "u".into(), model: "m".into(), backend_type: "vllm".into(), api_format: "openai".into() }, turn: 4 },
             HarnessOp::Usage { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, calls: 3, model: "qwen".into(), kind: "copilot".into(), task_id: Some("t1".into()) },
-            HarnessOp::TaskDone { task_id: "t1".into(), result: "shipped".into(), failed: false },
+            HarnessOp::TaskDone { task_id: "t1".into(), result: "shipped".into(), failed: false, text_answer: true },
             HarnessOp::DoorKey,
             HarnessOp::DoorKeyRevoke { key_id: "k1".into() },
             HarnessOp::BudgetCheck { task_id: "t1".into() },
@@ -270,7 +274,7 @@ mod tests {
             HarnessOp::OperatorAlert { kind: String::new(), target: String::new(), cooldown_secs: 0, message: String::new() },
             HarnessOp::TaskCheckpoint { task_id: String::new(), loops: 0, note: None, exhausted: false },
             HarnessOp::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, calls: 0, model: String::new(), kind: String::new(), task_id: None },
-            HarnessOp::TaskDone { task_id: String::new(), result: String::new(), failed: false },
+            HarnessOp::TaskDone { task_id: String::new(), result: String::new(), failed: false, text_answer: false },
             HarnessOp::DoorKey,
             HarnessOp::DoorKeyRevoke { key_id: String::new() },
             HarnessOp::BudgetCheck { task_id: String::new() },
