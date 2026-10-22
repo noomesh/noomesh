@@ -235,11 +235,11 @@ pub fn for_nodes() -> Vec<Value> {
     declared().iter().map(WorkloadDecl::for_node).collect()
 }
 
-/// The front door's rule for the workload proxy
-/// (`/api/addon-workloads/{addon}/{workload}/proxy/...`): an add-on's own
-/// token (`sub = addon:<addon>`) may reach the routes under ITS OWN add-on
-/// name and no other. Everything else on the path stays with the tier gate
-/// (an operator passes it anyway).
+/// The front door's rule for the workload proxy and status
+/// (`/api/addon-workloads/{addon}/{workload}/proxy/...` and `.../status`): an
+/// add-on's own token (`sub = addon:<addon>`) may reach the routes under ITS
+/// OWN add-on name and no other. Everything else on the path stays with the
+/// tier gate (an operator passes it anyway).
 pub fn proxy_allows(sub: &str, path: &str) -> bool {
     let Some(addon) = sub.strip_prefix(crate::auth::ADDON_SUBJECT_PREFIX) else { return false };
     if addon.is_empty() || !crate::addon_registry::name_ok(addon) {
@@ -247,7 +247,7 @@ pub fn proxy_allows(sub: &str, path: &str) -> bool {
     }
     let Some(rest) = path.strip_prefix("/api/addon-workloads/") else { return false };
     let Some((owner, tail)) = rest.split_once('/') else { return false };
-    owner == addon && tail.split('/').nth(1) == Some("proxy")
+    owner == addon && matches!(tail.split('/').nth(1), Some("proxy") | Some("status"))
 }
 
 /// Group declarations by add-on, for a report.
@@ -345,6 +345,8 @@ mod tests {
         assert!(proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/proxy/v1/health"));
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/proxy/x"), "another add-on's workload");
         assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/start"), "the actuator is not the proxy");
+        assert!(proxy_allows("addon:pai-voice", "/api/addon-workloads/pai-voice/voice-worker/status"), "its own status");
+        assert!(!proxy_allows("addon:pai-voice", "/api/addon-workloads/evolve/worker/status"));
         assert!(!proxy_allows("addon:pai-voice", "/api/cluster/reservations"), "not the reservation API");
         assert!(!proxy_allows("user:alice", "/api/addon-workloads/pai-voice/voice-worker/proxy/x"), "not an add-on token");
         assert!(!proxy_allows("addon:", "/api/addon-workloads//x/proxy/x"));
