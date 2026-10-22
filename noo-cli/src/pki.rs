@@ -415,9 +415,15 @@ pub const SERVICE_KEY_READERS: &[(&str, KeyReader)] = &[
     ("grafana", KeyReader::ContainerUid(65532)),
     // nginx:1.27-alpine: the master process loads certificates as root.
     ("model-cache", KeyReader::ContainerRoot),
-    // evolve: python:3.12-slim with no USER line (root); the overlay's
-    // entrypoint stages the key to /tmp as that uid before libpq reads it.
-    ("evolve", KeyReader::ContainerRoot),
+    // evolve (personifAI/trellion-evolve, from v0.1.4): a DHI python base
+    // ending `USER 65532:65532`, and its overlay pins `user: nonroot`. Through
+    // v0.1.3 it was python:3.12-slim running as root, which is why this row
+    // said ContainerRoot; a root-owned 0600 key then crash-looped v0.1.4 on
+    // every host (`PermissionError: [Errno 13] '/tls/services/evolve/
+    // service.key'`, 0.6.10-rc.3 rehearsal). Its launch script stages a 0600
+    // copy for libpq, so the 0640 group grant is never handed to libpq.
+    // Long term this uid belongs in the add-on's own declaration, not here.
+    ("evolve", KeyReader::ContainerUid(65532)),
     // docker/Dockerfile.sandbox ends `USER nonroot`: 65532, measured with
     // `docker run --rm --entrypoint id` on the published sandbox image.
     // uvicorn reads the key itself (`--ssl-keyfile`). Mounted under /tls,
@@ -2844,6 +2850,11 @@ mod key_mode_tests {
         assert_eq!(r("services/sandbox/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.sandbox USER nonroot");
         assert_eq!(r("services/whisper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.whisper USER nonroot (i105)");
         assert_eq!(r("services/piper/service.key"), KeyReader::ContainerUid(65532), "Dockerfile.piper USER nonroot (i105)");
+        assert_eq!(
+            r("services/evolve/service.key"),
+            KeyReader::ContainerUid(65532),
+            "evolve >= v0.1.4 is DHI USER 65532: a root-owned 0600 key crash-loops it (0.6.10-rc.3)"
+        );
         assert_eq!(r("services/postgres/service.key"), KeyReader::ContainerUid(70));
         // The stunnel doors and the NVIDIA exporter run as 65532 (i132).
         for door in ["ollama", "ollama-embed", "ollama-embed-cpu", "tei", "reranker", "llamacpp", "nvidia-exporter"] {

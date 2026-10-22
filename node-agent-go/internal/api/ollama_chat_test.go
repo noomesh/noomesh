@@ -439,3 +439,31 @@ func TestProxyRefusesAReservedTokenReplyAndCutsAReservedTokenStream(t *testing.T
 		t.Fatalf("the stream was cut, not relayed whole: %d tokens reached the caller", n)
 	}
 }
+
+// The allowlist runs before the translator (handleInferenceProxy): a
+// thinking switch the translator reads must survive it, or it is a silent
+// no-op (i183: chat_template_kwargs was stripped for ollama, so
+// enable_thinking=false left thinking on). Composed, the two must agree.
+func TestThinkingOffSurvivesTheAllowlistIntoTheOllamaBody(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false}}`,
+		`{"model":"x","messages":[],"reasoning":{"effort":"none"}}`,
+		`{"model":"x","messages":[],"reasoning_effort":"none"}`,
+		`{"model":"x","messages":[],"think":false}`,
+	} {
+		filtered := filterBodyForBackend([]byte(body), "ollama")
+		req, err := openAIToOllamaChat(filtered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := decode(t, req.body)
+		if v, ok := out["think"]; !ok || v != false {
+			t.Errorf("%s: think=%v after the allowlist, want false", body, out["think"])
+		}
+		for _, k := range []string{"chat_template_kwargs", "reasoning", "reasoning_effort"} {
+			if _, ok := out[k]; ok {
+				t.Errorf("%s: %s must be consumed by the translator, not sent to ollama", body, k)
+			}
+		}
+	}
+}

@@ -64,7 +64,9 @@ DDL = [
     "embedding_model text, embedding_dim integer)",
     "CREATE TABLE trellion_episodes (id uuid PRIMARY KEY, persona_id text NOT NULL, record_type text, "
     f"index_name text, content_summary text, prominence_score double precision, metadata jsonb, "
-    f"embedding vector({DIM}), user_id text)",
+    # embedding_model/embedding_dim: trellion migration 106_embedding_provenance
+    # (the archiver writes both on every episode since trellion c833b8c).
+    f"embedding vector({DIM}), user_id text, embedding_model text, embedding_dim integer)",
     "CREATE TABLE noo_user_settings (username text NOT NULL, key text NOT NULL, value jsonb NOT NULL, "
     "updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (username, key))",
 ]
