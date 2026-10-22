@@ -105,10 +105,16 @@ noo security posture set NOO_CLUSTER_TOKEN_V1 0
 (on a release that introduces the key, add `NOO_CLUSTER_TOKEN_V1` to
 `compose_env:` first and set it after the roll; a gate cannot be set before
 the release that defines it). A v1 token is then answered `401
-cluster_token_v1_refused` with the fix in the body. A node agent honours the
-same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), but the
-provisioned agent environment does not carry that key yet, so today the gateway
-is where the door closes; the agents keep counting v1 callers regardless. A node rolled
+cluster_token_v1_refused` with the fix in the body, and counted as a refusal,
+not a use: under `cluster_hmac_v1_refused` (gateway and agents alike), so
+`cluster_hmac_v1` stays admissions only and the `legacy lanes` row names a
+refused caller in a warning of its own. A node agent honours the
+same switch from its own environment (`NOO_CLUSTER_TOKEN_V1=0`), and
+`noo cluster provision` renders it from the controller's posture, so after
+`posture set` the next bundle (`noo upgrade --nodes`, or `noo cluster provision
+<node>`) closes the door on each node too; the agents keep counting v1 callers
+until then. The provision output says `NOT CHECKED` when it could not read the
+posture. A node rolled
 *before* its controller can pin the old form with `NOO_CLUSTER_TOKEN_SIGN=v1`.
 
 One claimed name is refused outright: an HMAC whose actor is the `noo` CLI
@@ -170,7 +176,7 @@ as registered, else the source address of the route to the controller) and on
 loopback, not on every interface. A docker bridge, a second NIC or a public
 address no longer sees the port. `NODE_AGENT_BIND` overrides: `all` (or
 `0.0.0.0`) restores every interface, or a comma list of IPs binds exactly
-those; a hostname is refused at start with a message naming the setting. When
+those; a hostname is refused at start with a message naming the setting. Set it for the fleet on the controller (`NODE_AGENT_BIND` in `.env` / `compose_env`): `noo cluster provision` renders it into each node's env with every bundle, and refuses an invalid value before staging anything. When
 no usable address is known the agent falls back to every interface and logs
 that it did, and a derived address that later changes (DHCP, tailscale coming
 up after the agent) is followed within a minute by a rebind. There is no
@@ -323,7 +329,8 @@ nothing else:
   `N_CTX` `N_THREADS` `N_BATCH` `N_PARALLEL` `GPU_MEMORY_UTILIZATION`
   `TENSOR_PARALLEL_SIZE` `GPU_COUNT` `OLLAMA_MODEL` `OLLAMA_HOST`
   `OLLAMA_NUM_PARALLEL` `OLLAMA_KEEP_ALIVE` `OLLAMA_MAX_LOADED_MODELS`
-  `OLLAMA_CONTEXT_LENGTH` `LOG_LEVEL` `RUST_LOG`
+  `OLLAMA_CONTEXT_LENGTH` `OLLAMA_FLASH_ATTENTION` `OLLAMA_KV_CACHE_TYPE`
+  `LOG_LEVEL` `RUST_LOG`
   (embed placements: `--env OLLAMA_NUM_PARALLEL=4` is the declared way to raise
   an ollama embedder's concurrency; an EMBEDDER's context window is not a
   placement setting, the gateway sends `options.num_ctx` on each embed
@@ -392,7 +399,9 @@ else plain alpine with stunnel installed at first start; the conf travels
 in `STUNNEL_CONF` (the agent owns no host directory a root-in-container
 sidecar should read from); `no-new-privileges`, `CapDrop ALL` plus
 `DAC_OVERRIDE` to read the leaf key, and `NET_BIND_SERVICE` only for a
-door below 1024. The sidecar forwards plaintext to the backend container
+door below 1024. The agent runs it as root (`User: "0"`) whatever the image's
+`USER` says: the published image runs the controller's doors as uid 65532, but
+a node's leaf is a root-owned `0600` file. The sidecar forwards plaintext to the backend container
 on the bridge; the backend's raw port stays reachable to OTHER containers
 on that bridge until each backend gets a private network (a deferred step
 the operator is exploring) — the sidecar is the door every client is
@@ -459,6 +468,73 @@ harness call carries tools; natively each token streams as it is made, so
 the gateway's and the harness's stream idle bounds see progress rather
 than silence. `/v1/completions` and `/v1/embeddings` are reverse-proxied
 as before.
+
+**A full backend is busy, not wedged.** The proxy counts each inference
+request against the backend's declared slots (`internal/occupancy`: Ollama's
+`OLLAMA_NUM_PARALLEL`, llama.cpp's `N_PARALLEL`, vLLM's `VLLM_MAX_NUM_SEQS`,
+read from the placement env the reconciler started it with; undeclared =
+unknown = counted, never queued here). When every slot is taken a request
+is not left to sit silently in the engine's own queue: with `X-Noo-Busy:
+reject` it gets `503 backend_busy` at once with `Retry-After` and
+`X-Noo-Queue` (how many wait ahead), so a caller with another candidate goes
+there; otherwise it waits its turn, first come first served, up to the
+first-byte bound, and a STREAMING request gets its SSE headers at once and a
+`: queued` / `: keep-alive` comment every 5 s while it waits. An admitted
+stream whose engine stays silent for 10 s (a long prefill) gets its headers
+and keep-alives the same way, so the gateway's 30 s windows see a live
+connection; an engine that refuses faster than that keeps its own status
+code, and a refusal that arrives after the headers went out is carried as an
+SSE error event. Every response names `X-Noo-In-Flight` and `X-Noo-Slots`,
+and each backend's heartbeat entry carries `in_flight`, `slots`, `queued`.
+SSE comment lines are ignored by every consumer on the path (the gateway's
+aggregate reader counts bytes; its pass-through forwards them; the harness
+and the vendor-CLI translator skip lines that are not `data:`).
+noomesh-internal i159, parts A and B.
+
+**A GPU hold is an owned lease, and it drains first.** `POST /gpu/hold`
+(controller-only) carries `{reason, owner, operation_id, mode, timeout_secs,
+force}` and `POST /gpu/release` carries `{operation_id, generation, force,
+resume}` (`internal/gpuyield`, `lease.go`). The agent persists the lease
+(`owner`, `operation_id`, the node's monotonic `generation`) and reports it
+in `gpu_contention.lease`; a release must quote the operation id and
+generation it was given (compare-and-set) or it is `409 held_by_other` with
+the current lease, so a stale retry can never end another operation's hold.
+`force` takes over or ends any hold and the gateway audits it as a force; a
+body with no operation id is a legacy call from an older CLI, treated as a
+force and audited `legacy`. One hold or release runs per node at a time
+(`409 transition_in_progress`, in the gateway and in the agent). In mode
+`drain` (the default) the hold closes admission on the GPU backends first
+(`occupancy.SetDraining`: a new request is answered `503 backend_draining`
+with `X-Noo-Busy: draining` at once, never queued; the gateway serves it
+elsewhere and raises no alert), waits until `in_flight` is 0 on each of
+them up to `timeout_secs` (default 120, cap 900), then stops them as before.
+A drain that times out aborts the hold: admission reopens, the state is
+restored, nothing was stopped, and the answer is `409 drain_timeout`
+(`status: needs_attention`, the counts still in flight). A request in
+flight is never cut by a drain hold; `immediate` (the old behaviour, a 30 s
+grace then kill) is for emergencies and is labelled so in the lease. The
+gateway marks the node's lanes out of routing before it asks the agent
+(`classes::set_node_draining`) and keeps the paused lanes out until the
+release, so the heartbeat's `paused_backends` never has to catch up. A
+drain cut short by an agent restart is not restored as a hold; the
+generation is.
+
+**The add-on workload actuator.** `POST /api/addon-workloads/{addon}/{workload}/start|stop`
+and `GET /api/addon-workloads/{addon}/{workload}` (controller-only) act on
+ONE kind of container: one that a verified add-on bundle declared
+(desired-config `addon_workloads`: `{addon, name, container, gpu, need_mb}`,
+held in `internal/addonwl`) AND that carries the labels `noo.addon=<addon>`
+and `noo.workload=<workload>` AND has the declared name. The caller sends
+the two names and nothing else: no image, command, mount or env ever comes
+over this door; start means start the container the add-on's own compose
+created, stop is a graceful stop that keeps its spec. An undeclared workload
+is 404 `not_declared`, a declared one with no such container 404
+`no_container`, and a GPU workload is refused 409 `gpu_not_held` unless the
+node's GPU is under a hold (the reservation holds first, so the pool's
+backends are paused, never stopped under the worker). The container proxy
+(`/api/containers/{name}/proxy/…`) admits a declared workload container
+beside the ones the agent started itself, so the gateway's reserved-workload
+proxy reaches the worker's loopback port, WebSocket upgrades included.
 
 **How a host agent reaches a door.** The agent is a host process
 (systemd on Linux, launchd on macOS); container names do not resolve on
@@ -762,6 +838,13 @@ the controller sends in desired-config for every placement with no image of
 its own (from 0.6.9; before that only a manual `/start` carried it, and a
 recreate fell back to the node's versioned default with no digest, which the
 agent refuses).
+
+From 0.6.10 the agent replaces it by itself: on its next reconcile, a
+running backend on a floating ref is drift, recreated once from the pinned
+ref through the normal start path. That path still honours a GPU yield or
+hold, still needs the placement, and leaves the old container running if
+the start is refused (a controller `OLLAMA_IMAGE` naming `:latest`, say);
+the row then stays, and the agent's `reconcile.start_failed` says why.
 
 The controller never sends a floating ref either. An operator
 `VLLM_IMAGE`, `VLLM2_IMAGE` or `OLLAMA_IMAGE` set to `:latest` (or with no

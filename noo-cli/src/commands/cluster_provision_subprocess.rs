@@ -83,8 +83,24 @@ pub fn cluster_import_model(g: &Globals, args: &[String]) -> Result<i32, Unhandl
     // The store must hold the pair the agent will ask for, or the import
     // fails one hop later with a less useful message.
     let store = gguf_store_dir();
-    let mf = store.join(format!("{name}.Modelfile"));
-    if !mf.is_file() {
+    // `ollama:<tag>` (or an unambiguous bare tag) names a registry tag that
+    // `noo models fetch ollama:<tag>` staged; the node resolves the same tag
+    // to the same pair and imports it through the verified path. A tag that
+    // is not staged is refused here, naming the fetch command.
+    let (name, mf, staged) = match super::ollama_stage::resolve_import_target(name, &store) {
+        Ok(super::ollama_stage::ImportTarget::Staged(r)) => {
+            let mf = store.join(format!("{}.Modelfile", r.stem()));
+            (r.short(), mf, true)
+        }
+        Ok(super::ollama_stage::ImportTarget::Plain(n)) => {
+            let mf = store.join(format!("{n}.Modelfile"));
+            (n, mf, false)
+        }
+        Err(e) => fail(g.json, ExitCode::Generic, "not_staged", &e,
+            Some("`noo models fetch ollama:<tag>` stages a registry tag in the controller store; `noo cluster ship-model <hf_id> <node>` publishes a converted model")),
+    };
+    let name = name.as_str();
+    if !staged && !mf.is_file() {
         // Not published yet: a model that ships as an OCI artifact under the
         // release namespace (<prefix>/<name>:v1 — harrier does) can be
         // staged from the registry the stack already logs into. On

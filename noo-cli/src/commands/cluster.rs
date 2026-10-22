@@ -1385,9 +1385,12 @@ pub(crate) fn current_env_for(
     placements
         .as_array()
         .and_then(|ps| {
+            // A node may serve several embed models (one row each), so the
+            // row is found by model as well as (backend, role).
             ps.iter().find(|p| {
                 p["backend"].as_str() == Some(backend)
                     && p["role"].as_str().filter(|r| !r.is_empty()).unwrap_or("chat") == want_role
+                    && (want_role != "embed" || p["model"].as_str() == Some(model))
             })
         })
         .filter(|p| p["model"].as_str() == Some(model))
@@ -1477,6 +1480,19 @@ mod placement_env_tests {
         assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "harrier"), json!({"OLLAMA_NUM_PARALLEL": "4"}));
         // A role with no row yet has nothing to inherit.
         assert_eq!(current_env_for(&placements, "ollama", Some("rerank"), "x"), serde_json::Value::Null);
+    }
+
+    /// A node serving two embedding spaces has two embed rows: each model
+    /// finds its own env, whichever row comes first.
+    #[test]
+    fn place_finds_the_embed_row_by_model() {
+        let placements = json!([
+            {"backend": "ollama", "role": "embed", "model": "harrier", "env": {"OLLAMA_NUM_PARALLEL": "4"}},
+            {"backend": "ollama", "role": "embed", "model": "nomic-embed-code", "env": {"OLLAMA_NUM_PARALLEL": "2"}}
+        ]);
+        assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "nomic-embed-code"), json!({"OLLAMA_NUM_PARALLEL": "2"}));
+        assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "harrier"), json!({"OLLAMA_NUM_PARALLEL": "4"}));
+        assert_eq!(current_env_for(&placements, "ollama", Some("embed"), "bge-m3"), serde_json::Value::Null);
     }
 
     #[test]
@@ -1594,7 +1610,7 @@ mod placement_env_tests {
     }
 }
 
-/// `noo cluster unplace NODE BACKEND` —
+/// `noo cluster unplace NODE BACKEND [--role R [--model M]]` —
 /// DELETE /api/cluster/nodes/{node}/placements/{backend}. The agent stops
 /// managing the backend.
 ///
@@ -1608,15 +1624,22 @@ mod placement_env_tests {
 pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut positional: Vec<&String> = Vec::new();
     let mut role: Option<&String> = None;
+    let mut model: Option<&String> = None;
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
         match tok.as_str() {
             "--role" => role = Some(iter.next().ok_or(Unhandled)?),
+            // Which embed model to remove: a node may serve several.
+            "--model" => model = Some(iter.next().ok_or(Unhandled)?),
             t if t.starts_with('-') => return Err(Unhandled),
             _ => positional.push(tok),
         }
     }
     let [node, backend] = positional.as_slice() else { return Err(Unhandled) };
+    if model.is_some() && role.map(|r| r.as_str()) != Some("embed") {
+        crate::output::fail(g.json, crate::output::ExitCode::Usage, "bad_model",
+            "--model names which embed model to remove: pass it with --role embed", None);
+    }
     let mut path = format!(
         "/api/cluster/nodes/{}/placements/{}",
         super::urlencode(node),
@@ -1624,15 +1647,19 @@ pub fn cluster_unplace(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     );
     if let Some(r) = role {
         path.push_str(&format!("?role={}", super::urlencode(r)));
+        if let Some(m) = model {
+            path.push_str(&format!("&model={}", super::urlencode(m)));
+        }
     }
     let resp = delete_json(g, &path, true, 10);
     if g.json {
         println!("{resp}");
         return Ok(0);
     }
-    match role {
-        Some(r) => ui::done(&format!("{node}: {backend} {r} placement removed")),
-        None => ui::done(&format!("{node}: {backend} placement removed")),
+    match (role, model) {
+        (Some(r), Some(m)) => ui::done(&format!("{node}: {backend} {r} placement of {m} removed")),
+        (Some(r), None) => ui::done(&format!("{node}: {backend} {r} placement removed")),
+        _ => ui::done(&format!("{node}: {backend} placement removed")),
     }
     Ok(0)
 }
@@ -3103,6 +3130,9 @@ pub fn cluster_sync_model_files(g: &Globals, args: &[String]) -> Result<i32, Unh
             .map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
                     .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("gguf"))
+                    // A weight `noo models fetch ollama:<tag>` staged rides a
+                    // placement (the node imports it), not a push to every node.
+                    .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(crate::commands::ollama_stage::is_staged_name))
                     .collect()
             })
             .unwrap_or_default();

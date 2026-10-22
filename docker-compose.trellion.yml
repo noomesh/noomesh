@@ -91,6 +91,8 @@ x-trellion-env: &trellion-env
   # via markitdown loads it. The image bakes the same switch (deps-core); this
   # covers a container recreated before its image is rebuilt.
   ORT_DISABLE_TELEMETRY: '1'
+  # The rootfs is read-only; /app/src is compiled at image build.
+  PYTHONDONTWRITEBYTECODE: '1'
   # Surfaces: trellion serves ONLY the ML pack —
   # the core subjects moved to the always-on noo-worker. Overridable
   # (=all) as a one-release escape hatch if the split misbehaves.
@@ -138,7 +140,7 @@ x-trellion-env: &trellion-env
   #
   # An older trellion image ignores this variable and falls through to
   # PAGEINDEX_DSN below (still `pai`), so the transition is order-free.
-  NOO_TRELLION_DDL_DATABASE_URL: 'postgresql://noo_trellion_ddl@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  NOO_TRELLION_DDL_DATABASE_URL: 'postgresql://noo_trellion_ddl@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_trellion_ddl.crt&sslkey=/app/pki/leaf/pg/noo_trellion_ddl.key'
   # Trellion's OWN engine (snapshot/consolidation handlers,
   # workers/common._trellion_engine, autonomy trellion bootstrap)
   # connects as the scoped noo_trellion role: owner of the 27 memory
@@ -150,7 +152,7 @@ x-trellion-env: &trellion-env
   # PAGEINDEX_DSN/DATABASE_URL and touch mesh tables — flipping them
   # to noo_trellion would fail those inits silently (they are all
   # try/except warnings). noo_app remains the mixed-plane identity.
-  NOO_TRELLION_DATABASE_URL: 'postgresql://noo_trellion@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  NOO_TRELLION_DATABASE_URL: 'postgresql://noo_trellion@postgres:5432/noomesh?sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_trellion.crt&sslkey=/app/pki/leaf/pg/noo_trellion.key'
   # NOO_TRELLION_DB_PASSWORD is NOT delivered. It used to be, "because
   # trellion CREATES the role" (noo-trellion #34) —
   # but role creation became the broker's job in phase A′ (trellion
@@ -190,7 +192,7 @@ x-trellion-env: &trellion-env
   # each-consumer-declares rule the gateway (state.rs) and trellion's
   # engine already follow. Absent schemas in the path are silently
   # skipped, so legacy installs resolve identically.
-  DATABASE_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  DATABASE_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
   # noo_app, NOT superuser — an earlier change closed (2026-08-05). The two
   # things that made these superuser by accident are both fixed at the
   # source: partition DDL goes through SECURITY DEFINER functions (036's
@@ -199,8 +201,8 @@ x-trellion-env: &trellion-env
   # Everything else the worker plane does on these DSNs is DML, which
   # noo_app holds on every table plus by default privilege. A compromised
   # worker container can no longer drop a database.
-  PGVECTOR_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
-  PAGEINDEX_DSN: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/service.crt&sslkey=/app/pki/leaf/service.key'
+  PGVECTOR_URL: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
+  PAGEINDEX_DSN: 'postgresql://noo_app@postgres:5432/noomesh?options=-c%20search_path%3Dmesh,public,trellion,evolve&sslmode=verify-full&sslrootcert=/app/pki/ca.crt&sslcert=/app/pki/leaf/pg/noo_app.crt&sslkey=/app/pki/leaf/pg/noo_app.key'
   REDIS_URL: '${REDIS_URL:-rediss://redis:6379}'
   REDIS_PASSWORD_FILE: '${REDIS_PASSWORD:+/run/secrets/redis_password}'
   NATS_URL: '${NATS_URL:-tls://nats:4222}'
@@ -361,19 +363,24 @@ x-trellion-env: &trellion-env
   NOO_ARTIFACT_DIR: '${NOO_ARTIFACT_DIR:-}'
 
 # The secrets only an add-on takes. Compose merges top-level `secrets:`
-# across `-f` files, so the shared ones (redis_password, noo_audit_hmac_key, …)
-# are the base file's entries, reused; these two are trellion's own. Sourced
-# from a variable of the LAUNCHER's environment, never a host file
-# (lib-secrets.sh derive_file_secrets exports every source, empty when the
-# store does not hold it, and derives NOO_PGPASS_TRELLION).
+# across `-f` files, so the shared ones (redis_password, noo_audit_hmac_key, ...)
+# are the base file's entries, reused; these are trellion's own. `file:` in
+# the launcher's tmpfs directory, exactly like the base file's (see the block
+# above its `secrets:`): this service is `read_only`, which refuses an
+# `environment:` source. `x-noo-source` names the launcher variable the file
+# is written from (lib-secrets.sh write_secret_files; derive_file_secrets
+# derives NOO_PGPASS_TRELLION).
 secrets:
   noo_svc_key_trellion:
-    environment: NOO_SVC_KEY_TRELLION
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/noo_svc_key_trellion
+    x-noo-source: NOO_SVC_KEY_TRELLION
   # trellion's own NATS password (x-noo-addon.nats_principal above).
   nats_trellion_password:
-    environment: NATS_TRELLION_PASSWORD
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/nats_trellion_password
+    x-noo-source: NATS_TRELLION_PASSWORD
   pgpass_trellion:
-    environment: NOO_PGPASS_TRELLION
+    file: ${NOO_SECRET_RUNDIR:-/nonexistent/noo-secret-rundir-unset}/pgpass_trellion
+    x-noo-source: NOO_PGPASS_TRELLION
 
 services:
   trellion:
@@ -504,15 +511,29 @@ services:
       # rehearsal, defect #20). The launchers detect the missing checkout
       # and repoint DEST at a scratch path so the baked package survives.
       - ${TRELLION_SRC:-../trellion/src/trellion}:${TRELLION_SRC_DEST:-/opt/python/cpython-3.12.13-linux-x86_64-gnu/lib/python3.12/site-packages/trellion}:ro
-    # The gateway/worker hardening: no capabilities and no privilege gain.
-    # The image runs as nonroot, so nothing here needs a capability; this
-    # container parses untrusted documents, so a parser bug must not be able
-    # to regain one through a setuid binary. (noomesh.yaml, the override and
-    # the host spool stay writable: worker.settings writes them from here.)
+    # The gateway/worker hardening: no capabilities, no privilege gain, and a
+    # READ-ONLY root filesystem (i132). The image runs as nonroot, so nothing
+    # here needs a capability; this container parses untrusted documents, so a
+    # parser bug must not be able to regain one through a setuid binary, nor
+    # write a payload next to the code. (noomesh.yaml, the override, prompts/,
+    # /data and the host spool are mounts and stay writable: worker.settings
+    # writes them from here.) The write set was measured with `docker diff
+    # noo-trellion` on the live controller:
+    #   /tmp               tmpfs: the PKI/leaf key copy db/engine.py makes at
+    #                      /tmp/pki, document-conversion scratch, ffmpeg temp,
+    #                      `.ses` and the dist-mode `-unused` mount points
+    #   /home/nonroot      tmpfs: HOME. ~/.cache holds library caches, e.g. the
+    #                      onnxruntime device id (switched off above)
+    #   /app/src bytecode  compiled at image build + PYTHONDONTWRITEBYTECODE
+    # Model weights and the HF cache are in the noo-data volume, not here.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+      - /home/nonroot:size=256m,mode=0700,uid=65532,gid=65532
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

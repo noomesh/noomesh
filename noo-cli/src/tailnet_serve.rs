@@ -665,6 +665,211 @@ pub fn parse_status(text: &str, gw_port: u32) -> Status {
     }
 }
 
+// ── Add-on UI origins ───────────────────────────────────────────────────
+//
+// Each add-on whose manifest has a `ui` is served by the gateway on an origin
+// of its own: its own HTTPS listener on a port from `NOO_ADDON_UI_PORTS`
+// (default 8450-8459), published on loopback (gateway-rust/src/addon_ui.rs).
+// The browser reaches it the way it reaches Grafana's origin: `tailscale
+// serve --https=<port>` on the tailnet name, with the tailnet's certificate,
+// proxying to `https://127.0.0.1:<port>` (the gateway leaf carries the
+// 127.0.0.1 IP SAN; tailscaled verifies it against the OS trust store that
+// onboarding fills with the cluster CA).
+//
+// The ports are the GATEWAY's to allocate, so the launcher asks it
+// (`GET /api/addons/ui`) rather than recomputing the hash. After every
+// successful `noo stack start|restart`:
+//
+// - a listed port with no serve entry gets `serve --bg --https=<port>
+//   https://127.0.0.1:<port>` (additive: serve_v2 rewrites only that port's
+//   `/` handler, see the Grafana notes above);
+// - a port in the range whose entry is EXACTLY ours (only `/`, proxying to
+//   `https://127.0.0.1:<port>`) but which the gateway no longer lists gets
+//   `serve --https=<port> off`;
+// - a port carrying anything else is never touched, only reported;
+// - when the gateway cannot be asked, nothing is written or removed.
+//
+// Serve config only. Nothing here touches the tailnet policy (no `tailscale
+// policy`, no ACL push).
+
+/// The default `NOO_ADDON_UI_PORTS`, matching the gateway's.
+pub const ADDON_UI_DEFAULT_RANGE: (u32, u32) = (8450, 8459);
+
+/// `NOO_ADDON_UI_PORTS` as `(first, last)`, the default when unset or
+/// unparseable (the gateway refuses a bad range and serves no UI; the
+/// launcher then only cleans up inside the default).
+pub fn addon_ui_range(raw: Option<&str>) -> (u32, u32) {
+    raw.and_then(|r| r.trim().split_once('-'))
+        .and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?)))
+        .filter(|(a, b)| *a > 1024 && a <= b && *b <= 65535 && b - a < 1000)
+        .unwrap_or(ADDON_UI_DEFAULT_RANGE)
+}
+
+/// Where serve sends an add-on UI port.
+pub fn addon_ui_backend(port: u32) -> String {
+    format!("https://127.0.0.1:{port}")
+}
+
+/// The write for one add-on UI port.
+pub fn addon_ui_command(port: u32) -> Vec<String> {
+    vec!["serve".to_string(), "--bg".to_string(), format!("--https={port}"), addon_ui_backend(port)]
+}
+
+/// The removal for one add-on UI port no longer allocated.
+pub fn addon_ui_off_command(port: u32) -> Vec<String> {
+    vec!["serve".to_string(), format!("--https={port}"), "off".to_string()]
+}
+
+/// What serve has on one add-on UI port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortServe {
+    /// Exactly our entry: `/` → `https://127.0.0.1:<port>`.
+    Ours,
+    /// Nothing.
+    Absent,
+    /// Something else (never touched): what it is.
+    Elsewhere(String),
+}
+
+/// Pure: one port of tailscale's ServeConfig JSON.
+pub fn parse_port_serve(v: &serde_json::Value, port: u32) -> PortServe {
+    let key = port.to_string();
+    if let Some(fwd) = v.get("TCP").and_then(|t| t.get(&key)).and_then(|t| t.get("TCPForward")).and_then(|f| f.as_str()).filter(|f| !f.is_empty()) {
+        return PortServe::Elsewhere(format!("TCP forwarding to {fwd}"));
+    }
+    let suffix = format!(":{port}");
+    let Some(web) = v.get("Web").and_then(|w| w.as_object()) else { return PortServe::Absent };
+    for (host, cfg) in web {
+        if !host.ends_with(&suffix) {
+            continue;
+        }
+        let handlers = cfg.get("Handlers").and_then(|h| h.as_object());
+        let Some(handlers) = handlers.filter(|h| !h.is_empty()) else { return PortServe::Absent };
+        let proxy = handlers.get("/").and_then(|r| r.get("Proxy")).and_then(|p| p.as_str()).unwrap_or("").trim_end_matches('/');
+        let ours = handlers.len() == 1
+            && (proxy == addon_ui_backend(port) || proxy == format!("https://localhost:{port}"));
+        if ours {
+            return PortServe::Ours;
+        }
+        let what = if proxy.is_empty() { format!("handlers at {}", handlers.keys().cloned().collect::<Vec<_>>().join(", ")) } else { proxy.to_string() };
+        return PortServe::Elsewhere(what);
+    }
+    PortServe::Absent
+}
+
+/// What to do about the add-on UI ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddonUiPlan {
+    /// Ports to front now.
+    pub write: Vec<u32>,
+    /// Ports in the range carrying only our entry that the gateway no longer lists.
+    pub remove: Vec<u32>,
+    /// Ports left alone because something else is on them.
+    pub occupied: Vec<(u32, String)>,
+}
+
+/// Pure: the plan from the gateway's ports, the range and the serve status.
+pub fn addon_ui_plan(listed: &[u32], range: (u32, u32), status: &serde_json::Value) -> AddonUiPlan {
+    let mut plan = AddonUiPlan::default();
+    let mut listed: Vec<u32> = listed.to_vec();
+    listed.sort_unstable();
+    listed.dedup();
+    for &p in &listed {
+        match parse_port_serve(status, p) {
+            PortServe::Ours => {}
+            PortServe::Absent => plan.write.push(p),
+            PortServe::Elsewhere(what) => plan.occupied.push((p, what)),
+        }
+    }
+    for p in range.0..=range.1 {
+        if !listed.contains(&p) && parse_port_serve(status, p) == PortServe::Ours {
+            plan.remove.push(p);
+        }
+    }
+    plan
+}
+
+/// How bringing the add-on UI ports in line went.
+#[derive(Debug, Default)]
+pub struct AddonUiReport {
+    pub written: Vec<u32>,
+    pub removed: Vec<u32>,
+    pub occupied: Vec<(u32, String)>,
+    /// `(port, failure)` for each command that did not run; the operator
+    /// gets its exact line.
+    pub failed: Vec<(Vec<String>, String)>,
+    pub granted_operator: bool,
+}
+
+/// Read serve's status as JSON (`{}` for "No serve config"); `Err` when
+/// tailscale cannot answer.
+fn serve_status_json() -> Result<serde_json::Value, String> {
+    match Command::new("tailscale").args(["serve", "status", "--json"]).output() {
+        Ok(o) if o.status.success() => {
+            let t = String::from_utf8_lossy(&o.stdout);
+            let t = t.trim();
+            if t.is_empty() || t.contains("No serve config") {
+                return Ok(serde_json::json!({}));
+            }
+            serde_json::from_str(t).map_err(|e| format!("unparseable serve status: {e}"))
+        }
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// [`ensure_addon_ui_fronted`] with the status and the runner passed in.
+pub fn ensure_addon_ui_fronted_with(
+    listed: &[u32],
+    range: (u32, u32),
+    status: &serde_json::Value,
+    run: &mut dyn FnMut(&[String]) -> Result<(), Failure>,
+) -> AddonUiReport {
+    let plan = addon_ui_plan(listed, range, status);
+    let mut report = AddonUiReport { occupied: plan.occupied.clone(), ..Default::default() };
+    for p in plan.write {
+        let cmd = addon_ui_command(p);
+        match run(&cmd) {
+            Ok(()) => report.written.push(p),
+            Err(f) => report.failed.push((cmd, f.detail)),
+        }
+    }
+    for p in plan.remove {
+        let cmd = addon_ui_off_command(p);
+        match run(&cmd) {
+            Ok(()) => report.removed.push(p),
+            Err(f) => report.failed.push((cmd, f.detail)),
+        }
+    }
+    report
+}
+
+/// Front every add-on UI port the gateway lists and drop our entries for
+/// ports it no longer lists. `None` when tailscale cannot say (nothing done).
+/// A permission failure gets one operator grant + retry, as for the
+/// console's mappings; what still fails is in `failed`, with its exact line.
+pub fn ensure_addon_ui_fronted(listed: &[u32], range: (u32, u32), non_interactive: bool) -> Option<AddonUiReport> {
+    let status = serve_status_json().ok()?;
+    let mut granted = false;
+    let mut report = ensure_addon_ui_fronted_with(listed, range, &status, &mut |cmd| {
+        let mut r = run_ts(cmd);
+        if let Err(f) = &r {
+            if !granted && looks_like_permission(&f.detail) && try_grant_operator(non_interactive) {
+                granted = true;
+                r = run_ts(cmd);
+            }
+        }
+        r
+    });
+    report.granted_operator = granted;
+    Some(report)
+}
+
+/// The line an operator runs by hand for a command noo could not run.
+pub fn manual_line(cmd: &[String]) -> String {
+    format!("sudo tailscale {}", cmd.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,5 +1158,89 @@ mod tests {
         assert_eq!(console_open_grafana_url("ctl.example.ts.net", ""), "https://ctl.example.ts.net/#/observability?open=grafana");
         assert_eq!(console_open_grafana_url("ctl.example.ts.net.", "obtest"), "https://ctl.example.ts.net/obtest/#/observability?open=grafana");
         assert_eq!(grafana_login_manual_line(3000), "tailscale serve --bg --https=3000 --set-path=/login https://127.0.0.1:3000/logout");
+    }
+}
+
+#[cfg(test)]
+mod addon_ui_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_range_defaults_to_ten_ports_and_refuses_nonsense() {
+        assert_eq!(addon_ui_range(None), (8450, 8459));
+        assert_eq!(addon_ui_range(Some("8450-8499")), (8450, 8499));
+        for bad in ["", "8450", "80-90", "9000-8000", "x-y", "2000-4000"] {
+            assert_eq!(addon_ui_range(Some(bad)), ADDON_UI_DEFAULT_RANGE, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_commands_front_loopback_on_the_same_port_and_never_touch_policy() {
+        assert_eq!(addon_ui_command(8451), vec!["serve", "--bg", "--https=8451", "https://127.0.0.1:8451"]);
+        assert_eq!(addon_ui_off_command(8451), vec!["serve", "--https=8451", "off"]);
+        let src = include_str!("tailnet_serve.rs");
+        let code = &src[src.find("Add-on UI origins").unwrap()..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(!code.contains("\"policy\"") && !code.contains("\"reset\""), "serve config only, and never a reset");
+    }
+
+    fn cfg(entries: &[(u32, &str)]) -> serde_json::Value {
+        let mut web = serde_json::Map::new();
+        for (port, proxy) in entries {
+            web.insert(format!("noo-controller.example.ts.net:{port}"), json!({"Handlers": {"/": {"Proxy": proxy}}}));
+        }
+        json!({"Web": web})
+    }
+
+    #[test]
+    fn listed_ports_are_written_unlisted_ours_removed_and_others_left_alone() {
+        let status = cfg(&[
+            (8450, "https://127.0.0.1:8450"),   // listed, already ours
+            (8453, "https://127.0.0.1:8453"),   // ours, no longer listed → off
+            (8455, "http://127.0.0.1:9999"),    // someone else's → untouched
+            (8460, "https://127.0.0.1:8460"),   // outside the range → untouched
+            (443, "https://100.64.0.9:8080"),   // the console → untouched
+        ]);
+        let plan = addon_ui_plan(&[8450, 8451, 8455], (8450, 8459), &status);
+        assert_eq!(plan.write, vec![8451]);
+        assert_eq!(plan.remove, vec![8453]);
+        assert_eq!(plan.occupied, vec![(8455, "http://127.0.0.1:9999".to_string())]);
+    }
+
+    #[test]
+    fn an_entry_with_more_than_our_root_is_not_ours() {
+        let v = json!({"Web": {"h:8451": {"Handlers": {"/": {"Proxy": "https://127.0.0.1:8451"}, "/x": {"Proxy": "https://127.0.0.1:1"}}}}});
+        assert!(matches!(parse_port_serve(&v, 8451), PortServe::Elsewhere(_)));
+        let v = json!({"TCP": {"8451": {"TCPForward": "127.0.0.1:22"}}});
+        assert!(matches!(parse_port_serve(&v, 8451), PortServe::Elsewhere(_)));
+        assert_eq!(parse_port_serve(&json!({}), 8451), PortServe::Absent);
+    }
+
+    /// Start, restart and the stack roll all front the add-on UI ports, so
+    /// `noo upgrade --all` needs no manual restart for a new add-on UI.
+    #[test]
+    fn start_restart_and_the_stack_roll_front_the_addon_ui_ports() {
+        let mesh = include_str!("commands/mesh.rs");
+        let mesh = &mesh[..mesh.find("#[cfg(test)]").unwrap_or(mesh.len())];
+        assert_eq!(mesh.matches("front_addon_uis(g);").count(), 2, "noo stack start and noo stack restart");
+        let up = include_str!("commands/upgrade.rs");
+        let up = &up[..up.find("#[cfg(test)]").unwrap_or(up.len())];
+        assert!(up.contains("super::mesh::front_addon_uis(g);"), "noo upgrade --stack");
+    }
+
+    #[test]
+    fn idempotent_and_failures_carry_their_exact_line() {
+        let status = cfg(&[(8450, "https://127.0.0.1:8450")]);
+        let mut ran = Vec::new();
+        let r = ensure_addon_ui_fronted_with(&[8450], (8450, 8459), &status, &mut |c| {
+            ran.push(c.to_vec());
+            Ok(())
+        });
+        assert!(ran.is_empty() && r.written.is_empty() && r.removed.is_empty(), "already right: nothing runs");
+        let r = ensure_addon_ui_fronted_with(&[8452], (8450, 8459), &json!({}), &mut |c| {
+            Err(Failure { command: c.join(" "), detail: "access denied".into() })
+        });
+        assert_eq!(r.failed.len(), 1);
+        assert_eq!(manual_line(&r.failed[0].0), "sudo tailscale serve --bg --https=8452 https://127.0.0.1:8452");
     }
 }

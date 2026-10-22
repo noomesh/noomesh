@@ -1237,6 +1237,57 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             Some("noo systems status   # then re-run: noo upgrade --stack")),
     }
 
+    // -1c. The Postgres role leaves (i132). This release's pg_hba requires a
+    //    client certificate whose CN is the role being asked for
+    //    (`clientcert=verify-full`) for noo, noo_app, noo_trellion and
+    //    noo_trellion_ddl, and its compose DSNs name `gateway/pg/<role>.*` or
+    //    `<leaf dir>/pg/<role>.*` inside what each container already mounts.
+    //    An install upgraded from before has only the shared leaves, so the
+    //    role leaves are
+    //    minted HERE, before anything moves: a leaf that cannot be issued
+    //    stops the roll with the slice, pin and running stack untouched,
+    //    because a Postgres that enforces the new rule in front of clients
+    //    that cannot present it is a database nobody can reach.
+    match reconcile_pg_leaves(&crate::pki::ClusterCa::new(crate::pki::pki_dir())) {
+        Ok(minted) => if !g.json && !minted.is_empty() {
+            ui::done(&format!("issued {} Postgres client certificate(s) ({}) — new in this release: pg_hba now requires the certificate's CN to be the role", minted.len(), minted.join(", ")));
+        },
+        Err(failures) => {
+            let (leaf, why) = &failures[0];
+            let dir = crate::pki::pki_dir().join(leaf.dir_rel());
+            let why = super::pki::permission_denied_hint(why, &dir).unwrap_or_else(|| why.clone());
+            fail(g.json, ExitCode::Generic, "pg_role_leaf_failed",
+                &format!("could not issue the Postgres client certificate for role {} ({}): {why}{} — nothing was changed; \
+                          without it this release's Postgres would refuse that container's logins",
+                    leaf.role, leaf.cert_rel(),
+                    if failures.len() > 1 { format!(" ({} more leaf(s) failed too)", failures.len() - 1) } else { String::new() }),
+                Some("noo security pki fix-modes   # then re-run: noo upgrade --stack"));
+        }
+    }
+
+    // -1d. The four stunnel doors the controller's own node-agent dials
+    //    (ollama, ollama-embed, ollama-embed-cpu, llamacpp) now pin that agent
+    //    by this controller's node id (`checkHost = $NODE_ID`, appended at
+    //    start by compose) and REFUSE to start without a usable one, rather
+    //    than accept any cluster certificate again. An install whose .env has
+    //    no NODE_ID would come up with those doors down: say so now, with the
+    //    fix, while the old stack is still serving. Not a refusal of the roll:
+    //    most controllers run none of the four.
+    if !g.json {
+        // The CLI loaded .env into its environment at startup, and the
+        // launcher exports noomesh.yaml `compose_env:` the same way: the
+        // process environment is what compose will see.
+        let node_id = std::env::var("NODE_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::onboard::env::read_env_key(&root.join(".env"), "NODE_ID"));
+        if let Some(why) = door_node_id_problem(&node_id) {
+            ui::warned(&format!(
+                "{why} — the ollama, ollama-embed, ollama-embed-cpu and llamacpp stunnel doors pin this controller's own node-agent by that id and will refuse to start without it. Set NODE_ID in .env to this controller's node id, then: noo stack restart --force"
+            ));
+        }
+    }
+
     // 0. Move any RETIRED gate key out of noomesh.yaml BEFORE the roll,
     //    while the old gateway is still up to accept the write.
     migrate_retired_yaml_gates(g, &root);
@@ -1410,6 +1461,11 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                     &crate::envfile::instance(),
                 );
             }
+            // The rolled gateway may allocate add-on UI origins it did not
+            // before (a newly enabled add-on with a `ui`): front them with
+            // tailscale serve now, as `noo stack start|restart` do, so
+            // `noo upgrade --all` needs no manual restart. Never fails the roll.
+            super::mesh::front_addon_uis(g);
             // Prune superseded release images (finding #93: 13 upgrades
             // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
             // failure must never taint a successful roll.
@@ -1650,11 +1706,13 @@ enum PreRollKeys {
     GoUnverified,
     Missing(Vec<String>),
     /// The gateway ANSWERED but its list could not be read (401/403, 5xx, bad
-    /// body, TLS failure) and there is no `--skip-gateway-key-check`.
+    /// body, a certificate this CLI refuses) and there is no
+    /// `--skip-gateway-key-check`.
     Unverifiable,
 }
 
-/// `gw_down`: nothing answered (connection refused / no route), which is not
+/// `gw_down`: nothing answered (refused, no route, reset or timed out before
+/// any HTTP response: [`crate::http::ProbeFail::Down`]), which is not
 /// the same as a gateway that answered and could not be read: a down stack
 /// has no list to show, and the refusal's fix (`noo auth login`) cannot
 /// work against it, so it falls back to the store check as the flag does.
@@ -1701,6 +1759,44 @@ fn reconcile_bus_keys(root: &std::path::Path) -> Result<Vec<String>, AuditKeyRef
     crate::commands::secrets::mint_unset(PER_SERVICE_KEYS, &sops)
         .map(|(minted, _)| minted)
         .map_err(AuditKeyRefusal::Store)
+}
+
+/// Why `NODE_ID` (as `.env` holds it) cannot be pinned by the stunnel doors:
+/// unset, `auto`, or not a plain node name. The same predicate the doors'
+/// entrypoint applies (`x-stunnel-self-pin` in docker-compose.cluster.yml:
+/// `""|auto|*[!A-Za-z0-9._-]*`); `None` = usable.
+fn door_node_id_problem(raw: &str) -> Option<String> {
+    let id = raw.trim().trim_matches(|c: char| c == '"' || c == '\'');
+    if id.is_empty() {
+        return Some("NODE_ID is not set (.env, or compose_env: in noomesh.yaml)".to_string());
+    }
+    if id == "auto" || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Some(format!("NODE_ID is '{id}', which is not a plain node name"));
+    }
+    None
+}
+
+/// Issue the Postgres role leaves an upgraded install does not have yet.
+/// `Ok` lists the leaves issued as `role@owner` (empty when every leaf was
+/// already right, and when there is no CA: `upgrade_stack` refuses an
+/// install with no PKI before it reaches here). `Err` lists every leaf that
+/// could not be issued with the reason, so the caller refuses the roll
+/// rather than starting a Postgres that enforces `verify-full` in front of
+/// clients with no leaf.
+fn reconcile_pg_leaves(ca: &crate::pki::ClusterCa) -> Result<Vec<String>, Vec<(&'static crate::pki::PgLeaf, String)>> {
+    if !ca.ca_exists() {
+        return Ok(Vec::new());
+    }
+    let mut minted = Vec::new();
+    let mut failed = Vec::new();
+    for (leaf, res) in ca.ensure_pg_leaves(crate::pki::DEFAULT_DAYS) {
+        match res {
+            Ok(true) => minted.push(format!("{}@{}", leaf.role, leaf.owner)),
+            Ok(false) => {}
+            Err(e) => failed.push((leaf, e)),
+        }
+    }
+    if failed.is_empty() { Ok(minted) } else { Err(failed) }
 }
 
 /// `SVC_LIST` names the mounted service certs the CURRENT release's compose
@@ -5573,6 +5669,25 @@ mod keyless_tests {
         assert!(w.contains("the gateway is down") && w.contains("noo cluster verify --controller") && w.contains("`service keys`"), "{w}");
         assert!(unverified_keys_warning(true).starts_with("--skip-gateway-key-check"));
 
+        // Crash-looping gateway (0.6.9 rehearsal B5.keycheck): it accepts and
+        // resets before any status line. Nothing answered, so the upgrade
+        // that would fix it goes ahead on the store check.
+        let crashing = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            std::thread::spawn(move || {
+                if let Ok((c, _)) = l.accept() {
+                    // Leave the request unread: the close goes out as RST.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    drop(c);
+                }
+            });
+            url
+        };
+        let (db, down) = read_gateway_key_shortfall(&probe_globals(crashing), &req);
+        assert_eq!((db.as_ref(), down), (None, true), "a reset before any response means nothing answered");
+        assert_eq!(pre_roll_key_verdict(&none, db.as_deref(), false, down), PreRollKeys::GoUnverified);
+
         // Answers 401 / 500 / garbage: unreadable, refuses.
         for (st, body) in [(401u16, "{}"), (403, "{}"), (500, "{}"), (200, "not json")] {
             let (db, down) = read_gateway_key_shortfall(&probe_globals(one_shot_gateway(st, body)), &req);
@@ -5731,5 +5846,93 @@ mod keyless_tests {
         ];
         assert_eq!(super::pick_latest_stack(&rels).as_deref(), Some("0.2.104"));
         assert_eq!(super::pick_latest_stack(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod pg_leaf_tests {
+    use crate::pki::{ClusterCa, PG_LEAVES};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("noo-pg-leaves-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An install upgraded from before role leaves has only the shared
+    /// service leaves: the reconcile mints every role leaf, and a second
+    /// roll changes nothing.
+    #[test]
+    fn an_old_install_gets_every_role_leaf_once() {
+        let ca = ClusterCa::new(scratch("old"));
+        ca.generate_ca("t", 3650).unwrap();
+        ca.issue_service_cert("worker", &[], &[], 90).unwrap();
+        let first = super::reconcile_pg_leaves(&ca).expect("mints");
+        assert_eq!(first.len(), PG_LEAVES.len());
+        assert!(first.contains(&"noo_app@worker".to_string()), "{first:?}");
+        assert_eq!(super::reconcile_pg_leaves(&ca).unwrap(), Vec::<String>::new(), "a second roll issues nothing");
+        for l in PG_LEAVES {
+            assert_eq!(ca.pg_leaf_cn(l).unwrap().as_deref(), Some(l.role));
+        }
+    }
+
+    /// No CA: nothing to issue and nothing to refuse (upgrade_stack's
+    /// install-incomplete guard owns that case).
+    #[test]
+    fn no_ca_is_not_a_refusal_here() {
+        let ca = ClusterCa::new(scratch("noca"));
+        assert_eq!(super::reconcile_pg_leaves(&ca).unwrap(), Vec::<String>::new());
+    }
+
+    /// A leaf that cannot be issued (the services dir is a FILE, the way an
+    /// unwritable directory fails) is an Err naming the leaf, not a silent
+    /// skip: the roll must stop.
+    #[test]
+    fn an_unissuable_leaf_is_reported_so_the_roll_can_refuse() {
+        let ca = ClusterCa::new(scratch("fail"));
+        ca.generate_ca("t", 3650).unwrap();
+        std::fs::write(ca.dir.join("services"), b"in the way").unwrap();
+        let err = super::reconcile_pg_leaves(&ca).expect_err("cannot issue under a file");
+        // The gateway's leaves live under gateway/, so they still issue.
+        assert_eq!(err.len(), PG_LEAVES.iter().filter(|l| l.owner != "gateway").count());
+        assert!(err.iter().all(|(_, why)| !why.is_empty()));
+        assert!(err.iter().any(|(l, _)| l.owner == "worker" && l.role == "noo_app"));
+    }
+
+    /// The step runs BEFORE anything moves (the pin, the slice, the
+    /// launcher) and refuses rather than warns.
+    #[test]
+    fn the_role_leaf_stage_runs_before_anything_moves_and_refuses() {
+        let src = include_str!("upgrade.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
+        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in upgrade_stack"));
+        let stage = at("reconcile_pg_leaves(&crate::pki::ClusterCa::new(");
+        for later in ["crate::onboard::standalone::materialize(&root)", "write_stack_lock(g, &tag", "reconcile_service_certs(g)", "let mut status = launch();"] {
+            assert!(stage < at(later), "the role leaves must exist before `{later}`");
+        }
+        assert!(body[stage..at("migrate_retired_yaml_gates(g, &root)")].contains("pg_role_leaf_failed"), "a missing leaf is a refusal, not a warning");
+    }
+}
+
+#[cfg(test)]
+mod door_node_id_tests {
+    /// The roll warns about a NODE_ID the doors would refuse, using the doors'
+    /// own rule (tests/test_stunnel_door_pinning.py runs the shell side).
+    #[test]
+    fn door_node_id_problem_matches_the_doors_rule() {
+        for ok in ["host8", "pop-os", "node_1.lan", "\"host8\"", "'host8'"] {
+            assert_eq!(super::door_node_id_problem(ok), None, "{ok}");
+        }
+        for bad in ["", "  ", "auto", "a b", "x;y", "host8/../x", "$(id)"] {
+            assert!(super::door_node_id_problem(bad).is_some(), "{bad:?}");
+        }
+        let src = include_str!("upgrade.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let body = &body[..body.find("\nfn ").unwrap()];
+        assert!(body.contains("door_node_id_problem("), "the roll must call it");
     }
 }

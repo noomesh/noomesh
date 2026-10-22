@@ -126,6 +126,10 @@ node-agent-go/bin/
 # from committing whatever a command payload happened to contain.
 .noo-host-spool/*
 !.noo-host-spool/.gitkeep
+# Add-on bundle declarations the launcher copies for the gateway (i163):
+# runtime state, rebuilt on every start.
+/.noo-addon-systems/
+/.noo-addon-workloads/
 
 # Local per-developer git-hooks directory (not shared across team)
 config/tailscale-acl.backup.*

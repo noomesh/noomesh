@@ -26,7 +26,7 @@
 //! | Was here | Is now |
 //! |---|---|
 //! | phase gates (nine `NOO_AGENT_*` env vars) | evolve's compose env, an explicit allowlist |
-//! | `phase2_dispatch`, `phase_c_dispatch` | `POST /api/agent/meta-loop/dispatch` |
+//! | `phase2_dispatch`, `phase_c_dispatch` | evolve's `meta_loop_dispatch` route (its manifest names the path) |
 //! | `audit_decision`, `was_recently_acted` | evolve, against the same two tables |
 //! | `noo_agent_decisions`, `noo_activity_proposals` | unchanged, in `public`; evolve reaches them under grants from migration `060_evolve_meta_loop_grants` |
 //!
@@ -38,7 +38,7 @@
 //! `NOO_AGENT_SELF_EDIT`, `NOO_SELF_DEVELOP_AUTO_RESTART` — are gone from
 //! `routes/settings.rs` with this change. They rendered as dashboard toggles
 //! beside switches that worked, which is worse than absent.
-//! evolve's `/api/agent/meta-loop/status` reports them as *unimplemented*
+//! evolve's meta-loop status route reports them as *unimplemented*
 //! rather than *off*, because those are different claims.
 
 use serde_json::{json, Value};

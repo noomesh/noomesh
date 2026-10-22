@@ -147,6 +147,12 @@ pub(crate) fn declared_map_at(path: &std::path::Path) -> Result<std::collections
     Ok(declared_in(&text))
 }
 
+/// This install's noomesh.yaml text; empty when it is absent or unreadable
+/// (`list` already failed on an unreadable file through `declared_map`).
+fn config_text() -> String {
+    std::fs::read_to_string(config_path()).unwrap_or_default()
+}
+
 /// The `addons:` map of a noomesh.yaml TEXT — the parse `declared_map` does,
 /// for a caller that already holds the file (the launcher's pre-`up` check
 /// reads the file the launcher names, not `repo_root()`'s). Unparseable or
@@ -348,7 +354,17 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 })
             })
             .collect();
-        println!("{}", json!({"addons": rows, "config": config_path().display().to_string()}));
+        let third: Vec<_> = third_party_rows(&config_text(), crate::addon_lock::now_unix())
+            .into_iter()
+            .map(|(n, d, signer)| {
+                let dev = signer.contains("DEV");
+                json!({
+                    "name": n, "declared": d, "effective": d == Some(true), "third_party": true,
+                    "signer": signer, "dev": dev, "pin": pins.get(&n),
+                })
+            })
+            .collect();
+        println!("{}", json!({"addons": rows, "third_party": third, "config": config_path().display().to_string()}));
         return Ok(0);
     }
 
@@ -402,13 +418,227 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             &rows
         )
     );
+    // Third-party add-ons the operator trusts a key for: who signs them, and
+    // a DEV marker with the expiry when it is a development key (i163 A).
+    let third = third_party_rows(&config_text(), crate::addon_lock::now_unix());
+    if !third.is_empty() {
+        println!();
+        let rows: Vec<Vec<String>> = third
+            .iter()
+            .map(|(n, d, signer)| {
+                let declared_cell = match d {
+                    Some(true) => ui::good("true"),
+                    Some(false) => ui::bad("false"),
+                    None => ui::muted("not declared → false"),
+                };
+                let signer_cell = if signer.contains("EXPIRED") {
+                    ui::bad(signer)
+                } else if signer.contains("DEV") {
+                    ui::warn(signer)
+                } else {
+                    signer.clone()
+                };
+                let mut row = vec![n.clone(), declared_cell, signer_cell];
+                row.extend(crate::commands::addon_pins::pin_cells(pins.get(n)));
+                row
+            })
+            .collect();
+        print!(
+            "{}",
+            ui::table(
+                &[
+                    ui::Col::left("third-party"),
+                    ui::Col::left("declared"),
+                    ui::Col::left("signer"),
+                    ui::Col::left("version"),
+                    ui::Col::left("stack"),
+                    ui::Col::left("digest"),
+                    ui::Col::left("key"),
+                ],
+                &rows
+            )
+        );
+    }
     println!();
+    print_bundle_decls(&crate::envfile::repo_root());
     ui::guide(&[
+        ("noo addons show <name>", "the database and workloads an add-on's signed bundle declares"),
         ("noo addons enable <name>", "pins a licensed add-on's signed lock, then declares it on"),
         ("noo addons verify", "re-checks every pin against its signed lock and what runs"),
         ("noo stack restart", "applies it — the switch decides which containers run"),
     ]);
     Ok(0)
+}
+
+/// `list`'s "bundle declarations" section: each add-on whose materialised
+/// bundle declares a database or workloads (or fails to validate). Nothing
+/// is printed when none does. Its JSON form is `noo addons show <name> --json`.
+fn print_bundle_decls(root: &std::path::Path) {
+    let decls = bundle_decls(root);
+    let nothing = crate::addons::decls::Declared::default();
+    if decls.iter().any(|(_, d)| !matches!(d, Ok(x) if *x == nothing)) {
+        println!("{}", ui::section("bundle declarations"));
+        for (name, d) in &decls {
+            match d {
+                Ok(d) if *d == nothing => {}
+                Ok(d) => {
+                    let mut parts = Vec::new();
+                    if let Some(sys) = &d.system {
+                        parts.push(format!("database {}", sys.schema));
+                    }
+                    if !d.workloads.is_empty() {
+                        parts.push(format!(
+                            "workloads {}",
+                            d.workloads.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                    println!("{}", ui::status_line(ui::Glyph::Bullet, &format!("{name}: {}", parts.join("; "))));
+                }
+                Err(e) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{name}: {e}"))),
+            }
+        }
+        println!();
+    }
+}
+
+// ── bundle declarations (i163 E/B) ──────────────────────────────────────
+
+/// Every add-on with a materialised bundle under `<root>/addons/`, with what
+/// it declares beyond its overlay (or why that does not validate).
+fn bundle_decls(root: &std::path::Path) -> Vec<(String, Result<crate::addons::decls::Declared, String>)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join(crate::addons::pins::ADDONS_DIR)) else { return out };
+    for e in rd.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+        if !crate::addons::trust::name_ok(&name) || !e.path().is_dir() {
+            continue;
+        }
+        out.push((name.clone(), crate::addons::decls::materialised(root, &name)));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn decl_json(d: &Result<crate::addons::decls::Declared, String>) -> serde_json::Value {
+    match d {
+        Err(e) => json!({"error": e}),
+        Ok(d) => json!({
+            "system": d.system.as_ref().map(|s| json!({
+                "schema": s.schema, "role": s.role, "ddl_role": s.ddl_role, "extensions": s.extensions,
+            })),
+            "workloads": d.workloads.iter().map(|w| json!({
+                "name": w.name, "container": w.container, "gpu": w.gpu, "need_mb": w.need_mb,
+                "drain": {"route": w.drain_route, "timeout_secs": w.drain_timeout_secs},
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// `noo addons show <name>`: one add-on's switch, pin, and what its signed
+/// bundle declares (database system, managed workloads). Reads the
+/// materialised bundle on this controller; changes nothing.
+pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [name] = args else { return Err(Unhandled) };
+    if name.starts_with('-') {
+        return Err(Unhandled);
+    }
+    let key = row(name).map_or(name.as_str(), |r| r.key);
+    if !crate::addons::trust::name_ok(key) {
+        fail(g.json, ExitCode::Usage, "unknown_addon", &format!("`{name}` is not an add-on name"), Some("noo addons list"));
+    }
+    let root = crate::envfile::repo_root();
+    let declared = declared_map().ok().and_then(|m| m.get(key).copied());
+    let default_on = row(key).is_some_and(|r| r.default_on);
+    let pin = crate::addons::pins::read(&root).unwrap_or_default().get(key).cloned();
+    let bundle_dir = crate::addons::pins::addon_dir(&root, key);
+    let has_bundle = bundle_dir.is_dir();
+    let decls = if has_bundle { crate::addons::decls::materialised(&root, key) } else { Ok(Default::default()) };
+    let (pw, ddl) = crate::addons::decls::password_envs(key);
+
+    if g.json {
+        println!(
+            "{}",
+            json!({
+                "addon": key,
+                "declared": declared,
+                "effective": resolve(declared, default_on),
+                "pin": pin.as_ref().map(|p| json!({"version": p.version, "stack": p.stack})),
+                "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
+                "declarations": decl_json(&decls),
+                "password_env": decls.as_ref().ok().and_then(|d| d.system.as_ref()).map(|_| json!([pw, ddl])),
+            })
+        );
+        return Ok(if decls.is_ok() { 0 } else { 1 });
+    }
+
+    println!("{}", ui::header(&format!("add-on {key}"), Some(&config_path().display().to_string())));
+    let eff = resolve(declared, default_on);
+    println!(
+        "{}",
+        ui::kv(&[
+            ("switch", match declared {
+                Some(true) => ui::good("on"),
+                Some(false) => ui::bad("off"),
+                None => ui::muted(&format!("not declared → {}", if eff { "on" } else { "off" })),
+            }),
+            ("pin", pin.as_ref().map_or_else(|| ui::muted("none"), |p| format!("{} for {}", p.version, p.stack))),
+            ("bundle", if has_bundle { bundle_dir.display().to_string() } else { ui::muted("none on this controller") }),
+        ])
+    );
+    let rc = match &decls {
+        Err(e) => {
+            println!("{}", ui::status_line(ui::Glyph::Err, e));
+            1
+        }
+        Ok(d) => {
+            println!("{}", ui::section("database"));
+            match &d.system {
+                None => println!("{}", ui::muted("  none declared")),
+                Some(sys) => println!(
+                    "{}",
+                    ui::kv(&[
+                        ("schema", sys.schema.clone()),
+                        ("runtime role", sys.role.clone()),
+                        ("migration role", sys.ddl_role.clone()),
+                        ("extensions", if sys.extensions.is_empty() { ui::muted("none") } else { sys.extensions.join(", ") }),
+                        ("passwords", format!("{pw}, {ddl} (names only; in the encrypted store)")),
+                    ])
+                ),
+            }
+            println!("{}", ui::section("workloads"));
+            if d.workloads.is_empty() {
+                println!("{}", ui::muted("  none declared"));
+            } else {
+                let rows: Vec<Vec<String>> = d
+                    .workloads
+                    .iter()
+                    .map(|w| {
+                        vec![
+                            w.name.clone(),
+                            w.container.clone(),
+                            if w.gpu { "gpu".into() } else { "cpu".into() },
+                            format!("{} MiB", w.need_mb),
+                            format!("{} ({}s)", w.drain_route, w.drain_timeout_secs),
+                        ]
+                    })
+                    .collect();
+                print!(
+                    "{}",
+                    ui::table(
+                        &[ui::Col::left("name"), ui::Col::left("container"), ui::Col::left("device"), ui::Col::left("needs"), ui::Col::left("drain")],
+                        &rows
+                    )
+                );
+            }
+            0
+        }
+    };
+    println!();
+    ui::guide(&[
+        ("noo addons verify", "re-checks the pin and the bundle files against the signed lock"),
+        ("noo stack restart --force", "hands the declarations to the gateway (switched on and verified only)"),
+    ]);
+    Ok(rc)
 }
 
 /// What `enable` does about the licence. `Ok(Some(feature))` = proceed but
@@ -450,19 +680,49 @@ pub(crate) fn enable_gate(
 }
 
 fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
-    let (name, force) = match args {
-        [n] => (n, false),
-        [n, f] if on && f == "--force" => (n, true),
-        _ => return Err(Unhandled),
-    };
-    let Some(r) = row(name) else {
-        fail(
+    let (mut name, mut force, mut lock) = (None, false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--force" if on => force = true,
+            "--lock" if on => match it.next() {
+                Some(v) if !v.starts_with('-') => lock = Some(v.clone()),
+                _ => return Err(Unhandled),
+            },
+            s if !s.starts_with('-') && name.is_none() => name = Some(a),
+            _ => return Err(Unhandled),
+        }
+    }
+    let Some(name) = name else { return Err(Unhandled) };
+    let r: &'static AddonRow = match row(name) {
+        Some(r) => r,
+        // Not an add-on the CLI ships. It can still be enabled when the
+        // operator trusts a signing key for it (`noo addons trust-key`); turning
+        // one OFF is a file edit and needs no trust.
+        None if crate::addons::trust::name_ok(name)
+            && (!on || matches!(crate::addons::trust::trusted_anchor(name), Ok(Some(_)))) =>
+        {
+            let key: &'static str = Box::leak(name.clone().into_boxed_str());
+            Box::leak(Box::new(AddonRow { key, title: key, blurb: &[], licensed: None, default_on: false }))
+        }
+        None if crate::addons::trust::name_ok(name) => fail(
+            g.json,
+            ExitCode::Usage,
+            "untrusted_addon",
+            &format!(
+                "`{name}` is not an add-on this CLI ships, and no signing key is trusted for it. Known add-ons: {}. \
+                 To enable a third-party add-on, trust its signer first",
+                names()
+            ),
+            Some(&format!("noo addons trust-key {name} <pubkey> --registry <root>")),
+        ),
+        None => fail(
             g.json,
             ExitCode::Usage,
             "unknown_addon",
             &format!("unknown add-on `{name}` — known add-ons: {}", names()),
             None,
-        );
+        ),
     };
     // From here on the canonical key, whatever spelling was typed.
     let name = r.key;
@@ -482,7 +742,7 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // data operation, and nothing it needs can be missing.
     let mut enabled_report = None;
     let path = if on {
-        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force }) {
+        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force, lock: lock.clone() }) {
             Ok(e) => {
                 let p = e.config.clone();
                 enabled_report = Some(e);
@@ -596,6 +856,188 @@ pub fn addons_granted_by(features: &[String]) -> Vec<&'static AddonRow> {
         .iter()
         .filter(|r| r.licensed.is_some_and(|f| features.iter().any(|x| x == f)))
         .collect()
+}
+
+// ── third-party trust and delegation ───────────────────────────────────
+
+/// Edit noomesh.yaml TEXT through `f` and write it back only if it still
+/// parses. A missing file is an empty one.
+fn edit_yaml(f: impl FnOnce(&str) -> Result<String, String>) -> Result<std::path::PathBuf, String> {
+    let path = config_path();
+    let text = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+    } else {
+        String::new()
+    };
+    let updated = f(&text)?;
+    crate::addons::trust::write_checked(&path, &text, &updated)?;
+    Ok(path)
+}
+
+/// `noo addons trust-key <name> <pubkey> [--registry <root>] [--dev --expires <dur>]`
+///
+/// `--dev` trusts a temporary DEVELOPMENT key (i163 part A): `--expires`
+/// is required with it (at most 30d) and refused without it. Enrolling one
+/// is a local operator action: it edits this install's noomesh.yaml.
+pub fn addons_trust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let (mut pos, mut registry, mut dev, mut expires) = (Vec::new(), None, false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--registry" => match it.next() {
+                Some(v) if !v.starts_with('-') => registry = Some(v.as_str()),
+                _ => return Err(Unhandled),
+            },
+            "--dev" => dev = true,
+            "--expires" => match it.next() {
+                Some(v) if !v.starts_with('-') => expires = Some(v.as_str()),
+                _ => return Err(Unhandled),
+            },
+            s if s.starts_with('-') => return Err(Unhandled),
+            _ => pos.push(a.as_str()),
+        }
+    }
+    let [name, key] = pos[..] else { return Err(Unhandled) };
+    let ttl = match (dev, expires) {
+        (false, None) => None,
+        (false, Some(_)) => fail(g.json, ExitCode::Usage, "trust_key",
+            "--expires applies to a development key only; a release key does not expire here",
+            Some("noo addons trust-key <name> <pubkey> --registry <host/path> --dev --expires 14d")),
+        (true, None) => fail(g.json, ExitCode::Usage, "trust_key",
+            "a development key needs --expires (at most 30d): it is temporary by design",
+            Some(&format!("noo addons trust-key {name} {key} --dev --expires 14d"))),
+        (true, Some(e)) => match crate::addons::trust::parse_dev_ttl(e) {
+            Ok(n) => Some(n),
+            Err(why) => fail(g.json, ExitCode::Usage, "trust_key", &why,
+                Some(&format!("noo addons trust-key {name} {key} --dev --expires 14d"))),
+        },
+    };
+    let now = crate::addon_lock::now_unix();
+    let edited = match ttl {
+        Some(ttl) => edit_yaml(|t| crate::addons::trust::add_dev_key(t, name, key, registry, ttl, now)),
+        None => edit_yaml(|t| crate::addons::trust::add_key(t, name, key, registry)),
+    };
+    let path = match edited {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Usage, "trust_key", &e, Some("noo addons trust-key <name> <pubkey> --registry <host/path>")),
+    };
+    let key = key.to_ascii_lowercase();
+    let expires_at = ttl.map(|t| now + t);
+    if g.json {
+        println!("{}", json!({
+            "addon": name, "trusted_key": key, "dev": dev,
+            "expires_at": expires_at.map(crate::addon_lock::utc_rfc3339),
+            "config": path.display().to_string(),
+        }));
+    } else if let Some(at) = expires_at {
+        ui::done(&format!(
+            "{name}: DEVELOPMENT key {key} trusted until {} ({})",
+            crate::addon_lock::utc_minute(at),
+            path.display()
+        ));
+        println!("{}", ui::note("this mesh only; a lock it signs is refused after that instant and never ships in a release"));
+        ui::guide(&[
+            ("noo addons enable <name>", "(add --lock <path|https-url> to hand it the lock) verifies the lock against this key, pins it, then declares it ON"),
+            ("noo addons untrust-key <name> --dev", "removes the add-on's development keys"),
+        ]);
+    } else {
+        ui::done(&format!("{name}: signing key {key} trusted ({})", path.display()));
+        ui::guide(&[
+            ("noo addons enable <name>", "(add --lock <path|https-url> to hand it the lock) verifies the add-on's signed lock against this key, pins it, then declares it ON"),
+            ("noo addons untrust-key <name> <pubkey>", "removes the key again"),
+        ]);
+    }
+    Ok(0)
+}
+
+/// `noo addons untrust-key <name> [<pubkey>] [--dev]`: a release key by its
+/// pubkey; with `--dev`, that development key, or all of the add-on's
+/// development keys when no pubkey is given.
+pub fn addons_untrust_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let dev = args.iter().any(|a| a == "--dev");
+    if args.iter().any(|a| a.starts_with('-') && a != "--dev") {
+        return Err(Unhandled);
+    }
+    let pos: Vec<&str> = args.iter().filter(|a| *a != "--dev").map(String::as_str).collect();
+    let (name, key) = match (dev, &pos[..]) {
+        (_, [name, key]) => (*name, Some(*key)),
+        (true, [name]) => (*name, None),
+        _ => return Err(Unhandled),
+    };
+    let edited = if dev {
+        edit_yaml(|t| crate::addons::trust::remove_dev_key(t, name, key))
+    } else {
+        edit_yaml(|t| crate::addons::trust::remove_key(t, name, key.unwrap_or_default()))
+    };
+    let path = match edited {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Usage, "untrust_key", &e, Some("noo addons list")),
+    };
+    let what = match (dev, key) {
+        (true, None) => "every development key".to_string(),
+        (true, Some(k)) => format!("development key {}", k.to_ascii_lowercase()),
+        (false, k) => format!("signing key {}", k.unwrap_or_default().to_ascii_lowercase()),
+    };
+    if g.json {
+        println!("{}", json!({
+            "addon": name, "dev": dev, "removed_key": key.map(str::to_ascii_lowercase),
+            "config": path.display().to_string(),
+        }));
+    } else {
+        ui::done(&format!("{name}: {what} no longer trusted ({})", path.display()));
+        println!("{}", ui::note("a pin made under it stays until `noo addons verify` or the next start re-checks it against the remaining keys"));
+    }
+    Ok(0)
+}
+
+/// `addons list` rows for third-party add-ons (trusted with `trust-key`):
+/// `(name, declared, signer)`. `signer` reads `release`, `DEV until <date>`,
+/// or `DEV EXPIRED <date>` (the launcher refuses it). Pure over the file text.
+pub(crate) fn third_party_rows(text: &str, now: i64) -> Vec<(String, Option<bool>, String)> {
+    let declared = declared_in(text);
+    let trust = crate::addons::trust::read(text).unwrap_or_default();
+    trust
+        .into_iter()
+        .filter(|(n, _)| row(n).is_none())
+        .map(|(n, a)| {
+            let live = a.dev.iter().filter(|d| d.expires_at > now).map(|d| d.expires_at).max();
+            let dead = a.dev.iter().map(|d| d.expires_at).max();
+            let signer = match (a.keys.is_empty(), live, dead) {
+                (true, Some(at), _) => format!("DEV until {}", crate::addon_lock::utc_minute(at)),
+                (true, None, Some(at)) => format!("DEV EXPIRED {}", crate::addon_lock::utc_minute(at)),
+                (false, Some(at), _) => format!("release + DEV until {}", crate::addon_lock::utc_minute(at)),
+                (false, None, Some(at)) => format!("release (DEV expired {})", crate::addon_lock::utc_minute(at)),
+                _ => "release".to_string(),
+            };
+            let d = declared.get(&n).copied();
+            (n, d, signer)
+        })
+        .collect()
+}
+
+/// `noo addons set <name> --delegate tasks|off`
+pub fn addons_set(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let [name, flag, value] = args else { return Err(Unhandled) };
+    if flag != "--delegate" {
+        return Err(Unhandled);
+    }
+    let on = match value.as_str() {
+        "tasks" => true,
+        "off" => false,
+        _ => fail(g.json, ExitCode::Usage, "usage", &format!("--delegate takes `tasks` or `off`, not `{value}`"), Some("noo addons set <name> --delegate tasks|off")),
+    };
+    let path = match edit_yaml(|t| crate::addons::trust::set_delegation(t, name, on)) {
+        Ok(p) => p,
+        Err(e) => fail(g.json, ExitCode::Generic, "config", &e, None),
+    };
+    if g.json {
+        println!("{}", json!({"addon": name, "delegate_tasks": on, "config": path.display().to_string(), "restart_required": true}));
+    } else {
+        ui::done(&format!("{name}: addon_delegation.{name}.tasks = {on} ({})", path.display()));
+        println!("{}", ui::note("it takes effect only if the add-on's manifest also declares `delegate: \"tasks\"`"));
+        ui::guide(&[("noo stack restart --force", "the gateway reads it at start")]);
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -723,6 +1165,29 @@ compose_env:
         assert!(row("nope").is_none());
     }
 
+    #[test]
+    fn show_and_list_read_the_declarations_of_each_materialised_bundle() {
+        let root = std::env::temp_dir().join(format!("noo-addons-decls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ex = root.join("addons").join("example-addon");
+        std::fs::create_dir_all(&ex).unwrap();
+        std::fs::write(ex.join("docker-compose.yml"), "services: {}\n").unwrap();
+        std::fs::write(ex.join("system.json"), r#"{"schema":"example_addon","role":"noo_example_addon","ddl_role":"noo_example_addon_ddl"}"#).unwrap();
+        std::fs::write(ex.join("workloads.json"), r#"{"workloads":[{"name":"worker","container":"noo-example-addon-worker","gpu":false,"need_mb":512,"drain":{"route":"drain","timeout_secs":30}}]}"#).unwrap();
+        let bad = root.join("addons").join("broken-addon");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("system.json"), r#"{"schema":"public","role":"noo_app","ddl_role":"noo"}"#).unwrap();
+        let got = bundle_decls(&root);
+        assert_eq!(got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["broken-addon", "example-addon"]);
+        assert!(got[0].1.is_err());
+        let j = decl_json(&got[1].1);
+        assert_eq!(j["system"]["schema"], "example_addon");
+        assert_eq!(j["workloads"][0]["container"], "noo-example-addon-worker");
+        assert_eq!(j["workloads"][0]["drain"]["timeout_secs"], 30);
+        assert!(decl_json(&got[0].1)["error"].as_str().unwrap().contains("`schema`"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn tmp(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("noo-addons-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -818,5 +1283,26 @@ compose_env:
             );
         }
         assert!(seen >= 4, "only found {seen} gateway add-ons — the parse is wrong, not the table");
+    }
+
+    #[test]
+    fn list_marks_a_dev_signed_third_party_addon_with_its_expiry() {
+        let pk = |seed: &str| crate::release_sig::pubkey_hex(&crate::release_sig::signing_key_from_seed_hex(seed).unwrap());
+        let now = 1_790_000_000;
+        let root = "ghcr.io/vendor/x";
+        let t = "addons:\n  pai-voice: true\n";
+        let t = crate::addons::trust::add_dev_key(t, "pai-voice", &pk(&"ab".repeat(32)), Some(root), 86_400, now).unwrap();
+        let t = crate::addons::trust::add_key(&t, "other-addon", &pk(&"cd".repeat(32)), Some(root)).unwrap();
+        let rows = third_party_rows(&t, now);
+        let until = crate::addon_lock::utc_minute(now + 86_400);
+        assert_eq!(rows, vec![
+            ("other-addon".to_string(), None, "release".to_string()),
+            ("pai-voice".to_string(), Some(true), format!("DEV until {until}")),
+        ]);
+        // After the expiry it reads EXPIRED (the launcher refuses it).
+        let rows = third_party_rows(&t, now + 86_400);
+        assert_eq!(rows[1].2, format!("DEV EXPIRED {until}"));
+        // The add-ons the CLI ships are never listed here.
+        assert!(third_party_rows("addons:\n  evolve: true\n", now).is_empty());
     }
 }

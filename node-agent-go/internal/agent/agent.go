@@ -39,6 +39,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/logship"
 	"github.com/noomesh/noomesh/node-agent-go/internal/messaging"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
+	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/reconcile"
 )
 
@@ -246,9 +247,21 @@ func (a *Agent) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle OS signals for graceful shutdown
+	// Handle OS signals for graceful shutdown. A signal cancels ctx at once,
+	// wherever Run is: everything before step 5 waits on ctx. A stop that
+	// arrived while the controller refused registration (a 401 loop) used to
+	// sit unread in sigCh until systemd's SIGKILL 30 s later.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	stopSig := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			stopSig <- sig
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	// 1. Start HTTP API server (in background so node is reachable during
 	//    registration). A listener that fails to come up is FATAL for the
@@ -276,13 +289,10 @@ func (a *Agent) Run() error {
 	hostIP := heartbeat.DetectHostIP(a.cfg)
 	slog.Info("registering with controller", "ip", hostIP)
 
-	for !a.hb.Register(caps, hostIP) {
-		slog.Warn("waiting for controller")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
+	if !registerUntil(ctx, func() bool { return a.hb.Register(caps, hostIP) }, 10*time.Second) {
+		slog.Info("shutting down before registration completed", "signal", <-stopSig)
+		a.shutdown()
+		return nil
 	}
 
 	// Publish registration event
@@ -299,10 +309,8 @@ func (a *Agent) Run() error {
 	gy := gpuyield.New(gpuyield.ConfigFromEnv(os.Getenv), gpuyield.NewSMIProbe(), a.docker, a.cfg.StateDir)
 	gpuyield.SetDefault(gy)
 	a.hb.SetGPUContention(func() any { return gy.Report() })
-	a.server.SetGPUHold(
-		func(ctx context.Context, reason string) any { return gy.Hold(ctx, reason) },
-		func() any { return gy.Release() },
-	)
+	gy.SetDrainer(occupancyDrainer{})
+	a.server.SetGPUHold(gy.Hold, gy.Release)
 	go a.hb.Run(ctx)
 
 	// 4a. GPU watchdog — only where a GPU is actually detected.
@@ -377,7 +385,7 @@ func (a *Agent) Run() error {
 		cancel()
 		a.shutdown()
 		return fmt.Errorf("control API: %w", err)
-	case sig := <-sigCh:
+	case sig := <-stopSig:
 		slog.Info("shutting down", "signal", sig)
 	}
 	cancel()
@@ -385,6 +393,21 @@ func (a *Agent) Run() error {
 	// Cleanup
 	a.shutdown()
 	return nil
+}
+
+// registerUntil calls register every retry until it succeeds (true) or ctx
+// is cancelled (false). The wait between tries is the only place it blocks,
+// and it gives way to ctx, so a stop is answered within one register call.
+func registerUntil(ctx context.Context, register func() bool, retry time.Duration) bool {
+	for !register() {
+		slog.Warn("waiting for controller")
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(retry):
+		}
+	}
+	return true
 }
 
 // startControlBus wires the control-over-the-bus service. Never fatal.
@@ -803,6 +826,7 @@ func (a *Agent) backendContainers() map[string]any {
 		m = a.docker.BackendContainersBeside(adopted)
 	}
 	if a.ollama == nil {
+		occupancy.Annotate(m)
 		return m
 	}
 	if m == nil {
@@ -812,6 +836,8 @@ func (a *Agent) backendContainers() map[string]any {
 		_, running := adoptedRunning["ollama"]
 		m["ollama"] = a.ollama.Report(running)
 	}
+	// in_flight / slots / queued per backend (the proxy's admission).
+	occupancy.Annotate(m)
 	return m
 }
 
@@ -867,4 +893,14 @@ func meshBackendInfos(backends map[string]string, selfURL, scheme string) map[st
 		result[bt] = messaging.BackendInfo{Model: model, URL: url, APIFormat: "openai"}
 	}
 	return result
+}
+
+// occupancyDrainer is the GPU hold's admission hook: a drain closes the
+// inference proxy's admission on the GPU backends and waits for what is
+// in flight to finish (internal/occupancy).
+type occupancyDrainer struct{}
+
+func (occupancyDrainer) SetDraining(backends []string, on bool) { occupancy.SetDraining(backends, on) }
+func (occupancyDrainer) WaitIdle(ctx context.Context, backends []string) (bool, map[string]int) {
+	return occupancy.WaitIdle(ctx, backends)
 }

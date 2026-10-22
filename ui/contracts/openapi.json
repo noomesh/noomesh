@@ -161,6 +161,14 @@
                           "unhealthy"
                         ]
                       }
+                    },
+                    "addons_dev": {
+                      "type": "object",
+                      "description": "Present only when some add-on is vouched for by a temporary development signing key rather than a release key (`noo addons trust-key <name> <pubkey> --dev --expires <dur>`): add-on name to `dev (expires YYYY-MM-DD HH:MM UTC)`. The add-on's `addons.<name>` word stays `enabled`; once the key expires it reads `unhealthy` and the add-on drops out of this map. Absent for an anonymous caller.",
+                      "additionalProperties": {
+                        "type": "string",
+                        "example": "dev (expires 2026-11-04 12:00 UTC)"
+                      }
                     }
                   }
                 }
@@ -18908,6 +18916,1036 @@
             }
           }
         }
+      }
+    },
+    "/api/prompt-skills/proposals": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get proposals",
+        "description": "[native] GET /api/prompt-skills/proposals?status=&limit= \u2014 pending first. Files a proposal for every runtime skill that has none on its current text (skills that predate this feature, or written while the table was unreachable).",
+        "operationId": "prompt_skills_proposals",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "promoted",
+                "rejected",
+                "superseded",
+                "withdrawn"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        ]
+      }
+    },
+    "/api/prompt-skills/proposals/{id}/decide": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create decide",
+        "description": "[native] POST /api/prompt-skills/proposals/{id}/decide \u2014 body `{decision: \"promote\"|\"reject\", reason?}`. A promoted skill is injected as instructions (system message, with core skills) while its text is the one decided on.",
+        "operationId": "prompt_skills_decide",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "decision"
+                ],
+                "properties": {
+                  "decision": {
+                    "type": "string",
+                    "enum": [
+                      "promote",
+                      "reject"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ]
+      }
+    },
+    "/api/tasks/stop": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create stop",
+        "description": "[native] Revoke background work: stop every unfinished task the caller owns that was created `via` an add-on. The owner, or that add-on's own delegated token, stops the caller's; an operator may name another person with `user`.",
+        "operationId": "tasks_stop_via",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/context": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create context",
+        "description": "[native] Context an add-on pushes into a running task: revisions are monotonic per task and a retry of the same revision is a no-op, picked up at the next loop boundary. Distinct from `answer`, which needs a pending question.",
+        "operationId": "tasks_context",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/events": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get events",
+        "description": "[native] The task's events after `after` (default: from the start), oldest first.",
+        "operationId": "tasks_events",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces/{space}/migration": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create migration",
+        "description": "[native] POST /api/cluster/embedding-spaces/{space}/migration `{model}` -- start re-embedding a space into another model (i150). The gateway PROBES the new model (one short text across the mesh nodes declaring it, its own balancer, no static endpoints); the answer's width must equal the space's, because trellion's `vector(N)` columns are fixed. 409 on a running migration, a model another space has, or a different width. When no node serves the model yet: 202 and the migration waits as `pending`.",
+        "operationId": "embedding_space_migration_start",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete migration",
+        "description": "[native] DELETE /api/cluster/embedding-spaces/{space}/migration -- cancel while filling. Once the cutover has begun trellion is swapping columns, so the model must follow: 409.",
+        "operationId": "embedding_space_migration_cancel",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/embedding-spaces/{space}/migration/complete": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create complete",
+        "description": "[native] POST /api/cluster/embedding-spaces/{space}/migration/complete -- the operator's go: refused unless trellion reported (fresh, about this model) every table fully re-embedded. Moves the migration to `cutover`; trellion swaps its columns and its `cutover_done` report flips the space's model.",
+        "operationId": "embedding_space_migration_complete",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/external/embedding-spaces/{space}/migration": {
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Update migration",
+        "description": "[native] PUT /api/external/embedding-spaces/{space}/migration (i150) -- trellion's re-embed worker reports progress with its consumer key. Stores the report and its time; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. 409 when the space has no migration or the report is about another model.",
+        "operationId": "embedding_migration_report",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/archive": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get archive",
+        "description": "[native] GET /api/agents/archive \u2014 the agent-mail archive files (operator-only).",
+        "operationId": "archive_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/archive/{month}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get archive",
+        "description": "[native] GET /api/agents/archive/{month} \u2014 one month's rows (`YYYY-MM` or the file name). Bodies stay sealed unless `?decrypt=true`, which needs an operator AND the review key and is audited before any plaintext is produced.",
+        "operationId": "archive_export",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addon-workloads/{addon}/{workload}/status": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get status",
+        "description": "[native] `GET /api/addon-workloads/{addon}/{workload}/status`: how an add-on observes its own reservation without touching the worker. The add-on's own token or an operator; 404 when the workload is not declared. `{workload, reserved, reservation: {id, node, holder, state, since, generation} | null}`.",
+        "operationId": "workload_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get reservations",
+        "description": "[native] GET /api/cluster/reservations \u2014 every lease the nodes report. Operator read.",
+        "operationId": "reservations_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create reservations",
+        "description": "[native] POST /api/cluster/reservations \u2014 body `{workload: \"<addon>/<name>\", node?, hand_over?: <reservation id>, timeout_secs?}`. Operator only; audited (`reservation_take`).",
+        "operationId": "reservation_take",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations/{id}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get reservations",
+        "description": "[native] GET /api/cluster/reservations/{id}",
+        "operationId": "reservation_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete reservations",
+        "description": "[native] POST /api/cluster/reservations/{id}/release (or DELETE \u2026/{id}) \u2014 body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.",
+        "operationId": "reservation_release",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations/{id}/release": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create release",
+        "description": "[native] POST /api/cluster/reservations/{id}/release (or DELETE \u2026/{id}) \u2014 body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.",
+        "operationId": "reservation_release",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/workloads": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get workloads",
+        "description": "[native] GET /api/cluster/workloads \u2014 what the verified add-on bundles declare.",
+        "operationId": "workloads_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addon-workloads/{addon}/{workload}/proxy/{*path}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_get",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_post",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_put",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_patch",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_delete",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        }
+      }
+    },
+    "/api/addons/ui": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "List add-on UIs",
+        "description": "[native] GET /api/addons/ui \u2014 the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.",
+        "operationId": "ui_list",
+        "responses": {
+          "200": {
+            "description": "The add-on web UIs this caller may see",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "uis"
+                  ],
+                  "properties": {
+                    "uis": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "addon",
+                          "title",
+                          "port",
+                          "can_open"
+                        ],
+                        "properties": {
+                          "addon": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "type": "integer"
+                          },
+                          "url_base": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "https://<host>:<port>, the add-on's own origin"
+                          },
+                          "can_open": {
+                            "type": "boolean",
+                            "description": "Whether this account's role may open it (ui.min_role)"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addons/{addon_id}/ui-session": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Open an add-on UI",
+        "description": "[native] POST /api/addons/{addon_id}/ui-session \u2014 hand the signed-in person over to an add-on's web UI, which is served on an origin of its own (a port of its own on this host). Send the access token as `Authorization: Bearer`; checks the UI's `min_role` and answers a one-time code (30 s, single use, bound to this person and add-on) and the URL `https://<host>:<port>/__noo/session?code=<code>` to navigate to. The add-on origin redeems it and sets its own cookie. 401 without a person's bearer, 403 below the UI's role, 404 when the add-on serves no UI, 503 when it is off or its UI listener is not up.",
+        "operationId": "ui_session",
+        "responses": {
+          "200": {
+            "description": "A one-time code and where to send the browser",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "port",
+                    "path",
+                    "expires_in"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer"
+                    },
+                    "path": {
+                      "type": "string",
+                      "description": "/__noo/session?code=<code>"
+                    },
+                    "url": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "https://<host>:<port>/__noo/session?code=<code>; open it in a new tab"
+                    },
+                    "expires_in": {
+                      "type": "integer"
+                    },
+                    "session_idle_secs": {
+                      "type": "integer"
+                    },
+                    "session_max_secs": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No person's bearer"
+          },
+          "403": {
+            "description": "Below the UI's min_role, or a delegated credential"
+          },
+          "404": {
+            "description": "The add-on serves no UI"
+          },
+          "503": {
+            "description": "The add-on is off or its UI origin is not listening"
+          }
+        },
+        "parameters": [
+          {
+            "name": "addon_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/addons/{addon_id}/ws-ticket": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Mint an add-on socket ticket",
+        "description": "[native] POST /api/addons/{addon_id}/ws-ticket \u2014 a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/\u2026?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.",
+        "operationId": "ws_ticket",
+        "responses": {
+          "200": {
+            "description": "A single-use ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ticket",
+                    "param",
+                    "expires_in"
+                  ],
+                  "properties": {
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "param": {
+                      "type": "string",
+                      "enum": [
+                        "ticket"
+                      ]
+                    },
+                    "expires_in": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No person's bearer"
+          },
+          "403": {
+            "description": "A delegated or harness credential"
+          },
+          "404": {
+            "description": "The add-on declares no WebSocket route"
+          },
+          "503": {
+            "description": "The add-on is off"
+          }
+        },
+        "parameters": [
+          {
+            "name": "addon_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
       }
     }
   },

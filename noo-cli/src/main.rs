@@ -75,6 +75,8 @@ mod passthrough;
 mod pki;
 mod role;
 mod shell_completion;
+#[cfg(test)]
+mod test_exec;
 mod tailnet_serve;
 mod ui;
 mod usage;
@@ -214,6 +216,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["recall", "lifecycle-stats"], commands::recall_stats), // alias (endpoint naming)
     (&["prompt-skills", "list"], commands::prompt_skills_list),
     (&["prompt-skills", "info"], commands::prompt_skills_info),
+    (&["prompt-skills", "proposals"], commands::prompt_skills_proposals),
     (&["prompt-skills", "get"], commands::prompt_skills_info), // alias (agent naming)
     (&["models", "cached"], commands::models_cached),
     // Streaming NDJSON/SSE progress from /api/terminal/ollama/pull.
@@ -264,6 +267,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "embedding-space", "list"], commands::cluster_embedding_space_list),
     (&["cluster", "embedding-space", "set"], commands::cluster_embedding_space_set),
     (&["cluster", "embedding-space", "unset"], commands::cluster_embedding_space_unset),
+    (&["cluster", "embedding-space", "migrate"], commands::cluster_embedding_space_migrate),
     // `cluster exec`/`logs` spawn ssh with inherited stdio (fixes the
     // Python versions' swallowed stdout) and propagate the remote rc.
     (&["cluster", "logs"], commands::cluster_logs),
@@ -271,6 +275,13 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    // Reservations: an add-on's declared workload takes a GPU out of the
+    // pool (drain, owned hold, start) and gives it back (drain, stop,
+    // release); the low-level `gpu hold|release` stay for emergencies.
+    (&["cluster", "reserve"], commands::cluster_reserve),
+    (&["cluster", "reservations"], commands::cluster_reservations),
+    (&["cluster", "release"], commands::cluster_release),
+    (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
     (&["cluster", "profile"], commands::cluster_profile),
@@ -439,6 +450,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["agents", "thread"], commands::agents_thread),
     (&["agents", "presence"], commands::agents_presence),
     (&["agents", "messages"], commands::agents_messages),
+    (&["agents", "archive", "list"], commands::agents_archive_list),
+    (&["agents", "archive", "export"], commands::agents_archive_export),
+    // `noo agent archive …`: the singular the operator spec names; same handlers.
+    (&["agent", "archive", "list"], commands::agents_archive_list),
+    (&["agent", "archive", "export"], commands::agents_archive_export),
     (&["tasks", "create"], commands::tasks_create),
     (&["tasks", "list"], commands::tasks_list),
     (&["tasks", "show"], commands::tasks_show),
@@ -450,6 +466,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["inference", "agent"], commands::inference_agent),
     (&["prompt-skills", "create"], commands::prompt_skills_create),
     (&["prompt-skills", "evolve"], commands::prompt_skills_evolve),
+    (&["prompt-skills", "decide"], commands::prompt_skills_decide),
     // ── WP-A4: observability — logs (containers/LogQL/Loki status), memory
     // conversation listing, recall archive/lifecycle/refresh triggers +
     // local test stub, heartbeat task add/remove. `debug query` stays
@@ -661,11 +678,15 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["backups", "setup"], commands::backups_setup),
     (&["backups", "status"], commands::backups_status),
     (&["addons", "list"], commands::addons_list),
+    (&["addons", "show"], commands::addons_show),
     (&["addons", "enable"], commands::addons_enable),
     (&["addons", "disable"], commands::addons_disable),
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["addons", "trust-key"], commands::addons_trust_key),
+    (&["addons", "untrust-key"], commands::addons_untrust_key),
+    (&["addons", "set"], commands::addons_set),
     (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),
     (&["kiosk", "labels"], commands::kiosk_labels),
@@ -711,7 +732,7 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["autonomy", "locations"],
     &["ops"],
     &["kiosk", "serve"],
-    // The seat's timer runs it (noo-seat-sync.service, root); nobody types it.
+    // The seat's timer runs it (noo-seat-sync.service, as the seat user); nobody types it.
     &["kiosk", "seat-sync"],
     &["tools", "select"],
     // Aliases and retired verbs: they still work, but are not offered.
@@ -737,6 +758,9 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
 ///     install.
 const HIDDEN_NO_USAGE: &[&[&str]] = &[
     &["tui"],
+    // The singular spelling of `agents archive`.
+    &["agent", "archive", "list"],
+    &["agent", "archive", "export"],
     // Plumbing and retired `cluster` verbs: dispatch only.
     &["node", "fetch"],
     &["cluster", "clean-node"],

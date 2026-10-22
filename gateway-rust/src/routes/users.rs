@@ -205,6 +205,15 @@ fn actor(ext: &Option<Extension<AuthActor>>) -> String {
 }
 
 fn hash_password(pw: &str) -> Result<String, AppError> {
+    // `check_new_password` refuses an over-long password first; this is the
+    // same rule at the hash itself. bcrypt's own `non_truncating_hash` is NOT
+    // used: it counts the NUL terminator bcrypt appends, so it refuses a
+    // password of exactly 72 bytes even though all 72 bytes are used. The 72
+    // byte rule is therefore enforced on the byte length, and `hash` then
+    // cannot drop anything of the password.
+    if let Some(why) = crate::password_policy::too_long_for_bcrypt(pw) {
+        return Err(AppError::BadRequest(why.to_string()));
+    }
     bcrypt::hash(pw, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("password hash failed: {e}")))
 }
@@ -2468,6 +2477,13 @@ const OPERATOR_ONLY_KEY_SCOPES: &[&str] =
     &[crate::mcp_local::OPERATOR_SCOPE, crate::auth::IDENTITY_SCOPE];
 
 fn validate_key_scopes(scopes: &[String]) -> Result<(), AppError> {
+    validate_key_scopes_with(scopes, &crate::addon_proxy::declared_scopes())
+}
+
+/// `declared` is the add-on scopes the loaded manifests declare: a key may
+/// carry one (it opens that add-on's GET route for the exchanged token), and
+/// nothing else of the `<addon>:<word>` shape.
+fn validate_key_scopes_with(scopes: &[String], declared: &[String]) -> Result<(), AppError> {
     // A retired scope gets its own refusal, naming what replaced it — "unknown
     // scope" would read as a typo to someone following an old runbook.
     if let Some((scope, why)) = crate::service_keys::RETIRED_KEY_SCOPES
@@ -2482,13 +2498,15 @@ fn validate_key_scopes(scopes: &[String]) -> Result<(), AppError> {
             !SERVICE_KEY_SCOPES.contains(&s.as_str())
                 && !OPERATOR_ONLY_KEY_SCOPES.contains(&s.as_str())
                 && !crate::auth::is_control_scope(s)
+                && !declared.contains(s)
         })
         .collect();
     if !bad.is_empty() {
         return Err(AppError::BadRequest(format!(
             "unknown scope(s): {bad:?}. Allowed: {SERVICE_KEY_SCOPES:?}, the control scopes \
              (temporal, heartbeat, activities, channels:send, metrics, config:<section>) \
-             (+ {OPERATOR_ONLY_KEY_SCOPES:?}, operator-issued only)"
+             (+ {OPERATOR_ONLY_KEY_SCOPES:?}, operator-issued only).{}",
+            addon_scope_hint(declared)
         )));
     }
     Ok(())
@@ -3352,18 +3370,41 @@ fn clean_str_list(xs: Vec<String>) -> Vec<String> {
 }
 
 fn unknown_scopes_error(scopes: &[String]) -> Option<String> {
+    unknown_scopes_error_with(scopes, &crate::addon_proxy::declared_scopes())
+}
+
+/// The refusal text for scopes that are neither core nor declared by a loaded
+/// add-on. A `<addon>:<word>` shape gets the add-on explanation (and names
+/// what the loaded add-ons DO declare) so a typo or an add-on that is off is
+/// not read as "that scope does not exist anywhere".
+fn unknown_scopes_error_with(scopes: &[String], declared: &[String]) -> Option<String> {
     let mut unknown: Vec<&String> = scopes
         .iter()
-        .filter(|s| !KNOWN_USER_SCOPES.contains(&s.as_str()))
+        .filter(|s| !KNOWN_USER_SCOPES.contains(&s.as_str()) && !declared.contains(s))
         .collect();
     if unknown.is_empty() {
         return None;
     }
     unknown.sort();
     unknown.dedup();
-    Some(format!(
-        "unknown scopes: {unknown:?} (known: {KNOWN_USER_SCOPES:?})"
-    ))
+    let mut msg = format!("unknown scopes: {unknown:?} (known: {KNOWN_USER_SCOPES:?})");
+    msg.push_str(&addon_scope_hint(declared));
+    Some(msg)
+}
+
+/// What to say about add-on scopes in a refusal: they are accepted only when a
+/// loaded add-on's manifest declares them on a route.
+fn addon_scope_hint(declared: &[String]) -> String {
+    if declared.is_empty() {
+        " An add-on scope (<addon>:<word>) is accepted only when a loaded add-on's manifest \
+         declares it; no loaded add-on declares any scope (is the add-on enabled?)."
+            .to_string()
+    } else {
+        format!(
+            " An add-on scope (<addon>:<word>) is accepted only when a loaded add-on's manifest \
+             declares it; the loaded add-ons declare: {declared:?}."
+        )
+    }
 }
 
 fn is_operator(r: &RequesterCtx) -> bool {
@@ -3883,14 +3924,19 @@ fn validate_user_proposal(action: &str, payload: &Value) -> Option<String> {
         _ => None,
     };
     if let Some(scopes) = scopes_to_check {
+        let declared = crate::addon_proxy::declared_scopes();
         let mut unknown: Vec<String> = scopes
             .into_iter()
-            .filter(|s| !KNOWN_USER_SCOPES.contains(&s.as_str()))
+            .filter(|s| !KNOWN_USER_SCOPES.contains(&s.as_str()) && !declared.contains(s))
             .collect();
         if !unknown.is_empty() {
             unknown.sort();
             unknown.dedup();
-            return Some(format!("unknown scopes: {}", py_list_repr(&unknown)));
+            return Some(format!(
+                "unknown scopes: {}.{}",
+                py_list_repr(&unknown),
+                addon_scope_hint(&declared)
+            ));
         }
     }
     None
@@ -4530,6 +4576,28 @@ mod tests {
     }
 
     /// The mutation guard refuses a non-admin the same way.
+    fn declared() -> Vec<String> {
+        vec!["evolve:read_items".to_string()]
+    }
+
+    #[test]
+    fn a_declared_addon_scope_is_grantable_to_a_user_and_a_key() {
+        let s = vec!["read".to_string(), "evolve:read_items".to_string()];
+        assert!(super::unknown_scopes_error_with(&s, &declared()).is_none());
+        assert!(super::validate_key_scopes_with(&["evolve:read_items".to_string()], &declared()).is_ok());
+    }
+
+    #[test]
+    fn an_undeclared_addon_scope_is_refused_naming_what_is_declared() {
+        let s = vec!["evolve:run_everything".to_string()];
+        let e = super::unknown_scopes_error_with(&s, &declared()).expect("refused");
+        assert!(e.contains("evolve:run_everything") && e.contains("evolve:read_items"), "{e}");
+        let e = super::unknown_scopes_error_with(&s, &[]).expect("refused with no add-on loaded");
+        assert!(e.contains("no loaded add-on declares any scope"), "{e}");
+        let ke = super::validate_key_scopes_with(&s, &declared()).expect_err("key refused");
+        assert!(format!("{ke:?}").contains("evolve:read_items"));
+    }
+
     #[test]
     fn users_admin_mutation_guard_is_403_for_a_non_admin() {
         let c = role_ctx(crate::auth::Role::User);
@@ -5943,6 +6011,32 @@ mod session_end_tests {
         assert!(me.contains("session_floor::refuses("));
         assert!(!me.contains("still return from token claims"), "a deleted account must not be echoed as live identity");
         assert!(me.contains("User no longer exists"));
+    }
+
+    #[test]
+    fn hash_password_refuses_over_72_bytes_and_old_hashes_verify() {
+        // Exactly 72 bytes hashes and verifies.
+        let ok = "x".repeat(72);
+        let h = super::hash_password(&ok).unwrap();
+        assert!(bcrypt::verify(&ok, &h).unwrap());
+        // 73 bytes, and 30 non-ASCII characters (90 bytes), are a 400.
+        for pw in ["x".repeat(73), "\u{20ac}".repeat(30)] {
+            match super::hash_password(&pw) {
+                Err(crate::routes::AppError::BadRequest(m)) => assert_eq!(m, crate::password_policy::TOO_LONG_MSG),
+                other => panic!("expected BadRequest, got {:?}", other.map(|_| ())),
+            }
+            assert!(check_new_password_msg(&pw));
+        }
+        // A hash made before the rule (truncating API) of an 80-byte
+        // password still verifies; verification is untouched.
+        let long = "y".repeat(80);
+        let old = bcrypt::hash(&long, 4).unwrap();
+        assert!(bcrypt::verify(&long, &old).unwrap());
+    }
+
+    fn check_new_password_msg(pw: &str) -> bool {
+        matches!(super::check_new_password(pw, "admin"),
+            Err(crate::routes::AppError::BadRequest(m)) if m.contains("longer than 72 bytes"))
     }
 
     #[test]

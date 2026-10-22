@@ -435,6 +435,37 @@ pub fn ensure_hostd_spool(cfg: &Value, services: &[String], no_deps: bool, syste
     made
 }
 
+/// Bind sources the LAUNCHER owns and fills: the add-on bundle declaration
+/// directories the gateway mounts read-only (i163 E/B: `lib-addons.sh`
+/// `addon_decls_materialise` copies `<addon>/system.json` and
+/// `<addon>/workloads.json` into them). Empty is their normal state, so a
+/// missing one is created here, as the invoking user, rather than refused
+/// (Docker would create it root-owned and the launcher could not fill it).
+pub const LAUNCHER_DIRS: &[&str] = &[".noo-addon-systems", ".noo-addon-workloads"];
+
+/// Create each MISSING bind source named in [`LAUNCHER_DIRS`] for the
+/// selected services, as the invoking user; return what was created.
+pub fn ensure_launcher_dirs(cfg: &Value, services: &[String], no_deps: bool) -> Vec<String> {
+    let mut made = Vec::new();
+    for svc in selected(cfg, services, no_deps) {
+        let vols = cfg["services"][&svc]["volumes"].as_array().cloned().unwrap_or_default();
+        for v in vols {
+            if v.get("type").and_then(Value::as_str) != Some("bind") {
+                continue;
+            }
+            let Some(source) = v.get("source").and_then(Value::as_str) else { continue };
+            let source = source.trim_end_matches('/');
+            if !LAUNCHER_DIRS.contains(&basename(source)) || Path::new(source).exists() || made.iter().any(|m| m == source) {
+                continue;
+            }
+            if std::fs::create_dir_all(source).is_ok() {
+                made.push(source.to_string());
+            }
+        }
+    }
+    made
+}
+
 /// The refusal text, header to footer. Empty when there is nothing to refuse.
 pub fn refusal(findings: &[Finding]) -> String {
     if findings.is_empty() {
@@ -504,6 +535,9 @@ fn launch_check(
     for made in ensure_hostd_spool(cfg, services, no_deps, systemd) {
         text.push_str(&format!("created the host executor spool {made} (no systemd, so no noo-hostd to own it)\n"));
     }
+    for made in ensure_launcher_dirs(cfg, services, no_deps) {
+        text.push_str(&format!("created {made} (the add-on declarations directory; the launcher fills it)\n"));
+    }
     let findings = check_except(cfg, services, no_deps, skip, data_root);
     if findings.is_empty() {
         return (0, text);
@@ -517,6 +551,24 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_addon_declaration_dirs_are_created_as_the_user_not_refused() {
+        let d = scratch("launcher-dirs");
+        let sys = d.join(".noo-addon-systems");
+        let wl = d.join(".noo-addon-workloads");
+        let other = d.join("not-ours");
+        let cfg = json!({"services": {"gateway": {"volumes": [
+            {"type": "bind", "source": sys.display().to_string(), "target": "/opt/noo/addon-systems", "read_only": true},
+            {"type": "bind", "source": wl.display().to_string(), "target": "/opt/noo/addon-workloads", "read_only": true},
+            {"type": "bind", "source": other.display().to_string(), "target": "/x"},
+        ]}}});
+        let made = ensure_launcher_dirs(&cfg, &[], false);
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert!(sys.is_dir() && wl.is_dir());
+        assert!(!other.exists(), "only the launcher's own directories are created");
+        assert!(ensure_launcher_dirs(&cfg, &[], false).is_empty(), "idempotent");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("noo-bind-sources-{name}-{}", std::process::id()));

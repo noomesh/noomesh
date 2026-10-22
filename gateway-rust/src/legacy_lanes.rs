@@ -10,7 +10,7 @@
 //! | `self_call_shared_secret` | a controller- or fleet-secret HMAC buying inference (transitional bridge, `NOO_SELF_CALL_SHARED_SECRET`) |
 //! | `cluster_hmac_non_inference` | a controller-secret HMAC (or a fleet HMAC in the legacy full-access mode) resolving to `ClusterKind::Internal` on any other route. The add-ons' HMAC is no longer admitted here: it is REFUSED first and counted as `addon_shared_secret_refused` (`addon_hmac_refusal.rs`) |
 //! | `node_token_no_cert` | a fleet-secret HMAC resolving to `ClusterKind::Node` with no client certificate on the connection |
-//! | `cluster_hmac_v1` | a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0` |
+//! | `cluster_hmac_v1` | a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0`, and then counted as `cluster_hmac_v1_refused` instead |
 //! | (node side) `static_token` / `whois_non_controller` | reported by each node agent on its heartbeat as `legacy_lanes` |
 //!
 //! The `noo` CLI is no longer on any of these lanes. Its controller-secret
@@ -61,9 +61,13 @@ pub const LANE_OPERATOR_CERT: &str = "operator_client_cert";
 /// A fleet-secret HMAC in the v1 wire form (`<actor>:<ts>:<hmac>`): signed
 /// over actor and time only, so a captured header replays on any route for
 /// five minutes. Admitted while `NOO_CLUSTER_TOKEN_V1` is open; every count
-/// is a caller that still has to upgrade to v2. When the gate is closed the
-/// same use is counted as [`LANE_HMAC_V1`] with the refusal in the log.
+/// is a caller that still has to upgrade to v2. Admissions only: when the
+/// gate is closed the token is counted as [`LANE_HMAC_V1_REFUSED`] instead.
 pub const LANE_HMAC_V1: &str = "cluster_hmac_v1";
+/// REFUSED, not admitted: a v1 cluster token after `NOO_CLUSTER_TOKEN_V1=0`
+/// closed the gate. Every count is a caller (by name) whose calls all fail
+/// until it signs v2.
+pub const LANE_HMAC_V1_REFUSED: &str = "cluster_hmac_v1_refused";
 /// Comparator: the request-bound v2 form, the replacement for [`LANE_HMAC_V1`].
 pub const LANE_HMAC_V2: &str = "cluster_hmac_v2";
 /// REFUSED, not admitted: a controller-secret HMAC signed by the `noo` CLI
@@ -229,10 +233,18 @@ pub fn operator_cert_use(operator: &str, path: &str) -> LaneUse {
     }
 }
 
-/// A fleet-secret HMAC admitted (or, gate closed, refused) in the v1 form.
+/// A fleet-secret HMAC admitted in the v1 form.
 pub fn hmac_v1_use(actor: &str, path: &str) -> LaneUse {
     LaneUse {
         lane: LANE_HMAC_V1,
+        labels: vec![("caller", bounded_name("caller", actor)), ("route_class", route_class(path).into())],
+    }
+}
+
+/// A fleet-secret HMAC in the v1 form, refused because the gate is closed.
+pub fn hmac_v1_refused_use(actor: &str, path: &str) -> LaneUse {
+    LaneUse {
+        lane: LANE_HMAC_V1_REFUSED,
         labels: vec![("caller", bounded_name("caller", actor)), ("route_class", route_class(path).into())],
     }
 }
@@ -473,6 +485,15 @@ mod tests {
         let out = rendered(&[u.clone(), u]).await;
         assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="cli-posture",lane="cli_shared_secret_refused",route_class="security"} 2"#), "{out}");
         assert!(!out.contains("cluster_hmac_non_inference"), "a refusal is not an admitted use: {out}");
+    }
+
+    /// A v1 token refused at a closed gate is its own lane: the admitted
+    /// `cluster_hmac_v1` series does not move.
+    #[tokio::test]
+    async fn a_refused_v1_token_is_not_counted_as_admitted() {
+        let out = rendered(&[hmac_v1_refused_use("pop-os", "/api/cluster/nodes/pop-os/heartbeat")]).await;
+        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1_refused",route_class="cluster"} 1"#), "{out}");
+        assert!(!out.contains(r#"lane="cluster_hmac_v1""#), "a refusal is not an admitted use: {out}");
     }
 
     /// The controller door refuses the CLI's actors BEFORE it classifies or

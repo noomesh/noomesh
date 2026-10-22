@@ -72,6 +72,10 @@ pub const FILE_BACKED_SECRETS: &[&str] = &[
     "NOO_EVOLVE_DDL_PASSWORD",
     "NOO_TRELLION_DB_PASSWORD",
     "NOO_TRELLION_DDL_PASSWORD",
+    // Every declared system's enable flag and role passwords that no named
+    // line above delivers, as ONE `KEY=VALUE` file the launcher writes
+    // (system_provision.rs `SYSTEMS_SECRETS`). A new system needs no entry here.
+    "NOO_SYSTEMS_SECRETS",
     "NATS_GATEWAY_PASSWORD",
     // The node's own bus password. Never delivered to the gateway container:
     // the node-hosted harness (`noo-gateway harness`, harness_main.rs) reads

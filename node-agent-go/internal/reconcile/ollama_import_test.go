@@ -221,3 +221,17 @@ func TestStoreCheckTimeout_RemembersImportOnly(t *testing.T) {
 		t.Fatalf("imports = %d, want 2", imp.count())
 	}
 }
+
+// A registry tag the controller staged (`noo models fetch ollama:gemma4:12b`)
+// reaches a placed node through the same import path, never `ollama pull`.
+func TestStagedRegistryTag_IsImportedNotPulled(t *testing.T) {
+	imp := newImportRecorder(nil)
+	r := importFixture(t, storeAnswers(true, nil), imp)
+	p := harrierPlacement()
+	p.Model = "gemma4:12b"
+	r.ensureOllamaModel("host8-ma", "ollama#chat", p, absent, noPull(t))
+	imp.wait(t)
+	if imp.count() != 1 || imp.calls[0] != "gemma4:12b" {
+		t.Fatalf("imports = %v, want exactly [gemma4:12b]", imp.calls)
+	}
+}

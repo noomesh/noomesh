@@ -654,6 +654,7 @@ pub fn security_admin_password_reset(g: &Globals, args: &[String]) -> Result<i32
     println!("    {password}");
     println!();
     println!("{}", ui::muted("shown once — store it now; run this again to replace it"));
+    println!("{}", ui::muted(&format!("every open session of '{username}' ends: refresh tokens are revoked and the gateway refuses older access tokens within a few seconds")));
     if let Err(e) = stored {
         ui::warned(&format!("the stored NOO_ADMIN_PASSWORD copy was not updated ({e}); the login above is what works"));
     }
@@ -1320,7 +1321,10 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
                 ("chain head", head),
             ])
         );
-        println!("{}", ui::muted("record the chain head somewhere the database owner cannot write: it is what shows the newest rows were not cut off"));
+        // The head against the copy the gateway keeps outside the database.
+        // Absent on an older gateway: said as NOT CHECKED, never as ok.
+        let (glyph, text) = exported_head_line(&chain["export"]);
+        println!("{}", ui::status_line(glyph, &text));
     } else {
         println!(
             "{}",
@@ -1362,6 +1366,31 @@ pub fn security_audit_verify(g: &Globals, args: &[String]) -> Result<i32, Unhand
     } else {
         println!("{}", ui::status_line(Glyph::Ok, "every hashed row verifies under the key of its epoch"));
         Ok(0)
+    }
+}
+
+/// What `audit verify` says about the exported chain head: `(glyph, text)`.
+/// A regression is an error (the verdict also fails through `problems`);
+/// anything that could not be compared is a warning that says NOT CHECKED.
+pub(crate) fn exported_head_line(export: &Value) -> (Glyph, String) {
+    if export.is_null() {
+        return (
+            Glyph::Warn,
+            "chain head NOT CHECKED against an exported head: this gateway predates the head export (update the controller)".into(),
+        );
+    }
+    if export["checked"].as_bool() != Some(true) {
+        return (
+            Glyph::Warn,
+            export["note"].as_str().unwrap_or("chain head NOT CHECKED against an exported head").to_string(),
+        );
+    }
+    let last = &export["last_exported"];
+    let at = format!("seq {} at {}", last["seq"].as_i64().unwrap_or(0), last["time"].as_str().unwrap_or("?"));
+    if export["regression"].as_bool() == Some(true) {
+        (Glyph::Err, format!("chain head is BEHIND or differs from the exported head ({at}): the newest rows were cut off or rewritten"))
+    } else {
+        (Glyph::Ok, format!("chain head is at or past the last exported head ({at})"))
     }
 }
 
@@ -3172,6 +3201,31 @@ mod posture_mirror_tests {
     }
 }
 
+
+#[cfg(test)]
+mod audit_verify_export_tests {
+    use super::*;
+
+    #[test]
+    fn a_regression_is_an_error_and_names_the_exported_head() {
+        let (g, t) = exported_head_line(&json!({"checked": true, "regression": true,
+            "last_exported": {"seq": 10, "time": "2026-10-19T04:00:00+00:00"}}));
+        assert!(matches!(g, Glyph::Err));
+        assert!(t.contains("BEHIND") && t.contains("seq 10"), "{t}");
+    }
+
+    #[test]
+    fn an_intact_head_is_ok_and_an_uncompared_one_is_never_ok() {
+        let (g, _) = exported_head_line(&json!({"checked": true, "regression": false,
+            "last_exported": {"seq": 4, "time": "t"}}));
+        assert!(matches!(g, Glyph::Ok));
+        for v in [json!(null), json!({"checked": false, "note": "NOT CHECKED: no file"}), json!({})] {
+            let (g, t) = exported_head_line(&v);
+            assert!(matches!(g, Glyph::Warn), "{v}");
+            assert!(t.contains("NOT CHECKED"), "{t}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod admin_password_reset_tests {

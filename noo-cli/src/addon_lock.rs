@@ -95,12 +95,72 @@ pub struct AddonLock {
 /// names one, is where the controller pulls from instead (the vendor's
 /// add-on registry proxy): the same path on another host. It never changes
 /// what is trusted: locks and image refs are still held to `registry`.
+///
+/// `dev` holds the add-on's temporary DEVELOPMENT keys (i163 part A,
+/// `noo addons trust-key <name> <pubkey> --dev --expires <dur>`): each is
+/// trusted until its `expires_at` and refused like an untrusted key after.
+/// It is `serde(skip)`: an anchor read from JSON (the entitlement's `addons`
+/// block, `security addon-lock verify` flags) can never carry one. Only the
+/// operator's own `addon_trust` section in noomesh.yaml fills it
+/// (`addons::trust::read`), so a development key is mesh-local by
+/// construction and never part of a release's trust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustAnchor {
     pub keys: Vec<String>,
     pub registry: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull: Option<String>,
+    #[serde(skip)]
+    pub dev: Vec<DevKey>,
+}
+
+/// A temporary development signing key for one add-on on this mesh (i163
+/// part A). Never a release key: `noo addons trust-key` refuses a key that
+/// is both, and release verification (`security addon-lock verify`) refuses
+/// a key this install holds as a development key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevKey {
+    /// 64 lowercase hex, an ed25519 public key.
+    pub key: String,
+    /// Unix seconds, UTC. The key verifies strictly before this instant.
+    pub expires_at: i64,
+}
+
+/// `YYYY-MM-DD HH:MM UTC` for a unix time: how an expiry is shown to an
+/// operator. Hand-rolled: the crate carries no date library.
+pub fn utc_minute(ts: i64) -> String {
+    let (days, secs) = (ts.div_euclid(86_400), ts.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, (secs % 3600) / 60)
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for a unix time: how an expiry is stored.
+pub fn utc_rfc3339(ts: i64) -> String {
+    let (days, secs) = (ts.div_euclid(86_400), ts.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Howard Hinnant's days-to-civil; 0 is 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Seconds since the epoch, now.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl TrustAnchor {
@@ -138,11 +198,14 @@ pub fn relocate(reference: &str, from: &str, to: &str) -> Option<String> {
 }
 
 /// A lock that passed [`verify`], with the index of the anchor key that
-/// signed it (0 is the current key).
+/// signed it (0 is the current key). A development key's index counts on
+/// from the release keys (`keys.len() + i`), and `dev_expires_at` is then
+/// that key's expiry: the lock is trusted only until it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedLock {
     pub lock: AddonLock,
     pub key_index: usize,
+    pub dev_expires_at: Option<i64>,
 }
 
 /// Why a lock was refused. `Display` is the operator-facing message
@@ -180,6 +243,9 @@ pub enum AddonLockError {
     NoOverlay,
     /// A bundle file is missing, extra, or does not hash to the lock.
     FileMismatch { name: String, why: String },
+    /// The only key the lock verifies against is a development key whose
+    /// `expires_at` has passed (i163 part A). Refused like an untrusted key.
+    DevKeyExpired { key: String, expires_at: i64 },
 }
 
 impl fmt::Display for AddonLockError {
@@ -211,6 +277,12 @@ impl fmt::Display for AddonLockError {
             BadFileName(n) => write!(f, "Add-on bundle file name {n:?} is not a plain file name"),
             NoOverlay => write!(f, "Add-on bundle carries no {OVERLAY_FILE}"),
             FileMismatch { name, why } => write!(f, "Add-on bundle file {name} {why}"),
+            DevKeyExpired { key, expires_at } => write!(
+                f,
+                "Add-on lock is signed only by development key {}… which expired {}",
+                &key[..12.min(key.len())],
+                utc_minute(*expires_at)
+            ),
         }
     }
 }
@@ -406,16 +478,34 @@ pub fn sign(lock: &AddonLock, seed_hex: &str) -> Result<(Vec<u8>, String), Strin
     Ok((bytes, sig))
 }
 
-/// Verify a lock's bytes and signature against one add-on's trust anchor.
-/// The signature is checked first, over the exact bytes, before anything in
-/// them is believed.
+/// Verify a lock's bytes and signature against one add-on's trust anchor,
+/// now. See [`verify_at`].
 pub fn verify(
     lock_bytes: &[u8],
     sig_text: &str,
     anchor: &TrustAnchor,
     expected_addon: &str,
 ) -> Result<VerifiedLock, AddonLockError> {
-    if anchor.keys.is_empty() {
+    verify_at(lock_bytes, sig_text, anchor, expected_addon, now_unix())
+}
+
+/// Verify a lock's bytes and signature against one add-on's trust anchor at
+/// unix time `now`. The signature is checked first, over the exact bytes,
+/// before anything in them is believed.
+///
+/// The release keys (`anchor.keys`) are tried first. Only when none of them
+/// verifies are the anchor's development keys (`anchor.dev`) tried: a lock
+/// one of them signed verifies while `now < expires_at` and is refused with
+/// [`AddonLockError::DevKeyExpired`] after; a lock no key signed is
+/// [`AddonLockError::BadSignature`] as always.
+pub fn verify_at(
+    lock_bytes: &[u8],
+    sig_text: &str,
+    anchor: &TrustAnchor,
+    expected_addon: &str,
+    now: i64,
+) -> Result<VerifiedLock, AddonLockError> {
+    if anchor.keys.is_empty() && anchor.dev.is_empty() {
         return Err(AddonLockError::NoTrustedKeys);
     }
     let root = anchor.registry.trim();
@@ -423,18 +513,52 @@ pub fn verify(
         return Err(AddonLockError::BadRegistryRoot(anchor.registry.clone()));
     }
     let keys: Vec<&str> = anchor.keys.iter().map(String::as_str).collect();
-    let key_index = release_sig::verify_with_keys(lock_bytes, sig_text, &keys).map_err(|e| {
-        // release_sig speaks of release keys; here the anchor is the add-on's.
-        let e = e.replace("any release key baked into this build", "any key trusted for this add-on");
-        AddonLockError::BadSignature(e)
-    })?;
+    let (key_index, dev_expires_at) = match release_sig::verify_with_keys(lock_bytes, sig_text, &keys) {
+        Ok(i) => (i, None),
+        Err(e) => {
+            let dev: Vec<&str> = anchor.dev.iter().map(|d| d.key.as_str()).collect();
+            match (!dev.is_empty()).then(|| release_sig::verify_with_keys(lock_bytes, sig_text, &dev)) {
+                Some(Ok(j)) => {
+                    let d = &anchor.dev[j];
+                    if now >= d.expires_at {
+                        return Err(AddonLockError::DevKeyExpired { key: d.key.clone(), expires_at: d.expires_at });
+                    }
+                    (anchor.keys.len() + j, Some(d.expires_at))
+                }
+                _ => {
+                    // release_sig speaks of release keys; here the anchor is the add-on's.
+                    let e = e.replace("any release key baked into this build", "any key trusted for this add-on");
+                    return Err(AddonLockError::BadSignature(e));
+                }
+            }
+        }
+    };
     let lock: AddonLock =
         serde_json::from_slice(lock_bytes).map_err(|e| AddonLockError::Malformed(e.to_string()))?;
     if lock.canonical_bytes() != lock_bytes {
         return Err(AddonLockError::NotCanonical);
     }
     lock.validate(expected_addon, Some(root))?;
-    Ok(VerifiedLock { lock, key_index })
+    Ok(VerifiedLock { lock, key_index, dev_expires_at })
+}
+
+/// Release-side guard (i163 part A, "never ships"): `release_keys` are the
+/// keys a release is about to be verified or published against, `dev` every
+/// development key this install knows. A key in both is refused: a release
+/// that trusted it would ship a lock nobody but one developer can sign for.
+pub fn refuse_dev_in_release(release_keys: &[String], dev: &[DevKey]) -> Result<(), String> {
+    for k in release_keys {
+        let k = k.trim().to_ascii_lowercase();
+        if let Some(d) = dev.iter().find(|d| d.key == k) {
+            return Err(format!(
+                "key {}… is a development key on this install (expires {}); a release is never verified \
+                 against a development key. Sign the lock with the add-on's release key",
+                &k[..12.min(k.len())],
+                utc_minute(d.expires_at)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// True when `candidate` orders below `current` by the CLI's semver
@@ -531,7 +655,7 @@ mod tests {
         assert!(valid_file_name("docker-compose.yml") && valid_file_name("routes.json"));
     }
     fn anchor() -> TrustAnchor {
-        TrustAnchor { keys: vec![pk(&seed())], registry: ROOT.into(), pull: None }
+        TrustAnchor { keys: vec![pk(&seed())], registry: ROOT.into(), pull: None, dev: vec![] }
     }
     fn signed(l: &AddonLock) -> (Vec<u8>, String) {
         sign(l, &seed()).unwrap()
@@ -549,7 +673,7 @@ mod tests {
     #[test]
     fn an_older_anchor_key_still_verifies_and_reports_its_index() {
         let (bytes, sig) = signed(&lock());
-        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32)), pk(&seed())], registry: ROOT.into(), pull: None };
+        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32)), pk(&seed())], registry: ROOT.into(), pull: None, dev: vec![] };
         assert_eq!(verify(&bytes, &sig, &a, "example_addon").unwrap().key_index, 1);
     }
 
@@ -566,9 +690,9 @@ mod tests {
     #[test]
     fn a_key_outside_the_anchor_is_refused() {
         let (bytes, sig) = signed(&lock());
-        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32))], registry: ROOT.into(), pull: None };
+        let a = TrustAnchor { keys: vec![pk(&"cd".repeat(32))], registry: ROOT.into(), pull: None, dev: vec![] };
         assert!(matches!(verify(&bytes, &sig, &a, "example_addon"), Err(AddonLockError::BadSignature(_))));
-        let none = TrustAnchor { keys: vec![], registry: ROOT.into(), pull: None };
+        let none = TrustAnchor { keys: vec![], registry: ROOT.into(), pull: None, dev: vec![] };
         assert_eq!(verify(&bytes, &sig, &none, "example_addon"), Err(AddonLockError::NoTrustedKeys));
     }
 
@@ -651,7 +775,7 @@ mod tests {
     fn a_bad_registry_root_is_refused_before_anything_else() {
         let (bytes, sig) = signed(&lock());
         for root in ["", "ghcr.io", "ghcr.io/example/", "https://ghcr.io/example", "ghcr.io/example:v1"] {
-            let a = TrustAnchor { keys: anchor().keys, registry: root.into(), pull: None };
+            let a = TrustAnchor { keys: anchor().keys, registry: root.into(), pull: None, dev: vec![] };
             assert!(matches!(verify(&bytes, &sig, &a, "example_addon"), Err(AddonLockError::BadRegistryRoot(_))), "{root}");
         }
     }
@@ -757,5 +881,85 @@ mod tests {
             assert!(s.chars().next().unwrap().is_uppercase(), "{s}");
             assert!(!s.ends_with('.'), "{s}");
         }
+    }
+
+    // ── development keys (i163 part A) ──────────────────────────────────
+
+    const NOW: i64 = 1_790_000_000;
+
+    fn dev_anchor(release: Vec<String>, dev_seed: &str, expires_at: i64) -> TrustAnchor {
+        TrustAnchor { keys: release, registry: ROOT.into(), pull: None, dev: vec![DevKey { key: pk(dev_seed), expires_at }] }
+    }
+
+    #[test]
+    fn a_lock_signed_by_a_dev_key_verifies_until_it_expires() {
+        let (bytes, sig) = signed(&lock());
+        // Only a dev key is trusted, and it is still good.
+        let a = dev_anchor(vec![], &seed(), NOW + 3600);
+        let v = verify_at(&bytes, &sig, &a, "example_addon", NOW).unwrap();
+        assert_eq!(v.dev_expires_at, Some(NOW + 3600));
+        assert_eq!(v.key_index, 0, "a dev key counts on from the release keys");
+        // Beside a release key it did not sign with, the index counts on.
+        let a = dev_anchor(vec![pk(&"cd".repeat(32))], &seed(), NOW + 3600);
+        let v = verify_at(&bytes, &sig, &a, "example_addon", NOW).unwrap();
+        assert_eq!((v.key_index, v.dev_expires_at), (1, Some(NOW + 3600)));
+        // At and after the instant it expires, it is refused, naming the expiry.
+        for t in [NOW + 3600, NOW + 86_400] {
+            let e = verify_at(&bytes, &sig, &a, "example_addon", t).unwrap_err();
+            assert_eq!(e, AddonLockError::DevKeyExpired { key: pk(&seed()), expires_at: NOW + 3600 });
+            assert!(e.to_string().contains(&utc_minute(NOW + 3600)), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_release_key_wins_over_a_dev_key_and_an_unrelated_dev_key_changes_nothing() {
+        let (bytes, sig) = signed(&lock());
+        // Signed by the release key: release verdict, even with an expired dev key present.
+        let a = dev_anchor(vec![pk(&seed())], &"cd".repeat(32), NOW - 1);
+        let v = verify_at(&bytes, &sig, &a, "example_addon", NOW).unwrap();
+        assert_eq!((v.key_index, v.dev_expires_at), (0, None));
+        // Signed by neither: a bad signature, not an expiry.
+        let a = dev_anchor(vec![pk(&"ef".repeat(32))], &"cd".repeat(32), NOW + 3600);
+        assert!(matches!(verify_at(&bytes, &sig, &a, "example_addon", NOW), Err(AddonLockError::BadSignature(_))));
+    }
+
+    #[test]
+    fn a_dev_signed_lock_is_still_held_to_every_other_rule() {
+        let mut l = lock();
+        l.images.insert("addon".into(), format!("ghcr.io/example/other@{}", d('a')));
+        let (bytes, sig) = signed(&l);
+        let a = dev_anchor(vec![], &seed(), NOW + 3600);
+        assert!(matches!(verify_at(&bytes, &sig, &a, "example_addon", NOW), Err(AddonLockError::OutsideRegistry { .. })));
+        assert!(matches!(verify_at(&bytes, &sig, &a, "other_addon", NOW), Err(AddonLockError::AddonMismatch { .. })));
+    }
+
+    #[test]
+    fn an_anchor_from_json_never_carries_a_dev_key() {
+        let mut a = dev_anchor(vec![pk(&seed())], &"cd".repeat(32), NOW + 3600);
+        let text = serde_json::to_string(&a).unwrap();
+        assert!(!text.contains("dev") && !text.contains(&pk(&"cd".repeat(32))), "{text}");
+        let back: TrustAnchor = serde_json::from_str(&format!(
+            r#"{{"keys":["{}"],"registry":"{ROOT}","dev":[{{"key":"{}","expires_at":9999999999}}]}}"#,
+            pk(&seed()), pk(&"cd".repeat(32))
+        )).unwrap();
+        assert!(back.dev.is_empty(), "a JSON anchor (an entitlement, a flag) cannot smuggle a dev key in");
+        a.dev.clear();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn release_verification_refuses_a_dev_key() {
+        let dev = vec![DevKey { key: pk(&"cd".repeat(32)), expires_at: NOW + 3600 }];
+        assert!(refuse_dev_in_release(&[pk(&seed())], &dev).is_ok());
+        let e = refuse_dev_in_release(&[pk(&seed()), pk(&"cd".repeat(32)).to_uppercase()], &dev).unwrap_err();
+        assert!(e.contains("development key") && e.contains(&utc_minute(NOW + 3600)), "{e}");
+    }
+
+    #[test]
+    fn utc_formatting_is_exact() {
+        assert_eq!(utc_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(utc_minute(1_700_000_000), "2023-11-14 22:13 UTC");
+        assert_eq!(utc_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
     }
 }

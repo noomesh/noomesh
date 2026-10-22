@@ -900,6 +900,25 @@ fn prompt_skills_create_posts_file_content() {
 }
 
 #[test]
+fn prompt_skills_decide_posts_the_decision_and_needs_exactly_one_verdict() {
+    let mock = Mock::start(200, "OK", "application/json", r#"{"id":7,"name":"my-skill","status":"promoted","decided_by":"olive","live":true}"#, 1);
+    let out = run(&["--gateway", &gw(mock.port), "prompt-skills", "decide", "7", "--promote", "--reason", "read it"], &[]);
+    let reqs = mock.requests();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(reqs[0].starts_with("POST /api/prompt-skills/proposals/7/decide "), "request was:\n{}", reqs[0]);
+    let body: serde_json::Value = serde_json::from_str(reqs[0].split("\r\n\r\n").last().unwrap_or("").split("\n\n").last().unwrap_or("").trim()).unwrap_or_default();
+    assert_eq!(body["decision"], "promote", "{}", reqs[0]);
+    assert_eq!(body["reason"], "read it", "{}", reqs[0]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Promoted 'my-skill'"));
+    // Neither or both verdicts: a usage error before any request.
+    for extra in [&["7"][..], &["7", "--promote", "--reject"]] {
+        let mut argv = vec!["--gateway", "http://127.0.0.1:9", "prompt-skills", "decide"];
+        argv.extend_from_slice(extra);
+        assert_eq!(run(&argv, &[]).status.code(), Some(2));
+    }
+}
+
+#[test]
 fn prompt_skills_create_error_reply_exits_one() {
     let mock = Mock::start(200, "OK", "application/json", r#"{"error":"Failed to write skill file: denied"}"#, 1);
     let out = run(&["--gateway", &gw(mock.port), "prompt-skills", "create", "s", "--file", "/dev/null"], &[]);
@@ -4953,4 +4972,99 @@ fn stack_stop_and_clean_short_v_never_reach_the_passthrough() {
         assert!(err.contains("use --volumes"), "{args:?}: {err}");
         assert!(!log.exists());
     }
+}
+
+// ── agent-mail archive (`noo agents archive …`) ───────────────────────────
+
+const ARCHIVE_SEALED: &str = r#"{"month":"2026-03","file":"noo_agent_messages_2026_03.jsonl.gz","count":2,"decrypted":false,"opened":0,"rows":[
+    {"id":"m1","enc":"sealed","body":{"ct":"CIPHERTEXT-ONE"},"from_agent":"a","to_agent":"b"},
+    {"id":"m2","enc":"sealed","body":{"ct":"CIPHERTEXT-TWO"},"from_agent":"a","to_agent":"b"}]}"#;
+const ARCHIVE_OPENED: &str = r#"{"month":"2026-03","file":"noo_agent_messages_2026_03.jsonl.gz","count":1,"decrypted":true,"opened":1,"rows":[
+    {"id":"m1","enc":"sealed","decrypted":true,"body":{"text":"PLAINTEXT-MARKER"},"from_agent":"a","to_agent":"b"}]}"#;
+
+#[test]
+fn agents_archive_list_shows_months_and_row_counts() {
+    let body = r#"{"dir":"/data/audit-archive","total_rows":7,"files":[
+        {"file":"noo_agent_messages_2026_02.jsonl.gz","month":"2026-02","rows":3,"bytes":1200},
+        {"file":"noo_agent_messages_2026_03.jsonl.gz","month":"2026-03","rows":4,"bytes":1500}]}"#;
+    let stdout = case("GET", "/api/agents/archive ", 200, body, &["agents", "archive", "list"], 0);
+    for want in ["2026-02", "2026-03", "noo_agent_messages_2026_03.jsonl.gz", "7 message(s)"] {
+        assert!(stdout.contains(want), "missing {want}: {stdout}");
+    }
+    // the hidden singular spelling reaches the same route
+    let stdout = case("GET", "/api/agents/archive ", 200, body, &["agent", "archive", "list"], 0);
+    assert!(stdout.contains("2026-03"), "{stdout}");
+}
+
+#[test]
+fn agents_archive_export_writes_sealed_jsonl_to_out() {
+    let dir = ScratchDir::new("noo-cli-archive-sealed");
+    let out_path = dir.path().join("m.jsonl");
+    let mock = Mock::start(200, "OK", "application/json", ARCHIVE_SEALED, 1);
+    let out = run(&["--gateway", &gw(mock.port), "agents", "archive", "export", "2026-03", "--out", out_path.to_str().unwrap()], &[]);
+    let reqs = mock.requests();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(reqs[0].starts_with("GET /api/agents/archive/2026-03 "), "must not ask for decryption: {}", reqs[0].lines().next().unwrap());
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!((first["id"].as_str(), first["enc"].as_str()), (Some("m1"), Some("sealed")));
+    assert!(text.contains("CIPHERTEXT-ONE") && !text.contains("PLAINTEXT"));
+}
+
+#[test]
+fn agents_archive_export_takes_a_file_name_and_prints_jsonl_without_out() {
+    let mock = Mock::start(200, "OK", "application/json", ARCHIVE_SEALED, 1);
+    let out = run(&["--gateway", &gw(mock.port), "agents", "archive", "export", "/backups/noo_agent_messages_2026_03.jsonl.gz"], &[]);
+    let reqs = mock.requests();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(reqs[0].starts_with("GET /api/agents/archive/noo_agent_messages_2026_03.jsonl.gz "), "{}", reqs[0].lines().next().unwrap());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 2);
+}
+
+#[test]
+fn agents_archive_decrypt_needs_out_and_never_prints_plaintext() {
+    // No --out: refused before any request is made.
+    let out = run(&["--gateway", &gw(closed_port()), "agents", "archive", "export", "2026-03", "--decrypt"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--out"));
+
+    // With --out: asked for decryption, plaintext lands in the file only.
+    let dir = ScratchDir::new("noo-cli-archive-decrypt");
+    let out_path = dir.path().join("plain.jsonl");
+    for json in [false, true] {
+        let mock = Mock::start(200, "OK", "application/json", ARCHIVE_OPENED, 1);
+        let gwu = gw(mock.port);
+        let mut argv = vec!["--gateway", gwu.as_str()];
+        if json {
+            argv.push("--json");
+        }
+        argv.extend_from_slice(&["agents", "archive", "export", "2026-03", "--decrypt", "--out", out_path.to_str().unwrap()]);
+        let out = run(&argv, &[]);
+        let reqs = mock.requests();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(reqs[0].starts_with("GET /api/agents/archive/2026-03?decrypt=true "), "{}", reqs[0].lines().next().unwrap());
+        let shown = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!shown.contains("PLAINTEXT-MARKER"), "decrypted content reached the terminal (json={json}): {shown}");
+        let text = std::fs::read_to_string(&out_path).unwrap();
+        assert!(text.contains("PLAINTEXT-MARKER"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(&out_path);
+    }
+}
+
+#[test]
+fn agents_archive_decrypt_refused_by_the_gateway_writes_nothing() {
+    let dir = ScratchDir::new("noo-cli-archive-refused");
+    let out_path = dir.path().join("plain.jsonl");
+    let mock = Mock::start(403, "Forbidden", "application/json", r#"{"error":"the agent-mail archive is operator-only"}"#, 1);
+    let out = run(&["--gateway", &gw(mock.port), "agents", "archive", "export", "2026-03", "--decrypt", "--out", out_path.to_str().unwrap()], &[]);
+    let _ = mock.requests();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!out_path.exists(), "a refused decrypt must not leave a file");
 }

@@ -87,7 +87,7 @@ RUN mkdir -p src/noomesh && touch src/noomesh/__init__.py
 COPY docker/core-lock/requirements.txt /tmp/requirements-core.txt
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
     uv pip install --system --require-hashes -r /tmp/requirements-core.txt \
-    && uv pip install --system --no-deps -e .
+    && uv pip install --system --no-deps --no-build-isolation -e .
 
 # Marker so downstream images can verify they're built on top of a
 # compatible base (handy for debugging mismatched layers).

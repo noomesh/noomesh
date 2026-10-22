@@ -380,6 +380,24 @@ pub fn failover_client() -> reqwest::Client {
 pub const FAILOVER_CONNECT_SECS: u64 = 5;
 
 fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> {
+    match cluster_rustls_config()? {
+        Some(cfg) => {
+            let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls((*cfg).clone());
+            Ok(builder.build()?)
+        }
+        None => {
+            // No custom TLS — use defaults
+            tracing::info!("TLS: using system trust store (no cluster CA)");
+            Ok(timeouts.apply(reqwest::Client::builder()).build()?)
+        }
+    }
+}
+
+/// The cluster's rustls client config (the CA in `NOO_TLS_CA`, the mTLS
+/// identity in `NOO_TLS_CERT`/`NOO_TLS_KEY`), shared by every HTTPS client
+/// here and by the reserved-workload WebSocket relay. `None` when neither is
+/// configured (the system trust store applies).
+pub fn cluster_rustls_config() -> Result<Option<std::sync::Arc<rustls::ClientConfig>>> {
     let ca_path = std::env::var("NOO_TLS_CA").unwrap_or_default();
     let cert_path = std::env::var("NOO_TLS_CERT").unwrap_or_default();
     let key_path = std::env::var("NOO_TLS_KEY").unwrap_or_default();
@@ -389,7 +407,9 @@ fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> 
     let has_identity = !cert_path.is_empty() && !key_path.is_empty()
         && Path::new(&cert_path).exists() && Path::new(&key_path).exists();
 
-    if has_ca || has_identity {
+    if !(has_ca || has_identity) {
+        return Ok(None);
+    }
         // Build root cert store
         let mut root_store = rustls::RootCertStore::empty();
 
@@ -437,14 +457,35 @@ fn build_https_client_with(timeouts: ClientTimeouts) -> Result<reqwest::Client> 
             config_builder.with_no_client_auth()
         };
 
-        let builder = timeouts.apply(reqwest::Client::builder()).use_preconfigured_tls(tls_config);
+    Ok(Some(std::sync::Arc::new(tls_config)))
+}
 
-        Ok(builder.build()?)
-    } else {
-        // No custom TLS — use defaults
-        tracing::info!("TLS: using system trust store (no cluster CA)");
-        Ok(timeouts.apply(reqwest::Client::builder()).build()?)
-    }
+/// The rustls config the gateway dials an add-on's WebSocket with
+/// (`addon_ws`): the SAME trust and identity as [`cluster_client`]
+/// ([`cluster_rustls_config`]: cluster CA, the gateway's leaf as client
+/// certificate), ALPN pinned to `http/1.1` because a WebSocket handshake is
+/// an HTTP/1.1 upgrade. Built once, like the shared clients; `None` when the
+/// cluster TLS material cannot be loaded, which the caller turns into a
+/// refusal (an add-on door is mTLS, there is no plain one to fall back to).
+pub fn cluster_ws_tls_config() -> Option<std::sync::Arc<rustls::ClientConfig>> {
+    static CONFIG: OnceLock<Option<std::sync::Arc<rustls::ClientConfig>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| match cluster_rustls_config() {
+            Ok(Some(c)) => {
+                let mut c = (*c).clone();
+                c.alpn_protocols = vec![b"http/1.1".to_vec()];
+                Some(std::sync::Arc::new(c))
+            }
+            Ok(None) => {
+                tracing::warn!("add-on WebSocket TLS: no cluster TLS material (NOO_TLS_CA/CERT/KEY); add-on sockets are refused");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "add-on WebSocket TLS: cluster TLS config build failed; add-on sockets are refused");
+                None
+            }
+        })
+        .clone()
 }
 
 /// The three env vars the listener cannot start without.

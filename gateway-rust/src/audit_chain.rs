@@ -53,9 +53,9 @@
 //! ## What it does not do
 //!
 //! Truncating the NEWEST rows leaves a shorter, valid chain. `verify` reports
-//! the head (`seq`, `chain_hash`); record it somewhere the database owner
-//! cannot write (a ticket, a signed message) to make a later truncation
-//! visible. The verifier also holds the same key as the writers, so it proves
+//! the head (`seq`, `chain_hash`), and `audit_head_export` records a signed
+//! copy of it outside the database every 15 minutes (a file on the gateway
+//! volume and the operator event stream); `verify` compares the two. The verifier also holds the same key as the writers, so it proves
 //! the log is intact, not who held the key.
 
 use chrono::{DateTime, Utc};
@@ -503,6 +503,9 @@ pub struct ChainReport {
     pub unchained_rows: u64,
     pub genesis: Option<GenesisView>,
     pub head: Option<HeadView>,
+    /// The head compared with the heads exported outside the database
+    /// (`audit_head_export`): truncation of the newest rows shows here.
+    pub export: crate::audit_head_export::ExportCheck,
     /// Signed retention checkpoints found, and how many chained rows they account for as removed.
     pub retention: Vec<RetentionView>,
     pub retired_rows: u64,

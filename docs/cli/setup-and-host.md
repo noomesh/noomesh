@@ -333,9 +333,13 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | Command | Arguments | What it does |
 |---|---|---|
 | `noo addons list` | — | Show every add-on: declared, effective and whether the licence grants it |
-| `noo addons enable` | `<name> [--force]` | Pin a licensed add-on's signed lock, mint its credentials and key, then declare it ON |
+| `noo addons show` | `<name>` | Show one add-on's switch, pin, and the database and workloads its signed bundle declares |
+| `noo addons enable` | `<name> [--force] [--lock <path\|https-url>]` | Pin an add-on's signed lock, mint its credentials and key, then declare it ON |
+| `noo addons trust-key` | `<name> <pubkey> [--registry <host/path>] [--dev] [--expires <dur>]` | Trust a third-party add-on's signing key; --dev --expires (max 30d): a temporary dev key |
+| `noo addons untrust-key` | `<name> [<pubkey>] [--dev]` | Stop trusting a third-party add-on's signing key; --dev removes its dev key(s) |
+| `noo addons set` | `<name> --delegate tasks\|off` | Let an add-on act on a person's tasks (needs its manifest to declare it too) |
 | `noo addons disable` | `<name>` | Declare an add-on OFF in noomesh.yaml; restart applies it |
-| `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade]` | Re-resolve licensed add-ons' signed locks for this stack, pull by digest and re-pin |
+| `noo addons upgrade` | `[<name>...] [--check] [--allow-downgrade] [--lock <path\|https-url>]` | Re-resolve add-ons' signed locks for this stack, pull by digest and re-pin |
 | `noo addons verify` | — | Re-verify add-on locks offline and compare local and running images with the pins |
 | `noo addons launch-pins` | `[--root <dir>] <tag> [<name>...]` | Hidden: print verified add-on image pins for the launcher (internal) |
 
@@ -346,7 +350,7 @@ on the tailnet. It ends with a silent re-audit and `offboard complete`.
 | `noo kiosk invite` | `<display-name> [--expiry-minutes <n>] [--url <https://…ts.net>]` | Controller: tag:kiosk, its two rules, a tagged auth key, the display's commands |
 | `noo kiosk labels` | `on\|off\|status` | Controller: entity names on the kiosk graph (kiosk.graph_labels; audited, no restart) |
 | `noo kiosk reload` | — | Reload the page on the display and report the console build either side |
-| `noo kiosk seat-sync` | — | Hidden: the seat's sync tick, run by noo-seat-sync.timer as root (internal) |
+| `noo kiosk seat-sync` | `[--migrate [--print]]` | Hidden: the seat's sync tick (internal); --migrate moves an old root seat, run once |
 | `noo kiosk seat-token` | `<seat-name> [--ttl <1h\|30m\|secs>] [--controller <https://…>]` | Controller: mint a one-time role=seat token; prints the seat's `noo kiosk enroll <blob>` |
 | `noo kiosk serve` | `[--port <n>]` | Hidden: the display's local proxy, run by kiosk-serve.service (internal) |
 | `noo kiosk setup` | `--mode dedicated\|shared --url <https://…ts.net> [--vt <n>] [--user <name>] [--view health\|graph] [--rotate <secs>] [--poll <secs>] [--quality lean\|full] [--browser <bin>] [--dry-run] [-y\|--yes]` | Install the display seat: kiosk user, cage + Chromium unit, token launcher, watchdog |

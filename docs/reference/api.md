@@ -28,8 +28,10 @@ the gateway refuses JWTs rather than accepting the well-known default. The
    otherwise User. Operators may call anything. Users may `GET` only an
    allow-list of the surfaces a person needs (conversations, memory, RAG and
    graph reads, their jobs, agent mail, usage, the dashboard's cluster/scheduler
-   overview, the runbooks, `/ws/*`, add-on read routes); a route not on the list
+   overview, the runbooks, `/ws/*`, and the add-on read routes whose manifest says `min_role: user`); a route not on the list
    is closed to a User until it is added on purpose, as for kiosk tokens.
+   An add-on route that declares no `min_role` is Operator+ for every method (see
+   [development/addons.md](../development/addons.md#who-may-call-a-route)).
    Installation-wide reads are Operator+: `/metrics`, `/api/metrics/*`,
    `/api/logs/*`, `/api/config*`, `/api/settings*` and `/api/v1/settings` (except
    `user-dirs` and `preference`), `/api/security/*` (audit, violations, PKI, posture,
@@ -125,11 +127,16 @@ or deleted account, or a token issued before the account's session floor).
 `service-key revoke-and-disable` and an approved `disable`/`scopes` proposal
 end the account's sessions immediately: every refresh token is revoked, open
 `/ws/*` sockets close (4401), the service-key cache is dropped, and a per-account
-"not before" time (Redis key `noo:auth:notbefore:<account>`, kept for one
-access-token lifetime) makes `require_any_auth` — and so the WebSocket handshake
+"not before" time (Redis key `noo:auth:notbefore_ms:<account>`, unix milliseconds, plus the
+durable Postgres row in `noo_session_floors.floor_ms`, both kept for one access-token lifetime;
+the gateway loads the rows at boot) makes `require_any_auth` — and so the WebSocket handshake
 — refuse any access token issued before it, so a reconnect with the old JWT
-fails. If Redis is down the gateway applies the floors it holds in memory
-(never fewer), logs a warning, and does not refuse every request; keys not
+fails. A person's access token carries `iat_ms` (mint time in ms) beside `iat`;
+a token without it counts from the start of its `iat` second. The floor is read from Redis, then the gateway's memory, then Postgres
+(the highest wins), so a Redis outage or a restart does not forget one; if
+neither store can be read the gateway applies the floors it holds in memory
+(never fewer), logs a warning, and does not refuse every request.
+`noo security admin-password reset` raises the same row from the host. Keys not
 bound to the account are not touched by `disable`. Passwords set through
 `POST /api/security/users` and `PUT …/{username}/password` must be at least
 12 characters, not on the common list and not contain the username (`400`);
@@ -194,6 +201,9 @@ add-on service key with the `metrics` scope; at most 256 series per source,
 | GET, PUT, DELETE | `/api/cluster/model-classes`, `/api/cluster/model-classes/{class}` | operator: the live class table with every candidate's placement and health; declare / forget a class (`noo cluster class`) |
 | PUT, DELETE | `/api/cluster/model-aliases/{alias}` | operator: point one alias (a purpose such as `knowledge`) at a class or served model `{class}`, tried first with the mesh behind it; a target nothing serves is accepted with a `note`; an alias may not hide a class or model of the same name (409). DELETE puts a purpose back on `chat-default` (`noo cluster prefer`) |
 | GET, PUT, DELETE | `/api/cluster/embedding-spaces`, `/api/cluster/embedding-spaces/{space}` | operator: each embedding space (one model per purpose), its pool of role=embed placements and which advertise `embed`, plus placements on a model no space uses; declare a space `{model, dims?}` (changing an existing space's model is a 409: that is a re-embed); forget one (not `knowledge`) (`noo cluster embedding-space`) |
+| POST, DELETE | `/api/cluster/embedding-spaces/{space}/migration` | operator: POST `{model}` starts re-embedding a space into another model (the gateway probes the model across its pool: 200 `filling`; 202 `pending` when no node serves it yet, and the gateway starts it once one does; 409 if one is running, the model belongs to a space, or its vector width differs from the space's); DELETE cancels while `pending` or `filling` (409 once `cutover`). `DELETE /api/cluster/embedding-spaces/{space}` is 409 while the space has any migration. The space listing and `capabilities.embeddings.spaces` carry `migration`: null or `{next_model, next_dims, state, progress, started_at, reported_at}` (`noo cluster embedding-space migrate`) |
+| POST | `/api/cluster/embedding-spaces/{space}/migration/complete` | operator: begin the cutover; 409 unless the migration is `filling` and trellion's report (about this next model, under 10 minutes old) shows every table done == total |
+| PUT | `/api/external/embedding-spaces/{space}/migration` | consumer key (scope `embeddings`): trellion's progress report `{next_model, tables: {<table>: {done, total, unsourced?}}, cutover_done}`; 409 with no migration, a `pending` one (not started: no node serves the model) or another next model; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. Embeds with `model: "<space>@next"` on `/api/external/embeddings` use the next model (409 without a migration or while `pending`) |
 
 ### Model classes, failover and what the answer says
 
@@ -663,6 +673,7 @@ answers when it does not reply.
 | GET | `/api/agents/roles` | agent roles (backends: `/api/cluster/backends`) |
 | POST | `/api/agents/collaborate` | `{prompt|task, roles?, wait?}` — one task per role, as the caller, on the nodes holding their models, all in one thread; answers `results` by role once they settle (or `wait` seconds pass), plus `task_id` and `thread_id` (`noo agents collaborate`) |
 | GET, POST | `/api/agents/messages`; GET `…/{id}`, `/api/agents/threads`; POST `…/{id}/ack` | agent-to-agent messages. A User-tier token may send (`POST /api/agents/messages`) and ack (`POST …/{id}/ack`), and only those two writes (collaborate, trust and keys stay Operator+): `from` must be an identity the caller owns, broadcast is refused, posting into an existing thread needs a seat, the recipient must exist and be the same owner or have trusted the sender, and ack needs to own the recipient address (a connection `user/label` cannot ack mail addressed to the bare account `user`; a database error on the thread-seat check is `500`, never an admit) (a non-privileged GET lists what the credential owns: an account reads its connections' mail too, a connection only its own; sealed and signed by the CONTROLLER with `NOO_AGENT_REVIEW_KEY` when set — the signature attests the gateway authenticated the sender it names, it is not the sender's own signature) |
+| GET | `/api/agents/archive`; `/api/agents/archive/{month}` | the agent-mail cold-storage archive (Operator+; below that `403`). The list returns the files with month, row count and size. `{month}` is `YYYY-MM` or the archive file name (never a path); the export returns that month's rows with bodies still sealed, or opened with the cluster review key under `?decrypt=true`, which writes an `agent_archive_decrypt` audit row first and is refused if it cannot be written (`503` when the cluster has no review key) |
 | GET, PUT | `/api/agents/keys/{agent}`, GET `/api/agents/keys/review` | agent keys |
 | GET, POST | `/api/agents/trust` (`?agent=`), POST `/api/agents/trust/remove` | the exceptions that let an identity outside the owner address an agent; the default (every identity the owner holds) is a rule, not rows |
 | GET | `/api/agents/presence` | which windows (connections) are online; an operator may list anyone, anyone else lists their own account and is refused (not emptied) for another's |
@@ -678,6 +689,8 @@ answers when it does not reply.
 | GET, POST | `/api/prompt-skills`, `/api/prompt-skills/{name}` | prompt skills (POST creates an evolved skill) |
 | PUT | `/api/prompt-skills/{name}` | rewrite an evolved skill; a core skill is 400 `core skills are never mutated` |
 | POST | `/api/prompt-skills/{name}/retire`, `/api/prompt-skills/{name}/fitness` | retire an evolved skill; adjust its score |
+| GET | `/api/prompt-skills/proposals` | operator or admin: promotion proposals for runtime skills (`?status=`, `?limit=`); files one for any runtime skill that has none on its current text |
+| POST | `/api/prompt-skills/proposals/{id}/decide` | a person only (operator or admin login; agent, harness, MCP-door and service credentials get 403): body `{decision: "promote"\|"reject", reason?}`; 409 when the skill's text changed since the proposal |
 | POST | `/api/prompt-skills/evolve` | LLM-driven create/mutate, served by the evolve add-on (503 + refusal without it); proposal by default, `apply: true` writes |
 
 The four skill writes are also opened, and only they, by the add-on control scope `prompt_skills:write`.
@@ -714,7 +727,7 @@ on the gateway's own). Broadcast is refused; a thread needs a seat.
 | GET, POST | `/api/security/kb-rules`; GET `/api/security/role-grants` | knowledge-base access rules and grants |
 | GET, POST | `/api/security/posture`; POST `/api/security/posture/profile` | posture gates — POST needs an operator client certificate plus a certificate-bound Admin token; an app login is refused however privileged |
 | GET, POST | `/api/security/service-keys`, `…/self`; GET `…/scopes`; POST `…/self/revoke`, `…/{consumer}/revoke`, `/revoke-and-disable`, `/rotate`, `/retire`, `/quota` | service keys (`retire` finishes a rotation by deactivating the superseded key once the new one has been seen) |
-| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key, checks the hash chain for deleted or reordered rows, and names what fails; Operator+. Its `chain` section reports `checked` (false with a `note` when it could not judge), the chained and pre-chain row counts, rows removed by retention, the `head` `{seq, chain_hash}` to record off-box, and the `first_break`) |
+| GET | `/api/security/audit-history`, `/api/security/audit/stats`, `/api/security/audit/verify`, `/api/security/violations`, `/api/security/pki/status`; POST `/api/security/pki/rotate-expiring` | audit and PKI (`audit/verify` recomputes each audit row's hash under its epoch's key, checks the hash chain for deleted or reordered rows, and names what fails; Operator+. Its `chain` section reports `checked` (false with a `note` when it could not judge), the chained and pre-chain row counts, rows removed by retention, the `head` `{seq, chain_hash}`, an `export` section comparing that head with the signed heads the gateway appends every 15 minutes to `/data/audit-archive/chain-head.jsonl` (`checked`, `note`, `last_exported`, `regression`; a database head older than an exported one is a `problems` entry and verdict `fail`, no export yet is `checked: false`), and the `first_break`) |
 | GET | `/api/security/audit/list` | read the security audit log, newest first. **Operator+** (a lower tier gets `403`). Query: `since` (RFC 3339 time or a window `30m`/`24h`/`7d`/`2w`; anything else is `400`), `event_type` and `actor` (exact), `limit` (default 100, max 500), `cursor` (the previous page's `next_cursor`; a forged one is `400`). Answers `{events, count, next_cursor}`; an event has `id`, `timestamp`, `event_type`, `severity`, `actor`, `resource`, `outcome`, `request_id`, `details` (where `source_ip` and, inside an agent turn, `conversation_id` are recorded), `chain_seq`, `entry_hash`. Listing does not verify. Each read writes an `audit_log_read` row (after the read, so it does not list itself) (`noo security audit list`) |
 | GET, POST | `/api/users`, `/disable`, `/propose`, `/proposals`; `/api/kb/grants`, `/rules`, `/teams`, `/teams/create`, `/teams/delete` | older short forms of some of the operations above |
 | GET, PUT | `/api/settings`, `/api/v1/settings`; GET `…/export`, `/api/v1/settings/preference` | the settings snapshot |
@@ -768,10 +781,13 @@ agent-message thread.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/tasks` | `{objective, model?, loop_budget?, token_budget?}` — creates and starts a task for the caller (`noo tasks create`). `token_budget` caps the prompt + completion tokens its loops may spend; leave it out for no cap of its own |
+| POST | `/api/tasks` | `{objective, model?, loop_budget?, token_budget?}` — creates and starts a task for the caller (`noo tasks create`). `token_budget` caps the prompt + completion tokens its loops may spend; leave it out for no cap of its own. `Idempotency-Key` header: a retry within 24 h returns the same task with `idempotent_replay: true`. Optional `context`. Every task carries `created_via` (`addon:<name>` when an add-on created it through a delegated token, else null); that token sees only its own add-on's tasks for the person |
 | GET | `/api/tasks` | the caller's tasks; operators see everyone's, or one person's with `user=`; `state=`, `limit=` |
 | GET | `/api/tasks/{id}` | state, loops, last note, result, `token_budget`, `tokens_spent`, `remaining` (null = no cap), `budget_state` (`exhausted`, `awaiting_clarification` or null), the owner's `allowance` when one is set, and its children (sub-tasks a loop delegated with `noo_task_delegate`, or the roles a collaboration fanned out) |
 | POST | `/api/tasks/{id}/stop` | stopped at the next checkpoint; the loops' tool calls stand |
+| POST | `/api/tasks/stop` | `{via, user?}` — stops the caller's unfinished tasks created via `addon:<name>` (revoking an add-on's background work); `user` is operator-only and not allowed with an add-on's delegated token, which may name only its own `addon:<name>` (`noo tasks stop --via`) |
+| POST | `/api/tasks/{id}/context` | `{text, revision}` — context pushed into a task (`revision` >= 1, text at most 32 KiB), applied at the next loop. `200 {accepted: true, applies: "next_loop"}`; a retry of the same revision `200 {accepted: false, current_revision}`; `409` for a lower revision or a finished task; `413` when too large |
+| GET | `/api/tasks/{id}/events` | `after=<seq>`, `limit=` — `{events, earliest_seq, last_seq}` |
 | POST | `/api/tasks/{id}/resubmit` | `{token_budget?}` — owner only. A task parked `exhausted` gets the new budget and resumes from its checkpoint (`resumed: true`); `409` when it would still be out of tokens (the reason says whether the task or the allowance is spent). On a running task it only changes the cap (`resumed: false`) (`noo tasks resubmit`) |
 | POST | `/api/tasks/{id}/ask` | `{question}` — owner only: records a question and posts it to the task's thread. The task parks `awaiting_clarification` at its next loop boundary. A loop asks with the `noo_task_ask` tool; a runner on a node with the `task_ask` rail op |
 | POST | `/api/tasks/{id}/answer` | `{text}` — owner only, for a task parked `awaiting_clarification`: posts the answer to the thread and starts a new loop whose prompt carries the question and the answer (`noo tasks answer`) |

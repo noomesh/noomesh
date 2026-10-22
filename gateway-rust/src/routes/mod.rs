@@ -32,6 +32,7 @@ mod intelligence;
 // shaped to what one screen draws.
 mod addon_token;
 mod kiosk;
+mod reservations;
 pub(crate) mod knowledge;
 pub(crate) mod memory;
 mod monitoring;
@@ -270,6 +271,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(ui::router())
         .merge(core::router())
         .merge(cluster::router())
+        .merge(reservations::router())
         .merge(artifacts::router())
         .merge(bootstrap::router())
         .merge(seats::router())
@@ -310,6 +312,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(mcp_registry::router())
         .merge(console_piece::router())
         .merge(cli_piece::router())
+        // An add-on's own web UI (`/addons/<addon>/ui/…`, its session
+        // cookie) and its WebSocket tickets: core routes that look up the
+        // add-on's manifest per request, so they name no add-on.
+        .merge(crate::addon_ui::router())
+        .merge(crate::addon_ws::router())
         .merge(websocket::router());
 
     // ── HTTP add-ons: routes from the manifest each add-on SHIPS ──

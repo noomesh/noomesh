@@ -291,10 +291,27 @@ pub fn principal_from_row(
 }
 
 /// How long a resolved account principal is reused. A role change or a
-/// disable takes at most this long to reach a channel turn.
+/// disable no longer waits this out: `session_floor::end_account_sessions`
+/// (every route that changes an account's standing) calls
+/// [`invalidate_account`], so the next turn re-reads `noo_users`. The TTL
+/// still bounds a change made by another gateway instance or by SQL.
 const ACCOUNT_PRINCIPAL_TTL_SECS: u64 = 30;
 
 type AccountCache = std::collections::HashMap<String, (u64, Option<Principal>)>;
+
+/// Bumped by every invalidation, so a lookup that started BEFORE one does not
+/// write its (stale) answer back after it.
+static ACCOUNT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Forget `account`'s cached principal: its next channel turn re-reads the
+/// row. Called when the account's role, scopes or disabled flag change.
+pub fn invalidate_account(account: &str) {
+    ACCOUNT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut c) = account_cache().lock() {
+        c.remove(account);
+        c.remove(crate::auth::account_of(account));
+    }
+}
 
 fn account_cache() -> &'static std::sync::Mutex<AccountCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<AccountCache>> = std::sync::OnceLock::new();
@@ -307,6 +324,7 @@ fn account_cache() -> &'static std::sync::Mutex<AccountCache> {
 /// it does not fall back to a wider identity). A failed read is not cached.
 pub async fn account_principal(db: &sqlx::PgPool, username: &str) -> Option<Principal> {
     let now = now_secs();
+    let gen = ACCOUNT_GEN.load(std::sync::atomic::Ordering::SeqCst);
     if let Ok(c) = account_cache().lock() {
         if let Some((at, p)) = c.get(username) {
             if now.saturating_sub(*at) < ACCOUNT_PRINCIPAL_TTL_SECS {
@@ -329,7 +347,9 @@ pub async fn account_principal(db: &sqlx::PgPool, username: &str) -> Option<Prin
         }
     };
     if let Ok(mut c) = account_cache().lock() {
-        c.insert(username.to_string(), (now, resolved.clone()));
+        if ACCOUNT_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen {
+            c.insert(username.to_string(), (now, resolved.clone()));
+        }
     }
     resolved
 }
@@ -813,6 +833,38 @@ mod tests {
     use super::*;
 
     const KEYS: &[(&str, &str)] = &[("worker", "worker-bus-key"), ("trellion", "trellion-bus-key")];
+
+    fn cached(name: &str) -> bool {
+        account_cache().lock().unwrap().contains_key(name)
+    }
+
+    /// A role change or disable must not wait out the 30 s cache: the entry
+    /// (under the account name and under a connection-labelled name) is gone
+    /// the moment the account change ends its sessions.
+    #[test]
+    fn invalidating_an_account_drops_its_cached_principal_only() {
+        let now = now_secs();
+        {
+            let mut c = account_cache().lock().unwrap();
+            c.insert("inv-alice".into(), (now, Some(Principal::user("inv-alice", crate::auth::Role::Admin, vec![]))));
+            c.insert("inv-alice/laptop".into(), (now, None));
+            c.insert("inv-bob".into(), (now, None));
+        }
+        assert!(cached("inv-alice") && cached("inv-bob"));
+        invalidate_account("inv-alice/laptop");
+        assert!(!cached("inv-alice/laptop"));
+        assert!(!cached("inv-alice"), "the account's entry goes with its connection label");
+        assert!(cached("inv-bob"), "other accounts keep their cache");
+    }
+
+    /// The place every account change funnels through must call it, or the
+    /// test above proves a function nobody runs.
+    #[test]
+    fn ending_an_accounts_sessions_invalidates_its_channel_principal() {
+        let src = include_str!("session_floor.rs");
+        let f = &src[src.find("pub async fn end_account_sessions").unwrap()..src.find("pub struct Summary").unwrap()];
+        assert!(f.contains("bus_principal::invalidate_account(account)"));
+    }
 
     fn split(token: &str) -> (String, String) {
         let (body, sig) = token.split_once('.').expect("two fields");

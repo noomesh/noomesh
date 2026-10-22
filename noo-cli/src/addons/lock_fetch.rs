@@ -1207,6 +1207,7 @@ mod tests {
             keys: vec!["ab".repeat(32)],
             registry: "ghcr.io/x/evolve".into(),
             pull: pull.then(|| "addons.noomesh.ai/x/evolve".to_string()),
+            dev: vec![],
         };
         crate::entitlement::Entitlement {
             v: 1, sub: "acme".into(), tier: "intelligent".into(), features: vec!["evolve".into()], iat: 1, exp: 0,

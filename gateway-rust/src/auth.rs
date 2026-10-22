@@ -628,7 +628,20 @@ pub(crate) fn addon_consumer(claims: &Claims, is_inference_surface: bool) -> Opt
 /// the revocation of the key it came from, which is the property the short
 /// lifetime exists to deny.
 pub fn addon_token_scopes(key_scopes: &[String]) -> Vec<String> {
-    key_scopes.iter().filter(|s| s.as_str() != ADDON_SCOPE).cloned().collect()
+    addon_token_scopes_with(key_scopes, &crate::addon_proxy::declared_scopes())
+}
+
+/// A key holding a declared add-on scope (`<addon>:<word>`) gets `read` on the
+/// exchanged token: an add-on scope opens a GET route only together with
+/// `read`, and `read` is not a service-key scope, so without this the granted
+/// scope could never open anything. `read` is the User tier's own baseline.
+fn addon_token_scopes_with(key_scopes: &[String], declared: &[String]) -> Vec<String> {
+    let mut out: Vec<String> =
+        key_scopes.iter().filter(|s| s.as_str() != ADDON_SCOPE).cloned().collect();
+    if out.iter().any(|s| declared.contains(s)) && !out.iter().any(|s| s == "read") {
+        out.push("read".to_string());
+    }
+    out
 }
 
 /// The service-key scope that marks a **provisioning credential** for the
@@ -1888,7 +1901,11 @@ pub(crate) const HANDLER_VERIFIED_WS_ROUTES: &[&str] =
 
 /// A genuine handshake to a route in [`HANDLER_VERIFIED_WS_ROUTES`].
 fn defers_to_ws_handler(request: &Request) -> bool {
-    HANDLER_VERIFIED_WS_ROUTES.contains(&request.uri().path())
+    (HANDLER_VERIFIED_WS_ROUTES.contains(&request.uri().path())
+        // An add-on socket handshake carrying a single-use `ticket=`: the
+        // handler (`addon_ws::serve_ws`) redeems it and answers 401 when it
+        // does not redeem. Only reached when no bearer was presented.
+        || crate::addon_ws::is_ticket_handshake(request.uri().path(), request.uri().query()))
         && has_websocket_upgrade_header(request)
 }
 
@@ -1906,8 +1923,15 @@ fn defers_to_ws_handler(request: &Request) -> bool {
 /// omits it is not a WebSocket and would be refused by the upgrade extractor
 /// three layers down anyway.
 fn query_token_allowed(request: &Request) -> bool {
-    is_ws_path(request.uri().path()) && has_websocket_upgrade_header(request)
+    // Add-on sockets take a single-use ticket instead (`addon_ws`): a bearer
+    // in an add-on socket URL is never a credential.
+    is_ws_path(request.uri().path())
+        && !request.uri().path().starts_with(ADDON_WS_PREFIX)
+        && has_websocket_upgrade_header(request)
 }
+
+/// Every add-on WebSocket route lives under here (`addon_proxy::ws_prefix`).
+const ADDON_WS_PREFIX: &str = "/ws/addons/";
 
 /// The `token` query parameter, if present.
 fn query_param_token(query: &str) -> Option<String> {
@@ -2679,7 +2703,9 @@ pub fn is_agent_message_write(method: &axum::http::Method, path: &str) -> bool {
 /// is UUID-shaped (job keys are `noo:jobs:{id}` and share the prefix with
 /// `noo:jobs:queue`, `active`, `history`, `drained_nodes`, so a word is never
 /// an id). Deliberately NOT a prefix: `/api/jobs/{id}/reprioritize`,
-/// `/api/tasks/*` and `/api/scheduler/*` stay operator-only. The handlers
+/// the scheduler's `/api/tasks/submit` and `/api/tasks/inference`, and
+/// `/api/scheduler/*` stay operator-only (a person's own harness tasks are
+/// [`is_task_owner_api`]). The handlers
 /// restrict what a User may submit and make cancel owner-only
 /// (`routes::admin`); this only lets the request reach them.
 pub fn is_job_user_api(method: &axum::http::Method, path: &str) -> bool {
@@ -2690,6 +2716,29 @@ pub fn is_job_user_api(method: &axum::http::Method, path: &str) -> bool {
     match path.strip_prefix("/api/jobs/") {
         Some(id) => *method == Method::DELETE && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok(),
         None => false,
+    }
+}
+
+/// The task writes any account may make on its OWN tasks: create, stop
+/// (one, or its own by `via`), ask, answer, context, resubmit — the same set
+/// the user MCP door's `noo_task_*` tools reach. `routes/tasks.rs` answers
+/// 404 for a task the caller does not own and keeps answer, context and
+/// resubmit owner-only, so opening the tier gate grants nothing beyond them
+/// (operator decision 2026-10-19, i143 requirement C).
+pub fn is_task_owner_api(method: &axum::http::Method, path: &str) -> bool {
+    if *method != axum::http::Method::POST {
+        return false;
+    }
+    if path == "/api/tasks" || path == "/api/tasks/stop" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/api/tasks/") else { return false };
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(id), Some(op), None) => {
+            uuid::Uuid::parse_str(id).is_ok() && matches!(op, "stop" | "ask" | "answer" | "context" | "resubmit")
+        }
+        _ => false,
     }
 }
 
@@ -2731,6 +2780,12 @@ pub(crate) fn scope_allows(claims: &Claims, method: &axum::http::Method, path: &
 /// `RequesterCtx.role` is `Claims::resolved_role` evaluated at validation, so
 /// the two entry points agree by construction.
 pub fn requester_allows(requester: &RequesterCtx, method: &axum::http::Method, path: &str) -> bool {
+    // An add-on's own token reaches the proxy to ITS OWN reserved workload
+    // (`addon_workloads::proxy_allows`); the handler then checks the
+    // reservation. Nothing else about the token changes.
+    if crate::addon_workloads::proxy_allows(&requester.sub, path) {
+        return true;
+    }
     scope_allows_for(&requester.scopes, requester.role, method, path)
 }
 
@@ -2744,7 +2799,14 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
         return false;
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
-        return user_may_read(path);
+        // An add-on's GET is scoped by the route's own `min_role`/`scopes`
+        // (addon_proxy), not waved through with the allow-list.
+        return user_may_read(path) || crate::addon_proxy::mounted_get_allows(scopes, role, path);
+    }
+    // A write the add-on's manifest opted in with `owner_scoped` (the add-on
+    // keeps every row to the forwarded account). Exact manifest match only.
+    if crate::addon_proxy::mounted_owner_scoped_allows(method, scopes, role, path) {
+        return true;
     }
     if CHAT_QUERY_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return true;
@@ -2785,6 +2847,10 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     if is_agent_message_write(method, path) {
         return true;
     }
+    // Creating and steering one's OWN tasks (`is_task_owner_api`).
+    if is_task_owner_api(method, path) {
+        return true;
+    }
     // Submitting an inference job and cancelling one's own (`is_job_user_api`).
     // Exact pairs; the handlers confine the type and the owner.
     if is_job_user_api(method, path) {
@@ -2796,6 +2862,12 @@ fn scope_allows_for(scopes: &[String], role: Role, method: &axum::http::Method, 
     // account and refuses a disabled one with a body. Without this the gate
     // answers a User with a bare 403 before the handler ever runs.
     if path == GRAFANA_SESSION_PATH {
+        return true;
+    }
+    // Opening an add-on's UI or socket as oneself. Exact shapes, POST only;
+    // the handlers apply the UI's / the socket's own `min_role` and refuse a
+    // delegated credential (`addon_ui::ui_session`, `addon_ws::ws_ticket`).
+    if *method == Method::POST && (crate::addon_ui::is_ui_session_path(path) || crate::addon_ws::is_ws_ticket_path(path)) {
         return true;
     }
     // Additive and last: a caller without `ingest` is unaffected, and a
@@ -2918,10 +2990,21 @@ pub const USER_READ_PREFIXES: &[&str] = &[
     "/v1/models/",
 ];
 
-/// Whether a `User`-tier token may GET `path`: the allow-list above, plus the
-/// GET routes of mounted add-on manifests (validated at load; they are the
-/// add-on's own surface and were reachable before this list existed).
+/// Whether a `User`-tier token may GET `path` by the allow-list above. An
+/// add-on's mounted GET routes are NOT here: each declares its own `min_role`
+/// and `scopes`, which `scope_allows_for` asks `addon_proxy::mounted_get_allows`
+/// (absent means Operator, so a User reads none an add-on did not vouch for).
+/// Operator-only reads that sit under a User-readable prefix: the skill
+/// promotion queue lives below `/api/prompt-skills`, which a User may list.
+const USER_READ_EXCLUDED_PREFIXES: &[&str] = &["/api/prompt-skills/proposals"];
+
 pub fn user_may_read(path: &str) -> bool {
+    if USER_READ_EXCLUDED_PREFIXES
+        .iter()
+        .any(|p| path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
+    {
+        return false;
+    }
     USER_READ_PATHS.contains(&path)
         || USER_READ_PREFIXES.iter().any(|p| {
             // `/x/` prefixes match by starts_with; a bare `/x` entry matches
@@ -2932,7 +3015,6 @@ pub fn user_may_read(path: &str) -> bool {
                 path == *p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/'))
             }
         })
-        || crate::addon_proxy::is_mounted_get_route(path)
 }
 
 /// Metric READS: Operator and Admin only. The metrics describe the whole
@@ -3215,6 +3297,24 @@ pub async fn require_any_auth(
             // A worker-delegated token reaches the tool
             // routes and nothing else — the same shape as the harness rail.
             crate::worker_delegation::confine(&claims, request.method().as_str(), &path)?;
+            // An add-on delegated token (i143) reaches the task routes and
+            // nothing else, only while its add-on is registered with
+            // delegation on, and only while the account is enabled and no
+            // lower than the token's role. Handlers key their isolation on the
+            // extension: the add-on sees its own tasks for this person.
+            if let Some(addon) = crate::addon_delegation::addon_of(&claims) {
+                crate::addon_delegation::confine(&claims, request.method().as_str(), &path)?;
+                if !crate::addon_registry::get(addon).is_some_and(|e| e.delegates_tasks() && e.operator_enabled()) {
+                    tracing::warn!(sub = %claims.sub, addon, "add-on delegated token refused: the add-on does not delegate tasks (unregistered, undeclared or not enabled)");
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                let live = live_account_role(&state.db, &claims.sub).await;
+                if !rail_token_admitted(claims.resolved_role(), live) {
+                    tracing::warn!(sub = %claims.sub, addon, live = ?live, "add-on delegated token refused: account disabled, absent or below the token's role");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                request.extensions_mut().insert(crate::addon_delegation::AddonDelegation { addon: addon.to_string() });
+            }
             if claims.scopes.iter().any(|s| s == "peer") {
                 let on_peer_surface = path.starts_with("/api/agents/peer")
                     || path.starts_with("/ws/agent");
@@ -3278,6 +3378,8 @@ pub async fn require_any_auth(
             // App-layer RBAC: User-tier callers see everything (GET) but can
             // only mutate the chat/query surface. Operator and above pass
             // (role claim or the legacy write/admin scopes — dual-accept).
+            // An add-on delegated token passes this gate exactly as its
+            // person would: it never opens a route the person cannot.
             if !scope_allows(&claims, request.method(), &path) {
                 return Err(StatusCode::FORBIDDEN);
             }
@@ -3362,6 +3464,23 @@ pub async fn require_any_auth(
         // lane, counted by caller, and refused once the gate is closed.
         if from_v2 {
             crate::legacy_lanes::observe(&state.metrics, &[crate::legacy_lanes::hmac_v2_use(&actor)], &peer).await;
+        } else if !crate::cluster_token_v2::v1_allowed() {
+            // Gate closed: counted as a REFUSAL, its own lane, never as a
+            // use of `cluster_hmac_v1` — that lane is admissions only, and a
+            // refused caller (whose calls all fail) must not read as one.
+            let u = crate::legacy_lanes::hmac_v1_refused_use(&actor, &path);
+            crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            if crate::legacy_lanes::log_due(&format!("hmac_v1_refused_detail|{actor}"), crate::legacy_lanes::HMAC_V1_DETAIL_LOG_EVERY) {
+                let headers = request.headers();
+                tracing::warn!(
+                    actor = %actor, method = %request.method(), path = %path,
+                    body_sha_header = headers.contains_key(crate::cluster_token_v2::BODY_SHA_HEADER),
+                    token_age_secs = v1_token_age_secs(&t),
+                    user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
+                    "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2"
+                );
+            }
+            return Ok(v1_refusal());
         } else {
             let u = crate::legacy_lanes::hmac_v1_use(&actor, &path);
             crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
@@ -3378,10 +3497,6 @@ pub async fn require_any_auth(
                     user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("-"),
                     "cluster token v1 admitted: the request it came on"
                 );
-            }
-            if !crate::cluster_token_v2::v1_allowed() {
-                tracing::warn!(actor = %actor, path = %path, "v1 cluster token refused (NOO_CLUSTER_TOKEN_V1=0): the caller must upgrade to sign v2");
-                return Ok(v1_refusal());
             }
         }
         // The fleet door refuses an add-on's actor too: the
@@ -3781,6 +3896,16 @@ mod tests {
     /// The door table is what makes a third consumer cheap. If the add-on
     /// path stopped resolving, the handler would be reachable by any
     /// credential the middleware happens to accept next.
+    #[test]
+    fn a_key_with_a_declared_addon_scope_exchanges_for_a_token_that_can_read_it() {
+        let declared = vec!["evolve:read_items".to_string()];
+        let key = vec!["addon".to_string(), "evolve:read_items".to_string()];
+        let t = super::addon_token_scopes_with(&key, &declared);
+        assert_eq!(t, vec!["evolve:read_items".to_string(), "read".to_string()]);
+        let plain = super::addon_token_scopes_with(&["addon".to_string(), "chat".to_string()], &declared);
+        assert_eq!(plain, vec!["chat".to_string()], "no add-on scope, no read");
+    }
+
     #[test]
     fn the_addon_path_is_an_exchange_door_and_only_for_post() {
         use axum::http::Method;
@@ -5427,6 +5552,9 @@ mod tests {
             (Method::POST, "/api/prompt-skills/my-skill/retire/extra"),
             (Method::PUT, "/api/prompt-skills/my-skill/retire"),
             (Method::POST, "/api/prompt-skills//retire"),
+            // Promotion is a person's decision: the writer's scope never opens it.
+            (Method::POST, "/api/prompt-skills/proposals/7/decide"),
+            (Method::GET, "/api/prompt-skills/proposals"),
             (Method::PUT, "/api/config/prompt_skills"),
             (Method::PUT, "/api/config/agent"),
             (Method::POST, "/api/temporal/adaptations"),
@@ -5824,6 +5952,48 @@ mod tests {
         assert!(verify_token(&mk(Some(JWT_ISSUER), Some("other-service")), secret).is_err());
         assert!(verify_token(&mk(Some("evil"), Some(JWT_AUDIENCE)), secret).is_err());
     }
+
+    /// PINNED (jsonwebtoken 11 port): the verifier accepts HS256 only on the
+    /// secret path, refuses every other algorithm including `none`, refuses an
+    /// expired token past the default 60s leeway, and still tolerates a few
+    /// seconds of clock skew. A bump that changed any default fails here.
+    #[test]
+    fn jwt_pins_algorithm_expiry_and_leeway() {
+        use base64::Engine as _;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let secret = "test-secret-jwt11";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let claims = |exp: u64| serde_json::json!({
+            "sub": "alice", "scopes": ["read"], "exp": exp,
+            "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
+        });
+        let sign = |alg: Algorithm, exp: u64| encode(
+            &Header::new(alg), &claims(exp), &EncodingKey::from_secret(secret.as_bytes())).unwrap();
+
+        // Baseline: HS256, unexpired.
+        assert!(verify_token(&sign(Algorithm::HS256, now + 3600), secret).is_ok());
+        // Other HMAC algorithms signed with the same secret are refused.
+        for alg in [Algorithm::HS384, Algorithm::HS512] {
+            let e = verify_token(&sign(alg, now + 3600), secret).unwrap_err();
+            assert!(e.contains("unsupported algorithm"), "{alg:?}: {e}");
+        }
+        // `alg: none` (unsigned) is refused, with or without an empty signature.
+        let b64 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let body = b64(&claims(now + 3600).to_string());
+        let head = b64(r#"{"alg":"none","typ":"JWT"}"#);
+        assert!(verify_token(&format!("{head}.{body}."), secret).is_err());
+        assert!(verify_token(&format!("{head}.{body}"), secret).is_err());
+        // A tampered signature is refused.
+        let good = sign(Algorithm::HS256, now + 3600);
+        let tampered = format!("{}x", &good[..good.len() - 1]);
+        assert!(verify_token(&tampered, secret).is_err());
+        // Expiry: well past the 60s default leeway is refused; a few seconds
+        // of skew is tolerated, exactly as before the port.
+        assert!(verify_token(&sign(Algorithm::HS256, now - 3600), secret).is_err());
+        assert!(verify_token(&sign(Algorithm::HS256, now - 10), secret).is_ok());
+        assert!(verify_token(&sign(Algorithm::HS256, now - 120), secret).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -5863,6 +6033,24 @@ mod harness_rail_tests {
     }
 
     #[test]
+    fn a_person_may_write_only_their_own_task_shapes() {
+        use axum::http::Method;
+        let id = "3f2a9c10-1111-4222-8333-444455556666";
+        for p in ["/api/tasks", "/api/tasks/stop"] {
+            assert!(is_task_owner_api(&Method::POST, p), "{p}");
+        }
+        for op in ["stop", "ask", "answer", "context", "resubmit"] {
+            assert!(is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}/{op}")), "{op}");
+        }
+        assert!(!is_task_owner_api(&Method::DELETE, "/api/tasks"));
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/submit"), "the scheduler's submit is not a person's task");
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/inference"));
+        assert!(!is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}")));
+        assert!(!is_task_owner_api(&Method::POST, &format!("/api/tasks/{id}/stop/x")));
+        assert!(!is_task_owner_api(&Method::POST, "/api/tasks/not-a-uuid/stop"));
+    }
+
+    #[test]
     fn a_harness_token_needs_an_enabled_account_at_or_above_its_role() {
         assert!(rail_token_admitted(Role::User, Some(Role::User)));
         assert!(rail_token_admitted(Role::User, Some(Role::Admin)), "an upgrade does not refuse; it waits for the next mint");
@@ -5884,6 +6072,31 @@ mod harness_rail_tests {
         assert!(check < attach);
         assert!(body[check..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
         assert!(body[check..attach].contains("StatusCode::UNAUTHORIZED"));
+    }
+
+    /// An add-on delegated token is confined, must belong to an add-on that
+    /// delegates tasks, and is held to the account's live role, all before
+    /// the extension handlers key their isolation on is attached.
+    #[test]
+    fn the_addon_delegation_branch_confines_then_checks_the_registry_then_the_live_role() {
+        let src = include_str!("auth.rs");
+        let body = src.split("pub async fn require_any_auth(").nth(1).unwrap().split("\npub async fn ").next().unwrap();
+        let branch = body.find("crate::addon_delegation::addon_of(&claims)").expect("addon branch");
+        let confine = body[branch..].find("crate::addon_delegation::confine(").expect("confine") + branch;
+        let registry = body[branch..].find("crate::addon_registry::get(addon)").expect("registry") + branch;
+        let live = body[branch..].find("live_account_role(&state.db, &claims.sub)").expect("live check") + branch;
+        let attach = body[branch..].find("AddonDelegation { addon: addon.to_string() }").expect("attach") + branch;
+        assert!(confine < registry && registry < live && live < attach);
+        assert!(body[registry..live].contains("e.delegates_tasks() && e.operator_enabled()"));
+        assert!(body[registry..live].contains("StatusCode::FORBIDDEN"));
+        assert!(body[live..attach].contains("rail_token_admitted(claims.resolved_role(), live)"));
+        assert!(body[live..attach].contains("StatusCode::UNAUTHORIZED"));
+        // The branch is before the terminal peer / kiosk / add-on-consumer
+        // returns, so none of them can carry an ADT past it.
+        let peer = body.find("claims.scopes.iter().any(|s| s == \"peer\")").expect("peer branch");
+        assert!(attach < peer);
+        // The existing disabled-account check on any delegated token stays.
+        assert!(body.contains("claims.act.is_some() && !delegated_subject_enabled(&state.db, &claims.sub).await"));
     }
 
     #[test]
@@ -6405,6 +6618,12 @@ mod v2_never_counts_as_v1_tests {
         let count = body.find("legacy_lanes::hmac_v1_use(").expect("the v1 count");
         let gate = body[..count].rfind("if from_v2 {").expect("the from_v2 split");
         assert!(body[gate..count].contains("} else {"), "the v1 count must be the not-from-v2 branch");
+        // A refusal (gate closed) is decided BEFORE the admitted count and
+        // is counted on its own lane, so `cluster_hmac_v1` is admissions only.
+        let refused = body.find("legacy_lanes::hmac_v1_refused_use(").expect("the v1 refusal count");
+        let closed = body[..refused].rfind("} else if !crate::cluster_token_v2::v1_allowed() {").expect("the closed-gate branch");
+        assert!(gate < closed && refused < count, "the closed-gate branch must come before the admitted count");
+        assert!(body[refused..count].contains("return Ok(v1_refusal());"), "the closed-gate branch must return the refusal");
     }
 
     /// A gateway that has just started has no Redis connection yet: a fresh

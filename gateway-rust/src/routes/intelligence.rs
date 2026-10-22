@@ -893,8 +893,9 @@ async fn heartbeat_actions() -> AppJson {
         json!({"name": "heartbeat_retention", "description": "Prune old heartbeat run records", "config_schema": {"fields": [
             {"name": "dry_run", "type": "boolean", "label": "Dry run only (report, don't delete)", "default": true},
         ]}}),
-        json!({"name": "agent_messages_retention", "description": "Prune old agent-to-agent messages", "config_schema": {"fields": [
+        json!({"name": "agent_messages_retention", "description": "Archive (sealed), then prune, old agent-to-agent messages", "config_schema": {"fields": [
             {"name": "days", "type": "number", "label": "Keep messages newer than (days)", "default": 90},
+            {"name": "archive_dir", "type": "string", "label": "Archive directory", "default": "/data/audit-archive"},
             {"name": "dry_run", "type": "boolean", "label": "Dry run only (report, don't delete)", "default": true},
         ]}}),
         json!({"name": "usage_rollup", "description": "Roll raw token-usage rows into monthly totals", "config_schema": {"fields": [

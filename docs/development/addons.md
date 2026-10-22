@@ -11,7 +11,11 @@ an overlay the same way but is never in `ADDONS` and never reported by
 `/health`.
 
 This page is the contract. Follow it and your add-on plugs into the gateway
-without a single new line of gateway routing code.
+without a single new line of gateway routing code. An HTTP add-on does not even
+need a row in `ADDONS`: the gateway's runtime registry
+(`gateway-rust/src/addon_registry.rs`) registers any add-on the operator turns
+on, from the route manifest its image delivers, once its signed lock has been
+verified (see "Registration" in step 2a).
 
 ## The two layers
 
@@ -22,7 +26,7 @@ pretending otherwise would make both worse.
 
 | Layer | Where | What it decides |
 |---|---|---|
-| Declaration | `gateway-rust/src/addons.rs` — one `Addon` row | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
+| Declaration | `gateway-rust/src/addons.rs` — one `Addon` row (the add-ons that shipped with the stack); a third-party HTTP add-on is declared by the operator (`addons.<name>: true`) and registered at runtime | Is it supposed to be here? What flag, which polarity, which entitlement, what does a refusal say? |
 | Transport (HTTP) | your repo's route manifest, delivered to `/opt/noo/addon-routes/<name>/routes.json` | Which paths the gateway proxies to it (validated and mounted at startup) |
 | Transport (NATS) | a subject prefix, matched in `worker_client.rs` | Which subjects it answers |
 
@@ -45,6 +49,8 @@ because everything else is something only you can keep true.
 | 6 | MCP tool fragment | `mcp-tools-<addon>.json`, named by `NOO_MCP_EXTRA_MANIFEST` | optional — only if your add-on should appear as MCP tools |
 | 7 | Compose overlay | `docker-compose.<addon>.yml` with an explicit env allowlist | the launcher composes it when `addons.<name>` is declared on in `noomesh.yaml` |
 | 8 | Gateway client | e.g. `gateway_client.py` | everything in the gateway's domain routes back over HTTP, and only you know which calls you make |
+| 9 | Database declaration | `system.json` in your signed bundle | optional: your schema and roles, provisioned by the gateway (see [Declaring a database](#declaring-a-database)) |
+| 10 | Workload declaration | `workloads.json` in your signed bundle | optional: containers noomesh may start, stop and drain for you (see [Declaring workloads](#declaring-workloads)) |
 
 ## A minimal worked example: `example-addon`
 
@@ -74,7 +80,7 @@ example-addon/
      "base_url_env": "NOO_EXAMPLE_ADDON_URL",
      "base_url_default": "https://noo-example-addon:8090",
      "routes": [
-       { "name": "status", "method": "GET", "path": "/api/example-addon/status" }
+       { "name": "status", "method": "GET", "path": "/api/example-addon/status", "min_role": "operator" }
      ]
    }
    ```
@@ -107,6 +113,11 @@ with a changelog as the coordination channel. Follow it.
 
 ## Step 1 — declare it
 
+An add-on that is not shipped with the stack needs no row: skip to step 2a,
+where the operator's `addons.<name>: true` and your manifest are the whole
+declaration. The row below is for add-ons the stack itself ships (it carries
+the polarity, licence feature and refusal text).
+
 One row in `ADDONS` (`gateway-rust/src/addons.rs`):
 
 ```rust
@@ -122,8 +133,10 @@ Addon {
 There is deliberately no `env` field: the switch is the `addons.<name>` key
 in `noomesh.yaml`, read by both the launcher (compose overlays) and the
 gateway (routing/refusals) from the same file. No per-add-on environment
-variable exists or is accepted. Set `routes_manifest: true` on the row if you
-serve HTTP routes through a manifest (step 2a).
+variable exists or is accepted. Set `routes_manifest: true` on the row only to
+make a missing manifest a loud refusal (the diagnostic for an image from before
+manifests shipped); the registry reads the manifest of every enabled add-on
+whether or not its row says so.
 
 `default_on` is the whole polarity decision. An open pack people expect to
 have (trellion) is opt-out; anything licensed is opt-in.
@@ -136,7 +149,88 @@ that is the reason this table exists rather than a scattering of env reads.
 
 Write your manifest in your own repo and ship it in your image. The gateway
 reads it at startup from `/opt/noo/addon-routes/<name>/routes.json` when your
-switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
+switch is on (`gateway-rust/src/addon_registry.rs`, `addon_proxy.rs`); you touch
+no gateway code.
+
+### Registration
+
+The gateway keeps a **runtime registry** of HTTP add-ons, built at startup. An
+add-on is registered when all three hold:
+
+1. the operator switched it on: `addons.<name>: true` in `noomesh.yaml`;
+2. its image delivered a manifest the gateway accepted (below);
+3. the launcher vouches for its signed lock: `noo addons enable|upgrade` verified
+   the lock against the add-on's key in the installed entitlement and checked
+   that it lists this stack (`supports_stack`), and `noo stack start|restart`
+   re-verified it offline and handed the gateway the verdict
+   (`NOO_ADDONS_VERIFIED`).
+
+An add-on that fails 2 or 3 is **refused, never silently skipped**: no routes,
+`/health` reads `addons.<name>: "unhealthy"`, and the log says why. A missing
+lock reads: "add-on `<name>` is enabled in noomesh.yaml but has no verified lock
+for this stack ... Run `noo addons upgrade <name>`". A lock verified for another
+stack is refused the same way, naming both stacks.
+
+Names are lowercase letters, digits, `-` and `_`, starting with a letter (at
+most 32). A name with `-` reads its upstream override from the variable with `_`
+(`pai-voice` reads `NOO_PAI_VOICE_URL`; the host stays `noo-pai-voice`) and may
+declare scopes as `pai-voice:<word>`.
+
+The routes are mounted once, when the router is built at startup. A reload
+rebuilds the registry (what is registered, what is delegated), but an add-on that
+appears later gets its routes at the next start.
+
+**Getting a lock the operator trusts.** A third-party add-on is released as a
+signed `noo-addon-lock/2` bundle (see "The signed add-on lock" below). The
+operator trusts your signing key with `noo addons trust-key <name> <pubkey>
+--registry <root>` (the CLI ships no key for you), and your images must sit
+under that registry root and be pullable anonymously.
+
+**Development keys.** To develop and test an add-on on your own mesh before it
+ships in a release, the operator can trust a temporary development key instead
+of your release key:
+
+```bash
+noo addons trust-key yourthing <dev-pubkey> --registry <root> --dev --expires 14d
+noo addons enable yourthing --lock ./addon-lock.json
+```
+
+- `--expires` is required with `--dev` (a whole number of `d`, `h` or `m`, at
+  most `30d`) and refused without it. The key is stored under
+  `addon_trust.yourthing.dev_keys` with `dev: true` and an absolute UTC
+  `expires_at`, never among the release `keys`. Trusting it again renews it.
+- It is scoped to that one add-on name on this mesh. No entitlement, flag or
+  release can carry it: an anchor read from JSON never holds a development key.
+- A key is never both: trusting a key without `--dev` that is a development key
+  for any add-on is refused, and the reverse.
+- A lock that only the development key signed verifies until `expires_at`. After
+  that the launcher refuses it exactly like an untrusted key, naming the expiry
+  and the renew command, and a gateway that is still running stops serving the
+  add-on's routes and reports it `unhealthy` with the reason.
+- While it is live, `/health` keeps `addons.yourthing: "enabled"` and adds
+  `addons_dev.yourthing: "dev (expires <date>)"`; `noo addons list` shows it
+  under "third-party" as `DEV until <date>` (`DEV EXPIRED <date>` after), and
+  `noo addons verify` says `signed by DEV key`.
+- It never ships. Your release verifies the lock with
+  `noo security addon-lock verify ... --key <release key>`, which refuses a
+  `--key` that is a development key and a lock that only a development key
+  signed (it knows the keys given with `--dev-key` and every development key in
+  the install's noomesh.yaml). The stack release records image digests only and
+  never reads an add-on key. Shipping means re-signing with your release key;
+  nothing about the development key carries over.
+- `noo addons untrust-key yourthing --dev` removes the add-on's development keys
+  (`untrust-key yourthing <pubkey> --dev` removes one).
+
+Enrolling a development key is a local operator action on the controller: the
+CLI edits the install's noomesh.yaml, and the gateway accepts a write of the
+`addon_trust` section only from an admin.
+
+**Upgrading.** An install that upgrades keeps its enabled add-ons working on the
+first boot: the new launcher already verified every composed licensed add-on's
+pin before the gateway started. If the gateway is started by an older launcher
+that does not report a verdict, it loads only the add-ons it already knew, as
+before, and logs that `noo upgrade` updates the launcher; it never extends that
+to a name it did not know.
 
 ```json
 {
@@ -146,11 +240,12 @@ switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
   "base_url_default": "https://noo-yourthing:8090",
   "timeout_secs": 60,
   "routes": [
-    { "name": "status", "method": "GET", "path": "/api/yourthing/status" },
-    { "name": "list", "method": "GET", "path": "/api/yourthing/items", "query": true },
+    { "name": "status", "method": "GET", "path": "/api/yourthing/status", "min_role": "user" },
+    { "name": "list", "method": "GET", "path": "/api/yourthing/items", "query": true,
+      "min_role": "operator", "scopes": ["yourthing:read_items"] },
     { "name": "detail", "method": "GET", "path": "/api/yourthing/items/{item_id}",
-      "params": { "item_id": "uuid" } },
-    { "name": "run", "method": "POST", "path": "/api/yourthing/run" },
+      "params": { "item_id": "uuid" }, "min_role": "operator" },
+    { "name": "run", "method": "POST", "path": "/api/yourthing/run", "min_role": "operator" },
     { "name": "internal_tick", "method": "POST", "path": "/api/yourthing/tick",
       "internal": true }
   ]
@@ -160,15 +255,64 @@ switch is on (`gateway-rust/src/addon_proxy.rs`); you touch no gateway code.
 | Field | Meaning |
 |---|---|
 | `name` | Stable key. Gateway code calls a route by this, never by its path. |
-| `method` | `GET` or `POST`. |
+| `method` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, or `WS` (a WebSocket route, see "WebSocket routes"). Every method but `GET` and `WS` is a **write** and follows the `POST` rule: `operator` or `admin` unless `owner_scoped`, no `scopes`, never where the front door admits a User. `PUT`/`PATCH`/`DELETE`/`WS` need a gateway from the release that reads them. |
 | `aliases` | Extra gateway paths reaching the same route — for a path that shipped under more than one spelling. |
 | `params` | `{"id": "uuid"}` (`uuid` or `string`). A malformed uuid is a 400 from the gateway; garbage never reaches your URL. |
 | `query` | Pass the caller's query string through. |
 | `internal` | Callable from gateway code, **not mounted** on the public API. |
 | `timeout_secs` | Per route (1–600); falls back to the manifest's. |
+| `min_role` | `user`, `operator` or `admin`: the lowest role that may call this public route. **Absent means `operator`**, for every method. Any other value refuses the whole manifest. A write (`POST`, `PUT`, `PATCH`, `DELETE`) cannot be `user` unless `owner_scoped`. |
+| `scopes` | Optional, `GET` only: add-on scopes written `<yourname>:<word>` that also open the route to an account holding `read` plus the scope, below `min_role`. Always namespaced, so a manifest can never name a core scope (`graph`, `ingest`, …). |
+| `owner_scoped` | A write at `min_role: "user"` whose add-on keeps every row to the calling account (see below). |
+| `max_message_bytes` | `WS` only: largest message (and frame) either way, bytes. Default 1048576 (1 MiB), at most 16 MiB. |
+| `idle_timeout_secs` | `WS` only: no frame either way for this long closes the socket (1001). Default 300, 1–3600. |
+| `max_connections_per_user` | `WS` only: sockets one account may hold open on this route. Default 4, 1–64; the next is a `429`. |
 | `note` | Free text for whoever reads the file. |
 
 Any other field is refused.
+
+A third **top-level** key serves your own web UI (see "Serving a UI"):
+
+| Key | Meaning |
+|---|---|
+| `ui` | `{"upstream_path": "/", "min_role": "user", "title": "Example"}`. The gateway serves your UI on an origin of its own, `https://<host>:<your port>/<rest>`, from `<your upstream><upstream_path>/<rest>`. `upstream_path` defaults to `/` (a plain path, no `{param}`); `min_role` as on a route (absent = `operator`); `title` is 1–64 plain characters for the console's link; `timeout_secs` 1–600. Any other field refuses the manifest. A manifest with a `ui` may declare no routes. |
+
+Two **top-level** keys (beside `routes`, not inside a route) prepare an add-on
+to act for a present person through that person's own tasks:
+
+| Key | Meaning |
+|---|---|
+| `delegate` | `"tasks"` is the only value. Declares that the add-on asks to create and steer a present person's tasks. An unknown value refuses the manifest. |
+| `task_events` | `{"method": "POST", "path": "/..."}`: where the gateway POSTs task events for this add-on. Valid only with `delegate: "tasks"`; the method must be `POST`; the path is plain (no `{param}`) and must not equal or match **any public route** of the same manifest (aliases and `{param}` routes included), so it is never reachable through the front door. An `internal` route's path is allowed. |
+
+A route-level boolean keeps the delegated token off routes that never need it
+(a GPU media route, say): `"receives_delegation": true` on a **public** route
+means the gateway may send that route the token. It defaults to false, is valid
+only when the manifest declares `delegate: "tasks"` (otherwise the manifest is
+refused), is refused on an `internal` route and on a route that shares the
+`task_events` path. The registry answers
+`route_receives_delegation(method, path)`, matching the way the proxy picks a
+route (aliases and `{param}` routes included; when several routes match, all must
+opt in). The token is minted only when that is true **and** `operator_enabled()`.
+
+Declaring `delegate` grants nothing. The operator must also enable it for the
+add-on, in `noomesh.yaml`:
+
+```yaml
+addon_delegation:
+  yourthing:
+    tasks: true
+```
+
+The default is off, and each half alone is off: the registry's
+`operator_enabled()` is true only when the manifest declares `delegate: "tasks"`
+**and** `addon_delegation.<name>.tasks` is true. The `addon_delegation` section
+is admin-only to write through the config API (a gated section), and the
+gateway reads it at startup. Minting the delegated token and delivering task
+events are separate changes (noomesh-internal i143); this release parses,
+validates and exposes the keys. A gateway that predates them refuses a manifest
+that carries them (unknown keys fail the whole manifest), so ship them with a
+`supports_stack` that starts at the release that reads them.
 
 ### Delivering it
 
@@ -181,9 +325,9 @@ being up first, and an image upgrade rewrites the file.
 
 ### What the gateway checks
 
-The gateway still decides what it exposes. A manifest declares paths and an
-upstream, never who may call them, and the gateway refuses the whole add-on
-when any of these fails:
+The gateway still decides what it exposes. A manifest declares paths, an
+upstream and the permission each route needs, and the gateway refuses the whole
+add-on when any of these fails:
 
 - `version` is 1 and `addon` is the add-on it was delivered for;
 - the upstream is your own service: `base_url_env` is `NOO_<NAME>_URL` and
@@ -196,16 +340,96 @@ when any of these fails:
 - routes the gateway calls by name (`CALLED_BY_NAME`: the console and CLI
   pieces and the gateway's own scheduled calls) are `internal`;
 - a public `POST` is one the front door already refuses a User-tier caller,
-  so a manifest cannot place a write where a User is admitted;
+  so a manifest cannot place a write where a User is admitted, unless the
+  route declares `"owner_scoped": true` (see "Who may call a route");
+- `min_role` is `user`, `operator` or `admin` (never anything else, never read
+  as `user`), a write (`POST`, `PUT`, `PATCH`, `DELETE`) is `user` only with
+  `owner_scoped`, and `scopes` are `<name>:<word>` on a `GET`;
+- a `WS` route lives under `/ws/addons/<name>/`, is never `internal`, and its
+  limits are in range; the WS limits appear on no other method;
+- `ui.upstream_path` is a plain path and `ui.min_role` a known role;
+- `delegate` is `"tasks"` or absent; `task_events` appears only with
+  `delegate`, is a `POST`, and names a path no public route of the manifest
+  covers;
 - no public route collides with a core route.
 
-Scopes are the gateway's: the global auth middleware runs in front of every
-mounted route exactly as it does for core routes.
+### Who may call a route
+
+Add-on routes are scoped by permission like every core route, with the same
+tiers (User, Operator, Admin). The gateway enforces `min_role` before it
+forwards anything, for every method: the global auth middleware runs in front
+of every mounted route exactly as it does for core routes, and the add-on
+receiver checks again (which also covers `admin` routes and aliases). A caller
+is allowed when its role is at least `min_role`, or, on a `GET` that lists
+`scopes`, when it holds `read` plus one of them. A refusal is a `403` naming the
+role needed, before your service is dialled.
+
+Choose the role by what the route returns. Anything that describes the whole
+installation (reflection text, genomes, rewards, policy state, fleet-wide
+counts) is `operator`. `user` is for what is per-account and safe for any
+signed-in person. Writes are `operator` or `admin` and a scope never widens
+them.
+
+**Absent `min_role` is `operator`.** An add-on that does not say who may read a
+route (an older release, a third-party add-on) is readable by Operators and
+Admins only. Before this field a manifest's `GET` routes were readable by any
+User-tier token; that is the one behaviour this narrows, and only for Users.
+Declare `"min_role": "user"` on a route a User should keep.
+
+Add-on scopes are checked against the scopes in the caller's token. They are
+grantable: `noo security user set-scopes <user> --scope read --scope
+<addon>:<word>` (and `service-key issue --scopes <addon>:<word>`) accept a scope
+exactly when a loaded manifest declares it on some route, and refuse any other
+`<addon>:<word>` with the list of declared ones. The grant ends the account's
+sessions; the scope opens that add-on's `GET` route (with `read`) and nothing
+else.
+
+#### `owner_scoped`: a User's own writes
+
+The default is: declare it, or it is Operator. A write (`POST`, `PUT`, `PATCH`,
+`DELETE`) cannot be `min_role: "user"`, because the front door refuses a User's
+writes.
+
+A route may opt out with `"owner_scoped": true`, and only a write at
+`"min_role": "user"` may (the flag on any other shape is refused at load, not
+ignored). It means the add-on **promises to read and write only rows owned by
+the account the gateway forwards**, for example a person's own voice sessions,
+notes and tasks. The gateway does not check that promise; add the flag only to
+routes that keep it. What the gateway does:
+
+- the tier gate lets a User through to exactly that route (method and path), and
+  nothing else the add-on declares;
+- it forwards the verified caller on every request, in headers it **sets**
+  (the outbound request is built from nothing, so a copy a client sends is
+  never passed on): `X-Noo-Requester-Sub` (the account),
+  `X-Noo-Requester-Connection` (the session), `X-Noo-Requester-Role` (resolved
+  at validation, never re-derived from scopes), `X-Noo-Requester-Scopes`
+  (comma-separated), beside the gateway's bearer;
+- a call with no verified caller is refused (`401`) rather than forwarded, so
+  the add-on never has to guess whose row it is.
+
+The add-on must key every query and every write on `X-Noo-Requester-Sub`, take
+no owner from the body or path, and treat an absent header as the gateway
+itself, never as "anyone".
+
+```json
+{ "name": "voice_session_create", "method": "POST", "path": "/api/voice/sessions",
+  "min_role": "user", "owner_scoped": true, "timeout_secs": 30,
+  "note": "creates a session owned by the calling account" }
+```
+
+An add-on image that declares `owner_scoped` is refused whole by a gateway that
+predates the field, for the same reason; roll the gateway first.
+
+Rolling: the gateway rolls first. A gateway that predates `min_role` refuses an
+unknown manifest field outright (unknown keys fail the whole manifest), so an
+add-on image that declares `min_role` must not meet an older gateway; a new
+gateway with an older add-on image treats every route as `operator`.
 
 ### When it is missing or wrong
 
-Switched on, with no manifest or an invalid one: **none** of your routes are
-mounted, never a partial surface. The gateway logs the reason at startup,
+Switched on, with no manifest, an invalid one, or no verified lock for this
+stack: **none** of your routes are mounted, never a partial surface. The gateway logs the reason at startup,
 `/health` reports `addons.<name>: "unhealthy"`, and every internal call to
 you answers with the reason (an image from before manifests shipped with the
 add-on is named as the likely cause, with the fix). Switched off: nothing is
@@ -220,6 +444,211 @@ A route marked `internal` is reachable from gateway code and from nowhere
 else. Use it for anything that should not be triggerable by a caller with API
 access: a route only the gateway's own scheduled work calls (`internal_tick`
 in the manifest above) is the typical case.
+
+### WebSocket routes
+
+```json
+{ "name": "audio_stream", "method": "WS", "path": "/ws/addons/example-addon/stream",
+  "min_role": "user", "query": true,
+  "max_message_bytes": 1048576, "idle_timeout_secs": 300, "max_connections_per_user": 2 }
+```
+
+A `WS` route is a WebSocket the gateway terminates for the client and opens
+again to you. In order, for every handshake:
+
+1. **Credential.** A browser cannot set `Authorization` on a WebSocket, and a
+   token in a URL ends up in access logs, so `?token=` is never a credential
+   under `/ws/addons/`. There are three ways in:
+   - **From your own UI** (see "Serving a UI"): open
+     `wss://<host>:<your port>/ws/addons/<name>/…` on your UI's origin. The
+     origin's session cookie authenticates the upgrade, and the `Origin`
+     header must be that origin. No ticket.
+   - **From another browser page on the console origin**: call
+     `POST /api/addons/<name>/ws-ticket` with `Authorization: Bearer <token>`,
+     get `{"ticket": "...", "param": "ticket", "expires_in": 30}`, and open
+     `wss://<console host>/ws/addons/<name>/…?ticket=<ticket>` within 30
+     seconds. A ticket is random, bound to that person and that add-on, and
+     consumed by the first handshake that presents it (valid or not).
+   - **A non-browser client**: `Authorization: Bearer` on the handshake to
+     the console port.
+2. **Permission.** The route's `min_role` is checked against the person
+   (`403` naming the role), then the per-account cap (`429`), all before you
+   are dialled.
+3. **Dial, then upgrade.** The gateway opens `wss://noo-<name>[:port]<path>`
+   with the cluster CA and its own client certificate (same door as your
+   HTTP routes), the gateway bearer and the `X-Noo-Requester-*` headers it
+   **sets** (see "Step 3b"), and the delegated task token when the route has
+   `receives_delegation`. The query is passed on only with `"query": true`,
+   always without `ticket` and `token`. Subprotocols the client asked for
+   (`Sec-WebSocket-Protocol`, plain tokens only) are passed on and the one you
+   select is echoed to the client. Only when you answered `101` is the client
+   upgraded; if you refuse (`4xx`) the client gets your status, if you are
+   down it gets a `503` with the reason.
+4. **Frames.** Text, binary, ping, pong and close are piped both ways; a close
+   code you send reaches the client when it is a sendable one (1000–1003,
+   1007–1014, 3000–4999). Each direction awaits the other side's write before
+   reading the next frame, so a slow reader slows its writer and nothing
+   buffers without bound. Oversize: `1009` to the sender. Idle: `1001` to both.
+   The person's access token expiring, or a logout or session revocation,
+   closes the client with `4401` (the console's convention: refresh, mint a
+   new ticket, reconnect) and you with `1001`.
+
+Serve your socket on your mTLS listener at the same path as the manifest
+(`/ws/addons/<name>/…`), read the account from `X-Noo-Requester-Sub` exactly
+as on an HTTP route, and keep a User's stream to that account. A gateway
+older than this release refuses a manifest with a `WS` route (unknown method),
+so ship it with a `supports_stack` that starts at this release.
+
+### Serving a UI
+
+```json
+"ui": { "min_role": "user", "title": "Example add-on" }
+```
+
+**Your UI gets an origin of its own.** The console keeps the person's access
+token in the browser on the console's origin, and no add-on script may read
+it. An origin is scheme + host + port, and the fleet is reached at a single
+tailnet name (`noo-controller.<tailnet>.ts.net`, no subdomains), so the
+gateway gives each add-on with a `ui` an HTTPS listener on a port of its own,
+from `NOO_ADDON_UI_PORTS` (default `8450-8459`, room for ten add-on UIs;
+widen it, e.g. `8450-8499`, when more add-ons serve one, at the cost of one
+published port each). The port comes from a hash of your add-on's name, so
+the same set of add-ons always gets the same ports. The listener uses the gateway's certificate, and the console origin
+never serves add-on UI.
+
+On that origin, everything is yours and nothing else is there:
+
+| On `https://<host>:<your port>` | Goes to |
+|---|---|
+| `/`, `/app.js`, `/assets/x.wasm` (any other GET/HEAD) | your upstream, `<upstream_path>/<path>`, unchanged: no prefix, no HTML rewriting |
+| `/api/<your routes>` | your manifest's HTTP routes (same handler, same `min_role`) |
+| `/ws/addons/<name>/…` | your `WS` routes |
+| `/__noo/session` | the gateway's session handoff |
+| any other `/api/…`, `/ws/…`, `/__noo/…` | 404 |
+
+So build the UI to be served from `/`, with root-relative or relative paths
+to its assets, its API and its sockets.
+
+**Finding and opening a UI.** `GET /api/addons/ui` (any signed-in account)
+answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
+User sees the UIs its role may open, an Operator or Admin sees all of them.
+The console's **Add-ons** tab lists them with an **Open** button.
+
+**Session handoff.**
+
+1. The console calls `POST /api/addons/<name>/ui-session` on its own origin
+   with `Authorization: Bearer`. The gateway checks `ui.min_role` and answers
+   `{"code", "port", "path", "url", "expires_in": 30, "session_idle_secs",
+   "session_max_secs"}`. The code is random, single use, valid for 30
+   seconds, and bound to that person, that add-on and this browser: the same
+   answer sets a cookie `noo_handoff_<name>` (HttpOnly, Secure,
+   SameSite=Strict, `Path=/__noo/session`, 30 s). Cookies ignore ports, so
+   the browser that minted the code presents it on your origin; any other
+   browser does not have it.
+2. The console opens `url` (`https://<host>:<port>/__noo/session?code=…`) in
+   a new tab. Your origin redeems the code only when the binding cookie
+   matches and the request is a top-level navigation no other site started
+   (no foreign `Origin`, no `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode:
+   navigate` when the browser sends it). It sets its own cookie
+   `noo_ui_<name>` (HttpOnly, Secure, SameSite=Strict, host-only, `Path=/`).
+   The cookie holds an opaque session id, never a token, and the binding
+   cookie is cleared. The browser is then redirected to `/`.
+3. The session **slides**: it ends after `NOO_ADDON_UI_SESSION_IDLE_SECS`
+   (default 8 h) without a request and after `NOO_ADDON_UI_SESSION_MAX_SECS`
+   (default 24 h) however active. It is not tied to the console's short
+   access token, and no refresh token ever reaches your origin. Instead,
+   every request re-checks the person:
+   - the session floor (logout, password change, disable);
+   - the live role (a demotion below the session's role ends it);
+   - your add-on still being enabled.
+
+   An open socket re-checks every minute and on a logout broadcast, then
+   closes with `4401`.
+4. On your origin that cookie authenticates your UI, your API routes and
+   your sockets, and nothing else does: a bearer token is not accepted
+   there, and the console port never reads a `noo_ui_*` cookie.
+
+When the session ends, your origin answers `401` and a socket closes with
+`4401`. Show the person a link back to the console's **Add-ons** tab.
+
+**Residual login-CSRF risk.** An attacker who holds an account can mint a
+code for themselves. Opening that code in a victim's browser fails, because
+the victim has no matching binding cookie. What remains: someone who can
+already run script on the console origin, or plant cookies on this host (a
+compromised add-on origin on the same host can set a host-only cookie for
+`Path=/__noo/session`, but cannot read the victim's console token), could
+fixate a session. The window is 30 seconds and one use.
+
+**Writes and sockets from your UI.** Cookies ignore ports, so the browser
+also sends your cookie to other add-ons' ports on the same host. On your
+origin:
+
+- a request that carries an `Origin` header must carry yours;
+- a WebSocket upgrade must carry your `Origin`;
+- a write (`POST`, `PUT`, `PATCH`, `DELETE`) must carry your `Origin` **and**
+  the header `X-Noo-Addon-Request: 1`. Send it on every write, e.g.
+  `fetch('/api/<name>/x', {method: 'POST', headers: {'X-Noo-Addon-Request': '1', 'Content-Type': 'application/json'}, body})`.
+
+The gateway answers no CORS preflight, so no other origin can send that
+header.
+
+**What the gateway does to a UI response.**
+
+- Status and body pass through, streamed.
+- Response headers are an allow-list: `Content-Type`, `Content-Length`,
+  `Content-Encoding`, `Content-Language`, `Content-Range`,
+  `Content-Disposition`, `Accept-Ranges`, `Cache-Control`, `ETag`,
+  `Last-Modified`, `Expires`, `Vary`, `Content-Security-Policy`. Everything
+  else is dropped, notably `Set-Cookie`, CORS headers, HSTS,
+  `Clear-Site-Data`, `Service-Worker-Allowed`, `X-Frame-Options`, `Refresh`
+  and `Link`. A `Location` survives only when it stays on your origin; your
+  own `<upstream_path>/…` is rewritten to `/…`.
+- The gateway's Content-Security-Policy is always added:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'
+  'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:
+  mediastream:; font-src 'self' data:; connect-src 'self'; worker-src 'self'
+  blob:; object-src 'none'; base-uri 'none'; form-action 'self';
+  frame-ancestors <console origin>`. `connect-src 'self'` is your own origin
+  only, which covers your API and your sockets. `frame-ancestors` is
+  `NOO_CONSOLE_ORIGIN` when set, otherwise this host on 443 and on the
+  gateway port. Your own CSP is kept beside it; the browser enforces both, so
+  yours can only narrow it.
+- `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
+  `Cross-Origin-Resource-Policy: same-origin`, and `Cache-Control: private,
+  no-cache` when you sent none.
+- Request headers passed to you: only `Accept`, `Accept-Language`,
+  `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range`, plus the
+  identity headers the gateway sets. Never the cookie.
+- Refused with `400`: a `.` or `..` segment, an empty segment, any `%`
+  (percent-encoding is refused, not decoded), or a character outside
+  `[A-Za-z0-9._~@+-]`. Refused with `403`: a service-worker script fetch.
+
+**Exposing the ports (operator).** The gateway publishes the range on
+loopback (`${NOO_ADDON_UI_BIND_ADDR:-127.0.0.1}:${NOO_ADDON_UI_PORTS}`, with
+the same number inside and out). The browser reaches each port through
+`tailscale serve` with the tailnet's certificate, exactly like Grafana's own
+origin. After every successful `noo stack start` and `noo stack restart`, the
+launcher asks the gateway which ports are allocated (`GET /api/addons/ui`)
+and then:
+
+- fronts each one: `tailscale serve --bg --https=<port> https://127.0.0.1:<port>`;
+- removes its own entry (only `/` → `https://127.0.0.1:<port>`) from any
+  port in the range that is no longer allocated (`tailscale serve
+  --https=<port> off`);
+- leaves alone, and reports, a port that carries anything else.
+
+It never touches the tailnet policy. If tailscale refuses the change (no
+operator permission and no passwordless sudo), it prints the exact
+`sudo tailscale serve …` line to run.
+
+- An install without tailscale sets `NOO_ADDON_UI_BIND_ADDR` to the address
+  browsers use.
+- Set `NOO_CONSOLE_ORIGIN=https://noo-controller.<tailnet>.ts.net` when the
+  console is reached under a different origin than the default (this host on
+  443 and on the gateway port). It is the CSP `frame-ancestors` of the add-on
+  origins.
+- The add-on origin listeners carry the console router's request logging,
+  rate limiting, audit-address and panic layers.
 
 ## Step 2b — claim a subject prefix (NATS add-ons)
 
@@ -266,6 +695,50 @@ This is the reverse of the key your add-on presents when it calls the gateway
 (`NOO_GATEWAY_KEY`). Both are rows in the same table with the
 same properties; they are not interchangeable, and neither is accepted where
 the other belongs.
+
+### Delegated tasks
+
+An add-on that should do background work for a person who is present declares
+`"delegate": "tasks"` in its manifest and marks the routes that need it with
+`"receives_delegation": true`. The operator must also enable delegation for the
+add-on (default off). Both are required.
+
+**What you receive.** On a request to an opted-in route, in addition to the
+headers above, the gateway sets `X-Noo-Delegation`: a short-lived token (five
+minutes) for that person, acting through your add-on (`act.sub` is
+`addon:<name>`). A client-sent `X-Noo-Delegation` is dropped, and a request
+whose own token is already delegated never receives another. Keep the token in
+memory for the request; never store it, log it, or send it to a model.
+
+**Confinement.** Present it to the gateway as a bearer on these routes only,
+and nowhere else (every other route answers 403):
+
+| Route | Use |
+|---|---|
+| `POST /api/tasks` | create a task; `Idempotency-Key` makes a retry return the same task (`idempotent_replay: true`); optional `context` (at most 32 KiB) |
+| `GET /api/tasks`, `GET /api/tasks/{id}` | list and read |
+| `POST /api/tasks/{id}/stop`, `/ask`, `/answer` | steer |
+| `POST /api/tasks/{id}/context` | `{text, revision}`: push context, picked up at the next loop |
+| `GET /api/tasks/{id}/events?after=<seq>` | pull events |
+| `POST /api/tasks/stop` | `{via: "addon:<name>"}`: revoke your own background work |
+
+`resubmit` (it spends the person's tokens) is not available: it needs the
+person directly. The token is refused when the account is disabled or its role
+is lower than the token's, and when the add-on is switched off or its
+delegation is disabled.
+
+**Isolation.** The token sees only the tasks your add-on created for that
+person (`created_via = addon:<name>`). Any other task, including another
+person's, one created directly, or another add-on's, answers 404, even when the
+person is an operator. Listing never takes the operator's all-tasks view.
+
+**Lifetime.** Authority tracks presence: each proxied request carries a fresh
+token, and five minutes after the person leaves you can start nothing new.
+Running tasks continue on noomesh; keep task ids, not tokens. Switching the
+add-on off does not stop its tasks.
+
+**Revoke.** The person (or you, with a token) calls `POST /api/tasks/stop
+{via}`; an operator runs `noo tasks stop --via addon:<name> [--user <u>]`.
 
 ### Verifying the bearer
 
@@ -630,7 +1103,8 @@ no add-on registry.
 **The bundle.** A release also signs a second lock, `addon-bundle.json`, in
 the format `noo-addon-lock/2`: the same fields plus `files`, each file the
 add-on ships beside its images (its compose overlay, `docker-compose.yml`, at
-least) by name and `sha256:…`. One signature therefore covers the overlay too.
+least; `system.json` and `workloads.json` when it declares them) by name and
+`sha256:…`. One signature therefore covers the overlay and the declarations.
 Sign it with the same command and one `--file <name>=<path>` per file, then
 check it with `verify … --files-dir <dir>`. File names are one plain component
 (`[A-Za-z0-9._-]`).
@@ -750,3 +1224,126 @@ leftover root overlay (`docker-compose.evolve.yml`,
 `docker-compose.trellion-intel.yml`), moving it aside as `.retired-<version>`
 if it was edited. Every add-on lock published for stack v0.6.2 and later is a
 bundle.
+
+## Declaring a database
+
+An add-on that owns tables declares its database system in its signed bundle,
+as a file named `system.json` listed in `files` like the overlay. It is never
+written in `noomesh.yaml`. The gateway's systems broker provisions it exactly
+like a `systems:` entry (see
+[the `systems` reference](../reference/config.md#systems--the-per-system-database-manifest-gateway-broker)):
+the schema owned by the migration role, a runtime role with no `CREATE`, the
+default privileges, and the extensions.
+
+```json
+{
+  "schema": "example_addon",
+  "role": "noo_example_addon",
+  "ddl_role": "noo_example_addon_ddl",
+  "extensions": ["pg_trgm"]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `schema` | exactly `<id>`, the add-on name with `-` as `_` (`example-addon` → `example_addon`) |
+| `role` | exactly `noo_<id>`: the runtime role (DML, no `CREATE`) |
+| `ddl_role` | exactly `noo_<id>_ddl`: owns the schema; run your migrations as it |
+| `extensions` | optional; each one of `vector`, `pg_trgm`, `pgcrypto`, `citext`, `btree_gin`, `btree_gist`, `hstore`, `unaccent`, `fuzzystrmatch` (the broker installs them as superuser, so the list is closed) |
+
+Any other value, any other field, or an add-on whose `<id>` would be a core
+name (`app`, `worker`, `gateway`, `admin`, `public`, `mesh`, `noo`, … or a
+`pg_` prefix) refuses the bundle. `noo addons enable | upgrade` refuses it
+before anything is pinned, and the gateway refuses the whole add-on (no routes)
+if one reaches it anyway.
+
+**Passwords are derived, never declared:** `NOO_<ID>_DB_PASSWORD` (runtime)
+and `NOO_<ID>_DDL_PASSWORD` (migrations). `noo addons enable <name>` mints
+both into the encrypted store when absent (never rotates), and `noo upgrade
+--stack` does the same for every add-on switched on. The launcher delivers
+them to the gateway in its one systems-secrets file. Your overlay delivers
+them to your own containers the usual way (`file: ${NOO_SECRET_RUNDIR}/<name>`
+with `x-noo-source: NOO_<ID>_DB_PASSWORD`).
+
+**When it is provisioned.** Only while the add-on is registered: switched on
+(`addons.<name>: true`), its signed lock verified by the launcher for this
+stack, and its manifest and declarations valid. On every `noo stack start |
+restart` the launcher copies `system.json` from the verified bundle to
+`.noo-addon-systems/<name>/system.json` in the install root, which the gateway
+mounts read-only at `/opt/noo/addon-systems/<name>/system.json`. A file the
+signed lock does not list is never copied. Switching the add-on off stops
+the declaration on the next start; like `noo systems disable`, that drops no
+role, schema or row.
+
+A `systems:` entry in `noomesh.yaml` with the same name wins, with a warning
+in the gateway log. A missing password skips the system (ERROR in the log,
+`dependencies.systems` on `/health`), and the gateway keeps booting.
+
+Your data-owning service runs on the controller, on the private database
+network, and connects as `noo_<id>` (migrations as `noo_<id>_ddl`) to the
+`noomesh` database with the cluster CA. Nodes never connect to Postgres.
+
+## Declaring workloads
+
+An add-on whose containers continuously consume a piece of the mesh (a voice,
+image or video worker with its model loaded on a GPU) declares them in its
+signed bundle as `workloads.json`. The gateway's add-on workload registry
+(`addon_workloads`) and the node agent's actuator consume it, and a
+reservation names a workload as `<addon>/<name>` (noomesh-internal i163 part B
+and the reservations layer).
+
+```json
+{
+  "workloads": [
+    {
+      "name": "worker",
+      "container": "noo-example-addon-worker",
+      "gpu": true,
+      "need_mb": 11264,
+      "drain": { "route": "drain", "timeout_secs": 120 }
+    }
+  ]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `name` | lowercase letters, digits and `-`, starting with a letter, at most 32; unique in the file; a reservation names it `<addon>/<name>` |
+| `container` | `noo-<addon>-<suffix>` (suffix: lowercase letters, digits, `-`; at most 63 characters in all); unique. The container must also carry the labels `noo.addon=<addon>` and `noo.workload=<name>` in your overlay |
+| `gpu` | `true` when the workload needs a GPU |
+| `need_mb` | memory it needs on that device, MiB, 1 to 262144 |
+| `drain.route` | the `name` of an `internal` route in your `routes.json`; noomesh calls it through the add-on proxy before stopping the workload |
+| `drain.timeout_secs` | 1 to 600 |
+
+Every field is required, unknown fields are refused, and at most 16 workloads
+may be declared. Nothing in the file names an image, a command or a mount: the
+node agent starts only the container your verified overlay already defines.
+
+The launcher copies the file from the verified bundle to
+`.noo-addon-workloads/<name>/workloads.json` in the install root (mounted
+read-only in the gateway at `/opt/noo/addon-workloads/<name>/workloads.json`),
+under the same rule as `system.json`: switched on, lock verified this start,
+and the file listed in the signed lock. `noo addons enable | upgrade` refuses a
+bundle whose `workloads.json` breaks a rule above (and checks `drain.route`
+when the bundle also ships `routes.json`); the gateway checks `drain.route`
+against the manifest it loaded. Nodes receive the registered add-ons'
+workloads in `desired-config` (`addon_workloads`) and act on nothing else.
+
+**Shipping it.** Add the files to the bundle when you sign it:
+
+```sh
+noo security addon-lock sign --out addon-bundle.json … \
+  --file docker-compose.yml=docker-compose.example-addon.yml \
+  --file system.json=deploy/system.json \
+  --file workloads.json=deploy/workloads.json
+```
+
+and push each as an `application/vnd.noomesh.addon-file.v1` layer next to the
+overlay. A CLI from before these files materialises them and ignores them; a
+gateway from before them never reads them. Ship them with a `supports_stack`
+that starts at the release that reads them. In a development checkout, put
+`system.json` and `workloads.json` beside your `docker-compose.<name>.yml`; a
+dev start copies them from there.
+
+`noo addons show <name>` prints what an add-on's bundle declares; `noo addons
+list` lists the add-ons that declare anything.

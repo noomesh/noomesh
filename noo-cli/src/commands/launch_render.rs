@@ -231,6 +231,37 @@ pub fn render_override(text: &str) -> Result<String, String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// `systems`: the variable NAMES each declared system reads, one line per
+/// system —
+///   `<name> <enabled_when or -> <password_env> <ddl_password_env> <addon>`
+/// where `<addon>` is `on` / `off` for a system named after an add-on (its
+/// switch is `addons.<name>`, the answer `systems::enabled_in` gives) and `-`
+/// for any other (its `enabled_when` flag decides; none means always on).
+/// For `lib-secrets.sh` `_declared_systems`, which builds the gateway's ONE
+/// systems-secrets file and delivers passwords only for systems that are on.
+/// Names only: the values stay in the launcher's shell. Parsed by
+/// `systems::parse_systems`, the same reader `noo systems` and the pre-`up`
+/// credential check use. Not a replacement for a python block, so it has no
+/// golden fixture.
+pub(crate) fn render_systems(text: &str) -> Result<String, String> {
+    let declared = crate::commands::addons::declared_in(text);
+    let mut out = String::new();
+    for (name, e) in crate::commands::systems::parse_systems(text)? {
+        let addon = match crate::commands::addons::row(&name) {
+            Some(r) if declared.get(&name).copied().unwrap_or(r.default_on) => "on",
+            Some(_) => "off",
+            None => "-",
+        };
+        out.push_str(&format!(
+            "{name} {} {} {} {addon}\n",
+            e.enabled_when.as_deref().unwrap_or("-"),
+            e.password_env,
+            e.ddl_password_env
+        ));
+    }
+    Ok(out)
+}
+
 /// `noo config launch-render <section>`. Reads `<repo_root>/noomesh.yaml`;
 /// a missing file prints nothing and exits 0 for every section — same as
 /// the Python blocks it replaces, which each guarded on `-f noomesh.yaml`
@@ -263,9 +294,19 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
                 1
             }
         },
+        "systems" => match render_systems(&text) {
+            Ok(out) => {
+                print!("{out}");
+                0
+            }
+            Err(e) => {
+                eprintln!("noo config launch-render systems: {e}");
+                65
+            }
+        },
         other => {
             eprintln!(
-                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override)"
+                "noo config launch-render: unknown section '{other}' (want: compose-env | addons | override | systems)"
             );
             64
         }
@@ -275,6 +316,21 @@ pub fn run(section: &str, file: Option<&std::path::Path>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── systems ──────────────────────────────────────────────────────
+
+    #[test]
+    fn systems_renders_the_variable_names_never_values() {
+        let yaml = "addons:\n  evolve: false\nsystems:\n  example_addon:\n    role: noo_example_addon\n    ddl_role: noo_example_addon_ddl\n    schema: example_addon\n    enabled_when: NOO_EXAMPLE_ADDON_ENABLED\n    password_env: NOO_EXAMPLE_ADDON_DB_PASSWORD\n    ddl_password_env: NOO_EXAMPLE_ADDON_DDL_PASSWORD\n  trellion:\n    role: noo_trellion\n    ddl_role: noo_trellion_ddl\n    schema: trellion\n    password_env: NOO_TRELLION_DB_PASSWORD\n    ddl_password_env: NOO_TRELLION_DDL_PASSWORD\n  evolve:\n    role: noo_evolve\n    ddl_role: noo_evolve_ddl\n    schema: evolve\n    password_env: NOO_EVOLVE_DB_PASSWORD\n    ddl_password_env: NOO_EVOLVE_DDL_PASSWORD\n";
+        assert_eq!(
+            render_systems(yaml).unwrap(),
+            "evolve - NOO_EVOLVE_DB_PASSWORD NOO_EVOLVE_DDL_PASSWORD off\n\
+             example_addon NOO_EXAMPLE_ADDON_ENABLED NOO_EXAMPLE_ADDON_DB_PASSWORD NOO_EXAMPLE_ADDON_DDL_PASSWORD -\n\
+             trellion - NOO_TRELLION_DB_PASSWORD NOO_TRELLION_DDL_PASSWORD on\n"
+        );
+        assert_eq!(render_systems("addons: {}\n").unwrap(), "");
+        assert!(render_systems("systems:\n  x:\n    role: r\n").is_err());
+    }
 
     // ── compose-env ──────────────────────────────────────────────────
 

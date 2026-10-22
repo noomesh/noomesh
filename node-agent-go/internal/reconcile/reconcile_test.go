@@ -137,6 +137,32 @@ func TestShortHash(t *testing.T) {
 // decideSpecDrift covers the recreate/converge/stuck state machine, including
 // the absent-label adoption path (a container predating this feature) and the
 // restart-loop guard.
+// 0.6.8 live (aserve, robopi): noo-ollama ran ollama/ollama:latest with a
+// spec label that matched, so the reconciler called it converged and
+// `noo cluster provision --wait` changed nothing. A floating ref is drift,
+// recreated once per desired hash and never looped.
+func TestDecideBackendDrift_AFloatingImageIsRecreatedOnce(t *testing.T) {
+	const desired = "deadbeefcafe0000"
+	cases := []struct {
+		name          string
+		hasLabel      bool
+		cur, last     string
+		floatingImage string
+		want          driftDecision
+	}{
+		{"pinned and converged", true, desired, "", "", driftConverged},
+		{"converged label on a floating ref", true, desired, "", "ollama/ollama:latest", driftRecreate},
+		{"already recreated for this hash, still floating", true, desired, desired, "ollama/ollama:latest", driftStuck},
+		{"spec drift wins as before", true, "other", "", "ollama/ollama:latest", driftRecreate},
+		{"spec drift, pinned", true, "other", "", "", driftRecreate},
+	}
+	for _, c := range cases {
+		if got := decideBackendDrift(c.hasLabel, c.cur, desired, c.last, c.floatingImage); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestDecideSpecDrift(t *testing.T) {
 	const desired = "deadbeefcafe0000"
 

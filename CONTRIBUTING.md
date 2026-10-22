@@ -30,7 +30,15 @@ shipped image (`docker/Dockerfile.deps-core`) does not: it installs from the
 hash-locked `docker/core-lock/requirements.txt` with `--require-hashes`. After you
 change a dependency in `pyproject.toml`, regenerate that file with the command
 in its header and commit both together; `tests/test_python_lock_guard.py`
-fails when the lock and the Dockerfile's extras drift apart.
+fails when the lock and the Dockerfile's extras drift apart. The project is
+built `--no-build-isolation`, so the build backend from `[build-system]` is
+locked too: it is named in `docker/core-lock/build-backends.in`, which is part
+of the regenerate command (change a backend range in both places).
+
+The ML tier (`docker/Dockerfile.deps-base`) is locked the same way, in
+`docker/ml-lock/requirements.txt`; regenerate it with
+`scripts/regen-ml-lock.sh` (it resolves trellion's dependencies too, so run it
+against the trellion checkout the release builds).
 
 The editable install provides the Python CLI as `noo-py`; the `noo`
 binary passes the few non-native commands through to it.

@@ -33,7 +33,7 @@ pub fn config_launch_render(_g: &Globals, args: &[String]) -> Result<i32, Unhand
         _ => return Err(Unhandled),
     };
     match section.as_str() {
-        "compose-env" | "addons" | "override" => Ok(crate::commands::launch_render::run(section, file)),
+        "compose-env" | "addons" | "override" | "systems" => Ok(crate::commands::launch_render::run(section, file)),
         _ => Err(Unhandled),
     }
 }

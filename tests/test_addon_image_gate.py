@@ -137,6 +137,107 @@ def test_verified_local_pins_are_exported_for_the_overlays(tmp_path):
     assert not (tmp_path / "docker.log").exists(), "the launcher must never pull or log in"
 
 
+VERDICT = 'require_addon_pins; rc=$?; printf "VERIFIED=%s\\n" "${NOO_ADDONS_VERIFIED-<unset>}"; exit $rc'
+
+PINS_WITH_VERDICT = (
+    "verified example_addon 1.0.0 v0.6.0\\n"
+    f"pin example_addon NOO_ADDON_IMAGE_EXAMPLE_ADDON {EXAMPLE_REF}\\n"
+    "verified other_addon 2.1.0 v0.6.0\\n"
+    f"pin other_addon NOO_ADDON_IMAGE_OTHER_ADDON {OTHER_REF}\\n"
+)
+
+
+def _verdict(r: subprocess.CompletedProcess) -> str:
+    (line,) = [l for l in r.stdout.splitlines() if l.startswith("VERIFIED=")]
+    return line.removeprefix("VERIFIED=")
+
+
+def test_the_launcher_hands_the_gateway_the_verdict_it_computed(tmp_path):
+    r = _run(tmp_path, VERDICT, FAKE_PINS=PINS_WITH_VERDICT)
+    assert r.returncode == 0, r.stderr
+    assert _verdict(r) == "example_addon=1.0.0@v0.6.0,other_addon=2.1.0@v0.6.0"
+
+
+def test_nothing_composed_is_verified_none_in_dist_and_dev_in_a_checkout(tmp_path):
+    r = _run(tmp_path, VERDICT, MAP="example_addon=0\nother_addon=0\n")
+    assert r.returncode == 0, r.stderr
+    assert _verdict(r) == "none"
+    r = _run(tmp_path, VERDICT, MAP="example_addon=0\nother_addon=0\n", DIST_MODE="0")
+    assert _verdict(r) == "dev"
+    r = _run(tmp_path, VERDICT, DIST_MODE="0")
+    assert _verdict(r) == "dev", "a source checkout builds its add-ons: there is no signed lock"
+
+
+def test_an_inherited_verdict_is_dropped_never_trusted(tmp_path):
+    # A shell export or an .env line must not vouch for an add-on.
+    r = _run(tmp_path, VERDICT, MAP="example_addon=0\nother_addon=0\n", NOO_ADDONS_VERIFIED="other_addon=9.9.9@v0.6.0")
+    assert _verdict(r) == "none"
+
+
+def test_a_refusal_exports_no_verdict_and_stops_the_start(tmp_path):
+    r = _run(tmp_path, VERDICT, MAP="other_addon=1\n", FAKE_PINS="refuse other_addon its lock does not list v0.6.0\\n")
+    assert r.returncode == 1
+    assert _verdict(r) == "<unset>"
+
+
+def test_a_cli_that_cannot_report_leaves_the_verdict_unset_and_says_so(tmp_path):
+    # `pin` lines with no `verified` beside them: a noo binary older than this
+    # launcher. Reporting "none" would make the gateway refuse a good add-on.
+    r = _run(tmp_path, VERDICT)
+    assert r.returncode == 0, r.stderr
+    assert _verdict(r) == "<unset>"
+    assert "does not report verified add-on locks" in r.stderr and "noo upgrade" in r.stderr
+
+
+DEV_VERDICT = (
+    'require_addon_pins; rc=$?; printf "VERIFIED=%s\\n" "${NOO_ADDONS_VERIFIED-<unset>}"; '
+    'printf "DEV=%s\\n" "${NOO_ADDONS_DEV-<unset>}"; exit $rc'
+)
+
+
+def _dev(r: subprocess.CompletedProcess) -> str:
+    (line,) = [l for l in r.stdout.splitlines() if l.startswith("DEV=")]
+    return line.removeprefix("DEV=")
+
+
+def test_a_dev_signed_addon_is_handed_to_the_gateway_with_its_expiry(tmp_path):
+    # i163 part A: `dev <addon> <unix>` after the verdict line.
+    pins = PINS_WITH_VERDICT.replace(
+        "verified other_addon 2.1.0 v0.6.0\\n", "verified other_addon 2.1.0 v0.6.0\\ndev other_addon 1793750400\\n"
+    )
+    assert "dev other_addon" in pins
+    r = _run(tmp_path, DEV_VERDICT, FAKE_PINS=pins)
+    assert r.returncode == 0, r.stderr
+    assert _verdict(r) == "example_addon=1.0.0@v0.6.0,other_addon=2.1.0@v0.6.0"
+    assert _dev(r) == "other_addon=1793750400"
+
+
+def test_no_dev_line_leaves_the_dev_variable_unset_and_an_inherited_one_is_dropped(tmp_path):
+    r = _run(tmp_path, DEV_VERDICT, FAKE_PINS=PINS_WITH_VERDICT, NOO_ADDONS_DEV="example_addon=9999999999")
+    assert r.returncode == 0, r.stderr
+    assert _dev(r) == "<unset>"
+
+
+def test_a_dev_line_alone_vouches_for_nothing(tmp_path):
+    # A `dev` line for an add-on with no `verified` line is not passed on.
+    pins = PINS_WITH_VERDICT + "dev stray_addon 1793750400\\n"
+    r = _run(tmp_path, DEV_VERDICT, FAKE_PINS=pins)
+    assert r.returncode == 0, r.stderr
+    assert _dev(r) == "<unset>"
+
+
+def test_a_malformed_dev_line_refuses(tmp_path):
+    pins = PINS_WITH_VERDICT + "dev other_addon soon;rm\\n"
+    r = _run(tmp_path, DEV_VERDICT, FAKE_PINS=pins)
+    assert r.returncode == 1 and "unreadable dev expiry" in r.stderr
+    assert _dev(r) == "<unset>"
+
+
+def test_a_malformed_verdict_line_refuses(tmp_path):
+    r = _run(tmp_path, VERDICT, MAP="other_addon=1\n", FAKE_PINS="verified other_addon 1.0;rm v0.6.0\\n")
+    assert r.returncode == 1 and "unreadable verdict" in r.stderr
+
+
 def test_addons_off_make_no_call_at_all(tmp_path):
     r = _run(tmp_path, SHOW, MAP="example_addon=0\nother_addon=0\n")
     assert r.returncode == 0, r.stderr

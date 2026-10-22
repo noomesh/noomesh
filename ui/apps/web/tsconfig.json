@@ -16,7 +16,6 @@
     "isolatedModules": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"],
       "@metis/api": ["../../packages/api/src/index.ts"],

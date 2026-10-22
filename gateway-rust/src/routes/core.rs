@@ -109,6 +109,11 @@ fn issue_access_token(user: &UserRecord) -> Result<(String, i64), TokenIssueErro
         "scopes": dual_emit_scopes(user.role, &user.scopes),
         "exp": exp.timestamp(),
         "iat": now.timestamp(),
+        // Millisecond mint time: the session floor (`session_floor.rs`) is in
+        // ms, so a token minted in the same second as a logout is ordered
+        // against it correctly. Person sessions only; delegated tokens keep
+        // their exact claim sets.
+        "iat_ms": now.timestamp_millis(),
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
@@ -1850,6 +1855,21 @@ async fn health(
     }));
     if !redis_ok && !redis_optional { all_ok = false; }
 
+    // Declared systems the broker skipped at boot because a role password
+    // was missing (system_provision.rs `missing_credential_is_fatal`: a
+    // runtime-declared system no longer stops the gateway). Reported only
+    // when there is one, `optional` so it never moves `status` or the code:
+    // the gateway serves everything else, and the ERROR log names the
+    // variable. `noo health` shows it as a down dependency.
+    let unprovisioned = crate::system_provision::unprovisioned();
+    if !unprovisioned.is_empty() {
+        deps.insert("systems".into(), json!({
+            "healthy": false,
+            "optional": true,
+            "unprovisioned": unprovisioned,
+        }));
+    }
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
@@ -1859,15 +1879,13 @@ async fn health(
     // Built from the addon table: a new add-on declares one row in
     // addons::ADDONS and appears here with no /health change.
     let addons = serde_json::Value::Object(
-        crate::addons::ADDONS
-            .iter()
-            .map(|a| {
-                (
-                    a.name.to_string(),
-                    // Licensed add-ons have a third word: flag on, no
-                    // licence → "unlicensed".
-                    json!(crate::addons::health_word(a.name)),
-                )
+        crate::addons::health_names()
+            .into_iter()
+            .map(|name| {
+                // Licensed add-ons have a third word: flag on, no
+                // licence → "unlicensed".
+                let word = json!(crate::addons::health_word(&name));
+                (name, word)
             })
             .collect(),
     );
@@ -1896,7 +1914,17 @@ async fn health(
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (code, Json(health_body(status, peers, deps, addons, ctx.is_some())))
+    let mut body = health_body(status, peers, deps, addons, ctx.is_some());
+    // Add-ons only a temporary development key vouches for (i163 part A):
+    // `addons.<name>` keeps its enum word (`enabled`; `unhealthy` once the
+    // key expires) so every client still reads it, and this sibling map says
+    // `dev (expires <date>)`. Absent when there is none.
+    if ctx.is_some() {
+        if let Some(dev) = crate::addons::health_dev_map() {
+            body["addons_dev"] = dev;
+        }
+    }
+    (code, Json(body))
 }
 
 /// The health body, by whether the caller presented a credential.

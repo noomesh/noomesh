@@ -160,11 +160,23 @@ func TestNativeOllamaTuningCarriesTheProfileContextToThePlist(t *testing.T) {
 		t.Errorf("lone placement + profile: %v", got)
 	}
 	set := []placement{{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running", Env: map[string]string{"OLLAMA_CONTEXT_LENGTH": "8192"}}}
-	if got := nativeOllamaTuning(set, p32); got != nil {
-		t.Errorf("a lone placement that sets the key is not touched: %v", got)
+	if got := nativeOllamaTuning(set, p32); len(got) != 1 || got["OLLAMA_CONTEXT_LENGTH"] != "8192" {
+		t.Errorf("a lone placement that sets the key keeps its own value: %v", got)
+	}
+	// A lone native ollama's own tuning reaches its plist too (the only way
+	// `--env OLLAMA_FLASH_ATTENTION=1` can reach a daemon that is not a
+	// container); keys outside the allow-list do not.
+	tuned := []placement{{Backend: "ollama", Model: "gemma4:12b", DesiredState: "running",
+		Env: map[string]string{"OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KV_CACHE_TYPE": "q8_0", "NOO_SECRET": "x"}}}
+	got := nativeOllamaTuning(tuned, p32)
+	if got["OLLAMA_FLASH_ATTENTION"] != "1" || got["OLLAMA_KV_CACHE_TYPE"] != "q8_0" || got["OLLAMA_CONTEXT_LENGTH"] != "32768" {
+		t.Errorf("lone placement carries its allow-listed env plus the profile default: %v", got)
+	}
+	if _, leaked := got["NOO_SECRET"]; leaked {
+		t.Errorf("allow-list not applied to a lone placement: %v", got)
 	}
 	multi := []placement{chatGemma(), embedHarrier()}
-	got := nativeOllamaTuning(multi, p32)
+	got = nativeOllamaTuning(multi, p32)
 	if got["OLLAMA_CONTEXT_LENGTH"] != "32768" || got["OLLAMA_MAX_LOADED_MODELS"] == "" {
 		t.Errorf("multi-role: merged env plus the default: %v", got)
 	}

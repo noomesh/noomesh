@@ -299,6 +299,12 @@ pub async fn run() -> Result<()> {
     let mut turns = nats.queue_subscribe(subject.clone(), "harness".to_string()).await?;
     let mut tasks = nats.queue_subscribe(crate::tasks::task_subject(&node), "harness".to_string()).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(max_turns.max(1)));
+    // The tasks this harness holds right now, by id: a hand-back of a task
+    // that is already here (the gateway hands a node's unfinished tasks
+    // back on every `harness.ready`) is acknowledged as taken and never
+    // started a second time, so it can neither run twice nor hold a second
+    // permit (noomesh-internal i176).
+    let running: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
 
     // Tasks: the same slot, many loops. A task holds
     // one concurrency permit for its whole life.
@@ -310,6 +316,8 @@ pub async fn run() -> Result<()> {
         let limit_t = limit.clone();
         let node_t = node.clone();
         let driver_t = driver.clone();
+        let running_t = running.clone();
+        let capacity = max_turns.max(1);
         tokio::spawn(async move {
             while let Some(msg) = tasks.next().await {
                 let req: crate::tasks::TaskRequest = match serde_json::from_slice(&msg.payload) {
@@ -319,10 +327,29 @@ pub async fn run() -> Result<()> {
                         continue;
                     }
                 };
+                if running_t.lock().map(|r| r.contains(&req.task_id)).unwrap_or(false) {
+                    // Already here: say so, do not start it again.
+                    tracing::info!(task = %req.task_id, "harness: task already running here; acknowledged, not started again");
+                    if let Some(reply) = msg.reply.clone() {
+                        let _ = nats_t.publish(reply, serde_json::to_vec(&json!({"ack": true, "already": true, "node": node_t})).unwrap_or_default().into()).await;
+                    }
+                    continue;
+                }
                 let Ok(permit) = limit_t.clone().try_acquire_owned() else {
-                    tracing::warn!(task = %req.task_id, "harness: at capacity; not taking this task");
+                    // Busy is not dead: the gateway keeps the task for this
+                    // node and hands it back when a slot frees.
+                    let held: Vec<String> = running_t.lock().map(|r| r.iter().cloned().collect()).unwrap_or_default();
+                    tracing::info!(task = %req.task_id, capacity, running = held.len(), holding = ?held, "harness: at capacity; task stays queued for this node");
+                    if let Some(reply) = msg.reply.clone() {
+                        let _ = nats_t.publish(reply, serde_json::to_vec(&json!({"ack": false, "busy": true, "node": node_t, "capacity": capacity, "running": held.len()})).unwrap_or_default().into()).await;
+                    }
                     continue;
                 };
+                if let Ok(mut r) = running_t.lock() {
+                    r.insert(req.task_id.clone());
+                }
+                let in_hand = running_t.lock().map(|r| r.len()).unwrap_or(0);
+                tracing::info!(task = %req.task_id, running = in_hand, capacity, "harness: task taken");
                 if let Some(reply) = msg.reply.clone() {
                     let _ = nats_t.publish(reply, serde_json::to_vec(&json!({"ack": true, "node": node_t})).unwrap_or_default().into()).await;
                 }
@@ -330,6 +357,9 @@ pub async fn run() -> Result<()> {
                 let client = client_t.clone();
                 let pinned = pinned_t.clone();
                 let driver = driver_t.clone();
+                let running_done = running_t.clone();
+                let nats_done = nats_t.clone();
+                let node_done = node_t.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let outcome = async {
@@ -345,6 +375,15 @@ pub async fn run() -> Result<()> {
                         Ok(state) => tracing::info!(task = %req.task_id, state = %state, "harness: task finished"),
                         Err(e) => tracing::error!(task = %req.task_id, error = %e, "harness: task failed"),
                     }
+                    if let Ok(mut r) = running_done.lock() {
+                        r.remove(&req.task_id);
+                    }
+                    drop(_permit);
+                    // A slot freed: the gateway hands this node's queued
+                    // tasks back on the same subject a start announces on.
+                    let _ = nats_done
+                        .publish(crate::tasks::ready_subject(&node_done), serde_json::to_vec(&json!({"node": node_done, "slot_freed": true})).unwrap_or_default().into())
+                        .await;
                 });
             }
         });
@@ -361,8 +400,12 @@ pub async fn run() -> Result<()> {
             }
         };
         let Ok(permit) = limit.clone().try_acquire_owned() else {
-            // Full: do not ack, and the gateway runs the turn itself.
-            tracing::warn!(conversation = %req.conversation_id, "harness: at capacity; not taking this turn");
+            // Full: say busy (a turn cannot wait, so the gateway runs it
+            // itself, and its log says busy rather than dead).
+            tracing::info!(conversation = %req.conversation_id, "harness: at capacity; not taking this turn (busy)");
+            if let Some(reply) = msg.reply.clone() {
+                let _ = nats.publish(reply, serde_json::to_vec(&json!({"ack": false, "busy": true, "node": node})).unwrap_or_default().into()).await;
+            }
             continue;
         };
         if let Some(reply) = msg.reply.clone() {
@@ -619,6 +662,26 @@ async fn run_turn<S: TurnSink>(
 
 #[cfg(test)]
 mod tests {
+    /// noomesh-internal i176: at capacity the harness says busy (a reply,
+    /// not silence); a task already here is acknowledged, not started
+    /// twice; a finished task re-announces ready so the gateway hands the
+    /// node's queued tasks back.
+    #[test]
+    fn a_busy_harness_says_so_and_never_runs_a_task_twice() {
+        let src = include_str!("harness_main.rs").split("fn a_busy_harness_says_so_and_never_runs_a_task_twice").next().unwrap();
+        let tasks = src.split("queue_subscribe(crate::tasks::task_subject(&node)").nth(1).unwrap();
+        let loop_body = tasks.split("while let Some(msg) = tasks.next().await").nth(1).unwrap();
+        let dedupe = loop_body.find("\"already\": true").expect("an already-running task is acknowledged as taken");
+        let permit = loop_body.find("try_acquire_owned()").expect("the permit");
+        assert!(dedupe < permit, "the dedupe runs before a permit is taken");
+        let busy = loop_body.find("\"busy\": true").expect("at capacity: a busy reply");
+        assert!(permit < busy && busy < loop_body.find("\"ack\": true, \"node\"").unwrap(), "busy is answered on the refusal path");
+        assert!(loop_body.contains("\"slot_freed\": true"), "a finished task re-announces ready");
+        assert!(loop_body.find("r.remove(&req.task_id)").unwrap() < loop_body.find("\"slot_freed\": true").unwrap(), "the id leaves the running set before the re-announce");
+        let turns = src.split("harness: at capacity; not taking this turn").nth(1).unwrap();
+        assert!(turns[..300].contains("\"busy\": true"), "a turn at capacity is answered busy too");
+    }
+
     use super::*;
 
     /// A stand-in node agent answering `/harness/placement` with `status`

@@ -114,9 +114,17 @@ replies on the request's reply subject with `{"ack": true, "node": "<id>"}`.
 The gateway waits 3 seconds. No ack, a reply that is not `ack: true`, or
 no responder means the work was not taken, and the gateway runs it itself.
 
-**At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit does not
-ack. That is the whole refusal; there is no negative reply. An
-unparseable payload is dropped without an ack.
+**At capacity.** A harness at its `NOO_HARNESS_MAX_TURNS` limit replies
+`{"ack": false, "busy": true, "node": "<id>", "running": n, "capacity": N}`
+on the task's reply subject. The gateway then keeps the task **open** on
+that node (`queued`, with the reason in its record) instead of running it
+on the controller: a busy node is not a dead one. When a task finishes on
+the harness it re-announces `harness.ready.<node>`, and the gateway hands
+the node's open and checkpointed tasks back; a task the harness already
+runs is acknowledged as taken (`"already": true`), never started twice.
+An unparseable payload is dropped without an ack. No reply at all within
+3 s is the dead case: the gateway runs the task in process and says so
+(`why` names the fallback; the log line is at warn).
 
 **Ready.** At start, after subscribing, the harness publishes
 `harness.ready.<node>`. The gateway answers by handing back that node's

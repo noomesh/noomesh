@@ -35,11 +35,17 @@ pub struct Addon {
     /// The refusal when the flag is on but the licence does not grant the
     /// feature. Empty for open add-ons.
     pub unlicensed_msg: &'static str,
-    /// An HTTP add-on that ships its own route manifest. When the switch is
-    /// on, the gateway reads it at startup from
-    /// `addon_proxy::ROUTES_DIR/<name>/routes.json` (delivered read-only by
-    /// the add-on's overlay) and refuses the add-on's routes, loudly, if it
-    /// is missing or invalid. `false` for NATS add-ons: nothing is read.
+    /// An HTTP add-on whose route manifest is REQUIRED: when the switch is
+    /// on and `addon_proxy::ROUTES_DIR/<name>/routes.json` is missing or
+    /// invalid, the add-on's routes are refused, loudly (the diagnostic for
+    /// an add-on image from before manifests shipped). `false` for NATS
+    /// add-ons: nothing is required.
+    ///
+    /// This flag no longer decides WHICH manifests are read. The runtime
+    /// registry ([`crate::addon_registry`]) reads the manifest of every
+    /// operator-enabled add-on, table row or not, and a third-party add-on
+    /// needs no row here. The flag only keeps the missing-manifest refusal
+    /// for the add-ons that shipped before the registry existed.
     pub routes_manifest: bool,
 }
 
@@ -145,15 +151,49 @@ pub fn state_from(flag_on: bool, licence: Option<Result<(), String>>) -> AddonSt
     }
 }
 
-/// The named add-on's state. Unknown names are `Disabled` — an add-on that
-/// never declared itself in [`ADDONS`] does not exist.
+/// The named add-on's state. A name that is neither a row of [`ADDONS`] nor
+/// registered at runtime ([`crate::addon_registry`]: operator-enabled and
+/// verified by the launcher) is `Disabled` — it does not exist. A registered
+/// one is `Enabled`: the registry only holds add-ons the operator switched on.
 pub fn state(name: &str) -> AddonState {
     let Some(a) = ADDONS.iter().find(|a| a.name == name) else {
-        return AddonState::Disabled;
+        return if crate::addon_registry::get(name).is_some() {
+            AddonState::Enabled
+        } else {
+            AddonState::Disabled
+        };
     };
     let declared = crate::config::global().addons.get(name).copied();
     let flag_on = resolve(declared, a.default_on);
     state_from(flag_on, a.requires_feature.map(crate::entitlement::licensed))
+}
+
+/// Every add-on `/health` reports: the compiled rows, then the runtime-registered
+/// ones (and the ones refused at load, so a third-party add-on that did not
+/// come up reads `unhealthy` instead of being absent).
+pub fn health_names() -> Vec<String> {
+    let mut names: Vec<String> = ADDONS.iter().map(|a| a.name.to_string()).collect();
+    let mut extra: Vec<String> = crate::addon_registry::all()
+        .iter()
+        .map(|e| e.name().to_string())
+        .chain(crate::addon_registry::refusals().into_keys())
+        .filter(|n| crate::addon_registry::name_ok(n) && !ADDONS.iter().any(|a| a.name == n.as_str()))
+        .collect();
+    extra.sort();
+    extra.dedup();
+    names.extend(extra);
+    names
+}
+
+/// `/health` `addons_dev`: `{ "<name>": "dev (expires <date>)" }` for every
+/// add-on only a live development key vouches for (i163 part A), or `None`
+/// when there is none. `addons.<name>` itself stays a [`health_word`].
+pub fn health_dev_map() -> Option<serde_json::Value> {
+    let map: serde_json::Map<String, serde_json::Value> = health_names()
+        .into_iter()
+        .filter_map(|n| crate::addon_registry::dev_label(&n).map(|l| (n, serde_json::Value::String(l))))
+        .collect();
+    (!map.is_empty()).then_some(serde_json::Value::Object(map))
 }
 
 /// Is the named add-on usable (flag on AND licensed where required)?
@@ -165,7 +205,8 @@ pub fn enabled(name: &str) -> bool {
 /// missing — "turned off" and "not licensed" read differently on purpose.
 pub fn refusal_msg(name: &str) -> String {
     let Some(a) = ADDONS.iter().find(|a| a.name == name) else {
-        return format!("unknown add-on `{name}`");
+        // A runtime add-on that was refused at load says why.
+        return crate::addon_proxy::refusal(name).unwrap_or_else(|| format!("unknown add-on `{name}`"));
     };
     match state(name) {
         AddonState::Enabled => String::new(),
@@ -176,6 +217,11 @@ pub fn refusal_msg(name: &str) -> String {
 
 /// `/health` word: enabled | unhealthy | disabled | unlicensed.
 pub fn health_word(name: &str) -> &'static str {
+    // A third-party add-on refused at load (no verified lock, bad manifest) is
+    // not registered, so `state` calls it Disabled; it is a fault, not a choice.
+    if !ADDONS.iter().any(|a| a.name == name) && crate::addon_proxy::refusal(name).is_some() {
+        return "unhealthy";
+    }
     match state(name) {
         // On, but its route manifest was missing or refused at startup: a
         // fault, not a choice (`addon_proxy::refusal` carries the reason).

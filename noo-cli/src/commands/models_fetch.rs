@@ -286,7 +286,7 @@ fn join_location(current: &str, loc: &str) -> String {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(120)))
@@ -410,7 +410,7 @@ pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-fn io(ctx: &str, e: std::io::Error) -> FetchErr {
+pub(crate) fn io(ctx: &str, e: std::io::Error) -> FetchErr {
     FetchErr::Io(format!("{ctx}: {e}"))
 }
 
@@ -534,12 +534,11 @@ pub(crate) fn human(n: u64) -> String {
     if n as f64 >= G { format!("{:.2} GB", n as f64 / G) } else { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) }
 }
 
-/// `noo models fetch <hf_repo> <file.gguf> [--revision <rev>] [--force]`
-pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let a = match parse_args(args) {
-        Ok(a) => a,
-        Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("noo models fetch <hf_repo> <file.gguf>")),
-    };
+/// The controller's model store as a directory this user can write — or the
+/// explained refusal (never a chown, never an escalation). Shared by every
+/// command that writes into the store; `rerun` is what the last remedy line
+/// tells the operator to run again.
+pub(crate) fn writable_store(g: &Globals, rerun: &str) -> (String, PathBuf) {
     let store = controller_store_dir();
     let dir = PathBuf::from(&store);
     if !dir.is_dir() {
@@ -557,7 +556,8 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let (uid, gid, mode) = md.map(|m| (m.uid(), m.gid(), m.mode())).unwrap_or((0, 0, 0));
         // SAFETY: geteuid has no preconditions.
         let me = user_name(unsafe { libc::geteuid() });
-        let (msg, guide) = unwritable_guide(&store, &user_name(uid), &group_name(gid), mode, &me);
+        let (msg, mut guide) = unwritable_guide(&store, &user_name(uid), &group_name(gid), mode, &me);
+        guide[2].0 = rerun.to_string();
         if g.json {
             fail(true, ExitCode::Generic, "store_not_writable", &msg, Some(&guide[0].0));
         }
@@ -567,6 +567,22 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ui::pager_finish();
         std::process::exit(ExitCode::Generic as i32);
     }
+
+    (store, dir)
+}
+
+/// `noo models fetch <hf_repo> <file.gguf> [--revision <rev>] [--force]`
+pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    // `ollama:<tag>` stages a registry.ollama.ai model instead
+    // (commands/ollama_stage.rs); everything else is a Hugging Face GGUF.
+    if args.first().is_some_and(|a| a.starts_with("ollama:")) {
+        return super::ollama_stage::models_fetch_ollama(g, args);
+    }
+    let a = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => fail(g.json, ExitCode::Usage, "bad_args", &e, Some("noo models fetch <hf_repo> <file.gguf>")),
+    };
+    let (store, dir) = writable_store(g, "noo models fetch <hf_repo> <file.gguf>");
 
     let token = hf_token();
     if !g.json {
@@ -651,7 +667,7 @@ pub fn models_fetch(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 /// Ask the gateway to hash the new file now (it caches by path+size+mtime),
 /// so the first `sync-model-files` does not wait on it. Best effort: the
 /// fetch already succeeded, so nothing here fails the command.
-fn prewarm_digest(g: &Globals, name: &str, verified: &str) -> Value {
+pub(crate) fn prewarm_digest(g: &Globals, name: &str, verified: &str) -> Value {
     use crate::commands::cluster::{warm_gguf_manifest, ManifestWarm};
     // One ask (no waiting out a 202): this command has already verified the
     // bytes; the gateway keeps hashing and sync-model-files waits for it.

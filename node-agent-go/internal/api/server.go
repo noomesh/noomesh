@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/gpuyield"
 	"log"
 	"log/slog"
 	"net"
@@ -77,8 +78,8 @@ type Server struct {
 	gpuWatch func() any
 	// gpuHold / gpuRelease drive the shared-GPU yield's operator hold
 	// (internal/gpuyield). nil = not wired; the routes then answer 503.
-	gpuHold    func(ctx context.Context, reason string) any
-	gpuRelease func() any
+	gpuHold    func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error)
+	gpuRelease func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)
 	// diskReclaim reports the node's own disk-reclaim state for /health.
 	diskReclaim func() any
 
@@ -91,6 +92,9 @@ type Server struct {
 
 	// proxyTarget overrides docker.ProxyTarget (tests only).
 	proxyTarget func(string) (string, error)
+	// workloadOps overrides the docker client for the add-on workload
+	// actuator (tests only).
+	workloadOps workloadOps
 }
 
 // nativeBackends is the set served natively on this host, backend -> model.
@@ -152,7 +156,8 @@ func (s *Server) SetGPUWatch(f func() any) { s.gpuWatch = f }
 
 // SetGPUHold installs the shared-GPU hold/release operations
 // (`noo cluster gpu hold|release`, via the gateway).
-func (s *Server) SetGPUHold(hold func(ctx context.Context, reason string) any, release func() any) {
+func (s *Server) SetGPUHold(hold func(ctx context.Context, req gpuyield.HoldRequest) (gpuyield.Contention, error),
+	release func(ctx context.Context, req gpuyield.ReleaseRequest) (gpuyield.Contention, error)) {
 	s.gpuHold, s.gpuRelease = hold, release
 }
 
@@ -277,6 +282,11 @@ func (s *Server) registerRoutes() {
 	// Reverse proxy into a managed container's loopback-published port (the
 	// only way in: the port is not bound on any other interface).
 	s.mux.Handle("/api/containers/{name}/proxy/{path...}", ctrlMW(http.HandlerFunc(s.handleContainerProxy)))
+	// The add-on workload actuator (internal/addonwl, i163 part B):
+	// controller-only, acts only on a declared, labelled container.
+	s.mux.Handle("GET /api/addon-workloads/{addon}/{workload}", ctrlMW(http.HandlerFunc(s.handleWorkloadStatus)))
+	s.mux.Handle("POST /api/addon-workloads/{addon}/{workload}/start", ctrlMW(http.HandlerFunc(s.handleWorkloadStart)))
+	s.mux.Handle("POST /api/addon-workloads/{addon}/{workload}/stop", ctrlMW(http.HandlerFunc(s.handleWorkloadStop)))
 
 	// The work routes are the controller's too.
 	//

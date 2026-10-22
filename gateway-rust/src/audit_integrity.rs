@@ -827,7 +827,14 @@ pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
         .fetch_all(db)
         .await?;
     let rows: Vec<AuditRow> = rows.into_iter().map(to_row).collect();
-    Ok(verify_all(&rows, &Keys { current: current_key(), retired: retired_key() }))
+    let keys = Keys { current: current_key(), retired: retired_key() };
+    let mut report = verify_all(&rows, &keys);
+    // The chain head against the copy kept outside the database: truncation
+    // of the newest rows is invisible to the table itself.
+    let file = crate::audit_head_export::head_file();
+    crate::audit_head_export::check(&file, crate::audit_head_export::read_file(&file), keys.current.as_deref(), &rows, &mut report);
+    report.verdict = if report.breaks.is_empty() && report.problems.is_empty() { "ok" } else { "fail" }.into();
+    Ok(report)
 }
 
 /// What boot did about the checkpoint — logged, and returned for the tests.

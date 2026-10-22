@@ -140,10 +140,16 @@ func withSecrets(root string, name string, args ...string) (string, []string) {
 	// day-old LOCAL build over the pinned GHCR release. Config
 	// load is best-effort (a worker may have no noomesh.yaml); secrets
 	// remain load-bearing.
+	//
+	// load_secrets also writes the compose `file:` secrets to a tmpfs directory
+	// (lib-secrets.sh write_secret_files) and exports NOO_SECRET_RUNDIR for the
+	// compose process it execs. Its stderr is NOT discarded: a refusal (the
+	// directory is not tmpfs, the chown container could not run) explains itself
+	// there, and the spool result is where the gateway and the operator read it.
 	script := fmt.Sprintf(
 		`. %s 2>/dev/null || true
-if ! load_secrets >/dev/null 2>&1; then
-  echo "could not load secrets — cannot read the authoritative store" >&2
+if ! load_secrets >/dev/null; then
+  echo "could not load secrets or write the secret files — cannot read the authoritative store (reason above)" >&2
   exit 1
 fi
 . %s 2>/dev/null && load_config >/dev/null 2>&1 || true

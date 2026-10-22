@@ -391,11 +391,36 @@ impl EmbeddingEndpoint {
         let statics = self.static_endpoints();
         let mut cands: Vec<Candidate> = Vec::with_capacity(mesh.len() + statics.len());
         for t in mesh {
-            let declared = crate::model_presence::node_role_model(state, &t.node_id, "embed").await;
+            let declared = crate::model_presence::node_role_models(state, &t.node_id, "embed").await;
             cands.push(Candidate::Mesh(t, declared));
         }
         cands.extend(statics.into_iter().map(Candidate::Static));
         self.embed_over(&BALANCER, cands, texts, timeout).await
+    }
+
+    /// Embed with an EXPLICIT model over the mesh pool only (i150): no static
+    /// endpoints, because those carry the primary's model and the static URL
+    /// would be sent a model it does not run. For a space's `next_model`
+    /// (migration probe and `<space>@next` embeds). `dims` 0 = learn the
+    /// width into `balancer`, so pass a balancer that has only seen this
+    /// model (a fresh one for the probe, [`NEXT_BALANCER`] with explicit dims
+    /// for `@next`).
+    pub(crate) async fn embed_model_over_mesh(
+        state: &crate::state::AppState,
+        model: &str,
+        dims: u64,
+        balancer: &EmbedBalancer,
+        texts: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f64>>, EmbedError> {
+        let ep = EmbeddingEndpoint { model: model.to_string(), dims, ..resolve() };
+        let mesh = crate::routes::external::mesh_targets(state, "embed", "embed", 5).await;
+        let mut cands: Vec<Candidate> = Vec::with_capacity(mesh.len());
+        for t in mesh {
+            let declared = crate::model_presence::node_role_models(state, &t.node_id, "embed").await;
+            cands.push(Candidate::Mesh(t, declared));
+        }
+        ep.embed_over(balancer, cands, texts, timeout).await
     }
 
     /// The static endpoints this install declares: the resolved primary
@@ -643,9 +668,9 @@ pub fn pgvector_literal(embedding: &[f64]) -> String {
 /// One place an embed request can go.
 pub(crate) enum Candidate {
     /// A node-agent `/embed` proxy found by mesh resolution.
-    /// The node's declared role=embed model (from its placement), when it
-    /// reports one.
-    Mesh(crate::routes::external::MeshTarget, Option<String>),
+    /// Every role=embed model the node declares (one per embedding space it
+    /// serves, from its placements); empty when it reports none.
+    Mesh(crate::routes::external::MeshTarget, Vec<String>),
     /// A declared static endpoint (primary or extra), spoken to directly.
     Static(EmbeddingEndpoint),
 }
@@ -680,6 +705,8 @@ fn log_mismatch(target: &str, what: &str) {
 
 /// Keep only candidates in the space's vector space: the ones whose
 /// declared model is the space's (`model`, from the embedding space record).
+/// A node serving several spaces declares several models and stays for any
+/// of them.
 ///
 /// There is no vote. The fleet's model used to be the most common role=embed
 /// declaration among the targets, so two of three nodes moving to another
@@ -694,15 +721,15 @@ pub(crate) fn consistent_candidates(cands: Vec<Candidate>, model: &str) -> Vec<C
     cands
         .into_iter()
         .filter(|c| {
-            let (key, declared) = match c {
-                Candidate::Mesh(t, Some(m)) => (t.node_id.as_str(), m.as_str()),
-                Candidate::Mesh(_, None) => return true,
-                Candidate::Static(e) => (e.url.as_str(), e.model.as_str()),
+            let (key, declared): (&str, Vec<&str>) = match c {
+                Candidate::Mesh(_, models) if models.is_empty() => return true,
+                Candidate::Mesh(t, models) => (t.node_id.as_str(), models.iter().map(String::as_str).collect()),
+                Candidate::Static(e) => (e.url.as_str(), vec![e.model.as_str()]),
             };
-            if same_model(declared, model) {
+            if declared.iter().any(|d| same_model(d, model)) {
                 return true;
             }
-            log_mismatch(key, &format!("serves model '{declared}' but this embedding space's model is '{model}'"));
+            log_mismatch(key, &format!("serves model '{}' but this embedding space's model is '{model}'", declared.join("', '")));
             false
         })
         .collect()
@@ -758,6 +785,11 @@ impl Drop for AdmitGuard<'_> {
 }
 
 static BALANCER: LazyLock<EmbedBalancer> = LazyLock::new(EmbedBalancer::new);
+
+/// Spreading state for `<space>@next` embeds (i150): kept apart from
+/// [`BALANCER`] so the next model's targets, cooldowns and width never mix
+/// with the live space's.
+pub(crate) static NEXT_BALANCER: LazyLock<EmbedBalancer> = LazyLock::new(EmbedBalancer::new);
 
 /// Decrements the in-flight count when the attempt ends (success, error or
 /// the request future being dropped).
@@ -946,9 +978,13 @@ mod tests {
     }
 
     fn mesh_declaring(id: &str, base: &str, model: Option<&str>) -> Candidate {
+        mesh_declaring_all(id, base, model.as_slice())
+    }
+
+    fn mesh_declaring_all(id: &str, base: &str, models: &[&str]) -> Candidate {
         Candidate::Mesh(
             MeshTarget { node_id: id.into(), url: format!("{base}/embed"), headers: Vec::new() },
-            model.map(str::to_string),
+            models.iter().map(|m| m.to_string()).collect(),
         )
     }
 
@@ -1306,6 +1342,24 @@ mod tests {
         }
         assert_eq!(sa.lock().unwrap().len() + sb.lock().unwrap().len(), 0, "the majority's model is not the space's");
         assert_eq!(sc.lock().unwrap().len(), 5);
+    }
+
+    /// i150: a node serving two spaces declares two models and stays in the
+    /// pool of either; a node declaring neither is dropped, one declaring
+    /// nothing stays.
+    #[test]
+    fn a_node_declaring_several_models_stays_for_any_of_its_spaces() {
+        let cands = || {
+            vec![
+                mesh_declaring_all("both", "http://b", &["harrier", "nomic-embed-code"]),
+                mesh_declaring_all("code-only", "http://c", &["nomic-embed-code"]),
+                mesh_declaring_all("other", "http://o", &["bge-m3", "mxbai"]),
+                mesh_declaring("undeclared", "http://u", None),
+            ]
+        };
+        let ids = |v: Vec<Candidate>| v.iter().map(Candidate::key).collect::<Vec<_>>();
+        assert_eq!(ids(consistent_candidates(cands(), "harrier")), vec!["both", "undeclared"]);
+        assert_eq!(ids(consistent_candidates(cands(), "nomic-embed-code:latest")), vec!["both", "code-only", "undeclared"]);
     }
 
     /// A node that declares nothing is asked by name; a reply naming another

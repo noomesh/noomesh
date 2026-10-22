@@ -11,8 +11,9 @@
 //! flow, start to end:
 //!
 //! 1. the pin lands in the table (reviewed like any change);
-//! 2. `noo cluster vendor stage <kind>` fetches each artefact the fleet's
-//!    platforms need ON THE CONTROLLER, refuses anything whose sha256 is not
+//! 2. `noo cluster vendor stage` fetches each artefact the nodes need (the
+//!    kinds their harness placement and `vendor_kinds` name, for their
+//!    platforms) ON THE CONTROLLER, refuses anything whose sha256 is not
 //!    the pinned one, and keeps it in the controller's asset cache;
 //! 3. `noo cluster provision <node>` puts it in the node's signed bundle as
 //!    `vendor-cli` beside a manifest, when the node's harness placement
@@ -25,14 +26,16 @@
 //!
 //! The node never touches the internet for it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::harness_kinds::{self, artifact_url, Format, Pinned, Table, Unpack};
 use crate::output::{fail, ExitCode};
+use crate::release_fetch::{self, FetchClass, FetchError};
 use crate::ui::{self, Col};
 use crate::{Globals, Unhandled};
 
@@ -389,8 +392,41 @@ pub(crate) fn pick_platforms(
 struct StageArgs {
     kind: Option<String>,
     all: bool,
+    fleet: bool,
     os: Option<String>,
     arch: Option<String>,
+}
+
+/// One node as `stage` sees it: its platform and the kinds its bundle
+/// carries ([`bundle_vendor_kinds`]).
+#[derive(Debug, Clone)]
+pub(crate) struct NodeCarry {
+    pub id: String,
+    pub platform: Option<(&'static str, &'static str)>,
+    pub kinds: Vec<String>,
+}
+
+/// What the nodes need staged: each (kind, os, arch) some node's bundle
+/// carries, with the nodes that carry it, narrowed to `kind` and to
+/// `--os` / `--arch`. A node that reports no platform needs nothing here
+/// (`status` says so).
+pub(crate) fn needed_targets(
+    nodes: &[NodeCarry],
+    kind: Option<&str>,
+    os: Option<&str>,
+    arch: Option<&str>,
+) -> BTreeMap<(String, &'static str, &'static str), Vec<String>> {
+    let mut out: BTreeMap<(String, &'static str, &'static str), Vec<String>> = BTreeMap::new();
+    for n in nodes {
+        let Some((o, a)) = n.platform else { continue };
+        if os.is_some_and(|x| x != o) || arch.is_some_and(|x| x != a) {
+            continue;
+        }
+        for k in n.kinds.iter().filter(|k| kind.is_none_or(|want| want == k.as_str())) {
+            out.entry((k.clone(), o, a)).or_default().push(n.id.clone());
+        }
+    }
+    out
 }
 
 fn parse_stage_args(args: &[String]) -> Result<StageArgs, Unhandled> {
@@ -399,6 +435,7 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, Unhandled> {
     while let Some(t) = it.next() {
         match t.as_str() {
             "--all" => a.all = true,
+            "--fleet" => a.fleet = true,
             "--os" => a.os = Some(it.next().ok_or(Unhandled)?.clone()),
             "--arch" => a.arch = Some(it.next().ok_or(Unhandled)?.clone()),
             x if x.starts_with('-') => return Err(Unhandled),
@@ -406,8 +443,11 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, Unhandled> {
             _ => return Err(Unhandled),
         }
     }
-    if a.all == a.kind.is_some() {
-        return Err(Unhandled); // exactly one of <kind> and --all
+    if a.all && a.kind.is_some() {
+        return Err(Unhandled); // <kind> or --all, not both
+    }
+    if a.fleet && a.kind.is_none() {
+        return Err(Unhandled); // `--all` is every kind fleet-wide
     }
     if a.os.as_deref().is_some_and(|o| !harness_kinds::OSES.contains(&o))
         || a.arch.as_deref().is_some_and(|x| !harness_kinds::ARCHES.contains(&x))
@@ -417,7 +457,14 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, Unhandled> {
     Ok(a)
 }
 
-/// `noo cluster vendor stage <kind>|--all [--os linux|macos] [--arch x86_64|aarch64]`
+/// `noo cluster vendor stage [<kind> [--fleet] | --all] [--os linux|macos] [--arch x86_64|aarch64]`
+///
+/// With no `<kind>` and no `--all` it stages what the nodes need: every kind
+/// a node's harness placement or `vendor_kinds` names, for that node's
+/// platform — the set `noo cluster provision` will put in their bundles.
+/// `<kind>` narrows that to one kind; `--fleet` widens it to every platform
+/// the fleet reports, needed or not; `--all` is every kind fleet-wide.
+/// `--os` with `--arch` names one platform outright.
 pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let a = parse_stage_args(args)?;
     let table = harness_kinds::shipped();
@@ -443,64 +490,114 @@ pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         }
         return Ok(0);
     }
-    let fleet = if a.os.is_some() && a.arch.is_some() {
-        BTreeSet::new()
-    } else {
+    let explicit = a.os.is_some() && a.arch.is_some() && (a.all || a.fleet || a.kind.is_some());
+    let needed = !(a.all || a.fleet || explicit);
+    // (kind, os, arch) → the nodes that carry it; empty for a fleet-wide or
+    // named-platform run, which stages whether or not a node needs it.
+    let targets: BTreeMap<(String, &'static str, &'static str), Vec<String>> = if needed {
         let body = crate::http::get_json(g, "/api/cluster/nodes", true, 10);
-        fleet_platforms(body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]))
+        let mut carries = Vec::new();
+        for n in body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            if super::cluster_provision::is_companion(n) {
+                continue;
+            }
+            let Some(id) = n["id"].as_str() else { continue };
+            let Some(desired) = crate::http::get_json_opt(g, &format!("/api/cluster/nodes/{}/desired-config", super::urlencode(id)), true, 10) else {
+                if !g.json { ui::warned(&format!("{id}: Skipped — its desired config did not load")); }
+                continue;
+            };
+            let kinds = bundle_vendor_kinds(desired_harness_kind(&desired).as_deref(), &node_vendor_kinds(&desired));
+            let platform = node_platform(n);
+            if platform.is_none() && !kinds.is_empty() && !g.json {
+                ui::warned(&format!("{id}: Skipped — it reports no platform"));
+            }
+            carries.push(NodeCarry { id: id.to_string(), platform, kinds });
+        }
+        let t = needed_targets(&carries, a.kind.as_deref(), a.os.as_deref(), a.arch.as_deref());
+        if t.is_empty() {
+            let what = a.kind.as_deref().unwrap_or("a vendor CLI");
+            if g.json {
+                println!("{}", json!({"status": "ok", "staged": [], "skipped": [], "note": format!("no node carries {what}")}));
+            } else {
+                ui::done(&format!("no node's harness placement or vendor_kinds names {what} — nothing to stage"));
+                ui::guide(&[
+                    ("noo cluster vendor install <node> <kind>...", "have a node carry a CLI, then stage again"),
+                    ("noo cluster vendor stage --all", "stage every CLI for every platform the fleet reports"),
+                ]);
+            }
+            return Ok(0);
+        }
+        t
+    } else {
+        let fleet = if explicit {
+            BTreeSet::new()
+        } else {
+            let body = crate::http::get_json(g, "/api/cluster/nodes", true, 10);
+            fleet_platforms(body["nodes"].as_array().map(Vec::as_slice).unwrap_or(&[]))
+        };
+        let platforms = pick_platforms(&fleet, a.os.as_deref(), a.arch.as_deref());
+        if platforms.is_empty() {
+            fail(g.json, ExitCode::Generic, "no_platforms",
+                "no enrolled node reports a platform this filter selects",
+                Some("name one: noo cluster vendor stage <kind> --os linux --arch x86_64"));
+        }
+        kinds.iter().flat_map(|k| platforms.iter().map(move |(o, a)| ((k.clone(), *o, *a), Vec::new()))).collect()
     };
-    let platforms = pick_platforms(&fleet, a.os.as_deref(), a.arch.as_deref());
-    if platforms.is_empty() {
-        fail(g.json, ExitCode::Generic, "no_platforms",
-            "no enrolled node reports a platform this filter selects",
-            Some("name one: noo cluster vendor stage <kind> --os linux --arch x86_64"));
-    }
     let dir = vendor_cache_dir(&crate::envfile::repo_root());
     let mut staged: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for kind in &kinds {
-        for (os, arch) in &platforms {
-            let needs = match needs_for(&table, kind, os, arch) {
-                Ok(Some(n)) => n,
-                Ok(None) => continue,
-                Err(e) => {
-                    if !g.json { ui::warned(&format!("{kind} on {os}/{arch}: Skipped — {e}")); }
-                    skipped.push(json!({"kind": kind, "platform": format!("{os}-{arch}"), "why": e}));
-                    continue;
-                }
+    let mut restage: BTreeSet<String> = BTreeSet::new();
+    for ((kind, os, arch), for_nodes) in &targets {
+        let needs = match needs_for(&table, kind, os, arch) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(e) => {
+                if !g.json { ui::warned(&format!("{kind} on {os}/{arch}: Skipped — {e}")); }
+                skipped.push(json!({"kind": kind, "platform": format!("{os}-{arch}"), "why": e}));
+                continue;
+            }
+        };
+        restage.extend(for_nodes.iter().cloned());
+        for n in needs {
+            if !seen.insert(n.file.clone()) {
+                continue; // an `any` artefact two kinds share: once
+            }
+            let platform = if n.any { "any".to_string() } else { format!("{os}-{arch}") };
+            let path = dir.join(&n.file);
+            let mut row = json!({"kind": kind, "name": n.name, "version": n.version, "platform": platform,
+                                 "sha256": n.sha256, "url": n.url, "path": path.display().to_string()});
+            if needed {
+                row["nodes"] = json!(for_nodes);
+            }
+            if let Some(b) = read_staged(&dir, &n) {
+                row["bytes"] = json!(b.len());
+                row["outcome"] = json!("already-staged");
+                if !g.json { ui::done(&format!("{} {} ({platform}): already staged, sha256 verified ({})", n.name, n.version, human(b.len()))); }
+                staged.push(row);
+                continue;
+            }
+            if !g.json { ui::step(&format!("fetching {} {} ({platform}) from {}", n.name, n.version, n.url)); }
+            let mut say = |got: u64, total: Option<u64>| if !g.json {
+                println!("{}", ui::sub(&match total {
+                    Some(t) if t > 0 => format!("{} of {} ({}%)", human(got as usize), human(t as usize), got * 100 / t),
+                    _ => format!("{} so far", human(got as usize)),
+                }));
             };
-            for n in needs {
-                if !seen.insert(n.file.clone()) {
-                    continue; // an `any` artefact two kinds share: once
-                }
-                let platform = if n.any { "any".to_string() } else { format!("{os}-{arch}") };
-                let path = dir.join(&n.file);
-                let mut row = json!({"kind": kind, "name": n.name, "version": n.version, "platform": platform,
-                                     "sha256": n.sha256, "url": n.url, "path": path.display().to_string()});
-                if let Some(b) = read_staged(&dir, &n) {
-                    row["bytes"] = json!(b.len());
-                    row["outcome"] = json!("already-staged");
-                    if !g.json { ui::done(&format!("{} {} ({platform}): already staged, sha256 verified ({})", n.name, n.version, human(b.len()))); }
+            let r = fetch_artifact(&n.url, &mut say).map_err(|e| e.summary())
+                .and_then(|b| verify_and_store(&path, &b, &n.url, &n.sha256).map(|_| b.len()));
+            match r {
+                Ok(len) => {
+                    row["bytes"] = json!(len);
+                    row["outcome"] = json!("staged");
+                    if !g.json { ui::done(&format!("{} {} ({platform}): Verified against its pin, staged ({})", n.name, n.version, human(len))); }
                     staged.push(row);
-                    continue;
                 }
-                if !g.json { ui::step(&format!("fetching {} {} ({platform}) from {}", n.name, n.version, n.url)); }
-                let r = super::upgrade::http_get_bytes(&n.url, None).map_err(|e| e.summary())
-                    .and_then(|b| verify_and_store(&path, &b, &n.url, &n.sha256).map(|_| b.len()));
-                match r {
-                    Ok(len) => {
-                        row["bytes"] = json!(len);
-                        row["outcome"] = json!("staged");
-                        if !g.json { ui::done(&format!("{} {} ({platform}): Verified against its pin, staged ({})", n.name, n.version, human(len))); }
-                        staged.push(row);
-                    }
-                    Err(e) => {
-                        if !g.json { ui::failed(&format!("{} {} ({platform}): {e}", n.name, n.version), None); }
-                        row["error"] = json!(e);
-                        failed.push(row);
-                    }
+                Err(e) => {
+                    if !g.json { ui::failed(&format!("{} {} ({platform}): {e}", n.name, n.version), None); }
+                    row["error"] = json!(e);
+                    failed.push(row);
                 }
             }
         }
@@ -512,16 +609,103 @@ pub fn cluster_vendor_stage(g: &Globals, args: &[String]) -> Result<i32, Unhandl
         println!();
         if failed.is_empty() {
             ui::close_done(&format!("{} artefact(s) staged in {}", staged.len(), dir.display()));
-            ui::guide(&[
-                ("noo cluster vendor status", "which nodes need which artefact, and whether it is staged"),
-                ("noo cluster provision <node>", "restage a node whose harness placement names the kind"),
-            ]);
+            let cmds: Vec<String> = restage.iter().map(|n| format!("noo cluster provision {n}")).collect();
+            let mut guide: Vec<(&str, &str)> = cmds.iter().map(|c| (c.as_str(), "restage it so its bundle carries the staged CLIs")).collect();
+            if guide.is_empty() {
+                guide.push(("noo cluster provision <node>", "restage a node whose harness placement or vendor_kinds names the kind"));
+            }
+            guide.push(("noo cluster vendor status", "which nodes need which artefact, and whether it is staged"));
+            ui::guide(&guide);
         } else {
             ui::close_failed(&format!("{} artefact(s) not staged; nothing unverified was written", failed.len()),
                 Some("noo cluster vendor status"));
         }
     }
     Ok(if failed.is_empty() { 0 } else { 1 })
+}
+
+/// A vendor CLI is 150–250 MB, so the release fetch's whole-call cap
+/// (120s) refuses one on a slow link, four times over. A vendor download
+/// instead fails when no byte arrives for [`STALL`]: a dead socket ends,
+/// a slow one finishes. [`CEILING`] still ends a trickle.
+const STALL: Duration = Duration::from_secs(60);
+const CEILING: Duration = Duration::from_secs(60 * 60);
+/// How often a running download says how far it has got.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+fn vendor_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(STALL))
+        .timeout_global(Some(CEILING))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// Fetch one vendor artefact (no token: vendors publish them openly),
+/// retried like a release asset, each attempt under the stall watch.
+fn fetch_artifact(url: &str, say: &mut dyn FnMut(u64, Option<u64>)) -> Result<Vec<u8>, FetchError> {
+    release_fetch::with_retry(&release_fetch::DEFAULT_RETRY, &mut release_fetch::real_sleep, || {
+        let u = url.to_string();
+        watched(url, STALL, PROGRESS_EVERY, move |seen: &mut dyn FnMut(u64, Option<u64>) -> bool| {
+            release_fetch::get_once_watched(&vendor_agent(), &u, None, seen)
+        }, say)
+    })
+}
+
+/// Run `work` on its own thread and watch the bytes it reports: a gap of
+/// `stall` with no new byte is a `Network` failure (retried), and every
+/// `every` `say` hears how far it has got. A stalled worker is told to stop
+/// at its next chunk, so a retry does not race it for the link.
+fn watched(
+    url: &str,
+    stall: Duration,
+    every: Duration,
+    work: impl FnOnce(&mut dyn FnMut(u64, Option<u64>) -> bool) -> Result<Vec<u8>, FetchError> + Send + 'static,
+    say: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, FetchError> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    let got = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(u64::MAX));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    {
+        let (got, total, stop) = (got.clone(), total.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let r = work(&mut |n, t| {
+                got.store(n, Ordering::Relaxed);
+                total.store(t.unwrap_or(u64::MAX), Ordering::Relaxed);
+                !stop.load(Ordering::Relaxed)
+            });
+            let _ = tx.send(r);
+        });
+    }
+    let tick = (stall / 10).min(Duration::from_secs(1));
+    let (mut last, mut moved, mut said) = (0u64, Instant::now(), Instant::now());
+    loop {
+        match rx.recv_timeout(tick) {
+            Ok(r) => return r,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(FetchError::new(FetchClass::Other, format!("GET {url}: the download ended without a result")))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let n = got.load(Ordering::Relaxed);
+        if n != last {
+            (last, moved) = (n, Instant::now());
+        } else if moved.elapsed() >= stall {
+            stop.store(true, Ordering::Relaxed);
+            return Err(FetchError::new(FetchClass::Network, format!(
+                "GET {url}: stalled, no data for {}s after {}", stall.as_secs(), human(n as usize))));
+        }
+        if said.elapsed() >= every {
+            said = Instant::now();
+            let t = total.load(Ordering::Relaxed);
+            say(n, (t != u64::MAX).then_some(t));
+        }
+    }
 }
 
 fn human(n: usize) -> String {
@@ -677,8 +861,10 @@ pub fn cluster_vendor_status(g: &Globals, args: &[String]) -> Result<i32, Unhand
     } else {
         print!("{}", ui::table(&[Col::left("node"), Col::left("platform"), Col::left("placed kind"), Col::left("vendor_kinds"), Col::left("bundle carries")], &node_rows));
     }
-    let cmds: Vec<String> = need_stage.iter().map(|k| format!("noo cluster vendor stage {k}")).collect();
-    let mut guide: Vec<(&str, &str)> = cmds.iter().map(|c| (c.as_str(), "fetch and verify what a placed node still needs")).collect();
+    let mut guide: Vec<(&str, &str)> = Vec::new();
+    if !need_stage.is_empty() {
+        guide.push(("noo cluster vendor stage", "fetch and verify what the nodes still need"));
+    }
     guide.push(("noo cluster provision <node>", "restage a node so its bundle carries the staged CLI"));
     guide.push(("noo cluster vendor install <node> <kind>...", "carry a CLI whatever the node's placement names"));
     ui::guide(&guide);
@@ -735,7 +921,7 @@ pub fn cluster_vendor_install(g: &Globals, args: &[String]) -> Result<i32, Unhan
         true,
         10,
     );
-    let stage: Vec<String> = asked.iter().map(|k| format!("noo cluster vendor stage {k}")).collect();
+    let stage = vec!["noo cluster vendor stage".to_string()];
     let restage = format!("noo cluster provision {node}");
     if g.json {
         let mut next = stage.clone();
@@ -745,7 +931,7 @@ pub fn cluster_vendor_install(g: &Globals, args: &[String]) -> Result<i32, Unhan
     }
     ui::done(&format!("{node}: vendor_kinds = {} (was: {})", vendor_kinds_cell(&after), vendor_kinds_cell(&before)));
     println!("{}", ui::muted("recorded only: nothing reaches the node until it is restaged"));
-    let mut guide: Vec<(&str, &str)> = stage.iter().map(|c| (c.as_str(), "fetch and verify it on this controller (a no-op when already staged)")).collect();
+    let mut guide: Vec<(&str, &str)> = stage.iter().map(|c| (c.as_str(), "fetch and verify what the nodes need on this controller (a no-op when already staged)")).collect();
     guide.push((restage.as_str(), "restage the node so its bundle carries the CLIs"));
     guide.push(("noo cluster vendor status", "what each node carries, and what is still to stage"));
     ui::guide(&guide);
@@ -759,7 +945,7 @@ pub fn cluster_vendor_usage(g: &Globals, _args: &[String]) -> Result<i32, Unhand
         ExitCode::Usage,
         "usage",
         "noo cluster vendor needs a subaction",
-        Some("stage <kind>|--all [--os linux|macos] [--arch x86_64|aarch64]   fetch and verify vendor CLIs on the controller; status   what is staged and who needs it; install <node> <kind>...   carry CLIs on a node whatever its placement names"),
+        Some("stage [<kind> [--fleet]|--all] [--os linux|macos] [--arch x86_64|aarch64]   fetch and verify the vendor CLIs the nodes need on the controller; status   what is staged and who needs it; install <node> <kind>...   carry CLIs on a node whatever its placement names"),
     );
 }
 
@@ -816,6 +1002,36 @@ mod tests {
         assert!(needs_for(&parse(&bad).unwrap(), "copilot", "linux", "x86_64").unwrap_err().contains("version"));
         let bad = FIXTURE.replace("\"cli\": \"codex\"", "\"cli\": \"noo-gateway\"");
         assert!(needs_for(&parse(&bad).unwrap(), "codex", "linux", "x86_64").is_err(), "a wrapper may not shadow a noo binary");
+    }
+
+    #[test]
+    fn a_download_that_stops_sending_fails_as_stalled_and_is_told_to_stop() {
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stopped.clone();
+        let e = watched("https://example.invalid/x.tgz", Duration::from_millis(300), Duration::from_secs(60), move |seen| {
+            seen(10, Some(100));
+            std::thread::sleep(Duration::from_millis(900));
+            s2.store(!seen(11, Some(100)), std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }, &mut |_, _| {}).unwrap_err();
+        assert_eq!(e.class, FetchClass::Network, "a stall is retried like any network failure");
+        assert!(e.detail.contains("stalled") && e.detail.contains("example.invalid"), "{}", e.detail);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "the stalled worker must be told to stop");
+    }
+
+    #[test]
+    fn a_slow_download_that_keeps_moving_finishes_and_reports_progress() {
+        let mut heard = Vec::new();
+        let r = watched("https://example.invalid/x.tgz", Duration::from_millis(400), Duration::from_millis(150), |seen| {
+            for i in 1..=10u64 {
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(seen(i * 10, Some(100)));
+            }
+            Ok(vec![7; 100])
+        }, &mut |got, total| heard.push((got, total))).unwrap();
+        assert_eq!(r.len(), 100, "1s in all, well past the 400ms stall bound, yet never 400ms without a byte");
+        assert!(!heard.is_empty() && heard.iter().all(|&(g, t)| g > 0 && t == Some(100)), "{heard:?}");
     }
 
     #[test]
@@ -1014,12 +1230,37 @@ mod tests {
     }
 
     #[test]
-    fn stage_args_take_one_kind_or_all() {
+    fn stage_args_take_nothing_one_kind_or_all() {
         let s = |v: &[&str]| parse_stage_args(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&[]).unwrap(), StageArgs::default());
         assert_eq!(s(&["copilot"]).unwrap().kind.as_deref(), Some("copilot"));
+        assert!(s(&["copilot", "--fleet"]).unwrap().fleet);
         assert!(s(&["--all", "--os", "linux", "--arch", "aarch64"]).unwrap().all);
-        assert!(s(&[]).is_err() && s(&["copilot", "--all"]).is_err() && s(&["a", "b"]).is_err());
+        assert_eq!(s(&["--os", "macos"]).unwrap().os.as_deref(), Some("macos"));
+        assert!(s(&["copilot", "--all"]).is_err() && s(&["a", "b"]).is_err() && s(&["--fleet"]).is_err());
         assert!(s(&["--all", "--os", "windows"]).is_err() && s(&["--all", "--arch", "arm64"]).is_err());
+    }
+
+    #[test]
+    fn stage_fetches_what_the_nodes_carry_on_their_own_platform() {
+        let n = |id: &str, p: Option<(&'static str, &'static str)>, k: &[&str]| NodeCarry {
+            id: id.into(), platform: p, kinds: k.iter().map(|x| x.to_string()).collect(),
+        };
+        let nodes = [
+            n("awolf", Some(("linux", "x86_64")), &["claude-code", "codex"]),
+            n("pop-os", Some(("linux", "x86_64")), &["codex"]),
+            n("mcmini", Some(("macos", "aarch64")), &["codex"]),
+            n("robopi", Some(("linux", "aarch64")), &[]),
+            n("nowhere", None, &["codex"]),
+        ];
+        let t = needed_targets(&nodes, None, None, None);
+        let keys: Vec<_> = t.keys().map(|(k, o, a)| format!("{k}/{o}-{a}")).collect();
+        // robopi carries nothing, so no linux-aarch64 build is fetched.
+        assert_eq!(keys, ["claude-code/linux-x86_64", "codex/linux-x86_64", "codex/macos-aarch64"]);
+        assert_eq!(t[&("codex".to_string(), "linux", "x86_64")], ["awolf", "pop-os"]);
+        let t = needed_targets(&nodes, Some("codex"), Some("macos"), None);
+        assert_eq!(t.into_values().collect::<Vec<_>>(), [vec!["mcmini".to_string()]]);
+        assert!(needed_targets(&nodes, Some("copilot"), None, None).is_empty());
     }
 
     #[test]

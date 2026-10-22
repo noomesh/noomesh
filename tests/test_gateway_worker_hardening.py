@@ -17,10 +17,8 @@ projection:
      it); the gateway's stays read-write, because its settings route writes
      that file;
   3. neither service is `privileged`;
-  4. `read_only` is NOT claimed for either (their write sets are not a fixed
-     list of paths; the comment on the service says why). If it is added
-     later, the tmpfs for every path must come with it, so this test asserts
-     the pair: read_only without a /tmp tmpfs fails;
+  4. all four are `read_only: true` with their tmpfs (tests/test_read_only_rootfs.py
+     holds the list; here: read_only without a /tmp tmpfs fails);
   5. the `node-agent` service's `privileged:` default is `false` and
      `.env.example` ships `NOO_NODE_AGENT_PRIVILEGED=false`.
 """

@@ -12,10 +12,12 @@ import { ObservabilityPanel } from '@/features/observability/ObservabilityPanel'
 import { UsagePanel } from '@/features/usage/UsagePanel';
 import { SecurityPanel } from '@/features/security/SecurityPanel';
 import { AutonomyPanel } from '@/features/autonomy/AutonomyPanel';
+import { SkillProposalsPanel } from '@/features/skills/SkillProposalsPanel';
 import { AdminPanel } from '@/features/admin/AdminPanel';
 import { ModelPrefsPanel } from '@/features/model-prefs/ModelPrefsPanel';
 import { DocsPanel } from '@/features/docs/DocsPanel';
 import { WorkflowPanel } from '@/features/workflow/WorkflowPanel';
+import { AddonUisPanel } from '@/features/addons/AddonUisPanel';
 
 /** Panels every edition ships. `chat` has no panel — it is the left column. */
 export const CORE_PANELS: Record<string, ComponentType> = {
@@ -29,8 +31,10 @@ export const CORE_PANELS: Record<string, ComponentType> = {
   usage: UsagePanel,
   security: SecurityPanel,
   autonomy: AutonomyPanel,
+  skills: SkillProposalsPanel,
   admin: AdminPanel,
   'model-prefs': ModelPrefsPanel,
   docs: DocsPanel,
   workflow: WorkflowPanel,
+  addons: AddonUisPanel,
 };

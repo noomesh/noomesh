@@ -11,6 +11,13 @@
 //! `--seed-file -` so a workflow can pipe its secret without writing it to
 //! disk. It is never read from an environment variable and never printed.
 //!
+//! `verify` is the release-side check (an add-on's release workflow runs it
+//! before publishing), so it never ships a development key (i163 part A):
+//! every `--key` must be a release key, and a lock that verifies only
+//! against a development key is refused. The development keys it knows are
+//! the `--dev-key` flags plus every `addon_trust.*.dev_keys` record in this
+//! install's noomesh.yaml, when there is one.
+//!
 //! `--file <name>=<path>` (repeatable) makes `sign` write a BUNDLE lock
 //! (`noo-addon-lock/2`): each file's sha256 is listed under `files`, so the
 //! one signature covers the add-on's compose overlay and anything else it
@@ -28,7 +35,7 @@ use crate::ui;
 use crate::{Globals, Unhandled};
 
 const SIGN_USAGE: &str = "usage: noo security addon-lock sign --addon <name> --version <v> --source-commit <sha> --supports <tag>[,<tag>]... --image <name>=<ref@digest>... [--base <image>=<digest>] [--file <name>=<path>]... [--registry <root>] --seed-file <path|-> --out <path>";
-const VERIFY_USAGE: &str = "usage: noo security addon-lock verify <path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>]";
+const VERIFY_USAGE: &str = "usage: noo security addon-lock verify <path> --key <pubkey>... --addon <name> --registry <root> [--sig <path>] [--stack <tag>] [--files-dir <dir>] [--dev-key <pubkey>]...";
 
 fn usage_fail(g: &Globals, msg: &str, usage: &str) -> ! {
     fail(g.json, ExitCode::Usage, "usage", msg, Some(usage))
@@ -167,13 +174,40 @@ pub fn security_addon_lock_sign(g: &Globals, args: &[String]) -> Result<i32, Unh
     Ok(0)
 }
 
+/// This install's development keys (`addon_trust.*.dev_keys`), when it has
+/// a noomesh.yaml. No file is no keys; a file that does not parse is an error.
+fn local_dev_keys() -> Result<Vec<addon_lock::DevKey>, String> {
+    let path = crate::commands::addons::config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => crate::addons::trust::all_dev_keys(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Every development key release verification must refuse: the `--dev-key`
+/// flags and this install's. Expiry does not matter here (an expired
+/// development key is still not a release key), so each is held as
+/// never-expiring, which makes a lock it signed verify as dev-signed and be
+/// refused by name rather than as a bad signature.
+pub(crate) fn release_dev_set(flags: &[String], local: Vec<addon_lock::DevKey>) -> Vec<addon_lock::DevKey> {
+    let mut out: Vec<addon_lock::DevKey> = Vec::new();
+    for key in flags.iter().cloned().chain(local.into_iter().map(|d| d.key)) {
+        if !out.iter().any(|d| d.key == key) {
+            out.push(addon_lock::DevKey { key, expires_at: i64::MAX });
+        }
+    }
+    out
+}
+
 pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (mut file, mut sig_path, mut addon, mut registry, mut stack, mut files_dir) = (None, None, None, None, None, None);
     let mut keys: Vec<String> = Vec::new();
+    let mut dev_flags: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--key" => keys.push(take(g, &mut it, a, VERIFY_USAGE).to_lowercase()),
+            "--dev-key" => dev_flags.push(take(g, &mut it, a, VERIFY_USAGE).trim().to_lowercase()),
             "--addon" => addon = Some(take(g, &mut it, a, VERIFY_USAGE)),
             "--registry" => registry = Some(take(g, &mut it, a, VERIFY_USAGE)),
             "--sig" => sig_path = Some(PathBuf::from(take(g, &mut it, a, VERIFY_USAGE))),
@@ -200,12 +234,25 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
         Ok(s) => s,
         Err(e) => fail(g.json, ExitCode::Generic, "read_failed", &format!("{}: {e}", sig_path.display()), None),
     };
-    let anchor = TrustAnchor { keys, registry, pull: None };
+    let local_dev = match local_dev_keys() {
+        Ok(d) => d,
+        Err(e) => fail(g.json, ExitCode::Generic, "config", &format!("{e} — refusing to verify a release without knowing this install's development keys"), None),
+    };
+    let dev = release_dev_set(&dev_flags, local_dev);
+    if let Err(e) = addon_lock::refuse_dev_in_release(&keys, &dev) {
+        fail(g.json, ExitCode::Generic, "addon_lock_dev_key", &e, Some("pass the add-on's release keys to --key"));
+    }
+    let anchor = TrustAnchor { keys, registry, pull: None, dev };
     let v = match addon_lock::verify(&bytes, &sig, &anchor, &addon) {
         Ok(v) => v,
         Err(e) => fail(g.json, ExitCode::Generic, "addon_lock_invalid", &e.to_string(),
             Some("the lock or its signature was altered, or it was signed for another add-on, key or registry")),
     };
+    if v.dev_expires_at.is_some() {
+        fail(g.json, ExitCode::Generic, "addon_lock_dev_signed",
+            &format!("Add-on lock {} is signed only by a development key; a release never ships one", file.display()),
+            Some("re-sign it with the add-on's release key"));
+    }
     if let Some(dir) = files_dir.as_deref() {
         // Exactly the files the lock lists, read from <dir>; anything else in
         // the directory is not the bundle's business.
@@ -255,4 +302,46 @@ pub fn security_addon_lock_verify(g: &Globals, args: &[String]) -> Result<i32, U
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pk(seed: &str) -> String {
+        release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(seed).unwrap())
+    }
+
+    fn lock() -> AddonLock {
+        AddonLock {
+            format: addon_lock::FORMAT.into(),
+            addon: "pai-voice".into(),
+            version: "0.1.0".into(),
+            source_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            supports_stack: vec!["v0.6.10".into()],
+            images: BTreeMap::from([("pai-voice".to_string(), format!("ghcr.io/vendor/pai-voice@sha256:{}", "a".repeat(64)))]),
+            base: None,
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn release_verification_refuses_a_lock_only_a_dev_key_signed() {
+        let dev_seed = "cd".repeat(32);
+        let (bytes, sig) = addon_lock::sign(&lock(), &dev_seed).unwrap();
+        // An expired local record is still a development key here.
+        let local = vec![addon_lock::DevKey { key: pk(&dev_seed), expires_at: 1 }];
+        let dev = release_dev_set(&[pk(&dev_seed)], local);
+        assert_eq!(dev.len(), 1, "the flag and the local record are one key");
+        assert_eq!(dev[0].expires_at, i64::MAX);
+        let anchor = TrustAnchor { keys: vec![pk(&"ab".repeat(32))], registry: "ghcr.io/vendor/pai-voice".into(), pull: None, dev: dev.clone() };
+        let v = addon_lock::verify(&bytes, &sig, &anchor, "pai-voice").expect("verifies, as dev-signed");
+        assert!(v.dev_expires_at.is_some(), "the release verb refuses exactly this");
+        // Passing the dev key as a release key is refused before any verification.
+        assert!(addon_lock::refuse_dev_in_release(&[pk(&dev_seed)], &dev).is_err());
+        // A lock signed by the release key passes as a release lock.
+        let (bytes, sig) = addon_lock::sign(&lock(), &"ab".repeat(32)).unwrap();
+        let v = addon_lock::verify(&bytes, &sig, &anchor, "pai-voice").unwrap();
+        assert_eq!((v.key_index, v.dev_expires_at), (0, None));
+    }
 }

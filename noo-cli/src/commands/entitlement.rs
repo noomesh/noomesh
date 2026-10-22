@@ -224,7 +224,7 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
         enable_unlocked(
             &crate::commands::addons::config_path(),
             &unlock_names,
-            &mut crate::commands::addon_enable::Live { g, force: false },
+            &mut crate::commands::addon_enable::Live { g, force: false, lock: None },
         )
     } else {
         (Vec::new(), Vec::new(), crate::commands::addon_enable::PrincipalStep::Unchanged)
@@ -476,7 +476,7 @@ mod tests {
     fn show_lists_addon_signers_by_registry_and_key_zero() {
         let mut e = Entitlement { v: 1, sub: "a".into(), tier: "t".into(), features: vec![], iat: 0, exp: 0, id: "i".into(), bound: None, max_nodes: None, terms: None, addons: Default::default(), cnf: None };
         assert!(super::addon_signer_rows(&e).is_empty());
-        e.addons.insert("evolve".into(), crate::addon_lock::TrustAnchor { keys: vec!["cd".repeat(32), "ef".repeat(32)], registry: "ghcr.io/example/evolve".into(), pull: None });
+        e.addons.insert("evolve".into(), crate::addon_lock::TrustAnchor { keys: vec!["cd".repeat(32), "ef".repeat(32)], registry: "ghcr.io/example/evolve".into(), pull: None, dev: vec![] });
         let rows = super::addon_signer_rows(&e);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "evolve");

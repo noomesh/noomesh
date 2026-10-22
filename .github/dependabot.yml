@@ -54,6 +54,24 @@ updates:
         update-types:
           - minor
           - patch
+  # The ML tier's lock (docker/ml-lock/requirements.txt, Dockerfile.deps-base).
+  # Same rule as core-lock, and a stricter consequence: it holds deps-core's
+  # pins at the same versions (tests/test_python_lock_guard.py), so a bump that
+  # lands in one lock alone fails CI. Regenerate both with
+  # scripts/regen-ml-lock.sh and the command in core-lock's header.
+  - package-ecosystem: pip
+    directory: "/docker/ml-lock"
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      pip-ml-lock-minor-patch:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: pip
     directory: "/packages/noo-gateway-client"
     target-branch: dev

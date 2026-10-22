@@ -147,6 +147,7 @@ pub fn parse_addon_flag(v: &str) -> Result<(String, TrustAnchor), String> {
         keys: keys.split(',').map(str::trim).filter(|k| !k.is_empty()).map(String::from).collect(),
         registry: registry.trim().to_string(),
         pull: None,
+        dev: vec![],
     };
     if name.is_empty() {
         return Err(bad());
@@ -368,7 +369,7 @@ mod tests {
     }
 
     fn with_addons() -> Entitlement {
-        let a = TrustAnchor { keys: vec![key_hex(7), key_hex(8)], registry: "ghcr.io/example/intel".into(), pull: None };
+        let a = TrustAnchor { keys: vec![key_hex(7), key_hex(8)], registry: "ghcr.io/example/intel".into(), pull: None, dev: vec![] };
         Entitlement { addons: BTreeMap::from([("trellion_intel".to_string(), a)]), ..ent() }
     }
 
@@ -437,7 +438,7 @@ mod tests {
         let (k1, k2) = (key_hex(7), key_hex(8));
         let (name, a) = parse_addon_flag(&format!("trellion_intel=ghcr.io/example/intel:{k1},{k2}")).unwrap();
         assert_eq!(name, "trellion_intel");
-        assert_eq!(a, TrustAnchor { keys: vec![k1.clone(), k2], registry: "ghcr.io/example/intel".into(), pull: None });
+        assert_eq!(a, TrustAnchor { keys: vec![k1.clone(), k2], registry: "ghcr.io/example/intel".into(), pull: None, dev: vec![] });
         for bad in ["trellion_intel", "=ghcr.io/x/y:aa", &format!("x=ghcr.io/x/y:{k1},zz"), &format!("x=ghcr.io:{k1}"), "x=ghcr.io/x/y:"] {
             assert!(parse_addon_flag(bad).is_err(), "{bad} must be refused");
         }

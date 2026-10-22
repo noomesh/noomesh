@@ -210,6 +210,18 @@ pub(crate) fn enable(config: &Path, addon: &str, ops: &mut dyn EnableOps) -> Res
 
 // ── the live side ──────────────────────────────────────────────────────
 
+/// The database system `addon`'s materialised bundle declares
+/// (`<root>/addons/<addon>/system.json`), as a `systems:` entry. `None` when
+/// it declares none. A declaration that does not validate refuses the enable
+/// (it was validated when pinned; reaching this means it was edited).
+pub(crate) fn bundle_system(root: &Path, addon: &str) -> Result<Option<systems::SystemEntry>, Refusal> {
+    let d = crate::addons::decls::materialised(root, addon).map_err(|e| Refusal {
+        why: format!("{e}. Nothing was changed"),
+        fix: format!("noo addons upgrade {addon}   # re-materialises the signed bundle"),
+    })?;
+    Ok(d.system.map(|s| crate::addons::decls::system_entry(addon, &s)))
+}
+
 const TIMEOUT: u64 = 15;
 
 /// The production [`EnableOps`]: the systems manifest and sops store under
@@ -221,6 +233,9 @@ pub(crate) struct Live<'a> {
     /// cannot be verified without the licence's trust anchor, so step 0 is
     /// skipped (said so); the launcher refuses the add-on until it is pinned.
     pub force: bool,
+    /// `--lock <path|https-url>`: a third-party add-on's signed lock handed
+    /// over by the operator. Ignored for an add-on the CLI ships.
+    pub lock: Option<String>,
 }
 
 fn sops_path() -> PathBuf {
@@ -235,6 +250,13 @@ pub(crate) fn pin_fix(addon: &str, r: &crate::addons::resolve::Refusal) -> Strin
     }
     match r {
         R::NoEntitlement(_) => "noo security entitlement install <token>".into(),
+        R::Untrusted(_) | R::Lock(crate::addon_lock::AddonLockError::BadSignature(_)) if crate::addons::resolve::third_party(addon) => {
+            format!("noo addons trust-key {addon} <pubkey> --registry <root>")
+        }
+        R::Lock(crate::addon_lock::AddonLockError::DevKeyExpired { .. }) => {
+            format!("noo addons trust-key {addon} <pubkey> --dev --expires 14d")
+        }
+        R::Supplied(_) => format!("noo addons enable {addon} --lock <path|https-url>"),
         R::Store(_) => "noo security secrets audit".into(),
         R::NoAnchor => "noo security entitlement show   # a token naming the add-on's signer is needed; ask for a reissue".into(),
         R::Downgrade { .. } => format!("noo addons upgrade {addon} --allow-downgrade"),
@@ -259,7 +281,8 @@ impl EnableOps for Live<'_> {
     }
     fn pin_lock(&mut self, addon: &str) -> Result<PinStep, Refusal> {
         use crate::addons::{self, resolve::Refusal as R};
-        if crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
+        let third_party = crate::addons::resolve::third_party(addon);
+        if !third_party && crate::commands::addons::row(addon).and_then(|r| r.licensed).is_none() {
             return Ok(PinStep::NotLicensed);
         }
         let root = crate::envfile::repo_root();
@@ -269,10 +292,17 @@ impl EnableOps for Live<'_> {
             ));
         };
         let stack_lock = addons::resolve::installed_stack_lock(&root, &tag);
-        let client = addons::installed_client().map_err(|e| Refusal {
-            why: format!("{e}. Nothing was changed"),
-            fix: "noo security secrets audit".into(),
-        })?;
+        // A third-party registry is the OPERATOR's choice, not the vendor's: it
+        // gets no credential (the vendor token is never sent to it) and no
+        // entitlement proxy. Anonymous pulls only.
+        let client = if third_party {
+            addons::lock_fetch::Client::new(None)
+        } else {
+            addons::installed_client().map_err(|e| Refusal {
+                why: format!("{e}. Nothing was changed"),
+                fix: "noo security secrets audit".into(),
+            })?
+        };
         let ctx = addons::Ctx {
             root: &root,
             tag: &tag,
@@ -283,7 +313,20 @@ impl EnableOps for Live<'_> {
         if !self.g.json {
             crate::ui::step(&format!("{addon}: resolving its signed lock for stack {tag}"));
         }
-        let prepared = match addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker::new(&root)) {
+        let outcome = if third_party {
+            let supplied = match self.lock.as_deref().map(addons::trust::fetch_supplied).transpose() {
+                Ok(s) => s,
+                Err(e) => {
+                    let r = R::Supplied(e);
+                    return Err(Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) });
+                }
+            };
+            addons::resolve::installed_anchor(addon)
+                .and_then(|a| addons::prepare_from(&ctx, addon, &a, supplied, &mut addons::resolve::LiveDocker::new(&root)))
+        } else {
+            addons::prepare(&ctx, addon, &mut addons::resolve::LiveDocker::new(&root))
+        };
+        let prepared = match outcome {
             Ok(p) => p,
             Err(r @ (R::NoEntitlement(_) | R::NoAnchor)) if self.force => {
                 return Ok(PinStep::Skipped(format!(
@@ -353,19 +396,34 @@ impl EnableOps for Live<'_> {
 
     fn mint_credentials(&mut self, addon: &str) -> Result<Vec<String>, Refusal> {
         let path = systems::manifest_path();
-        let Ok(text) = std::fs::read_to_string(&path) else { return Ok(Vec::new()) };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
         let manifest = systems::parse_systems(&text).map_err(|e| Refusal {
             why: format!("{}: {e}. Nothing was changed", path.display()),
             fix: "noo systems status".into(),
         })?;
-        let Some(entry) = manifest.get(addon) else { return Ok(Vec::new()) };
+        // A `systems:` entry in noomesh.yaml wins (the gateway does the
+        // same); otherwise the system the add-on's signed bundle declares
+        // (`system.json`, materialised by step 0 and validated there), whose
+        // password variables are derived from the add-on name (i163 E).
+        let (entry, from_bundle) = match manifest.get(addon) {
+            Some(e) => (e.clone(), false),
+            None => match bundle_system(&crate::envfile::repo_root(), addon)? {
+                Some(e) => (e, true),
+                None => return Ok(Vec::new()),
+            },
+        };
+        let entry = &entry;
         systems::mint_credentials(entry, &sops_path()).map(|(minted, _backup)| minted).map_err(|e| Refusal {
             why: format!(
                 "could not mint {}'s credentials ({}): {e}. The switch was not flipped",
                 addon,
                 systems::required_keys(entry).join(", ")
             ),
-            fix: format!("noo systems enable {addon}   # then: noo addons enable {addon}"),
+            fix: if from_bundle {
+                "noo security secrets audit   # the store must be writable; then re-run noo addons enable".to_string()
+            } else {
+                format!("noo systems enable {addon}   # then: noo addons enable {addon}")
+            },
         })
     }
 
