@@ -535,7 +535,7 @@ pub(crate) async fn execute_spec(
     // NOO_SELF_URL. A misconfiguration pointing off-host would then be
     // silently unauthenticated rather than a loud TLS error.
     let mut builder =
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(spec.timeout_secs));
+        crate::tls::client_builder().timeout(std::time::Duration::from_secs(spec.timeout_secs));
     if base.starts_with("https://") {
         // No cluster CA configured — a public cert (tailscale serve) or
         // plain dev. Leave the system roots in place rather than weakening
@@ -543,7 +543,7 @@ pub(crate) async fn execute_spec(
         if let Some(ca) = std::env::var("NOO_TLS_CA").ok().filter(|s| !s.is_empty()) {
             match std::fs::read(&ca) {
                 Ok(pem) => match crate::tls::certificate_from_pem(&pem) {
-                    Ok(cert) => builder = builder.add_root_certificate(cert),
+                    Ok(cert) => builder = builder.tls_certs_merge([cert]),
                     Err(e) => return Err(format!("NOO_TLS_CA at {ca} is not valid PEM: {e}")),
                 },
                 Err(e) => return Err(format!("cannot read NOO_TLS_CA at {ca}: {e}")),

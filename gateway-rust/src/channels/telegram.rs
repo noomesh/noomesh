@@ -186,7 +186,7 @@ pub fn start(state: Arc<AppState>) {
 async fn run(state: Arc<AppState>) {
     let mut offset: i64 = 0;
     let mut backoff = 1.0_f64;
-    let client = reqwest::Client::new();
+    let client = crate::tls::client_builder().build().unwrap_or_default();
 
     tracing::info!("telegram_poll_loop_started");
     loop {
