@@ -1216,6 +1216,18 @@ mod addon_ui_tests {
         assert_eq!(parse_port_serve(&json!({}), 8451), PortServe::Absent);
     }
 
+    /// Start, restart and the stack roll all front the add-on UI ports, so
+    /// `noo upgrade --all` needs no manual restart for a new add-on UI.
+    #[test]
+    fn start_restart_and_the_stack_roll_front_the_addon_ui_ports() {
+        let mesh = include_str!("commands/mesh.rs");
+        let mesh = &mesh[..mesh.find("#[cfg(test)]").unwrap_or(mesh.len())];
+        assert_eq!(mesh.matches("front_addon_uis(g);").count(), 2, "noo stack start and noo stack restart");
+        let up = include_str!("commands/upgrade.rs");
+        let up = &up[..up.find("#[cfg(test)]").unwrap_or(up.len())];
+        assert!(up.contains("super::mesh::front_addon_uis(g);"), "noo upgrade --stack");
+    }
+
     #[test]
     fn idempotent_and_failures_carry_their_exact_line() {
         let status = cfg(&[(8450, "https://127.0.0.1:8450")]);
