@@ -97,10 +97,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/responses", post(v1_responses))
 }
 
-crate::ported! {
-    POST "/api/tasks/inference" => "worker.inference.task",
-}
-
 /// POST /api/tasks/inference — queue an inference job for a worker node.
 ///
 /// Native port of `worker.inference.task` (reference implementation kept

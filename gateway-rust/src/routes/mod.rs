@@ -141,7 +141,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
-            Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            Self::Internal(m) => return internal_response(&m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
@@ -173,9 +173,44 @@ impl IntoResponse for AppError {
     }
 }
 
+/// The ONE place an internal failure becomes an HTTP body (i191 D3). The
+/// full message goes to the log under a short ref; the caller gets only the
+/// ref, so SQL text, hostnames and paths never leave in a response.
+fn internal_response(msg: &str) -> Response {
+    let r = short_ref();
+    tracing::error!(ref_id = %r, error = %msg, "internal error returned to a caller as a fixed body");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(internal_body(&r))).into_response()
+}
+
+fn short_ref() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+fn internal_body(r: &str) -> Value {
+    // `detail` is the key the noo CLI and the console read off every error
+    // body; keep it so an operator sees the ref without a log in front of them.
+    json!({"error": "internal error", "detail": format!("internal error (ref {r}); the gateway log has the cause"), "ref": r})
+}
+
+/// Map a SQLSTATE to the client-fault variant it means, if any.
+/// 23505 unique_violation -> Conflict; 23503 foreign_key, 23502 not_null,
+/// 23514 check -> BadRequest. Anything else stays internal.
+fn client_fault_for_sqlstate(code: &str) -> Option<AppError> {
+    match code {
+        "23505" => Some(AppError::Conflict("resource already exists".into())),
+        "23503" | "23502" | "23514" => Some(AppError::BadRequest("request violates a data constraint".into())),
+        _ => None,
+    }
+}
+
 /// Convenience: convert sqlx errors to AppError.
 impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(d) = &e {
+            if let Some(fault) = d.code().and_then(|c| client_fault_for_sqlstate(&c)) {
+                return fault;
+            }
+        }
         AppError::Internal(format!("Database error: {e}"))
     }
 }
@@ -451,5 +486,39 @@ mod operator_read_guard_tests {
                 .unwrap_or(usize::MAX);
             assert!(at < first_read, "{sig}: the guard must come before the first read");
         }
+    }
+}
+
+#[cfg(test)]
+mod internal_body_tests {
+    use super::*;
+
+    async fn body_of(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The body never carries the internal message, only a fixed string and a ref.
+    #[tokio::test]
+    async fn internal_error_body_hides_detail() {
+        let secret = "Database error: relation \"noo_users\" does not exist at db.internal:5432";
+        let (status, v) = body_of(AppError::Internal(secret.into()).into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "internal error");
+        let r = v["ref"].as_str().unwrap();
+        assert_eq!(r.len(), 8);
+        assert!(!v.to_string().contains("noo_users"));
+        assert!(!v.to_string().contains("db.internal"));
+    }
+
+    #[test]
+    fn constraint_sqlstates_map_to_client_faults() {
+        assert!(matches!(client_fault_for_sqlstate("23505"), Some(AppError::Conflict(_))));
+        for c in ["23503", "23502", "23514"] {
+            assert!(matches!(client_fault_for_sqlstate(c), Some(AppError::BadRequest(_))), "{c}");
+        }
+        assert!(client_fault_for_sqlstate("42P01").is_none());
+        assert!(client_fault_for_sqlstate("40001").is_none());
     }
 }

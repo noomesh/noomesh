@@ -171,7 +171,6 @@ mod log_gate;
 mod loop_health;
 mod ops;
 mod erasure_archive;
-mod ported;
 mod agent_roles;
 mod workflows;
 mod llm_rerank;

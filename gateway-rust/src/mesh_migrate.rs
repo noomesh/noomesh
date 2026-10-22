@@ -6,9 +6,11 @@
 //! This runner now owns the mesh migration chain for everything authored
 //! after the frozen Alembic baseline ([`BASELINE_REVISION`], `046_...`): it reads the existing
 //! Alembic state, computes what it would apply, and is provable against
-//! `noo db current`. As of this writing [`MIGRATIONS`] holds 35 entries
+//! `noo db current`. As of this writing [`MIGRATIONS`] holds 44 entries
 //! starting at `047_audit_drop_partition_fn` with the chain head at
-//! `081_host_login_tickets`. A schema change now means appending a
+//! `090_service_key_expiry`. `migrations/` at the crate root holds ONLY the
+//! baseline (`0001_baseline.sql`); every later revision lives in this file,
+//! not as a `.sql` file there. A schema change now means appending a
 //! `Migration { revision, down_revision, sql }` entry to [`MIGRATIONS`],
 //! not a new Python/Alembic revision.
 //!
