@@ -364,7 +364,8 @@ mod tests {
 
     #[test]
     fn workload_rules_refuse_with_their_reason() {
-        let cases: Vec<(Box<dyn Fn(&mut Value)>, &str)> = vec![
+        type Mutate = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<(Mutate, &str)> = vec![
             (Box::new(|w| w["container"] = json!("noo-other-worker")), "must be `noo-example-addon-<suffix>`"),
             (Box::new(|w| w["need_mb"] = json!(0)), "need_mb 0"),
             (Box::new(|w| w["need_mb"] = json!(262_145)), "need_mb 262145"),
