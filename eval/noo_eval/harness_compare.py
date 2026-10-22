@@ -201,6 +201,14 @@ class Comparer:
         return {"model": orig.get("model") or "auto", "desired_state": "running",
                 "role": "harness", "env": env}
 
+    async def _stop_task(self, task_id: str) -> bool:
+        """POST /api/tasks/{id}/stop; True when the gateway accepted it."""
+        try:
+            r = await self.tasks.post(f"/api/tasks/{_q(task_id)}/stop")
+            return r.status_code < 300
+        except httpx.HTTPError:
+            return False
+
     async def place(self, kind: str) -> KindRun:
         kr = KindRun(kind=kind)
         node = self.spec.node
@@ -310,8 +318,12 @@ class Comparer:
             c, u = _ts(rec.get("created_at")), _ts(rec.get("updated_at"))
             tr.wall_s = round((u - c).total_seconds(), 1) if (c and u and not timed_out) else round(wall, 1)
             if timed_out:
+                # Stop it now: a task left looping on the node would fill the
+                # harness's slots and the model for every later task and kind,
+                # and the next kind's numbers would measure this one's leftovers.
+                stopped = await self._stop_task(tr.task_id)
                 tr.note = (f"timed out after {timeout:.0f}s in state {tr.state or 'unknown'} "
-                           f"(left running; stop it with POST /api/tasks/{tr.task_id}/stop)")
+                           f"({'stopped' if stopped else 'could not stop it; stop it with POST /api/tasks/' + tr.task_id + '/stop'})")
                 tr.state = f"timeout ({tr.state})" if tr.state else "timeout"
         except httpx.HTTPError as e:
             tr.state = tr.state or "error"
