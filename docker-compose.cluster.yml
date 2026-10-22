@@ -265,6 +265,11 @@ services:
       - NOO_ADDON_UI_SESSION_MAX_SECS=${NOO_ADDON_UI_SESSION_MAX_SECS:-}
       - NOO_PORT_GATEWAY=${NOO_PORT_GATEWAY:-8080}
       - NOO_CONSOLE_ORIGIN=${NOO_CONSOLE_ORIGIN:-}
+      # The operator's brake on the node-held tunnel (docs/reference/env.md):
+      # `0`/`false`/`off` makes `GET /api/node/tunnel` answer 404 and sends
+      # every streaming and bulk node call over HTTPS :8081 again. The
+      # gateway only sees what this list names (test_tunnel_brake_reaches_the_gateway).
+      - NOO_NODE_TUNNEL=${NOO_NODE_TUNNEL:-}
       - DEV_MODE=${DEV_MODE:-}
       # The controller's OWN identity, and it must be stable across container
       # recreates. Without it `agent_messages::controller_node()` falls through
