@@ -98,6 +98,7 @@ mod redact;
 mod egress;
 mod dlq_drain;
 mod drive;
+mod embed_jobs;
 mod embedding_client;
 mod embedding_spaces;
 mod google_auth;

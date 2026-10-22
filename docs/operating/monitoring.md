@@ -141,6 +141,9 @@ native agent, never compose.
 | `nats_dlq_pending`, `nats_dlq_abandoned` | gauge | DB | messages awaiting the DLQ drain / given up on. **`abandoned > 0` needs eyes** |
 | `noo_auth_failures_5m`, `noo_exec_denials_5m` | gauge | DB (security audit) | the security alert rules read these |
 | `noo_cluster_nodes_total`, `…_online`, `…_busy`, `…_offline` | gauge | cluster collector | fleet size and health, the same counts `noo cluster status` prints |
+| `noo_embed_queue_pending`, `…_ack_pending`, `…_waiting` (label `model`) | gauge | JetStream consumer info | bulk embedding queue per model: batches waiting, batches a node holds unacknowledged, and open node fetches. `waiting` of 0 with `pending` growing means no node is pulling, and the gateway runs those jobs itself after 2 minutes. Omitted for a model whose consumer cannot be read |
+| `noo_embed_pull_jobs_total` (label `path`) | counter | gateway | embedding jobs by path: `pull` (a node claims it) or `push` (the gateway runs it, including a job flipped after a pull stalled) |
+| `noo_embed_pull_failures_total` (label `reason`) | counter | gateway | `flipped_to_push_run`: a pulled job stalled and the gateway took it over; `result_refused`: a node returned vectors for the wrong model, count or width, and the job was failed |
 | `noo_cluster_tier1_nodes`, `…_tier2_…`, `…_tier3_…` | gauge | cluster collector | worker-tier mix. Edge (4), companion (5) and monitor (6) nodes count in the total but have no series of their own |
 | `noo_cluster_vram_total_gb` | gauge | cluster collector | fleet VRAM |
 | `noo_node_load{node}`, `noo_node_tier{node}`, `noo_node_vram_gb{node}`, `noo_node_backends_running{node}` | gauge | cluster collector | per node. **A value that is not known is not emitted** — a node absent from gossip has an unknown load, and an absent series reads as "no data" where a `0` would read as "idle, send it work" |

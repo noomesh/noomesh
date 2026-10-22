@@ -716,6 +716,9 @@ mod publish_sites {
         "routes/cluster.rs",
         // Control over the bus (i131): publishes `node.<id>.rpc.<op>`, never `worker.*`.
         "node_rpc.rs",
+        // i179: publishes `work.embed.<slug>` (the WORK_EMBED work queue),
+        // never `worker.*`.
+        "embed_jobs.rs",
         "autonomy_loop.rs",
         "bus.rs",
     ];
