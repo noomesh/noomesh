@@ -69,6 +69,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | Document | Description |
 |----------|-------------|
 | [operating/runbooks/backup-restore-secrets.md](operating/runbooks/backup-restore-secrets.md) | The two recovery artifacts, the restore drill, restoring a database or a whole controller, scheduled backups, passphrase rotation |
+| [operating/runbooks/nats-isolation.md](operating/runbooks/nats-isolation.md) | Grant changes on the node's NATS credential: render and reload the bus before upgrading an agent that needs a new subject |
 | [operating/runbooks/host-updates.md](operating/runbooks/host-updates.md) | Updating the OS without taking the mesh down: everyday vs platform packages, the hold command, canary → soak → controller, the pre-reboot check, and recovering a controller that does not boot |
 | [operating/runbooks/security-release-upgrade.md](operating/runbooks/security-release-upgrade.md) | Taking an existing controller and fleet onto the posture-review release: the prerequisites that must precede the tag, the deploy, the posture, bus, agent and signing-key rollout after it, and a probe-by-probe verification checklist |
 
