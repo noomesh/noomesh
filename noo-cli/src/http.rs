@@ -410,7 +410,7 @@ pub(crate) fn effective_timeout(g: &Globals, default_timeout: u64) -> u64 {
 
 fn slow_answer_message(secs: u64) -> String {
     format!(
-        "the gateway is up but this answer took longer than {secs}s (the model may be slow on this box) — retry with --timeout {}",
+        "the gateway is up but this answer took longer than {secs}s (the box may be slow, or the work behind it) — retry with --timeout {}",
         secs.saturating_mul(2)
     )
 }
