@@ -52,14 +52,16 @@ type Agent struct {
 	coll   *metrics.Collector
 	http   *http.Client
 
-	nats   *messaging.Client
-	jobs   *jobs.Executor
-	hb     *heartbeat.Reporter
-	server *api.Server
-	mesh   *messaging.MeshResponder
-	ctrl   *ctrlrpc.Service
-	tun    *tunnel.Client
-	gossip *messaging.GossipAnnouncer
+	nats *messaging.Client
+	jobs *jobs.Executor
+	// embedPull claims bulk embedding jobs (nil when NOO_EMBED_PULL=0).
+	embedPull *jobs.EmbedPuller
+	hb        *heartbeat.Reporter
+	server    *api.Server
+	mesh      *messaging.MeshResponder
+	ctrl      *ctrlrpc.Service
+	tun       *tunnel.Client
+	gossip    *messaging.GossipAnnouncer
 
 	// native probes backends served outside Docker (darwin/Metal). nil off
 	// darwin, where there is no native lane.
@@ -518,6 +520,12 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		a.jobs.ActiveCount,
 	)
 	a.hb.SetBusStatus(func() any { return a.busStatus() })
+	// Bulk-embedding pull worker (proposal i179). Independent of the
+	// dispatch executor: a bind failure here never reaches tasks.dispatch.
+	if a.cfg.EmbedPull {
+		a.embedPull = jobs.NewEmbedPuller(a.nats, a.cfg.NodeID, a.server.EmbedLocal)
+		a.hb.SetPullEmbed(func() any { return a.embedPull.Status() })
+	}
 	a.hb.SetBackendRuntimes(a.backendRuntimes)
 	a.hb.SetLoadedModels(func() map[string]string {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -554,6 +562,9 @@ func (a *Agent) startMessaging(ctx context.Context) {
 		slog.Error("job subscription failed", "error", err)
 	}
 	go a.jobs.EnsureBound(ctx)
+	if a.embedPull != nil {
+		go a.embedPull.Run(ctx)
+	}
 
 	// Control over the bus (followup i131 phase 1): answer the controller's
 	// small control calls on node.<id>.rpc.> through the same handlers the

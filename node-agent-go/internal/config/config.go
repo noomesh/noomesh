@@ -92,7 +92,10 @@ type Config struct {
 	// material, see LogShipEnabled. LogShipUnits overrides the journal
 	// allowlist the agent asks hostd to follow (NOO_LOG_SHIP_UNITS,
 	// comma-separated; hostd enforces its own allowlist regardless).
-	LogShip      bool
+	LogShip bool
+	// EmbedPull: claim bulk embedding jobs from the WORK_EMBED stream
+	// (proposal i179). On by default; NOO_EMBED_PULL=0 turns the worker off.
+	EmbedPull    bool
 	LogShipUnits []string
 
 	// StateDir is the agent's writable state directory (NOO_AGENT_STATE;
@@ -136,6 +139,7 @@ func Load() *Config {
 		NodeIP:            os.Getenv("NODE_IP"),
 		ComposeProject:    envOr("NOO_COMPOSE_PROJECT", "pai-assistant"),
 		LogShip:           !envOff("NOO_LOG_SHIP"),
+		EmbedPull:         !envOff("NOO_EMBED_PULL"),
 		LogShipUnits:      envList("NOO_LOG_SHIP_UNITS"),
 		StateDir:          envOr("NOO_AGENT_STATE", "/var/lib/noo-node-agent"),
 	}
