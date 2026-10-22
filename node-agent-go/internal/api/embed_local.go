@@ -13,11 +13,12 @@ import (
 // local embedder IN PROCESS and returns the status and body the /embed route
 // would have written.
 //
-// It is handleEmbedProxy itself, not a copy: the pulled-embedding worker
+// It is the /embed handler's body itself (embedProxyBody), not a copy: the pulled-embedding worker
 // (internal/jobs/embedpull.go, proposal i179) must resolve the target, speak
 // the engine's dialect and strip the knobs the engine rejects exactly as a
 // query-time /embed does, and a second implementation would drift. The only
-// thing this adds is a buffering ResponseWriter.
+// thing this adds is a buffering ResponseWriter. It skips the route's
+// occupancy.Track: the worker counts its job through occupancy.Admit.
 func (s *Server) EmbedLocal(ctx context.Context, body []byte) (int, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/embed", bytes.NewReader(body))
 	if err != nil {
@@ -25,7 +26,7 @@ func (s *Server) EmbedLocal(ctx context.Context, body []byte) (int, []byte, erro
 	}
 	req.Header.Set("Content-Type", "application/json")
 	rec := &bufferedResponse{header: http.Header{}, status: http.StatusOK}
-	s.handleEmbedProxy(rec, req)
+	s.embedProxyBody(rec, req, body)
 	return rec.status, rec.body.Bytes(), nil
 }
 

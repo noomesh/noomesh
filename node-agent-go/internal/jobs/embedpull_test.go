@@ -301,6 +301,35 @@ func TestPullWorkerWithNoFreeSlotFetchesNothing(t *testing.T) {
 	}
 }
 
+// The reserved slot is for query-time /embed, which the route counts with
+// occupancy.Track: on a 3-slot backend with chat holding one, one live embed
+// leaves the worker nothing to take (3 - 1 chat - 1 live - 1 reserve = 0)
+// until it finishes.
+func TestPullWorkerLeavesTheReserveToALiveEmbed(t *testing.T) {
+	e := newPullEnv(t)
+	const model = "bge-m3"
+	e.createWork(model, 5*time.Second)
+	occupancy.SetSlots(map[string]int{"ollama": 3})
+	busy, err := occupancy.Admit(context.Background(), "ollama") // chat holds one slot
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy()
+	live := occupancy.Track("ollama") // a query-time /embed in flight
+	var calls atomic.Int32
+	startPuller(t, fastPuller(e.client, "it-node", "ollama", model, fakeEmbedder(model, &calls)))
+	e.publishJob(model, "job-reserve", []string{"x"})
+
+	time.Sleep(600 * time.Millisecond) // several fetch cycles
+	if ci := e.info(model); ci.Delivered.Consumer != 0 || calls.Load() != 0 {
+		t.Fatalf("worker took the slot reserved for a live embed: %+v calls=%d", ci, calls.Load())
+	}
+	live()
+	if _, ok := e.next("complete", 5*time.Second); !ok {
+		t.Fatal("job not taken once the live embed finished")
+	}
+}
+
 func TestPullWorkerModelMismatchNaksWithoutCompletion(t *testing.T) {
 	e := newPullEnv(t)
 	const model = "harrier"
