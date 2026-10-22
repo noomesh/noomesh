@@ -41,6 +41,19 @@
       "input_schema": {
         "description": "Read your account's agent messages, newest first: everything addressed\nto any name under your account (every window and label you run), plus\nthe threads those names take part in. Narrow with to= (one name) or\nthread=. Read state is per reader: unread=true shows what THIS\ncredential has not yet acknowledged, whatever a sibling window acked.\nAcknowledge with noo_agent_ack. Operators may name another account.",
         "properties": {
+          "all": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Operators only: list every session's messages, not just yours.",
+            "title": "All"
+          },
           "limit": {
             "anyOf": [
               {
@@ -285,6 +298,29 @@
       "method": "GET",
       "name": "noo_agent_thread",
       "path": "/api/agents/messages",
+      "risk_level": "low",
+      "tags": [
+        "agents",
+        "messaging",
+        "external"
+      ],
+      "timeout_secs": 30
+    },
+    {
+      "aliases": {},
+      "auth": "cluster",
+      "body_field": "",
+      "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
+      "had_custom_format": false,
+      "input_schema": {
+        "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
+        "properties": {},
+        "title": "NooAgentWhoami",
+        "type": "object"
+      },
+      "method": "GET",
+      "name": "noo_agent_whoami",
+      "path": "/api/agents/whoami",
       "risk_level": "low",
       "tags": [
         "agents",

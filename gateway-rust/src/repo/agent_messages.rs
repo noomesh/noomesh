@@ -196,12 +196,9 @@ pub async fn list(db: &PgPool, f: &Filter<'_>) -> Result<Vec<Value>, sqlx::Error
         push(&mut sql, AGENT_CLAUSE, a);
     }
     if let Some(o) = f.owner {
-        if o.contains(crate::auth::CONNECTION_SEP) {
-            // A connection owns exactly itself — the same clause as `agent`.
-            push(&mut sql, AGENT_CLAUSE, o);
-        } else {
-            push(&mut sql, &owner_clause(), o);
-        }
+        // A connection owns exactly itself (the `agent` clause); an
+        // account owns its name and everything under it.
+        push(&mut sql, &owner_scope_clause(o), o);
     }
     if let Some(node) = f.node_prefix {
         // LIKE with the node name escaped (`_` and `%` are wildcards).
@@ -287,23 +284,38 @@ pub async fn mark_read(db: &PgPool, id: &str, reader: &str) -> Result<bool, sqlx
     Ok(true)
 }
 
-/// Threads: derived from the messages (no thread table). Newest activity
-/// first; `agent` scopes to threads the agent took part in.
-pub async fn threads(db: &PgPool, agent: Option<&str>, limit: i64) -> Result<Vec<Value>, sqlx::Error> {
-    use sqlx::Row;
-    let sql = if agent.is_some() {
-        "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
-                array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
-         FROM noo_agent_messages WHERE from_agent = $1 OR to_agent = $1 \
-         GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
+/// The clause for "mail that is mine" given the name a caller holds: a
+/// connection (`account/label`) owns exactly itself, an account owns its
+/// name and everything under `<name>/`. One definition, used by [`list`]
+/// (`Filter::owner`) and [`threads`], so "mine" cannot drift between them.
+fn owner_scope_clause(owner: &str) -> String {
+    if owner.contains(crate::auth::CONNECTION_SEP) {
+        AGENT_CLAUSE.to_string()
     } else {
+        owner_clause()
+    }
+}
+
+/// Threads: derived from the messages (no thread table). Newest activity
+/// first. `agent` scopes to one exact name's view; `owner` to everything a
+/// caller holds ([`owner_scope_clause`]); neither lists every thread.
+pub async fn threads(db: &PgPool, agent: Option<&str>, owner: Option<&str>, limit: i64) -> Result<Vec<Value>, sqlx::Error> {
+    use sqlx::Row;
+    let scope = agent.or(owner);
+    let clause = match (agent, owner) {
+        (Some(_), _) => AGENT_CLAUSE.replace("$N", "$1"),
+        (None, Some(o)) => owner_scope_clause(o).replace("$N", "$1"),
+        (None, None) => " AND $1::text IS NULL".to_string(),
+    };
+    let sql = format!(
         "SELECT thread_id, COUNT(*) AS n, MIN(ts) AS started, MAX(ts) AS last, \
                 array_agg(DISTINCT from_agent) AS senders, array_agg(DISTINCT to_agent) AS recipients \
-         FROM noo_agent_messages WHERE $1::text IS NULL \
+         FROM noo_agent_messages WHERE 1=1{clause} \
          GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
-    };
+    );
+    let sql = sql.as_str();
     let rows = sqlx::query(sql)
-        .bind(agent)
+        .bind(scope)
         .bind(limit.clamp(1, 500))
         .fetch_all(db)
         .await?;
@@ -383,6 +395,15 @@ mod owner_tests {
     /// `to`, in the outer query and in the thread sub-select.
     fn terms(sql: &str) -> usize {
         sql.matches("starts_with(").count()
+    }
+
+    #[test]
+    fn thread_listing_reuses_the_one_definition_of_mine() {
+        assert_eq!(owner_scope_clause("bob"), owner_clause());
+        assert_eq!(owner_scope_clause("bob/laptop"), AGENT_CLAUSE);
+        let src = include_str!("agent_messages.rs");
+        let body = src.split("pub async fn threads(").nth(1).expect("threads fn");
+        assert!(body.contains("owner_scope_clause(o)"), "threads must reuse the owner clause");
     }
 
     #[test]

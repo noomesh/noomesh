@@ -311,6 +311,28 @@ pub async fn live_for(db: &sqlx::PgPool, account: &str) -> Result<Vec<serde_json
     })).collect())
 }
 
+/// Live sessions under EVERY account (operator view), newest first. Same
+/// rows as [`live_for`] plus the `account` each belongs to.
+pub async fn live_all(db: &sqlx::PgPool) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let rows: Vec<(String, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT account, label, consumer, display_name, opened_at, last_seen FROM noo_mcp_sessions \
+         WHERE last_seen > now() - ($1 || ' seconds')::interval \
+         ORDER BY last_seen DESC",
+    )
+    .bind(IDLE_TTL.as_secs().to_string())
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|(account, label, consumer, display_name, opened_at, last_seen)| serde_json::json!({
+        "account": account,
+        "connection": format!("{account}{}{label}", crate::auth::CONNECTION_SEP),
+        "label": label,
+        "consumer": consumer,
+        "display_name": display_name,
+        "opened_at": opened_at,
+        "last_seen": last_seen,
+    })).collect())
+}
+
 /// Live session count, for `/health`-style reporting and tests.
 pub fn live() -> usize {
     registry().read().map(|m| m.len()).unwrap_or(0)
