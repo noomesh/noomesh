@@ -19947,6 +19947,52 @@
           }
         ]
       }
+    },
+    "/api/cluster/nodes/{node_id}/tunnel-probe": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tunnel probe",
+        "description": "[native] GET /api/cluster/nodes/{node_id}/tunnel-probe",
+        "operationId": "tunnel_probe",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/node/tunnel": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get tunnel",
+        "description": "[native] GET /api/node/tunnel: the node's upgrade. Admission: a node-actor cluster token (the auth layer put it in `ClusterNode`), on a connection whose mTLS leaf names the same node, with a certificate thumbprint to bind the hello to. Anything less is refused with the remedy. After the upgrade the node must still answer the gateway's signed challenge.",
+        "operationId": "upgrade",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
