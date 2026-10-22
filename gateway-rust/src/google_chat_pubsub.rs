@@ -73,7 +73,7 @@ pub fn spawn(state: Arc<AppState>) {
 }
 
 async fn run(state: Arc<AppState>, subscription: String) {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()
         .timeout(Duration::from_secs(PULL_TIMEOUT_SECS + 15))
         .build()
         .unwrap_or_default();

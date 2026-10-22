@@ -249,9 +249,9 @@ async fn health_probe() -> ! {
     // reason, rather than reporting healthy against an unidentified peer:
     // "unhealthy because I cannot establish who answered" is the honest
     // verdict, and the message says which file to fix.
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+    let mut builder = tls::client_builder().timeout(Duration::from_secs(5));
     match tls::cluster_ca_certificate() {
-        Ok(Some(cert)) => builder = builder.add_root_certificate(cert),
+        Ok(Some(cert)) => builder = builder.tls_certs_merge([cert]),
         Ok(None) => {}
         Err(e) => {
             eprintln!("health: {e}");
