@@ -176,7 +176,7 @@ func TestDeclarationsReplaceAndValidate(t *testing.T) {
 	if _, ok := addonwl.Lookup("pai-voice", "voice-worker"); ok {
 		t.Fatal("cleared")
 	}
-	for name, want := range map[string]bool{"pai-voice": true, "voice_worker2": true, "": false, "Voice": false, "1x": false, "a.b": false, strings.Repeat("a", 33): false} {
+	for name, want := range map[string]bool{"pai-voice": true, "voice_worker2": false, "voice-worker2": true, "": false, "Voice": false, "1x": false, "a.b": false, strings.Repeat("a", 33): false} {
 		if addonwl.NameOK(name) != want {
 			t.Fatalf("NameOK(%q) = %v", name, !want)
 		}

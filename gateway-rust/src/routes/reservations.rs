@@ -183,7 +183,7 @@ async fn workloads_list(ctx: Option<axum::Extension<crate::auth::RequesterCtx>>)
     let v: Vec<Value> = crate::addon_workloads::declared()
         .iter()
         .map(|d| json!({"workload": d.key(), "addon": d.addon, "name": d.name, "container": d.container, "gpu": d.gpu, "need_mb": d.need_mb,
-            "drain": d.drain.as_ref().map(|x| json!({"route": x.route, "timeout_secs": x.timeout_secs}))}))
+            "drain": {"route": d.drain.route, "timeout_secs": d.drain.timeout_secs}}))
         .collect();
     Ok(Json(json!({"workloads": v})))
 }
@@ -240,8 +240,9 @@ async fn wait_ready(link: &crate::node_link::NodeLink, decl: &crate::addon_workl
 /// Drain and stop a workload on a node: the add-on's declared drain route,
 /// then the actuator's stop. `force` carries on past a failed drain.
 async fn drain_and_stop(link: &crate::node_link::NodeLink, decl: &crate::addon_workloads::WorkloadDecl, reservation: &str, force: bool) -> Result<Value, String> {
-    let mut drained = json!(null);
-    if let Some(drain) = &decl.drain {
+    let drained;
+    let drain = &decl.drain;
+    {
         let body = json!({"reservation": reservation, "workload": decl.key(), "timeout_secs": drain.timeout_secs});
         match tokio::time::timeout(
             std::time::Duration::from_secs(drain.timeout_secs + 30),
@@ -251,12 +252,18 @@ async fn drain_and_stop(link: &crate::node_link::NodeLink, decl: &crate::addon_w
         {
             Ok(crate::addon_proxy::CallOutcome::Ok(v)) => drained = v,
             Ok(crate::addon_proxy::CallOutcome::Unavailable(reason)) if !force => return Err(format!("drain route {} refused: {reason}", drain.route)),
-            Ok(crate::addon_proxy::CallOutcome::Unavailable(reason)) => tracing::warn!(addon = %decl.addon, route = %drain.route, reason = %reason, "reservation_drain_skipped_by_force"),
+            Ok(crate::addon_proxy::CallOutcome::Unavailable(reason)) => {
+                tracing::warn!(addon = %decl.addon, route = %drain.route, reason = %reason, "reservation_drain_skipped_by_force");
+                drained = json!({"skipped": reason});
+            }
             Err(_) if !force => return Err(format!("drain route {} did not answer within {} s", drain.route, drain.timeout_secs + 30)),
-            Err(_) => tracing::warn!(addon = %decl.addon, route = %drain.route, "reservation_drain_timeout_forced"),
+            Err(_) => {
+                tracing::warn!(addon = %decl.addon, route = %drain.route, "reservation_drain_timeout_forced");
+                drained = json!({"skipped": "timeout"});
+            }
         }
     }
-    let grace = decl.drain.as_ref().map(|d| d.timeout_secs.min(600)).unwrap_or(30);
+    let grace = drain.timeout_secs.min(600);
     let stopped = actuator(link, decl, "/stop", json!({"timeout_secs": grace}), grace + 60).await?;
     Ok(json!({"drained": drained, "stopped": stopped}))
 }
@@ -651,7 +658,8 @@ mod tests {
     use crate::addon_workloads::WorkloadDecl;
 
     fn decl(gpu: bool, need_mb: u64) -> WorkloadDecl {
-        WorkloadDecl { addon: "pai-voice".into(), name: "voice-worker".into(), container: "noo-pai-voice-worker".into(), gpu, need_mb, drain: None }
+        WorkloadDecl { addon: "pai-voice".into(), name: "voice-worker".into(), container: "noo-pai-voice-worker".into(), gpu, need_mb,
+            drain: crate::addon_workloads::DrainSpec { route: "drain".into(), timeout_secs: 120 } }
     }
 
     fn node(gc: Value) -> Value {
