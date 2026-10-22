@@ -51,6 +51,7 @@ import (
 	dockerpkg "github.com/noomesh/noomesh/node-agent-go/internal/docker"
 	"github.com/noomesh/noomesh/node-agent-go/internal/embedtarget"
 	"github.com/noomesh/noomesh/node-agent-go/internal/harnessprofile"
+	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 )
 
 // Per-backend TLS env-var names. When set to a truthy value, node-agent
@@ -1047,7 +1048,17 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.Body.Close()
+	// Counted, never queued: a query-time embed must not wait here, but the
+	// pulled-embedding worker (i179) reserves a slot for it and has to see
+	// it in in_flight to keep that reserve.
+	defer occupancy.Track(embedTargetFor(body).Backend)()
+	s.embedProxyBody(w, r, body)
+}
 
+// embedProxyBody is /embed after the body is read: resolve the local target,
+// speak its dialect, copy the answer back. EmbedLocal calls it directly; its
+// caller has already admitted the work through occupancy.
+func (s *Server) embedProxyBody(w http.ResponseWriter, r *http.Request, body []byte) {
 	// A NATIVE embedder (ollama served on this host, a Mac's Metal lane) is
 	// on loopback, not on the docker network, and has no container for the
 	// guard below to find. Same rule as the chat proxy above: the adopted
