@@ -1415,15 +1415,22 @@ fn strike_outcome(recorded: &Result<(), sqlx::Error>) -> StrikeOutcome {
 /// Record a failed login attempt (increment counter, lock after threshold).
 /// An `Err` means the strike was NOT counted; the caller must fail closed.
 async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
-    let sql = format!(
+    // The threshold and the window are bound, not interpolated: sqlx 0.9
+    // refuses a dynamic SQL string, and a literal with binds is what we want.
+    let r = sqlx::query(
         "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
          locked_until = CASE \
-           WHEN COALESCE(failed_login_count, 0) + 1 >= {LOCKOUT_STRIKES} THEN NOW() + INTERVAL '{LOCKOUT_MINUTES} minutes' \
+           WHEN COALESCE(failed_login_count, 0) + 1 >= $2 THEN NOW() + make_interval(mins => $3) \
            ELSE locked_until \
          END \
-         WHERE username = $1"
-    );
-    let r = sqlx::query(&sql).bind(username).execute(db).await.map(|_| ());
+         WHERE username = $1",
+    )
+    .bind(username)
+    .bind(LOCKOUT_STRIKES)
+    .bind(LOCKOUT_MINUTES)
+    .execute(db)
+    .await
+    .map(|_| ());
     if let Err(e) = &r {
         tracing::error!(username = %username, error = %e, "failed-login strike could not be recorded; refusing the attempt");
     }
