@@ -1991,12 +1991,6 @@ fn bearer_token(request: &Request) -> Option<String> {
     {
         return Some(t.to_string());
     }
-    // An add-on UI page load: the path-scoped cookie the console set with
-    // `POST /api/addons/<addon>/ui-session`, on a GET/HEAD under
-    // `/addons/<addon>/ui` only (`addon_ui::cookie_token`).
-    if let Some(t) = crate::addon_ui::cookie_token(request.method(), request.uri().path(), request.headers()) {
-        return Some(t);
-    }
     let token = request.uri().query().and_then(query_param_token)?;
     if query_token_allowed(request) {
         return Some(token);

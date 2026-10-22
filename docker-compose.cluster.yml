@@ -185,6 +185,13 @@ services:
       # overlay. There is no public tunnel any more — the tailnet (and LAN
       # /mDNS) is the only way in. See .env.example.
       - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_PORT_GATEWAY:-8080}:8080"
+      # Add-on UI origins (gateway-rust/src/addon_ui.rs): each add-on with a
+      # `ui` gets an HTTPS listener of its own on a port from this range, so
+      # its scripts run on an origin separate from the console's. Same
+      # numbers inside and out: the browser is sent to that port. Front each
+      # allocated port with `tailscale serve --https=<port>` like :8080
+      # (docs/development/addons.md "Serving a UI").
+      - "${NOO_BIND_ADDR:-0.0.0.0}:${NOO_ADDON_UI_PORTS:-8450-8499}:${NOO_ADDON_UI_PORTS:-8450-8499}"
       # No MCP port. The operator door is `/mcp/operator` on the gateway
       # port above, credential mandatory. The plain-HTTP listener this used
       # to publish on 127.0.0.1:3100 was removed in stack-v0.2.40 (§3f R38):
@@ -248,6 +255,12 @@ services:
       - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
       - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
     environment:
+      # Add-on UI origin ports (see `ports:` above) and, optionally, the
+      # console origin(s) allowed to frame an add-on UI (CSP frame-ancestors);
+      # unset means this host on 443 and on NOO_PORT_GATEWAY.
+      - NOO_ADDON_UI_PORTS=${NOO_ADDON_UI_PORTS:-8450-8499}
+      - NOO_PORT_GATEWAY=${NOO_PORT_GATEWAY:-8080}
+      - NOO_CONSOLE_ORIGIN=${NOO_CONSOLE_ORIGIN:-}
       - DEV_MODE=${DEV_MODE:-}
       # The controller's OWN identity, and it must be stable across container
       # recreates. Without it `agent_messages::controller_node()` falls through

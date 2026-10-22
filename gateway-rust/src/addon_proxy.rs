@@ -121,10 +121,11 @@
 //! headers, and only then upgraded; frames are piped both ways
 //! ([`crate::addon_ws`]).
 //!
-//! The top-level `ui` key serves the add-on's own web UI at
-//! `/addons/<addon>/ui/…`, a gateway-owned namespace no core route uses:
-//! GET/HEAD only, `min_role` enforced, path traversal refused, response
-//! headers sanitised and a gateway CSP added ([`crate::addon_ui`]).
+//! The top-level `ui` key serves the add-on's own web UI on an ORIGIN OF ITS
+//! OWN: a gateway listener on a port allocated from `NOO_ADDON_UI_PORTS`,
+//! entered through a one-time code the console mints, authenticated there by
+//! that origin's own cookie only; the console origin never serves add-on UI
+//! ([`crate::addon_ui`]).
 //!
 //! A gateway from before these keys refuses a manifest that uses them
 //! (unknown method, unknown key), so an add-on that declares them ships with
@@ -217,24 +218,22 @@ pub struct AddonManifest {
     /// manifest: it is reachable by the gateway, not through the front door.
     #[serde(default)]
     pub task_events: Option<TaskEventsSpec>,
-    /// The add-on's own web UI, served at `/addons/<addon>/ui/…`
+    /// The add-on's own web UI, served on an origin of its own
     /// ([`crate::addon_ui`]). Absent: the add-on serves no UI.
     #[serde(default)]
     pub ui: Option<UiSpec>,
 }
 
-/// The manifest's `ui` key: `{"upstream_path": "/ui", "min_role": "user"}`.
+/// The manifest's `ui` key: `{"upstream_path": "/", "min_role": "user"}`.
 ///
-/// `/addons/<addon>/ui/<rest>` is fetched from `<upstream><upstream_path>/<rest>`.
-/// The gateway path is fixed (the add-on cannot choose where its UI is
-/// mounted), so it can never shadow a core path.
+/// On the add-on's own origin (`https://<host>:<its port>`), `/<rest>` is
+/// fetched from `<upstream><upstream_path>/<rest>` ([`crate::addon_ui`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiSpec {
     /// Where the add-on serves its UI on its own side: a plain path, no
-    /// `{param}`. Default `/`: the gateway strips `/addons/<addon>/ui` and
-    /// forwards the rest as it is (a UI built for a directory mount, with
-    /// relative asset, API and socket paths, needs nothing else).
+    /// `{param}`. Default `/`: the request path on the add-on origin is
+    /// forwarded as it is.
     #[serde(default = "default_ui_upstream")]
     pub upstream_path: String,
     /// The lowest role that may load the UI. Absent means `operator`, as on
@@ -1016,14 +1015,6 @@ fn owner_scoped_allows(
 }
 
 fn get_allows(manifests: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-    // An add-on's UI (`/addons/<addon>/ui/…`) is scoped by its `ui.min_role`.
-    if let Some(addon) = crate::addon_ui::ui_addon_of(path) {
-        return manifests
-            .iter()
-            .find(|m| m.addon == addon)
-            .and_then(|m| m.ui.as_ref())
-            .is_some_and(|ui| ui.permits(role));
-    }
     let hits = matching_routes(manifests, "GET", path);
     !hits.is_empty() && hits.iter().all(|r| r.permits(role, scopes))
 }
@@ -1652,12 +1643,6 @@ pub(crate) mod tests {
                  "internal": true, "timeout_secs": 5}
             ]
         })
-    }
-
-    /// The front door's add-on GET decision over given manifests (for tests
-    /// in sibling modules).
-    pub(crate) fn get_allows_for_test(m: &[AddonManifest], scopes: &[String], role: crate::auth::Role, path: &str) -> bool {
-        get_allows(m, scopes, role, path)
     }
 
     pub(crate) fn sample() -> AddonManifest {

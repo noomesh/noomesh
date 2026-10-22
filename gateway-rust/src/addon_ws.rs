@@ -9,7 +9,7 @@
 //!
 //! 1. **Authenticated before the upgrade.** A browser cannot set
 //!    `Authorization` on a WebSocket, and a bearer in a URL lands in every
-//!    access log on the way, so an add-on socket takes one of two
+//!    access log on the way, so an add-on socket takes one of three
 //!    credentials and never `?token=` (the front door ignores `?token=` under
 //!    `/ws/addons/`):
 //!    - a **ticket**: the page (holding the person's access token) calls
@@ -21,7 +21,10 @@
 //!      front door lets a handshake carrying `ticket=` through to
 //!      [`serve_ws`], which redeems it (gone after one use, valid or not);
 //!    - the `Authorization` header, for a non-browser client, checked by the
-//!      front door like any bearer.
+//!      front door like any bearer;
+//!    - on the add-on's OWN origin ([`crate::addon_ui`]), that origin's
+//!      session cookie, checked with the `Origin` header by the origin's gate
+//!      (no ticket there).
 //! 2. **Permission before anything is dialled.** [`serve_ws`] checks the
 //!    route's `min_role` against the verified requester, then the per-user
 //!    connection cap, and only then dials the add-on.
@@ -303,13 +306,15 @@ pub fn method_router(
               params: Option<Path<HashMap<String, String>>>,
               RawQuery(q): RawQuery,
               headers: HeaderMap,
-              ctx: Option<axum::Extension<crate::auth::RequesterCtx>>| {
+              ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+              origin: Option<axum::Extension<crate::addon_ui::OriginSession>>| {
             let manifest = manifest.clone();
             let spec = spec.clone();
             async move {
                 let params = params.map(|Path(p)| p).unwrap_or_default();
                 let requester = ctx.map(|axum::Extension(r)| r);
-                serve_ws(state, &manifest, &spec, ws, params, q, &headers, requester).await
+                let origin = origin.map(|axum::Extension(o)| (o.exp, o.sub));
+                serve_ws(state, &manifest, &spec, ws, params, q, &headers, requester, origin).await
             }
         },
     )
@@ -344,6 +349,7 @@ async fn serve_ws(
     query: Option<String>,
     headers: &HeaderMap,
     requester: Option<crate::auth::RequesterCtx>,
+    origin_session: Option<(usize, String)>,
 ) -> Response {
     let addon = manifest.addon.as_str();
     // 0. Who is calling. A `ticket=` is redeemed here (the front door let the
@@ -367,10 +373,12 @@ async fn serve_ws(
             }
         },
         None => {
-            // A bearer the front door verified (header only: `?token=` is not
-            // a credential under /ws/addons/).
+            // On the add-on's own origin: the origin's cookie session (its
+            // gate already checked the cookie and the Origin header). On the
+            // console port: a bearer the front door verified (header only:
+            // `?token=` is not a credential under /ws/addons/).
             if requester.is_some() {
-                session_of = bearer_session(headers);
+                session_of = origin_session.or_else(|| bearer_session(headers));
             }
             requester
         }
