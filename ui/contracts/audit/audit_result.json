@@ -3,8 +3,14 @@
   "/api/addons/<id>/console-piece": [
    "apps/web/src/features/addons/useConsolePieces.ts"
   ],
+  "/api/addons/ui": [
+   "apps/web/src/features/addons/useAddonUis.ts"
+  ],
   "/api/addons/{addon_id}/console-piece": [
    "apps/web/src/features/addons/useConsolePieces.ts"
+  ],
+  "/api/addons/{addon_id}/ui-session": [
+   "apps/web/src/features/addons/useAddonUis.ts"
   ],
   "/api/alerts/clients": [
    "apps/web/src/features/jobs/useJobs.ts"
@@ -300,6 +306,7 @@
   "/api/activities/{id}/status",
   "/api/addon/token",
   "/api/addons/{addon_id}/cli-piece",
+  "/api/addons/{addon_id}/ws-ticket",
   "/api/agent/loops",
   "/api/agent/run",
   "/api/agents/archive",

@@ -510,9 +510,10 @@ token in the browser on the console's origin, and no add-on script may read
 it. An origin is scheme + host + port, and the fleet is reached at a single
 tailnet name (`noo-controller.<tailnet>.ts.net`, no subdomains), so the
 gateway gives each add-on with a `ui` an HTTPS listener on a port of its own,
-from `NOO_ADDON_UI_PORTS` (default `8450-8499`). The port comes from a hash
-of your add-on's name, so the same set of add-ons always gets the same
-ports. The listener uses the gateway's certificate, and the console origin
+from `NOO_ADDON_UI_PORTS` (default `8450-8459`, room for ten add-on UIs;
+widen it, e.g. `8450-8499`, when more add-ons serve one, at the cost of one
+published port each). The port comes from a hash of your add-on's name, so
+the same set of add-ons always gets the same ports. The listener uses the gateway's certificate, and the console origin
 never serves add-on UI.
 
 On that origin, everything is yours and nothing else is there:
@@ -528,28 +529,55 @@ On that origin, everything is yours and nothing else is there:
 So build the UI to be served from `/`, with root-relative or relative paths
 to its assets, its API and its sockets.
 
+**Finding and opening a UI.** `GET /api/addons/ui` (any signed-in account)
+answers `{"uis": [{"addon", "title", "port", "url_base", "can_open"}]}`: a
+User sees the UIs its role may open, an Operator or Admin sees all of them.
+The console's **Add-ons** tab lists them with an **Open** button.
+
 **Session handoff.**
 
 1. The console calls `POST /api/addons/<name>/ui-session` on its own origin
    with `Authorization: Bearer`. The gateway checks `ui.min_role` and answers
-   `{"code", "port", "path", "url", "expires_in": 30, "session_expires_at"}`.
-   The code is random, single use, valid for 30 seconds, and bound to that
-   person and that add-on.
-2. The browser opens `url` (`https://<host>:<port>/__noo/session?code=…`) in a
-   tab or the console's iframe. Your origin redeems the code and sets its
-   own cookie `noo_ui_<name>`: HttpOnly, Secure, SameSite=Strict, host-only,
-   `Path=/`. The cookie holds an opaque session id, never the token. It
-   expires with the access token the console presented. The browser is then
-   redirected to `/`.
-3. On your origin that cookie authenticates your UI, your API routes and
-   your sockets, and nothing else does: a bearer token is not accepted
-   there, and the console port never reads a `noo_ui_*` cookie. Every
-   request re-checks the account's session floor (logout, disable,
-   demotion).
+   `{"code", "port", "path", "url", "expires_in": 30, "session_idle_secs",
+   "session_max_secs"}`. The code is random, single use, valid for 30
+   seconds, and bound to that person, that add-on and this browser: the same
+   answer sets a cookie `noo_handoff_<name>` (HttpOnly, Secure,
+   SameSite=Strict, `Path=/__noo/session`, 30 s). Cookies ignore ports, so
+   the browser that minted the code presents it on your origin; any other
+   browser does not have it.
+2. The console opens `url` (`https://<host>:<port>/__noo/session?code=…`) in
+   a new tab. Your origin redeems the code only when the binding cookie
+   matches and the request is a top-level navigation no other site started
+   (no foreign `Origin`, no `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode:
+   navigate` when the browser sends it). It sets its own cookie
+   `noo_ui_<name>` (HttpOnly, Secure, SameSite=Strict, host-only, `Path=/`).
+   The cookie holds an opaque session id, never a token, and the binding
+   cookie is cleared. The browser is then redirected to `/`.
+3. The session **slides**: it ends after `NOO_ADDON_UI_SESSION_IDLE_SECS`
+   (default 8 h) without a request and after `NOO_ADDON_UI_SESSION_MAX_SECS`
+   (default 24 h) however active. It is not tied to the console's short
+   access token, and no refresh token ever reaches your origin. Instead,
+   every request re-checks the person:
+   - the session floor (logout, password change, disable);
+   - the live role (a demotion below the session's role ends it);
+   - your add-on still being enabled.
 
-When the session ends, your origin answers `401` (and a socket closes with
-`4401`). Ask the console for a new handoff, for example with `postMessage` to
-the parent frame.
+   An open socket re-checks every minute and on a logout broadcast, then
+   closes with `4401`.
+4. On your origin that cookie authenticates your UI, your API routes and
+   your sockets, and nothing else does: a bearer token is not accepted
+   there, and the console port never reads a `noo_ui_*` cookie.
+
+When the session ends, your origin answers `401` and a socket closes with
+`4401`. Show the person a link back to the console's **Add-ons** tab.
+
+**Residual login-CSRF risk.** An attacker who holds an account can mint a
+code for themselves. Opening that code in a victim's browser fails, because
+the victim has no matching binding cookie. What remains: someone who can
+already run script on the console origin, or plant cookies on this host (a
+compromised add-on origin on the same host can set a host-only cookie for
+`Path=/__noo/session`, but cannot read the victim's console token), could
+fixate a session. The window is 30 seconds and one use.
 
 **Writes and sockets from your UI.** Cookies ignore ports, so the browser
 also sends your cookie to other add-ons' ports on the same host. On your
@@ -595,23 +623,32 @@ header.
   (percent-encoding is refused, not decoded), or a character outside
   `[A-Za-z0-9._~@+-]`. Refused with `403`: a service-worker script fetch.
 
-**Exposing the ports (operator).** The gateway publishes the whole range,
-with the same number on the host as in the container
-(`docker-compose.cluster.yml`: `${NOO_BIND_ADDR}:${NOO_ADDON_UI_PORTS}`).
-The console is reached through `tailscale serve` on 443, fronting
-`https://<tailnet-ip>:8080`. Each add-on UI port needs the same treatment on
-its own number, because the browser is sent to that port:
+**Exposing the ports (operator).** The gateway publishes the range on
+loopback (`${NOO_ADDON_UI_BIND_ADDR:-127.0.0.1}:${NOO_ADDON_UI_PORTS}`, with
+the same number inside and out). The browser reaches each port through
+`tailscale serve` with the tailnet's certificate, exactly like Grafana's own
+origin. After every successful `noo stack start` and `noo stack restart`, the
+launcher asks the gateway which ports are allocated (`GET /api/addons/ui`)
+and then:
 
-```bash
-# the port is in the gateway log ("add-on UI origin listening", addon=…, port=…)
-# and in the ui-session answer
-sudo tailscale serve --bg --https=8461 https://<tailnet-ip>:8461
-```
+- fronts each one: `tailscale serve --bg --https=<port> https://127.0.0.1:<port>`;
+- removes its own entry (only `/` → `https://127.0.0.1:<port>`) from any
+  port in the range that is no longer allocated (`tailscale serve
+  --https=<port> off`);
+- leaves alone, and reports, a port that carries anything else.
 
-`noo onboard` does not write these mappings yet. Change the range with
-`NOO_ADDON_UI_PORTS=<first>-<last>` in `.env` (above 1024, at most 1000
-ports). Set `NOO_CONSOLE_ORIGIN=https://noo-controller.<tailnet>.ts.net` if
-the console is reached under a different origin than the default.
+It never touches the tailnet policy. If tailscale refuses the change (no
+operator permission and no passwordless sudo), it prints the exact
+`sudo tailscale serve …` line to run.
+
+- An install without tailscale sets `NOO_ADDON_UI_BIND_ADDR` to the address
+  browsers use.
+- Set `NOO_CONSOLE_ORIGIN=https://noo-controller.<tailnet>.ts.net` when the
+  console is reached under a different origin than the default (this host on
+  443 and on the gateway port). It is the CSP `frame-ancestors` of the add-on
+  origins.
+- The add-on origin listeners carry the console router's request logging,
+  rate limiting, audit-address and panic layers.
 
 ## Step 2b — claim a subject prefix (NATS add-ons)
 

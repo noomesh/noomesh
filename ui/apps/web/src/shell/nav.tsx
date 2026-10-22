@@ -33,6 +33,8 @@ const CORE_NAV: NavSection[] = [
       { id: 'backends', label: 'Backends', status: 'live' },
       { id: 'model-prefs', label: 'Models', status: 'live' },
       { id: 'tasks', label: 'Tasks', status: 'live' },
+      // Add-on web UIs, each opened in a new tab on its own origin.
+      { id: 'addons', label: 'Add-ons', status: 'live' },
     ],
   },
   {
@@ -162,6 +164,14 @@ const CORE_ICONS: Record<string, ReactNode> = {
     <>
       <circle cx="10" cy="10" r="2.6" />
       <path d="M10 3v2M10 15v2M3 10h2M15 10h2M5 5l1.5 1.5M13.5 13.5L15 15M15 5l-1.5 1.5M5 15l1.5-1.5" />
+    </>
+  ),
+  addons: (
+    <>
+      <rect x="3" y="3" width="6" height="6" rx="1" />
+      <rect x="11" y="3" width="6" height="6" rx="1" />
+      <rect x="3" y="11" width="6" height="6" rx="1" />
+      <path d="M14 11v6M11 14h6" />
     </>
   ),
   workflow: (
