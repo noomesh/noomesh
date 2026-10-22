@@ -272,15 +272,24 @@ print_service_urls() {
     if declare -F ui_note >/dev/null 2>&1; then
         ui_note "NATS monitoring verifies client certs — curl needs --cert/--key/--cacert from the cluster PKI"
     fi
-    _say_kv "PostgreSQL" "localhost:${POSTGRES_PORT:-5433}" "  PostgreSQL:         localhost:${POSTGRES_PORT:-5433}"
+    # Print where Postgres is really published (the compose publish is
+    # ${POSTGRES_BIND:-127.0.0.1}), so the line never reads as loopback when a
+    # warm-standby POSTGRES_BIND puts it on the tailnet, and the gateway's
+    # bind note below is never mistaken for Postgres' (2026-10-21: it was).
+    _pg_bind="${POSTGRES_BIND:-127.0.0.1}"
+    if [ "$_pg_bind" = "127.0.0.1" ] || [ "$_pg_bind" = "localhost" ]; then
+        _say_kv "PostgreSQL" "localhost:${POSTGRES_PORT:-5433} (loopback only)" "  PostgreSQL:         localhost:${POSTGRES_PORT:-5433} (loopback only)"
+    else
+        _say_kv "PostgreSQL" "${_pg_bind}:${POSTGRES_PORT:-5433} (POSTGRES_BIND: reachable on that address, for a warm standby)" "  PostgreSQL:         ${_pg_bind}:${POSTGRES_PORT:-5433} (POSTGRES_BIND: reachable on that address, for a warm standby)"
+    fi
     if [ "$host" != "localhost" ]; then
         if declare -F ui_note >/dev/null 2>&1; then
-            ui_note "bound to $host, not loopback — the https://localhost form will refuse; this node's MagicDNS URL works too (noo stack status prints it). Prometheus, NATS monitoring and Postgres are loopback-only by design"
+            ui_note "the gateway and console are bound to $host, not loopback — https://localhost to them will refuse; this node's MagicDNS URL works too (noo stack status prints it). Prometheus and NATS monitoring stay loopback-only"
         else
             echo ""
-            echo "  (bound to $host, not loopback — the https://localhost form will"
-            echo "   refuse. This node's MagicDNS URL works too (noo stack status). Prometheus,"
-            echo "   NATS monitoring and Postgres are loopback-only by design.)"
+            echo "  (the gateway and console are bound to $host, not loopback — https://localhost"
+            echo "   to them will refuse. This node's MagicDNS URL works too (noo stack status)."
+            echo "   Prometheus and NATS monitoring stay loopback-only.)"
         fi
     fi
 }
