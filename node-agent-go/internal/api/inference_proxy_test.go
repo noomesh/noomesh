@@ -148,8 +148,9 @@ func TestFilterBodyForBackend(t *testing.T) {
 			name:        "ollama keeps its reasoning fields",
 			in:          `{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false},"reasoning":{"effort":"none"},"reasoning_effort":"low","think":false}`,
 			backendType: "ollama",
-			mustHave:    []string{"reasoning", "reasoning_effort", "think"},
-			mustNotHave: []string{"chat_template_kwargs"},
+			// chat_template_kwargs too: the /api/chat translator reads it
+			// (i183); it is consumed there, never sent to ollama.
+			mustHave: []string{"reasoning", "reasoning_effort", "think", "chat_template_kwargs"},
 		},
 		{
 			name:        "llamacpp keeps n_predict",
