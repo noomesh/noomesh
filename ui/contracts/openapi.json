@@ -19278,6 +19278,465 @@
           }
         }
       }
+    },
+    "/api/addon-workloads/{addon}/{workload}/status": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get status",
+        "description": "[native] `GET /api/addon-workloads/{addon}/{workload}/status`: how an add-on observes its own reservation without touching the worker. The add-on's own token or an operator; 404 when the workload is not declared. `{workload, reserved, reservation: {id, node, holder, state, since, generation} | null}`.",
+        "operationId": "workload_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get reservations",
+        "description": "[native] GET /api/cluster/reservations \u2014 every lease the nodes report. Operator read.",
+        "operationId": "reservations_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create reservations",
+        "description": "[native] POST /api/cluster/reservations \u2014 body `{workload: \"<addon>/<name>\", node?, hand_over?: <reservation id>, timeout_secs?}`. Operator only; audited (`reservation_take`).",
+        "operationId": "reservation_take",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations/{id}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get reservations",
+        "description": "[native] GET /api/cluster/reservations/{id}",
+        "operationId": "reservation_get",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Delete reservations",
+        "description": "[native] POST /api/cluster/reservations/{id}/release (or DELETE \u2026/{id}) \u2014 body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.",
+        "operationId": "reservation_release",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/reservations/{id}/release": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Create release",
+        "description": "[native] POST /api/cluster/reservations/{id}/release (or DELETE \u2026/{id}) \u2014 body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.",
+        "operationId": "reservation_release",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cluster/workloads": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Get workloads",
+        "description": "[native] GET /api/cluster/workloads \u2014 what the verified add-on bundles declare.",
+        "operationId": "workloads_list",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addon-workloads/{addon}/{workload}/proxy/{*path}": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_get",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_post",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_put",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_patch",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Reach a reserved workload",
+        "description": "[native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.",
+        "operationId": "workload_proxy_delete",
+        "parameters": [
+          {
+            "name": "addon",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The path inside the worker's container, forwarded as is"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker's answer, streamed"
+          },
+          "403": {
+            "description": "Not the add-on's own token, nor an operator"
+          },
+          "404": {
+            "description": "No verified add-on bundle declares this workload"
+          },
+          "409": {
+            "description": "not_reserved: the workload holds no GPU right now"
+          }
+        }
+      }
     }
   },
   "components": {
