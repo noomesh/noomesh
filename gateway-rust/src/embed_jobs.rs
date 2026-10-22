@@ -107,19 +107,18 @@ static PUSH_SLOTS: LazyLock<tokio::sync::Semaphore> =
 
 // ── Names ────────────────────────────────────────────────────────────────
 
-/// The model's slug: lowercase, then every character outside `[a-z0-9_-]`
-/// becomes `_`. No trimming, no collapsing. Byte-for-byte what the node-agent
-/// computes (`embedpull_subjects.go`); the test vectors below are the
-/// contract's.
+/// The model's slug: ASCII `A-Z` lowercased, then every character outside
+/// `[a-z0-9_-]` becomes `_`. No trimming, no collapsing. Byte-for-byte what
+/// the node-agent computes (`EmbedSlug`, node-agent-go/internal/jobs); the
+/// test vectors below are the contract's.
 ///
-/// Lowercasing is per character and keeps the first character of a multi-
-/// character expansion, which is Go's `unicode.ToLower` (simple case mapping).
-/// `str::to_lowercase` would turn U+0130 into two characters and shift every
-/// `_` after it.
+/// ASCII only on purpose: Unicode lowercasing differs between Rust and Go
+/// (U+0130 is one character in one and two in the other), and a slug that
+/// differs by one `_` sends a model's jobs to a subject nobody pulls.
 pub fn slug(model: &str) -> String {
     model
         .chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .map(|c| c.to_ascii_lowercase())
         .map(|c| if matches!(c, 'a'..='z' | '0'..='9' | '_' | '-') { c } else { '_' })
         .collect()
 }
@@ -1341,9 +1340,18 @@ mod tests {
     }
 
     #[test]
+    fn slug_never_lowercases_outside_ascii() {
+        // One `_` per non-ASCII character, whatever its case mapping.
+        assert_eq!(slug("\u{130}x"), "_x");
+        assert_eq!(slug("\u{212A}elvin"), "_elvin");
+        assert_eq!(slug("Émbed"), "_mbed");
+    }
+
+    #[test]
     fn slug_is_one_underscore_per_character() {
-        // The multi-character lowercase of U+0130 must not add a character.
-        assert_eq!(slug("\u{130}"), "i");
+        // Non-ASCII is never lowercased, so U+0130 (two characters when Go
+        // lowercases it) is one `_` here and in EmbedSlug.
+        assert_eq!(slug("\u{130}"), "_");
         assert_eq!(slug("é"), "_");
         assert_eq!(slug("日本"), "__");
     }
