@@ -132,8 +132,8 @@ all = [
 ]
 
 [project.scripts]
-# NOTE: the console script is `noo-py`, not `pai` — the `pai` name belongs to
-# the Rust front-door binary (noo-cli/, installed at ~/.local/bin/pai), which
+# NOTE: the console script is `noo-py`, not `noo` — the `noo` name belongs to
+# the Rust front-door binary (noo-cli/, installed at ~/.local/bin/noo), which
 # passes unported commands through to `noo-py` automatically.
 noo-py = "noomesh.cli:app"
 noo-mcp-server = "noomesh.mcp.server:main"

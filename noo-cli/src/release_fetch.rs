@@ -264,11 +264,10 @@ fn looks_like_tls(s: &str) -> bool {
     l.contains("certificate") || l.contains("x509") || l.contains("unknownissuer")
 }
 
+/// u64 view of the one clock (`host_exec::now_unix`); the rate-limit math
+/// here is unsigned.
 fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::host_exec::now_unix().max(0) as u64
 }
 
 /// One GET, classified. The agent must have `http_status_as_error(false)`

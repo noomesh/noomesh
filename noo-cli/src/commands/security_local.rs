@@ -36,6 +36,7 @@ use crate::ui::{self, Col, Glyph};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::host_exec::which;
 use crate::output::{fail, ExitCode};
 use crate::pki::{pki_dir, ClusterCa, RotateResult};
 use crate::{Globals, Unhandled};
@@ -4351,24 +4352,6 @@ fn is_wsl2() -> bool {
 fn has_desktop_session() -> bool {
     std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
         || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-}
-
-/// `shutil.which` equivalent: first executable `name` on `$PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let cand = Path::new(dir).join(name);
-        if let Ok(md) = std::fs::metadata(&cand) {
-            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-                return Some(cand);
-            }
-        }
-    }
-    None
 }
 
 /// POSIX single-quote escaping (shlex.quote-style) for the macOS

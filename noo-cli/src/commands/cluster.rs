@@ -1,38 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! `noo cluster …` — cluster node inventory + desired-state control plane
-//! (Rust gateway routes in `routes/cluster.rs`) plus the agent-relevant
-//! SSH commands (`exec`, `logs`), which resolve the node via the gateway
-//! and spawn `ssh` with INHERITED stdio — fixing the Python versions'
-//! swallowed-stdout / 30s-timeout behavior — and propagate the remote
-//! exit code (never 0 on failure).
+//! `noo cluster …` — cluster node inventory and the desired-state control
+//! plane, over the gateway's `routes/cluster.rs` (i191 D4: this header used
+//! to describe an SSH program and an SSH-user ladder; neither exists).
 //!
-//! Ported: status, desired, place, unplace, exec, logs, restart-agent, up,
-//! down, scale (the destructive pair uses the agent-first confirm contract
-//! in `commands::confirm_destructive` — `--yes` skips, `--json`/non-TTY
-//! never block on a prompt).
+//! Every verb here is a gateway call, a local file operation, or a rail:
 //!
-//! Batch 3 (this pass):
-//!   HTTP/local — init-secret (local `token_urlsafe(32)`,
-//!   no gateway), assign, set-config, clear-cooldowns, add-companion,
-//!   add-monitor.
-//!   Retired stubs (name their replacements rather than 404) — clean-node,
-//!   sync-models.
+//! * Inventory and state: status (`--watch`), show, fit, desired, place,
+//!   unplace, assign, set-config, seed, proposals, maintenance, forget,
+//!   clear-cooldowns, add-companion, add-monitor, init-secret (local, no
+//!   gateway call).
+//! * Backends: up, down, scale, restart-agent. The destructive ones use the
+//!   agent-first confirm contract in `commands::confirm_destructive`
+//!   (`--yes` skips; `--json` or a non-TTY never blocks on a prompt).
+//! * Node logs: `logs` reads the node-agent's log route through the gateway
+//!   (a one-shot tail, no follow).
+//! * Weights: `sync-model-files` queues a job on the dispatch rail that
+//!   fetches the files on the node itself.
+//! * Retired stubs that name their replacement instead of answering "unknown
+//!   command": exec, reconnect, clean-node, sync-models.
 //!
-//!   This module spawns no `ssh` and no `scp`. It was the last one in the
-//!   crate that did; `tests/test_no_controller_ssh.py` keeps it that way.
+//! Nothing in this crate reaches a node over SSH. The controller-to-node
+//! shell lane is retired; `tests/test_no_controller_ssh.py` is the full-tree
+//! guard that keeps it retired, and the node-agent exposes named operations
+//! only (no arbitrary exec). The `ssh_user` field survives only as inert
+//! node metadata, and `--ssh-user` is a named retired flag.
 //!
 //! The provisioning surface (auto-place, place-model, reconcile-models,
 //! sync-images, upgrade-agents, set-primary, mint-join-key, ship-model,
-//! clean) is now native too — see `cluster_provision.rs`.
-//!
-//! SSH user resolution (superset of Python's `_resolve_ssh_user`):
-//! `--user` override → node's `ssh_user` from the gateway → the YAML
-//! cluster inventory (`~/.config/noo/cluster-inventory.yaml`, concrete
-//! hosts then subnets) → `ansible/inventory/hosts` `ansible_user=` (extra
-//! fallback the Python exec lacks — without it host8 resolves to the
-//! local user and fails auth) → none (ssh uses the local username).
+//! clean) lives in `cluster_provision.rs`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,6 +41,15 @@ use crate::http::{
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Col, Glyph};
 use crate::{Globals, Unhandled};
+
+/// A node's load as a percentage, or "not reported" when the node sent no
+/// number: a node that has not reported a load is not an idle one (i191 D5).
+fn load_cell(v: &serde_json::Value) -> String {
+    match v.as_f64() {
+        Some(x) => format!("{:.0}%", x * 100.0),
+        None => ui::state("not reported"),
+    }
+}
 
 /// `noo cluster status` — node inventory from /api/cluster/nodes.
 /// `--watch [SECS]` (default 2): redraw on a TTY until Ctrl-C. Rejected
@@ -108,7 +114,7 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // the 2026-09-05 gossip outage, where only the nodes holding a
         // per-principal credential had silently stopped announcing.
         let cred = n["nats_role"].as_str().unwrap_or("?");
-        let load = n["current_load"].as_f64().unwrap_or(0.0);
+        let load = load_cell(&n["current_load"]);
         let backends: Vec<&str> = n["capabilities"]["backends"]
             .as_array()
             .map(|a| a.iter().filter_map(|b| b.as_str()).collect())
@@ -156,7 +162,7 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "anonymous" => ui::warn("anon"),
                 other => ui::muted(other),
             },
-            format!("{:.0}%", load * 100.0),
+            load,
             running.join(","),
             harness_cell(n),
             // Derived by the gateway from the node's ROLE placements
@@ -352,10 +358,7 @@ fn archive_node_pki(node: &str) -> Option<std::path::PathBuf> {
     if !dir.is_dir() {
         return None;
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = crate::host_exec::now_unix();
     let dest = crate::pki::pki_dir().join(format!(".forgotten-{node}-{ts}"));
     std::fs::rename(&dir, &dest).ok().map(|()| dest)
 }
@@ -522,7 +525,7 @@ pub fn cluster_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     println!("{}", ui::kv(&[
         ("running", if running.is_empty() { ui::muted("idle").to_string() } else { running.join(", ") }),
         ("can run", if can_run.is_empty() { dash.clone() } else { can_run.join(", ") }),
-        ("load", format!("{:.0}%", n["current_load"].as_f64().unwrap_or(0.0) * 100.0)),
+        ("load", load_cell(&n["current_load"])),
     ]));
 
     // ── roles ───────────────────────────────────────────────────────────
@@ -2313,8 +2316,8 @@ pub(crate) fn online_nodes(g: &Globals) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Spawn a subprocess with INHERITED stdio (streams live, propagates rc) —
-/// the same pattern as `run_ssh`, for scp/ssh transfers.
+/// Spawn a local subprocess with INHERITED stdio (streams live, propagates
+/// rc). Used for local helper scripts; nothing here dials a node.
 pub(crate) fn spawn_inherited(g: &Globals, program: &str, args: &[String]) -> i32 {
     if g.verbose {
         eprintln!("{program} {}", args.join(" "));
@@ -2504,7 +2507,7 @@ pub fn cluster_assign(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 ("node", selected_id.clone()),
                 ("tier", format!("tier {}", selected["tier"].as_i64().unwrap_or(3))),
                 ("gpu", selected["gpu_model"].as_str().unwrap_or("CPU").to_string()),
-                ("load", format!("{:.0}%", selected["load"].as_f64().unwrap_or(0.0) * 100.0)),
+                ("load", load_cell(&selected["load"])),
                 ("running backends", if running.is_empty() { ui::dash().to_string() } else { running }),
                 ("backend", backend.as_deref().unwrap_or("auto").to_string()),
                 ("priority", format!("{priority} ({priority_raw})")),
@@ -3065,14 +3068,17 @@ pub fn cluster_reconnect(g: &Globals, _args: &[String]) -> Result<i32, Unhandled
     );
 }
 
-// ── sync-model-files (ship gguf weights via scp) ────────────────────
+// ── sync-model-files (ship gguf weights over the artifact rail) ─────
 
-/// `noo cluster sync-model-files [NODE…] [-m/--model FILE]… [-u/--user U]
-/// [--dry-run]` — ship gguf weights from the controller store to worker
-/// nodes. Source = $MODELS_DIR else $NOO_DATA_ROOT/models (default
-/// DEFAULT_DATA_ROOT/models). Per node: SSH-probe the node's own .env for its
-/// MODELS_DIR/NOO_DATA_ROOT (read-only), then scp each file (streaming, with
-/// a cheap same-size idempotence skip). `--dry-run` probes + prints only.
+/// `noo cluster sync-model-files [NODE…] [-m/--model FILE]… [--dry-run]` —
+/// ship gguf weights from the controller store to worker nodes. Source =
+/// $MODELS_DIR else $NOO_DATA_ROOT/models (default DEFAULT_DATA_ROOT/models).
+/// The gateway hashes each file first (warming its manifest), then one
+/// `model_file` job per (node, file) goes out on the dispatch rail; each node
+/// pulls the file from the controller's model cache and verifies the digest,
+/// and a file already present with the right hash is a no-op. `--dry-run`
+/// lists the jobs it would send and sends none. `-u/--user` is a retired
+/// flag (there is no account to name) and is refused.
 pub fn cluster_sync_model_files(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut want_nodes: Vec<String> = Vec::new();
     let mut want_models: Vec<String> = Vec::new();
@@ -4174,10 +4180,7 @@ pub fn cluster_maintenance(g: &Globals, args: &[String]) -> Result<i32, Unhandle
                 println!("{}", ui::muted("no node is in maintenance"));
                 return Ok(0);
             }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            let now = crate::host_exec::now_unix();
             let rows: Vec<Vec<String>> = entries
                 .iter()
                 .map(|m| {
@@ -4300,5 +4303,22 @@ mod manifest_warm_tests {
         assert_eq!(path_escape("gemma-4-E2B_q4_0-it.gguf"), "gemma-4-E2B_q4_0-it.gguf");
         assert_eq!(path_escape("a b+c.gguf"), "a%20b%2Bc.gguf");
         assert_eq!(path_escape("../x"), "..%2Fx");
+    }
+}
+
+#[cfg(test)]
+mod load_cell_tests {
+    use super::load_cell;
+
+    #[test]
+    fn a_node_that_reports_no_load_is_not_idle() {
+        assert_eq!(load_cell(&serde_json::json!(0.25)), "25%");
+        assert_eq!(load_cell(&serde_json::json!(0.0)), "0%");
+        for v in [serde_json::Value::Null, serde_json::json!("high"), serde_json::json!({})] {
+            let c = load_cell(&v);
+            assert!(c.contains("Not reported") && !c.contains('%') && !c.contains('0'), "{v}: {c}");
+        }
+        // A missing key indexes to Null.
+        assert!(load_cell(&serde_json::json!({})["current_load"]).contains("Not reported"));
     }
 }

@@ -496,13 +496,10 @@ fn ask_to_lock_out(g: &Globals, question: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// The path of `name` on PATH, as text. Delegates to the one owner
+/// (`host_exec::which`): no shell, so the name is never interpreted.
 fn which(name: &str) -> Option<String> {
-    let out = std::process::Command::new("bash").arg("-c").arg(format!("command -v {name}")).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if p.is_empty() { None } else { Some(p) }
+    crate::host_exec::which(name).map(|p| p.to_string_lossy().into_owned())
 }
 
 fn resolved(path: &str) -> String {
@@ -550,12 +547,11 @@ fn sh(cmd: &str) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("`{cmd}` exited {st}")) }
 }
 
+/// stdout of a CLEAN run (exit zero) of `cmd` under bash; None for any
+/// other outcome (absent bash, non-zero exit). A caller whose tool carries
+/// part of its answer in the exit status uses `sh_out_any` instead.
 fn sh_out(cmd: &str) -> Option<String> {
-    let out = std::process::Command::new("bash").arg("-c").arg(cmd).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    crate::host_exec::run_sh(cmd).ok_stdout().map(str::to_string)
 }
 
 /// stdout REGARDLESS of exit status; `None` only if the command could not
@@ -570,8 +566,7 @@ fn sh_out(cmd: &str) -> Option<String> {
 /// worse than no row at all: it invites someone to "fix" what is not
 /// broken.
 fn sh_out_any(cmd: &str) -> Option<String> {
-    let out = std::process::Command::new("bash").arg("-c").arg(cmd).output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    crate::host_exec::run_sh(cmd).any_stdout().map(str::to_string)
 }
 
 /// The "mint path" row, as a decision of its own so it can be TESTED
@@ -1240,7 +1235,7 @@ pub fn kiosk_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ]);
         return Ok(0);
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::host_exec::now_unix();
     let heartbeat = if cdp { sh_out("noo-kiosk-cdp heartbeat 2>/dev/null").and_then(|s| s.parse::<i64>().ok()) } else { None };
     // The graph's own measure of how slow the box is: smoothed ms of work
     // per frame and the tier it chose. "Choppy" was the operator's word;
@@ -1762,13 +1757,13 @@ pub fn kiosk_teardown(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // MASKED getty survives the file being deleted — teardown that leaves
     // it masked hands back a machine with no console login and no override
     // left to explain why.
-    if sh_out("systemctl is-enabled getty@.service 2>/dev/null").as_deref() == Some("masked") {
+    if sh_out_any("systemctl is-enabled getty@.service 2>/dev/null").as_deref() == Some("masked") {
         ui::step("unmasking getty@.service");
         if let Err(e) = sh("sudo systemctl unmask getty@.service") {
             ui::warned(&format!("{e} — run `sudo systemctl unmask getty@.service` by hand or this box has no console login"));
         }
     }
-    if sh_out("systemctl is-enabled display-manager.service 2>/dev/null").as_deref() == Some("disabled") {
+    if sh_out_any("systemctl is-enabled display-manager.service 2>/dev/null").as_deref() == Some("disabled") {
         ui::step("re-enabling the display manager");
         if let Err(e) = sh("sudo systemctl enable display-manager.service") {
             ui::warned(&format!("{e} — re-enable it by hand if this box should boot to a desktop"));
@@ -3072,6 +3067,23 @@ mod tests {
         assert!(!display_manager_will_be_disabled(Mode::Dedicated, Some("disabled")));
         assert!(!display_manager_will_be_disabled(Mode::Dedicated, None));
         assert!(!display_manager_will_be_disabled(Mode::Shared, Some("enabled")));
+    }
+
+    /// Teardown asks `is-enabled` about states that EXIT NON-ZERO (`masked`,
+    /// `disabled`). Read through the clean-run-only helper that answer is
+    /// None and teardown never unmasks the getty it masked (i191 D3).
+    #[test]
+    fn teardown_reads_is_enabled_through_the_any_status_helper() {
+        let body = include_str!("kiosk.rs").split("#[cfg(test)]").next().unwrap();
+        for needle in [
+            "sh_out_any(\"systemctl is-enabled getty@.service 2>/dev/null\").as_deref() == Some(\"masked\")",
+            "sh_out_any(\"systemctl is-enabled display-manager.service 2>/dev/null\").as_deref() == Some(\"disabled\")",
+        ] {
+            assert!(body.contains(needle), "teardown reads a non-zero-exit answer through sh_out: {needle}");
+        }
+        // And the helper really does keep stdout of a failed run.
+        assert_eq!(sh_out_any("echo masked; exit 1").as_deref(), Some("masked"));
+        assert_eq!(sh_out("echo masked; exit 1"), None);
     }
 
     #[test]

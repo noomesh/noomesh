@@ -51,6 +51,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::host_exec::now_unix;
 use crate::output::{fail, ExitCode};
 use crate::ui::{self, Glyph};
 use crate::{Globals, Unhandled};
@@ -290,10 +291,6 @@ pub(crate) fn plan_seat_apply(kinds: &[String], cfg: &SeatConfig) -> Result<Vec<
 /// seat nor a seat bundle to a node.
 pub(crate) fn seat_manifest_header(seat: &str, issued: i64) -> String {
     format!("#noo-seat-bundle 1\n#seat {seat}\n#issued {issued}\n")
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -1080,9 +1077,15 @@ fn sign_proof(key: &Path, tag: &str, seat: &str, sha: &str) -> Result<String, St
     r
 }
 
+/// stdout of `cmd` REGARDLESS of exit status (`systemctl is-active` prints
+/// `inactive` and exits non-zero; the word is the answer), with a fixed PATH.
+/// None only when the command could not be run at all. The opposite rule
+/// from the clean-run-only helper in kiosk.rs, on purpose: see
+/// `host_exec::Outcome`.
 fn sh_out(cmd: &mut Command) -> Option<String> {
-    let o = cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").output().ok()?;
-    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    crate::host_exec::run_cmd(cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
+        .any_stdout()
+        .map(str::to_string)
 }
 
 fn unit_state(unit: &str) -> String {

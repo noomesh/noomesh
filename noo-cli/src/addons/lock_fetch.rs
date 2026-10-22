@@ -186,7 +186,7 @@ impl std::fmt::Debug for ProxyAuth {
 /// is not the bound one; every proxy pull would be refused, so say why now.
 pub fn installed_proxy_auth() -> Result<Option<ProxyAuth>, String> {
     let Some(token) = crate::entitlement::installed_token_checked()? else { return Ok(None) };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::host_exec::now_unix();
     let Ok(ent) = crate::entitlement::check(&token, now) else { return Ok(None) };
     proxy_auth_for(&ent, &token, &super::pop::controller_key)
 }
