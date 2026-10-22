@@ -108,6 +108,12 @@ ENV UV_EXTRA_INDEX_URL=${TORCH_INDEX} \
 #     builds the SHA release-line resolved and records it in the stack lock;
 #     trellion-protocols is checked against trellion's pin above.
 #
+# hatchling is a build backend only: it is removed once the local packages
+# are built, so the image (and every image FROM it) ships no build backend —
+# the add-on images assert exactly that ("the build backend leaked into the
+# image"), and 0.6.10-rc.1's trellion-intel resign failed on it. setuptools
+# stays: some runtime packages still import it.
+#
 # `uv pip check` then refuses an image whose installed set has an unmet
 # requirement — the build fails if trellion's dependencies moved since the
 # lock was generated, instead of shipping an import error.
@@ -117,7 +123,10 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
     uv pip install --system --require-hashes -r /tmp/requirements-ml.txt \
     && uv pip install --system --no-deps --no-build-isolation \
        /tmp/noo-gateway-client /tmp/trellion-protocols /tmp/noo-trellion \
-    && uv pip check --system
+    && uv pip check --system \
+    && uv pip uninstall --system hatchling \
+    && uv pip check --system \
+    && if python -c 'import hatchling' 2>/dev/null; then echo 'hatchling is still importable' >&2; exit 1; fi
 
 # Marker so downstream images can verify they're built on top of a
 # compatible base (handy for debugging mismatched layers).
