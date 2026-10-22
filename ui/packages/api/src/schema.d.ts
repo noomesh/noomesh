@@ -10217,6 +10217,170 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/addon-workloads/{addon}/{workload}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get status
+         * @description [native] `GET /api/addon-workloads/{addon}/{workload}/status`: how an add-on observes its own reservation without touching the worker. The add-on's own token or an operator; 404 when the workload is not declared. `{workload, reserved, reservation: {id, node, holder, state, since, generation} | null}`.
+         */
+        get: operations["workload_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/reservations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get reservations
+         * @description [native] GET /api/cluster/reservations — every lease the nodes report. Operator read.
+         */
+        get: operations["reservations_list"];
+        put?: never;
+        /**
+         * Create reservations
+         * @description [native] POST /api/cluster/reservations — body `{workload: "<addon>/<name>", node?, hand_over?: <reservation id>, timeout_secs?}`. Operator only; audited (`reservation_take`).
+         */
+        post: operations["reservation_take"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/reservations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get reservations
+         * @description [native] GET /api/cluster/reservations/{id}
+         */
+        get: operations["reservation_get"];
+        put?: never;
+        post?: never;
+        /**
+         * Delete reservations
+         * @description [native] POST /api/cluster/reservations/{id}/release (or DELETE …/{id}) — body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.
+         */
+        delete: operations["reservation_release"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/reservations/{id}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create release
+         * @description [native] POST /api/cluster/reservations/{id}/release (or DELETE …/{id}) — body `{force?}`. The holder, or an operator with `force` (audited). The workload drains (its declared route), stops, and the lease is released by compare-and-set with `resume: now`.
+         */
+        post: operations["reservation_release"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/workloads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get workloads
+         * @description [native] GET /api/cluster/workloads — what the verified add-on bundles declare.
+         */
+        get: operations["workloads_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addon-workloads/{addon}/{workload}/proxy/{*path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reach a reserved workload
+         * @description [native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.
+         */
+        get: operations["workload_proxy_get"];
+        /**
+         * Reach a reserved workload
+         * @description [native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.
+         */
+        put: operations["workload_proxy_put"];
+        /**
+         * Reach a reserved workload
+         * @description [native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.
+         */
+        post: operations["workload_proxy_post"];
+        /**
+         * Reach a reserved workload
+         * @description [native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.
+         */
+        delete: operations["workload_proxy_delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Reach a reserved workload
+         * @description [native] The reserved-workload proxy: an add-on's own token (subject `addon:<addon>`) or an operator reaches the RESERVED workload's container through its node agent's container proxy, any method; a request with `Upgrade: websocket` is relayed as a WebSocket for as long as the reservation stands (close code 4001 when it ends). 404 when the workload is not declared by a verified add-on bundle, 409 `not_reserved` when it holds no GPU right now. The container is always the declared one; path and query are forwarded; `x-noo-reservation` names the reservation on every answer.
+         */
+        patch: operations["workload_proxy_patch"];
+        trace?: never;
+    };
+    "/api/addons/ui": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List add-on UIs
+         * @description [native] GET /api/addons/ui — the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.
+         */
+        get: operations["ui_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/addons/{addon_id}/ui-session": {
         parameters: {
             query?: never;
@@ -10251,26 +10415,6 @@ export interface paths {
          * @description [native] POST /api/addons/{addon_id}/ws-ticket — a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/…?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.
          */
         post: operations["ws_ticket"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/addons/ui": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List add-on UIs
-         * @description [native] GET /api/addons/ui — the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.
-         */
-        get: operations["ui_list"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -10372,6 +10516,10 @@ export interface operations {
                         /** @description Opt-in subsystem states, keyed by add-on name (`trellion`, `evolve`, `trellion_intel`, …). Built from the gateway's `addons::ADDONS` table, so a new add-on appears here with no schema change — clients must render the keys they receive rather than a fixed list. Three of the four states are emitted today by `addons::health_word`: `enabled`; `disabled`, meaning the operator turned it off, which is NOT a fault; and `unlicensed`, meaning the flag is on but no entitlement grants it, which is also not a fault but needs an action the operator can take (`noo security entitlement install <token>`). The per-add-on reason is deliberately NOT carried here — /health is polled by the compose healthcheck and the host watcher on a short interval, and operator prose on every poll costs bandwidth continuously for something only a human reading a console needs. `unhealthy` (flag on, container missing or down) IS a fault and is specced but NOT YET EMITTED — no arm of `health_word` produces it. Treat any unrecognised value as unknown rather than guessing. */
                         addons?: {
                             [key: string]: "enabled" | "disabled" | "unlicensed" | "unhealthy";
+                        };
+                        /** @description Present only when some add-on is vouched for by a temporary development signing key rather than a release key (`noo addons trust-key <name> <pubkey> --dev --expires <dur>`): add-on name to `dev (expires YYYY-MM-DD HH:MM UTC)`. The add-on's `addons.<name>` word stays `enabled`; once the key expires it reads `unhealthy` and the add-on drops out of this map. Absent for an anonymous caller. */
+                        addons_dev?: {
+                            [key: string]: string;
                         };
                     };
                 };
@@ -23338,6 +23486,434 @@ export interface operations {
             };
         };
     };
+    workload_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    reservations_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    reservation_take: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    reservation_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    reservation_release: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    reservation_release: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    workloads_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    workload_proxy_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon: string;
+                workload: string;
+                /** @description The path inside the worker's container, forwarded as is */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The worker's answer, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not the add-on's own token, nor an operator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No verified add-on bundle declares this workload */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not_reserved: the workload holds no GPU right now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    workload_proxy_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon: string;
+                workload: string;
+                /** @description The path inside the worker's container, forwarded as is */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The worker's answer, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not the add-on's own token, nor an operator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No verified add-on bundle declares this workload */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not_reserved: the workload holds no GPU right now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    workload_proxy_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon: string;
+                workload: string;
+                /** @description The path inside the worker's container, forwarded as is */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The worker's answer, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not the add-on's own token, nor an operator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No verified add-on bundle declares this workload */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not_reserved: the workload holds no GPU right now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    workload_proxy_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon: string;
+                workload: string;
+                /** @description The path inside the worker's container, forwarded as is */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The worker's answer, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not the add-on's own token, nor an operator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No verified add-on bundle declares this workload */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not_reserved: the workload holds no GPU right now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    workload_proxy_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon: string;
+                workload: string;
+                /** @description The path inside the worker's container, forwarded as is */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The worker's answer, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not the add-on's own token, nor an operator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No verified add-on bundle declares this workload */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not_reserved: the workload holds no GPU right now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ui_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The add-on web UIs this caller may see */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        uis: {
+                            addon: string;
+                            title: string;
+                            port: number;
+                            /** @description https://<host>:<port>, the add-on's own origin */
+                            url_base?: string | null;
+                            /** @description Whether this account's role may open it (ui.min_role) */
+                            can_open: boolean;
+                        }[];
+                    };
+                };
+            };
+        };
+    };
     ui_session: {
         parameters: {
             query?: never;
@@ -23450,36 +24026,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-        };
-    };
-    ui_list: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description The add-on web UIs this caller may see */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        uis: {
-                            addon: string;
-                            title: string;
-                            port: number;
-                            /** @description https://<host>:<port>, the add-on's own origin */
-                            url_base?: string | null;
-                            /** @description Whether this account's role may open it (ui.min_role) */
-                            can_open: boolean;
-                        }[];
-                    };
-                };
             };
         };
     };
