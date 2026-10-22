@@ -1461,6 +1461,11 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                     &crate::envfile::instance(),
                 );
             }
+            // The rolled gateway may allocate add-on UI origins it did not
+            // before (a newly enabled add-on with a `ui`): front them with
+            // tailscale serve now, as `noo stack start|restart` do, so
+            // `noo upgrade --all` needs no manual restart. Never fails the roll.
+            super::mesh::front_addon_uis(g);
             // Prune superseded release images (finding #93: 13 upgrades
             // quietly accumulated 78 tags — gigabytes). Best-effort — a prune
             // failure must never taint a successful roll.

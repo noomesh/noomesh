@@ -480,12 +480,14 @@ pub fn mesh_restart(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 }
 
 /// Front each add-on UI origin the gateway allocated with `tailscale serve
-/// --https=<port>`, and drop our entries for ports it no longer allocates
+/// --https=<port>`, and drop our entries for ports it no longer allocates.
+/// Called after a successful `noo stack start`, `noo stack restart` and
+/// `noo upgrade --stack`
 /// (tailnet_serve.rs "Add-on UI origins"). Asks the gateway which ports
 /// (`GET /api/addons/ui`); when it cannot be asked, or on a worker, nothing
 /// is written or removed. Never fails the start: what could not be written is
 /// printed as the exact line to run.
-fn front_addon_uis(g: &Globals) {
+pub(crate) fn front_addon_uis(g: &Globals) {
     if crate::role::detect().controller.is_none() {
         return;
     }
