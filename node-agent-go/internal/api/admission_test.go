@@ -72,6 +72,25 @@ func readUntil(t *testing.T, body io.Reader, want string, within time.Duration) 
 	}
 }
 
+// waitReleased: the slot is released by the handler's deferred done() AFTER
+// the response is written, so a client that has read the whole body can
+// observe in_flight 1 for a moment; the contract is "released once the
+// handler returns", not "before the last byte". Wait for it, briefly.
+func waitReleased(t *testing.T, backend string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		e := occupancy.Report()[backend]
+		if e.InFlight == 0 && e.Queued == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot not released after the response: %+v", e)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestAFullBackendQueuesAStreamWithKeepAlivesThenServesIt(t *testing.T) {
 	occupancy.Reset()
 	t.Cleanup(occupancy.Reset)
@@ -226,9 +245,7 @@ func TestAQuickEngineRefusalKeepsItsOwnStatus(t *testing.T) {
 	if resp.StatusCode != 404 {
 		t.Fatalf("an engine that answers before earlyHeadersAfter keeps its status: %d", resp.StatusCode)
 	}
-	if e := occupancy.Report()["ollama"]; e.InFlight != 0 {
-		t.Fatalf("released: %+v", e)
-	}
+	waitReleased(t, "ollama")
 }
 
 func TestARefusalAfterEarlyHeadersIsAnSSEErrorEvent(t *testing.T) {
@@ -309,9 +326,7 @@ func TestOllamaChatGoesThroughAdmissionToo(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(string(body), `"content":"ok"`) || resp.Header.Get("X-Noo-In-Flight") != "1" {
 		t.Fatalf("%d %v %s", resp.StatusCode, resp.Header, body)
 	}
-	if e := occupancy.Report()["ollama"]; e.InFlight != 0 {
-		t.Fatalf("released after the stream: %+v", e)
-	}
+	waitReleased(t, "ollama")
 }
 
 // A GPU hold's drain (internal/gpuyield, mode drain) closes admission: a
