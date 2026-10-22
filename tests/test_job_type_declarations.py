@@ -35,10 +35,10 @@ GO_EXECUTOR = REPO / "node-agent-go" / "internal" / "jobs" / "executor.go"
 
 
 def _rust_table() -> dict[str, str]:
-    """{job_type: "Node" | "Gateway"} parsed from JOB_TYPES."""
+    """{job_type: "Node" | "Gateway" | "Pull"} parsed from JOB_TYPES."""
     src = RUST_TABLE.read_text()
     body = src.split("pub const JOB_TYPES", 1)[1].split("];", 1)[0]
-    pairs = re.findall(r'\("([a-z_]+)",\s*Executor::(Node|Gateway)\)', body)
+    pairs = re.findall(r'\("([a-z_]+)",\s*Executor::(Node|Gateway|Pull)\)', body)
     assert pairs, "could not parse JOB_TYPES out of job_types.rs"
     return dict(pairs)
 
@@ -63,6 +63,17 @@ def rust() -> dict[str, str]:
 
 def test_rust_table_declares_test_run_as_gateway_local(rust):
     assert rust["test_run"] == "Gateway"
+
+
+def test_pull_types_are_never_node_executable(rust):
+    # `embed_batch` (i179) is claimed from a JetStream work queue by the
+    # node-agent's pull worker, or run by the gateway. It has no case in the
+    # Go `switch job.Type` and must not gain one: a dispatched copy would
+    # race the queue. The Rust table is the only place it is declared.
+    pull_types = {t for t, ex in rust.items() if ex == "Pull"}
+    assert pull_types == {"embed_batch"}
+    assert not (pull_types & _go_executable())
+    assert not (pull_types & _go_switch_cases())
 
 
 def test_rust_node_types_match_go_executable_map(rust):

@@ -1041,18 +1041,31 @@ async fn job_history(
     Ok(Json(json!({"history": history, "count": count})))
 }
 
+/// `GET /api/jobs/{job_id}` query. `vectors=1` (or `true`) asks for an
+/// `embed_batch` job's vectors along with the job; every other job ignores it.
+#[derive(Deserialize, Default)]
+struct GetJobParams {
+    vectors: Option<String>,
+}
+
 /// Get a single job by ID.
 ///
-/// GET /api/jobs/{job_id}
+/// GET /api/jobs/{job_id}[?vectors=1]
 ///
 /// Reads the job hash from Redis. Returns 404 if not found.
 /// Mirrors Python `JobScheduler.get_job()`.
+///
+/// For a completed `embed_batch` job, `?vectors=1` adds `"vectors"`: the
+/// batch's embeddings as `[[f32, ...], ...]`, decoded from the 15-minute side
+/// key. Once that key has expired the answer is `410 Gone` (resubmit; embedding
+/// is idempotent). A job that is not complete yet is returned without vectors.
 async fn get_job(
     State(state): State<Arc<AppState>>,
     requester: Option<Extension<RequesterCtx>>,
     cluster: Option<Extension<ClusterNode>>,
     Path(job_id): Path<String>,
-) -> AppResult {
+    Query(params): Query<GetJobParams>,
+) -> Result<axum::response::Response, AppError> {
     let scope = scoped_account(
         requester.as_ref().map(|Extension(r)| r),
         cluster.as_ref().map(|Extension(c)| c),
@@ -1086,7 +1099,18 @@ async fn get_job(
                     job.insert(k.clone(), json!(v));
                 }
             }
-            Ok(Json(Value::Object(job)))
+            if crate::embed_jobs::wants_vectors(params.vectors.as_deref())
+                && crate::embed_jobs::is_embed_job(&map)
+                && map.get("status").map(String::as_str) == Some("completed")
+            {
+                match crate::embed_jobs::read_vectors(redis, &job_id, &map).await {
+                    Ok(vectors) => {
+                        job.insert("vectors".to_string(), json!(vectors));
+                    }
+                    Err(e) => return Ok(e.to_response(&job_id)),
+                }
+            }
+            Ok(Json(Value::Object(job)).into_response())
         }
         None => Err(AppError::NotFound("Job not found".into())),
     }
@@ -1401,6 +1425,11 @@ async fn route_by_executor(
             }))))
         }
         Some(crate::job_types::Executor::Node) => Ok(None),
+        // A pulled type has its own route: it is created with its input
+        // already published to a work queue, which a bare submit cannot do.
+        Some(crate::job_types::Executor::Pull) => Err(AppError::BadRequest(format!(
+            "job type '{job_type}' is not submitted here; embedding batches go to POST /api/external/embeddings/jobs"
+        ))),
     }
 }
 

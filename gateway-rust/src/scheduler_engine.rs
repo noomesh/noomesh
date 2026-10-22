@@ -159,6 +159,12 @@ pub fn spawn(state: Arc<AppState>) {
             if let Err(e) = reap_timeouts(&state).await {
                 tracing::warn!(error = %e, "scheduler_engine.reap_failed");
             }
+            // Bulk embedding jobs (i179) are judged here, on the reaper's
+            // 30 s clock, not the janitor's 300 s: a pull job with nobody
+            // pulling flips to a gateway run after 120 s, not after 420.
+            if let Err(e) = crate::embed_jobs::sweep(&state).await {
+                tracing::warn!(error = %e, "scheduler_engine.embed_sweep_failed");
+            }
             Ok(())
         },
     );
@@ -804,6 +810,13 @@ pub async fn reap_timeouts(state: &AppState) -> anyhow::Result<()> {
         if status != "dispatched" && status != "running" {
             continue;
         }
+        // An embed_batch job is not ours to retry: a pull job's redelivery
+        // belongs to JetStream (`max_deliver`), and a requeue here would ZADD
+        // it onto the node dispatch queue as well. `embed_jobs::sweep`
+        // judges them, for both paths.
+        if crate::embed_jobs::is_embed_job(&hash) {
+            continue;
+        }
         let Some(dispatch_time) = parse_ts(hash.get("dispatched_at")) else {
             continue;
         };
@@ -940,6 +953,13 @@ pub async fn janitor(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
 
+        // The dispatch-ack and dead-node rules below requeue onto the node
+        // dispatch queue. A pulled embed job was never dispatched and its
+        // acking node is only a record, so neither rule applies to it.
+        if crate::embed_jobs::is_embed_job(&hash) {
+            continue;
+        }
+
         if status == "dispatched" {
             if let Some(t) = parse_ts(hash.get("dispatched_at")) {
                 let elapsed = (now - t).num_seconds() as f64;
@@ -1051,6 +1071,12 @@ pub async fn recover_from_restart(state: &AppState) -> anyhow::Result<()> {
         let status = hash.get("status").cloned().unwrap_or_default();
         if is_terminal(&status) {
             redis.srem(ACTIVE_SET, &job_id).await;
+            continue;
+        }
+        // A pulled embed job survives a gateway restart in JetStream, and a
+        // gateway-run one is judged by `embed_jobs::sweep`. Requeueing either
+        // would put it on the node dispatch queue.
+        if crate::embed_jobs::is_embed_job(&hash) {
             continue;
         }
         let node_id = hash.get("node_id").cloned().unwrap_or_default();

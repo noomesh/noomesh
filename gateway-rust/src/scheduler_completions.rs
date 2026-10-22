@@ -194,8 +194,8 @@ async fn handle(state: &AppState, subject: &str, event: &Value) -> anyhow::Resul
     }
 
     match kind {
-        "ack" => on_ack(state, job_id).await,
-        "complete" => on_complete(state, job_id, event).await,
+        "ack" => on_ack(state, job_id, origin).await,
+        "complete" => on_complete(state, job_id, event, origin).await,
         "failed" => on_failed(state, job_id, event).await,
         _ => Ok(()), // cancel and anything else: not ours
     }
@@ -203,12 +203,20 @@ async fn handle(state: &AppState, subject: &str, event: &Value) -> anyhow::Resul
 
 /// The node this job was dispatched to, or "" when nothing is recorded
 /// (no Redis, unknown job, or a requeue that cleared the field).
+///
+/// A pulled job (`path=pull`, i179) was dispatched to nobody: any node that
+/// serves the model may claim it, and JetStream may redeliver it to a
+/// different one after the first acked. Its `node_id` only records the last
+/// node to report, so it is never an assignment to enforce.
 async fn assigned_node(state: &AppState, job_id: &str) -> String {
     let Some(redis) = state.redis.as_ref() else {
         return String::new();
     };
     let hash: HashMap<String, String> =
         redis.hgetall(&format!("{JOB_KEY_PREFIX}{job_id}")).await.unwrap_or_default();
+    if hash.get("path").map(String::as_str) == Some("pull") {
+        return String::new();
+    }
     hash.get("node_id").cloned().unwrap_or_default()
 }
 
@@ -217,7 +225,7 @@ async fn assigned_node(state: &AppState, job_id: &str) -> String {
 /// Also stamps `started_at`, which Python never wrote — `noo_job_runs`
 /// needs a start instant to report `duration_ms`, and `dispatched_at`
 /// (the fallback) includes queue-to-node latency.
-async fn on_ack(state: &AppState, job_id: &str) -> anyhow::Result<()> {
+async fn on_ack(state: &AppState, job_id: &str, origin: Option<&str>) -> anyhow::Result<()> {
     let Some(redis) = state.redis.as_ref() else {
         return Ok(());
     };
@@ -236,12 +244,33 @@ async fn on_ack(state: &AppState, job_id: &str) -> anyhow::Result<()> {
     if hash.get("started_at").map(|s| s.is_empty()).unwrap_or(true) {
         fields.push(("started_at", now.as_str()));
     }
+    // A pulled job has no assignment until a worker claims it: record which
+    // node did (the last one, if JetStream redelivers).
+    if hash.get("path").map(String::as_str) == Some("pull") {
+        if let Some(node) = origin {
+            fields.push(("node_id", node));
+        }
+    }
     redis.hset(&key, &fields).await;
     tracing::debug!(job_id, "scheduler_completions.job_running");
     Ok(())
 }
 
-async fn on_complete(state: &AppState, job_id: &str, event: &Value) -> anyhow::Result<()> {
+async fn on_complete(
+    state: &AppState,
+    job_id: &str,
+    event: &Value,
+    origin: Option<&str>,
+) -> anyhow::Result<()> {
+    // An embed_batch completion carries vectors: they move to a side key and
+    // only a summary reaches the 24 h job hash (see `embed_jobs`).
+    if let Some(redis) = state.redis.as_ref() {
+        let hash: HashMap<String, String> =
+            redis.hgetall(&format!("{JOB_KEY_PREFIX}{job_id}")).await.unwrap_or_default();
+        if crate::embed_jobs::is_embed_job(&hash) {
+            return crate::embed_jobs::on_complete(state, job_id, &hash, event, origin).await;
+        }
+    }
     let result = match event.get("result") {
         Some(Value::String(s)) => s.clone(),
         Some(v) if !v.is_null() => v.to_string(),
@@ -282,6 +311,11 @@ async fn on_failed(state: &AppState, job_id: &str, event: &Value) -> anyhow::Res
     let hash: HashMap<String, String> = redis.hgetall(&key).await.unwrap_or_default();
     if hash.is_empty() {
         return Ok(());
+    }
+    // A pulled job's retry budget is the work queue's `max_deliver`, not
+    // `max_retries`: requeueing here would put it on the node dispatch queue.
+    if crate::embed_jobs::is_embed_job(&hash) {
+        return crate::embed_jobs::on_failed(state, job_id, &hash, event).await;
     }
     let retries = num(&hash, "retries", 0);
     let max_retries = num(&hash, "max_retries", 2);

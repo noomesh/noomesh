@@ -146,6 +146,14 @@ impl RawChatError {
         Self { public: Some(msg.clone()), ..Self::new(StatusCode::CONFLICT, "conflict", msg) }
     }
 
+    /// A refusal about the caller's own request that is not a 400 or 409
+    /// (413 over a cap, 404 for a record that is not theirs): the message IS
+    /// the public one.
+    pub fn request_refused(status: StatusCode, kind: &'static str, msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self { public: Some(msg.clone()), ..Self::new(status, kind, msg) }
+    }
+
     /// From a legacy resolver error: 404 for a pin nothing serves, else 503.
     pub fn from_resolve(e: &anyhow::Error) -> Self {
         let status = coordinator::resolve_failure_status(e, 503);
