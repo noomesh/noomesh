@@ -348,7 +348,11 @@ detect_gpu_tier() {
     fi
     local vram_mb
     vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-    if [ -z "$vram_mb" ] || [ "$vram_mb" = "0" ]; then
+    # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
+    # stdout ("Failed to initialize NVML: ..."), which would reach the
+    # arithmetic below and abort the script. Only a purely numeric value is
+    # a VRAM reading; anything else means "no usable GPU here".
+    if ! [[ "$vram_mb" =~ ^[0-9]+$ ]] || [ "$vram_mb" = "0" ]; then
         echo ""
         return
     fi
