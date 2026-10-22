@@ -113,6 +113,11 @@ type Reporter struct {
 	// broken. nil = this agent has no messaging at all.
 	busStatus func() any
 
+	// pullEmbed reports the bulk-embedding pull worker's models and whether
+	// its consumers are bound. Nil = this node does not run the worker; the
+	// key is then omitted.
+	pullEmbed func() any
+
 	// natsRPC reports whether control over the bus is live on this node
 	// (subscription accepted by the server, no later refusal). nil = false.
 	natsRPC func() bool
@@ -271,6 +276,11 @@ func (r *Reporter) gpuContentionReport() any {
 // SetBusStatus installs the NATS status provider whose value is echoed on
 // every heartbeat as `nats_status`.
 func (r *Reporter) SetBusStatus(f func() any) { r.busStatus = f }
+
+// SetPullEmbed installs the provider of the heartbeat's pull_embed field,
+// {"models": [...], "bound": bool}. For humans and the console; the gateway
+// routes on the consumer's own state, not on this claim.
+func (r *Reporter) SetPullEmbed(f func() any) { r.pullEmbed = f }
 
 // SetNatsRPC installs the probe behind control_transports.nats_rpc. The
 // agent passes ctrlrpc.Service.Ready, so the field is true only while the
@@ -523,6 +533,11 @@ func (r *Reporter) SendHeartbeat() {
 		payload["nats_status"] = bus
 	}
 	clk.mark("bus")
+	if r.pullEmbed != nil {
+		if pe := r.pullEmbed(); pe != nil {
+			payload["pull_embed"] = pe
+		}
+	}
 
 	// Omitted, never empty: an older agent reports nothing here, and the
 	// controller must not read that as "every backend is container-managed".
