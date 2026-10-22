@@ -201,6 +201,13 @@ impl super::runtime::TaskRuntime for RemoteRuntime {
         RemoteRuntime::budget_check(self, task_id).await
     }
 
+    async fn finish_text(&mut self, task_id: &str, text: &str) -> Result<String> {
+        // The foreign kinds' `task_done`, flagged: the gateway applies the
+        // native loop's evidence mark (its tool calls are on record).
+        let v = self.call(HarnessOp::TaskDone { task_id: task_id.to_string(), result: text.to_string(), failed: false, text_answer: true }).await?;
+        Self::field(&v, "state")
+    }
+
     async fn loop_usage(&mut self, task_id: &str, result: &CoordinatorResult) -> Result<()> {
         self.call(HarnessOp::TaskUsage {
             task_id: task_id.to_string(),

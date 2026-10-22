@@ -907,6 +907,41 @@ pub fn excerpt(text: &str) -> String {
     s
 }
 
+/// The rule (noomesh-internal i171): a loop that ends in plain text, having
+/// called no tool at all, has answered — take that text as the task's
+/// result instead of looping until the budget parks it.
+///
+/// gemma-4 through ollama's tool calling answered "Reply with the single
+/// word: ok" with `ok`, twice, never calling `noo_task_done`; the runner
+/// checkpointed both loops and ended the task `checkpointed` ("loop budget
+/// exhausted"), an answer given twice and a task parked for its owner to
+/// stop by hand. A loop that called any tool (bookkeeping included) is
+/// still working, or has finished through the tool: not this rule's.
+/// `after` is the task's state after the loop's checkpoint — a task the
+/// model finished (`done`), the owner stopped, or that parked, is left as
+/// it is.
+pub fn text_answer(after: &str, tool_calls_in_loop: usize, response: &str) -> bool {
+    matches!(after, "running" | "checkpointed") && tool_calls_in_loop == 0 && !response.trim().is_empty()
+}
+
+/// Finish a task with the text a loop answered in (i171). The evidence
+/// gate's second-attempt rule applies: a task whose conversation called
+/// no tool gets the [`NO_TOOLS_MARK`] prefix, so the reader sees the
+/// answer was written, not looked up; the result is posted to the task's
+/// thread as `noo_task_done` would. Returns the task's state after.
+pub async fn finish_text(state: &AppState, id: &str, text: &str) -> Result<String> {
+    let Some(task) = get(&state.db, id).await? else { return Err(anyhow!("task {id} not found")) };
+    let text = text.trim();
+    let text = if tools_used(&state.db, &task.conversation_id).await == 0 { format!("{NO_TOOLS_MARK} {text}") } else { text.to_string() };
+    let changed = finish(&state.db, id, true, &text, /* require_tool_use */ false).await?;
+    if changed {
+        if let Some(owner) = task.owner.as_deref() {
+            crate::tools::post_task_result(state, &task, owner, true, &text).await;
+        }
+    }
+    Ok(get(&state.db, id).await?.map(|t| t.state).unwrap_or_else(|| "failed".into()))
+}
+
 /// Run a task's loops on any runtime until it is done, failed, stopped or
 /// out of budget. Each loop is one `run_inner` in the task's conversation;
 /// each checkpoint reads the state back and, remotely, renews the token.
@@ -971,6 +1006,13 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
             }
         };
         let after = rt.checkpoint(&req.task_id, loops, Some(&note), false).await?;
+        // i171: a loop that answered in text and called nothing is the answer.
+        if let Ok(r) = &outcome {
+            if text_answer(&after, r.tool_calls.len(), &r.response) {
+                tracing::info!(task = %req.task_id, loop_no = loops, "task: the loop answered in text without noo_task_done; taken as the result");
+                return rt.finish_text(&req.task_id, &r.response).await;
+            }
+        }
         if failures >= 3 {
             return rt.checkpoint(&req.task_id, loops, Some("three consecutive loop failures; giving up"), true).await;
         }
@@ -1327,6 +1369,36 @@ pub fn stale_alert(t: &Task, since: &str) -> crate::operator_alert::OperatorAler
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// i171: the text a tool-less loop ends with is the task's result —
+    /// only while the task is still the runner's to finish.
+    #[test]
+    fn a_text_only_loop_answers_the_task() {
+        assert!(text_answer("checkpointed", 0, "ok"));
+        assert!(text_answer("running", 0, "  ok\n"));
+        // the model finished, or the owner stopped it, or it parked: not ours
+        for state in ["done", "failed", "stopped", "awaiting_clarification", "open"] {
+            assert!(!text_answer(state, 0, "ok"), "{state}");
+        }
+        // it called a tool (even noo_task_done): still working, or finished through it
+        assert!(!text_answer("checkpointed", 1, "ok"));
+        // nothing said is not an answer
+        assert!(!text_answer("checkpointed", 0, "   "));
+    }
+
+    /// The runner takes the text answer AFTER the loop's checkpoint (so the
+    /// usage and the note are recorded first) and BEFORE the failure and
+    /// budget decisions.
+    #[test]
+    fn the_text_answer_is_read_after_the_checkpoint_and_before_the_budget() {
+        let src = include_str!("tasks.rs");
+        let body = &src[src.find("pub async fn run_task_loops").unwrap()..src.find("// ── dispatch and resume").unwrap()];
+        let checkpoint = body.find("rt.checkpoint(&req.task_id, loops, Some(&note), false)").unwrap();
+        let answer = body.find("text_answer(&after, r.tool_calls.len(), &r.response)").unwrap();
+        let finish = body.find("rt.finish_text(").unwrap();
+        let budget = body.find("keep_looping(&after").unwrap();
+        assert!(checkpoint < answer && answer < finish && finish < budget);
+    }
 
     #[test]
     fn tools_called_counts_names_and_drops_bookkeeping() {
