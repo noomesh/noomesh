@@ -19745,6 +19745,208 @@
           }
         }
       }
+    },
+    "/api/addons/ui": {
+      "get": {
+        "tags": [
+          "other"
+        ],
+        "summary": "List add-on UIs",
+        "description": "[native] GET /api/addons/ui \u2014 the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.",
+        "operationId": "ui_list",
+        "responses": {
+          "200": {
+            "description": "The add-on web UIs this caller may see",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "uis"
+                  ],
+                  "properties": {
+                    "uis": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "addon",
+                          "title",
+                          "port",
+                          "can_open"
+                        ],
+                        "properties": {
+                          "addon": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "type": "integer"
+                          },
+                          "url_base": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "https://<host>:<port>, the add-on's own origin"
+                          },
+                          "can_open": {
+                            "type": "boolean",
+                            "description": "Whether this account's role may open it (ui.min_role)"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addons/{addon_id}/ui-session": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Open an add-on UI",
+        "description": "[native] POST /api/addons/{addon_id}/ui-session \u2014 hand the signed-in person over to an add-on's web UI, which is served on an origin of its own (a port of its own on this host). Send the access token as `Authorization: Bearer`; checks the UI's `min_role` and answers a one-time code (30 s, single use, bound to this person and add-on) and the URL `https://<host>:<port>/__noo/session?code=<code>` to navigate to. The add-on origin redeems it and sets its own cookie. 401 without a person's bearer, 403 below the UI's role, 404 when the add-on serves no UI, 503 when it is off or its UI listener is not up.",
+        "operationId": "ui_session",
+        "responses": {
+          "200": {
+            "description": "A one-time code and where to send the browser",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "port",
+                    "path",
+                    "expires_in"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer"
+                    },
+                    "path": {
+                      "type": "string",
+                      "description": "/__noo/session?code=<code>"
+                    },
+                    "url": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "https://<host>:<port>/__noo/session?code=<code>; open it in a new tab"
+                    },
+                    "expires_in": {
+                      "type": "integer"
+                    },
+                    "session_idle_secs": {
+                      "type": "integer"
+                    },
+                    "session_max_secs": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No person's bearer"
+          },
+          "403": {
+            "description": "Below the UI's min_role, or a delegated credential"
+          },
+          "404": {
+            "description": "The add-on serves no UI"
+          },
+          "503": {
+            "description": "The add-on is off or its UI origin is not listening"
+          }
+        },
+        "parameters": [
+          {
+            "name": "addon_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/addons/{addon_id}/ws-ticket": {
+      "post": {
+        "tags": [
+          "other"
+        ],
+        "summary": "Mint an add-on socket ticket",
+        "description": "[native] POST /api/addons/{addon_id}/ws-ticket \u2014 a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/\u2026?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.",
+        "operationId": "ws_ticket",
+        "responses": {
+          "200": {
+            "description": "A single-use ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ticket",
+                    "param",
+                    "expires_in"
+                  ],
+                  "properties": {
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "param": {
+                      "type": "string",
+                      "enum": [
+                        "ticket"
+                      ]
+                    },
+                    "expires_in": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No person's bearer"
+          },
+          "403": {
+            "description": "A delegated or harness credential"
+          },
+          "404": {
+            "description": "The add-on declares no WebSocket route"
+          },
+          "503": {
+            "description": "The add-on is off"
+          }
+        },
+        "parameters": [
+          {
+            "name": "addon_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {
