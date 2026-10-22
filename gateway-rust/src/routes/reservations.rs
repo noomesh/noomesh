@@ -589,6 +589,72 @@ fn to_client(m: tokio_tungstenite::tungstenite::Message) -> Option<axum::extract
     })
 }
 
+/// The upstream WebSocket stream: TCP, then the cluster's TLS (tokio-rustls
+/// over `tls::cluster_rustls_config`, the same CA and mTLS identity every
+/// node call presents) for `wss://`, then the WebSocket handshake.
+type UpstreamWs = tokio_tungstenite::WebSocketStream<UpstreamIo>;
+
+/// Plain or TLS, as the agent's URL says.
+enum UpstreamIo {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for UpstreamIo {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamIo::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            UpstreamIo::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpstreamIo {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            UpstreamIo::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            UpstreamIo::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamIo::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            UpstreamIo::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            UpstreamIo::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            UpstreamIo::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect_upstream(request: tokio_tungstenite::tungstenite::handshake::client::Request, url: &str) -> Result<UpstreamWs, String> {
+    let uri = request.uri().clone();
+    let host = uri.host().ok_or_else(|| format!("no host in {url}"))?.to_string();
+    let tls = matches!(uri.scheme_str(), Some("wss") | Some("https"));
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::TcpStream::connect((host.as_str(), port)))
+        .await
+        .map_err(|_| format!("connect to {host}:{port} timed out"))?
+        .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    let io = if tls {
+        let cfg = match crate::tls::cluster_rustls_config() {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => return Err("no cluster TLS config for a wss:// node call".into()),
+            Err(e) => return Err(format!("cluster TLS config: {e}")),
+        };
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("server name {host}: {e}"))?;
+        let s = tokio_rustls::TlsConnector::from(cfg).connect(name, tcp).await.map_err(|e| format!("TLS to {host}:{port}: {e}"))?;
+        UpstreamIo::Tls(Box::new(s))
+    } else {
+        UpstreamIo::Plain(tcp)
+    };
+    let (ws, _) = tokio_tungstenite::client_async_with_config(request, io, None).await.map_err(|e| format!("websocket handshake with the node agent: {e}"))?;
+    Ok(ws)
+}
+
 /// Relay one client WebSocket to the worker's, through the node agent, for
 /// as long as the reservation stands.
 async fn relay_websocket(
@@ -622,15 +688,7 @@ async fn relay_websocket(
             return;
         }
     };
-    let connector = match crate::tls::cluster_rustls_config() {
-        Ok(Some(cfg)) => Some(tokio_tungstenite::Connector::Rustls(cfg)),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, "workload_ws_tls_config");
-            None
-        }
-    };
-    let (upstream, _) = match tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector).await {
+    let upstream = match connect_upstream(request, &url).await {
         Ok(x) => x,
         Err(e) => {
             tracing::warn!(error = %e, node = %node, reservation = %reservation, "workload_ws_upstream_failed");
