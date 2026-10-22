@@ -324,3 +324,20 @@ func TestSubstituteAutoModel(t *testing.T) {
 		}
 	}
 }
+
+// What the allowlist removed is named on the answer (i183): sorted, only
+// when something was removed, and never for a backend the list does not
+// know.
+func TestDroppedKeysAreNamedSorted(t *testing.T) {
+	body := []byte(`{"model":"x","messages":[],"guided_json":{},"chat_template_kwargs":{},"n_predict":1}`)
+	_, dropped := filterBodyForBackendDropped(body, "ollama")
+	if got := strings.Join(dropped, ","); got != "guided_json,n_predict" {
+		t.Fatalf("ollama dropped %q, want guided_json,n_predict", got)
+	}
+	if _, dropped := filterBodyForBackendDropped([]byte(`{"model":"x","think":false}`), "ollama"); dropped != nil {
+		t.Fatalf("nothing to drop must report nothing, got %v", dropped)
+	}
+	if _, dropped := filterBodyForBackendDropped(body, "something-new"); dropped != nil {
+		t.Fatalf("an unknown backend passes everything through, got %v", dropped)
+	}
+}
