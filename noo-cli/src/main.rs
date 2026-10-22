@@ -1352,6 +1352,14 @@ pub(crate) fn is_reserved_command_word(word: &str) -> bool {
         || word == "py"
 }
 
+/// True when the command words collected so far name a subcommand that
+/// parses its own `--timeout <secs>`, so pass 1 must leave the flag (and its
+/// value, which falls through to `rest` next) for the handler.
+fn subcommand_owns_timeout(rest: &[String]) -> bool {
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..])
+}
+
 /// Parse `argv` (the args AFTER the program name) into the global options and a
 /// dispatch [`Resolution`]. This replicates `main()`'s decision sequence
 /// EXACTLY and has no side effects, so tests can assert routing directly:
@@ -1400,6 +1408,12 @@ pub fn resolve_with(
             "--json" => globals.json = true,
             "-v" | "--verbose" => globals.verbose = true,
             "--gateway" | "-G" => globals.gateway_override = iter.next().cloned(),
+            // A subcommand that declares its own `--timeout` (reserve, gpu
+            // hold: the drain budget, which also sizes their HTTP budget)
+            // keeps it; only the global form is consumed. rc.4 rehearsal:
+            // `cluster reserve --timeout 60` set the global HTTP timeout and
+            // the drain stayed at 120.
+            "--timeout" if subcommand_owns_timeout(&rest) => rest.push(tok.clone()),
             "--timeout" => globals.timeout_secs = iter.next().and_then(|v| v.parse().ok()),
             "--token" => globals.token = iter.next().cloned(),
             // Output styling (CLI_STYLE_GUIDE.md §3). Recorded as process
@@ -2289,6 +2303,27 @@ const SOURCES: &[(&str, &str)] = &[
         assert_eq!(g.gateway_override.as_deref(), Some("https://x:1"));
         assert_eq!(g.timeout_secs, Some(5));
         assert_eq!(native_prefix(&r), Some(&["jobs", "list"][..]));
+    }
+
+    #[test]
+    fn subcommand_timeout_is_not_taken_as_the_global_one() {
+        // `cluster reserve --timeout 60` is the drain budget, not the HTTP one.
+        let (g, r) = resolve(&argv(&["cluster", "reserve", "pai-voice/voice-worker", "--timeout", "60"]));
+        assert_eq!(g.timeout_secs, None);
+        assert_eq!(native_prefix(&r), Some(&["cluster", "reserve"][..]));
+        match r {
+            Resolution::Native { prefix, rest } => {
+                let a = crate::commands::cluster_reserve::parse_reserve(&rest[prefix.len()..]).expect("parses");
+                assert_eq!(a.timeout, Some(60));
+            }
+            other => panic!("not native: {other:?}"),
+        }
+        let (g, _) = resolve(&argv(&["cluster", "gpu", "hold", "awolf", "--timeout", "45"]));
+        assert_eq!(g.timeout_secs, None);
+        // A global --timeout BEFORE the subcommand still is the global one.
+        let (g, r) = resolve(&argv(&["--timeout", "5", "cluster", "reserve", "pai-voice/voice-worker"]));
+        assert_eq!(g.timeout_secs, Some(5));
+        assert_eq!(native_prefix(&r), Some(&["cluster", "reserve"][..]));
     }
 
     #[test]
