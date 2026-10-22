@@ -160,4 +160,26 @@ noo_data_volume() {
     printf '%s_noo-data\n' "$project"
 }
 
+# The directories the gateway (nonroot, uid 65532) creates under /data on
+# the noo-data volume, made and handed to 65532 before it starts. The volume
+# root stays owned by whoever first wrote it (onboard's `subdir_owner` leaves
+# noo-data with the operator, on purpose: host tooling reads it), so the
+# gateway's own create_dir_all of a NEW top-level dir fails EACCES:
+#   - ingest/{working,archive}: Drive/folder ingest staging (live 2026-08-08,
+#     Drive->KB ingestion silently broken, one warn per file per tick);
+#   - audit-archive: the agent-mail archive (gateway-rust
+#     agent_mail_archive.rs) and audit retention export
+#     (`${NOO_DATA_DIR}/audit-archive`). 0.6.10-rc.3 rehearsal: "cannot
+#     create /data/audit-archive: Permission denied" on every host.
+# A throwaway root container through the same volume: no sudo, idempotent,
+# never touches anything outside these dirs. Not fatal (no docker, no
+# alpine): the gateway then names the directory it could not create.
+# Pinned by tests/test_gateway_data_dirs_prepared.py.
+NOO_GATEWAY_DATA_DIRS="ingest audit-archive"
+noo_prepare_gateway_data_dirs() {
+    docker run --rm -v "$(noo_data_volume)":/d alpine \
+        sh -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive' \
+        2>/dev/null || true
+}
+
 noo_instance_env
