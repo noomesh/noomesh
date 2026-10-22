@@ -34,10 +34,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Where the launcher materialises each add-on's declaration from its signed
-/// bundle: `<WORKLOADS_DIR>/<addon>/workloads.json`. The same value as
-/// `addon_decls::WORKLOADS_DIR` (noomesh/noomesh#288); read that constant
-/// once it is on dev.
-pub const WORKLOADS_DIR: &str = "/opt/noo/addon-workloads";
+/// bundle: `<WORKLOADS_DIR>/<addon>/workloads.json`. One home for the path:
+/// `addon_decls` (noomesh/noomesh#288) owns it; this is the same constant.
+pub use crate::addon_decls::WORKLOADS_DIR;
 /// The declaration file's name.
 pub const WORKLOADS_FILE: &str = "workloads.json";
 /// At most this many workloads per add-on.
