@@ -41,6 +41,7 @@
 //! workers`; the constants below must stay in step with that file.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -104,6 +105,17 @@ const JOBS_SET: &str = "noo:embed:jobs";
 
 static PUSH_SLOTS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(PUSH_CONCURRENCY));
+
+/// Gateway-run jobs started and not yet finished (waiting for a slot, or
+/// embedding). Each one holds its batch text in memory, so a submit that
+/// would go past [`PUSH_MAX_BACKLOG`] is refused with 429, and the sweep
+/// leaves a flip for its next pass.
+static PUSH_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+const PUSH_MAX_BACKLOG: usize = 64;
+/// How long a gateway run keeps retrying a saturated fleet (each wait is the
+/// fleet's own Retry-After, 1..=30 s) before the job fails. Under
+/// [`PUSH_STALE_SECS`], which counts from the slot, not from submit.
+const PUSH_SATURATED_DEADLINE: Duration = Duration::from_secs(300);
 
 // ── Names ────────────────────────────────────────────────────────────────
 
@@ -345,14 +357,20 @@ pub fn decode_vectors(b64: &str, n: usize, dims: usize) -> Result<Vec<Vec<f32>>,
             bytes.len()
         ));
     }
-    Ok(bytes
+    let rows: Vec<Vec<f32>> = bytes
         .chunks_exact(dims * 4)
         .map(|row| {
             row.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         })
-        .collect())
+        .collect();
+    // JSON has no NaN: serde_json would turn one into `null` and hand the
+    // submitter a vector with a hole in it.
+    if rows.iter().flatten().any(|x| !x.is_finite()) {
+        return Err("vectors_b64 holds a NaN or infinite value".into());
+    }
+    Ok(rows)
 }
 
 /// A gateway-run answer is rectangular, the right count, and the expected
@@ -616,7 +634,7 @@ async fn create_job(redis: &RedisCache, job: &NewJob<'_>) -> bool {
     });
     let dims_s = job.target.dims.map(|d| d.to_string()).unwrap_or_default();
     let n_s = job.n.to_string();
-    let extras: Vec<(&str, &str)> = vec![
+    let extras = [
         ("owner", job.owner),
         ("path", job.path.as_str()),
         ("model", job.target.model.as_str()),
@@ -626,6 +644,9 @@ async fn create_job(redis: &RedisCache, job: &NewJob<'_>) -> bool {
         ("slug", job.slug),
     ];
     if !crate::routes::admin::hset_job_hash(redis, &key, &pairs, &extras).await {
+        // `hset` writes field by field: drop what landed, or a hash with no
+        // TTL and in no set would stay forever.
+        redis.del_key(&key).await;
         return false;
     }
     redis.sadd(ACTIVE_SET, job.id).await;
@@ -739,6 +760,9 @@ pub async fn submit(
         }),
         Decision::PushRun(reason) => {
             tracing::info!(model = %target.model, reason = %reason, "embed_jobs.push_run");
+            if push_backlog_full() {
+                return Err(push_busy(&target));
+            }
             if pool_is_empty(state, &target).await {
                 return Err(unavailable_for(&target));
             }
@@ -794,6 +818,11 @@ pub async fn submit(
                 }
                 Err(PublishFailure::Other(why)) => {
                     tracing::warn!(job_id = %job_id, error = %why, "embed_jobs.publish_failed — running the batch in the gateway");
+                    if push_backlog_full() {
+                        scheduler_engine::terminalize(state, &job_id, "dead", "", "refused: the work queue failed and the gateway is at its own limit").await;
+                        redis.del_key(&in_key(&job_id)).await;
+                        return Err(push_busy(&target));
+                    }
                     if pool_is_empty(state, &target).await {
                         scheduler_engine::terminalize(state, &job_id, "dead", "", "no embed target and the work queue refused it").await;
                         redis.del_key(&in_key(&job_id)).await;
@@ -819,8 +848,34 @@ pub async fn submit(
 
 // ── Push-run ─────────────────────────────────────────────────────────────
 
+fn push_backlog_full() -> bool {
+    PUSH_BACKLOG.load(Ordering::SeqCst) >= PUSH_MAX_BACKLOG
+}
+
+fn push_busy(t: &Target) -> SubmitError {
+    SubmitError::Busy {
+        retry_after_secs: BUSY_RETRY_AFTER_SECS,
+        detail: format!(
+            "no node is pulling model '{}' and the gateway is already running {PUSH_MAX_BACKLOG} batches itself",
+            t.model
+        ),
+    }
+}
+
+/// One count in [`PUSH_BACKLOG`], given back when the run ends (or panics).
+struct BacklogSlot;
+
+impl Drop for BacklogSlot {
+    fn drop(&mut self) {
+        PUSH_BACKLOG.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub fn spawn_push_run(state: Arc<AppState>, job_id: String, target: Target, texts: Vec<String>) {
+    PUSH_BACKLOG.fetch_add(1, Ordering::SeqCst);
+    let slot = BacklogSlot;
     tokio::spawn(async move {
+        let _slot = slot;
         run_push(&state, &job_id, &target, &texts).await;
     });
 }
@@ -845,7 +900,65 @@ async fn run_push(state: &Arc<AppState>, job_id: &str, t: &Target, texts: &[Stri
             return; // cancelled, or a worker finished it first
         }
     }
-    let result = if t.next {
+    // The stale rule counts from the slot, not from submit: a job that
+    // waited its turn is not stale.
+    touch(state, job_id).await;
+    let deadline = tokio::time::Instant::now() + PUSH_SATURATED_DEADLINE;
+    let result = loop {
+        match embed_once(state, t, texts).await {
+            // A busy fleet is a wait, not a failure: the sync route answers
+            // it with 429 + Retry-After, and so the run waits that long.
+            Err(crate::embedding_client::EmbedError::Saturated { retry_after_secs })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_secs(retry_after_secs.clamp(1, 30))).await;
+                if let Some(redis) = state.redis.as_ref() {
+                    if job_is_terminal(redis, job_id).await {
+                        return;
+                    }
+                }
+                touch(state, job_id).await;
+            }
+            other => break other,
+        }
+    };
+    let vectors = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let shown = public_error(job_id, "the gateway's embed failed", &e.to_string());
+            fail_job(state, job_id, &shown).await;
+            return;
+        }
+    };
+    let dims = match check_vectors(&vectors, texts.len(), t.dims) {
+        Ok(d) => d,
+        Err(why) => {
+            fail_job(state, job_id, &why).await;
+            return;
+        }
+    };
+    let b64 = encode_vectors(&vectors);
+    if let Err(why) = store_and_complete(state, job_id, &t.model, dims, texts.len(), &b64).await {
+        fail_job(state, job_id, &why).await;
+    }
+}
+
+/// Mark the job as alive now, for [`verdict`]'s stale rule.
+async fn touch(state: &AppState, job_id: &str) {
+    if let Some(redis) = state.redis.as_ref() {
+        let now = chrono::Utc::now().to_rfc3339();
+        redis.hset(&format!("{JOB_KEY_PREFIX}{job_id}"), &[("updated_at", now.as_str())]).await;
+    }
+}
+
+/// One embed of the whole batch, over the space's pool (`@next`: the mesh
+/// pool for the next model only).
+async fn embed_once(
+    state: &Arc<AppState>,
+    t: &Target,
+    texts: &[String],
+) -> Result<Vec<Vec<f64>>, crate::embedding_client::EmbedError> {
+    if t.next {
         crate::embedding_client::EmbeddingEndpoint::embed_model_over_mesh(
             state,
             &t.model,
@@ -862,24 +975,6 @@ async fn run_push(state: &Arc<AppState>, job_id: &str, t: &Target, texts: &[Stri
             ..crate::embedding_client::resolve()
         };
         ep.embed_with_mesh(state, texts, PUSH_EMBED_TIMEOUT).await
-    };
-    let vectors = match result {
-        Ok(v) => v,
-        Err(e) => {
-            fail_job(state, job_id, &format!("the gateway's embed failed: {e}")).await;
-            return;
-        }
-    };
-    let dims = match check_vectors(&vectors, texts.len(), t.dims) {
-        Ok(d) => d,
-        Err(why) => {
-            fail_job(state, job_id, &why).await;
-            return;
-        }
-    };
-    let b64 = encode_vectors(&vectors);
-    if let Err(why) = store_and_complete(state, job_id, &t.model, dims, texts.len(), &b64).await {
-        fail_job(state, job_id, &why).await;
     }
 }
 
@@ -912,6 +1007,17 @@ async fn fail_job(state: &AppState, job_id: &str, reason: &str) {
     if let Some(redis) = state.redis.as_ref() {
         redis.del_key(&in_key(job_id)).await;
     }
+}
+
+/// A job's `error` and `status_detail` are shown to the external submitter
+/// ([`status_view`]), so they never carry an operator detail: an embedder
+/// error names the node's URL. The detail is logged under a reference and
+/// the job gets `public` plus that reference, as the sync route's refusals
+/// do.
+fn public_error(job_id: &str, public: &str, detail: &str) -> String {
+    let reference = crate::egress::new_ref();
+    tracing::warn!(job_id, reference = %reference, detail, "embed_jobs.error_detail");
+    format!("{public} ({reference})")
 }
 
 // ── Events from workers ──────────────────────────────────────────────────
@@ -972,7 +1078,8 @@ pub async fn on_failed(
     {
         return Ok(());
     }
-    let error = event.get("error").and_then(Value::as_str).unwrap_or("unknown error").to_string();
+    let reported = event.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+    let error = public_error(job_id, "a worker's embedder failed", reported);
     let retryable = event.get("retryable").and_then(Value::as_bool).unwrap_or(true);
     if !retryable {
         scheduler_engine::terminalize(state, job_id, "dead", "", &error).await;
@@ -1210,17 +1317,22 @@ pub async fn sweep(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
         let queue = if needs_queue_info(&hash, now) {
             let sl = hash.get("slug").cloned().unwrap_or_default();
-            if !probes.contains_key(&sl) {
-                let found = probe_queue(&state.js, &sl).await.unwrap_or(None);
-                probes.insert(sl.clone(), found);
+            match probes.get(&sl) {
+                Some(found) => *found,
+                None => {
+                    let found = probe_queue(&state.js, &sl).await.unwrap_or(None);
+                    probes.insert(sl.clone(), found);
+                    found
+                }
             }
-            probes.get(&sl).copied().flatten()
         } else {
             None
         };
         match verdict(&hash, now, queue.as_ref(), now_unix) {
             Verdict::Leave => {}
             Verdict::Fail(reason) => fail_job(state, &job_id, &reason).await,
+            // At the gateway's own limit: leave it queued for the next pass.
+            Verdict::FlipToPush(_) if push_backlog_full() => {}
             Verdict::FlipToPush(reason) => flip_to_push(state, &job_id, &hash, &reason).await,
         }
     }
@@ -1458,7 +1570,7 @@ mod tests {
 
     #[test]
     fn vectors_round_trip_through_base64() {
-        let vs = vec![vec![1.0_f64, -2.5, 3.25], vec![0.0, 0.5, -0.125]];
+        let vs = [vec![1.0_f64, -2.5, 3.25], vec![0.0, 0.5, -0.125]];
         let b64 = encode_vectors(&vs);
         let back = decode_vectors(&b64, 2, 3).expect("decodes");
         assert_eq!(back, vec![vec![1.0_f32, -2.5, 3.25], vec![0.0, 0.5, -0.125]]);
@@ -1473,7 +1585,7 @@ mod tests {
         want.extend_from_slice(&2.0_f32.to_le_bytes());
         assert_eq!(raw, want);
         // Padded, standard alphabet.
-        assert!(b64.len() % 4 == 0);
+        assert!(b64.len().is_multiple_of(4));
     }
 
     #[test]
@@ -1490,7 +1602,7 @@ mod tests {
 
     #[test]
     fn a_gateway_run_answer_must_be_rectangular_and_counted() {
-        let ok = vec![vec![0.1_f64, 0.2], vec![0.3, 0.4]];
+        let ok = [vec![0.1_f64, 0.2], vec![0.3, 0.4]];
         assert_eq!(check_vectors(&ok, 2, Some(2)), Ok(2));
         assert_eq!(check_vectors(&ok, 2, None), Ok(2));
         assert!(check_vectors(&ok, 3, None).is_err());
@@ -1758,5 +1870,26 @@ mod tests {
             prod.matches("crate::embed_jobs::is_embed_job").count() >= 3,
             "reap_timeouts, janitor and recover_from_restart must each skip embed jobs"
         );
+    }
+
+    #[test]
+    fn a_job_error_never_carries_the_operator_detail() {
+        let shown = public_error(
+            "j1",
+            "the gateway's embed failed",
+            "error sending request for url (https://100.64.0.10:8081/embed)",
+        );
+        assert!(shown.starts_with("the gateway's embed failed (ref-"), "{shown}");
+        assert!(!shown.contains("100.64.0.10") && !shown.contains("https://"), "{shown}");
+    }
+
+    #[test]
+    fn decode_refuses_non_finite_values() {
+        let mut bytes = Vec::new();
+        for x in [1.0_f32, f32::NAN] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert!(decode_vectors(&b64, 1, 2).is_err(), "a NaN would reach the submitter as null");
     }
 }
