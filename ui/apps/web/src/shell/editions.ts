@@ -81,6 +81,7 @@ export const EXTENDED_TABS: Record<string, { reason: 'closed' | 'operator' | 'th
     },
     proposals: { reason: 'operator', note: 'cluster governance' },
     channels: { reason: 'operator', note: 'Telegram/Chat bridges' },
+    traffic: { reason: 'operator', note: 'all agent-to-agent threads (operator-only)' },
     files: { reason: 'operator', note: 'user directory config' },
   };
 
