@@ -316,30 +316,45 @@ func jsonError(w http.ResponseWriter, status int, code, message string) {
 //   - backend type isn't in backendExtraKeys (unknown / new backend —
 //     pass through; safer than over-stripping for unknown configurations)
 func filterBodyForBackend(body []byte, backendType string) []byte {
+	out, _ := filterBodyForBackendDropped(body, backendType)
+	return out
+}
+
+// DroppedKeysHeader names, on the response, the request keys the allowlist
+// removed before forwarding (sorted, comma-separated). A key a backend does
+// not take is otherwise a silent no-op: `chat_template_kwargs` on ollama
+// left thinking on and nobody could tell from the answer (noomesh-internal
+// i183). Absent when nothing was dropped.
+const DroppedKeysHeader = "X-Noo-Dropped-Keys"
+
+// filterBodyForBackendDropped is filterBodyForBackend plus the names of the
+// keys it removed, sorted.
+func filterBodyForBackendDropped(body []byte, backendType string) ([]byte, []string) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
+		return body, nil
 	}
 	extras, known := backendExtraKeys[backendType]
 	if !known {
-		return body
+		return body, nil
 	}
-	changed := false
+	var dropped []string
 	for k := range obj {
 		if portableOpenAIKeys[k] || extras[k] {
 			continue
 		}
 		delete(obj, k)
-		changed = true
+		dropped = append(dropped, k)
 	}
-	if !changed {
-		return body
+	if len(dropped) == 0 {
+		return body, nil
 	}
+	sort.Strings(dropped)
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return body
+		return body, nil
 	}
-	return out
+	return out, dropped
 }
 
 // Preferred order when no backend hint + no model match — vllm wins
@@ -440,7 +455,15 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// Filter body to only keys the target backend accepts (portable
 	// OpenAI keys + this backend's vendor extras). Catches vendor-key
 	// mismatches across backends without hardcoding "vllm vs others".
-	body = filterBodyForBackend(body, backendType)
+	var dropped []string
+	body, dropped = filterBodyForBackendDropped(body, backendType)
+	if len(dropped) > 0 {
+		// Said on the answer, not only here: the caller is the one who
+		// sent a key this backend does not take.
+		w.Header().Set(DroppedKeysHeader, strings.Join(dropped, ","))
+		slog.Debug("inference proxy dropped request keys the backend does not take",
+			"backend", backendType, "keys", dropped)
+	}
 
 	targetURL, scheme := s.inferenceTarget(backendType, port, native)
 	target, err := url.Parse(targetURL)
