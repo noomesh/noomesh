@@ -2977,6 +2977,7 @@ pub const USER_READ_PREFIXES: &[&str] = &[
     "/api/agents/messages",
     "/api/agents/threads",
     "/api/agents/presence",
+    "/api/agents/whoami",
     "/api/agents/roles",
     "/api/agents/peer/",
     "/api/heartbeat/tasks/",

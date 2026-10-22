@@ -41,6 +41,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/trust/remove", post(trust_remove))
         // which of a person's windows are alive.
         .route("/api/agents/presence", get(presence_list))
+        // who am I on this session — the address others message.
+        .route("/api/agents/whoami", get(whoami))
         .route("/api/agents/keys/{agent}", get(keys_get).put(keys_put))
         .route("/api/agents/keys/review", get(keys_review))
         .route("/api/agent/run", post(agent_run))
@@ -1286,6 +1288,67 @@ mod tests {
         assert!(routes.matches(ack_needle.as_str()).count() >= 1, "ack route must pass its reader");
     }
 
+    /// The default is the caller's OWN mail, operator role or not. Only a
+    /// caller with no acting identity (the shared cluster token) sees
+    /// everything by default; `all=true` widens for a privileged caller and
+    /// is refused for anyone else.
+    #[test]
+    fn list_scope_defaults_to_own_mail_and_all_is_operator_only() {
+        // privileged WITH a sub (an operator's session): scoped by default
+        assert_eq!(list_sees_everything(true, true, false), Ok(false));
+        // …and widened only on request
+        assert_eq!(list_sees_everything(true, true, true), Ok(true));
+        // cluster token (privileged, no sub): unchanged, sees everything
+        assert_eq!(list_sees_everything(true, false, false), Ok(true));
+        assert_eq!(list_sees_everything(true, false, true), Ok(true));
+        // non-privileged: scoped, and all=true is a 403, not a silent narrow
+        assert_eq!(list_sees_everything(false, true, false), Ok(false));
+        assert!(list_sees_everything(false, true, true).is_err());
+        assert!(list_sees_everything(false, false, true).is_err());
+    }
+
+    /// Source pin: both list routes must consult the one rule, and the
+    /// threads listing must go through the repo's owner clause rather than
+    /// a second definition of "mine".
+    #[test]
+    fn messages_and_threads_both_apply_the_scope_rule() {
+        let src = include_str!("agents.rs");
+        for f in ["async fn messages_list(", "async fn threads_list("] {
+            let needle = ["async fn ", f.trim_start_matches("async fn ")].concat();
+            let body = src.split(needle.as_str()).last().expect("route");
+            let body = &body[..body.find("\n}").unwrap()];
+            let call = ["list_sees_everything(", "who.privileged"].concat();
+            assert!(body.contains(&call), "{f} must apply list_sees_everything");
+            assert!(body.contains("q.all"), "{f} must honour all=");
+            assert!(body.contains("owner = Some(own.as_str())"), "{f} must fall back to owner scope");
+        }
+    }
+
+    /// presence `all=true` is gated on privilege and served by `live_all`.
+    #[test]
+    fn presence_all_is_operator_only() {
+        let src = include_str!("agents.rs");
+        let needle = ["async fn ", "presence_list("].concat();
+        let body = src.split(needle.as_str()).last().expect("presence route");
+        let body = &body[..body.find("\n}").unwrap()];
+        let gate = ["q.get(\"all\")", ".is_some_and"].concat();
+        assert!(body.contains(&gate), "presence must read all=");
+        let deny = ["if !who.priv", "ileged {"].concat();
+        let all_at = body.find(&gate).unwrap();
+        assert!(body[all_at..].find(&deny).unwrap() < body[all_at..].find("live_all").unwrap(), "403 check must precede live_all");
+    }
+
+    /// `/api/agents/whoami` is registered and answers from `caller(...)`.
+    #[test]
+    fn whoami_route_is_registered() {
+        let src = include_str!("agents.rs");
+        let route = ["\"/api/agents/", "whoami\", get(whoami)"].concat();
+        assert!(src.contains(&route));
+        let auth = include_str!("../auth.rs");
+        let listed = ["\"/api/agents/", "whoami\""].concat();
+        assert!(auth.contains(&listed), "whoami must be allow-listed in auth.rs");
+    }
+
     /// Presence is scoped by the WIDE question (same owner), acting by the
     /// NARROW one (owns). A window sees its siblings and cannot become
     /// them. Pinned as source with the plant target named: swap
@@ -1692,6 +1755,15 @@ async fn presence_list(
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> AppResult {
     let who = caller(&requester, &cluster);
+    // `all=true`: every account's live sessions. Operator-only, refused
+    // (not narrowed) for anyone else, like the message and thread lists.
+    if q.get("all").is_some_and(|v| v == "true" || v == "1") {
+        if !who.privileged {
+            return Err(AppError::Forbidden("all=true is operator-only — omit it to list your own account's presence".into()));
+        }
+        let sessions = crate::mcp_session::live_all(&state.db).await?;
+        return Ok(Json(json!({ "owner": null, "all": true, "sessions": sessions, "idle_ttl_secs": crate::mcp_session::IDLE_TTL.as_secs() })));
+    }
     let mine = who.account();
     let owner = q.get("owner").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).or_else(|| mine.clone());
     let Some(owner) = owner else {
@@ -1705,6 +1777,26 @@ async fn presence_list(
     }
     let sessions = crate::mcp_session::live_for(&state.db, &owner).await?;
     Ok(Json(json!({ "owner": owner, "sessions": sessions, "idle_ttl_secs": crate::mcp_session::IDLE_TTL.as_secs() })))
+}
+
+/// GET /api/agents/whoami — the acting agent name of this session (the
+/// address other sessions use to message it), its account, the harness the
+/// credential arrived through, and whether it is privileged. `name` is null
+/// only when no identity can be derived at all (an anonymous caller); a
+/// service token reports its controller-side service identity.
+async fn whoami(
+    requester: Option<Extension<RequesterCtx>>,
+    cluster: Option<Extension<ClusterNode>>,
+) -> AppResult {
+    let who = caller(&requester, &cluster);
+    let name = who.acting_agent(None).ok();
+    let account = name.as_deref().map(|n| crate::auth::account_of(n).to_string());
+    Ok(Json(json!({
+        "name": name,
+        "account": account,
+        "harness": who.harness,
+        "privileged": who.privileged,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -2046,7 +2138,26 @@ struct ListQuery {
     harness: Option<String>,
     #[serde(default)]
     unread: bool,
+    /// Operators only: list every session's mail, not just the caller's own.
+    #[serde(default)]
+    all: bool,
     limit: Option<i64>,
+}
+
+/// Does this list call see the whole system (`true`) or only the caller's
+/// own mail (`false`)?
+///
+/// Anything with an acting identity (`sub`) is scoped to its own names by
+/// default, operator role or not: an operator's window is a person's
+/// session with its own inbox, not a firehose. Widening is explicit
+/// (`all=true`) and only a privileged caller may ask — anyone else is
+/// refused rather than silently narrowed. The shared cluster token (the
+/// stack's own services) has no `sub` and keeps seeing everything.
+fn list_sees_everything(privileged: bool, has_sub: bool, all: bool) -> Result<bool, &'static str> {
+    if all && !privileged {
+        return Err("all=true is operator-only — omit it to list your own messages");
+    }
+    Ok(privileged && (all || !has_sub))
 }
 
 /// **Delivery is to a CONNECTION, not to an owner** — decided by the
@@ -2144,7 +2255,11 @@ async fn messages_list(
     let reader = who.acting_agent(None).ok();
     let own;
     let mut owner: Option<&str> = None;
-    let (agent, node_prefix) = if who.privileged {
+    let widen = list_sees_everything(who.privileged, who.sub.is_some(), q.all)
+        .map_err(|m| AppError::Forbidden(m.into()))?;
+    // An explicit `agent=` from a privileged caller is already a deliberate
+    // choice and keeps working as before.
+    let (agent, node_prefix) = if who.privileged && (widen || q.agent.is_some()) {
         (q.agent.as_deref(), None)
     } else if let Some(n) = &who.node {
         // A node sees its own agents' traffic; a narrower `agent` is fine
@@ -2256,6 +2371,9 @@ async fn messages_ack(
 #[derive(Deserialize, Default)]
 struct ThreadsQuery {
     agent: Option<String>,
+    /// Operators only: every thread, not just the caller's own.
+    #[serde(default)]
+    all: bool,
     limit: Option<i64>,
 }
 
@@ -2267,8 +2385,11 @@ async fn threads_list(
     Query(q): Query<ThreadsQuery>,
 ) -> AppResult {
     let who = caller(&requester, &cluster);
+    let widen = list_sees_everything(who.privileged, who.sub.is_some(), q.all)
+        .map_err(|m| AppError::Forbidden(m.into()))?;
     let own;
-    let agent = if who.privileged {
+    let mut owner: Option<&str> = None;
+    let agent = if who.privileged && (widen || q.agent.is_some()) {
         q.agent.as_deref()
     } else if who.node.is_some() {
         // Threads are per agent; a node names which of its agents.
@@ -2278,10 +2399,13 @@ async fn threads_list(
             None => return Err(AppError::BadRequest("agent is required (one of this node's agents)".into())),
         }
     } else {
+        // The account rule (`auth::owns_name`), via the repo's one owner
+        // clause — the same "mine" `messages_list` uses.
         own = who.sub.clone().unwrap_or_default();
-        Some(own.as_str())
+        owner = Some(own.as_str());
+        None
     };
-    let rows = crate::repo::agent_messages::threads(&state.db, agent, q.limit.unwrap_or(50))
+    let rows = crate::repo::agent_messages::threads(&state.db, agent, owner, q.limit.unwrap_or(50))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(json!({ "threads": rows, "count": rows.len() })))

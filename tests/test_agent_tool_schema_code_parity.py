@@ -33,6 +33,9 @@ ACCEPTED_ELSEWHERE = {
     # identity is derived from the credential, never claimed
     ("noo_agent_send", "agent"): "identity comes from the credential",
     ("noo_agent_send", "harness"): "harness class comes from the credential",
+    # the loop's native inbox is ALWAYS scoped to its own names; `all` widens
+    # the HTTP route for operators only and has no meaning in the loop
+    ("noo_agent_inbox", "all"): "native inbox is always owner-scoped",
     # the ack route's path parameter; the native reader takes it as `id`/`message_id`
 }
 

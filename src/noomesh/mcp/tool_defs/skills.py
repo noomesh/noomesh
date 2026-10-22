@@ -267,7 +267,23 @@ class NooAgentInbox(ToolDef):
     thread: Optional[str] = Field(default=None, description="Only this thread")
     unread: Optional[bool] = Field(default=None, description="Only messages not yet acknowledged")
     since: Optional[str] = Field(default=None, description="RFC 3339 — only messages after this time")
+    all: Optional[bool] = Field(
+        default=None,
+        description="Operators only: list every session's messages, not just yours.",
+    )
     limit: Optional[int] = Field(default=None, description="Max messages (default 50)")
+
+
+@register
+class NooAgentWhoami(ToolDef):
+    """Your own agent name on this session — the address other sessions use to message you."""
+
+    name: ClassVar[str] = "noo_agent_whoami"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.GET
+    path: ClassVar[str] = "/api/agents/whoami"
+    tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
 
 
 @register

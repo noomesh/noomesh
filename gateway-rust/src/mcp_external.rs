@@ -378,6 +378,39 @@ pub(crate) fn wire_key<'a>(spec: &'a ToolSpec, field: &'a str) -> &'a str {
     spec.aliases.get(field).map(String::as_str).unwrap_or(field)
 }
 
+/// Refuse an argument the tool's schema does not declare.
+///
+/// The request is built from the arguments the client sent, so an unknown
+/// one used to be silently dropped: `noo_agent_thread(thread_id=…)` (the
+/// parameter is `thread`) ran with NO thread filter and returned every
+/// message. A dropped filter widens a read, so it is an error naming what
+/// the tool does accept. A schema with no declared properties (the
+/// no-argument tools) or with `additionalProperties: true` is not checked;
+/// an alias wire key is accepted as well as the field name.
+pub(crate) fn unknown_args(spec: &ToolSpec, args: &Map<String, Value>) -> Option<String> {
+    let props = spec.input_schema.get("properties")?.as_object()?;
+    if props.is_empty() || spec.input_schema.get("additionalProperties") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    let bad: Vec<&str> = args
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !props.contains_key(*k) && !spec.aliases.values().any(|v| v == k))
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    let mut expected: Vec<&str> = props.keys().map(String::as_str).collect();
+    expected.sort_unstable();
+    Some(format!(
+        "unknown argument{} {} for {}; expected one of: {}",
+        if bad.len() > 1 { "s" } else { "" },
+        bad.iter().map(|b| format!("'{b}'")).collect::<Vec<_>>().join(", "),
+        spec.name,
+        expected.join(", ")
+    ))
+}
+
 /// Substitute `{placeholder}` segments in the path from the arguments, and
 /// return the keys consumed so they are not ALSO sent as body/query params.
 pub(crate) fn build_path(
@@ -505,6 +538,9 @@ pub(crate) async fn execute_spec(
     args: &Map<String, Value>,
     auth_header: (String, String),
 ) -> Result<Value, String> {
+    if let Some(e) = unknown_args(spec, args) {
+        return Err(e);
+    }
     let (path, consumed) = build_path(spec, args)?;
     let rest = remaining_args(spec, args, &consumed);
     let rest = match body_payload(spec, args) {
@@ -1222,6 +1258,22 @@ mod body_field_tests {
         assert_eq!(got.get("NOO_X").and_then(Value::as_str), Some("1"));
         assert!(!got.contains_key("updates"), "must not wrap: {got:?}");
         assert!(!got.contains_key("section"), "path arg must not leak in");
+    }
+
+    /// `thread_id` for a tool whose parameter is `thread` used to be dropped,
+    /// running the read unfiltered. It must be refused, naming the real keys.
+    #[test]
+    fn an_undeclared_argument_is_refused_not_dropped() {
+        let mut spec = spec_with("");
+        spec.name = "noo_agent_thread".into();
+        spec.input_schema = json!({"type": "object", "properties": {"thread": {}, "limit": {}}});
+        let e = unknown_args(&spec, &args(json!({"thread_id": "thr_x"}))).expect("refused");
+        assert!(e.contains("unknown argument 'thread_id' for noo_agent_thread"), "{e}");
+        assert!(e.contains("expected one of: limit, thread"), "{e}");
+        assert!(unknown_args(&spec, &args(json!({"thread": "thr_x", "limit": 5}))).is_none());
+        // no declared properties (no-argument tools) is not checked
+        spec.input_schema = json!({"type": "object", "properties": {}});
+        assert!(unknown_args(&spec, &args(json!({"anything": 1}))).is_none());
     }
 
     /// The opt-in must not change every other tool.

@@ -14252,7 +14252,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -14364,7 +14375,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
+          }
+        ]
       }
     },
     "/api/agents/keys/review": {
@@ -15948,6 +15970,15 @@
               "type": "string"
             },
             "description": "Account to list. Defaults to the caller's own."
+          },
+          {
+            "name": "all",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Operators only: include every session's data, not just the caller's own. 403 for anyone else."
           }
         ],
         "responses": {
@@ -15998,6 +16029,48 @@
           },
           "403": {
             "description": "The caller may not list that account's presence."
+          }
+        }
+      }
+    },
+    "/api/agents/whoami": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "This session's own agent name",
+        "operationId": "agent_whoami",
+        "description": "The acting agent name of this session (the address other sessions use to message it), its account, the harness the credential arrived through, and whether it is privileged.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "account": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "harness": {
+                      "type": "string"
+                    },
+                    "privileged": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
