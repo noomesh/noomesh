@@ -268,6 +268,11 @@ var backendExtraKeys = map[string]map[string]bool{
 		"reasoning":        true,
 		"reasoning_effort": true,
 		"think":            true,
+		// Read by the /api/chat translator (ollama_chat.go, ollamaThink)
+		// as the last-resort thinking switch and never forwarded: the
+		// translator builds a fresh body. Stripped here, it was a silent
+		// no-op (noomesh-internal i183).
+		"chat_template_kwargs": true,
 	},
 	"llamacpp": {
 		"n_predict":      true, // alias for max_tokens
