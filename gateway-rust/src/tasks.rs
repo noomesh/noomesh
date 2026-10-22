@@ -1381,8 +1381,11 @@ mod tests {
         let src = include_str!("tasks.rs").split("fn a_busy_node_queues_the_task_and_only_silence_falls_back").next().unwrap();
         let start = src.split("pub async fn start(").nth(1).unwrap().split("\nfn run_in_process(").next().unwrap();
         let busy = start.find("get(\"busy\")").expect("the busy reply is read");
-        let queued = start[busy..].find("mark_queued(").expect("a busy node queues the task");
-        assert!(start[busy..busy + queued + 200].contains("Started::queued("), "and returns queued, never falls through");
+        let after = &start[busy..];
+        let queued = after.find("mark_queued(").expect("a busy node queues the task");
+        let returned = after.find("return Ok(Started::queued(").expect("and returns queued");
+        let fallback = after.find("running in process (fallback)").expect("the fallback wording");
+        assert!(queued < returned && returned < fallback, "queued is returned before any fallback path: {queued} {returned} {fallback}");
         assert!(start.contains("running in process (fallback)"), "the controller run is named a fallback");
         assert!(start.contains("tracing::warn!(task = %task.id, node = %node, answered"), "and logged at warn");
         let unfinished = &src[src.find("async fn list_unfinished_on").unwrap()..];
