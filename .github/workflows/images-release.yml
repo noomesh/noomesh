@@ -86,8 +86,9 @@ jobs:
       # re-run resolved the branch again and could mix two generations of
       # sibling code into one lock (stack-v0.2.96).
       trellion_sha: ${{ steps.siblings.outputs.trellion_sha }}
-      # The final re-tag plan (scripts/release-retag-plan.py). For an rc, or
-      # a final with no equal-tree rc, every image is `false` = build.
+      # The re-tag plan (scripts/release-retag-plan.py). For a release with
+      # no equal-tree earlier rc (a final: any rc; an rc: a lower rc), every
+      # image is `false` = build.
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
       rc_image_tag: ${{ steps.plan.outputs.rc_image_tag }}
       rc_commit: ${{ steps.plan.outputs.rc_commit }}
@@ -153,7 +154,10 @@ jobs:
       # provably unchanged (this tree, and each sibling's tree vs the one the
       # rc lock recorded) is re-tagged from the rc's digest instead of rebuilt.
       # gateway and node-agent stamp the tag into their bits and always build.
-      # The rules, and why each fails open to BUILD, are in the script.
+      # The same holds for an rc re-cut on an earlier rc's tree (rc.N+1 on
+      # rc.N's commit): it re-tags rc.N's images, and still mints and signs
+      # its own lock. The rules, and why each fails open to BUILD, are in the
+      # script.
       - name: Plan — re-tag from the rc, or build
         id: plan
         env:
@@ -220,8 +224,21 @@ jobs:
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
+        if: env.RETAG != 'true'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
         if: env.RETAG != 'true'
@@ -265,7 +282,9 @@ jobs:
         run: |
           set -eux
           # Controller-side image: amd64 only, same policy as deps-base.
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-core \
             --cache-from type=gha,scope=deps-core \
@@ -314,8 +333,21 @@ jobs:
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
+        if: env.RETAG != 'true'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
         if: env.RETAG != 'true'
@@ -429,7 +461,9 @@ jobs:
           # Controller-side image: amd64 only. The heavy Python/CUDA stack runs
           # on x86 GPU nodes; arm64 edge nodes run node-agent + llama.cpp, not
           # this base. (nvidia-cudnn-cu13 also has no clean arm64 wheel.)
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-base \
             --cache-from type=gha,scope=deps-base \
@@ -646,8 +680,21 @@ jobs:
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
+        if: env.RETAG != 'true'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
         if: env.RETAG != 'true'
@@ -726,7 +773,9 @@ jobs:
         if: env.RETAG != 'true'
         run: |
           set -eux
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
             --cache-from type=gha,scope=${{ matrix.name }} \
@@ -832,10 +881,10 @@ jobs:
           check digests/source-trellion "$WANT_TRELLION"
           exit $bad
 
-      # Provenance for a re-tagged final: which rc the reused digests came
+      # Provenance for a re-tagged release: which rc the reused digests came
       # from. Not an image row (no sha256 digest), so `noo upgrade` and the
       # launcher skip it, exactly as they skip the source: rows.
-      - name: Record the rc a re-tagged final reuses
+      - name: Record the rc a re-tagged release reuses
         if: contains(needs.release-line.outputs.retag, 'true')
         env:
           RC_TAG: ${{ needs.release-line.outputs.rc_tag }}

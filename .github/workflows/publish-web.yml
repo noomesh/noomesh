@@ -118,7 +118,17 @@ jobs:
 
       # FROM scratch — just /dist, nothing to run. No Node or JS build
       # toolchain ever enters the gateway image.
+      #
+      # Tried twice. The image is `FROM scratch` + `COPY . /dist` of a tree the
+      # steps above already built and tested, so this step has no build of
+      # its own that can fail for a code reason: what fails it is the
+      # registry (0.6.10-rc: "buildx failed with: ERROR: failed to build:
+      # unknown blob", cleared by a re-run with no change). The second attempt
+      # re-sends only what the first did not push (content-addressed); a
+      # second failure fails the job.
       - name: Build & push artifact image
+        id: push
+        continue-on-error: true
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6
         with:
           context: ui/apps/web/dist
@@ -126,6 +136,20 @@ jobs:
           push: true
           # A release candidate never moves :latest (promotion model, #697);
           # build-push-action drops the empty line an rc leaves here.
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
+            ${{ !contains(steps.tag.outputs.value, '-rc.') && format('{0}:latest', env.IMAGE) || '' }}
+      - name: Wait before the second push attempt
+        if: steps.push.outcome == 'failure'
+        working-directory: .
+        run: echo "::warning::the artifact push failed once (a registry error, see above); retrying in 30s" && sleep 30
+      - name: Build & push artifact image, second attempt
+        if: steps.push.outcome == 'failure'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6
+        with:
+          context: ui/apps/web/dist
+          file: ui/deploy/web-artifact.Dockerfile
+          push: true
           tags: |
             ${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
             ${{ !contains(steps.tag.outputs.value, '-rc.') && format('{0}:latest', env.IMAGE) || '' }}
