@@ -105,3 +105,40 @@ def test_an_unknown_studio_command_fails_without_touching_docker():
     r = subprocess.run([BASH, str(DEMO / "studio.sh"), "frobnicate"], capture_output=True, text=True,
                        env={"PATH": "/nonexistent", "HOME": "/nonexistent"})
     assert r.returncode == 1 and "unknown command" in r.stderr
+
+
+def test_the_cache_answers_as_ghcr_with_a_ca_only_the_box_trusts():
+    """A pull-through cache of ghcr.io that the box reaches under the real
+    name: Docker Engine mirrors only Docker Hub, so the cache must answer AS
+    ghcr.io, and the box must trust its throwaway CA in both places TLS to a
+    registry is checked. Anything less and the film's pulls go to the internet
+    (or fail) while `cache status` says otherwise."""
+    studio = (DEMO / "studio.sh").read_text()
+    assert "REGISTRY_PROXY_REMOTEURL=\"$CACHE_UPSTREAM\"" in studio and "CACHE_UPSTREAM=https://ghcr.io" in studio
+    assert "subjectAltName=DNS:ghcr.io" in studio, "the cache's leaf must be for the name the box resolves"
+    up = studio.split("cmd_up()", 1)[1].split("\n}\n", 1)[0]
+    assert '--add-host "ghcr.io:$cache_ip"' in up, "the box must resolve ghcr.io to the cache"
+    assert "/etc/docker/certs.d/ghcr.io/ca.crt" in up and "update-ca-certificates" in up
+    assert "https://ghcr.io/v2/" in up, "up must prove the box reaches the cache as ghcr.io"
+    # only when the cache is actually running: a box made otherwise is a plain stranger's machine
+    assert "if cache_running; then" in up
+
+
+def test_cache_verbs_only_touch_the_cache_the_studio_made():
+    studio = (DEMO / "studio.sh").read_text()
+    assert "noo-demo-cache=1" in studio
+    for verb in ("cmd_cache_up", "cmd_cache_down"):
+        body = studio.split(f"{verb}()", 1)[1].split("\n}\n", 1)[0]
+        assert "cache_is_ours" in body, f"{verb} must check the label"
+    # purge is down plus the volume; it must not reach past the studio's own names
+    purge = studio.split("cmd_cache_purge()", 1)[1].split("\n}\n", 1)[0]
+    assert "cmd_cache_down" in purge and '"$CACHE_VOL"' in purge and '"$CACHE_DIR"' in purge
+
+
+@needs_bash
+def test_an_unknown_cache_command_fails_without_touching_docker():
+    r = subprocess.run([BASH, str(DEMO / "studio.sh"), "cache", "frobnicate"], capture_output=True, text=True,
+                       env={"PATH": "/nonexistent", "HOME": "/nonexistent"})
+    assert r.returncode == 1 and "unknown cache command" in r.stderr
+    r = subprocess.run([BASH, str(DEMO / "studio.sh"), "--help"], capture_output=True, text=True)
+    assert "studio.sh cache up" in r.stdout
