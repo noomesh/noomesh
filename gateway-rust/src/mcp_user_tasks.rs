@@ -351,6 +351,7 @@ pub async fn call(state: &Arc<AppState>, user: &str, name: &str, args: &Map<Stri
             if let Some(s) = started {
                 out["node"] = json!(s.node);
                 out["dispatched"] = json!(s.dispatched);
+                out["queued"] = json!(s.queued);
             }
             Ok(out)
         }
@@ -361,6 +362,7 @@ pub async fn call(state: &Arc<AppState>, user: &str, name: &str, args: &Map<Stri
             let mut out = brief(&after);
             out["node"] = json!(started.node);
             out["dispatched"] = json!(started.dispatched);
+            out["queued"] = json!(started.queued);
             Ok(out)
         }
         other => Err(format!("unknown tool: {other}")),

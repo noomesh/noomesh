@@ -783,6 +783,13 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
     Ok(after)
 }
 
+/// Keep the task `open`, assigned to `node`, for the node's busy harness to
+/// take when a slot frees (its `harness.ready` hand-back lists open tasks
+/// on the node).
+pub async fn mark_queued(db: &sqlx::PgPool, id: &str, node: &str) -> Result<()> {
+    set_state(db, id, "open", Some(node)).await
+}
+
 /// Mark the task running on `node` (or in process when `None`) before a
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
@@ -923,15 +930,22 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
 pub struct Started {
     pub node: String,
     pub dispatched: bool,
+    /// The node's harness is busy: the task stays `open` on that node and
+    /// is handed back when a slot frees (noomesh-internal i176). Never
+    /// run on the controller for that.
+    pub queued: bool,
     pub why: Option<String>,
 }
 
 impl Started {
     fn dispatched(node: String) -> Self {
-        Self { node, dispatched: true, why: None }
+        Self { node, dispatched: true, queued: false, why: None }
     }
     fn here(node: String, why: impl Into<String>) -> Self {
-        Self { node, dispatched: false, why: Some(why.into()) }
+        Self { node, dispatched: false, queued: false, why: Some(why.into()) }
+    }
+    fn queued(node: String, why: impl Into<String>) -> Self {
+        Self { node, dispatched: false, queued: true, why: Some(why.into()) }
     }
     /// Where it went, for callers that only need the name.
     pub fn node(&self) -> &str {
@@ -987,18 +1001,38 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
                     state.nats.send_request(task_subject(&node), crate::coordinator::node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
                 )
                 .await;
+                let mut answered = false;
                 if let Ok(Ok(msg)) = ack {
+                    answered = true;
                     let body: Value = serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
                     if body.get("ack").and_then(|a| a.as_bool()) == Some(true) {
+                        if body.get("already").and_then(|a| a.as_bool()) == Some(true) {
+                            tracing::info!(task = %task.id, node = %node, "task_already_on_node");
+                        } else {
+                            tracing::info!(task = %task.id, node = %node, "task_dispatched");
+                        }
                         mark_running(&state.db, &task.id, Some(&node)).await?;
-                        tracing::info!(task = %task.id, node = %node, "task_dispatched");
                         return Ok(Started::dispatched(node));
                     }
+                    if body.get("busy").and_then(|b| b.as_bool()) == Some(true) {
+                        // Busy is not dead: the task waits for THIS node's
+                        // harness, which hands it back when a slot frees.
+                        let running = body.get("running").and_then(Value::as_u64).unwrap_or(0);
+                        let capacity = body.get("capacity").and_then(Value::as_u64).unwrap_or(0);
+                        mark_queued(&state.db, &task.id, &node).await?;
+                        tracing::info!(task = %task.id, node = %node, running, capacity, "task_queued_for_node");
+                        return Ok(Started::queued(node.clone(), format!("node '{node}' has a harness and it is busy ({running} of {capacity} running); the task is queued for it")));
+                    }
                 }
-                why = format!(
-                    "node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node"
-                );
-                tracing::info!(task = %task.id, node = %node, "task: harness did not ack; running in process");
+                // No ack at all (or a refusal): the dead case. Running a
+                // node-placed task on the controller is a fallback, said
+                // so in the record and at warn in the log.
+                why = if answered {
+                    format!("node '{node}' has a harness and it refused the task; running in process (fallback)")
+                } else {
+                    format!("node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node; running in process (fallback)")
+                };
+                tracing::warn!(task = %task.id, node = %node, answered, "task: harness did not take it; running in process (fallback)");
             } else {
                 why = format!("no harness token could be minted for '{owner}' on node '{node}'");
             }
@@ -1180,7 +1214,8 @@ fn describe_runner(node: Option<&str>) -> String {
 /// A node's tasks to hand back. A PARKED task (`budget_state` set) is not
 /// one: it waits for its owner's resubmit or answer, not for a harness.
 async fn list_unfinished_on(db: &sqlx::PgPool, node: &str) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') AND t.budget_state IS NULL ORDER BY t.created_at")))
+    // `open` with a node: queued for that node's busy harness (i176).
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('open','running','checkpointed') AND t.budget_state IS NULL ORDER BY t.created_at")))
         .bind(node)
         .fetch_all(db)
         .await?;
@@ -1336,6 +1371,24 @@ mod tests {
 
     /// PINNED: a runner stops on any terminal state and on the budget,
     /// and continues only while the task is live.
+    /// noomesh-internal i176: a busy harness keeps the task on its node;
+    /// only no answer at all runs it on the controller, and says so.
+    #[test]
+    fn a_busy_node_queues_the_task_and_only_silence_falls_back() {
+        let q = Started::queued("mcmini".into(), "busy");
+        assert!(q.queued && !q.dispatched && q.node() == "mcmini");
+        assert!(!Started::dispatched("mcmini".into()).queued && !Started::here("pop-os".into(), "x").queued);
+        let src = include_str!("tasks.rs").split("fn a_busy_node_queues_the_task_and_only_silence_falls_back").next().unwrap();
+        let start = src.split("pub async fn start(").nth(1).unwrap().split("\nfn run_in_process(").next().unwrap();
+        let busy = start.find("get(\"busy\")").expect("the busy reply is read");
+        let queued = start[busy..].find("mark_queued(").expect("a busy node queues the task");
+        assert!(start[busy..busy + queued + 200].contains("Started::queued("), "and returns queued, never falls through");
+        assert!(start.contains("running in process (fallback)"), "the controller run is named a fallback");
+        assert!(start.contains("tracing::warn!(task = %task.id, node = %node, answered"), "and logged at warn");
+        let unfinished = &src[src.find("async fn list_unfinished_on").unwrap()..];
+        assert!(unfinished[..500].contains("t.state IN ('open','running','checkpointed')"), "a queued (open) task is handed back");
+    }
+
     #[test]
     fn keep_looping_rule() {
         assert!(keep_looping("checkpointed", 1, 5));

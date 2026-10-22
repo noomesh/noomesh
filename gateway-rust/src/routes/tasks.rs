@@ -148,6 +148,7 @@ async fn tasks_create(State(state): State<Arc<AppState>>, ctx: Option<Extension<
         "task": task,
         "node": started.node,
         "dispatched": started.dispatched,
+        "queued": started.queued,
         "why": started.why,
     })))
 }
@@ -299,7 +300,7 @@ async fn tasks_answer(State(state): State<Arc<AppState>>, ctx: Option<Extension<
     let (after, started) = crate::task_budget::answer(&state, &task, &req.text).await?;
     let (user, _) = person(&ctx)?;
     crate::routes::core::audit_event(&state.db, "task_answered", "info", &user, &task.id, "resumed", json!({"node": started.node})).await;
-    Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "why": started.why})))
+    Ok(Json(json!({"task": after, "node": started.node, "dispatched": started.dispatched, "queued": started.queued, "why": started.why})))
 }
 
 /// Stop a task: it ends at its next checkpoint, and its loops' tool calls stand.
