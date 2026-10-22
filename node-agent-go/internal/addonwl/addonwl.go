@@ -83,15 +83,15 @@ func Declared() []Decl {
 	return out
 }
 
-// NameOK is the rule for an add-on or workload name as it is joined into a
-// label value and a path: lowercase letters, digits, `-` and `_`, starting
-// with a letter, at most 32 characters (the gateway's add-on name rule).
+// NameOK is the spec's rule for an add-on or workload name as it is joined
+// into a label value and a path: `^[a-z][a-z0-9-]{0,31}$` (the gateway's
+// `addon_workloads::workload_name_ok`).
 func NameOK(s string) bool {
 	if s == "" || len(s) > 32 || s[0] < 'a' || s[0] > 'z' {
 		return false
 	}
 	for _, c := range s {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
 			return false
 		}
 	}
