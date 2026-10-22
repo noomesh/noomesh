@@ -2370,7 +2370,7 @@ mod permission_tests {
             validate(&m, "evolve").unwrap_or_else(|e| panic!("{method} owner_scoped user: {e}"));
             let meth = axum::http::Method::from_bytes(method.as_bytes()).unwrap();
             let id = "/api/sample/things/00000000-0000-0000-0000-000000000001";
-            assert!(owner_scoped_allows(&[m.clone()], &meth, &held(&["read"]), Role::User, id));
+            assert!(owner_scoped_allows(std::slice::from_ref(&m), &meth, &held(&["read"]), Role::User, id));
             assert!(!owner_scoped_allows(&[m], &axum::http::Method::POST, &held(&["read"]), Role::User, id), "method must match");
 
             let mut scoped = v.clone();
