@@ -10053,6 +10053,230 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create stop
+         * @description [native] Revoke background work: stop every unfinished task the caller owns that was created `via` an add-on. The owner, or that add-on's own delegated token, stops the caller's; an operator may name another person with `user`.
+         */
+        post: operations["tasks_stop_via"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create context
+         * @description [native] Context an add-on pushes into a running task: revisions are monotonic per task and a retry of the same revision is a no-op, picked up at the next loop boundary. Distinct from `answer`, which needs a pending question.
+         */
+        post: operations["tasks_context"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get events
+         * @description [native] The task's events after `after` (default: from the start), oldest first.
+         */
+        get: operations["tasks_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/embedding-spaces/{space}/migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create migration
+         * @description [native] POST /api/cluster/embedding-spaces/{space}/migration `{model}` -- start re-embedding a space into another model (i150). The gateway PROBES the new model (one short text across the mesh nodes declaring it, its own balancer, no static endpoints); the answer's width must equal the space's, because trellion's `vector(N)` columns are fixed. 409 on a running migration, a model another space has, or a different width. When no node serves the model yet: 202 and the migration waits as `pending`.
+         */
+        post: operations["embedding_space_migration_start"];
+        /**
+         * Delete migration
+         * @description [native] DELETE /api/cluster/embedding-spaces/{space}/migration -- cancel while filling. Once the cutover has begun trellion is swapping columns, so the model must follow: 409.
+         */
+        delete: operations["embedding_space_migration_cancel"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/embedding-spaces/{space}/migration/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create complete
+         * @description [native] POST /api/cluster/embedding-spaces/{space}/migration/complete -- the operator's go: refused unless trellion reported (fresh, about this model) every table fully re-embedded. Moves the migration to `cutover`; trellion swaps its columns and its `cutover_done` report flips the space's model.
+         */
+        post: operations["embedding_space_migration_complete"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/external/embedding-spaces/{space}/migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update migration
+         * @description [native] PUT /api/external/embedding-spaces/{space}/migration (i150) -- trellion's re-embed worker reports progress with its consumer key. Stores the report and its time; in `cutover`, `cutover_done: true` swaps the space to its next model in one UPDATE. 409 when the space has no migration or the report is about another model.
+         */
+        put: operations["embedding_migration_report"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get archive
+         * @description [native] GET /api/agents/archive — the agent-mail archive files (operator-only).
+         */
+        get: operations["archive_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/archive/{month}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get archive
+         * @description [native] GET /api/agents/archive/{month} — one month's rows (`YYYY-MM` or the file name). Bodies stay sealed unless `?decrypt=true`, which needs an operator AND the review key and is audited before any plaintext is produced.
+         */
+        get: operations["archive_export"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addons/{addon_id}/ui-session": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open an add-on UI
+         * @description [native] POST /api/addons/{addon_id}/ui-session — hand the signed-in person over to an add-on's web UI, which is served on an origin of its own (a port of its own on this host). Send the access token as `Authorization: Bearer`; checks the UI's `min_role` and answers a one-time code (30 s, single use, bound to this person and add-on) and the URL `https://<host>:<port>/__noo/session?code=<code>` to navigate to. The add-on origin redeems it and sets its own cookie. 401 without a person's bearer, 403 below the UI's role, 404 when the add-on serves no UI, 503 when it is off or its UI listener is not up.
+         */
+        post: operations["ui_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addons/{addon_id}/ws-ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint an add-on socket ticket
+         * @description [native] POST /api/addons/{addon_id}/ws-ticket — a single-use ticket for opening one of the add-on's WebSocket routes from a browser, which cannot send an Authorization header on a WebSocket. Send the access token as `Authorization: Bearer`; open `/ws/addons/{addon_id}/…?ticket=<ticket>` within 30 seconds. The ticket is bound to this person and this add-on and is consumed by the first handshake that presents it. The route's own `min_role` is checked at the handshake. 401 without a person's bearer, 404 when the add-on declares no WebSocket route, 503 when it is off.
+         */
+        post: operations["ws_ticket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/addons/ui": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List add-on UIs
+         * @description [native] GET /api/addons/ui — the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.
+         */
+        get: operations["ui_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -22881,6 +23105,379 @@ export interface operations {
                 content: {
                     "application/json": {
                         [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    tasks_stop_via: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    tasks_context: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    tasks_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embedding_space_migration_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embedding_space_migration_cancel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embedding_space_migration_complete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    embedding_migration_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    archive_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    archive_export: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    ui_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A one-time code and where to send the browser */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        code: string;
+                        port: number;
+                        /** @description /__noo/session?code=<code> */
+                        path: string;
+                        /** @description https://<host>:<port>/__noo/session?code=<code>; open it in a new tab */
+                        url?: string | null;
+                        expires_in: number;
+                        session_idle_secs?: number;
+                        session_max_secs?: number;
+                    };
+                };
+            };
+            /** @description No person's bearer */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Below the UI's min_role, or a delegated credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The add-on serves no UI */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The add-on is off or its UI origin is not listening */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ws_ticket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                addon_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A single-use ticket */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ticket: string;
+                        /** @enum {string} */
+                        param: "ticket";
+                        expires_in: number;
+                    };
+                };
+            };
+            /** @description No person's bearer */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A delegated or harness credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The add-on declares no WebSocket route */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The add-on is off */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ui_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The add-on web UIs this caller may see */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        uis: {
+                            addon: string;
+                            title: string;
+                            port: number;
+                            /** @description https://<host>:<port>, the add-on's own origin */
+                            url_base?: string | null;
+                            /** @description Whether this account's role may open it (ui.min_role) */
+                            can_open: boolean;
+                        }[];
                     };
                 };
             };

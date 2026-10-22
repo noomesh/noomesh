@@ -42,6 +42,7 @@ export const CORE_TABS: readonly string[] = [
   'backends', // start/stop models across nodes — the differentiator vs plain Ollama
   'model-prefs', // which model answers each purpose; embedding spaces (operator-gated)
   'tasks', // scheduled work; basic self-hosting need
+  'addons', // add-on web UIs, each on its own origin; empty until one is enabled
   'memory', // conversations persist — the other thing cloud does not do privately
   'rag', // document ingest — the reason to have a graph at all
   'graph', // the knowledge graph itself

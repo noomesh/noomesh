@@ -13,7 +13,7 @@
 //!
 //! ## Ports
 //!
-//! `NOO_ADDON_UI_PORTS` (default [`DEFAULT_PORT_RANGE`], `8450-8499`) is the
+//! `NOO_ADDON_UI_PORTS` (default [`DEFAULT_PORT_RANGE`], `8450-8459`, ten add-on UIs; widen it for more) is the
 //! range. Each add-on with a `ui` gets the port its name hashes to, probing
 //! upward (wrapping) past ports already given, in name order
 //! ([`allocate_ports`]): the same set of add-ons always gets the same ports,
@@ -27,12 +27,25 @@
 //!    gateway checks `ui.min_role` and answers a ONE-TIME CODE (random, 30 s,
 //!    single use, bound to that person and that add-on) and the URL
 //!    `https://<host>:<port>/__noo/session?code=<code>`.
-//! 2. The browser navigates there (a tab, or the console's iframe). The
-//!    add-on origin redeems the code and sets ITS OWN cookie,
-//!    `noo_ui_<addon>=<opaque session id>`: HttpOnly, Secure,
-//!    SameSite=Strict, host-only, `Path=/`, expiring with the access token
-//!    the console presented. Then it redirects to `/`.
-//! 3. On the add-on origin that cookie, and nothing else, authenticates
+//!    The same answer sets `noo_handoff_<addon>` (HttpOnly, Secure,
+//!    SameSite=Strict, `Path=/__noo/session`, 30 s): the code is bound to
+//!    the browser that minted it.
+//! 2. The browser navigates there (a new tab). The add-on origin redeems the
+//!    code only with that binding cookie and no foreign `Origin` /
+//!    cross-site `Sec-Fetch-Site` (a top-level navigation from the console),
+//!    and sets ITS OWN cookie, `noo_ui_<addon>=<opaque session id>`:
+//!    HttpOnly, Secure, SameSite=Strict, host-only, `Path=/`. Then it
+//!    redirects to `/`.
+//! 3. The session SLIDES: it ends after `NOO_ADDON_UI_SESSION_IDLE_SECS`
+//!    (default 8 h) without a request, and after
+//!    `NOO_ADDON_UI_SESSION_MAX_SECS` (default 24 h) regardless. It is not
+//!    tied to the console's 15-minute access token, and no refresh token
+//!    ever reaches the add-on origin. Instead, every request re-checks the
+//!    person: the session floor (logout, password change, disable), the live
+//!    role (a demotion below the session's role ends it) and the add-on
+//!    still being enabled; an open socket re-checks every minute and closes
+//!    4401.
+//! 4. On the add-on origin that cookie, and nothing else, authenticates
 //!    ([`gate`]): the UI's pages and assets, the add-on's own manifest HTTP
 //!    routes (`/api/…`, the same proxy handler as on the console port) and its
 //!    WS routes (cookie on the upgrade, plus an `Origin` check). Every other
@@ -87,8 +100,10 @@ use serde_json::json;
 use crate::addon_proxy::{AddonManifest, UiSpec};
 use crate::state::AppState;
 
-/// The default port range for add-on UI origins.
-pub const DEFAULT_PORT_RANGE: &str = "8450-8499";
+/// The default port range for add-on UI origins: ten add-ons with a UI (ten
+/// published ports, ten docker-proxy processes). Widen with
+/// `NOO_ADDON_UI_PORTS`.
+pub const DEFAULT_PORT_RANGE: &str = "8450-8459";
 /// The variable that overrides it (`<first>-<last>`).
 pub const PORT_RANGE_ENV: &str = "NOO_ADDON_UI_PORTS";
 /// Where the add-on origin redeems a one-time code.
@@ -99,6 +114,20 @@ pub const COOKIE_PREFIX: &str = "noo_ui_";
 pub const ADDON_REQUEST_HEADER: &str = "x-noo-addon-request";
 /// How long a one-time code may wait to be redeemed.
 pub const CODE_TTL: Duration = Duration::from_secs(30);
+/// The cookie that binds a code to the browser that minted it:
+/// `noo_handoff_<addon>`, `Path=/__noo/session`, set on the console's answer
+/// to `ui-session`. Cookies ignore ports, so the same browser presents it to
+/// the add-on origin's redeem path; a code opened in any other browser has
+/// none.
+pub const HANDOFF_COOKIE_PREFIX: &str = "noo_handoff_";
+/// Session idle bound (no request on the origin for this long ends it).
+pub const SESSION_IDLE_ENV: &str = "NOO_ADDON_UI_SESSION_IDLE_SECS";
+pub const DEFAULT_SESSION_IDLE_SECS: u64 = 8 * 3600;
+/// Session absolute bound, however active.
+pub const SESSION_MAX_ENV: &str = "NOO_ADDON_UI_SESSION_MAX_SECS";
+pub const DEFAULT_SESSION_MAX_SECS: u64 = 24 * 3600;
+/// How often an open socket re-checks its session.
+pub const SOCKET_RECHECK: Duration = Duration::from_secs(60);
 /// Codes and sessions kept at most (a flood of mints cannot grow memory).
 const MAX_ENTRIES: usize = 10_000;
 
@@ -234,86 +263,132 @@ pub fn spawn_origins(state: Arc<AppState>, tls: axum_server::tls_rustls::RustlsC
 pub struct Grant {
     pub addon: String,
     pub requester: crate::auth::RequesterCtx,
-    /// The access token the console presented; kept on the gateway, re-checked
-    /// against the session floor, never sent to the browser on this origin.
+    /// The access token the console presented; kept on the gateway (the
+    /// session floor is checked against its issue time), never sent to the
+    /// browser on the add-on origin.
     pub token: String,
-    pub token_exp: usize,
+    /// The value of the `noo_handoff_<addon>` cookie the minting browser holds.
+    pub bind: String,
 }
 
-struct Entry {
+struct CodeEntry {
     grant: Grant,
     expires: Instant,
 }
 
-static CODES: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
-static SESSIONS: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
+struct SessionEntry {
+    grant: Grant,
+    created: Instant,
+    last: Instant,
+}
+
+static CODES: Mutex<Option<HashMap<String, CodeEntry>>> = Mutex::new(None);
+static SESSIONS: Mutex<Option<HashMap<String, SessionEntry>>> = Mutex::new(None);
 
 fn random_id() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
 
-fn put(store: &Mutex<Option<HashMap<String, Entry>>>, grant: Grant, ttl: Duration) -> String {
-    let id = random_id();
-    let mut guard = match store.lock() {
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v > 0).unwrap_or(default)
+}
+
+/// The session bounds in force: (idle, absolute).
+pub fn session_bounds() -> (Duration, Duration) {
+    let max = env_secs(SESSION_MAX_ENV, DEFAULT_SESSION_MAX_SECS);
+    let idle = env_secs(SESSION_IDLE_ENV, DEFAULT_SESSION_IDLE_SECS).min(max);
+    (Duration::from_secs(idle), Duration::from_secs(max))
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
-    };
+    }
+}
+
+/// Mint a one-time code for `grant`.
+pub fn mint_code(grant: Grant) -> String {
+    let id = random_id();
+    let mut guard = lock(&CODES);
     let map = guard.get_or_insert_with(HashMap::new);
     let now = Instant::now();
     map.retain(|_, e| e.expires > now);
     if map.len() >= MAX_ENTRIES {
         map.clear();
     }
-    map.insert(id.clone(), Entry { grant, expires: now + ttl });
+    map.insert(id.clone(), CodeEntry { grant, expires: now + CODE_TTL });
     id
 }
 
-/// Seconds until a token's `exp`, at least 1.
-fn secs_until(exp: usize) -> u64 {
-    let now = chrono::Utc::now().timestamp().max(0) as usize;
-    exp.saturating_sub(now).max(1) as u64
+/// Redeem a code on `addon`'s origin, presented with the binding cookie
+/// `bind`. Single use: removed whether or not it matches.
+pub fn redeem_code(code: &str, addon: &str, bind: Option<&str>) -> Option<Grant> {
+    let e = lock(&CODES).as_mut()?.remove(code)?;
+    let bound = bind.is_some_and(|b| !b.is_empty() && b == e.grant.bind);
+    (e.expires > Instant::now() && e.grant.addon == addon && bound).then_some(e.grant)
 }
 
-/// Mint a one-time code for `grant`.
-pub fn mint_code(grant: Grant) -> String {
-    put(&CODES, grant, CODE_TTL)
-}
-
-/// Redeem a code on `addon`'s origin. Single use: removed whether or not it
-/// matches.
-pub fn redeem_code(code: &str, addon: &str) -> Option<Grant> {
-    let mut guard = match CODES.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let e = guard.as_mut()?.remove(code)?;
-    (e.expires > Instant::now() && e.grant.addon == addon).then_some(e.grant)
-}
-
-/// Open a session for `grant`, living until its token expires.
+/// Open a session for `grant`.
 pub fn open_session(grant: Grant) -> String {
-    let ttl = Duration::from_secs(secs_until(grant.token_exp));
-    put(&SESSIONS, grant, ttl)
+    let id = random_id();
+    let (idle, max) = session_bounds();
+    let mut guard = lock(&SESSIONS);
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    map.retain(|_, e| live_at(e, now, idle, max));
+    if map.len() >= MAX_ENTRIES {
+        map.clear();
+    }
+    map.insert(id.clone(), SessionEntry { grant, created: now, last: now });
+    id
 }
 
-/// The live session `sid` on `addon`'s origin.
+fn live_at(e: &SessionEntry, now: Instant, idle: Duration, max: Duration) -> bool {
+    now.duration_since(e.last) < idle && now.duration_since(e.created) < max
+}
+
+/// The live session `sid` on `addon`'s origin. Using it slides it: its idle
+/// clock restarts; the absolute bound does not move.
 pub fn session(sid: &str, addon: &str) -> Option<Grant> {
-    let guard = match SESSIONS.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let e = guard.as_ref()?.get(sid)?;
-    (e.expires > Instant::now() && e.grant.addon == addon).then(|| e.grant.clone())
+    let (idle, max) = session_bounds();
+    let mut guard = lock(&SESSIONS);
+    let map = guard.as_mut()?;
+    let now = Instant::now();
+    let e = map.get_mut(sid)?;
+    if !live_at(e, now, idle, max) {
+        map.remove(sid);
+        return None;
+    }
+    if e.grant.addon != addon {
+        return None;
+    }
+    e.last = now;
+    Some(e.grant.clone())
 }
 
-fn end_session(sid: &str) {
-    let mut guard = match SESSIONS.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    if let Some(m) = guard.as_mut() {
+pub(crate) fn end_session(sid: &str) {
+    if let Some(m) = lock(&SESSIONS).as_mut() {
         m.remove(sid);
     }
+}
+
+/// Why the person behind a session may no longer use it, re-read on every
+/// request: logged out / password changed / disabled (session floor), demoted
+/// below the session's role or removed (live role), or the add-on switched
+/// off. `None` when the session stands.
+pub async fn session_refusal(state: &AppState, grant: &Grant) -> Option<&'static str> {
+    if crate::session_floor::refuses(state, &grant.requester.sub, &grant.token).await {
+        return Some("signed out");
+    }
+    let live = crate::auth::live_account_role(&state.db, &grant.requester.sub).await;
+    if !crate::auth::rail_token_admitted(grant.requester.role, live) {
+        return Some("account disabled or role lowered");
+    }
+    if !crate::addons::enabled(&grant.addon) {
+        return Some("add-on switched off");
+    }
+    None
 }
 
 /// The add-on's cookie name.
@@ -331,6 +406,19 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .find_map(|c| c.trim().strip_prefix(name).and_then(|r| r.strip_prefix('=')))
         .filter(|t| !t.is_empty())
         .map(str::to_string)
+}
+
+/// The cookie binding a code to the browser that minted it (see
+/// [`HANDOFF_COOKIE_PREFIX`]). `max_age_secs` 0 clears it.
+pub fn handoff_cookie(addon: &str, bind: &str, max_age_secs: i64) -> axum_extra::extract::cookie::Cookie<'static> {
+    use axum_extra::extract::cookie::{Cookie, SameSite};
+    let mut c = Cookie::new(format!("{HANDOFF_COOKIE_PREFIX}{addon}"), bind.to_string());
+    c.set_http_only(true);
+    c.set_secure(true);
+    c.set_same_site(SameSite::Strict);
+    c.set_path(SESSION_PATH);
+    c.set_max_age(time::Duration::seconds(max_age_secs));
+    c
 }
 
 /// The add-on origin's session cookie: HttpOnly, Secure, SameSite=Strict,
@@ -351,7 +439,61 @@ pub fn session_cookie(addon: &str, sid: &str, max_age_secs: i64) -> axum_extra::
 /// The core route on the console port. The console origin never serves an
 /// add-on's UI itself.
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/addons/{addon_id}/ui-session", post(ui_session))
+    Router::new()
+        .route("/api/addons/ui", get(ui_list))
+        .route("/api/addons/{addon_id}/ui-session", post(ui_session))
+}
+
+/// One add-on UI as the listing shows it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct UiEntry {
+    pub addon: String,
+    pub title: String,
+    pub port: u16,
+    /// `https://<host>:<port>`, when the request named a usable host.
+    pub url_base: Option<String>,
+    /// May this caller open it (`ui.min_role`)?
+    pub can_open: bool,
+}
+
+/// The listing, pure over its inputs: every enabled add-on with a `ui` and an
+/// allocated port. A User sees only the UIs it may open; an Operator, an
+/// Admin and a machine credential see all of them (with `can_open`), so the
+/// launcher can front every port.
+pub fn ui_entries(
+    manifests: &[AddonManifest],
+    ports: &BTreeMap<String, u16>,
+    role: Option<crate::auth::Role>,
+    host: Option<&str>,
+    enabled: &dyn Fn(&str) -> bool,
+) -> Vec<UiEntry> {
+    let mut out: Vec<UiEntry> = manifests
+        .iter()
+        .filter(|m| enabled(&m.addon))
+        .filter_map(|m| {
+            let ui = m.ui.as_ref()?;
+            let port = *ports.get(&m.addon)?;
+            let can_open = role.is_none_or(|r| ui.permits(r));
+            let sees_all = role.is_none_or(|r| r >= crate::auth::Role::Operator);
+            (can_open || sees_all).then(|| UiEntry {
+                addon: m.addon.clone(),
+                title: ui.title.clone().unwrap_or_else(|| m.addon.clone()),
+                port,
+                url_base: host.map(|h| format!("https://{h}:{port}")),
+                can_open,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.addon.cmp(&b.addon));
+    out
+}
+
+/// GET /api/addons/ui — the add-on web UIs this gateway serves, each on its own origin: `[{addon, title, port, url_base, can_open}]`. Any signed-in account; a User sees only the UIs its role may open, an Operator or Admin sees every one (with `can_open`). Open one with `POST /api/addons/{addon_id}/ui-session`.
+async fn ui_list(headers: HeaderMap, ctx: Option<axum::Extension<crate::auth::RequesterCtx>>) -> Response {
+    let role = ctx.map(|axum::Extension(r)| r.role);
+    let ports = PORTS.get().cloned().unwrap_or_default();
+    let entries = ui_entries(&crate::addon_proxy::manifests(), &ports, role, request_host(&headers), &crate::addons::enabled);
+    Json(json!({ "uis": entries })).into_response()
 }
 
 /// Is `path` the ui-session route? (The tier gate lets a User POST it; the
@@ -470,21 +612,27 @@ async fn ui_session(
         return (StatusCode::UNAUTHORIZED, Json(json!({ "detail": "send the access token as Authorization: Bearer" })))
             .into_response();
     };
-    let Ok(claims) = crate::auth::verify_token(token, &crate::auth::jwt_secret()) else {
+    if crate::auth::verify_token(token, &crate::auth::jwt_secret()).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "detail": "not an access token" }))).into_response();
-    };
-    let code = mint_code(Grant { addon: addon_id.clone(), requester: r, token: token.to_string(), token_exp: claims.exp });
+    }
+    let bind = random_id();
+    let code = mint_code(Grant { addon: addon_id.clone(), requester: r, token: token.to_string(), bind: bind.clone() });
     let path = format!("{SESSION_PATH}?code={code}");
     let url = request_host(&headers).map(|h| format!("https://{h}:{port}{path}"));
+    let (idle, max) = session_bounds();
     let mut resp = Json(json!({
         "code": code,
         "port": port,
         "path": path,
         "url": url,
         "expires_in": CODE_TTL.as_secs(),
-        "session_expires_at": claims.exp,
+        "session_idle_secs": idle.as_secs(),
+        "session_max_secs": max.as_secs(),
     }))
     .into_response();
+    if let Ok(v) = HeaderValue::from_str(&handoff_cookie(&addon_id, &bind, CODE_TTL.as_secs() as i64).to_string()) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
     resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
@@ -500,11 +648,42 @@ pub struct Origin {
 }
 
 /// The session behind an add-on-origin request, for a socket's lifetime
-/// (`addon_ws`): the token's `exp` and subject.
+/// (`addon_ws`).
 #[derive(Clone, Debug)]
 pub struct OriginSession {
-    pub exp: usize,
-    pub sub: String,
+    pub sid: String,
+    pub addon: String,
+}
+
+impl OriginSession {
+    /// Resolves when the socket must close (4401): a logout or session end
+    /// broadcast for the person, or a periodic re-check that finds the
+    /// session gone (idle/absolute bound, ended) or refused
+    /// ([`session_refusal`]). An open socket counts as activity: each
+    /// successful re-check slides the idle clock.
+    pub fn ended(self, state: Arc<AppState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>> {
+        Box::pin(async move {
+            let Some(first) = session(&self.sid, &self.addon) else { return "Session ended" };
+            let sub = first.requester.sub.clone();
+            let mut ends = state.alert_hub.subscribe_session_end();
+            loop {
+                tokio::select! {
+                    ended = ends.recv() => match ended {
+                        Ok(who) if who == sub => return "Logged out",
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => tokio::time::sleep(SOCKET_RECHECK).await,
+                    },
+                    _ = tokio::time::sleep(SOCKET_RECHECK) => {
+                        let Some(g) = session(&self.sid, &self.addon) else { return "Session ended" };
+                        if session_refusal(&state, &g).await.is_some() {
+                            end_session(&self.sid);
+                            return "Session ended";
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// The router of one add-on's origin: the add-on's own manifest routes (HTTP
@@ -518,9 +697,9 @@ pub fn origin_router(state: Arc<AppState>, manifest: &AddonManifest, port: u16) 
     crate::addon_proxy::addon_router(manifest)
         .route(
             SESSION_PATH,
-            get(move |RawQuery(q): RawQuery| {
+            get(move |RawQuery(q): RawQuery, headers: HeaderMap| {
                 let o = o_session.clone();
-                async move { redeem(&o, q.as_deref()) }
+                async move { redeem(&o, q.as_deref(), &headers) }
             }),
         )
         .fallback(
@@ -544,6 +723,16 @@ pub fn origin_router(state: Arc<AppState>, manifest: &AddonManifest, port: u16) 
             let o = o_gate.clone();
             async move { gate(&o, req, next).await }
         }))
+        // The same outer layers as the console's router (routes/mod.rs), in
+        // the same order: the caller's address for audit rows, the rate
+        // limiter, the access log, and a panic answered as a logged 500.
+        // Not the console's security-header layer: its `X-Frame-Options: DENY` and
+        // `Permissions-Policy: microphone=()` are the console's, and an
+        // add-on UI answers with its own (see `sanitise_response_headers`).
+        .layer(axum::middleware::from_fn(crate::audit_context::origin_layer))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::middleware::rate_limit))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::middleware::request_logger))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::middleware::panic_response))
         .with_state(state)
 }
 
@@ -552,24 +741,52 @@ pub fn is_reserved_on_origin(path: &str) -> bool {
     ["/api/", "/ws/", "/__noo/"].iter().any(|p| path.starts_with(p)) || path == "/api" || path == "/ws"
 }
 
-/// `GET /__noo/session?code=…` on the add-on origin: redeem the code, set
-/// this origin's own cookie, go to `/`.
-fn redeem(o: &Origin, query: Option<&str>) -> Response {
-    let code = query.and_then(|q| q.split('&').find_map(|p| p.strip_prefix("code="))).unwrap_or("");
-    let Some(grant) = redeem_code(code, &o.addon) else {
-        return (
+/// May this request redeem a code? Only a top-level navigation that no
+/// other site started: no `Origin` other than this origin, no cross-site
+/// `Sec-Fetch-Site`, and (when the browser says) `Sec-Fetch-Mode: navigate`.
+pub fn redeem_request_ok(headers: &HeaderMap, port: u16) -> bool {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_ascii_lowercase);
+    if let Some(o) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !origin_matches(o, request_host(headers), port) {
+            return false;
+        }
+    }
+    if h("sec-fetch-site").is_some_and(|s| s == "cross-site") {
+        return false;
+    }
+    if h("sec-fetch-mode").is_some_and(|m| m != "navigate") {
+        return false;
+    }
+    true
+}
+
+/// `GET /__noo/session?code=…` on the add-on origin: redeem the code (bound
+/// to this browser, top-level navigation only), set this origin's own
+/// cookie, clear the binding cookie, go to `/`.
+fn redeem(o: &Origin, query: Option<&str>, headers: &HeaderMap) -> Response {
+    let refused = || {
+        (
             StatusCode::UNAUTHORIZED,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
-            "This link is used, expired or for another add-on. Open the add-on again from the console.",
+            "This link is used, expired, opened in another browser, or for another add-on. Open the add-on again from the console.",
         )
-            .into_response();
+            .into_response()
     };
-    let max_age = secs_until(grant.token_exp) as i64;
+    let code = query.and_then(|q| q.split('&').find_map(|p| p.strip_prefix("code="))).unwrap_or("");
+    if !redeem_request_ok(headers, o.port) {
+        // Consume it anyway: a code shown to a cross-site request is spent.
+        let _ = redeem_code(code, &o.addon, None);
+        return refused();
+    }
+    let bind = cookie_value(headers, &format!("{HANDOFF_COOKIE_PREFIX}{}", o.addon));
+    let Some(grant) = redeem_code(code, &o.addon, bind.as_deref()) else { return refused() };
+    let (_, max) = session_bounds();
     let sid = open_session(grant);
-    let cookie = session_cookie(&o.addon, &sid, max_age);
     let mut resp = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
-    if let Ok(v) = HeaderValue::from_str(&cookie.to_string()) {
-        resp.headers_mut().append(header::SET_COOKIE, v);
+    for c in [session_cookie(&o.addon, &sid, max.as_secs() as i64), handoff_cookie(&o.addon, "", 0)] {
+        if let Ok(v) = HeaderValue::from_str(&c.to_string()) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
     }
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -642,11 +859,12 @@ async fn gate(o: &Origin, mut req: Request, next: Next) -> Response {
     };
     let Some(sid) = cookie_value(req.headers(), &cookie_name(&o.addon)) else { return unauth() };
     let Some(grant) = session(&sid, &o.addon) else { return unauth() };
-    if crate::session_floor::refuses(&o.state, &grant.requester.sub, &grant.token).await {
+    if let Some(why) = session_refusal(&o.state, &grant).await {
+        tracing::info!(target: "security", addon = %o.addon, sub = %grant.requester.sub, why, "add-on origin session ended");
         end_session(&sid);
         return unauth();
     }
-    req.extensions_mut().insert(OriginSession { exp: grant.token_exp, sub: grant.requester.sub.clone() });
+    req.extensions_mut().insert(OriginSession { sid, addon: o.addon.clone() });
     req.extensions_mut().insert(grant.requester);
     next.run(req).await
 }
@@ -933,7 +1151,7 @@ mod tests {
 
     #[test]
     fn ports_are_deterministic_distinct_and_inside_the_range() {
-        assert_eq!(parse_port_range(DEFAULT_PORT_RANGE), Ok((8450, 8499)));
+        assert_eq!(parse_port_range(DEFAULT_PORT_RANGE), Ok((8450, 8459)), "ten ports by default");
         for bad in ["8450", "80-90", "9000-8000", "x-y", "2000-4000"] {
             assert!(parse_port_range(bad).is_err(), "{bad}");
         }
@@ -951,14 +1169,20 @@ mod tests {
     }
 
     #[test]
-    fn a_code_is_single_use_bound_to_its_addon_and_opens_a_session() {
-        let grant = |addon: &str| Grant { addon: addon.into(), requester: ctx("alice", Role::User), token: "tok".into(), token_exp: usize::MAX / 2 };
+    fn a_code_is_single_use_bound_to_its_addon_and_its_browser_and_opens_a_session() {
+        let grant = |addon: &str| Grant { addon: addon.into(), requester: ctx("alice", Role::User), token: "tok".into(), bind: "B1".into() };
         let code = mint_code(grant("example-addon"));
-        assert!(redeem_code(&code, "other").is_none(), "another add-on's origin");
-        assert!(redeem_code(&code, "example-addon").is_none(), "tried once, gone");
+        assert!(redeem_code(&code, "other", Some("B1")).is_none(), "another add-on's origin");
+        assert!(redeem_code(&code, "example-addon", Some("B1")).is_none(), "tried once, gone");
+        // Login CSRF: the attacker's code opened in the victim's browser has
+        // no (or another) binding cookie.
         let code = mint_code(grant("example-addon"));
-        let g = redeem_code(&code, "example-addon").expect("redeems once");
-        assert!(redeem_code(&code, "example-addon").is_none());
+        assert!(redeem_code(&code, "example-addon", None).is_none());
+        let code = mint_code(grant("example-addon"));
+        assert!(redeem_code(&code, "example-addon", Some("B2")).is_none());
+        let code = mint_code(grant("example-addon"));
+        let g = redeem_code(&code, "example-addon", Some("B1")).expect("redeems once, in the browser that minted it");
+        assert!(redeem_code(&code, "example-addon", Some("B1")).is_none());
         let sid = open_session(g);
         assert_eq!(session(&sid, "example-addon").unwrap().requester.sub, "alice");
         assert!(session(&sid, "other").is_none(), "a session opens only its own add-on");
@@ -968,7 +1192,79 @@ mod tests {
     }
 
     #[test]
+    fn sessions_slide_with_an_idle_and_an_absolute_bound() {
+        if std::env::var(SESSION_IDLE_ENV).is_ok() || std::env::var(SESSION_MAX_ENV).is_ok() {
+            return;
+        }
+        assert_eq!(session_bounds(), (Duration::from_secs(8 * 3600), Duration::from_secs(24 * 3600)));
+        let g = Grant { addon: "a".into(), requester: ctx("alice", Role::User), token: "t".into(), bind: "b".into() };
+        let t0 = Instant::now();
+        let idle = Duration::from_secs(100);
+        let max = Duration::from_secs(1000);
+        let mut e = SessionEntry { grant: g, created: t0, last: t0 };
+        assert!(live_at(&e, t0 + Duration::from_secs(99), idle, max));
+        assert!(!live_at(&e, t0 + Duration::from_secs(100), idle, max), "idle bound");
+        // Activity slides the idle clock …
+        e.last = t0 + Duration::from_secs(950);
+        assert!(live_at(&e, t0 + Duration::from_secs(999), idle, max));
+        // … but never past the absolute bound.
+        assert!(!live_at(&e, t0 + Duration::from_secs(1000), idle, max), "absolute bound");
+    }
+
+    #[test]
+    fn a_code_is_redeemed_only_by_a_top_level_navigation_no_other_site_started() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("noo-controller.tail.ts.net:8451"));
+        assert!(redeem_request_ok(&h, 8451), "an old browser that sends no fetch metadata");
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
+        h.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        assert!(redeem_request_ok(&h, 8451), "the console (same site, other port) navigating a tab");
+        let mut x = h.clone();
+        x.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!redeem_request_ok(&x, 8451), "another site sent the browser here");
+        let mut x = h.clone();
+        x.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+        assert!(!redeem_request_ok(&x, 8451), "a fetch, not a navigation");
+        let mut x = h.clone();
+        x.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert!(!redeem_request_ok(&x, 8451), "a foreign Origin");
+    }
+
+    #[test]
+    fn the_listing_shows_a_user_only_what_it_may_open_and_an_operator_everything() {
+        let user_ui = with_ui(json!({"min_role": "user", "title": "Voice"})).unwrap();
+        let mut op_ui = with_ui(json!({})).unwrap();
+        op_ui.addon = "other".into();
+        let ms = [user_ui, op_ui];
+        let ports: BTreeMap<String, u16> = [("evolve".to_string(), 8451u16), ("other".to_string(), 8452)].into();
+        let on = |_: &str| true;
+        let user = ui_entries(&ms, &ports, Some(Role::User), Some("h.ts.net"), &on);
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0], UiEntry { addon: "evolve".into(), title: "Voice".into(), port: 8451, url_base: Some("https://h.ts.net:8451".into()), can_open: true });
+        let op = ui_entries(&ms, &ports, Some(Role::Operator), None, &on);
+        assert_eq!(op.iter().map(|e| (e.addon.as_str(), e.can_open)).collect::<Vec<_>>(), [("evolve", true), ("other", true)]);
+        let machine = ui_entries(&ms, &ports, None, None, &on);
+        assert_eq!(machine.len(), 2, "the launcher fronts every port");
+        // Off, or no port allocated: not listed.
+        assert!(ui_entries(&ms, &ports, Some(Role::Admin), None, &|_| false).is_empty());
+        assert_eq!(ui_entries(&ms, &BTreeMap::new(), Some(Role::Admin), None, &on).len(), 0);
+    }
+
+    /// The add-on origin carries the console router's outer layers.
+    #[test]
+    fn the_origin_router_has_the_main_routers_layers() {
+        let src = include_str!("addon_ui.rs");
+        let body = src.split("pub fn origin_router(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        for layer in ["audit_context::origin_layer", "middleware::rate_limit", "middleware::request_logger", "CatchPanicLayer"] {
+            assert!(body.contains(layer), "{layer}");
+        }
+        assert!(!body.contains("security_headers"), "the console's frame/mic policy is not the add-on's");
+    }
+
+    #[test]
     fn the_cookie_is_per_addon_host_only_and_never_the_token() {
+        let h = handoff_cookie("example-addon", "B1", 30).to_string();
+        assert!(h.starts_with("noo_handoff_example-addon=B1") && h.contains("Path=/__noo/session") && h.contains("HttpOnly") && h.contains("SameSite=Strict"), "{h}");
         let c = session_cookie("example-addon", "sid123", 600).to_string();
         assert!(c.starts_with("noo_ui_example-addon=sid123"), "{c}");
         assert!(c.contains("HttpOnly") && c.contains("Secure") && c.contains("SameSite=Strict"), "{c}");
@@ -1110,7 +1406,11 @@ mod tests {
         assert!(body.contains("cookie_name(&o.addon)"));
         assert!(!body.contains("AUTHORIZATION") && !body.contains("verify_token"), "no bearer on an add-on origin");
         assert!(body.find("origin_rule(").unwrap() < body.find("cookie_value(").unwrap());
-        assert!(body.contains("session_floor::refuses"));
+        assert!(body.contains("session_refusal("), "the person is re-checked on every request");
+        let refusal = src.split("pub async fn session_refusal(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        for check in ["session_floor::refuses", "live_account_role", "rail_token_admitted", "addons::enabled"] {
+            assert!(refusal.contains(check), "{check}");
+        }
     }
 
     #[tokio::test]

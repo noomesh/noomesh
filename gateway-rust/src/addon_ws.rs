@@ -313,7 +313,7 @@ pub fn method_router(
             async move {
                 let params = params.map(|Path(p)| p).unwrap_or_default();
                 let requester = ctx.map(|axum::Extension(r)| r);
-                let origin = origin.map(|axum::Extension(o)| (o.exp, o.sub));
+                let origin = origin.map(|axum::Extension(o)| o);
                 serve_ws(state, &manifest, &spec, ws, params, q, &headers, requester, origin).await
             }
         },
@@ -349,7 +349,7 @@ async fn serve_ws(
     query: Option<String>,
     headers: &HeaderMap,
     requester: Option<crate::auth::RequesterCtx>,
-    origin_session: Option<(usize, String)>,
+    origin_session: Option<crate::addon_ui::OriginSession>,
 ) -> Response {
     let addon = manifest.addon.as_str();
     // 0. Who is calling. A `ticket=` is redeemed here (the front door let the
@@ -377,8 +377,8 @@ async fn serve_ws(
             // gate already checked the cookie and the Origin header). On the
             // console port: a bearer the front door verified (header only:
             // `?token=` is not a credential under /ws/addons/).
-            if requester.is_some() {
-                session_of = origin_session.or_else(|| bearer_session(headers));
+            if requester.is_some() && origin_session.is_none() {
+                session_of = bearer_session(headers);
             }
             requester
         }
@@ -452,7 +452,13 @@ async fn serve_ws(
         Ok(ok) => ok,
         Err(e) => return e.into_response(addon, &base),
     };
-    let session = session_end(&state, session_of);
+    // On the add-on origin the socket lives as long as the origin's sliding
+    // session (re-checked every minute: floor, live role, add-on on);
+    // elsewhere as long as the token or ticket behind it.
+    let session = match origin_session {
+        Some(o) => o.ended(state.clone()),
+        None => session_end(&state, session_of),
+    };
     let mut ws = ws.max_message_size(limits.max_message_bytes).max_frame_size(limits.max_message_bytes);
     if let Some(p) = selected {
         ws = ws.protocols([p]);
