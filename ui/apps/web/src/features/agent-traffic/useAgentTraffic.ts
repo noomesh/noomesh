@@ -136,6 +136,6 @@ export function usePresence(refetchMs: number | false) {
   return useQuery<LiveSession[]>({
     queryKey: ['agent-traffic', 'presence'],
     refetchInterval: refetchMs,
-    queryFn: async () => parsePresence(await must('/api/agents/presence', 'Presence API')),
+    queryFn: async () => parsePresence(await must('/api/agents/presence?all=true', 'Presence API')),
   });
 }
