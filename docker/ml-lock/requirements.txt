@@ -1166,7 +1166,7 @@ h11==0.16.0 \
 hatchling==1.32.4 \
     --hash=sha256:08ecf7548fb48205e7f213d70c71e67b8271b7242093dc3f1da578b42c734a2c \
     --hash=sha256:c4468f73144c054d2aab4ef0f0378c43b9878bf07f8ffd6b79690e970d375f07
-    # via -r /tmp/tmp.IuhaJlX1G4/in.txt
+    # via -r /tmp/tmp.au4eUDoU4s/in.txt
 hf-xet==1.7.0 ; platform_machine == 'AMD64' or platform_machine == 'ARM64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' \
     --hash=sha256:0a9e802f33bf50c851abe45fc5380e61f959e2d369647d6742b79ad9d6c27cab \
     --hash=sha256:19c0e64f14175ccb6a1aff69e0d2ab9ec5269a560e6687abaf2b3fa4f73de7cd \
@@ -1323,10 +1323,12 @@ httpcore==1.0.9 \
     # via
     #   -c docker/core-lock/requirements.txt
     #   httpx
-httpcore2==2.14.0 ; sys_platform != 'emscripten' \
-    --hash=sha256:4c4f64f4b544afeb778c42c0ffb5941b29e671157e90ed3f6dc787c4bca90cd1 \
-    --hash=sha256:4f57a1a8249fe6af589d935cfd456f1d13bbdcb0f0fc72af9142368fc94811d7
-    # via httpx2
+httpcore2==2.15.1 ; sys_platform != 'emscripten' \
+    --hash=sha256:730f603058c260a3288378217b464713350c23e3b8fe8bba753701054032d98a \
+    --hash=sha256:a94b6b3e6260e1a3f035915408d3dcd7dc8e844c2b544b642e227cf98a747af0
+    # via
+    #   -c docker/core-lock/requirements.txt
+    #   httpx2
 httptools==0.9.0 \
     --hash=sha256:02bc5b3dcb6394b9d825fd62a7bfa0b2943063a3c89abc4492ad45e334a20eb5 \
     --hash=sha256:050f7ab098121873c8f13e35857f97ab60a76185c8302bde9a384939bb7c3b96 \
@@ -1455,26 +1457,23 @@ httpx==0.28.1 \
     # via
     #   -c docker/core-lock/requirements.txt
     #   noomesh (pyproject.toml)
-    #   mcp
     #   noo-gateway-client
     #   trellion
     #   weasel
-httpx-sse==0.4.3 \
-    --hash=sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc \
-    --hash=sha256:9b1ed0127459a66014aec3c56bebd93da3c1bc8bb6618c8082039a44889a755d
+httpx2==2.15.1 \
+    --hash=sha256:75841cd83d16b417f7d6da8f2089ce8120806efdbf96af37d46c5129c49015be \
+    --hash=sha256:ff75485308fbe441e75b1218546e4e78d884df41e1a9741c1f79335ed8fcfef7
     # via
     #   -c docker/core-lock/requirements.txt
-    #   mcp
-httpx2==2.14.0 \
-    --hash=sha256:47ad61a3c40282cd8d0dc96311531f00f5bfc71a066c6fe3b36d8f63fb9e4f6e \
-    --hash=sha256:9d20c13a10bae1773a0be3b0f1e5beeb4bdd549bc3a2ba18efa32897c65403e4
-    # via
     #   huggingface-hub
+    #   mcp
     #   openai
 httpx2-jsfetch==1.0 ; sys_platform == 'emscripten' \
     --hash=sha256:70a0e3eabfef7cce5ad9c629f7d01ca05e418f586646f4ddf14782e4c1454c60 \
     --hash=sha256:cb916b707601e69a07721aabc8f3f6659be3a6893bc1ff5c6f9e02241df2da32
-    # via httpx2
+    # via
+    #   -c docker/core-lock/requirements.txt
+    #   httpx2
 huggingface-hub==2.2.0 \
     --hash=sha256:1667f145dc56dc210d60966069397df9ecfca9607a5d43db88b308c89dae56b3 \
     --hash=sha256:5d1b47537394e4215cb858aa12fd493d0f7ef7f58990f5dcd24bc173107b2871
@@ -2002,12 +2001,18 @@ markupsafe==3.0.4 \
     #   -c docker/core-lock/requirements.txt
     #   jinja2
     #   mako
-mcp==1.30.0 \
-    --hash=sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4 \
-    --hash=sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0
+mcp==2.3.0 \
+    --hash=sha256:8b147a50441cf059dc88c684e0aeed3687f0aa0f39c6cde7b90330effd2b34d8 \
+    --hash=sha256:dd0c44c089d16453e8ae31a3877a0054d7a2314caaa81f5e0541b9b1734b2377
     # via
     #   -c docker/core-lock/requirements.txt
     #   noomesh (pyproject.toml)
+mcp-types==2.3.0 \
+    --hash=sha256:968efdbdaedfab06adae40d378a34395f1090c5921d4be3c9cde283aaf76d91d \
+    --hash=sha256:d1e46549edb35ee19a94940fcee6d1addd7e589ab7ea92dda83f5d84781fc362
+    # via
+    #   -c docker/core-lock/requirements.txt
+    #   mcp
 mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
@@ -2404,6 +2409,7 @@ opentelemetry-api==1.45.1 \
     # via
     #   -c docker/core-lock/requirements.txt
     #   fastapi
+    #   mcp
 orjson==3.13.0 \
     --hash=sha256:0526a3456db67b264c6d661b5f090077f326b6cd074d0ef53a72763595dec5d7 \
     --hash=sha256:08bf722f923d2100bc5e5a5dcf72c656db557049c1bea26582fdd5dd9d5395a1 \
@@ -3056,6 +3062,7 @@ pydantic==2.14.1 \
     #   noomesh (pyproject.toml)
     #   fastapi
     #   mcp
+    #   mcp-types
     #   openai
     #   pydantic-settings
     #   spacy
@@ -3206,10 +3213,7 @@ pydantic-core==2.50.1 \
 pydantic-settings==2.16.0 \
     --hash=sha256:5b6c578049ede4db0e2ef3b4eaa4ad4069cfa9211f83fb38df899dfade50a614 \
     --hash=sha256:7e73acf7f61936a15e5a3b6eedaea29f133357faf7272f2607ba479b049dd7f2
-    # via
-    #   -c docker/core-lock/requirements.txt
-    #   mcp
-    #   trellion
+    # via trellion
 pydub==0.25.1 \
     --hash=sha256:65617e33033874b59d87db603aa1ed450633288aefead953b30bded59cb599a6 \
     --hash=sha256:980a33ce9949cab2a569606b65674d748ecbca4f0796887fd6f46173a7b0d30f
@@ -3384,9 +3388,9 @@ pyyaml==6.0.3 \
     #   huggingface-hub
     #   trellion
     #   uvicorn
-redis==4.6.0 \
-    --hash=sha256:585dc516b9eb042a619ef0a39c3d7d55fe81bdb4df09a52c9cdde0d07bf1aa7d \
-    --hash=sha256:e2b03db868160ee4591de3cb90d40ebb50a90dd302138775937f6a42b7ed183c
+redis==8.1.0 \
+    --hash=sha256:6e1a19beef9225c83efd689c7e6b7da2d5215b1f42cd13b7fc3714d0a09c7b25 \
+    --hash=sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb
     # via
     #   -c docker/core-lock/requirements.txt
     #   noomesh (pyproject.toml)
@@ -3614,7 +3618,8 @@ setuptools==84.0.0 \
     --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
     --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
     # via
-    #   -r /tmp/tmp.IuhaJlX1G4/in.txt
+    #   -c docker/core-lock/requirements.txt
+    #   -r /tmp/tmp.au4eUDoU4s/in.txt
     #   spacy
     #   thinc
 shellingham==1.5.4 \
@@ -3963,6 +3968,7 @@ truststore==0.10.5 ; sys_platform != 'emscripten' \
     --hash=sha256:30d36967ccaded5cbb38d602c433f53600036c79d502f4533a49b60a03bbefcd \
     --hash=sha256:9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c
     # via
+    #   -c docker/core-lock/requirements.txt
     #   httpcore2
     #   httpx2
 typer==0.27.3 \
@@ -3994,6 +4000,7 @@ typing-extensions==4.16.0 \
     #   httpx2
     #   huggingface-hub
     #   mcp
+    #   mcp-types
     #   openai
     #   opentelemetry-api
     #   psycopg
