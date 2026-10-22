@@ -19,15 +19,6 @@ use crate::state::AppState;
 use super::{AppJson, AppError, AppResult};
 use super::admin::all_node_agents;
 
-// Python subjects this module has replaced. See `crate::ported`.
-crate::ported! {
-    POST "/api/cluster/discover"            => "worker.api.cluster.discover",
-    POST "/api/cluster/mint-join-key"       => "worker.api.cluster.mint-join-key",
-    POST "/api/cluster/proposals"           => "worker.api.cluster.propose",
-    GET  "/api/cluster/replication-status"  => "worker.api.cluster.replication-status",
-    POST "/api/cluster/suggest-placement"   => "worker.api.cluster.suggest-placement",
-}
-
 
 /// Is this capability map's node an ARM box? `None` = it doesn't say.
 ///

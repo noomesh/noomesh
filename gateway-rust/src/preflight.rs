@@ -83,7 +83,6 @@ pub async fn run(state: &Arc<AppState>) -> PreflightReport {
     checks.push(check_embedding_dims(state).await);
     checks.push(check_tool_schemas(state).await);
     checks.push(check_tool_subjects(state).await);
-    checks.push(check_ported_subjects().await);
     checks.push(check_nats_monitoring().await);
     checks.push(check_nats_isolation(state).await);
     PreflightReport { checks }
@@ -472,34 +471,9 @@ async fn check_tool_subjects(state: &Arc<AppState>) -> CheckResult {
     )
 }
 
-/// Report Python handlers that a Rust route has already replaced.
-///
-/// The ledger (`crate::ported`) records what each port superseded; this asks
-/// NATS which of those subjects still have a Python subscriber. Anything
-/// listed here is dead code with a Rust owner — deletable, with the route
-/// that replaced it named.
-///
-/// Wildcards are ignored for the same reason as `check_tool_subjects`:
-/// `worker_pool.py` subscribes to `worker.>`, so a subject "having a
-/// responder" is meaningless unless the subscription is exact.
-///
-/// Never critical, and never a failure: leftover Python is untidy, not
-/// broken. It reports `ok` either way and puts the work in the detail line.
-async fn check_ported_subjects() -> CheckResult {
-    // Same startup race as check_tool_subjects — deferred.
-    ok(
-        "ported_subjects",
-        false,
-        format!(
-            "{} ported route(s) — Python leftovers reported after worker pool registers",
-            crate::ported::all().len()
-        ),
-    )
-}
-
 /// Exact (non-wildcard) subject subscriptions, from NATS monitoring.
 ///
-/// Shared by the tool and ledger checks so they cannot disagree about what
+/// Shared by the tool checks so they cannot disagree about what
 /// "has a responder" means.
 async fn nats_exact_subjects() -> Result<std::collections::BTreeSet<String>, String> {
     let (base, client) = nats_monitor_endpoint();
@@ -585,8 +559,7 @@ fn nats_monitor_endpoint() -> (String, reqwest::Client) {
 /// Advisory, never critical — nothing the gateway serves depends on it.
 /// It exists so that closing or hardening `:8222` (N9) can never be a
 /// SILENT loss: `spawn_subject_verification` reads `/subsz` to answer "which
-/// declared tool subjects have no responder" and "which ported Python
-/// handlers are still registered", and both of those questions simply stop
+/// declared tool subjects have no responder", and that question simply stops
 /// being asked if the endpoint is unreachable. This row says so at boot,
 /// with the URL it tried.
 async fn check_nats_monitoring() -> CheckResult {
@@ -683,8 +656,6 @@ fn fail(name: &'static str, critical: bool, detail: String) -> CheckResult {
 /// then answers both questions once:
 ///
 ///   - tool subjects declared in `tools.json` with no exact responder
-///   - Python handlers superseded by a Rust route (`crate::ported`) that are
-///     still registered, i.e. deletable
 ///
 /// Advisory only: it logs and never affects startup or health.
 pub fn spawn_subject_verification(state: Arc<AppState>) {
@@ -715,7 +686,7 @@ pub fn spawn_subject_verification(state: Arc<AppState>) {
                     // just make these two checks quietly stop happening.
                     tracing::warn!(
                         error = %e,
-                        "subject_verification skipped: NATS monitoring unreachable — declared-but-unimplemented tool subjects and superseded Python handlers are NOT being reported. See the nats_monitoring preflight row"
+                        "subject_verification skipped: NATS monitoring unreachable — declared-but-unimplemented tool subjects are NOT being reported. See the nats_monitoring preflight row"
                     );
                     return;
                 }
@@ -756,21 +727,6 @@ pub fn spawn_subject_verification(state: Arc<AppState>) {
             tracing::info!(
                 orphans = %orphans.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                 "subject_verification.tool_orphans: handlers no tool selects — deletable"
-            );
-        }
-
-        // ── Python handlers a Rust route already replaced ──
-        let removable: Vec<String> = crate::ported::all()
-            .iter()
-            .filter(|p| exact.contains(p.supersedes))
-            .map(|p| format!("{} (replaced by {} {})", p.supersedes, p.method, p.path))
-            .collect();
-        if removable.is_empty() {
-            tracing::info!("subject_verification.ported_clean: no superseded Python handlers remain");
-        } else {
-            tracing::info!(
-                removable = %removable.join("; "),
-                "subject_verification.ported_removable: superseded by Rust, still registered in Python"
             );
         }
     });

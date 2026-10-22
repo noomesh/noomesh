@@ -527,7 +527,12 @@ async fn auth_token(
             )
             .await;
         }
-        record_failed_login(&state.db, &creds.username).await;
+        if strike_outcome(&record_failed_login(&state.db, &creds.username).await)
+            == StrikeOutcome::Unrecorded
+        {
+            return (StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"detail": "Too many login attempts — try again shortly"}))).into_response();
+        }
         return (StatusCode::UNAUTHORIZED,
             Json(json!({
                 "detail": "Incorrect username or password",
@@ -536,7 +541,7 @@ async fn auth_token(
 
     // Success — issue JWT (access) + refresh cookie.
     audit_auth(&state.db, "auth_success", &creds.username, "ok", ip.as_deref()).await;
-    record_successful_login(&state.db, &creds.username).await;
+    let _ = record_successful_login(&state.db, &creds.username).await; // logged inside
 
     // Bootstrap self-close: the first successful env-admin login materialises
     // a real `noo_users` row. From the next login on, the account is
@@ -690,7 +695,7 @@ async fn host_ticket_login(
     let outcome = format!("host_ticket:{purpose}");
     tracing::warn!(user = %username, purpose = %purpose, "login with a one-time HOST ticket (minted on the controller)");
     audit_auth(&state.db, "auth_success", username, &outcome, ip).await;
-    record_successful_login(&state.db, username).await;
+    let _ = record_successful_login(&state.db, username).await; // logged inside
     if used_bootstrap {
         seed_bootstrap_admin(&state.db, &user).await;
     }
@@ -1384,30 +1389,62 @@ fn lookup_user_env(username: &str) -> Option<UserRecord> {
     })
 }
 
+/// Strikes at which an account locks.
+const LOCKOUT_STRIKES: i32 = 5;
+/// Minutes an account stays locked once the strike threshold is reached.
+const LOCKOUT_MINUTES: i32 = 15;
+
+/// What the login handler does after trying to record a failed-password strike.
+#[derive(Debug, PartialEq, Eq)]
+enum StrikeOutcome {
+    /// Recorded; answer the ordinary 401.
+    Counted,
+    /// Could not be recorded: the brake is gone, so the attempt is refused as
+    /// locked rather than silently allowed to guess again (i191 D2).
+    Unrecorded,
+}
+
+/// Pure decision over "was the strike recorded?".
+fn strike_outcome(recorded: &Result<(), sqlx::Error>) -> StrikeOutcome {
+    match recorded {
+        Ok(()) => StrikeOutcome::Counted,
+        Err(_) => StrikeOutcome::Unrecorded,
+    }
+}
+
 /// Record a failed login attempt (increment counter, lock after threshold).
-async fn record_failed_login(db: &sqlx::PgPool, username: &str) {
-    let _ = sqlx::query(
+/// An `Err` means the strike was NOT counted; the caller must fail closed.
+async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
+    let sql = format!(
         "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
          locked_until = CASE \
-           WHEN COALESCE(failed_login_count, 0) + 1 >= 5 THEN NOW() + INTERVAL '15 minutes' \
+           WHEN COALESCE(failed_login_count, 0) + 1 >= {LOCKOUT_STRIKES} THEN NOW() + INTERVAL '{LOCKOUT_MINUTES} minutes' \
            ELSE locked_until \
          END \
          WHERE username = $1"
-    )
-    .bind(username)
-    .execute(db)
-    .await;
+    );
+    let r = sqlx::query(&sql).bind(username).execute(db).await.map(|_| ());
+    if let Err(e) = &r {
+        tracing::error!(username = %username, error = %e, "failed-login strike could not be recorded; refusing the attempt");
+    }
+    r
 }
 
-/// Reset failed login count on successful login.
-async fn record_successful_login(db: &sqlx::PgPool, username: &str) {
-    let _ = sqlx::query(
+/// Reset failed login count on successful login. A failure is logged and the
+/// login continues: a stale counter is not a reason to deny a correct password.
+async fn record_successful_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
+    let r = sqlx::query(
         "UPDATE noo_users SET failed_login_count = 0, locked_until = NULL, \
          last_login_at = NOW() WHERE username = $1"
     )
     .bind(username)
     .execute(db)
-    .await;
+    .await
+    .map(|_| ());
+    if let Err(e) = &r {
+        tracing::error!(username = %username, error = %e, "successful-login reset could not be recorded; continuing");
+    }
+    r
 }
 
 /// Severity for an auth audit event. Previously every row was hardcoded
@@ -2390,6 +2427,17 @@ mod tests {
             !body.contains("if secret.is_empty()"),
             "the narrower is_empty() check is exactly the D6 bug — it accepts the placeholder"
         );
+    }
+
+    /// i191 D2: an unrecorded strike must refuse; a recorded one must not.
+    #[test]
+    fn an_unrecorded_strike_fails_closed() {
+        assert_eq!(strike_outcome(&Ok(())), StrikeOutcome::Counted);
+        assert_eq!(
+            strike_outcome(&Err(sqlx::Error::PoolTimedOut)),
+            StrikeOutcome::Unrecorded
+        );
+        assert_eq!((LOCKOUT_STRIKES, LOCKOUT_MINUTES), (5, 15));
     }
 
     // ── R6: /auth/token abuse controls ────────────────────────────────

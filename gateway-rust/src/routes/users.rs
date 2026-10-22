@@ -30,11 +30,6 @@ use crate::auth::{AuthActor, RequesterCtx};
 use crate::state::AppState;
 use super::{AppError, AppResult};
 
-// Python subjects this module has replaced. See `crate::ported`.
-crate::ported! {
-    POST "/api/users/propose" => "worker.api.users.propose",
-}
-
 
 /// Scopes a service key may carry (external inference contract;
 /// "mcp" gates the external MCP hub surface). "kiosk" is NOT here any more:
