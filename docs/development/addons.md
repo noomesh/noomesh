@@ -275,7 +275,7 @@ A third **top-level** key serves your own web UI (see "Serving a UI"):
 
 | Key | Meaning |
 |---|---|
-| `ui` | `{"upstream_path": "/", "min_role": "user", "title": "Example"}`. The gateway serves `/addons/<name>/ui/<rest>` from `<your upstream><upstream_path>/<rest>`. `upstream_path` defaults to `/` (a plain path, no `{param}`); `min_role` as on a route (absent = `operator`); `title` is 1–64 plain characters for the console's link; `timeout_secs` 1–600. Any other field refuses the manifest. A manifest with a `ui` may declare no routes. |
+| `ui` | `{"upstream_path": "/", "min_role": "user", "title": "Example"}`. The gateway serves your UI on an origin of its own, `https://<host>:<your port>/<rest>`, from `<your upstream><upstream_path>/<rest>`. `upstream_path` defaults to `/` (a plain path, no `{param}`); `min_role` as on a route (absent = `operator`); `title` is 1–64 plain characters for the console's link; `timeout_secs` 1–600. Any other field refuses the manifest. A manifest with a `ui` may declare no routes. |
 
 Two **top-level** keys (beside `routes`, not inside a route) prepare an add-on
 to act for a present person through that person's own tasks:
@@ -457,16 +457,20 @@ A `WS` route is a WebSocket the gateway terminates for the client and opens
 again to you. In order, for every handshake:
 
 1. **Credential.** A browser cannot set `Authorization` on a WebSocket, and a
-   token in a URL ends up in access logs, so an add-on socket takes a
-   **ticket**, never `?token=` (the gateway ignores `?token=` under
-   `/ws/addons/`). Your page, holding the signed-in person's access token,
-   calls `POST /api/addons/<name>/ws-ticket` with `Authorization: Bearer
-   <token>` and gets `{"ticket": "...", "param": "ticket", "expires_in": 30}`.
-   It then opens `wss://<gateway>/ws/addons/<name>/stream?ticket=<ticket>`
-   within 30 seconds. A ticket is random, bound to that person and that
-   add-on, and consumed by the first handshake that presents it (valid or
-   not); mint one per connection. A non-browser client may instead send
-   `Authorization: Bearer` on the handshake.
+   token in a URL ends up in access logs, so `?token=` is never a credential
+   under `/ws/addons/`. There are three ways in:
+   - **From your own UI** (see "Serving a UI"): open
+     `wss://<host>:<your port>/ws/addons/<name>/…` on your UI's origin. The
+     origin's session cookie authenticates the upgrade, and the `Origin`
+     header must be that origin. No ticket.
+   - **From another browser page on the console origin**: call
+     `POST /api/addons/<name>/ws-ticket` with `Authorization: Bearer <token>`,
+     get `{"ticket": "...", "param": "ticket", "expires_in": 30}`, and open
+     `wss://<console host>/ws/addons/<name>/…?ticket=<ticket>` within 30
+     seconds. A ticket is random, bound to that person and that add-on, and
+     consumed by the first handshake that presents it (valid or not).
+   - **A non-browser client**: `Authorization: Bearer` on the handshake to
+     the console port.
 2. **Permission.** The route's `min_role` is checked against the person
    (`403` naming the role), then the per-account cap (`429`), all before you
    are dialled.
@@ -501,28 +505,66 @@ so ship it with a `supports_stack` that starts at this release.
 "ui": { "min_role": "user", "title": "Example add-on" }
 ```
 
-The gateway serves your UI at `/addons/<name>/ui/`, a namespace no core route
-uses, so it can shadow nothing. It strips `/addons/<name>/ui` and fetches the
-rest from your upstream under `upstream_path` (default `/`), GET and HEAD
-only; it does **not** rewrite your HTML. Build the UI for a directory mount:
-every asset, API and socket path relative, or absolute to the gateway's own
-paths:
+**Your UI gets an origin of its own.** The console keeps the person's access
+token in the browser on the console's origin, and no add-on script may read
+it. An origin is scheme + host + port, and the fleet is reached at a single
+tailnet name (`noo-controller.<tailnet>.ts.net`, no subdomains), so the
+gateway gives each add-on with a `ui` an HTTPS listener on a port of its own,
+from `NOO_ADDON_UI_PORTS` (default `8450-8499`). The port comes from a hash
+of your add-on's name, so the same set of add-ons always gets the same
+ports. The listener uses the gateway's certificate, and the console origin
+never serves add-on UI.
 
-| From the UI | Goes to |
+On that origin, everything is yours and nothing else is there:
+
+| On `https://<host>:<your port>` | Goes to |
 |---|---|
-| `./app.js`, `assets/x.wasm` | `/addons/<name>/ui/…`, your upstream under `upstream_path` |
-| `/api/<your routes>` | your manifest's HTTP routes, with `Authorization: Bearer` |
-| `/ws/addons/<name>/…?ticket=…` | your `WS` routes (ticket above) |
+| `/`, `/app.js`, `/assets/x.wasm` (any other GET/HEAD) | your upstream, `<upstream_path>/<path>`, unchanged: no prefix, no HTML rewriting |
+| `/api/<your routes>` | your manifest's HTTP routes (same handler, same `min_role`) |
+| `/ws/addons/<name>/…` | your `WS` routes |
+| `/__noo/session` | the gateway's session handoff |
+| any other `/api/…`, `/ws/…`, `/__noo/…` | 404 |
 
-**Opening it.** A page load carries no `Authorization` header, so the console
-first calls `POST /api/addons/<name>/ui-session` (Bearer). The gateway checks
-`ui.min_role` and sets a cookie `noo_addon_ui`: HttpOnly, Secure,
-SameSite=Strict, `Path=/addons/<name>/ui`, expiring with the access token. The
-gateway reads it only on a GET/HEAD under that path; anywhere else it is not a
-credential. Then the console links to `/addons/<name>/ui/`. When the cookie
-expires, assets answer `401`; call `ui-session` again.
+So build the UI to be served from `/`, with root-relative or relative paths
+to its assets, its API and its sockets.
 
-**What the gateway does to the response.**
+**Session handoff.**
+
+1. The console calls `POST /api/addons/<name>/ui-session` on its own origin
+   with `Authorization: Bearer`. The gateway checks `ui.min_role` and answers
+   `{"code", "port", "path", "url", "expires_in": 30, "session_expires_at"}`.
+   The code is random, single use, valid for 30 seconds, and bound to that
+   person and that add-on.
+2. The browser opens `url` (`https://<host>:<port>/__noo/session?code=…`) in a
+   tab or the console's iframe. Your origin redeems the code and sets its
+   own cookie `noo_ui_<name>`: HttpOnly, Secure, SameSite=Strict, host-only,
+   `Path=/`. The cookie holds an opaque session id, never the token. It
+   expires with the access token the console presented. The browser is then
+   redirected to `/`.
+3. On your origin that cookie authenticates your UI, your API routes and
+   your sockets, and nothing else does: a bearer token is not accepted
+   there, and the console port never reads a `noo_ui_*` cookie. Every
+   request re-checks the account's session floor (logout, disable,
+   demotion).
+
+When the session ends, your origin answers `401` (and a socket closes with
+`4401`). Ask the console for a new handoff, for example with `postMessage` to
+the parent frame.
+
+**Writes and sockets from your UI.** Cookies ignore ports, so the browser
+also sends your cookie to other add-ons' ports on the same host. On your
+origin:
+
+- a request that carries an `Origin` header must carry yours;
+- a WebSocket upgrade must carry your `Origin`;
+- a write (`POST`, `PUT`, `PATCH`, `DELETE`) must carry your `Origin` **and**
+  the header `X-Noo-Addon-Request: 1`. Send it on every write, e.g.
+  `fetch('/api/<name>/x', {method: 'POST', headers: {'X-Noo-Addon-Request': '1', 'Content-Type': 'application/json'}, body})`.
+
+The gateway answers no CORS preflight, so no other origin can send that
+header.
+
+**What the gateway does to a UI response.**
 
 - Status and body pass through, streamed.
 - Response headers are an allow-list: `Content-Type`, `Content-Length`,
@@ -531,16 +573,18 @@ expires, assets answer `401`; call `ui-session` again.
   `Last-Modified`, `Expires`, `Vary`, `Content-Security-Policy`. Everything
   else is dropped, notably `Set-Cookie`, CORS headers, HSTS,
   `Clear-Site-Data`, `Service-Worker-Allowed`, `X-Frame-Options`, `Refresh`
-  and `Link`. A `Location` survives only when it stays inside your UI (your
-  own `<upstream_path>/…` is rewritten to the gateway path).
-- The gateway's Content-Security-Policy is always added: `default-src 'self';
-  script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
-  img-src 'self' data: blob:; media-src 'self' blob: mediastream:; font-src
-  'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none';
-  base-uri 'none'; form-action 'self'; frame-ancestors 'self'`. Your own CSP is
-  kept beside it; the browser enforces both, so yours can only narrow it. No
-  third-party script, no fetch or socket to another host, no framing except
-  by the console.
+  and `Link`. A `Location` survives only when it stays on your origin; your
+  own `<upstream_path>/…` is rewritten to `/…`.
+- The gateway's Content-Security-Policy is always added:
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'
+  'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:
+  mediastream:; font-src 'self' data:; connect-src 'self'; worker-src 'self'
+  blob:; object-src 'none'; base-uri 'none'; form-action 'self';
+  frame-ancestors <console origin>`. `connect-src 'self'` is your own origin
+  only, which covers your API and your sockets. `frame-ancestors` is
+  `NOO_CONSOLE_ORIGIN` when set, otherwise this host on 443 and on the
+  gateway port. Your own CSP is kept beside it; the browser enforces both, so
+  yours can only narrow it.
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
   `Cross-Origin-Resource-Policy: same-origin`, and `Cache-Control: private,
   no-cache` when you sent none.
@@ -551,11 +595,23 @@ expires, assets answer `401`; call `ui-session` again.
   (percent-encoding is refused, not decoded), or a character outside
   `[A-Za-z0-9._~@+-]`. Refused with `403`: a service-worker script fetch.
 
-**Trust.** The UI runs on the gateway's origin, so its scripts act with the
-signed-in person's authority (that is how they reach your API and sockets).
-Enabling an add-on with a UI trusts its code with that, which is why the lock
-is signed and launcher-verified before anything is mounted, and why the CSP
-keeps everything on this origin.
+**Exposing the ports (operator).** The gateway publishes the whole range,
+with the same number on the host as in the container
+(`docker-compose.cluster.yml`: `${NOO_BIND_ADDR}:${NOO_ADDON_UI_PORTS}`).
+The console is reached through `tailscale serve` on 443, fronting
+`https://<tailnet-ip>:8080`. Each add-on UI port needs the same treatment on
+its own number, because the browser is sent to that port:
+
+```bash
+# the port is in the gateway log ("add-on UI origin listening", addon=…, port=…)
+# and in the ui-session answer
+sudo tailscale serve --bg --https=8461 https://<tailnet-ip>:8461
+```
+
+`noo onboard` does not write these mappings yet. Change the range with
+`NOO_ADDON_UI_PORTS=<first>-<last>` in `.env` (above 1024, at most 1000
+ports). Set `NOO_CONSOLE_ORIGIN=https://noo-controller.<tailnet>.ts.net` if
+the console is reached under a different origin than the default.
 
 ## Step 2b — claim a subject prefix (NATS add-ons)
 

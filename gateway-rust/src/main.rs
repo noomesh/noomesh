@@ -720,7 +720,7 @@ async fn main() -> Result<()> {
     mcp_local::warn_retired_token();
 
     // Build router with all routes + TLS
-    let app = routes::build_router(state);
+    let app = routes::build_router(state.clone());
 
     // The ONE listener: TLS, with the peer's certificate identity attached.
     //
@@ -743,6 +743,11 @@ async fn main() -> Result<()> {
     // request: a node's cert is proof, where its token's actor field is only
     // a claim signed with a fleet-wide secret. The CA is mandatory now
     // (require_server_material), so the acceptor is always installed.
+    // Each add-on with a `ui` gets an HTTPS origin of its own (a port from
+    // NOO_ADDON_UI_PORTS, the same certificate), so its scripts can never read
+    // what the console stores on this origin. Started after the router, so
+    // the add-on registry is built (addon_ui.rs).
+    addon_ui::spawn_origins(state.clone(), tls_config.clone());
     let acceptor = node_identity::NodeIdentityAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
     );
