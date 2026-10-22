@@ -63,12 +63,17 @@ type embedServed struct {
 	Backend string
 }
 
-// EmbedSlug is the gateway's model slug: lowercase, then every char outside
-// [a-z0-9_-] becomes '_'. No trimming or collapsing. Both sides test the
-// same vectors.
+// EmbedSlug is the gateway's model slug (embed_jobs::slug): ASCII A-Z
+// lowercased, then every char outside [a-z0-9_-] becomes '_'. No trimming or
+// collapsing. ASCII only because Go's and Rust's Unicode lowercasing differ
+// (U+0130), and one stray '_' would route a model's jobs to a subject nobody
+// pulls. Both sides test the same vectors.
 func EmbedSlug(model string) string {
 	var b strings.Builder
-	for _, r := range strings.ToLower(model) {
+	for _, r := range model {
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A' // ASCII only: Unicode lowercasing differs from Rust's
+		}
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
 			b.WriteRune(r)
