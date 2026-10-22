@@ -632,7 +632,7 @@ pub fn secrets_reveal(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // 6. Clipboard.
     let mut clip_msg = String::new();
     if !no_clipboard {
-        match clip_tool(is_wsl(), which) {
+        match clip_tool(is_wsl(), |bin| crate::host_exec::which(bin).is_some()) {
             Some(tool) if clip_copy(&tool, &value) => {
                 if arm_clipboard_clear(&tool, CLIPBOARD_TTL_SECS) {
                     clip_msg = format!(
