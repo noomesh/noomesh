@@ -534,7 +534,7 @@ fn perms_for(role: Role, id: &str, addons_rendered: &[&str]) -> String {
         // That was #1218.
         Role::Node => format!(
             "{ind}publish: {{\n\
-             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.STREAM.NAMES\", \"{NODE_REPLY_ROOT}.{tok}.>\", \"node.{id}.evt.>\"]\n\
+             {ind}  allow: [\"mesh.gossip.announce.{id}\", \"events.job.ack.{id}\", \"events.job.complete.{id}\", \"events.job.failed.{id}\", \"events.node.registered.{id}\", \"events.ingest.doc.parsed.{id}\", \"harness.turn.{id}.>\", \"harness.ready.{id}\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.TASKS.node_{id}_dispatch.>\", \"$JS.API.CONSUMER.INFO.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.MSG.NEXT.TASKS.node_{id}_dispatch\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.CREATE.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.EVENTS.node_{id}_cancel\", \"$JS.API.CONSUMER.MSG.NEXT.EVENTS.node_{id}_cancel\", \"$JS.ACK.TASKS.node_{id}_dispatch.>\", \"$JS.ACK.EVENTS.node_{id}_cancel.>\", \"$JS.API.CONSUMER.INFO.WORK_EMBED.*\", \"$JS.API.CONSUMER.MSG.NEXT.WORK_EMBED.*\", \"$JS.ACK.WORK_EMBED.*.>\", \"$JS.API.STREAM.NAMES\", \"{NODE_REPLY_ROOT}.{tok}.>\", \"node.{id}.evt.>\"]\n\
              {ind}  deny: [\"tasks.>\", \"worker.>\", \"$KV.>\", \"$JS.API.STREAM.CREATE.>\", \"$JS.API.STREAM.DELETE.>\", \"$JS.API.STREAM.PURGE.>\", \"$JS.API.STREAM.UPDATE.>\", \"$JS.API.CONSUMER.DELETE.>\", \"{NODE_RPC_DENY}\"]\n\
              {ind}}}\n\
              {ind}subscribe: {{\n\
@@ -1601,6 +1601,12 @@ mod tests {
         // beat the allow above: deny wins, so widening the allow alone did not
         // work. Only the four mutating verbs are denied.
         assert!(!host9.contains("\"$JS.API.STREAM.>\""));
+        // i179: a node may BIND and pull the embed consumers (token wildcard: `embed_*` would be literal; the
+        // gateway creates them), and nothing more on WORK_EMBED.
+        assert!(host9.contains("\"$JS.API.CONSUMER.INFO.WORK_EMBED.*\""));
+        assert!(host9.contains("\"$JS.API.CONSUMER.MSG.NEXT.WORK_EMBED.*\""));
+        assert!(host9.contains("\"$JS.ACK.WORK_EMBED.*.>\""));
+        assert!(!host9.contains("CONSUMER.CREATE.WORK_EMBED"), "a node binds the embed consumers, it never creates them");
         assert!(host9.contains("node_host9_dispatch"));
         assert!(!host9.contains("host8"), "host9's block names another node:\n{host9}");
         assert!(host9.contains("deny: [\"tasks.>\", \"worker.>\", \"$KV.>\""));
