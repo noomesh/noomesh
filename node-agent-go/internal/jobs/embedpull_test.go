@@ -27,6 +27,12 @@ func TestEmbedSlugVectors(t *testing.T) {
 		"Harrier/1024":          "harrier_1024",
 		"bge-m3":                "bge-m3",
 		"a.b*c>d e":             "a_b_c_d_e",
+		// non-ASCII is never lowercased: one '_' per character, as in Rust
+		"\u0130":      "_",
+		"\u0130x":     "_x",
+		"\u212Aelvin": "_elvin",
+		"é":           "_",
+		"日本":          "__",
 	} {
 		if got := EmbedSlug(in); got != want {
 			t.Errorf("EmbedSlug(%q) = %q, want %q", in, got, want)
