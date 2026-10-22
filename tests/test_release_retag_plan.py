@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""A final re-tags the rc's images only when every input provably matches.
+"""A final (or an rc re-cut on an earlier rc's tree) re-tags that rc's images
+only when every input provably matches.
 
 images-release.yml asks scripts/release-retag-plan.py, per image, "re-tag the
 rc's digest, or build?" A wrong "re-tag" ships an image built from inputs
@@ -73,9 +74,36 @@ def test_equal_trees_retag_everything_but_the_tag_stamped_images():
     assert p["rc_digests"]["whisper"] == "sha256:w"
 
 
-def test_an_rc_always_builds():
-    p = _plan(tag="stack-v1.2.3-rc.3")
-    assert not any(p["retag"].values()) and p["rc_tag"] == ""
+def test_an_rc_on_a_new_tree_builds():
+    p = _plan(tag="stack-v1.2.3-rc.3", trees={"stack-v1.2.3-rc.3": "T3", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T"})
+    assert not any(p["retag"].values()) and p["rc_tag"] == "", p["why"]
+    assert "no earlier rc of stack-v1.2.3 has this tree" in p["why"]["whisper"]
+
+
+def test_an_rc_recut_on_an_earlier_rcs_tree_retags_it():
+    """2026-10-22: rc.N+1 on the commit rc.N built (an add-on-only or
+    lane-only re-cut) re-tags rc.N's images; only the tag-stamped ones build."""
+    trees = {"stack-v1.2.3-rc.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T0"}
+    p = _plan(tag="stack-v1.2.3-rc.3", trees=trees)
+    assert p["rc_tag"] == "stack-v1.2.3-rc.2", p["why"]
+    assert {i for i, r in p["retag"].items() if not r} == {"gateway", "node-agent"}, p["why"]
+    assert p["rc_digests"]["worker"] == "sha256:k"
+
+
+def test_an_rc_never_retags_from_itself_or_a_later_rc():
+    """A re-run of rc.2 must not re-tag from its own (maybe half-published)
+    images, and rc.2 cannot take rc.3's."""
+    trees = {"stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.3": "T", "stack-v1.2.3-rc.1": "T0"}
+    p = _plan(tag="stack-v1.2.3-rc.2", trees=trees, rcs=("stack-v1.2.3-rc.3", "stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"))
+    assert p["rc_tag"] == "" and not any(p["retag"].values()), p["why"]
+    assert P.candidates("stack-v1.2.3-rc.2", lambda v: ["stack-v1.2.3-rc.3", "stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"]) == ["stack-v1.2.3-rc.1"]
+    assert P.candidates("stack-v1.2.3", lambda v: ["stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"]) == ["stack-v1.2.3-rc.2", "stack-v1.2.3-rc.1"]
+
+
+def test_an_rc_recut_with_a_moved_sibling_rebuilds_what_it_feeds():
+    trees = {"stack-v1.2.3-rc.3": "T", "stack-v1.2.3-rc.2": "T", "stack-v1.2.3-rc.1": "T"}
+    p = _plan(tag="stack-v1.2.3-rc.3", trees=trees, sibs={**MAINS, "trellion": "TRE_MOVED"})
+    assert {i for i, r in p["retag"].items() if not r} == {"gateway", "node-agent", "deps-base", "trellion"}, p["why"]
 
 
 def test_no_equal_tree_rc_builds_everything():

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 PersonifAI LLC
 
-"""Plan a final stack release: which images to RE-TAG from the rc, which to build.
+"""Plan a stack release: which images to RE-TAG from an earlier rc, which to build.
 
 A final `stack-vX.Y.Z` is cut on main from a tree that is byte-identical to a
 release candidate `stack-vX.Y.Z-rc.N` cut on staging — that is the promotion
@@ -10,6 +10,14 @@ model. Rebuilding every image for the final (12-23 min) re-ran work whose
 result already existed, and produced DIFFERENT bits from the ones the rc
 proved: builds are not reproducible, so every digest in the v0.2.99 final lock
 differed from rc.1's. Re-tagging ships exactly what the candidate shipped.
+
+The same holds for a release candidate cut again on an unchanged tree
+(2026-10-22): `stack-vX.Y.Z-rc.N+1` tagged on the commit rc.N already built
+(a re-cut for an add-on, a lane that failed after the images, a sibling-only
+fix) re-tags rc.N's images instead of rebuilding them. For an rc tag the
+candidates are the LOWER rc.M of the same version; everything below applies
+unchanged (equal trees, equal sibling trees, the tag-stamped images rebuilt),
+and the new tag still gets its own signed lock.
 
 An image is RE-TAGGED from the rc only when every input it is built from is
 provably the same:
@@ -28,7 +36,7 @@ provably the same:
       node-agent  --build-arg NODE_AGENT_VERSION / NODE_AGENT_COMMIT are the
                   tag and its commit.
 
-Anything else — not a final, no rc with an equal tree, the rc lock missing or
+Anything else — no earlier rc with an equal tree, the rc lock missing or
 unreadable, a sibling tree that differs, an image missing from the rc lock —
 answers BUILD for the affected image(s). Failing open costs a rebuild; failing
 closed would ship an image whose inputs nobody compared.
@@ -123,6 +131,21 @@ def rc_tags(final: str) -> list[str]:
     return sorted(tags, key=lambda t: int(t.rsplit(".", 1)[1]), reverse=True)
 
 
+def rc_number(tag: str) -> int:
+    return int(tag.rsplit(".", 1)[1])
+
+
+def candidates(tag: str, list_rcs=rc_tags) -> list[str]:
+    """The rc tags a release may re-tag from, highest first: every rc of a
+    final; for an rc, only the LOWER rcs of the same version (never itself:
+    a re-run of rc.N must not re-tag from its own, possibly half-published,
+    images)."""
+    if "-rc." not in tag:
+        return list(list_rcs(tag))
+    version, n = tag.rsplit("-rc.", 1)
+    return [t for t in list_rcs(version) if rc_number(t) < int(n)]
+
+
 def fetch_asset(repo: str, rc_tag: str, suffix: str, token: str) -> str:
     rel = json.loads(_get(f"{API}/repos/{repo}/releases/tags/{rc_tag}", token))
     name = f"{rc_tag}{suffix}"
@@ -177,13 +200,13 @@ def plan(final_tag: str, repo: str, sibling_shas: dict[str, str],
         result["why"] = {img: reason for img in SIBLING_INPUTS}
         return result
 
-    if "-rc." in final_tag:
-        return everything("a release candidate always builds")
     if os.environ.get("RELEASE_RETAG", "").strip().lower() == "off":
         return everything("re-tagging disabled by the repo variable RELEASE_RETAG=off")
     final_tree = tree_of(final_tag)
-    rc = next((t for t in list_rcs(final_tag) if tree_of(t) == final_tree), None)
+    rc = next((t for t in candidates(final_tag, list_rcs) if tree_of(t) == final_tree), None)
     if rc is None:
+        if "-rc." in final_tag:
+            return everything(f"no earlier rc of {final_tag.rsplit('-rc.', 1)[0]} has this tree ({final_tree[:12]})")
         return everything(f"no {final_tag}-rc.N has this tree ({final_tree[:12]})")
     result["rc_tag"], result["rc_commit"] = rc, commit_of(rc)
     try:

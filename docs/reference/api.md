@@ -280,6 +280,42 @@ with that `ref` and, for `/api/external/*`, in the audit row
 (the backend answered with a non-retryable status), `bad_request`
 (the message names the field).
 
+### Reasoning models: thinking, budgets and structured output
+
+A reasoning model (gemma4 on Ollama is the fleet's default) spends tokens
+thinking before it answers, and on every backend those tokens come out of
+the same budget as the answer: `max_tokens` is the **whole** generation,
+reasoning included. A short probe with thinking on (`max_tokens: 64`)
+returns `finish_reason: "length"` with an empty `content` and the
+reasoning in `reasoning`/`reasoning_content`; that is the budget, not a
+model fault. For a bounded structured answer:
+
+- **Turn thinking off** with `"reasoning": {"effort": "none"}` (or
+  `"reasoning_effort": "none"`, or Ollama's own `"think": false`). `none`
+  and `minimal` both mean off on the native Ollama path; `low`, `medium`
+  and `high` keep it on. `chat_template_kwargs.enable_thinking: false` is
+  the vLLM/llama.cpp spelling and reaches Ollama's translator too (0.6.11);
+  prefer the `reasoning` form, it is the portable one.
+- **Budget with thinking on**: allow for the reasoning (gemma4 spends
+  60–100 tokens on a yes/no) plus the answer; read `usage` and the
+  `finish_reason`.
+- **`response_format`** (`json_object`, `json_schema`) is honoured as
+  Ollama's `format`, but grammar-constrained decoding on a large-vocabulary
+  model such as gemma4 runs at seconds per token on today's nodes. For a
+  bounded answer ask for JSON in the prompt with thinking off and validate
+  client-side; use `response_format` only where the per-token cost is
+  acceptable.
+- **A key the backend does not take is dropped**, not forwarded: the node
+  agent keeps the portable OpenAI fields plus the vendor extras of the
+  backend it picked (`think`/`reasoning`/`format`/`options` for Ollama,
+  `guided_*`/`chat_template_kwargs` for vLLM, `n_predict`/`grammar` for
+  llama.cpp). The answer names what was dropped in `X-Noo-Dropped-Keys`
+  (sorted, comma-separated; absent when nothing was). A request that seems
+  to ignore a control is one whose spelling was dropped: check that header.
+- **Read `X-Noo-Served-Model`**: a fallback answer comes from a different
+  (often smaller) model; pin with `node` + `node_strict: true` to refuse a
+  fallback outright.
+
 ### Pointing an OpenAI SDK at the gateway
 
 Use `base_url=https://<host>:8080/api/external`. The SDK appends

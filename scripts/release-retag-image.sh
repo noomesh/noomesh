@@ -43,7 +43,8 @@ if [ -n "$want" ] && [ "$got" != "$want" ]; then
 fi
 
 set -x
-docker buildx imagetools create \
+# a transient registry error (unknown blob, 5xx, ...) is retried; nothing else
+"$(dirname "$0")/retry-registry.sh" docker buildx imagetools create \
     --tag "$ref:$tag" \
     ${PUSH_LATEST:+--tag "$ref:latest"} \
     "$ref@$got"

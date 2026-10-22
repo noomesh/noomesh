@@ -11,7 +11,7 @@ at a steady pace; the output is whatever the machine really prints.
 | `smoke.tape.in` | a harmless tape (a fake `noo` printing made-up sensitive values) that proves vhs, ttyd, ffmpeg and the masker work |
 | `mask.pl` | the output filter: real names, IPs and secrets become generic stand-ins |
 | `record-onboarding.sh` | guard rails, fills the templates, runs vhs, checks for leaks and failed steps, makes a contact sheet |
-| `studio.sh` | makes a throwaway Ubuntu 24.04 box with its own Docker, films inside it, deletes it (see below) |
+| `studio.sh` | makes a throwaway Ubuntu 24.04 box with its own Docker, films inside it, deletes it; `cache` keeps the stack's images on this host between boxes (see below) |
 
 ## Quick start
 
@@ -35,6 +35,45 @@ the box with `docker exec`. The box has a generic host name and user by construc
 stack the film onboards lives and dies inside it, and its own Docker pulls images anonymously,
 so it is a real stranger's first run. In box mode the recorder's guard rails inspect the box,
 not your machine, and only accept a container the studio labelled `noo-demo-box=1`.
+
+## Pulling from here: the cache
+
+```bash
+scripts/demo/studio.sh cache up        # a pull-through cache of ghcr.io on this host (once)
+scripts/demo/studio.sh up              # a box made now pulls ghcr.io through it
+scripts/demo/studio.sh cache status    # running? how full?
+scripts/demo/studio.sh cache purge     # delete the blobs, the certificate and the network
+```
+
+A fresh box pulls the whole stack (about 10 GB) from ghcr.io, and `down` deletes
+the box's images with the box. The cache keeps that download on this host, in a
+named volume that survives `down`, so the second fresh box costs LAN time, not
+internet time. What the film shows is unchanged: a real `docker pull
+ghcr.io/noomesh/...`, the real layer list, the real digests — the lock pins every
+image by digest, so a cached image cannot differ from the public one. The
+install itself (`curl | sh` from the release repo) and the model download are not
+cached.
+
+How it works, and why this way: Docker Engine's `registry-mirrors` setting
+applies to Docker Hub only, and the engine ignores containerd's `hosts.toml`
+for other registries, so a mirror for ghcr.io cannot be configured. Instead the
+cache *answers as* ghcr.io inside the box: it is the registry image in proxy
+mode (`REGISTRY_PROXY_REMOTEURL=https://ghcr.io`, anonymous, public images
+only) listening on :443 with a certificate for `ghcr.io` signed by a throwaway
+CA the studio makes once (`demo-out/cache/`, keys never leave it). A box made
+while the cache runs is born on the cache's network with `ghcr.io` in its hosts
+file pointing at the cache, and trusts that CA in its system store and in
+`/etc/docker/certs.d/ghcr.io/`. Nothing else in the box is configured, and a
+box made while the cache is down is a plain stranger's machine. `up` proves the
+box reaches the cache as `ghcr.io` before it says ready. A box outlives a `cache
+down` badly (its `ghcr.io` points at nothing): bring the cache back, or make a
+fresh box.
+
+What the first real take proves: the proxy serves the registry API (`/v2/`
+manifests and blobs, by tag and by digest). Anything the stack fetches from
+ghcr.io outside that API would fail inside the box with the cache's name
+resolution; the recorder's failed-step check catches it, and the fix is either
+to teach the cache or to film that step without it.
 
 Costs and cautions: about 10 GB of images and a model download, a slow CPU-only chat step, and
 `--privileged`. The recorder container is given the host's Docker socket (so it can reach the
