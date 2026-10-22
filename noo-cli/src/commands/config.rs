@@ -455,10 +455,10 @@ mod search_path_tests {
     #[test]
     fn a_cwd_that_is_the_install_is_listed_once() {
         let got = config_search_candidates(
-            Some(PathBuf::from("/srv/noomesh")),
-            PathBuf::from("/srv/noomesh"),
+            Some(PathBuf::from("/srv/mesh-install")),
+            PathBuf::from("/srv/mesh-install"),
             None,
         );
-        assert_eq!(got, vec![PathBuf::from("/srv/noomesh/noomesh.yaml")]);
+        assert_eq!(got, vec![PathBuf::from("/srv/mesh-install/noomesh.yaml")]);
     }
 }
