@@ -1198,6 +1198,8 @@ mod tests {
                 delegation: &delegation(&[]),
                 reported,
                 gateway_stack: Some(STACK),
+                dev: &Ok(BTreeMap::new()),
+                now: NOW,
             },
             &|_| false,
         )
