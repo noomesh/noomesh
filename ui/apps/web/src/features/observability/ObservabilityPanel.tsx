@@ -191,22 +191,24 @@ export function ObservabilityPanel() {
                   <span className="gpu-name">{g.name}</span>
                 </div>
                 <div className="gpu-metrics">
-                  <span className="gpu-stat">{g.temp}°C</span>
+                  <span className="gpu-stat">{g.temp === null ? '—' : `${g.temp}°C`}</span>
                   <span className="meter gpu-util">
-                    {g.util}%
+                    {g.util === null ? '—' : `${g.util}%`}
                     <span className="track">
                       <span
-                        className={cn('fill', meterLevel(g.util, 'high-bad'))}
-                        style={{ width: `${Math.min(100, g.util)}%` }}
+                        className={cn('fill', g.util === null ? '' : meterLevel(g.util, 'high-bad'))}
+                        style={{ width: `${Math.min(100, g.util ?? 0)}%` }}
                       />
                     </span>
                   </span>
                   <span className="gpu-stat">
-                    {g.vramTotal > 0
-                      ? `${g.vramUsed.toFixed(1)} / ${g.vramTotal.toFixed(1)} GB`
-                      : `${g.vramUsed.toFixed(1)} GB`}
+                    {g.vramUsed === null
+                      ? '—'
+                      : g.vramTotal !== null && g.vramTotal > 0
+                        ? `${g.vramUsed.toFixed(1)} / ${g.vramTotal.toFixed(1)} GB`
+                        : `${g.vramUsed.toFixed(1)} GB`}
                   </span>
-                  <span className="gpu-stat">{Math.round(g.power)}W</span>
+                  <span className="gpu-stat">{g.power === null ? '—' : `${Math.round(g.power)}W`}</span>
                 </div>
               </div>
             ))

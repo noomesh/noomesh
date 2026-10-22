@@ -3,18 +3,29 @@
 
 import { useQuery, useMetisClient, useAuth } from '@metis/core';
 
+/** A reported number, or null when the field is absent or not a number. */
+export function num(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+/** Scale a reported number; null stays null. */
+export function scale(v: number | null, k: number): number | null {
+  return v === null ? null : v * k;
+}
+
 export interface HealthDep {
   name: string;
   /** 'unknown' = the gateway reported nothing about this dependency. */
   status: 'ok' | 'down' | 'unknown';
 }
+// A telemetry number the gateway did not send is `null`, never 0: a GPU
+// whose temperature is unreported must not draw as a cold one (i191 D-UI).
 export interface Gpu {
   name: string;
-  temp: number;
-  util: number;
-  vramUsed: number;
-  vramTotal: number;
-  power: number;
+  temp: number | null;
+  util: number | null;
+  vramUsed: number | null;
+  vramTotal: number | null;
+  power: number | null;
 }
 export interface Container {
   name: string;
@@ -132,11 +143,11 @@ export function useObservability() {
         })),
         gpus: (g.data?.gpus ?? []).map((x) => ({
           name: x.name || `GPU ${x.index ?? 0}`,
-          temp: x.temperature ?? 0,
-          util: x.utilization ?? 0,
-          vramUsed: (x.memory_used ?? 0) / 1024,
-          vramTotal: (x.memory_total ?? 0) / 1024,
-          power: x.power ?? 0,
+          temp: num(x.temperature),
+          util: num(x.utilization),
+          vramUsed: scale(num(x.memory_used), 1 / 1024),
+          vramTotal: scale(num(x.memory_total), 1 / 1024),
+          power: num(x.power),
         })),
         containersAvailable: isOperator,
         containers: (c.data?.containers ?? []).map((x) => ({

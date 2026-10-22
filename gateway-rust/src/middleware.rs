@@ -1347,6 +1347,23 @@ pub fn on_tool_rejected(call: &ToolCall, error: &SecurityError) {
 // HTTP middleware
 // ═══════════════════════════════════════════════════════════════
 
+/// Per-route request counter. Labels are bounded: `route_class` is one of
+/// the fixed `legacy_lanes` buckets, `method` one of the standard verbs or
+/// `OTHER`, `status` the 3-digit code. No raw path or id ever becomes a label.
+const REQUESTS_METRIC: &str = "noo_http_requests_total";
+
+fn request_metric_labels(method: &str, path: &str, status: u16) -> std::collections::HashMap<String, String> {
+    let method = match method {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" => method,
+        _ => "OTHER",
+    };
+    std::collections::HashMap::from([
+        ("route_class".to_string(), crate::legacy_lanes::route_class(path).to_string()),
+        ("method".to_string(), method.to_string()),
+        ("status".to_string(), format!("{status:03}")),
+    ])
+}
+
 /// Request logging middleware — structured tracing for each request.
 ///
 /// Carries the socket peer, because a request line without one cannot be
@@ -1375,6 +1392,11 @@ pub async fn request_logger(
 
     let elapsed = start.elapsed();
     let status = response.status().as_u16();
+
+    state
+        .metrics
+        .inc_counter(REQUESTS_METRIC, Some(&request_metric_labels(method.as_str(), &path, status)), 1)
+        .await;
 
     if access_log_suppressed(method.as_str(), &path) {
         // The self-loop route (fleet logging phase 2): the controller's
@@ -2366,5 +2388,28 @@ mod csp_default_tests {
         let body = src.split("pub async fn security_headers(").nth(1).unwrap().split("\n}\n").next().unwrap();
         assert!(body.contains("csp_choice(csp_env.as_deref())"));
         assert!(body.contains("X_FRAME_OPTIONS"));
+    }
+}
+
+#[cfg(test)]
+mod request_counter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_counter_renders_three_bounded_labels() {
+        let m = crate::metrics::MetricsState::new();
+        m.inc_counter(REQUESTS_METRIC, Some(&request_metric_labels("GET", "/api/cluster/nodes", 200)), 1).await;
+        m.inc_counter(REQUESTS_METRIC, Some(&request_metric_labels("BREW", "/api/0123456789abcdef/x", 404)), 1).await;
+        let out = m.render().await;
+        assert!(
+            out.contains(r#"noo_http_requests_total{method="GET",route_class="cluster",status="200"} 1"#),
+            "{out}"
+        );
+        // Unknown path -> `other`, unknown verb -> OTHER; the raw id never appears.
+        assert!(
+            out.contains(r#"noo_http_requests_total{method="OTHER",route_class="other",status="404"} 1"#),
+            "{out}"
+        );
+        assert!(!out.contains("0123456789abcdef"), "{out}");
     }
 }

@@ -31,8 +31,6 @@ use crate::auth::{scoped_user, ClusterNode, RequesterCtx};
 use crate::state::AppState;
 use super::{AppResult, AppError};
 
-// Python subjects this module has replaced. See `crate::ported`.
-//
 // `worker.channels.send` was the LAST live `worker.channels.*` subject: the
 // route below has dispatched natively since 2026-03-31, and the two residual
 // escape paths into the Python adapter (`NOO_CHANNEL_FORCE_PYTHON` and the
@@ -48,9 +46,6 @@ use super::{AppResult, AppError};
 // rather than left to imply a working revert lever that no longer exists.
 // There is nothing to revert TO — the Python channel engine is deleted, not
 // dormant.
-crate::ported! {
-    POST "/api/channels/send" => "worker.channels.send",
-}
 
 /// Body limit for the two transcribe routes: 10 MiB.
 ///

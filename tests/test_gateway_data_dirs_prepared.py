@@ -114,3 +114,37 @@ def test_restart_prepares_when_it_recreates_the_gateway() -> None:
     assert re.search(r"grep -qx gateway;\s*then\s*noo_prepare_gateway_data_dirs", body[named:]), (
         "the named-services path must prepare after resolving names (an alias resolves to `gateway` only then)"
     )
+
+
+def test_prep_volume_is_the_compose_project_not_the_cwd(tmp_path: Path) -> None:
+    """A dist install runs from the install root (~/.noo); basename-of-$PWD
+    made ".noo_noo-data", invalid, and `|| true` hid docker's exit 125."""
+    bindir = _fake_bin(tmp_path)
+    log = tmp_path / "docker.log"
+    cwd = tmp_path / ".noo"
+    cwd.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "COMPOSE_PROJECT_NAME"}
+    env.update(PATH=f"{bindir}:{os.environ['PATH']}", FAKE_DOCKER_LOG=str(log))
+    r = subprocess.run(
+        ["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs'],
+        env=env, capture_output=True, text=True, cwd=cwd,
+    )
+    assert r.returncode == 0, r.stderr
+    argv = log.read_text().splitlines()
+    assert "noomesh_noo-data:/d" in argv, argv
+    assert not any(a.startswith(".noo") for a in argv), argv
+
+
+def test_prep_failure_is_reported_not_swallowed(tmp_path: Path) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    docker = bindir / "docker"
+    docker.write_text('#!/bin/sh\necho "invalid volume name" >&2\nexit 125\n')
+    docker.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "COMPOSE_PROJECT_NAME": "proj"}
+    r = subprocess.run(
+        ["bash", "-c", f'. "{LIB_INSTANCE}" >/dev/null 2>&1; noo_prepare_gateway_data_dirs'],
+        env=env, capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert r.returncode == 0, "a failed prep stays non-fatal (the start continues)"
+    assert "WARNING" in r.stderr and "invalid volume name" in r.stderr, r.stderr

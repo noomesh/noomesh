@@ -948,7 +948,7 @@ mod tests {
     /// route (so the router 404s it and the middleware admits no key for
     /// it), and the tailnet lane is the one mint. Read from the source
     /// because the router cannot be listed without a live state; the
-    /// Python guard (`tests/test_kiosk_key_lane_retired.py`) checks the
+    /// Python guard (`tests/test_mcp_token_and_kiosk_key_lane_retired.py`) checks the
     /// same thing across the whole router tree.
     #[test]
     fn kiosk_key_lane_is_not_routed() {

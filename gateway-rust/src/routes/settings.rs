@@ -27,11 +27,6 @@ use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
 use axum::http::header;
 
-// Python subjects this module has replaced. See `crate::ported`.
-crate::ported! {
-    GET "/api/prompt-skills" => "worker.prompt_skills.list",
-}
-
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()

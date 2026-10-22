@@ -150,8 +150,8 @@ pub fn delegate_post(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opt
 // The catch-all handlers (`catchall_get` / `catchall_post`) and
 // `path_to_nats_subject` were removed with the `/api/{*path}` route. Any
 // remaining delegation is explicit: a named route calling `delegate_post`
-// with a subject spelled out in source, which is greppable and appears in
-// the ported ledger. Path-derived subjects were neither.
+// with a subject spelled out in source, which is greppable. Path-derived
+// subjects were not.
 #[cfg(test)]
 mod tests {
     use super::*;

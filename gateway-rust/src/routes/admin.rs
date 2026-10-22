@@ -30,16 +30,6 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 use super::{logs_search, AppJson, AppError, AppResult};
 
-// Python subjects this module has replaced. See `crate::ported`.
-crate::ported! {
-    POST "/api/logs/errors"    => "worker.api.logs.errors",
-    POST "/api/logs/tail"      => "worker.api.logs.tail",
-    POST "/api/mesh/rebuild"  => "worker.api.mesh.rebuild",
-    POST "/api/mesh/restart"  => "worker.api.mesh.restart",
-    GET  "/api/mesh/status"   => "worker.api.mesh.status",
-    GET  "/api/metrics/query"  => "worker.api.metrics.query",
-}
-
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()

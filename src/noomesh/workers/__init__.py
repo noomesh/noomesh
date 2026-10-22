@@ -56,12 +56,13 @@ from . import registry  # noqa: F401  (re-exported for convenience)
 #
 # NOTE: this gates only the import-time @worker_handler REGISTRATIONS.
 # Direct submodule imports (e.g. worker_pool's `from ..workers.kb
-# import _TEAM_NAME_RE`) are unaffected — kb/users/cluster register no
-# subjects and stay cheap to import by design.
+# import _TEAM_NAME_RE`) are unaffected — kb/users register no
+# subjects and stay cheap to import by design. (workers/cluster.py, which
+# registered nothing and had no caller, was removed 2026-10-22.)
 import os as _os
 import warnings as _warnings
 
-_CORE_MODULES = ("cluster", "common", "heartbeat", "kb", "misc", "tools", "users")
+_CORE_MODULES = ("common", "heartbeat", "kb", "misc", "tools", "users")
 _ML_MODULES = ("autonomy", "memory", "rag", "snapshots", "recall")
 # The Intelligent tier's surface: graph
 # (worker.temporal.extract) and heartbeat_ml (worker.api.heartbeat.run_ml,

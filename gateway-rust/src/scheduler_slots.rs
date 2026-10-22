@@ -6,7 +6,7 @@
 //! Phase 2 of the scheduler port. These
 //! are the pure functions — no Redis, no NATS — ported first so they can
 //! be checked against the Python characterization tests
-//! (`tests/test_scheduler_slots.py`) before any dispatch logic moves.
+//! (`tests/test_scheduler_slots.py`, since deleted with the Python scheduler) before any dispatch logic moves.
 //!
 //! Since phase 7 this IS the slot policy: the Python `_max_slots` /
 //! `normalize_tier` / `_has_slots` it was ported from were deleted with the

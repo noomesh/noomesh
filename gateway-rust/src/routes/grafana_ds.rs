@@ -70,7 +70,6 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// The provisioned dashboards whose queries a read-only person may run.
 /// Every file in `configs/grafana/dashboards/` is listed here;
-/// `tests/test_grafana_ds_allowlist_parity.py` fails when one is not, and
 /// `docker/Dockerfile.gateway-rust` copies each into the build context.
 const DASHBOARDS: &[(&str, &str)] = &[(
     "cluster-overview.json",
