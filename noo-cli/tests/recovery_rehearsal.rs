@@ -112,12 +112,11 @@ fn sha256_hex(b: &[u8]) -> String {
 /// made, so the CLI verifies it against `$NOO_TLS_CA` like a real gateway.
 fn server_leaf(pki: &Path) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let ca_key = rcgen::KeyPair::from_pem(&std::fs::read_to_string(pki.join("ca.key")).unwrap()).unwrap();
-    let ca_params = rcgen::CertificateParams::from_ca_cert_pem(&std::fs::read_to_string(pki.join("ca.crt")).unwrap()).unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_issuer = rcgen::Issuer::from_ca_cert_pem(&std::fs::read_to_string(pki.join("ca.crt")).unwrap(), ca_key).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.subject_alt_names.push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
     let key = rcgen::KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+    let cert = params.signed_by(&key, &ca_issuer).unwrap();
     (cert.der().clone(), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())))
 }
 

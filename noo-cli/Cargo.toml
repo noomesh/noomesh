@@ -27,7 +27,7 @@ libc = "0.2"
 # `security pki` — X.509 issuance with ca.py profile fidelity (see src/pki.rs).
 # sha1 is REQUIRED for RFC 5280 method-1 key identifiers (python-cryptography
 # parity); rcgen itself only offers RFC 7093 SHA-2 key IDs.
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 x509-parser = "0.18"
 sha1 = "0.11"
 # "formatting" also serves `config export-effective`'s generated_at stamp.

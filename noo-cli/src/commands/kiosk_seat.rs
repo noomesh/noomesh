@@ -2312,7 +2312,7 @@ mod tests {
 
     struct TestCa {
         cert: rcgen::Certificate,
-        key: rcgen::KeyPair,
+        issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     }
 
     fn test_ca(name: &str) -> TestCa {
@@ -2320,7 +2320,8 @@ mod tests {
         p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         p.distinguished_name.push(rcgen::DnType::CommonName, name);
         let key = rcgen::KeyPair::generate().unwrap();
-        TestCa { cert: p.self_signed(&key).unwrap(), key }
+        let cert = p.self_signed(&key).unwrap();
+        TestCa { cert, issuer: rcgen::Issuer::new(p, key) }
     }
 
     /// A 127.0.0.1 leaf signed by `ca`.
@@ -2328,7 +2329,7 @@ mod tests {
         let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         p.subject_alt_names.push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
         let key = rcgen::KeyPair::generate().unwrap();
-        let cert = p.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        let cert = p.signed_by(&key, &ca.issuer).unwrap();
         (cert.der().clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
     }
 
