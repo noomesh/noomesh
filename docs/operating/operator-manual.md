@@ -211,6 +211,27 @@ gateway-signed binary swap is retired.
 Newest first. Anything here changes behaviour on an install that already
 works, so read it before you pull.
 
+#### A 0.6.9 Mac node and the 0.6.10 bundle (2026-10-23)
+
+A Mac node still on 0.6.9 cannot take a bundle staged by a 0.6.10 controller:
+its applier checks `agent-env` before it hands over to the CLI the bundle
+carries, and refuses the two keys 0.6.10 added
+(`REFUSED agent-env -- line N sets 'NODE_AGENT_BIND', which is not a key
+agent-env is rendered with`, exit 65). The node keeps its previous state. From
+0.6.11 the controller withholds `NODE_AGENT_BIND` and `NOO_CLUSTER_TOKEN_V1`
+from a Mac that reports a CLI older than 0.6.10 (or none), so the bundle
+applies and installs the new CLI; run `noo cluster provision <node>` once the
+node reports 0.6.10 to apply the two keys.
+
+If your controller is already on 0.6.10, update the CLI on the Mac by hand
+first, then restage:
+
+```sh
+curl -fsSL https://github.com/noomesh/noomesh/releases/download/noo-cli-v0.6.10/install.sh \
+  | NOO_CLI_VERSION=noo-cli-v0.6.10 NOO_INSTALL_DIR=/usr/local/bin sh
+noo cluster provision <node> --wait     # on the controller
+```
+
 #### Add-on flags moved out of `.env` (2026-09-04)
 
 **`noo stack start` refuses to run** while `.env` still contains
