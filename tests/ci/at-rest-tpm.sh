@@ -18,6 +18,7 @@ set -euo pipefail
 
 log() { printf '[at-rest-tpm] %s\n' "$*" >&2; }
 die() { printf '[at-rest-tpm] FAIL: %s\n' "$*" >&2; exit 1; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command missing: $1"; }
 
 TPMRM_GLOB="${TPMRM_GLOB:-/dev/tpmrm*}"
@@ -50,6 +51,34 @@ assert_device() {
   die "no TPM device appeared (looked for $TPMRM_GLOB for ${TPM_WAIT_SECS}s). The lane does not skip: without a TPM it proves nothing."
 }
 
+# Build tpm_vtpm_proxy.ko out of tree from the matching upstream kernel tag.
+# Fetches two files (the driver and the tpm core's private header); sha256 is
+# verified for the kernel series we have proved, logged as unverified otherwise.
+build_vtpm_proxy_module() {
+  local series base dir sum_c sum_h
+  series="$(uname -r | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
+  base="https://raw.githubusercontent.com/torvalds/linux/v${series}/drivers/char/tpm"
+  dir="$(mktemp -d)"
+  log "building tpm_vtpm_proxy out of tree for $(uname -r) from kernel tag v${series}"
+  apt-get install -y -qq "linux-headers-$(uname -r)" build-essential >"$LOG_DIR/headers.log" 2>&1 || { tail -20 "$LOG_DIR/headers.log" >&2; return 1; }
+  curl -fsSL --retry 3 -o "$dir/tpm_vtpm_proxy.c" "$base/tpm_vtpm_proxy.c" || return 1
+  curl -fsSL --retry 3 -o "$dir/tpm.h" "$base/tpm.h" || return 1
+  if [ "$series" = "6.17" ]; then
+    sum_c=8268e005f7eeac4170546b8040a0053c4fb6eecabf76b06213790e1f73b14f10
+    sum_h=a6abcf2cfe79aad03eb565d677f70ef0b44e06132a77c6ae99dbd971c1ef96de
+    [ "$(sha "$dir/tpm_vtpm_proxy.c")" = "$sum_c" ] && [ "$(sha "$dir/tpm.h")" = "$sum_h" ] \
+      || die "upstream v6.17 driver sources do not match the pinned sha256"
+  else
+    log "WARNING: no pinned sha256 for kernel series $series; sources used unverified"
+  fi
+  printf 'obj-m += tpm_vtpm_proxy.o\n' >"$dir/Makefile"
+  make -C "/lib/modules/$(uname -r)/build" "M=$dir" modules >"$LOG_DIR/vtpm-build.log" 2>&1 \
+    || { tail -30 "$LOG_DIR/vtpm-build.log" >&2; return 1; }
+  insmod "$dir/tpm_vtpm_proxy.ko" || return 1
+  [ -e /dev/vtpmx ] || return 1
+  log "tpm_vtpm_proxy loaded (out of tree)"
+}
+
 setup_tpm() {
   [ "$(id -u)" = 0 ] || die "setup-tpm needs root"
   need_cmd swtpm; need_cmd swtpm_setup; need_cmd systemd-creds
@@ -62,20 +91,16 @@ setup_tpm() {
   if modprobe tpm_vtpm_proxy 2>"$LOG_DIR/modprobe.err" || [ -e /dev/vtpmx ]; then
     mode=vtpm-proxy
   else
-    log "tpm_vtpm_proxy not loadable on $(uname -r): $(cat "$LOG_DIR/modprobe.err")"
-    log "trying linux-modules-extra-$(uname -r)"
-    if apt-get install -y -qq "linux-modules-extra-$(uname -r)" >"$LOG_DIR/modextra.log" 2>&1 \
-       && modprobe tpm_vtpm_proxy; then
-      mode=vtpm-proxy
-    fi
+    log "tpm_vtpm_proxy not shipped with $(uname -r): $(cat "$LOG_DIR/modprobe.err")"
+    # GitHub's azure kernel has CONFIG_TCG_TPM=y but CONFIG_TCG_VTPM_PROXY unset
+    # and no linux-modules-extra carries it. The driver is one small file that
+    # builds out of tree against the runner's own headers (proved on 6.17.0-1022).
+    if build_vtpm_proxy_module; then mode=vtpm-proxy; fi
   fi
 
   if [ "$mode" = vtpm-proxy ]; then
-    swtpm_setup --tpm2 --tpmstate "$TPM_STATE_DIR" --createek --create-ek-cert \
-      --create-platform-cert --lock-nvram --not-overwrite --overwrite \
+    swtpm_setup --tpm2 --tpmstate "$TPM_STATE_DIR" --createek --lock-nvram \
       >"$LOG_DIR/swtpm_setup.log" 2>&1 \
-      || swtpm_setup --tpm2 --tpmstate "$TPM_STATE_DIR" --createek --lock-nvram \
-           >"$LOG_DIR/swtpm_setup.log" 2>&1 \
       || { cat "$LOG_DIR/swtpm_setup.log" >&2; die "swtpm_setup failed"; }
     swtpm chardev --tpm2 --vtpm-proxy --tpmstate "dir=$TPM_STATE_DIR" \
       --flags not-need-init,startup-clear --daemon \
@@ -115,7 +140,6 @@ setup_tpm() {
 }
 
 # ---- helpers for the tests -----------------------------------------------------
-sha() { sha256sum "$1" | cut -d' ' -f1; }
 assert_eq() { [ "$1" = "$2" ] || die "$3 (got '$1', want '$2')"; log "ok: $3"; }
 assert_fails() {
   local what="$1"; shift
