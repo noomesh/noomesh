@@ -35,28 +35,19 @@ tokio-tungstenite = "0.30"
 futures = "0.3"
 
 # HTTP client (for LLM backends)
-# default-features = false: reqwest's default TLS was native-tls (0.12), which
-# links OpenSSL, so the gateway carried BOTH stacks and the builder needed
+# default-features = false: reqwest's default TLS is native-tls, which links
+# OpenSSL — so the gateway carried BOTH stacks and the builder needed
 # libssl-dev, while every TLS decision in the tree (tls.rs, bus.rs, the
 # rustls provider) is rustls. Found 2026-09-18 when the harness binary had
-# to cross-compile for aarch64 and darwin: OpenSSL was the one C dependency
-# with no cross story. Nothing used it.
-# reqwest 0.13 renamed the TLS features: `rustls` = rustls + the aws-lc-rs
-# provider (the one main.rs installs, and already in the tree via axum-server,
-# fred and sqlx) + rustls-platform-verifier, which trusts the SYSTEM store.
-# The old `rustls-tls` / `rustls-tls-native-roots` features are gone, and
-# `query` and `form` are now features of their own.
-# Both stores, as before (without the system store the DEFAULT client would
-# trust only Mozilla's roots, where OpenSSL trusted the system store): the external MCP client dials whatever an operator
-# registered, and a server behind a private CA installed in the system store
-# must keep working. The system store comes from the platform verifier; the
-# bundled Mozilla roots are merged in by tls::client_builder() through
-# tls_certs_merge (webpki-root-certs below). Cluster calls pin the cluster CA
-# through a preconfigured rustls config and trust ONLY it (tls.rs).
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "multipart", "query", "form", "rustls", "charset", "http2", "system-proxy"] }
-# Mozilla roots as DER certificates, for reqwest's tls_certs_merge (reqwest 0.13
-# ships no bundled roots). Same Mozilla set as webpki-roots, in the form reqwest takes.
-webpki-root-certs = "1"
+# to cross-compile for aarch64 and darwin: OpenSSL was
+# the one C dependency with no cross story. Nothing used it.
+# rustls-tls-native-roots: with native-tls gone (#248) the DEFAULT client
+# would trust only Mozilla's bundled roots, where OpenSSL trusted the system
+# store. Cluster calls pin the cluster CA explicitly and never noticed; the
+# external MCP client dials whatever an operator registered, and a server
+# behind a private CA installed in the system store would have failed after
+# the roll with no line of config changed. Both stores, as before.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "rustls-tls-native-roots", "charset", "http2"] }
 
 # NATS messaging + KV
 # websockets is off because NATS is reached over tls:// only; it keeps
@@ -151,7 +142,7 @@ serde_urlencoded = "0.7"
 # for that: it was already compiled for the test profile and is already in
 # Cargo.lock, so this adds nothing to the build graph. Still the only
 # non-test use; certificate ISSUANCE lives in noo-cli, not here.
-rcgen = "0.13"
+rcgen = "0.14"
 flate2 = "1"
 
 [dev-dependencies]

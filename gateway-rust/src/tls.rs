@@ -755,7 +755,7 @@ mod loopback_verification_tests {
     /// `NOO_TLS_CA` is process-global; `cargo test` runs these on threads.
     pub(super) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey, rcgen::CertifiedKey) {
+    fn issue(ca_cn: &str, san: &str) -> (rcgen::CertifiedKey<rcgen::KeyPair>, rcgen::CertifiedKey<rcgen::KeyPair>) {
         let mut ca_params = rcgen::CertificateParams::new(vec![ca_cn.to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         // DISTINCT subject DNs. rcgen defaults every DN to "rcgen self signed
@@ -773,7 +773,7 @@ mod loopback_verification_tests {
         leaf_params.distinguished_name.push(rcgen::DnType::CommonName, san);
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .unwrap();
         (
             rcgen::CertifiedKey { cert: ca_cert, key_pair: ca_key },
@@ -782,7 +782,7 @@ mod loopback_verification_tests {
     }
 
     /// A one-shot HTTPS listener presenting `leaf`. Returns its port.
-    async fn serve(leaf: &rcgen::CertifiedKey) -> u16 {
+    async fn serve(leaf: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         let cert = CertificateDer::from(leaf.cert.der().to_vec());
         let key = PrivateKeyDer::try_from(leaf.key_pair.serialize_der()).unwrap();
