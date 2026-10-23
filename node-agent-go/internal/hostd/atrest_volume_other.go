@@ -12,7 +12,7 @@ import (
 
 // IsAtRestVolumeVerb mirrors the Linux build so main dispatches the same way.
 func IsAtRestVolumeVerb(args []string) bool {
-	return len(args) > 0 && args[0] == "create-volume"
+	return len(args) > 0 && (args[0] == "create-volume" || args[0] == "copy" || args[0] == "wipe")
 }
 
 // RunAtRestVolume is Linux-only: the encrypted state volume is LUKS2 with a
