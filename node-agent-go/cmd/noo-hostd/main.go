@@ -23,6 +23,8 @@
 //	noo-hostd status  [--root DIR]
 //	noo-hostd drain   [--root DIR]     # process pending commands once, exit
 //	noo-hostd uninstall [--system]
+//	sudo noo-hostd at-rest seal-age-key --user <op> --key <path> [--pcrs 7|none|auto]
+//	noo-hostd at-rest unseal-status [--json]
 package main
 
 import (
@@ -62,6 +64,9 @@ func main() {
 		err = cmdUninstall(args)
 	case "status":
 		err = cmdStatus(args)
+	case "at-rest":
+		// Root, interactive only (sudo by a person; i10a). Never a spool op.
+		err = hostd.RunAtRest(args, os.Stdout, os.Stderr)
 	case "version", "--version", "-v":
 		fmt.Println("noo-hostd", version.String())
 	case "help", "--help", "-h":
@@ -95,6 +100,11 @@ func usage() {
         Process any pending commands once, then exit.
 
   noo-hostd uninstall [--system]
+
+  sudo noo-hostd at-rest seal-age-key --user <op> --key <path> [--pcrs 7|none|auto]
+  noo-hostd at-rest unseal-status [--json]
+        Seal the SOPS age key to this machine's TPM and unseal it into RAM at
+        boot (Linux controllers; see 'noo-hostd at-rest help').
 
 `)
 }

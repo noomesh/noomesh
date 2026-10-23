@@ -72,5 +72,7 @@ func (e *Engine) BootRestore(ctx context.Context) {
 		}
 		sleepCtx(ctx, 10*time.Second)
 	}
-	e.logf("BOOT-RESTORE gave up: run `noo stack start` to rewrite the secret files")
+	// A key sealed to the TPM (i10a) that did not unseal fails every attempt
+	// the same way; lib-secrets.sh names the unit in the stderr above.
+	e.logf("BOOT-RESTORE gave up: run `noo stack start` to rewrite the secret files (age key sealed to the TPM? systemctl status noo-unseal.service)")
 }

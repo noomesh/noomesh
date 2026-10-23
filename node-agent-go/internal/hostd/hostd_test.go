@@ -598,6 +598,9 @@ func TestNothingExecsOutsideTheRunnerSeam(t *testing.T) {
 		"exec.go":    true, // the seam itself
 		"watch.go":   true, // runStreaming: the detached rebuild's log tee
 		"install.go": true, // systemctl/launchctl, an operator-invoked path
+		// at-rest (i10a): sudo by a person, never the spool; every binary it
+		// runs is an AtRestConfig field, and its tests set each to a fake.
+		"atrest_linux.go": true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
