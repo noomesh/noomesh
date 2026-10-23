@@ -31,7 +31,7 @@ tokio-stream = "0.1"
 # (routes/reservations.rs) and add-on WS routes (addon_ws.rs). The same
 # tokio-tungstenite axum's `ws` feature pins; the TLS hop is tokio-rustls
 # over the cluster's rustls config (tls.rs).
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures = "0.3"
 
 # HTTP client (for LLM backends)
