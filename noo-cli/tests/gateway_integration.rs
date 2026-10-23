@@ -2515,9 +2515,10 @@ fn cluster_seed_missing_file_errors() {
 // minutes. The desired column alone cannot say that, and the node's own
 // report was on a different screen.
 
-/// Two calls: the desired-config, then the node list the ACTUAL column reads.
+/// Two calls, in `cluster show`'s order (`desired` is its alias since i195
+/// decision 1): the node list first, then the desired-config.
 fn desired_mock(desired: &str, nodes: &str) -> Mock {
-    Mock::start_seq(vec![ok_json(desired), ok_json(nodes)])
+    Mock::start_seq(vec![ok_json(nodes), ok_json(desired)])
 }
 
 #[test]
@@ -2557,11 +2558,13 @@ fn cluster_desired_prints_actual_beside_desired() {
 
 #[test]
 fn cluster_desired_shows_a_dash_when_the_node_has_not_reported() {
-    // Absence is never a negative (CLI_STYLE_GUIDE §4): a node that has
-    // said nothing must not render as "not running".
+    // Absence is never a negative (CLI_STYLE_GUIDE §4): a registered node
+    // that has said nothing (no `running_backends` yet) must not render as
+    // "not running". (An unregistered node is `show`'s "not registered",
+    // exit 1 — a different screen.)
     let desired = r#"{"node":{"data_root":"/opt/noo"},"placements":[
         {"backend":"vllm","model":"gemma","desired_state":"running"}]}"#;
-    let nodes = r#"{"nodes":[]}"#;
+    let nodes = r#"{"nodes":[{"id":"n1"}]}"#;
     let mock = desired_mock(desired, nodes);
     let out = run(&["--gateway", &gw(mock.port), "cluster", "desired", "n1"], &[]);
     let _ = mock.requests();
