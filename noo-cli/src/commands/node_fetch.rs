@@ -2671,6 +2671,8 @@ fn verify_header(manifest: &str, node: &str) -> Result<(), String> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SelfUpdate {
     Allowed,
+    /// Only tests pass this: every daemon path allows the self-update.
+    #[cfg_attr(not(test), allow(dead_code))]
     Never,
 }
 
