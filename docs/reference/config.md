@@ -106,6 +106,47 @@ Types and defaults are what the Rust loader (`gateway-rust/src/config.rs`)
 and the Python models (`src/noomesh/config.py`) declare; the *Read by*
 column says which side actually consumes the key.
 
+### `addons` and `addon_delegation` — which add-ons run, and what they may do (gateway + launcher)
+
+`addons` is a map of add-on name to a boolean. The launcher composes each
+enabled add-on's overlay from it; the gateway's add-on registry
+(`gateway-rust/src/addon_registry.rs`) registers each enabled HTTP add-on at
+startup from the route manifest its image delivers. Both read the same file.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `addons.<name>` | bool | the add-on's own polarity (trellion and identity on, the rest off) | Switch the add-on on or off. A name the stack does not ship is off until you set it `true`; set it with `noo addons enable <name>`. |
+| `addon_delegation.<name>.tasks` | bool | `false` | Let the add-on create and steer a present person's tasks. Takes effect only if the add-on's manifest also declares `delegate: "tasks"`; both are required. |
+
+An enabled add-on is registered only if its signed lock was verified for this
+stack; one that is enabled with no verified lock is refused, with an error that
+names `noo addons upgrade <name>` (see
+[development/addons.md](../development/addons.md#registration)).
+
+`addon_delegation` is a separate section on purpose: `addons` stays a plain
+`name: bool` map that the launcher and older releases read, and a switch that
+widens what an add-on may do for a person is its own admin-only entry (writing it
+through `PUT /api/config/addon_delegation` needs an Admin login, never a cluster
+credential). It is not a posture row: delegation is off by default, so no install
+is stranded, and its keys are add-on names a fixed posture catalog cannot list.
+The gateway reads the file at startup, so restart the gateway after editing.
+
+```yaml
+addons:
+  yourthing: true
+addon_delegation:
+  yourthing:
+    tasks: true
+```
+
+`addon_trust.<name>` (`registry`, `keys`) holds the signing keys you trust for an
+add-on the stack does not ship; it is read by the CLI (`noo addons trust-key`,
+`untrust-key`) and is an admin-only config section like `addon_delegation`.
+`addon_trust.<name>.dev_keys` (`{key, dev: true, expires_at}` records, written by
+`trust-key ... --dev --expires <dur>`) holds temporary development keys for that
+add-on on this mesh only; each is refused after its UTC `expires_at`.
+`noo addons set <name> --delegate tasks|off` writes `addon_delegation.<name>.tasks`.
+
 ### `services` — endpoints (gateway + workers)
 
 Topology only — credentials stay in the secret store. Each key's env
@@ -524,19 +565,68 @@ systems:
     password_env: NOO_TRELLION_DB_PASSWORD
     ddl_password_env: NOO_TRELLION_DDL_PASSWORD
     extensions: [vector, pg_trgm]     # installed by the broker (need superuser)
-  example_addon:
-    role: noo_example_addon
-    ddl_role: noo_example_addon_ddl
-    schema: example_addon
-    password_env: NOO_EXAMPLE_ADDON_DB_PASSWORD
-    ddl_password_env: NOO_EXAMPLE_ADDON_DDL_PASSWORD
-    # no enabled_when: a system named after an add-on follows the
-    # `addons:` map. Only a system that is NOT an add-on names an env flag.
+  example_system:
+    role: noo_example_system
+    ddl_role: noo_example_system_ddl
+    schema: example_system
+    password_env: NOO_EXAMPLE_SYSTEM_DB_PASSWORD
+    ddl_password_env: NOO_EXAMPLE_SYSTEM_DDL_PASSWORD
+    enabled_when: NOO_EXAMPLE_SYSTEM_ENABLED
+    # A system named after a built-in add-on (evolve) has no
+    # enabled_when: it follows the `addons:` map. A third-party add-on's
+    # system is never written here: its signed bundle declares it (below).
 ```
 
 `enabled_when` names the env flag that decides whether the system is
 provisioned; it is deliberately not "is the password set", because the CLI
 generates every role password unconditionally.
+
+**How a system's flag and passwords reach the gateway.** trellion and evolve
+are named in `docker-compose.cluster.yml`, so each of their role passwords has
+its own secret file. Any other system you declare here needs nothing in
+compose. `noo systems enable <name>` mints its two passwords into
+`secrets/env.sops`, sets its `enabled_when` flag in `.env`, and names the
+gateway as the container to recreate. On the next
+`noo stack start` the launcher writes them into the gateway's one
+`noo_systems_secrets` file. The flag is always written; the passwords are
+written only while the system is enabled (see
+[Secrets](../security/secrets.md#how-secrets-reach-a-container)). The broker
+reads a name from the gateway's environment first, then from that file.
+
+**A missing password does not stop the gateway** for a system core does not
+name. The broker logs an ERROR that names the system and the variable, skips
+that system, and keeps booting. Both passwords are checked before either role is
+created, so a skipped system is left with no role and no schema, never a
+migration role on its own. Authenticated `/health`
+then shows `dependencies.systems` as `healthy: false, optional: true`, with an
+`unprovisioned` map of each skipped system and its reason. `noo health`
+lists it as a down dependency, and `noo systems status` shows the credential
+missing from the store. trellion and evolve keep the old rule: without their
+passwords the gateway refuses to start, and the launcher refuses before `up`
+(`noo config launch-check system-credentials`).
+
+**Systems an add-on's bundle declares.** The `systems:` manifest is not the
+only source. An add-on declares its own database in its signed bundle
+(`system.json`, see
+[Declaring a database](../development/addons.md#declaring-a-database)), never
+in `noomesh.yaml`. The gateway provisions it exactly like a `systems:` entry,
+and only while the add-on is registered: switched on in `addons:`, its signed
+lock verified by the launcher for this stack, and its declarations valid. Its
+names are fixed by the add-on name (`<id>` = the name with `-` as `_`):
+schema `<id>`, roles `noo_<id>` and `noo_<id>_ddl`, passwords
+`NOO_<ID>_DB_PASSWORD` and `NOO_<ID>_DDL_PASSWORD`. `noo addons enable` (and
+`noo upgrade --stack`) mint the two passwords into `secrets/env.sops` when
+absent, and they reach the gateway through the same `noo_systems_secrets`
+file; there is no flag. A missing password follows the rule above (skipped,
+reported, the gateway keeps booting).
+
+If `noomesh.yaml` also has a `systems:` entry with the bundle's system name,
+the `noomesh.yaml` entry wins and the gateway logs a warning naming it: that
+entry is what the database was provisioned from so far, and keeping it changes
+nothing that runs. Remove the entry to let the bundle declare the system.
+
+`noo addons show <name>` prints the system (and workloads) an add-on's bundle
+declares.
 
 ### Other sections
 

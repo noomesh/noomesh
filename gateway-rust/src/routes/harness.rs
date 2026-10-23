@@ -94,7 +94,7 @@ async fn harness_call(
             "preferred_skills": rt.preferred_skills().await,
         }),
         HarnessOp::Catalogs => json!({
-            "skills": state.prompt_skills.list_all(),
+            "skills": state.prompt_skills.catalog_for_node(),
             "runbooks": state.runbooks,
         }),
         HarnessOp::ModelPreference => json!({"model": rt.user_model_preference(user).await}),
@@ -244,7 +244,24 @@ async fn harness_call(
             let after = crate::tasks::checkpoint(&state, &task.id, loops, note.as_deref(), exhausted).await.map_err(|e| AppError::Internal(e.to_string()))?;
             let token = match crate::coordinator::role_of(&state, user).await {
                 Some(role) => crate::auth::mint_harness_jwt(user, role, &turn.node, conv, crate::coordinator::turn_deadline().as_secs() + 60),
-                None => None,
+                None => {
+                    // i143 D: the renewal was refused. When that is because
+                    // the account is DISABLED (confirmed, not a failed read),
+                    // an add-on's task gets `revoked account_disabled` and its
+                    // final `state`, and the task stops.
+                    let disabled: Option<bool> = sqlx::query_scalar("SELECT disabled FROM noo_users WHERE username = $1")
+                        .bind(user)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+                    if disabled == Some(true) {
+                        if let Err(e) = crate::tasks::stop_with(&state.db, &task.id, "account_disabled").await {
+                            tracing::warn!(task = %task.id, error = %e, "harness rail: task not stopped for a disabled account");
+                        }
+                    }
+                    None
+                }
             };
             json!({"state": after, "token": token})
         }

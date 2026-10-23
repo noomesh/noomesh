@@ -13,7 +13,19 @@
 //!   checks each pinned image is local, and compares running containers with
 //!   the pins.
 //! - `launch-pins <tag> [<name>…]` (hidden) is the launcher's reader: one
-//!   `pin <addon> <VAR> <ref>` or `refuse <addon> <why>` line per add-on.
+//!   `verified <addon> <version> <stack>` line, then `dev <addon> <unix>`
+//!   when only a development key vouches for it (i163 part A; the unix
+//!   time is that key's expiry), then one `pin <addon> <VAR> <ref>` line per
+//!   image; or one `refuse <addon> <why>` line, per add-on. The launcher
+//!   hands the `verified` lines to the gateway's add-on registry
+//!   (`NOO_ADDONS_VERIFIED`, gateway-rust/src/addon_registry.rs) and the
+//!   `dev` lines beside them (`NOO_ADDONS_DEV`). A launcher that predates
+//!   `dev` lines skips them: it reads only the kinds it knows.
+//!
+//! `launch-pins` also prints one `decl <addon> <file>` line per bundle
+//! declaration file (`system.json`, `workloads.json`) a verified lock lists
+//! (i163 E/B). The launcher copies only those to the gateway (`lib-dist.sh`
+//! `addon_decls_materialise`); an older launcher ignores the kind.
 //!
 //! Nothing here restarts anything: a new pin takes effect on the operator's
 //! next `noo stack restart --force`.
@@ -27,7 +39,7 @@ use crate::output::{fail, ExitCode};
 use crate::ui;
 use crate::{Globals, Unhandled};
 
-const UPGRADE_USAGE: &str = "usage: noo addons upgrade [<name>...] [--check] [--allow-downgrade]";
+const UPGRADE_USAGE: &str = "usage: noo addons upgrade [<name>...] [--check] [--allow-downgrade] [--lock <path|https-url>]";
 const VERIFY_USAGE: &str = "usage: noo addons verify";
 
 /// The add-ons a verb acts on: the named ones (licensed only), else every
@@ -45,7 +57,12 @@ fn targets(g: &Globals, root: &Path, named: &[String]) -> Vec<&'static str> {
             Some(r) if r.licensed.is_some() => r.key,
             Some(r) => fail(g.json, ExitCode::Usage, "not_licensed",
                 &format!("{} ships with the stack and has no signed lock of its own", r.key), Some("noo addons list")),
-            None => fail(g.json, ExitCode::Usage, "unknown_addon", &format!("unknown add-on `{n}`"), Some("noo addons list")),
+            // Not an add-on the CLI ships: acceptable when the operator trusts a
+            // signing key for it (`noo addons trust-key`).
+            None if matches!(addons::trust::trusted_anchor(n), Ok(Some(_))) => Box::leak(n.clone().into_boxed_str()) as &'static str,
+            None => fail(g.json, ExitCode::Usage, "unknown_addon",
+                &format!("unknown add-on `{n}`, and no signing key is trusted for it"),
+                Some(&format!("noo addons trust-key {n} <pubkey> --registry <root>"))),
         })
         .collect()
 }
@@ -62,10 +79,16 @@ fn require_tag(g: &Globals, root: &Path) -> String {
 /// `noo addons upgrade`
 pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let (mut check, mut allow_downgrade, mut named) = (false, false, Vec::new());
-    for a in args {
+    let mut lock_ref: Option<String> = None;
+    let mut args_it = args.iter();
+    while let Some(a) = args_it.next() {
         match a.as_str() {
             "--check" => check = true,
             "--allow-downgrade" => allow_downgrade = true,
+            "--lock" => match args_it.next() {
+                Some(v) if !v.starts_with('-') => lock_ref = Some(v.clone()),
+                _ => fail(g.json, ExitCode::Usage, "usage", "--lock needs a path or an https:// URL", Some(UPGRADE_USAGE)),
+            },
             "--help" | "-h" => {
                 println!("{UPGRADE_USAGE}");
                 return Ok(0);
@@ -94,12 +117,27 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         Ok(p) => p,
         Err(e) => fail(g.json, ExitCode::Generic, "pins_unreadable", &e, Some("noo addons verify")),
     };
-    let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client: &client };
+    // A third-party add-on is fetched with NO credential: the vendor token is
+    // never sent to a registry the operator named.
+    let plain = addons::lock_fetch::Client::new(None);
+    if lock_ref.is_some() && (named.len() != 1 || !resolve::third_party(&named[0])) {
+        fail(g.json, ExitCode::Usage, "usage", "--lock names one third-party add-on's lock: give exactly that add-on", Some(UPGRADE_USAGE));
+    }
     let mut rows = Vec::new();
     let mut failed = 0;
     for addon in list {
+        let third_party = resolve::third_party(addon);
+        let client = if third_party { &plain } else { &client };
+        let ctx = addons::Ctx { root: &root, tag: &tag, stack_lock: stack_lock.as_deref(), allow_downgrade, client };
         let installed = current.get(addon).cloned();
-        let outcome = if check {
+        let supplied = match (third_party, lock_ref.as_deref()) {
+            (true, Some(r)) => Some(addons::trust::fetch_supplied(r).map_err(resolve::Refusal::Supplied)),
+            _ => None,
+        };
+        let outcome = if let Some(Err(e)) = &supplied {
+            Err(e.clone())
+        } else if check {
+            let supplied = supplied.and_then(Result::ok);
             resolve::installed_anchor(addon)
                 .and_then(|anchor| {
                     let want = resolve::Want {
@@ -110,12 +148,14 @@ pub fn addons_upgrade(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                         allow_downgrade,
                     };
                     let route = client.route(&anchor).map_err(resolve::Refusal::Route)?;
-                    resolve::fetch_and_check(&client, &anchor, &want)
+                    addons::resolve_lock(client, &anchor, &want, supplied)
                         .and_then(|(v, f)| resolve::require_bundle(&v, &tag).map(|()| (v, f)))
                         .map(|(v, f)| (pins::Pin::from_verified(&v, &tag, &f.lock, route.pulled_from()), 0usize, client.describe(&route)))
                 })
         } else {
-            addons::prepare(&ctx, addon, &mut resolve::LiveDocker::new(&root))
+            let supplied = supplied.and_then(Result::ok);
+            resolve::installed_anchor(addon)
+                .and_then(|anchor| addons::prepare_from(&ctx, addon, &anchor, supplied, &mut resolve::LiveDocker::new(&root)))
                 .and_then(|p| addons::commit(&root, &p, &tag).map(|pin| (pin, p.pulled, p.via.clone())))
         };
         match outcome {
@@ -271,6 +311,7 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "addon": v.addon, "ok": v.problem.is_none(), "problem": v.problem, "notes": v.notes,
                 "version": v.pin.as_ref().map(|p| &p.version), "stack": v.pin.as_ref().map(|p| &p.stack),
                 "key_index": v.pin.as_ref().map(|p| p.key_index), "images": v.pin.as_ref().map(|p| &p.images),
+                "dev_expires_at": v.pin.as_ref().and_then(|p| p.dev_expires_at).map(crate::addon_lock::utc_rfc3339),
                 "pulled_from": v.pin.as_ref().and_then(|p| p.pulled_from.as_ref()),
             }))
             .collect();
@@ -286,8 +327,12 @@ pub fn addons_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         match (&v.problem, &v.pin) {
             (None, Some(p)) => {
                 let notes = if v.notes.is_empty() { String::new() } else { ui::muted(&format!("  ({})", v.notes.join("; "))) };
+                let signer = match p.dev_expires_at {
+                    Some(at) => format!("DEV key #{}, expires {}", p.key_index, crate::addon_lock::utc_minute(at)),
+                    None => format!("add-on key #{}", p.key_index),
+                };
                 println!("{}", ui::status_line(ui::Glyph::Ok, &format!(
-                    "{} {} @{} for {}, signed by add-on key #{}{notes}", v.addon, p.version, p.short_digest(), p.stack, p.key_index)));
+                    "{} {} @{} for {}, signed by {signer}{notes}", v.addon, p.version, p.short_digest(), p.stack)));
             }
             (Some(why), _) => println!("{}", ui::status_line(ui::Glyph::Err, &format!("{}: {why}", v.addon))),
             (None, None) => {}
@@ -304,18 +349,41 @@ pub(crate) fn launch_lines(root: &Path, tag: &str, names: &[String], anchor: &dy
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for n in names {
-        let Some(r) = crate::commands::addons::row(n) else { continue };
-        if r.licensed.is_none() || !seen.insert(r.key) {
+        // A built-in add-on is covered when it is licensed; any other name is a
+        // third-party add-on whose lock must verify against a trusted key (no
+        // key, no verdict: it is refused here, by name).
+        let addon: &str = match crate::commands::addons::row(n) {
+            Some(r) if r.licensed.is_none() => continue,
+            Some(r) => r.key,
+            None if resolve::third_party(n) => n.as_str(),
+            None => continue,
+        };
+        if !seen.insert(addon.to_string()) {
             continue;
         }
-        let addon = r.key;
-        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check(root, addon, tag, &a));
+        let res = anchor(addon).map_err(|e| e.why(addon)).and_then(|a| resolve::offline_check_files(root, addon, tag, &a));
         match res {
-            Ok(pin) => {
+            Ok((pin, files)) => {
+                // The verdict the gateway's add-on registry reads
+                // (`NOO_ADDONS_VERIFIED`): this add-on's signed lock verified
+                // offline AND lists `tag`. Emitted before its `pin` lines so a
+                // launcher that stops at the first problem still saw it.
+                out.push(format!("verified {addon} {} {}", pin.version, pin.stack));
+                if let Some(at) = pin.dev_expires_at {
+                    out.push(format!("dev {addon} {at}"));
+                }
                 for (image, reference) in &pin.local_images() {
                     match pins::image_env_var(image) {
                         Some(var) => out.push(format!("pin {addon} {var} {reference}")),
                         None => out.push(format!("refuse {addon} its lock names image {image:?}, which has no variable name")),
+                    }
+                }
+                // The bundle declarations the launcher may hand the gateway:
+                // only files the verified lock lists (and offline_check just
+                // held to their signed hash).
+                for f in crate::addons::decls::DECL_FILES {
+                    if files.contains(*f) {
+                        out.push(format!("decl {addon} {f}"));
                     }
                 }
             }
@@ -390,6 +458,9 @@ pub(crate) fn addon_image_env(
         let (kind, addon, rest) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let fix = format!("noo addons upgrade {addon}");
         match kind {
+            // Not an image: the registry verdict (`launch_lines`). The wizard
+            // composes the stack but starts no gateway of its own.
+            "verified" | "dev" => {}
             "pin" => {
                 let (var, reference) = rest.split_once(' ').unwrap_or((rest, ""));
                 if present(reference) {
@@ -398,6 +469,9 @@ pub(crate) fn addon_image_env(
                     refused.push((addon.to_string(), format!("its pinned image {reference} is not on this host"), fix));
                 }
             }
+            // A bundle declaration the launcher copies for the gateway; the
+            // wizard starts no gateway of its own.
+            "decl" => {}
             _ => refused.push((addon.to_string(), format!("no verified pin for {}: {rest}", input.tag), fix)),
         }
     }
@@ -477,16 +551,47 @@ mod tests {
     }
 
     #[test]
+    fn launch_lines_name_only_the_declaration_files_the_verified_lock_lists() {
+        use crate::addons::resolve::tests::{signed_example_bundle, EXAMPLE_SYSTEM, EXAMPLE_WORKLOADS};
+        let d = scratch("decl-lines");
+        let f = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
+        );
+        let want = resolve::Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        let names = vec!["example-addon".to_string()];
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert_eq!(lines[0], "verified example-addon 1.0.0 v0.6.0", "{lines:?}");
+        let decls: Vec<&String> = lines.iter().filter(|l| l.starts_with("decl ")).collect();
+        assert_eq!(decls, ["decl example-addon system.json", "decl example-addon workloads.json"], "{lines:?}");
+
+        // A bundle that lists only its overlay: an unsigned system.json left
+        // beside it is never named.
+        let d = scratch("decl-unsigned");
+        let f = signed_example_bundle(&lock("1.0.0", &["v0.6.0"], None), &[]);
+        let v = resolve::check(&f, &anchor(), &want).unwrap();
+        resolve::record(&d, "example-addon", &v, &f, "v0.6.0", None).unwrap();
+        std::fs::write(crate::addons::pins::addon_dir(&d, "example-addon").join("system.json"), EXAMPLE_SYSTEM).unwrap();
+        let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(anchor()));
+        assert!(lines[0].starts_with("verified "), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("decl ")), "{lines:?}");
+    }
+
+    #[test]
     fn launch_lines_pin_what_verifies_and_refuse_the_rest() {
         let (d, reference) = pinned_root("launch");
         let names = vec!["trellion-intel".to_string(), "evolve".to_string(), "voice".to_string(), "trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|a| if a == "trellion_intel" { Ok(anchor()) } else { Err(resolve::Refusal::NoAnchor) });
-        assert_eq!(lines[0], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
-        assert!(lines[1].starts_with("refuse evolve the installed entitlement names no signing key"), "{lines:?}");
-        assert_eq!(lines.len(), 2, "voice is not licensed and a duplicate spelling is one add-on: {lines:?}");
+        assert_eq!(lines[0], "verified trellion_intel 1.2.0 v0.6.0", "the registry verdict leads: {lines:?}");
+        assert_eq!(lines[1], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
+        assert!(lines[2].starts_with("refuse evolve the installed entitlement names no signing key"), "{lines:?}");
+        assert_eq!(lines.len(), 3, "voice is not licensed and a duplicate spelling is one add-on: {lines:?}");
 
         let other_tag = launch_lines(&d, "v0.6.1", &names[..1], &|_| Ok(anchor()));
         assert!(other_tag[0].starts_with("refuse trellion_intel trellion_intel is pinned for stack v0.6.0"), "{other_tag:?}");
+        assert!(!other_tag.iter().any(|l| l.starts_with("verified")), "a refused add-on is never reported verified: {other_tag:?}");
     }
 
     /// Pulled through the proxy: compose runs, and verify compares with,
@@ -505,7 +610,7 @@ mod tests {
         let local = signed_ref.replacen("ghcr.io", "addons.noomesh.ai", 1);
         let names = vec!["trellion_intel".to_string()];
         let lines = launch_lines(&d, "v0.6.0", &names, &|_| Ok(a.clone()));
-        assert_eq!(lines, [format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
+        assert_eq!(lines, ["verified trellion_intel 1.2.0 v0.6.0".to_string(), format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {local}")]);
         let running = vec![resolve::Container { name: "noo-trellion-intel".into(), config_image: local.clone(), image_id: "sha256:x".into() }];
         let mut docker = FakeDocker { local: vec![local.clone()], ids: vec![(local.clone(), "sha256:x".into())], ..Default::default() };
         let verdict = verify_one(&d, "trellion_intel", "v0.6.0", Ok(a.clone()), &mut docker, &running);
@@ -556,7 +661,8 @@ mod tests {
         assert_eq!(root.as_deref(), Some(d.as_path()));
         assert_eq!(rest, ["v0.6.0", "trellion_intel"]);
         let lines = launch_lines(root.as_deref().unwrap(), &rest[0], &rest[1..], &|_| Ok(anchor()));
-        assert_eq!(lines[0], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
+        assert_eq!(lines[0], "verified trellion_intel 1.2.0 v0.6.0");
+        assert_eq!(lines[1], format!("pin trellion_intel NOO_ADDON_IMAGE_TRELLION_INTEL {reference}"));
         // The cwd has no pins: reading it (the old behaviour) finds nothing.
         let from_cwd = launch_lines(&cwd, "v0.6.0", &rest[1..], &|_| Ok(anchor()));
         assert!(from_cwd[0].starts_with("refuse"), "{from_cwd:?}");

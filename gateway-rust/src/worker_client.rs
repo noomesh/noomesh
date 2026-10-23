@@ -76,7 +76,7 @@ pub async fn request_with_timeout(
 
     // Every `worker.*` message carries the caller. See
     // `crate::bus_principal`. This module is the only place a worker message
-    // leaves the gateway, and `tests/bus_principal_sites.rs` fails the build
+    // leaves the gateway, and the `publish_sites` test module in `bus_principal.rs` fails the build
     // if a publish appears anywhere else.
     let headers = crate::bus_principal::headers_for(subject);
 

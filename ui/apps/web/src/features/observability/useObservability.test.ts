@@ -105,3 +105,44 @@ describe('container stats are operator-only', () => {
     expect(d.containersAvailable).toBe(true);
   });
 });
+
+describe('GPU telemetry the gateway did not send', () => {
+  /** Same driver as `run`, with a gpu-metrics payload. */
+  async function runGpus(gpus: unknown[]): Promise<ObsData> {
+    H.get.mockImplementation((path: string) => {
+      if (path === '/health') return Promise.resolve({ data: { status: 'healthy' } });
+      if (path === '/api/cluster/gpu-metrics') return Promise.resolve({ data: { gpus } });
+      return Promise.resolve({ data: {} });
+    });
+    useObservability();
+    const fn = H.lastQuery.current?.queryFn as () => Promise<ObsData>;
+    return fn();
+  }
+
+  it('is null, not 0: an unreported temperature is not a cold GPU', async () => {
+    const d = await runGpus([{ index: 0, name: 'A' }]);
+    expect(d.gpus).toHaveLength(1);
+    expect(d.gpus[0].temp).toBeNull();
+    expect(d.gpus[0].util).toBeNull();
+    expect(d.gpus[0].power).toBeNull();
+    expect(d.gpus[0].vramUsed).toBeNull();
+    expect(d.gpus[0].vramTotal).toBeNull();
+  });
+
+  it('keeps a reported number, zero included, and scales memory to GB', async () => {
+    const d = await runGpus([
+      { index: 1, name: 'B', temperature: 0, utilization: 42, power: 180.4, memory_used: 2048, memory_total: 8192 },
+    ]);
+    expect(d.gpus[0].temp).toBe(0);
+    expect(d.gpus[0].util).toBe(42);
+    expect(d.gpus[0].power).toBeCloseTo(180.4);
+    expect(d.gpus[0].vramUsed).toBe(2);
+    expect(d.gpus[0].vramTotal).toBe(8);
+  });
+
+  it('treats a non-numeric value as unreported', async () => {
+    const d = await runGpus([{ index: 2, name: 'C', temperature: 'N/A', utilization: null }]);
+    expect(d.gpus[0].temp).toBeNull();
+    expect(d.gpus[0].util).toBeNull();
+  });
+});

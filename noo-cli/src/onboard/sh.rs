@@ -174,6 +174,9 @@ fn bind_sources_refusal(ctx: &Ctx, args: &[&str]) -> Option<String> {
     // No systemd = no hostd to create the host spool: make it here, as the
     // user, rather than refuse (and rather than let Docker make it root-owned).
     crate::commands::bind_sources::ensure_hostd_spool(&cfg, &services, no_deps, crate::commands::bind_sources::systemd_present());
+    // The add-on declarations directories the launcher fills (i163): empty
+    // is normal, so make them as the user rather than refuse.
+    crate::commands::bind_sources::ensure_launcher_dirs(&cfg, &services, no_deps);
     let findings = crate::commands::bind_sources::check(&cfg, &services, no_deps, Some(&root));
     (!findings.is_empty()).then(|| crate::commands::bind_sources::refusal(&findings))
 }
@@ -258,7 +261,15 @@ pub(crate) fn file_secret_sources(compose: &str) -> Vec<String> {
     };
     secrets
         .values()
-        .filter_map(|v| v.get("environment").and_then(|e| e.as_str()).map(str::to_string))
+        // A secret is sourced from the env var compose reads (`environment:`)
+        // or, for the RAM-file form the read-only services need, the one the
+        // launcher writes the file from (`x-noo-source:`).
+        .filter_map(|v| {
+            v.get("environment")
+                .or_else(|| v.get("x-noo-source"))
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -324,15 +335,20 @@ pub(crate) fn file_secret_env(composes: &[&str], env: &dyn Fn(&str) -> Option<St
 /// above all. So the call runs through the launcher's own loader in a child
 /// bash, exactly as noo-hostd does (`withSecrets`): the values live in that
 /// child and the compose process it execs, never here and never on disk, and
-/// `load_secrets` derives the pgpass bodies itself. Without the store (the
-/// pre-sops window, or an .env install) compose reads `.env` natively and
-/// `launcher_env` covers the rest.
+/// `load_secrets` derives the pgpass bodies and writes the secret FILES to
+/// tmpfs itself (it reads `.env` for an install without the store).
 fn compose_command(ctx: &Ctx, args: &[String]) -> Command {
     let lib = ctx.repo_root.join("scripts/lib-secrets.sh");
-    if ctx.sops_active() && lib.is_file() {
+    // Every install, not only SOPS ones: since the read-only-rootfs change the
+    // `secrets:` sources are FILES the loader writes to tmpfs
+    // (`write_secret_files`, from `load_secrets`), and on an .env install
+    // `load_secrets` writes them from .env. A bare `docker` here would run
+    // compose with NOO_SECRET_RUNDIR unset and fail creating any service that
+    // takes a secret.
+    if lib.is_file() {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
-            .arg(r#"source "$0" >/dev/null 2>&1 && load_secrets >/dev/null || { echo "could not load secrets/env.sops — refusing to run compose without the store" >&2; exit 1; }; exec docker "$@""#)
+            .arg(r#"source "$0" >/dev/null 2>&1 && load_secrets >/dev/null || { echo "could not load the secret store or write the secret files (is NOO_SECRET_RUNDIR on tmpfs?) — refusing to run compose without them" >&2; exit 1; }; exec docker "$@""#)
             .arg(&lib)
             .args(args);
         return cmd;

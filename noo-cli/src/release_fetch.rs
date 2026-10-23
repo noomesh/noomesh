@@ -264,16 +264,26 @@ fn looks_like_tls(s: &str) -> bool {
     l.contains("certificate") || l.contains("x509") || l.contains("unknownissuer")
 }
 
+/// u64 view of the one clock (`host_exec::now_unix`); the rate-limit math
+/// here is unsigned.
 fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    crate::host_exec::now_unix().max(0) as u64
 }
 
 /// One GET, classified. The agent must have `http_status_as_error(false)`
 /// so the status and rate-limit headers are visible here.
 pub(crate) fn get_once(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Result<Vec<u8>, FetchError> {
+    get_once_watched(agent, url, token, &mut |_, _| true)
+}
+
+/// [`get_once`], reading the body in chunks: `seen(bytes so far,
+/// Content-Length)` runs after each one, and `false` abandons the read.
+pub(crate) fn get_once_watched(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+    seen: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) -> Result<Vec<u8>, FetchError> {
     let mut req = agent.get(url).header("User-Agent", "noo-cli");
     if let Some(t) = token {
         req = req.header("Authorization", &format!("Bearer {t}"));
@@ -287,12 +297,22 @@ pub(crate) fn get_once(agent: &ureq::Agent, url: &str, token: Option<&str>) -> R
         e.retry_after = retry_after;
         return Err(e);
     }
+    let total = header(&resp, "content-length").and_then(|v| v.parse::<u64>().ok());
+    let mut reader = resp.into_body().into_reader();
     let mut buf = Vec::new();
-    resp.into_body()
-        .into_reader()
-        .read_to_end(&mut buf)
-        .map_err(|e| FetchError::new(FetchClass::Network, format!("GET {url}: body cut off: {e}")))?;
-    Ok(buf)
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| FetchError::new(FetchClass::Network, format!("GET {url}: body cut off: {e}")))?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if !seen(buf.len() as u64, total) {
+            return Err(FetchError::new(FetchClass::Network, format!("GET {url}: abandoned after {} bytes", buf.len())));
+        }
+    }
 }
 
 /// [`get_once`] under a retry policy.
@@ -680,12 +700,7 @@ mod tests {
             }
         }
         let p = dir.join("gh");
-        std::fs::write(&p, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::write_exec(&p, script, 0o755);
         p
     }
 

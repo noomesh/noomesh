@@ -307,6 +307,8 @@ func TestConvergeAppliesPlacementTuningToThePlist(t *testing.T) {
 			"OLLAMA_MAX_LOADED_MODELS": "2",
 			"OLLAMA_KEEP_ALIVE":        "-1",
 			"OLLAMA_CONTEXT_LENGTH":    "32768",
+			"OLLAMA_FLASH_ATTENTION":   "1",
+			"OLLAMA_KV_CACHE_TYPE":     "q8_0",
 			"OLLAMA_HOST":              "0.0.0.0", // not honoured
 		}
 	}
@@ -320,6 +322,8 @@ func TestConvergeAppliesPlacementTuningToThePlist(t *testing.T) {
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_MAX_LOADED_MODELS -string 2 " + plist,
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_KEEP_ALIVE -string -1 " + plist,
 		plutilBin + " -replace EnvironmentVariables.OLLAMA_CONTEXT_LENGTH -string 32768 " + plist,
+		plutilBin + " -replace EnvironmentVariables.OLLAMA_FLASH_ATTENTION -string 1 " + plist,
+		plutilBin + " -replace EnvironmentVariables.OLLAMA_KV_CACHE_TYPE -string q8_0 " + plist,
 		"launchctl bootout gui/501 " + plist,
 		"launchctl bootstrap gui/501 " + plist,
 	} {

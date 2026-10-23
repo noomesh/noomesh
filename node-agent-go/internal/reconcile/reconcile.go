@@ -24,11 +24,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/noomesh/noomesh/node-agent-go/internal/addonwl"
 	"github.com/noomesh/noomesh/node-agent-go/internal/diskreclaim"
 	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -44,6 +46,7 @@ import (
 	"github.com/noomesh/noomesh/node-agent-go/internal/hostsvc"
 	"github.com/noomesh/noomesh/node-agent-go/internal/mcpsrv"
 	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
+	"github.com/noomesh/noomesh/node-agent-go/internal/occupancy"
 	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
 )
 
@@ -95,6 +98,10 @@ type desiredConfig struct {
 	// measured). A pre-profile gateway omits it; absent means "no
 	// profile", which is exactly the behaviour before profiles existed.
 	HarnessProfile json.RawMessage `json:"harness_profile"`
+	// Add-on workloads this node may start and stop (the verified bundles'
+	// declarations; internal/addonwl, i163 part B). A pre-workload gateway
+	// omits the field: nothing is declared, the actuator refuses everything.
+	AddonWorkloads []addonwl.Decl `json:"addon_workloads"`
 }
 
 // Reconciler pulls desired config and converges the node toward it.
@@ -291,6 +298,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// Before the empty-state return below: the profile is the node's, not a
 	// placement's (the inference proxy reads first_byte_secs from it).
 	applyHarnessProfile(desired.HarnessProfile)
+	addonwl.SetDeclared(desired.AddonWorkloads)
 	r.recordChatPlacement(desired.Placements)
 	// Before the empty-state return below: a node with nothing placed still
 	// has a disk to keep.
@@ -306,6 +314,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 		// Nothing is placed: nothing is held, tuned, or in conflict.
 		modelpresence.Retain(map[string]bool{})
 		gpuyield.PublishPlacements(nil)
+		occupancy.SetSlots(nil)
 		backendrt.SetOllamaTuning(nil)
 		r.surfaceEnvConflicts(nil)
 		if r.mcp != nil {
@@ -392,6 +401,11 @@ func (r *Reconciler) Once(ctx context.Context) {
 	// backend's container (SpecHashLabel), so a changed placement env /
 	// image / port / tls (not just model) triggers a recreate.
 	specLabels := r.docker.BackendLabels(dockerpkg.SpecHashLabel)
+	// Backends still running on a floating ref (`:latest`, no tag) that an
+	// older agent created. The spec hash cannot see it — a placement with
+	// no image of its own hashes the same whichever ref the agent picked —
+	// so it is its own drift signal: recreated once from the pinned ref.
+	floating := r.docker.FloatingBackendImages()
 	// Multi-role placements: ONE effective placement per backend (a lone
 	// placement is passed through untouched; several running ollama rows
 	// merge into one daemon spec - see multirole.go).
@@ -405,9 +419,11 @@ func (r *Reconciler) Once(ctx context.Context) {
 	ollamaRows := runningOllama(desired.Placements)
 	// The shared-GPU yield sizes what the GPU backends need from these.
 	gpuyield.PublishPlacements(gpuPlacements(effective))
+	// The proxy's admission counts requests against these (occupancy).
+	occupancy.SetSlots(backendSlots(effective))
 	// Fetch the images this tick will start, concurrently, before the
 	// ordered start loop below (which then finds them local).
-	r.prefetchImages(ctx, effective, running, specLabels, native)
+	r.prefetchImages(ctx, effective, running, specLabels, floating, native)
 	for _, p := range effective {
 		if p.Backend == "harness" {
 			// Not a container: the host service, converged
@@ -454,10 +470,12 @@ func (r *Reconciler) Once(ctx context.Context) {
 						hcancel()
 					}
 					r.native.SetHeldModels(held...)
-					// A launchd-managed ollama gets the merged env through
-					// its plist (OllamaGuard.Tuning); only when several
-					// roles share the daemon - a lone placement's env is
-					// left as it has always been.
+					// A launchd-managed ollama gets the placement env
+					// through its plist (OllamaGuard.Tuning): the merged
+					// env when several roles share the daemon, a lone
+					// placement's own allow-listed env otherwise. A native
+					// ollama is not a container, so this is the only way
+					// `--env OLLAMA_FLASH_ATTENTION=1` reaches it.
 					backendrt.SetOllamaTuning(nativeOllamaTuning(ollamaRows, harnessprofile.Current()))
 				}
 				continue
@@ -487,7 +505,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 					r.ensureOllamaModels(r.cfg.NodeID, ollamaRows, r.docker.OllamaHasModel, r.docker.OllamaPull)
 				}
 				curHash, hasLabel := specLabels[p.Backend]
-				switch decideSpecDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend]) {
+				switch decideBackendDrift(hasLabel, curHash, desiredHash, r.driftRecreated[p.Backend], floating[p.Backend]) {
 				case driftConverged:
 					// Fully converged — clear any prior drift bookkeeping.
 					delete(r.driftRecreated, p.Backend)
@@ -502,13 +520,15 @@ func (r *Reconciler) Once(ctx context.Context) {
 						"note", "recreated once for this spec but label still absent/mismatched; not looping")
 					continue
 				case driftRecreate:
-					// Model matches but spec drifted (env/image/port/tls edit)
-					// or the container predates the label. Recreate to converge.
+					// Model matches but spec drifted (env/image/port/tls edit),
+					// the container predates the label, or it runs on a
+					// floating ref. Recreate to converge.
 					slog.Info("reconcile.spec_drift",
 						"backend", p.Backend,
 						"old_hash", shortHash(curHash),
 						"new_hash", shortHash(desiredHash),
-						"label_absent", !hasLabel)
+						"label_absent", !hasLabel,
+						"floating_image", floating[p.Backend])
 					r.driftRecreated[p.Backend] = desiredHash
 					// fall through to the shared start path (StartBackend
 					// removes the old container and recreates it labeled).
@@ -640,7 +660,7 @@ func (r *Reconciler) Once(ctx context.Context) {
 	if len(ollamaRows) > 0 {
 		primary := ollamaRows[0]
 		for _, p := range ollamaRows {
-			keep[presenceKey(p.Backend, p, primary)] = true
+			keep[presenceKey(p.Backend, p, primary, ollamaRows)] = true
 		}
 	}
 	modelpresence.Retain(keep)
@@ -925,6 +945,10 @@ var placementEnvExact = map[string]struct{}{
 	// Claude Code's system prompt overflows ollama's 4096 default and the
 	// model answers a truncated prompt (mcmini probe, 2026-10-19).
 	"OLLAMA_CONTEXT_LENGTH": {},
+	// Attention kernel and KV-cache quantisation. On a unified-memory Mac
+	// these are the difference between a 32k context that fits and one
+	// that swaps (mcmini, 2026-10-21: flash attention + q8_0 cache).
+	"OLLAMA_FLASH_ATTENTION": {}, "OLLAMA_KV_CACHE_TYPE": {},
 	// Log level of the served process. Not a secret, frequently needed.
 	"LOG_LEVEL": {}, "RUST_LOG": {},
 }
@@ -1085,6 +1109,23 @@ func decideSpecDrift(hasLabel bool, curHash, desiredHash, lastRecreated string) 
 	return driftRecreate
 }
 
+// decideBackendDrift is decideSpecDrift plus the floating-image signal:
+// floatingImage is the ref a running container was created from when it can
+// move under it ("" when pinned). A converged spec on a floating ref is still
+// drift, recreated ONCE for the desired hash like any other — a refusal at
+// start (the controller itself naming :latest) leaves the old container
+// running, and the stuck guard keeps it from looping.
+func decideBackendDrift(hasLabel bool, curHash, desiredHash, lastRecreated, floatingImage string) driftDecision {
+	d := decideSpecDrift(hasLabel, curHash, desiredHash, lastRecreated)
+	if d != driftConverged || floatingImage == "" {
+		return d
+	}
+	if lastRecreated == desiredHash {
+		return driftStuck
+	}
+	return driftRecreate
+}
+
 // shortHash returns a log-friendly prefix of a hex hash ("" stays "").
 func shortHash(h string) string {
 	if len(h) > 8 {
@@ -1174,17 +1215,46 @@ func resolveEmbedTarget(placements []placement) embedtarget.Target {
 	return embedtarget.Target{}
 }
 
-// publishEmbedTarget records the node's declared embedder and logs when it
-// changes. (No on-demand gossip hook exists: the announcer re-derives
+// resolveEmbedTargets is every embedder this node is DECLARED to serve, one
+// per running role=embed row (a node may serve several embedding spaces),
+// ordered by model so the primary is stable. resolveEmbedTarget's rules apply
+// to each row.
+func resolveEmbedTargets(placements []placement) []embedtarget.Target {
+	var embeds []placement
+	for _, p := range placements {
+		if p.Role == "embed" {
+			embeds = append(embeds, p)
+		}
+	}
+	sort.SliceStable(embeds, func(i, j int) bool { return embeds[i].Model < embeds[j].Model })
+	var out []embedtarget.Target
+	for _, p := range embeds {
+		if t := resolveEmbedTarget([]placement{p}); t != (embedtarget.Target{}) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// publishEmbedTarget records the node's declared embedders and logs when
+// they change. (No on-demand gossip hook exists: the announcer re-derives
 // capabilities from embedtarget each of its own intervals.)
 func (r *Reconciler) publishEmbedTarget(placements []placement) {
-	prev := embedtarget.Get()
-	next := resolveEmbedTarget(placements)
-	embedtarget.Set(next)
-	if prev != next {
+	prev := embedtarget.All()
+	next := resolveEmbedTargets(placements)
+	embedtarget.SetAll(next)
+	if !slices.Equal(prev, next) {
+		old, cur := embedtarget.Target{}, embedtarget.Target{}
+		if len(prev) > 0 {
+			old = prev[0]
+		}
+		if len(next) > 0 {
+			cur = next[0]
+		}
 		slog.Info("reconcile.embed_target_changed",
-			"from_backend", prev.Backend, "from_model", prev.Model,
-			"to_backend", next.Backend, "to_model", next.Model)
+			"from_backend", old.Backend, "from_model", old.Model,
+			"to_backend", cur.Backend, "to_model", cur.Model,
+			"targets", len(next))
 	}
 }
 

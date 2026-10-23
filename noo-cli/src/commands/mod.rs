@@ -27,6 +27,7 @@ pub mod cluster_vendor;
 pub mod node_vendor;
 pub mod cluster_push_secrets;
 pub mod cluster_gpu;
+pub mod cluster_reserve;
 pub mod cluster_profile;
 pub mod cluster_verify;
 pub mod image_stage;
@@ -64,6 +65,7 @@ pub mod controller;
 pub mod migrate;
 pub mod models;
 pub mod models_fetch;
+pub mod ollama_stage;
 pub mod voice_models;
 pub mod pki;
 pub mod plugins;
@@ -94,7 +96,7 @@ pub mod workflow;
 pub mod tasks;
 
 pub use agents::{
-    agents_collaborate, agents_inbox, agents_list, agents_messages, agents_peer_card, agents_peer_dispatch, agents_peer_list,
+    agents_archive_export, agents_archive_list, agents_collaborate, agents_inbox, agents_list, agents_messages, agents_peer_card, agents_peer_dispatch, agents_peer_list,
     agents_presence, agents_send, agents_thread,
 };
 pub use auth::{auth_login, auth_logout, auth_status};
@@ -169,7 +171,8 @@ pub use models::{
 pub use pki::{pki_fix_modes, pki_init, pki_issue, pki_issue_client, pki_issue_gateway, pki_issue_service, pki_issue_sso_key, pki_revoke_client, pki_rotate, pki_rotate_client, pki_status};
 pub use proactive::{proactive_history, proactive_rules, proactive_status};
 pub use prompt_skills::{
-    prompt_skills_create, prompt_skills_evolve, prompt_skills_info, prompt_skills_list,
+    prompt_skills_create, prompt_skills_decide, prompt_skills_evolve, prompt_skills_info, prompt_skills_list,
+    prompt_skills_proposals,
 };
 pub use rag::{
     rag_deduplicate, rag_doc, rag_docs, rag_held, rag_hold, rag_ingest, rag_purge, rag_query, rag_retag, rag_scan,
@@ -200,10 +203,13 @@ pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_tele
 pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
 pub use cluster_push_secrets::cluster_push_secrets;
 pub use cluster_gpu::{cluster_gpu_hold, cluster_gpu_release};
+pub use cluster_reserve::{cluster_release, cluster_reservations, cluster_reserve, cluster_workloads};
 pub use cluster_profile::cluster_profile;
 pub use cluster_verify::cluster_verify;
 pub use cluster_class::{cluster_class_list, cluster_class_set, cluster_class_unset, cluster_prefer};
-pub use cluster_embedding_space::{cluster_embedding_space_list, cluster_embedding_space_set, cluster_embedding_space_unset};
+pub use cluster_embedding_space::{
+    cluster_embedding_space_list, cluster_embedding_space_migrate, cluster_embedding_space_set, cluster_embedding_space_unset,
+};
 pub use security_local::{
     secrets_absorb_files,
     cluster_teardown_node, pki_issue_node, pki_push_nodes, pki_rotate_all, security_generate_secret, security_scan, security_trust_ca,
@@ -422,7 +428,7 @@ pub use entitlement_signer::*;
 pub use release_sign::*;
 pub use addon_lock_cmd::{security_addon_lock_sign, security_addon_lock_verify};
 pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
-pub use addons::{addons_disable, addons_enable, addons_list};
+pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
 pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

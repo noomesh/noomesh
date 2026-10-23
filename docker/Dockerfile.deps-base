@@ -38,28 +38,22 @@ LABEL pai.image.keep=true
 WORKDIR /app
 
 # trellion comes from the additional_contexts mount; see compose.
-# uv --overrides rewrites the git+ssh URL in pyproject.toml to a local
-# file:// path so the build container never needs SSH/credentials.
+# The git URL in pyproject.toml is never fetched: the packages install from
+# these contexts, so the build container needs no SSH/credentials.
 COPY --from=trellion . /tmp/noo-trellion
 # The add-on gateway client comes from THIS build
 # context — it lives in the monorepo so a stack tag pins it even though it
-# does not pin trellion. The override line resolves trellion's dependency on
-# it (once trellion declares one) to the same tree; the explicit install
-# below puts it in the image before trellion depends on it.
+# does not pin trellion. It is installed from this tree with the others, below.
 COPY packages/noo-gateway-client /tmp/noo-gateway-client
 # trellion-protocols (the interface trellion offers add-ons; Apache-2.0, its
 # own private repo) is a dependency of trellion pinned by full commit. Same
 # arrangement as trellion: a named build context (compose:
 # ../trellion-protocols; images-release: a checkout at the SHA trellion pins),
-# resolved by the override line, so the build needs no credentials. The
-# check refuses a context that is not the pinned commit.
+# so the build needs no credentials. The check refuses a context that is not
+# the pinned commit.
 COPY --from=trellion_protocols . /tmp/trellion-protocols
 COPY scripts/check-protocols-pin.py /tmp/check-protocols-pin.py
 RUN python /tmp/check-protocols-pin.py /tmp/noo-trellion /tmp/trellion-protocols
-RUN echo "trellion[transport,video] @ file:///tmp/noo-trellion" > /tmp/uv-overrides.txt \
-    && echo "noo-gateway-client @ file:///tmp/noo-gateway-client" >> /tmp/uv-overrides.txt \
-    && echo "trellion-protocols @ file:///tmp/trellion-protocols" >> /tmp/uv-overrides.txt
-
 # CPU-only torch. NOTHING built on this base has a GPU — trellion
 # runs with DeviceRequests=null, and `torch.cuda.is_available()` returns
 # False there. GPU inference lives in the vllm / llamacpp / ollama
@@ -99,14 +93,40 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
 ENV UV_EXTRA_INDEX_URL=${TORCH_INDEX} \
     UV_INDEX_STRATEGY=unsafe-best-match
 
-# The ML extras on top of the deps-core layer — done ONCE per
-# pyproject.toml / noo-trellion change. Re-lists the deps-core extras so
-# uv resolves ONE consistent environment (the already-installed wheels
-# are cache hits, not re-downloads).
+# The ML tier on top of the deps-core layer — done ONCE per pyproject.toml /
+# noo-trellion change, in two steps:
+#
+#  1. every third-party package from docker/ml-lock/requirements.txt with
+#     --require-hashes (the lock holds deps-core's pins at the same versions,
+#     so the layer below is not touched; the already-installed wheels are
+#     cache hits, not re-downloads). Nothing resolves from a range at build
+#     time: a PyPI release published after the lock cannot reach the image.
+#  2. the three local packages from their build contexts, --no-deps (their
+#     dependencies are step 1's) and --no-build-isolation (their build
+#     backends, hatchling and setuptools, are in the lock too, so no backend
+#     is fetched unhashed). trellion is the build context itself: the release
+#     builds the SHA release-line resolved and records it in the stack lock;
+#     trellion-protocols is checked against trellion's pin above.
+#
+# hatchling is a build backend only: it is removed once the local packages
+# are built, so the image (and every image FROM it) ships no build backend —
+# the add-on images assert exactly that ("the build backend leaked into the
+# image"), and 0.6.10-rc.1's trellion-intel resign failed on it. setuptools
+# stays: some runtime packages still import it.
+#
+# `uv pip check` then refuses an image whose installed set has an unmet
+# requirement — the build fails if trellion's dependencies moved since the
+# lock was generated, instead of shipping an import error.
+# Regenerate: scripts/regen-ml-lock.sh (see the lock's header).
+COPY docker/ml-lock/requirements.txt /tmp/requirements-ml.txt
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
-    uv pip install --system --overrides /tmp/uv-overrides.txt \
-    -e ".[trellion,web,cache,feedback,pgvector,mcp,rag,voice]" \
-    /tmp/noo-gateway-client
+    uv pip install --system --require-hashes -r /tmp/requirements-ml.txt \
+    && uv pip install --system --no-deps --no-build-isolation \
+       /tmp/noo-gateway-client /tmp/trellion-protocols /tmp/noo-trellion \
+    && uv pip check --system \
+    && uv pip uninstall --system hatchling \
+    && uv pip check --system \
+    && if python -c 'import hatchling' 2>/dev/null; then echo 'hatchling is still importable' >&2; exit 1; fi
 
 # Marker so downstream images can verify they're built on top of a
 # compatible base (handy for debugging mismatched layers).

@@ -169,6 +169,41 @@ else
     echo "  ERROR: noo-postgres container not running — NO database dump was made (this run fails at the end)" >&2
 fi
 
+# --- Cold-storage archive (archive_<ts>.tar.enc) ---
+# /data/audit-archive on the gateway's noo-data volume holds what retention
+# has TAKEN OUT of Postgres: the expired audit partitions
+# (noo_security_audit_YYYY_MM.jsonl), the signed chain heads, and the expired
+# agent mail (noo_agent_messages_YYYY_MM.jsonl.gz, bodies still sealed). Once a
+# row is archived it is deleted from the database, so the pg dump above does
+# NOT contain it: this file is the only backup of those rows. Without this
+# step, "backups and off-machine copies include the archive" was false.
+# `docker cp ... -` streams a tar from the (distroless) gateway container
+# without needing a shell in it; encrypted with the same passphrase as the dump.
+ARCHIVE_FILE=""
+ARCHIVE_FAILED=0
+if docker inspect noo-gateway >/dev/null 2>&1; then
+    ARCHIVE_TMP="$BACKUP_DIR/archive_${TIMESTAMP}.tar.enc"
+    ARCHIVE_ERR="$(mktemp)"
+    if docker cp noo-gateway:/data/audit-archive - 2>"$ARCHIVE_ERR" \
+            | BACKUP_PASS="$PASSPHRASE" openssl enc -aes-256-cbc -pbkdf2 -salt \
+                -pass env:BACKUP_PASS -out "$ARCHIVE_TMP"; then
+        chmod 600 "$ARCHIVE_TMP" 2>/dev/null || true
+        ARCHIVE_FILE="$ARCHIVE_TMP"
+        echo "  Archive backup (encrypted): $ARCHIVE_FILE ($(du -h "$ARCHIVE_FILE" | cut -f1))"
+    else
+        rm -f "$ARCHIVE_TMP"
+        if grep -qi "could not find\|no such file" "$ARCHIVE_ERR"; then
+            echo "  note: no /data/audit-archive in the gateway yet (nothing has been archived) — skipping archive backup"
+        else
+            echo "  ERROR: encrypted archive backup failed: $(head -c 300 "$ARCHIVE_ERR")" >&2
+            ARCHIVE_FAILED=1
+        fi
+    fi
+    rm -f "$ARCHIVE_ERR"
+else
+    echo "  note: noo-gateway container not running — skipping archive backup"
+fi
+
 # --- Age key backup (SOPS root of trust; encrypted with an INDEPENDENT passphrase) ---
 # AGE_KEY_FILE and AGE_PASS were resolved and validated in preflight. There is
 # no `cp` of the private key here and there must never be one again: until
@@ -220,6 +255,17 @@ if [ "$PG_OK" = 1 ]; then
 else
     echo "  note: no new dump this run — skipping retention so existing backups are preserved"
 fi
+# Each archive_<ts>.tar.enc is a FULL snapshot of the archive directory, so an
+# older one is redundant once a newer one exists: age them out like the dumps,
+# keeping the newest PG_KEEP_MIN regardless, and only after this run wrote a new one.
+if [ -n "$ARCHIVE_FILE" ]; then
+    # shellcheck disable=SC2012
+    { ls -t "$BACKUP_DIR"/archive_*.tar.enc 2>/dev/null || true; } \
+        | tail -n +$((PG_KEEP_MIN + 1)) \
+        | while IFS= read -r f; do
+            if [ -n "$(find "$f" -mtime +"${RETAIN_DAYS}" 2>/dev/null)" ]; then rm -f "$f"; fi
+          done || true
+fi
 # Age-key backups are tiny and the key rarely rotates — keep the newest 3
 # regardless of age so the only copy of the current key can never age out while
 # backups are silently stalled.
@@ -232,7 +278,7 @@ fi
 { ls -t "$BACKUP_DIR"/age-key_* 2>/dev/null || true; } | tail -n +4 | xargs -r rm -f
 
 echo "[$(date)] Backup complete. Backups in $BACKUP_DIR:"
-found="$(find "$BACKUP_DIR" -maxdepth 1 \( -name 'pg_*.sql.gz' -o -name 'pg_*.sql.gz.enc' -o -name 'pgroles_*.sql.enc' -o -name 'age-key_*' \) 2>/dev/null | sort)"
+found="$(find "$BACKUP_DIR" -maxdepth 1 \( -name 'pg_*.sql.gz' -o -name 'pg_*.sql.gz.enc' -o -name 'pgroles_*.sql.enc' -o -name 'archive_*.tar.enc' -o -name 'age-key_*' \) 2>/dev/null | sort)"
 if [ -n "$found" ]; then
     # shellcheck disable=SC2086
     ls -lh $found
@@ -284,6 +330,7 @@ offsite_copy() {
     if [ -n "${PG_FILE:-}" ] && [ -f "${PG_FILE}" ]; then made+=("$PG_FILE"); fi
     if [ -n "${ROLES_FILE:-}" ] && [ -f "${ROLES_FILE}" ]; then made+=("$ROLES_FILE"); fi
     if [ -n "${AGE_FILE:-}" ] && [ -f "${AGE_FILE}" ]; then made+=("$AGE_FILE"); fi
+    if [ -n "${ARCHIVE_FILE:-}" ] && [ -f "${ARCHIVE_FILE}" ]; then made+=("$ARCHIVE_FILE"); fi
     if [ ${#made[@]} -eq 0 ]; then
         echo "  offsite: nothing new this run"
         return 0
@@ -353,5 +400,13 @@ fi
 # wrote the dump but not the roles file is a failed backup, said out loud.
 if [ "$ROLES_FAILED" = 1 ]; then
     echo "[$(date)] Backup FAILED: the database dump was written but the roles file was not." >&2
+    exit 1
+fi
+
+# The archive holds rows that exist nowhere else (they were deleted from
+# Postgres after being archived). A run that could not back it up is a failed
+# backup, said out loud, not a note.
+if [ "$ARCHIVE_FAILED" = 1 ]; then
+    echo "[$(date)] Backup FAILED: the database dump was written but the cold-storage archive was not." >&2
     exit 1
 fi

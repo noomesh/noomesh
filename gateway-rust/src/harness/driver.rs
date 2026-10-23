@@ -1050,7 +1050,10 @@ async fn task_loops<R: DriverRail>(ctx: &DriverCtx, rail: &mut R, req: &TaskRequ
             tracing::info!(task = %req.task_id, reason = check.reason.as_deref().unwrap_or(""), "harness driver: budget switch says no more loops");
             return Ok(check.state);
         }
-        let prompt = task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref());
+        let prompt = crate::task_budget::with_context(
+            task_prompt(req, loops + 1, last_note.as_deref(), check.clarification.as_ref()),
+            check.context.as_deref(),
+        );
         let outcome = invoke(ctx, &*rail, ws, &prompt, Some(&req.task_id)).await;
         loops += 1;
         let mut decided = false;

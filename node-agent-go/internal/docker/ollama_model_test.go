@@ -6,6 +6,7 @@ package docker
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -148,5 +149,20 @@ func TestOllamaBinary_FallsBackToKnownInstallPaths(t *testing.T) {
 	ollamaHostPaths = []string{filepath.Join(dir, "missing"), notExec}
 	if got, ok := ollamaBinary(); ok {
 		t.Fatalf("ollamaBinary() = %q, true; want not found (missing and non-executable only)", got)
+	}
+}
+
+// A pull body naming `ollama:<tag>` resolves to the staged pair, with the
+// created model named by the tag (not "ollama:gemma4:12b").
+func TestPullOllamaModelStripsOllamaPrefix(t *testing.T) {
+	t.Setenv("NOO_MODEL_CACHE_URL", "")
+	c := &Client{}
+	_, err := c.PullOllamaModel(context.Background(), "ollama:gemma4:12b")
+	if err == nil || !strings.Contains(err.Error(), "NOO_MODEL_CACHE_URL") {
+		t.Fatalf("err = %v, want it to get past name resolution to the data-plane check", err)
+	}
+	_, err = c.PullOllamaModel(context.Background(), "ollama:hf.co/org/repo")
+	if err == nil || !strings.Contains(err.Error(), "neither a store artifact name nor a registry.ollama.ai reference") {
+		t.Fatalf("err = %v, want a bad-reference refusal", err)
 	}
 }

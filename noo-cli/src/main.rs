@@ -66,6 +66,7 @@ mod envfile;
 #[cfg(test)]
 mod hint_lint;
 mod host_access;
+mod host_exec;
 mod password_policy;
 mod http;
 pub(crate) mod onboard;
@@ -75,6 +76,8 @@ mod passthrough;
 mod pki;
 mod role;
 mod shell_completion;
+#[cfg(test)]
+mod test_exec;
 mod tailnet_serve;
 mod ui;
 mod usage;
@@ -214,6 +217,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["recall", "lifecycle-stats"], commands::recall_stats), // alias (endpoint naming)
     (&["prompt-skills", "list"], commands::prompt_skills_list),
     (&["prompt-skills", "info"], commands::prompt_skills_info),
+    (&["prompt-skills", "proposals"], commands::prompt_skills_proposals),
     (&["prompt-skills", "get"], commands::prompt_skills_info), // alias (agent naming)
     (&["models", "cached"], commands::models_cached),
     // Streaming NDJSON/SSE progress from /api/terminal/ollama/pull.
@@ -264,6 +268,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "embedding-space", "list"], commands::cluster_embedding_space_list),
     (&["cluster", "embedding-space", "set"], commands::cluster_embedding_space_set),
     (&["cluster", "embedding-space", "unset"], commands::cluster_embedding_space_unset),
+    (&["cluster", "embedding-space", "migrate"], commands::cluster_embedding_space_migrate),
     // `cluster exec`/`logs` spawn ssh with inherited stdio (fixes the
     // Python versions' swallowed stdout) and propagate the remote rc.
     (&["cluster", "logs"], commands::cluster_logs),
@@ -271,6 +276,13 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["cluster", "maintenance"], commands::cluster_maintenance),
     (&["cluster", "gpu", "hold"], commands::cluster_gpu_hold),
     (&["cluster", "gpu", "release"], commands::cluster_gpu_release),
+    // Reservations: an add-on's declared workload takes a GPU out of the
+    // pool (drain, owned hold, start) and gives it back (drain, stop,
+    // release); the low-level `gpu hold|release` stay for emergencies.
+    (&["cluster", "reserve"], commands::cluster_reserve),
+    (&["cluster", "reservations"], commands::cluster_reservations),
+    (&["cluster", "release"], commands::cluster_release),
+    (&["cluster", "workloads"], commands::cluster_workloads),
     // A node's harness profile: resolved per field (override > measured >
     // tier default), its overrides, and its chat-model bench.
     (&["cluster", "profile"], commands::cluster_profile),
@@ -439,6 +451,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["agents", "thread"], commands::agents_thread),
     (&["agents", "presence"], commands::agents_presence),
     (&["agents", "messages"], commands::agents_messages),
+    (&["agents", "archive", "list"], commands::agents_archive_list),
+    (&["agents", "archive", "export"], commands::agents_archive_export),
+    // `noo agent archive …`: the singular the operator spec names; same handlers.
+    (&["agent", "archive", "list"], commands::agents_archive_list),
+    (&["agent", "archive", "export"], commands::agents_archive_export),
     (&["tasks", "create"], commands::tasks_create),
     (&["tasks", "list"], commands::tasks_list),
     (&["tasks", "show"], commands::tasks_show),
@@ -450,6 +467,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["inference", "agent"], commands::inference_agent),
     (&["prompt-skills", "create"], commands::prompt_skills_create),
     (&["prompt-skills", "evolve"], commands::prompt_skills_evolve),
+    (&["prompt-skills", "decide"], commands::prompt_skills_decide),
     // ── WP-A4: observability — logs (containers/LogQL/Loki status), memory
     // conversation listing, recall archive/lifecycle/refresh triggers +
     // local test stub, heartbeat task add/remove. `debug query` stays
@@ -661,11 +679,15 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["backups", "setup"], commands::backups_setup),
     (&["backups", "status"], commands::backups_status),
     (&["addons", "list"], commands::addons_list),
+    (&["addons", "show"], commands::addons_show),
     (&["addons", "enable"], commands::addons_enable),
     (&["addons", "disable"], commands::addons_disable),
     (&["addons", "upgrade"], commands::addons_upgrade),
     (&["addons", "verify"], commands::addons_verify),
     (&["addons", "launch-pins"], commands::addons_launch_pins),
+    (&["addons", "trust-key"], commands::addons_trust_key),
+    (&["addons", "untrust-key"], commands::addons_untrust_key),
+    (&["addons", "set"], commands::addons_set),
     (&["kiosk", "enroll"], commands::kiosk_enroll),
     (&["kiosk", "invite"], commands::kiosk_invite),
     (&["kiosk", "labels"], commands::kiosk_labels),
@@ -711,7 +733,7 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
     &["autonomy", "locations"],
     &["ops"],
     &["kiosk", "serve"],
-    // The seat's timer runs it (noo-seat-sync.service, root); nobody types it.
+    // The seat's timer runs it (noo-seat-sync.service, as the seat user); nobody types it.
     &["kiosk", "seat-sync"],
     &["tools", "select"],
     // Aliases and retired verbs: they still work, but are not offered.
@@ -737,6 +759,9 @@ const HIDDEN_NATIVE: &[&[&str]] = &[
 ///     install.
 const HIDDEN_NO_USAGE: &[&[&str]] = &[
     &["tui"],
+    // The singular spelling of `agents archive`.
+    &["agent", "archive", "list"],
+    &["agent", "archive", "export"],
     // Plumbing and retired `cluster` verbs: dispatch only.
     &["node", "fetch"],
     &["cluster", "clean-node"],
@@ -1328,6 +1353,14 @@ pub(crate) fn is_reserved_command_word(word: &str) -> bool {
         || word == "py"
 }
 
+/// True when the command words collected so far name a subcommand that
+/// parses its own `--timeout <secs>`, so pass 1 must leave the flag (and its
+/// value, which falls through to `rest` next) for the handler.
+fn subcommand_owns_timeout(rest: &[String]) -> bool {
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    matches!(words.as_slice(), ["cluster", "reserve", ..] | ["cluster", "gpu", "hold", ..])
+}
+
 /// Parse `argv` (the args AFTER the program name) into the global options and a
 /// dispatch [`Resolution`]. This replicates `main()`'s decision sequence
 /// EXACTLY and has no side effects, so tests can assert routing directly:
@@ -1376,6 +1409,12 @@ pub fn resolve_with(
             "--json" => globals.json = true,
             "-v" | "--verbose" => globals.verbose = true,
             "--gateway" | "-G" => globals.gateway_override = iter.next().cloned(),
+            // A subcommand that declares its own `--timeout` (reserve, gpu
+            // hold: the drain budget, which also sizes their HTTP budget)
+            // keeps it; only the global form is consumed. rc.4 rehearsal:
+            // `cluster reserve --timeout 60` set the global HTTP timeout and
+            // the drain stayed at 120.
+            "--timeout" if subcommand_owns_timeout(&rest) => rest.push(tok.clone()),
             "--timeout" => globals.timeout_secs = iter.next().and_then(|v| v.parse().ok()),
             "--token" => globals.token = iter.next().cloned(),
             // Output styling (CLI_STYLE_GUIDE.md §3). Recorded as process
@@ -2265,6 +2304,27 @@ const SOURCES: &[(&str, &str)] = &[
         assert_eq!(g.gateway_override.as_deref(), Some("https://x:1"));
         assert_eq!(g.timeout_secs, Some(5));
         assert_eq!(native_prefix(&r), Some(&["jobs", "list"][..]));
+    }
+
+    #[test]
+    fn subcommand_timeout_is_not_taken_as_the_global_one() {
+        // `cluster reserve --timeout 60` is the drain budget, not the HTTP one.
+        let (g, r) = resolve(&argv(&["cluster", "reserve", "pai-voice/voice-worker", "--timeout", "60"]));
+        assert_eq!(g.timeout_secs, None);
+        assert_eq!(native_prefix(&r), Some(&["cluster", "reserve"][..]));
+        match r {
+            Resolution::Native { prefix, rest } => {
+                let a = crate::commands::cluster_reserve::parse_reserve(&rest[prefix.len()..]).expect("parses");
+                assert_eq!(a.timeout, Some(60));
+            }
+            other => panic!("not native: {other:?}"),
+        }
+        let (g, _) = resolve(&argv(&["cluster", "gpu", "hold", "awolf", "--timeout", "45"]));
+        assert_eq!(g.timeout_secs, None);
+        // A global --timeout BEFORE the subcommand still is the global one.
+        let (g, r) = resolve(&argv(&["--timeout", "5", "cluster", "reserve", "pai-voice/voice-worker"]));
+        assert_eq!(g.timeout_secs, Some(5));
+        assert_eq!(native_prefix(&r), Some(&["cluster", "reserve"][..]));
     }
 
     #[test]

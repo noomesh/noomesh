@@ -395,9 +395,34 @@ pub fn spawn_kv_bucket_watchdog(js: async_nats::jetstream::Context) {
 /// wins; nothing is ever removed or weakened.
 pub fn with_cluster_tls(url: String) -> String {
     let ca = std::env::var("NOO_TLS_CA").unwrap_or_default();
-    let cert = std::env::var("NOO_TLS_CERT").unwrap_or_default();
-    let key = std::env::var("NOO_TLS_KEY").unwrap_or_default();
+    let mut cert = std::env::var("NOO_TLS_CERT").unwrap_or_default();
+    let mut key = std::env::var("NOO_TLS_KEY").unwrap_or_default();
+    // Postgres requires the client certificate's CN to BE the role being
+    // asked for (pg_hba `clientcert=verify-full`), so a bare DSN presents the
+    // leaf issued for its user (`$NOO_TLS_PG_DIR/<user>.crt|key`) when there
+    // is one, and the gateway's own leaf otherwise — which a role with a
+    // `verify-full` rule refuses at the handshake, naming the CN.
+    if let Some((c, k)) = pg_role_leaf(&url, &std::env::var("NOO_TLS_PG_DIR").unwrap_or_default()) {
+        cert = c;
+        key = k;
+    }
     complete_pg_tls(url, &ca, &cert, &key)
+}
+
+/// `<dir>/<user>.crt` and `.key` for the user in a `scheme://user[:pw]@host/…`
+/// DSN, when both files exist. Only a bare `[A-Za-z0-9_]` user names a file:
+/// nothing in a DSN can steer the path out of `dir`.
+pub(crate) fn pg_role_leaf(url: &str, dir: &str) -> Option<(String, String)> {
+    if dir.is_empty() {
+        return None;
+    }
+    let authority = url.split_once("://")?.1.split(['/', '?']).next()?;
+    let user = authority.rsplit_once('@')?.0.split(':').next()?;
+    if user.is_empty() || !user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (cert, key) = (format!("{}/{user}.crt", dir.trim_end_matches('/')), format!("{}/{user}.key", dir.trim_end_matches('/')));
+    (std::path::Path::new(&cert).exists() && std::path::Path::new(&key).exists()).then_some((cert, key))
 }
 
 /// The pure half of [`with_cluster_tls`]: `ca`/`cert`/`key` are used only
@@ -721,6 +746,28 @@ mod pg_tls_url_tests {
         let out = complete_pg_tls("postgresql://u:p@postgres:5432/db?sslmode=verify-ca".into(), &ca, &cert, &key);
         assert!(out.ends_with(&format!("?sslmode=verify-ca&sslrootcert={ca}&sslcert={cert}&sslkey={key}")), "{out}");
         assert_eq!(out.matches("sslmode=").count(), 1);
+    }
+
+    /// A bare DSN presents the leaf issued for ITS user, never the gateway's,
+    /// and a user with no leaf (or a hostile one) falls back unchanged.
+    #[test]
+    fn a_bare_dsn_presents_the_leaf_of_its_own_role() {
+        let (d, ca, gw_cert, gw_key) = files();
+        let pg = d.join("pg");
+        std::fs::create_dir_all(&pg).unwrap();
+        for f in ["noo_app.crt", "noo_app.key"] {
+            std::fs::write(pg.join(f), "x").unwrap();
+        }
+        let dir = pg.to_string_lossy().into_owned();
+        let (c, k) = crate::state::pg_role_leaf("postgresql://noo_app:pw@postgres:5432/db", &dir).expect("noo_app has a leaf");
+        assert_eq!((c.as_str(), k.as_str()), (format!("{dir}/noo_app.crt").as_str(), format!("{dir}/noo_app.key").as_str()));
+        let out = complete_pg_tls("postgresql://noo_app:pw@postgres:5432/db".into(), &ca, &c, &k);
+        assert!(out.contains(&format!("sslcert={dir}/noo_app.crt")) && !out.contains(&gw_cert), "{out}");
+        assert!(crate::state::pg_role_leaf("postgresql://noo@postgres/db", &dir).is_none(), "no leaf for `noo` here: fall back");
+        assert!(crate::state::pg_role_leaf("postgresql://../x@postgres/db", &dir).is_none());
+        assert!(crate::state::pg_role_leaf("postgresql://noo_app@postgres/db", "").is_none(), "no NOO_TLS_PG_DIR: unchanged behaviour");
+        assert!(crate::state::pg_role_leaf("postgresql://postgres/db", &dir).is_none(), "no user in the DSN");
+        let _ = gw_key;
     }
 
     #[test]

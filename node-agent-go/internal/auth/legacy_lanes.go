@@ -32,7 +32,12 @@ const (
 	LaneWhoisNonController = "whois_non_controller"
 	// LaneHMACv1: a request admitted on a v1 cluster token (HMAC over actor
 	// and time only, not bound to the request, replayable for the window).
-	LaneHMACv1              = "cluster_hmac_v1"
+	LaneHMACv1 = "cluster_hmac_v1"
+	// LaneHMACv1Refused: a v1 cluster token REFUSED because this node's
+	// NOO_CLUSTER_TOKEN_V1=0 closed the gate. Counted apart from LaneHMACv1,
+	// which is admissions only: a refusal is a caller whose calls all fail,
+	// not a use of the lane.
+	LaneHMACv1Refused       = "cluster_hmac_v1_refused"
 	legacyLaneLogEvery      = time.Hour
 	legacyLaneLogMaxEntries = 256
 )
@@ -41,6 +46,7 @@ var (
 	laneStaticToken        atomic.Uint64
 	laneWhoisNonController atomic.Uint64
 	laneHMACv1             atomic.Uint64
+	laneHMACv1Refused      atomic.Uint64
 	lanesSince             = time.Now()
 
 	laneLogMu   sync.Mutex
@@ -57,6 +63,7 @@ func LegacyLaneSnapshot() map[string]any {
 		LaneStaticToken:        laneStaticToken.Load(),
 		LaneWhoisNonController: laneWhoisNonController.Load(),
 		LaneHMACv1:             laneHMACv1.Load(),
+		LaneHMACv1Refused:      laneHMACv1Refused.Load(),
 	}
 }
 
@@ -66,6 +73,7 @@ func LegacyLaneCounts() map[string]uint64 {
 		LaneStaticToken:        laneStaticToken.Load(),
 		LaneWhoisNonController: laneWhoisNonController.Load(),
 		LaneHMACv1:             laneHMACv1.Load(),
+		LaneHMACv1Refused:      laneHMACv1Refused.Load(),
 	}
 }
 
@@ -111,10 +119,11 @@ func noteHMACv1(actor string, r *http.Request) {
 	}
 }
 
-// noteHMACv1Refused is the closed-gate twin: counted too, so a caller that
-// still signs v1 after the gate closed is visible.
+// noteHMACv1Refused is the closed-gate twin: counted under its own lane, so
+// a caller that still signs v1 after the gate closed is visible without
+// reading as an admission.
 func noteHMACv1Refused(actor string, r *http.Request) {
-	laneHMACv1.Add(1)
+	laneHMACv1Refused.Add(1)
 	if laneLogDue(LaneHMACv1 + "|refused|" + actor) {
 		slog.Warn("node agent: v1 cluster token REFUSED (NOO_CLUSTER_TOKEN_V1=0) — the caller must upgrade",
 			"actor", actor, "path", r.URL.Path)

@@ -109,6 +109,11 @@ fn issue_access_token(user: &UserRecord) -> Result<(String, i64), TokenIssueErro
         "scopes": dual_emit_scopes(user.role, &user.scopes),
         "exp": exp.timestamp(),
         "iat": now.timestamp(),
+        // Millisecond mint time: the session floor (`session_floor.rs`) is in
+        // ms, so a token minted in the same second as a logout is ordered
+        // against it correctly. Person sessions only; delegated tokens keep
+        // their exact claim sets.
+        "iat_ms": now.timestamp_millis(),
         "iss": crate::auth::JWT_ISSUER,
         "aud": crate::auth::JWT_AUDIENCE,
     });
@@ -522,7 +527,12 @@ async fn auth_token(
             )
             .await;
         }
-        record_failed_login(&state.db, &creds.username).await;
+        if strike_outcome(&record_failed_login(&state.db, &creds.username).await)
+            == StrikeOutcome::Unrecorded
+        {
+            return (StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"detail": "Too many login attempts — try again shortly"}))).into_response();
+        }
         return (StatusCode::UNAUTHORIZED,
             Json(json!({
                 "detail": "Incorrect username or password",
@@ -531,7 +541,7 @@ async fn auth_token(
 
     // Success — issue JWT (access) + refresh cookie.
     audit_auth(&state.db, "auth_success", &creds.username, "ok", ip.as_deref()).await;
-    record_successful_login(&state.db, &creds.username).await;
+    let _ = record_successful_login(&state.db, &creds.username).await; // logged inside
 
     // Bootstrap self-close: the first successful env-admin login materialises
     // a real `noo_users` row. From the next login on, the account is
@@ -685,7 +695,7 @@ async fn host_ticket_login(
     let outcome = format!("host_ticket:{purpose}");
     tracing::warn!(user = %username, purpose = %purpose, "login with a one-time HOST ticket (minted on the controller)");
     audit_auth(&state.db, "auth_success", username, &outcome, ip).await;
-    record_successful_login(&state.db, username).await;
+    let _ = record_successful_login(&state.db, username).await; // logged inside
     if used_bootstrap {
         seed_bootstrap_admin(&state.db, &user).await;
     }
@@ -1379,30 +1389,69 @@ fn lookup_user_env(username: &str) -> Option<UserRecord> {
     })
 }
 
-/// Record a failed login attempt (increment counter, lock after threshold).
-async fn record_failed_login(db: &sqlx::PgPool, username: &str) {
-    let _ = sqlx::query(
-        "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
-         locked_until = CASE \
-           WHEN COALESCE(failed_login_count, 0) + 1 >= 5 THEN NOW() + INTERVAL '15 minutes' \
-           ELSE locked_until \
-         END \
-         WHERE username = $1"
-    )
-    .bind(username)
-    .execute(db)
-    .await;
+/// Strikes at which an account locks.
+const LOCKOUT_STRIKES: i32 = 5;
+/// Minutes an account stays locked once the strike threshold is reached.
+const LOCKOUT_MINUTES: i32 = 15;
+
+/// What the login handler does after trying to record a failed-password strike.
+#[derive(Debug, PartialEq, Eq)]
+enum StrikeOutcome {
+    /// Recorded; answer the ordinary 401.
+    Counted,
+    /// Could not be recorded: the brake is gone, so the attempt is refused as
+    /// locked rather than silently allowed to guess again (i191 D2).
+    Unrecorded,
 }
 
-/// Reset failed login count on successful login.
-async fn record_successful_login(db: &sqlx::PgPool, username: &str) {
-    let _ = sqlx::query(
+/// Pure decision over "was the strike recorded?".
+fn strike_outcome(recorded: &Result<(), sqlx::Error>) -> StrikeOutcome {
+    match recorded {
+        Ok(()) => StrikeOutcome::Counted,
+        Err(_) => StrikeOutcome::Unrecorded,
+    }
+}
+
+/// Record a failed login attempt (increment counter, lock after threshold).
+/// An `Err` means the strike was NOT counted; the caller must fail closed.
+async fn record_failed_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
+    // The threshold and the window are bound, not interpolated: sqlx 0.9
+    // refuses a dynamic SQL string, and a literal with binds is what we want.
+    let r = sqlx::query(
+        "UPDATE noo_users SET failed_login_count = COALESCE(failed_login_count, 0) + 1, \
+         locked_until = CASE \
+           WHEN COALESCE(failed_login_count, 0) + 1 >= $2 THEN NOW() + make_interval(mins => $3) \
+           ELSE locked_until \
+         END \
+         WHERE username = $1",
+    )
+    .bind(username)
+    .bind(LOCKOUT_STRIKES)
+    .bind(LOCKOUT_MINUTES)
+    .execute(db)
+    .await
+    .map(|_| ());
+    if let Err(e) = &r {
+        tracing::error!(username = %username, error = %e, "failed-login strike could not be recorded; refusing the attempt");
+    }
+    r
+}
+
+/// Reset failed login count on successful login. A failure is logged and the
+/// login continues: a stale counter is not a reason to deny a correct password.
+async fn record_successful_login(db: &sqlx::PgPool, username: &str) -> Result<(), sqlx::Error> {
+    let r = sqlx::query(
         "UPDATE noo_users SET failed_login_count = 0, locked_until = NULL, \
          last_login_at = NOW() WHERE username = $1"
     )
     .bind(username)
     .execute(db)
-    .await;
+    .await
+    .map(|_| ());
+    if let Err(e) = &r {
+        tracing::error!(username = %username, error = %e, "successful-login reset could not be recorded; continuing");
+    }
+    r
 }
 
 /// Severity for an auth audit event. Previously every row was hardcoded
@@ -1850,6 +1899,21 @@ async fn health(
     }));
     if !redis_ok && !redis_optional { all_ok = false; }
 
+    // Declared systems the broker skipped at boot because a role password
+    // was missing (system_provision.rs `missing_credential_is_fatal`: a
+    // runtime-declared system no longer stops the gateway). Reported only
+    // when there is one, `optional` so it never moves `status` or the code:
+    // the gateway serves everything else, and the ERROR log names the
+    // variable. `noo health` shows it as a down dependency.
+    let unprovisioned = crate::system_provision::unprovisioned();
+    if !unprovisioned.is_empty() {
+        deps.insert("systems".into(), json!({
+            "healthy": false,
+            "optional": true,
+            "unprovisioned": unprovisioned,
+        }));
+    }
+
     let status = if all_ok { "healthy" } else { "degraded" };
     let peers = state.gossip.alive_peers().len();
 
@@ -1859,15 +1923,13 @@ async fn health(
     // Built from the addon table: a new add-on declares one row in
     // addons::ADDONS and appears here with no /health change.
     let addons = serde_json::Value::Object(
-        crate::addons::ADDONS
-            .iter()
-            .map(|a| {
-                (
-                    a.name.to_string(),
-                    // Licensed add-ons have a third word: flag on, no
-                    // licence → "unlicensed".
-                    json!(crate::addons::health_word(a.name)),
-                )
+        crate::addons::health_names()
+            .into_iter()
+            .map(|name| {
+                // Licensed add-ons have a third word: flag on, no
+                // licence → "unlicensed".
+                let word = json!(crate::addons::health_word(&name));
+                (name, word)
             })
             .collect(),
     );
@@ -1896,7 +1958,17 @@ async fn health(
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (code, Json(health_body(status, peers, deps, addons, ctx.is_some())))
+    let mut body = health_body(status, peers, deps, addons, ctx.is_some());
+    // Add-ons only a temporary development key vouches for (i163 part A):
+    // `addons.<name>` keeps its enum word (`enabled`; `unhealthy` once the
+    // key expires) so every client still reads it, and this sibling map says
+    // `dev (expires <date>)`. Absent when there is none.
+    if ctx.is_some() {
+        if let Some(dev) = crate::addons::health_dev_map() {
+            body["addons_dev"] = dev;
+        }
+    }
+    (code, Json(body))
 }
 
 /// The health body, by whether the caller presented a credential.
@@ -2362,6 +2434,17 @@ mod tests {
             !body.contains("if secret.is_empty()"),
             "the narrower is_empty() check is exactly the D6 bug — it accepts the placeholder"
         );
+    }
+
+    /// i191 D2: an unrecorded strike must refuse; a recorded one must not.
+    #[test]
+    fn an_unrecorded_strike_fails_closed() {
+        assert_eq!(strike_outcome(&Ok(())), StrikeOutcome::Counted);
+        assert_eq!(
+            strike_outcome(&Err(sqlx::Error::PoolTimedOut)),
+            StrikeOutcome::Unrecorded
+        );
+        assert_eq!((LOCKOUT_STRIKES, LOCKOUT_MINUTES), (5, 15));
     }
 
     // ── R6: /auth/token abuse controls ────────────────────────────────

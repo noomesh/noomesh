@@ -229,7 +229,9 @@ ever goes elsewhere. The `legacy lanes` row of
 node by name, from the gateway's counters and from each agent's heartbeat)
 still signing the old, replayable cluster token instead of the request-bound
 v2; it reads 0 once every node has upgraded, and only then is it safe to set
-`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page). `noo cluster
+`NOO_CLUSTER_TOKEN_V1=0` (see the node-agent security page; the next
+`noo cluster provision` / `noo upgrade --nodes` bundle then carries the closed gate to
+every node). `noo cluster
 verify --controller` has a `model classes` row for candidates that are neither
 running nor pulled where they are declared.
 
@@ -339,9 +341,42 @@ the pool and never sends them to a node on another model, and a reply that
 names another model is discarded and the next node tried. Callers send the
 space as `model` on `/api/external/embeddings` (`knowledge` when absent).
 An embed placement on a model no space uses is refused; a space's model does
-not change by setting (that is a re-embed: declare a new space instead).
-One node agent serves one embed model today, so a node belongs to one
-space's pool.
+not change by setting: that is a re-embed (below), or declare a new space.
+A node may serve several spaces: place each model as its own embed row
+(`noo cluster place gpu-2 ollama harrier --role embed`, then the code model
+the same way) and the node joins each space's pool. Placing a second embed
+model on ollama adds a row; chat and rerank placements still replace the
+role's one row, and a backend other than ollama (TEI, llama.cpp) holds one
+embed model, so a second replaces the first. Remove one embed model with
+`noo cluster unplace gpu-2 ollama --role embed --model nomic-embed-code`.
+
+**Re-embedding a space into a new model.** `noo cluster embedding-space migrate
+knowledge bge-m3` starts it. The gateway first probes the new model (one short
+text, over the nodes that run it) and refuses if the vector width differs from
+the space's: trellion's vector columns are `vector(1024)`,
+and a model of a different width needs the columns retyped, which is not
+built. While the migration is `filling`, nothing changes for readers or
+writers: trellion embeds every stored row again with the new model
+(`knowledge@next`) into a second column beside the live one, and reports
+progress, which `embedding-space list` and `noo cluster verify` show. If no node serves
+the model yet the migration is `pending` (the command answers 202): place the
+model with `noo cluster place <node> ollama <model> --role embed` (allowed
+because a migration names it) and the gateway re-probes about every 15 seconds
+and starts the migration by itself; a width mismatch found then keeps it
+pending and is shown as the reason. trellion acts only on `filling` and
+`cutover`.
+When every table reports done == total (and trellion has reported in the last
+10 minutes), `migrate knowledge --complete` begins the cutover: trellion swaps
+the new vectors into place table by table and reports `cutover_done`, and only
+then does the space's model change, in one step. Rows trellion cannot embed
+again (no stored source text, e.g. concept centroids, or a row the embedder
+rejects on its own) are counted as `unsourced`: they lose their vector at the
+cutover rather than keep one from the old model, and `embedding-space list`
+says how many; whatever owns them regenerates them on its next run. Rows
+written under an old model later (a writer racing the cutover) are found and
+re-embedded by trellion's stale sweep. `migrate knowledge --cancel`
+abandons a `pending` or `filling` migration and leaves the live vectors untouched; once the
+cutover has begun it cannot be cancelled. A space with a migration cannot be unset until it is cancelled.
 
 ### Get a model onto the fleet
 
@@ -515,9 +550,16 @@ noomesh** needs the GPU, the node agent does not stop. It stays online, gives
 the GPU back, says so, and takes it again on its own once the GPU is free.
 
 **What counts as foreign.** A GPU process is noomesh's when it runs in a
-container the agent manages (`noo-<backend>`); everything else (another
-compose stack, a game, a training script) is foreign. The agent only measures
-foreign work. It never signals, stops or reconfigures it.
+any noomesh container on the host: the agent's backends, the compose-managed
+controller stack (`noo-ollama-embed`, `noo-tei`, ...) and older leftovers.
+Containers are recognised by their labels (compose project `noomesh` or
+`pai-assistant`, `noo.managed-by`), with the `noo-` name as the fallback; a
+container recognised only by name is reported as `orphan`. Everything else
+(another compose stack, a game, a training script) is foreign. The agent only
+measures foreign work. It never signals, stops or reconfigures it. Memory it
+cannot attribute (docker unreachable, a process gone) is `unknown_mb`, is never
+counted as foreign and never yields; the method then reads
+`nvidia-smi-unattributed` and `reason` says so.
 
 **How it measures.** Every 15 s it reads `nvidia-smi` (`memory.used`,
 `memory.total` and the compute processes). When the process IDs resolve, each
@@ -547,16 +589,85 @@ side starts first keeps the GPU, and a stack that refuses to start on a busy
 GPU never gets it. An operator hold settles that:
 
 ```bash
-noo cluster gpu hold host3 --reason voice   # pauses host3's GPU backends now; no auto-resume
+noo cluster gpu hold host3 --reason voice   # drains, then pauses host3's GPU backends; no auto-resume
+#   ✓ host3: GPU held (voice) — vllm paused; it stays paused until you release it
+#   lease: operation 7c1e…, generation 4, drained first
 pai-voice-gpu enable                        # on host3: the voice stack now finds the GPU free
 # ... later
 pai-voice-gpu disable                       # the voice stack drains and frees the GPU
-noo cluster gpu release host3               # back to automatic: vLLM resumes once the GPU stays free
+noo cluster gpu release host3 --operation 7c1e… --generation 4   # back to automatic: vLLM resumes once the GPU stays free
 ```
 
 `hold` and `release` are operator-only and audited (`node_gpu_hold`,
 `node_gpu_release`). A hold survives an agent restart. Nothing flows in the
 other direction: the other stack never calls noomesh.
+
+**A hold drains first.** From the moment the gateway accepts the hold the
+node's lanes get no new request; the agent closes admission on its GPU
+backends (a request that still arrives is answered `503 backend_draining`
+at once and the gateway serves it elsewhere) and waits for every request in
+flight on them to finish, up to `--timeout` (default 120 s, max 900). Only
+then are the backends stopped. If something is still running at the
+timeout the hold is **not** applied: admission reopens, nothing was
+stopped, and the command fails with `drain_timeout` naming the backends and
+counts still busy. Nothing in flight is ever cut by a drain hold.
+`--immediate` is the old behaviour (stop after a 30 s grace, requests in
+flight included): for emergencies, and the output says what it did.
+
+**A hold is an owned lease.** Every hold carries an operation id (yours
+with `--operation`, else a fresh UUID) and is given the node's next
+`generation`; the output prints both and the exact `release` line. A
+release quotes them (compare-and-set): a release with the wrong pair, a
+stale retry, or a release of a node held by another operation is refused
+(`held_by_other`, naming the current lease) and changes nothing. A hold on
+a node another operation holds is refused the same way. `--force` on either
+takes over or ends any hold and is audited as a force; a bare
+`noo cluster gpu release <node>` is a force too (the operator's hand). One
+hold or release runs per node at a time (`transition_in_progress`).
+`release --now` restarts the paused backends at once instead of waiting
+for the GPU to stay clear for `NOO_GPU_RESUME_AFTER_S`.
+
+An older CLI's bare `hold` (no operation id) still works for an operator:
+it is immediate and a force, and the audit row says `legacy`.
+
+### Reservations: a feature takes a GPU, the pool gets it back
+
+A feature that must continuously consume a piece of the mesh (voice while
+voice is on; an image or video worker with its model loaded) **reserves** a
+GPU. The workload is what an add-on's verified bundle declares
+(`<addon>/<workload>`: its container, whether it takes the GPU and how much,
+its own drain route); core never names one. `noo cluster gpu hold|release`
+stay as the low-level emergency tools underneath.
+
+```bash
+noo cluster workloads                              # what the installed add-ons declare
+noo cluster reserve pai-voice/voice-worker         # the mesh picks a node: any live node with enough free GPU memory
+noo cluster reserve pai-voice/voice-worker --node awolf   # or pin one
+noo cluster reservations                           # id, workload, holder, node, state, since
+noo cluster release <reservation-id>               # the GPU returns to the pool
+```
+
+Taking a reservation: an owned GPU hold in mode drain (the pool's requests
+in flight on that GPU finish, nothing is cut; its backends pause), then the
+node agent starts the declared container, then the command waits for it to
+run (and pass its healthcheck when it has one). A start that fails gives the
+GPU back at once; a container that is not ready in time keeps the
+reservation and the command says `needs_attention`. Releasing: the add-on's
+declared drain route runs first (its sessions end on its own terms), the
+container stops, and the hold is released by compare-and-set with an
+immediate resume. Only the holder releases, or an operator with `--force`
+(audited). `--hand-over <reservation-id>` moves a GPU from one workload to
+the next on the same node without the pool getting it in between.
+
+The reservation **is** the node's GPU lease: its id is the lease's operation
+id, so nothing is stored twice and `reservations` reads the nodes'
+heartbeats. While a workload is reserved, its add-on reaches it through
+`/api/addon-workloads/<addon>/<workload>/proxy/<path>` (requests and
+WebSockets; the add-on's own token for its own workloads, or an operator):
+the gateway resolves the reservation's node, the node agent proxies to the
+container's published loopback port. A relayed WebSocket closes with code
+4001 when the reservation ends. Nothing else on the node is reachable that
+way, and a workload that is not reserved answers 409.
 
 **Knobs** (operator overrides in `/etc/noo-node-agent.env`; restart the agent):
 
@@ -570,14 +681,17 @@ other direction: the other stack never calls noomesh.
 **What the operator sees.** The heartbeat carries `gpu_contention`:
 
 ```json
-{"state": "yielded", "foreign_mb": 11468, "total_mb": 16376, "free_mb": 4908,
+{"state": "yielded", "foreign_mb": 11468, "noomesh_mb": 3754, "unknown_mb": 0, "total_mb": 16376, "free_mb": 4908,
  "method": "memory-accounting", "since": "2026-10-17T12:00:00Z",
  "paused_backends": ["vllm"], "need_mb": 14738,
  "reason": "foreign GPU use 11.2 GB > 2.0 GB threshold", "policy": "auto"}
 ```
 
 `state` is one of `free`, `shared` (foreign work beside running backends),
-`yielded` or `held`.
+`yielded`, `draining` (a hold waiting for requests in flight) or `held`.
+`generation` counts the node's accepted holds; while draining or held,
+`lease` carries `{owner, operation_id, generation, mode, reason, since,
+drain_started, drained_at}`.
 
 - `noo cluster status` prints `! host3: GPU in use by other work — vllm paused since <t> (foreign 11.2 GB)`.
 - `noo cluster verify host3` has a `control over bus` row: one `health` round
@@ -611,7 +725,7 @@ other direction: the other stack never calls noomesh.
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
 | `noo cluster place` | `<node> <backend\|harness> <model\|auto> [--on cpu\|gpu] [--env KEY=VALUE]... [--kind noo\|claude-code\|copilot\|codex] [--role chat\|embed\|rerank] [--port <port>] [--tls] [--image <image>] [--stopped] [--force]` | Declare a backend and model in a role on a node, on cpu or gpu; auto-tunes unless --env |
-| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank]` | Remove a placement (one role); a container is left running, the harness is stopped |
+| `noo cluster unplace` | `<node> <backend> [--role chat\|embed\|rerank] [--model <model>]` | Remove a placement, or one embed model; a container keeps running, a harness is stopped |
 | `noo cluster fit` | `<node> [--with <backend> <model> [--on cpu\|gpu] [--role <role>] [--env KEY=VALUE]...]` | Show whether placements fit a node's GPU memory and RAM, with or without one more |
 | `noo cluster class list` | — | Show the model classes consumers may send as `model`, with candidate placement and health |
 | `noo cluster class set` | `<class> <node>/<backend>[=<model>]... [--degraded <node>/<backend>[=<model>]]... [--alias <name>]... [--pool]` | Declare a model class: failover order, or --pool to share the load; --degraded ones last |
@@ -620,11 +734,16 @@ other direction: the other stack never calls noomesh.
 | `noo cluster embedding-space list` | — | Show each embedding space, its model and the nodes serving it |
 | `noo cluster embedding-space set` | `<space> <model> [--dims <n>]` | Declare an embedding space: a purpose bound to one embedding model |
 | `noo cluster embedding-space unset` | `<space>` | Forget an embedding space; the default (knowledge) cannot be removed |
+| `noo cluster embedding-space migrate` | `<space> <model> \| <space> --complete \| <space> --cancel` | Re-embed a space into a new model: start, complete or cancel |
 | `noo cluster logs` | `[<node>] [<service>] [-b\|--backend <backend>] [-n\|--tail <n>]` | Tail logs for a noo-* container or host service (harness, agent) on one node or all |
 | `noo cluster restart-agent` | `<node>` | Ask the gateway to restart a node's node-agent |
 | `noo cluster maintenance` | `<node> on --reason <text> [--until <duration>] \| <node> off \| list` | Mute a known-down node's operator alerts (operator-only); the daily summary still lists it |
-| `noo cluster gpu hold` | `<node> [--reason <text>]` | Pause a node's GPU backends and keep them paused, to free its GPU (operator-only) |
-| `noo cluster gpu release` | `<node>` | End a GPU hold: GPU backends resume once the GPU has stayed free (operator-only) |
+| `noo cluster gpu hold` | `<node> [--reason <text>] [--operation <id>] [--timeout <secs>] [--immediate] [--force]` | Drain, then pause a node's GPU backends, held as an owned lease until released (operator) |
+| `noo cluster gpu release` | `<node> [--operation <id> --generation <n>] [--force] [--now]` | End a GPU hold by its lease (or any with --force); backends resume when free, or now |
+| `noo cluster reserve` | `<addon>/<workload> [--node <node>] [--hand-over <reservation-id>] [--timeout <secs>]` | Reserve a GPU for an add-on workload: drain the pool there, pause it, start the workload |
+| `noo cluster reservations` | — | List the GPU reservations the nodes hold: id, workload, holder, node, state |
+| `noo cluster release` | `<reservation-id> [--force]` | Release a reservation: drain and stop the workload, give the GPU back (holder or --force) |
+| `noo cluster workloads` | — | List the workloads the installed add-ons declare (container, GPU need, drain route) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
 | `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
@@ -653,14 +772,14 @@ other direction: the other stack never calls noomesh.
 | `noo cluster restart-backends` | `<node> <noo-svc>... [-y\|--yes\|--force]` | Restart noo-* backend containers on a node via a rail-delivered bundle |
 | `noo cluster host-telemetry apply` | `[<node>...] [--all] [--include-controller] [-y\|--yes]` | Switch off tailscaled's log upload on nodes over the pull rail, one at a time |
 | `noo cluster host-telemetry` | — | Print host-telemetry subcommand usage (apply) |
-| `noo cluster vendor stage` | `<kind> \| --all [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch a harness kind's vendor CLI on the controller, checked against its pin |
+| `noo cluster vendor stage` | `[<kind> [--fleet] \| --all] [--os linux\|macos] [--arch x86_64\|aarch64]` | Fetch the vendor CLIs the nodes need on the controller, checked against their pins |
 | `noo cluster vendor status` | — | List staged vendor CLIs per platform, and which nodes need which |
 | `noo cluster vendor install` | `<node> <kind>...` | Carry these vendor CLIs on a node whatever its placement names; restage to deliver |
 | `noo cluster vendor` | — | Print vendor subcommand usage (stage, status, install) |
 | `noo cluster push-secrets` | `[<node>...] [--dry-run] [--explain] [--gateway-container <name>] [--sops-file <path>] [-y\|--yes]` | Stage fleet-wide secrets from env.sops as a bundle each node collects |
 | `noo cluster nats-users render` | `[--rotate] [--dry-run] [-y\|--yes]` | Mint per-principal NATS passwords from the gateway registry and render users.conf |
 | `noo cluster nats-creds rotate` | `<node\|gateway\|worker\|trellion\|trellion_intel>... [--mint-only] [--restart] [-y\|--yes]` | Rotate a bus credential: nodes deliver over the rail; others re-render + recreate |
-| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a published GGUF + Modelfile from the controller store into a node's ollama |
+| `noo cluster import-model` | `<node> <name> [--place] [--role chat\|embed\|rerank] [-b\|--backend <backend>]` | Import a store model or a staged ollama:<tag> into a node's ollama |
 | `noo cluster ship-model` | `<hf_id> <node> [--name <name>] [--quant <quant>] [--place] [-b\|--backend <backend>]` | Convert an HF model to GGUF and have a node import it; needs a source checkout |
 | `noo cluster clean` | `<node>\|all [--deep] [-y\|--yes]` | Remove this stack's containers on node(s) through their agents; --deep removes images too |
 | `noo cluster seed` | `[-f\|--file <path>] [--export] [--dry-run]` | Apply (or export) the cluster desired state from config/cluster-seed.yaml |
@@ -670,7 +789,7 @@ other direction: the other stack never calls noomesh.
 |---|---|---|
 | `noo models cached` | — | List models currently loaded on running node backends |
 | `noo models pull` | `<model> [--backend <b>]` | Pull onto the gateway's Ollama; whisper:<size> / piper:<voice> stage a voice model |
-| `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face into the controller store (resumable, sha256-verified) |
+| `noo models fetch` | `<hf_repo> <file.gguf> [--revision <rev>] [--force]` | Download a GGUF from Hugging Face, or stage ollama:<tag> from the registry, into the store |
 | `noo models list` | `[--backend <b>] [--tier <n>] [--limit <n>] [--refresh]` | List popular models per backend from the HuggingFace catalog cache |
 | `noo models search` | `<query> [--backend <b>] [--limit <n>]` | Search HuggingFace for models, with cached offline fallback |
 | `noo models info` | `<model>` | Show detailed HuggingFace info for a model, including gating hints |

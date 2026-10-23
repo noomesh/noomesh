@@ -73,7 +73,7 @@ ANSWERS = [   # first match wins: the delegation objective quotes the one-word o
 class FakeHarnessGateway:
     def __init__(self, node: str = "awolf", original_kind: Optional[str] = "noo",
                  clock: Optional[FakeClock] = None,
-                 profiles: Optional[dict[str, KindProfile]] = None):
+                 profiles: Optional[dict[str, KindProfile]] = None, synthesized: bool = False):
         self.node = node
         self.clock = clock or FakeClock()
         self.profiles = profiles or PROFILES
@@ -82,6 +82,11 @@ class FakeHarnessGateway:
             self.placement = {"backend": "harness", "role": "harness", "model": "auto", "tls": False,
                               "desired_state": "running", "env": {"NOO_HARNESS_KIND": original_kind,
                                                                   "NOO_HARNESS_LOG": "info"}}
+        if synthesized:
+            # The auto policy's placement: reported, never stored.
+            self.placement = {"backend": "harness", "role": "harness", "model": "auto", "tls": False,
+                              "desired_state": "running", "env": {}, "synthesized": True}
+            original_kind = "noo"
         self.running_kind = original_kind
         self.down_beats = 0           # heartbeats the harness reports stopped after a kind change
         # What the heartbeat says the harness RUNS (host_services.harness.kind):

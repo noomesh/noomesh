@@ -53,8 +53,9 @@ env:
   OWNER: noomesh   # un-nested: ghcr.io/noomesh/<image>; packages CREATED by this repo (see publish-web.yml)
   # DHI-derived images (dhi.io mirrors + deps-core / deps-base / static-ffmpeg
   # layered on them) live under the prefix ghcr.io/noomesh/dhi/<name>, apart
-  # from the stack images at ghcr.io/noomesh/<name>. The hardened bases are
-  # public (DHI Community), so there is no visibility requirement on them.
+  # from the stack images at ghcr.io/noomesh/<name>. The runtime images,
+  # python and the derived deps images are public; the golang/rust/uv/alpine-base
+  # build bases stay private (see scripts/dhi-images.txt).
   # DHI_OWNER is the path under $REGISTRY, i.e. DHI_REGISTRY=ghcr.io/noomesh/dhi.
   DHI_OWNER: noomesh/dhi
   PLATFORMS: linux/amd64,linux/arm64
@@ -85,16 +86,17 @@ jobs:
       # re-run resolved the branch again and could mix two generations of
       # sibling code into one lock (stack-v0.2.96).
       trellion_sha: ${{ steps.siblings.outputs.trellion_sha }}
-      # The final re-tag plan (scripts/release-retag-plan.py). For an rc, or
-      # a final with no equal-tree rc, every image is `false` = build.
+      # The re-tag plan (scripts/release-retag-plan.py). For a release with
+      # no equal-tree earlier rc (a final: any rc; an rc: a lower rc), every
+      # image is `false` = build.
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
       rc_image_tag: ${{ steps.plan.outputs.rc_image_tag }}
       rc_commit: ${{ steps.plan.outputs.rc_commit }}
       retag: ${{ steps.plan.outputs.retag }}
       rc_digests: ${{ steps.plan.outputs.rc_digests }}
     steps:
-      - name: Checkout (full history)   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout (full history)   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: The tag sits on its promotion branch
@@ -152,7 +154,10 @@ jobs:
       # provably unchanged (this tree, and each sibling's tree vs the one the
       # rc lock recorded) is re-tagged from the rc's digest instead of rebuilt.
       # gateway and node-agent stamp the tag into their bits and always build.
-      # The rules, and why each fails open to BUILD, are in the script.
+      # The same holds for an rc re-cut on an earlier rc's tree (rc.N+1 on
+      # rc.N's commit): it re-tags rc.N's images, and still mints and signs
+      # its own lock. The rules, and why each fails open to BUILD, are in the
+      # script.
       - name: Plan — re-tag from the rc, or build
         id: plan
         env:
@@ -211,20 +216,33 @@ jobs:
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-core'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
-      - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v3
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
       - name: Resolve tag
         run: |
@@ -264,7 +282,9 @@ jobs:
         run: |
           set -eux
           # Controller-side image: amd64 only, same policy as deps-base.
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-core \
             --cache-from type=gha,scope=deps-core \
@@ -305,27 +325,40 @@ jobs:
       RC_TAG: ${{ needs.release-line.outputs.rc_image_tag }}
       RC_DIGEST: ${{ fromJSON(needs.release-line.outputs.rc_digests)['deps-base'] }}   # from the rc's stack-<rc>.bases; empty for an rc cut before it existed
     steps:
-      - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v3
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
       # deps-base does `COPY --from=trellion` (compose supplies this as the
       # `trellion` additional build-context = the ../trellion sibling). CI
       # checks the trellion repo out and passes it as a named build context so
       # buildx doesn't try to pull `trellion` as a docker image.
       - name: Checkout noo-trellion (deps-base build context)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: personifAI/trellion
           # The SHA release-line resolved from staging (-rc.N) / main (final),
@@ -376,15 +409,15 @@ jobs:
           echo "sha=${sha:-dev}" >> "$GITHUB_OUTPUT"
           echo "repo=${repo:-personifAI/trellion-protocols}" >> "$GITHUB_OUTPUT"
       - name: Checkout trellion-protocols (deps-base build context)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ steps.protocols.outputs.repo }}
           ref: ${{ steps.protocols.outputs.sha }}
           path: _trellion_protocols
 
-      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v3.2.0
+      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v4.4.0
         if: env.RETAG != 'true'
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
         with:
           platforms: arm64
 
@@ -428,7 +461,9 @@ jobs:
           # Controller-side image: amd64 only. The heavy Python/CUDA stack runs
           # on x86 GPU nodes; arm64 edge nodes run node-agent + llama.cpp, not
           # this base. (nvidia-cudnn-cu13 also has no clean arm64 wheel.)
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform linux/amd64 \
             -f docker/Dockerfile.deps-base \
             --cache-from type=gha,scope=deps-base \
@@ -637,24 +672,37 @@ jobs:
             platforms: linux/amd64
             extra_args: ""
     steps:
-      - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Hosted runner: no persistent builder or disk. A docker-container
       # builder (multi-platform, type=gha layer cache) and a roomier disk.
       - name: Free disk (preinstalled toolchains the build does not use)
         if: env.RETAG != 'true'
         run: scripts/ci-free-disk.sh
-      - name: Set up buildx   # docker/setup-buildx-action@v3
+      # BuildKit's own image comes from Docker Hub, whose token service now
+      # and then answers a public pull "unauthorized: authentication required"
+      # (it cost 0.6.10-rc a run). Pull it first, retrying transient registry
+      # errors only (scripts/retry-registry.sh); buildx uses this local copy
+      # when its own pull fails, and a setup that still fails is tried once more.
+      - name: Pre-pull the BuildKit image (transient registry errors retried)
         if: env.RETAG != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v3
+        run: scripts/retry-registry.sh docker pull moby/buildkit:buildx-stable-1 || echo "::warning::could not pre-pull moby/buildkit:buildx-stable-1; setup-buildx pulls it itself"
+      - name: Set up buildx   # docker/setup-buildx-action@v4.4.1
+        id: buildx
         if: env.RETAG != 'true'
-        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124
+        continue-on-error: true
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Set up buildx, second attempt   # docker/setup-buildx-action@v4.4.1
+        if: env.RETAG != 'true' && steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Expose the Actions cache token to buildx   # crazy-max/ghaction-github-runtime@v4.0.0
+        if: env.RETAG != 'true'
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487
 
-      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v3.2.0
+      - name: Set up QEMU (arm64)   # docker/setup-qemu-action@v4.4.0
         if: env.RETAG != 'true'
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
         with:
           platforms: arm64
 
@@ -725,7 +773,9 @@ jobs:
         if: env.RETAG != 'true'
         run: |
           set -eux
-          docker buildx build --push \
+          # Retried only on a transient registry error (`unknown blob`, Hub
+          # auth/rate answers, 5xx, resets); a failed build step is not.
+          scripts/retry-registry.sh docker buildx build --push \
             --platform "${{ matrix.platforms }}" \
             -f "${{ matrix.dockerfile }}" \
             --cache-from type=gha,scope=${{ matrix.name }} \
@@ -794,8 +844,8 @@ jobs:
       # `noo-cli/src/release_sig.rs` — both of them repository content at this
       # tag, which is the only thing in this job that did not arrive over the
       # network a moment ago.
-      - name: Checkout   # actions/checkout@v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout   # actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: digest-*
@@ -831,10 +881,10 @@ jobs:
           check digests/source-trellion "$WANT_TRELLION"
           exit $bad
 
-      # Provenance for a re-tagged final: which rc the reused digests came
+      # Provenance for a re-tagged release: which rc the reused digests came
       # from. Not an image row (no sha256 digest), so `noo upgrade` and the
       # launcher skip it, exactly as they skip the source: rows.
-      - name: Record the rc a re-tagged final reuses
+      - name: Record the rc a re-tagged release reuses
         if: contains(needs.release-line.outputs.retag, 'true')
         env:
           RC_TAG: ${{ needs.release-line.outputs.rc_tag }}

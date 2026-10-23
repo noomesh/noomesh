@@ -42,12 +42,14 @@ export const CORE_TABS: readonly string[] = [
   'backends', // start/stop models across nodes — the differentiator vs plain Ollama
   'model-prefs', // which model answers each purpose; embedding spaces (operator-gated)
   'tasks', // scheduled work; basic self-hosting need
+  'addons', // add-on web UIs, each on its own origin; empty until one is enabled
   'memory', // conversations persist — the other thing cloud does not do privately
   'rag', // document ingest — the reason to have a graph at all
   'graph', // the knowledge graph itself
   'observability', // GPU metrics
   'usage', // token accounting; nobody else self-hosted shows it
   'security', // approval gates on agent actions — a genuine differentiator
+  'skills', // promote or reject learned prompt skills before they are injected
   'autonomy', // what it does when nobody asked; same safety class as approvals
   'admin', // users and behavioural flags (operator-gated in the sidebar)
   'docs', // in-app runbooks

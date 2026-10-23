@@ -86,9 +86,14 @@ func nativeOllamaTuning(rows []placement, prof *harnessprofile.Profile) map[stri
 		}
 		return buildPlacementEnv(placement{Backend: "ollama", Env: env})
 	case len(rows) == 1:
+		env := buildPlacementEnv(rows[0])
 		if v := profileOllamaContext(rows[0].Env, prof); v != "" {
-			return map[string]string{ollamaContextKey: v}
+			env[ollamaContextKey] = v
 		}
+		if len(env) == 0 {
+			return nil
+		}
+		return env
 	}
 	return nil
 }

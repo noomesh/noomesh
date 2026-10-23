@@ -3,8 +3,14 @@
   "/api/addons/<id>/console-piece": [
    "apps/web/src/features/addons/useConsolePieces.ts"
   ],
+  "/api/addons/ui": [
+   "apps/web/src/features/addons/useAddonUis.ts"
+  ],
   "/api/addons/{addon_id}/console-piece": [
    "apps/web/src/features/addons/useConsolePieces.ts"
+  ],
+  "/api/addons/{addon_id}/ui-session": [
+   "apps/web/src/features/addons/useAddonUis.ts"
   ],
   "/api/alerts/clients": [
    "apps/web/src/features/jobs/useJobs.ts"
@@ -163,6 +169,12 @@
   "/api/monitoring/grafana-session": [
    "apps/web/src/features/observability/useGrafanaSession.ts"
   ],
+  "/api/prompt-skills/proposals": [
+   "apps/web/src/features/skills/useSkillProposals.ts"
+  ],
+  "/api/prompt-skills/proposals/{id}/decide": [
+   "apps/web/src/features/skills/useSkillProposals.ts"
+  ],
   "/api/scheduler/drain/{node_id}": [
    "apps/web/src/features/jobs/useJobs.ts"
   ],
@@ -292,10 +304,15 @@
   "/api/activities/{id}/link-task",
   "/api/activities/{id}/progress",
   "/api/activities/{id}/status",
+  "/api/addon-workloads/{addon}/{workload}/proxy/{*path}",
+  "/api/addon-workloads/{addon}/{workload}/status",
   "/api/addon/token",
   "/api/addons/{addon_id}/cli-piece",
+  "/api/addons/{addon_id}/ws-ticket",
   "/api/agent/loops",
   "/api/agent/run",
+  "/api/agents/archive",
+  "/api/agents/archive/{month}",
   "/api/agents/collaborate",
   "/api/agents/keys/review",
   "/api/agents/keys/{agent}",
@@ -332,6 +349,8 @@
   "/api/cluster/cli-asset/{name}",
   "/api/cluster/delete-tailscale-device",
   "/api/cluster/discover",
+  "/api/cluster/embedding-spaces/{space}/migration",
+  "/api/cluster/embedding-spaces/{space}/migration/complete",
   "/api/cluster/enroll-tailnet",
   "/api/cluster/maintenance",
   "/api/cluster/mint-join-key",
@@ -358,6 +377,9 @@
   "/api/cluster/provision-bundle/{node}",
   "/api/cluster/provision-bundle/{node}/status",
   "/api/cluster/replication-status",
+  "/api/cluster/reservations",
+  "/api/cluster/reservations/{id}",
+  "/api/cluster/reservations/{id}/release",
   "/api/cluster/seat-enroll",
   "/api/cluster/seat-tokens",
   "/api/cluster/seat-tokens/{id}/revoke",
@@ -366,6 +388,7 @@
   "/api/cluster/seats/{seat}/status",
   "/api/cluster/self-node",
   "/api/cluster/suggest-placement",
+  "/api/cluster/workloads",
   "/api/coding/task",
   "/api/coding/tasks",
   "/api/coding/tasks/{task_id}",
@@ -384,6 +407,7 @@
   "/api/external/capabilities",
   "/api/external/chat/completions",
   "/api/external/classify",
+  "/api/external/embedding-spaces/{space}/migration",
   "/api/external/embeddings",
   "/api/external/inference",
   "/api/external/models",
@@ -456,7 +480,6 @@
   "/api/proactive/status",
   "/api/prompt-skills",
   "/api/prompt-skills/evolve",
-  "/api/prompt-skills/{name}",
   "/api/prompt-skills/{name}/fitness",
   "/api/prompt-skills/{name}/retire",
   "/api/security/audit-history",
@@ -513,10 +536,13 @@
   "/api/tags",
   "/api/tasks",
   "/api/tasks/inference",
+  "/api/tasks/stop",
   "/api/tasks/submit",
   "/api/tasks/{id}",
   "/api/tasks/{id}/answer",
   "/api/tasks/{id}/ask",
+  "/api/tasks/{id}/context",
+  "/api/tasks/{id}/events",
   "/api/tasks/{id}/resubmit",
   "/api/tasks/{id}/stop",
   "/api/temporal/adaptations",

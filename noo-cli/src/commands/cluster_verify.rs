@@ -391,20 +391,45 @@ pub(crate) fn gpu_contention_check(n: &Value) -> Option<Check> {
     let paused_phrase = if none_paused { "no GPU backend paused".to_string() } else { format!("{paused} paused") };
     let method = gc["method"].as_str().unwrap_or("?");
     let state = gc["state"].as_str().unwrap_or("?");
-    if method == "not-measured" && state != "held" && state != "yielded" {
+    if method == "not-measured" && state != "held" && state != "yielded" && state != "draining" {
         return Some(ok("gpu", "not measured (no NVIDIA GPU, or unified memory) — the node never yields"));
     }
-    let off = if gc["policy"].as_str() == Some("off") { " (yield off)" } else { "" };
+    let mut off = if gc["policy"].as_str() == Some("off") { " (yield off)".to_string() } else { String::new() };
+    // Why: noomesh's own GPU use, and memory nobody could be blamed for, are
+    // reported apart from foreign (an older agent sends neither key).
+    if gc["noomesh_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+        off.push_str(&format!(", noomesh {:.1} GB", gb("noomesh_mb")));
+    }
+    if gc["unknown_mb"].as_f64().unwrap_or(0.0) > 0.0 {
+        off.push_str(&format!(", unattributed {:.1} GB (not counted as foreign)", gb("unknown_mb")));
+    }
+    let orphans: Vec<&str> = gc["orphan"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if !orphans.is_empty() {
+        off.push_str(&format!(", orphan container {} holds the GPU — remove it", orphans.join(", ")));
+    }
     Some(match state {
         "free" => ok("gpu", format!("free{off}")),
         "shared" => ok("gpu", format!("shared: foreign {:.1} GB beside noomesh, backends running ({method}){off}", gb("foreign_mb"))),
         "yielded" => warn("gpu",
-            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}) — resumes when the GPU frees", gb("foreign_mb")),
+            format!("yielded: {paused_phrase} (foreign {:.1} GB, {method}{off}) — resumes when the GPU frees", gb("foreign_mb")),
             None),
-        "held" => warn("gpu",
-            format!("held by operator{}: {paused_phrase}",
-                gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
-            Some(format!("noo cluster gpu release {id}   # when the other work is done"))),
+        "held" => {
+            // The lease's ids make the remedy an exact release; without a
+            // lease (an older agent) the bare release is the force it was.
+            let lease = &gc["lease"];
+            let ids = match (lease["operation_id"].as_str(), lease["generation"].as_u64()) {
+                (Some(op), Some(generation)) if !op.is_empty() => format!(" --operation {op} --generation {generation}"),
+                _ => String::new(),
+            };
+            warn("gpu",
+                format!("held by {}{}: {paused_phrase}",
+                    super::cluster_gpu::lease_holder(gc),
+                    gc["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" ({r})")).unwrap_or_default()),
+                Some(format!("noo cluster gpu release {id}{ids}   # when the other work is done")))
+        }
+        "draining" => warn("gpu",
+            format!("hold by {} draining: waiting for requests in flight on the GPU backends to finish", super::cluster_gpu::lease_holder(gc)),
+            None),
         other => warn("gpu", format!("agent reports an unknown gpu_contention state {other:?}"), None),
     })
 }
@@ -518,12 +543,16 @@ pub(crate) fn backend_images_check(n: &Value) -> Check {
         return fail(
             NAME,
             format!("{} — a floating ref (no digest; tag latest or none) can change under the node with no check", floating.join("; ")),
-            // What works (0.6.8 live, aserve + robopi): the agent never
-            // replaces a RUNNING container, so a provision that leaves the
-            // binaries alone changed nothing. Removed, it is recreated from
-            // the ref desired-config carries: the signed lock's digest.
+            // What works (0.6.8 live, aserve + robopi): an agent before
+            // 0.6.10 never replaces a RUNNING container, so a provision that
+            // left the binaries alone changed nothing; removed, it is
+            // recreated from the ref desired-config carries (the signed
+            // lock's digest, 0.6.9+ controller). A 0.6.10+ agent replaces it
+            // itself, so on one the row persists only when that start was
+            // refused.
             format!("docker rm -f {}   # on {id}: the agent recreates it from the stack lock's pinned ref within a minute \
-                     (it never replaces a running container itself). If the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, \
+                     (a 0.6.10+ agent does this itself on its next reconcile; if it is still listed, that start was refused: \
+                     see the agent's reconcile.start_failed). If the controller's VLLM_IMAGE / OLLAMA_IMAGE names :latest, \
                      unset it or pin repo:version@sha256:… first", floating_ctrs.join(" ")),
         );
     }
@@ -1520,12 +1549,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-pub(crate) fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub(crate) use crate::host_exec::now_unix;
 
 fn signing_adopted_for(node: &str) -> Option<bool> {
     let dir = crate::pki::pki_dir().join("nodes").join(node);
@@ -1661,7 +1685,9 @@ pub(crate) fn default_chat_check(classes: Option<&Value>) -> Check {
 /// The `embedding spaces` row (i145): each space, its one model and how many
 /// nodes serve it. `x` when the default space (`knowledge`) has no live node
 /// (every unqualified embed fails); `!` when another space has none, or an
-/// embed node serves a model no space uses (it serves nobody).
+/// embed node serves a model no space uses (it serves nobody). A static
+/// endpoint that answered the gateway's probe embed (`static_live`, the
+/// compose embedder on a fresh install) serves the space like a node.
 pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     const NAME: &str = "embedding spaces";
     let Some(body) = body else {
@@ -1674,10 +1700,17 @@ pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
     }
     let listed: Vec<String> = spaces
         .iter()
-        .map(|s| format!("{}={} ({} live)", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"), s["live"].as_u64().unwrap_or(0)))
+        .map(|s| {
+            let (live, st) = (s["live"].as_u64().unwrap_or(0), s["static_live"].as_u64().unwrap_or(0));
+            let served = if st > 0 { format!("{live} live + {st} static") } else { format!("{live} live") };
+            format!("{}={} ({served})", s["space"].as_str().unwrap_or("?"), s["model"].as_str().unwrap_or("?"))
+        })
         .collect();
     let detail = listed.join(", ");
-    let dead: Vec<&Value> = spaces.iter().filter(|s| s["live"].as_u64().unwrap_or(0) == 0).collect();
+    let dead: Vec<&Value> = spaces
+        .iter()
+        .filter(|s| s["live"].as_u64().unwrap_or(0) + s["static_live"].as_u64().unwrap_or(0) == 0)
+        .collect();
     if dead.iter().any(|s| s["default"].as_bool() == Some(true)) {
         return fail(NAME, format!("{detail} — the default space has no live node: every unqualified embed fails"), "noo cluster embedding-space list");
     }
@@ -1687,8 +1720,13 @@ pub(crate) fn embedding_spaces_check(body: Option<&Value>) -> Check {
         .iter()
         .map(|n| format!("{}={}", n["node"].as_str().unwrap_or("?"), n["model"].as_str().unwrap_or("?")))
         .collect();
-    if !dead.is_empty() || !unmatched.is_empty() {
+    let migrating: Vec<String> = spaces
+        .iter()
+        .filter_map(|s| crate::commands::cluster_embedding_space::migration_line(s["space"].as_str().unwrap_or("?"), &s["migration"]))
+        .collect();
+    if !dead.is_empty() || !unmatched.is_empty() || !migrating.is_empty() {
         let mut why: Vec<String> = Vec::new();
+        why.extend(migrating);
         if !dead.is_empty() {
             why.push(format!("no live node for {}", dead.iter().filter_map(|s| s["space"].as_str()).collect::<Vec<_>>().join(", ")));
         }
@@ -2947,6 +2985,48 @@ pub(crate) fn postgres_hba_check(hba: Option<&str>, compose: Option<&str>) -> Ch
     ok("postgres hba", "TLS + cluster-CA client certificate + password on every TCP connection; plaintext rejected; socket-only trust")
 }
 
+/// The "postgres role identity" row (i132): every Postgres role this stack's
+/// containers connect as has its own client leaf (CN = the role) AND
+/// pg_hba.conf holds that role to `clientcert=verify-full`. A role missing
+/// either half is still reachable with a leaf that is not its own, or its
+/// container cannot log in at all. FAIL names the role, the half, and the
+/// verb that fixes it. A pg_hba.conf that could not be read is a WARN: the
+/// leaves were judged, the file was NOT CHECKED.
+pub(crate) fn postgres_role_identity_check(ca: &crate::pki::ClusterCa, hba: Option<&str>) -> Check {
+    if !ca.ca_exists() {
+        return warn("postgres role identity", format!("no cluster CA at {}: nothing to check", ca.dir.display()), Some("noo onboard --only security".into()));
+    }
+    let gaps = crate::pki::pg_identity_gaps(ca, hba);
+    if !gaps.is_empty() {
+        let missing_file = gaps.iter().any(|g| g.contains("does not exist") || g.contains("has CN"));
+        return fail(
+            "postgres role identity",
+            format!(
+                "{} role(s) still on a shared leaf or without one: {}",
+                gaps.len(),
+                gaps.join("; ")
+            ),
+            if missing_file {
+                "noo upgrade --stack   # issues the role leaves before it recreates anything (or: noo onboard --only security)"
+            } else {
+                "noo upgrade --stack   # re-materialises docker/postgres/pg_hba.conf; then: noo stack restart --force postgres"
+            },
+        );
+    }
+    let roles = crate::pki::pg_leaf_roles().join(", ");
+    match hba {
+        Some(_) => ok(
+            "postgres role identity",
+            format!("each of {roles} has its own client certificate (CN = the role) and pg_hba.conf requires it (clientcert=verify-full) on top of the password"),
+        ),
+        None => warn(
+            "postgres role identity",
+            format!("the leaves for {roles} are right, but docker/postgres/pg_hba.conf could not be read: NOT CHECKED that it enforces them"),
+            Some("noo stack status".into()),
+        ),
+    }
+}
+
 /// What one `psql` probe from inside the postgres container proved.
 /// `(exit_ok, stderr)` for a connection that presented NO client
 /// certificate over TLS, and for one that offered no TLS at all; `None`
@@ -3258,6 +3338,11 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// A v1 cluster token REFUSED because `NOO_CLUSTER_TOKEN_V1=0` closed the
+/// gate — on the gateway (`/metrics`, by caller) and on each node (its
+/// `legacy_lanes`). Never part of `cluster_hmac_v1`, which is admissions
+/// only: every count is a caller whose calls all fail until it signs v2.
+pub(crate) const V1_REFUSED_LANE: &str = "cluster_hmac_v1_refused";
 /// The node-side lanes, as each agent reports them in `legacy_lanes`.
 pub(crate) const NODE_LEGACY_LANES: &[&str] = &["static_token", "whois_non_controller", "cluster_hmac_v1"];
 /// Below this window a zero is not yet retirement evidence
@@ -3359,6 +3444,7 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     // that used it, and the online ones that do not report at all.
     let mut node_totals: Vec<(String, u64, Vec<String>)> =
         NODE_LEGACY_LANES.iter().map(|l| (l.to_string(), 0, Vec::new())).collect();
+    let (mut node_v1_refused_n, mut node_v1_refused) = (0u64, Vec::new());
     let mut unreported = Vec::new();
     let mut shortest_node_window: Option<i64> = None;
     for n in fleet {
@@ -3374,6 +3460,10 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
         if let Some(since) = ll.get("since_unix").and_then(Value::as_i64) {
             let w = now_unix - since;
             shortest_node_window = Some(shortest_node_window.map_or(w, |s: i64| s.min(w)));
+        }
+        if let Some(c) = ll.get(V1_REFUSED_LANE).and_then(Value::as_u64).filter(|c| *c > 0) {
+            node_v1_refused_n += c;
+            node_v1_refused.push(format!("{id} {c}"));
         }
         for (lane, total, who) in node_totals.iter_mut() {
             let c = ll.get(lane.as_str()).and_then(Value::as_u64).unwrap_or(0);
@@ -3406,7 +3496,9 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}");
+    let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
@@ -3421,6 +3513,16 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
         return warn(NAME,
             format!("an old `noo` CLI signed with the controller secret and was REFUSED {refused} time(s){refused_who} — {detail}"),
             Some("noo upgrade --all   # on the box running the old CLI; the gateway refuses the CLI's shared-secret HMAC".into()));
+    }
+    if v1_refused > 0 {
+        return warn(NAME,
+            format!("a caller signed a v1 cluster token and the gateway REFUSED it {v1_refused} time(s){v1_who} (NOO_CLUSTER_TOKEN_V1=0) — {detail}"),
+            Some("noo upgrade --nodes   # the callers named above sign the old v1 form; every call they make fails until they sign v2".into()));
+    }
+    if node_v1_refused_n > 0 {
+        return warn(NAME,
+            format!("a node REFUSED a v1 cluster token {node_v1_refused_n} time(s){node_v1_who} (its NOO_CLUSTER_TOKEN_V1=0) — {detail}"),
+            Some("noo upgrade --all   # whoever calls that node still signs v1; the node's log names the actor".into()));
     }
     if !used.is_empty() {
         return warn(NAME, format!("in use: {} — {detail}", used.join(", ")),
@@ -4789,6 +4891,12 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // that presents none.
         let hba = std::fs::read_to_string(root.join("docker/postgres/pg_hba.conf")).ok();
         checks.push(postgres_hba_check(hba.as_deref(), compose.as_deref()));
+        // And each role reachable only with ITS certificate (i132): a leaf
+        // per role (CN = role) and a `clientcert=verify-full` line for it.
+        checks.push(postgres_role_identity_check(
+            &crate::pki::ClusterCa::new(crate::pki::pki_dir()),
+            hba.as_deref(),
+        ));
         let (no_cert, plaintext) = postgres_live_probes();
         checks.push(postgres_client_cert_check(
             no_cert.as_ref().map(|(ok, e)| (*ok, e.as_str())),
@@ -5068,6 +5176,11 @@ mod tests {
         assert!(c.detail.contains("knowledge=harrier (2 live)"), "{}", c.detail);
         let dead_default = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0}]}));
         assert_eq!(embedding_spaces_check(Some(&dead_default)).verdict, super::Verdict::Fail);
+        // F1: a fresh install's compose embedder answers for the default space.
+        let compose_only = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 0, "static_live": 1}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&compose_only));
+        assert_eq!(c.verdict, super::Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("knowledge=harrier (0 live + 1 static)"), "{}", c.detail);
         let dead_code = j(serde_json::json!({"spaces": [
             {"space": "knowledge", "model": "harrier", "default": true, "live": 1},
             {"space": "code", "model": "nomic-embed-code", "default": false, "live": 0}], "unmatched": []}));
@@ -5078,6 +5191,12 @@ mod tests {
             "unmatched": [{"node": "host9", "model": "bge-m3"}]}));
         assert!(embedding_spaces_check(Some(&stray)).detail.contains("serving no space: host9=bge-m3"));
         assert_eq!(embedding_spaces_check(None).verdict, super::Verdict::Warn);
+        // A re-embed under way is a warning that names it, never a failure.
+        let moving = j(serde_json::json!({"spaces": [{"space": "knowledge", "model": "harrier", "default": true, "live": 1,
+            "migration": {"next_model": "bge-m3", "state": "filling", "progress": null}}], "unmatched": []}));
+        let c = embedding_spaces_check(Some(&moving));
+        assert_eq!(c.verdict, super::Verdict::Warn);
+        assert!(c.detail.contains("re-embedding into bge-m3"), "{}", c.detail);
     }
 
     /// The `default chat` row lists the live candidates in routing order,
@@ -7330,6 +7449,7 @@ mod tests {
         // 0.6.8 live: a provision changed nothing; removing the container is
         // what makes the agent recreate it from the lock's pinned ref.
         assert!(c.remedy.as_deref().unwrap_or("").starts_with("docker rm -f noo-vllm   # on awolf"), "{c:?}");
+        assert!(c.remedy.as_deref().unwrap_or("").contains("a 0.6.10+ agent does this itself"), "{c:?}");
 
         let pinned = serde_json::json!({"id": "awolf", "backend_containers": {
             "vllm": {"running": true, "image": "vllm/vllm-openai:v0.29.0", "image_floating": false},
@@ -7992,6 +8112,32 @@ mod tests {
         assert!(c.detail.contains("static_token 7 (host3 7)") && c.detail.contains("whois_non_controller 2 (host9 2)"), "{}", c.detail);
     }
 
+    /// 0.6.8 rehearsal (F2): v1 tokens REFUSED under `NOO_CLUSTER_TOKEN_V1=0`
+    /// read as `in use: cluster_hmac_v1 (gateway admitted)`. A refusal is its
+    /// own lane and its own warning, naming the caller, and never "admitted".
+    #[test]
+    fn a_refused_v1_token_is_a_refusal_not_an_admission() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="pop-os",lane="cluster_hmac_v1_refused",route_class="cluster"} 12"#,
+        ]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0, "cluster_hmac_v1": 0, "cluster_hmac_v1_refused": 0 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("the gateway REFUSED it 12 time(s) (pop-os 12)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:") && !c.detail.contains("(gateway admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("gateway admitted (by caller): ") && c.detail.contains("cluster_hmac_v1 0"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").contains("noo upgrade --nodes"), "{:?}", c.remedy);
+
+        // The node side: its own refusals, by node, apart from what it admitted.
+        let text = lane_metrics(now - 86_400, &[]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0, "cluster_hmac_v1": 0, "cluster_hmac_v1_refused": 5 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("a node REFUSED a v1 cluster token 5 time(s) (host3 5)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:") && !c.detail.contains("(nodes admitted)"), "{}", c.detail);
+    }
+
     /// `cluster_hmac_v1` is counted on both sides. The 0.6.7 roll printed it
     /// twice with no side named, and "(pop-os 46, …)" read as the nodes'
     /// count when it was the gateway's: the verdict and the detail say which.
@@ -8114,6 +8260,45 @@ mod tests {
         let bad_compose = compose.replace("ARGS=\"$$ARGS -c ssl=on", "if [ -n \"$$NOO_PG_TLS\" ]; then ARGS=\"$$ARGS -c ssl=on");
         assert_eq!(postgres_hba_check(Some(&hba), Some(&bad_compose)).verdict, Verdict::Fail);
         assert_eq!(postgres_hba_check(None, Some(&compose)).verdict, Verdict::Warn);
+    }
+
+    /// The role-identity row over the shipped file and a scratch PKI: ok when
+    /// every role has its leaf and the file enforces it, and each missing half
+    /// fails naming the role.
+    #[test]
+    fn postgres_role_identity_row_needs_both_the_leaf_and_the_rule() {
+        let hba = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../docker/postgres/pg_hba.conf")).unwrap();
+        let dir = std::env::temp_dir().join(format!("noo-pg-identity-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = crate::pki::ClusterCa::new(dir.clone());
+        assert_eq!(postgres_role_identity_check(&ca, Some(&hba)).verdict, Verdict::Warn, "no CA is not a pass");
+        ca.generate_ca("t", 3650).unwrap();
+        // An upgraded install before the roll: no leaves yet.
+        let c = postgres_role_identity_check(&ca, Some(&hba));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("noo_app (worker)") && c.detail.contains("does not exist"), "{}", c.detail);
+        ca.ensure_pg_leaves(90);
+        let c = postgres_role_identity_check(&ca, Some(&hba));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        // planted: the OLD file (any cluster-CA leaf reaches every role)
+        let old = "hostssl all all all scram-sha-256 clientcert=verify-ca\nhostnossl all all all reject\n";
+        let c = postgres_role_identity_check(&ca, Some(old));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo_app: pg_hba.conf has no") && c.detail.contains("any cluster-CA leaf"), "{}", c.detail);
+        // planted: one role downgraded back to verify-ca
+        let weak = hba.replace(
+            "hostssl all             noo_trellion    all                     scram-sha-256   clientcert=verify-full",
+            "hostssl all             noo_trellion    all                     scram-sha-256   clientcert=verify-ca",
+        );
+        assert_ne!(weak, hba, "the shipped line changed shape: update this test");
+        let c = postgres_role_identity_check(&ca, Some(&weak));
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("noo_trellion: pg_hba.conf"), "{}", c.detail);
+        // the file unreadable: leaves judged, the file said NOT CHECKED
+        let c = postgres_role_identity_check(&ca, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("NOT CHECKED"), "{}", c.detail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The live row, over the exact stderr a Postgres 18 with the shipped
@@ -8606,12 +8791,37 @@ mod gpu_contention_tests {
     }
 
     #[test]
+    fn the_row_separates_noomesh_foreign_unknown_and_orphan() {
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "free", "method": "nvidia-smi-unattributed", "foreign_mb": 0, "noomesh_mb": 3754,
+            "unknown_mb": 2048, "orphan": ["noo-ollama"], "paused_backends": []}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("noomesh 3.7 GB"), "{}", c.detail);
+        assert!(c.detail.contains("unattributed 2.0 GB"), "{}", c.detail);
+        assert!(c.detail.contains("orphan container noo-ollama"), "{}", c.detail);
+        let y = gpu_contention_check(&node(serde_json::json!({
+            "state": "yielded", "method": "nvidia-smi", "foreign_mb": 3400, "noomesh_mb": 3754, "paused_backends": ["ollama"]}))).unwrap();
+        assert!(y.detail.starts_with("yielded: ollama paused (foreign 3.3 GB, nvidia-smi, noomesh 3.7 GB)"), "{}", y.detail);
+    }
+
+    #[test]
     fn held_is_a_warn_with_the_release_command() {
         let c = gpu_contention_check(&node(serde_json::json!({
             "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"]}))).unwrap();
         assert_eq!(c.verdict, Verdict::Warn);
         assert_eq!(c.detail, "held by operator (voice): vllm paused");
         assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3   # when the other work is done"));
+        // An owned lease (i163 D): the holder is named and the remedy quotes
+        // the lease, so the operator's release is a compare-and-set.
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "held", "reason": "voice", "method": "nvidia-smi", "paused_backends": ["vllm"],
+            "lease": {"owner": "rbwolf", "operation_id": "op-1", "generation": 4}}))).unwrap();
+        assert_eq!(c.detail, "held by rbwolf (voice): vllm paused");
+        assert_eq!(c.remedy.as_deref(), Some("noo cluster gpu release host3 --operation op-1 --generation 4   # when the other work is done"));
+        let c = gpu_contention_check(&node(serde_json::json!({
+            "state": "draining", "method": "nvidia-smi", "paused_backends": [], "lease": {"owner": "rbwolf"}}))).unwrap();
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("hold by rbwolf draining"), "{}", c.detail);
     }
 
     #[test]

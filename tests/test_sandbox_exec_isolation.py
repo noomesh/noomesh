@@ -166,9 +166,166 @@ def test_rlimits_scale_cpu_with_timeout_and_forbid_cores(monkeypatch):
 
 
 def test_with_rlimits_wraps_the_real_argv():
-    wrapped = sandbox.with_rlimits({resource.RLIMIT_CORE: (0, 0)}, ["/bin/true", "x"])
+    wrapped = sandbox.with_rlimits({resource.RLIMIT_CORE: (0, 0)}, "/tmp/scratch-x", ["/bin/true", "x"])
     assert wrapped[:3] == [sys.executable, "-I", "-c"]
+    assert wrapped[5] == "/tmp/scratch-x"
     assert wrapped[-2:] == ["/bin/true", "x"]
+
+
+# ── the executor uid ────────────────────────────────────────────────────
+
+
+class _PW:
+    def __init__(self, uid):
+        self.pw_uid = uid
+        self.pw_gid = uid
+
+
+def _with_executor(monkeypatch, uid=65600, caps=sandbox._EXECUTOR_CAPS, setpriv="/usr/bin/setpriv"):
+    monkeypatch.setattr(sandbox.pwd, "getpwnam", lambda name: _PW(uid) if name == sandbox.EXECUTOR_USER else (_ for _ in ()).throw(KeyError(name)))
+    monkeypatch.setattr(sandbox, "effective_caps", lambda *a: caps)
+    real_which = shutil.which
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name, *a, **kw: setpriv if name == "setpriv" else real_which(name, *a, **kw))
+
+
+def test_no_executor_without_the_user_the_caps_or_setpriv(monkeypatch):
+    monkeypatch.setattr(sandbox.pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    base, detail = sandbox.executor()
+    assert base is None and "no sandbox-exec user" in detail
+    _with_executor(monkeypatch, caps=0)
+    base, detail = sandbox.executor()
+    assert base is None and "CAP_SETUID/CAP_SETGID/CAP_KILL" in detail
+    _with_executor(monkeypatch, caps=sandbox._EXECUTOR_CAPS & ~(1 << sandbox._CAP_KILL))
+    assert sandbox.executor()[0] is None, "two of the three capabilities is not enough"
+    _with_executor(monkeypatch, setpriv=None)
+    base, detail = sandbox.executor()
+    assert base is None and "setpriv" in detail
+    _with_executor(monkeypatch, uid=os.getuid())
+    assert sandbox.executor()[0] is None, "the range must not contain the server's uid"
+    _with_executor(monkeypatch)
+    assert sandbox.executor() == (65600, "sandbox-exec (uids 65600-65663)")
+
+
+def test_effective_caps_reads_the_mask(tmp_path):
+    status = tmp_path / "status"
+    status.write_text("Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t00000000000000e0\nCapEff:\t00000000000000e0\n")
+    assert sandbox.effective_caps(str(status)) == sandbox._EXECUTOR_CAPS
+    assert sandbox.effective_caps(str(tmp_path / "missing")) == 0
+
+
+def test_drop_argv_clears_every_set_the_kernel_carries_across_exec(monkeypatch):
+    _with_executor(monkeypatch)
+    argv = sandbox.drop_argv((65601, 65601))
+    assert argv[0].endswith("setpriv")
+    assert argv[1:] == ["--reuid", "65601", "--regid", "65601", "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--"]
+    # No bounding-set drop: that needs CAP_SETPCAP the server does not hold.
+    assert not any(a.startswith("--bounding-set") for a in argv)
+    # Capabilities held but no executor user: the uid stays, the caps still go.
+    assert sandbox.drop_argv(None) == [argv[0], "--inh-caps=-all", "--ambient-caps=-all", "--"]
+    # Nothing held, nothing to drop; no setpriv, nothing to drop with.
+    _with_executor(monkeypatch, caps=0)
+    assert sandbox.drop_argv(None) == []
+    _with_executor(monkeypatch, setpriv=None)
+    assert sandbox.drop_argv((65601, 65601)) == []
+
+
+def test_launch_argv_drops_first_then_shim_then_the_real_command(tmp_path, monkeypatch):
+    _with_executor(monkeypatch)
+    scratch = str(tmp_path / "scratch")
+    argv = sandbox.launch_argv("process", scratch, {resource.RLIMIT_CORE: (0, 0)}, (65601, 65601))
+    sep = argv.index("--")
+    assert argv[0].endswith("setpriv") and argv[sep + 1] == sys.executable
+    assert argv[sep + 2 : sep + 4] == ["-I", "-c"]
+    assert argv[sep + 6] == scratch
+    assert argv[-3:] == [sys.executable, "-I", "-"]
+    # Without an executor and without capabilities the prefix is simply absent.
+    _with_executor(monkeypatch, caps=0)
+    plain = sandbox.launch_argv("process", scratch, {resource.RLIMIT_CORE: (0, 0)}, None)
+    assert plain == argv[sep + 1 :]
+    _with_executor(monkeypatch)
+    # bwrap mode: the jail sits inside the drop, so the namespaces are the executor's.
+    jailed = sandbox.launch_argv("bwrap", scratch, {resource.RLIMIT_CORE: (0, 0)}, (65601, 65601))
+    assert jailed[0].endswith("setpriv") and "--unshare-all" in jailed
+
+
+def test_executor_slots_hand_out_distinct_uids_and_give_them_back(monkeypatch):
+    _with_executor(monkeypatch)
+    with sandbox.executor_slot() as a, sandbox.executor_slot() as b:
+        assert a != b and a[0] == a[1] and 65600 <= a[0] < 65664 and 65600 <= b[0] < 65664
+    assert sandbox._slots.qsize() == sandbox.EXECUTOR_SLOTS
+    monkeypatch.setattr(sandbox.pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    with sandbox.executor_slot() as none:
+        assert none is None
+    assert sandbox._slots.qsize() == sandbox.EXECUTOR_SLOTS
+
+
+def test_the_shim_makes_the_scratch_dir_itself_and_refuses_an_existing_one(tmp_path, scrubbed_python):
+    scratch = tmp_path / "fresh"
+    argv = sandbox.with_rlimits({resource.RLIMIT_CORE: (0, 0)}, str(scratch), [scrubbed_python, "-I", "-c", "import os; print(os.getcwd())"])
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=sandbox.child_env(str(scratch)))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == os.path.realpath(scratch)
+    assert oct(scratch.stat().st_mode & 0o777) == "0o700"
+    # A path that already exists is never reused — a guess at the name
+    # cannot hand the code a directory someone else prepared.
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=sandbox.child_env(str(scratch)))
+    assert r.returncode == 125 and "cannot create the scratch directory" in r.stderr
+
+
+def test_cleanup_runs_as_the_executor_then_sweeps(monkeypatch, tmp_path):
+    _with_executor(monkeypatch)
+    calls = []
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    scratch = tmp_path / "s"
+    scratch.mkdir()
+    sandbox.cleanup(str(scratch), (65602, 65602))
+    assert calls and calls[0][:5] == ["/usr/bin/setpriv", "--reuid", "65602", "--regid", "65602"]
+    assert calls[0][-1] == str(scratch) and "rmtree" in calls[0][-2]
+    assert not scratch.exists(), "the server's own sweep still runs"
+    scratch.mkdir()
+    sandbox.cleanup(str(scratch), None)
+    assert len(calls) == 1 and not scratch.exists()
+
+
+def test_kill_everything_of_signals_only_that_uid(monkeypatch, tmp_path):
+    for pid, uid in (("100", 65605), ("101", 65532), ("102", 65605), ("notapid", 65605)):
+        d = tmp_path / pid
+        d.mkdir()
+        (d / "status").write_text(f"Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    killed = []
+    monkeypatch.setattr(sandbox.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert sandbox.kill_everything_of(65605, proc_root=str(tmp_path)) == 2
+    assert sorted(killed) == [(100, 9), (102, 9)]
+
+
+def test_run_code_reports_the_executor_and_kills_by_uid_on_timeout(monkeypatch, scrubbed_python):
+    """With a (fake) executor the launch goes through setpriv, which a
+    workstation cannot do — so stand in for the drop with a no-op prefix
+    and check the server's side: the uid in the result, the uid kill
+    after a timeout, the cleanup as the executor."""
+    _with_executor(monkeypatch, setpriv="/usr/bin/env")
+    monkeypatch.setattr(sandbox, "drop_argv", lambda exec_user: ["/usr/bin/env", "--"])
+    killed, cleaned = [], []
+    monkeypatch.setattr(sandbox, "kill_everything_of", lambda uid: killed.append(uid) or 0)
+    real_cleanup = sandbox.cleanup
+    monkeypatch.setattr(sandbox, "cleanup", lambda scratch, eu: cleaned.append(eu) or real_cleanup(scratch, None))
+    result = sandbox.run_code("print('hi')", 5, "process")
+    assert result["exit_code"] == 0, result
+    uid = result["executor"]
+    assert 65600 <= uid < 65600 + sandbox.EXECUTOR_SLOTS, result
+    assert cleaned == [(uid, uid)] and killed == []
+    result = sandbox.run_code("import time; time.sleep(30)", 1, "process")
+    assert result["timed_out"] is True and killed == [result["executor"]]
+
+
+def test_health_reports_the_executor(monkeypatch):
+    monkeypatch.setattr(sandbox, "_run_bwrap_probe", lambda: (True, "bwrap"))
+    monkeypatch.setattr(sandbox.pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    h = sandbox.health()
+    assert h["executor"]["uid"] is None and h["executor"]["slots"] == 0 and "sandbox-exec" in h["executor"]["detail"]
+    _with_executor(monkeypatch)
+    h = sandbox.health()
+    assert h["executor"] == {"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}
 
 
 # ── process mode, live ──────────────────────────────────────────────────
@@ -176,14 +333,14 @@ def test_with_rlimits_wraps_the_real_argv():
 
 def test_process_mode_runs_code_in_a_private_scratch_dir(monkeypatch, scrubbed_python):
     seen = []
-    real = tempfile.mkdtemp
+    real = sandbox._scratch_path
 
-    def spy(*a, **kw):
-        d = real(*a, **kw)
+    def spy():
+        d = real()
         seen.append(d)
         return d
 
-    monkeypatch.setattr(sandbox.tempfile, "mkdtemp", spy)
+    monkeypatch.setattr(sandbox, "_scratch_path", spy)
     result = sandbox.run_code(
         "import os; print(os.getcwd() == os.environ['HOME'], sorted(os.environ)[:2])",
         5,

@@ -15,18 +15,25 @@
 ARG HUB_MIRROR=ghcr.io/noomesh/mirror
 FROM ${HUB_MIRROR}/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 
-RUN apk add --no-cache stunnel openssl
-RUN adduser -D -H stunnel 2>/dev/null || true
+RUN apk add --no-cache stunnel openssl \
+ && addgroup -g 65532 -S nonroot \
+ && adduser -S -D -H -u 65532 -G nonroot -s /sbin/nologin nonroot
 
-# Runs as root ON PURPOSE (the only first-party image that still does, with the
-# nvidia exporter): the service leaf key it reads is mode 0600, owned by the
-# operator who issued it (noo-cli pki.rs KeyReader::ContainerRoot: root inside
-# the container reads it through CAP_DAC_OVERRIDE). A non-root USER here would
-# need every stunnel-* service key handed to a fixed uid (the ContainerUid
-# path, a chown that needs sudo on each host) - a change to the PKI key table,
-# not to this image. The base is current alpine pinned by digest (3.19 was end
-# of life), and the stunnel.conf the sidecars mount sets `pid =` and
-# `foreground = yes`, so nothing else needs root.
+# NON-ROOT (i132). The controller's doors run as `nonroot`, uid 65532, the uid the PKI
+# key table hands every `services/<door>/service.key` to (noo-cli pki.rs
+# SERVICE_KEY_READERS, KeyReader::ContainerUid): `noo upgrade --stack` and
+# `noo security pki fix-modes` give that uid the key (group, else ACL) before
+# the launcher recreates the door. stunnel needs no privilege here: the
+# stunnel.conf the sidecars mount sets `pid =` and `foreground = yes`, its
+# ports are above 1024 or reached through the container netns' unprivileged
+# port range (Docker sets net.ipv4.ip_unprivileged_port_start=0), and the
+# self-pin entrypoint in compose writes only under /tmp.
+#
+# The doors a NODE's agent starts (node-agent-go internal/docker/sidecar.go)
+# read a root-owned 0600 copy of the leaf under /etc/noo/pki: the agent runs
+# them with `User: "0"` explicitly, so this USER never reaches them. The base
+# is current alpine pinned by digest (3.19 was end of life).
+USER nonroot
 
 ENTRYPOINT ["stunnel"]
 CMD ["/etc/stunnel/stunnel.conf"]

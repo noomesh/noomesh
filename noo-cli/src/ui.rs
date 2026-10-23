@@ -330,6 +330,21 @@ pub fn state(word: &str) -> String {
     }
 }
 
+/// A count from a gateway payload, for a status/stat row or table cell.
+///
+/// Three answers, not one: a JSON number renders as itself; a key that is
+/// MISSING, null, or not a number (a string, a bool, an object) renders as
+/// "not reported". A gateway that omits or renames a field must not print
+/// "documents 0" with exit 0 (i191 D5): absence is what an older or
+/// diverged peer looks like, and zero is a claim. Use this for rendering
+/// only; arithmetic, paging and exit-code decisions keep their own handling.
+pub fn count(v: &serde_json::Value, key: &str) -> String {
+    match &v[key] {
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => state("not reported"),
+    }
+}
+
 // ── layout (§5) ─────────────────────────────────────────────────────────
 
 /// Layout width: the terminal width, capped so a very wide terminal does
@@ -1377,6 +1392,21 @@ pub fn pager_finish() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn count_renders_numbers_and_calls_everything_else_not_reported() {
+        let v = serde_json::json!({"zero": 0, "n": 42, "f": 1.5, "s": "7", "nul": null, "b": true, "o": {"a": 1}});
+        assert_eq!(super::count(&v, "zero"), "0", "a real zero is a zero");
+        assert_eq!(super::count(&v, "n"), "42");
+        assert_eq!(super::count(&v, "f"), "1.5");
+        for key in ["missing", "s", "nul", "b", "o"] {
+            let c = super::count(&v, key);
+            assert_eq!(c, super::state("not reported"), "{key}");
+            assert!(c.contains("Not reported") && !c.contains('0'), "{key}: {c}");
+        }
+        // Not an object at all: still a clean answer, no panic.
+        assert_eq!(super::count(&serde_json::json!(null), "x"), super::state("not reported"));
+    }
+
     #[test]
     fn a_progress_frame_never_wraps_the_terminal() {
         let long = "⠙ → Staged — waiting for host3 to pull, apply and report (poked over the bus; its 5-min timer is the fallback)";

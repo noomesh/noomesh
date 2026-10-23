@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -350,5 +351,119 @@ func TestOllamaChatWholeReplyAndErrorsKeepOpenAIShape(t *testing.T) {
 	rec = call(`not json`)
 	if rec.Code != 400 {
 		t.Fatalf("bad body status %d", rec.Code)
+	}
+}
+
+// noomesh-internal i174: a reply made of reserved tokens only is a backend
+// error, never an answer; a stream of them is cut with an error event.
+func TestReservedTokensOnlyIsABackendErrorNotAnAnswer(t *testing.T) {
+	for s, want := range map[string]bool{
+		"<unused49><unused49><unused49>": true,
+		" <unused0> \n<unused12>":        true,
+		"ok":                             false,
+		"":                               false,
+		"<unused49> and a word":          false,
+		"the <unused3> token":            false,
+	} {
+		if got := reservedTokensOnly(s); got != want {
+			t.Fatalf("reservedTokensOnly(%q) = %v", s, got)
+		}
+	}
+	var g reservedTokenGuard
+	for i := 0; i < reservedTokenTripAfter-1; i++ {
+		if g.feed("<unused49>", false) {
+			t.Fatalf("tripped at %d tokens", i+1)
+		}
+	}
+	if !g.feed("<unused49>", false) {
+		t.Fatal("trips at the limit")
+	}
+	g = reservedTokenGuard{}
+	if g.feed("<unused49><unused49>", false) || !g.feed("", true) {
+		t.Fatal("a stream that ends with only reserved tokens trips at done")
+	}
+	g = reservedTokenGuard{}
+	if g.feed("Sure", false) || g.feed("<unused49>", false) || g.feed("<unused49><unused49><unused49><unused49><unused49><unused49><unused49><unused49>", true) {
+		t.Fatal("real text first: never tripped")
+	}
+}
+
+func TestProxyRefusesAReservedTokenReplyAndCutsAReservedTokenStream(t *testing.T) {
+	garbage := strings.Repeat("<unused49>", 20)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &req)
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"model":"m","message":{"role":"assistant","content":%q},"done":true,"done_reason":"stop"}`, garbage)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for i := 0; i < 20; i++ {
+			fmt.Fprint(w, `{"model":"m","message":{"role":"assistant","content":"<unused49>"},"done":false}`+"\n")
+		}
+		fmt.Fprint(w, `{"model":"m","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}`+"\n")
+	}))
+	defer mock.Close()
+	s := &Server{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s.proxyOllamaChat(w, r, body, mock.URL, "http", time.Second)
+	}))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 502 || !strings.Contains(string(body), `"bad_output"`) || strings.Contains(string(body), "<unused49><unused49>") {
+		t.Fatalf("whole reply: %d %s", resp.StatusCode, body)
+	}
+
+	resp, err = http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	out := string(body)
+	if resp.StatusCode != 200 || !strings.Contains(out, `"bad_output"`) || !strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]") {
+		t.Fatalf("stream: %d %s", resp.StatusCode, out)
+	}
+	if n := strings.Count(out, "<unused49>"); n >= 20 {
+		t.Fatalf("the stream was cut, not relayed whole: %d tokens reached the caller", n)
+	}
+}
+
+// The allowlist runs before the translator (handleInferenceProxy): a
+// thinking switch the translator reads must survive it, or it is a silent
+// no-op (i183: chat_template_kwargs was stripped for ollama, so
+// enable_thinking=false left thinking on). Composed, the two must agree.
+func TestThinkingOffSurvivesTheAllowlistIntoTheOllamaBody(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"x","messages":[],"chat_template_kwargs":{"enable_thinking":false}}`,
+		`{"model":"x","messages":[],"reasoning":{"effort":"none"}}`,
+		`{"model":"x","messages":[],"reasoning_effort":"none"}`,
+		`{"model":"x","messages":[],"think":false}`,
+	} {
+		filtered := filterBodyForBackend([]byte(body), "ollama")
+		req, err := openAIToOllamaChat(filtered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := decode(t, req.body)
+		if v, ok := out["think"]; !ok || v != false {
+			t.Errorf("%s: think=%v after the allowlist, want false", body, out["think"])
+		}
+		for _, k := range []string{"chat_template_kwargs", "reasoning", "reasoning_effort"} {
+			if _, ok := out[k]; ok {
+				t.Errorf("%s: %s must be consumed by the translator, not sent to ollama", body, k)
+			}
+		}
 	}
 }

@@ -151,13 +151,44 @@ noo_check_port_collisions() {
     return 0
 }
 
-# The compose-project data volume (e.g. pai-assistant_noo-data for the
-# default instance, noo-galaxy_noo-data for instance `galaxy`). Mirrors
-# compose's own project→volume naming so scripts stop hardcoding the
-# literal.
+# The compose-project data volume: noomesh_noo-data for the default
+# instance, noo-galaxy_noo-data for instance `galaxy`. The project is the
+# `name:` the compose files declare (noomesh), NOT the cwd: on a dist
+# install the cwd is the install root (~/.noo), and basename-of-$PWD built
+# ".noo_noo-data", an invalid volume name (docker exit 125, rc.4 rehearsal).
+# Instances override it via COMPOSE_PROJECT_NAME (noo_instance_env above).
 noo_data_volume() {
-    local project="${COMPOSE_PROJECT_NAME:-$(basename "$PWD" | tr '[:upper:]' '[:lower:]')}"
-    printf '%s_noo-data\n' "$project"
+    printf '%s_noo-data\n' "${COMPOSE_PROJECT_NAME:-noomesh}"
+}
+
+# The directories the gateway (nonroot, uid 65532) creates under /data on
+# the noo-data volume, made and handed to 65532 before it starts. The volume
+# root stays owned by whoever first wrote it (onboard's `subdir_owner` leaves
+# noo-data with the operator, on purpose: host tooling reads it), so the
+# gateway's own create_dir_all of a NEW top-level dir fails EACCES:
+#   - ingest/{working,archive}: Drive/folder ingest staging (live 2026-08-08,
+#     Drive->KB ingestion silently broken, one warn per file per tick);
+#   - audit-archive: the agent-mail archive (gateway-rust
+#     agent_mail_archive.rs) and audit retention export
+#     (`${NOO_DATA_DIR}/audit-archive`). 0.6.10-rc.3 rehearsal: "cannot
+#     create /data/audit-archive: Permission denied" on every host.
+# A throwaway root container through the same volume: no sudo, idempotent,
+# never touches anything outside these dirs. Not fatal (no docker, no
+# alpine), but never silent: a failed prep prints a WARNING with docker's
+# own error, and the gateway then names the directory it could not create.
+# Pinned by tests/test_gateway_data_dirs_prepared.py.
+NOO_GATEWAY_DATA_DIRS="ingest audit-archive"
+noo_prepare_gateway_data_dirs() {
+    local vol out
+    vol="$(noo_data_volume)"
+    if ! out="$(docker run --rm -v "$vol":/d alpine \
+        sh -c 'mkdir -p /d/ingest/working /d/ingest/archive /d/audit-archive && chown -R 65532:65532 /d/ingest /d/audit-archive' \
+        2>&1)"; then
+        echo "WARNING: could not prepare the gateway's data dirs on volume '$vol'" >&2
+        echo "         (the gateway may fail with 'Permission denied' on /data/audit-archive):" >&2
+        printf '%s\n' "$out" | sed 's/^/         /' >&2
+    fi
+    return 0
 }
 
 noo_instance_env

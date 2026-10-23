@@ -3,19 +3,28 @@
 
 //! `noo cluster …` provisioning surface — the operator-facing fleet bring-up
 //! commands, ported so the static Rust binary is a STANDALONE controller
-//! artifact (curl the binary, provision a fleet, zero Python present). These
-//! still shell out to external TOOLS (ssh, scp, docker, tailscale via its HTTP
-//! API) — that's an inherent dependency of provisioning — but they no longer
-//! require the Python CLI runtime.
+//! artifact (curl the binary, provision a fleet, zero Python present). They
+//! still call a few external TOOLS (tailscale, openssl) and the Tailscale
+//! HTTP API — an inherent dependency of provisioning — but none reaches a
+//! node over SSH or scp: that lane is retired (see the notes below and
+//! `tests/test_no_controller_ssh.py`). Nodes are brought up and kept current
+//! over the pull rails (enrollment, signed bundles, the artifact rail).
 //!
-//! | command          | kind                    | replicates                                   |
-//! |------------------|-------------------------|----------------------------------------------|
-//! | `auto-place`     | native (HTTP + local)   | `model_placement.plan_model_placements`      |
-//! | `place-model`    | native (HTTP + local)   | `model_placement.match_node_for_model`       |
-//! | `mint-join-key`  | native (Tailscale API)  | `tailscale.mint_join_key` + one-liner        |
-//! | `set-primary`    | native (Tailscale API + ssh) | device rename + Postgres promotion      |
-//! | `sync-images`    | subprocess (docker/ssh/scp) | cross-arch save|load orchestration       |
-//! | `upgrade-agents` | subprocess (child provision) | serial `cluster provision <n> --wait` (bundle rail; swap retired, prop 58 A3) |
+//! | command                  | kind                         | what it does                                  |
+//! |--------------------------|------------------------------|-----------------------------------------------|
+//! | `auto-place`             | native (HTTP + local)        | plans model placements across online nodes    |
+//! | `place-model`            | native (HTTP + local)        | picks the node a given model fits best        |
+//! | `reconcile-models`       | native (HTTP + local)        | plans placement only for the gap to the set   |
+//! | `mint-join-key`          | native (Tailscale API)       | mints a tagged auth key + the join one-liner  |
+//! | `set-primary`            | native (Tailscale API)       | device rename for the controller cutover; the |
+//! |                          |                              | Postgres promotion is run ON the target, and  |
+//! |                          |                              | `--promoted` confirms it                      |
+//! | `bootstrap-token ...`    | native (HTTP + local)        | create / list / revoke node bootstrap tokens  |
+//! | `invite`                 | native (Tailscale)           | tailnet-native node invitation                |
+//!
+//! The image and agent orchestrators (`sync-images`, `upgrade-agents`,
+//! `ship-model`, `clean`) live in `cluster_provision_subprocess.rs` and
+//! `image_stage.rs`; both stage over the artifact and bundle rails.
 //!
 //! Faithful-replication notes / narrowings (honest, per command):
 //!   - `add-node` was DELETED 2026-09-03. It drove the

@@ -611,6 +611,9 @@ pub fn build_table(nodes: &[NodeFacts], placements: &[PlacementRow], decl: &Decl
             if n.non_chat.iter().any(|b| b == bt) || n.model_missing.iter().any(|b| b == bt) || n.paused_backends.iter().any(|b| b == bt) {
                 continue;
             }
+            if lane_held(&n.node_id, bt) {
+                continue;
+            }
             let Some(chat_model) = chat_model_for(n, placements, bt, m) else { continue };
             served.push(candidate(n, bt, &chat_model, 0, false, CandidateStatus::Placed));
         }
@@ -1077,6 +1080,56 @@ fn node_refusal(table: &ClassTable, node: &str, hint: Option<&str>) -> Refusal {
         hint.unwrap_or(CHAT_DEFAULT),
         serves.join(", ")
     ))
+}
+
+// ── GPU holds in progress (routes/cluster.rs gpu_hold) ──────────────────
+//
+// A drain hold must route nothing new to the node BEFORE the agent stops
+// anything, and the heartbeat that lists the paused lanes is up to a poll
+// away; the hold route marks the gateway's own view here. Nodes marked
+// draining lose every lane for the drain (at most the hold's timeout); a
+// held node's paused lanes are kept out until the release, which is what
+// the heartbeat's `paused_backends` says by then too.
+
+static GPU_DRAINING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+static GPU_PAUSED_LANES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Mark (or unmark) a node as draining for a GPU hold: no lane of it is a
+/// candidate while marked.
+pub fn set_node_draining(node_id: &str, on: bool) {
+    let set = GPU_DRAINING.get_or_init(Default::default);
+    if let Ok(mut g) = set.lock() {
+        if on {
+            g.insert(node_id.to_string());
+        } else {
+            g.remove(node_id);
+        }
+    }
+    tracing::info!(node_id, draining = on, "gpu_hold_routing_mark");
+}
+
+/// Record the lanes a GPU hold paused on the node (empty = none, on release).
+pub fn set_lanes_paused(node_id: &str, backends: &[String]) {
+    let m = GPU_PAUSED_LANES.get_or_init(Default::default);
+    if let Ok(mut g) = m.lock() {
+        if backends.is_empty() {
+            g.remove(node_id);
+        } else {
+            g.insert(node_id.to_string(), backends.to_vec());
+        }
+    }
+}
+
+/// Is `(node, backend)` kept out of routing by a GPU hold in progress or in
+/// force, as the gateway marked it?
+pub fn lane_held(node_id: &str, backend: &str) -> bool {
+    if GPU_DRAINING.get().and_then(|s| s.lock().ok()).is_some_and(|g| g.contains(node_id)) {
+        return true;
+    }
+    GPU_PAUSED_LANES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .is_some_and(|g| g.get(node_id).is_some_and(|v| v.iter().any(|b| b == backend)))
 }
 
 // ── stall memory ─────────────────────────────────────────────────────────
@@ -2305,6 +2358,28 @@ mod tests {
         assert!(matches!(select_with(&t, None, Some("pop-os"), true, &|c| c.node_id == "pop-os", &idle, &fresh), Err(Refusal::NoCandidates(_))));
         // strict with no node means nothing.
         assert_eq!(order(&select_with(&t, None, None, true, &|_| false, &idle, &fresh).unwrap()), ["mcmini", "pop-os"]);
+    }
+
+    /// A GPU hold in progress keeps the node out of routing before the
+    /// heartbeat says so: the whole node while it drains, the paused lanes
+    /// once held, nothing once released.
+    #[test]
+    fn a_gpu_hold_marks_lanes_out_of_routing_before_the_heartbeat() {
+        let id = "hold-mark-test";
+        let n = node(id, "100.64.1.9", &[("vllm", "m"), ("llamacpp", "m")], &[], true, 1, 0.1);
+        let lanes = |t: &ClassTable| -> Vec<String> {
+            t.classes.iter().find(|c| c.name == CHAT_DEFAULT).map(|c| c.candidates.iter().map(|c| c.backend.clone()).collect()).unwrap_or_default()
+        };
+        let mut all = lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default()));
+        all.sort();
+        assert_eq!(all, ["llamacpp", "vllm"], "both lanes before the hold");
+        set_node_draining(id, true);
+        assert!(lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default())).is_empty(), "draining: no lane of the node");
+        set_node_draining(id, false);
+        set_lanes_paused(id, &["vllm".to_string()]);
+        assert_eq!(lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default())), ["llamacpp"], "held: only the paused lane is out");
+        set_lanes_paused(id, &[]);
+        assert_eq!(lanes(&build_table(std::slice::from_ref(&n), &[], &Declarations::default())).len(), 2, "released: both back");
     }
 
     #[test]

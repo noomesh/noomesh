@@ -113,6 +113,19 @@ shred -u ~/noo-backups/age-key_*.txt   # then destroy the plaintext
 
 `restore-drill.sh` fails while any plaintext `age-key_*.txt` remains.
 
+### The cold-storage archive is in the backup
+
+Retention archives expired audit partitions and agent mail under
+`/data/audit-archive` on the gateway's volume and then deletes them from
+Postgres, so the dump above does not contain them. `backup-controller.sh`
+therefore also writes `archive_<ts>.tar.enc` (the whole directory, AES-256 with
+`NOO_BACKUP_PASSPHRASE`, a full snapshot each time; the newest three are always
+kept and older ones age out with the dumps). It is copied offsite with the
+dump and carried by `noo-backup-export.sh`. A run that cannot back it up fails.
+Restore: `openssl enc -d -aes-256-cbc -pbkdf2 -in archive_<ts>.tar.enc | tar -x`
+and copy the files back into `/data/audit-archive`. The agent-mail bodies in it
+are sealed with `NOO_AGENT_REVIEW_KEY`; keep that key as safe as the age key.
+
 ### Getting a copy off the machine
 
 Everything above — the dumps, the Postgres volume, the encrypted age key —
@@ -323,8 +336,11 @@ socket, which is the one path `pg_hba` still trusts. Postgres accepts no TCP
 client without TLS **and** a cluster-CA client certificate (since 2026-09-28,
 `docker/postgres/pg_hba.conf`), so a `psql -h 127.0.0.1 -p 5433` from the host
 needs `sslmode=verify-ca sslrootcert=$NOO_PKI_DIR/ca.crt
-sslcert=$NOO_PKI_DIR/gateway/gateway.crt sslkey=<a 0600 copy of gateway.key>`
-on top of the password — libpq refuses the 0644 key as mounted. Prefer the
+sslcert=$NOO_PKI_DIR/gateway/pg/noo.crt sslkey=<a 0600 copy of gateway/pg/noo.key>`
+on top of the password — libpq refuses the key as mounted. The certificate
+must be the one issued for the role you log in as (its CN is the role:
+`gateway/pg/noo.crt` for `noo`, `gateway/pg/noo_app.crt` for `noo_app`);
+the gateway's own `gateway/gateway.crt` is refused for those roles. Prefer the
 `docker exec` form.
 
 (`noo` / `noomesh` are the defaults for `POSTGRES_USER` / `POSTGRES_DB`.)

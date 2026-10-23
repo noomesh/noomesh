@@ -132,8 +132,10 @@ def test_the_images_install_it() -> None:
     for the evolve add-on's Dockerfile to `COPY --from=gwclient`."""
     deps_base = (ROOT / "docker" / "Dockerfile.deps-base").read_text()
     assert "COPY packages/noo-gateway-client /tmp/noo-gateway-client" in deps_base
-    assert "noo-gateway-client @ file:///tmp/noo-gateway-client" in deps_base
-    assert "/tmp/noo-gateway-client" in deps_base.split("uv pip install --system")[-1]
+    # Installed from that tree, --no-deps, after the hash-locked third-party set
+    # (the old uv-overrides line is gone: nothing resolves from ranges now).
+    last = deps_base.replace("\\\n", " ").split("uv pip install --system")[-1]
+    assert "/tmp/noo-gateway-client" in last and "--no-deps" in deps_base.split("--require-hashes")[-1]
     # The evolve image is built by the add-on's own release workflow
     # (2026-10-11), not here, so this release no longer passes the `gwclient`
     # named context. The Dockerfile has never used it; that workflow refuses

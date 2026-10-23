@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -525,11 +526,59 @@ func (s *Server) proxyOllamaChat(w http.ResponseWriter, r *http.Request, body []
 			jsonError(w, http.StatusBadGateway, "backend_error", reply.Error)
 			return
 		}
+		if len(reply.Message.ToolCalls) == 0 && reservedTokensOnly(reply.Message.Content) {
+			slog.Warn("inference proxy: the model answered with reserved tokens only", "backend", "ollama", "model", req.model, "chars", len(reply.Message.Content))
+			jsonError(w, http.StatusBadGateway, "bad_output", badOutputMessage)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ollamaToOpenAIResponse(&reply, req.model, id, created))
 		return
 	}
 	streamOllamaChat(r.Context(), w, resp.Body, &ollamaChunker{id: id, model: req.model, created: created, includeUsage: req.includeUsage})
+}
+
+// A reply made of nothing but the model's reserved vocabulary (gemma's
+// `<unusedN>` ids) is not text: a broken sample, never an answer. Returned
+// as a backend error so the caller retries or fails loudly instead of
+// posting it as a result (noomesh-internal i174, mcmini 2026-10-22).
+var reservedTokenRe = regexp.MustCompile(`^(\s*<unused\d+>)+\s*$`)
+
+const badOutputMessage = "the model answered with reserved tokens only (<unusedN>); not an answer — check the backend's KV cache / quantisation settings"
+
+// reservedTokensOnly: non-empty content that is reserved tokens throughout.
+func reservedTokensOnly(content string) bool {
+	return strings.TrimSpace(content) != "" && reservedTokenRe.MatchString(content)
+}
+
+// reservedTokenGuard watches a stream's content: it trips once
+// reservedTokenTripAfter reserved tokens have arrived with no real text in
+// front of them, or when the stream ends having carried reserved tokens
+// and nothing else.
+type reservedTokenGuard struct {
+	tokens int
+	text   bool
+}
+
+const reservedTokenTripAfter = 8
+
+var reservedTokenFindRe = regexp.MustCompile(`<unused\d+>`)
+
+// feed records one content delta; true = tripped (stop the stream).
+func (g *reservedTokenGuard) feed(content string, done bool) bool {
+	if g.text {
+		return false
+	}
+	rest := strings.TrimSpace(reservedTokenFindRe.ReplaceAllString(content, ""))
+	if rest != "" {
+		g.text = true
+		return false
+	}
+	g.tokens += len(reservedTokenFindRe.FindAllStringIndex(content, -1))
+	if g.tokens >= reservedTokenTripAfter {
+		return true
+	}
+	return done && g.tokens > 0
 }
 
 // streamOllamaChat relays an /api/chat NDJSON stream as OpenAI SSE, one
@@ -549,6 +598,7 @@ func streamOllamaChat(ctx context.Context, w http.ResponseWriter, body io.Reader
 	flush()
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64<<10), 16<<20)
+	var guard reservedTokenGuard
 	for sc.Scan() {
 		if ctx.Err() != nil {
 			return
@@ -564,6 +614,13 @@ func streamOllamaChat(ctx context.Context, w http.ResponseWriter, body io.Reader
 		}
 		if reply.Error != "" {
 			e, _ := json.Marshal(map[string]any{"error": map[string]any{"message": reply.Error, "type": "node_agent_proxy_error", "code": "backend_error"}})
+			fmt.Fprintf(w, "data: %s\n\n", e)
+			flush()
+			break
+		}
+		if len(reply.Message.ToolCalls) == 0 && guard.feed(reply.Message.Content, reply.Done) {
+			slog.Warn("inference proxy: the model is emitting reserved tokens only; cutting the stream", "backend", "ollama", "model", c.model, "tokens", guard.tokens)
+			e, _ := json.Marshal(map[string]any{"error": map[string]any{"message": badOutputMessage, "type": "node_agent_proxy_error", "code": "bad_output", "status": 502}})
 			fmt.Fprintf(w, "data: %s\n\n", e)
 			flush()
 			break

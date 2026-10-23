@@ -158,7 +158,11 @@ def test_each_service_presents_exactly_its_own_leaf():
         dsns = [v for v in env.values() if re.match(r"postgres(ql)?://", v or "")]
         assert len(dsns) >= min_dsns, f"{name}: only {len(dsns)} DSNs"
         for dsn in dsns:
-            assert f"sslcert={LEAF_TARGET}/service.crt" in dsn and f"sslkey={LEAF_TARGET}/service.key" in dsn, dsn
+            # Inside the leaf the DSN's certificate is the one issued for the
+            # DSN's ROLE (`<leaf>/pg/<role>.crt`, CN = role: pg_hba requires
+            # it, i132); the service's own `service.crt` is for the doors.
+            role = re.match(r"postgres(?:ql)?://([^:@/]+)", dsn).group(1)
+            assert f"sslcert={LEAF_TARGET}/pg/{role}.crt" in dsn and f"sslkey={LEAF_TARGET}/pg/{role}.key" in dsn, dsn
 
 
 def test_the_exception_list_is_empty():

@@ -114,6 +114,10 @@ pub struct Task {
     /// Computed on read: tokens left under `token_budget`; `None` = no cap.
     #[serde(default)]
     pub remaining: Option<i64>,
+    /// Who started it on the person's behalf: `addon:<name>` for a task an
+    /// add-on created with a delegated token (i143); `None` = created directly.
+    #[serde(default)]
+    pub created_via: Option<String>,
 }
 
 impl Task {
@@ -171,6 +175,7 @@ fn row_to_task(r: &sqlx::postgres::PgRow) -> Task {
         token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
         tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
         budget_state: r.try_get::<Option<String>, _>("budget_state").ok().flatten(),
+        created_via: r.try_get::<Option<String>, _>("created_via").ok().flatten(),
         remaining: crate::task_budget::remaining_task(crate::task_budget::TaskSpend {
             token_budget: r.try_get::<Option<i64>, _>("token_budget").ok().flatten(),
             tokens_spent: r.try_get::<i64, _>("tokens_spent").unwrap_or(0),
@@ -218,7 +223,7 @@ pub fn is_stale(state: &str, last: Option<chrono::DateTime<chrono::Utc>>, loops_
 
 const SELECT: &str = "SELECT t.id, t.objective, u.username AS owner, t.node, t.state, t.conversation_id, t.thread_id, \
     t.channel, t.model, t.loops, t.loop_budget, t.last_checkpoint, t.last_note, t.result, t.error, t.created_at, t.updated_at, \
-    t.parent_id, t.role, t.budget_default, t.token_budget, t.tokens_spent, t.budget_state \
+    t.parent_id, t.role, t.budget_default, t.token_budget, t.tokens_spent, t.budget_state, t.created_via \
     FROM noo_tasks t LEFT JOIN noo_users u ON u.user_uuid = t.owner_uuid";
 
 /// How a task is created: who for, under which parent, in which thread.
@@ -234,6 +239,8 @@ pub struct NewTask<'a> {
     pub role: Option<&'a str>,
     /// The task's token cap (i83 G); `None` = no cap.
     pub token_budget: Option<i64>,
+    /// `addon:<name>` when an add-on creates it through a delegated token.
+    pub created_via: Option<&'a str>,
 }
 
 /// The most children one task may fan out or delegate, and how deep a
@@ -268,8 +275,8 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
     sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via) \
+         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(new.objective)
@@ -283,8 +290,11 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     .bind(new.role)
     .bind(budget_default)
     .bind(new.token_budget.filter(|b| *b > 0))
+    .bind(new.created_via)
     .execute(db)
     .await?;
+    // i143 D: the first event of an add-on's task (a no-op for any other).
+    crate::task_events::emit_state(db, &id.to_string(), "open", None).await;
     get(db, &id.to_string()).await?.ok_or_else(|| anyhow!("task vanished after insert"))
 }
 
@@ -379,8 +389,8 @@ pub async fn settle_parent(db: &sqlx::PgPool, child: &Task) -> Result<()> {
     Ok(())
 }
 
-pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>, token_budget: Option<i64>) -> Result<Task> {
-    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None, token_budget }).await
+pub async fn create(db: &sqlx::PgPool, owner: &str, objective: &str, model: Option<&str>, loop_budget: Option<u32>, token_budget: Option<i64>, created_via: Option<&str>) -> Result<Task> {
+    create_task(db, NewTask { owner: Some(owner), objective, model, loop_budget: loop_budget.map(|b| b.max(1)), parent: None, role: None, token_budget, created_via }).await
 }
 
 pub async fn get(db: &sqlx::PgPool, id: &str) -> Result<Option<Task>> {
@@ -400,6 +410,101 @@ pub async fn list(db: &sqlx::PgPool, owner: Option<&str>, state: Option<&str>, l
     .fetch_all(db)
     .await?;
     Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// `owner`'s tasks that were created `via` (`addon:<name>`), newest first.
+/// What an add-on's delegated token lists: never another account's, never a
+/// directly created task.
+pub async fn list_via(db: &sqlx::PgPool, owner: &str, via: &str, state: Option<&str>, limit: i64) -> Result<Vec<Task>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT} WHERE u.username = $1 AND t.created_via = $2 AND ($3::text IS NULL OR t.state = $3) \
+         AND t.parent_id IS NULL ORDER BY t.created_at DESC LIMIT $4"
+    )))
+    .bind(owner)
+    .bind(via)
+    .bind(state)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(row_to_task).collect())
+}
+
+/// Stop every unfinished task of `owner` that was created `via`: "revoke this
+/// add-on's background work". Each goes through [`stop_with`], the single stop
+/// path (it records the `revoked` event), so it is honoured at the task's next
+/// checkpoint like any stop. Returns the ids it stopped.
+pub async fn stop_via(db: &sqlx::PgPool, owner: &str, via: &str) -> Result<Vec<String>> {
+    let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM noo_tasks \
+         WHERE owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1) AND created_via = $2 \
+         AND state IN ('open','running','checkpointed')",
+    )
+    .bind(owner)
+    .bind(via)
+    .fetch_all(db)
+    .await?;
+    let mut stopped = Vec::new();
+    for id in live {
+        let id = id.to_string();
+        if stop_with(db, &id, "background_revoked").await? {
+            stopped.push(id);
+        }
+    }
+    Ok(stopped)
+}
+
+/// How long an `Idempotency-Key` is remembered.
+pub const IDEMPOTENCY_HOURS: i32 = 24;
+
+/// The task a recent create with this key made, if any. `via` is the empty
+/// string for a direct create, `addon:<name>` for a delegated one, so a key
+/// never crosses from one to the other.
+pub async fn idempotent_task(db: &sqlx::PgPool, owner: &str, via: &str, key: &str) -> Result<Option<String>> {
+    let id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT i.task_id FROM noo_task_idempotency i JOIN noo_tasks t ON t.id = i.task_id \
+         WHERE i.owner = $1 AND i.via = $2 AND i.key = $3 AND i.created_at > now() - make_interval(hours => $4)",
+    )
+    .bind(owner)
+    .bind(via)
+    .bind(key)
+    .bind(IDEMPOTENCY_HOURS)
+    .fetch_optional(db)
+    .await?;
+    Ok(id.map(|u| u.to_string()))
+}
+
+/// Record that `task_id` is the answer to `(owner, via, key)` and return the
+/// task id that now owns the key. Race-safe: of two concurrent creates with
+/// one key exactly one wins and both get its id; an expired or orphaned entry
+/// is taken over. A caller that gets back an id other than its own has lost.
+pub async fn claim_idempotency(db: &sqlx::PgPool, owner: &str, via: &str, key: &str, task_id: &str) -> Result<String> {
+    let mine = uuid::Uuid::parse_str(task_id)?;
+    let won: Option<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO noo_task_idempotency (owner, via, key, task_id) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (owner, via, key) DO UPDATE SET task_id = EXCLUDED.task_id, created_at = now() \
+         WHERE noo_task_idempotency.created_at <= now() - make_interval(hours => $5) \
+            OR NOT EXISTS (SELECT 1 FROM noo_tasks WHERE id = noo_task_idempotency.task_id) \
+         RETURNING task_id",
+    )
+    .bind(owner)
+    .bind(via)
+    .bind(key)
+    .bind(mine)
+    .bind(IDEMPOTENCY_HOURS)
+    .fetch_optional(db)
+    .await?;
+    if let Some(id) = won {
+        return Ok(id.to_string());
+    }
+    // Lost: the live entry's task is the answer.
+    idempotent_task(db, owner, via, key).await?.ok_or_else(|| anyhow!("idempotency entry vanished"))
+}
+
+/// Remove a task that lost an idempotency race before it was ever started.
+pub async fn discard_unstarted(db: &sqlx::PgPool, id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(id)?;
+    sqlx::query("DELETE FROM noo_tasks WHERE id = $1 AND state = 'open'").bind(uuid).execute(db).await?;
+    Ok(())
 }
 
 /// The running task of a conversation, for the person — what
@@ -481,7 +586,7 @@ pub async fn finish(db: &sqlx::PgPool, id: &str, ok: bool, text: &str, require_t
 pub const NO_TOOLS_MARK: &str = "[completed without calling any tool]";
 
 /// Tools that are not looking at anything: the loop's own bookkeeping.
-const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_task_ask", "noo_agent_message"];
+pub(crate) const BOOKKEEPING_TOOLS: &[&str] = &["noo_task_done", "noo_task_ask", "noo_agent_message"];
 
 /// What the evidence gate says about a success claim.
 #[derive(Debug, PartialEq, Eq)]
@@ -597,17 +702,43 @@ async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result
     .execute(db)
     .await?
     .rows_affected();
+    if n > 0 {
+        // i143 D: `result` (the answer, or null on failure) then the final
+        // `state`. Here, not in `finish`, so a parent settled by
+        // `settle_parent` reports too.
+        crate::task_events::emit_finished(db, id, ok, text).await;
+    }
     Ok(n > 0)
 }
 
-/// The operator's stop: honoured at the next checkpoint.
+/// The owner's stop: honoured at the next checkpoint.
 pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
+    stop_with(db, id, "stopped_by_owner").await
+}
+
+/// Stop a live task, telling an add-on why (i143 D): a `revoked {reason}`
+/// event, then the state change, then the final `state` event.
+/// `reason` is `stopped_by_owner` | `background_revoked` | `account_disabled`.
+/// Every stop path goes through here so the final `state` event always
+/// follows the revoked one.
+pub async fn stop_with(db: &sqlx::PgPool, id: &str, reason: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
+    let live: Option<String> = sqlx::query_scalar("SELECT state FROM noo_tasks WHERE id = $1 AND state IN ('open','running','checkpointed')")
+        .bind(uuid)
+        .fetch_optional(db)
+        .await?;
+    if live.is_none() {
+        return Ok(false);
+    }
+    crate::task_events::emit_revoked(db, id, reason).await;
     let n = sqlx::query("UPDATE noo_tasks SET state = 'stopped', updated_at = now() WHERE id = $1 AND state IN ('open','running','checkpointed')")
         .bind(uuid)
         .execute(db)
         .await?
         .rows_affected();
+    if n > 0 {
+        crate::task_events::emit_final_state(db, id, Some(reason)).await;
+    }
     Ok(n > 0)
 }
 
@@ -638,13 +769,102 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
         }
     }
     let after = get(&state.db, id).await?.map(|t| t.state).unwrap_or_else(|| "failed".into());
+    // i143 D: progress at each checkpoint with a note, and the state change
+    // it caused. Nothing after a terminal state (the exhausted path above
+    // already emitted its final one).
+    if matches!(after.as_str(), "open" | "running" | "checkpointed") {
+        if let Some(n) = note.filter(|n| !n.trim().is_empty()) {
+            crate::task_events::emit_logged(&state.db, id, "progress", json!({"loop": loops, "note": n})).await;
+        }
+        if task.state == "running" && after == "checkpointed" {
+            crate::task_events::emit_state(&state.db, id, "checkpointed", None).await;
+        }
+    }
     Ok(after)
+}
+
+/// What a node's harness said to a dispatch, read from its reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessAnswer {
+    /// `{"ack": true}`; `already` when the harness had the task already.
+    Taken { already: bool },
+    /// `{"ack": false, "busy": true, "running": n, "capacity": N}`.
+    Busy { running: u64, capacity: u64 },
+    /// A reply that is neither (a refusal, or an unreadable one).
+    Refused,
+    /// No reply within the ack window.
+    Silent,
+}
+
+/// Read a harness's reply body (`None` = nothing came back).
+pub fn harness_answer(body: Option<&Value>) -> HarnessAnswer {
+    let Some(b) = body else { return HarnessAnswer::Silent };
+    if b.get("ack").and_then(Value::as_bool) == Some(true) {
+        return HarnessAnswer::Taken { already: b.get("already").and_then(Value::as_bool) == Some(true) };
+    }
+    if b.get("busy").and_then(Value::as_bool) == Some(true) {
+        return HarnessAnswer::Busy {
+            running: b.get("running").and_then(Value::as_u64).unwrap_or(0),
+            capacity: b.get("capacity").and_then(Value::as_u64).unwrap_or(0),
+        };
+    }
+    HarnessAnswer::Refused
+}
+
+/// Where a node-placed task goes after the harness's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The node's harness runs it.
+    Dispatched { already: bool },
+    /// The node's harness is busy: the task stays open on the node, queued.
+    Queued { why: String, running: u64, capacity: u64 },
+    /// The controller runs it, as a named fallback; `answered` says whether
+    /// the harness refused or said nothing at all.
+    Fallback { why: String, answered: bool },
+}
+
+/// The rule (noomesh-internal i176): taken → dispatched; busy → queued for
+/// that node, never the controller; a refusal or silence → the controller,
+/// named a fallback.
+pub fn place_after(node: &str, answer: &HarnessAnswer) -> Placement {
+    match answer {
+        HarnessAnswer::Taken { already } => Placement::Dispatched { already: *already },
+        HarnessAnswer::Busy { running, capacity } => Placement::Queued {
+            why: format!("node '{node}' has a harness and it is busy ({running} of {capacity} running); the task is queued for it"),
+            running: *running,
+            capacity: *capacity,
+        },
+        HarnessAnswer::Refused => Placement::Fallback {
+            why: format!("node '{node}' has a harness and it refused the task; running in process (fallback)"),
+            answered: true,
+        },
+        HarnessAnswer::Silent => Placement::Fallback {
+            why: format!("node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node; running in process (fallback)"),
+            answered: false,
+        },
+    }
+}
+
+/// Keep the task `open`, assigned to `node`, for the node's busy harness to
+/// take when a slot frees (its `harness.ready` hand-back lists open tasks
+/// on the node).
+pub async fn mark_queued(db: &sqlx::PgPool, id: &str, node: &str) -> Result<()> {
+    set_state(db, id, "open", Some(node)).await
 }
 
 /// Mark the task running on `node` (or in process when `None`) before a
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
-    set_state(db, id, "running", node).await
+    let before = match uuid::Uuid::parse_str(id) {
+        Ok(u) => sqlx::query_scalar::<_, String>("SELECT state FROM noo_tasks WHERE id = $1").bind(u).fetch_optional(db).await.ok().flatten(),
+        Err(_) => None,
+    };
+    set_state(db, id, "running", node).await?;
+    // i143 D: a state change, once (a resume of a running task is not one).
+    if before.as_deref() != Some("running") {
+        crate::task_events::emit_state(db, id, "running", None).await;
+    }
+    Ok(())
 }
 
 // ── the runner ──────────────────────────────────────────────────────────
@@ -718,6 +938,8 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
             None if loops == 0 => objective_prompt(&req.objective, &req.thread_id, req.loop_budget),
             None => continuation_prompt(&req.objective, loops + 1, req.loop_budget),
         };
+        // The owner's context since the last loop (i143 C), in front.
+        let prompt = crate::task_budget::with_context(prompt, check.context.as_deref());
         let outcome = crate::coordinator::run_inner(
             &rt,
             &prompt,
@@ -770,15 +992,22 @@ pub async fn run_task_loops<R: TaskRuntime>(mut rt: R, req: &TaskRequest) -> Res
 pub struct Started {
     pub node: String,
     pub dispatched: bool,
+    /// The node's harness is busy: the task stays `open` on that node and
+    /// is handed back when a slot frees (noomesh-internal i176). Never
+    /// run on the controller for that.
+    pub queued: bool,
     pub why: Option<String>,
 }
 
 impl Started {
     fn dispatched(node: String) -> Self {
-        Self { node, dispatched: true, why: None }
+        Self { node, dispatched: true, queued: false, why: None }
     }
     fn here(node: String, why: impl Into<String>) -> Self {
-        Self { node, dispatched: false, why: Some(why.into()) }
+        Self { node, dispatched: false, queued: false, why: Some(why.into()) }
+    }
+    fn queued(node: String, why: impl Into<String>) -> Self {
+        Self { node, dispatched: false, queued: true, why: Some(why.into()) }
     }
     /// Where it went, for callers that only need the name.
     pub fn node(&self) -> &str {
@@ -834,18 +1063,35 @@ pub async fn start(state: &std::sync::Arc<AppState>, task: &Task) -> Result<Star
                     state.nats.send_request(task_subject(&node), crate::coordinator::node_request(&state.nats, &node, serde_json::to_vec(&req)?)),
                 )
                 .await;
-                if let Ok(Ok(msg)) = ack {
-                    let body: Value = serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
-                    if body.get("ack").and_then(|a| a.as_bool()) == Some(true) {
+                let body = match ack {
+                    Ok(Ok(msg)) => Some(serde_json::from_slice::<Value>(&msg.payload).unwrap_or(Value::Null)),
+                    _ => None,
+                };
+                match place_after(&node, &harness_answer(body.as_ref())) {
+                    Placement::Dispatched { already } => {
+                        if already {
+                            tracing::info!(task = %task.id, node = %node, "task_already_on_node");
+                        } else {
+                            tracing::info!(task = %task.id, node = %node, "task_dispatched");
+                        }
                         mark_running(&state.db, &task.id, Some(&node)).await?;
-                        tracing::info!(task = %task.id, node = %node, "task_dispatched");
                         return Ok(Started::dispatched(node));
                     }
+                    Placement::Queued { why: q, running, capacity } => {
+                        // Busy is not dead: the task waits for THIS node's
+                        // harness, which hands it back when a slot frees.
+                        mark_queued(&state.db, &task.id, &node).await?;
+                        tracing::info!(task = %task.id, node = %node, running, capacity, "task_queued_for_node");
+                        return Ok(Started::queued(node.clone(), q));
+                    }
+                    Placement::Fallback { why: f, answered } => {
+                        // No ack at all (or a refusal): the dead case.
+                        // Running a node-placed task on the controller is
+                        // a fallback, said so in the record and at warn.
+                        why = f;
+                        tracing::warn!(task = %task.id, node = %node, answered, "task: harness did not take it; running in process (fallback)");
+                    }
                 }
-                why = format!(
-                    "node '{node}' has a harness and it did not answer within 3s — check `noo cluster status` and the harness service on that node"
-                );
-                tracing::info!(task = %task.id, node = %node, "task: harness did not ack; running in process");
             } else {
                 why = format!("no harness token could be minted for '{owner}' on node '{node}'");
             }
@@ -1027,7 +1273,8 @@ fn describe_runner(node: Option<&str>) -> String {
 /// A node's tasks to hand back. A PARKED task (`budget_state` set) is not
 /// one: it waits for its owner's resubmit or answer, not for a harness.
 async fn list_unfinished_on(db: &sqlx::PgPool, node: &str) -> Result<Vec<Task>> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('running','checkpointed') AND t.budget_state IS NULL ORDER BY t.created_at")))
+    // `open` with a node: queued for that node's busy harness (i176).
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE t.node = $1 AND t.state IN ('open','running','checkpointed') AND t.budget_state IS NULL ORDER BY t.created_at")))
         .bind(node)
         .fetch_all(db)
         .await?;
@@ -1156,6 +1403,7 @@ mod tests {
             tokens_spent: 0,
             budget_state: None,
             remaining: None,
+            created_via: None,
         };
         let alert = stale_alert(&t, "2026-09-22T00:20:26Z");
         let text = crate::egress::system(&alert, "ref-0").into_string();
@@ -1182,6 +1430,63 @@ mod tests {
 
     /// PINNED: a runner stops on any terminal state and on the budget,
     /// and continues only while the task is live.
+    /// noomesh-internal i176, the decision itself: what each harness reply
+    /// does to a node-placed task.
+    #[test]
+    fn a_harness_reply_decides_where_a_task_goes() {
+        use serde_json::json;
+        let busy = json!({"ack": false, "busy": true, "node": "mcmini", "running": 8, "capacity": 8});
+        assert_eq!(harness_answer(Some(&busy)), HarnessAnswer::Busy { running: 8, capacity: 8 });
+        match place_after("mcmini", &harness_answer(Some(&busy))) {
+            Placement::Queued { why, running: 8, capacity: 8 } => {
+                assert!(why.contains("busy (8 of 8 running)") && why.contains("queued for it"), "{why}");
+                assert!(!why.contains("fallback") && !why.contains("in process"), "a busy node never means the controller: {why}");
+            }
+            other => panic!("busy must queue: {other:?}"),
+        }
+        let taken = json!({"ack": true, "node": "mcmini"});
+        assert_eq!(place_after("mcmini", &harness_answer(Some(&taken))), Placement::Dispatched { already: false });
+        let already = json!({"ack": true, "already": true, "node": "mcmini"});
+        assert_eq!(place_after("mcmini", &harness_answer(Some(&already))), Placement::Dispatched { already: true });
+        assert_eq!(harness_answer(None), HarnessAnswer::Silent);
+        match place_after("mcmini", &harness_answer(None)) {
+            Placement::Fallback { why, answered: false } => assert!(why.contains("did not answer within 3s") && why.ends_with("(fallback)"), "{why}"),
+            other => panic!("silence is the fallback: {other:?}"),
+        }
+        let refused = json!({"ack": false, "node": "mcmini"});
+        match place_after("mcmini", &harness_answer(Some(&refused))) {
+            Placement::Fallback { why, answered: true } => assert!(why.contains("refused") && why.ends_with("(fallback)"), "{why}"),
+            other => panic!("a refusal is the fallback: {other:?}"),
+        }
+        assert_eq!(harness_answer(Some(&json!("garbage"))), HarnessAnswer::Refused);
+        // The outcome the API shows for each.
+        let q = Started::queued("mcmini".into(), "busy");
+        assert!(q.queued && !q.dispatched);
+        assert!(Started::dispatched("mcmini".into()).dispatched);
+        let f = Started::here("pop-os".into(), "fallback");
+        assert!(!f.queued && !f.dispatched);
+    }
+
+    /// noomesh-internal i176: a busy harness keeps the task on its node;
+    /// only no answer at all runs it on the controller, and says so.
+    #[test]
+    fn a_busy_node_queues_the_task_and_only_silence_falls_back() {
+        let q = Started::queued("mcmini".into(), "busy");
+        assert!(q.queued && !q.dispatched && q.node() == "mcmini");
+        assert!(!Started::dispatched("mcmini".into()).queued && !Started::here("pop-os".into(), "x").queued);
+        let src = include_str!("tasks.rs").split("fn a_busy_node_queues_the_task_and_only_silence_falls_back").next().unwrap();
+        let start = src.split("pub async fn start(").nth(1).unwrap().split("\nfn run_in_process(").next().unwrap();
+        let decide = start.find("place_after(&node, &harness_answer(").expect("the reply goes through the one rule");
+        let after = &start[decide..];
+        let queued = after.find("Placement::Queued {").expect("the queued arm");
+        assert!(after[queued..].find("mark_queued(").unwrap() < after[queued..].find("return Ok(Started::queued(").unwrap(), "queued: state set, then returned");
+        let fallback = after.find("Placement::Fallback {").expect("the fallback arm");
+        assert!(after[fallback..].contains("tracing::warn!(task = %task.id, node = %node, answered"), "the controller run is logged at warn");
+        assert!(!after[queued..fallback].contains("tracing::warn!"), "a queued task is not a warning");
+        let unfinished = &src[src.find("async fn list_unfinished_on").unwrap()..];
+        assert!(unfinished[..500].contains("t.state IN ('open','running','checkpointed')"), "a queued (open) task is handed back");
+    }
+
     #[test]
     fn keep_looping_rule() {
         assert!(keep_looping("checkpointed", 1, 5));
@@ -1198,7 +1503,7 @@ mod tests {
             thread_id: "thr".into(), channel: "task".into(), model: None, loops: 0, loop_budget: 5, last_checkpoint: None,
             last_note: None, result: result.map(str::to_string), error: error.map(str::to_string), created_at: String::new(),
             updated_at: String::new(), parent_id: Some("p".into()), role: Some(role.into()), budget_default: false, stale: false,
-            token_budget: None, tokens_spent: 0, budget_state: None, remaining: None,
+            token_budget: None, tokens_spent: 0, budget_state: None, remaining: None, created_via: None,
         }
     }
 
@@ -1355,6 +1660,7 @@ mod stale_alert_tests {
             tokens_spent: 0,
             budget_state: None,
             remaining: None,
+            created_via: None,
         };
         let alert = super::stale_alert(&t, "t1");
         assert!(alert.detail.contains("NODE_ID"), "it must say how to stop it recurring: {}", alert.detail);

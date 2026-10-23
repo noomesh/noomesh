@@ -75,6 +75,14 @@ pub enum Refusal {
     /// The lock is a `noo-addon-lock/1` lock: it lists no `files`, so no
     /// compose overlay travels with it (N6 retired that path).
     Unbundled { tag: String },
+    /// A third-party add-on (no `ADDON_ROWS` entry) with no key the operator
+    /// trusted for it, or an unreadable `noomesh.yaml`.
+    Untrusted(String),
+    /// The lock handed over with `--lock` could not be read.
+    Supplied(String),
+    /// The bundle's `system.json` or `workloads.json` breaks a rule
+    /// ([`super::decls`]). Signed content the gateway would refuse.
+    Decl(String),
 }
 
 impl Refusal {
@@ -101,7 +109,14 @@ impl Refusal {
                 ),
                 _ => format!("{reference}: {}", err.summary()),
             },
+            Refusal::Lock(addon_lock::AddonLockError::BadSignature(e)) if third_party(addon) => format!(
+                "{addon}'s lock is not signed by a key you trust for it ({e}). If you trust its signer, add the \
+                 key: `noo addons trust-key {addon} <pubkey> --registry <root>`"
+            ),
+            Refusal::Lock(addon_lock::AddonLockError::DevKeyExpired { key, expires_at }) => dev_expired(addon, key, *expires_at),
             Refusal::Lock(e) => format!("{addon}'s lock refused: {e}"),
+            Refusal::Untrusted(e) => e.clone(),
+            Refusal::Supplied(e) => format!("the lock supplied for {addon} could not be read: {e}"),
             Refusal::NotForStack { tag, version, supports } => format!(
                 "{addon} {version} does not support stack {tag} (it lists {})",
                 supports.join(", ")
@@ -119,6 +134,7 @@ impl Refusal {
             Refusal::Write(e) => format!("{addon}'s pin could not be written: {e}"),
             Refusal::Store(e) => format!("the encrypted store could not be read to resolve {addon}: {e}"),
             Refusal::Unbundled { tag } => unbundled(addon, tag),
+            Refusal::Decl(e) => format!("{addon}'s signed bundle is refused: {e}; the vendor must fix and re-sign it"),
         }
     }
 
@@ -190,6 +206,19 @@ pub fn unbundled(addon: &str, tag: &str) -> String {
     )
 }
 
+/// The refusal for a lock whose only signer is an expired development key
+/// (i163 part A): the same refusal as an untrusted key, naming the expiry
+/// and both ways out.
+pub fn dev_expired(addon: &str, key: &str, expires_at: i64) -> String {
+    format!(
+        "{addon}'s lock is signed only by a development key ({}…) that expired {}, so it is refused like an \
+         untrusted key. Renew it: `noo addons trust-key {addon} <pubkey> --dev --expires 14d`, or ship the add-on \
+         signed by its release key",
+        &key[..12.min(key.len())],
+        addon_lock::utc_minute(expires_at)
+    )
+}
+
 /// A v1-only lock (no `files`) is refused: there is no overlay to compose.
 /// Called where a lock is about to be acted on (enable, upgrade, `--check`).
 pub fn require_bundle(v: &VerifiedLock, tag: &str) -> Result<(), Refusal> {
@@ -203,6 +232,10 @@ pub fn require_bundle(v: &VerifiedLock, tag: &str) -> Result<(), Refusal> {
 pub fn check(fetched: &Fetched, anchor: &TrustAnchor, want: &Want) -> Result<VerifiedLock, Refusal> {
     let v = addon_lock::verify(&fetched.lock, &fetched.sig, anchor, want.addon).map_err(Refusal::Lock)?;
     addon_lock::verify_files(&v.lock, &fetched.files).map_err(Refusal::Lock)?;
+    // The declarations beyond the overlay (system.json, workloads.json):
+    // signed, and still refused here when they break a rule, before anything
+    // is pinned, so the gateway never meets a bundle it would refuse.
+    super::decls::check_bundle(want.addon, &fetched.files).map_err(Refusal::Decl)?;
     if !v.lock.supports(want.stack_tag) {
         return Err(Refusal::NotForStack {
             tag: want.stack_tag.to_string(),
@@ -243,8 +276,30 @@ pub fn fetch_and_check(
     Ok((v, fetched))
 }
 
-/// The anchor for `addon` from the installed, unexpired entitlement.
+/// Is `addon` one the CLI has no row for? Those are trusted only through
+/// `noo addons trust-key`, never through the entitlement.
+pub fn third_party(addon: &str) -> bool {
+    super::trust::name_ok(addon) && !super::trust::is_builtin(addon)
+}
+
+/// The anchor for `addon`: from the installed, unexpired entitlement for an
+/// add-on the CLI ships, from the operator's `addon_trust` for any other.
 pub fn installed_anchor(addon: &str) -> Result<TrustAnchor, Refusal> {
+    if third_party(addon) {
+        return match super::trust::trusted_anchor(addon) {
+            Ok(Some(a)) if !a.keys.is_empty() || !a.dev.is_empty() => Ok(a),
+            Ok(_) => Err(Refusal::Untrusted(format!(
+                "no key is trusted for {addon}, so its lock cannot be verified. If you trust its signer: \
+                 `noo addons trust-key {addon} <pubkey> --registry <root>`"
+            ))),
+            Err(e) => Err(Refusal::Untrusted(format!("the trust list could not be read to resolve {addon}: {e}"))),
+        };
+    }
+    installed_anchor_from_entitlement(addon)
+}
+
+/// The anchor for a built-in `addon` from the installed, unexpired entitlement.
+fn installed_anchor_from_entitlement(addon: &str) -> Result<TrustAnchor, Refusal> {
     let token = crate::entitlement::installed_token_checked()
         .map_err(Refusal::Store)?
         .ok_or_else(|| Refusal::NoEntitlement("none installed".into()))?;
@@ -362,17 +417,36 @@ pub fn record(
 /// The offline check: the cached lock still verifies against `anchor`,
 /// lists `tag`, and is exactly what the pin says. Returns the pin.
 pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) -> Result<Pin, String> {
+    offline_check_files(root, addon, tag, anchor).map(|(pin, _)| pin)
+}
+
+/// [`offline_check`], also returning the file names the verified lock lists
+/// (each verified against its materialised copy). The launcher copies a
+/// declaration file (`decls::DECL_FILES`) only when it is listed here, so an
+/// unsigned file left beside the bundle never reaches the gateway.
+pub fn offline_check_files(
+    root: &Path,
+    addon: &str,
+    tag: &str,
+    anchor: &TrustAnchor,
+) -> Result<(Pin, std::collections::BTreeSet<String>), String> {
     let all = pins::read(root)?;
     let pin = all.get(addon).cloned().ok_or_else(|| format!("{addon} has no pin in {}", pins::PINS_FILE))?;
     if pin.stack != tag {
         return Err(format!("{addon} is pinned for stack {}, and this stack runs {tag}", pin.stack));
     }
     let (lock, sig) = pins::cached_lock(root, addon, &pin)?;
-    let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| format!("{addon}'s cached lock no longer verifies: {e}"))?;
+    let v = addon_lock::verify(&lock, &sig, anchor, addon).map_err(|e| match e {
+        AddonLockError::DevKeyExpired { key, expires_at } => dev_expired(addon, &key, expires_at),
+        e => format!("{addon}'s cached lock no longer verifies: {e}"),
+    })?;
     if !v.lock.supports(tag) {
         return Err(format!("{addon} {}'s lock does not list stack {tag}", v.lock.version));
     }
-    if v.lock.images != pin.images || v.lock.version != pin.version || v.key_index != pin.key_index {
+    // A development key's index counts on from the release keys, so trusting
+    // another release key moves it; the signature itself was just re-checked.
+    let key_moved = v.dev_expires_at.is_none() && v.key_index != pin.key_index;
+    if v.lock.images != pin.images || v.lock.version != pin.version || key_moved {
         return Err(format!("{addon}'s pin does not match its signed lock ({} was edited)", pins::PINS_FILE));
     }
     // `pulled_from` is not signed content: it must be the pull root the
@@ -388,6 +462,10 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
     if v.lock.files.is_empty() {
         return Err(unbundled(addon, tag));
     }
+    // Not stored: whether a development key vouches for this pin is decided
+    // now, against the keys trusted now (a renewal moves the expiry).
+    let mut pin = pin;
+    pin.dev_expires_at = v.dev_expires_at;
     let found = pins::materialised_files(root, addon, v.lock.files.keys());
     addon_lock::verify_files(&v.lock, &found).map_err(|e| {
         format!(
@@ -395,7 +473,7 @@ pub fn offline_check(root: &Path, addon: &str, tag: &str, anchor: &TrustAnchor) 
             pins::addon_dir(root, addon).display()
         )
     })?;
-    Ok(pin)
+    Ok((pin, v.lock.files.keys().cloned().collect()))
 }
 
 /// The production [`Docker`]. Its throwaway docker configs live under the
@@ -720,7 +798,7 @@ pub(crate) mod tests {
 
     pub(crate) fn anchor() -> TrustAnchor {
         let pk = release_sig::pubkey_hex(&release_sig::signing_key_from_seed_hex(&seed()).unwrap());
-        TrustAnchor { keys: vec![pk], registry: ROOT.into(), pull: None }
+        TrustAnchor { keys: vec![pk], registry: ROOT.into(), pull: None, dev: vec![] }
     }
 
     pub(crate) fn digest(c: char) -> String {
@@ -750,6 +828,54 @@ pub(crate) mod tests {
     pub(crate) const OVERLAY: &str =
         "services:\n  trellion-intel:\n    image: ${NOO_ADDON_IMAGE_TRELLION_INTEL:-noo-addon-unpinned.invalid/trellion-intel:x}\n";
 
+    /// A signed bundle of `l` for the fixture add-on `example-addon`,
+    /// carrying [`OVERLAY`] plus `extra` files (all signed).
+    pub(crate) fn signed_example_bundle(l: &AddonLock, extra: &[(&str, &[u8])]) -> Fetched {
+        let mut l = l.clone();
+        l.addon = "example-addon".into();
+        l.format = addon_lock::FORMAT_V2.into();
+        let mut files = BTreeMap::from([(addon_lock::OVERLAY_FILE.to_string(), OVERLAY.as_bytes().to_vec())]);
+        for (n, b) in extra {
+            files.insert((*n).to_string(), b.to_vec());
+        }
+        l.files = files.iter().map(|(n, b)| (n.clone(), addon_lock::sha256_ref(b))).collect();
+        let (bytes, sig) = addon_lock::sign(&l, &seed()).unwrap();
+        Fetched { lock: bytes, sig, files }
+    }
+
+    pub(crate) const EXAMPLE_SYSTEM: &str =
+        r#"{"schema":"example_addon","role":"noo_example_addon","ddl_role":"noo_example_addon_ddl","extensions":["pg_trgm"]}"#;
+    pub(crate) const EXAMPLE_WORKLOADS: &str = r#"{"workloads":[{"name":"worker","container":"noo-example-addon-worker","gpu":true,"need_mb":4096,"drain":{"route":"drain","timeout_secs":60}}]}"#;
+
+    #[test]
+    fn a_bundle_with_valid_declarations_passes_and_a_bad_one_is_refused_before_any_pin() {
+        let want = Want { addon: "example-addon", stack_tag: "v0.6.0", stack_lock: None, pinned: None, allow_downgrade: false };
+        let good = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", EXAMPLE_SYSTEM.as_bytes()), ("workloads.json", EXAMPLE_WORKLOADS.as_bytes())],
+        );
+        assert!(check(&good, &anchor(), &want).is_ok());
+        // Signed, but naming a core role: the signature is not the only rule.
+        let bad = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("system.json", br#"{"schema":"example_addon","role":"noo_app","ddl_role":"noo_example_addon_ddl"}"#)],
+        );
+        match check(&bad, &anchor(), &want) {
+            Err(r @ Refusal::Decl(_)) => {
+                let why = r.why("example-addon");
+                assert!(why.contains("`role`") && why.contains("re-sign"), "{why}");
+            }
+            other => panic!("expected a declaration refusal, got {other:?}"),
+        }
+        // A drain route the bundle's own routes.json says is public.
+        let routes = br#"{"routes":[{"name":"drain","method":"POST","path":"/api/example-addon/drain"}]}"#;
+        let bad = signed_example_bundle(
+            &lock("1.0.0", &["v0.6.0"], None),
+            &[("workloads.json", EXAMPLE_WORKLOADS.as_bytes()), ("routes.json", routes)],
+        );
+        assert!(matches!(check(&bad, &anchor(), &want), Err(Refusal::Decl(e)) if e.contains("public route")));
+    }
+
     /// A signed BUNDLE of `l` (format 2) carrying [`OVERLAY`].
     pub(crate) fn signed_bundle(l: &AddonLock) -> Fetched {
         let mut l = l.clone();
@@ -778,7 +904,7 @@ pub(crate) mod tests {
     #[test]
     fn a_lock_the_registry_does_not_have_yet_says_so_and_names_the_way_back() {
         let reg = super::lock_fetch::fake::serve(|_| Default::default());
-        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")), pull: None };
+        let anchor = TrustAnchor { keys: anchor().keys, registry: format!("{}/example/intel", reg.base.trim_start_matches("http://")), pull: None, dev: vec![] };
         let client = lock_fetch::Client::plain_http_for_tests(None);
         let e = fetch_and_check(&client, &anchor, &want(None, None)).unwrap_err();
         assert!(is_not_published(&e) && !e.is_auth(), "{e:?}");
@@ -889,7 +1015,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pulls_only_what_is_missing_by_digest() {
-        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0 };
+        let v = VerifiedLock { lock: lock("1.2.0", &["v0.6.0"], None), key_index: 0, dev_expires_at: None };
         let mut d = FakeDocker::default();
         let cred = Credential { user: "u".into(), token: "t".into() };
         let mut asked = 0;
@@ -911,7 +1037,7 @@ pub(crate) mod tests {
     fn the_proxy_route_pulls_the_signed_digest_from_the_pull_host() {
         let mut l = lock("1.2.0", &["v0.6.0"], None);
         l.images.insert("trellion-intel-worker".into(), format!("{ROOT}/worker@{}", digest('4')));
-        let v = VerifiedLock { lock: l, key_index: 0 };
+        let v = VerifiedLock { lock: l, key_index: 0, dev_expires_at: None };
         let route = lock_fetch::Route::Proxy { root: "addons.noomesh.ai/example/intel".into(), registry: ROOT.into() };
         let mut d = FakeDocker::default();
         let mut asked = 0;

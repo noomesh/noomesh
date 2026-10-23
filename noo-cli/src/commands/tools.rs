@@ -84,42 +84,68 @@ pub fn tools_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         .or_else(|| stats["total_tools"].as_u64())
         .map(|n| n.to_string())
         .unwrap_or_else(|| tools.len().to_string());
-    println!(
-        "{}",
-        ui::header(
-            "tools",
-            Some(&format!(
-                "{total} total · base {} · specialized {}",
-                num(&stats["base_tools"]),
-                num(&stats["node_specific_tools"]),
-            ))
-        )
-    );
+    // A split the gateway did not measure is left out of the banner rather
+    // than printed as "base not reported · specialized not reported".
+    let mut banner = format!("{total} total");
+    for (label, key) in [("base", "base_tools"), ("specialized", "node_specific_tools")] {
+        if stats[key].as_u64().is_some() {
+            banner.push_str(&format!(" · {label} {}", num(&stats[key])));
+        }
+    }
+    println!("{}", ui::header("tools", Some(&banner)));
     println!();
+    // The gateway sends `is_base_tool: null` and `available_on_nodes: null`
+    // for every tool today (the registry carries neither; see the
+    // `*_detail` strings in `--json`). Two columns of "Not reported" fifteen
+    // times over say that worse than one line under the table does, so a
+    // column is drawn only when at least one row has data for it.
+    let (show_kind, show_placement) = reported_columns(tools);
     let rows: Vec<Vec<String>> = tools
         .iter()
         .map(|t| {
-            // The gateway hardcodes `available_on_nodes: []`, so this column used
-            // to claim "all nodes" for every base tool and "0 node(s)" for the
-            // rest — a placement claim the CLI has no data for. Only report a
-            // count when the gateway actually sends one.
-            let availability = match t["available_on_nodes"].as_array() {
-                Some(nodes) if !nodes.is_empty() => format!("{} node(s)", nodes.len()),
-                _ => ui::state("not reported"),
-            };
-            vec![
-                truncate(t["name"].as_str().unwrap_or("?"), 36),
-                tool_kind(t, "base", "specialized"),
-                availability,
-                ui::muted(&truncate(t["description"].as_str().unwrap_or(""), 50)),
-            ]
+            let mut row = vec![truncate(t["name"].as_str().unwrap_or("?"), 36)];
+            if show_kind {
+                row.push(tool_kind(t, "base", "specialized"));
+            }
+            if show_placement {
+                // Only report a count when the gateway actually sends one.
+                row.push(match t["available_on_nodes"].as_array() {
+                    Some(nodes) if !nodes.is_empty() => format!("{} node(s)", nodes.len()),
+                    _ => ui::state("not reported"),
+                });
+            }
+            row.push(ui::muted(&truncate(t["description"].as_str().unwrap_or(""), if show_kind || show_placement { 50 } else { 70 })));
+            row
         })
         .collect();
-    print!(
-        "{}",
-        ui::table(&[Col::left("tool"), Col::left("type"), Col::left("availability"), Col::left("description")], &rows)
-    );
+    let mut cols = vec![Col::left("tool")];
+    if show_kind {
+        cols.push(Col::left("type"));
+    }
+    if show_placement {
+        cols.push(Col::left("availability"));
+    }
+    cols.push(Col::left("description"));
+    print!("{}", ui::table(&cols, &rows));
+    if !show_kind || !show_placement {
+        let missing = match (show_kind, show_placement) {
+            (false, false) => "base/specialized split and per-node placement",
+            (false, true) => "base/specialized split",
+            _ => "per-node placement",
+        };
+        println!("{}", ui::muted(&format!("  {missing}: not reported — the tool registry does not carry it (`--json` has the detail strings)")));
+    }
     Ok(0)
+}
+
+/// Which of the two optional columns have data in at least one row:
+/// (type, availability). A column nobody fills is not drawn.
+fn reported_columns(tools: &[serde_json::Value]) -> (bool, bool) {
+    let kind = tools.iter().any(|t| t["is_base_tool"].as_bool().is_some());
+    let placement = tools
+        .iter()
+        .any(|t| t["available_on_nodes"].as_array().is_some_and(|a| !a.is_empty()));
+    (kind, placement)
 }
 
 /// `noo tools select PROMPT` — retired. The route it called previewed a
@@ -479,5 +505,31 @@ mod kind_tests {
         assert!(!k.contains("specialized"));
         assert_eq!(tool_kind(&serde_json::json!({"is_base_tool": true}), "base", "specialized"), "base");
         assert_eq!(tool_kind(&serde_json::json!({"is_base_tool": false}), "base", "specialized"), "specialized");
+    }
+}
+
+#[cfg(test)]
+mod reported_columns_tests {
+    use super::reported_columns;
+    use serde_json::json;
+
+    #[test]
+    fn all_null_draws_neither_column() {
+        let tools = vec![
+            json!({"name": "a", "is_base_tool": null, "available_on_nodes": null}),
+            json!({"name": "b"}),
+        ];
+        assert_eq!(reported_columns(&tools), (false, false));
+    }
+
+    #[test]
+    fn one_row_with_data_is_enough_for_its_column() {
+        let tools = vec![
+            json!({"name": "a", "is_base_tool": null, "available_on_nodes": null}),
+            json!({"name": "b", "is_base_tool": false, "available_on_nodes": ["n1"]}),
+        ];
+        assert_eq!(reported_columns(&tools), (true, true));
+        let kind_only = vec![json!({"name": "a", "is_base_tool": true, "available_on_nodes": []})];
+        assert_eq!(reported_columns(&kind_only), (true, false));
     }
 }

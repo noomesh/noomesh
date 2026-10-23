@@ -6,9 +6,11 @@
 //! This runner now owns the mesh migration chain for everything authored
 //! after the frozen Alembic baseline ([`BASELINE_REVISION`], `046_...`): it reads the existing
 //! Alembic state, computes what it would apply, and is provable against
-//! `noo db current`. As of this writing [`MIGRATIONS`] holds 35 entries
+//! `noo db current`. As of this writing [`MIGRATIONS`] holds 44 entries
 //! starting at `047_audit_drop_partition_fn` with the chain head at
-//! `081_host_login_tickets`. A schema change now means appending a
+//! `090_service_key_expiry`. `migrations/` at the crate root holds ONLY the
+//! baseline (`0001_baseline.sql`); every later revision lives in this file,
+//! not as a `.sql` file there. A schema change now means appending a
 //! `Migration { revision, down_revision, sql }` entry to [`MIGRATIONS`],
 //! not a new Python/Alembic revision.
 //!
@@ -2011,7 +2013,149 @@ CREATE TABLE IF NOT EXISTS noo_embedding_spaces (
     updated_at  timestamptz NOT NULL DEFAULT now()
 )
 "#,
+}, Migration {
+    revision: SESSION_FLOORS_REVISION,
+    down_revision: Some(EMBEDDING_SPACES_REVISION),
+    // The per-account "not before" floor (`session_floor.rs`), made durable.
+    // Redis held it alone, so a floor written by another gateway instance, or
+    // before a restart, was invisible while Redis was down. One row per
+    // account: the highest floor (unix MILLISECONDS, `floor_ms`) and when it stops mattering
+    // (one access-token lifetime past the raise; after that no token that
+    // predates it can still be valid). `noo security admin-password reset`
+    // writes the same row from the host. Additive; nothing reads it until the
+    // new gateway does, and an old gateway ignores it.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_session_floors (
+    account    text        PRIMARY KEY,
+    floor_ms   bigint      NOT NULL,
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS noo_session_floors_expires_idx ON noo_session_floors (expires_at)
+"#,
+}, Migration {
+    revision: PROMPT_SKILL_PROPOSALS_REVISION,
+    down_revision: Some(SESSION_FLOORS_REVISION),
+    // Promotion proposals for prompt skills written at runtime. One row per
+    // (skill name, hash of the text a person would review): `pending` until
+    // an operator decides, then `promoted` or `rejected`; `superseded` when
+    // the text changed before a decision, `withdrawn` when the skill was
+    // retired. The gateway injects a skill as instructions only while a
+    // `promoted` row matches its CURRENT text. Additive; an old gateway
+    // ignores the table and keeps framing every runtime skill as data.
+    sql: r#"
+CREATE TABLE IF NOT EXISTS noo_prompt_skill_proposals (
+    id           bigserial   PRIMARY KEY,
+    name         text        NOT NULL,
+    content_sha  text        NOT NULL,
+    description  text        NOT NULL DEFAULT '',
+    content      text        NOT NULL,
+    proposed_by  text        NOT NULL,
+    proposed_at  timestamptz NOT NULL DEFAULT now(),
+    status       text        NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'promoted', 'rejected', 'superseded', 'withdrawn')),
+    decided_by   text,
+    decided_at   timestamptz,
+    reason       text,
+    UNIQUE (name, content_sha)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS noo_prompt_skill_proposals_one_pending
+    ON noo_prompt_skill_proposals (name) WHERE status = 'pending'
+"#,
+}, Migration {
+    revision: ADDON_DELEGATION_REVISION,
+    down_revision: Some(PROMPT_SKILL_PROPOSALS_REVISION),
+    // Tasks an add-on starts for a present person (i143, the add-on delegated
+    // token). `created_via` is the provenance (`addon:<name>`; NULL = created
+    // directly) so "revoke this add-on's background work" is one query;
+    // `context_revision` is the monotonic revision of the context the add-on
+    // pushed. `noo_task_idempotency` makes a retried create return the same
+    // task (owner = the account username). `noo_task_context` holds each
+    // pushed revision until the loop that applies it. `noo_task_events` is the
+    // per-task outbox (`seq` starts at 1, +1 per event) and
+    // `noo_task_event_delivery` its cursor and retry state. Additive; an old
+    // gateway ignores the columns and tables.
+    sql: r#"
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS created_via text;
+ALTER TABLE noo_tasks ADD COLUMN IF NOT EXISTS context_revision integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS noo_tasks_owner_created_via_idx ON noo_tasks (owner_uuid, created_via);
+CREATE TABLE IF NOT EXISTS noo_task_idempotency (
+    owner      text        NOT NULL,
+    via        text        NOT NULL DEFAULT '',
+    key        text        NOT NULL,
+    task_id    uuid        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner, via, key)
+);
+CREATE TABLE IF NOT EXISTS noo_task_context (
+    task_id    uuid        NOT NULL REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    revision   integer     NOT NULL,
+    text       text        NOT NULL,
+    sha256     text        NOT NULL,
+    at         timestamptz NOT NULL DEFAULT now(),
+    applied_at timestamptz,
+    PRIMARY KEY (task_id, revision)
+);
+CREATE TABLE IF NOT EXISTS noo_task_events (
+    task_id uuid        NOT NULL REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    seq     bigint      NOT NULL,
+    kind    text        NOT NULL,
+    data    jsonb       NOT NULL,
+    at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, seq)
+);
+CREATE TABLE IF NOT EXISTS noo_task_event_delivery (
+    task_id          uuid        PRIMARY KEY REFERENCES noo_tasks(id) ON DELETE CASCADE,
+    addon            text        NOT NULL,
+    last_seq         bigint      NOT NULL DEFAULT 0,
+    next_seq         bigint      NOT NULL DEFAULT 1,
+    attempts         integer     NOT NULL DEFAULT 0,
+    next_try_at      timestamptz NOT NULL DEFAULT now(),
+    first_failure_at timestamptz,
+    undelivered_at   timestamptz
+)
+"#,
+}, Migration {
+    revision: EMBED_PLACEMENT_MODEL_REVISION,
+    down_revision: Some(ADDON_DELEGATION_REVISION),
+    // i150 E1: a node may serve several embedding spaces, so the placement
+    // key gains the MODEL for role=embed rows only. chat/rerank/etc. keep
+    // one row per (node, backend, role) (the model slot is the constant ''),
+    // embed gets one row per model. Placing a second embed model ADDS a row;
+    // it no longer replaces the first. No row is rewritten or dropped: every
+    // old triple is unique, so it is trivially unique under the wider key.
+    // `ON CONFLICT` in routes::cluster::PLACEMENT_UPSERT names the same
+    // expression. Guarded by to_regclass like 087.
+    sql: r#"
+DO $$
+BEGIN
+    IF to_regclass('noo_backend_placements') IS NOT NULL THEN
+        DROP INDEX IF EXISTS uq_placement_node_backend_role;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_placement_node_backend_role_model
+            ON noo_backend_placements (node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END));
+    END IF;
+END $$
+"#,
+}, Migration {
+    revision: EMBEDDING_SPACE_MIGRATION_REVISION,
+    down_revision: Some(EMBED_PLACEMENT_MODEL_REVISION),
+    // Re-embedding a space into another model (i150). All NULL = no
+    // migration. `migration_state` is NULL | 'filling' | 'cutover';
+    // `migration_progress` is trellion's last report; the gateway holds the
+    // state, trellion does the work.
+    sql: r#"
+ALTER TABLE noo_embedding_spaces
+    ADD COLUMN IF NOT EXISTS next_model text,
+    ADD COLUMN IF NOT EXISTS next_dims integer,
+    ADD COLUMN IF NOT EXISTS migration_state text,
+    ADD COLUMN IF NOT EXISTS migration_progress jsonb,
+    ADD COLUMN IF NOT EXISTS migration_started_at timestamptz,
+    ADD COLUMN IF NOT EXISTS migration_reported_at timestamptz
+"#,
 }];
+
+/// The embedding-space migration revision (i150). A constant so a renumber
+/// at rebase is one line.
+pub const EMBEDDING_SPACE_MIGRATION_REVISION: &str = "102_embedding_space_migration";
 
 /// The harness-profile revision. A constant so a renumber at rebase is one
 /// line.
@@ -2021,9 +2165,24 @@ pub const HARNESS_PROFILE_REVISION: &str = "096_harness_profile";
 /// one line.
 pub const NODE_VENDOR_KINDS_REVISION: &str = "095_node_vendor_kinds";
 
+/// Embed placements keyed by model (i150 E1). A constant so a renumber at
+/// rebase is one line.
+pub const EMBED_PLACEMENT_MODEL_REVISION: &str = "101_embed_placement_model";
+
 /// Embedding spaces (i145 phase B): `noo_embedding_spaces`. A constant so a
 /// renumber at rebase is one line.
 pub const EMBEDDING_SPACES_REVISION: &str = "097_embedding_spaces";
+
+/// The add-on delegated task token's tables and columns (i143 part B). A
+/// constant so a renumber at integration is one line.
+pub const ADDON_DELEGATION_REVISION: &str = "100_addon_delegation";
+
+/// The prompt-skill promotion table. A constant so a renumber at integration
+/// is one line.
+pub const PROMPT_SKILL_PROPOSALS_REVISION: &str = "099_prompt_skill_proposals";
+
+/// The durable session floor table (`session_floor.rs`).
+pub const SESSION_FLOORS_REVISION: &str = "098_session_floors";
 
 /// The kiosk-seat revision (i77).
 pub const KIOSK_SEATS_REVISION: &str = "092_kiosk_seats";
@@ -2861,17 +3020,57 @@ mod tests {
         assert!(cluster.contains("harness_profile = CASE WHEN"), "the upsert must write harness_profile");
     }
 
-    /// i145: the embedding-space table is the chain head, sits on the
+    /// i145: the embedding-space table sits on the
     /// harness-profile revision, and is empty (the gateway seeds it at boot).
     #[test]
     fn embedding_spaces_revision_creates_the_table_and_seeds_nothing() {
         let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACES_REVISION).expect("must be in the chain");
         assert_eq!(m.revision, "097_embedding_spaces");
         assert_eq!(m.down_revision, Some(HARNESS_PROFILE_REVISION));
-        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACES_REVISION), "the chain head");
         assert!(m.sql.contains("CREATE TABLE IF NOT EXISTS noo_embedding_spaces"));
         assert!(!m.sql.contains("INSERT"), "a migration cannot read the fleet's embed model; the boot seed does");
         assert!(include_str!("embedding_spaces.rs").contains("FROM noo_embedding_spaces"));
+    }
+
+    /// i150 E1: the embed-placement key sits on the add-on delegation
+    /// revision, and widens the unique index with the model
+    /// for embed rows only.
+    #[test]
+    fn embed_placement_model_revision_keys_embed_rows_by_model() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBED_PLACEMENT_MODEL_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "101_embed_placement_model");
+        assert!(m.revision.len() <= 32, "alembic_version.version_num is varchar(32)");
+        assert_eq!(m.down_revision, Some(ADDON_DELEGATION_REVISION));
+        assert!(m.sql.contains("DROP INDEX IF EXISTS uq_placement_node_backend_role;"));
+        assert!(m.sql.contains(
+            "(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"
+        ));
+        assert!(!m.sql.contains("DELETE") && !m.sql.contains("UPDATE"), "no row is rewritten or dropped");
+        // The upsert's ON CONFLICT must name the identical expression.
+        assert!(include_str!("routes/cluster.rs")
+            .contains("(node_id, backend, role, (CASE WHEN role = 'embed' THEN model ELSE '' END))"));
+    }
+
+    /// i150: the migration columns are the chain head, on the embed-placement revision, all nullable
+    /// (no row changes), and `embedding_spaces::load` reads every one.
+    #[test]
+    fn embedding_space_migration_revision_is_the_head_and_adds_nullable_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == EMBEDDING_SPACE_MIGRATION_REVISION).expect("must be in the chain");
+        assert_eq!(m.revision, "102_embedding_space_migration");
+        assert!(m.revision.len() <= 32);
+        assert_eq!(m.down_revision, Some(EMBED_PLACEMENT_MODEL_REVISION));
+        assert_eq!(MIGRATIONS.last().map(|m| m.revision), Some(EMBEDDING_SPACE_MIGRATION_REVISION), "the chain head");
+        for col in [
+            "next_model text", "next_dims integer", "migration_state text", "migration_progress jsonb",
+            "migration_started_at timestamptz", "migration_reported_at timestamptz",
+        ] {
+            assert!(m.sql.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")), "{col}");
+        }
+        assert!(!m.sql.contains("NOT NULL") && !m.sql.contains("UPDATE"), "existing spaces stay un-migrating");
+        let spaces = include_str!("embedding_spaces.rs");
+        for col in ["next_model", "next_dims", "migration_state", "migration_progress", "migration_started_at", "migration_reported_at"] {
+            assert!(spaces.contains(col), "{col} must be read/written by embedding_spaces");
+        }
     }
 
     /// The vendor-kinds revision sits on the audit chain and adds what
@@ -2884,6 +3083,47 @@ mod tests {
         let cluster = include_str!("routes/cluster.rs");
         assert!(cluster.contains("usage_profile, vendor_kinds"), "desired-config must read vendor_kinds");
         assert!(cluster.contains("vendor_kinds = CASE WHEN"), "the upsert must write vendor_kinds");
+    }
+
+    /// 098 is the durable session floor; the CLI's reset writes the same
+    /// table and columns, so a rename on either side must fail a test.
+    #[test]
+    fn session_floors_revision_sits_on_embedding_spaces_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == SESSION_FLOORS_REVISION).expect("098 must be in the chain");
+        assert_eq!(m.down_revision, Some(EMBEDDING_SPACES_REVISION));
+        for needle in ["noo_session_floors", "account    text        PRIMARY KEY", "floor_ms   bigint", "expires_at timestamptz"] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
+    }
+
+    /// 099 is the prompt-skill promotion table the gateway reads at boot.
+    #[test]
+    fn prompt_skill_proposals_revision_sits_on_the_session_floors_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == PROMPT_SKILL_PROPOSALS_REVISION).expect("099 must be in the chain");
+        assert_eq!(m.down_revision, Some(SESSION_FLOORS_REVISION));
+        for needle in ["noo_prompt_skill_proposals", "content_sha", "UNIQUE (name, content_sha)", "WHERE status = 'pending'"] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
+    }
+
+    /// 097 is the add-on delegated token's schema; the task code writes these
+    /// names, so a rename on either side must fail a test.
+    #[test]
+    fn addon_delegation_revision_sits_on_the_prompt_skills_and_names_the_columns() {
+        let m = MIGRATIONS.iter().find(|m| m.revision == ADDON_DELEGATION_REVISION).expect("100 must be in the chain");
+        assert_eq!(m.down_revision, Some(PROMPT_SKILL_PROPOSALS_REVISION));
+        for needle in [
+            "created_via text",
+            "context_revision integer NOT NULL DEFAULT 0",
+            "noo_task_idempotency",
+            "PRIMARY KEY (owner, via, key)",
+            "noo_task_context",
+            "noo_task_events",
+            "PRIMARY KEY (task_id, seq)",
+            "noo_task_event_delivery",
+        ] {
+            assert!(m.sql.contains(needle), "{needle}");
+        }
     }
 
     /// 092 adds the chain columns and makes the app role INSERT-only, and the

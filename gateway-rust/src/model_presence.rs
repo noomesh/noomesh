@@ -82,6 +82,43 @@ pub fn role_model(node: &Value, role: &str) -> Option<String> {
     })
 }
 
+/// Every model the node reports for `role`, deduplicated, in report order.
+///
+/// A node may serve several embedding spaces: the node keys the first embed
+/// entry `<backend>#embed` and each further embed model
+/// `<backend>#embed@<model>`. The entry's own `role` and `model` fields are the
+/// truth (the key only keeps entries apart), so every key form is read the same
+/// way. Empty when the node reports none (an older agent reports one at most).
+pub fn role_models(node: &Value, role: &str) -> Vec<String> {
+    let Some(map) = node.get("model_presence").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for e in map.values() {
+        let r = match e["role"].as_str() {
+            Some("") | None => "chat",
+            Some(r) => r,
+        };
+        if r != role {
+            continue;
+        }
+        if let Some(m) = e["model"].as_str().filter(|m| !m.is_empty()) {
+            if !out.iter().any(|o| o == m) {
+                out.push(m.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `role_models` against the node's record in the `mesh_nodes` KV; empty when
+/// unknown (unreadable record, older agent that reports nothing).
+pub async fn node_role_models(state: &crate::state::AppState, node_id: &str, role: &str) -> Vec<String> {
+    let Ok(kv) = state.js.get_key_value("mesh_nodes").await else { return Vec::new() };
+    let Ok(Some(entry)) = kv.get(node_id).await else { return Vec::new() };
+    serde_json::from_slice::<Value>(&entry).map(|n| role_models(&n, role)).unwrap_or_default()
+}
+
 /// `role_model` against the node's record in the `mesh_nodes` KV; None when
 /// unknown (unreadable record, older agent that reports nothing).
 pub async fn node_role_model(state: &crate::state::AppState, node_id: &str, role: &str) -> Option<String> {
@@ -124,6 +161,26 @@ mod tests {
         assert_eq!(role_model(&n, "chat").as_deref(), Some("gemma4:26b-a4b-it-qat"));
         assert_eq!(missing_entry(&n, "ollama").unwrap()["model"], "harrier");
         assert!(!backend_model_missing(&n, "ollamax"), "a prefix of another backend's name is not this backend");
+    }
+
+    #[test]
+    fn role_models_reads_every_embed_entry_in_both_key_forms() {
+        let n = json!({"model_presence": {
+            "ollama": {"model": "gemma4:26b-a4b-it-qat", "role": "chat", "present": true},
+            "ollama#embed": {"model": "harrier", "role": "embed", "present": true},
+            "ollama#embed@nomic-embed-code": {"model": "nomic-embed-code", "role": "embed", "present": true},
+            "llamacpp#embed@harrier": {"model": "harrier", "role": "embed", "present": true}}});
+        let mut got = role_models(&n, "embed");
+        got.sort();
+        assert_eq!(got, vec!["harrier", "nomic-embed-code"], "both embed models, harrier once");
+        assert_eq!(role_models(&n, "chat"), vec!["gemma4:26b-a4b-it-qat"]);
+        assert!(role_models(&n, "rerank").is_empty());
+        assert!(role_models(&json!({}), "embed").is_empty());
+        // The bare key can be an embed primary (no chat row on the node).
+        let only = json!({"model_presence": {"ollama": {"model": "harrier", "role": "embed", "present": true}}});
+        assert_eq!(role_models(&only, "embed"), vec!["harrier"]);
+        // role_model keeps returning one of them for existing callers.
+        assert!(role_model(&n, "embed").is_some());
     }
 
     #[test]

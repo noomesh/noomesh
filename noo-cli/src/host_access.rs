@@ -138,7 +138,23 @@ pub(crate) fn login_with_ticket(g: &Globals, account: &str, purpose: &str) -> Re
 /// The SQL that makes `account` a working admin with `bcrypt_hash` as its
 /// password: created when the row is missing, and otherwise re-enabled,
 /// unlocked and given back the admin tier. One transaction.
-pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
+///
+/// The same transaction ENDS the account's sessions, because a password reset
+/// that leaves yesterday's bearer working is not a reset: it revokes every
+/// refresh token and writes the durable "not before" floor the gateway reads
+/// (`gateway-rust/src/session_floor.rs`, table `noo_session_floors`, migration
+/// 095). The floor is in MILLISECONDS (`floor_ms`), `now + 1 ms` like an operator account change, and lives
+/// `floor_ttl_secs` (one access-token lifetime plus margin). A running gateway
+/// adopts it within its Postgres re-read interval (5 s); one that is down
+/// loads it at boot. This path deliberately does not call the gateway: the
+/// reset must work with no login, no secret and the gateway down. The floor
+/// row is written only when migration 095's table exists: this connection is
+/// not the role that owns the schema, so creating the table here could leave
+/// it owned by a role the gateway cannot read. Against an unmigrated database
+/// the password still resets and the refresh tokens are still revoked;
+/// already-issued access tokens then last until they expire (15 minutes by
+/// default), as before this change.
+pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str, floor_ttl_secs: i64) -> String {
     let (u, h) = (quote(account), quote(bcrypt_hash));
     format!(
         "{SEARCH_PATH}BEGIN;\n\
@@ -150,8 +166,24 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
          scopes = CASE WHEN COALESCE(noo_users.scopes, '[]'::jsonb) @> '[\"admin\"]'::jsonb \
          THEN noo_users.scopes ELSE '{ADMIN_SCOPES}'::jsonb END, \
          role = 'admin';\n\
+         UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = {u} AND revoked_at IS NULL;\n\
+         DO $floor$ BEGIN IF to_regclass('noo_session_floors') IS NOT NULL THEN \
+         INSERT INTO noo_session_floors (account, floor_ms, expires_at) \
+         VALUES ({u}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 1, now() + interval '{floor_ttl_secs} seconds') \
+         ON CONFLICT (account) DO UPDATE SET \
+         floor_ms = GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms), \
+         expires_at = GREATEST(noo_session_floors.expires_at, EXCLUDED.expires_at); \
+         END IF; END $floor$;\n\
          COMMIT;\n"
     )
+}
+
+/// How long a floor row stays: the gateway's `session_floor::floor_ttl_secs`
+/// (the longest access token, never under 15 minutes, plus 5 minutes). Read
+/// from the same env var; an unreadable value falls back to the default.
+pub(crate) fn floor_ttl_secs() -> i64 {
+    let mins = std::env::var("NOO_TOKEN_EXPIRE_MINUTES").ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(15);
+    mins.max(15) * 60 + 300
 }
 
 /// Write `account`'s new password straight into the gateway's database.
@@ -159,13 +191,37 @@ pub(crate) fn reset_admin_sql(account: &str, bcrypt_hash: &str) -> String {
 /// disabled account.
 pub(crate) fn reset_admin(db: &HostDb, account: &str, password: &str) -> Result<(), String> {
     validate_account(account)?;
+    // bcrypt 0.15 has no non-truncating API (and the later one refuses exactly
+    // 72 bytes, counting its NUL terminator), so enforce the 72-byte rule here.
+    if let Some(why) = crate::password_policy::too_long_for_bcrypt(password) {
+        return Err(why.to_string());
+    }
     let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| format!("bcrypt: {e}"))?;
-    db.run(&reset_admin_sql(account, &hash))
+    db.run(&reset_admin_sql(account, &hash, floor_ttl_secs()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_admin_refuses_over_72_bytes_before_touching_the_db() {
+        let db = HostDb::resolve();
+        for pw in ["x".repeat(73), "\u{20ac}".repeat(30)] {
+            let e = reset_admin(&db, "admin", &pw).unwrap_err();
+            assert_eq!(e, "Password is longer than 72 bytes; bcrypt would silently ignore the rest. Use 72 bytes or fewer.");
+        }
+    }
+
+    #[test]
+    fn an_old_hash_of_a_long_password_still_verifies() {
+        // Hashed before the rule, with the truncating API: only the first 72
+        // bytes counted. Verification is unchanged.
+        let long = "y".repeat(80);
+        let old = bcrypt::hash(&long, 4).unwrap();
+        assert!(bcrypt::verify(&long, &old).unwrap());
+        assert!(bcrypt::verify("y".repeat(72), &old).unwrap());
+    }
 
     #[test]
     fn a_ticket_row_carries_only_the_hash() {
@@ -187,7 +243,7 @@ mod tests {
 
     #[test]
     fn the_reset_recreates_reenables_and_unlocks_the_admin() {
-        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv");
+        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv", 1200);
         for needle in [
             "INSERT INTO noo_users",
             "ON CONFLICT (username) DO UPDATE",
@@ -201,6 +257,45 @@ mod tests {
         ] {
             assert!(sql.contains(needle), "missing {needle}: {sql}");
         }
+    }
+
+    /// A reset must end the account's sessions: the refresh chain is revoked
+    /// and the durable floor is raised, in the SAME transaction as the new
+    /// password (all or nothing), so the next gateway read honours it.
+    #[test]
+    fn the_reset_ends_the_accounts_sessions_in_the_same_transaction() {
+        let sql = reset_admin_sql("admin", "$2b$12$abcdefghijklmnopqrstuv", 1200);
+        let begin = sql.find("BEGIN;").unwrap();
+        let commit = sql.find("COMMIT;").unwrap();
+        for needle in [
+            "UPDATE noo_refresh_tokens SET revoked_at = now() WHERE user_id = 'admin'",
+            "IF to_regclass('noo_session_floors') IS NOT NULL THEN",
+            "INSERT INTO noo_session_floors (account, floor_ms, expires_at)",
+            "VALUES ('admin', (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 1, now() + interval '1200 seconds')",
+            "GREATEST(noo_session_floors.floor_ms, EXCLUDED.floor_ms)",
+        ] {
+            let at = sql.find(needle).unwrap_or_else(|| panic!("missing {needle}: {sql}"));
+            assert!(begin < at && at < commit, "{needle} must sit inside the transaction");
+        }
+        assert!(!sql.contains("CREATE TABLE"), "the CLI must never create schema: {sql}");
+    }
+
+    #[test]
+    fn the_floor_row_lives_one_token_lifetime_and_never_under_the_default() {
+        assert!(floor_ttl_secs() >= 15 * 60 + 300);
+    }
+
+    /// The gateway reads these columns; a rename on one side strands the floor.
+    #[test]
+    fn the_floor_table_matches_the_gateways_migration() {
+        let mig = include_str!("../../gateway-rust/src/mesh_migrate.rs");
+        let m = mig.split("revision: SESSION_FLOORS_REVISION").nth(1).expect("migration 095");
+        for col in ["noo_session_floors", "account", "floor_ms", "expires_at"] {
+            assert!(m.contains(col), "migration 095 lacks {col}");
+        }
+        let gw = include_str!("../../gateway-rust/src/session_floor.rs");
+        assert!(gw.contains("floor_ms FROM noo_session_floors WHERE account = $1 AND expires_at > now()"));
+        assert!(gw.contains("fn floor_ttl_secs() -> i64 {\n    crate::auth_refresh::default_access_minutes().max(15) * 60 + 300"));
     }
 
     /// The SQL is built by quoting, and the name is checked first: an
@@ -227,5 +322,50 @@ mod tests {
         let core = include_str!("../../gateway-rust/src/routes/core.rs");
         assert!(core.contains(&format!("pub(crate) const HOST_TICKET_GRANT: &str = \"{HOST_TICKET_GRANT}\";")));
         assert!(core.contains("auth_refresh::hash_token(ticket.trim())"), "the gateway hashes the ticket as sha256 hex");
+    }
+}
+
+/// bcrypt crate-upgrade guards (0.15 -> 0.19): hashes written by the old
+/// crate must keep verifying, the cost factors must not drift, and the
+/// >72-byte behaviour is pinned rather than left to the crate's defaults.
+#[cfg(test)]
+mod bcrypt_compat_tests {
+    // Produced by bcrypt 0.15.1 `hash("correct horse battery staple", cost)`.
+    const OLD_COST_11: &str = "$2b$11$r/NlN7sum.DHEUCYEdhb9uK5hVow8WKi9vIno9HNXaqfvQGp.ZZTC";
+    const OLD_DEFAULT_COST: &str = "$2b$12$Esqeyv21p38BucQWsUKBn.nTByoyFKs2RERJFClQEgk8hwExmHx/K";
+    // bcrypt 0.15.1 `hash("x" * 80, 6)`: the old crate truncated at 72 bytes.
+    const OLD_LONG_COST_6: &str = "$2b$06$SSuCX5bo/IF9BiOaNUCp3uqm.r..iG03zNsNx/bvCJdnOXIhhgBTy";
+    const PW: &str = "correct horse battery staple";
+
+    #[test]
+    fn hashes_made_by_bcrypt_0_15_still_verify_and_wrong_passwords_fail() {
+        for h in [OLD_COST_11, OLD_DEFAULT_COST] {
+            assert!(bcrypt::verify(PW, h).unwrap(), "old hash must verify: {h}");
+            assert!(!bcrypt::verify("correct horse battery stapl3", h).unwrap());
+            assert!(!bcrypt::verify("", h).unwrap());
+        }
+    }
+
+    #[test]
+    fn cost_factors_are_unchanged() {
+        // reset_admin uses DEFAULT_COST (12 in 0.15); NATS users use 11.
+        assert_eq!(bcrypt::DEFAULT_COST, 12);
+        let h = bcrypt::hash(PW, bcrypt::DEFAULT_COST).unwrap();
+        assert!(h.starts_with("$2b$12$"), "{h}");
+        assert!(crate::commands::nats_users::nats_bcrypt(PW).unwrap().starts_with("$2b$11$"));
+        assert!(bcrypt::verify(PW, &h).unwrap());
+    }
+
+    #[test]
+    fn over_72_bytes_behaviour_matches_the_old_crate() {
+        // Unchanged from 0.15: `hash` truncates at 72 bytes (an old hash of
+        // 80 bytes verifies against the first 72 and no more). The CLI does
+        // not add a length rule here; see followup i74.
+        let long = "x".repeat(80);
+        assert!(bcrypt::verify(&long, OLD_LONG_COST_6).unwrap());
+        assert!(bcrypt::verify("x".repeat(72), OLD_LONG_COST_6).unwrap());
+        assert!(!bcrypt::verify("x".repeat(71), OLD_LONG_COST_6).unwrap());
+        // The non-truncating API refuses: that is what a hard rule would use.
+        assert!(bcrypt::non_truncating_hash(&long, 4).is_err());
     }
 }

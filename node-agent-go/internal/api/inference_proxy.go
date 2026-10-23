@@ -268,6 +268,11 @@ var backendExtraKeys = map[string]map[string]bool{
 		"reasoning":        true,
 		"reasoning_effort": true,
 		"think":            true,
+		// Read by the /api/chat translator (ollama_chat.go, ollamaThink)
+		// as the last-resort thinking switch and never forwarded: the
+		// translator builds a fresh body. Stripped here, it was a silent
+		// no-op (noomesh-internal i183).
+		"chat_template_kwargs": true,
 	},
 	"llamacpp": {
 		"n_predict":      true, // alias for max_tokens
@@ -311,30 +316,45 @@ func jsonError(w http.ResponseWriter, status int, code, message string) {
 //   - backend type isn't in backendExtraKeys (unknown / new backend —
 //     pass through; safer than over-stripping for unknown configurations)
 func filterBodyForBackend(body []byte, backendType string) []byte {
+	out, _ := filterBodyForBackendDropped(body, backendType)
+	return out
+}
+
+// DroppedKeysHeader names, on the response, the request keys the allowlist
+// removed before forwarding (sorted, comma-separated). A key a backend does
+// not take is otherwise a silent no-op: `chat_template_kwargs` on ollama
+// left thinking on and nobody could tell from the answer (noomesh-internal
+// i183). Absent when nothing was dropped.
+const DroppedKeysHeader = "X-Noo-Dropped-Keys"
+
+// filterBodyForBackendDropped is filterBodyForBackend plus the names of the
+// keys it removed, sorted.
+func filterBodyForBackendDropped(body []byte, backendType string) ([]byte, []string) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
+		return body, nil
 	}
 	extras, known := backendExtraKeys[backendType]
 	if !known {
-		return body
+		return body, nil
 	}
-	changed := false
+	var dropped []string
 	for k := range obj {
 		if portableOpenAIKeys[k] || extras[k] {
 			continue
 		}
 		delete(obj, k)
-		changed = true
+		dropped = append(dropped, k)
 	}
-	if !changed {
-		return body
+	if len(dropped) == 0 {
+		return body, nil
 	}
+	sort.Strings(dropped)
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return body
+		return body, nil
 	}
-	return out
+	return out, dropped
 }
 
 // Preferred order when no backend hint + no model match — vllm wins
@@ -435,7 +455,15 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// Filter body to only keys the target backend accepts (portable
 	// OpenAI keys + this backend's vendor extras). Catches vendor-key
 	// mismatches across backends without hardcoding "vllm vs others".
-	body = filterBodyForBackend(body, backendType)
+	var dropped []string
+	body, dropped = filterBodyForBackendDropped(body, backendType)
+	if len(dropped) > 0 {
+		// Said on the answer, not only here: the caller is the one who
+		// sent a key this backend does not take.
+		w.Header().Set(DroppedKeysHeader, strings.Join(dropped, ","))
+		slog.Debug("inference proxy dropped request keys the backend does not take",
+			"backend", backendType, "keys", dropped)
+	}
 
 	targetURL, scheme := s.inferenceTarget(backendType, port, native)
 	target, err := url.Parse(targetURL)
@@ -444,12 +472,29 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Restore the body we consumed for hint detection (now possibly
+	// vllm-key-stripped) BEFORE admission: once a queued stream's headers
+	// go out, net/http reads the request's body fields on another
+	// goroutine, so the request is not touched after this point.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+
+	// A slot on the backend, or a busy answer (admission.go): a full
+	// engine is reported as busy, never left silent to be read as wedged.
+	firstByte := backendFirstByteTimeout()
+	adm := s.admit(w, r, backendType, body, firstByte)
+	if adm == nil {
+		return
+	}
+	defer adm.done()
+	w = adm.w
+
 	// An ollama answers chat on its NATIVE /api/chat, translated here both
 	// ways: its OpenAI-compatible layer holds a tool-carrying stream until
 	// the whole answer exists, and every harness call carries tools
 	// (ollama_chat.go, noomesh-internal i159).
 	if backendType == "ollama" && r.URL.Path == "/v1/chat/completions" {
-		s.proxyOllamaChat(w, r, body, targetURL, scheme, backendFirstByteTimeout())
+		s.proxyOllamaChat(w, r, body, targetURL, scheme, firstByte)
 		return
 	}
 
@@ -470,7 +515,6 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 	// backendFirstByteTimeout answers, and the next request's transport is
 	// built with the new value. No agent restart, no transport to rebuild;
 	// a request already in flight keeps the bound it started with.
-	firstByte := backendFirstByteTimeout()
 	proxy.Transport = s.inferenceTransport(scheme, firstByte)
 	// Surface upstream errors as OpenAI-shape JSON instead of the default
 	// plain text "Bad Gateway".
@@ -488,10 +532,6 @@ func (s *Server) handleInferenceProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(rw, http.StatusBadGateway, "backend_unreachable", err.Error())
 	}
 
-	// Restore the body we consumed for hint detection (now possibly
-	// vllm-key-stripped).
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
 	r.Header.Set("X-Forwarded-By", "noo-node-agent-inference-proxy")
 	// Strip the hint header before forwarding — backends would reject it.
 	r.Header.Del("X-Noo-Backend")
@@ -907,7 +947,7 @@ func (s *Server) handleRerankProxy(w http.ResponseWriter, r *http.Request) {
 // sidecar with a client certificate, or a pre-door container plain until
 // the reconciler recreates it). Override with NOO_LOCAL_EMBED_URL if the
 // embedder is exposed under a different service name/port.
-func (s *Server) localEmbedURL() string {
+func (s *Server) localEmbedURL(t embedtarget.Target) string {
 	if u := strings.TrimSpace(os.Getenv("NOO_LOCAL_EMBED_URL")); u != "" {
 		return strings.TrimRight(u, "/")
 	}
@@ -918,7 +958,6 @@ func (s *Server) localEmbedURL() string {
 	// harrier-on-ollama at 1024 dims — wrong answers, no error. Container
 	// names cannot disambiguate this (ollama serves chat on some nodes and
 	// embeddings on others), so role is the only sound signal.
-	t := embedtarget.Get()
 	if t.Backend != "" {
 		return strings.TrimRight(s.docker.BackendDialURL(t.Backend), "/")
 	}
@@ -938,8 +977,8 @@ func (s *Server) localEmbedURL() string {
 // placement is declared yet). The scheme is the endpoint's own: plaintext
 // loopback ollama, or the self-node's https door (backendClient picks the
 // transport from it).
-func (s *Server) nativeEmbedURL() (string, bool) {
-	backend := embedtarget.Get().Backend
+func (s *Server) nativeEmbedURL(t embedtarget.Target) (string, bool) {
+	backend := t.Backend
 	if backend == "" || s.native == nil {
 		return "", false
 	}
@@ -1015,9 +1054,10 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// lane's own endpoint wins. Before this, every embed request to a Mac
 	// whose embed placement was live answered 503 no_local_embedder while
 	// ollama served the model fine.
-	base, native := s.nativeEmbedURL()
+	tgt := embedTargetFor(body)
+	base, native := s.nativeEmbedURL(tgt)
 	if !native {
-		base = s.localEmbedURL()
+		base = s.localEmbedURL(tgt)
 	}
 
 	// Guard: precise 503 when no embedding container is here (stale gossip).
@@ -1056,11 +1096,11 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// ollama serves many and rejects a request without one — that mismatch
 	// is why a correctly-routed /embed still answered "404 page not found"
 	// (ollama's own 404, copied straight through to the caller).
-	body = ensureEmbedModel(body, embedtarget.Get().Model)
+	body = ensureEmbedModel(body, tgt.Model)
 	// `options` is an ollama knob (the gateway sends num_ctx on every
 	// embed). TEI and other OpenAI-compatible engines have no such field;
 	// keep it from reaching them.
-	if embedtarget.Get().Backend != backendOllama {
+	if tgt.Backend != backendOllama {
 		body = stripEmbedOptions(body)
 		body = stripEmbedKeepAlive(body)
 	}
@@ -1071,7 +1111,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// Skipped for ollama when the caller sent `options` (the gateway sends
 	// num_ctx on every embed): ollama's /v1/embeddings drops them, so the
 	// native /api/embed below is the only route that honours them.
-	if !embedNativeFirst(embedtarget.Get().Backend, body) {
+	if !embedNativeFirst(tgt.Backend, body) {
 		resp, err := post(base+"/v1/embeddings", body)
 		if err != nil {
 			jsonError(w, http.StatusBadGateway, "embedder_unreachable", err.Error())
@@ -1110,7 +1150,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 	// Native fallback, driven by the dialect registry rather than a chain
 	// of per-engine branches. The backend type comes from the role=embed
 	// placement, so adding an engine is a table entry, not another `if`.
-	d, ok := embedDialects[embedtarget.Get().Backend]
+	d, ok := embedDialects[tgt.Backend]
 	if !ok {
 		// Unknown/undeclared engine: TEI's dialect is the historical
 		// default and the only one every existing deployment has spoken.
@@ -1119,7 +1159,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 
 	model := in.Model
 	if model == "" {
-		model = embedtarget.Get().Model
+		model = tgt.Model
 	}
 
 	nativeReq, err := d.encode(inputs, model, embedOptions(body))
@@ -1127,7 +1167,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "encode_failed", err.Error())
 		return
 	}
-	if embedtarget.Get().Backend == backendOllama {
+	if tgt.Backend == backendOllama {
 		nativeReq = withEmbedKeepAlive(nativeReq, embedKeepAlive(body))
 	}
 	nresp, err := post(base+d.path, nativeReq)
@@ -1147,7 +1187,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		// node-agent has no /embed route" when the route was fine and the
 		// DIALECT was wrong.
 		slog.Warn("embed.native_dialect_failed",
-			"backend", embedtarget.Get().Backend,
+			"backend", tgt.Backend,
 			"path", d.path,
 			"status", nresp.StatusCode)
 		w.Header().Set("Content-Type", "application/json")
@@ -1161,7 +1201,7 @@ func (s *Server) handleEmbedProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if model == "" {
-		model = embedtarget.Get().Backend
+		model = tgt.Backend
 	}
 	writeOpenAIEmbeddings(w, vectors, model)
 }
@@ -1212,6 +1252,23 @@ func embedContainerFromURL(base string) string {
 		return ""
 	}
 	return u.Hostname()
+}
+
+// embedTargetFor picks the declared embedder a request is for: the one whose
+// model the body names, else the primary (first) target. A node serving
+// several embedding spaces carries one target per model; a body naming a
+// model this node does not declare is not an error here -- the primary
+// answers as it always did, and the backend itself rejects a model it lacks.
+func embedTargetFor(body []byte) embedtarget.Target {
+	var in struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &in); err == nil {
+		if t, ok := embedtarget.For(in.Model); ok {
+			return t
+		}
+	}
+	return embedtarget.Get()
 }
 
 // ensureEmbedModel injects `model` into an embeddings body that omits it.

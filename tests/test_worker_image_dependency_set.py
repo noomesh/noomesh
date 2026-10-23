@@ -56,16 +56,24 @@ def _installed_extras(dockerfile: str) -> set[str]:
     return found
 
 
-LOCK_REF = "docker/core-lock/requirements.txt"
+# The images that install from a hash lock, and the lock each one uses.
+LOCK_REFS = ["docker/core-lock/requirements.txt", "docker/ml-lock/requirements.txt"]
+LOCK_REF = LOCK_REFS[0]
+
+
+def _image_lock(dockerfile: str) -> str | None:
+    text = (ROOT / dockerfile).read_text()
+    return next((ref for ref in LOCK_REFS if ref in text), None)
 
 
 def _image_reqs(dockerfile: str) -> list[Requirement]:
     """What the image installs: its hash lock when it installs from one
-    (deps-core, `--require-hashes`), else the extras closure from pyproject."""
-    text = (ROOT / dockerfile).read_text()
-    if LOCK_REF in text:
-        names = re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==", (ROOT / LOCK_REF).read_text(), re.M)
-        assert names, f"{LOCK_REF} names no pinned package"
+    (deps-core and deps-base, `--require-hashes`), else the extras closure
+    from pyproject."""
+    ref = _image_lock(dockerfile)
+    if ref:
+        names = re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==", (ROOT / ref).read_text(), re.M)
+        assert names, f"{ref} names no pinned package"
         return [Requirement(n) for n in names]
     return _closure(_installed_extras(dockerfile))
 
@@ -90,7 +98,7 @@ def test_src_really_imports_async_sqlalchemy() -> None:
 
 def test_each_image_install_line_was_parsed() -> None:
     for df in INSTALLERS:
-        assert _installed_extras(df), f"parse found no extras in {df}"
+        assert _installed_extras(df) or _image_lock(df), f"parse found no extras or lock in {df}"
 
 
 def test_every_image_that_installs_noomesh_gets_greenlet() -> None:

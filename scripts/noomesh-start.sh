@@ -348,7 +348,11 @@ detect_gpu_tier() {
     fi
     local vram_mb
     vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-    if [ -z "$vram_mb" ] || [ "$vram_mb" = "0" ]; then
+    # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
+    # stdout ("Failed to initialize NVML: ..."), which would reach the
+    # arithmetic below and abort the script. Only a purely numeric value is
+    # a VRAM reading; anything else means "no usable GPU here".
+    if ! [[ "$vram_mb" =~ ^[0-9]+$ ]] || [ "$vram_mb" = "0" ]; then
         echo ""
         return
     fi
@@ -491,6 +495,10 @@ else
     # A dev start: composed add-on overlays run the dev build's names.
     DIST_MODE=0 require_addon_pins || exit 1
 fi
+# What the verified add-ons' signed bundles declare beyond their overlays
+# (system.json, workloads.json) goes to the gateway's read-only directories,
+# for exactly the add-ons the verdict above names (lib-dist.sh).
+addon_decls_materialise || exit 1
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$SCRIPT_DIR/lib-created-guard.sh"
 source "$SCRIPT_DIR/lib-stuck-container.sh"
@@ -673,18 +681,12 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
     # `up` at all without this (sandbox rehearsal 2026-08-06, defect #13).
     docker network create "${NOO_CLUSTER_NETWORK:-noo-cluster}" --driver bridge 2>/dev/null || true
 
-    # The gateway runs as nonroot (uid 65532) and stages Drive/folder
-    # ingest downloads into /data/ingest/working on the noo-data volume —
-    # but the volume root is owned by whoever first wrote it, so the
-    # gateway's own create_dir_all fails EACCES and every download then
-    # dies with a misleading "No such file or directory" (live,
-    # 2026-08-08: Drive→KB ingestion silently broken, one warn per file
-    # per tick). Same throwaway-container pattern as the wizard's
-    # ensure_dir_ownership: no sudo needed, idempotent, never touches
-    # anything outside /data/ingest.
-    docker run --rm -v "$(noo_data_volume)":/d alpine \
-        sh -c 'mkdir -p /d/ingest/working /d/ingest/archive && chown -R 65532:65532 /d/ingest' \
-        2>/dev/null || true
+    # The gateway runs as nonroot (uid 65532) and creates its own dirs on
+    # the noo-data volume (/data/ingest, /data/audit-archive), whose root is
+    # owned by whoever first wrote it: make them and hand them to 65532 first
+    # (lib-instance.sh noo_prepare_gateway_data_dirs; same throwaway-container
+    # pattern as the wizard's ensure_dir_ownership, no sudo needed).
+    noo_prepare_gateway_data_dirs
 
     # noomesh.yaml must be WRITABLE BY THE GATEWAY, not just readable.
     # `noo config set` and every dashboard settings write go through the

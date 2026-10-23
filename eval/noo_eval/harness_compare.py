@@ -201,6 +201,14 @@ class Comparer:
         return {"model": orig.get("model") or "auto", "desired_state": "running",
                 "role": "harness", "env": env}
 
+    async def _stop_task(self, task_id: str) -> bool:
+        """POST /api/tasks/{id}/stop; True when the gateway accepted it."""
+        try:
+            r = await self.tasks.post(f"/api/tasks/{_q(task_id)}/stop")
+            return r.status_code < 300
+        except httpx.HTTPError:
+            return False
+
     async def place(self, kind: str) -> KindRun:
         kr = KindRun(kind=kind)
         node = self.spec.node
@@ -310,8 +318,12 @@ class Comparer:
             c, u = _ts(rec.get("created_at")), _ts(rec.get("updated_at"))
             tr.wall_s = round((u - c).total_seconds(), 1) if (c and u and not timed_out) else round(wall, 1)
             if timed_out:
+                # Stop it now: a task left looping on the node would fill the
+                # harness's slots and the model for every later task and kind,
+                # and the next kind's numbers would measure this one's leftovers.
+                stopped = await self._stop_task(tr.task_id)
                 tr.note = (f"timed out after {timeout:.0f}s in state {tr.state or 'unknown'} "
-                           f"(left running; stop it with POST /api/tasks/{tr.task_id}/stop)")
+                           f"({'stopped' if stopped else 'could not stop it; stop it with POST /api/tasks/' + tr.task_id + '/stop'})")
                 tr.state = f"timeout ({tr.state})" if tr.state else "timeout"
         except httpx.HTTPError as e:
             tr.state = tr.state or "error"
@@ -337,9 +349,15 @@ class Comparer:
     async def run(self) -> HarnessCompare:
         spec = self.spec
         self.original = await read_harness_placement(self.ops, spec.node)
+        auto = bool(self.original and self.original.get("synthesized"))
+        if auto:
+            # The node's `auto` harness policy made this placement; none is
+            # stored. Writing it back would store one and pin the node, so the
+            # run treats it as absent and removes its own at the end.
+            self.original = None
         self.out.original_kind = kind_of(self.original)
         self.log(f"[noo-eval] harness-compare on {spec.node}: kinds {', '.join(spec.kinds)} "
-                 f"(original: {self.out.original_kind or 'no harness placement'})")
+                 f"(original: {self.out.original_kind or ('the auto policy' if auto else 'no harness placement')})")
         try:
             for kind in spec.kinds:
                 kr = await self.place(kind)

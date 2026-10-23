@@ -179,7 +179,10 @@ addon_licensed_names() {
 addon_overlay() {
     _ao_name="$1"
     _ao_kebab="$(printf '%s' "$_ao_name" | tr '_' '-')"
-    _ao_var="NOO_$(printf '%s' "$_ao_name" | tr 'a-z' 'A-Z')_PATH"
+    # A hyphenated add-on name (pai-voice) reads NOO_PAI_VOICE_PATH, the same
+    # `-` → `_` rule the gateway uses for NOO_<ADDON>_URL; `NOO_PAI-VOICE_PATH`
+    # is not a variable name and ${!...} dies on it (2026-10-22).
+    _ao_var="NOO_$(printf '%s' "$_ao_name" | tr 'a-z-' 'A-Z_')_PATH"
     _ao_base="${!_ao_var:-../noo-$_ao_kebab}"
     _ao_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     if [ -f "$_ao_base/docker-compose.$_ao_kebab.yml" ]; then
@@ -281,7 +284,7 @@ addons_report_licensed() {
         addon_on "$_arl_n" 0 || continue
         _arl_o="$(addon_overlay "$_arl_n" 2>/dev/null)"
         case "$_arl_o" in
-            '') echo "addons.$_arl_n is true but no overlay was found: not in its signed bundle (noo addons upgrade $_arl_n) nor in a development checkout (NOO_$(printf '%s' "$_arl_n" | tr 'a-z' 'A-Z')_PATH)" ;;
+            '') echo "addons.$_arl_n is true but no overlay was found: not in its signed bundle (noo addons upgrade $_arl_n) nor in a development checkout (NOO_$(printf '%s' "$_arl_n" | tr 'a-z-' 'A-Z_')_PATH)" ;;
             */addons/"$_arl_n"/docker-compose.yml) echo "Add-on $_arl_n: ENABLED (its signed bundle, $_arl_o)" ;;
             *) echo "Add-on $_arl_n: ENABLED (via $_arl_o)" ;;
         esac

@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history and tags)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       # Promotion model: a final CLI release is cut on `main`, a candidate
@@ -118,7 +118,7 @@ jobs:
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
     steps:
       - name: Checkout (full history and tags)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: Plan
@@ -181,7 +181,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # Tag ↔ Cargo.toml version guard. noo-cli-v0.2.2 shipped a binary
       # self-reporting 0.2.1 because nothing tied the tag to the crate
@@ -394,7 +394,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Registry login (dhi.io)
         env:
           DHI_USERNAME: ${{ secrets.DHI_USERNAME }}
@@ -476,7 +476,7 @@ jobs:
             kind: darwin-host
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       # The rc's bytes, proven against BOTH its .sha256 and its sha256sums.txt
       # row. Any failure (download, digest) is a warning and this lane builds
       # instead: the two steps below run unless this one set reused=true. The
@@ -596,7 +596,7 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Download artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333

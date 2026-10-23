@@ -61,6 +61,8 @@ rm -f /etc/systemd/system/noo-node-agent.service /etc/systemd/system/noo-hostd.s
 systemctl daemon-reload 2>/dev/null || true
 rm -f /etc/sudoers.d/noo-cluster /etc/sudoers.d/noo-node-maintenance /etc/sudoers.d/noo-apply
 rm -rf /etc/noo /var/lib/noo-node-agent /var/lib/noo-hostd
+# The launcher's RAM secret files (lib-secrets.sh secret_rundir): root's, and the repo user's.
+rm -rf /run/noo/secrets "/dev/shm/noo-secrets-$(id -u "$REPO_USER" 2>/dev/null || echo none)"
 id -u noo-agent >/dev/null 2>&1 && userdel noo-agent 2>/dev/null || true
 say "on-box node plane removed (agent, hostd, gate, /etc/noo, grants, noo-agent)"
 

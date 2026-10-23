@@ -123,6 +123,14 @@ def test_a_node_with_no_harness_placement_gets_the_one_the_run_made_removed():
     assert fake.writes[-1][0] == "DELETE" and fake.placement is None
 
 
+def test_a_placement_the_auto_policy_made_is_removed_not_stored():
+    fake = FakeHarnessGateway(original_kind=None, synthesized=True)
+    hc = _run(_spec(kinds=["noo", "codex"]), fake)
+    assert hc.restored and hc.original_kind is None
+    assert fake.writes[-1][0] == "DELETE", "writing the synthesized placement back would pin the node"
+    assert all(not (b or {}).get("synthesized") for m, _, b in fake.writes if m == "PUT")
+
+
 def test_a_refused_kind_is_a_row_and_the_next_kind_still_runs():
     not_installed = 'harness kind "codex": its runner is present but the "codex" command is not installed on this node'
     fake = FakeHarnessGateway(profiles={**PROFILES, "codex": KindProfile(refused=not_installed)})

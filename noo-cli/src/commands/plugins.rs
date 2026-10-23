@@ -259,7 +259,6 @@ pub fn plugins_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -273,10 +272,7 @@ mod tests {
 
     fn write_file(dir: &Path, name: &str, body: &str, mode: u32) -> PathBuf {
         let p = dir.join(name);
-        std::fs::write(&p, body).unwrap();
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(mode);
-        std::fs::set_permissions(&p, perm).unwrap();
+        crate::test_exec::write_exec(&p, body, mode);
         p
     }
 

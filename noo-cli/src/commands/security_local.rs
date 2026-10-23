@@ -36,6 +36,7 @@ use crate::ui::{self, Col, Glyph};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::host_exec::which;
 use crate::output::{fail, ExitCode};
 use crate::pki::{pki_dir, ClusterCa, RotateResult};
 use crate::{Globals, Unhandled};
@@ -212,6 +213,12 @@ pub(crate) struct ScanInputs {
     /// Service leaf keys with no row in `pki::SERVICE_KEY_READERS`, left
     /// 0644 on purpose so an unknown consumer keeps starting.
     pub pki_unknown_reader_keys: Vec<String>,
+    /// Postgres roles still reachable with a leaf that is not their own
+    /// (i132): a role leaf missing, with the wrong CN or without a key, or a
+    /// role the shipped pg_hba.conf does not hold to `clientcert=verify-full`
+    /// (`pki::pg_identity_gaps`). One entry per gap. Empty on a clean install,
+    /// and when the PKI or the compose file is not there to judge.
+    pub pg_identity_gaps: Vec<String>,
     /// `Some(why)` when `secrets/env.sops` EXISTS and the startup loader
     /// could not read it (`envfile::secret_store_state`). Every credential
     /// above was then read from an environment the store never filled, so
@@ -718,6 +725,23 @@ pub(crate) fn scan_findings(i: &ScanInputs) -> Vec<Finding> {
         ));
     }
 
+    // Postgres role identity (i132). A role is reachable only with the client
+    // certificate issued for it when it has the leaf AND pg_hba.conf holds it
+    // to `clientcert=verify-full`; either half missing leaves any cluster-CA
+    // leaf one password away from that role. MEDIUM: the leaves are
+    // infrastructure on a network of their own, and the fix is one roll.
+    if !i.pg_identity_gaps.is_empty() {
+        issues.push((
+            "MEDIUM",
+            "Postgres Role Identity",
+            format!(
+                "{} role(s) still on a shared leaf or without one: {} — run 'noo upgrade --stack' (it issues the role leaves, then re-materialises pg_hba.conf)",
+                i.pg_identity_gaps.len(),
+                i.pg_identity_gaps.join("; ")
+            ),
+        ));
+    }
+
     // Gateway transport. Two CRITICALs, because the CLI sends a
     // bearer credential on nearly every request and both states hand it to
     // an unauthenticated peer:
@@ -1136,6 +1160,25 @@ fn install_findings(
 
     let gateway_url = crate::envfile::gateway_url(&g.gateway_override);
     let key_issues = crate::pki::ClusterCa::new(pki_dir()).audit_key_modes();
+    // Postgres role identity: judged only where there is a CA and a compose
+    // file to run Postgres from; an unreadable pg_hba.conf is NOT CHECKED,
+    // never "fine".
+    let pg_identity_gaps = {
+        let ca = crate::pki::ClusterCa::new(pki_dir());
+        if ca.ca_exists() && root.join("docker-compose.cluster.yml").exists() {
+            let hba = std::fs::read_to_string(root.join("docker/postgres/pg_hba.conf")).ok();
+            if hba.is_none() {
+                not_checked.push(format!(
+                    "Postgres role identity: {} could not be read, so whether pg_hba.conf holds each role to its own certificate is unknown (the role leaves themselves were checked)",
+                    root.join("docker/postgres/pg_hba.conf").display()
+                ));
+            }
+            checked.push("Postgres role identity (role leaves; pg_hba.conf clientcert=verify-full)".into());
+            crate::pki::pg_identity_gaps(&ca, hba.as_deref())
+        } else {
+            Vec::new()
+        }
+    };
     let store_problem = match crate::envfile::secret_store_state() {
         crate::envfile::StoreState::Unreadable(e) => Some(e),
         _ => None,
@@ -1227,6 +1270,7 @@ fn install_findings(
             .filter(|k| k.kind == crate::pki::KeyIssueKind::UnknownReader)
             .map(|k| k.rel.clone())
             .collect(),
+        pg_identity_gaps,
         store_unreadable: store_problem.as_ref().map(|e| e.to_string()),
         docker_inline_auth_registries: docker_config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1297,6 +1341,13 @@ pub(crate) fn cert_consumers(name: &str, role: &str, local_hostname: &str) -> Ve
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
+    // A Postgres role leaf (`gateway/pg/<role>.crt`, `services/<owner>/pg/
+    // <role>.crt`) is presented by the owner's container, which is not named
+    // for the leaf's directory (`pg`): restart the owner, or it keeps dialling
+    // Postgres with the certificate that was just replaced.
+    if let Some(l) = crate::pki::pg_leaf_at(name) {
+        return l.consumers.iter().map(|c| (*c).to_string()).collect();
+    }
     match role {
         "gateway" => vec!["noo-gateway".into()],
         "service" => {
@@ -1321,7 +1372,11 @@ pub(crate) fn replica_consumers(name: &str, running: &[String]) -> Vec<String> {
         .and_then(|p| p.file_name())
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // worker-extra shares the worker's compose anchor, so it presents the
+    // worker's role leaf too (and has no container_name either).
+    let svc = if crate::pki::pg_leaf_at(name).is_some_and(|l| l.owner == "worker") { "worker-pg".to_string() } else { svc };
     let replica = match svc.as_str() {
+        "worker-pg" => "-worker-extra-",
         "sandbox" if name.starts_with("services/") => "-sandbox-extra-",
         _ => return Vec::new(),
     };
@@ -4299,24 +4354,6 @@ fn has_desktop_session() -> bool {
         || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// `shutil.which` equivalent: first executable `name` on `$PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let cand = Path::new(dir).join(name);
-        if let Ok(md) = std::fs::metadata(&cand) {
-            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-                return Some(cand);
-            }
-        }
-    }
-    None
-}
-
 /// POSIX single-quote escaping (shlex.quote-style) for the macOS
 /// `do shell script` payload.
 fn shquote(s: &str) -> String {
@@ -5133,6 +5170,7 @@ mod tests {
             lingering_passphrase_files: Vec::new(),
             pki_exposed_keys: Vec::new(),
             pki_unknown_reader_keys: Vec::new(),
+            pg_identity_gaps: Vec::new(),
             store_unreadable: None,
             docker_inline_auth_registries: Vec::new(),
             retired_nats_names: Vec::new(),
@@ -5314,6 +5352,42 @@ mod tests {
         assert_eq!((f[0].0, f[0].1), ("MEDIUM", "PKI Key Reader"));
         assert!(f[0].2.contains("SERVICE_KEY_READERS") && f[0].2.contains("services/mystery/service.key"), "{}", f[0].2);
 
+    }
+
+    /// A rotated Postgres role leaf restarts the container that PRESENTS it
+    /// (its directory is `pg`, which names no container), including the
+    /// worker's compose replicas; without this a rotation would leave the
+    /// old certificate loaded until the next restart.
+    #[test]
+    fn a_rotated_postgres_role_leaf_restarts_its_owner_not_a_container_named_pg() {
+        assert_eq!(cert_consumers("gateway/pg/noo_app.crt", "gateway", "host1"), vec!["noo-gateway".to_string()]);
+        assert_eq!(cert_consumers("services/worker/pg/noo_app.crt", "service", "host1"), vec!["noo-worker".to_string()]);
+        assert_eq!(cert_consumers("services/trellion-intel/pg/noo_trellion.crt", "service", "host1"), vec!["noo-trellion-intel".to_string()]);
+        // Not a role leaf: unchanged behaviour for the service's own leaf.
+        assert_eq!(
+            cert_consumers("services/worker/service.crt", "service", "host1"),
+            vec!["noo-worker".to_string(), "noo-stunnel-worker".to_string()]
+        );
+        let running: Vec<String> = ["noo-worker", "pai-assistant-worker-extra-1", "noo-trellion"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(replica_consumers("services/worker/pg/noo_app.crt", &running), vec!["pai-assistant-worker-extra-1".to_string()]);
+        assert!(replica_consumers("services/trellion/pg/noo_app.crt", &running).is_empty());
+    }
+
+    /// PLANTED: a Postgres role still on a shared leaf (no role leaf yet, or a
+    /// pg_hba.conf that does not hold it to its own certificate) is a MEDIUM
+    /// naming the role and the verb; a clean install has none.
+    #[test]
+    fn scan_flags_a_postgres_role_still_on_a_shared_leaf() {
+        let mut i = clean_inputs();
+        i.pg_identity_gaps = vec![
+            "noo_app (worker): services/worker/pg/noo_app.crt does not exist".into(),
+            "noo: pg_hba.conf has no `hostssl … noo … scram-sha-256 clientcert=verify-full` line, so any cluster-CA leaf reaches its password check".into(),
+        ];
+        let f = scan_findings(&i);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!((f[0].0, f[0].1), ("MEDIUM", "Postgres Role Identity"));
+        assert!(f[0].2.contains("2 role(s)") && f[0].2.contains("noo_app (worker)") && f[0].2.contains("noo upgrade --stack"), "{}", f[0].2);
+        assert!(scan_findings(&clean_inputs()).is_empty());
     }
 
     #[test]
@@ -5595,6 +5669,7 @@ mod tests {
             grafana_password: String::new(),
             pki_exposed_keys: Vec::new(),
             pki_unknown_reader_keys: Vec::new(),
+            pg_identity_gaps: Vec::new(),
             lingering_passphrase_files: Vec::new(),
             store_unreadable: None,
             docker_inline_auth_registries: Vec::new(),

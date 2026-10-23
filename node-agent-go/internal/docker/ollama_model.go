@@ -109,8 +109,12 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// No Docker check here: a node serving ollama natively (a Mac with no
 	// Docker) imports through the host binary below, and reconcile calls
 	// this for such a node too. Only the container path needs Docker.
-	if !safeArtifactName(name) {
-		return nil, fmt.Errorf("model name %q is not a single path component", name)
+	// `ollama:<tag>` is how the operator spells a staged registry tag; the
+	// model ollama creates is the tag itself.
+	name = strings.TrimPrefix(strings.TrimSpace(name), "ollama:")
+	cands, err := storeCandidates(name)
+	if err != nil {
+		return nil, err
 	}
 	cacheURL := preseed.CacheURL()
 	if cacheURL == "" {
@@ -130,34 +134,54 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	// Multi-GB weights: never leave one behind because a create failed.
 	defer func() { _ = os.RemoveAll(work) }()
 
-	fetch := func(kind, artifact string) (string, error) {
+	fetch := func(kind, artifact string) (string, string, error) {
 		// The GGUF behind a Modelfile can be GBs: wait out the gateway's hash.
 		m, err := awaitArtifactManifest(ctx, kind, artifact)
 		if errors.Is(err, ErrArtifactAbsent) {
-			return "", fmt.Errorf(
+			return "", "", &storeAbsentError{msg: fmt.Sprintf(
 				"no artifact manifest for %s/%s — the controller store does not have it, or this gateway predates the %s kind; run `noo cluster ship-model` from the controller",
-				kind, artifact, kind)
+				kind, artifact, kind)}
 		}
 		if err != nil {
 			// Not "absent": the controller was not heard from. Saying the
 			// store lacks the file here sends the operator to re-ship bytes
 			// that are already there.
-			return "", fmt.Errorf("could not get the artifact manifest for %s/%s from the controller: %w", kind, artifact, err)
+			return "", "", fmt.Errorf("could not get the artifact manifest for %s/%s from the controller: %w", kind, artifact, err)
 		}
 		dest := filepath.Join(work, artifact)
 		src := cacheURL + "/gguf/" + url.PathEscape(artifact)
 		fetchCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
 		defer cancel()
 		if _, err := preseed.New().FetchOneVerified(fetchCtx, src, dest, m.SHA256); err != nil {
-			return "", fmt.Errorf("fetch %s: %w", artifact, err)
+			return "", "", fmt.Errorf("fetch %s: %w", artifact, err)
 		}
-		return dest, nil
+		return dest, m.SHA256, nil
 	}
 
-	mfName := name + ".Modelfile"
-	mfPath, err := fetch("modelfile", mfName)
-	if err != nil {
-		return nil, err
+	// The first candidate the store has. A miss on ALL of them is the
+	// store's answer; any other failure stops here, because "could not ask"
+	// is not "absent".
+	var cand storeCandidate
+	var mfPath, mfName string
+	for _, cd := range cands {
+		p, _, ferr := fetch("modelfile", cd.base+".Modelfile")
+		if ferr == nil {
+			cand, mfPath, mfName = cd, p, cd.base+".Modelfile"
+			break
+		}
+		var absent *storeAbsentError
+		if !errors.As(ferr, &absent) {
+			return nil, ferr
+		}
+		if cd == cands[len(cands)-1] {
+			if cd.staged {
+				return nil, &storeAbsentError{msg: fmt.Sprintf(
+					"%s is not in the controller's model store (no %s.Modelfile%s) — stage the registry tag on the controller with `noo models fetch ollama:%s`; "+
+						"this node never reaches registry.ollama.ai for it",
+					name, cd.base, map[bool]string{true: ", and no plain " + cands[0].base + ".Modelfile", false: ""}[len(cands) > 1], name)}
+			}
+			return nil, ferr
+		}
 	}
 	body, err := os.ReadFile(mfPath)
 	if err != nil {
@@ -167,10 +191,31 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	if err != nil {
 		return nil, err
 	}
-	if _, err := fetch("gguf", weight); err != nil {
+	var staged *stagedHeader
+	if cand.staged {
+		// A staged recipe is held to a stricter shape than a hand-made one,
+		// and its weight must be the layer the registry's manifest named.
+		if staged, err = checkStagedModelfile(string(body), cand.base); err != nil {
+			return nil, err
+		}
+		if weight != cand.base+".gguf" {
+			return nil, fmt.Errorf("%s names weight %q, not %s.gguf", mfName, weight, cand.base)
+		}
+	}
+	weightPath, weightSHA, err := fetch("gguf", weight)
+	if err != nil {
 		return nil, err
 	}
-	slog.Info("ollama model staged", "model", name, "weight", weight, "work", work)
+	if staged != nil {
+		if weightSHA != staged.ModelSHA256 {
+			return nil, fmt.Errorf("%s: the controller store's %s hashes to %s, but the registry manifest the controller staged it from named %s — "+
+				"the file changed after staging; restage with `noo models fetch ollama:%s --force`", name, weight, weightSHA, staged.ModelSHA256, name)
+		}
+		if err := requireGGUFMagic(weightPath); err != nil {
+			return nil, fmt.Errorf("%s: %w", weight, err)
+		}
+	}
+	slog.Info("ollama model staged", "model", name, "weight", weight, "work", work, "staged_from_registry", cand.staged)
 
 	// Host binary first: a node running ollama natively has no noo-ollama
 	// container to copy into, and this is the cheaper path when it exists.
@@ -192,22 +237,89 @@ func (c *Client) PullOllamaModel(ctx context.Context, name string) (*PullOllamaM
 	return &PullOllamaModelResult{Status: "created", Model: name, GGUF: weight, Via: "container"}, nil
 }
 
-// ModelInStore asks the controller's store whether it publishes
-// `<name>.Modelfile` — the recipe `noo cluster import-model` (and reconcile,
-// for a placed import-only model) imports from. A model the store publishes
-// is import-only: it is not on the public registry, so `ollama pull` for it
-// can never succeed.
+// storeCandidate is one store name a placement's model may be published
+// under: the plain `<name>.Modelfile` (a converted or hand-made model), or the
+// stem `noo models fetch ollama:<tag>` writes for a registry tag.
+type storeCandidate struct {
+	base   string
+	staged bool
+}
+
+// storeCandidates lists them in the order they are tried. A tag the CLI could
+// not have staged (a host-prefixed ref, a malformed name) has none, and is an
+// error for an import, not a reason to guess.
+func storeCandidates(name string) ([]storeCandidate, error) {
+	var out []storeCandidate
+	plain := strings.TrimSuffix(name, ":latest")
+	if safeArtifactName(plain) && !strings.Contains(plain, ":") {
+		out = append(out, storeCandidate{base: plain})
+	}
+	if stem, err := OllamaStoreStem(name); err == nil {
+		out = append(out, storeCandidate{base: stem, staged: true})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("model name %q is neither a store artifact name nor a registry.ollama.ai reference", name)
+	}
+	return out, nil
+}
+
+// storeAbsentError is the store's own "no" for one candidate, so a loop over
+// candidates can tell it from a failure to ask. errors.Is matches
+// ErrArtifactAbsent.
+type storeAbsentError struct{ msg string }
+
+func (e *storeAbsentError) Error() string        { return e.msg }
+func (e *storeAbsentError) Is(target error) bool { return target == ErrArtifactAbsent }
+
+// requireGGUFMagic refuses a staged weight that is not a GGUF file.
+func requireGGUFMagic(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil || string(magic[:]) != "GGUF" {
+		return fmt.Errorf("is not a GGUF file (bad magic) — refusing to hand it to ollama")
+	}
+	return nil
+}
+
+// ModelInStore asks the controller's store whether it publishes `name` — as
+// `<name>.Modelfile`, the recipe `noo cluster import-model` (and reconcile,
+// for a placed import-only model) imports from, or, for a registry tag, as the
+// pair `noo models fetch ollama:<tag>` staged. A model the store publishes is
+// import-only on this node: `ollama pull` for it either can never succeed (it
+// is not on the public registry) or is refused (a placed node takes models only
+// from the store).
 //
 // (true, nil): the store has it. (false, nil): the store answered that it
-// does not, or the name cannot be a store artifact (a registry tag such as
-// `llama3.2:1b`). (false, err): the question went unanswered — a timeout or
-// a transport failure — and the caller must not read that as either answer.
+// does not, or the name cannot be a store artifact. (false, err): the question
+// went unanswered — a timeout or a transport failure — and the caller must not
+// read that as either answer.
+//
+// A registry tag is asked about only on a PLACED node (a store configured):
+// an unplaced node (the controller's own agent, a dev box) keeps pulling from
+// the registry as it always did, and is not made to depend on a staged copy.
 func ModelInStore(ctx context.Context, name string) (bool, error) {
-	name = strings.TrimSuffix(strings.TrimSpace(name), ":latest")
-	if !safeArtifactName(name) || strings.Contains(name, ":") {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "ollama:")
+	if plain := strings.TrimSuffix(name, ":latest"); safeArtifactName(plain) && !strings.Contains(plain, ":") {
+		_, err := lookupArtifactManifest(ctx, "modelfile", plain+".Modelfile")
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, ErrArtifactAbsent) {
+			return false, err
+		}
+	}
+	if !preseed.Placed() {
 		return false, nil
 	}
-	_, err := lookupArtifactManifest(ctx, "modelfile", name+".Modelfile")
+	stem, err := OllamaStoreStem(name)
+	if err != nil {
+		return false, nil
+	}
+	_, err = lookupArtifactManifest(ctx, "modelfile", stem+".Modelfile")
 	if errors.Is(err, ErrArtifactAbsent) {
 		return false, nil
 	}

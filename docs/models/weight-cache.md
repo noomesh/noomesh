@@ -158,14 +158,17 @@ When the node-agent is asked to start a backend:
   agent's user cannot write. A node with no store configured (the
   controller's own agent, a hand-run dev box) keeps the old behaviour:
   online on a miss, the token passed through.
-- **Ollama registry tags** (`gemma4:12b`): the controller store carries GGUF
-  files, not ollama registry blobs, so a placed node **refuses** to
-  `ollama pull` a tag from `registry.ollama.ai`
-  (`ollama_registry_pull_refused`). Fetch the model as a GGUF onto the
-  controller (`noo models fetch <hf_repo> <file.gguf>`) and place the file
-  name, which the node imports from the store. A node that must pull a tag
-  accepts that explicitly with `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` in its
-  node-agent environment.
+- **Ollama registry tags** (`gemma4:12b`): the controller stages the tag
+  (`noo models fetch ollama:gemma4:12b`, below) and a placed node imports
+  it from the store: it fetches the staged pair by name, each file verified
+  against the gateway's artifact manifest, checks the weight against the
+  registry digest recorded in the Modelfile, and runs `ollama create`. It
+  never contacts `registry.ollama.ai`. A tag the controller has **not**
+  staged is **refused** (`ollama_registry_pull_refused`, naming the
+  `noo models fetch ollama:<tag>` remedy): the controller store is the only
+  source on a placed node. A node that must pull a tag anyway accepts that
+  explicitly with `NOO_ALLOW_OLLAMA_REGISTRY_PULL=1` in its node-agent
+  environment.
 
 `noo models recommended` prefers models that are already in the cache
 (`GET /api/models/cached`) precisely because they preseed over the LAN.
@@ -230,6 +233,66 @@ noo cluster place <node> llamacpp <file>
 
 If you run `sync-model-files -m <file>` for a file that is not in the store,
 the error names the resolved store path and points at `noo models fetch`.
+
+## Stage an ollama registry model
+
+An ollama tag is not a GGUF file, so the controller pulls it for the nodes:
+
+```bash
+noo models fetch ollama:gemma4:12b            # library/gemma4:12b
+noo models fetch ollama:user/model:q4_K_M     # another namespace
+noo models fetch ollama:gemma4:12b --force    # replace a store copy that differs
+noo cluster place <node> ollama gemma4:12b    # then place the tag as usual
+```
+
+What it does, in order:
+
+- **Resolves and checks the store** exactly like `noo models fetch <hf_repo>`
+  (same writability refusal, same `MODELS_DIR`).
+- **Reads the registry's manifest** (`registry.ollama.ai`, or the mirror in
+  `NOO_OLLAMA_REGISTRY`) and downloads every layer and the config blob, each
+  **checked against the `sha256:` digest and the size the manifest carries**.
+  A mismatch installs nothing.
+- **Refuses what a GGUF and a Modelfile cannot rebuild**: a vision projector,
+  an adapter, any layer type it does not know, template or parameter text a
+  Modelfile cannot quote. The refusal says so before the weight is
+  downloaded. For such a model use a text-only tag, a GGUF from Hugging Face,
+  or the per-node exception above.
+- **Writes two files**, the weight first and the recipe last, 0644:
+  `ollama+<namespace>+<name>+<tag>.gguf` (the model layer, byte for byte) and
+  `ollama+<namespace>+<name>+<tag>.Modelfile` (`FROM` that file, plus the
+  template, system prompt, parameters, licence and messages layers, and a
+  header recording the registry digest). `library/` and `:latest` are implied
+  and the name is lower-case, so `gemma4:12b` is
+  `ollama+library+gemma4+12b.*`. The weight download resumes after an
+  interruption (HTTP `Range`). These two names are served by the existing
+  `/gguf/` tree and the existing `gguf` and `modelfile` artifact kinds; nothing
+  new is mounted or exposed. `noo cluster sync-model-files` leaves them out of
+  its default sweep (they ride a placement, not a push to every node).
+- **Pre-warms the gateway's digest** for the weight, as `models fetch` does.
+
+On the node, reconcile asks the store about a placed tag it does not hold; a
+staged tag takes the same import path as `noo cluster import-model`, which
+now accepts the tag itself: `noo cluster import-model <node> ollama:gemma4:12b
+[--place --role chat]` (a bare `gemma4:12b`, or `gemma4` for `:latest`, works
+when it is not also the name of a plain store model; if it is both, the verb
+refuses and asks for the `ollama:` form). The CLI checks the controller store
+for the complete `ollama+...` pair first and, when it is not staged, refuses
+naming `noo models fetch ollama:<tag>`; a node older than this release has no
+staged-tag import and answers with its own error. The node
+holds a staged Modelfile to a stricter shape than a hand-made one: only the
+directives `FROM`, `TEMPLATE`, `SYSTEM`, `PARAMETER`, `LICENSE`, `MESSAGE`,
+`RENDERER` and `PARSER`; `FROM` must be exactly the staged weight; the weight
+must start with the `GGUF` magic and hash to the digest in the Modelfile
+header. Any of those failing is a refusal that names the restage command, and
+`ollama create` is not run.
+
+Failure cases: the registry unreachable or a 404 stops the command with the
+store untouched; a controller that cannot be reached by a node leaves the
+placement waiting (a timeout is never read as "not staged"); a node older than
+this release has no staged-tag import and keeps refusing the registry pull.
+An unplaced node (the controller's own agent, a dev box with no
+`NOO_MODEL_CACHE_URL`) is unchanged: it still pulls from the registry itself.
 
 ## Container images
 
@@ -380,6 +443,8 @@ Create it with `noo heartbeat` like any other task; see
 | `NOO_MODEL_CACHE_URL` | node-agent env (set by `noo cluster provision`) | `https://<controller>:8443`; empty disables preseed and the image rail; an `http://` value is refused by the agent (re-run `noo cluster provision <node>`) |
 | `HF_CACHE_DIR`, `MODELS_DIR`, `IMAGES_DIR` | controller `compose_env` | The three served directories (`BIN_DIR` and its `/bin/` tree were retired with the agent swap); each defaults to a subdirectory of `NOO_DATA_ROOT`. `HF_CACHE_DIR` is an **HF_HOME** — the store serves its `hub/` subtree, not the directory itself (above) |
 | `HF_HUB_OFFLINE=1` | injected into the backend container | Set only after a successful HF preseed |
+| `NOO_OLLAMA_REGISTRY` | the CLI's environment on the controller | Base URL `noo models fetch ollama:<tag>` reads manifests and blobs from (default `https://registry.ollama.ai`); for a mirror |
+| `NOO_ALLOW_OLLAMA_REGISTRY_PULL` | node-agent env | `1` lets that node `ollama pull` a tag the controller has not staged (default: refused on a placed node) |
 | `NOO_IMAGE_SOURCE` | node-agent env | `legacy` (default this release: pre-rail behaviour) or `rail` (everything above) |
 | `NOO_IMAGE_REGISTRY_FALLBACK` | node-agent env | `public` (default) or `off`: may a third-party image the controller has not staged come from its public registry. Our own images are rail-only under both |
 
@@ -387,6 +452,8 @@ Code: `docker/model-cache.nginx.conf`, `node-agent-go/internal/preseed/`,
 `node-agent-go/internal/docker/backends.go` (`preseedModel`,
 `preseedGGUF`), `noo-cli/src/commands/cluster.rs` (`sync-model-files`),
 `noo-cli/src/commands/models_fetch.rs` (`models fetch`),
+`noo-cli/src/commands/ollama_stage.rs` (`models fetch ollama:<tag>`),
+`node-agent-go/internal/docker/ollama_stage.go` + `ollama_model.go` (the node's import),
 
 `preseedGGUF`), `node-agent-go/internal/docker/image_source.go` (`EnsureImage`),
 `noo-cli/src/commands/image_stage.rs` (staging), `noo-cli/src/commands/cluster.rs` (`sync-model-files`),

@@ -42,10 +42,20 @@ binary itself: in its signed bundle, from the controller.
    where the vendor publishes the CLI (a URL template filled in from the
    node's platform), its version, and the sha256 each artefact must hash
    to. Changing a pin is a reviewed change to that file.
-2. **Stage.** `noo cluster vendor stage <kind>` (or `--all`) fetches every
-   artefact the fleet's platforms need, on the controller, and refuses one
-   whose sha256 is not the pinned one, naming the URL and both digests and
-   writing nothing. `--os` and `--arch` narrow it to one platform.
+2. **Stage.** `noo cluster vendor stage` looks at the nodes and fetches,
+   on the controller, every CLI a node's harness placement or
+   `vendor_kinds` names, for that node's platform and no other. It refuses
+   an artefact whose sha256 is not the pinned one, naming the URL and both
+   digests and writing nothing, and ends by listing the
+   `noo cluster provision <node>` commands that put the CLIs on the nodes.
+   `noo cluster vendor stage <kind>` does the same for one kind;
+   `--fleet` (with a kind) or `--all` (every kind) stages for every
+   platform the fleet reports, needed or not, to have a CLI ready before a
+   node names it. `--os` and `--arch` narrow any of these; both together
+   name one platform outright.
+   A CLI is 150–250 MB, so the fetch has no whole-download cap short of an
+   hour: it reports how far it has got every 30 seconds and fails (then
+   retries, four tries in all) only when no data arrives for 60 seconds.
    `noo cluster vendor status` lists what is staged and which nodes need
    which.
 3. **Restage.** `noo cluster provision <node>` (or `noo upgrade --nodes`)

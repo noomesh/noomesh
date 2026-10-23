@@ -590,8 +590,9 @@ fn save_tar(dir: &Path, tar: &str, save_args: &[&str], id: &str, g: &Globals) ->
     Ok(())
 }
 
+/// u64 view of the one clock (`host_exec::now_unix`); the index fields are unsigned.
 fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    crate::host_exec::now_unix().max(0) as u64
 }
 
 /// Stage `image` for `arch`: pull with the controller's registry login (by

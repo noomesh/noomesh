@@ -33,6 +33,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agents/messages/{id}", get(messages_get))
         .route("/api/agents/messages/{id}/ack", post(messages_ack))
         .route("/api/agents/threads", get(threads_list))
+        // cold storage of expired mail (operator-only; sealed unless ?decrypt=true, which is audited).
+        .route("/api/agents/archive", get(archive_list))
+        .route("/api/agents/archive/{month}", get(archive_export))
         // the exceptions to the owner boundary.
         .route("/api/agents/trust", get(trust_list).post(trust_add))
         .route("/api/agents/trust/remove", post(trust_remove))
@@ -2068,6 +2071,62 @@ struct ListQuery {
 /// because the alternative is learning the answer from a message one
 /// window saw and another did not.
 const _ACCOUNT_ADDRESSED_DELIVERY_IS_UNDECIDED: () = ();
+
+/// GET /api/agents/archive — the agent-mail archive files (operator-only).
+async fn archive_list(
+    State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
+    cluster: Option<Extension<ClusterNode>>,
+) -> AppResult {
+    let who = caller(&requester, &cluster);
+    if !who.privileged {
+        return Err(AppError::Forbidden("the agent-mail archive is operator-only".into()));
+    }
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let d = dir.clone();
+    let files = tokio::task::spawn_blocking(move || crate::agent_mail_archive::list(&d))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(AppError::Internal)?;
+    let total: u64 = files.iter().map(|f| f.rows).sum();
+    Ok(Json(json!({
+        "dir": dir.display().to_string(),
+        "files": files.iter().map(|f| f.to_json()).collect::<Vec<_>>(),
+        "total_rows": total,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ArchiveExportQuery {
+    #[serde(default)]
+    decrypt: bool,
+}
+
+/// GET /api/agents/archive/{month} — one month's rows (`YYYY-MM` or the file
+/// name). Bodies stay sealed unless `?decrypt=true`, which needs an operator
+/// AND the review key and is audited before any plaintext is produced.
+async fn archive_export(
+    State(state): State<Arc<AppState>>,
+    requester: Option<Extension<RequesterCtx>>,
+    cluster: Option<Extension<ClusterNode>>,
+    Path(month): Path<String>,
+    Query(q): Query<ArchiveExportQuery>,
+) -> AppResult {
+    use crate::agent_mail_archive::ExportError as E;
+    let who = caller(&requester, &cluster);
+    let dir = crate::agent_mail_archive::configured_dir(&state.db).await;
+    let keys = if q.decrypt { crate::agent_crypto::controller_keys() } else { None };
+    crate::agent_mail_archive::export(&state.db, &dir, who.privileged, &who.label, &month, keys, q.decrypt)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            E::Forbidden(m) => AppError::Forbidden(m),
+            E::BadRequest(m) => AppError::BadRequest(m),
+            E::NotFound(m) => AppError::NotFound(m),
+            E::NoKey(m) => AppError::Unavailable(m),
+            E::Internal(m) => AppError::Internal(m),
+        })
+}
 
 /// GET /api/agents/messages — list, newest first. Non-privileged callers
 /// see only messages they sent or received.

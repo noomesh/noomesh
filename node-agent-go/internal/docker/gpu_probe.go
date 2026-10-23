@@ -198,3 +198,77 @@ func (c *Client) StartContainer(ctx context.Context, id string) error {
 	_, err := c.docker.ContainerStart(ctx, id, client.ContainerStartOptions{})
 	return err
 }
+
+// NoomeshContainer is ANY container on this host that is noomesh's — the
+// agent's own backends, the compose-managed controller stack (noo-ollama-embed,
+// noo-tei, noo-reranker, noo-whisper, noo-piper, ...), and leftovers from an
+// older agent or image. The shared-GPU yield uses this set to tell "our
+// process" from "someone else's"; it must be a superset of GPUBackend.
+type NoomeshContainer struct {
+	ID      string
+	Name    string
+	Running bool
+	// GPU: the container's own config requests the GPU (running ones only).
+	GPU bool
+	// Orphan: recognised by NAME only. It carries neither the stack's compose
+	// project label nor the agent's noo.managed-by label, so nothing this
+	// agent or the stack currently owns made it — an older-image leftover
+	// (found live on pop-os 2026-10-21: a noo-ollama from before the labels).
+	// It is still noomesh's GPU use; it is flagged so it can be cleaned up.
+	Orphan bool
+}
+
+// stackComposeProjects are the compose project labels that mark noomesh's
+// own containers: "noomesh" is the controller stack (docker-compose.cluster.yml
+// `name:`), "pai-assistant" the project the agent stamps on the backends it
+// starts (and that older stacks used).
+var stackComposeProjects = map[string]bool{"noomesh": true, "pai-assistant": true}
+
+// ClassifyNoomesh decides whether a container is noomesh's. Labels are
+// authoritative (compose project, noo.managed-by); the `noo-` name prefix is
+// the fallback for containers that predate the labels, flagged orphan. The
+// image is NOT consulted: attribution here only decides whether a GPU
+// process counts as ours, and a mislabelled container can at worst make the
+// node tolerate a lookalike's GPU use (fail-safe), never touch it.
+func ClassifyNoomesh(name string, labels map[string]string, composeProject string) (owned, orphan bool) {
+	if labels["noo.managed-by"] != "" || stackComposeProjects[labels["com.docker.compose.project"]] ||
+		(composeProject != "" && labels["com.docker.compose.project"] == composeProject) {
+		return true, false
+	}
+	if strings.HasPrefix(name, "noo-") {
+		return true, true
+	}
+	return false, false
+}
+
+// NoomeshContainers lists every noomesh container on the host, stopped ones
+// included (a stopped container's id can still sit in a cgroup path for a
+// moment). Not limited to backends the agent knows a key for.
+func (c *Client) NoomeshContainers(ctx context.Context) ([]NoomeshContainer, error) {
+	if c == nil || c.docker == nil {
+		return nil, fmt.Errorf("docker unavailable")
+	}
+	containers, err := c.listContainers(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	var out []NoomeshContainer
+	for _, ctr := range containers {
+		name := ctr.ID
+		if len(ctr.Names) > 0 {
+			name = strings.TrimPrefix(ctr.Names[0], "/")
+		}
+		owned, orphan := ClassifyNoomesh(name, ctr.Labels, c.composeProject)
+		if !owned {
+			continue
+		}
+		nc := NoomeshContainer{ID: ctr.ID, Name: name, Orphan: orphan, Running: string(ctr.State) == "running"}
+		if nc.Running {
+			if res, err := c.docker.ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{}); err == nil && res.Container.HostConfig != nil {
+				nc.GPU = requestsGPU(res.Container.HostConfig, res.Container.Config)
+			}
+		}
+		out = append(out, nc)
+	}
+	return out, nil
+}

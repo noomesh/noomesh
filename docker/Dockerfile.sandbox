@@ -55,6 +55,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
+# The executor user. Every /exec call runs as one of 64 uids from 65600
+# (`sandbox-exec` is the first and the only one with a passwd entry; the
+# rest are numeric), never as the server: compose starts the container as
+# root under setpriv with CAP_SETUID/SETGID/KILL kept ambient, drops to
+# nonroot for uvicorn, and the server drops again per call with every
+# capability cleared (src/noomesh/sandbox/app.py `executor`). The leaf key
+# is nonroot's (0640), so the code cannot read it. No useradd in this
+# image: the passwd and group lines are written directly. No home, no
+# shell.
+RUN echo 'sandbox-exec:x:65600:65600:sandbox executor, first of 64 uids:/nonexistent:/usr/sbin/nologin' >> /etc/passwd \
+    && echo 'sandbox-exec:x:65600:' >> /etc/group
+
 # Real source overlays the stub from deps-core. The editable .pth file
 # in deps-core points at /app/src so the overlay is transparent.
 COPY src ./src

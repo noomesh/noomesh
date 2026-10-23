@@ -69,6 +69,8 @@ mod harness;
 mod harness_main;
 mod tasks;
 mod task_budget;
+mod task_context;
+mod task_events;
 mod text;
 mod auth_refresh;
 mod cache;
@@ -110,13 +112,21 @@ mod graph_prune;
 mod addon_auth;
 mod alert_digest;
 mod addons;
+mod addon_decls;
 mod addon_proxy;
+mod addon_workloads;
+mod addon_ui;
+mod addon_ws;
+mod addon_delegation;
+mod addon_registry;
 mod google_drive;
 mod agent_activities;
 mod agent_meta_loop;
 mod audit_partition;
+mod agent_mail_archive;
 mod audit_integrity;
 mod audit_chain;
+mod audit_head_export;
 mod audit_context;
 mod audit_spool;
 mod autonomy_audit;
@@ -161,7 +171,6 @@ mod log_gate;
 mod loop_health;
 mod ops;
 mod erasure_archive;
-mod ported;
 mod agent_roles;
 mod workflows;
 mod llm_rerank;
@@ -411,6 +420,13 @@ async fn main() -> Result<()> {
     // open because the credential IS a database row.
     crate::addon_auth::init(&state.db).await;
 
+    // Operator decisions on runtime prompt skills (promoted / rejected). Until
+    // loaded every runtime skill is framed as data, so a failure here demotes
+    // promoted skills, loudly, and never the other way round.
+    if let Err(e) = crate::routes::settings::refresh_skill_decisions(&state).await {
+        tracing::error!(error = %e, "prompt_skill_decisions_unavailable: promoted skills are framed as data until this loads (is migration 096 applied?)");
+    }
+
     // A retired gate key left in noomesh.yaml does not serve either.
     // Checked AFTER the posture pass so the message can be about the yaml
     // alone: by this point posture has already had its say, and anything the
@@ -471,7 +487,7 @@ async fn main() -> Result<()> {
     crate::settings::spawn_refresh(state.db.clone());
     // Embedding spaces (i145): seed `knowledge` on an empty table, then keep
     // the space cache warm the same way.
-    crate::embedding_spaces::spawn_refresh(state.db.clone());
+    crate::embedding_spaces::spawn_refresh(state.clone());
 
     // Re-assert the NATS KV buckets periodically. A NATS server that comes
     // back with a fresh JetStream store (what a container recreate does)
@@ -488,6 +504,7 @@ async fn main() -> Result<()> {
     // controller's own resume at boot.
     tasks::spawn_ready_watcher(state.clone());
     tasks::spawn_stale_sweep(state.clone());
+    task_events::spawn_delivery(state.clone());
 
     // Start gossip mesh (uses interior mutability — safe from Arc)
     //
@@ -589,6 +606,9 @@ async fn main() -> Result<()> {
     // Then the hash chain's first row: from here a deleted or reordered audit
     // row fails `noo security audit verify`. Once; idempotent.
     audit_chain::ensure_genesis(&state.db).await;
+    // The durable session floors: a restart must not forget an account change.
+    let floors = session_floor::load_durable(&state.db).await;
+    tracing::info!(floors, "durable session floors loaded");
 
     // Log initial cluster snapshot (proof-of-wiring for cluster_manager.rs).
     // Same data is available to autonomy actions, heartbeat tasks, and
@@ -603,6 +623,8 @@ async fn main() -> Result<()> {
         "cluster_initial_snapshot"
     );
 
+    // The signed audit chain head, recorded outside the database.
+    audit_head_export::spawn(state.clone());
     ingest_loop::spawn(state.clone());
     recall_archive_loop::spawn(state.clone());
 
@@ -697,7 +719,7 @@ async fn main() -> Result<()> {
     mcp_local::warn_retired_token();
 
     // Build router with all routes + TLS
-    let app = routes::build_router(state);
+    let app = routes::build_router(state.clone());
 
     // The ONE listener: TLS, with the peer's certificate identity attached.
     //
@@ -720,6 +742,11 @@ async fn main() -> Result<()> {
     // request: a node's cert is proof, where its token's actor field is only
     // a claim signed with a fleet-wide secret. The CA is mandatory now
     // (require_server_material), so the acceptor is always installed.
+    // Each add-on with a `ui` gets an HTTPS origin of its own (a port from
+    // NOO_ADDON_UI_PORTS, the same certificate), so its scripts can never read
+    // what the console stores on this origin. Started after the router, so
+    // the add-on registry is built (addon_ui.rs).
+    addon_ui::spawn_origins(state.clone(), tls_config.clone());
     let acceptor = node_identity::NodeIdentityAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
     );
@@ -737,7 +764,7 @@ async fn main() -> Result<()> {
     // each request's extensions so the rate limiter can key on the real client
     // IP (see middleware::extract_client_ip) instead of one shared "unknown"
     // bucket.
-    axum_server::bind(addr.parse()?)
+    axum_server::bind(addr.parse::<std::net::SocketAddr>()?)
         .acceptor(acceptor)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;

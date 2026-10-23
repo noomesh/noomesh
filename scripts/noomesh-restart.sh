@@ -84,6 +84,8 @@ restart_require_lock() {
 # Licensed add-ons run only their signed, local pins for this tag (see
 # lib-dist.sh require_addon_pins); restart never pulls one either.
 require_addon_pins || exit 1
+# The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
+addon_decls_materialise || exit 1
 
 DEFAULT_PROFILE="controller"
 
@@ -112,7 +114,11 @@ detect_gpu_tier() {
     fi
     local vram_mb
     vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-    if [ -z "$vram_mb" ] || [ "$vram_mb" = "0" ]; then
+    # Guard (same as noomesh-rebuild.sh): nvidia-smi can print an error to
+    # stdout ("Failed to initialize NVML: ..."), which would reach the
+    # arithmetic below and abort the script. Only a purely numeric value is
+    # a VRAM reading; anything else means "no usable GPU here".
+    if ! [[ "$vram_mb" =~ ^[0-9]+$ ]] || [ "$vram_mb" = "0" ]; then
         echo ""
         return
     fi
@@ -236,6 +242,9 @@ dist_assert_addon_refs $COMPOSE_FILES $PROFILE_ARGS || exit 1
 if [ ${#SERVICES[@]} -eq 0 ]; then
     ui_phase "Stack"
     ui_step "Restarting all services (profile $PROFILE)"
+    # The gateway's own dirs on noo-data (uid 65532), as noomesh-start.sh
+    # makes them: a restart can be the first start of a new gateway image.
+    noo_prepare_gateway_data_dirs
     if [ "$FORCE_RECREATE" = true ]; then
         # Same service arithmetic as noomesh-start.sh: the profile's set,
         # minus the GPU-only exporter when this daemon has no NVIDIA
@@ -292,6 +301,9 @@ else
     # shellcheck disable=SC2086
     restart_resolve_all "$VALID_SVCS" $COMPOSE_FILES $PROFILE_ARGS -- "${SERVICES[@]}" || exit 1
     SERVICES=("${RESOLVED_SERVICES[@]}")
+    if printf '%s\n' "${SERVICES[@]}" | grep -qx gateway; then
+        noo_prepare_gateway_data_dirs
+    fi
     ui_step "Restarting ${SERVICES[*]}"
     if [ "$FORCE_RECREATE" != true ]; then
         # A plain restart keeps the old image: after `noo addons upgrade` the

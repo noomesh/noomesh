@@ -25,7 +25,9 @@ COMPOSE_FILES = ["docker-compose.cluster.yml", "docker-compose.dist.yml"]
 # Paths compose references that the slice deliberately does NOT ship: build
 # contexts (dist never builds), and things the wizard/launcher generate.
 NOT_SHIPPED_PREFIXES = ("docker/Dockerfile", "docker/sandbox", "docker/tools")
-GENERATED = {".env", "noomesh.yaml", "secrets", "pki", ".noo-host-spool", "docker-compose.override.yml", "stack.lock"}
+GENERATED = {".env", "noomesh.yaml", "secrets", "pki", ".noo-host-spool", "docker-compose.override.yml", "stack.lock",
+             # the launcher fills these with add-on bundle declarations (i163)
+             ".noo-addon-systems", ".noo-addon-workloads"}
 
 
 def slice_lists() -> tuple[set[str], list[str]]:

@@ -199,7 +199,10 @@ class MCPClientManager:
         if server.transport in {"http", "streamable_http"}:
             if not server.url:
                 raise ValueError(f"MCP server '{server.name}' missing url.")
-            import httpx as _httpx
+            # mcp 2.x talks through httpx2 (a drop-in fork of httpx) and
+            # `streamable_http_client(http_client=...)` is typed httpx2.AsyncClient;
+            # build that, not a plain httpx client that merely duck-types today.
+            import httpx2 as _httpx
             http_kwargs: dict[str, Any] = {}
             from noomesh._providers import default_http_context
             _http_ctx = default_http_context()
@@ -210,7 +213,9 @@ class MCPClientManager:
                     verify=_http_ctx.verify,
                     cert=_http_ctx.cert,
                 )
-            async with streamable_http_client(server.url, **http_kwargs) as (read, write, _):
+            # mcp 2.x yields (read, write); 1.x yielded a third item, the
+            # session-id getter, which nothing here used.
+            async with streamable_http_client(server.url, **http_kwargs) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await fn(session)

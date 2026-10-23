@@ -89,6 +89,15 @@ answers **HTTP 503** with `{"error": "<why>", "addon": "<name>"}`, and the
 and reports each add-on as `enabled`, `disabled` or `unlicensed` (flag on,
 no valid entitlement).
 
+## Who can use an add-on's routes
+
+An add-on's HTTP routes are scoped by role like the core's. Each route in the
+add-on's manifest names the lowest role that may call it; a route that names
+none is Operator-only, so a User-tier login reads nothing an add-on did not
+vouch for. The evolve add-on's loop, GA, RL-policy and meta-loop reads
+describe the whole installation and are Operator and Admin only. Add-on authors:
+[development/addons.md](../development/addons.md#who-may-call-a-route).
+
 ## Licensed add-ons
 
 A licensed add-on needs an entitlement token from PersonifAI. Register at
@@ -105,6 +114,73 @@ noo stack restart --force
 In a non-interactive run, pass `--accept-terms <version>` naming the terms
 version the install prints. If `install` refuses a token,
 `noo security entitlement verify <token>` says why.
+
+## Enable a third-party add-on
+
+An add-on you did not get with the stack (a voice assistant from another
+vendor, say) is switched on the same way as a built-in one, with one extra
+decision that is yours: **which signing key you trust for it.** The add-on's
+release is a signed lock (its images by digest, the stack versions it runs on,
+its compose overlay). noomesh will pin and run it only if the lock verifies
+against a key you trusted and lists your stack.
+
+```bash
+noo addons trust-key yourthing <pubkey> --registry ghcr.io/vendor/yourthing
+noo addons enable yourthing                  # fetches <registry>:stack-<your tag>
+noo addons enable yourthing --lock ./yourthing-lock.json    # or hand it the lock
+noo stack restart --force                    # the launcher re-verifies it, then starts it
+noo health --json                            # "addons" reads enabled for it
+```
+
+- `trust-key` writes the key and the registry root its images come from to
+  `addon_trust` in `noomesh.yaml`. The ed25519 public key (64 hex characters)
+  comes from the vendor, through a channel you trust. `noo addons untrust-key
+  <name> <pubkey>` removes it. The section is admin-only to change through the
+  API. The CLI ships no default key for third parties; the built-in add-ons
+  (evolve, trellion-intel) are trusted through your entitlement and cannot be
+  given other keys.
+- `--lock` takes a file path or an `https://` URL for the lock JSON. The
+  signature must sit beside it as `<name>.sig`, and every bundle file the lock
+  names (at least `docker-compose.yml`) in the same directory. Without
+  `--lock` the lock is fetched from the registry you named.
+- A lock signed by a key you did not trust is refused, and the message names
+  `noo addons trust-key`. A lock that does not list your stack, whose files do
+  not match their signed hashes, or whose images sit outside the trusted
+  registry root is refused too, with nothing changed.
+- Images are pulled by digest into the same pins as a built-in add-on's
+  (`noo addons verify` checks them), and the launcher re-verifies the lock on
+  every start and tells the gateway, which registers the add-on's routes. If
+  you enable it without a verified lock, nothing loads quietly: `noo health`
+  reads `unhealthy`, and the gateway log says "has no verified lock for this
+  stack ... Run `noo addons upgrade yourthing`".
+- To try an add-on before it ships, trust its developer's temporary key with
+  `noo addons trust-key yourthing <pubkey> --registry <root> --dev --expires 14d`
+  (30 days at most). It works on this mesh until it expires, `noo addons list`
+  marks it DEV with the expiry, and `noo addons untrust-key yourthing --dev`
+  removes it. See "Development keys" in docs/development/addons.md.
+
+Limits of the third-party path today: the lock and the images are fetched
+**anonymously** from the registry you named, so a private registry is not
+supported (the vendor's `NOO_ADDON_REGISTRY_TOKEN` is never sent to it), and
+there is no proxy or entitlement-mediated pull. The add-on's own gateway key and
+database credentials are not minted for it: its overlay's key declaration is
+read only for the add-ons the CLI ships, so provision a key with `noo security
+service-key provision` if it needs one.
+
+An add-on that wants to create and steer a person's tasks for them (a voice
+assistant that starts work while you talk) must declare that in its manifest
+**and** be allowed by you. It is off until you allow it, and the gateway reads
+it at startup:
+
+```bash
+noo addons set yourthing --delegate tasks     # --delegate off turns it off again
+noo stack restart --force
+```
+
+That writes `addon_delegation.yourthing.tasks: true`. Setting it for an add-on
+that does not declare delegation does nothing, and the gateway log says so. The
+key is admin-only to change through the API. Upgrading noomesh keeps the
+add-ons you already run working on the first start.
 
 ## Build your own
 

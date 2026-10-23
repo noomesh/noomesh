@@ -62,6 +62,11 @@ pub struct Pin {
     /// CLI that predates it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pulled_from: Option<String>,
+    /// Set when the lock verified only against a development key (i163 part
+    /// A): that key's expiry, unix seconds. Never written to `addons.lock`:
+    /// it is decided on every verification against the keys trusted then.
+    #[serde(skip)]
+    pub dev_expires_at: Option<i64>,
 }
 
 impl Pin {
@@ -73,6 +78,7 @@ impl Pin {
             key_index: v.key_index,
             lock_sha256: sha256_hex(lock_bytes),
             pulled_from,
+            dev_expires_at: v.dev_expires_at,
         }
     }
 
@@ -276,6 +282,28 @@ pub fn materialised_files<'a>(root: &Path, addon: &str, names: impl IntoIterator
     out
 }
 
+/// A materialised bundle is read by container uids, not only by this
+/// process: the gateway (uid 65532) reads an add-on's route manifest through
+/// a bind mount of it. So its directory and files get these modes set
+/// explicitly, never what the umask leaves (`create_dir` under umask 077 is
+/// 0700, and `write_atomic` copies `stack.lock`'s mode, 0600 when that was
+/// written under umask 077) — the same 0755/0644 the launcher sets on the
+/// declaration dirs it materialises (scripts/lib-dist.sh). The bytes are
+/// public: verified against the add-on's signed lock, no secret among them.
+pub(crate) const BUNDLE_DIR_MODE: u32 = 0o755;
+pub(crate) const BUNDLE_FILE_MODE: u32 = 0o644;
+
+fn set_bundle_mode(p: &Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (p, mode);
+    Ok(())
+}
+
 /// Replace `<root>/addons/<addon>/` with exactly `files` (name to bytes;
 /// the caller has verified them against the signed lock). The new set is
 /// written to a sibling temporary directory first and swapped in by rename,
@@ -302,13 +330,20 @@ pub fn materialise(root: &Path, addon: &str, files: &BTreeMap<String, Vec<u8>>) 
             return Err(format!("{addon}: bundle file name {name:?} is not a plain file name"));
         }
     }
+    let parent_existed = parent.exists();
     std::fs::create_dir_all(&parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    if !parent_existed {
+        set_bundle_mode(&parent, BUNDLE_DIR_MODE)?;
+    }
     let new = parent.join(format!(".{addon}.new.{pid}"));
     remove_old(&new)?;
     std::fs::create_dir(&new).map_err(|e| format!("{}: {e}", new.display()))?;
     let written = (|| -> Result<(), String> {
+        set_bundle_mode(&new, BUNDLE_DIR_MODE)?;
         for (name, bytes) in files {
-            write_atomic(root, &new.join(name), bytes)?;
+            let p = new.join(name);
+            write_atomic(root, &p, bytes)?;
+            set_bundle_mode(&p, BUNDLE_FILE_MODE)?;
         }
         Ok(())
     })();
@@ -373,6 +408,7 @@ mod tests {
             key_index: 0,
             lock_sha256: sha256_hex(b"{}"),
             pulled_from: None,
+            dev_expires_at: None,
         }
     }
 
@@ -474,6 +510,41 @@ mod tests {
         let bad = BTreeMap::from([("../x".to_string(), b"".to_vec())]);
         assert!(materialise(&d, "evolve", &bad).is_err());
         assert!(!d.join("x").exists());
+    }
+
+    /// The bundle is readable by the gateway's uid whatever the umask or
+    /// `stack.lock`'s mode: 0.6.10-rc.3 materialised `.<addon>.new.<pid>`
+    /// 0700 under umask 077 and the gateway (65532) could not read the
+    /// bind-mounted route manifest. A `stack.lock` written 0600 (umask 077)
+    /// is the deterministic half of that here; the directory's mode is the
+    /// explicit set below (a test cannot change the process umask without
+    /// racing every other test's file creation).
+    #[cfg(unix)]
+    #[test]
+    fn materialise_sets_world_readable_modes_whatever_the_umask_left() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = scratch("modes");
+        std::fs::write(d.join("stack.lock"), b"{}").unwrap();
+        std::fs::set_permissions(d.join("stack.lock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let files = BTreeMap::from([("evolve.routes.json".to_string(), b"{}".to_vec()), ("docker-compose.yml".to_string(), b"a: 1\n".to_vec())]);
+        materialise(&d, "evolve", &files).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&addon_dir(&d, "evolve")), BUNDLE_DIR_MODE, "the bundle dir");
+        assert_eq!(mode(&d.join(ADDONS_DIR)), BUNDLE_DIR_MODE, "the addons/ dir this call created");
+        for n in files.keys() {
+            assert_eq!(mode(&addon_dir(&d, "evolve").join(n)), BUNDLE_FILE_MODE, "{n}");
+        }
+        // A tightened dir from an older materialise is replaced, not kept.
+        std::fs::set_permissions(addon_dir(&d, "evolve"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        materialise(&d, "evolve", &files).unwrap();
+        assert_eq!(mode(&addon_dir(&d, "evolve")), BUNDLE_DIR_MODE);
+        let src = include_str!("pins.rs");
+        let body = &src[src.find("pub fn materialise(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.contains("set_bundle_mode(&new, BUNDLE_DIR_MODE)"),
+            "the new bundle dir's mode must be set explicitly, not left to the umask"
+        );
     }
 
     #[test]

@@ -71,6 +71,37 @@ fn run_script(g: &Globals, name: &str, args: &[String], json_action: Option<&str
         }
     }
 
+    // Postgres role leaves (i132). This release's pg_hba requires a client
+    // certificate whose CN is the role being asked for, and its compose points
+    // each DSN at `gateway/pg/<role>.*` or `<leaf>/pg/<role>.*`. An install
+    // started from a checkout that predates them (no `noo upgrade --stack`
+    // in between) has none: mint what is absent, as the operator, BEFORE the
+    // launcher recreates anything. Idempotent; a leaf that cannot be issued
+    // refuses the start here, with the fix, instead of leaving the database
+    // unreachable for every container.
+    if ["start", "restart", "rebuild"].iter().any(|verb| name == format!("noomesh-{verb}.sh")) {
+        let ca = crate::pki::ClusterCa::new(crate::pki::pki_dir());
+        if ca.ca_exists() {
+            let failed: Vec<String> = ca
+                .ensure_pg_leaves(crate::pki::DEFAULT_DAYS)
+                .into_iter()
+                .filter_map(|(l, r)| r.err().map(|e| format!("{} ({}): {e}", l.role, l.cert_rel())))
+                .collect();
+            if !failed.is_empty() {
+                fail(
+                    g.json,
+                    ExitCode::Generic,
+                    "pg_role_leaf_failed",
+                    &format!(
+                        "could not issue the Postgres client certificate(s) this release's pg_hba requires: {} — nothing was started",
+                        failed.join("; ")
+                    ),
+                    Some("noo security pki fix-modes   # then re-run the same command"),
+                );
+            }
+        }
+    }
+
     // The gateway refuses to boot without its audit key. Mint it into the
     // encrypted store when absent, BEFORE the launcher can recreate the
     // gateway; a store that cannot be read is left to the launcher, which
@@ -441,7 +472,61 @@ pub fn mesh_restart(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         script_args.push("--force".into());
     }
     script_args.extend(services);
-    Ok(run_script(g, "noomesh-restart.sh", &script_args, Some("restart")))
+    let rc = run_script(g, "noomesh-restart.sh", &script_args, Some("restart"));
+    if rc == 0 {
+        front_addon_uis(g);
+    }
+    Ok(rc)
+}
+
+/// Front each add-on UI origin the gateway allocated with `tailscale serve
+/// --https=<port>`, and drop our entries for ports it no longer allocates.
+/// Called after a successful `noo stack start`, `noo stack restart` and
+/// `noo upgrade --stack`
+/// (tailnet_serve.rs "Add-on UI origins"). Asks the gateway which ports
+/// (`GET /api/addons/ui`); when it cannot be asked, or on a worker, nothing
+/// is written or removed. Never fails the start: what could not be written is
+/// printed as the exact line to run.
+pub(crate) fn front_addon_uis(g: &Globals) {
+    if crate::role::detect().controller.is_none() {
+        return;
+    }
+    let listing = match crate::http::get_json_try(g, "/api/addons/ui", true, 15) {
+        Ok(v) => v,
+        Err(e) => {
+            if !g.json {
+                println!("{}", ui::note(&format!("add-on UI ports not checked: the gateway did not list them ({e})")));
+            }
+            return;
+        }
+    };
+    let ports: Vec<u32> = listing["uis"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|u| u["port"].as_u64()).map(|p| p as u32).collect())
+        .unwrap_or_default();
+    crate::envfile::ensure_repo_env();
+    let range = crate::tailnet_serve::addon_ui_range(std::env::var("NOO_ADDON_UI_PORTS").ok().as_deref());
+    let Some(report) = crate::tailnet_serve::ensure_addon_ui_fronted(&ports, range, true) else {
+        return; // no tailscale, or it cannot say: not our call
+    };
+    if g.json {
+        return;
+    }
+    for p in &report.written {
+        ui::done(&format!("tailscale serve now fronts the add-on UI origin on :{p}"));
+    }
+    for p in &report.removed {
+        ui::done(&format!("tailscale serve no longer fronts :{p} (no add-on UI is allocated there)"));
+    }
+    for (p, what) in &report.occupied {
+        ui::warned(&format!("add-on UI port :{p} is already served by tailscale ({what}); noo leaves it alone — that add-on's UI is not reachable until the port is free"));
+    }
+    if !report.failed.is_empty() {
+        ui::warned("could not change tailscale serve for the add-on UI ports; run:");
+        for (cmd, detail) in &report.failed {
+            println!("    {}    # {detail}", crate::tailnet_serve::manual_line(cmd));
+        }
+    }
 }
 
 /// `noo stack start [--profile P] [--pull] [--build]` → scripts/noomesh-start.sh
@@ -490,6 +575,9 @@ pub fn mesh_start(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // without jq. Say it here, where tailscale's JSON is easy.
     if rc == 0 && !g.json {
         crate::tailnet_serve::print_front_door(8080 + crate::envfile::port_offset(), &crate::envfile::instance());
+    }
+    if rc == 0 {
+        front_addon_uis(g);
     }
     Ok(rc)
 }

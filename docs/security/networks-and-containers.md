@@ -33,18 +33,54 @@ Redis publishes no port.
 `tests/test_db_networks_are_isolated.py` holds the member list. Adding a
 service to `noo-db` is a reviewed edit of that file.
 
-### Why `pg_hba.conf` does not map certificate names to roles
+### Each role is reachable only with its own certificate
 
-Every TCP client already needs a certificate from the cluster CA **and** its
-role password. Narrowing that to "only the gateway's, the worker's and
-trellion's leaf" inside Postgres is not expressible: a `map=` is accepted
-only for the ident, peer, gssapi, sspi and cert methods, not for
-`scram-sha-256`, and `clientcert=verify-full` without a map requires the
-certificate's CN to equal the database role, while the stack's leaves are
-named for the service holding them and several roles share one leaf. The
-`cert` method would take a map but would remove the password from the TCP
-path. The network above is the control instead. Redis cannot restrict clients
-by certificate name at all.
+Every TCP client needs a certificate from the cluster CA **and** its role
+password, and for every role this stack's own containers connect as, the
+certificate's CN must also **be that role**. Each such role has its own client
+leaf, `CN=<role>`, kept inside the directory its container already mounts:
+
+| Role | Presented by | Leaf |
+|---|---|---|
+| `noo`, `noo_app` | gateway | `gateway/pg/<role>.crt` |
+| `noo_app` | worker, `worker-extra` | `services/worker/pg/noo_app.crt` |
+| `noo_app`, `noo_trellion`, `noo_trellion_ddl` | trellion | `services/trellion/pg/<role>.crt` |
+| the same three | trellion-intel | `services/trellion-intel/pg/<role>.crt` |
+
+`docker/postgres/pg_hba.conf` matches each of those roles with
+`scram-sha-256 clientcert=verify-full`: with `scram-sha-256`, Postgres then
+requires the certificate's CN to equal the database role being asked for, and
+the password is still required (a `map=` with the `cert` method would have
+dropped it). So the gateway's own leaf logs in as no role at all, `noo_app`'s
+leaf cannot log in as `noo`, and a stolen role leaf alone reaches the password
+check for **its one role**. Checked against a real Postgres by
+`tests/test_postgres_role_identity.py`. A CN mismatch is logged by Postgres
+as `password authentication failed for user "<role>"` with a `DETAIL` naming
+the `verify-full` line it matched; `noo cluster verify --controller` →
+`postgres role identity` and `noo security scan` → `Postgres Role Identity`
+name the role and the half (leaf or rule) that is missing.
+
+Two other tiers precede and follow the per-role lines:
+
+- A connection from one of the server's **own** addresses (`samehost`, a
+  process inside the postgres container) needs a cluster-CA certificate and
+  the password but not a role-named one. `noo security secrets rotate|audit`
+  proves a rotated password by logging in as the role from inside the
+  container with the server's own leaf; the same process can already use the
+  `local` socket rule, and a peer on `noo-db` arrives from its own address,
+  not the server's.
+- Roles whose clients live in **other repos** (`noo_evolve`, `noo_evolve_ddl`
+  in the evolve add-on) and the warm standby's `replicator` keep
+  `clientcert=verify-ca`: any cluster-CA leaf reaches their password check
+  until their repos present a leaf named for the role and get a per-role line.
+  The network above stays the control for those.
+
+**Upgrade.** `noo upgrade --stack` issues the role leaves before it moves
+anything (`-1c`) and refuses the roll if one cannot be issued ("nothing was
+changed"); `noo stack start|restart|rebuild` does the same before the
+launcher; `noo onboard` issues them with the other leaves. The new
+`pg_hba.conf`, the compose DSNs and the leaves therefore arrive together; the
+running stack keeps its old rules until it is recreated.
 
 The `local` (unix socket) rules stay `trust`: the socket exists only inside
 the container, the backup script, `noo security secrets rotate` and the
@@ -57,31 +93,119 @@ root-equivalent on the host already.
 
 Each inference backend that has no TLS listener of its own sits behind a
 stunnel sidecar that requires a client certificate from the cluster CA
-(`verify = 2`). The TEI, TEI GPU and reranker doors additionally pin the peer
-by the DNS name in its leaf (`checkHost`): only the gateway, worker, trellion,
-trellion-intel and evolve leaves pass the handshake, so a node's or a
-monitoring container's certificate is refused. The ollama, ollama-embed,
-ollama-embed-cpu and llamacpp doors are also dialled by the controller's own
-node-agent with its node certificate, whose names a static file cannot list
-and which stunnel cannot match by organisation, so they require a cluster
-certificate without naming the caller.
+(`verify = 2`) and pins the peer by the DNS name in its leaf (`checkHost`):
+only the gateway, worker, trellion, trellion-intel and evolve leaves pass the
+handshake, so a node's or a monitoring container's certificate is refused.
+
+The ollama, ollama-embed, ollama-embed-cpu and llamacpp doors are also dialled
+by the controller's own node-agent with its **node** certificate, whose only
+distinguishing name is the controller's node id. stunnel cannot match
+organisation, and a static file cannot list the id, so those four doors append
+`checkHost = $NODE_ID` at start (the `stunnel-self-pin` entrypoint in
+`docker-compose.cluster.yml`). If `NODE_ID` is unset, `auto` or not a plain
+node name the door **refuses to start** (exit 78) and says to set it in `.env`;
+it never falls back to accepting any cluster certificate, and never starts
+silently locking the host agent out. Pinned by
+`tests/test_stunnel_door_pinning.py`, which runs the entrypoint.
+
+The controller's stunnel doors and `nvidia-exporter` run as the unprivileged
+uid 65532 (`USER nonroot` in `docker/Dockerfile.stunnel` and
+`docker/Dockerfile.nvidia-exporter`, `user: nonroot` in compose, a name rather
+than a number because Docker 27 resolves the string by name); their
+leaf keys are `0640` handed to that uid like every other non-root service
+(`SERVICE_KEY_READERS` in `noo-cli/src/pki.rs`). Doors a **node's** agent
+starts keep running as root with a root-owned `0600` copy of their leaf: the
+agent sets `User: "0"` on them explicitly.
 
 ## Container hardening
 
 | Service | `cap_drop` | `no-new-privileges` | Read-only root filesystem |
 |---|---|---|---|
-| `sandbox` | ALL (plus the few it adds back) | yes | yes |
-| `gateway` | ALL | yes | no |
-| `worker`, `worker-extra` | ALL | yes | no |
+| `sandbox`, `sandbox-extra` | ALL, plus `SETUID`, `SETGID` and `KILL` for the launcher (below) | yes | yes (tmpfs `/tmp` 100m, `/run` 10m) |
+| `gateway` | ALL | yes | yes (tmpfs `/tmp` 512m, `/home/nonroot` 64m) |
+| `worker`, `worker-extra` | ALL | yes | yes (tmpfs `/tmp` 256m, `/home/nonroot` 64m) |
+| `trellion` | ALL | yes | yes (tmpfs `/tmp` 1g, `/home/nonroot` 256m) |
 
-The gateway and the worker run as an unprivileged user, bind ports above 1024
-and use no capability, so dropping all of them removes nothing they need.
-Their root filesystem stays writable: the gateway writes the mounted
-`noomesh.yaml`, prompts and compose override and starts helper processes that
-write under their home and `/tmp`, and the worker's tools write where the
-operator's configuration points. The worker mounts `noomesh.yaml` read-only
-because nothing in it writes the file; the gateway's settings route does, so
-the gateway keeps it read-write.
+The gateway, the worker and trellion run as an unprivileged user, bind ports
+above 1024 and use no capability, so dropping all of them removes nothing they
+need.
+
+### The sandbox executor user
+
+The sandbox is the one service that runs code it does not trust, so the code
+and the server are two different uids. The container starts as root only for
+its first instruction: `setpriv` keeps `CAP_SETUID`, `CAP_SETGID` and
+`CAP_KILL` as ambient capabilities and execs uvicorn as `nonroot`; no root
+process remains. Each `python_exec` call is then launched through `setpriv`
+again into one of 64 executor uids (`sandbox-exec`, 65600 and up, one per
+concurrent call) with every capability cleared, in both isolation modes. What
+that buys, measured in the image on 2026-10-21:
+
+* the code cannot read the sandbox's own leaf key, which is `0640` and
+  nonroot's (`cat: Permission denied`), so it cannot present the sandbox's
+  identity to anything on `noo-sandbox`;
+* it cannot signal the server or another call (`kill: Operation not
+  permitted`), and `ptrace` across uids needs a capability it does not have;
+* it cannot return to either uid (`setresuid failed: Operation not
+  permitted`), and `no-new-privileges` stops a file capability from granting
+  anything at exec;
+* a call that times out is killed by process group and then by uid, which
+  reaches a snippet that left the group with `setsid()`; `RLIMIT_NPROC` is
+  the call's own, so a fork bomb in one call starves no other;
+* the scratch directory is made by the executor (0700) and removed as the
+  executor; the server never hands the code a directory it owns.
+
+A non-root process keeps no effective capability, so without this launcher
+the `cap_add` lines were inert and the code ran as the server. `/health`
+reports the executor under `executor`; a null uid means the image has no
+`sandbox-exec` user or the container was started without the launcher, and
+the code runs as the server's uid as it did before.
+
+### Read-only root filesystem
+
+Since 2026-10-19 the four services above cannot write to their image. The
+write set was measured, not guessed: `docker diff` on the live controller
+listed, outside mounts, only
+
+* a copy of the PKI tree under `/tmp/pki` (the gateway's `stage_pki`, and the
+  leaf-key copy `db/engine.py` makes in the worker and trellion), the CA
+  bundle `/tmp/noo-ca-bundle.pem` and the mount points of the dev-mode source
+  overlays: all under `/tmp`;
+* `/tmp/.ses` and the onnxruntime id and event store under
+  `~/.cache/Microsoft` in trellion (the latter is vendor telemetry and is
+  switched off, [telemetry.md](telemetry.md));
+* Python bytecode under `/app/src/**/__pycache__`.
+
+Each service gets a size-capped tmpfs for `/tmp` and for its home directory
+(`/home/nonroot`, owned by uid 65532, mode 0700). The caps bound host RAM, not
+disk, and are not reservations. Because they are RAM, the **key copies in
+`/tmp/pki` no longer persist in the container's layer** (before this change
+`docker diff` showed `/tmp/pki/gateway/gateway.key`, readable by anyone with the
+docker group); a tmpfs is gone when the container stops. Bytecode is compiled
+at image build (`python -m compileall /app/src` in `Dockerfile.worker` and
+`Dockerfile.trellion`) and `PYTHONDONTWRITEBYTECODE=1` stops the runtime
+writing it. The mounted `noomesh.yaml`, `prompts/`, the compose override, the
+`/data` volume and the host spool are bind mounts and volumes, not image
+paths; they stay writable where they were (the worker mounts `noomesh.yaml`
+read-only because nothing in it writes the file; the gateway's settings route
+does).
+
+Secrets are the other thing a writable layer would have kept. Compose refuses
+an `environment:`-sourced secret in a read-only service, so they are `file:`
+secrets bind-mounted from a tmpfs directory the launcher writes
+([secrets.md](secrets.md#where-the-files-live)): nothing plaintext reaches a
+disk or a layer.
+
+What to expect when a path is missed: the write fails with `Read-only file
+system` (EROFS) naming it, in that service's log, not at build time. A
+configuration that points a worker tool at a directory inside the image
+(`workspace_dir`, `output_dir`, the audit archive) now fails the same way; the
+defaults are `/data` and `/tmp`. Verify a roll with:
+
+```sh
+docker inspect -f '{{.Name}} {{.HostConfig.ReadonlyRootfs}}' noo-gateway noo-worker noo-trellion
+docker diff noo-gateway noo-worker noo-trellion    # only mount points (A /opt/noo/addon-routes, /root/.claude): no files
+```
 
 `NOO_NODE_AGENT_PRIVILEGED` defaults to `false` for the opt-in
 `node-agent-compose` lane. The containerised agent holds no Docker socket and

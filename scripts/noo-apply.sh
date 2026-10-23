@@ -382,7 +382,7 @@ done
 # bundle BEFORE anything is installed, so a refused bundle changes nothing.
 # A refusal exits 65 with the line that failed, and logs it.
 # BEGIN env_unit_shape
-AGENT_ENV_KEYS="NODE_ID NODE_IP NODE_TIER GPU_MODEL CONTROLLER_URL NATS_URL NOO_NODE_AGENT_TOKEN NOO_CLUSTER_SECRET NOO_PKI_DIR NOO_TLS_CA NOO_TLS_CERT NOO_TLS_KEY NOO_MTLS_NODES OLLAMA_URL NOO_SELF_NODE NOO_DATA_ROOT HF_CACHE_DIR MODELS_DIR OLLAMA_DATA_DIR NOO_MODEL_CACHE_URL PATH NOO_FORCE_GPU NOO_OLLAMA_GPU_COUNT NOO_IMAGE_PREFIX NOO_IMAGE_TAG NODE_AGENT_PORT LOG_LEVEL DOCKER_HOST"
+AGENT_ENV_KEYS="NODE_ID NODE_IP NODE_TIER GPU_MODEL CONTROLLER_URL NATS_URL NOO_NODE_AGENT_TOKEN NOO_CLUSTER_SECRET NOO_PKI_DIR NOO_TLS_CA NOO_TLS_CERT NOO_TLS_KEY NOO_MTLS_NODES NODE_AGENT_BIND NOO_CLUSTER_TOKEN_V1 OLLAMA_URL NOO_SELF_NODE NOO_DATA_ROOT HF_CACHE_DIR MODELS_DIR OLLAMA_DATA_DIR NOO_MODEL_CACHE_URL PATH NOO_FORCE_GPU NOO_OLLAMA_GPU_COUNT NOO_IMAGE_PREFIX NOO_IMAGE_TAG NODE_AGENT_PORT LOG_LEVEL DOCKER_HOST"
 # Inert keys an older controller still renders: accepted, never acted on.
 # NOO_APPLY_ACCEPT_CA_SIGNED gated the CA-signed lane.
 AGENT_ENV_INERT_KEYS="NOO_APPLY_ACCEPT_CA_SIGNED"
@@ -417,6 +417,8 @@ env_payload_ok() {
             PATH) [ "$_v" = "$AGENT_ENV_PATH" ] || { _shape_refuse "$_kind" "PATH is not the rendered value"; return 65; } ;;
             DOCKER_HOST) [ "$_v" = "$AGENT_ENV_DOCKER_HOST" ] || { _shape_refuse "$_kind" "DOCKER_HOST is not the local socket"; return 65; } ;;
             NOO_APPLY_ACCEPT_CA_SIGNED) [ "$_v" = 0 ] || { _shape_refuse "$_kind" "NOO_APPLY_ACCEPT_CA_SIGNED may only say 0"; return 65; } ;;
+            NOO_CLUSTER_TOKEN_V1) case "$_v" in ''|0|1) : ;; *) _shape_refuse "$_kind" "NOO_CLUSTER_TOKEN_V1 may only say 0, 1 or nothing"; return 65 ;; esac ;;
+            NODE_AGENT_BIND) case "$_v" in all) : ;; *[!0-9a-fA-F:.,]*) _shape_refuse "$_kind" "NODE_AGENT_BIND may only be all, an address, or a comma list of addresses"; return 65 ;; esac ;;
         esac
     done < "$_f"
     return 0

@@ -332,7 +332,13 @@ pub(crate) fn credentials_stage(
 pub(crate) fn reconcile_credentials(root: &Path) -> Result<Vec<(String, Vec<String>)>, CredRefusal> {
     let path = root.join("noomesh.yaml");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(Vec::new()) };
-    let manifest = parse_systems(&text).map_err(|e| CredRefusal::Store(format!("{}: {e}", path.display())))?;
+    let mut manifest = parse_systems(&text).map_err(|e| CredRefusal::Store(format!("{}: {e}", path.display())))?;
+    // Plus the systems switched-on add-ons' signed bundles declare
+    // (`system.json`, i163 E); a noomesh.yaml entry of the same name wins.
+    let on = crate::commands::addons::declared_in(&text);
+    for (name, e) in crate::addons::decls::bundle_systems(root, &|a| on.get(a).copied() == Some(true)) {
+        manifest.entry(name).or_insert(e);
+    }
     let sops = root.join("secrets/env.sops");
     let store = if sops.is_file() {
         Some(secrets::SecretStore::load_sops(&sops).map_err(CredRefusal::Store)?)
@@ -536,7 +542,7 @@ fn run_toggle(_g: &Globals, args: &[String], enabling: bool) -> Result<i32, Unha
     // that grants the feature only produces a gateway that refuses
     // "unlicensed" — say so here, before minting anything.
     if let Some(feature) = licensed_feature(&name) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let now = crate::host_exec::now_unix();
         match crate::entitlement::installed_grants(feature, now) {
             Ok(ent) => ui::done(&format!("{name} is licensed to '{}' (feature `{feature}`)", ent.sub)),
             Err(why) => {
@@ -625,8 +631,14 @@ fn run_toggle(_g: &Globals, args: &[String], enabling: bool) -> Result<i32, Unha
 /// Containers that must be recreated. Taken from the secrets REGISTRY, which
 /// already records exactly this per credential, rather than a second list in
 /// the manifest that could disagree with it.
+///
+/// The gateway is ALWAYS first: it hosts the broker, and it receives every
+/// system's flag and passwords — by name for the systems compose names, in
+/// the one `noo_systems_secrets` file for every other — only when it is
+/// recreated. A system the registry has no rows for (one core does not name)
+/// therefore still names it.
 fn entry_consumers(e: &SystemEntry) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<String> = vec!["noo-gateway".to_string()];
     for key in required_keys(e) {
         if let Some(spec) = secrets::spec_for(key) {
             for c in spec.consumers {
@@ -635,9 +647,6 @@ fn entry_consumers(e: &SystemEntry) -> Vec<String> {
                 }
             }
         }
-    }
-    if out.is_empty() {
-        out.push("noo-gateway".into());
     }
     // Display-only list — remap once so the "recreate these" message
     // names THIS instance's containers.
@@ -672,6 +681,29 @@ mod tests {
     password_env: NOO_EVOLVE_DB_PASSWORD
     ddl_password_env: NOO_EVOLVE_DDL_PASSWORD
 "
+    }
+
+    #[test]
+    fn enabling_a_system_core_does_not_name_recreates_the_gateway() {
+        // No registry row knows these keys: the gateway (the broker's host,
+        // and the only reader of the systems-secrets file) must still be named.
+        let e = SystemEntry {
+            role: "noo_example_addon".into(),
+            ddl_role: "noo_example_addon_ddl".into(),
+            schema: "example_addon".into(),
+            enabled_when: Some("NOO_EXAMPLE_ADDON_ENABLED".into()),
+            password_env: "NOO_EXAMPLE_ADDON_DB_PASSWORD".into(),
+            ddl_password_env: "NOO_EXAMPLE_ADDON_DDL_PASSWORD".into(),
+        };
+        let got = entry_consumers(&e);
+        assert_eq!(got.first(), Some(&crate::envfile::instanced("noo-gateway")), "{got:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+        // A system with registry rows keeps them, after the gateway, once each.
+        let trellion = parse_systems(example_manifest()).unwrap().remove("trellion").unwrap();
+        let got = entry_consumers(&trellion);
+        assert_eq!(got.first(), Some(&crate::envfile::instanced("noo-gateway")), "{got:?}");
+        let unique: std::collections::BTreeSet<&String> = got.iter().collect();
+        assert_eq!(unique.len(), got.len(), "{got:?}");
     }
 
     #[test]

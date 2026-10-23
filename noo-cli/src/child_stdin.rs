@@ -34,7 +34,6 @@ pub fn write_child_stdin<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
 
@@ -63,8 +62,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("noo-child-stdin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let docker = dir.join("docker");
-        std::fs::write(&docker, "#!/bin/sh\necho 'Error: No such container' >&2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_exec(&docker, "#!/bin/sh\necho 'Error: No such container' >&2\nexit 1\n", 0o755);
         let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
         let out = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_stdin::tests::child_mode_psql_stdin_against_a_dead_docker", "--nocapture", "--test-threads=1"])

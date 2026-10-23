@@ -410,7 +410,7 @@ pub(crate) fn effective_timeout(g: &Globals, default_timeout: u64) -> u64 {
 
 fn slow_answer_message(secs: u64) -> String {
     format!(
-        "the gateway is up but this answer took longer than {secs}s (the model may be slow on this box) — retry with --timeout {}",
+        "the gateway is up but this answer took longer than {secs}s (the box may be slow, or the work behind it) — retry with --timeout {}",
         secs.saturating_mul(2)
     )
 }
@@ -709,26 +709,51 @@ pub fn get_json_try(
 /// answer was no use. The split `noo upgrade`'s pre-roll key check needs: a
 /// stack that is DOWN cannot be asked (fall back to the store check), while
 /// a gateway that answers 401/5xx/garbage has told us something (refuse).
+///
+/// "Answered" means an HTTP status line came back. A crash-looping gateway
+/// accepts and then resets, or holds the socket and never writes; neither
+/// is an answer, and calling it one made `noo upgrade` (the command that
+/// fixes the crash loop) refuse to run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProbeFail {
-    /// Nothing answered: connection refused, connect/DNS timeout, DNS
-    /// failure, no route. Classified from `ureq::Error`, never from text.
-    /// A TLS failure is NOT here: a handshake means a listener answered.
+    /// No HTTP response at all: refused, DNS failure, no route, reset or
+    /// closed before the status line (TLS handshake included), or a timeout
+    /// before the response headers. Classified from `ureq::Error`, never
+    /// from text.
     Down(String),
-    /// Something answered (or the transport failed after connecting): any
-    /// non-2xx status, an unparseable body, a TLS failure, a slow answer.
+    /// Something answered: any HTTP status (non-2xx), an unparseable body,
+    /// a listener whose TLS certificate this CLI rejects, a peer that spoke
+    /// something other than HTTP.
     Unreadable(String),
 }
 
-/// True when `e` proves that no listener answered at all.
+/// True when `e`, returned by a request's `call()` (which returns once the
+/// response headers are in), proves that no HTTP response came back.
+///
+/// Kept strict (NOT nothing-answered): a TLS certificate/protocol failure
+/// (`Io(InvalidData)` wrapping a rustls error, `Rustls`, `Tls`) and a
+/// non-HTTP reply (`Protocol`). A listener completed enough of a handshake
+/// to present something this CLI refused; reading that as "the gateway is
+/// down" would wave an upgrade past an impostor or a mis-anchored box.
 pub(crate) fn nothing_answered(e: &ureq::Error) -> bool {
     use std::io::ErrorKind as K;
     match e {
         ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
-        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        // Every phase `call()` can time out in precedes the status line;
+        // `RecvBody` is the one that follows it.
+        ureq::Error::Timeout(t) => !matches!(t, ureq::Timeout::RecvBody),
         ureq::Error::Io(io) => matches!(
             io.kind(),
-            K::ConnectionRefused | K::NetworkUnreachable | K::HostUnreachable | K::AddrNotAvailable | K::NotFound
+            K::ConnectionRefused
+                | K::ConnectionReset
+                | K::ConnectionAborted
+                | K::BrokenPipe
+                | K::UnexpectedEof
+                | K::TimedOut
+                | K::NetworkUnreachable
+                | K::HostUnreachable
+                | K::AddrNotAvailable
+                | K::NotFound
         ),
         _ => false,
     }
@@ -746,7 +771,11 @@ pub fn get_json_probe(
     let base = crate::envfile::gateway_url(&g.gateway_override);
     let url = format!("{base}{path}");
     let agent = agent(g, &base, default_timeout);
+    // A second send only happens after the first one got an HTTP 401, so
+    // a transport failure on the retry still follows an answer.
+    let mut sends = 0u32;
     let mut resp = send_with_retry(g, with_auth, |b| {
+        sends += 1;
         let mut req = agent.get(&url);
         if let Some(b) = b {
             req = req.header("Authorization", b);
@@ -755,7 +784,7 @@ pub fn get_json_probe(
     })
     .map_err(|e| {
         let line = describe_send_error(&base, &e, effective_timeout(g, default_timeout));
-        if nothing_answered(&e) { ProbeFail::Down(line) } else { ProbeFail::Unreadable(line) }
+        if sends == 1 && nothing_answered(&e) { ProbeFail::Down(line) } else { ProbeFail::Unreadable(line) }
     })?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().unwrap_or_default();
@@ -1896,5 +1925,130 @@ mod send_classify_tests {
         assert!(!m.contains("cannot reach"), "{m}");
         let m = describe_send_error("https://x", &ureq::Error::HostNotFound, 60);
         assert!(m.starts_with("cannot reach gateway at https://x"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod nothing_answered_tests {
+    use super::*;
+    use std::io::{ErrorKind as K, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn io(k: K) -> ureq::Error {
+        ureq::Error::Io(std::io::Error::new(k, "test"))
+    }
+
+    /// What `call()` returns against a peer that does `serve` with each connection.
+    fn call_against(scheme: &str, serve: fn(std::net::TcpStream)) -> Result<u16, ureq::Error> {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("{scheme}://{}/api/security/service-keys", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((c, _)) = l.accept() {
+                serve(c);
+            }
+        });
+        test_agent().get(&url).call().map(|r| r.status().as_u16())
+    }
+
+    /// The production agent's TLS and status settings, with a 1s budget.
+    fn test_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .tls_config(tls_for(&Trust::Platform))
+            .timeout_global(Some(Duration::from_secs(1)))
+            .http_status_as_error(false)
+            .build()
+            .into()
+    }
+
+    /// Leave the request unread and close: the kernel answers with RST.
+    fn reset(c: std::net::TcpStream) {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(c);
+    }
+
+    #[test]
+    fn refused_is_nothing_answered() {
+        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let e = test_agent().get(&format!("http://127.0.0.1:{port}/")).call().unwrap_err();
+        assert!(nothing_answered(&e), "{e:?}");
+        assert!(nothing_answered(&io(K::ConnectionRefused)));
+    }
+
+    /// The 0.6.9 rehearsal B5.keycheck case: a crash-looping gateway
+    /// accepts and resets. That is not an answer.
+    #[test]
+    fn reset_before_the_status_line_is_nothing_answered() {
+        let e = call_against("http", reset).unwrap_err();
+        assert!(nothing_answered(&e), "{e:?}");
+        let e = call_against("http", drop::<std::net::TcpStream>).unwrap_err();
+        assert!(nothing_answered(&e), "closed with no bytes: {e:?}");
+        for k in [K::ConnectionReset, K::ConnectionAborted, K::BrokenPipe, K::UnexpectedEof] {
+            assert!(nothing_answered(&io(k)), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn timeout_before_the_headers_is_nothing_answered() {
+        let e = call_against("http", |mut c| {
+            let mut buf = [0u8; 2048];
+            let _ = c.read(&mut buf);
+            std::thread::sleep(Duration::from_secs(3));
+        })
+        .unwrap_err();
+        assert!(matches!(e, ureq::Error::Timeout(_)), "{e:?}");
+        assert!(nothing_answered(&e), "{e:?}");
+        for t in [
+            ureq::Timeout::Resolve,
+            ureq::Timeout::Connect,
+            ureq::Timeout::SendRequest,
+            ureq::Timeout::SendBody,
+            ureq::Timeout::RecvResponse,
+            ureq::Timeout::Global,
+            ureq::Timeout::PerCall,
+        ] {
+            assert!(nothing_answered(&ureq::Error::Timeout(t)), "{t:?}");
+        }
+        assert!(!nothing_answered(&ureq::Error::Timeout(ureq::Timeout::RecvBody)), "the body phase follows an answer");
+    }
+
+    #[test]
+    fn tls_handshake_reset_is_nothing_answered() {
+        let e = call_against("https", reset).unwrap_err();
+        assert!(nothing_answered(&e), "{e:?}");
+        let e = call_against("https", |mut c| {
+            let mut buf = [0u8; 2048];
+            let _ = c.read(&mut buf);
+        })
+        .unwrap_err();
+        assert!(nothing_answered(&e), "closed mid-handshake: {e:?}");
+    }
+
+    /// Kept strict: a certificate this CLI refuses, or a peer that is not
+    /// speaking HTTP, came from a listener; that is not a down gateway.
+    #[test]
+    fn a_refused_certificate_or_garbage_still_counts_as_answered() {
+        let cert = std::io::Error::new(K::InvalidData, rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer));
+        assert!(!nothing_answered(&ureq::Error::Io(cert)));
+        assert!(!nothing_answered(&ureq::Error::Tls("bad")));
+        assert!(!nothing_answered(&ureq::Error::Rustls(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))));
+        let e = call_against("http", |mut c| {
+            let mut buf = [0u8; 2048];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"SSH-2.0-OpenSSH_9.6\r\n\r\n");
+        })
+        .unwrap_err();
+        assert!(!nothing_answered(&e), "a non-HTTP reply: {e:?}");
+    }
+
+    #[test]
+    fn a_5xx_response_is_an_answer() {
+        let status = call_against("http", |mut c| {
+            let mut buf = [0u8; 2048];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"HTTP/1.1 503 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        })
+        .expect("a status line is an answer, not a transport error");
+        assert_eq!(status, 503);
     }
 }

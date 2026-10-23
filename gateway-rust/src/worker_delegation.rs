@@ -201,7 +201,7 @@ static TOOL_ROUTES: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
 
 /// Does `path` match `template`? A `{name}` segment matches exactly one
 /// non-empty segment; everything else is literal.
-fn template_matches(template: &str, path: &str) -> bool {
+pub(crate) fn template_matches(template: &str, path: &str) -> bool {
     let t: Vec<&str> = template.split('/').collect();
     let p: Vec<&str> = path.split('/').collect();
     t.len() == p.len()
