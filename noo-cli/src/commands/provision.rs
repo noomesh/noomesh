@@ -3863,7 +3863,16 @@ pub(crate) const CLUSTER_TRUST_ENV_KEYS: &[&str] = &["NODE_AGENT_BIND", "NOO_CLU
 /// The first CLI whose Mac applier accepts [`CLUSTER_TRUST_ENV_KEYS`] in an
 /// `agent-env` payload (node_fetch.rs `AGENT_ENV_KEYS`). A Linux node is
 /// never withheld from: `noo-apply.sh` self-updates before it validates.
-const CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 8);
+///
+/// This is the TAG the keys first shipped in, not the version the change was
+/// written against: the keys landed on dev while 0.6.8 was in flight and were
+/// first released in noo-cli-v0.6.10. With the floor at 0.6.8, a 0.6.9 Mac
+/// (mcmini, 2026-10-23) was sent the keys and its applier refused the whole
+/// bundle with exit 65 — including the CLI that would have taught it the keys.
+/// The applier now self-updates before it validates (node_fetch.rs
+/// `verify_bundle_with`), so this floor is belt-and-braces for Macs whose
+/// applier predates that too.
+const CLUSTER_TRUST_KEYS_MAC_FLOOR: (u32, u32, u32) = (0, 6, 10);
 
 /// Does this node's applier accept the cluster-trust keys? An unreadable
 /// version is assumed capable (as for the leaf kinds): withholding on a parse
@@ -4017,7 +4026,11 @@ mod cluster_trust_tests {
     fn an_old_mac_applier_is_not_sent_keys_it_would_refuse() {
         assert!(applier_knows_cluster_trust_keys(false, "noo-cli-v0.5.1"), "linux self-updates its applier");
         assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.7+abc"));
-        assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.8"));
+        // 0.6.8 and 0.6.9 shipped WITHOUT the keys in the Mac applier's
+        // allow-list; mcmini on noo-cli-v0.6.9 refused the 0.6.10 bundle.
+        assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.8"));
+        assert!(!applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.9+bdf4c07"));
+        assert!(applier_knows_cluster_trust_keys(true, "noo-cli-v0.6.10+c6c4814"));
         assert!(applier_knows_cluster_trust_keys(true, "unknown"), "an unreadable version is assumed capable");
     }
 
