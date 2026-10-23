@@ -48,6 +48,22 @@ use std::collections::BTreeMap;
 /// root outright instead of falling back.
 pub(crate) const DEFAULT_DATA_ROOT: &str = "/var/lib/noo";
 
+/// The root of the SENSITIVE state set (postgres, redis, nats, prometheus,
+/// grafana, loki, noo-data): `NOO_STATE_ROOT` when it is set and not blank,
+/// else the data root itself, so an install that never sets it resolves every
+/// path exactly as before (i10a groundwork; a later change points it at the
+/// encrypted volume). models / hf-cache / ollama / images are NOT in the set
+/// and always stay under the data root. Mirrors compose's
+/// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}` (an empty value counts as unset) and
+/// scripts/lib-instance.sh `noo_state_root`. Pure: the caller supplies the
+/// two values it already read.
+pub(crate) fn state_root_of(state_root: Option<&str>, data_root: &str) -> String {
+    match state_root.map(|s| s.trim().trim_end_matches('/')).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => data_root.to_string(),
+    }
+}
+
 /// The macOS default: the Mac agent runs as the user, so its data lives under
 /// that user's ~/noomesh (where its env, keys and binary already are). The
 /// path has NO whitespace: the Mac agent env is sourced by a shell, and the
@@ -408,6 +424,15 @@ pub(crate) fn link_notes(rendered: &Rendered, reported: Option<&Value>) -> Vec<S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_root_defaults_to_the_data_root_and_a_set_value_wins() {
+        assert_eq!(super::state_root_of(None, "/srv/noo"), "/srv/noo", "unset: the data root, unchanged");
+        assert_eq!(super::state_root_of(Some(""), "/srv/noo"), "/srv/noo", "empty counts as unset, like compose's :-");
+        assert_eq!(super::state_root_of(Some("  "), "/srv/noo"), "/srv/noo");
+        assert_eq!(super::state_root_of(Some("/mnt/state/"), "/srv/noo"), "/mnt/state", "set: wins, trailing slash trimmed");
+        assert_eq!(super::state_root_of(None, "/srv/noo/"), "/srv/noo/", "the data-root fallback is passed through untouched");
+    }
+
     #[test]
     fn shape_matches_the_shared_vectors() {
         let doc: serde_json::Value =

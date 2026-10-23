@@ -32,6 +32,14 @@ if [ -z "$DATA_ROOT" ] && [ -f "$_REPO_ROOT/.env" ]; then
     DATA_ROOT="$(grep -E '^NOO_DATA_ROOT=' "$_REPO_ROOT/.env" | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
 fi
 
+# The sensitive state set (postgres, redis, nats) lives under NOO_STATE_ROOT,
+# which defaults to the data root (i10a). Same empty-means-refused rule.
+STATE_ROOT="${NOO_STATE_ROOT:-}"
+if [ -z "$STATE_ROOT" ] && [ -f "$_REPO_ROOT/.env" ]; then
+    STATE_ROOT="$(grep -E '^NOO_STATE_ROOT=' "$_REPO_ROOT/.env" | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
+fi
+STATE_ROOT="${STATE_ROOT:-$DATA_ROOT}"
+
 # Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -251,7 +259,8 @@ fi
 
 # --- Bind-mounted data directories (deep clean only) ---
 # The stateful "volumes" are bind mounts onto the host storage root
-# (NOO_DATA_ROOT in .env; postgres may be redirected via NOO_PG_DATA).
+# (NOO_DATA_ROOT in .env, NOO_STATE_ROOT for the state set; postgres may be
+# redirected via NOO_PG_DATA).
 # `docker volume rm` above removes only the volume RECORD — the host
 # directory keeps every byte, and the next `up` recreates the volume
 # pointing at the same populated dir. This is what turned the 2026-08-06
@@ -264,7 +273,7 @@ if [ "$DEEP_CLEAN" = true ]; then
     if [ -f "$REPO_ROOT/.env" ]; then
         PG_DATA=$(grep -E '^NOO_PG_DATA=' "$REPO_ROOT/.env" | tail -1 | cut -d= -f2-)
     fi
-    [ -n "$PG_DATA" ] || PG_DATA="$DATA_ROOT/postgres"
+    [ -n "$PG_DATA" ] || PG_DATA="$STATE_ROOT/postgres"
 
     wipe_data_dir() {
         local dir="$1" label="$2" chown_to="$3"
@@ -295,8 +304,8 @@ if [ "$DEEP_CLEAN" = true ]; then
     # chainguard postgres = 70, chainguard redis = 65532 (nonroot),
     # nats = host uid 1000.
     wipe_data_dir "$PG_DATA"          "postgres" "70:70"
-    wipe_data_dir "$DATA_ROOT/redis"  "redis"    "65532:65532"
-    wipe_data_dir "$DATA_ROOT/nats"   "nats"     "1000:1000"
+    wipe_data_dir "$STATE_ROOT/redis"  "redis"    "65532:65532"
+    wipe_data_dir "$STATE_ROOT/nats"   "nats"     "1000:1000"
 fi
 
 if [ "$REMOVE_IMAGES" = true ]; then

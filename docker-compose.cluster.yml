@@ -3058,25 +3058,29 @@ networks:
 
 volumes:
   # Heavy data volumes — bind-mounted to D: drive to avoid filling C:
-  # Override with NOO_DATA_ROOT env var if your D: mount path differs
+  # Override with NOO_DATA_ROOT env var if your D: mount path differs.
+  # The sensitive STATE set (noo-data, redis, nats, prometheus, grafana, loki,
+  # postgres) binds under NOO_STATE_ROOT, which defaults to NOO_DATA_ROOT (so
+  # nothing moves while it is unset). models / hf-cache / ollama / images
+  # always stay under NOO_DATA_ROOT. See i10a.
   noo-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/noo-data
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/noo-data
   redis-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/redis
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/redis
   nats-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/nats
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/nats
   ollama-data:
     driver: local
     driver_opts:
@@ -3101,10 +3105,13 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/prometheus
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/prometheus
   alertmanager-data:
-    # Plain named volume (not a NOO_DATA_ROOT bind): alertmanager state
-    # (silences / notification log) is non-critical and this avoids requiring
+    # Plain named volume (not a NOO_DATA_ROOT bind). i10a: it joins the state
+    # set only via the PR-D migrate step (a compose volume cannot switch type
+    # on an env var, and re-pointing it would orphan existing silences).
+    # Alertmanager state (silences / notification log) is non-critical and
+    # this avoids requiring
     # the host dir to pre-exist before `up`.
     driver: local
   grafana-data:
@@ -3112,16 +3119,17 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/grafana
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/grafana
   loki-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/loki
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/loki
   postgres-data:
     # PostgreSQL needs POSIX ownership/permissions (chmod/chown).
-    # On Linux/macOS NOO_PG_DATA == NOO_DATA_ROOT/postgres (same drive).
+    # On Linux/macOS NOO_PG_DATA == NOO_STATE_ROOT/postgres (NOO_STATE_ROOT
+    # defaults to NOO_DATA_ROOT, same drive); NOO_PG_DATA keeps precedence.
     # On WSL2 with NTFS data root, `noo onboard` redirects NOO_PG_DATA
     # to $HOME/noo/postgres on the ext4 root filesystem
     # (onboard/steps.rs `ensure_pg_data_path`).
@@ -3129,8 +3137,10 @@ volumes:
     driver_opts:
       type: none
       o: bind
-      device: ${NOO_PG_DATA:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/postgres}
+      device: ${NOO_PG_DATA:-${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/postgres}
   claude-config:
+  # i10a: claude-config is a plain named volume on /; like alertmanager-data
+  # it is moved into the state set by the PR-D migrate step, not here.
 
 # ── Tier-1 secrets, delivered as FILES (2026-09-29; RAM files 2026-10-19) ──
 # Every entry is sourced from a FILE the launcher writes on every start to a
