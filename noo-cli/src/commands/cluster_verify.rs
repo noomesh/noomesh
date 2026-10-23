@@ -3301,6 +3301,22 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
     ]
 }
 
+/// Remedy for a row in the clear (operator decision i10a, 2026-10-11: no
+/// full-disk LUKS, a reinstall is not acceptable on a running controller).
+/// The two secret-key rows get the TPM-sealing plan, the data-root rows the
+/// LUKS2-volume plan. Both say what it protects (a drive in someone else's
+/// hands) and what it does not (root on the running machine). Planned, not
+/// built: no command is named. Rows with the same text print once.
+const AT_REST_REMEDY_KEYS: &str = "planned (i10a): seal these keys to this machine's TPM so they decrypt only into RAM at service start. Until then anyone holding the drive can read them; root on the running machine always can.";
+const AT_REST_REMEDY_DATA: &str = "planned (i10a): move the data root onto a LUKS2 volume on this disk (no reinstall), unlocked at boot by this machine's TPM. Until then anyone holding the drive can read these files; root on the running machine always can.";
+
+fn at_rest_remedy(name: &str) -> &'static str {
+    match name {
+        "pki at rest" | "age key at rest" => AT_REST_REMEDY_KEYS,
+        _ => AT_REST_REMEDY_DATA,
+    }
+}
+
 /// One "<name> at rest" row. Nothing here encrypts its own files (Loki's
 /// options exist for S3 only, Postgres has no TDE, the rest write plain
 /// files), so what protects them at rest is the host's disk encryption — a
@@ -3322,7 +3338,7 @@ pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exis
         Some(false) => warn(
             name,
             format!("{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}"),
-            Some("encrypt the data root's disk (LUKS) or accept it: access to the files is root on the controller, as for Postgres".into()),
+            Some(at_rest_remedy(name).into()),
         ),
         None => warn(
             name,
@@ -5494,15 +5510,24 @@ mod tests {
 
     #[test]
     fn identical_remedies_print_once_with_every_row_they_cover() {
-        let luks = "encrypt the data root's disk (LUKS) or accept it";
+        let luks = at_rest_remedy("loki at rest");
+        assert_ne!(luks, at_rest_remedy("age key at rest"));
         let rows = vec![
             warn("loki at rest", "plaintext", Some(luks.into())),
             warn("loki", "other", Some("noo health".into())),
             warn("postgres at rest", "plaintext", Some(luks.into())),
-            warn("age key at rest", "plaintext", Some(luks.into())),
+            warn("age key at rest", "plaintext", Some(at_rest_remedy("age key at rest").into())),
+            warn("pki at rest", "plaintext", Some(at_rest_remedy("pki at rest").into())),
         ];
         let c = remedies_to_print("controller", &rows);
-        assert_eq!(c, vec![(luks, vec!["loki at rest", "postgres at rest", "age key at rest"]), ("noo health", vec!["loki"])]);
+        assert_eq!(
+            c,
+            vec![
+                (luks, vec!["loki at rest", "postgres at rest"]),
+                ("noo health", vec!["loki"]),
+                (at_rest_remedy("age key at rest"), vec!["age key at rest", "pki at rest"]),
+            ]
+        );
         // Node sections group identical FAIL remedies the same way.
         let fails = vec![fail("a", "x", "noo fix"), fail("b", "x", "noo fix")];
         assert_eq!(remedies_to_print("node n", &fails), vec![("noo fix", vec!["a", "b"])]);
@@ -8004,7 +8029,15 @@ mod tests {
             if on_home {
                 assert_eq!(c.verdict, Verdict::Warn, "{}: {}", row.name, c.detail);
                 assert!(c.detail.contains("in the clear") && c.detail.contains(row.what), "{}: {}", row.name, c.detail);
-                assert!(c.remedy.as_deref().unwrap_or("").contains("LUKS"), "{}", row.name);
+                let remedy = c.remedy.as_deref().unwrap_or("");
+                if row.name == "pki at rest" || row.name == "age key at rest" {
+                    assert!(remedy.contains("seal these keys to this machine's TPM"), "{}: {remedy}", row.name);
+                    assert!(!remedy.contains("LUKS"), "{}: keys are sealed, not volume-encrypted: {remedy}", row.name);
+                } else {
+                    assert!(remedy.contains("LUKS2 volume on this disk (no reinstall)"), "{}: {remedy}", row.name);
+                }
+                assert!(remedy.contains("root on the running machine always can"), "{}: must disclose what it does not cover", row.name);
+                assert!(!remedy.contains("encrypt the data root's disk"), "{}: full-disk LUKS is not the plan", row.name);
             } else {
                 assert_eq!(c.verdict, Verdict::Ok, "{}: {}", row.name, c.detail);
             }

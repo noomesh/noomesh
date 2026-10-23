@@ -312,7 +312,11 @@ the `monitoring web config` row
 (every mounted web-config is named by its command) and one `<name> at rest`
 row per data directory — loki, postgres, redis, nats, prometheus, grafana,
 noo-data, pki, age key — OK on a dm-crypt device, WARN otherwise: nothing
-here encrypts its own files, so disk encryption is the host's control.
+here encrypts its own files. The WARN's remedy states the plan (operator
+decision i10a, no full-disk LUKS): the data-root rows point at a LUKS2 volume
+unlocked by the machine's TPM, the `pki` and `age key` rows at keys sealed to
+the TPM. Both protect a stolen or lost drive, not root on the running machine,
+and neither is built yet.
 
 | Rule | Fires when |
 |---|---|
@@ -687,7 +691,9 @@ Loki's filesystem store writes chunks and its index under
 encryption for the filesystem object store (its encryption options exist
 for S3). In transit everything is mTLS (node-agent → gateway → Loki,
 Grafana → Loki). What protects the logs on disk is the host's disk
-encryption, which is the operator's control: `noo cluster verify
+encryption (planned, i10a: a LUKS2 volume for the data root, unlocked by the
+machine's TPM; it covers a stolen drive, not root on the running machine):
+`noo cluster verify
 --controller` reports `loki at rest` as OK only when the mount holding the
 data root sits on a dm-crypt device, WARNs when it does not, and says
 "could not determine" when it cannot tell — it never assumes. Access to
