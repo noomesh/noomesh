@@ -72,6 +72,13 @@ updates:
         update-types:
           - minor
           - patch
+    # thinc is pinned by spaCy (spacy 3.8.x requires thinc>=8.3.12,<8.4.0), so a
+    # thinc major cannot resolve until spaCy declares support for it (checked
+    # against spacy 3.8.16, the latest at the time). Drop this when it does.
+    ignore:
+      - dependency-name: thinc
+        update-types:
+          - version-update:semver-major
   - package-ecosystem: pip
     directory: "/packages/noo-gateway-client"
     target-branch: dev
