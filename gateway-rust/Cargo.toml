@@ -142,7 +142,7 @@ serde_urlencoded = "0.7"
 # for that: it was already compiled for the test profile and is already in
 # Cargo.lock, so this adds nothing to the build graph. Still the only
 # non-test use; certificate ISSUANCE lives in noo-cli, not here.
-rcgen = "0.13"
+rcgen = "0.14"
 flate2 = "1"
 
 [dev-dependencies]
