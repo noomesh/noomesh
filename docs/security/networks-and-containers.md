@@ -161,6 +161,24 @@ reports the executor under `executor`; a null uid means the image has no
 `sandbox-exec` user or the container was started without the launcher, and
 the code runs as the server's uid as it did before.
 
+#### AppArmor on Ubuntu 24.04 and later
+
+Docker's `docker-default` profile denies every mount in a container, and on
+hosts that restrict unprivileged user namespaces through AppArmor it denies
+the user namespace too. Bubblewrap needs both, so under `docker-default` on
+such a host every call fails ("No permissions to create new namespace",
+"Can't mount proc") and `/health` reports the isolation as unusable. The
+stack ships `docker/apparmor-noo-sandbox`: `docker-default` verbatim, with
+`userns,`, `mount,` and `pivot_root,` in place of `deny mount,` and nothing
+else loosened (pinned by `tests/test_sandbox_apparmor_profile.py`). The
+operator installs it once into `/etc/apparmor.d/noo-sandbox` and sets
+`NOO_SANDBOX_APPARMOR=noo-sandbox`; the mounts a call makes stay inside its
+own user namespace, since the container holds no `CAP_SYS_ADMIN`.
+`unconfined` remains only for a parser older than 4.0, which cannot load
+the `userns,` rule. The `sandbox executor` row of `noo cluster verify`
+fails, with that install as its remedy, whenever the sandbox reports that
+its isolation cannot run.
+
 ### Read-only root filesystem
 
 Since 2026-10-19 the four services above cannot write to their image. The

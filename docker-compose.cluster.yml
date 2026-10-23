@@ -2735,10 +2735,13 @@ services:
       # Ubuntu 24.04+ hosts restrict unprivileged user namespaces through
       # AppArmor and the docker-default profile also denies mount, so
       # Bubblewrap fails there with "No permissions to create new
-      # namespace" / "Can't mount proc". Set NOO_SANDBOX_APPARMOR=unconfined
-      # on such a host: the container is still under seccomp, cap_drop ALL,
-      # read-only rootfs and no-new-privileges. Ignored where AppArmor is
-      # absent (WSL2).
+      # namespace" / "Can't mount proc". On such a host install the shipped
+      # profile (docker/apparmor-noo-sandbox: docker-default plus the
+      # user-namespace and mount rules Bubblewrap needs, nothing else) into
+      # /etc/apparmor.d/noo-sandbox and set NOO_SANDBOX_APPARMOR=noo-sandbox;
+      # `unconfined` is the fallback where that profile cannot load, and
+      # the container is still under seccomp, cap_drop ALL, read-only
+      # rootfs and no-new-privileges. Ignored where AppArmor is absent (WSL2).
       - apparmor=${NOO_SANDBOX_APPARMOR:-docker-default}
     cap_drop: &sandbox-cap-drop
       - ALL

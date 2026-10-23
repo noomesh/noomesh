@@ -161,6 +161,11 @@ const STANDALONE_FILES: &[&str] = &[
     // tests/test_standalone_slice_ships_compose_host_files.py pins this
     // list against the compose files so the next one cannot slip.
     "docker/seccomp-sandbox.json",
+    // The sandbox's AppArmor profile for Ubuntu 24.04+ hosts (docker-default
+    // plus the user-namespace and mount rules Bubblewrap needs). Not mounted
+    // by compose: the operator installs it into /etc/apparmor.d once, so a
+    // --dist controller must have the file to install.
+    "docker/apparmor-noo-sandbox",
     // Redis reads its password from the environment through this script
     // instead of from a compose `command:` line, so a --dist
     // controller needs the script or redis will not start at all.
