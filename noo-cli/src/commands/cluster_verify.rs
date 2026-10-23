@@ -3282,20 +3282,24 @@ pub(crate) fn at_rest_dirs(env: &dyn Fn(&str) -> Option<String>) -> Vec<AtRestDi
     let get = |k: &str| env(k).filter(|v| !v.trim().is_empty()).map(|v| v.trim().trim_end_matches('/').to_string());
     let root = get("NOO_DATA_ROOT").unwrap_or_else(|| crate::commands::data_root::DEFAULT_DATA_ROOT.into());
     let home = get("HOME").unwrap_or_else(|| "/root".into());
-    let pg = get("NOO_PG_DATA").unwrap_or_else(|| format!("{root}/postgres"));
+    // The sensitive state set binds under NOO_STATE_ROOT (default: the data
+    // root, so nothing moves while it is unset); NOO_PG_DATA still wins for
+    // postgres. i10a.
+    let state = crate::commands::data_root::state_root_of(get("NOO_STATE_ROOT").as_deref(), &root);
+    let pg = get("NOO_PG_DATA").unwrap_or_else(|| format!("{state}/postgres"));
     let pki = get("NOO_PKI_DIR").unwrap_or_else(|| format!("{home}/.config/mesh/pki"));
     let age = get("SOPS_AGE_KEY_FILE")
         .and_then(|f| std::path::Path::new(&f).parent().map(|p| p.to_string_lossy().into_owned()))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| format!("{home}/.config/sops/age"));
     vec![
-        AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{root}/loki") },
+        AtRestDir { name: "loki at rest", what: LOKI_WHAT, path: format!("{state}/loki") },
         AtRestDir { name: "postgres at rest", what: "the database files (every account, session, message and memory)", path: pg },
-        AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{root}/redis") },
-        AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{root}/nats") },
-        AtRestDir { name: "prometheus at rest", what: "the TSDB blocks (node names, rates, security signals)", path: format!("{root}/prometheus") },
-        AtRestDir { name: "grafana at rest", what: "Grafana's own database (users, sessions, dashboards)", path: format!("{root}/grafana") },
-        AtRestDir { name: "noo-data at rest", what: "the gateway's data volume (uploads, artifacts, state)", path: format!("{root}/noo-data") },
+        AtRestDir { name: "redis at rest", what: "the Redis dumps (RDB/AOF: sessions, rate limits, cached results)", path: format!("{state}/redis") },
+        AtRestDir { name: "nats at rest", what: "the JetStream streams (queued tasks, agent mail, KV)", path: format!("{state}/nats") },
+        AtRestDir { name: "prometheus at rest", what: "the TSDB blocks (node names, rates, security signals)", path: format!("{state}/prometheus") },
+        AtRestDir { name: "grafana at rest", what: "Grafana's own database (users, sessions, dashboards)", path: format!("{state}/grafana") },
+        AtRestDir { name: "noo-data at rest", what: "the gateway's data volume (uploads, artifacts, state)", path: format!("{state}/noo-data") },
         AtRestDir { name: "pki at rest", what: "the cluster CA and every service private key", path: pki },
         AtRestDir { name: "age key at rest", what: "the SOPS age key, which decrypts env.sops and so every other secret", path: age },
     ]
@@ -7988,6 +7992,32 @@ mod tests {
         assert_eq!(path("age key at rest"), "/home/alice/.config/sops/age");
         assert!(rows.iter().all(|r| r.name.ends_with(" at rest")), "one naming for the whole table");
         assert_eq!(rows.len(), 9);
+
+        // NOO_STATE_ROOT moves exactly the state set; NOO_PG_DATA still wins
+        // for postgres; the PKI / age rows are untouched by it.
+        let env_s = |k: &str| -> Option<String> {
+            match k {
+                "NOO_DATA_ROOT" => Some("/media/alice/data/noo".into()),
+                "NOO_STATE_ROOT" => Some("/mnt/state/".into()),
+                "HOME" => Some("/home/alice".into()),
+                _ => None,
+            }
+        };
+        let rows_s = at_rest_dirs(&env_s);
+        let path_s = |name: &str| rows_s.iter().find(|r| r.name == name).unwrap().path.clone();
+        for (row, dir) in [("loki", "loki"), ("postgres", "postgres"), ("redis", "redis"), ("nats", "nats"), ("prometheus", "prometheus"), ("grafana", "grafana"), ("noo-data", "noo-data")] {
+            assert_eq!(path_s(&format!("{row} at rest")), format!("/mnt/state/{dir}"), "{row} reads the state root");
+        }
+        assert_eq!(path_s("pki at rest"), "/home/alice/.config/mesh/pki");
+        let env_pg = |k: &str| -> Option<String> {
+            match k {
+                "NOO_STATE_ROOT" => Some("/mnt/state".into()),
+                "NOO_PG_DATA" => Some("/home/alice/noo/postgres".into()),
+                _ => None,
+            }
+        };
+        let pg_row = at_rest_dirs(&env_pg).into_iter().find(|r| r.name == "postgres at rest").unwrap();
+        assert_eq!(pg_row.path, "/home/alice/noo/postgres", "NOO_PG_DATA keeps precedence over the state root");
 
         // The overrides the wizard writes / the operator exports.
         let env2 = |k: &str| -> Option<String> {

@@ -427,6 +427,9 @@ _data_root="${NOO_DATA_ROOT:-}"
 if [ -z "$_data_root" ] && [ -f ".env" ]; then
     _data_root="$(grep -E '^[[:space:]]*NOO_DATA_ROOT=' .env | tail -1 | cut -d= -f2- | tr -d ' \t\r"')"
 fi
+# The sensitive state set (redis, grafana, ...) lives under NOO_STATE_ROOT,
+# which defaults to the data root (i10a); the re-own below follows it.
+_state_root="$(noo_state_root)"
 if [ -z "$_data_root" ]; then
     ui_warned "NOO_DATA_ROOT is not set — compose will refuse to start"
     ui_note "pin one path: run 'noo onboard --only storage', or set NOO_DATA_ROOT in .env"
@@ -906,7 +909,7 @@ require_compose_v2 || exit 1
     reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046  # one service name per word
-        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
+        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "$ACTIVE_SVCS" | grep -xE 'redis|grafana' || true) || exit 1
     fi
     # The voice add-on mounts the controller's staged models read-only
     # (<MODELS_DIR>/voice/{whisper,piper}, i105). `noo models pull` and
@@ -983,7 +986,7 @@ else
     reown_stop_service() { docker compose $COMPOSE_FILES $PROFILE_ARGS stop "$1" >/dev/null 2>&1; }
     if [ -n "$_data_root" ]; then
         # shellcheck disable=SC2046
-        reown_nonroot_dirs "$_data_root" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
+        reown_nonroot_dirs "${_state_root:-$_data_root}" $(printf '%s\n' "${SERVICES[@]}" | grep -xE 'redis|grafana' || true) || exit 1
     fi
     if printf '%s\n' "${SERVICES[@]}" | grep -qxE 'whisper|piper'; then
         noo_voice_model_dirs

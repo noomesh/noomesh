@@ -5,11 +5,11 @@
 //! Each is a faithful port of the matching `onboard/step_*.py`.
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::prompt::Prompt;
-use super::{env, sh, util, yamlcfg, Ctx, SECRETS, STORAGE_SUBDIRS};
+use super::{env, sh, util, yamlcfg, Ctx, SECRETS, STATE_SUBDIRS, STORAGE_SUBDIRS};
 use crate::envfile::ENROLLED_CONTROLLER_URL;
 use crate::pki::{ClusterCa, DEFAULT_DAYS};
 
@@ -3490,8 +3490,17 @@ pub fn storage(ctx: &mut Ctx) {
     ctx.progress("Creating storage directories...");
     ensure_root_dir(ctx, Path::new(&chosen_root));
 
+    // The sensitive state set binds under NOO_STATE_ROOT (default: the data
+    // root, so unset changes nothing; i10a). This step does not choose it —
+    // the operator or a later change sets it — it only follows it.
+    let state_root = state_root_path(ctx, Path::new(&chosen_root)).to_string_lossy().into_owned();
+    if state_root.trim_end_matches('/') != chosen_root.trim_end_matches('/') {
+        ctx.info(&format!("State root (postgres, redis, nats, metrics, logs, app data): {state_root}"));
+        ensure_root_dir(ctx, Path::new(&state_root));
+    }
+
     // Postgres data path (NTFS → ext4 under home)
-    ensure_pg_data_path(ctx, &chosen_root, &home);
+    ensure_pg_data_path(ctx, &state_root, &home);
 
     let failed = create_storage_dirs(ctx, Path::new(&chosen_root));
     if failed > 0 {
@@ -3508,18 +3517,18 @@ pub fn storage(ctx: &mut Ctx) {
     ctx.info("Docker bind-mount paths:");
     for (label, sub) in [
         ("PostgreSQL", ctx.read_env("NOO_PG_DATA")),
-        ("Redis", format!("{chosen_root}/redis")),
-        ("NATS", format!("{chosen_root}/nats")),
+        ("Redis", format!("{state_root}/redis")),
+        ("NATS", format!("{state_root}/nats")),
         ("Ollama models", format!("{chosen_root}/ollama")),
         ("HF model cache", format!("{chosen_root}/hf-cache")),
-        ("Application data", format!("{chosen_root}/noo-data")),
+        ("Application data", format!("{state_root}/noo-data")),
     ] {
         ctx.info(&format!("  {label:<18} {sub}"));
     }
 
     // Docker bind-mount test
     ctx.progress("Testing Docker bind mount access...");
-    verify_bind_mount(ctx, &chosen_root);
+    verify_bind_mount(ctx, &state_root);
 
     // User dirs + workspace
     configure_user_dirs(ctx);
@@ -3799,6 +3808,46 @@ fn storage_subdirs(ctx: &Ctx, root: &Path) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// The root of the sensitive state set for this install: `NOO_STATE_ROOT`
+/// from `.env` when set, else `root` itself (i10a: unset = no change).
+fn state_root_path(ctx: &Ctx, root: &Path) -> PathBuf {
+    PathBuf::from(crate::commands::data_root::state_root_of(
+        Some(ctx.read_env("NOO_STATE_ROOT").as_str()),
+        &root.to_string_lossy(),
+    ))
+}
+
+/// Every (name, full path) this step creates: [`storage_subdirs`] under the
+/// data root, except that when `NOO_STATE_ROOT` names a DIFFERENT root the
+/// state set ([`STATE_SUBDIRS`]) is created under it instead (postgres only
+/// when `NOO_PG_DATA` points there; elsewhere it is not ours to make).
+/// Identical to the old per-root list while `NOO_STATE_ROOT` is unset.
+fn storage_targets(ctx: &Ctx, root: &Path) -> Vec<(String, PathBuf)> {
+    let state = state_root_path(ctx, root);
+    let trim = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
+    let separated = trim(&state) != trim(root);
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for name in storage_subdirs(ctx, root) {
+        if separated && STATE_SUBDIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let target = root.join(&name);
+        out.push((name, target));
+    }
+    if separated {
+        let pg = ctx.read_env("NOO_PG_DATA");
+        let pg = pg.trim_end_matches('/');
+        let pg_elsewhere = !pg.is_empty() && pg != format!("{}/postgres", trim(&state));
+        for name in STATE_SUBDIRS {
+            if *name == "postgres" && pg_elsewhere {
+                continue;
+            }
+            out.push((name.to_string(), state.join(name)));
+        }
+    }
+    out
+}
+
 /// Returns how many subdirectories could not be created.
 /// Create the data root itself, owned by the operator. /var/lib/noo needs
 /// sudo to create, but a sudo `mkdir -p` of the subdirectories leaves them
@@ -3832,8 +3881,7 @@ fn ensure_root_dir(ctx: &mut Ctx, root: &Path) {
 
 fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
     let (mut created, mut existing, mut failed) = (0, 0, 0);
-    for name in &storage_subdirs(ctx, root) {
-        let target = root.join(name);
+    for (name, target) in &storage_targets(ctx, root) {
         if target.exists() {
             existing += 1;
             continue;
@@ -5100,7 +5148,7 @@ fn ensure_storage_dirs(ctx: &mut Ctx) {
     let root = ctx.read_env("NOO_DATA_ROOT");
     let root = if root.is_empty() { crate::commands::data_root::DEFAULT_DATA_ROOT.to_string() } else { root };
     let path = Path::new(&root);
-    let missing: Vec<_> = storage_subdirs(ctx, path).into_iter().filter(|d| !path.join(d).exists()).collect();
+    let missing: Vec<_> = storage_targets(ctx, path).into_iter().filter(|(_, t)| !t.exists()).collect();
     if !missing.is_empty() {
         ctx.info(&format!("Creating {} missing storage dirs under {}", missing.len(), root));
         create_storage_dirs(ctx, path);

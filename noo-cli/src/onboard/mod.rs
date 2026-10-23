@@ -99,6 +99,14 @@ pub(crate) const STORAGE_SUBDIRS: &[&str] = &[
     "models/voice/whisper", "models/voice/piper",
 ];
 
+/// The subset of [`STORAGE_SUBDIRS`] that is SENSITIVE STATE and so lives under
+/// `NOO_STATE_ROOT` (default: the data root) rather than `NOO_DATA_ROOT`
+/// (i10a). Mirrors the compose volumes bound under
+/// `${NOO_STATE_ROOT:-${NOO_DATA_ROOT}}`; models, hf-cache, ollama and images
+/// are not here and always stay under the data root.
+/// tests/test_state_root_groundwork.py holds this to the compose file.
+pub(crate) const STATE_SUBDIRS: &[&str] = &["noo-data", "redis", "nats", "prometheus", "grafana", "loki", "postgres"];
+
 /// The eleven step titles, in wizard order — the single source for both
 /// `run_all`'s banners and the TUI's step list. DEPENDENCY-ORDERED
 /// (finding #16, operator design 2026-08-20): Secrets (credential gen +
@@ -1045,11 +1053,14 @@ fn confirm_data_plane_is_fresh(ctx: &mut Ctx) -> bool {
         v if v.is_empty() => crate::commands::data_root::DEFAULT_DATA_ROOT.to_string(),
         v => v,
     };
+    // The state set (postgres, redis, nats) lives under NOO_STATE_ROOT, which
+    // defaults to the data root (i10a).
+    let state_root = crate::commands::data_root::state_root_of(Some(ctx.read_env("NOO_STATE_ROOT").as_str()), &data_root);
     let pg_data = match ctx.read_env("NOO_PG_DATA") {
-        v if v.is_empty() => format!("{data_root}/postgres"),
+        v if v.is_empty() => format!("{state_root}/postgres"),
         v => v,
     };
-    let populated: Vec<String> = [pg_data, format!("{data_root}/redis"), format!("{data_root}/nats")]
+    let populated: Vec<String> = [pg_data, format!("{state_root}/redis"), format!("{state_root}/nats")]
         .into_iter()
         .filter(|d| {
             std::fs::read_dir(d)
