@@ -693,7 +693,7 @@ pub(crate) fn age_key_row(f: &AgeKeyFacts) -> Check {
         }
     }
     if !f.plaintext.is_empty() {
-        let unfinalized = f.plaintext.iter().any(|p| *p == f.default_path);
+        let unfinalized = f.plaintext.contains(&f.default_path);
         return check(
             AGE_ROW,
             Verdict::Warn,
