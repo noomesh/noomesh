@@ -4701,17 +4701,27 @@ mod gateway_redis_tests {
     }
 }
 
+/// The seat rows whose WARN remedy is the only way out and must print in a
+/// `seat <name>` section: the layout moves (`seat-sync --migrate`, run on the
+/// seat under sudo) and the display. 0.6.10 printed the legacy-layout WARN
+/// only in `--json`.
+const SEAT_WARN_REMEDY_ROWS: [&str; 3] = ["seat layout", "display binaries", "display"];
+
 /// The `(remedy, row name)` pairs a section prints under its table: every
 /// FAIL row's, and in the controller section every WARN row's too. In a
 /// node section only the held `gpu` WARN prints its remedy: `gpu release` is
 /// the one way out of an operator hold and was visible only in `--json`
 /// (rehearsal 0.6.7-rc.1 F4). Other node WARNs stay remedy-less on purpose.
+/// In a seat section the layout and display WARNs print theirs
+/// ([`SEAT_WARN_REMEDY_ROWS`]).
 fn remedies_to_print<'a>(title: &str, checks: &'a [Check]) -> Vec<(&'a str, Vec<&'a str>)> {
     // An identical remedy is printed once, with every row it covers (the
     // v0.2.97 roll printed one LUKS remedy nine times, once per `* at rest`).
+    let seat_section = title.starts_with("seat ");
     let mut out: Vec<(&str, Vec<&str>)> = Vec::new();
     for c in checks.iter()
-        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu")))
+        .filter(|c| c.verdict == Verdict::Fail || (c.verdict == Verdict::Warn && (title == "controller" || c.name == "gpu"
+            || (seat_section && SEAT_WARN_REMEDY_ROWS.contains(&c.name)))))
     {
         let Some(r) = c.remedy.as_deref() else { continue };
         match out.iter_mut().find(|(x, _)| *x == r) {
@@ -9121,6 +9131,32 @@ mod gpu_contention_tests {
         // other node warns stay remedy-less
         let other = vec![warn("harness", "x", Some("noo cluster desired host3".into()))];
         assert!(remedies_to_print("host3", &other).is_empty());
+    }
+
+    /// A seat whose display runs from a home directory (the 0.6.10
+    /// migration) or that is still on the root layout: the WARN remedy is
+    /// the one command that fixes it, and it prints in the seat's section.
+    #[test]
+    fn seat_layout_and_display_warn_remedies_print_in_the_seat_section() {
+        let seen = "2025-10-09T08:53:10Z";
+        let now = parse_rfc3339_unix(seen).unwrap() + 10;
+        let seat = serde_json::json!({"seat_name": "homeserver", "enroll_user": "rbwolf", "last_seen": seen,
+            "heartbeat": {"cli_version": "0.6.11", "layout": "user", "user_cli_current": true, "kiosk_serve": "active",
+                          "kiosk_display": "active", "kiosk_bins": "home", "console_build": "stack-v0.6.11"}});
+        let checks = crate::commands::kiosk_seat::seat_checks(&seat, "0.6.11", "stack-v0.6.11", now);
+        let row = checks.iter().find(|c| c.name == "display binaries").expect("the home layout is a row");
+        assert_eq!(row.verdict, Verdict::Warn, "a display that still runs is a WARN");
+        let want = "on homeserver: sudo ~rbwolf/.local/libexec/noo-seat/noo kiosk seat-sync --migrate";
+        let r = remedies_to_print("seat homeserver", &checks);
+        assert!(r.iter().any(|(rem, names)| *rem == want && names.contains(&"display binaries")), "{r:?}");
+        // The same WARN in a node section stays remedy-less (only gpu prints there).
+        assert!(remedies_to_print("homeserver", &checks).iter().all(|(rem, _)| *rem != want));
+        // The legacy root layout's WARN prints in the seat section too.
+        let legacy = vec![warn("seat layout", "still on the root layout", Some("on s: sudo /usr/local/libexec/noo-seat/noo kiosk seat-sync --migrate".into()))];
+        assert_eq!(remedies_to_print("seat s", &legacy).len(), 1);
+        // Other seat WARNs keep the node rule.
+        let other = vec![warn("seat cli", "x", Some("noo upgrade --seats".into()))];
+        assert!(remedies_to_print("seat s", &other).is_empty());
     }
 
     #[test]
