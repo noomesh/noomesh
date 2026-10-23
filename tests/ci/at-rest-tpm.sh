@@ -243,6 +243,11 @@ run_tests() {
     echo "::warning title=at-rest-tpm::steps 2-6 SKIPPED: noo-hostd has no at-rest verb in this tree"
     return 0
   fi
+  # Each verb is detected on its own: PR-C's create-volume can be in a tree
+  # without PR-B's seal-age-key (and the other way round). A tree with
+  # 'at-rest' but no seal verb skips only the seal steps, explicitly.
+  local has_seal=no
+  "$HOSTD" at-rest help 2>&1 | grep -q 'seal-age-key' && has_seal=yes
 
   local work key want
   work="$(mktemp -d)"; key="$work/age-key.txt"
@@ -251,11 +256,12 @@ run_tests() {
   chmod 0600 "$key"; want="$(sha "$key")"
   grep -q AGE-SECRET-KEY-1 "$key" || die "test key is not an age secret key"
 
+  local cred=/var/lib/noo/sealed/age-key.cred
+  if [ "$has_seal" = yes ]; then
   log "=== 2/3. seal (--pcrs none) and unseal"
   seal_and_unseal none "$key" "$want"
 
   log "=== 4. negative: the credential really is sealed"
-  local cred=/var/lib/noo/sealed/age-key.cred
   sudo cp "$cred" "$work/copy.cred"; sudo chown "$(id -u)" "$work/copy.cred"
   if grep -q AGE-SECRET-KEY "$work/copy.cred"; then die "plaintext key found inside the .cred"; fi
   cp "$work/copy.cred" "$work/bad.cred"
@@ -267,6 +273,10 @@ run_tests() {
   log "=== 2b. seal --pcrs 7 (swtpm exposes PCR 7; a hosted VM's firmware PCRs are irrelevant)"
   tpm2_pcrread sha256:7 >"$LOG_DIR/pcr7.out" 2>&1 || { cat "$LOG_DIR/pcr7.out" >&2; die "cannot read PCR 7 from the TPM"; }
   seal_and_unseal 7 "$key" "$want"
+  else
+    log "TODO/SKIPPED (explicit): this tree's noo-hostd has no 'seal-age-key' (i10a PR-B not merged here); steps 2-4 and the seal half of 6 skipped."
+    echo "::warning title=at-rest-tpm::seal steps SKIPPED: noo-hostd has no seal-age-key in this tree"
+  fi
 
   local vol_ran=no
   log "=== 5. create-volume"
@@ -280,13 +290,15 @@ run_tests() {
 
   log "=== 6. PCR 7 change: PCR-7-sealed material must stop unsealing"
   tpm2_pcrextend "7:sha256=$(printf 'noo-ci-boot-chain-change' | sha256sum | cut -d' ' -f1)"
+  if [ "$has_seal" = yes ]; then
   assert_fails "PCR-7-sealed credential must not decrypt after PCR 7 changed" sudo systemd-creds decrypt --name=noo-age-key "$cred" -
   sudo systemctl stop noo-unseal.service || true
   sudo rm -f /run/noo/keys/age.txt
   assert_fails "noo-unseal.service must fail after PCR 7 changed" sudo systemctl start noo-unseal.service
   [ ! -e /run/noo/keys/age.txt ] || die "key was unsealed despite a PCR 7 change"
+  fi
   if [ "$vol_ran" = yes ]; then volume_after_pcr_change; fi
-  log "ALL ASSERTIONS PASSED (create-volume ran: $vol_ran)"
+  log "ALL ASSERTIONS PASSED (seal ran: $has_seal, create-volume ran: $vol_ran)"
 }
 
 # ---- step 5: file-backed LUKS2 volume (PR-C) --------------------------------------

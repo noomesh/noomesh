@@ -103,13 +103,16 @@ def test_assert_device_passes_when_a_device_node_exists(tmp_path):
 
 
 def test_every_conditional_skip_is_explicit_and_only_for_a_verb_missing_from_the_tree():
-    """The only skips: no `at-rest` verb at all (before PR-B), or create-volume
-    absent / without --size-mib (before PR-C). Each logs SKIPPED (explicit) and
-    raises a workflow warning; the TPM device and has-tpm2 checks are never
-    conditional."""
+    """The only skips: no `at-rest` verb at all, an `at-rest` without
+    seal-age-key (PR-C's verbs in a tree without PR-B's), or create-volume
+    absent / without --size-mib (before PR-C). Each is gated on the verb itself,
+    logs SKIPPED (explicit) and raises a workflow warning; the TPM device and
+    has-tpm2 checks are never conditional."""
     src = SCRIPT.read_text()
-    assert src.count("SKIPPED (explicit)") == 3
-    assert src.count("::warning title=at-rest-tpm::") == 3
+    assert src.count("SKIPPED (explicit)") == 4
+    assert src.count("::warning title=at-rest-tpm::") == 4
+    # The seal steps are gated on the seal verb, not on `at-rest` existing.
+    assert "grep -q 'seal-age-key' && has_seal=yes" in src
     assert src.index("SKIPPED (explicit)") > src.index("systemd-creds has-tpm2")
 
 

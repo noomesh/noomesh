@@ -235,7 +235,7 @@ skipped unless `--integration`. See [testing.md](../development/developer-guide.
 | `noo config get` | `[<section>\|cli]` | Print gateway runtime config, whole or one section; `cli` reads this machine's prefs |
 | `noo config set` | `<section> <updates-json>` | Update a gateway config section from JSON (no confirm); `cli` writes local prefs |
 | `noo config launch-render` | `compose-env \| addons \| override \| systems [<file>]` | Hidden: render one noomesh.yaml section for the launcher scripts (internal) |
-| `noo config launch-check` | `bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] \| system-credentials [<noomesh.yaml>] \| secrets-at-rest [<dir>]` | Hidden: pre-start refusals: bind sources, system credentials, plaintext secrets (internal) |
+| `noo config launch-check` | `bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] \| system-credentials [<noomesh.yaml>] \| secrets-at-rest [<dir>] \| state-root [<dir>]` | Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume |
 | `noo config show` | `[--config <path>]` | Print noomesh.yaml: --config, $NOO_CONFIG, ./noomesh.yaml, ~/.config/mesh/config.yaml |
 | `noo config export-effective` | `[-o <file>]` | Export the effective runtime config (autonomy + KB rules/grants) as YAML |
 
