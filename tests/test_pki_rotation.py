@@ -144,7 +144,7 @@ class TestClusterCA:
 
 
 # remove_ca_trust unit tests moved with onboard/ca_trust.py to
-# legacy/python-onboard/ (2026-08-06); the live trust-store logic is native
+# git history (before 2026-08-08) (2026-08-06); the live trust-store logic is native
 # Rust with its own tests (noo-cli security_local.rs).
 
 

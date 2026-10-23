@@ -68,7 +68,7 @@ def _run_script(
 
 # install-watcher is NATIVE ONLY (noo-cli commands/mesh.rs, WP-B2) — the
 # Python version and its impl (onboard/watcher_install.py) were archived to
-# legacy/python-onboard/ on 2026-08-06 with the rest of the Python wizard.
+# git history (before 2026-08-08) on 2026-08-06 with the rest of the Python wizard.
 
 
 @mesh_app.command()

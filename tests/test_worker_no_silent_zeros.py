@@ -49,7 +49,7 @@ class TestCheckRagEngineUnavailable:
 
 # ── worker.autonomy.evaluate_custom: tests removed with the 2026-08-08
 # reference sweep. The subject was ported in #573 and the Python body is
-# archived in legacy/python-workers-reference/autonomy.py; the live
+# archived in git history (before 2026-08-08); the live
 # implementation is gateway-rust autonomy_evaluators.rs::eval_custom_location,
 # which carries the same non-200→error branch explicitly and pins the
 # condition-evaluation semantics (dotted lookup, all-must-hold, empty-never-
@@ -288,7 +288,7 @@ class TestRagContextErrorsAreVisible:
         assert "error" not in result
 
 # TestNodeStatsOneLivenessDefinition moved to
-# legacy/python-cluster-reference/test_node.py with cluster/node.py (fu 58
+# git history (before 2026-08-08) with cluster/node.py (fu 58
 # round 2): it tested NodeRegistry.get_stats, not the workers.
 
 

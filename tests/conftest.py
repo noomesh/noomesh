@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 from noomesh.config import AppConfig
 from noomesh.gateway.tools_executor import ToolResult
-from noomesh.gateway.tool_parser import ToolCallParser
 from noomesh.channels.base import ChannelMessage
 
 # "A skip in CI must be explained" (see docs/development/developer-guide.md).
@@ -59,7 +58,7 @@ tools:
 
 
 # The node/cluster fixtures (_make_node, make_node, node_registry) moved to
-# legacy/python-cluster-reference/test_node.py with cluster/node.py (fu 58
+# git history (before 2026-08-08) with cluster/node.py (fu 58
 # round 2) — the registry was an empty shell nobody populated.
 
 
@@ -74,12 +73,6 @@ def tool_result_fail():
 
 
 # ── Tool-related fixtures ────────────────────────────────────────
-
-
-@pytest.fixture
-def tool_parser():
-    """Shared ToolCallParser instance."""
-    return ToolCallParser()
 
 
 @pytest.fixture

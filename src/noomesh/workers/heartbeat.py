@@ -7,7 +7,7 @@ Moved verbatim from ``noomesh.gateway.worker_pool`` (2026-07-14 split
 — pure code motion). Live subjects register on import via
 ``@worker_handler``; see ``noomesh.workers.registry``. Handlers whose
 subjects were ported to native Rust were moved to
-``legacy/python-workers-reference/`` (2026-08-08 sweep) — only live
+``git history (before 2026-08-08)`` (2026-08-08 sweep) — only live
 registrations and helpers that live paths still call remain here.
 
 NOTE on lazy (in-function) imports: they are deliberate — heavy/optional

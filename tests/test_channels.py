@@ -53,7 +53,7 @@ class TestChannelMessage:
 
 # Adapter / ChannelManager / GoogleChat formatting tests left with the
 # code they tested: the Python adapters moved to
-# legacy/python-channels-reference/ in the task #23 sweep (2026-08-12) —
+# git history (before 2026-08-08) in the task #23 sweep (2026-08-12) —
 # outbound is routes/communication.rs, exercised by its own Rust tests,
 # and the trellion-side client by tests/test_gateway_channel_client.py.
 # Only the still-live base contract (ChannelMessage) is pinned here.
