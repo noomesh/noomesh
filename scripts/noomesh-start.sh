@@ -531,6 +531,10 @@ check_system_credentials || exit 1
 # A plaintext-.env install is refused before anything is pulled or
 # recreated; the message names the sops remedy.
 check_secrets_at_rest || exit 1
+# An install whose state lives on the encrypted volume (i10a) is refused
+# while that volume is not open: the services would start on an empty dir.
+source "$SCRIPT_DIR/lib-state-volume.sh"
+check_state_volume_open || exit 1
 
 # Parse arguments
 PROFILE=""

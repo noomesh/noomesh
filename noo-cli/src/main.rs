@@ -530,6 +530,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "at-rest", "status"], commands::security_at_rest_status),
     (&["security", "at-rest", "opt-out"], commands::security_at_rest_opt_out),
     (&["security", "at-rest", "opt-in"], commands::security_at_rest_opt_in),
+    (&["security", "at-rest", "create-volume"], commands::security_at_rest_create_volume),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),

@@ -790,6 +790,7 @@ default, cached and refreshed every 15 s. The registry
 | `NOO_EVOLVE_HOFSTADTER_ENABLED` | features | on (with the evolve add-on) |
 | `kiosk.graph_labels` | kiosk | off — **DB only** (see below) |
 | `at_rest.unencrypted_accepted` | security | off — **DB only, person only** (see below) |
+| `at_rest.recovery_key_acknowledged` | security | off — **DB only, person only** (see below) |
 | `NOO_HEARTBEAT_TZ` (string) | heartbeat | `America/New_York` |
 | `NOO_REPORTS_DRIVE_FOLDER_ID` (string) | heartbeat | empty (reports are sent inline) |
 | `NOO_OPS_WAIT_<TYPE>_SECS`, `NOO_OPS_RESULT_TTL_SECS` (strings) | ops | see [Asynchronous operations](#asynchronous-operations) |
@@ -824,6 +825,13 @@ the `setting_flag_set` audit event) always name who decided and when. While
 it is on, `noo cluster verify` shows the at-rest rows as accepted risk and
 still states that the data is not encrypted. Switch it with
 `noo security at-rest opt-out|opt-in|status`.
+
+`at_rest.recovery_key_acknowledged` records that a person was shown the
+encrypted state volume's recovery key (once, on a terminal, never stored) and
+confirmed storing it off the machine by retyping its first and last groups
+(i10a). Person-only and DB-only like the opt-out; `noo cluster verify` shows
+the `at-rest recovery key` row as a warning until it is set. Written by
+`noo security at-rest create-volume` and by `noo onboard`.
 
 `kiosk.graph_labels` decides whether `/api/kiosk/graph` sends the kiosk
 display entity names and relation types. It has **no env layer**: it is the

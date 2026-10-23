@@ -44,9 +44,35 @@ def test_the_decision_flag_is_off_and_db_only():
     assert db_only is True
 
 
+def _person_only() -> list[str]:
+    m = re.search(r'PERSON_ONLY_FLAGS: &\[&str\] = &\[([^\]]*)\]', SETTINGS_RS)
+    assert m, "PERSON_ONLY_FLAGS not found"
+    return [x.strip() for x in m.group(1).split(",") if x.strip()]
+
+
 def test_the_setter_refuses_non_persons_for_it():
-    assert re.search(r'PERSON_ONLY_FLAGS: &\[&str\] = &\[AT_REST_UNENCRYPTED_ACCEPTED\]', SETTINGS_RS)
+    assert "AT_REST_UNENCRYPTED_ACCEPTED" in _person_only()
     setter = SETTINGS_RS[SETTINGS_RS.index("async fn settings_flags_set("):]
     gate = setter.index("needs_person(&key)")
     assert gate < setter.index("INSERT INTO noo_settings")
     assert "Origin::Person" in setter[gate:gate + 200]
+
+
+# ── i10a PR-C: the recovery-key acknowledgement ──────────────────────────
+
+ACK = "at_rest.recovery_key_acknowledged"
+
+
+def test_the_recovery_key_acknowledgement_is_registered_off_db_only_and_person_only():
+    rust = _rust_flags()
+    assert ACK in rust, "the acknowledgement flag is not in FLAG_REGISTRY"
+    category, default, db_only = rust[ACK]
+    assert (category, default, db_only) == ("security", False, True)
+    assert "AT_REST_RECOVERY_KEY_ACKNOWLEDGED" in _person_only()
+    py = {f.key: f for f in py_settings._FLAGS}
+    assert ACK in py and py[ACK].default is False and py[ACK].category == "security"
+
+
+def test_the_cli_writes_the_same_key_it_reads():
+    cli = (ROOT / "noo-cli" / "src" / "commands" / "at_rest_volume.rs").read_text()
+    assert f'pub(crate) const RECOVERY_SETTING: &str = "{ACK}";' in cli

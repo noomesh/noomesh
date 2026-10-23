@@ -74,6 +74,12 @@ _FLAGS = [
              "Unencrypted data at rest accepted",
              "Record that you accept this controller's data being stored unencrypted on disk "
              "(anyone with the drive can read it)."),
+    # The person confirmed storing the encrypted state volume's recovery key
+    # off this machine (i10a PR-C). DB-only and person-only in the gateway.
+    FlagSpec("at_rest.recovery_key_acknowledged", "security", False,
+             "At-rest recovery key acknowledged",
+             "Recorded when a person confirms storing the encrypted state volume's recovery key "
+             "off this machine (it is shown once and never stored)."),
 ]
 
 # Registered STRING settings (config-graduation phase 2). Same DB-override

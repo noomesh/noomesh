@@ -27,15 +27,21 @@ import (
 // `docker start`s exactly the stopped containers that bind from that directory.
 //
 // Not a launcher: nothing is pulled, built or recreated, and a container that
-// does not bind a secret file is never touched. A directory that EXISTS means
+// does not bind a secret file is never touched. When the install's state lives
+// on the encrypted volume (i10a) and that volume did not open, nothing is
+// started (lib-state-volume.sh check_state_volume_open). A directory that EXISTS means
 // the files are there (a hostd restart, not a reboot) and the step does nothing,
 // so a service an operator stopped by hand stays stopped.
 
-const bootRestoreScript = `. %s 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
+const bootRestoreScript = `_noo_lib=%s
+. "$_noo_lib" 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
 d="$(secret_rundir)"
 if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
   echo "boot-restore: $d is populated; nothing to do"
   exit 0
+fi
+if . "$(dirname "$_noo_lib")/lib-state-volume.sh" 2>/dev/null; then
+  check_state_volume_open || { echo "boot-restore: the encrypted state volume is not open — not starting the stack (reason above)" >&2; exit 3; }
 fi
 load_secrets >/dev/null || { echo "boot-restore: could not write the secret files (reason above)" >&2; exit 1; }
 d="$(secret_rundir)"
@@ -54,6 +60,9 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	if e.Mode == ModeWorker {
 		return
 	}
+	// i10a: the script also sources lib-state-volume.sh beside lib-secrets.sh:
+	// a reboot whose TPM unlock failed leaves the state volume closed, and
+	// starting the stack then would run it on an empty directory.
 	script := fmt.Sprintf(bootRestoreScript, shellQuote(filepath.Join(e.Root, "scripts", "lib-secrets.sh")))
 	for attempt := 1; attempt <= 12; attempt++ {
 		unlock, err := acquireComposeLock(ctx)

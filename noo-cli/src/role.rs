@@ -134,6 +134,7 @@ const CONTROLLER_ONLY: &[&[&str]] = &[
     &["offboard"],
     &["migrate", "export"],
     &["controller"],
+    &["security", "at-rest", "create-volume"],
     &["security", "pki"],
     &["security", "trust-ca"],
     &["security", "untrust-ca"],

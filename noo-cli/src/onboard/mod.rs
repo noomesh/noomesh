@@ -185,6 +185,10 @@ pub(crate) struct State {
     /// gateway is up, then recorded by `steps::at_rest_record` (the setting
     /// lives in the gateway's database).
     pub at_rest_opt_out: bool,
+    /// The person retyped the state volume's recovery key in the storage
+    /// step (i10a PR-C). Recorded with `at_rest_record` once the gateway is
+    /// up (`at_rest.recovery_key_acknowledged`, person-only).
+    pub at_rest_recovery_ack: bool,
     pub model_pulled: String,
     pub backend_used: String,
     pub admin_username: String,
@@ -1239,6 +1243,12 @@ fn run_all(ctx: &mut Ctx) {
         ctx.info("Skipped.");
     } else {
         steps::storage(ctx);
+        // A "yes" to encryption at rest whose volume could not be made
+        // stops here, before any service starts (i10a): never carry on
+        // unencrypted after the person said yes.
+        if ctx.state.interrupted {
+            return;
+        }
     }
     ctx.pause(6, TOTAL);
 
@@ -1758,13 +1768,44 @@ mod at_rest_tests {
         let steps = include_str!("steps.rs");
         let storage = &steps[steps.find("pub fn storage(").unwrap()..];
         let storage = &storage[..storage.find("\n}\n").unwrap()];
-        assert!(storage.contains("at_rest_choice(ctx);"), "the storage step does not ask about encryption at rest");
+        assert!(storage.contains("at_rest_choice(ctx, &chosen_root)"), "the storage step does not ask about encryption at rest");
         // the wizard never writes the flag before the gateway exists
         let choice = &steps[steps.find("fn at_rest_choice(").unwrap()..];
         let choice = &choice[..choice.find("\n}\n").unwrap()];
         assert!(!choice.contains("flags/set"), "at_rest_choice must only remember the answer");
         assert!(choice.contains("state.at_rest_opt_out = true"));
-        assert!(choice.contains("setup_fresh()"), "'yes' goes through the labelled stub");
+        assert!(choice.contains("at_rest_encrypt_fresh(ctx, data_root)"), "'yes' makes the encrypted volume");
+    }
+
+    /// i10a PR-C: a "yes" makes the volume BEFORE any state directory and
+    /// before any service: the choice is the first thing after the data root
+    /// exists, ahead of the state root, postgres' path and the directories;
+    /// the storage step runs before the services step; and a failed volume
+    /// stops the wizard there.
+    #[test]
+    fn a_yes_makes_the_volume_before_any_state_or_service() {
+        let steps = include_str!("steps.rs");
+        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
+        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        let at = |needle: &str| storage.find(needle).unwrap_or_else(|| panic!("storage() lacks {needle}"));
+        let choice = at("if !at_rest_choice(ctx, &chosen_root) {");
+        assert!(at("ensure_root_dir(ctx, Path::new(&chosen_root));") < choice, "the data root must exist first (the backing file lives in it)");
+        for later in ["state_root_path(ctx,", "ensure_pg_data_path(", "create_storage_dirs(ctx,", "verify_bind_mount("] {
+            assert!(choice < at(later), "{later} ran before the at-rest choice: state could be written in the clear");
+        }
+        assert!(storage[choice..].starts_with("if !at_rest_choice(ctx, &chosen_root) {\n        return;"), "a failed volume must stop the step");
+        let m = include_str!("mod.rs");
+        let run = &m[m.find("steps::storage(ctx);").unwrap()..];
+        let stop = run.find("if ctx.state.interrupted {").expect("run_all must stop after a failed volume");
+        assert!(stop < run.find("steps::services(ctx);").unwrap(), "the stop must come before the services start");
+        // the yes path is the trait-driven setup_fresh, and a failure is a hard failure
+        let enc = &steps[steps.find("fn at_rest_encrypt_fresh(").unwrap()..];
+        let enc = &enc[..enc.find("\n}\n").unwrap()];
+        assert!(enc.contains("vol::setup_fresh(&mut io, plan)"));
+        assert!(enc.contains("Err(e) => at_rest_stop(ctx, &e)"));
+        let stop_fn = &steps[steps.find("fn at_rest_stop(").unwrap()..];
+        assert!(stop_fn[..stop_fn.find("\n}\n").unwrap()].contains("ctx.state.interrupted = true"));
+        assert!(!State::default().at_rest_recovery_ack, "no acknowledgement until the person retypes the key");
     }
 
     #[test]

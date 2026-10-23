@@ -3257,7 +3257,14 @@ fn block_device_encrypted(dev: &str) -> Option<bool> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    lsblk_types_say_crypt(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The verdict of an `lsblk -sno TYPE` listing: any `crypt` row = dm-crypt.
+/// The i10a state volume lists `crypt` then `loop` (a LUKS2 mapping over a
+/// loop device over `<data_root>/state.luks2`), so every row under it reads
+/// encrypted. `None` for an empty listing.
+pub(crate) fn lsblk_types_say_crypt(text: &str) -> Option<bool> {
     let types: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if types.is_empty() {
         return None;
@@ -5279,9 +5286,8 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // What this machine can do (TPM) and what the person decided
         // (`noo security at-rest opt-out`): the rows below read both.
         let tpm_facts = crate::commands::at_rest::TpmFacts::probe(std::path::Path::new("/"));
-        let at_rest_decision = get_json_opt(g, "/api/settings/flags", true, 10)
-            .as_ref()
-            .and_then(crate::commands::at_rest::state_from_flags);
+        let at_rest_flags = get_json_opt(g, "/api/settings/flags", true, 10);
+        let at_rest_decision = at_rest_flags.as_ref().and_then(crate::commands::at_rest::state_from_flags);
         checks.push(at_rest_tpm_check(&tpm_facts));
         for row in at_rest_dirs(&|k| std::env::var(k).ok()) {
             let exists = std::path::Path::new(&row.path).is_dir();
@@ -5306,6 +5312,13 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             },
         ));
         checks.push(at_rest_outside_check(&outside_items(&mounts), at_rest_decision.as_ref()));
+        // The encrypted state volume and its recovery key (i10a PR-C).
+        checks.extend(crate::commands::at_rest_volume::rows_live(
+            &mounts,
+            at_rest_flags.as_ref(),
+            at_rest_decision.as_ref(),
+            &tpm_facts,
+        ));
         checks.push(monitoring_web_config_check(compose.as_deref()));
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).
