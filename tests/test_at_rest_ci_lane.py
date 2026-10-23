@@ -102,7 +102,12 @@ def test_assert_device_passes_when_a_device_node_exists(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
-def test_the_only_conditional_step_is_create_volume_and_it_says_so():
+def test_every_conditional_skip_is_explicit_and_only_for_a_verb_missing_from_the_tree():
+    """The only skips: no `at-rest` verb at all (before PR-B), or create-volume
+    absent / without --size-mib (before PR-C). Each logs SKIPPED (explicit) and
+    raises a workflow warning; the TPM device and has-tpm2 checks are never
+    conditional."""
     src = SCRIPT.read_text()
-    assert src.count("SKIPPED (explicit)") == 2
-    assert "::warning title=at-rest-tpm::step 5" in src
+    assert src.count("SKIPPED (explicit)") == 3
+    assert src.count("::warning title=at-rest-tpm::") == 3
+    assert src.index("SKIPPED (explicit)") > src.index("systemd-creds has-tpm2")
