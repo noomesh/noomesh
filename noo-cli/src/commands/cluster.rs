@@ -806,7 +806,7 @@ fn print_desired(node: &str, body: &serde_json::Value, node_live: &serde_json::V
                 match role_state {
                     Some("missing") => ui::warn("model missing").to_string(),
                     Some("down") => ui::warn("not running").to_string(),
-                    _ => actual_cell(&node_live, backend, dash),
+                    _ => actual_cell(node_live, backend, dash),
                 },
             ]
         })
@@ -828,15 +828,15 @@ fn print_desired(node: &str, body: &serde_json::Value, node_live: &serde_json::V
             &rows,
         )
     );
-    if let Some(r) = refusal_for(&node_live, "harness") {
+    if let Some(r) = refusal_for(node_live, "harness") {
         println!();
         ui::warned(&format!("harness: {r}"));
     }
     // Why a model is missing, with the command that fixes it.
     for p in placements {
         let backend = p["backend"].as_str().unwrap_or("?");
-        if backend_model_missing(&node_live, backend) {
-            if let Some(r) = refusal_for(&node_live, backend) {
+        if backend_model_missing(node_live, backend) {
+            if let Some(r) = refusal_for(node_live, backend) {
                 println!();
                 ui::warned(&format!("{backend}: {r}"));
             }
