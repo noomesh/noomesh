@@ -99,9 +99,16 @@ setup_tpm() {
   fi
 
   if [ "$mode" = vtpm-proxy ]; then
+    # Ubuntu ships an AppArmor profile for swtpm that only allows libvirt's
+    # state dirs; unload it so our own state dir is writable.
+    if [ -f /etc/apparmor.d/usr.bin.swtpm ] && command -v apparmor_parser >/dev/null; then
+      apparmor_parser -R /etc/apparmor.d/usr.bin.swtpm >"$LOG_DIR/apparmor.log" 2>&1 \
+        || log "apparmor unload of swtpm profile: $(cat "$LOG_DIR/apparmor.log")"
+    fi
     swtpm_setup --tpm2 --tpmstate "$TPM_STATE_DIR" --createek --lock-nvram \
+      --logfile "$LOG_DIR/swtpm_setup.trace" --config /dev/null \
       >"$LOG_DIR/swtpm_setup.log" 2>&1 \
-      || { cat "$LOG_DIR/swtpm_setup.log" >&2; die "swtpm_setup failed"; }
+      || { cat "$LOG_DIR/swtpm_setup.log" "$LOG_DIR/swtpm_setup.trace" >&2; die "swtpm_setup failed"; }
     swtpm chardev --tpm2 --vtpm-proxy --tpmstate "dir=$TPM_STATE_DIR" \
       --flags not-need-init,startup-clear --daemon \
       --pid "file=$TPM_STATE_DIR/swtpm.pid" --log "file=$LOG_DIR/swtpm.log,level=5" \
