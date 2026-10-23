@@ -129,7 +129,7 @@ jobs:
       - name: Build & push artifact image
         id: push
         continue-on-error: true
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc   # v7.4.0
         with:
           context: ui/apps/web/dist
           file: ui/deploy/web-artifact.Dockerfile
@@ -145,7 +145,7 @@ jobs:
         run: echo "::warning::the artifact push failed once (a registry error, see above); retrying in 30s" && sleep 30
       - name: Build & push artifact image, second attempt
         if: steps.push.outcome == 'failure'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8   # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc   # v7.4.0
         with:
           context: ui/apps/web/dist
           file: ui/deploy/web-artifact.Dockerfile
