@@ -91,6 +91,10 @@ pub type AppJson = Json<Value>;
 pub enum AppError {
     NotFound(String),
     Internal(String),
+    /// A node agent, device, or the controller's own self-agent answered with
+    /// a failure or did not answer; the message says what it said. 502, never
+    /// 500: the gateway is not what broke.
+    Upstream(String),
     BadRequest(String),
     Conflict(String),
     Forbidden(String),
@@ -126,6 +130,7 @@ impl std::fmt::Display for AppError {
         let msg = match self {
             Self::NotFound(m)
             | Self::Internal(m)
+            | Self::Upstream(m)
             | Self::BadRequest(m)
             | Self::Conflict(m)
             | Self::Forbidden(m)
@@ -142,6 +147,7 @@ impl IntoResponse for AppError {
         let (status, msg) = match self {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Self::Internal(m) => return internal_response(&m),
+            Self::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
@@ -170,6 +176,20 @@ impl IntoResponse for AppError {
             }
         };
         (status, Json(json!({"error": msg}))).into_response()
+    }
+}
+
+/// Map a `(StatusCode, msg)` pair from a helper that answers in HTTP terms
+/// (e.g. `settings::mutate_config`) back onto the matching `AppError`, so a
+/// 404/409/503 is not flattened into an anonymous 500.
+pub(crate) fn from_status(status: StatusCode, msg: String) -> AppError {
+    match status {
+        StatusCode::BAD_REQUEST => AppError::BadRequest(msg),
+        StatusCode::NOT_FOUND => AppError::NotFound(msg),
+        StatusCode::CONFLICT => AppError::Conflict(msg),
+        StatusCode::FORBIDDEN => AppError::Forbidden(msg),
+        StatusCode::SERVICE_UNAVAILABLE => AppError::Unavailable(msg),
+        _ => AppError::Internal(msg),
     }
 }
 
@@ -511,6 +531,25 @@ mod internal_body_tests {
         assert_eq!(r.len(), 8);
         assert!(!v.to_string().contains("noo_users"));
         assert!(!v.to_string().contains("db.internal"));
+    }
+
+    /// An upstream failure is a 502 that says what the upstream said.
+    #[tokio::test]
+    async fn upstream_error_is_502_with_message() {
+        let msg = "Node agent returned 409: lease held by job 7";
+        let (status, v) = body_of(AppError::Upstream(msg.into()).into_response()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], msg);
+    }
+
+    #[test]
+    fn from_status_keeps_the_class() {
+        assert!(matches!(from_status(StatusCode::BAD_REQUEST, "m".into()), AppError::BadRequest(_)));
+        assert!(matches!(from_status(StatusCode::NOT_FOUND, "m".into()), AppError::NotFound(_)));
+        assert!(matches!(from_status(StatusCode::CONFLICT, "m".into()), AppError::Conflict(_)));
+        assert!(matches!(from_status(StatusCode::FORBIDDEN, "m".into()), AppError::Forbidden(_)));
+        assert!(matches!(from_status(StatusCode::SERVICE_UNAVAILABLE, "m".into()), AppError::Unavailable(_)));
+        assert!(matches!(from_status(StatusCode::IM_A_TEAPOT, "m".into()), AppError::Internal(_)));
     }
 
     #[test]

@@ -1060,7 +1060,7 @@ async fn get_job(
     .map_err(AppError::Forbidden)?;
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
+        None => return Err(redis_not_connected()),
     };
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -1118,7 +1118,7 @@ async fn cancel_job(
     .map_err(AppError::Forbidden)?;
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
+        None => return Err(redis_not_connected()),
     };
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -1271,7 +1271,7 @@ async fn reprioritize_job(
     .map_err(AppError::Forbidden)?;
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
+        None => return Err(redis_not_connected()),
     };
 
     let key = format!("{JOB_KEY_PREFIX}{job_id}");
@@ -1358,7 +1358,7 @@ async fn scheduler_submit_task(
 
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return Err(AppError::Internal("Redis not connected".into())),
+        None => return Err(redis_not_connected()),
     };
     // The owner is the ACCOUNT (`account_of`), not the session label.
     let owner = actor.as_ref().map(|Extension(a)| account_of(a.0.as_str())).unwrap_or("");
