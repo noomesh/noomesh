@@ -3890,7 +3890,7 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
             created += 1;
             continue;
         }
-        match std::fs::create_dir_all(&target) {
+        match std::fs::create_dir_all(target) {
             Ok(_) => {
                 created += 1;
                 if let Some(owner) = subdir_owner(name.as_str()) {
@@ -3906,7 +3906,7 @@ fn create_storage_dirs(ctx: &mut Ctx, root: &Path) -> usize {
                 }
                 let ok = cmd
                     .args(["mkdir", "-p"])
-                    .arg(&target)
+                    .arg(target)
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
