@@ -2134,16 +2134,14 @@ fn sops_credentials(root: &Path) -> Result<Creds, String> {
     }
     let mut cmd = crate::commands::secrets::sops_command().map_err(|e| e.to_string())?;
     cmd.args(["-d", "--input-type", "dotenv", "--output-type", "dotenv"]).arg(&path);
-    if std::env::var("SOPS_AGE_KEY_FILE").is_err() {
-        if let Ok(home) = std::env::var("HOME") {
-            cmd.env("SOPS_AGE_KEY_FILE", format!("{home}/.config/sops/age/keys.txt"));
-        }
-    }
+    // SOPS_AGE_KEY_FILE, the TPM-sealed runtime key, or the default (i10a).
+    let age_key = crate::age_key::path();
+    cmd.env("SOPS_AGE_KEY_FILE", &age_key);
     let out = cmd.output().map_err(|e| format!("could not run sops: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "sops could not decrypt {} (exit {}) — age key at ~/.config/sops/age/keys.txt or $SOPS_AGE_KEY_FILE?",
-            path.display(), out.status.code().unwrap_or(-1)));
+            "sops could not decrypt {} (exit {}) — is the age key at {}?",
+            path.display(), out.status.code().unwrap_or(-1), age_key.display()));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let get = |k: &str| -> String {

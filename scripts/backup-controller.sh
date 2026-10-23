@@ -68,6 +68,18 @@ RETAIN_DAYS="${NOO_BACKUP_RETAIN_DAYS:-7}"
 # already been written in plaintext.
 AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$HOME/.config/sops/age/keys.txt}"
 
+# A key SEALED to the TPM (i10a; /etc/noo/at-rest.json says so) lives in RAM
+# once noo-unseal.service has run. Missing then means "did not unseal", not
+# "SOPS not in use" — and the age-key block below would SKIP it silently,
+# producing a run with no age-key backup that reports success. Refuse.
+AT_REST_MANIFEST="${NOO_AT_REST_MANIFEST:-/etc/noo/at-rest.json}"
+if [ ! -f "$AGE_KEY_FILE" ] && [ -r "$AT_REST_MANIFEST" ] \
+        && grep -Eq '"age_key_sealed"[[:space:]]*:[[:space:]]*true' "$AT_REST_MANIFEST"; then
+    echo "  ERROR: the age key is sealed to this machine's TPM and has not been unsealed (no $AGE_KEY_FILE) — REFUSING to run." >&2
+    echo "         A backup without the age key is one nobody can restore. Check: systemctl status noo-unseal.service" >&2
+    exit 1
+fi
+
 # Inline env wins over file.
 PASSPHRASE="${NOO_BACKUP_PASSPHRASE:-}"
 if [ -z "$PASSPHRASE" ] && [ -n "${NOO_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "$NOO_BACKUP_PASSPHRASE_FILE" ]; then

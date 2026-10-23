@@ -1864,12 +1864,16 @@ pub fn secrets_setup(ctx: &mut Ctx) -> bool {
                         .unwrap_or(0);
                     if count > 0 {
                         ctx.success(&format!(
-                            "Secret store restored: {count} keys decrypt with the age key at ~/.config/sops/age/keys.txt"
+                            "Secret store restored: {count} keys decrypt with the age key at {}",
+                            crate::age_key::path().display()
                         ));
                     } else {
                         let _ = std::fs::remove_file(&store_path);
                         ctx.warn("The restored store did NOT decrypt (wrong file, or the age key is absent) — removed; minting fresh.");
-                        ctx.raw("    (Restore the matching age key to ~/.config/sops/age/keys.txt and re-run --only secrets.)");
+                        ctx.raw(&format!(
+                            "    (Restore the matching age key to {} and re-run --only secrets.)",
+                            crate::age_key::default_path().display()
+                        ));
                     }
                 }
             }
@@ -2614,7 +2618,10 @@ fn arm_secret_store(ctx: &mut Ctx) -> bool {
         return refuse_store(
             ctx,
             &format!("secrets/env.sops exists but cannot be decrypted here ({e})"),
-            "restore the matching age key to ~/.config/sops/age/keys.txt, then re-run: noo onboard --reconfigure --only secrets",
+            &format!(
+                "restore the matching age key to {}, then re-run: noo onboard --reconfigure --only secrets",
+                crate::age_key::default_path().display()
+            ),
         );
     }
     // The encryption consumed the current .env this very second — the
@@ -2643,8 +2650,9 @@ fn arm_secret_store(ctx: &mut Ctx) -> bool {
     };
     ctx.forget_store_cache();
     ctx.success(&format!(
-        "Secrets encrypted at rest (SOPS+age){}. BACK UP your age key: ~/.config/sops/age/keys.txt — it is the root of trust.",
-        if carried > 0 { format!("; {carried} plaintext secret(s) moved out of .env") } else { String::new() }
+        "Secrets encrypted at rest (SOPS+age){}. BACK UP your age key: {} — it is the root of trust.",
+        if carried > 0 { format!("; {carried} plaintext secret(s) moved out of .env") } else { String::new() },
+        crate::age_key::path().display()
     ));
     true
 }

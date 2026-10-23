@@ -138,6 +138,8 @@ const CONTROLLER_ONLY: &[&[&str]] = &[
     &["security", "pki"],
     &["security", "trust-ca"],
     &["security", "untrust-ca"],
+    &["security", "at-rest", "seal"],
+    &["security", "at-rest", "finalize"],
     &["db"],
     &["logs"],
 ];

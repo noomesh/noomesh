@@ -48,6 +48,7 @@
 #![allow(clippy::ptr_arg)]
 
 mod addon_decl_parse;
+mod age_key;
 mod addon_lock;
 mod addons;
 mod auth;
@@ -531,6 +532,9 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["security", "at-rest", "opt-out"], commands::security_at_rest_opt_out),
     (&["security", "at-rest", "opt-in"], commands::security_at_rest_opt_in),
     (&["security", "at-rest", "create-volume"], commands::security_at_rest_create_volume),
+    // i10a PR-B: the age key sealed to the TPM (root half: noo-hostd at-rest).
+    (&["security", "at-rest", "seal"], commands::at_rest_seal),
+    (&["security", "at-rest", "finalize"], commands::at_rest_finalize),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),

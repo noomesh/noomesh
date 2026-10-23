@@ -467,6 +467,8 @@ the lock. The layout both locks are published in is in
 | `noo security at-rest opt-out` | — | Record that you accept unencrypted data at rest (audited; needs your own login) |
 | `noo security at-rest opt-in` | — | Withdraw the at-rest opt-out (audited; needs your own login) |
 | `noo security at-rest create-volume` | `[--size <GiB>] [--pcrs 7\|none\|auto] [--defer-recovery-key] [--dry-run]` | Create the TPM-unlocked encrypted state volume; shows its recovery key once |
+| `noo security at-rest seal` | `[--pcrs 7\|none\|auto] [--dry-run]` | Seal the age key to this TPM; unsealed into RAM at boot, plaintext kept until finalize |
+| `noo security at-rest finalize` | `[--dry-run] [-y\|--yes]` | Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
 | `noo security posture apply-profile` | `<profile> [--include-bridges]` | Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply |

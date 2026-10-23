@@ -117,6 +117,8 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "at-rest", "opt-out"], "", "Record that you accept unencrypted data at rest (audited; needs your own login)"),
     (&["security", "at-rest", "opt-in"], "", "Withdraw the at-rest opt-out (audited; needs your own login)"),
     (&["security", "at-rest", "create-volume"], "[--size <GiB>] [--pcrs 7|none|auto] [--defer-recovery-key] [--dry-run]", "Create the TPM-unlocked encrypted state volume; shows its recovery key once"),
+    (&["security", "at-rest", "seal"], "[--pcrs 7|none|auto] [--dry-run]", "Seal the age key to this TPM; unsealed into RAM at boot, plaintext kept until finalize"),
+    (&["security", "at-rest", "finalize"], "[--dry-run] [-y|--yes]", "Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
     (&["security", "posture", "set"], "<key> <value>", "Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply"),
     (&["security", "posture", "apply-profile"], "<profile> [--include-bridges]", "Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply"),
@@ -481,7 +483,10 @@ mod tests {
             assert_eq!(syntax, "");
             assert!(desc.contains("own login"), "{verb}: {desc}");
         }
-        assert_eq!(super::subcommands_under(&["security", "at-rest"]), vec!["status", "opt-out", "opt-in", "create-volume"]);
+        assert_eq!(
+            super::subcommands_under(&["security", "at-rest"]),
+            vec!["status", "opt-out", "opt-in", "create-volume", "seal", "finalize"]
+        );
         // i10a PR-C: the volume, with the deferral that is the only way to run it without a terminal.
         let (syntax, desc) = super::lookup(&["security", "at-rest", "create-volume"]).expect("at-rest create-volume");
         assert!(syntax.contains("--defer-recovery-key") && syntax.contains("--size <GiB>"), "{syntax}");

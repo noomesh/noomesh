@@ -765,8 +765,9 @@ pub fn onboard(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 let home = standalone::default_home();
                 let _ = std::fs::create_dir_all(&home);
                 // Age key first, with the different-key guard.
-                let key_dst = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join(".config/sops/age/keys.txt");
+                // A restore writes the plaintext home, never the sealed
+                // runtime file (that one belongs to noo-unseal.service).
+                let key_dst = crate::age_key::default_path();
                 let src_key = extracted.join("age/keys.txt");
                 if key_dst.exists()
                     && std::fs::read(&key_dst).ok() != std::fs::read(&src_key).ok()

@@ -37,11 +37,10 @@ const MANIFEST: &str = "manifest.json";
 const STATE_PATHS: &[&str] =
     &[".env", ".sops.yaml", "noomesh.yaml", "secrets", "pki"];
 
+/// The key the archive carries: SOPS_AGE_KEY_FILE, the TPM-sealed runtime
+/// key (i10a), or ~/.config/sops/age/keys.txt — `crate::age_key::path`.
 fn age_key_path() -> PathBuf {
-    std::env::var("SOPS_AGE_KEY_FILE").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".config/sops/age/keys.txt")
-    })
+    crate::age_key::path()
 }
 
 /// Passphrase from --passphrase-file, else a hidden double prompt.
