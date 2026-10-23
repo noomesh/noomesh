@@ -3521,8 +3521,81 @@ pub fn storage(ctx: &mut Ctx) {
     ctx.progress("Testing Docker bind mount access...");
     verify_bind_mount(ctx, &chosen_root);
 
+    // Encrypt at rest? (i10a) Decided here, with the storage; recorded after
+    // the services start.
+    at_rest_choice(ctx);
+
     // User dirs + workspace
     configure_user_dirs(ctx);
+}
+
+/// i10a PR-A: detect a TPM and ask whether to encrypt data at rest.
+///
+/// - not a Linux controller: said plainly, nothing recorded;
+/// - no usable TPM: explain why and how to enable one, record nothing (the
+///   verify rows keep warning with the reason);
+/// - a TPM: ask (default yes, `--ci` never asks) and print the disclosure
+///   for the answer. "No" is kept in `ctx.state` and written after the
+///   services start; "yes" calls the labelled stub `setup_fresh`.
+fn at_rest_choice(ctx: &mut Ctx) {
+    use crate::commands::at_rest::{self, Plan, TpmFacts};
+    if ctx.state.mode == "worker" || !cfg!(target_os = "linux") {
+        ctx.info("Encryption at rest is for Linux controllers; not supported on this machine.");
+        return;
+    }
+    if ctx.dry_run {
+        ctx.dry("check for a TPM 2.0 and ask whether to encrypt data at rest");
+        return;
+    }
+    let facts = TpmFacts::probe(Path::new("/"));
+    let asker = &ctx.asker;
+    let chosen = at_rest::plan(&facts, ctx.non_interactive, &mut || asker.confirm(at_rest::ONBOARD_PROMPT, true));
+    match chosen {
+        Plan::Unavailable => {
+            ctx.warn(&format!("Your data cannot be encrypted at rest here: {}.", facts.unavailable_reason()));
+            ctx.info(&at_rest::enable_hint(&facts));
+            ctx.info(at_rest::DISCLOSURE_OFF);
+        }
+        Plan::Encrypt => {
+            ctx.info(at_rest::DISCLOSURE_ON);
+            ctx.info(&at_rest::setup_fresh());
+        }
+        Plan::OptOut => {
+            ctx.info(at_rest::DISCLOSURE_OFF);
+            ctx.state.at_rest_opt_out = true;
+        }
+    }
+}
+
+/// Record the at-rest opt-out chosen in the storage step, now that the
+/// gateway is up. A failure is a warning with the retry command, not a hard
+/// failure: the person's answer is not lost, only not yet on record.
+pub fn at_rest_record(ctx: &mut Ctx) {
+    if !ctx.state.at_rest_opt_out {
+        return;
+    }
+    if ctx.dry_run {
+        ctx.dry("record the at-rest opt-out in the gateway");
+        return;
+    }
+    if !ctx.state.services_started {
+        ctx.warn("The gateway is not running, so your choice not to encrypt at rest was NOT recorded.");
+        ctx.info("Once the stack is up: noo security at-rest opt-out");
+        return;
+    }
+    match crate::http::post_json_try(
+        ctx.g,
+        "/api/settings/flags/set",
+        &serde_json::json!({"key": crate::commands::at_rest::SETTING, "value": true}),
+        true,
+        15,
+    ) {
+        Ok(_) => ctx.success("Recorded: you accept unencrypted data at rest (noo security at-rest status shows it)."),
+        Err(e) => {
+            ctx.warn(&format!("Could not record your at-rest choice ({e})."));
+            ctx.info("Record it yourself: noo security at-rest opt-out");
+        }
+    }
 }
 
 /// Mount targets from a /proc/mounts listing that could hold a data root:

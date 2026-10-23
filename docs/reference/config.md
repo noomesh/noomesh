@@ -789,6 +789,7 @@ default, cached and refreshed every 15 s. The registry
 | `CLOUD_PROVIDERS_ENABLED` | features | off |
 | `NOO_EVOLVE_HOFSTADTER_ENABLED` | features | on (with the evolve add-on) |
 | `kiosk.graph_labels` | kiosk | off — **DB only** (see below) |
+| `at_rest.unencrypted_accepted` | security | off — **DB only, person only** (see below) |
 | `NOO_HEARTBEAT_TZ` (string) | heartbeat | `America/New_York` |
 | `NOO_REPORTS_DRIVE_FOLDER_ID` (string) | heartbeat | empty (reports are sent inline) |
 | `NOO_OPS_WAIT_<TYPE>_SECS`, `NOO_OPS_RESULT_TTL_SECS` (strings) | ops | see [Asynchronous operations](#asynchronous-operations) |
@@ -814,6 +815,15 @@ The `NOO_AGENT_*` gates and `NOO_SELF_DEVELOP_AUTO_RESTART` are not in this
 registry. The add-on that owns them reads them from its own container
 environment; a row here would be a switch on another process's behaviour that
 this one cannot honour.
+
+`at_rest.unencrypted_accepted` records that a person has accepted this
+controller's data being stored unencrypted on disk (i10a). It has no env
+layer and can be set only by a person's own credential: the cluster
+credential and service keys get 403, so `updated_by` and `updated_at` (and
+the `setting_flag_set` audit event) always name who decided and when. While
+it is on, `noo cluster verify` shows the at-rest rows as accepted risk and
+still states that the data is not encrypted. Switch it with
+`noo security at-rest opt-out|opt-in|status`.
 
 `kiosk.graph_labels` decides whether `/api/kiosk/graph` sends the kiosk
 display entity names and relation types. It has **no env layer**: it is the

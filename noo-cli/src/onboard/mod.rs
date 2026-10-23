@@ -173,6 +173,10 @@ pub(crate) struct State {
     pub security_configured: bool,
     pub tls_enabled: bool,
     pub services_started: bool,
+    /// The person said no to encrypting at rest (i10a). Held here until the
+    /// gateway is up, then recorded by `steps::at_rest_record` (the setting
+    /// lives in the gateway's database).
+    pub at_rest_opt_out: bool,
     pub model_pulled: String,
     pub backend_used: String,
     pub admin_username: String,
@@ -1237,6 +1241,9 @@ fn run_all(ctx: &mut Ctx) {
         // rides along here rather than becoming an eleventh step.
         steps::provision_service_keys(ctx);
         steps::security_posture(ctx);
+        // The at-rest decision from the storage step, now that there is a
+        // gateway to record it in.
+        steps::at_rest_record(ctx);
     }
     ctx.pause(7, TOTAL);
 
@@ -1717,5 +1724,42 @@ mod rerun_tests {
         let guard = &body[..body.find("let proceed = ctx").expect("interactive branch")];
         assert!(guard.contains("return verdict.exit_code();"), "the non-interactive re-run exits on the health verdict");
         assert!(!guard.contains("return 0;"), "no unconditional success in the non-interactive re-run");
+    }
+}
+
+/// i10a PR-A: the at-rest question is asked in the storage step, and its
+/// answer is recorded after the services start, next to the posture.
+#[cfg(test)]
+mod at_rest_tests {
+    use super::State;
+
+    #[test]
+    fn no_decision_is_recorded_until_someone_says_no() {
+        assert!(!State::default().at_rest_opt_out);
+    }
+
+    #[test]
+    fn the_answer_is_recorded_after_services_start_and_the_question_is_asked_in_storage() {
+        let m = include_str!("mod.rs");
+        let posture = m.find("steps::security_posture(ctx);").expect("posture call");
+        let record = m.find("steps::at_rest_record(ctx);").expect("the opt-out is never recorded");
+        assert!(record > posture, "the flag is written where posture is applied, after the gateway is up");
+        let steps = include_str!("steps.rs");
+        let storage = &steps[steps.find("pub fn storage(").unwrap()..];
+        let storage = &storage[..storage.find("\n}\n").unwrap()];
+        assert!(storage.contains("at_rest_choice(ctx);"), "the storage step does not ask about encryption at rest");
+        // the wizard never writes the flag before the gateway exists
+        let choice = &steps[steps.find("fn at_rest_choice(").unwrap()..];
+        let choice = &choice[..choice.find("\n}\n").unwrap()];
+        assert!(!choice.contains("flags/set"), "at_rest_choice must only remember the answer");
+        assert!(choice.contains("state.at_rest_opt_out = true"));
+        assert!(choice.contains("setup_fresh()"), "'yes' goes through the labelled stub");
+    }
+
+    #[test]
+    fn the_onboard_prompt_asks_the_operators_question() {
+        let c = crate::commands::at_rest::ONBOARD_PROMPT;
+        assert!(c.starts_with("Encrypt your data, keys and secrets on disk, unlocked only on this machine?"));
+        assert!(c.ends_with("(recommended)"));
     }
 }

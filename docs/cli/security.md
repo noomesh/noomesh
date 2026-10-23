@@ -463,6 +463,9 @@ the lock. The layout both locks are published in is in
 | `noo security tailnet policy` | `[--merge \| --push] [--yes]` | Compare live tailnet policy to declared; --merge adds what is missing, --push replaces |
 | `noo security audit verify` | — | Verify audit hashes, the chain, and its head against the exported head (operator-only) |
 | `noo security audit list` | `[--since <30m\|24h\|7d\|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]` | List security audit rows, newest first, with source address (operator-only) |
+| `noo security at-rest status` | `[--json]` | Show TPM facts, how to enable one, and your recorded at-rest encryption decision |
+| `noo security at-rest opt-out` | — | Record that you accept unencrypted data at rest (audited; needs your own login) |
+| `noo security at-rest opt-in` | — | Withdraw the at-rest opt-out (audited; needs your own login) |
 | `noo security posture list` | — | List security posture gates: running vs desired value (operator-only) |
 | `noo security posture set` | `<key> <value>` | Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply |
 | `noo security posture apply-profile` | `<profile> [--include-bridges]` | Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply |
