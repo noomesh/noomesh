@@ -313,8 +313,7 @@ pub async fn threads(db: &PgPool, agent: Option<&str>, owner: Option<&str>, limi
          FROM noo_agent_messages WHERE 1=1{clause} \
          GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT $2"
     );
-    let sql = sql.as_str();
-    let rows = sqlx::query(sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(scope)
         .bind(limit.clamp(1, 500))
         .fetch_all(db)

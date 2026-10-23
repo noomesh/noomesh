@@ -1226,7 +1226,7 @@ mod tests {
 
 #[cfg(test)]
 mod body_field_tests {
-    use super::{body_payload, remaining_args, ToolSpec};
+    use super::{body_payload, remaining_args, unknown_args, ToolSpec};
     use serde_json::{json, Map, Value};
     use std::collections::HashMap;
 
