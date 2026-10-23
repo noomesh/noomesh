@@ -848,14 +848,14 @@ A client with no loop of its own (a CLI harness, your own MCP client) reaches ta
 | Listener | Path | Auth | Purpose |
 |---|---|---|---|
 | `:8080` | `POST /mcp/operator` | an `mcp:operator` service key bound to an account that holds the admin role (re-checked on every call) — mandatory, and the only credential (the shared `NOO_MCP_TOKEN` was retired on 2026-09-30; the plain-HTTP `/mcp` listener on 3100 was removed in stack-v0.2.41) | the operator door: the full tool manifest (`gateway-rust/mcp-tools-local.json`, 124 tools, plus any add-on fragment named by `NOO_MCP_EXTRA_MANIFEST`), for a machine acting as the operator |
-| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 32 tools) plus the seven task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
+| `:8080` | `POST /mcp/user` | a key that names a user (`POST /api/security/service-keys/self` mints your own; `noo mcp external-setup` prints the recipe); the call runs under that user's own JWT | the external door, opened by `NOO_MCP_EXTERNAL_ENABLED` (off: `404`); serves the curated user manifest (`gateway-rust/mcp-tools.json`, 33 tools) plus the seven task tools (below). The key needs the `mcp` scope and must be bound to a user (`403` otherwise) |
 
 Both speak streamable-HTTP JSON-RPC (`POST` only: `GET` and `DELETE` are
 `405`; a request body over 256 KiB is refused). Identity is re-resolved from
 the key on every call, so a revoked or narrowed key stops at once. They do
 **not** serve the same registry: the user door (`/mcp/user`) embeds
-`gateway-rust/mcp-tools.json` (32 tools), and the operator door
-(`/mcp/operator`) embeds `gateway-rust/mcp-tools-local.json` (124 tools) — a strict superset that
+`gateway-rust/mcp-tools.json` (33 tools), and the operator door
+(`/mcp/operator`) embeds `gateway-rust/mcp-tools-local.json` (123 tools) — a strict superset that
 also includes every tool in the user manifest. Both files are generated
 from `src/noomesh/mcp/tool_defs/` by `scripts/build-mcp-manifest.py` and
 embedded at compile time. Set-up:
