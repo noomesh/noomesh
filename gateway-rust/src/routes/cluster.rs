@@ -135,7 +135,7 @@ pub fn router() -> Router<Arc<AppState>> {
         //     -> 400 {"error":"'BackendManager' object has no attribute 'scale_backend'"}
         //
         // Scaling is unaffected and already works two other ways:
-        //   - `noo cluster scale` composes it CLIENT-side from the native
+        //   - `noo cluster scale` (retired) composed it CLIENT-side from the native
         //     /backends/start and /backends/stop routes below
         //   - the autonomy engine's scale_backend action calls scale_replicas
         //     directly, with the correct name
@@ -2822,7 +2822,7 @@ struct BackendStartBody {
 ///
 /// Exposed for the autonomy engine: `backend_availability` must consult the
 /// same map the HTTP route does, or a flapping node would be hammered every
-/// 60s by the loop while the operator's own `noo cluster up` is politely
+/// 60s by the loop while the operator's own direct /backends/start call is politely
 /// refused.
 pub(crate) fn backend_start_cooled_down(node_id: &str, backend: &str) -> bool {
     cooldowns::is_cooled_down(&format!("{node_id}:{backend}"))
@@ -2930,7 +2930,7 @@ async fn backends_start(
 /// There is exactly one of these on purpose: the cooldown map, the controller's
 /// image/parser env forwarding and the node-agent auth headers all
 /// live here, and an autonomy engine that reimplemented "start a backend" would
-/// drift from `noo cluster up` the first time any of the three changed.
+/// drift from the /backends/start route the first time any of the three changed.
 ///
 /// `node_id: None` auto-selects a node the same way the route does.
 pub(crate) async fn start_backend_core(
