@@ -81,6 +81,7 @@ jobs:
             sudo journalctl -u noo-unseal.service --no-pager 2>&1 | tail -80;
             sudo cat /etc/noo/at-rest.json 2>&1;
             sudo cat /etc/systemd/system/noo-unseal.service 2>&1; } > /tmp/at-rest-tpm-logs/diagnostics.txt || true
+          sudo chmod -R a+rX /tmp/at-rest-tpm-logs
 
       - name: Upload logs (failure only)
         if: failure()

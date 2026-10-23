@@ -203,7 +203,17 @@ run_tests() {
   assert_eq "${TPM_MODE:-unset}" vtpm-proxy "TPM mode (only the vtpm-proxy mode can back PID 1)"
 
   log "=== 1. systemd-creds sees a TPM2"
-  systemd-creds has-tpm2 >"$LOG_DIR/has-tpm2.out" 2>&1 || { cat "$LOG_DIR/has-tpm2.out" >&2; die "systemd-creds has-tpm2 reports no usable TPM2"; }
+  # has-tpm2 exits non-zero ("partial") when only the *firmware* leg is missing:
+  # a VM without UEFI measured boot has no TPM event log. Sealing needs the
+  # driver, the system (tss2 libs + device), the subsystem and the libraries.
+  local rc=0
+  systemd-creds has-tpm2 >"$LOG_DIR/has-tpm2.out" 2>&1 || rc=$?
+  cat "$LOG_DIR/has-tpm2.out" >&2
+  local leg
+  for leg in driver system subsystem libraries; do
+    grep -q "^+$leg\$" "$LOG_DIR/has-tpm2.out" || die "systemd-creds has-tpm2: '$leg' not supported (exit $rc): no usable TPM2 for sealing"
+  done
+  grep -q '^-firmware$' "$LOG_DIR/has-tpm2.out" && log "note: firmware leg absent (no UEFI measured-boot log): expected on a vTPM VM"
   log "ok: systemd-creds has-tpm2"
 
   if ! "$HOSTD" at-rest help >/dev/null 2>&1; then
