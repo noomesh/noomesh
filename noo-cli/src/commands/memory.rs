@@ -114,36 +114,25 @@ pub fn memory_stats(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     println!("{}", ui::header("memory", None));
     println!("{}", ui::section("storage"));
     let enabled = storage["embeddings_enabled"].as_bool().unwrap_or(false);
-    print!(
-        "{}",
-        ui::kv(&[
-            ("total records", storage["total_records"].as_u64().unwrap_or(0).to_string()),
-            ("embedded", storage["embedded_records"].as_u64().unwrap_or(0).to_string()),
-            ("unembedded", storage["unembedded_records"].as_u64().unwrap_or(0).to_string()),
-            ("unique users", storage["unique_users"].as_u64().unwrap_or(0).to_string()),
-            ("embeddings", if enabled { ui::state("enabled") } else { ui::warn("disabled") }),
-        ])
-    );
+    let mut storage_rows = storage_count_rows(&storage);
+    storage_rows.push(("embeddings", if enabled { ui::state("enabled") } else { ui::warn("disabled") }));
+    print!("{}", ui::kv(&storage_rows));
 
     if let Some(c) = &conv {
         println!("{}", ui::section("conversations (30 days)"));
         print!(
             "{}",
             ui::kv(&[
-                ("conversations", c["total_conversations"].as_u64().unwrap_or(0).to_string()),
-                ("messages", c["total_messages"].as_u64().unwrap_or(0).to_string()),
-                ("tool calls", c["total_tool_calls"].as_u64().unwrap_or(0).to_string()),
+                ("conversations", ui::count(c, "total_conversations")),
+                ("messages", ui::count(c, "total_messages")),
+                ("tool calls", ui::count(c, "total_tool_calls")),
                 (
                     "avg messages/conv",
                     format!("{:.1}", c["avg_messages_per_conversation"].as_f64().unwrap_or(0.0)),
                 ),
                 (
                     "tokens in/out",
-                    format!(
-                        "{}/{}",
-                        c["total_tokens_in"].as_u64().unwrap_or(0),
-                        c["total_tokens_out"].as_u64().unwrap_or(0)
-                    ),
+                    format!("{}/{}", ui::count(c, "total_tokens_in"), ui::count(c, "total_tokens_out")),
                 ),
             ])
         );
@@ -217,7 +206,7 @@ pub fn memory_conversations(g: &Globals, args: &[String]) -> Result<i32, Unhandl
             vec![
                 ui::muted(&id),
                 truncate(c["user_id"].as_str().unwrap_or(""), 16),
-                c["total_messages"].as_u64().unwrap_or(0).to_string(),
+                ui::count(c, "total_messages"),
                 ui::muted(&started),
                 c["preview"].as_str().unwrap_or("").replace('\n', " "),
             ]
@@ -502,20 +491,35 @@ fn progress_line(status: &serde_json::Value) -> String {
     )
 }
 
+/// The four storage counters of `memory stats`. A counter the gateway did
+/// not send reads "not reported", never 0 (i191 D5).
+fn storage_count_rows(storage: &serde_json::Value) -> Vec<(&'static str, String)> {
+    vec![
+        ("total records", ui::count(storage, "total_records")),
+        ("embedded", ui::count(storage, "embedded_records")),
+        ("unembedded", ui::count(storage, "unembedded_records")),
+        ("unique users", ui::count(storage, "unique_users")),
+    ]
+}
+
 /// Render the Rust gateway's embed-status shape
 /// ({state, stats:{total,embedded,unembedded,progress}, config:{…}}).
 fn print_embed_state(body: &serde_json::Value) {
+    print!("{}", ui::kv(&embed_state_rows(body)));
+}
+
+fn embed_state_rows(body: &serde_json::Value) -> Vec<(&'static str, String)> {
     let state = body["state"].as_str().unwrap_or("unknown");
-    let mut rows: Vec<(&str, String)> = vec![("state", ui::state(state))];
+    let mut rows: Vec<(&'static str, String)> = vec![("state", ui::state(state))];
     let stats = &body["stats"];
     if stats.is_object() {
         rows.push((
             "records",
             format!(
                 "{} total, {} embedded, {} unembedded ({:.1}%)",
-                stats["total"].as_u64().unwrap_or(0),
-                stats["embedded"].as_u64().unwrap_or(0),
-                stats["unembedded"].as_u64().unwrap_or(0),
+                ui::count(stats, "total"),
+                ui::count(stats, "embedded"),
+                ui::count(stats, "unembedded"),
                 stats["progress"].as_f64().unwrap_or(0.0) * 100.0,
             ),
         ));
@@ -526,13 +530,13 @@ fn print_embed_state(body: &serde_json::Value) {
             "config",
             ui::muted(&format!(
                 "batch_size={}, build_relationships={}, model={}",
-                config["batch_size"].as_u64().unwrap_or(0),
+                ui::count(config, "batch_size"),
                 config["build_relationships"].as_bool().unwrap_or(false),
                 config["embedding_model"].as_str().unwrap_or(ui::dash()),
             )),
         ));
     }
-    print!("{}", ui::kv(&rows));
+    rows
 }
 
 fn print_tool_table<'a>(tools: impl Iterator<Item = &'a serde_json::Value>) {
@@ -542,8 +546,8 @@ fn print_tool_table<'a>(tools: impl Iterator<Item = &'a serde_json::Value>) {
             let avg = tool["avg_execution_ms"].as_f64();
             vec![
                 truncate(tool["name"].as_str().unwrap_or("?"), 32),
-                tool["total_calls"].as_u64().unwrap_or(0).to_string(),
-                tool["successful"].as_u64().unwrap_or(0).to_string(),
+                ui::count(tool, "total_calls"),
+                ui::count(tool, "successful"),
                 format!("{rate:.0}%"),
                 avg.map(|a| format!("{a:.0}ms")).unwrap_or_default(),
             ]
@@ -561,6 +565,22 @@ fn print_tool_table<'a>(tools: impl Iterator<Item = &'a serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_and_embed_rows_say_not_reported_for_missing_counters() {
+        let rows = storage_count_rows(&serde_json::json!({"total_records": 0, "embedded_records": 10}));
+        let cell = |k: &str| rows.iter().find(|(n, _)| *n == k).unwrap().1.clone();
+        assert_eq!(cell("total records"), "0");
+        assert_eq!(cell("embedded"), "10");
+        for k in ["unembedded", "unique users"] {
+            assert!(cell(k).contains("Not reported") && !cell(k).contains('0'), "{k}: {}", cell(k));
+        }
+        let rows = embed_state_rows(&serde_json::json!({"state": "idle", "stats": {"embedded": 4}, "config": {}}));
+        let records = &rows.iter().find(|(n, _)| *n == "records").unwrap().1;
+        assert!(records.starts_with("Not reported total, 4 embedded, Not reported unembedded"), "{records}");
+        let config = &rows.iter().find(|(n, _)| *n == "config").unwrap().1;
+        assert!(config.contains("batch_size=Not reported"), "{config}");
+    }
 
     // Reply shapes from gateway-rust/src/routes/memory.rs `embed_start`.
     #[test]

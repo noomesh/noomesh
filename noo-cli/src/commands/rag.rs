@@ -60,7 +60,10 @@ pub fn rag_query(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let mut meta = vec![
         format!("strategy {}", resp["strategy_used"].as_str().unwrap_or("?")),
         format!("intent {}", resp["intent"].as_str().unwrap_or("?")),
-        format!("{} evidence pages", resp["evidence_count"].as_u64().unwrap_or(0)),
+        match resp["evidence_count"].as_u64() {
+            Some(n) => format!("{n} evidence pages"),
+            None => format!("evidence pages {}", ui::count(&resp, "evidence_count")),
+        },
     ];
     if let Some(p) = resp["persona_id"].as_str() {
         meta.push(format!("persona {}", truncate(p, 12)));
@@ -162,10 +165,17 @@ pub fn rag_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         println!("{}", ui::status_line(Glyph::Err, "PageIndex RAG is not running"));
         return Ok(1);
     }
-    let n = |key: &str| body[key].as_u64().unwrap_or(0);
     println!("{}", ui::header("rag", Some(&ui::state("running"))));
+    print!("{}", ui::kv(&status_rows(&body)));
+    Ok(0)
+}
+
+/// The `rag status` rows. A count the gateway did not send reads "not
+/// reported", never 0 (i191 D5).
+fn status_rows(body: &serde_json::Value) -> Vec<(&'static str, String)> {
+    let n = |key: &str| ui::count(body, key);
     let mut rows = vec![
-        ("documents", n("doc_count").to_string()),
+        ("documents", n("doc_count")),
         (
             "pages",
             format!(
@@ -175,14 +185,13 @@ pub fn rag_status(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ),
         ),
         ("chunks", format!("{}  {}", n("chunk_count"), ui::muted(&format!("{} embedded", n("embedded_chunks"))))),
-        ("entities", n("entity_count").to_string()),
-        ("edges", n("edge_count").to_string()),
+        ("entities", n("entity_count")),
+        ("edges", n("edge_count")),
     ];
     if let Some(state) = body["embedder_state"]["state"].as_str() {
         rows.push(("embedder", ui::state(state)));
     }
-    print!("{}", ui::kv(&rows));
-    Ok(0)
+    rows
 }
 
 /// What `noo rag docs` was asked for.
@@ -268,10 +277,10 @@ fn audience_counts(summary: &serde_json::Value) -> String {
 
 /// `269 documents · 0 untagged · admin 150 · user:* 80 · company 39`.
 fn summary_line(summary: &serde_json::Value, filtered: bool) -> String {
-    let total = summary["total"].as_u64().unwrap_or(0);
+    let total = ui::count(summary, "total");
     let mut parts = vec![
         format!("{total} {}", if filtered { "matching documents" } else { "documents" }),
-        format!("{} untagged", summary["untagged"].as_u64().unwrap_or(0)),
+        format!("{} untagged", ui::count(summary, "untagged")),
     ];
     let counts = audience_counts(summary);
     if !counts.is_empty() {
@@ -435,7 +444,7 @@ fn render_doc(d: &serde_json::Value) -> String {
         ("ingested", ingested),
         ("source", d["source_uri"].as_str().unwrap_or("").to_string()),
         ("created", when(d["created_at"].as_str().unwrap_or(""))),
-        ("pages", d["page_count"].as_u64().unwrap_or(0).to_string()),
+        ("pages", ui::count(d, "page_count")),
     ];
     out.push_str(&ui::kv(&rows));
     if let Some(h) = d["audience_history"].as_array().filter(|h| !h.is_empty()) {
@@ -1704,6 +1713,27 @@ mod tests {
         assert_eq!(docs.len(), 620);
         assert_eq!(seen.len(), 2, "500 then 120");
         assert!(seen[1].starts_with("/api/v1/docs?limit=120&offset=500"));
+    }
+
+    #[test]
+    fn status_rows_say_not_reported_for_a_field_the_gateway_did_not_send() {
+        // A gateway that renamed `doc_count` and omitted the chunk counts.
+        let body = serde_json::json!({"page_count": 7, "entity_count": 0, "embedded_pages": 7});
+        let rows = status_rows(&body);
+        let cell = |k: &str| rows.iter().find(|(name, _)| *name == k).unwrap().1.clone();
+        assert!(cell("documents").contains("Not reported"), "{}", cell("documents"));
+        assert!(!cell("documents").contains('0'), "absent must not read as zero: {}", cell("documents"));
+        assert!(cell("chunks").contains("Not reported") && !cell("chunks").contains('0'), "{}", cell("chunks"));
+        assert!(cell("edges").contains("Not reported"));
+        // A real zero is still a zero, and a real number is itself.
+        assert_eq!(cell("entities"), "0");
+        assert!(cell("pages").starts_with("7  "), "{}", cell("pages"));
+    }
+
+    #[test]
+    fn summary_line_does_not_turn_a_missing_total_into_zero() {
+        let s = summary_line(&serde_json::json!({"by_audience": {}}), false);
+        assert!(s.contains("Not reported") && !s.contains('0'), "{s}");
     }
 
     #[test]

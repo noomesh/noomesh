@@ -802,6 +802,20 @@ mod tests {
         assert_eq!(actuator_path(&d, ""), "/api/addon-workloads/pai-voice/voice-worker");
     }
 
+    /// The record the hold write-back produces yields the new lease at once.
+    #[test]
+    fn a_merged_record_lists_the_new_lease_and_a_release_clears_it() {
+        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free", "total_mb": 16376}});
+        let held = super::super::cluster::with_contention(rec, json!({"state": "held", "total_mb": 16376, "paused_backends": ["vllm"],
+            "lease": {"operation_id": "op-7", "owner": "op", "workload": "pai-voice/voice-worker", "generation": 3}}));
+        let r = reservation_of("awolf", &held).expect("the new lease is a reservation");
+        assert_eq!(r["id"], "op-7");
+        assert_eq!(r["generation"], 3);
+        assert_eq!(r["state"], "held");
+        let freed = super::super::cluster::with_contention(held, json!({"state": "free", "total_mb": 16376}));
+        assert!(reservation_of("awolf", &freed).is_none());
+    }
+
     /// Source test: the reservation routes are operator-gated and audited;
     /// a failed start releases the GPU; a ready timeout keeps the holder.
     #[test]

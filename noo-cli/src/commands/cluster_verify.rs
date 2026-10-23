@@ -1549,12 +1549,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-pub(crate) fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub(crate) use crate::host_exec::now_unix;
 
 fn signing_adopted_for(node: &str) -> Option<bool> {
     let dir = crate::pki::pki_dir().join("nodes").join(node);
