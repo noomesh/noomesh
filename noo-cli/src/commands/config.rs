@@ -51,6 +51,9 @@ pub fn config_launch_render(_g: &Globals, args: &[String]) -> Result<i32, Unhand
 /// `noo config launch-check secrets-at-rest [<install-root>]` — the
 /// launchers' refusal of a plaintext-`.env` install. See
 /// `plaintext_env::launch_check`.
+/// `noo config launch-check state-root [<install-root>]` — the launchers'
+/// (and hostd boot restore's) refusal to start onto a closed encrypted state
+/// volume (i10a). See `at_rest_volume::launch_check`.
 pub fn config_launch_check(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     match args.split_first() {
         Some((what, rest)) if what == "bind-sources" => {
@@ -58,6 +61,7 @@ pub fn config_launch_check(_g: &Globals, args: &[String]) -> Result<i32, Unhandl
         }
         Some((what, rest)) if what == "system-credentials" => Ok(crate::commands::systems::launch_check(rest)),
         Some((what, rest)) if what == "secrets-at-rest" => Ok(crate::commands::plaintext_env::launch_check(rest)),
+        Some((what, rest)) if what == "state-root" => Ok(crate::commands::at_rest_volume::launch_check(rest)),
         _ => Err(Unhandled),
     }
 }

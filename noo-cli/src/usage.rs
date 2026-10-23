@@ -116,6 +116,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "at-rest", "status"], "[--json]", "Show TPM facts, how to enable one, and your recorded at-rest encryption decision"),
     (&["security", "at-rest", "opt-out"], "", "Record that you accept unencrypted data at rest (audited; needs your own login)"),
     (&["security", "at-rest", "opt-in"], "", "Withdraw the at-rest opt-out (audited; needs your own login)"),
+    (&["security", "at-rest", "create-volume"], "[--size <GiB>] [--pcrs 7|none|auto] [--defer-recovery-key] [--dry-run]", "Create the TPM-unlocked encrypted state volume; shows its recovery key once"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
     (&["security", "posture", "set"], "<key> <value>", "Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply"),
     (&["security", "posture", "apply-profile"], "<profile> [--include-bridges]", "Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply"),
@@ -241,7 +242,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["config", "get"], "[<section>|cli]", "Print gateway runtime config, whole or one section; `cli` reads this machine's prefs"),
     (&["config", "set"], "<section> <updates-json>", "Update a gateway config section from JSON (no confirm); `cli` writes local prefs"),
     (&["config", "launch-render"], "compose-env | addons | override | systems [<file>]", "Hidden: render one noomesh.yaml section for the launcher scripts (internal)"),
-    (&["config", "launch-check"], "bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] | system-credentials [<noomesh.yaml>] | secrets-at-rest [<dir>]", "Hidden: pre-start refusals: bind sources, system credentials, plaintext secrets (internal)"),
+    (&["config", "launch-check"], "bind-sources [--data-root <dir>] [--no-deps] [--skip <service>]... [<service>...] | system-credentials [<noomesh.yaml>] | secrets-at-rest [<dir>] | state-root [<dir>]", "Hidden: pre-start refusals: bind sources, credentials, plaintext secrets, closed volume"),
     (&["logs", "errors"], "[-c <container>] [-m <min>] [-n <limit>] [--node <id>] [--name <n>] [--since <t>]", "List recent warning/error lines across the fleet (Loki, else a container scan)"),
     (&["logs", "tail"], "<container> | -c <container> | --name <n> [-l <lines>] [-n <node>] [--since <t>]", "Print the last N log lines of one container or unit, optionally on a given node"),
     (&["logs", "search"], "[<text>] [-n <node>] [--name <n>] [--level <l>] [--since <t>] [--until <t>] [-l <n>]", "Search the fleet's logs in Loki by node, name, level, time window and text"),
@@ -480,6 +481,10 @@ mod tests {
             assert_eq!(syntax, "");
             assert!(desc.contains("own login"), "{verb}: {desc}");
         }
-        assert_eq!(super::subcommands_under(&["security", "at-rest"]), vec!["status", "opt-out", "opt-in"]);
+        assert_eq!(super::subcommands_under(&["security", "at-rest"]), vec!["status", "opt-out", "opt-in", "create-volume"]);
+        // i10a PR-C: the volume, with the deferral that is the only way to run it without a terminal.
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "create-volume"]).expect("at-rest create-volume");
+        assert!(syntax.contains("--defer-recovery-key") && syntax.contains("--size <GiB>"), "{syntax}");
+        assert!(desc.contains("recovery key once"), "{desc}");
     }
 }

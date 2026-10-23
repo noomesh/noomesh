@@ -206,6 +206,9 @@ source "$SCRIPT_DIR/lib-bind-sources.sh"
 check_system_credentials || exit 1
 # ...and an install whose secrets sit in plaintext .env.
 check_secrets_at_rest || exit 1
+# ...and a start onto a closed encrypted state volume (i10a).
+source "$SCRIPT_DIR/lib-state-volume.sh"
+check_state_volume_open || exit 1
 
 if [ -f "$PROJECT_ROOT/pyproject.toml" ]; then
     ui_step "Syncing local Python dependencies"

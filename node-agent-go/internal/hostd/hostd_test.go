@@ -598,6 +598,10 @@ func TestNothingExecsOutsideTheRunnerSeam(t *testing.T) {
 		"exec.go":    true, // the seam itself
 		"watch.go":   true, // runStreaming: the detached rebuild's log tee
 		"install.go": true, // systemctl/launchctl, an operator-invoked path
+		// at-rest create-volume (i10a PR-C): sudo by a person, never the
+		// spool; every binary it runs is a VolumeConfig field, and its tests
+		// set each to a fake.
+		"atrest_volume_linux.go": true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -864,6 +868,24 @@ func TestBootRestoreWritesFilesThenStartsOnlyBoundContainers(t *testing.T) {
 	}
 	if strings.Contains(got, "up -d") || strings.Contains(got, "pull") || strings.Contains(got, "--force-recreate") {
 		t.Fatalf("boot-restore must not recreate or pull:\n%s", got)
+	}
+}
+
+// i10a: when the state lives on the encrypted volume and it did not open at
+// boot, the restore refuses before writing secrets or starting anything.
+func TestBootRestoreChecksTheStateVolumeBeforeStarting(t *testing.T) {
+	e, fr := testEngine(t)
+	e.BootRestore(context.Background())
+	got := strings.Join(fr.joined(), "\n")
+	check := strings.Index(got, "check_state_volume_open")
+	if !strings.Contains(got, "lib-state-volume.sh") || check < 0 {
+		t.Fatalf("boot-restore does not check the state volume:\n%s", got)
+	}
+	if !(strings.Index(got, "populated") < check && check < strings.Index(got, "load_secrets >/dev/null") && check < strings.Index(got, "docker start")) {
+		t.Fatalf("the volume check must come before the write and the start:\n%s", got)
+	}
+	if !strings.Contains(got, "exit 3") {
+		t.Fatalf("a closed volume must fail the attempt:\n%s", got)
 	}
 }
 

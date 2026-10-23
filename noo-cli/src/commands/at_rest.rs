@@ -16,8 +16,8 @@
 //!   the db_only, person-only setting [`SETTING`], written through the same
 //!   audited route as `noo kiosk labels` (its `updated_by`/`updated_at` say
 //!   who and when).
-//! - [`plan`] and [`setup_fresh`] are what onboard calls; `setup_fresh` is a
-//!   labelled stub until the sealing PRs land.
+//! - [`plan`] is what onboard calls; a "yes" runs
+//!   `at_rest_volume::setup_fresh` (PR-C: the encrypted state volume).
 //!
 //! The two disclosure sentences below are the operator's wording
 //! (i10a, 2026-10-11) and are pinned by tests: no "your data is secure", and
@@ -479,7 +479,7 @@ fn run(g: &Globals, args: &[String], want: Option<bool>) -> Result<i32, Unhandle
     println!("{}", ui::kv(&rows));
     println!("{}", if state.as_ref().is_some_and(|s| s.accepted) { DISCLOSURE_OFF } else { DISCLOSURE_ON });
     if state.as_ref().is_some_and(|s| s.accepted) {
-        ui::guide(&[("noo security at-rest opt-in", "withdraw the opt-out (encryption is not set up by this yet)")]);
+        ui::guide(&[("noo security at-rest opt-in", "withdraw the opt-out; then noo security at-rest create-volume")]);
     } else if want.is_none() {
         ui::guide(&[("noo security at-rest opt-out", "record that you accept unencrypted data on disk (audited)")]);
     }
@@ -511,15 +511,6 @@ pub(crate) fn plan(facts: &TpmFacts, non_interactive: bool, ask: &mut dyn FnMut(
     } else {
         Plan::OptOut
     }
-}
-
-/// STUB (i10a PR-A). Encryption setup lands in a later 0.6.11 step; until
-/// then choosing "yes" records nothing and changes nothing on disk. The
-/// returned line is what onboard prints.
-pub(crate) fn setup_fresh() -> String {
-    "Encryption at rest is not set up by this step yet: it lands in a later 0.6.11 step. \
-     Nothing was changed on disk and no decision was recorded; `noo cluster verify --controller` still lists what is in the clear."
-        .to_string()
 }
 
 #[cfg(test)]
@@ -765,12 +756,5 @@ mod tests {
         // interactive: the answer decides
         assert_eq!(plan(&with, false, &mut || true), Plan::Encrypt);
         assert_eq!(plan(&with, false, &mut || false), Plan::OptOut);
-    }
-
-    #[test]
-    fn the_fresh_setup_stub_says_it_does_nothing() {
-        let m = setup_fresh();
-        assert!(m.contains("later 0.6.11 step"), "{m}");
-        assert!(m.contains("no decision was recorded"), "{m}");
     }
 }

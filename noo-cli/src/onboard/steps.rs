@@ -3490,6 +3490,16 @@ pub fn storage(ctx: &mut Ctx) {
     ctx.progress("Creating storage directories...");
     ensure_root_dir(ctx, Path::new(&chosen_root));
 
+    // Encrypt at rest? (i10a) Asked BEFORE any state directory exists: a
+    // "yes" makes the encrypted volume and points NOO_STATE_ROOT (and the
+    // PKI) at it, so every directory below is made ON it and nothing is ever
+    // written in the clear. A "yes" whose volume cannot be made stops the
+    // wizard here, before any service starts. A "no" is recorded after the
+    // services start.
+    if !at_rest_choice(ctx, &chosen_root) {
+        return;
+    }
+
     // The sensitive state set binds under NOO_STATE_ROOT (default: the data
     // root, so unset changes nothing; i10a). This step does not choose it —
     // the operator or a later change sets it — it only follows it.
@@ -3530,31 +3540,31 @@ pub fn storage(ctx: &mut Ctx) {
     ctx.progress("Testing Docker bind mount access...");
     verify_bind_mount(ctx, &state_root);
 
-    // Encrypt at rest? (i10a) Decided here, with the storage; recorded after
-    // the services start.
-    at_rest_choice(ctx);
-
     // User dirs + workspace
     configure_user_dirs(ctx);
 }
 
-/// i10a PR-A: detect a TPM and ask whether to encrypt data at rest.
+/// i10a: detect a TPM and ask whether to encrypt data at rest.
 ///
 /// - not a Linux controller: said plainly, nothing recorded;
 /// - no usable TPM: explain why and how to enable one, record nothing (the
 ///   verify rows keep warning with the reason);
 /// - a TPM: ask (default yes, `--ci` never asks) and print the disclosure
 ///   for the answer. "No" is kept in `ctx.state` and written after the
-///   services start; "yes" calls the labelled stub `setup_fresh`.
-fn at_rest_choice(ctx: &mut Ctx) {
+///   services start; "yes" runs `at_rest_volume::setup_fresh` (PR-C): the
+///   encrypted state volume, before any service starts.
+///
+/// Returns false when the wizard must stop: the person said yes and the
+/// volume could not be made. It never carries on unencrypted after a yes.
+fn at_rest_choice(ctx: &mut Ctx, data_root: &str) -> bool {
     use crate::commands::at_rest::{self, Plan, TpmFacts};
     if ctx.state.mode == "worker" || !cfg!(target_os = "linux") {
         ctx.info("Encryption at rest is for Linux controllers; not supported on this machine.");
-        return;
+        return true;
     }
     if ctx.dry_run {
-        ctx.dry("check for a TPM 2.0 and ask whether to encrypt data at rest");
-        return;
+        ctx.dry("check for a TPM 2.0 and ask whether to encrypt data at rest (yes: create the encrypted state volume before any service starts)");
+        return true;
     }
     let facts = TpmFacts::probe(Path::new("/"));
     let asker = &ctx.asker;
@@ -3565,13 +3575,172 @@ fn at_rest_choice(ctx: &mut Ctx) {
             ctx.info(&at_rest::enable_hint(&facts));
             ctx.info(at_rest::DISCLOSURE_OFF);
         }
-        Plan::Encrypt => {
-            ctx.info(at_rest::DISCLOSURE_ON);
-            ctx.info(&at_rest::setup_fresh());
-        }
+        Plan::Encrypt => return at_rest_encrypt_fresh(ctx, data_root),
         Plan::OptOut => {
             ctx.info(at_rest::DISCLOSURE_OFF);
             ctx.state.at_rest_opt_out = true;
+        }
+    }
+    true
+}
+
+/// The "yes" of [`at_rest_choice`]: the encrypted state volume through
+/// `at_rest_volume::setup_fresh`, whose step order is pinned by its tests.
+fn at_rest_encrypt_fresh(ctx: &mut Ctx, data_root: &str) -> bool {
+    use crate::commands::at_rest;
+    use crate::commands::at_rest_volume::{self as vol, CreatePlan, FreshOutcome};
+    let Some(user) = vol::operator_user() else {
+        return at_rest_stop(ctx, "onboard runs as root, so there is no operator account to hand the encrypted state to");
+    };
+    let pki_from = ctx
+        .pki_dir
+        .join("ca.crt")
+        .is_file()
+        .then(|| std::fs::canonicalize(&ctx.pki_dir).ok())
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned());
+    let plan = CreatePlan {
+        data_root: data_root.trim_end_matches('/').to_string(),
+        size_gib: vol::MIN_SIZE_GIB,
+        user,
+        pcrs: "auto".into(),
+        subdirs: vol::state_subdir_specs(),
+        age_key: vol::age_key_to_escrow(&ctx.read_env("SOPS_AGE_KEY_FILE")),
+        pki_from,
+        defer: false,
+    };
+    ctx.progress("Creating the encrypted state volume (LUKS2, unlocked by this machine's TPM)...");
+    let outcome = {
+        let mut io = OnboardFresh { ctx: &mut *ctx };
+        vol::setup_fresh(&mut io, plan)
+    };
+    match outcome {
+        Ok(FreshOutcome::Created { state_root, acknowledged, deferred }) => {
+            ctx.success(&format!("Encrypted state volume open and mounted at {state_root}; the state set and the PKI live on it"));
+            ctx.info(at_rest::DISCLOSURE_ON);
+            ctx.info("Data written before this step can linger on an SSD: the keys and secrets are rotated after sealing (i10a).");
+            ctx.state.at_rest_recovery_ack = acknowledged;
+            if deferred {
+                ctx.warn("No recovery key yet: this wizard has no private terminal to show it on. The volume unlocks by this machine's TPM only until one is made with the recovery-key verb (a later 0.6.11 step).");
+            } else if !acknowledged {
+                ctx.warn("The recovery key was not acknowledged: verify warns until a new one is made and stored off this machine.");
+            }
+            true
+        }
+        Ok(FreshOutcome::AlreadyThere { state_root }) => {
+            ctx.info(&format!("The encrypted state volume is already open at {state_root}."));
+            ctx.info(at_rest::DISCLOSURE_ON);
+            true
+        }
+        Ok(FreshOutcome::Skipped(why)) => {
+            ctx.warn(&format!("Encryption at rest was not set up: {why}."));
+            ctx.info(at_rest::DISCLOSURE_OFF);
+            true
+        }
+        Err(e) => at_rest_stop(ctx, &e),
+    }
+}
+
+/// Stop the wizard after a "yes" that could not be carried out. Nothing has
+/// started; nothing is left half-switched (`setup_fresh` points `.env` at
+/// the volume only after it exists).
+fn at_rest_stop(ctx: &mut Ctx, why: &str) -> bool {
+    ctx.error(&format!("Encryption at rest could not be set up: {why}"));
+    ctx.info("Nothing was started. Fix the cause and re-run: noo onboard --only storage — or answer no to keep your data unencrypted on disk (recorded).");
+    ctx.state.hard_failures.push(format!("at rest: the encrypted state volume was not created ({why})"));
+    ctx.state.interrupted = true;
+    false
+}
+
+/// The wizard's side of `at_rest_volume::FreshSteps`.
+struct OnboardFresh<'c, 'a> {
+    ctx: &'c mut Ctx<'a>,
+}
+
+impl crate::commands::at_rest_volume::FreshSteps for OnboardFresh<'_, '_> {
+    fn existing_volume(&self) -> Option<crate::commands::at_rest_volume::Volume> {
+        crate::commands::at_rest_volume::read_volume()
+    }
+
+    fn state_in_use(&self) -> Option<String> {
+        let root = self.ctx.state.data_root.clone();
+        let state = crate::commands::data_root::state_root_of(Some(self.ctx.read_env("NOO_STATE_ROOT").as_str()), &root);
+        let mut dirs: Vec<String> = STATE_SUBDIRS.iter().map(|n| format!("{}/{n}", state.trim_end_matches('/'))).collect();
+        let pg = self.ctx.read_env("NOO_PG_DATA");
+        if !pg.trim().is_empty() {
+            dirs.push(pg);
+        }
+        dirs.into_iter().find(|d| std::fs::read_dir(d).map(|mut it| it.next().is_some()).unwrap_or(false))
+    }
+
+    fn free_bytes(&self, path: &str) -> Option<u64> {
+        crate::commands::at_rest_volume::free_bytes(path)
+    }
+
+    fn can_show_secret(&self) -> bool {
+        !self.ctx.non_interactive
+            && self.ctx.ui.inherit_stdio()
+            && super::prompt::stdin_is_tty()
+            && super::prompt::stdout_is_tty()
+    }
+
+    fn create_volume(&mut self, plan: &crate::commands::at_rest_volume::CreatePlan) -> Result<crate::commands::at_rest_volume::Created, String> {
+        let console = self.ctx.ui.inherit_stdio();
+        let hostd = std::env::var("NOO_HOSTD_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::commands::at_rest_volume::HOSTD_BIN.to_string());
+        if !Path::new(&hostd).is_file() {
+            if !console {
+                return Err(format!(
+                    "{hostd} is not installed and this wizard cannot run sudo at a terminal — run noo onboard --only storage from a terminal"
+                ));
+            }
+            obtain_hostd_binary(self.ctx)?;
+        }
+        let argv = crate::commands::at_rest_volume::hostd_argv(&hostd, plan);
+        self.ctx.info(&format!("running: sudo {}", argv.join(" ")));
+        let sudo_n = self.ctx.non_interactive || !console;
+        let (res, stderr) = crate::commands::at_rest_volume::run_hostd(&argv, sudo_n, console);
+        for l in stderr.lines().filter(|l| !l.trim().is_empty()) {
+            self.ctx.raw(&format!("    {l}"));
+        }
+        res
+    }
+
+    fn show_recovery_key(&mut self, key: &str) -> bool {
+        self.ctx.warn(crate::commands::at_rest_volume::RECOVERY_KEY_WARNING);
+        if !self.ctx.ui.reveal_secret("Recovery key for the encrypted state volume", key) {
+            return false;
+        }
+        loop {
+            let first = self.ctx.asker.ask(&Prompt::new("Type the FIRST group of the recovery key (empty to skip)"));
+            if first.trim().is_empty() {
+                if self.ctx.asker.confirm("Continue WITHOUT confirming you stored the recovery key", false) {
+                    return false;
+                }
+                continue;
+            }
+            let last = self.ctx.asker.ask(&Prompt::new("Type the LAST group of the recovery key"));
+            if crate::commands::at_rest_volume::retyped_ok(key, &first, &last) {
+                self.ctx.success("Recovery key handed over (no copy on this machine).");
+                return true;
+            }
+            self.ctx.warn("Those groups do not match the key above — read it again and retype them.");
+        }
+    }
+
+    fn read_env(&self, key: &str) -> String {
+        self.ctx.read_env(key)
+    }
+
+    fn set_env(&mut self, key: &str, value: &str) {
+        self.ctx.update_env(key, value);
+        // Later steps in this same run read these from the process
+        // environment (pki::pki_dir, the launcher's env) and from ctx.
+        std::env::set_var(key, value);
+        if key == "NOO_PKI_DIR" {
+            self.ctx.pki_dir = PathBuf::from(value);
         }
     }
 }
@@ -3580,6 +3749,7 @@ fn at_rest_choice(ctx: &mut Ctx) {
 /// gateway is up. A failure is a warning with the retry command, not a hard
 /// failure: the person's answer is not lost, only not yet on record.
 pub fn at_rest_record(ctx: &mut Ctx) {
+    at_rest_record_recovery_ack(ctx);
     if !ctx.state.at_rest_opt_out {
         return;
     }
@@ -3604,6 +3774,33 @@ pub fn at_rest_record(ctx: &mut Ctx) {
             ctx.warn(&format!("Could not record your at-rest choice ({e})."));
             ctx.info("Record it yourself: noo security at-rest opt-out");
         }
+    }
+}
+
+/// Record that the person acknowledged the state volume's recovery key
+/// (shown in the storage step), now that the gateway is up. Person-only on
+/// the gateway side, so it carries the operator's own login.
+fn at_rest_record_recovery_ack(ctx: &mut Ctx) {
+    if !ctx.state.at_rest_recovery_ack {
+        return;
+    }
+    if ctx.dry_run {
+        ctx.dry("record the recovery-key acknowledgement in the gateway");
+        return;
+    }
+    if !ctx.state.services_started {
+        ctx.warn("The gateway is not running, so your recovery-key acknowledgement was NOT recorded; verify will warn about it.");
+        return;
+    }
+    match crate::http::post_json_try(
+        ctx.g,
+        "/api/settings/flags/set",
+        &serde_json::json!({"key": crate::commands::at_rest_volume::RECOVERY_SETTING, "value": true}),
+        true,
+        15,
+    ) {
+        Ok(_) => ctx.success("Recorded: you stored the recovery key off this machine."),
+        Err(e) => ctx.warn(&format!("Could not record your recovery-key acknowledgement ({e}); verify will warn about it.")),
     }
 }
 

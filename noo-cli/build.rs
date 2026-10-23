@@ -79,6 +79,8 @@ const STANDALONE_FILES: &[&str] = &[
     "scripts/lib-config.sh",
     "scripts/lib-instance.sh",
     "scripts/lib-secrets.sh",
+    // Every launcher refuses a closed encrypted state volume (i10a).
+    "scripts/lib-state-volume.sh",
     "scripts/lib-dist.sh",
     // The compose file list has one home; every
     // launcher sources it, so a standalone install must ship it.
