@@ -1,19 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
+import { num } from '@/lib/num';
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
 
+// Every count is `number | null`: null = the gateway did not send it (i195 E1).
 export interface ToolStat {
   name: string;
-  calls: number;
-  successful: number;
-  successRate: number;
-  avgMs: number;
+  calls: number | null;
+  successful: number | null;
+  successRate: number | null;
+  avgMs: number | null;
 }
 export interface MemoryData {
-  worker: { state: string; processed: number; embedded: number; failed: number; relationships: number };
-  storage: { total: number; embedded: number; unembedded: number; users: number };
-  conv: { conversations: number; messages: number; toolCalls: number; avgMessages: number };
+  worker: {
+    state: string;
+    processed: number | null;
+    embedded: number | null;
+    failed: number | null;
+    relationships: number | null;
+  };
+  storage: { total: number | null; embedded: number | null; unembedded: number | null; users: number | null };
+  conv: {
+    conversations: number | null;
+    messages: number | null;
+    toolCalls: number | null;
+    avgMessages: number | null;
+  };
   tools: ToolStat[];
 }
 
@@ -37,29 +50,29 @@ export function useMemory() {
       return {
         worker: {
           state: w.data?.state ?? 'not_initialized',
-          processed: st.total_processed ?? 0,
-          embedded: st.total_embedded ?? 0,
-          failed: st.total_failed ?? 0,
-          relationships: st.relationships_created ?? 0,
+          processed: num(st.total_processed),
+          embedded: num(st.total_embedded),
+          failed: num(st.total_failed),
+          relationships: num(st.relationships_created),
         },
         storage: {
-          total: s.data?.total_records ?? 0,
-          embedded: s.data?.embedded_records ?? 0,
-          unembedded: s.data?.unembedded_records ?? 0,
-          users: s.data?.unique_users ?? 0,
+          total: num(s.data?.total_records),
+          embedded: num(s.data?.embedded_records),
+          unembedded: num(s.data?.unembedded_records),
+          users: num(s.data?.unique_users),
         },
         conv: {
-          conversations: o.data?.total_conversations ?? 0,
-          messages: o.data?.total_messages ?? 0,
-          toolCalls: o.data?.total_tool_calls ?? 0,
-          avgMessages: o.data?.avg_messages_per_conversation ?? 0,
+          conversations: num(o.data?.total_conversations),
+          messages: num(o.data?.total_messages),
+          toolCalls: num(o.data?.total_tool_calls),
+          avgMessages: num(o.data?.avg_messages_per_conversation),
         },
         tools: (t.data?.tools ?? []).map((x) => ({
           name: x.name ?? '?',
-          calls: x.total_calls ?? 0,
-          successful: x.successful ?? 0,
-          successRate: x.success_rate ?? 0,
-          avgMs: x.avg_execution_ms ?? 0,
+          calls: num(x.total_calls),
+          successful: num(x.successful),
+          successRate: num(x.success_rate),
+          avgMs: num(x.avg_execution_ms),
         })),
       };
     },

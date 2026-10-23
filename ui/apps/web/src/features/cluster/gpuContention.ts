@@ -2,6 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { relTime } from '@/lib/format';
+import { DASH } from '@/lib/num';
 
 /** The node agent's `gpu_contention` heartbeat report (internal/gpuyield),
  *  carried verbatim on the node record. Not in the typed contract yet, so it
@@ -23,7 +24,7 @@ export function readGpuContention(raw: unknown): GpuContention | undefined {
   return v && typeof v === 'object' ? (v as GpuContention) : undefined;
 }
 
-const gb = (mb?: number) => `${((mb ?? 0) / 1024).toFixed(1)} GB`;
+const gb = (mb?: number) => (mb == null ? DASH : `${(mb / 1024).toFixed(1)} GB`);
 
 /** The one line a node card shows, or null when there is nothing to say.
  *  Yielded/held is by design (the GPU was handed to other work), so it is

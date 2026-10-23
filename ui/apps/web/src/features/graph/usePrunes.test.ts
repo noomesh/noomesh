@@ -205,3 +205,15 @@ describe('useRestorePrune', () => {
     expect(H.invalidate).toHaveBeenCalledWith({ queryKey: ['graph'] });
   });
 });
+
+describe('usePrunes — unreported is null, never 0 (i195 E1)', () => {
+  it('entity edge/mention counts and totals are null when the gateway sends none', async () => {
+    H.get.mockResolvedValue({ data: { staged: [{ staging_id: 's1', canonical_name: 'A' }] } });
+    useStagedPrunes();
+    const out = (await (H.lastQuery.current!.queryFn as () => Promise<StagedPrunes>)());
+    expect(out.rows[0]!.edgeCount).toBeNull();
+    expect(out.rows[0]!.mentionCount).toBeNull();
+    expect(out.entityTotal).toBeNull();
+    expect(out.edgeTotal).toBeNull();
+  });
+});

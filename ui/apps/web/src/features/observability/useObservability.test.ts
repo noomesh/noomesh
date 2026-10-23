@@ -146,3 +146,15 @@ describe('GPU telemetry the gateway did not send', () => {
     expect(d.gpus[0].util).toBeNull();
   });
 });
+
+describe('useObservability — container stats', () => {
+  it('unreported cpu/mem are null, not 0 (i195 E1)', async () => {
+    H.get.mockImplementation((path: string) => {
+      if (path === '/api/logs/docker-stats') return Promise.resolve({ data: { containers: [{ name: 'x' }] } });
+      return Promise.resolve({ data: {} });
+    });
+    useObservability();
+    const d = await (H.lastQuery.current?.queryFn as () => Promise<ObsData>)();
+    expect(d.containers[0]).toMatchObject({ name: 'x', cpu: null, memUsed: null, memLimit: null, memPct: null });
+  });
+});

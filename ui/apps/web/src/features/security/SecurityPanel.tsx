@@ -4,6 +4,7 @@
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { relTime } from '@/lib/format';
+import { num, dash, compareNullable } from '@/lib/num';
 import { StatTiles } from '@/components/StatTiles';
 import { StatusBadge, type Tone } from '@/components/StatusBadge';
 import { Button } from '@/components/ui/button';
@@ -11,7 +12,7 @@ import { useConfirm } from '@/components/ConfirmDialog';
 import { useSecurity, useApprovalDecision, type PendingApproval, type Cert } from './useSecurity';
 
 const certTone = (s: string): Tone =>
-  s === 'expired' || s === 'missing' ? 'bad' : s === 'expiring' ? 'warn' : 'good';
+  s === 'expired' || s === 'missing' ? 'bad' : s === 'expiring' ? 'warn' : s === 'unknown' ? 'neutral' : 'good';
 const approvalTone = (r: string): Tone => (r === 'high' ? 'bad' : r === 'medium' ? 'warn' : 'neutral');
 
 const VIOLATION_TYPES: [string, string][] = [
@@ -64,8 +65,8 @@ export function SecurityPanel() {
           <StatTiles
             tiles={[
               { label: 'Risk', value: sec.data.riskLevel, hot: sec.data.riskLevel !== 'LOW' && sec.data.riskLevel !== 'UNKNOWN' },
-              { label: 'Violations', value: sec.data.violations.total ?? 0 },
-              { label: 'Pending', value: sec.data.stats.pending, hot: sec.data.stats.pending > 0 },
+              { label: 'Violations', value: dash(num(sec.data.violations.total)) },
+              { label: 'Pending', value: sec.data.stats.pending, hot: (sec.data.stats.pending ?? 0) > 0 },
               { label: 'Certs expiring', value: sec.data.pki.summary.expiring, hot: sec.data.pki.summary.expiring > 0 },
             ]}
           />
@@ -122,8 +123,8 @@ export function SecurityPanel() {
                     <span className="cert-role">{c.role}</span>
                   </div>
                   <div className="cert-right">
-                    <span className={`cert-days ${c.daysLeft < 0 ? 'bad' : c.daysLeft <= 30 ? 'warn' : ''}`}>
-                      {c.daysLeft}d
+                    <span className={`cert-days ${c.daysLeft === null ? '' : c.daysLeft < 0 ? 'bad' : c.daysLeft <= 30 ? 'warn' : ''}`}>
+                      {dash(c.daysLeft, (n) => `${n}d`)}
                     </span>
                     <StatusBadge tone={certTone(c.status)}>{c.status}</StatusBadge>
                   </div>
@@ -140,13 +141,15 @@ export function SecurityPanel() {
           <h3 className="subhead">Violations · last 24h</h3>
           <div className="cache-list">
             {[...VIOLATION_TYPES]
-              .sort((a, b) => (sec.data!.violations[b[0]] ?? 0) - (sec.data!.violations[a[0]] ?? 0))
+              .sort((a, b) =>
+                compareNullable(num(sec.data!.violations[a[0]]), num(sec.data!.violations[b[0]]), -1),
+              )
               .map(([key, label]) => {
-                const n = sec.data!.violations[key] ?? 0;
+                const n = num(sec.data!.violations[key]);
                 return (
-                  <div className={cn('cache-row', n === 0 && 'quiet')} key={key}>
+                  <div className={cn('cache-row', n !== null && n === 0 && 'quiet')} key={key}>
                     <span className="cache-name">{label}</span>
-                    <span className={cn('cache-meta', n > 0 && 'vio-hit')}>{n.toLocaleString()}</span>
+                    <span className={cn('cache-meta', n !== null && n > 0 && 'vio-hit')}>{dash(n)}</span>
                   </div>
                 );
               })}
