@@ -612,6 +612,8 @@ func TestNothingExecsOutsideTheRunnerSeam(t *testing.T) {
 		// at-rest copy/wipe (i10a PR-D): same rules, rsync/fstrim are
 		// MigrateConfig fields and its tests set both to fakes.
 		"atrest_migrate_linux.go": true,
+		// recovery-key / reenroll (PR-E): the same shape, same fakes.
+		"atrest_recovery_linux.go": true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {

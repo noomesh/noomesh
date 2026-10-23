@@ -10,6 +10,7 @@
 pub mod addons;
 pub mod at_rest;
 pub mod at_rest_migrate;
+pub mod at_rest_recovery;
 pub mod at_rest_volume;
 pub mod channel;
 pub mod addon_enable;
@@ -438,5 +439,6 @@ pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
 pub use at_rest::{security_at_rest_opt_in, security_at_rest_opt_out, security_at_rest_status};
 pub use at_rest_migrate::{security_at_rest_migrate, security_at_rest_wipe_plaintext};
+pub use at_rest_recovery::{security_at_rest_preflight_firmware, security_at_rest_recovery_key, security_at_rest_reenroll};
 pub use at_rest_volume::security_at_rest_create_volume;
 pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

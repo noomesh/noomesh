@@ -3629,7 +3629,7 @@ fn at_rest_encrypt_fresh(ctx: &mut Ctx, data_root: &str) -> bool {
             ctx.info("Data written before this step can linger on an SSD: the keys and secrets are rotated after sealing (i10a).");
             ctx.state.at_rest_recovery_ack = acknowledged;
             if deferred {
-                ctx.warn("No recovery key yet: this wizard has no private terminal to show it on. The volume unlocks by this machine's TPM only until one is made with the recovery-key verb (a later 0.6.11 step).");
+                ctx.warn("No recovery key yet: this wizard has no private terminal to show it on. The volume unlocks by this machine's TPM only until one is made with `noo security at-rest recovery-key`.");
             } else if !acknowledged {
                 ctx.warn("The recovery key was not acknowledged: verify warns until a new one is made and stored off this machine.");
             }
