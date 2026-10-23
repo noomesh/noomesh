@@ -158,6 +158,11 @@ jobs:
       # rc.N's commit): it re-tags rc.N's images, and still mints and signs
       # its own lock. The rules, and why each fails open to BUILD, are in the
       # script.
+      #
+      # An rc on a NEW tree is diffed against the highest lower rc and only
+      # the images whose declared inputs changed build
+      # (scripts/release-image-inputs.json); a change to this workflow or
+      # the other lane files rebuilds everything.
       - name: Plan — re-tag from the rc, or build
         id: plan
         env:

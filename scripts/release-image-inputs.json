@@ -1,0 +1,113 @@
+{
+  "_comment": "Build inputs of every stack image, used by scripts/release-retag-plan.py to re-tag (not rebuild) an image whose inputs did not change between two release candidates. ONE place. tests/test_release_image_inputs.py fails when a Dockerfile COPYs/ADDs a path that is not listed here, so this cannot go stale silently. `context` is the docker build context relative to the repo root; `inputs` are globs relative to the repo root (** crosses directories); `parents` are images this one is built FROM (a rebuilt parent rebuilds the child). Sibling-repo sources (trellion) are compared separately, by tree, in the plan script.",
+  "lane": [
+    ".dockerignore",
+    ".github/workflows/images-release.yml",
+    "scripts/release-image-inputs.json",
+    "scripts/release-retag-plan.py",
+    "scripts/release-retag-image.sh",
+    "scripts/retry-registry.sh",
+    "scripts/hub-mirror.py"
+  ],
+  "unreleased_dockerfiles": [
+    "docker/Dockerfile.airllm",
+    "docker/Dockerfile.node-agent-prebuilt"
+  ],
+  "images": {
+    "deps-core": {
+      "dockerfile": "docker/Dockerfile.deps-core",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.deps-core", "pyproject.toml", "README.md", "docker/core-lock/**"]
+    },
+    "deps-base": {
+      "dockerfile": "docker/Dockerfile.deps-base",
+      "context": ".",
+      "parents": ["deps-core"],
+      "inputs": ["docker/Dockerfile.deps-base", "packages/noo-gateway-client/**", "scripts/check-protocols-pin.py", "docker/ml-lock/**"]
+    },
+    "trellion": {
+      "dockerfile": "docker/Dockerfile.trellion",
+      "context": ".",
+      "parents": ["deps-base"],
+      "inputs": ["docker/Dockerfile.trellion", "src/**", "docker/entrypoint.py"]
+    },
+    "sandbox": {
+      "dockerfile": "docker/Dockerfile.sandbox",
+      "context": ".",
+      "parents": ["deps-core"],
+      "inputs": ["docker/Dockerfile.sandbox", "src/**", "docker/mcp-servers.json", "config/tools.json", "docker/entrypoint.py"]
+    },
+    "worker": {
+      "dockerfile": "docker/Dockerfile.worker",
+      "context": ".",
+      "parents": ["deps-core"],
+      "inputs": ["docker/Dockerfile.worker", "src/**", "config/tools.json"]
+    },
+    "whisper": {
+      "dockerfile": "docker/Dockerfile.whisper",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.whisper", "docker/voice_local.py", "docker/whisper_server.py"]
+    },
+    "piper": {
+      "dockerfile": "docker/Dockerfile.piper",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.piper", "docker/voice_local.py", "docker/piper_server.py"]
+    },
+    "postgres-pgvector": {
+      "dockerfile": "docker/Dockerfile.postgres",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.postgres"]
+    },
+    "llamacpp": {
+      "dockerfile": "docker/Dockerfile.llamacpp",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.llamacpp"]
+    },
+    "stunnel": {
+      "dockerfile": "docker/Dockerfile.stunnel",
+      "context": "docker",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.stunnel"]
+    },
+    "nvidia-exporter": {
+      "dockerfile": "docker/Dockerfile.nvidia-exporter",
+      "context": "docker",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.nvidia-exporter", "docker/nvidia-smi-exporter.py"]
+    },
+    "gateway": {
+      "dockerfile": "docker/Dockerfile.gateway-rust",
+      "context": ".",
+      "parents": [],
+      "inputs": [
+        "docker/Dockerfile.gateway-rust",
+        "gateway-rust/**",
+        "tests/fixtures/redaction_corpus.json",
+        "tests/fixtures/audit_hash_v2_vectors.json",
+        "tests/fixtures/audit_chain_vectors.json",
+        "tests/fixtures/kb_audience_isolation.json",
+        "tests/fixtures/own_image_cases.json",
+        "config/harness-kinds.json",
+        "config/harness-profiles.json",
+        "config/tools.json",
+        "configs/grafana/dashboards/cluster-overview.json",
+        "scripts/**",
+        "src/noomesh/gateway/static/**",
+        "docker/mcp-servers.json",
+        "docs/operating/runbooks/**",
+        "ui/**"
+      ]
+    },
+    "node-agent": {
+      "dockerfile": "docker/Dockerfile.node-agent-go",
+      "context": ".",
+      "parents": [],
+      "inputs": ["docker/Dockerfile.node-agent-go", "node-agent-go/**", "docker/inject-ca.sh"]
+    }
+  }
+}
