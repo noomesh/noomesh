@@ -302,7 +302,7 @@ pub(crate) fn volume_check(
                 "{MAPPER_PATH} is open and mounted at {} ({} GiB{free}), but this install's state root is {state_root}: the state is not on it yet",
                 v.mountpoint, v.size_gib
             ),
-            Some("moving existing state onto it is a later 0.6.11 step (at-rest migrate); until then it stays in the clear".into()),
+            Some("noo security at-rest migrate --dry-run".into()),
         );
     }
     check(
@@ -596,7 +596,7 @@ pub(crate) fn setup_fresh(s: &mut dyn FreshSteps, mut plan: CreatePlan) -> Resul
     }
     if let Some(p) = s.state_in_use() {
         return Ok(FreshOutcome::Skipped(format!(
-            "{p} already holds data, so this is not a fresh install: moving existing state onto an encrypted volume is a later 0.6.11 step (at-rest migrate). Nothing was changed"
+            "{p} already holds data, so this is not a fresh install: move it onto an encrypted volume with `noo security at-rest migrate`. Nothing was changed"
         )));
     }
     let need = (plan.size_gib + MARGIN_GIB) * GIB;
@@ -866,7 +866,7 @@ pub fn security_at_rest_create_volume(g: &Globals, args: &[String]) -> Result<i3
         println!(
             "{}",
             ui::note(&format!(
-                "it is empty: this install's state is still at {state_root}, in the clear. Moving it is a later 0.6.11 step (at-rest migrate)."
+                "it is empty: this install's state is still at {state_root}, in the clear. Move it with `noo security at-rest migrate`."
             ))
         );
     }

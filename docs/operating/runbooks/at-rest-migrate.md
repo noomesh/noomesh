@@ -28,6 +28,12 @@ against someone with admin access to the running machine.
   is saved byte for byte as `.noo-at-rest-migrate.env.orig`.
 - It never deletes the old plaintext. That is a separate verb.
 
+The size is measured as root (`sudo noo-hostd at-rest measure`), because the
+database directory is not readable by the operator. The volume is twice the
+measured state, at least 50 GiB. If the measurement fails or is partial, the
+migration refuses; it never falls back to the minimum. It also refuses when the
+data disk cannot hold the volume plus a 5 GiB margin.
+
 ## Steps
 
 ```bash

@@ -361,21 +361,6 @@ fn sha256_bytes(b: &[u8]) -> String {
     hex(&sha2::Sha256::digest(b))
 }
 
-fn du_bytes(paths: &[String]) -> u64 {
-    let dirs: Vec<&String> = paths.iter().filter(|p| Path::new(p.as_str()).is_dir()).collect();
-    if dirs.is_empty() {
-        return 0;
-    }
-    let out = Command::new("du").arg("-sbc").args(dirs).stderr(Stdio::null()).output();
-    let Ok(out) = out else { return 0 };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .last()
-        .and_then(|l| l.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
-}
-
 fn on_wsl() -> bool {
     std::fs::read_to_string("/proc/version").map(|v| v.to_ascii_lowercase().contains("microsoft")).unwrap_or(false)
 }
@@ -469,6 +454,55 @@ fn docker_volume(ctx: &Ctx, suffix: &str) -> Result<Option<(String, String)>, St
     }
 }
 
+/// `noo-hostd at-rest measure --entry <path>=<name> ...` behind sudo, as an argv.
+pub(crate) fn hostd_measure_argv(ctx: &Ctx, entries: &[(String, String)]) -> Vec<String> {
+    let mut a = vec![ctx.sudo.clone(), ctx.hostd.clone(), "at-rest".into(), "measure".into()];
+    for (name, src) in entries {
+        a.push("--entry".into());
+        a.push(format!("{src}={name}"));
+    }
+    a
+}
+
+/// Parse measure's one JSON line. EVERY requested name must be present: a
+/// partial answer is refused, never summed (a too-small total would size a
+/// volume that fails mid-copy).
+pub(crate) fn parse_measure(stdout: &str, names: &[String]) -> Result<u64, String> {
+    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
+    let v: Value = serde_json::from_str(line).map_err(|_| "the size measurement printed nothing readable".to_string())?;
+    if v["ok"] != true {
+        return Err("the size measurement did not report success".into());
+    }
+    let mut total = 0u64;
+    for n in names {
+        total = total.saturating_add(v["bytes"][n].as_u64().ok_or_else(|| format!("the size measurement has no figure for {n}"))?);
+    }
+    Ok(total)
+}
+
+/// Measure the state as ROOT (the operator cannot read postgres's directory,
+/// so `du` here would under-count and the volume would be sized too small).
+/// Failure or a partial answer REFUSES; it never falls back to a minimum.
+fn measure_state(ctx: &Ctx, entries: &[(String, String)]) -> Result<u64, String> {
+    let argv = hostd_measure_argv(ctx, entries);
+    let o = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&ctx.root)
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", argv[0]))?;
+    let refuse = |why: String| {
+        format!("could not measure the state as root, so the volume cannot be sized safely: {why}. Nothing was changed. Fix it (is noo-hostd installed and sudo allowed?) and run again")
+    };
+    if !o.status.success() {
+        return Err(refuse(format!("`sudo noo-hostd at-rest measure` exited {} (its reason is above)", o.status.code().unwrap_or(-1))));
+    }
+    let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    parse_measure(&String::from_utf8_lossy(&o.stdout), &names).map_err(refuse)
+}
+
 /// Read-only: the plan for this machine, or the reason it cannot proceed.
 /// Touches nothing (so `--dry-run` can print it).
 pub(crate) fn compute_plan(ctx: &Ctx) -> Result<Value, String> {
@@ -560,13 +594,12 @@ pub(crate) fn compute_plan(ctx: &Ctx) -> Result<Value, String> {
     if !Path::new(&pki_src).is_dir() {
         return Err(format!("the PKI directory {pki_src} does not exist (NOO_PKI_DIR?): refusing to migrate without it"));
     }
-    let mut measured: Vec<String> = copies
+    let mut measured: Vec<(String, String)> = copies
         .iter()
-        .filter(|c| c["volume"].is_null())
-        .filter_map(|c| c["src"].as_str().map(str::to_string))
+        .filter_map(|c| Some((c["name"].as_str()?.to_string(), c["src"].as_str()?.to_string())))
         .collect();
-    measured.push(pki_src.clone());
-    let du = du_bytes(&measured);
+    measured.push(("pki".to_string(), pki_src.clone()));
+    let du = measure_state(ctx, &measured)?;
 
     // Space, and the TPM when the volume has to be made.
     let size_gib = at_rest_volume::size_for(du);
@@ -584,7 +617,9 @@ pub(crate) fn compute_plan(ctx: &Ctx) -> Result<Value, String> {
         let need = (size_gib + MARGIN_GIB) * GIB;
         if let Some(free) = at_rest_volume::free_bytes(&data_root).filter(|f| *f < need) {
             return Err(format!(
-                "not enough free space under {data_root} for a {size_gib} GiB encrypted volume: {} GiB free, {} GiB needed with the margin",
+                "not enough free space under {data_root} for the {size_gib} GiB encrypted volume (twice the measured {} GiB of state, at least {} GiB) plus the {MARGIN_GIB} GiB margin: {} GiB free, {} GiB needed. Free space on that disk, or move NOO_DATA_ROOT, and run again",
+                du / GIB,
+                at_rest_volume::MIN_SIZE_GIB,
                 free / GIB,
                 need / GIB
             ));
@@ -1456,6 +1491,7 @@ mod tests {
             r.script("backup", BACKUP);
             r.script("drill", DRILL);
             r.script("psql", PSQL);
+            r.script("noo-hostd", HOSTD);
             std::fs::write(r.ctl.join("tables"), "public.users\npublic.memories\n").unwrap();
             std::fs::write(r.ctl.join("counts"), "public.users 10\npublic.memories 20\n").unwrap();
             r
@@ -1571,6 +1607,20 @@ esac
 case "$*" in *--delete*) rm -rf "$dst"* ;; esac
 mkdir -p "$dst"
 cp -a "$src". "$dst"
+exit 0
+"#;
+
+    // `noo-hostd at-rest measure --entry p=name ...`: reports $ctl/measure_each
+    // bytes per name (default 1000), unless told to fail or to leave one out.
+    const HOSTD: &str = r#"echo "hostd $*" >> @CTL@/calls
+[ -f @CTL@/fail_measure ] && { echo "permission denied" >&2; exit 1; }
+each=$(cat @CTL@/measure_each 2>/dev/null || echo 1000)
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = --entry ]; then n="${2##*=}"; [ "$n" = "$(cat @CTL@/measure_skip 2>/dev/null)" ] || out="$out\"$n\":$each,"; shift; fi
+  shift
+done
+printf '{"ok":true,"bytes":{%s"zz":0},"total":0}\n' "$out"
 exit 0
 "#;
 
@@ -1718,6 +1768,66 @@ exit 0
         assert!(rig.vol.join("postgres/PG_VERSION").is_file(), "the NOO_PG_DATA dir is the one copied");
         assert!(rig.env_text().contains(&format!("NOO_PG_DATA={}/postgres\n", rig.vol.display())));
         assert_eq!(rig.journal().v["old_env"]["NOO_PG_DATA"], json!(pg.display().to_string()));
+    }
+
+    // ── the size is measured as root ────────────────────────────────────
+
+    const GIB_: u64 = 1 << 30;
+
+    #[test]
+    fn preflight_sizes_the_volume_from_the_root_measurement() {
+        let rig = Rig::new();
+        // 8 entries (7 state dirs + pki) at 20 GiB each, as root reports them,
+        // although the files on disk are a few bytes (what `du` would say).
+        std::fs::write(rig.ctl.join("measure_each"), (20 * GIB_).to_string()).unwrap();
+        let plan = compute_plan(&rig.ctx());
+        // The dir backend checks free space on a real tmp disk; whether that
+        // refuses is the disk's business. What must hold either way: the
+        // figure used is the measured one.
+        match plan {
+            Ok(p) => {
+                assert_eq!(p["du_bytes"].as_u64().unwrap(), 8 * 20 * GIB_);
+                assert_eq!(p["size_gib"].as_u64().unwrap(), at_rest_volume::size_for(8 * 20 * GIB_));
+                assert_eq!(p["size_gib"].as_u64().unwrap(), 320);
+            }
+            Err(e) => assert!(e.contains("not enough free space") && e.contains("160 GiB"), "{e}"),
+        }
+        let c = rig.calls();
+        assert!(c.contains("hostd at-rest measure --entry"), "{c}");
+        assert!(c.contains(&format!("{}/postgres=postgres", rig.old_state.display())), "{c}");
+        assert!(c.contains(&format!("{}=pki", rig.pki.display())), "{c}");
+    }
+
+    #[test]
+    fn a_small_state_still_gets_the_fifty_gib_minimum_and_twice_otherwise() {
+        assert_eq!(at_rest_volume::size_for(3 * GIB_), 50);
+        assert_eq!(at_rest_volume::size_for(100 * GIB_), 200);
+    }
+
+    #[test]
+    fn a_failed_or_partial_measurement_refuses_instead_of_falling_back() {
+        let rig = Rig::new();
+        rig.flag("fail_measure");
+        let e = compute_plan(&rig.ctx()).unwrap_err();
+        assert!(e.contains("cannot be sized safely") && e.contains("Nothing was changed"), "{e}");
+        rig.unflag("fail_measure");
+        std::fs::write(rig.ctl.join("measure_skip"), "loki").unwrap();
+        let e = compute_plan(&rig.ctx()).unwrap_err();
+        assert!(e.contains("no figure for loki"), "{e}");
+        // Through the engine: refused at preflight, nothing journaled or run.
+        let e = err(run_migrate(&rig.ctx()));
+        assert!(e.contains("no figure for loki"), "{e}");
+        assert!(!rig.root.join(JOURNAL).exists());
+        assert!(!rig.calls().contains("rsync") && !rig.calls().contains("noo stack"));
+    }
+
+    #[test]
+    fn parse_measure_needs_every_name_and_success() {
+        let names = vec!["postgres".to_string(), "pki".to_string()];
+        assert_eq!(parse_measure("{\"ok\":true,\"bytes\":{\"postgres\":5,\"pki\":7}}", &names), Ok(12));
+        assert!(parse_measure("{\"ok\":true,\"bytes\":{\"postgres\":5}}", &names).is_err());
+        assert!(parse_measure("{\"ok\":false}", &names).is_err());
+        assert!(parse_measure("garbage", &names).is_err());
     }
 
     // ── the gates ───────────────────────────────────────────────────────
