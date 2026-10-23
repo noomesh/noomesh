@@ -2571,6 +2571,10 @@ pub(crate) struct SandboxProbe {
     pub leaf: String,
     /// Plain HTTP to the same port.
     pub plain: String,
+    /// The `/health` body the leaf dial read, parsed; `None` when no body
+    /// came back (the listener row says why). Absent from an older probe.
+    #[serde(default)]
+    pub health: Option<Value>,
 }
 
 const SANDBOX_REMEDY_RESTART: &str = "noo stack restart --force sandbox";
@@ -2648,11 +2652,90 @@ pub(crate) fn sandbox_listener_check(compose: Option<&str>, probe: Option<&Sandb
     ok(ROW, "client certificate required from every caller (none and plaintext refused, the gateway's leaf accepted); no published port")
 }
 
+/// The "sandbox executor" row (i161, noomesh#278): model-written code runs
+/// as the sandbox's own executor uid, one of 64 below the server, never
+/// as the server process (which can read the sandbox's leaf key in
+/// process mode and signal uvicorn). The sandbox says so itself in
+/// `/health`: `executor.uid` is the first executor uid, or null with the
+/// reason the code would run as the server (no user in the image, the
+/// server holds no CAP_SETUID/SETGID/KILL because it was started around
+/// the compose entrypoint, no setpriv). The row reads the body the live
+/// probe fetched over the gateway's leaf; a sandbox from before 0.6.10
+/// reports no `executor` at all, which is NOT CHECKED, not a pass.
+pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
+    const ROW: &str = "sandbox executor";
+    let Some(p) = probe else {
+        return warn(ROW, "not probed live (gateway or sandbox container not running)", Some("noo stack status".into()));
+    };
+    let Some(h) = p.health.as_ref().filter(|h| h.is_object()) else {
+        return warn(
+            ROW,
+            format!("the gateway's leaf got no /health body from the sandbox ({}); see the sandbox listener row", p.leaf),
+            Some(SANDBOX_REMEDY_RESTART.into()),
+        );
+    };
+    let Some(ex) = h.get("executor").filter(|e| e.is_object()) else {
+        return warn(
+            ROW,
+            "NOT CHECKED — the sandbox image predates the executor uid (0.6.10): code runs as the server's own uid until the stack is upgraded",
+            Some("noo upgrade --stack".into()),
+        );
+    };
+    let detail = ex["detail"].as_str().unwrap_or("").to_string();
+    let Some(uid) = ex["uid"].as_u64() else {
+        let why = if detail.is_empty() { "the sandbox reports no executor uid".to_string() } else { detail };
+        return fail(
+            ROW,
+            format!("code runs as the SERVER's uid: {why} — in process mode it can read the sandbox's leaf key and signal the server"),
+            SANDBOX_REMEDY_RESTART,
+        );
+    };
+    let iso = &h["isolation"];
+    let mode = iso["mode"].as_str().unwrap_or("unknown");
+    let active = iso["active"].as_str().unwrap_or("unknown");
+    if active == "none" {
+        return fail(
+            ROW,
+            format!(
+                "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({}) — the sandbox refuses calls until it can",
+                iso["detail"].as_str().unwrap_or("no detail")
+            ),
+            "NOO_SANDBOX_APPARMOR=unconfined in .env on a host whose AppArmor blocks bwrap's user namespace (docs/reference/env.md), then: noo stack restart --force sandbox",
+        );
+    }
+    ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
+}
+
 /// Run on the gateway's own interpreter (its runtime image is DHI python,
 /// no shell): dial `sandbox:9000` three ways and print one JSON line. TCP
 /// is opened BEFORE TLS so a down sandbox reads `unreachable`, never as a
-/// refusal that would pass the row.
+/// refusal that would pass the row. A fourth dial, over the leaf again,
+/// reads the whole `/health` body for the executor row (`health`, or
+/// null when nothing parsable came back).
 const SANDBOX_PROBE_PY: &str = r#"import json,os,socket,ssl
+def health():
+    try:
+        raw=socket.create_connection(('sandbox',9000),timeout=5)
+    except OSError:
+        return None
+    try:
+        c=ssl.create_default_context(cafile=os.environ['NOO_TLS_CA'])
+        c.load_cert_chain(os.environ['NOO_TLS_CERT'],os.environ['NOO_TLS_KEY'])
+        s=c.wrap_socket(raw,server_hostname='sandbox')
+        s.sendall(b'GET /health HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n\r\n')
+        b=b''
+        while len(b)<65536:
+            d=s.recv(4096)
+            if not d: break
+            b+=d
+        head,_,body=b.partition(b'\r\n\r\n')
+        if not head.startswith(b'HTTP/'): return None
+        j=json.loads(body.decode('utf-8','replace'))
+        return j if isinstance(j,dict) else None
+    except (ssl.SSLError,OSError,KeyError,ValueError):
+        return None
+    finally:
+        raw.close()
 def dial(tls,cert):
     try:
         raw=socket.create_connection(('sandbox',9000),timeout=5)
@@ -2672,7 +2755,7 @@ def dial(tls,cert):
         return 'refused: %s'%(e,)
     finally:
         raw.close()
-print(json.dumps({'no_cert':dial(True,False),'leaf':dial(True,True),'plain':dial(False,False)}))
+print(json.dumps({'no_cert':dial(True,False),'leaf':dial(True,True),'plain':dial(False,False),'health':health()}))
 "#;
 
 fn sandbox_live_probe() -> Option<SandboxProbe> {
@@ -4905,7 +4988,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // its uvicorn with a required client certificate, and the gateway
         // container proves it live — no cert and plaintext refused, its own
         // leaf accepted.
-        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_live_probe().as_ref()));
+        let sandbox_probe = sandbox_live_probe();
+        checks.push(sandbox_listener_check(compose.as_deref(), sandbox_probe.as_ref()));
+        // The sandbox executor (i161): the health body that probe read over
+        // the gateway's leaf says which uid model-written code runs as.
+        checks.push(sandbox_executor_check(sandbox_probe.as_ref()));
         // The voice doors (mTLS doors phase 2): only when the overlay is
         // composed; then the same static + live three-way proof per door.
         let voice_on = addon_on("voice");
@@ -7209,7 +7296,59 @@ mod tests {
     const SANDBOX_COMPOSE_OK: &str = "services:\n  sandbox:\n    entrypoint: []\n    command: &sandbox-command\n      - python\n      - -m\n      - uvicorn\n      - noomesh.sandbox.app:app\n      - --port\n      - \"9000\"\n      - --ssl-certfile\n      - /tls/services/sandbox/service.crt\n      - --ssl-keyfile\n      - /tls/services/sandbox/service.key\n      - --ssl-ca-certs\n      - /tls/ca.crt\n      - --ssl-cert-reqs\n      - \"2\"\n    expose:\n      - \"9000\"\n  sandbox-extra:\n    command: *sandbox-command\n  postgres:\n    ports:\n      - \"5432:5432\"\n";
 
     fn sandbox_probe(no_cert: &str, leaf: &str, plain: &str) -> SandboxProbe {
-        SandboxProbe { no_cert: no_cert.into(), leaf: leaf.into(), plain: plain.into() }
+        SandboxProbe { no_cert: no_cert.into(), leaf: leaf.into(), plain: plain.into(), health: None }
+    }
+
+    fn sandbox_health(executor: Value, isolation: Value) -> SandboxProbe {
+        let mut p = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        p.health = Some(serde_json::json!({"status": "healthy", "executor": executor, "isolation": isolation}));
+        p
+    }
+
+    /// The executor row: OK only when the sandbox reports an executor uid
+    /// and its isolation is active. A null uid is a FAIL that quotes the
+    /// sandbox's reason; a body with no `executor` is an older image, NOT
+    /// CHECKED; no body or no probe is a WARN that points at the listener
+    /// row — never a pass by absence.
+    #[test]
+    fn the_sandbox_executor_row_reads_the_uid_the_sandbox_reports() {
+        let bwrap = serde_json::json!({"mode": "bwrap", "active": "bwrap", "detail": "bwrap 0.9.0"});
+        let good = sandbox_health(serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}), bwrap.clone());
+        let c = sandbox_executor_check(Some(&good));
+        assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
+        assert!(c.detail.contains("uids 65600-65663") && c.detail.contains("uid 65600 first") && c.detail.contains("isolation bwrap"), "{}", c.detail);
+
+        let as_server = sandbox_health(
+            serde_json::json!({"uid": null, "slots": 0, "detail": "the server holds no CAP_SETUID/CAP_SETGID/CAP_KILL (start it through the compose entrypoint): code runs as the server's uid"}),
+            bwrap.clone(),
+        );
+        let c = sandbox_executor_check(Some(&as_server));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("SERVER's uid") && c.detail.contains("compose entrypoint"), "{}", c.detail);
+        assert_eq!(c.remedy.as_deref(), Some(SANDBOX_REMEDY_RESTART));
+
+        let unusable = sandbox_health(
+            serde_json::json!({"uid": 65600, "slots": 64, "detail": "sandbox-exec (uids 65600-65663)"}),
+            serde_json::json!({"mode": "bwrap", "active": "none", "detail": "bwrap: setting up uid map: Permission denied"}),
+        );
+        let c = sandbox_executor_check(Some(&unusable));
+        assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
+        assert!(c.detail.contains("cannot run") && c.detail.contains("uid map"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("NOO_SANDBOX_APPARMOR"), "{:?}", c.remedy);
+
+        // an older sandbox image: a health body with no executor at all
+        let mut old = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
+        old.health = Some(serde_json::json!({"status": "healthy", "isolation": bwrap}));
+        let c = sandbox_executor_check(Some(&old));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.starts_with("NOT CHECKED") && c.detail.contains("0.6.10"), "{}", c.detail);
+
+        // no body (the leaf dial was refused): a WARN naming the listener row
+        let none = sandbox_probe("refused: x", "refused: [SSL: CERTIFICATE_VERIFY_FAILED]", "refused: y");
+        let c = sandbox_executor_check(Some(&none));
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("sandbox listener row") && c.detail.contains("CERTIFICATE_VERIFY_FAILED"), "{}", c.detail);
+        assert_eq!(sandbox_executor_check(None).verdict, Verdict::Warn);
     }
 
     /// The sandbox row: OK only when compose requires a client certificate
@@ -7268,6 +7407,12 @@ mod tests {
         assert_eq!(c.verdict, Verdict::Ok, "{}", c.detail);
         let parsed: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b"}"#).unwrap();
         assert_eq!(parsed, sandbox_probe("refused: a", "answered HTTP/1.1 200 OK", "refused: b"));
+        // the probe's fourth field: the health body, or null, and absent from an older probe
+        let with: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "answered HTTP/1.1 200 OK", "plain": "refused: b", "health": {"executor": {"uid": 65600}}}"#).unwrap();
+        assert_eq!(with.health.as_ref().unwrap()["executor"]["uid"], 65600);
+        let null: SandboxProbe = serde_json::from_str(r#"{"no_cert": "refused: a", "leaf": "refused: c", "plain": "refused: b", "health": null}"#).unwrap();
+        assert_eq!(null.health, None);
+        assert!(SANDBOX_PROBE_PY.contains("'health':health()") && SANDBOX_PROBE_PY.contains("GET /health"));
         assert!(SANDBOX_PROBE_PY.contains("('sandbox',9000)") && SANDBOX_PROBE_PY.contains("NOO_TLS_CERT"));
         assert!(!SANDBOX_PROBE_PY.contains("CERT_NONE") && !SANDBOX_PROBE_PY.contains("check_hostname"));
     }
