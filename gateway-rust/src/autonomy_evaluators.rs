@@ -388,7 +388,7 @@ fn availability_backend(config: &serde_json::Value) -> String {
 ///
 /// ARMED (`enabled_action: true`): start `config.backend` (default ollama) on
 /// the first node-agent that is not inside a start-failure cooldown, through
-/// the same `start_backend_core` path `noo cluster up` drives — cooldown map,
+/// the same `start_backend_core` path the /backends/start route drives — cooldown map,
 /// controller image/parser forwarding and node-agent auth included. The
 /// cooldown check is what keeps a flapping node from being hammered once a
 /// minute by a loop that never gets bored.
@@ -1629,7 +1629,7 @@ pub async fn eval_backend_idle_scaledown(
                         )
                         .detail(format!(
                             "under {IDLE_LOAD_CEILING} load; restart it with \
-                             `noo cluster up {backend} <model> --node {node_id}`; disarm with \
+                             `noo cluster place {node_id} {backend} <model>`; disarm with \
                              `enabled_action: false` on the backend_idle_scaledown location"
                         ))
                         .investigate("noo autonomy audit"),
