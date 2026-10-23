@@ -100,6 +100,9 @@ const (
 	VolumeManifestName = "at-rest.json"
 	// VolumeMarginBytes is the free space kept beyond the volume on the data root.
 	VolumeMarginBytes = uint64(5) << 30
+	// VolumeMinTestMiB is the floor of the hidden --size-mib (the swtpm CI
+	// lane needs a small file; LUKS2's own header is 16 MiB).
+	VolumeMinTestMiB = 32
 
 	volTempKeySlot   = "0"
 	volTmpfsMagic    = 0x01021994
@@ -277,6 +280,10 @@ func parseCreateVolumeArgs(args []string, stderr io.Writer) (VolumeOptions, erro
 	fset.SetOutput(stderr)
 	dataRoot := fset.String("data-root", "", "the data root; the volume is <data-root>/state.luks2, mounted at <data-root>/state")
 	size := fset.Int("size", 0, "the volume size in GiB (fully allocated)")
+	// Hidden from the operator's help except as "(testing)": the swtpm CI
+	// lane (tests/ci/at-rest-tpm.sh) makes a 64 MiB volume. Every other
+	// check is the same.
+	sizeMiB := fset.Int("size-mib", 0, "testing only: the volume size in MiB")
 	u := fset.String("user", "", "the operator account that owns the mounted state")
 	pcrs := fset.String("pcrs", "auto", "PCR policy: 7, none, or auto (7 iff Secure Boot is on)")
 	ageKey := fset.String("age-key", "", "escrow this age key file at <state>/keys/age.txt (copied; the source is kept)")
@@ -284,6 +291,8 @@ func parseCreateVolumeArgs(args []string, stderr io.Writer) (VolumeOptions, erro
 	deferKey := fset.Bool("defer-recovery-key", false, "enroll no recovery key now (TPM-only until `noo security at-rest recovery-key`)")
 	var subdirs subdirList
 	fset.Var(&subdirs, "subdir", "a state subdirectory to create: name or name=uid:gid (repeatable)")
+	// -h prints the operator's usage, not every flag (--size-mib is testing only).
+	fset.Usage = func() { volUsage(stderr) }
 	if err := fset.Parse(args); err != nil {
 		return VolumeOptions{}, err
 	}
@@ -291,7 +300,7 @@ func parseCreateVolumeArgs(args []string, stderr io.Writer) (VolumeOptions, erro
 		return VolumeOptions{}, fmt.Errorf("create-volume: unexpected argument %q", fset.Arg(0))
 	}
 	return VolumeOptions{
-		DataRoot: *dataRoot, SizeGiB: *size, User: *u, PCRs: *pcrs,
+		DataRoot: *dataRoot, SizeGiB: *size, SizeMiB: *sizeMiB, User: *u, PCRs: *pcrs,
 		AgeKey: *ageKey, PKIFrom: *pkiFrom, DeferRecoveryKey: *deferKey, Subdirs: subdirs,
 	}, nil
 }
@@ -306,6 +315,9 @@ func volUsage(w io.Writer) {
         TPM), mount it at <dir>/state, write crypttab/fstab and a docker
         drop-in, and print ONE JSON line on stdout carrying the recovery key.
         Run by 'noo security at-rest create-volume' and by 'noo onboard'.
+
+        --size-mib <n>  (testing) a small volume in MiB instead of --size,
+                        at least 32; for the CI lane, never for a real install.
 `)
 }
 
@@ -313,6 +325,7 @@ func volUsage(w io.Writer) {
 type VolumeOptions struct {
 	DataRoot         string
 	SizeGiB          int
+	SizeMiB          int // testing only; exclusive with SizeGiB
 	User             string
 	PCRs             string // "auto" (or ""), "7", "none"
 	AgeKey           string
@@ -330,6 +343,7 @@ type VolumeResult struct {
 	Mountpoint  string `json:"volume_mountpoint"`
 	Mapper      string `json:"volume_mapper"`
 	SizeGiB     int    `json:"volume_size_gib"`
+	SizeMiB     uint64 `json:"volume_size_mib"`
 	PCRs        string `json:"volume_pcrs"`
 	PCRNote     string `json:"pcr_note"`
 	PKIDir      string `json:"pki_dir,omitempty"`
@@ -740,6 +754,24 @@ func volCopyTree(src, dst string) error {
 	})
 }
 
+// volSizeBytes: exactly one of --size (GiB, at least 1) or the testing-only
+// --size-mib (at least VolumeMinTestMiB).
+func volSizeBytes(o VolumeOptions) (uint64, error) {
+	switch {
+	case o.SizeGiB != 0 && o.SizeMiB != 0:
+		return 0, errors.New("--size and --size-mib are exclusive")
+	case o.SizeMiB != 0:
+		if o.SizeMiB < VolumeMinTestMiB {
+			return 0, fmt.Errorf("--size-mib must be at least %d", VolumeMinTestMiB)
+		}
+		return uint64(o.SizeMiB) << 20, nil
+	case o.SizeGiB >= 1:
+		return uint64(o.SizeGiB) << 30, nil
+	default:
+		return 0, errors.New("--size must be a whole number of GiB, at least 1")
+	}
+}
+
 // volStep prints one progress line on stderr (never a secret).
 func volStep(w io.Writer, format string, a ...any) {
 	fmt.Fprintf(w, "noo-hostd at-rest: "+format+"\n", a...)
@@ -770,8 +802,9 @@ func CreateVolume(cfg VolumeConfig, o VolumeOptions, stdout, stderr io.Writer) (
 	if st, err := os.Stat(o.DataRoot); err != nil || !st.IsDir() {
 		return fmt.Errorf("--data-root %s is not an existing directory", o.DataRoot)
 	}
-	if o.SizeGiB < 1 {
-		return errors.New("--size must be a whole number of GiB, at least 1")
+	size, err := volSizeBytes(o)
+	if err != nil {
+		return err
 	}
 	subdirs, err := volParseSubdirs(o.Subdirs)
 	if err != nil {
@@ -823,14 +856,13 @@ func CreateVolume(cfg VolumeConfig, o VolumeOptions, stdout, stderr io.Writer) (
 	if _, err := os.Lstat(cfg.DropInPath()); err == nil {
 		return fmt.Errorf("%s already exists", cfg.DropInPath())
 	}
-	size := uint64(o.SizeGiB) << 30
 	free, err := cfg.FreeBytes(o.DataRoot)
 	if err != nil {
 		return fmt.Errorf("cannot read the free space under %s: %w", o.DataRoot, err)
 	}
 	if free < size+VolumeMarginBytes {
-		return fmt.Errorf("not enough space under %s: %d GiB free, the volume needs %d GiB plus a %d GiB margin",
-			o.DataRoot, free>>30, o.SizeGiB, VolumeMarginBytes>>30)
+		return fmt.Errorf("not enough space under %s: %d MiB free, the volume needs %d MiB plus a %d GiB margin",
+			o.DataRoot, free>>20, size>>20, VolumeMarginBytes>>30)
 	}
 	if !cfg.IsTmpfs(cfg.RunDir) {
 		return fmt.Errorf("%s is not tmpfs — the temporary key must never touch a disk", cfg.RunDir)
@@ -899,7 +931,7 @@ func CreateVolume(cfg VolumeConfig, o VolumeOptions, stdout, stderr io.Writer) (
 	}
 
 	// ── 3. the backing file ────────────────────────────────────────────
-	volStep(stderr, "allocating %s (%d GiB, fully allocated)", file, o.SizeGiB)
+	volStep(stderr, "allocating %s (%d MiB, fully allocated)", file, size>>20)
 	if err := volRun(nil, nil, cfg.Fallocate, "-l", strconv.FormatUint(size, 10), file); err != nil {
 		_ = os.Remove(file)
 		return err
@@ -1094,7 +1126,8 @@ func CreateVolume(cfg VolumeConfig, o VolumeOptions, stdout, stderr io.Writer) (
 	if err := volMergeManifest(cfg, map[string]any{
 		"version":                      1,
 		"volume_file":                  file,
-		"volume_size_gib":              o.SizeGiB,
+		"volume_size_gib":              int(size >> 30),
+		"volume_size_mib":              size >> 20,
 		"volume_mapper":                VolumeMapperName,
 		"volume_mountpoint":            mnt,
 		"volume_mount_unit":            VolumeMountUnit(mnt),
@@ -1124,7 +1157,7 @@ func CreateVolume(cfg VolumeConfig, o VolumeOptions, stdout, stderr io.Writer) (
 
 	res := VolumeResult{
 		OK: true, RecoveryKey: recovery, Deferred: o.DeferRecoveryKey,
-		File: file, Mountpoint: mnt, Mapper: mapper, SizeGiB: o.SizeGiB,
+		File: file, Mountpoint: mnt, Mapper: mapper, SizeGiB: int(size >> 30), SizeMiB: size >> 20,
 		PCRs: pcrs, PCRNote: note, AgeEscrow: escrow, PKIDir: pkiDir,
 	}
 	b, err := json.Marshal(res)
