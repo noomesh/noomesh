@@ -875,6 +875,14 @@ fn run_fleet_stages(g: &Globals, stack: bool, nodes: bool, seats: bool, tag_over
         ui::close_failed(&format!("upgrade stopped at the {failed_stage} stage — fix the cause above, then resume"), Some(&resume));
         eprintln!("{}", ui::note("stages are idempotent — the CLI stays current, the stack re-pulls on the moved pin, nodes restage"));
     }
+    // i10a: a hint, never an action. A controller whose state is not on an
+    // encrypted volume is told how to move it (or to record the opt-out);
+    // `upgrade` itself never migrates.
+    if rc == 0 && stack && !g.json {
+        if let Some(h) = crate::commands::at_rest_migrate::upgrade_hint() {
+            println!("{}", ui::note(&h));
+        }
+    }
     Ok(rc)
 }
 

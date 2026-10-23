@@ -243,7 +243,7 @@ func (c VolumeConfig) DropInPath() string { return filepath.Join(c.UnitDir, Volu
 // IsAtRestVolumeVerb reports whether `noo-hostd at-rest <verb>` is one this
 // file serves. With PR-B's RunAtRest in the same binary, main dispatches on it.
 func IsAtRestVolumeVerb(args []string) bool {
-	return len(args) > 0 && args[0] == "create-volume"
+	return len(args) > 0 && (args[0] == "create-volume" || IsAtRestMigrateVerb(args))
 }
 
 // RunAtRestVolume dispatches `noo-hostd at-rest create-volume …`.
@@ -258,6 +258,9 @@ func RunAtRestVolume(args []string, stdout, stderr io.Writer) error {
 	if !IsAtRestVolumeVerb(args) {
 		volUsage(stderr)
 		return fmt.Errorf("at-rest: unknown verb %q", args[0])
+	}
+	if IsAtRestMigrateVerb(args) { // copy, wipe: atrest_migrate_linux.go (i10a PR-D)
+		return RunAtRestMigrate(args, stdout, stderr)
 	}
 	cfg := VolumeConfigFromEnv()
 	for _, o := range cfg.Overrides {

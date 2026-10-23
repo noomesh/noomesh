@@ -796,7 +796,7 @@ services:
       # Image tars exported by `noo cluster sync-images` (prop 22 step 2) —
       # same one-directory/three-views contract as models above.
       - ${IMAGES_DIR:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}/images}:/artifacts/images:ro
-      - claude-config:/root/.claude
+      - ${NOO_CLAUDE_CONFIG_VOLUME:-claude-config}:/root/.claude
       # PKI: a certificate-only view, never the PKI root.
       # This container runs as 65532 — the uid loki, prometheus,
       # alertmanager, node-exporter and llamacpp read their keys as — so a
@@ -2380,7 +2380,7 @@ services:
     ports:
       - "127.0.0.1:${NOO_PORT_ALERTMANAGER:-9093}:9093"  # localhost only — internal to the cluster network
     volumes:
-      - alertmanager-data:/alertmanager
+      - ${NOO_ALERTMANAGER_VOLUME:-alertmanager-data}:/alertmanager
       - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - ./monitoring/alertmanager/web-config.yml:/etc/alertmanager/web-config.yml:ro
       - ./monitoring/alertmanager/amtool-http.yml:/etc/alertmanager/amtool-http.yml:ro
@@ -3101,8 +3101,9 @@ volumes:
       device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/prometheus
   alertmanager-data:
     # Plain named volume (not a NOO_DATA_ROOT bind). i10a: it joins the state
-    # set only via the PR-D migrate step (a compose volume cannot switch type
-    # on an env var, and re-pointing it would orphan existing silences).
+    # set only via `noo security at-rest migrate`, which switches the service
+    # to alertmanager-data-state below (re-pointing this one would orphan
+    # existing silences).
     # Alertmanager state (silences / notification log) is non-critical and
     # this avoids requiring
     # the host dir to pre-exist before `up`.
@@ -3132,8 +3133,27 @@ volumes:
       o: bind
       device: ${NOO_PG_DATA:-${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/postgres}
   claude-config:
-  # i10a: claude-config is a plain named volume on /; like alertmanager-data
-  # it is moved into the state set by the PR-D migrate step, not here.
+  # i10a: claude-config and alertmanager-data are plain named volumes on /.
+  # They stay exactly that for every install that never migrates: re-pointing
+  # them would orphan existing data (a compose volume cannot switch type on
+  # an env var). `noo security at-rest migrate` copies their data into the
+  # state set and then points NOO_CLAUDE_CONFIG_VOLUME / NOO_ALERTMANAGER_VOLUME
+  # at the two bind volumes below; rollback restores .env and the old named
+  # volumes (never touched) are in use again. Compose creates only the
+  # volumes a started service uses, and a bind volume's device is checked
+  # when it is mounted, so the unused pair costs a non-migrated install nothing.
+  claude-config-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/claude-config
+  alertmanager-data-state:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOO_STATE_ROOT:-${NOO_DATA_ROOT:?NOO_DATA_ROOT is not set - run noo onboard --only storage or set it in .env}}/alertmanager-data
 
 # ── Tier-1 secrets, delivered as FILES (2026-09-29; RAM files 2026-10-19) ──
 # Every entry is sourced from a FILE the launcher writes on every start to a
