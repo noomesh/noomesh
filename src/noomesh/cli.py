@@ -277,8 +277,8 @@ except ImportError:
     pass
 
 # The onboarding wizard is native Rust only (noo-cli/src/onboard/ — plain,
-# --tui and --web frontends). The Python wizard was archived to
-# git history (before 2026-08-08) on 2026-08-06; registering a second, divergent
+# --tui and --web frontends). The Python wizard was removed on
+# 2026-08-06 (history in git log before that); registering a second, divergent
 # implementation here is how a critical fix (tailscale cert SANs) once
 # shipped as dead code. `noo onboard` never reaches this CLI.
 
@@ -311,7 +311,7 @@ def tui() -> None:
     """[dim]Retired[/] — use the web dashboard or `noo chat`."""
     # Retired 2026-08-16: the web dashboard (noo-mesh-ui-web, served by the
     # gateway) is the interactive UI and `noo chat` covers the terminal. The
-    # module is archived at git history (before 2026-08-08). The Rust front door
+    # module is gone (history in git log before 2026-08-08). The Rust front door
     # answers `noo tui` natively with the same pointer; this stub is only for
     # direct `noo-py tui` invocations.
     print_error("`noo tui` is retired — use the web dashboard or `noo chat`.")
