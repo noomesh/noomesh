@@ -41,7 +41,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::envfile::repo_root;
-use crate::http::{get_json, post_json_try};
+// Several of these are used only by the `include!`d
+// cluster_provision_subprocess.rs below, which shares this module's scope.
+use std::path::PathBuf;
+use std::process::Command;
+use super::cluster::{fetch_node, online_nodes, spawn_inherited};
+use crate::http::{get_json, get_json_opt, post_json_try};
 use crate::output::{fail, ExitCode};
 use crate::{Globals, Unhandled};
 use crate::ui::{self, Col, Glyph};
