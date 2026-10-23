@@ -122,6 +122,9 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "tailnet", "policy"], "[--merge | --push] [--yes]", "Compare live tailnet policy to declared; --merge adds what is missing, --push replaces"),
     (&["security", "audit", "verify"], "", "Verify audit hashes, the chain, and its head against the exported head (operator-only)"),
     (&["security", "audit", "list"], "[--since <30m|24h|7d|time>] [--event <type>] [--actor <name>] [-n <limit>] [--cursor <c>]", "List security audit rows, newest first, with source address (operator-only)"),
+    (&["security", "at-rest", "status"], "[--json]", "Show TPM facts, how to enable one, and your recorded at-rest encryption decision"),
+    (&["security", "at-rest", "opt-out"], "", "Record that you accept unencrypted data at rest (audited; needs your own login)"),
+    (&["security", "at-rest", "opt-in"], "", "Withdraw the at-rest opt-out (audited; needs your own login)"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
     (&["security", "posture", "set"], "<key> <value>", "Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply"),
     (&["security", "posture", "apply-profile"], "<profile> [--include-bridges]", "Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply"),
@@ -472,5 +475,21 @@ mod tests {
         assert!(syntax.contains("[--vendor-kinds <kind,kind>|none]"), "{syntax}");
         let (syntax, _) = super::lookup(&["cluster", "vendor", "install"]).expect("vendor install");
         assert_eq!(syntax, "<node> <kind>...");
+    }
+
+    /// `noo security at-rest status|opt-out|opt-in` (i10a) are on the help
+    /// lines, with `--json` on status and the "your own login" requirement on
+    /// the two writers.
+    #[test]
+    fn at_rest_verbs_are_on_the_help_lines() {
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "status"]).expect("at-rest status");
+        assert_eq!(syntax, "[--json]");
+        assert!(desc.contains("TPM"), "{desc}");
+        for verb in ["opt-out", "opt-in"] {
+            let (syntax, desc) = super::lookup(&["security", "at-rest", verb]).unwrap_or_else(|| panic!("at-rest {verb}"));
+            assert_eq!(syntax, "");
+            assert!(desc.contains("own login"), "{verb}: {desc}");
+        }
+        assert_eq!(super::subcommands_under(&["security", "at-rest"]), vec!["status", "opt-out", "opt-in"]);
     }
 }

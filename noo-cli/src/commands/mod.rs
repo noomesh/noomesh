@@ -8,6 +8,7 @@
 //! stderr, exit code per the contract in output.rs.
 
 pub mod addons;
+pub mod at_rest;
 pub mod channel;
 pub mod addon_enable;
 pub mod addon_pins;
@@ -431,4 +432,5 @@ pub use addon_pins::{addons_launch_pins, addons_upgrade, addons_verify};
 pub use addons::{addons_disable, addons_enable, addons_list, addons_set, addons_show, addons_trust_key, addons_untrust_key};
 pub use backups::{backups_setup, backups_status};
 pub use kiosk::*;
+pub use at_rest::{security_at_rest_opt_in, security_at_rest_opt_out, security_at_rest_status};
 pub use kiosk_seat::{kiosk_enroll, kiosk_seat_sync, kiosk_seat_token};

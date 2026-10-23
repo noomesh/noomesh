@@ -241,6 +241,8 @@ pub enum Glyph {
     Bullet,
     Section,
     Hint,
+    /// A risk the person has accepted on the record: not a pass, not a warning.
+    Accepted,
 }
 
 impl Glyph {
@@ -254,6 +256,7 @@ impl Glyph {
                 Glyph::Bullet => "•",
                 Glyph::Section => "◆",
                 Glyph::Hint => "▸",
+                Glyph::Accepted => "◇",
             }
         } else {
             match self {
@@ -264,6 +267,7 @@ impl Glyph {
                 Glyph::Bullet => "-",
                 Glyph::Section => "#",
                 Glyph::Hint => ">",
+                Glyph::Accepted => "~",
             }
         }
     }
@@ -278,6 +282,7 @@ pub fn glyph(g: Glyph) -> String {
         Glyph::Warn => warn(s),
         Glyph::Step | Glyph::Section | Glyph::Hint => brand(s),
         Glyph::Bullet => s.to_string(),
+        Glyph::Accepted => warn(s),
     }
 }
 
@@ -1508,6 +1513,7 @@ mod tests {
         assert_eq!(glyph(Glyph::Warn), "!");
         assert_eq!(glyph(Glyph::Section), "#");
         assert_eq!(glyph(Glyph::Hint), ">");
+        assert_eq!(glyph(Glyph::Accepted), "~");
         assert_eq!(dash(), "-");
         assert_eq!(wordmark("0.0.0"), "");
     }

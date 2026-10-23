@@ -58,6 +58,10 @@ pub enum Verdict {
     /// A readiness miss explained by a container that started moments ago
     /// Neither OK nor FAIL, and not a pass.
     Starting,
+    /// A gap the person has accepted on the record (i10a: the at-rest
+    /// opt-out). Still states plainly what is exposed; never fails the verb,
+    /// and is not a pass.
+    Accepted,
 }
 
 pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Check {
@@ -65,6 +69,9 @@ pub(crate) fn ok(name: &'static str, detail: impl Into<String>) -> Check {
 }
 fn warn(name: &'static str, detail: impl Into<String>, remedy: Option<String>) -> Check {
     Check { name, verdict: Verdict::Warn, detail: detail.into(), remedy }
+}
+fn accepted(name: &'static str, detail: impl Into<String>) -> Check {
+    Check { name, verdict: Verdict::Accepted, detail: detail.into(), remedy: None }
 }
 fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Check {
     Check { name, verdict: Verdict::Fail, detail: detail.into(), remedy: Some(remedy.into()) }
@@ -3322,7 +3329,39 @@ fn at_rest_remedy(name: &str) -> &'static str {
 /// files), so what protects them at rest is the host's disk encryption — a
 /// fact each row reports and never assumes. A WARN, never a failure: it is
 /// the operator's control, and the row exists so the gap is visible.
+#[cfg(test)]
 pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exists: bool, mount: Option<(&str, &str)>, encrypted: Option<bool>) -> Check {
+    at_rest_check_with(name, what, data_dir, exists, mount, encrypted, None, None)
+}
+
+/// The text of an accepted at-rest row: who and when from the recorded
+/// decision, the operator's own sentence about the data, and what is exposed.
+pub(crate) fn accepted_detail(d: &crate::commands::at_rest::AcceptedState, what: &str) -> String {
+    format!(
+        "accepted risk (opted out by {} at {}): {} In the clear: {what}",
+        d.updated_by.as_deref().unwrap_or("an unknown person"),
+        d.updated_at.as_deref().unwrap_or("an unknown time"),
+        crate::commands::at_rest::DISCLOSURE_OFF,
+    )
+}
+
+/// [`at_rest_check`] with the person's recorded decision and this machine's
+/// TPM facts (i10a). Only a row that IS in the clear changes:
+///
+/// - the person opted out: ACCEPTED, still saying the data is unencrypted;
+/// - no usable TPM here: WARN with the reason, and how to get one as the remedy;
+/// - a TPM and no decision: WARN, the #351 remedy (what the setup will do).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn at_rest_check_with(
+    name: &'static str,
+    what: &str,
+    data_dir: &str,
+    exists: bool,
+    mount: Option<(&str, &str)>,
+    encrypted: Option<bool>,
+    decision: Option<&crate::commands::at_rest::AcceptedState>,
+    tpm: Option<&crate::commands::at_rest::TpmFacts>,
+) -> Check {
     if !exists {
         return warn(name, format!("{data_dir} does not exist on this host — nothing to judge (not created yet, or the path is set elsewhere)"), None);
     }
@@ -3335,11 +3374,27 @@ pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exis
     };
     match encrypted {
         Some(true) => ok(name, format!("{data_dir} is on {dev} ({mp}), a dm-crypt device")),
-        Some(false) => warn(
-            name,
-            format!("{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}"),
-            Some(at_rest_remedy(name).into()),
-        ),
+        Some(false) => {
+            if let Some(d) = decision.filter(|d| d.accepted) {
+                return accepted(name, accepted_detail(d, what));
+            }
+            match tpm.filter(|t| !t.tpm2_usable()) {
+                Some(t) => warn(
+                    name,
+                    format!(
+                        "{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}; \
+                         it cannot be encrypted here: {}",
+                        t.unavailable_reason()
+                    ),
+                    Some(crate::commands::at_rest::enable_hint(t)),
+                ),
+                None => warn(
+                    name,
+                    format!("{data_dir} is on {dev} ({mp}), not a dm-crypt device — in the clear on that disk: {what}"),
+                    Some(at_rest_remedy(name).into()),
+                ),
+            }
+        }
         None => warn(
             name,
             format!("{data_dir} is on {dev} ({mp}); could not determine whether that device is encrypted (lsblk unavailable, or not a block device)"),
@@ -3354,6 +3409,159 @@ pub(crate) fn at_rest_check(name: &'static str, what: &str, data_dir: &str, exis
 #[cfg(test)]
 pub(crate) fn loki_at_rest_check(data_dir: &str, mount: Option<(&str, &str)>, encrypted: Option<bool>) -> Check {
     at_rest_check("loki at rest", LOKI_WHAT, data_dir, true, mount, encrypted)
+}
+
+/// The "at-rest tpm" row (i10a): what this machine can do about encrypting
+/// at rest. Facts only; nothing here seals anything yet. WARN, never FAIL: a
+/// machine with no TPM is a fact to know, not a broken invariant.
+pub(crate) fn at_rest_tpm_check(f: &crate::commands::at_rest::TpmFacts) -> Check {
+    const NAME: &str = "at-rest tpm";
+    if !f.tpm2_usable() {
+        return warn(NAME, f.tpm_phrase(), Some(crate::commands::at_rest::enable_hint(f)));
+    }
+    let missing = f.missing_tools();
+    if !missing.is_empty() {
+        return warn(
+            NAME,
+            format!("TPM 2.0 present; missing tools: {}", missing.join(", ")),
+            Some("install cryptsetup and a systemd that ships systemd-creds and systemd-cryptenroll (v250 or newer)".into()),
+        );
+    }
+    let sb = match f.secure_boot {
+        Some(true) => "Secure Boot on (PCR 7 can be bound)".to_string(),
+        _ => format!(
+            "Secure Boot {}: sealed keys would be TPM-only, and a live-USB boot is not blocked",
+            f.secure_boot_phrase()
+        ),
+    };
+    ok(NAME, format!("TPM 2.0 present; {sb}"))
+}
+
+/// The "at-rest swap" row (i10a): secrets in memory can be paged out to a
+/// swap device, so swap must be absent, zram, or on a dm-crypt device.
+/// `proc_swaps` is `/proc/swaps`; `encrypted(filename, type)` answers whether
+/// the device behind a swap entry is dm-crypt (`None` = could not tell).
+pub(crate) fn at_rest_swap_check(proc_swaps: &str, encrypted: &dyn Fn(&str, &str) -> Option<bool>) -> Check {
+    const NAME: &str = "at-rest swap";
+    let mut clear: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut total = 0;
+    for line in proc_swaps.lines().skip(1) {
+        let mut it = line.split_whitespace();
+        let (Some(file), Some(ty)) = (it.next(), it.next()) else { continue };
+        total += 1;
+        if file.starts_with("/dev/zram") {
+            continue;
+        }
+        match encrypted(file, ty) {
+            Some(true) => {}
+            Some(false) => clear.push(file.to_string()),
+            None => unknown.push(file.to_string()),
+        }
+    }
+    if total == 0 {
+        return ok(NAME, "no swap is active");
+    }
+    if !clear.is_empty() {
+        return warn(
+            NAME,
+            format!("swap on {} is not encrypted: secrets in memory can be written to disk", clear.join(", ")),
+            Some("use zram or encrypted swap (a cryptswap entry in /etc/crypttab with a random key), or turn swap off: sudo swapoff -a and remove it from /etc/fstab".into()),
+        );
+    }
+    if !unknown.is_empty() {
+        return warn(
+            NAME,
+            format!("could not determine whether swap on {} is encrypted (lsblk unavailable, or not a block device)", unknown.join(", ")),
+            None,
+        );
+    }
+    ok(NAME, format!("{total} swap device(s), each zram or on dm-crypt"))
+}
+
+/// One place that holds sensitive state outside the nine at-rest rows.
+pub(crate) struct OutsideItem {
+    pub what: String,
+    pub path: String,
+    pub encrypted: Option<bool>,
+}
+
+/// The "at-rest outside the set" row (i10a): the `claude-config` and
+/// `alertmanager-data` docker volumes, docker's json logs and journald are
+/// not among the nine rows but can hold sensitive text. WARN while any sits
+/// on a device that is not dm-crypt; ACCEPTED when the person opted out.
+pub(crate) fn at_rest_outside_check(
+    items: &[OutsideItem],
+    decision: Option<&crate::commands::at_rest::AcceptedState>,
+) -> Check {
+    const NAME: &str = "at-rest outside the set";
+    let exposed: Vec<String> = items
+        .iter()
+        .filter(|i| i.encrypted != Some(true))
+        .map(|i| match i.encrypted {
+            Some(false) => format!("{} ({})", i.what, i.path),
+            _ => format!("{} ({}, encryption unknown)", i.what, i.path),
+        })
+        .collect();
+    if exposed.is_empty() {
+        return ok(
+            NAME,
+            if items.is_empty() {
+                "none of claude-config, alertmanager-data, docker logs or journald found on disk here".to_string()
+            } else {
+                format!("{} location(s) outside the nine rows, all on dm-crypt", items.len())
+            },
+        );
+    }
+    let list = exposed.join(", ");
+    if let Some(d) = decision.filter(|d| d.accepted) {
+        return accepted(NAME, accepted_detail(d, &list));
+    }
+    warn(
+        NAME,
+        format!("in the clear, outside the nine rows above: {list}"),
+        Some("planned (i10a): claude-config and alertmanager-data ride the encrypted state volume; docker logs and journald need their own handling. Until then anyone holding the drive can read them.".into()),
+    )
+}
+
+/// Lines of `docker <args>` stdout; empty when docker is absent or refuses.
+fn docker_lines(args: &[&str]) -> Vec<String> {
+    Command::new("docker")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// The sensitive locations outside the nine rows that exist on this host,
+/// with whether the device under each is dm-crypt.
+fn outside_items(proc_mounts: &str) -> Vec<OutsideItem> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let volumes = docker_lines(&["volume", "ls", "--format", "{{.Name}}"]);
+    for suffix in ["claude-config", "alertmanager-data"] {
+        if let Some(v) = volumes.iter().find(|n| n.ends_with(suffix)) {
+            if let Some(mp) = docker_lines(&["volume", "inspect", "--format", "{{.Mountpoint}}", v]).into_iter().next() {
+                found.push((format!("docker volume {suffix}"), mp));
+            }
+        }
+    }
+    if let Some(root) = docker_lines(&["info", "--format", "{{.DockerRootDir}}"]).into_iter().next() {
+        // The directory is root-only: its path decides the device, no read is needed.
+        found.push(("docker json logs".to_string(), format!("{}/containers", root.trim_end_matches('/'))));
+    }
+    // Persistent journald only; /run/log/journal is RAM.
+    if std::path::Path::new("/var/log/journal").is_dir() {
+        found.push(("journald".to_string(), "/var/log/journal".to_string()));
+    }
+    found
+        .into_iter()
+        .map(|(what, path)| {
+            let encrypted = mount_of(proc_mounts, &path).and_then(|(dev, _)| block_device_encrypted(&dev));
+            OutsideItem { what, path, encrypted }
+        })
+        .collect()
 }
 
 /// The "monitoring web config" row (shipped tree, no probe). Every service
@@ -4730,6 +4938,8 @@ fn render(title: &str, checks: &[Check]) -> bool {
             Verdict::Warn => (Glyph::Warn, ui::warn(&c.detail)),
             Verdict::Fail => (Glyph::Err, ui::err(&c.detail)),
             Verdict::Starting => (Glyph::Warn, ui::warn(&c.detail)),
+            // Plain text: the row states what is exposed and must be read, not dimmed.
+            Verdict::Accepted => (Glyph::Accepted, c.detail.clone()),
         };
         vec![ui::glyph_cell(glyph), c.name.to_string(), detail]
     }).collect();
@@ -5062,12 +5272,36 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         // clear (`at_rest_dirs`): the process env is what the launcher
         // resolved from `.env`, so the paths are the ones compose bound.
         let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        // What this machine can do (TPM) and what the person decided
+        // (`noo security at-rest opt-out`): the rows below read both.
+        let tpm_facts = crate::commands::at_rest::TpmFacts::probe(std::path::Path::new("/"));
+        let at_rest_decision = get_json_opt(g, "/api/settings/flags", true, 10)
+            .as_ref()
+            .and_then(crate::commands::at_rest::state_from_flags);
+        checks.push(at_rest_tpm_check(&tpm_facts));
         for row in at_rest_dirs(&|k| std::env::var(k).ok()) {
             let exists = std::path::Path::new(&row.path).is_dir();
             let mount = if exists { mount_of(&mounts, &row.path) } else { None };
             let encrypted = mount.as_ref().and_then(|(dev, _)| block_device_encrypted(dev));
-            checks.push(at_rest_check(row.name, row.what, &row.path, exists, mount.as_ref().map(|(d, m)| (d.as_str(), m.as_str())), encrypted));
+            checks.push(at_rest_check_with(
+                row.name,
+                row.what,
+                &row.path,
+                exists,
+                mount.as_ref().map(|(d, m)| (d.as_str(), m.as_str())),
+                encrypted,
+                at_rest_decision.as_ref(),
+                Some(&tpm_facts),
+            ));
         }
+        checks.push(at_rest_swap_check(
+            &std::fs::read_to_string("/proc/swaps").unwrap_or_default(),
+            &|file, ty| {
+                let dev = if ty == "file" { mount_of(&mounts, file).map(|(d, _)| d)? } else { file.to_string() };
+                block_device_encrypted(&dev)
+            },
+        ));
+        checks.push(at_rest_outside_check(&outside_items(&mounts), at_rest_decision.as_ref()));
         checks.push(monitoring_web_config_check(compose.as_deref()));
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).
@@ -5195,7 +5429,7 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 fn checks_json(checks: &[Check]) -> Value {
     Value::Array(checks.iter().map(|c| serde_json::json!({
         "name": c.name,
-        "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting" },
+        "verdict": match c.verdict { Verdict::Ok => "ok", Verdict::Warn => "warn", Verdict::Fail => "fail", Verdict::Starting => "starting", Verdict::Accepted => "accepted" },
         "detail": c.detail,
         "remedy": c.remedy,
     })).collect())
@@ -7961,6 +8195,183 @@ mod tests {
         assert_eq!(unknown.verdict, Verdict::Warn);
         assert!(unknown.detail.contains("could not determine"), "{}", unknown.detail);
         assert_eq!(loki_at_rest_check("/x/loki", None, Some(true)).verdict, Verdict::Warn, "no mount = no claim");
+    }
+
+    // ── i10a PR-A: the recorded at-rest decision, TPM facts, the new rows ──
+
+    fn tpm_facts(tpm: crate::commands::at_rest::TpmState) -> crate::commands::at_rest::TpmFacts {
+        use crate::commands::at_rest::{Cpu, Tools, TpmFacts};
+        TpmFacts {
+            tpm,
+            secure_boot: Some(true),
+            container: false,
+            wsl: false,
+            vm: None,
+            sys_vendor: String::new(),
+            product_name: String::new(),
+            cpu: Cpu::Intel,
+            tools: Tools { systemd_creds: true, systemd_cryptenroll: true, cryptsetup: true },
+        }
+    }
+
+    fn opted_out() -> crate::commands::at_rest::AcceptedState {
+        crate::commands::at_rest::AcceptedState {
+            accepted: true,
+            source: "db".into(),
+            updated_by: Some("alice".into()),
+            updated_at: Some("2026-10-23T12:00:00Z".into()),
+        }
+    }
+
+    /// A row in the clear, with a recorded opt-out, is ACCEPTED: it names who
+    /// and when, still says the data is unencrypted and what is exposed, has
+    /// no remedy to nag with, and does not fail the verb.
+    #[test]
+    fn an_opt_out_turns_a_plaintext_row_into_accepted_risk_that_still_says_unencrypted() {
+        use crate::commands::at_rest::TpmState;
+        let m = Some(("/dev/nvme0n1p1", "/media/alice/data"));
+        let d = opted_out();
+        for tpm in [None, Some(tpm_facts(TpmState::Tpm2)), Some(tpm_facts(TpmState::Absent))] {
+            let c = at_rest_check_with("postgres at rest", "the database files", "/media/alice/data/noo/postgres", true, m, Some(false), Some(&d), tpm.as_ref());
+            assert_eq!(c.verdict, Verdict::Accepted, "{}", c.detail);
+            assert_eq!(
+                c.detail,
+                "accepted risk (opted out by alice at 2026-10-23T12:00:00Z): Your data is stored unencrypted on disk. Anyone with the drive can read it. In the clear: the database files"
+            );
+            assert!(c.detail.contains("unencrypted"));
+            assert_eq!(c.remedy, None);
+        }
+        // not accepted (flag false): the plain warning, not Accepted
+        let mut off = opted_out();
+        off.accepted = false;
+        let c = at_rest_check_with("postgres at rest", "x", "/d", true, m, Some(false), Some(&off), None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        // an encrypted row is OK whatever was decided
+        let c = at_rest_check_with("postgres at rest", "x", "/d", true, m, Some(true), Some(&d), None);
+        assert_eq!(c.verdict, Verdict::Ok);
+    }
+
+    /// No usable TPM and no decision: WARN naming the reason, with the way
+    /// to enable one as the remedy. A TPM and no decision: the #351 remedy.
+    #[test]
+    fn a_plaintext_row_without_a_tpm_says_why_and_how_and_with_one_keeps_the_plan_remedy() {
+        use crate::commands::at_rest::TpmState;
+        let m = Some(("/dev/vda1", "/"));
+        let none = tpm_facts(TpmState::Absent);
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&none));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("no TPM was found"), "{}", c.detail);
+        assert!(c.detail.contains("in the clear"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("Intel PTT"), "{:?}", c.remedy);
+        let mut wsl = tpm_facts(TpmState::Absent);
+        wsl.wsl = true;
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&wsl));
+        assert!(c.remedy.as_deref().unwrap().contains("run on the host"), "{:?}", c.remedy);
+
+        let with = tpm_facts(TpmState::Tpm2);
+        let c = at_rest_check_with("age key at rest", "the SOPS age key", "/h/.config/sops/age", true, m, Some(false), None, Some(&with));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert_eq!(c.remedy.as_deref(), Some(AT_REST_REMEDY_KEYS), "a TPM and no decision keeps the #351 remedy");
+        let c = at_rest_check_with("loki at rest", LOKI_WHAT, "/x/loki", true, m, Some(false), None, Some(&with));
+        assert_eq!(c.remedy.as_deref(), Some(AT_REST_REMEDY_DATA));
+    }
+
+    /// Accepted is its own verdict: "accepted" in --json, a distinct glyph,
+    /// never counted as a failure, and carries no remedy to print.
+    #[test]
+    fn accepted_is_its_own_verdict_in_json_and_never_fails_the_exit_code() {
+        let rows = vec![
+            accepted("postgres at rest", "accepted risk (opted out by alice at t): x"),
+            ok("a", "fine"),
+            warn("w", "careful", Some("do it".into())),
+        ];
+        let j = checks_json(&rows);
+        assert_eq!(j[0]["verdict"], "accepted");
+        assert_eq!(j[1]["verdict"], "ok");
+        assert_eq!(j[2]["verdict"], "warn");
+        // the same predicate the exit code uses
+        assert!(rows.iter().all(|c| c.verdict != Verdict::Fail && c.verdict != Verdict::Starting));
+        assert!(remedies_to_print("controller", &rows).iter().all(|(_, names)| !names.contains(&"postgres at rest")));
+        assert_ne!(Verdict::Accepted, Verdict::Ok, "accepted is not a pass");
+        assert_ne!(Verdict::Accepted, Verdict::Warn);
+        assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Warn));
+        assert_ne!(ui::glyph(Glyph::Accepted), ui::glyph(Glyph::Ok));
+        // render() is the one place a row becomes a glyph; it must not drop Accepted into a failure.
+        assert!(render("controller", &rows));
+    }
+
+    #[test]
+    fn the_at_rest_tpm_row_reports_the_machine_and_never_fails() {
+        use crate::commands::at_rest::TpmState;
+        let c = at_rest_tpm_check(&tpm_facts(TpmState::Tpm2));
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("TPM 2.0 present") && c.detail.contains("PCR 7 can be bound"), "{}", c.detail);
+        let mut nosb = tpm_facts(TpmState::Tpm2);
+        nosb.secure_boot = Some(false);
+        let c = at_rest_tpm_check(&nosb);
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("live-USB boot is not blocked"), "{}", c.detail);
+        let mut notools = tpm_facts(TpmState::Tpm2);
+        notools.tools.cryptsetup = false;
+        let c = at_rest_tpm_check(&notools);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("cryptsetup"), "{}", c.detail);
+        let c = at_rest_tpm_check(&tpm_facts(TpmState::Tpm12));
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("1.2"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn the_at_rest_swap_row_wants_no_swap_zram_or_dm_crypt() {
+        let header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        let enc = |file: &str, _ty: &str| match file {
+            "/dev/mapper/cryptswap" => Some(true),
+            "/swapfile" | "/dev/sda2" => Some(false),
+            _ => None,
+        };
+        assert_eq!(at_rest_swap_check(header, &enc).verdict, Verdict::Ok, "no swap");
+        assert_eq!(at_rest_swap_check("", &enc).verdict, Verdict::Ok, "unreadable /proc/swaps is no swap");
+        let zram = format!("{header}/dev/zram0 partition 8388604 0 100\n");
+        assert_eq!(at_rest_swap_check(&zram, &enc).verdict, Verdict::Ok);
+        let crypt = format!("{header}/dev/mapper/cryptswap partition 8388604 0 -2\n");
+        assert_eq!(at_rest_swap_check(&crypt, &enc).verdict, Verdict::Ok);
+        let plain = format!("{header}/swapfile file 8388604 0 -2\n/dev/zram0 partition 1 0 100\n");
+        let c = at_rest_swap_check(&plain, &enc);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("/swapfile") && c.detail.contains("written to disk"), "{}", c.detail);
+        assert!(c.remedy.is_some());
+        let unknown = format!("{header}/dev/sdz9 partition 1 0 -2\n");
+        let c = at_rest_swap_check(&unknown, &enc);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("could not determine"), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_outside_the_set_row_lists_what_is_in_the_clear_and_honours_the_opt_out() {
+        let item = |what: &str, path: &str, enc| OutsideItem { what: what.into(), path: path.into(), encrypted: enc };
+        assert_eq!(at_rest_outside_check(&[], None).verdict, Verdict::Ok);
+        let enc = [item("journald", "/var/log/journal", Some(true))];
+        assert_eq!(at_rest_outside_check(&enc, None).verdict, Verdict::Ok);
+        let items = [
+            item("docker volume claude-config", "/var/lib/docker/volumes/x_claude-config/_data", Some(false)),
+            item("docker volume alertmanager-data", "/var/lib/docker/volumes/x_alertmanager-data/_data", Some(false)),
+            item("docker json logs", "/var/lib/docker/containers", Some(false)),
+            item("journald", "/var/log/journal", Some(true)),
+        ];
+        let c = at_rest_outside_check(&items, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        for want in ["claude-config", "alertmanager-data", "docker json logs"] {
+            assert!(c.detail.contains(want), "{want} missing: {}", c.detail);
+        }
+        assert!(!c.detail.contains("journald"), "an encrypted location was listed as exposed: {}", c.detail);
+        let c = at_rest_outside_check(&items, Some(&opted_out()));
+        assert_eq!(c.verdict, Verdict::Accepted);
+        assert!(c.detail.contains("alice") && c.detail.contains("unencrypted") && c.detail.contains("claude-config"), "{}", c.detail);
+        let unknown = [item("journald", "/var/log/journal", None)];
+        let c = at_rest_outside_check(&unknown, None);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("encryption unknown"), "{}", c.detail);
     }
 
     /// The at-rest table resolves each directory the way the stack does:

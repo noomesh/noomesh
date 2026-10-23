@@ -66,6 +66,14 @@ _FLAGS = [
     FlagSpec("kiosk.graph_labels", "kiosk", False,
              "Kiosk graph labels",
              "Show entity names and relation types on the kiosk display's knowledge graph."),
+    # ── At rest (Rust-read) ──
+    # The recorded opt-out of encrypting this controller's data at rest
+    # (i10a). DB-only and person-only in the gateway; read by `noo cluster
+    # verify` through the flags list. Listed for parity.
+    FlagSpec("at_rest.unencrypted_accepted", "security", False,
+             "Unencrypted data at rest accepted",
+             "Record that you accept this controller's data being stored unencrypted on disk "
+             "(anyone with the drive can read it)."),
 ]
 
 # Registered STRING settings (config-graduation phase 2). Same DB-override
