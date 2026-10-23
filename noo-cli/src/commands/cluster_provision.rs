@@ -12,15 +12,15 @@
 //!
 //! | command                  | kind                         | what it does                                  |
 //! |--------------------------|------------------------------|-----------------------------------------------|
-//! | `auto-place`             | native (HTTP + local)        | plans model placements across online nodes    |
-//! | `place-model`            | native (HTTP + local)        | picks the node a given model fits best        |
-//! | `reconcile-models`       | native (HTTP + local)        | plans placement only for the gap to the set   |
-//! | `mint-join-key`          | native (Tailscale API)       | mints a tagged auth key + the join one-liner  |
 //! | `set-primary`            | native (Tailscale API)       | device rename for the controller cutover; the |
 //! |                          |                              | Postgres promotion is run ON the target, and  |
 //! |                          |                              | `--promoted` confirms it                      |
 //! | `bootstrap-token ...`    | native (HTTP + local)        | create / list / revoke node bootstrap tokens  |
 //! | `invite`                 | native (Tailscale)           | tailnet-native node invitation                |
+//!
+//! `auto-place`, `place-model`, `reconcile-models` and `mint-join-key` are
+//! retired stubs (i195 decision 1, A2/A3): they answer with the successor
+//! (`place`/`prefer`/`class`, `invite`) instead of "unknown command".
 //!
 //! The image and agent orchestrators (`sync-images`, `upgrade-agents`,
 //! `ship-model`, `clean`) live in `cluster_provision_subprocess.rs` and
@@ -36,15 +36,12 @@
 //!     stub-testing without hitting the real control plane).
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::cluster::{fetch_node, online_nodes, spawn_inherited};
 use crate::envfile::repo_root;
-use crate::http::{get_json, get_json_opt, post_json_try};
+use crate::http::{get_json, post_json_try};
 use crate::output::{fail, ExitCode};
 use crate::{Globals, Unhandled};
 use crate::ui::{self, Col, Glyph};
@@ -75,25 +72,6 @@ fn base64_std(input: &[u8]) -> String {
         out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
     }
     out
-}
-
-/// Python `%g`-style number formatting (drop trailing zeros: 8.0→"8", 6.5→"6.5").
-fn fmt_g(v: f64) -> String {
-    if v == v.trunc() && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        let s = format!("{v:.6}");
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        s.to_string()
-    }
-}
-
-/// round to 1 decimal, matching Python `round(x, 1)` — correct round-half-to-
-/// even on the EXACT double (Rust's `{:.1}` formatting is correctly rounded,
-/// same as CPython's round; the naive `(x*10).round()/10` diverges on ties
-/// like 1.65 → Python 1.6 vs 1.7).
-fn round1(x: f64) -> f64 {
-    format!("{x:.1}").parse().unwrap_or(x)
 }
 
 /// A default-verification ureq agent (real TLS via platform-verifier) for
@@ -253,398 +231,45 @@ pub(crate) fn read_hidden(prompt: &str) -> Option<String> {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Model placement (auto-place / place-model) — full local port of
-//  cluster/model_placement.py + the catalog VRAM estimator it depends on.
+//  Retired placement planners (place-model / auto-place / reconcile-models)
 // ════════════════════════════════════════════════════════════════════
 
-/// (id, params_b, quant) rows lifted verbatim from `FALLBACK_MODELS` — the
-/// ONLY catalog data `estimate_model_vram` reads (it never hits the live HF
-/// API). quant "" == Python None.
-const FALLBACK_MODELS: &[(&str, f64, &str)] = &[
-    // vllm
-    ("google/gemma-4-12B-it", 12.0, "none"),
-    ("google/gemma-4-E4B-it", 4.0, "none"),
-    ("google/gemma-4-E2B-it", 2.0, "none"),
-    ("microsoft/harrier-oss-v1-0.6b", 0.6, "none"),
-    ("microsoft/Phi-4", 14.0, "none"),
-    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4", 30.0, "NVFP4"),
-    ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 120.0, "NVFP4"),
-    ("nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4", 30.0, "NVFP4"),
-    ("nvidia/nemotron-3.5-asr-streaming-0.6b", 0.6, "none"),
-    ("meta-llama/Llama-3.1-8B-Instruct", 8.0, "none"),
-    // llamacpp
-    ("unsloth/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4", 30.0, "GGUF"),
-    ("unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF", 120.0, "GGUF"),
-    ("bartowski/microsoft_Phi-4-GGUF", 14.0, "GGUF"),
-    ("harrier-oss-v1-0.6b", 0.6, "GGUF"),
-    ("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF", 8.0, "GGUF"),
-    ("bartowski/Llama-3.2-3B-Instruct-GGUF", 3.0, "GGUF"),
-    ("bartowski/Llama-3.2-1B-Instruct-GGUF", 1.0, "GGUF"),
-    // ollama
-    ("phi4", 14.0, "GGUF"),
-    ("llama3.1:8b", 8.0, "GGUF"),
-    ("llama3.2:3b", 3.0, "GGUF"),
-    ("llama3.2:1b", 1.0, "GGUF"),
-    ("nemotron-mini", 4.0, "GGUF"),
-    // airllm
-    ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", 561.0, ""),
-    ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", 124.0, ""),
-    ("meta-llama/Llama-3.1-405B-Instruct", 405.0, ""),
-    // embedding
-    ("nvidia/NV-EmbedCode-7b-v1", 7.0, "none"),
-    ("nvidia/NV-Embed-v2", 7.0, "none"),
-    ("nvidia/llama-3.2-nv-embedqa-1b-v2", 1.0, "none"),
-];
-
-/// `ModelCatalog.estimate_vram_gb` — VRAM (GB) from param count + quant.
-fn estimate_vram_gb(params_b: Option<f64>, quant: &str) -> Option<f64> {
-    let p = params_b?;
-    let q = quant.to_uppercase();
-    Some(match q.as_str() {
-        "AWQ" | "GPTQ" | "INT4" => round1(p * 0.6 + 1.5),
-        "GGUF" => round1(p * 0.65 + 1.0),
-        "INT8" | "W8A8" => round1(p * 1.1 + 1.5),
-        _ => round1(p * 2.1 + 2.0), // fp16 / no quant (incl. NVFP4, none)
-    })
-}
-
-/// `_extract_param_count` — first `(\d+(\.\d+)?)\s*[Bb]` in the id.
-fn extract_param_count(model_id: &str) -> Option<f64> {
-    let bytes: Vec<char> = model_id.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == '.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            let num: String = bytes[start..i].iter().collect();
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len() && (bytes[j] == 'b' || bytes[j] == 'B') {
-                if let Ok(v) = num.parse::<f64>() {
-                    return Some(v);
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-/// `estimate_model_vram` — catalog lookup by id, else parse-from-id (fp16).
-fn estimate_model_vram(model_id: &str) -> f64 {
-    for (id, params, quant) in FALLBACK_MODELS {
-        if *id == model_id {
-            return estimate_vram_gb(Some(*params), quant).unwrap_or(0.0);
-        }
-    }
-    match extract_param_count(model_id) {
-        Some(p) => estimate_vram_gb(Some(p), "").unwrap_or(0.0),
-        None => 0.0,
-    }
-}
-
-/// `model_is_cached` — tolerant match of an id against a node's inventory.
-fn model_is_cached(model_id: &str, available: Option<&Vec<Value>>) -> bool {
-    let Some(list) = available else { return false };
-    if list.is_empty() {
-        return false;
-    }
-    let mid = model_id.to_lowercase();
-    let base = mid.rsplit('/').next().unwrap_or(&mid).to_string();
-    for a in list {
-        let Some(al) = a.as_str() else { continue };
-        let al = al.to_lowercase();
-        if al == mid
-            || al == base
-            || al.starts_with(&format!("{base}:"))
-            || al.contains(&base)
-            || base.contains(&al)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// `match_node_for_model` — pick the best node (or an error dict).
-fn match_node_for_model(model_id: &str, nodes: &[Value]) -> Value {
-    let vram_need = estimate_model_vram(model_id);
-    let mut candidates: Vec<(f64, usize, bool, bool)> = Vec::new();
-    for (idx, n) in nodes.iter().enumerate() {
-        if !n["online"].as_bool().unwrap_or(true) {
-            continue;
-        }
-        let vram = n["vram_gb"].as_f64().unwrap_or(0.0);
-        let ram = n["ram_gb"].as_f64().unwrap_or(0.0);
-        let on_gpu = vram >= vram_need && vram > 0.0;
-        let on_cpu = !on_gpu && ram >= (vram_need * 1.3).max(2.0);
-        if !(on_gpu || on_cpu) {
-            continue;
-        }
-        let cached = model_is_cached(model_id, n["available_models"].as_array());
-        let load = n["current_load"].as_f64().unwrap_or(0.0);
-        let waste = if on_gpu { vram - vram_need } else { 0.0 };
-        let score = (if cached { 0.0 } else { 100.0 })
-            + (if on_gpu { 0.0 } else { 40.0 })
-            + waste
-            + load * 10.0;
-        candidates.push((score, idx, cached, on_gpu));
-    }
-    if candidates.is_empty() {
-        return json!({
-            "error": format!("no online node can run {model_id} (needs ~{}GB)", fmt_g(vram_need)),
-            "vram_need": vram_need,
-        });
-    }
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let (_, idx, cached, on_gpu) = candidates[0];
-    let node = &nodes[idx];
-    let nid = node["node_id"].as_str().or_else(|| node["id"].as_str()).unwrap_or("");
-    json!({
-        "node_id": nid,
-        "needs_pull": !cached,
-        "on_gpu": on_gpu,
-        "vram_need": vram_need,
-        "reason": format!(
-            "{} · {} · ~{}GB",
-            if cached { "cached" } else { "pull required" },
-            if on_gpu { "GPU" } else { "CPU" },
-            fmt_g(vram_need)
+/// `noo cluster place-model` — RETIRED (i195 decision 1, A2). A second planner
+/// beside the desired state; `place` declares the placement and the fit check
+/// refuses a model that does not fit. (Kept in dispatch for one release so an
+/// old runbook gets this answer instead of "unknown command".)
+pub fn cluster_place_model(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "place-model is retired: it planned a node by a local VRAM estimate and then started the backend imperatively, outside the desired state",
+        Some(
+            "declare a placement:   noo cluster place <node> <backend> <model>\n  \
+             prefer a model:        noo cluster prefer <purpose> <model>\n  \
+             share a load:          noo cluster class set <class> <node>/<backend>=<model> --pool"
         ),
-    })
+    );
 }
 
-/// `plan_model_placements` — spread a set of models across the fleet.
-fn plan_model_placements(models: &[String], nodes: &[Value]) -> Vec<Value> {
-    let mut working: Vec<Value> = nodes.to_vec();
-    let mut plan: Vec<Value> = Vec::new();
-    for model in models {
-        let d = match_node_for_model(model, &working);
-        let mut entry = serde_json::Map::new();
-        entry.insert("model".into(), json!(model));
-        if let Some(obj) = d.as_object() {
-            for (k, v) in obj {
-                entry.insert(k.clone(), v.clone());
-            }
-        }
-        plan.push(Value::Object(entry));
-        if let Some(nid) = d["node_id"].as_str() {
-            for n in working.iter_mut() {
-                let this = n["node_id"].as_str().or_else(|| n["id"].as_str()).unwrap_or("");
-                if this == nid {
-                    let cur = n["current_load"].as_f64().unwrap_or(0.0) + 0.25;
-                    n["current_load"] = json!(cur);
-                    let mut am: Vec<Value> = n["available_models"].as_array().cloned().unwrap_or_default();
-                    if !am.iter().any(|x| x.as_str() == Some(model.as_str())) {
-                        am.push(json!(model));
-                    }
-                    n["available_models"] = json!(am);
-                    break;
-                }
-            }
-        }
-    }
-    plan
-}
-
-/// Ask the gateway whether `model` fits `node` beside what it already runs -
-/// the same memory-fit verdict `noo cluster fit` prints and a desired-state
-/// place enforces. `Some(message)` is a reason NOT to place (does not fit);
-/// `None` means go ahead (fits, tight, unknown, or the gateway is too old to
-/// answer: the placement route itself still enforces).
-fn fit_refusal(g: &Globals, node: &str, backend: &str, model: &str) -> Option<String> {
-    let resp = post_json_try(
-        g,
-        &format!("/api/cluster/nodes/{}/fit", super::urlencode(node)),
-        &json!({"with": {"backend": backend, "model": model}}),
-        true,
-        10,
-    )
-    .ok()?;
-    if resp["verdict"] == "does_not_fit" {
-        let total = resp["total_gb"].as_f64().unwrap_or(0.0);
-        let budget = resp["budget"]["total_gb"].as_f64().unwrap_or(0.0);
-        return Some(format!(
-            "{model} does not fit {node}: {total:.1} GB needed against a {budget:.1} GB budget (see `noo cluster fit {node} --with {backend} {model}`)"
-        ));
-    }
-    None
-}
-
-/// `noo cluster place-model MODEL [--backend/-b B] [--apply]` — pick the best
-/// node for MODEL by capability × cache and (with --apply) start it there.
-pub fn cluster_place_model(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    const USAGE: &str = "usage: noo cluster place-model <model> [-b|--backend <backend>] [--node <node>] [--apply]\n  \
-        picks the best node by capability and cache (or --node pins one); --apply starts it there.\n  \
-        desired-state placement the agent keeps running: noo cluster place <node> <backend> <model>";
-    let mut model: Option<String> = None;
-    let mut backend = "ollama".to_string();
-    let mut apply = false;
-    let mut pin: Option<String> = None;
-    let mut iter = args.iter();
-    // Native-only verb: bad arguments print THIS usage. Returning Unhandled
-    // fell through to "not available in this standalone binary … set
-    // NOO_PY_CLI", which read as a broken install (host8, 2026-09-03).
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-b" | "--backend" => backend = iter.next().cloned().unwrap_or_else(|| fail(g.json, ExitCode::Usage, "usage", "--backend needs a value", Some(USAGE))),
-            "--node" | "-n" => pin = iter.next().cloned(),
-            "--apply" => apply = true,
-            "--help" | "-h" => { println!("{USAGE}"); return Ok(0); }
-            t if t.starts_with('-') => fail(g.json, ExitCode::Usage, "usage", &format!("unknown flag {t}"), Some(USAGE)),
-            t if model.is_none() => model = Some(t.to_string()),
-            t => fail(g.json, ExitCode::Usage, "usage",
-                &format!("unexpected argument {t} — the model is the only positional (a node is --node, a backend is --backend)"), Some(USAGE)),
-        }
-    }
-    let Some(model) = model else { fail(g.json, ExitCode::Usage, "usage", "a model is required", Some(USAGE)) };
-
-    let body = get_json(g, "/api/cluster/nodes", true, 10);
-    let empty = Vec::new();
-    let nodes = body["nodes"].as_array().unwrap_or(&empty);
-    let decision = match pin {
-        Some(n) => {
-            let known = nodes.iter().any(|nd| nd.get("id").and_then(|v| v.as_str())
-                .or_else(|| nd.get("node_id").and_then(|v| v.as_str()))
-                .or_else(|| nd.get("name").and_then(|v| v.as_str()))
-                .is_some_and(|id| id.eq_ignore_ascii_case(&n)));
-            if !known {
-                fail(g.json, ExitCode::Generic, "unknown_node", &format!("no node named {n} — see noo cluster status"), None);
-            }
-            json!({"node_id": n, "reason": "pinned with --node", "needs_pull": false})
-        }
-        None => match_node_for_model(&model, nodes),
-    };
-
-    if g.json {
-        println!("{}", decision);
-        return Ok(0);
-    }
-    if let Some(err) = decision["error"].as_str() {
-        fail(g.json, ExitCode::Generic, "no_candidate", err, None);
-    }
-    let node = decision["node_id"].as_str().unwrap_or("?");
-    ui::step(&format!("place {model} on {node}  ({})", decision["reason"].as_str().unwrap_or("")));
-    if decision["needs_pull"].as_bool().unwrap_or(false) {
-        say(&format!("  {}", ui::muted(&format!("needs pull: model not cached on {node}"))));
-    }
-    if !apply {
-        say(&format!("  {}", ui::warn("dry-run — pass --apply to place it")));
-        return Ok(0);
-    }
-    if let Some(why) = fit_refusal(g, node, &backend, &model) {
-        fail(g.json, ExitCode::Generic, "does_not_fit", &why, None);
-    }
-    say(&format!("  placing via: {}", ui::cmd(&format!("noo cluster up {backend} {model} --node {node}"))));
-    match post_json_try(
-        g,
-        "/api/cluster/backends/start",
-        &json!({"backend": backend, "model": model, "node_id": node}),
-        true,
-        60,
-    ) {
-        Ok(_) => {
-            ui::done(&format!("placement requested on {node}"));
-            Ok(0)
-        }
-        Err(e) => {
-            fail(g.json, ExitCode::Generic, "placement_failed", &format!("placement failed: {e}"), None);
-        }
-    }
-}
-
-/// `noo cluster auto-place MODELS… [--backend/-b B] [--apply]` — spread a SET
-/// of models across the fleet (dry-run unless --apply).
-pub fn cluster_auto_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut models: Vec<String> = Vec::new();
-    let mut backend = "ollama".to_string();
-    let mut apply = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-b" | "--backend" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            "--apply" => apply = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => models.push(t.to_string()),
-        }
-    }
-    if models.is_empty() {
-        return Err(Unhandled);
-    }
-
-    let body = get_json(g, "/api/cluster/nodes", true, 10);
-    let empty = Vec::new();
-    let nodes = body["nodes"].as_array().unwrap_or(&empty);
-    let plan = plan_model_placements(&models, nodes);
-
-    if g.json {
-        println!("{}", Value::Array(plan));
-        return Ok(0);
-    }
-
-    let mut ok = true;
-    for p in &plan {
-        if let Some(err) = p["error"].as_str() {
-            ui::failed(&format!("{}: {err}", p["model"].as_str().unwrap_or("?")), None);
-            ok = false;
-            continue;
-        }
-        let pull = if p["needs_pull"].as_bool().unwrap_or(false) { " (pull)" } else { "" };
-        say(&ui::status_line(
-                Glyph::Step,
-                &format!(
-                    "{}  →  {}{pull}  {}",
-                    p["model"].as_str().unwrap_or("?"),
-                    p["node_id"].as_str().unwrap_or("?"),
-                    ui::muted(p["reason"].as_str().unwrap_or(""))
-                ),
-            ));
-    }
-    if !apply {
-        say(&format!("  {}", ui::warn("dry-run — pass --apply to place them")));
-        return Ok(if ok { 0 } else { 1 });
-    }
-    for p in &plan {
-        if p["error"].is_string() {
-            continue;
-        }
-        let model = p["model"].as_str().unwrap_or("");
-        let node = p["node_id"].as_str().unwrap_or("");
-        if let Some(why) = fit_refusal(g, node, &backend, model) {
-            ui::failed(&why, None);
-            ok = false;
-            continue;
-        }
-        match post_json_try(
-            g,
-            "/api/cluster/backends/start",
-            &json!({"backend": backend, "model": model, "node_id": node}),
-            true,
-            60,
-        ) {
-            Ok(_) => ui::done(&format!("{model} → {node}")),
-            Err(e) => {
-                ui::failed(&format!("{model} placement failed: {e}"), None);
-                ok = false;
-            }
-        }
-    }
-    Ok(if ok { 0 } else { 1 })
+/// `noo cluster auto-place` — RETIRED (i195 decision 1, A2); same reason and
+/// successors as `place-model`.
+pub fn cluster_auto_place(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "auto-place is retired: it planned models across the fleet from a local VRAM estimate and started them imperatively, outside the desired state",
+        Some(
+            "declare a placement:   noo cluster place <node> <backend> <model>\n  \
+             prefer a model:        noo cluster prefer <purpose> <model>\n  \
+             share a load:          noo cluster class set <class> <node>/<backend>=<model> --pool"
+        ),
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Tailscale API (mint-join-key / set-primary)
+//  Tailscale API (set-primary / invite / bootstrap tokens)
 // ════════════════════════════════════════════════════════════════════
 
 fn tailscale_base() -> String {
@@ -1189,93 +814,20 @@ mod acl_grant_tests {
     }
 }
 
-/// `noo cluster mint-join-key [--tag T] [--expiry-minutes N] [--reusable]
-/// [--ssh-user U] [--script-url URL]` — mint a pre-authorized tagged Tailscale
-/// auth key and print the bootstrap one-liner.
-pub fn cluster_mint_join_key(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut tag = "tag:worker".to_string();
-    let mut expiry_minutes: i64 = 60;
-    let mut reusable = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "--tag" => tag = iter.next().ok_or(Unhandled)?.clone(),
-            "--expiry-minutes" => {
-                expiry_minutes = iter.next().and_then(|v| v.parse().ok()).ok_or(Unhandled)?
-            }
-            "--reusable" => reusable = true,
-            // --ssh-user / --script-url fed the retired bootstrap-node
-            // composition (#114); refuse loudly instead of silently ignoring.
-            "--ssh-user" | "--script-url" => {
-                fail(g.json, ExitCode::Generic, "retired_flag",
-                     &format!("{tok} belonged to the retired bootstrap-node lane — use `noo cluster invite` or the unified paste"),
-                     None);
-            }
-            _ => return Err(Unhandled),
-        }
-    }
-    let api_key = tailscale_api_key();
-    if api_key.is_empty() {
-        fail(g.json, ExitCode::Generic, "no_api_key", TAILSCALE_KEY_HINT, None);
-    }
-
-    // Mint the key (POST /tailnet/{tailnet}/keys).
-    let payload = json!({
-        "capabilities": {"devices": {"create": {
-            "reusable": reusable,
-            "ephemeral": false,
-            "preauthorized": true,
-            "tags": [tag],
-        }}},
-        "expirySeconds": expiry_minutes * 60,
-        "description": format!("noo-join-{}", tag.replace(':', "-")),
-    });
-    let (status, text) = match ts_request("POST", &format!("/tailnet/{}/keys", tailnet()), &api_key, Some(&payload)) {
-        Ok(v) => v,
-        Err(e) => fail(g.json, ExitCode::Generic, "tailscale_unreachable", &format!("Could not reach the Tailscale API: {e}"), None),
-    };
-    if status != 200 {
-        let hint = if text.to_lowercase().contains("tag") {
-            format!(" (is '{tag}' declared under tagOwners in the tailnet ACL policy?)")
-        } else {
-            String::new()
-        };
-        fail(g.json, ExitCode::Generic, "tailscale_error", &format!("Tailscale API {status}: {}{hint}", &text.chars().take(300).collect::<String>()), None);
-    }
-    let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-    let auth_key = parsed["key"].as_str().unwrap_or("").to_string();
-    if auth_key.is_empty() {
-        fail(g.json, ExitCode::Generic, "no_key", &format!("Tailscale API returned no key: {}", &text.chars().take(200).collect::<String>()), None);
-    }
-
-    // The bootstrap-node.sh one-liner + `add-node by
-    // overlay IP` composition is RETIRED — it pointed at the stale private
-    // mirror (HEAD probe already failed on every standalone install) and
-    // at the pre-token lane the three enrollment lanes replaced. The raw
-    // key mint stays useful (tagged keys have uses beyond enrollment);
-    // enrollment guidance now points at the living lanes.
-    if g.json {
-        println!(
-            "{}",
-            json!({
-                "auth_key": auth_key,
-                "tag": tag,
-                "expiry_minutes": expiry_minutes,
-                "reusable": reusable,
-                "note": "bootstrap-node one-liner retired — enroll with `noo cluster invite` (tailnet) or `noo cluster bootstrap-token create --node <n>`",
-            })
-        );
-        return Ok(0);
-    }
-    ui::done(&format!("join key minted (single-use={}, expires in {expiry_minutes} min, tag={tag})", !reusable));
-    ui::value(&auth_key.to_string());
-    say(&ui::note("this key alone only joins the tailnet — to enroll a node, prefer the full flows"));
-    ui::guide(&[
-        ("noo cluster invite", "tailnet-native lane: no shared secrets, admission by whois + dialback"),
-        ("noo cluster bootstrap-token create --node <n>", "unified one-paste lane (the default): mints a single-use token bound to the node name"),
-    ]);
-    Ok(0)
-
+/// `noo cluster mint-join-key` — RETIRED (i195 decision 1, A3). It minted a bare
+/// tailnet auth key that joined a machine to the tailnet and nothing else;
+/// `invite` mints the key AND prints the enroll line that uses it.
+pub fn cluster_mint_join_key(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "mint-join-key is retired: a bare tailnet key joins the tailnet and enrolls nothing",
+        Some(
+            "mint a key and the enroll line:  noo cluster invite\n  \
+             one-paste lane:                  noo cluster bootstrap-token create --node <name>"
+        ),
+    );
 }
 
 const PRIMARY_ALIAS: &str = "noo-controller";
@@ -1531,122 +1083,20 @@ pub fn cluster_set_primary(g: &Globals, args: &[String]) -> Result<i32, Unhandle
     Ok(0)
 }
 
-// ── reconcile-models (idempotent desired-state convergence) ─────────
-
-/// `_norm_model_name` — loose key: strip org + :tag, drop non-alphanumerics.
-fn norm_model_name(m: &str) -> String {
-    let lower = m.to_lowercase();
-    let base = lower.rsplit('/').next().unwrap_or(&lower);
-    let base = base.split(':').next().unwrap_or(base);
-    base.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
-}
-
-/// `reconcile_models` — plan placement only for desired models NOT already
-/// running anywhere (per each node's `running_backends` map).
-fn reconcile_models(desired: &[String], nodes: &[Value]) -> Vec<Value> {
-    let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for n in nodes {
-        if let Some(map) = n["running_backends"].as_object() {
-            for v in map.values() {
-                if let Some(m) = v.as_str() {
-                    if !m.is_empty() {
-                        running.insert(norm_model_name(m));
-                    }
-                }
-            }
-        }
-    }
-    let to_place: Vec<String> =
-        desired.iter().filter(|m| !running.contains(&norm_model_name(m))).cloned().collect();
-    plan_model_placements(&to_place, nodes)
-}
-
-/// `noo cluster reconcile-models [MODELS…] [--backend/-b B] [--apply]` —
-/// converge the fleet to a desired set (default `NOO_DESIRED_MODELS`),
-/// planning placement only for the gap. Dry-run unless --apply.
-pub fn cluster_reconcile_models(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
-    let mut models: Vec<String> = Vec::new();
-    let mut backend = "ollama".to_string();
-    let mut apply = false;
-    let mut iter = args.iter();
-    while let Some(tok) = iter.next() {
-        match tok.as_str() {
-            "-b" | "--backend" => backend = iter.next().ok_or(Unhandled)?.clone(),
-            "--apply" => apply = true,
-            t if t.starts_with('-') => return Err(Unhandled),
-            t => models.push(t.to_string()),
-        }
-    }
-    let desired: Vec<String> = if !models.is_empty() {
-        models
-    } else {
-        env_value("NOO_DESIRED_MODELS")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-    if desired.is_empty() {
-        fail(
-            g.json,
-            ExitCode::Generic,
-            "no_desired",
-            "no desired models (pass them as args or set NOO_DESIRED_MODELS)",
-            None,
-        );
-    }
-
-    let body = get_json(g, "/api/cluster/nodes", true, 10);
-    let empty = Vec::new();
-    let nodes = body["nodes"].as_array().unwrap_or(&empty);
-    let plan = reconcile_models(&desired, nodes);
-
-    if g.json {
-        println!("{}", json!({"desired": desired, "to_place": plan}));
-        return Ok(0);
-    }
-    if plan.is_empty() {
-        ui::done(&format!("fleet already satisfies the desired set ({} models)", desired.len()));
-        return Ok(0);
-    }
-    say(&ui::emph(&format!("{} model(s) need placing", plan.len())));
-    let mut ok = true;
-    for p in &plan {
-        if let Some(err) = p["error"].as_str() {
-            ui::failed(&format!("{}: {err}", p["model"].as_str().unwrap_or("?")), None);
-            ok = false;
-            continue;
-        }
-        let pull = if p["needs_pull"].as_bool().unwrap_or(false) { " (pull)" } else { "" };
-        say(&ui::status_line(
-                Glyph::Step,
-                &format!(
-                    "{}  →  {}{pull}  {}",
-                    p["model"].as_str().unwrap_or("?"),
-                    p["node_id"].as_str().unwrap_or("?"),
-                    ui::muted(p["reason"].as_str().unwrap_or(""))
-                ),
-            ));
-    }
-    if !apply {
-        say(&format!("  {}", ui::warn("dry-run — pass --apply to converge")));
-        return Ok(if ok { 0 } else { 1 });
-    }
-    for p in &plan {
-        if p["error"].is_string() {
-            continue;
-        }
-        let model = p["model"].as_str().unwrap_or("");
-        let node = p["node_id"].as_str().unwrap_or("");
-        match post_json_try(g, "/api/cluster/backends/start", &json!({"backend": backend, "model": model, "node_id": node}), true, 60) {
-            Ok(_) => ui::done(&format!("{model} → {node}")),
-            Err(e) => {
-                ui::failed(&format!("{model} placement failed: {e}"), None);
-                ok = false;
-            }
-        }
-    }
-    Ok(if ok { 0 } else { 1 })
+/// `noo cluster reconcile-models` — RETIRED (i195 decision 1, A2); same reason and
+/// successors as `place-model`.
+pub fn cluster_reconcile_models(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "reconcile-models is retired: it planned placement for a desired set of models and started them imperatively; the desired state is already what the node-agent converges to",
+        Some(
+            "declare a placement:   noo cluster place <node> <backend> <model>\n  \
+             prefer a model:        noo cluster prefer <purpose> <model>\n  \
+             share a load:          noo cluster class set <class> <node>/<backend>=<model> --pool"
+        ),
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════

@@ -823,7 +823,7 @@ pub fn post_json_operator_try(
     post_posture_try(g, path, body, default_timeout).map_err(PostureError::into_line)
 }
 
-/// Tolerant POST for multi-step orchestration (`cluster scale`): returns
+/// Tolerant POST for multi-step orchestration (`cluster bootstrap-token create`): returns
 /// `Err(detail)` on transport/status/parse failures instead of exiting, so
 /// callers can warn-and-continue per step exactly like the Python CLI's
 /// per-replica try/except. The error string carries the gateway's `detail`

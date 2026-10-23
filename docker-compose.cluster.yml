@@ -1866,7 +1866,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-tei-gpu
     # SUPERSEDED on GPU nodes by the node-agent `embedding` backend
-    # (`noo cluster up embedding <model> --node <node>`). Gated to an
+    # (`noo cluster place <node> embedding <model>`). Gated to an
     # opt-in profile so normal embedding/gpu-tier2 startup can't duplicate
     # the GPU embedder. Use `--profile tei-compose` to run the compose path.
     profiles: ["tei-compose"]
@@ -1970,7 +1970,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:1.6${NOO_IMAGE_DIGEST_TEI:-}
     container_name: ${NOO_CONTAINER_PREFIX:-noo}-reranker
     # SUPERSEDED on GPU nodes by the node-agent `reranker` backend
-    # (`noo cluster up reranker <model> --node <node>`). Gated to opt-in
+    # (`noo cluster place <node> reranker <model>`). Gated to opt-in
     # so normal startup can't duplicate the GPU reranker. The mesh path
     # (gateway -> node-agent /rerank) does not use this service.
     profiles: ["tei-compose"]

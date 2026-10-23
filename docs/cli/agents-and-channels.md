@@ -154,7 +154,6 @@ see [Tool risk tiers](../reference/config.md#tool-risk-tiers).
 ```sh
 noo proactive status
 noo proactive rules
-noo proactive history -n 50
 ```
 
 Rules live in the `proactive.rules` section of `noomesh.yaml` (edit them
@@ -272,7 +271,6 @@ or have the person log in and run `noo security service-key self`
 |---|---|---|
 | `noo proactive status` | — | Show proactive agent state and rule counts |
 | `noo proactive rules` | — | List configured proactive rules |
-| `noo proactive history` | `[-n <limit>]` | Say plainly that no firing history is stored (nothing records proactive firings) |
 
 ### `noo approval` — Exec approval queue
 | Command | Arguments | What it does |

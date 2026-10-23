@@ -1141,7 +1141,7 @@ pub const CORE_REGISTRY: &[SecretSpec] = &[
         class: Class::ProviderIssued,
         gen_bytes: 0,
         consequence: "issued by login.tailscale.com/admin/settings/keys and they EXPIRE \
-                      (typically 90d); `cluster mint-join-key` / `set-primary` start failing \
+                      (typically 90d); `cluster invite` / `set-primary` start failing \
                       once it lapses, which looks like a network fault",
         // Gateway-only since an earlier release: the Python reader
         // (cluster/tailscale.py) is reached only from the `noomesh cluster
@@ -1407,7 +1407,7 @@ impl SecretStore {
 
     /// Plaintext of a stored value, for use as a bearer credential in an
     /// API call made by THIS process. The second and last deliberate escape
-    /// hatch from "no accessor returns a value": `cluster mint-join-key` /
+    /// hatch from "no accessor returns a value": `cluster invite` /
     /// `set-primary` call the Tailscale API from the CLI itself, and
     /// NOO_TAILSCALE_API_KEY lives in the sops store — NOT in `.env`, which
     /// is exactly where the old "add it to .env" hint invited it (the

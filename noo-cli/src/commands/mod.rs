@@ -255,7 +255,7 @@ pub use models::models_refresh;
 pub mod addon_cli;
 
 /// Destructive-operation confirmation, agent-first (shared by `stack clean`,
-/// `cluster down`, `cluster scale`). Semantics:
+/// `cluster down`). Semantics:
 ///   `--yes/-y`      → proceed, no prompt (the agent path).
 ///   `--json`        → NEVER prompt: without --yes emit the JSON error
 ///                     contract on stderr and exit 1.

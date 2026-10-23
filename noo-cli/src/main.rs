@@ -771,6 +771,17 @@ const HIDDEN_NO_USAGE: &[&[&str]] = &[
     &["cluster", "exec"],
     &["cluster", "reconnect"],
     &["cluster", "sync-models"],
+    // Retired in 0.6.12 (i195 decision 1, D2): stubs that name the successor.
+    &["cluster", "up"],
+    &["cluster", "scale"],
+    &["cluster", "place-model"],
+    &["cluster", "auto-place"],
+    &["cluster", "reconcile-models"],
+    &["cluster", "mint-join-key"],
+    &["cluster", "assign"],
+    &["cluster", "add-companion"],
+    &["cluster", "add-monitor"],
+    &["proactive", "history"],
     &["stack", "install-watcher"],
     &["db", "stamp"],
     &["doctor", "backups"],
@@ -2011,7 +2022,12 @@ const SOURCES: &[(&str, &str)] = &[
     #[test]
     fn retired_and_plumbing_cluster_verbs_are_hidden_and_issue_token_is_gone() {
         for w in [&["node", "fetch"][..], &["cluster", "clean-node"], &["cluster", "exec"],
-                  &["cluster", "reconnect"], &["cluster", "sync-models"]] {
+                  &["cluster", "reconnect"], &["cluster", "sync-models"],
+                  &["cluster", "up"], &["cluster", "scale"], &["cluster", "place-model"],
+                  &["cluster", "auto-place"], &["cluster", "reconcile-models"],
+                  &["cluster", "mint-join-key"], &["cluster", "assign"],
+                  &["cluster", "add-companion"], &["cluster", "add-monitor"],
+                  &["proactive", "history"]] {
             assert!(NATIVE.iter().any(|(e, _)| e == &w), "{w:?} must still dispatch");
             assert!(is_hidden_native(w), "{w:?} must be out of customer help");
         }
