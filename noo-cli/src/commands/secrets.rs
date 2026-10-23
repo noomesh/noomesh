@@ -1502,13 +1502,17 @@ impl std::fmt::Display for StoreLoadError {
                  scripts/noo-secrets-sops-init.sh, or put its directory on PATH"
             ),
             StoreLoadError::SopsFailedToRun { detail } => write!(f, "could not run sops: {detail}"),
+            // The path is `crate::age_key::path()`: SOPS_AGE_KEY_FILE, the
+            // TPM-sealed runtime key (i10a), or ~/.config/sops/age/keys.txt.
             StoreLoadError::DecryptFailed { path, exit, age_key_present: false } => write!(
                 f,
-                "sops could not decrypt {} (exit {exit}): no age key at \
-                 ~/.config/sops/age/keys.txt and $SOPS_AGE_KEY_FILE names none — restore the key \
+                "sops could not decrypt {} (exit {exit}): no age key at {} — restore the key \
                  from its backup (docs/security/secrets.md, 'Back up and restore the age key') \
-                 or point SOPS_AGE_KEY_FILE at it",
-                path.display()
+                 or point SOPS_AGE_KEY_FILE at it; if it is sealed to this machine's TPM: \
+                 systemctl status {}",
+                path.display(),
+                crate::age_key::path().display(),
+                crate::age_key::UNSEAL_UNIT
             ),
             StoreLoadError::DecryptFailed { path, exit, age_key_present: true } => write!(
                 f,
@@ -1611,12 +1615,8 @@ fn age_key_present() -> bool {
     if std::env::var_os("SOPS_AGE_KEY").is_some() {
         return true;
     }
-    if let Some(p) = std::env::var_os("SOPS_AGE_KEY_FILE") {
-        return Path::new(&p).is_file();
-    }
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".config/sops/age/keys.txt").is_file())
-        .unwrap_or(false)
+    // SOPS_AGE_KEY_FILE, the sealed runtime key, or the default (i10a).
+    crate::age_key::path().is_file()
 }
 
 /// Decrypt the store to dotenv TEXT, in memory. The one decrypt path for

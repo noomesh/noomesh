@@ -5300,6 +5300,15 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         let at_rest_decision = at_rest_flags.as_ref().and_then(crate::commands::at_rest::state_from_flags);
         checks.push(at_rest_tpm_check(&tpm_facts));
         for row in at_rest_dirs(&|k| std::env::var(k).ok()) {
+            // A key sealed to the TPM (i10a PR-B) is judged by what sealed
+            // it, where the live copy is, and what plaintext remains — not
+            // by the disk under its directory.
+            if row.name == "age key at rest" {
+                if let Some(c) = crate::commands::at_rest_seal::sealed_age_key_row(&mounts) {
+                    checks.push(c);
+                    continue;
+                }
+            }
             let exists = std::path::Path::new(&row.path).is_dir();
             let mount = if exists { mount_of(&mounts, &row.path) } else { None };
             let encrypted = mount.as_ref().and_then(|(dev, _)| block_device_encrypted(dev));
@@ -5329,6 +5338,10 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             at_rest_decision.as_ref(),
             &tpm_facts,
         ));
+        // The sealed key's PCR policy vs Secure Boot now (only when sealed).
+        if let Some(c) = crate::commands::at_rest_seal::pcr_binding_row_live() {
+            checks.push(c);
+        }
         checks.push(monitoring_web_config_check(compose.as_deref()));
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).

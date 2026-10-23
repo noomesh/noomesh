@@ -79,6 +79,7 @@ pub mod secrets;
 pub mod secrets_remove;
 pub mod secrets_reveal;
 pub mod plaintext_env;
+pub mod at_rest_seal;
 pub mod secrets_delivery;
 pub mod container_files;
 pub mod offboard;
@@ -200,6 +201,7 @@ pub use security::{
 pub use secrets::{secrets_audit, secrets_resync, secrets_rotate, secrets_tidy};
 pub use secrets_remove::secrets_remove;
 pub use secrets_reveal::secrets_reveal;
+pub use at_rest_seal::{at_rest_finalize, at_rest_seal};
 // ── Fleet secret convergence (WP-FS): the missing push half of a rotation.
 pub use cluster_host_telemetry::{cluster_host_telemetry_apply, cluster_host_telemetry_usage};
 pub use cluster_vendor::{cluster_vendor_install, cluster_vendor_stage, cluster_vendor_status, cluster_vendor_usage};
