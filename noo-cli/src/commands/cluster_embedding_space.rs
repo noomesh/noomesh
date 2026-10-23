@@ -70,8 +70,9 @@ pub(crate) struct SpaceRows {
 
 /// `knowledge: re-embedding into bge-m3 (filling, 120/300 rows)` for one
 /// space's `migration` object; `None` when there is none. Rows trellion has
-/// no source text for (`unsourced`) lose their vector at the cutover, so the
-/// line says how many.
+/// no source text for (`unsourced`) get no new vector at the cutover, so the
+/// line says how many: text and episode rows keep their old one until the
+/// stale sweep heals them, the rest lose it.
 pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<String> {
     let next = m["next_model"].as_str()?;
     let state = m["state"].as_str().unwrap_or("?");
@@ -90,7 +91,7 @@ pub(crate) fn migration_line(space: &str, m: &serde_json::Value) -> Option<Strin
     let progress = if m["progress"].is_null() {
         "no report from trellion yet".to_string()
     } else if unsourced > 0 {
-        format!("{done}/{total} rows; {unsourced} with no source text lose their vector at the cutover")
+        format!("{done}/{total} rows; {unsourced} with no source text get no new vector at the cutover")
     } else {
         format!("{done}/{total} rows")
     };
@@ -294,7 +295,7 @@ mod tests {
             "progress": {"tables": {"concepts": {"done": 0, "total": 0, "unsourced": 12}, "pages": {"done": 5, "total": 9}}}});
         assert_eq!(
             migration_line("k", &lossy).unwrap(),
-            "k: re-embedding into x (filling, 5/9 rows; 12 with no source text lose their vector at the cutover)"
+            "k: re-embedding into x (filling, 5/9 rows; 12 with no source text get no new vector at the cutover)"
         );
     }
 

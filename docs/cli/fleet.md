@@ -370,9 +370,12 @@ When every table reports done == total (and trellion has reported in the last
 the new vectors into place table by table and reports `cutover_done`, and only
 then does the space's model change, in one step. Rows trellion cannot embed
 again (no stored source text, e.g. concept centroids, or a row the embedder
-rejects on its own) are counted as `unsourced`: they lose their vector at the
-cutover rather than keep one from the old model, and `embedding-space list`
-says how many; whatever owns them regenerates them on its next run. Rows
+rejects on its own) are counted as `unsourced` and get no new vector at the
+cutover, and `embedding-space list` says how many. Text chunks and episodes
+keep their old vector, still labelled with the old model so no search under
+the new model reads it, until trellion's stale sweep re-embeds them (episodes
+copy from their healed record); entities are removed and cluster centroids
+cleared, and whatever owns them regenerates them on its next run. Rows
 written under an old model later (a writer racing the cutover) are found and
 re-embedded by trellion's stale sweep. `migrate knowledge --cancel`
 abandons a `pending` or `filling` migration and leaves the live vectors untouched; once the
