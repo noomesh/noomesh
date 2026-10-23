@@ -111,3 +111,33 @@ def test_every_conditional_skip_is_explicit_and_only_for_a_verb_missing_from_the
     assert src.count("SKIPPED (explicit)") == 3
     assert src.count("::warning title=at-rest-tpm::") == 3
     assert src.index("SKIPPED (explicit)") > src.index("systemd-creds has-tpm2")
+
+
+def _check_pin(uname_r: str, tmp_path):
+    return subprocess.run(
+        ["bash", str(SCRIPT), "check-pin"],
+        env={"PATH": "/usr/bin:/bin", "UNAME_R": uname_r, "AT_REST_LOG_DIR": str(tmp_path)},
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_an_unpinned_kernel_series_fails_closed_naming_series_and_files(tmp_path):
+    r = _check_pin("9.99.0-1-azure", tmp_path)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "::error" in r.stderr or "::error" in r.stdout
+    out = r.stdout + r.stderr
+    assert "9.99" in out and "tpm_vtpm_proxy.c" in out and "tpm.h" in out and "VTPM_PINS" in out
+
+
+def test_the_6_17_pins_are_present_and_resolve(tmp_path):
+    r = _check_pin("6.17.0-1022-azure", tmp_path)
+    assert r.returncode == 0, r.stderr
+    c, h = r.stdout.split()
+    assert re.fullmatch(r"[0-9a-f]{64}", c) and re.fullmatch(r"[0-9a-f]{64}", h)
+    assert "8268e005f7eeac4170546b8040a0053c4fb6eecabf76b06213790e1f73b14f10" in SCRIPT.read_text()
+
+
+def test_the_script_never_builds_from_unverified_sources():
+    src = SCRIPT.read_text()
+    assert "sources used unverified" not in src
+    assert src.index("vtpm_pin_lookup)") < src.index("curl -fsSL --retry 3 -o")
