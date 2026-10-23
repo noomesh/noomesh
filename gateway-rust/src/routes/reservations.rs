@@ -521,7 +521,7 @@ async fn workload_proxy(
     for (k, v) in peer_headers(&reservation, &r) {
         up = up.header(k, v);
     }
-    let resp = up.send().await.map_err(|e| AppError::Internal(format!("node agent unreachable: {e}")))?;
+    let resp = up.send().await.map_err(|e| AppError::Upstream(format!("node agent unreachable: {e}")))?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ct = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
     let mut out = Response::new(Body::from_stream(resp.bytes_stream()));

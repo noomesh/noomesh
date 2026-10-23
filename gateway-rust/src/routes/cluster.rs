@@ -2051,7 +2051,7 @@ async fn pull_node_artifact(
             if status.is_success() {
                 Ok(Json(parsed))
             } else {
-                Err(AppError::Internal(format!(
+                Err(AppError::Upstream(format!(
                     "Node agent /pull returned {}: {}",
                     status.as_u16(),
                     parsed["detail"].as_str().unwrap_or(&text)
@@ -2060,7 +2060,7 @@ async fn pull_node_artifact(
         }
         Err(e) => {
             tracing::error!(node_id = %node_id, error = %e, "artifact pull proxy failed");
-            Err(AppError::Internal(format!("Failed to contact node agent: {e}")))
+            Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))
         }
     }
 }
@@ -2112,11 +2112,11 @@ async fn clean_node(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!("Node agent returned {status}: {body}")))
+            Err(AppError::Upstream(format!("Node agent returned {status}: {body}")))
         }
         Err(e) => {
             tracing::error!(node_id = %node_id, error = %e, "clean node failed");
-            Err(AppError::Internal(format!("Failed to contact node agent: {e}")))
+            Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))
         }
     }
 }
@@ -2342,9 +2342,9 @@ pub(crate) async fn gpu_hold_op(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            (false, Err(AppError::Internal(format!("Node agent returned {status}: {body}"))))
+            (false, Err(AppError::Upstream(format!("Node agent returned {status}: {body}"))))
         }
-        Err(e) => (false, Err(AppError::Internal(format!("Failed to contact node agent: {e}")))),
+        Err(e) => (false, Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))),
     };
     match (op, ok) {
         ("hold", true) => {
@@ -3037,11 +3037,11 @@ pub(crate) async fn start_backend_core(
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             cooldowns::record_failure(&cooldown_key);
-            return Err(AppError::Internal(format!("Node agent returned {status}: {body}")));
+            return Err(AppError::Upstream(format!("Node agent returned {status}: {body}")));
         }
         Err(e) => {
             cooldowns::record_failure(&cooldown_key);
-            return Err(AppError::Internal(format!("Failed to contact node agent: {e}")));
+            return Err(AppError::Upstream(format!("Failed to contact node agent: {e}")));
         }
     }
 
@@ -3117,9 +3117,9 @@ pub(crate) async fn stop_backend_core(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!("Stop failed ({status}): {text}")))
+            Err(AppError::Upstream(format!("Stop failed ({status}): {text}")))
         }
-        Err(e) => Err(AppError::Internal(format!("Failed to contact node agent: {e}"))),
+        Err(e) => Err(AppError::Upstream(format!("Failed to contact node agent: {e}"))),
     }
 }
 
@@ -3332,13 +3332,13 @@ async fn models_cache(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!(
+            Err(AppError::Upstream(format!(
                 "Node agent returned {status}: {text}"
             )))
         }
         Err(e) => {
             tracing::error!(node_id = %node_id, error = %e, "model cache failed");
-            Err(AppError::Internal(format!("Failed to contact node agent: {e}")))
+            Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))
         }
     }
 }
@@ -3416,13 +3416,13 @@ pub(crate) async fn models_pull(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!(
+            Err(AppError::Upstream(format!(
                 "Node agent returned {status}: {text}"
             )))
         }
         Err(e) => {
             tracing::error!(node_id = %node_id, error = %e, "model pull failed");
-            Err(AppError::Internal(format!("Failed to contact node agent: {e}")))
+            Err(AppError::Upstream(format!("Failed to contact node agent: {e}")))
         }
     }
 }
@@ -5486,7 +5486,7 @@ async fn delete_tailscale_device(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("device delete failed: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("device delete failed: {e}")))?;
     let dstatus = del.status().as_u16();
     if dstatus != 200 && dstatus != 204 {
         let dtext = del.text().await.unwrap_or_default();

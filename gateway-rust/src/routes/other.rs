@@ -316,10 +316,10 @@ async fn device_action(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
-            Err(AppError::Internal(format!("Device returned {status}: {text}")))
+            Err(AppError::Upstream(format!("Device returned {status}: {text}")))
         }
         Err(e) => {
-            Err(AppError::Internal(format!("Device unreachable: {e}")))
+            Err(AppError::Upstream(format!("Device unreachable: {e}")))
         }
     }
 }

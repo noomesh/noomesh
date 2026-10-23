@@ -801,9 +801,10 @@ async fn proactive_create_rule(
         Ok(())
     })
     .await
-    .map_err(|(_, body)| {
-        AppError::Internal(
-            body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string()
+    .map_err(|(status, body)| {
+        super::from_status(
+            status,
+            body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string(),
         )
     })?;
 
@@ -844,11 +845,7 @@ async fn proactive_delete_rule(
     .await
     .map_err(|(status, body)| {
         let msg = body.0.get("error").and_then(|e| e.as_str()).unwrap_or("write failed").to_string();
-        if status == axum::http::StatusCode::NOT_FOUND {
-            AppError::NotFound(msg)
-        } else {
-            AppError::Internal(msg)
-        }
+        super::from_status(status, msg)
     })?;
 
     Ok(Json(json!({ "status": "deleted", "rule_id": rule_id })))
@@ -1318,7 +1315,7 @@ async fn browser_start(
     // "unhealthy".
     let browser_key = crate::config::secret_env::secret_or_empty(BROWSER_KEY);
     if browser_key.is_empty() {
-        return Err(AppError::Internal(
+        return Err(AppError::Unavailable(
             "NOO_BROWSER_KEY is not set — the browser service refuses to run \
              unauthenticated, so there is nothing to start"
                 .into(),
@@ -1374,12 +1371,12 @@ async fn browser_start(
         .timeout(std::time::Duration::from_secs(60));
 
     let resp = req.send().await
-        .map_err(|e| AppError::Internal(format!("Failed to start browser container: {e}")))?;
+        .map_err(|e| AppError::Upstream(format!("Failed to start browser container: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(
+        return Err(AppError::Upstream(
             format!("Node agent returned {status}: {body_text}")
         ));
     }
