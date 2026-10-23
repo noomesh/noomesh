@@ -7,12 +7,25 @@ Does not cover: the Docker stack on THIS host (`noo stack`), or memory and the k
 ## Disambiguation
 
 - `noo cluster` is the **fleet**: nodes, their desired state, enrollment and teardown. `noo stack` (Stack & data) is the Docker stack on **this host** — start, stop, rebuild, clean.
-- `noo cluster place` **declares** that a node should run a backend with a model and lets the node-agent converge to it; `noo cluster up`/`down`/`scale` are the older **imperative** start/stop calls and are not remembered across an agent restart.
+- `noo cluster place` **declares** that a node should run a backend with a model and lets the node-agent converge to it; `noo cluster down` is the older **imperative** stop call and is not remembered across an agent restart.
 - `noo inference run` sends one prompt straight to a backend; `noo inference agent` runs the coordinator's full agentic loop (plan, tools, reflect); `noo jobs run` queues the prompt through the scheduler and polls the job. `noo chat` (Agents & channels) is the streaming conversation.
 - `noo models` is the **catalog** (search, info, recommendations, pull through the gateway's Ollama proxy); getting a model onto a **specific node** is `noo cluster ship-model`, `sync-model-files` or a placement.
 - `noo autonomy` is the self-healing engine (condition → action patrols); `noo heartbeat` (Stack & data) is the cron scheduler for user-facing tasks.
 - `noo skills` runs **containerized code** in a sandbox on a node; `noo prompt-skills` (Memory & knowledge) are prompt templates; `noo tools` is the gateway's registry of the tools an agent may call.
-- `noo cluster clean-node` is retired: it reported success while doing nothing on a pull-enrolled node, then de-registered it. Use `noo cluster teardown-node <node>` to dismantle, `noo cluster forget <node>` for a dead node, or `sudo noo-deenroll` on an orphaned node. `noo cluster add-node` was removed (2026-09-03) — it drove Ansible playbooks that no longer ship; enrol with a bootstrap token and finish with `noo cluster provision`. `noo cluster assign` without `--dry-run` calls a route the gateway no longer serves.
+- `noo cluster clean-node` is retired: it reported success while doing nothing on a pull-enrolled node, then de-registered it. Use `noo cluster teardown-node <node>` to dismantle, `noo cluster forget <node>` for a dead node, or `sudo noo-deenroll` on an orphaned node. `noo cluster add-node` was removed (2026-09-03) — it drove Ansible playbooks that no longer ship; enrol with a bootstrap token and finish with `noo cluster provision`. 
+
+Retired in 0.6.12 (each still answers with its successor instead of "unknown command" for one release, and is hidden from help):
+
+| Retired | Use instead |
+|---|---|
+| `noo cluster up`, `noo cluster scale` | `noo cluster place <node> <backend> <model>` and `noo cluster unplace <node> <backend>` |
+| `noo cluster place-model`, `auto-place`, `reconcile-models` | `noo cluster place`, then `noo cluster prefer` or `noo cluster class set` to steer which model is tried first |
+| `noo cluster mint-join-key` | `noo cluster invite` |
+| `noo cluster assign` | `noo jobs run <prompt> --node <node>` |
+| `noo cluster add-companion`, `add-monitor` | `noo enroll` on the device; the agent registers itself on its first heartbeat |
+| `noo proactive history` | `noo proactive status` (nothing records proactive firings) |
+
+`noo cluster desired <node>` is an alias of `noo cluster show <node>`; `show` ends with the desired config and placements.
 
 ## Recipes
 
@@ -316,11 +329,10 @@ noo cluster seed
 noo cluster seed --export > cluster-snapshot.yaml   # snapshot a live cluster in seed shape
 ```
 
-Let the planner pick nodes when you only care that a model runs somewhere:
-`noo cluster place-model <model>` prints `place <model> on <node> (<reason>)`
-and needs `--apply` to act; `auto-place <model>...` plans a set across
-the fleet; `reconcile-models` does the same for `NOO_DESIRED_MODELS` minus
-what is already running.
+Name the node yourself with `noo cluster place`; to steer which model a stack
+purpose tries first use `noo cluster prefer`, and to let several nodes share
+one model name use `noo cluster class set <class> ... --pool`. The old
+planner verbs (`place-model`, `auto-place`, `reconcile-models`) are retired.
 
 ### Embedding spaces: one model per purpose
 
@@ -726,8 +738,7 @@ drain_started, drained_at}`.
 | `noo cluster verify` | `[<node>...] [--controller] [--wait]` | Assert every invariant a node and the controller must meet; exit 1 with the remedy |
 | `noo cluster invite` | — | Mint a tagged tailscale auth key and print the `noo enroll --via-tailnet <url>` line |
 | `noo cluster down` | `<backend> [--node <node>] [-y\|--yes]` | Stop a backend on one node or all nodes; destructive, asks for confirmation (-y) |
-| `noo cluster scale` | `<backend> -r\|--replicas <n> [-m\|--model <model>] [-y\|--yes]` | Scale a backend to N replicas fleet-wide; scale-down asks for confirmation (-y) |
-| `noo cluster desired` | `<node>` | Show the desired config and every placement (with its role) the node-agent converges to |
+| `noo cluster desired` | `<node>` | Alias of `noo cluster show`: the node in full, including its desired config and every placement |
 | `noo cluster proposals` | `[--status <s>] [--limit <n>]` | List the enrollment proposals agents filed, with each host in full |
 | `noo cluster show` | `<node>` | Show one node in full: hardware, agent version, tier drift, bus principal, roles |
 | `noo cluster forget` | `<node> [--purge-tailscale] [-y\|--yes]` | Remove a dead node's row, KV entry and enrollments; --purge-tailscale drops its device |
@@ -752,20 +763,12 @@ drain_started, drained_at}`.
 | `noo cluster release` | `<reservation-id> [--force]` | Release a reservation: drain and stop the workload, give the GPU back (holder or --force) |
 | `noo cluster workloads` | — | List the workloads the installed add-ons declare (container, GPU need, drain route) |
 | `noo cluster profile` | `<node> [--set <key=value>]... [--clear <key>]... [--clear-all] [--bench]` | Show a node's harness profile with each value's source; set overrides; bench its model |
-| `noo cluster up` | `<backend> <model> [--node <node>] [--replicas <n>]` | Start a backend with a model via the imperative start route (prefer place) |
 | `noo cluster init-secret` | — | Generate and print a fresh random cluster secret locally (no gateway call) |
-| `noo cluster assign` | `<task> [--node <node>] [--backend <backend>] [--model <m>] [--priority low\|medium\|high\|<n>] [--dry-run] [--async]` | Pin a task to the least-loaded node and run it; --dry-run prints the choice only |
 | `noo cluster set-config` | `<node> [--usage shared\|dedicated\|default] [--harness auto\|manual\|off] [--loop-budget <n>\|default] [--data-root <path>] [--models-dir <path>] [--ip <ip>] [--tier <n>] [--gpu-model <model>] [--vram-gb <n>] [--min-battery <pct>] [--require-wifi <bool>] [--block-thermal <s,s>] [--policy-default] [--vendor-kinds <kind,kind>\|none]` | Update a node's stored config row with only the given fields |
 | `noo cluster clear-cooldowns` | — | Clear backend auto-start cooldown backoff on every node |
-| `noo cluster add-companion` | `<node> [-p\|--platform <p>] [--hostname <host>] [--ip <ip>] [-s\|--sensors <a,b>] [-b\|--backends <a,b>] [--battery <n>] [-n\|--network <type>] [--npu-tops <n>] [--app-version <v>]` | Register a Tier-5 companion device with the gateway and send a first heartbeat |
-| `noo cluster add-monitor` | `<node> [--hostname <host>] [--ip <ip>] [-s\|--services <a,b>]` | Register a Tier-6 monitor node with the gateway and send an initial heartbeat |
 | `noo cluster teardown-node` | `<node> \| --all [--purge-data] [--purge-tailscale] [--factory] [-y\|--yes]` | Dismantle one node or --all via a signed teardown bundle, verify silence, then forget |
 | `noo cluster provision` | `<node> [<tier>] [--harness auto\|manual\|off] [--wait [<secs>]] [--stage-only] [--move-data]` | Stage a node's signed bundle; --wait blocks until enrolled, --stage-only skips the apply |
 | `noo cluster sync-model-files` | `[<node>...] [-m\|--model <file>]... [--dry-run]` | Dispatch a job per node to pull GGUF weights from the controller store and verify them |
-| `noo cluster auto-place` | `<model>... [-b\|--backend <backend>] [--apply]` | Plan placement of a set of models across the fleet; --apply starts them |
-| `noo cluster place-model` | `<model> [-b\|--backend <backend>] [--node <node>] [--apply]` | Pick the best node for a model by capability and cache; --apply starts it there |
-| `noo cluster reconcile-models` | `[<model>...] [-b\|--backend <backend>] [--apply]` | Plan placement for desired models (args or NOO_DESIRED_MODELS) not yet running |
-| `noo cluster mint-join-key` | `[--tag <tag>] [--expiry-minutes <n>] [--reusable]` | Mint a pre-authorized tagged Tailscale auth key (bootstrap-node lane is retired) |
 | `noo cluster bootstrap-token create` | `[--ttl <1h\|30m\|24h\|secs>] [--role <role>] [--cidr <cidr>] [--node <name>] [--with-tailscale\|--no-tailscale]` | Mint a single-use enrollment token and print the node enrollment one-liner |
 | `noo cluster bootstrap-token list` | — | List bootstrap tokens with status, creator, expiry and redeeming IP |
 | `noo cluster bootstrap-token revoke` | `<id>` | Revoke a bootstrap token by id (idempotent) |

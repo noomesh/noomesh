@@ -953,7 +953,7 @@ fn ensure_controller_tag(ctx: &mut Ctx) {
         return;
     }
     if ctx.state.multinode == Some(false) {
-        ctx.info("Single box for now — when you add nodes, `noo cluster mint-join-key` walks you through tagging this machine tag:controller first");
+        ctx.info("Single box for now — when you add nodes, `noo cluster invite` walks you through tagging this machine tag:controller first");
         return;
     }
     let self_tags = || -> String {
@@ -1564,7 +1564,7 @@ fn tailscale_multinode(ctx: &mut Ctx) {
              Set up cluster enrollment now? (optional)",
             false,
         ) {
-            ctx.info("Skipped — `noo cluster mint-join-key` will walk you through it when needed.");
+            ctx.info("Skipped — `noo cluster invite` will walk you through it when needed.");
             ctx.state.multinode = Some(false);
             return;
         }
@@ -1618,7 +1618,7 @@ fn tailscale_multinode(ctx: &mut Ctx) {
             .asker
             .ask(&super::prompt::Prompt::new("OAuth client ID (blank to skip)"));
         if id.trim().is_empty() {
-            ctx.info("Skipped — set it up later via `noo cluster mint-join-key`.");
+            ctx.info("Skipped — set it up later via `noo cluster invite`.");
             return;
         }
         let secret = ctx

@@ -422,8 +422,7 @@ file under its own `MODELS_DIR`/`HF_CACHE_DIR`. Success prints
 `model files synced` and the two commands to start using them:
 
 ```
-noo cluster up llamacpp <file> --node <node>
-noo cluster place-model <node> llamacpp <file>
+noo cluster place <node> llamacpp <file>
 ```
 
 ## Pre-cache models on a schedule

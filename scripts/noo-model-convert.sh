@@ -100,4 +100,4 @@ case "$OLLAMA_MODE" in
 esac
 
 say "done. smoke test:  ollama run $OLLAMA_NAME 'hello'"
-say "register on a node: noo cluster up ollama $OLLAMA_NAME --node <node>"
+say "register on a node: noo cluster place <node> ollama $OLLAMA_NAME"
