@@ -227,7 +227,7 @@ pub use usage::{usage, usage_me};
 /// `noo tui` — RETIRED 2026-08-16. Native so the answer needs no Python and
 /// a broken venv can't turn it into a traceback: the web dashboard
 /// (noo-mesh-ui-web, served by the gateway) is the interactive UI; `noo
-/// chat` covers the terminal. Module archived at git history (before 2026-08-08).
+/// chat` covers the terminal. Module was removed (history in git log before 2026-08-08).
 pub fn tui_retired(g: &crate::Globals, _args: &[String]) -> Result<i32, crate::Unhandled> {
     crate::output::fail(
         g.json,

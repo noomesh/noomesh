@@ -17,8 +17,7 @@ post the task #23 sweep:
 
 The Python adapters (google_chat, telegram), ChannelManager, the
 registry and the approvals bridge are gone from the tree. Their final
-versions live in git history, at the parent of commit b97a4e02 (history:
-git log before 2026-08-08).
+versions live in git history, at the parent of commit b97a4e02 (the 2026-08-08 sweep).
 """
 
 from .base import (

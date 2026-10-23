@@ -60,7 +60,7 @@ from ..workers.registry import all_handlers, get_handler
 # 2026-07-14 split and are imported by gateway/exec_approval.py and
 # tests/test_kb_teams.py. (The users-proposal trio left with the 2026-08-08
 # reference sweep: _users_propose/_validate_user_proposal/_users_admin_error
-# are archived in git history (before 2026-08-08) — the flow is
+# were removed (history in git log before 2026-08-08) — the flow is
 # native Rust, routes/users.rs.)
 from ..workers.common import (  # noqa: F401
     _get_conversation_store,

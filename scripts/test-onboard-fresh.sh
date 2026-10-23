@@ -8,7 +8,7 @@
 # nothing pre-installed — gets working encrypted-at-rest secrets. Runs the
 # REAL scripts/noo-secrets-sops-init.sh (the exact script the native Rust
 # wizard's security step invokes; the Python wizard that used to be driven
-# here is archived in git history (before 2026-08-08)) inside a fresh container,
+# here was removed; history in git log before 2026-08-08) inside a fresh container,
 # then asserts the artifacts and a decrypt round-trip.
 #
 # The wizard-side wiring (backend prompt, NOO_SECRETS_BACKEND flip, fallback

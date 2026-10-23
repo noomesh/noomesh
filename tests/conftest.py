@@ -57,9 +57,8 @@ tools:
     return config_file
 
 
-# The node/cluster fixtures (_make_node, make_node, node_registry) moved to
-# git history (before 2026-08-08) with cluster/node.py (fu 58
-# round 2) — the registry was an empty shell nobody populated.
+# The node/cluster fixtures (_make_node, make_node, node_registry) went away
+# with cluster/node.py (fu 58 round 2; history in git log before 2026-08-08) — the registry was an empty shell nobody populated.
 
 
 @pytest.fixture

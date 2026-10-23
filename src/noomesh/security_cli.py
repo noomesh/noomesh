@@ -869,8 +869,8 @@ def user_decide(
 # ---------------------------------------------------------------------------
 
 # trust-ca / untrust-ca are NATIVE ONLY (noo-cli security_local.rs) — the
-# Python versions and their shared impl (onboard/ca_trust.py) were archived
-# to git history (before 2026-08-08) on 2026-08-06 after the trust-store flip
+# Python versions and their shared impl (onboard/ca_trust.py) were removed
+# on 2026-08-06 after the trust-store flip (history in git log before that)
 # (Linux store always; Windows store is legacy cleanup). Keeping a second,
 # unreachable implementation here is how divergence ships.
 

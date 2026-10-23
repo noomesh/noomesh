@@ -180,7 +180,7 @@ class CodingTaskManager:
         # relay, self-develop audit open/close, tier classification +
         # post-edit apply — was removed the earlier sweep. It had been
         # unreachable since the 2026-08-11 design flip. The verify/ gate it
-        # called is archived at git history (before 2026-08-08).)
+        # called was removed in the same sweep (history in git log before 2026-08-08).)
 
     def get_status(self, task_id: str) -> dict[str, Any]:
         """Get status of a coding task. Checks in-memory first (fast,

@@ -700,7 +700,7 @@ const NATIVE: &[(&[&str], Handler)] = &[
     (&["kiosk", "teardown"], commands::kiosk_teardown),
     // ── tui (RETIRED 2026-08-16) ── native so the answer needs no Python:
     // the web dashboard is the interactive UI; `noo chat` covers the
-    // terminal. Module archived at git history (before 2026-08-08).
+    // terminal. Module was removed (history in git log before 2026-08-08).
     (&["tui"], commands::tui_retired),
 ];
 

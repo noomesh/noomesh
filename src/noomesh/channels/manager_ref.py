@@ -4,8 +4,8 @@
 """Process-global reference to the channel client.
 
 worker_pool injects the GatewayChannelClient here at startup; in-process
-consumers resolve it through ``get_channel_manager``. History of the old
-FastAPI channels router this replaced: git log before 2026-08-08.
+consumers resolve it through ``get_channel_manager``. It replaced the old
+FastAPI channels router, removed in the 2026-08-08 sweep (history in git log before that).
 """
 
 from __future__ import annotations
