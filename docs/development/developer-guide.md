@@ -272,7 +272,7 @@ the persona flow and autonomy smoke checks.
 
 Shared fixtures in `tests/conftest.py`: `test_config` (an `AppConfig` with
 memory off and two tool loops), `temp_config_file`, `tool_result_ok` /
-`tool_result_fail`, `tool_parser`, `mock_tool_registry`,
+`tool_result_fail`, `mock_tool_registry`,
 `sample_channel_message`, `sample_telegram_update`.
 
 A large share of the suite is **parity and guard tests** rather than unit

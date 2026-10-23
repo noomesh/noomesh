@@ -10,7 +10,7 @@ that used to share this module — LocationChecker / ActionDispatcher /
 AutonomyEngine — was never started in the live stack (the sole instantiation
 was a commented-out block in ``gateway/worker_pool.py``; the live loop is
 ``gateway-rust/src/autonomy_loop.rs``) and is archived at
-``legacy/python-cluster-reference/autonomy.py`` (cleanup sweep).
+``git history (before 2026-08-08)`` (cleanup sweep).
 
 Moved verbatim from ``cluster/autonomy.py``.
 """

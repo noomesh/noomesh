@@ -49,7 +49,7 @@ const PY_ONLY: &[&[&str]] = &[
     // `tui` left this list 2026-08-16: RETIRED outright (not ported) — the
     // web dashboard is the interactive UI and `noo chat` covers the
     // terminal. `noo tui` is a NATIVE entry that prints that pointer; the
-    // module is archived at legacy/python-tui-reference/.
+    // module is archived at git history (before 2026-08-08).
     // Python-PACKAGE plugin loading (~/.noo/plugins, imported in-process by
     // PluginManager) is inherently Python. No longer a blanket gate on the
     // group: `plugins list` is NATIVE since WP-PL (it lists executable

@@ -60,7 +60,7 @@ from ..workers.registry import all_handlers, get_handler
 # 2026-07-14 split and are imported by gateway/exec_approval.py and
 # tests/test_kb_teams.py. (The users-proposal trio left with the 2026-08-08
 # reference sweep: _users_propose/_validate_user_proposal/_users_admin_error
-# are archived in legacy/python-workers-reference/users.py — the flow is
+# are archived in git history (before 2026-08-08) — the flow is
 # native Rust, routes/users.rs.)
 from ..workers.common import (  # noqa: F401
     _get_conversation_store,
@@ -676,11 +676,11 @@ async def _init_python_services(messaging) -> None:
     # a prior change, so this retires the last live use of them (and the
     # stats-persistence loop, which by then was counting only Python-side
     # sends — the Rust pipeline never incremented it). Consumers keep the
-    # same access points: services.channel_manager and the channels.router
+    # same access points: services.channel_manager and the channels.manager_ref
     # global, both of which now hold the client.
     try:
         from ..channels.gateway_client import GatewayChannelClient
-        from ..channels.router import set_channel_manager
+        from ..channels.manager_ref import set_channel_manager
 
         channel_client = GatewayChannelClient()
         set_channel_manager(channel_client)
