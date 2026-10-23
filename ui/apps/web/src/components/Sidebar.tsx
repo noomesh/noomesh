@@ -12,6 +12,7 @@ export function Sidebar({ active, onSelect }: { active: string; onSelect: (id: s
   const { isOperator } = useAuth();
   // Shared query key with the Cluster tab — no extra polling.
   const cluster = useClusterNodes();
+  // Only read after the isLoading/isError branches below; 0 here is the "nothing yet" layout default.
   const online = cluster.data?.stats.online ?? 0;
 
   // Groups start open. They used to start collapsed, which meant a fresh

@@ -2,14 +2,17 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 
 export interface Cert {
   name: string;
   role: string;
   subject: string;
   expires: string;
-  daysLeft: number;
-  status: 'ok' | 'expiring' | 'expired' | 'missing';
+  /** null = no readable expiry (renders a dash, never 0d). */
+  daysLeft: number | null;
+  /** 'unknown' = the cert exists but reported no readable expiry. */
+  status: 'ok' | 'expiring' | 'expired' | 'missing' | 'unknown';
 }
 export interface PendingApproval {
   id: string;
@@ -20,7 +23,7 @@ export interface PendingApproval {
 export interface SecurityData {
   riskLevel: string;
   violations: Record<string, number>;
-  stats: { pending: number; approved: number; denied: number; total: number };
+  stats: { pending: number | null; approved: number | null; denied: number | null; total: number | null };
   pending: PendingApproval[];
   pki: {
     configured: boolean;
@@ -53,10 +56,12 @@ export function useSecurity() {
       const parseCert = (name: string, role: string, c?: PkiCert): Cert => {
         const exp = c?.not_after ? new Date(c.not_after) : null;
         const daysLeft =
-          exp && !isNaN(exp.getTime()) ? Math.round((exp.getTime() - Date.now()) / 86_400_000) : 0;
+          exp && !isNaN(exp.getTime()) ? Math.round((exp.getTime() - Date.now()) / 86_400_000) : null;
         const status: Cert['status'] = !c?.exists
           ? 'missing'
-          : daysLeft < 0
+          : daysLeft === null
+            ? 'unknown'
+            : daysLeft < 0
             ? 'expired'
             : daysLeft <= 30
               ? 'expiring'
@@ -74,10 +79,10 @@ export function useSecurity() {
         riskLevel: v.data?.risk_level ?? 'UNKNOWN',
         violations: (v.data?.violations ?? {}) as Record<string, number>,
         stats: {
-          pending: s.data?.pending ?? 0,
-          approved: s.data?.approved ?? 0,
-          denied: s.data?.denied ?? 0,
-          total: s.data?.total ?? 0,
+          pending: num(s.data?.pending),
+          approved: num(s.data?.approved),
+          denied: num(s.data?.denied),
+          total: num(s.data?.total),
         },
         pending: (p.data?.pending ?? []).map((r) => ({
           id: r.id ?? '',

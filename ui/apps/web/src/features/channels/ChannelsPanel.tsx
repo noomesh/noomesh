@@ -7,6 +7,7 @@ import { StatusBadge } from '@/components/StatusBadge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useConfirm } from '@/components/ConfirmDialog';
+import { dash, DASH } from '@/lib/num';
 import {
   useChannels,
   useDeleteRecipient,
@@ -93,7 +94,7 @@ export function ChannelsPanel() {
       <div className="panel-head">
         <h2>Channels</h2>
         <span className="meta">
-          {ch.data ? `${ch.data.summary.adapters} adapters · ${ch.data.summary.activeConvos} active · queue ${ch.data.summary.queueMode}` : '—'}
+          {ch.data ? `${ch.data.summary.adapters} adapters · ${dash(ch.data.summary.activeConvos)} active · queue ${ch.data.summary.queueMode}` : '—'}
         </span>
       </div>
 
@@ -110,17 +111,24 @@ export function ChannelsPanel() {
                     <span className="adapter-name">{prettyChannel(a.name)}</span>
                     <StatusBadge tone="good">active</StatusBadge>
                   </div>
-                  <div className="adapter-stats">
-                    <span>
-                      recv <b>{a.received}</b>
-                    </span>
-                    <span>
-                      sent <b>{a.sent}</b>
-                    </span>
-                    <span className={a.errors > 0 ? 'err' : undefined}>
-                      errors <b>{a.errors}</b>
-                    </span>
-                  </div>
+                  {a.received === null && a.sent === null && a.errors === null ? (
+                    // Not measured: say so in the gateway's words, not as a bare dash.
+                    <div className="adapter-stats" title={a.statsDetail ?? undefined}>
+                      <span>{a.statsDetail ?? `traffic counters ${DASH}`}</span>
+                    </div>
+                  ) : (
+                    <div className="adapter-stats">
+                      <span>
+                        recv <b>{dash(a.received)}</b>
+                      </span>
+                      <span>
+                        sent <b>{dash(a.sent)}</b>
+                      </span>
+                      <span className={a.errors !== null && a.errors > 0 ? 'err' : undefined}>
+                        errors <b>{dash(a.errors)}</b>
+                      </span>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

@@ -4,6 +4,7 @@
 import { useState } from 'react';
 import { toast } from 'sonner';
 import { relTime } from '@/lib/format';
+import { dash } from '@/lib/num';
 import { StatTiles } from '@/components/StatTiles';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Button } from '@/components/ui/button';
@@ -156,9 +157,9 @@ export function JobsPanel() {
         <StatTiles
           tiles={[
             { label: 'Scheduler', value: paused ? 'Paused' : 'Running', hot: paused },
-            { label: 'Queued', value: sched.data.queued },
-            { label: 'Running', value: sched.data.running },
-            { label: 'Clients', value: sched.data.clients },
+            { label: 'Queued', value: dash(sched.data.queued) },
+            { label: 'Running', value: dash(sched.data.running) },
+            { label: 'Clients', value: dash(sched.data.clients) },
           ]}
         />
       )}

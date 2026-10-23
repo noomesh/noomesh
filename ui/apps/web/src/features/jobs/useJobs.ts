@@ -2,6 +2,7 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 import type { Job } from './types';
 
 const JOBS_KEY = ['scheduler', 'jobs'];
@@ -9,9 +10,10 @@ const STATUS_KEY = ['scheduler', 'status'];
 
 export interface SchedulerStatus {
   paused: boolean;
-  queued: number;
-  running: number;
-  clients: number;
+  // null = the gateway did not send it (renders a dash, never 0).
+  queued: number | null;
+  running: number | null;
+  clients: number | null;
   drainedNodes: string[];
 }
 
@@ -29,9 +31,9 @@ export function useSchedulerStatus() {
       if (s.error || !s.data) throw new Error('Scheduler API unavailable');
       return {
         paused: s.data.paused ?? false,
-        queued: s.data.queue_depth ?? 0,
-        running: s.data.active_jobs ?? 0,
-        clients: c.data?.connected_clients ?? 0,
+        queued: num(s.data.queue_depth),
+        running: num(s.data.active_jobs),
+        clients: num(c.data?.connected_clients),
         drainedNodes: s.data.drained_nodes ?? [],
       };
     },

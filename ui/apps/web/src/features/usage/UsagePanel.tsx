@@ -3,10 +3,11 @@
 
 import { useState } from 'react';
 import { StatTiles } from '@/components/StatTiles';
+import { dash } from '@/lib/num';
 import {
   useUsage,
   recentMonths,
-  compactTokens,
+  compactOrDash,
   type UsageGroup,
 } from './useUsage';
 
@@ -34,7 +35,7 @@ export function UsagePanel() {
   const [group, setGroup] = useState<UsageGroup>('node');
   const u = useUsage(window, group);
 
-  const max = u.data?.rows[0]?.total ?? 1;
+  const max = u.data?.rows.find((r) => r.total !== null)?.total || 1;
 
   return (
     <section className="panel">
@@ -83,10 +84,10 @@ export function UsagePanel() {
         <>
           <StatTiles
             tiles={[
-              { label: 'Total tokens', value: compactTokens(u.data.total) },
-              { label: 'Prompt', value: compactTokens(u.data.promptTokens) },
-              { label: 'Completion', value: compactTokens(u.data.completionTokens) },
-              { label: 'Requests', value: u.data.requests.toLocaleString() },
+              { label: 'Total tokens', value: compactOrDash(u.data.total) },
+              { label: 'Prompt', value: compactOrDash(u.data.promptTokens) },
+              { label: 'Completion', value: compactOrDash(u.data.completionTokens) },
+              { label: 'Requests', value: dash(u.data.requests) },
             ]}
           />
 
@@ -97,8 +98,8 @@ export function UsagePanel() {
           {u.data.rows.map((r) => {
             const note = rowNote(u.data.group, r.key);
             // Split bar: prompt vs completion, scaled against the biggest row.
-            const promptPct = (r.promptTokens / max) * 100;
-            const completionPct = (r.completionTokens / max) * 100;
+            const promptPct = ((r.promptTokens ?? 0) / max) * 100;
+            const completionPct = ((r.completionTokens ?? 0) / max) * 100;
             return (
               <div className="usage-row" key={r.key}>
                 <div className="usage-id">
@@ -107,14 +108,14 @@ export function UsagePanel() {
                 </div>
                 <div
                   className="usage-bar"
-                  title={`${r.promptTokens.toLocaleString()} prompt + ${r.completionTokens.toLocaleString()} completion`}
+                  title={`${dash(r.promptTokens)} prompt + ${dash(r.completionTokens)} completion`}
                 >
                   <span className="usage-fill prompt" style={{ width: `${promptPct}%` }} />
                   <span className="usage-fill completion" style={{ width: `${completionPct}%` }} />
                 </div>
                 <div className="usage-nums">
-                  <span className="usage-total">{compactTokens(r.total)}</span>
-                  <span className="usage-reqs">{r.requests.toLocaleString()} req</span>
+                  <span className="usage-total">{compactOrDash(r.total)}</span>
+                  <span className="usage-reqs">{dash(r.requests)} req</span>
                 </div>
               </div>
             );

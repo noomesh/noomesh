@@ -5,6 +5,7 @@ import { StatTiles } from '@/components/StatTiles';
 import { NodeCard } from '@/components/NodeCard';
 import { useClusterNodes } from './useClusterNodes';
 import { AddNode } from './AddNode';
+import { dash } from '@/lib/num';
 
 export function ClusterPanel() {
   const { data, isLoading, isError, error, isFetching } = useClusterNodes();
@@ -32,7 +33,7 @@ export function ClusterPanel() {
               { label: 'Nodes', value: data.stats.total },
               { label: 'Online', value: data.stats.online },
               { label: 'Busy', value: data.stats.busy, hot: data.stats.busy > 0 },
-              { label: 'VRAM GB', value: data.stats.vramGb.toFixed(1) },
+              { label: 'VRAM GB', value: dash(data.stats.vramGb, (n) => n.toFixed(1)) },
             ]}
           />
           {data.nodes.length ? (

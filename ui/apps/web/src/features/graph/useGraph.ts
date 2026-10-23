@@ -2,19 +2,22 @@
 // Copyright 2026 PersonifAI LLC
 
 import { useQuery, useMetisClient } from '@metis/core';
+import { num } from '@/lib/num';
 import type { LayoutEdge } from '@/lib/graph/layout';
 
 export interface GraphNode {
   id: string;
   name: string;
   type: string;
-  degree: number;
+  /** null = unreported (renders a dash, never 0). */
+  degree: number | null;
 }
 
 export interface GraphData {
   nodeCount: number;
   edgeCount: number;
-  maxDegree: number;
+  /** null when the gateway sent no max and no node reported a degree. */
+  maxDegree: number | null;
   types: { type: string; count: number }[];
   nodes: GraphNode[];
   edges: LayoutEdge[];
@@ -61,7 +64,7 @@ export function useGraph(filters: GraphFilters) {
         id: n.id || n.name || '?',
         name: n.name || n.id || '?',
         type: n.type ?? '',
-        degree: n.degree ?? 0,
+        degree: num(n.degree),
       }));
 
       const edges: LayoutEdge[] = (o.data?.edges ?? [])
@@ -71,7 +74,11 @@ export function useGraph(filters: GraphFilters) {
       return {
         nodeCount: o.data?.stats?.node_count ?? nodes.length,
         edgeCount: o.data?.stats?.edge_count ?? s.data?.total_edges ?? edges.length,
-        maxDegree: o.data?.stats?.max_degree ?? Math.max(0, ...nodes.map((n) => n.degree)),
+        maxDegree:
+          num(o.data?.stats?.max_degree) ??
+          (nodes.some((n) => n.degree !== null)
+            ? Math.max(...nodes.map((n) => n.degree ?? 0))
+            : null),
         types,
         nodes,
         edges,

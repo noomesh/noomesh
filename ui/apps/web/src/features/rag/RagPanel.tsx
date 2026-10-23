@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
 import { awaitOperation, isOperationHandle, OperationError } from '@metis/api';
 import { relTime } from '@/lib/format';
+import { num, dash, ratioOrNull } from '@/lib/num';
 import { StatTiles } from '@/components/StatTiles';
 import { StatusBadge, type Tone } from '@/components/StatusBadge';
 import { Input } from '@/components/ui/input';
@@ -18,10 +19,11 @@ interface Doc {
   createdAt: string;
 }
 interface RagData {
-  docs: number;
-  pages: number;
-  chunks: number;
-  embeddedPages: number;
+  // null = the gateway did not send it (renders a dash, never 0).
+  docs: number | null;
+  pages: number | null;
+  chunks: number | null;
+  embeddedPages: number | null;
   embedderState: string;
   documents: Doc[];
 }
@@ -37,10 +39,10 @@ function useRag() {
         client.GET('/api/v1/docs'),
       ]);
       return {
-        docs: s.data?.doc_count ?? 0,
-        pages: s.data?.page_count ?? 0,
-        chunks: s.data?.chunk_count ?? 0,
-        embeddedPages: s.data?.embedded_pages ?? 0,
+        docs: num(s.data?.doc_count),
+        pages: num(s.data?.page_count),
+        chunks: num(s.data?.chunk_count),
+        embeddedPages: num(s.data?.embedded_pages),
         // The live gateway reports `started` (bool), not the previously-assumed
         // `embedder_state.state`, so the badge always read 'unknown'.
         embedderState: s.data?.started ? 'running' : 'stopped',
@@ -107,7 +109,8 @@ const stateTone = (s: string): Tone => (s === 'running' ? 'good' : s === 'error'
 export function RagPanel() {
   const rag = useRag();
   const ingest = useIngestDoc();
-  const coverage = rag.data && rag.data.pages > 0 ? Math.round((rag.data.embeddedPages / rag.data.pages) * 100) : 0;
+  const ratio = rag.data ? ratioOrNull(rag.data.embeddedPages, rag.data.pages) : null;
+  const coverage = ratio === null ? null : Math.round(ratio * 100);
 
   const [title, setTitle] = useState('');
   const [source, setSource] = useState('');
@@ -154,10 +157,10 @@ export function RagPanel() {
         <>
           <StatTiles
             tiles={[
-              { label: 'Documents', value: rag.data.docs.toLocaleString() },
-              { label: 'Pages', value: rag.data.pages.toLocaleString() },
-              { label: 'Chunks', value: rag.data.chunks.toLocaleString() },
-              { label: 'Embedded', value: `${coverage}%`, hot: coverage < 100 },
+              { label: 'Documents', value: dash(rag.data.docs) },
+              { label: 'Pages', value: dash(rag.data.pages) },
+              { label: 'Chunks', value: dash(rag.data.chunks) },
+              { label: 'Embedded', value: dash(coverage, (n) => `${n}%`), hot: coverage !== null && coverage < 100 },
             ]}
           />
 

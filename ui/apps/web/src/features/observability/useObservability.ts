@@ -3,14 +3,8 @@
 
 import { useQuery, useMetisClient, useAuth } from '@metis/core';
 
-/** A reported number, or null when the field is absent or not a number. */
-export function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-/** Scale a reported number; null stays null. */
-export function scale(v: number | null, k: number): number | null {
-  return v === null ? null : v * k;
-}
+export { num, scale } from '@/lib/num';
+import { num, scale } from '@/lib/num';
 
 export interface HealthDep {
   name: string;
@@ -31,10 +25,10 @@ export interface Container {
   name: string;
   node: string;
   status: string;
-  cpu: number;
-  memUsed: number;
-  memLimit: number;
-  memPct: number;
+  cpu: number | null;
+  memUsed: number | null;
+  memLimit: number | null;
+  memPct: number | null;
 }
 /**
  * Add-on state. Deliberately **not** a boolean.
@@ -154,10 +148,10 @@ export function useObservability() {
           name: x.name ?? '?',
           node: x.node_hostname || x.node_id || '?',
           status: x.status ?? '',
-          cpu: x.cpu_percent ?? 0,
-          memUsed: x.mem_usage_mb ?? 0,
-          memLimit: x.mem_limit_mb ?? 0,
-          memPct: x.mem_percent ?? 0,
+          cpu: num(x.cpu_percent),
+          memUsed: num(x.mem_usage_mb),
+          memLimit: num(x.mem_limit_mb),
+          memPct: num(x.mem_percent),
         })),
       };
     },

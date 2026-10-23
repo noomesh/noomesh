@@ -19,6 +19,7 @@
 // No React, no fetch, no DOM: everything here is testable with plain values.
 
 import type { StreamEvent } from '@metis/api';
+import { num } from '@/lib/num';
 
 export type NodeStatus = 'online' | 'busy' | 'offline' | 'unknown';
 export type SourceKey = 'cluster' | 'gpus' | 'jobs' | 'scheduler' | 'heartbeat' | 'memory' | 'rag' | 'graph' | 'addons';
@@ -287,7 +288,7 @@ export interface KioskState {
   scheduler: { running: boolean; paused: boolean; queueDepth: number | null; active: number | null; error: string | null } | null;
   heartbeat: { enabled: boolean; running: boolean } | null;
   memory: { grade: string | null; warnings: string[]; error: string | null } | null;
-  rag: { started: boolean; unembedded: number; docs: number } | null;
+  rag: { started: boolean; unembedded: number | null; docs: number | null } | null;
   tasks: Record<string, TaskState>;
   transitions: Transition[];
   graph: GraphState | null;
@@ -359,10 +360,6 @@ export function addonWord(raw: unknown): AddonWord {
 
 const gpuKey = (g: { node_id?: string | null; hostname?: string | null; name?: string | null; index?: string | number | null }) =>
   `${g.node_id ?? g.hostname ?? g.name ?? '?'}/${g.index ?? 0}`;
-
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
 
 function parseTs(v: unknown, fallback: number): number {
   if (typeof v !== 'string') return fallback;
@@ -478,7 +475,7 @@ export function applySource<K extends SourceKey>(state: KioskState, key: K, data
     }
     case 'rag': {
       const r = data as SnapshotRag;
-      next.rag = { started: r.started ?? false, unembedded: r.unembedded_chunks ?? 0, docs: r.doc_count ?? 0 };
+      next.rag = { started: r.started ?? false, unembedded: num(r.unembedded_chunks), docs: num(r.doc_count) };
       break;
     }
     case 'graph': {
@@ -504,6 +501,7 @@ export function applySource<K extends SourceKey>(state: KioskState, key: K, data
       for (const n of g.nodes ?? []) {
         if (!n.id) continue;
         const prev = state.graph?.nodes[n.id];
+        // Sim input (mass), not a displayed measurement: absent degree lays out as 0.
         const degree = num(n.degree) ?? 0;
         const gain = prev ? degree - prev.degree : 0;
         if (gain > 0) {
@@ -882,7 +880,7 @@ export function exceptions(state: KioskState, now: number): Exception[] {
   if (m?.error) out.push({ key: 'mem', text: `memory: ${m.error}`, since: null, severity: 'bad' });
   else if (m && (m.grade === 'D' || m.grade === 'F')) out.push({ key: 'mem', text: `memory grade ${m.grade}${m.warnings[0] ? ` — ${m.warnings[0]}` : ''}`, since: null, severity: 'warn' });
   const r = state.rag;
-  if (r && !r.started && r.docs > 0) out.push({ key: 'rag', text: 'RAG not started', since: null, severity: 'warn' });
+  if (r && !r.started && r.docs !== null && r.docs > 0) out.push({ key: 'rag', text: 'RAG not started', since: null, severity: 'warn' });
   for (const k of SOURCES) {
     const src = state.sources[k];
     if (src.error) {
