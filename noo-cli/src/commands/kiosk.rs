@@ -307,13 +307,10 @@ pub(crate) fn render_env(a: &SetupArgs) -> String {
 /// band — which the proxy produces by answering 401 when its mint fails
 /// — is a display saying what is wrong. Those are different outcomes and
 /// only one of them is useful from across a room.
-#[cfg(test)]
-pub(crate) fn render_serve_service(user: &str) -> String {
-    render_serve_service_in(user, BIN_DIR)
-}
-
-/// [`render_serve_service`] exec'ing `noo-kiosk-serve` from `bin` (a seat's
-/// shared dir, `kiosk_seat::SEAT_KIOSK_DIR`).
+///
+/// `bin` is where `noo-kiosk-serve` is exec'd from: `/usr/local/bin` on a
+/// plain display, the seat's shared dir (`kiosk_seat::SEAT_KIOSK_DIR`) on
+/// an enrolled seat.
 pub(crate) fn render_serve_service_in(user: &str, bin: &str) -> String {
     format!(
         "# Written by `noo kiosk setup`. The browser's only hop.\n\
@@ -355,12 +352,8 @@ pub(crate) fn render_serve_service_in(user: &str, bin: &str) -> String {
 /// A shared unit that named `display-manager.service` would take the
 /// laptop's desktop away on the next boot, which is exactly what shared
 /// mode exists to avoid.
-#[cfg(test)]
-pub(crate) fn render_kiosk_service(user: &str, mode: Mode, vt: u8) -> String {
-    render_kiosk_service_in(user, mode, vt, BIN_DIR)
-}
-
-/// [`render_kiosk_service`] exec'ing `noo-kiosk-launch` from `bin`.
+///
+/// `bin` is where `noo-kiosk-launch` is exec'd from (as for the proxy).
 pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str) -> String {
     let conflicts = match mode {
         Mode::Dedicated => format!("Conflicts=getty@tty{vt}.service display-manager.service\n"),
@@ -1885,6 +1878,15 @@ mod tests {
     }
 
     use super::*;
+
+    /// The units as `setup` renders them on a plain display (no seat).
+    pub(crate) fn render_serve_service(user: &str) -> String {
+        render_serve_service_in(user, BIN_DIR)
+    }
+
+    pub(crate) fn render_kiosk_service(user: &str, mode: Mode, vt: u8) -> String {
+        render_kiosk_service_in(user, mode, vt, BIN_DIR)
+    }
 
     /// The proxy asset's own source. `SERVE` is the same bytes the unit
     /// runs, so assertions on it are assertions on the display.

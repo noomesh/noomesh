@@ -2635,8 +2635,8 @@ exec {real_install} "$@"
         /// The display as `noo kiosk setup` (pre-seat) installs it: root copies in /usr/local/bin.
         fn with_display(self) -> FakeRoot {
             use super::super::kiosk as k;
-            std::fs::write(self.at("/etc/systemd/system/kiosk.service"), k::render_kiosk_service("kiosk", k::Mode::Dedicated, 1)).unwrap();
-            std::fs::write(self.at("/etc/systemd/system/kiosk-serve.service"), k::render_serve_service("kiosk")).unwrap();
+            std::fs::write(self.at("/etc/systemd/system/kiosk.service"), k::render_kiosk_service_in("kiosk", k::Mode::Dedicated, 1, "/usr/local/bin")).unwrap();
+            std::fs::write(self.at("/etc/systemd/system/kiosk-serve.service"), k::render_serve_service_in("kiosk", "/usr/local/bin")).unwrap();
             std::fs::write(self.at("/etc/systemd/system/kiosk-watchdog.service"), k::render_watchdog_service()).unwrap();
             for n in ["launch", "cdp", "serve", "watchdog"] {
                 std::fs::write(self.at(&format!("/usr/local/bin/noo-kiosk-{n}")), format!("#!/bin/sh\n# root copy {n}\n")).unwrap();
