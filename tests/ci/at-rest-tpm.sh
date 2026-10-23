@@ -51,28 +51,48 @@ assert_device() {
   die "no TPM device appeared (looked for $TPMRM_GLOB for ${TPM_WAIT_SECS}s). The lane does not skip: without a TPM it proves nothing."
 }
 
+# Pinned upstream sources for the out-of-tree tpm_vtpm_proxy build. One line
+# per kernel series: "series  sha256(tpm_vtpm_proxy.c)  sha256(tpm.h)", both
+# from https://raw.githubusercontent.com/torvalds/linux/v<series>/drivers/char/tpm/.
+# To support a new hosted-kernel series: download those two files at tag
+# v<series>, run sha256sum on each, add one line here.
+VTPM_PINS='
+6.17 8268e005f7eeac4170546b8040a0053c4fb6eecabf76b06213790e1f73b14f10 a6abcf2cfe79aad03eb565d677f70ef0b44e06132a77c6ae99dbd971c1ef96de
+'
+VTPM_URL_BASE="${VTPM_URL_BASE:-https://raw.githubusercontent.com/torvalds/linux}"
+UNAME_R="${UNAME_R:-$(uname -r)}"
+
+kernel_series() { printf '%s' "$UNAME_R" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/'; }
+
+# Prints "sha_c sha_h" for the running series, or fails CLOSED with an ::error.
+vtpm_pin_lookup() {
+  local series line
+  series="$(kernel_series)"
+  line="$(printf '%s\n' "$VTPM_PINS" | awk -v s="$series" '$1==s {print $2, $3; exit}')"
+  if [ -z "$line" ]; then
+    printf '::error title=at-rest-tpm::no pinned sha256 for kernel series %s (runner kernel %s). Refusing to build and load a kernel module from unverified downloads. Fix: download tpm_vtpm_proxy.c and tpm.h from %s/v%s/drivers/char/tpm/, sha256sum both, and add a "%s <sha256 tpm_vtpm_proxy.c> <sha256 tpm.h>" line to VTPM_PINS in tests/ci/at-rest-tpm.sh.\n' \
+      "$series" "$UNAME_R" "$VTPM_URL_BASE" "$series" "$series"
+    die "no pinned sha256 for kernel series $series (files: tpm_vtpm_proxy.c, tpm.h)"
+  fi
+  printf '%s\n' "$line"
+}
+
 # Build tpm_vtpm_proxy.ko out of tree from the matching upstream kernel tag.
-# Fetches two files (the driver and the tpm core's private header); sha256 is
-# verified for the kernel series we have proved, logged as unverified otherwise.
+# Fails closed: sources are verified against VTPM_PINS before anything builds.
 build_vtpm_proxy_module() {
-  local series base dir sum_c sum_h
-  series="$(uname -r | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
-  base="https://raw.githubusercontent.com/torvalds/linux/v${series}/drivers/char/tpm"
+  local series base dir pin sum_c sum_h
+  series="$(kernel_series)"
+  pin="$(vtpm_pin_lookup)"; sum_c="${pin% *}"; sum_h="${pin#* }"
+  base="$VTPM_URL_BASE/v${series}/drivers/char/tpm"
   dir="$(mktemp -d)"
-  log "building tpm_vtpm_proxy out of tree for $(uname -r) from kernel tag v${series}"
-  apt-get install -y -qq "linux-headers-$(uname -r)" build-essential >"$LOG_DIR/headers.log" 2>&1 || { tail -20 "$LOG_DIR/headers.log" >&2; return 1; }
+  log "building tpm_vtpm_proxy out of tree for $UNAME_R from kernel tag v${series}"
+  apt-get install -y -qq "linux-headers-$UNAME_R" build-essential >"$LOG_DIR/headers.log" 2>&1 || { tail -20 "$LOG_DIR/headers.log" >&2; return 1; }
   curl -fsSL --retry 3 -o "$dir/tpm_vtpm_proxy.c" "$base/tpm_vtpm_proxy.c" || return 1
   curl -fsSL --retry 3 -o "$dir/tpm.h" "$base/tpm.h" || return 1
-  if [ "$series" = "6.17" ]; then
-    sum_c=8268e005f7eeac4170546b8040a0053c4fb6eecabf76b06213790e1f73b14f10
-    sum_h=a6abcf2cfe79aad03eb565d677f70ef0b44e06132a77c6ae99dbd971c1ef96de
-    [ "$(sha "$dir/tpm_vtpm_proxy.c")" = "$sum_c" ] && [ "$(sha "$dir/tpm.h")" = "$sum_h" ] \
-      || die "upstream v6.17 driver sources do not match the pinned sha256"
-  else
-    log "WARNING: no pinned sha256 for kernel series $series; sources used unverified"
-  fi
+  [ "$(sha "$dir/tpm_vtpm_proxy.c")" = "$sum_c" ] || die "tpm_vtpm_proxy.c for v${series} does not match its pinned sha256"
+  [ "$(sha "$dir/tpm.h")" = "$sum_h" ] || die "tpm.h for v${series} does not match its pinned sha256"
   printf 'obj-m += tpm_vtpm_proxy.o\n' >"$dir/Makefile"
-  make -C "/lib/modules/$(uname -r)/build" "M=$dir" modules >"$LOG_DIR/vtpm-build.log" 2>&1 \
+  make -C "/lib/modules/$UNAME_R/build" "M=$dir" modules >"$LOG_DIR/vtpm-build.log" 2>&1 \
     || { tail -30 "$LOG_DIR/vtpm-build.log" >&2; return 1; }
   insmod "$dir/tpm_vtpm_proxy.ko" || return 1
   [ -e /dev/vtpmx ] || return 1
@@ -344,6 +364,7 @@ volume_after_pcr_change() {
 case "${1:-}" in
   setup-tpm)     setup_tpm ;;
   assert-device) assert_device >/dev/null ;;
+  check-pin)     vtpm_pin_lookup ;;
   test)          run_tests ;;
-  *) die "usage: $0 setup-tpm|assert-device|test" ;;
+  *) die "usage: $0 setup-tpm|assert-device|check-pin|test" ;;
 esac
