@@ -1103,8 +1103,14 @@ struct SeatState {
     display: Option<String>,
 }
 
+/// Where applier state lives for a layout: the pre-0.6.10 root applier kept
+/// it in `LEGACY_STATE_DIR`, the user layout under the seat user's home.
+fn state_dir_for(cfg: &SeatConfig, layout: &str) -> PathBuf {
+    if layout == "legacy-root" { PathBuf::from(LEGACY_STATE_DIR) } else { cfg.state_dir() }
+}
+
 fn read_state(cfg: &SeatConfig) -> SeatState {
-    std::fs::read(cfg.state_dir().join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    std::fs::read(state_dir_for(cfg, layout_word()).join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 fn write_state(cfg: &SeatConfig, s: &SeatState) {
@@ -1121,6 +1127,10 @@ fn layout_word() -> &'static str {
 
 /// The heartbeat body. What `noo upgrade` and `noo cluster verify` judge.
 fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
+    heartbeat_body_for(cfg, state, layout_word())
+}
+
+fn heartbeat_body_for(cfg: &SeatConfig, state: &SeatState, layout: &str) -> Value {
     let applier_sha = std::fs::read(cfg.applier_path()).or_else(|_| std::fs::read(LEGACY_APPLIER_BIN)).ok().map(|b| sha256_hex(&b));
     let user_sha = std::fs::read(cfg.cli_path()).ok().map(|b| sha256_hex(&b));
     let console = sh_out(Command::new(format!("{KIOSK_BIN}/noo-kiosk-cdp")).arg("build"))
@@ -1128,7 +1138,7 @@ fn heartbeat_body(cfg: &SeatConfig, state: &SeatState) -> Value {
     let kiosk_env = std::fs::read_to_string(super::kiosk::ENV_FILE).ok().map(|t| read_kiosk_env(&t)).unwrap_or_default();
     json!({
         "cli_version": env!("CARGO_PKG_VERSION"),
-        "layout": layout_word(),
+        "layout": layout,
         "user_cli_current": applier_sha.is_some() && applier_sha == user_sha,
         "kiosk_serve": unit_state("kiosk-serve.service"),
         "kiosk_display": unit_state("kiosk.service"),
@@ -1410,9 +1420,11 @@ pub fn kiosk_seat_sync(_g: &Globals, args: &[String]) -> Result<i32, Unhandled> 
         }
     };
     // An old seat's root timer runs the new binary here after a rail update:
-    // it only reports (the heartbeat above carries layout=legacy-root) and
+    // it only reports (a heartbeat carrying layout=legacy-root and the running
+    // version, sent HERE: this branch returns before the one below) and
     // tells the operator the ONE migration command. It never applies as root.
     if layout_word() == "legacy-root" {
+        heartbeat(&state);
         say(&format!(
             "this seat still runs the pre-0.6.10 root layout; migrate it once, on this box: \
              sudo {LEGACY_APPLIER_BIN} kiosk seat-sync --migrate"));
@@ -1732,6 +1744,22 @@ mod tests {
     fn cfg() -> SeatConfig {
         SeatConfig { seat: "lobby".into(), controller_url: "https://ctl.example.ts.net:8080".into(),
             cli_user: "alex".into(), cli_home: "/home/alex".into() }
+    }
+
+    #[test]
+    fn a_legacy_root_heartbeat_names_the_layout_and_the_running_version() {
+        let st = SeatState { last_applied_sha: Some("abc".into()), ..Default::default() };
+        let b = heartbeat_body_for(&cfg(), &st, "legacy-root");
+        assert_eq!(b["layout"], "legacy-root");
+        assert_eq!(b["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(b["last_applied_sha"], "abc");
+        assert_eq!(heartbeat_body_for(&cfg(), &st, "user")["layout"], "user");
+    }
+
+    #[test]
+    fn the_legacy_layout_reads_state_from_the_legacy_dir() {
+        assert_eq!(state_dir_for(&cfg(), "legacy-root"), PathBuf::from("/var/lib/noo-seat"));
+        assert_eq!(state_dir_for(&cfg(), "user"), PathBuf::from("/home/alex/.local/state/noo-seat"));
     }
 
     const SIGPUB: &str = "-----BEGIN PUBLIC KEY-----\nMHYw\n-----END PUBLIC KEY-----\n";

@@ -2275,6 +2275,33 @@ pub(crate) async fn reported_gpu_lanes(state: &AppState, node_id: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+/// The node record with the agent's `gpu_contention` in place of the one the
+/// last heartbeat carried. Pure, so the merge is tested without a KV.
+pub(crate) fn with_contention(mut record: Value, gc: Value) -> Value {
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("gpu_contention".to_string(), gc);
+    }
+    record
+}
+
+/// Write the agent-returned `gpu_contention` into the node's `mesh_nodes`
+/// record by compare-and-swap on the revision (a heartbeat write racing this
+/// one wins; it carries the same value). Best effort: any failure is logged
+/// and swallowed, the user's hold/release already succeeded on the node.
+async fn write_back_contention(state: &AppState, node_id: &str, gc: Value) {
+    let Ok(kv) = state.js.get_key_value("mesh_nodes").await else { return };
+    for _ in 0..3 {
+        let Ok(Some(entry)) = kv.entry(node_id).await else { return };
+        let Ok(record) = serde_json::from_slice::<Value>(&entry.value) else { return };
+        let Ok(bytes) = serde_json::to_vec(&with_contention(record, gc.clone())) else { return };
+        match kv.update(node_id, bytes.into(), entry.revision).await {
+            Ok(_) => return,
+            Err(e) => tracing::debug!(node_id = %node_id, error = %e, "gpu_contention write-back lost a revision race; retrying"),
+        }
+    }
+    tracing::warn!(node_id = %node_id, "gpu_contention write-back gave up; the next heartbeat carries it");
+}
+
 pub(crate) async fn gpu_hold_op(
     state: &AppState,
     actor: String,
@@ -2341,6 +2368,14 @@ pub(crate) async fn gpu_hold_op(
         }
         ("release", true) => crate::coordinator::classes::set_lanes_paused(node_id, &[]),
         _ => {}
+    }
+    // Read-after-write: the lease the agent just returned goes into the
+    // node's KV record now, so reservation list/status/release see it
+    // before the next heartbeat (up to 30 s later) carries the same value.
+    if ok {
+        if let Some(gc) = result.as_ref().ok().and_then(|v| v.get("gpu_contention")).cloned() {
+            write_back_contention(state, node_id, gc).await;
+        }
     }
     tracing::info!(node_id = %node_id, op, ok, actor = %actor, force = payload["force"].as_bool().unwrap_or(false),
         legacy = payload["legacy"].as_bool().unwrap_or(false), operation_id = %payload["operation_id"].as_str().unwrap_or(""), "node_gpu_hold");
@@ -6562,6 +6597,18 @@ mod heartbeat_carry_tests {
         assert!(drain < call && lanes < call, "the lanes leave routing before the agent is asked to stop anything");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/hold\", post(gpu_hold))"));
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/gpu/release\", post(gpu_release))"));
+    }
+
+    #[test]
+    fn with_contention_replaces_only_the_contention() {
+        let rec = json!({"id": "awolf", "status": "online", "gpu_contention": {"state": "free"}});
+        let gc = json!({"state": "held", "lease": {"operation_id": "op-1", "owner": "op"}});
+        let merged = with_contention(rec, gc.clone());
+        assert_eq!(merged["gpu_contention"], gc);
+        assert_eq!(merged["status"], "online");
+        assert_eq!(merged["id"], "awolf");
+        // A record with no prior contention gains it.
+        assert_eq!(with_contention(json!({"id": "x"}), gc.clone())["gpu_contention"], gc);
     }
 
     /// One hold or release per node at a time; the slot frees when the
