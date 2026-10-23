@@ -828,6 +828,31 @@ pub fn clear_line() {
     let _ = std::io::stderr().flush();
 }
 
+/// Wipe a secret that was just revealed with [`value`] (the at-rest recovery
+/// key, i10a) off the terminal: clear the screen and, where the terminal
+/// honours it, its scrollback. Written where [`value`] wrote (the original
+/// stdout, even under `--quiet`), and only when that is a TTY: a pipe never
+/// gets the escape.
+pub fn clear_revealed_secret() {
+    use std::io::Write as _;
+    const SEQ: &str = "\x1b[H\x1b[2J\x1b[3J";
+    match VALUE_FD.get() {
+        Some(&fd) => {
+            // SAFETY: fd is a dup of our original stdout, kept open for the
+            // process lifetime (see `value`).
+            if unsafe { libc::isatty(fd) } == 1 {
+                let _ = unsafe { libc::write(fd, SEQ.as_ptr() as *const _, SEQ.len()) };
+            }
+        }
+        None => {
+            if unsafe { libc::isatty(1) } == 1 {
+                print!("{SEQ}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+}
+
 // ── printers ────────────────────────────────────────────────────────────
 // Narration → stdout, suppressed by --quiet/--json. Errors → stderr, always.
 

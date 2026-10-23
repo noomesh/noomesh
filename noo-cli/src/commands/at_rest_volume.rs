@@ -545,7 +545,7 @@ pub(crate) fn retyped_ok(key: &str, first: &str, last: &str) -> bool {
 }
 
 /// What the person is told above the key.
-pub(crate) const RECOVERY_KEY_WARNING: &str = "This recovery key opens the encrypted state volume when the TPM cannot (a firmware or Secure Boot change, a new motherboard, a moved disk). It is shown ONCE and is not stored anywhere on this machine. Write it down or put it in a password manager OFF this machine now.";
+pub(crate) const RECOVERY_KEY_WARNING: &str = "This recovery key opens the encrypted state volume when the TPM cannot (a firmware or boot-chain change, a new motherboard, a moved disk). It is shown ONCE and is not stored anywhere on this machine. Write it down or put it in a password manager OFF this machine now.";
 
 // ── fresh onboard ───────────────────────────────────────────────────────
 
@@ -700,9 +700,7 @@ fn reveal_on_terminal(key: &str) -> bool {
         let last = read_answer("Type the LAST group of the key").unwrap_or_default();
         if retyped_ok(key, &first, &last) {
             // Off the screen and, where the terminal allows, its scrollback.
-            print!("\x1b[H\x1b[2J\x1b[3J");
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
+            ui::clear_revealed_secret();
             return true;
         }
         ui::warned("those groups do not match the key above — read it again and retype them");
