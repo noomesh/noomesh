@@ -231,7 +231,6 @@ fn cluster_status_once(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     ui::guide(&[
         ("noo cluster desired <node>", "the placements and config this node is meant to run"),
         ("noo cluster place <node> <backend> <model>", "assign a model to a node (desired state; the agent keeps it running)"),
-        ("noo cluster place-model <model> --apply", "let the scheduler pick the best node for a model"),
     ]);
     Ok(0)
 }
@@ -3498,7 +3497,8 @@ mod authenticated_fleet_reads_tests {
     fn no_fleet_read_goes_out_without_a_credential() {
         let src = include_str!("cluster.rs");
         let calls = src.matches("\"/api/cluster/nodes\"").count();
-        assert!(calls >= 8, "expected the fleet endpoint to be read here, found {calls}");
+        // Nine readers in 2026-09; i195 decision 1 retired two of them (2026-10-23).
+        assert!(calls >= 7, "expected the fleet endpoint to be read here, found {calls}");
         let unauthenticated: Vec<&str> = src
             .lines()
             .filter(|l| l.contains("\"/api/cluster/nodes\", false"))
