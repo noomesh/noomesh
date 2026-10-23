@@ -285,3 +285,72 @@ func TestWipeFstrimFailureIsNotFatalButSaid(t *testing.T) {
 		t.Fatalf("%v %q", err, out)
 	}
 }
+
+func TestMeasureReportsBytesPerNameAsRoot(t *testing.T) {
+	r := newMigRig(t, true, true)
+	other := filepath.Join(r.root, "plain", "loki")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "big"), bytes.Repeat([]byte("x"), 300000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := r.run("measure", "--entry", r.src+"=postgres", "--entry", other+"=loki")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		OK    bool              `json:"ok"`
+		Bytes map[string]uint64 `json:"bytes"`
+		Total uint64            `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil || !got.OK {
+		t.Fatalf("%v %q", err, out)
+	}
+	if got.Bytes["loki"] < 300000 || got.Bytes["postgres"] == 0 || got.Total != got.Bytes["loki"]+got.Bytes["postgres"] {
+		t.Errorf("bytes %+v", got)
+	}
+}
+
+func TestMeasureRefusesAPartialMeasurement(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a 0700 directory; the refusal is exercised as a normal user")
+	}
+	r := newMigRig(t, true, true) // the verb believes it is root; the OS does not
+	locked := filepath.Join(r.src, "pgdata-private")
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "rel"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	out, _, err := r.run("measure", "--entry", r.src+"=postgres")
+	if err == nil || !strings.Contains(err.Error(), "partly readable") {
+		t.Fatalf("a partial measurement must be refused, got %v", err)
+	}
+	if out != "" {
+		t.Errorf("no size may be reported on a partial measurement: %q", out)
+	}
+}
+
+func TestMeasureRefusesNonRootAndBadEntries(t *testing.T) {
+	r := newMigRig(t, true, false)
+	if _, _, err := r.run("measure", "--entry", r.src+"=postgres"); err == nil || !strings.Contains(err.Error(), "root") {
+		t.Errorf("non-root: %v", err)
+	}
+	r = newMigRig(t, true, true)
+	for name, args := range map[string][]string{
+		"none":         {"measure"},
+		"bad name":     {"measure", "--entry", r.src + "=home"},
+		"no equals":    {"measure", "--entry", r.src},
+		"missing path": {"measure", "--entry", filepath.Join(r.root, "nope", "x") + "=postgres"},
+	} {
+		if _, _, err := r.run(args...); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

@@ -33,6 +33,16 @@ package hostd
 // <mountpoint>/<name> present. Then fstrim on the parent filesystem
 // (best-effort; the SSD caveat is the CLI's to print).
 //
+// measure: how many bytes the state really is, read as root (postgres is 0700
+// and owned by another user, so the operator's own `du` under-counts).
+//
+//	--entry <abs dir>=<state name>   (repeatable)
+//
+// Read-only. It needs no volume (the size decides the volume), but the names
+// are the same allowed set and each path a real directory. ANY unreadable
+// entry fails the verb: a partial measurement is refused, never reported, so
+// the caller cannot size a volume from a number that is too small.
+//
 // Protocol: progress to stderr; stdout carries exactly ONE JSON line.
 // Test seam: NOO_RSYNC, NOO_FSTRIM (and PR-C's NOO_ETC_NOO, NOO_MAPPER_DIR),
 // printed when active.
@@ -45,10 +55,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // MigrateStateNames is what `copy --name` and `wipe --entry` accept: the
@@ -90,7 +102,7 @@ func MigrateConfigFromEnv() MigrateConfig {
 // IsAtRestMigrateVerb reports whether `noo-hostd at-rest <verb>` is one of
 // this file's.
 func IsAtRestMigrateVerb(args []string) bool {
-	return len(args) > 0 && (args[0] == "copy" || args[0] == "wipe")
+	return len(args) > 0 && (args[0] == "copy" || args[0] == "wipe" || args[0] == "measure")
 }
 
 // RunAtRestMigrate dispatches `noo-hostd at-rest copy|wipe …`.
@@ -108,6 +120,8 @@ func runAtRestMigrate(cfg MigrateConfig, args []string, stdout, stderr io.Writer
 	switch args[0] {
 	case "copy":
 		return migrateCopyCmd(cfg, args[1:], stdout, stderr)
+	case "measure":
+		return migrateMeasureCmd(cfg, args[1:], stdout, stderr)
 	default:
 		return migrateWipeCmd(cfg, args[1:], stdout, stderr)
 	}
@@ -134,12 +148,12 @@ func migrateMountedFromMapper(vc VolumeConfig, procMounts, mountpoint string) bo
 	last := ""
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		fs := strings.Fields(sc.Text())
-		if len(fs) < 2 {
+		fl := strings.Fields(sc.Text())
+		if len(fl) < 2 {
 			continue
 		}
-		if strings.TrimRight(strings.ReplaceAll(fs[1], `\040`, " "), "/") == want {
-			last = fs[0]
+		if strings.TrimRight(strings.ReplaceAll(fl[1], `\040`, " "), "/") == want {
+			last = fl[0]
 		}
 	}
 	if last == "" {
@@ -343,4 +357,74 @@ func migrateWipeCmd(cfg MigrateConfig, args []string, stdout, stderr io.Writer) 
 		}
 	}
 	return migrateJSON(stdout, map[string]any{"ok": true, "verb": "wipe", "removed": removed, "fstrim": trim})
+}
+
+// migrateMeasure sums the on-disk size of a tree: the larger of apparent size
+// and allocated blocks per file, hard links once, and any error is fatal.
+func migrateMeasure(root string) (uint64, error) {
+	var total uint64
+	seen := map[[2]uint64]bool{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		size := uint64(info.Size())
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			if alloc := uint64(st.Blocks) * 512; alloc > size {
+				size = alloc
+			}
+			if !info.IsDir() && st.Nlink > 1 {
+				k := [2]uint64{uint64(st.Dev), uint64(st.Ino)}
+				if seen[k] {
+					return nil
+				}
+				seen[k] = true
+			}
+		}
+		total += size
+		return nil
+	})
+	return total, err
+}
+
+func migrateMeasureCmd(cfg MigrateConfig, args []string, stdout, stderr io.Writer) error {
+	fset := flag.NewFlagSet("measure", flag.ContinueOnError)
+	fset.SetOutput(stderr)
+	var entries migrateEntries
+	fset.Var(&entries, "entry", "<abs dir>=<state name> (repeatable)")
+	if err := fset.Parse(args); err != nil {
+		return err
+	}
+	if fset.NArg() != 0 || len(entries) == 0 {
+		return errors.New("measure: one or more --entry <abs path>=<name> are required")
+	}
+	if cfg.Volume.Geteuid() != 0 {
+		return errors.New("measure: must run as root (sudo noo-hostd at-rest measure): as the operator it would under-count what it cannot read")
+	}
+	bytesBy := map[string]uint64{}
+	var total uint64
+	for _, e := range entries {
+		i := strings.LastIndex(e, "=")
+		if i <= 0 {
+			return fmt.Errorf("measure: --entry %q is not <path>=<name>", e)
+		}
+		p, n := e[:i], e[i+1:]
+		if !migrateNameOK(n) {
+			return fmt.Errorf("measure: %q: %q is not a state name", p, n)
+		}
+		if err := migrateCheckDir(p); err != nil {
+			return fmt.Errorf("measure: %w", err)
+		}
+		b, err := migrateMeasure(p)
+		if err != nil {
+			return fmt.Errorf("measure: %s is only partly readable (%v): refusing to report a partial size", p, err)
+		}
+		bytesBy[n] = b
+		total += b
+	}
+	return migrateJSON(stdout, map[string]any{"ok": true, "verb": "measure", "bytes": bytesBy, "total": total})
 }
