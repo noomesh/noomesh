@@ -307,6 +307,7 @@ pub(crate) fn render_env(a: &SetupArgs) -> String {
 /// band — which the proxy produces by answering 401 when its mint fails
 /// — is a display saying what is wrong. Those are different outcomes and
 /// only one of them is useful from across a room.
+#[cfg(test)]
 pub(crate) fn render_serve_service(user: &str) -> String {
     render_serve_service_in(user, BIN_DIR)
 }
@@ -354,6 +355,7 @@ pub(crate) fn render_serve_service_in(user: &str, bin: &str) -> String {
 /// A shared unit that named `display-manager.service` would take the
 /// laptop's desktop away on the next boot, which is exactly what shared
 /// mode exists to avoid.
+#[cfg(test)]
 pub(crate) fn render_kiosk_service(user: &str, mode: Mode, vt: u8) -> String {
     render_kiosk_service_in(user, mode, vt, BIN_DIR)
 }
