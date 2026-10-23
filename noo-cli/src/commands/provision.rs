@@ -4065,7 +4065,7 @@ mod cluster_trust_tests {
             return None;
         }
         let tmpl = std::fs::read_to_string(&path).unwrap();
-        let body = render_env_template(&tmpl, &full_vars()).unwrap();
+        let body = render_env_template(&tmpl, &super::tests::full_vars()).unwrap();
         Some(if applier_knows_cluster_trust_keys(darwin, app_version) {
             body
         } else {
@@ -4621,7 +4621,7 @@ mod tests {
         }
     }
 
-    fn full_vars() -> BTreeMap<&'static str, String> {
+    pub(super) fn full_vars() -> BTreeMap<&'static str, String> {
         let mut v = BTreeMap::new();
         for k in ["na_node_id","node_ip","node_tier","gpu_model","controller_url","nats_url",
                   "noo_node_agent_token","noo_cluster_secret",
