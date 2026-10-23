@@ -248,6 +248,9 @@ func IsAtRestVolumeVerb(args []string) bool {
 
 // RunAtRestVolume dispatches `noo-hostd at-rest create-volume …`.
 func RunAtRestVolume(args []string, stdout, stderr io.Writer) error {
+	if IsAtRestRecoveryVerb(args) { // recovery-key, reenroll (PR-E)
+		return RunAtRestRecovery(args, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		volUsage(stderr)
 		if len(args) == 0 {
@@ -321,6 +324,11 @@ func volUsage(w io.Writer) {
 
         --size-mib <n>  (testing) a small volume in MiB instead of --size,
                         at least 32; for the CI lane, never for a real install.
+
+  sudo noo-hostd at-rest recovery-key [--finish --new-slot N --old-slots a,b]
+  sudo noo-hostd at-rest reenroll [--pcrs 7|none|auto]
+        New recovery key / TPM re-enrollment after a firmware change. Run by
+        'noo security at-rest recovery-key|reenroll'.
 `)
 }
 

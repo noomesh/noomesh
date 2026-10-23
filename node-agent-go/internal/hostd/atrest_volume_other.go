@@ -19,5 +19,7 @@ func IsAtRestVolumeVerb(args []string) bool {
 // systemd TPM enrollment (i10a — Linux controllers only; Mac, WSL2 and worker
 // nodes report "not supported here").
 func RunAtRestVolume(_ []string, _, _ io.Writer) error {
-	return errors.New("at-rest: not supported here (the encrypted state volume needs a Linux controller with systemd and a TPM)")
+	return errNotSupportedHere
 }
+
+var errNotSupportedHere = errors.New("at-rest: not supported here (the encrypted state volume needs a Linux controller with systemd and a TPM)")
