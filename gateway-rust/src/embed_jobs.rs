@@ -360,8 +360,10 @@ pub fn decode_vectors(b64: &str, n: usize, dims: usize) -> Result<Vec<Vec<f32>>,
     let rows: Vec<Vec<f32>> = bytes
         .chunks_exact(dims * 4)
         .map(|row| {
-            row.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         })
         .collect();
