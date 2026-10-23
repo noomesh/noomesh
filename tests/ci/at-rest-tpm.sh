@@ -331,16 +331,22 @@ volume_tests() {
   grep -q -- '--pcrs'  "$LOG_DIR/create-volume.help" && flags+=(--pcrs 7)
   grep -q -- '--image' "$LOG_DIR/create-volume.help" && flags+=(--image "$VOL_IMG")
   grep -q -- '--mount' "$LOG_DIR/create-volume.help" && flags+=(--mount "$work/mnt")
+  # PR-C's verb takes a data root: the volume is <root>/state.luks2, mounted
+  # at <root>/state, and the manifest records it as volume_file.
+  if grep -q -- '--data-root' "$LOG_DIR/create-volume.help"; then
+    mkdir -p "$work/root"; flags+=(--data-root "$work/root")
+  fi
   mkdir -p "$work/mnt"
   log "create-volume ${flags[*]}"
   hostd at-rest create-volume "${flags[@]}" 2>&1 | tee "$out"
   if [ ! -f "$VOL_IMG" ]; then
-    VOL_IMG="$(jq -r '.volume_image // .volume.image // .volume_path // empty' /etc/noo/at-rest.json)"
+    VOL_IMG="$(jq -r '.volume_image // .volume.image // .volume_path // .volume_file // empty' /etc/noo/at-rest.json)"
   fi
   [ -n "$VOL_IMG" ] && sudo test -f "$VOL_IMG" || die "cannot find the volume image (pass --image or record it in the manifest)"
   RECOVERY_KEY="$(grep -Eo '([cbdefghijklnrtuv]{8}-){7}[cbdefghijklnrtuv]{8}' "$out" | head -1 || true)"
   [ -n "$RECOVERY_KEY" ] || die "create-volume printed no recovery key"
-  printf '%s' "$RECOVERY_KEY" >"$work/recovery.key"; chmod 0600 "$work/recovery.key"
+  # Next to the image: volume_after_pcr_change reads $(dirname "$VOL_IMG")/recovery.key.
+  printf '%s' "$RECOVERY_KEY" >"$(dirname "$VOL_IMG")/recovery.key"; chmod 0600 "$(dirname "$VOL_IMG")/recovery.key"
 
   log "luksDump: tpm2 token + recovery keyslot"
   local meta; meta="$(sudo cryptsetup luksDump --dump-json-metadata "$VOL_IMG")"

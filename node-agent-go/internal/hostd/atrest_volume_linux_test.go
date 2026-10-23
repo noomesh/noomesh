@@ -650,3 +650,75 @@ func TestCreateVolumeFlagsParse(t *testing.T) {
 		t.Fatal("IsAtRestVolumeVerb")
 	}
 }
+
+// The testing-only --size-mib: a small volume for the swtpm CI lane, with
+// every other check unchanged.
+func TestSizeMiBIsAcceptedFlooredAndExclusive(t *testing.T) {
+	r := newVolRig(t, volBoolp(true))
+	o := r.opts()
+	o.SizeGiB, o.SizeMiB = 0, 64
+	res, stderr, err := r.run(t, o)
+	if err != nil {
+		t.Fatalf("--size-mib 64: %v\n%s", err, stderr)
+	}
+	if callIndex(r.calls(), "fallocate -l 67108864 ") < 0 {
+		t.Fatalf("64 MiB not allocated:\n%s", strings.Join(r.calls(), "\n"))
+	}
+	if res.SizeMiB != 64 || r.manifest(t)["volume_size_mib"] != float64(64) {
+		t.Errorf("size not reported in MiB: %+v", res)
+	}
+
+	for name, c := range map[string]struct {
+		gib, mib int
+		want     string
+	}{
+		"below the floor": {0, 31, "at least 32"},
+		"both":            {50, 64, "exclusive"},
+		"neither":         {0, 0, "--size must be"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newVolRig(t, volBoolp(true))
+			o := r.opts()
+			o.SizeGiB, o.SizeMiB = c.gib, c.mib
+			if _, _, err := r.run(t, o); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want %q, got %v", c.want, err)
+			}
+			if len(r.calls()) != 0 {
+				t.Errorf("a refusal ran binaries: %v", r.calls())
+			}
+		})
+	}
+
+	// The free-space check still applies, scaled to the small size: 64 MiB
+	// plus the 5 GiB margin.
+	r2 := newVolRig(t, volBoolp(true))
+	r2.free = (5 << 30) + (63 << 20)
+	o2 := r2.opts()
+	o2.SizeGiB, o2.SizeMiB = 0, 64
+	if _, _, err := r2.run(t, o2); err == nil || !strings.Contains(err.Error(), "not enough space") {
+		t.Fatalf("the free-space check was relaxed for --size-mib: %v", err)
+	}
+	// And the other refusals: e.g. no TPM.
+	r3 := newVolRig(t, volBoolp(true))
+	_ = os.Remove(r3.cfg.TPMDevice)
+	o3 := r3.opts()
+	o3.SizeGiB, o3.SizeMiB = 0, 64
+	if _, _, err := r3.run(t, o3); err == nil || !strings.Contains(err.Error(), "no TPM") {
+		t.Fatalf("--size-mib skipped the TPM check: %v", err)
+	}
+
+	// The flag parses, and the help names it only as "(testing)".
+	var help bytes.Buffer
+	p, err := parseCreateVolumeArgs([]string{"--user", "op", "--size-mib", "64"}, &help)
+	if err != nil || p.SizeMiB != 64 || p.SizeGiB != 0 {
+		t.Fatalf("parse: %+v %v", p, err)
+	}
+	_, _ = parseCreateVolumeArgs([]string{"--help"}, &help)
+	h := help.String()
+	if !strings.Contains(h, "--size-mib <n>  (testing)") || !strings.Contains(h, "--pcrs") || !strings.Contains(h, "--data-root") {
+		t.Fatalf("help:\n%s", h)
+	}
+	if strings.Contains(h, "-age-key string") {
+		t.Fatalf("-h must print the operator's usage, not Go's flag dump:\n%s", h)
+	}
+}
