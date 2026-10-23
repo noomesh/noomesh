@@ -2700,7 +2700,7 @@ pub(crate) fn sandbox_executor_check(probe: Option<&SandboxProbe>) -> Check {
                 "the executor uid is in place ({detail}) but the configured {mode} isolation cannot run ({}) — the sandbox refuses calls until it can",
                 iso["detail"].as_str().unwrap_or("no detail")
             ),
-            "NOO_SANDBOX_APPARMOR=unconfined in .env on a host whose AppArmor blocks bwrap's user namespace (docs/reference/env.md), then: noo stack restart --force sandbox",
+            "on a host whose AppArmor blocks bwrap (Ubuntu 24.04+): sudo install -m 0644 docker/apparmor-noo-sandbox /etc/apparmor.d/noo-sandbox && sudo apparmor_parser -r /etc/apparmor.d/noo-sandbox, then NOO_SANDBOX_APPARMOR=noo-sandbox in .env (docs/reference/env.md) and: noo stack restart --force sandbox",
         );
     }
     ok(ROW, format!("code runs as {detail}, uid {uid} first, never as the server; isolation {active}"))
@@ -7334,7 +7334,7 @@ mod tests {
         let c = sandbox_executor_check(Some(&unusable));
         assert_eq!(c.verdict, Verdict::Fail, "{}", c.detail);
         assert!(c.detail.contains("cannot run") && c.detail.contains("uid map"), "{}", c.detail);
-        assert!(c.remedy.as_deref().unwrap().contains("NOO_SANDBOX_APPARMOR"), "{:?}", c.remedy);
+        assert!(c.remedy.as_deref().unwrap().contains("/etc/apparmor.d/noo-sandbox") && c.remedy.as_deref().unwrap().contains("NOO_SANDBOX_APPARMOR=noo-sandbox"), "{:?}", c.remedy);
 
         // an older sandbox image: a health body with no executor at all
         let mut old = sandbox_probe("refused: x", "answered HTTP/1.1 200 OK", "refused: y");
