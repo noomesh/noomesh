@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 PersonifAI LLC
+
+# i10a at-rest lane: the TPM-sealed age key (noo-hostd at-rest seal-age-key,
+# noo-unseal.service) and, once it is in the tree, the TPM-bound state volume
+# (at-rest create-volume), run against a REAL software TPM (swtpm behind the
+# kernel's vtpm proxy, so /dev/tpmrmN exists) with the runner's real systemd
+# as PID 1. The rehearsal's fake-TPM shim cannot prove any of this.
+#
+# This lane never skips its TPM checks: if no TPM device can be created the job
+# FAILS (tests/ci/at-rest-tpm.sh, pinned by tests/test_at_rest_ci_lane.py).
+# GitHub-hosted only (no secrets, read-only token).
+name: at-rest-tpm
+
+on:
+  pull_request:
+    branches: [ main, staging, develop, dev ]
+    paths:
+      - 'node-agent-go/internal/hostd/atrest*'
+      - 'node-agent-go/internal/hostd/at_rest*'
+      - 'node-agent-go/cmd/noo-hostd/**'
+      - 'node-agent-go/go.mod'
+      - 'node-agent-go/go.sum'
+      - 'scripts/lib-secrets.sh'
+      - 'tests/ci/at-rest-tpm.sh'
+      - '.github/workflows/at-rest-tpm.yml'
+  # A merge group has no path filter: the queue builds it, this lane reports.
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: at-rest-tpm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  at-rest-tpm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Go toolchain the agent builds with (same pin as ci.yml's go job).
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff   # v5
+        with:
+          go-version-file: node-agent-go/go.mod
+          cache-dependency-path: node-agent-go/go.sum
+
+      - name: Install swtpm, tpm2-tools, cryptsetup
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq swtpm swtpm-tools tpm2-tools cryptsetup cryptsetup-bin age jq
+          systemctl --version | head -1
+          test "$(ps -o comm= -p 1)" = systemd
+
+      - name: Build noo-hostd (linux/amd64, from this tree)
+        working-directory: node-agent-go
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$RUNNER_TEMP/noo-hostd" ./cmd/noo-hostd
+          sudo install -m 0755 "$RUNNER_TEMP/noo-hostd" /usr/local/bin/noo-hostd
+
+      - name: Start a software TPM (vtpm-proxy) and require a device
+        run: sudo -E bash tests/ci/at-rest-tpm.sh setup-tpm
+
+      - name: Assert the TPM device is there
+        run: bash tests/ci/at-rest-tpm.sh assert-device
+
+      - name: At-rest seal, unseal, volume and PCR 7 assertions against the TPM
+        run: bash tests/ci/at-rest-tpm.sh test
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          mkdir -p /tmp/at-rest-tpm-logs
+          { uname -a; systemctl --version | head -1; ls -l /dev/tpm* /dev/vtpmx 2>&1;
+            sudo journalctl -u noo-unseal.service --no-pager 2>&1 | tail -80;
+            sudo cat /etc/noo/at-rest.json 2>&1;
+            sudo cat /etc/systemd/system/noo-unseal.service 2>&1; } > /tmp/at-rest-tpm-logs/diagnostics.txt || true
+
+      - name: Upload logs (failure only)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: at-rest-tpm-logs
+          path: /tmp/at-rest-tpm-logs
+          if-no-files-found: warn
