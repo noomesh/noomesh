@@ -776,8 +776,8 @@ mod loopback_verification_tests {
             .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .unwrap();
         (
-            rcgen::CertifiedKey { cert: ca_cert, key_pair: ca_key },
-            rcgen::CertifiedKey { cert: leaf_cert, key_pair: leaf_key },
+            rcgen::CertifiedKey { cert: ca_cert, signing_key: ca_key },
+            rcgen::CertifiedKey { cert: leaf_cert, signing_key: leaf_key },
         )
     }
 
@@ -785,7 +785,7 @@ mod loopback_verification_tests {
     async fn serve(leaf: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         let cert = CertificateDer::from(leaf.cert.der().to_vec());
-        let key = PrivateKeyDer::try_from(leaf.key_pair.serialize_der()).unwrap();
+        let key = PrivateKeyDer::try_from(leaf.signing_key.serialize_der()).unwrap();
         let cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
