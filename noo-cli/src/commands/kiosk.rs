@@ -308,6 +308,12 @@ pub(crate) fn render_env(a: &SetupArgs) -> String {
 /// — is a display saying what is wrong. Those are different outcomes and
 /// only one of them is useful from across a room.
 pub(crate) fn render_serve_service(user: &str) -> String {
+    render_serve_service_in(user, BIN_DIR)
+}
+
+/// [`render_serve_service`] exec'ing `noo-kiosk-serve` from `bin` (a seat's
+/// shared dir, `kiosk_seat::SEAT_KIOSK_DIR`).
+pub(crate) fn render_serve_service_in(user: &str, bin: &str) -> String {
     format!(
         "# Written by `noo kiosk setup`. The browser's only hop.\n\
          #\n\
@@ -332,7 +338,7 @@ pub(crate) fn render_serve_service(user: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        user = user, env = ENV_FILE, bin = BIN_DIR,
+        user = user, env = ENV_FILE, bin = bin,
     )
 }
 
@@ -349,6 +355,11 @@ pub(crate) fn render_serve_service(user: &str) -> String {
 /// laptop's desktop away on the next boot, which is exactly what shared
 /// mode exists to avoid.
 pub(crate) fn render_kiosk_service(user: &str, mode: Mode, vt: u8) -> String {
+    render_kiosk_service_in(user, mode, vt, BIN_DIR)
+}
+
+/// [`render_kiosk_service`] exec'ing `noo-kiosk-launch` from `bin`.
+pub(crate) fn render_kiosk_service_in(user: &str, mode: Mode, vt: u8, bin: &str) -> String {
     let conflicts = match mode {
         Mode::Dedicated => format!("Conflicts=getty@tty{vt}.service display-manager.service\n"),
         // Deliberately none. See the doc comment.
@@ -393,7 +404,7 @@ pub(crate) fn render_kiosk_service(user: &str, mode: Mode, vt: u8) -> String {
          [Install]\n\
          WantedBy=graphical.target\n",
         why = why, mode = mode.as_str(), vt = vt, conflicts = conflicts,
-        user = user, env = ENV_FILE, bin = BIN_DIR,
+        user = user, env = ENV_FILE, bin = bin,
     )
 }
 
@@ -659,14 +670,24 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         fail(g.json, ExitCode::Usage, "kiosk_url", &e, None);
     }
 
+    // On an enrolled seat the display's scripts live in the seat's shared dir
+    // (seat user : display group, 2750) so the seat's sync can update them
+    // and the display user can run them; the units exec them from there.
+    // Elsewhere they are root's, in /usr/local/bin. The watchdog runs as root
+    // and so stays root-owned either way.
+    let seat_user = super::kiosk_seat::enrolled_seat_user();
+    let (run_dir, run_mode, run_owner) = match seat_user.as_deref() {
+        Some(u) => (super::kiosk_seat::SEAT_KIOSK_DIR, "0750", u),
+        None => (BIN_DIR, "0755", "root"),
+    };
     let files: Vec<(String, String, &str, &str)> = vec![
         (ENV_FILE.into(), render_env(&a), "0640", "root"),
-        (format!("{BIN_DIR}/noo-kiosk-launch"), LAUNCH.into(), "0755", "root"),
-        (format!("{BIN_DIR}/noo-kiosk-cdp"), CDP.into(), "0755", "root"),
+        (format!("{run_dir}/noo-kiosk-launch"), LAUNCH.into(), run_mode, run_owner),
+        (format!("{run_dir}/noo-kiosk-cdp"), CDP.into(), run_mode, run_owner),
         (format!("{BIN_DIR}/noo-kiosk-watchdog"), WATCHDOG.into(), "0755", "root"),
-        (format!("{BIN_DIR}/noo-kiosk-serve"), SERVE.into(), "0755", "root"),
-        (format!("{UNIT_DIR}/kiosk-serve.service"), render_serve_service(&a.user), "0644", "root"),
-        (format!("{UNIT_DIR}/kiosk.service"), render_kiosk_service(&a.user, a.mode, a.vt), "0644", "root"),
+        (format!("{run_dir}/noo-kiosk-serve"), SERVE.into(), run_mode, run_owner),
+        (format!("{UNIT_DIR}/kiosk-serve.service"), render_serve_service_in(&a.user, run_dir), "0644", "root"),
+        (format!("{UNIT_DIR}/kiosk.service"), render_kiosk_service_in(&a.user, a.mode, a.vt, run_dir), "0644", "root"),
         (format!("{UNIT_DIR}/kiosk-watchdog.service"), render_watchdog_service(), "0644", "root"),
         (format!("{UNIT_DIR}/kiosk-watchdog.timer"), render_watchdog_timer().into(), "0644", "root"),
         (LOGIND_CONF.into(), render_logind_conf(a.mode), "0644", "root"),
@@ -750,18 +771,47 @@ pub fn kiosk_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         fail(g.json, ExitCode::Generic, "state_dir", &e, None);
     }
 
+    // The seat's shared dir, owned by the seat user with the display user's
+    // group (root creates it; the seat never does).
+    let display_group = sh_out(&format!("id -gn {}", a.user)).filter(|g| !g.is_empty()).unwrap_or_else(|| a.user.clone());
+    if let Some(su) = seat_user.as_deref() {
+        ui::step(&format!("seat shared dir {} ({su}:{display_group}, 2750)", super::kiosk_seat::SEAT_KIOSK_DIR));
+        if let Err(e) = sh(&format!(
+            "sudo install -d -m 0755 -o root -g root {opt} && sudo install -d -m 2750 -o {su} -g {display_group} {dir}",
+            opt = super::kiosk_seat::SEAT_OPT_DIR, dir = super::kiosk_seat::SEAT_KIOSK_DIR,
+        )) {
+            fail(g.json, ExitCode::Generic, "seat_dir", &e, None);
+        }
+    }
+
     // 2. the files
     for (p, c, m, o) in &files {
         ui::step(&format!("installing {p}"));
         // The env file is root:kiosk so the launcher (kiosk) can read it
-        // and nothing else on the box can.
-        let group = if p == ENV_FILE { a.user.as_str() } else { "root" };
+        // and nothing else on the box can; a seat's shared-dir scripts are
+        // <seat user>:<display group>.
+        let group = if p == ENV_FILE {
+            a.user.as_str()
+        } else if seat_user.is_some() && p.starts_with(super::kiosk_seat::SEAT_KIOSK_DIR) {
+            display_group.as_str()
+        } else {
+            "root"
+        };
         let mut content = c.clone();
         if p.ends_with("noo-kiosk-launch") && browser != "chromium" {
             content = content.replace("BROWSER=\"${NOO_KIOSK_BROWSER:-chromium}\"", &format!("BROWSER=\"${{NOO_KIOSK_BROWSER:-{browser}}}\""));
         }
         if let Err(e) = install_text(&content, p, m, &format!("{o} -g {group}")) {
             fail(g.json, ExitCode::Generic, "install", &e, None);
+        }
+    }
+    // The PATH names (the proxy's mint, the watchdog, `kiosk status`) lead
+    // to the seat's shared dir.
+    if seat_user.is_some() {
+        for n in ["launch", "cdp", "serve"] {
+            if let Err(e) = sh(&format!("sudo ln -sfn {dir}/noo-kiosk-{n} {BIN_DIR}/noo-kiosk-{n}", dir = super::kiosk_seat::SEAT_KIOSK_DIR)) {
+                fail(g.json, ExitCode::Generic, "install", &e, None);
+            }
         }
     }
 
@@ -1738,6 +1788,9 @@ pub fn kiosk_teardown(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         format!("{BIN_DIR}/noo-kiosk-cdp"),
         format!("{BIN_DIR}/noo-kiosk-serve"),
         format!("{BIN_DIR}/noo-kiosk-watchdog"),
+        format!("{}/noo-kiosk-launch", super::kiosk_seat::SEAT_KIOSK_DIR),
+        format!("{}/noo-kiosk-cdp", super::kiosk_seat::SEAT_KIOSK_DIR),
+        format!("{}/noo-kiosk-serve", super::kiosk_seat::SEAT_KIOSK_DIR),
         ENV_FILE.to_string(),
         LOGIND_CONF.to_string(),
         format!("{STATE_DIR}/token.json"),
