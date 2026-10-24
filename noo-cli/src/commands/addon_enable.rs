@@ -236,6 +236,11 @@ pub(crate) struct Live<'a> {
     /// `--lock <path|https-url>`: a third-party add-on's signed lock handed
     /// over by the operator. Ignored for an add-on the CLI ships.
     pub lock: Option<String>,
+    /// `--provision-only`: the bundle must declare a database (`system.json`).
+    /// Checked on the VERIFIED bundle before the pin is written, so a refusal
+    /// leaves nothing changed (an add-on with no database has nothing to
+    /// provision).
+    pub require_system: bool,
 }
 
 fn sops_path() -> PathBuf {
@@ -336,6 +341,16 @@ impl EnableOps for Live<'_> {
             }
             Err(r) => return Err(Refusal { why: format!("{}. Nothing was changed", r.why(addon)), fix: pin_fix(addon, &r) }),
         };
+        if self.require_system && !prepared.fetched.files.contains_key(crate::addons::decls::SYSTEM_FILE) {
+            return Err(Refusal {
+                why: format!(
+                    "{addon}'s signed bundle declares no database ({}), so there is nothing to provision. \
+                     Nothing was changed",
+                    crate::addons::decls::SYSTEM_FILE
+                ),
+                fix: format!("noo addons enable {addon}   # without --provision-only, if it should run"),
+            });
+        }
         if !self.g.json {
             crate::ui::step(&format!("{addon}: lock verified, images pulled {}", prepared.via));
         }

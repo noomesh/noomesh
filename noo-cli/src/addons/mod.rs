@@ -10,6 +10,7 @@ pub mod decls;
 pub mod lock_fetch;
 pub mod pins;
 pub mod pop;
+pub mod provisioned;
 pub mod resolve;
 pub mod trust;
 

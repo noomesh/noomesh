@@ -364,7 +364,12 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 })
             })
             .collect();
-        println!("{}", json!({"addons": rows, "third_party": third, "config": config_path().display().to_string()}));
+        let marks = crate::addons::provisioned::read_all(&crate::envfile::repo_root());
+        let prov: Vec<_> = crate::addons::provisioned::only(&marks, &declared).into_iter().collect();
+        println!(
+            "{}",
+            json!({"addons": rows, "third_party": third, "provisioned": prov, "config": config_path().display().to_string()})
+        );
         return Ok(0);
     }
 
@@ -455,6 +460,23 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     ui::Col::left("digest"),
                     ui::Col::left("key"),
                 ],
+                &rows
+            )
+        );
+    }
+    // Add-ons whose database exists but whose services are not started.
+    let marks = crate::addons::provisioned::read_all(&crate::envfile::repo_root());
+    let prov = crate::addons::provisioned::only(&marks, &declared);
+    if !prov.is_empty() {
+        println!();
+        let rows: Vec<Vec<String>> = prov
+            .iter()
+            .map(|m| vec![m.addon.clone(), ui::warn(crate::addons::provisioned::WORDS), m.schema.clone(), format!("{}, {}", m.role, m.ddl_role)])
+            .collect();
+        print!(
+            "{}",
+            ui::table(
+                &[ui::Col::left("provisioned"), ui::Col::left("state"), ui::Col::left("schema"), ui::Col::left("roles")],
                 &rows
             )
         );
@@ -554,6 +576,10 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let has_bundle = bundle_dir.is_dir();
     let decls = if has_bundle { crate::addons::decls::materialised(&root, key) } else { Ok(Default::default()) };
     let (pw, ddl) = crate::addons::decls::password_envs(key);
+    // Provisioned = schema and roles exist, switch not on, no service started.
+    let provisioned = crate::addons::provisioned::read_all(&root)
+        .remove(key)
+        .filter(|_| declared != Some(true));
 
     if g.json {
         println!(
@@ -562,6 +588,8 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "addon": key,
                 "declared": declared,
                 "effective": resolve(declared, default_on),
+                "state": if provisioned.is_some() { "provisioned" } else if resolve(declared, default_on) { "on" } else { "off" },
+                "provisioned": provisioned,
                 "pin": pin.as_ref().map(|p| json!({"version": p.version, "stack": p.stack})),
                 "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
                 "declarations": decl_json(&decls),
@@ -585,6 +613,15 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ("bundle", if has_bundle { bundle_dir.display().to_string() } else { ui::muted("none on this controller") }),
         ])
     );
+    if let Some(m) = &provisioned {
+        println!(
+            "{}",
+            ui::kv(&[
+                ("state", ui::warn(crate::addons::provisioned::WORDS)),
+                ("provisioned", format!("schema {}, roles {} and {}", m.schema, m.role, m.ddl_role)),
+            ])
+        );
+    }
     let rc = match &decls {
         Err(e) => {
             println!("{}", ui::status_line(ui::Glyph::Err, e));
@@ -680,11 +717,12 @@ pub(crate) fn enable_gate(
 }
 
 fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
-    let (mut name, mut force, mut lock) = (None, false, None);
+    let (mut name, mut force, mut lock, mut provision_only) = (None, false, None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--force" if on => force = true,
+            "--provision-only" if on => provision_only = true,
             "--lock" if on => match it.next() {
                 Some(v) if !v.starts_with('-') => lock = Some(v.clone()),
                 _ => return Err(Unhandled),
@@ -726,6 +764,16 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     };
     // From here on the canonical key, whatever spelling was typed.
     let name = r.key;
+    // `--force` skips the very verification provisioning exists to rely on.
+    if provision_only && force {
+        fail(
+            g.json,
+            ExitCode::Usage,
+            "provision_only_force",
+            "--provision-only verifies the signed lock and bundle; --force skips that, so the two cannot be combined",
+            Some(&format!("noo addons enable {name} --lock <path|https-url> --provision-only")),
+        );
+    }
     let features = granted_features();
     let unlicensed = if on {
         match enable_gate(r, &features, force) {
@@ -735,6 +783,10 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     } else {
         None
     };
+    // Schema and roles only: no switch, no key, no restart (`addon_provision`).
+    if provision_only {
+        return Ok(crate::commands::addon_provision::run(g, name, lock));
+    }
     let before = declared_map().ok().and_then(|d| d.get(name).copied());
     // ON is not a file edit: the add-on's credentials and
     // gateway key are minted first, and the switch flips only once both
@@ -742,9 +794,11 @@ fn set(g: &Globals, args: &[String], on: bool) -> Result<i32, Unhandled> {
     // data operation, and nothing it needs can be missing.
     let mut enabled_report = None;
     let path = if on {
-        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force, lock: lock.clone() }) {
+        match crate::commands::addon_enable::enable(&config_path(), name, &mut crate::commands::addon_enable::Live { g, force, lock: lock.clone(), require_system: false }) {
             Ok(e) => {
                 let p = e.config.clone();
+                // Fully on now: it is no longer merely "provisioned".
+                let _ = crate::addons::provisioned::clear(&crate::envfile::repo_root(), name);
                 enabled_report = Some(e);
                 // Its own NATS principal, when its overlay declares one (i70
                 // residue): mint + render + HUP. Best-effort — without it the
