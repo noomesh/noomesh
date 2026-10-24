@@ -138,6 +138,24 @@ def fatal(msg: str) -> None:
     raise typer.Exit(1)
 
 
+def _refusal_sentence(status: int, text: str) -> str:
+    """The gateway's own sentence for a refusal that carries a ``detail``.
+
+    A 503 ``redis_reconnecting`` is ``{"error": code, "detail": sentence,
+    "retry_after_secs": N}``: show the sentence and the retry, not the raw
+    JSON glued onto the status.
+    """
+    try:
+        body = _json.loads(text)
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("detail"), str):
+        retry = body.get("retry_after_secs")
+        tail = f" — retry in {retry}s" if isinstance(retry, int) else ""
+        return f"gateway returned {status}: {body['detail']}{tail}"
+    return f"gateway returned {status}: {text[:200]}"
+
+
 def http_fail(e: Exception):
     """Standardized exit for gateway HTTP failures (agent contract).
 
@@ -152,7 +170,7 @@ def http_fail(e: Exception):
         status = e.response.status_code
         code = 4 if status in (401, 403) else 5
         kind = "auth_failed" if code == 4 else "remote_error"
-        msg = f"gateway returned {status}: {e.response.text[:200]}"
+        msg = _refusal_sentence(status, e.response.text)
     elif isinstance(e, httpx.HTTPError):
         code, kind = 3, "gateway_unreachable"
         msg = f"cannot reach gateway: {e}"

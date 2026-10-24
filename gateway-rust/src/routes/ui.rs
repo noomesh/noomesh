@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use sha2::{Sha256, Digest};
 
 use crate::measured::{put_into, put_keyed_into, Measured};
+use crate::redis_or_unavailable::redis_or_unavailable;
 use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
 use crate::node_link::NodeLink;
@@ -1269,6 +1270,11 @@ async fn browser_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> AppResult {
+    // The session lives in Redis (stop/action/list find it there): a
+    // container started without it would be orphaned, so refuse BEFORE
+    // starting one.
+    let redis = redis_or_unavailable(&state)?;
+
     // Generate session ID (matches Python: uuid4().hex[:8])
     let session_id = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
     let container_name = format!("noo-browser-{session_id}");
@@ -1397,7 +1403,7 @@ async fn browser_start(
     });
 
     // Store session in Redis for cross-process visibility
-    if let Some(redis) = state.redis.as_ref() {
+    {
         // Store individual session
         redis.set_string(
             &format!("noo:browser:session:{session_id}"),
@@ -1433,13 +1439,12 @@ async fn browser_stop(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> AppResult {
-    // Look up session from Redis
-    let session_data: Option<Value> = if let Some(redis) = state.redis.as_ref() {
-        redis.get_string(&format!("noo:browser:session:{session_id}")).await
-            .and_then(|s| serde_json::from_str(&s).ok())
-    } else {
-        None
-    };
+    // Look up session from Redis. Without it the container's node and name
+    // are unknown (a guess would stop the wrong thing), so refuse.
+    let redis = redis_or_unavailable(&state)?;
+    let session_data: Option<Value> = redis
+        .get_string(&format!("noo:browser:session:{session_id}")).await
+        .and_then(|s| serde_json::from_str(&s).ok());
 
     let container_name = session_data.as_ref()
         .and_then(|s| s.get("container_name"))
@@ -1472,7 +1477,7 @@ async fn browser_stop(
     }
 
     // Remove session from Redis
-    if let Some(redis) = state.redis.as_ref() {
+    {
         redis.del_key(&format!("noo:browser:session:{session_id}")).await;
 
         // Update session list (remove this session)
@@ -1498,20 +1503,15 @@ async fn browser_stop(
 /// GET /api/tools/browser/sessions — list active browser sessions.
 ///
 /// Reads session data from Redis (noo:browser:sessions key).
-/// Returns an empty list if Redis is unavailable or no sessions exist.
+/// 503 `redis_reconnecting` when Redis is unavailable: an empty list there
+/// would claim no sessions exist. An empty list means there are none.
 async fn browser_sessions(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
-    // Try to read sessions from Redis
-    let sessions: Vec<Value> = if let Some(redis) = state.redis.as_ref() {
-        match redis.get_string("noo:browser:sessions").await {
-            Some(data) => {
-                serde_json::from_str::<Vec<Value>>(&data).unwrap_or_default()
-            }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    let redis = redis_or_unavailable(&state)?;
+    let sessions: Vec<Value> = match redis.get_string("noo:browser:sessions").await {
+        Some(data) => serde_json::from_str::<Vec<Value>>(&data).unwrap_or_default(),
+        None => Vec::new(),
     };
 
     Ok(Json(json!({
@@ -1604,13 +1604,11 @@ async fn browser_action(
 
     // Look up the session's container URL.
     let session_key = format!("noo:browser:session:{session_id}");
-    let session_data: Option<Value> = match state.redis.as_ref() {
-        Some(redis) => redis
-            .get_string(&session_key)
-            .await
-            .and_then(|s| serde_json::from_str(&s).ok()),
-        None => None,
-    };
+    let redis = redis_or_unavailable(&state)?;
+    let session_data: Option<Value> = redis
+        .get_string(&session_key)
+        .await
+        .and_then(|s| serde_json::from_str(&s).ok());
     let Some(mut session_data) = session_data else {
         return Ok(Json(json!({"error": format!("No browser session: {session_id}")})));
     };

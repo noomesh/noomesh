@@ -1323,9 +1323,8 @@ pub(crate) fn drain_step(reply: &Value) -> DrainStep {
 /// entries embedded for three weeks while search answered "no relevant
 /// context". The working path, `worker.memory.batch_index`, had no caller.
 async fn embed_start(State(state): State<Arc<AppState>>) -> AppResult {
-    let Some(redis) = state.redis.as_ref() else {
-        return Ok(Json(json!({"status": "error", "error": "Redis unavailable: the drain's start/stop flag has nowhere to live"})));
-    };
+    // The drain's start/stop flag lives in Redis: nowhere to put it, no start.
+    let redis = crate::redis_or_unavailable::redis_or_unavailable(&state)?;
     if redis.get_string(EMBED_STATE_KEY).await.as_deref() == Some("running") {
         return Ok(Json(json!({"status": "already_running"})));
     }
@@ -1361,13 +1360,10 @@ async fn embed_start(State(state): State<Arc<AppState>>) -> AppResult {
 /// POST /api/memory/embed/stop
 /// Set embedding worker state to "stopped" via Redis flag.
 async fn embed_stop(State(state): State<Arc<AppState>>) -> AppResult {
-    match state.redis.as_ref() {
-        Some(redis) => {
-            redis.set_string(EMBED_STATE_KEY, "stopped").await;
-            Ok(Json(json!({"status": "stopped"})))
-        }
-        None => Ok(Json(json!({"status": "stopped", "warning": "Redis unavailable, flag not persisted"}))),
-    }
+    // A stop that cannot write the flag has not stopped anything.
+    let redis = crate::redis_or_unavailable::redis_or_unavailable(&state)?;
+    redis.set_string(EMBED_STATE_KEY, "stopped").await;
+    Ok(Json(json!({"status": "stopped"})))
 }
 
 /// GET /api/memory/embed/status

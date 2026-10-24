@@ -170,7 +170,7 @@ async fn jobs(State(state): State<Arc<AppState>>, Query(p): Query<JobsParams>) -
         scope: None,
         fleet: false,
     };
-    let full = super::admin::list_jobs_for(state, params).await;
+    let full = super::admin::list_jobs_for(state, params).await?;
     Ok(Json(json!({
         "jobs": pick_from(&full, "jobs", &["job_id", "status", "type", "node_id", "created_at"]),
     })))
@@ -923,7 +923,9 @@ impl Sampler {
 
 fn scheduler_pair(v: &Value) -> Option<(bool, bool)> {
     let running = v.get("running").and_then(|x| x.as_bool())?;
-    let paused = v.get("paused").and_then(|x| x.as_bool()).unwrap_or(false);
+    // A null `paused` is "Redis was not readable", not "not paused": no pair,
+    // so no `scheduler.state` event is invented from it.
+    let paused = v.get("paused").and_then(|x| x.as_bool())?;
     Some((running, paused))
 }
 

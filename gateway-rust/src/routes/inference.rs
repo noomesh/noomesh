@@ -110,11 +110,9 @@ async fn submit_inference_task(
     actor: Option<Extension<crate::auth::AuthActor>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let Some(redis) = state.redis.as_ref() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Redis not connected"})),
-        );
+    let redis = match crate::redis_or_unavailable::redis_or_unavailable(&state) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
     };
     // Python passed the WHOLE request dict as the job payload (priority
     // field included) — preserved so node-agent consumers see the same
@@ -126,11 +124,13 @@ async fn submit_inference_task(
         Some(job_id) => (
             StatusCode::OK,
             Json(json!({"job_id": job_id, "status": "queued"})),
-        ),
+        )
+            .into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "Failed to submit inference task to Redis"})),
-        ),
+        )
+            .into_response(),
     }
 }
 

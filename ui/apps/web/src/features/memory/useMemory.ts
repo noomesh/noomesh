@@ -3,6 +3,7 @@
 
 import { num } from '@/lib/num';
 import { useQuery, useMutation, useQueryClient, useMetisClient } from '@metis/core';
+import { refusalMessage } from '../jobs/useJobs';
 
 // Every count is `number | null`: null = the gateway did not send it (i195 E1).
 export interface ToolStat {
@@ -89,7 +90,8 @@ export function useEmbedControl() {
         action === 'start'
           ? await client.POST('/api/memory/embed/start', {})
           : await client.POST('/api/memory/embed/stop', {});
-      if (res.error) throw new Error(`Embed ${action} failed`);
+      const refused: unknown = res.error;
+      if (refused) throw new Error(refusalMessage(refused, `Embed ${action} failed`));
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: KEY }),
   });
