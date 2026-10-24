@@ -4783,6 +4783,9 @@ pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
         .collect();
     if ec != 0 || !bad.is_empty() {
         let why = if bad.is_empty() { "not verified".to_string() } else { bad.join("; ") };
+        // The launcher leaves such an add-on out of the start instead of
+        // refusing the whole stack (2026-10-24): say that it is not running.
+        let why = format!("{why} (an add-on whose pin does not verify is left out of every start: NOT running)");
         return fail("add-on pins", why, "noo addons upgrade");
     }
     let mut keys: Vec<u64> = rows.iter().filter_map(|r| r["key_index"].as_u64()).collect();
@@ -7252,6 +7255,7 @@ mod tests {
         let c = addon_pins_check(1, &bad);
         assert_eq!(c.verdict, Verdict::Fail);
         assert!(c.detail.contains("evolve has no pin"), "{c:?}");
+        assert!(c.detail.contains("left out of every start: NOT running"), "the row says it did not start: {c:?}");
         assert_eq!(c.remedy.as_deref(), Some("noo addons upgrade"));
         assert_eq!(addon_pins_check(1, &Value::Null).verdict, Verdict::Warn);
     }

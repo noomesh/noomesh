@@ -194,7 +194,7 @@ _addon_composed_names() {
 
 # require_addon_pins — a start or restart runs each composed licensed add-on
 # overlay from the image its signed lock pins for THIS tag, present locally by
-# digest, or it does not start.
+# digest, or that add-on does not start.
 #
 # The set looked at is exactly what is composed (addon_compose_overlay_args:
 # addon_on, so `--core-only` defers the same add-ons it leaves out of the file
@@ -205,43 +205,101 @@ _addon_composed_names() {
 # cached lock against the installed entitlement and answers one line per
 # licensed add-on:
 #   pin <addon> <VAR> <ref@sha256:…>     export VAR=ref once the image is local
-#   refuse <addon> <why>                 REFUSE, naming the add-on and why
-# Then every variable the composed overlays read must have been exported from
-# a pin: a lock whose image name maps to another variable (the overlay would
-# render its unpinned sentinel) is refused here, by name. The exports are
-# recorded in _ADDON_PINS for dist_assert_addon_refs.
+#   refuse <addon> <why>                 REFUSE that add-on, naming it and why
+# Then every variable a composed overlay reads must have been exported from
+# a pin: an add-on whose lock maps its image to another variable (its overlay
+# would render the unpinned sentinel) is refused here, by name. The exports
+# are recorded in _ADDON_PINS for dist_assert_addon_refs.
+#
+# A REFUSED add-on is left out of this start; the core stack and every other
+# add-on start (approved 2026-10-24: one stale add-on pin used to refuse every
+# restart of the gateway, auth and Postgres). It is never silent:
+#   - a `REFUSED add-on <name>: <why>` line and its remedy, on every start;
+#   - addon_on answers "off" for it (_NOO_ADDONS_REFUSED), so its overlay,
+#     images, env and secrets are not composed, its bundle declarations
+#     (system.json, workloads.json) are not handed to the gateway, and
+#     addons_stop_refused stops a container left from an earlier start;
+#   - it is absent from NOO_ADDONS_VERIFIED, so the gateway's add-on registry
+#     refuses its routes (a stale routes.json in the routes volume included)
+#     and /health reads `unhealthy` for it; NOO_ADDONS_REFUSED names it, so
+#     the systems broker runs no DDL for a `systems:` entry of that name;
+#   - the launcher's closing line says which add-ons did NOT start
+#     (addons_report_refused).
+# What still refuses the WHOLE start: the reader failing or sending a line it
+# should never send (unreadable verdict, a non add-on variable), a CLI too old
+# to report verdicts while something is refused (the gateway would then load
+# a refused built-in add-on as it always did), a composed variable no add-on
+# can be blamed for, and everything stack-level (stack.lock, core digests:
+# dist_require_lock).
 #
 # Dist also exports NOO_ADDONS_VERIFIED, from the `verified <addon> <version>
-# <stack>` lines: `name=version@stack,...`, or `none`. Dev exports `dev`. The
-# gateway's add-on registry registers an add-on only when it is named there.
-# Beside it, NOO_ADDONS_DEV, from the `dev <addon> <unix>` lines:
-# `name=<unix expiry>,...` for the add-ons only a temporary development key
-# vouches for (i163 part A); the gateway reports them as dev and refuses them
-# once that instant passes. Unset when there are none.
+# <stack>` lines of the add-ons that are launched: `name=version@stack,...`,
+# or `none`. Dev exports `dev`. The gateway's add-on registry registers an
+# add-on only when it is named there. Beside it, NOO_ADDONS_DEV, from the
+# `dev <addon> <unix>` lines: `name=<unix expiry>,...` for the add-ons only a
+# temporary development key vouches for (i163 part A); the gateway reports
+# them as dev and refuses them once that instant passes. Unset when there are
+# none.
 #
 # Dev (not dist): each variable the composed overlays read is set to the dev
 # build's name, `${NOO_IMAGE_PREFIX:-noomesh}/<name>:${NOO_IMAGE_TAG:-latest}`.
 #
-# REFUSE = return 1; both launchers `|| exit 1` before anything is pulled or
-# recreated.
+# REFUSE (the whole start) = return 1; both launchers `|| exit 1` before
+# anything is pulled or recreated.
 _ADDON_PINS=()
 # The `decl <addon> <file>` lines launch-pins printed (a declaration file the
 # verified lock lists: system.json, workloads.json), for
 # addon_decls_materialise below. An older noo prints none: nothing is handed
 # to the gateway, which then provisions no bundle system (the safe side).
 _ADDON_DECLS=()
+# `<addon><TAB><why>` per add-on refused this start (addons_report_refused).
+_ADDON_REFUSED=()
 # The install root this launcher belongs to (scripts/..), fixed when the
 # library is sourced. launch-pins reads the pins under it, never the cwd.
 _DIST_LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+
+# _addon_refuse <addon> <why> — leave one add-on out of this start, loudly.
+# Once per add-on (the first reason wins).
+_addon_refuse() {
+    case ",${_NOO_ADDONS_REFUSED:-}," in *",$1,"*) return 0 ;; esac
+    _NOO_ADDONS_REFUSED="${_NOO_ADDONS_REFUSED:+${_NOO_ADDONS_REFUSED},}$1"
+    _ADDON_REFUSED+=("$1"$'\t'"$2")
+    _addon_refused_lines "$1" "$2" >&2
+}
+
+# _addon_refused_lines <addon> <why> — the REFUSED line and its remedy.
+_addon_refused_lines() {
+    echo "REFUSED add-on $1: $2"
+    echo "  It is left out of this start and is NOT running; the rest of the stack starts without it."
+    case "$2" in
+        *"development key"*expired*)
+            echo "  Fix:  noo addons trust-key $1 <pubkey> --dev --expires 14d   (renew the dev key; or turn it off: noo addons disable $1)" ;;
+        *)
+            echo "  Fix:  noo addons upgrade $1   (or turn it off: noo addons disable $1)" ;;
+    esac
+}
+
+# addons_report_refused — repeat, at the end of a start or restart, every
+# add-on refused this start (nothing when none was). Prints to stderr.
+addons_report_refused() {
+    local _r
+    for _r in ${_ADDON_REFUSED[@]+"${_ADDON_REFUSED[@]}"}; do
+        _addon_refused_lines "${_r%%$'\t'*}" "${_r#*$'\t'}" >&2
+    done
+    return 0
+}
+
 require_addon_pins() {
     local _v _on _nb _out _kind _addon _rest _var _ref _vars _args _name fail=0
-    local _verified=() _pinned=() _dev=() _legacy_cli=0 _p
+    local _verified=() _pinned=() _dev=() _pinlines=() _decls=() _legacy_cli=0 _p _n _o _l _miss
     for _v in $(compgen -e | grep '^NOO_ADDON_IMAGE_' || true); do unset "$_v"; done
     # The registry verdict is set here and nowhere else: a value inherited from
     # the shell or an .env line is dropped, like the image variables above.
-    unset NOO_ADDONS_VERIFIED NOO_ADDONS_DEV
+    unset NOO_ADDONS_VERIFIED NOO_ADDONS_DEV NOO_ADDONS_REFUSED
+    _NOO_ADDONS_REFUSED=""
     _ADDON_PINS=()
     _ADDON_DECLS=()
+    _ADDON_REFUSED=()
     _args="$(addon_compose_overlay_args 2>/dev/null)"
     # shellcheck disable=SC2086
     _vars="$(addon_image_vars $_args)"
@@ -279,7 +337,20 @@ require_addon_pins() {
         } >&2
         return 1
     fi
+    # Read every line first; nothing is exported until the refused set is known.
     while read -r _kind _addon _rest; do
+        case "$_kind" in verified|dev|pin|decl|refuse)
+            # An add-on name goes into the gateway's environment: only a name
+            # the gateway accepts (addon_registry::name_ok) is read at all.
+            case "$_addon" in
+                [a-z]*) case "$_addon" in *[!a-z0-9_-]*) _addon="" ;; esac ;;
+                *) _addon="" ;;
+            esac
+            if [ -z "$_addon" ]; then
+                echo "REFUSING: noo addons launch-pins sent a line for something that is not an add-on name: ${_kind} …" >&2
+                fail=1; continue
+            fi ;;
+        esac
         case "$_kind" in
             verified)
                 # `verified <addon> <version> <stack>`: the signed lock verified
@@ -296,57 +367,93 @@ require_addon_pins() {
                     *) _dev+=("${_addon}=${_rest}") ;;
                 esac ;;
             pin)
-                _pinned+=("$_addon")
                 _var="${_rest%% *}"; _ref="${_rest#* }"
                 case "$_var" in NOO_ADDON_IMAGE_*) : ;; *)
                     echo "REFUSING: noo addons launch-pins named '${_var}' for ${_addon}, not an add-on image variable" >&2
                     fail=1; continue ;;
                 esac
                 if ! docker image inspect "$_ref" >/dev/null 2>&1; then
-                    {
-                        echo "REFUSING: the ${_addon} add-on is on, and its pinned image is not on this host:"
-                        echo "  image:  ${_ref}"
-                        echo "  The launcher never pulls an add-on; the CLI pulls it by digest with the registry token."
-                        echo "  Fix:  noo addons upgrade ${_addon}"
-                    } >&2
-                    fail=1; continue
+                    # The launcher never pulls an add-on; the CLI pulls it by
+                    # digest with the registry token.
+                    _addon_refuse "$_addon" "its pinned image is not on this host (${_ref}); the launcher never pulls an add-on"
+                    continue
                 fi
-                export "${_var}=${_ref}"
-                _ADDON_PINS+=("${_var}=${_ref}") ;;
+                _pinlines+=("${_addon} ${_var} ${_ref}") ;;
             decl)
                 # `decl <addon> <file>`: a declaration file its verified lock
                 # lists. Only the two names the gateway reads are kept.
                 case "$_rest" in
-                    system.json|workloads.json) _ADDON_DECLS+=("${_addon} ${_rest}") ;;
+                    system.json|workloads.json) _decls+=("${_addon} ${_rest}") ;;
                 esac ;;
             refuse)
-                {
-                    echo "REFUSING: the ${_addon} add-on is on and has no verified pin for ${_tag}:"
-                    echo "  ${_rest}"
-                    echo "  Fix:  noo addons upgrade ${_addon}   (or turn it off: noo addons disable ${_addon})"
-                } >&2
-                fail=1 ;;
+                _addon_refuse "$_addon" "${_rest:-no verified pin for ${_tag}}" ;;
         esac
     done <<PINS
 $_out
 PINS
     [ "$fail" = 0 ] || return 1
+    # Each add-on's overlay must find every image variable it reads among the
+    # pins of add-ons that are launched; one that does not is refused by name
+    # (its lock names its image differently, or it is not licensed here).
+    for _n in $_on; do
+        case " $CORE_OVERLAY_ADDONS " in *" $_n "*) continue ;; esac
+        case ",${_NOO_ADDONS_REFUSED}," in *",$_n,"*) continue ;; esac
+        _o="$(addon_overlay "$_n" 2>/dev/null)"
+        [ -n "$_o" ] || continue
+        for _v in $(addon_image_vars -f "$_o"); do
+            _miss=1
+            for _p in ${_pinlines[@]+"${_pinlines[@]}"}; do
+                case ",${_NOO_ADDONS_REFUSED}," in *",${_p%% *},"*) continue ;; esac
+                _p="${_p#* }"
+                [ "${_p%% *}" = "$_v" ] && _miss=0
+            done
+            if [ "$_miss" = 1 ]; then
+                _addon_refuse "$_n" "its overlay runs \${${_v}}, and no verified pin supplies it (its signed lock names its image differently, or it is not licensed on this install)"
+                break
+            fi
+        done
+    done
+    # Export the pins, the declarations and the verdict of the launched add-ons only.
+    for _p in ${_pinlines[@]+"${_pinlines[@]}"}; do
+        _addon="${_p%% *}"; _p="${_p#* }"; _var="${_p%% *}"; _ref="${_p#* }"
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_addon},"*) continue ;; esac
+        _pinned+=("$_addon")
+        export "${_var}=${_ref}"
+        _ADDON_PINS+=("${_var}=${_ref}")
+    done
+    for _p in ${_decls[@]+"${_decls[@]}"}; do
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_p%% *},"*) continue ;; esac
+        _ADDON_DECLS+=("$_p")
+    done
     # The gateway's add-on registry reads this (gateway-rust/src/addon_registry.rs).
     # A pin with no verdict beside it came from a noo binary older than this
     # launcher: it verified, it just cannot say so. Leave the variable unset
     # (the gateway then loads only the add-ons it already knew and says why)
     # rather than report "none" and refuse a good add-on.
-    local _vstr
-    _vstr="$(IFS=,; printf '%s' "${_verified[*]-}")"
+    local _vstr="" _d
+    for _d in ${_verified[@]+"${_verified[@]}"}; do
+        case ",${_NOO_ADDONS_REFUSED}," in *",${_d%%=*},"*) continue ;; esac
+        _vstr="${_vstr:+${_vstr},}${_d}"
+    done
     for _p in ${_pinned[@]+"${_pinned[@]}"}; do
         case ",${_vstr}," in *",${_p}="*) : ;; *) _legacy_cli=1 ;; esac
     done
     if [ "$_legacy_cli" = 1 ]; then
+        if [ -n "$_NOO_ADDONS_REFUSED" ]; then
+            # An unset verdict makes the gateway load the built-in add-ons it
+            # already knew, the refused one included: refuse the start instead.
+            {
+                echo "REFUSING: add-on(s) ${_NOO_ADDONS_REFUSED//,/, } were refused, and this noo CLI does not report verified"
+                echo "  add-on locks, so the gateway could not be told to leave them out."
+                echo "  Fix:  noo upgrade"
+            } >&2
+            return 1
+        fi
         echo "WARNING: this noo CLI does not report verified add-on locks; the gateway loads only the add-ons it already knew. Run: noo upgrade" >&2
     elif [ -n "$_vstr" ]; then
         export NOO_ADDONS_VERIFIED="$_vstr"
         # Only for add-ons the verdict names: a dev line alone vouches for nothing.
-        local _dstr="" _d
+        local _dstr=""
         for _d in ${_dev[@]+"${_dev[@]}"}; do
             case ",${_vstr}," in *",${_d%%=*}="*) _dstr="${_dstr:+${_dstr},}${_d}" ;; esac
         done
@@ -354,7 +461,14 @@ PINS
     else
         export NOO_ADDONS_VERIFIED=none
     fi
-    for _v in $_vars; do
+    # The systems broker reads this: no DDL for a refused add-on's system.
+    [ -z "$_NOO_ADDONS_REFUSED" ] || export NOO_ADDONS_REFUSED="$_NOO_ADDONS_REFUSED"
+    # Last line of defence: what is composed NOW (refused add-ons are off)
+    # must find every image variable it reads. A variable no add-on can be
+    # blamed for (a core overlay reading one) refuses the start.
+    _args="$(addon_compose_overlay_args 2>/dev/null)"
+    # shellcheck disable=SC2086
+    for _v in $(addon_image_vars $_args); do
         if [ -z "${!_v:-}" ]; then
             {
                 echo "REFUSING: a composed add-on overlay runs \${${_v}}, and no verified pin supplies it."

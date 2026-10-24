@@ -99,7 +99,18 @@ GATEWAY_FEATURE_ADDONS="identity"
 # the one declaration.
 # Absent from the map is NOT "off": it is "not stated", which resolves to the
 # add-on's own polarity, matching addons::resolve in the gateway.
+#
+# An add-on the launcher REFUSED this start (lib-dist.sh require_addon_pins:
+# its signed pin does not verify for the running stack) is off from then on,
+# whatever the map says: its overlay is not composed, its declarations are not
+# handed to the gateway, and addons_stop_refused stops a leftover container.
+# _NOO_ADDONS_REFUSED is a plain shell variable (never exported, never read
+# from the environment), set only by require_addon_pins.
+_NOO_ADDONS_REFUSED=""
 addon_on() {
+    case ",${_NOO_ADDONS_REFUSED}," in
+        *",$1,"*) return 1 ;;
+    esac
     if [ "${CORE_ONLY:-false}" = true ]; then
         case " $CORE_ONLY_DEFERS " in
             *" $1 "*) return 1 ;;
@@ -298,12 +309,39 @@ addons_report_licensed() {
 addons_stop_disabled() {
     for _asd_n in $(addon_licensed_names); do
         addon_on "$_asd_n" 0 && continue
+        # A refused add-on's overlay is never composed, not even to stop it:
+        # addons_stop_refused reaches its containers by label instead.
+        case ",${_NOO_ADDONS_REFUSED}," in *",$_asd_n,"*) continue ;; esac
         _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
         [ -n "$_asd_o" ] || continue
         _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
         [ -n "${_asd_s// /}" ] || continue
         # shellcheck disable=SC2086
         docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
+    done
+    return 0
+}
+
+# addons_stop_refused — an add-on the launcher refused this start must not
+# keep running from an earlier start (a stale container still holds its
+# image, env and service key). Its overlay is NOT composed, not even for
+# `stop`: the service names are read from the overlay's text
+# (addon_own_services parses it; only the core files are rendered), and the
+# containers are found by compose's own labels in this project.
+addons_stop_refused() {
+    [ -n "${_NOO_ADDONS_REFUSED}" ] || return 0
+    _asr_proj="${COMPOSE_PROJECT_NAME:-noomesh}"
+    for _asr_n in $(printf '%s' "$_NOO_ADDONS_REFUSED" | tr ',' ' '); do
+        _asr_o="$(addon_overlay "$_asr_n" 2>/dev/null)"
+        [ -n "$_asr_o" ] || continue
+        for _asr_s in $(addon_own_services "$_asr_o"); do
+            _asr_ids="$(docker ps -q --filter "label=com.docker.compose.project=${_asr_proj}" \
+                --filter "label=com.docker.compose.service=${_asr_s}" 2>/dev/null)"
+            [ -n "$_asr_ids" ] || continue
+            echo "Stopping ${_asr_s}: add-on ${_asr_n} was refused this start and must not keep running" >&2
+            # shellcheck disable=SC2086
+            docker stop $_asr_ids >/dev/null 2>&1 || echo "WARNING: could not stop ${_asr_s} (add-on ${_asr_n}); stop it: docker stop ${_asr_ids}" >&2
+        done
     done
     return 0
 }
