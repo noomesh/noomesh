@@ -181,11 +181,36 @@ fn password_from(
     Ok(delivered.get(var).filter(|p| !p.trim().is_empty()).cloned())
 }
 
+/// The add-ons the launcher refused this start: `name,name`, empty or unset
+/// when it refused none (lib-dist.sh require_addon_pins).
+pub const REFUSED_ENV: &str = "NOO_ADDONS_REFUSED";
+
+/// Is `name` one of the add-ons named in a [`REFUSED_ENV`] value? Pure. An
+/// entry that is not an add-on name never matches anything.
+pub(crate) fn refused_by_launcher(name: &str, raw: Option<&str>) -> bool {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .any(|n| crate::addon_registry::name_ok(n) && n == name)
+}
+
 /// True when the operator has turned this system on.
 ///
 /// `None` means unconditional — trellion, which is mandatory since the
 /// container split and has no flag to check.
 fn intent_declared(name: &str, spec: &SystemConfig, delivered: &BTreeMap<String, String>) -> bool {
+    // An add-on the launcher REFUSED this start (its signed pin does not
+    // verify for this stack) was left out of the compose set: its system is
+    // not provisioned either, whatever the map or a flag says. The launcher
+    // names it in NOO_ADDONS_REFUSED (lib-dist.sh require_addon_pins).
+    if refused_by_launcher(name, std::env::var(REFUSED_ENV).ok().as_deref()) {
+        tracing::warn!(
+            system = name,
+            "add-on {name} was refused by the launcher this start (its pin does not verify for this \
+             stack), so its system is not provisioned. `noo addons upgrade {name}` re-pins it"
+        );
+        return false;
+    }
     // A system whose name matches a declared add-on follows the add-on. This
     // used to be `enabled_when: NOO_PRO_ENABLED` — a THIRD place the same
     // fact was written down (after the flag itself and the launcher), and the
@@ -703,6 +728,22 @@ mod tests {
             ddl_password_env: "NOO_EVOLVE_DDL_PASSWORD".into(),
             extensions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_system_of_an_addon_the_launcher_refused_is_never_provisioned() {
+        // The launcher left `refused_example` out of this start (its pin is
+        // for another stack): no DDL for it, though nothing else says off.
+        assert!(refused_by_launcher("refused_example", Some("other,refused_example")));
+        assert!(!refused_by_launcher("refused_example", Some("other")));
+        assert!(!refused_by_launcher("refused_example", None));
+        assert!(!refused_by_launcher("refused_example", Some("")));
+        assert!(!refused_by_launcher("Refused_Example", Some("Refused_Example")), "not an add-on name");
+        assert!(intent_declared("refused_example", &spec(None), &BTreeMap::new()));
+        std::env::set_var(REFUSED_ENV, "refused_example");
+        let refused = intent_declared("refused_example", &spec(None), &BTreeMap::new());
+        std::env::remove_var(REFUSED_ENV);
+        assert!(!refused, "a refused add-on's system must not be provisioned");
     }
 
     #[test]

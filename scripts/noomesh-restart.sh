@@ -89,7 +89,8 @@ restart_require_lock() {
     dist_require_lock "$DIST_TAG" "recreate"
 }
 # Licensed add-ons run only their signed, local pins for this tag (see
-# lib-dist.sh require_addon_pins); restart never pulls one either.
+# lib-dist.sh require_addon_pins); restart never pulls one either. An add-on
+# whose pin does not verify is left out (REFUSED, by name); the rest restarts.
 require_addon_pins || exit 1
 # The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
 addon_decls_materialise || exit 1
@@ -293,6 +294,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
             exit "$_rc"
         }
     fi
+    # Add-ons refused this start (require_addon_pins): a container left from
+    # an earlier start must not keep running.
+    addons_stop_refused
 else
     ui_phase "Stack"
     # Names resolve against the services compose renders for THIS profile and
@@ -343,5 +347,11 @@ else
     fi
 fi
 
-ui_close_done "Services restarted"
+if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
+    # Never a plain "restarted": the outcome names what did NOT start.
+    ui_close_warned "Services restarted WITHOUT add-on(s) ${NOO_ADDONS_REFUSED//,/, }: refused, NOT running"
+    addons_report_refused
+else
+    ui_close_done "Services restarted"
+fi
 ui_note "noo stack status shows the containers"
