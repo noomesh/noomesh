@@ -298,8 +298,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
         }
     fi
     # Add-ons refused this start (require_addon_pins): a container left from
-    # an earlier start must not keep running.
-    addons_stop_refused
+    # an earlier start must not keep running. Only services the add-on OWNS
+    # are stopped; a core service found stopped afterwards fails the restart.
+    addons_stop_leftovers addons_stop_refused || exit 1
 else
     ui_phase "Stack"
     # Names resolve against the services compose renders for THIS profile and
