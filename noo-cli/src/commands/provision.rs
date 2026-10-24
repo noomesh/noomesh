@@ -4012,7 +4012,7 @@ mod cluster_trust_tests {
     fn an_unset_gate_or_an_older_gateway_renders_nothing() {
         let unset = json!({"posture": [{"key": "NOO_CLUSTER_TOKEN_V1", "db_value": null, "running": null}]});
         assert_eq!(v1_gate_from_posture(&unset), None);
-        let old = json!({"posture": [{"key": "NOO_SELF_CALL_SHARED_SECRET", "db_value": "0"}]});
+        let old = json!({"posture": [{"key": "NOO_EXEC_APPROVAL_MODE", "db_value": "approval"}]});
         assert_eq!(v1_gate_from_posture(&old), None);
         assert_eq!(v1_gate_from_posture(&json!({})), None);
     }

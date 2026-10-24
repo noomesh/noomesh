@@ -79,7 +79,6 @@ fn run(pki: &PathBuf, repo: &PathBuf, args: &[&str]) -> Output {
         "NOO_ADMIN_PASSWORD",
         "NOO_CSP",
         "NOO_MTLS_GATEWAY",
-        "NOO_SELF_CALL_SHARED_SECRET",
         "NOO_NATS_ALLOW_ANONYMOUS",
         "NOO_ALLOW_LOCAL_PYTHON_EXEC",
         "NOO_SANDBOX_ISOLATION",

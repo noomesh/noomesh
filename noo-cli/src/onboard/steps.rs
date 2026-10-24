@@ -7274,13 +7274,11 @@ pub(crate) fn consumers_to_mint<'a>(
 ///
 /// Until 2026-09-24 nothing in the wizard minted these. Compose fell back to
 /// an empty `NOO_SVC_KEY_*`, the consumer presented nothing, and the
-/// fleet-wide `NOO_SELF_CALL_SHARED_SECRET` bridge quietly bought its
+/// fleet-wide shared-secret bridge (since deleted) quietly bought its
 /// inference; `cluster verify` then failed every fresh install on the keys
 /// row. This is `noo security service-key
 /// provision` without its per-call whole-stack recreate: every missing key is
-/// minted and stored first, then the consumers are recreated ONCE. It does
-/// not close the bridge — that is a posture decision once a key has been
-/// seen in use, and `provision` is the verb that proves one.
+/// minted and stored first, then the consumers are recreated ONCE.
 ///
 /// Called twice: after the core stack is healthy (worker, trellion) and
 /// after the add-ons step (whatever it turned on). Idempotent: a consumer
