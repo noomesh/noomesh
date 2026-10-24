@@ -196,3 +196,24 @@ def test_the_cut_script_and_the_tape_after_take_seven():
     assert "noo stack status" in typed and "noo cluster status" not in typed, typed
     assert not any("what can you do on this machine" in t for t in typed), "the prompt gemma4:e2b misread"
     assert any(t.startswith("noo chat --message") and "noomesh" in t for t in typed), typed
+
+
+def test_the_box_boots_systemd_and_runs_docker_as_a_unit():
+    """Take 7 (2026-10-24): a box with `sleep infinity` as PID 1 never ran the
+    host node agent or noo-hostd (both are systemd units on a real install),
+    so the node never registered and the prep step printed "Failed to connect
+    to bus" on camera. The box is now built with systemd as init."""
+    studio = (DEMO / "studio.sh").read_text()
+    assert "sleep infinity" not in studio and "start-dockerd" not in studio
+    assert 'CMD ["/sbin/init"]' in studio and "STOPSIGNAL SIGRTMIN+3" in studio
+    assert "systemd systemd-sysv" in studio and "systemctl enable docker" in studio
+    run = studio.split("docker run -d --name \"$BOX\"", 1)[1].split(">/dev/null", 1)[0]
+    assert "--tmpfs /run --tmpfs /run/lock" in run and "--cgroupns=private" in run and '"$BOX_IMAGE"' in run
+    assert "box_wait_booted" in studio and "systemctl is-system-running" in studio
+    # a tmpfs systemd mounts on /tmp inside the box is invisible to `docker cp`,
+    # which collects the recorder's logs from /tmp/demo: tmp.mount stays masked
+    assert "tmp.mount" in studio.split("systemctl mask", 1)[1].split("\n", 1)[0]
+    assert "--tmpfs /tmp" not in studio
+    # the recorder's fallback starts the unit, not a hand-rolled daemon
+    assert "systemctl start docker" in studio
+    assert "useradd -m -s /bin/bash you" in studio and "usermod -aG docker you" in studio

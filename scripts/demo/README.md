@@ -29,9 +29,14 @@ scripts/demo/studio.sh record --speed 2   # the real film (needs the public inst
 scripts/demo/studio.sh down               # deletes the box and its volume
 ```
 
-Two containers: the **box** (Docker-in-Docker, `--privileged`, memory cap `NOO_STUDIO_MEM`,
-default 10g, images in a named volume) and the **recorder** (the vhs image), which types into
-the box with `docker exec`. The box has a generic host name and user by construction, the
+Two containers: the **box** (Ubuntu 24.04 with **systemd as PID 1** and Docker as a unit:
+Docker-in-Docker, `--privileged`, memory cap `NOO_STUDIO_MEM`, default 10g, images in a named
+volume) and the **recorder** (the vhs image), which types into the box with `docker exec`. The box
+image (`noo-demo-box:base`: systemd, Docker from Docker's apt repository, the film's user) is built
+once on your machine and cached; `docker rmi noo-demo-box:base` rebuilds it. With systemd in the
+box, the host node agent and `noo-hostd` the film installs run as units, as on a real box: the
+node registers, and the prep step prints no "Failed to connect to bus" lines (take 7, 2026-10-24,
+on a box without it). The box has a generic host name and user by construction, the
 stack the film onboards lives and dies inside it, and its own Docker pulls images anonymously,
 so it is a real stranger's first run. In box mode the recorder's guard rails inspect the box,
 not your machine, and only accept a container the studio labelled `noo-demo-box=1`.
@@ -143,10 +148,9 @@ not routed through the masker (the typed commands, and the prompt, which is forc
 - **The GIF is the teaser, the MP4 is the film.** `NOO_DEMO_GIF_RANGE=START:SECONDS` makes the
   GIF from one stretch; the defaults (`NOO_DEMO_GIF_FPS` 8, `NOO_DEMO_GIF_WIDTH` 800, whole take)
   still make hundreds of MB from a five-minute take.
-- **What the film shows that a real install would not.** The studio's box has no systemd, and in
-  the standalone profile the node agent is a host binary under systemd, so the box never registers
-  its own node: `noo cluster status` reads "no nodes" there, while a real install shows the node a
-  minute after onboard. The tape films `noo stack status` instead.
+- **`noo stack status`, not `noo cluster status`.** The node registers about a minute after
+  onboard (the host agent's first heartbeat); the tape does not wait for it. Before the box had
+  systemd it never registered at all (take 7, "no nodes").
 - The non-interactive wizard (`--ci --skip-tailscale`) is what is filmed because
   it is the path the release rehearsals exercise. An interactive take needs the
   wizard's prompts typed in; add them to the template after one dry take.
