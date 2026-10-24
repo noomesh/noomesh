@@ -1010,14 +1010,9 @@ async fn queue_disk_reclaim(state: &AppState, watermark: f64, dry_run: bool, cac
 /// 5 minutes. Reads from `noo_security_audit` (event_type='auth_failure').
 pub async fn eval_failed_auth_spike(state: &AppState) -> Result<bool, String> {
     const THRESHOLD: i64 = 10;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM noo_security_audit \
-         WHERE event_type = 'auth_failure' \
-           AND timestamp > NOW() - INTERVAL '5 minutes'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let count: i64 = crate::repo::audit::count_last_5m(&state.db, "auth_failure")
+        .await
+        .map_err(|e| e.to_string())?;
     if count > THRESHOLD {
         tracing::warn!(auth_failures_5m = count, "autonomy.failed_auth_spike.alert");
         crate::operator_alert::send_operator_alert_with(

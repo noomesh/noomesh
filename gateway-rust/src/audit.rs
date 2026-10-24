@@ -1067,26 +1067,22 @@ pub(crate) async fn insert_signed_audit_row(
     entry_hash: &str,
     prev_hash: Option<&str>,
 ) -> bool {
-    let run = || {
-        sqlx::query(
-            "INSERT INTO noo_security_audit \
-               (id, \"timestamp\", event_type, severity, actor, resource, outcome, details, \
-                request_id, entry_hash, prev_hash) \
-             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)",
-        )
-        .bind(id)
-        .bind(ts)
-        .bind(event_type)
-        .bind(severity)
-        .bind(actor)
-        .bind(resource)
-        .bind(outcome)
-        .bind(details)
-        .bind(request_id)
-        .bind(entry_hash)
-        .bind(prev_hash)
-        .execute(db)
+    let row = crate::repo::audit::InsertRow {
+        id,
+        ts,
+        event_type,
+        severity,
+        actor,
+        resource,
+        outcome,
+        details,
+        request_id,
+        entry_hash,
+        prev_hash,
+        chain_seq: None,
+        chain_hash: None,
     };
+    let run = || crate::repo::audit::insert(db, &row);
 
     match run().await {
         Ok(_) => true,

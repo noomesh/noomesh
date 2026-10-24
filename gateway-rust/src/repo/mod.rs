@@ -55,6 +55,7 @@
 //!   the call site, not moved in here.
 
 pub mod agent_messages;
+pub mod audit;
 pub mod cluster;
 pub mod graph;
 pub mod heartbeat;

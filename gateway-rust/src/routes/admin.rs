@@ -637,15 +637,7 @@ async fn security_audit_stats(
     let minutes = params.minutes.unwrap_or(5).clamp(1, 1440);
     let interval = format!("{minutes} minutes");
 
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT event_type, COUNT(*) AS cnt \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - $1::interval \
-         GROUP BY event_type",
-    )
-    .bind(&interval)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = crate::repo::audit::counts_by_type_within(&state.db, &interval).await?;
 
     let mut events_5m = serde_json::Map::new();
     let mut auth_failures = 0i64;

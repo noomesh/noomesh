@@ -2835,15 +2835,7 @@ async fn action_security_audit(
     // durable source — the Python version's "in-memory SecurityManager
     // stats" path is lost on restart, so DB-grouped query is strictly
     // better here.
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*)::bigint \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - ($1::int * INTERVAL '1 hour') \
-         GROUP BY event_type \
-         ORDER BY 2 DESC",
-    )
-    .bind(period_hours as i32)
-    .fetch_all(&state.db)
+    let rows: Vec<(String, i64)> = crate::repo::audit::counts_by_type_hours(&state.db, period_hours as i32)
     .await
     .map_err(|e| format!("noo_security_audit query failed: {e}"))?;
 
@@ -3184,18 +3176,10 @@ async fn action_agent_self_check(
     .unwrap_or_default();
 
     // ── Section 5: security event spikes ──────────────────────────────
-    let security_spikes: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, COUNT(*)::bigint \
-         FROM noo_security_audit \
-         WHERE timestamp > NOW() - INTERVAL '1 hour' \
-         GROUP BY event_type \
-         HAVING COUNT(*) > $1::bigint \
-         ORDER BY 2 DESC",
-    )
-    .bind(security_spike_threshold)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let security_spikes: Vec<(String, i64)> =
+        crate::repo::audit::spikes_last_hour(&state.db, security_spike_threshold)
+            .await
+            .unwrap_or_default();
 
     // ── Section 6: active activities (Phase 3 meta-loop) ──────────────
     // Flag stalled activities (no progress in stuck_threshold_minutes
