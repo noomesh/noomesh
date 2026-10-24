@@ -338,6 +338,10 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     // Signed-lock pins (licensed add-ons only); an unreadable pins file shows
     // as no pins here — `noo addons verify` is the place that fails on it.
     let pins = crate::addons::pins::read(&crate::envfile::repo_root()).unwrap_or_default();
+    // The add-ons that are on but that the launcher leaves out of a start:
+    // their pin does not verify for this stack, so they are NOT running.
+    let refused = launch_refusals(&crate::envfile::repo_root(), &declared);
+    let refusal = |n: &str| refused.iter().find(|(r, _)| r == n).map(|(_, why)| why.clone());
 
     if g.json {
         let rows: Vec<_> = ADDON_ROWS
@@ -351,6 +355,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                     "licensed": r.licensed,
                     "granted": r.licensed.is_none_or(|f| grants(&features, f)),
                     "pin": pins.get(r.key),
+                    "launch_refused": refusal(r.key),
                 })
             })
             .collect();
@@ -360,7 +365,7 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 let dev = signer.contains("DEV");
                 json!({
                     "name": n, "declared": d, "effective": d == Some(true), "third_party": true,
-                    "signer": signer, "dev": dev, "pin": pins.get(&n),
+                    "signer": signer, "dev": dev, "pin": pins.get(&n), "launch_refused": refusal(&n),
                 })
             })
             .collect();
@@ -393,7 +398,9 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 Some(_) if features.is_none() => ui::bad("no entitlement"),
                 Some(_) => ui::bad("not granted"),
             };
-            let effective = if eff && r.licensed.is_none_or(|f| grants(&features, f)) {
+            let effective = if eff && refusal(r.key).is_some() {
+                ui::bad("on, REFUSED: not running")
+            } else if eff && r.licensed.is_none_or(|f| grants(&features, f)) {
                 ui::good("on")
             } else if eff {
                 ui::bad("on, but unlicensed")
@@ -464,6 +471,14 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             )
         );
     }
+    // On, but left out of every start until re-pinned: never silent.
+    if !refused.is_empty() {
+        println!();
+        println!("{}", ui::section("refused at launch"));
+        for (n, why) in &refused {
+            println!("{}", ui::status_line(ui::Glyph::Err, &format!("{n}: REFUSED, not running: {why}")));
+        }
+    }
     // Add-ons whose database exists but whose services are not started.
     let marks = crate::addons::provisioned::read_all(&crate::envfile::repo_root());
     let prov = crate::addons::provisioned::only(&marks, &declared);
@@ -483,6 +498,12 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     }
     println!();
     print_bundle_decls(&crate::envfile::repo_root());
+    if !refused.is_empty() {
+        ui::guide(&[
+            ("noo addons upgrade <name>", "re-pins a refused add-on for this stack; the next restart starts it"),
+            ("noo addons disable <name>", "turns a refused add-on off instead"),
+        ]);
+    }
     ui::guide(&[
         ("noo addons show <name>", "the database and workloads an add-on's signed bundle declares"),
         ("noo addons enable <name>", "pins a licensed add-on's signed lock, then declares it on"),
@@ -490,6 +511,29 @@ pub fn addons_list(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         ("noo stack restart", "applies it — the switch decides which containers run"),
     ]);
     Ok(0)
+}
+
+/// Every add-on that is on and that the launcher would leave out of a start
+/// (`launch-pins` refuses it for the running stack tag), with why. The same
+/// offline check the launcher runs, so `list` and `show` cannot call an add-on
+/// on that the launcher refuses. Empty when no stack tag is pinned.
+fn launch_refusals(root: &std::path::Path, declared: &std::collections::BTreeMap<String, bool>) -> Vec<(String, String)> {
+    let Some(tag) = crate::addons::current_tag(root) else { return Vec::new() };
+    let mut names: Vec<String> = ADDON_ROWS
+        .iter()
+        .filter(|r| r.licensed.is_some() && resolve(declared.get(r.key).copied(), r.default_on))
+        .map(|r| r.key.to_string())
+        .collect();
+    names.extend(
+        third_party_rows(&config_text(), crate::addon_lock::now_unix())
+            .into_iter()
+            .filter(|(_, d, _)| *d == Some(true))
+            .map(|(n, _, _)| n),
+    );
+    names
+        .into_iter()
+        .filter_map(|n| crate::commands::addon_pins::launch_refusal(root, &tag, &n).map(|why| (n, why)))
+        .collect()
 }
 
 /// `list`'s "bundle declarations" section: each add-on whose materialised
@@ -580,6 +624,12 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let provisioned = crate::addons::provisioned::read_all(&root)
         .remove(key)
         .filter(|_| declared != Some(true));
+    // On, but the launcher leaves it out of every start: NOT running.
+    let refused = if resolve(declared, default_on) {
+        crate::addons::current_tag(&root).and_then(|t| crate::commands::addon_pins::launch_refusal(&root, &t, key))
+    } else {
+        None
+    };
 
     if g.json {
         println!(
@@ -588,7 +638,16 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 "addon": key,
                 "declared": declared,
                 "effective": resolve(declared, default_on),
-                "state": if provisioned.is_some() { "provisioned" } else if resolve(declared, default_on) { "on" } else { "off" },
+                "state": if provisioned.is_some() {
+                    "provisioned"
+                } else if refused.is_some() {
+                    "refused"
+                } else if resolve(declared, default_on) {
+                    "on"
+                } else {
+                    "off"
+                },
+                "launch_refused": refused,
                 "provisioned": provisioned,
                 "pin": pin.as_ref().map(|p| json!({"version": p.version, "stack": p.stack})),
                 "bundle": has_bundle.then(|| bundle_dir.display().to_string()),
@@ -613,6 +672,10 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
             ("bundle", if has_bundle { bundle_dir.display().to_string() } else { ui::muted("none on this controller") }),
         ])
     );
+    if let Some(why) = &refused {
+        println!("{}", ui::kv(&[("state", ui::bad("REFUSED at launch: left out of the stack, NOT running"))]));
+        println!("{}", ui::status_line(ui::Glyph::Err, why));
+    }
     if let Some(m) = &provisioned {
         println!(
             "{}",
@@ -671,6 +734,12 @@ pub fn addons_show(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         }
     };
     println!();
+    if refused.is_some() {
+        ui::guide(&[
+            ("noo addons upgrade <name>", "re-pins it for this stack; the next restart starts it"),
+            ("noo addons disable <name>", "turns it off instead"),
+        ]);
+    }
     ui::guide(&[
         ("noo addons verify", "re-checks the pin and the bundle files against the signed lock"),
         ("noo stack restart --force", "hands the declarations to the gateway (switched on and verified only)"),

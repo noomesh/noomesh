@@ -42,7 +42,10 @@ import (
 // not on the filesystem recorded in .noo-data-root-id, it stops the stack's
 // containers (postgres first), writes why to .noo-data-root-refused, starts
 // nothing and fails the attempt (retried: a slow disk may yet mount). It never
-// starts a container on that path. The race is real (dockerd is up before
+// starts a container on that path. On Linux a host without findmnt
+// (util-linux) is refused the same way, since the filesystem cannot be
+// checked; the reason says retrying will not help (the binary does not appear
+// by waiting), and the bounded loop below only repeats the harmless stop. The race is real (dockerd is up before
 // this daemon), so the stop is a backstop; the launchers' check is the gate.
 // Hardening for later: a controller-only docker drop-in RequiresMountsFor=<data
 // root> would keep dockerd from starting at all, at the price of docker (and
@@ -51,7 +54,7 @@ import (
 const bootRestoreScript = `_noo_lib=%s
 . "$_noo_lib" 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
 if . "$(dirname "$_noo_lib")/lib-data-root-mount.sh" 2>/dev/null; then
-  data_root_mount_boot_guard || { echo "boot-restore: the data root is not on its recorded filesystem — stateful containers stopped, nothing started (reason above, and in .noo-data-root-refused)" >&2; exit 3; }
+  data_root_mount_boot_guard || { echo "boot-restore: the data-root guard refused (the data root is not on its recorded filesystem, or it cannot be checked) — stateful containers stopped, nothing started (reason above, and in .noo-data-root-refused)" >&2; exit 3; }
 fi
 d="$(secret_rundir)"
 if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
@@ -101,5 +104,5 @@ func (e *Engine) BootRestore(ctx context.Context) {
 	}
 	// A key sealed to the TPM (i10a) that did not unseal fails every attempt
 	// the same way; lib-secrets.sh names the unit in the stderr above.
-	e.logf("BOOT-RESTORE gave up: run `noo stack start` to rewrite the secret files (age key sealed to the TPM? systemctl status noo-unseal.service)")
+	e.logf("BOOT-RESTORE gave up: run `noo stack start` to rewrite the secret files (age key sealed to the TPM? systemctl status noo-unseal.service; a data-root refusal says why in .noo-data-root-refused)")
 }

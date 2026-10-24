@@ -39,6 +39,9 @@ source "$_LIBDIR/lib-config.sh"
 # the add-on profiles recreates every core consumer and leaves the add-ons
 # on the old secrets (noo-trellion-intel, 2026-09-14 → 18).
 source "$_LIBDIR/lib-addons.sh"
+# A retired key left in .env or the sops store is inert; say so (start and
+# rebuild do the same).
+warn_retired_env_keys
 load_config || echo "warning: config load reported problems (continuing)" >&2
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$_LIBDIR/lib-created-guard.sh"
@@ -89,7 +92,8 @@ restart_require_lock() {
     dist_require_lock "$DIST_TAG" "recreate"
 }
 # Licensed add-ons run only their signed, local pins for this tag (see
-# lib-dist.sh require_addon_pins); restart never pulls one either.
+# lib-dist.sh require_addon_pins); restart never pulls one either. An add-on
+# whose pin does not verify is left out (REFUSED, by name); the rest restarts.
 require_addon_pins || exit 1
 # The verified add-ons' bundle declarations, for the gateway (lib-dist.sh).
 addon_decls_materialise || exit 1
@@ -293,6 +297,9 @@ if [ ${#SERVICES[@]} -eq 0 ]; then
             exit "$_rc"
         }
     fi
+    # Add-ons refused this start (require_addon_pins): a container left from
+    # an earlier start must not keep running.
+    addons_stop_refused
 else
     ui_phase "Stack"
     # Names resolve against the services compose renders for THIS profile and
@@ -343,5 +350,11 @@ else
     fi
 fi
 
-ui_close_done "Services restarted"
+if [ -n "${NOO_ADDONS_REFUSED:-}" ]; then
+    # Never a plain "restarted": the outcome names what did NOT start.
+    ui_close_warned "Services restarted WITHOUT add-on(s) ${NOO_ADDONS_REFUSED//,/, }: refused, NOT running"
+    addons_report_refused
+else
+    ui_close_done "Services restarted"
+fi
 ui_note "noo stack status shows the containers"

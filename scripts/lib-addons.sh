@@ -99,7 +99,18 @@ GATEWAY_FEATURE_ADDONS="identity"
 # the one declaration.
 # Absent from the map is NOT "off": it is "not stated", which resolves to the
 # add-on's own polarity, matching addons::resolve in the gateway.
+#
+# An add-on the launcher REFUSED this start (lib-dist.sh require_addon_pins:
+# its signed pin does not verify for the running stack) is off from then on,
+# whatever the map says: its overlay is not composed, its declarations are not
+# handed to the gateway, and addons_stop_refused stops a leftover container.
+# _NOO_ADDONS_REFUSED is a plain shell variable (never exported, never read
+# from the environment), set only by require_addon_pins.
+_NOO_ADDONS_REFUSED=""
 addon_on() {
+    case ",${_NOO_ADDONS_REFUSED}," in
+        *",$1,"*) return 1 ;;
+    esac
     if [ "${CORE_ONLY:-false}" = true ]; then
         case " $CORE_ONLY_DEFERS " in
             *" $1 "*) return 1 ;;
@@ -255,14 +266,24 @@ EOF
 # reads any more, naming what replaced it. A warning, not a refusal: these
 # keys are inert (compose no longer delivers them), so the stack is correct
 # either way — the operator just deserves to know the line does nothing.
+#
+# It looks in `.env` AND in the sops store (${NOO_SOPS_FILE:-secrets/env.sops}),
+# where load_secrets exports every key it holds. A sops dotenv file keeps key
+# NAMES in plaintext (`KEY=ENC[AES256_GCM,...]`; comments are encrypted whole
+# as `#ENC[...]`), so a name match needs no decryption: the store is grepped
+# for `^KEY=` and nothing else, never decrypted, and no value is printed.
 warn_retired_env_keys() {
-    [ -f ".env" ] || return 0
     _wr_list="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/retired-env-keys"
     [ -f "$_wr_list" ] || return 0
+    _wr_store="${NOO_SOPS_FILE:-secrets/env.sops}"
+    [ -f ".env" ] || [ -f "$_wr_store" ] || return 0
     while IFS='|' read -r _wr_key _wr_note; do
         case "$_wr_key" in ''|'#'*) continue ;; esac
-        if grep -qE "^[[:space:]]*${_wr_key}=" .env; then
+        if [ -f ".env" ] && grep -qE "^[[:space:]]*${_wr_key}=" .env; then
             echo "WARN: .env sets ${_wr_key}, which is RETIRED and ignored — ${_wr_note}. Run \`noo onboard --only env\` to remove it (it backs up .env first)." >&2
+        fi
+        if [ -f "$_wr_store" ] && grep -qE "^${_wr_key}=" "$_wr_store" 2>/dev/null; then
+            echo "WARN: ${_wr_store} holds ${_wr_key}, which is RETIRED and ignored — ${_wr_note}. Run \`noo security secrets remove ${_wr_key}\` to remove it (it keeps an encrypted backup)." >&2
         fi
     done < "$_wr_list"
     return 0
@@ -298,12 +319,39 @@ addons_report_licensed() {
 addons_stop_disabled() {
     for _asd_n in $(addon_licensed_names); do
         addon_on "$_asd_n" 0 && continue
+        # A refused add-on's overlay is never composed, not even to stop it:
+        # addons_stop_refused reaches its containers by label instead.
+        case ",${_NOO_ADDONS_REFUSED}," in *",$_asd_n,"*) continue ;; esac
         _asd_o="$(addon_overlay "$_asd_n" 2>/dev/null)"
         [ -n "$_asd_o" ] || continue
         _asd_s="$(addon_own_services "$_asd_o" | tr '\n' ' ')"
         [ -n "${_asd_s// /}" ] || continue
         # shellcheck disable=SC2086
         docker compose $COMPOSE_FILES -f "$_asd_o" stop $_asd_s 2>/dev/null || true
+    done
+    return 0
+}
+
+# addons_stop_refused — an add-on the launcher refused this start must not
+# keep running from an earlier start (a stale container still holds its
+# image, env and service key). Its overlay is NOT composed, not even for
+# `stop`: the service names are read from the overlay's text
+# (addon_own_services parses it; only the core files are rendered), and the
+# containers are found by compose's own labels in this project.
+addons_stop_refused() {
+    [ -n "${_NOO_ADDONS_REFUSED}" ] || return 0
+    _asr_proj="${COMPOSE_PROJECT_NAME:-noomesh}"
+    for _asr_n in $(printf '%s' "$_NOO_ADDONS_REFUSED" | tr ',' ' '); do
+        _asr_o="$(addon_overlay "$_asr_n" 2>/dev/null)"
+        [ -n "$_asr_o" ] || continue
+        for _asr_s in $(addon_own_services "$_asr_o"); do
+            _asr_ids="$(docker ps -q --filter "label=com.docker.compose.project=${_asr_proj}" \
+                --filter "label=com.docker.compose.service=${_asr_s}" 2>/dev/null)"
+            [ -n "$_asr_ids" ] || continue
+            echo "Stopping ${_asr_s}: add-on ${_asr_n} was refused this start and must not keep running" >&2
+            # shellcheck disable=SC2086
+            docker stop $_asr_ids >/dev/null 2>&1 || echo "WARNING: could not stop ${_asr_s} (add-on ${_asr_n}); stop it: docker stop ${_asr_ids}" >&2
+        done
     done
     return 0
 }
