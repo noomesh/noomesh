@@ -1023,7 +1023,9 @@ mod tests {
             std::fs::write(bk.join(n), "x").unwrap();
         }
         let got = plaintext_copies(&age, &bk);
-        let names: Vec<String> = got.iter().map(|p| Path::new(p).file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> = got.iter().map(|p| Path::new(p).file_name().unwrap().to_string_lossy().into_owned()).collect();
+        // The order is the walk's (age dir, then backup dir); the set is what matters.
+        names.sort();
         assert_eq!(names, vec!["age-key_1.txt", "keys.new", "keys.txt", "keys.txt.bak"], "{got:?}");
         // The finalize symlink is not a plaintext copy.
         std::fs::remove_file(age.join("keys.txt")).unwrap();
