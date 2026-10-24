@@ -3724,7 +3724,7 @@ pub(crate) fn logs_last_seen_check(metrics: Option<&str>, nodes: &[(String, bool
 /// REFUSES it: a count names an add-on image older than the
 /// change, or one with no key, whose gateway calls are all failing.
 pub(crate) const GATEWAY_LEGACY_LANES: &[&str] =
-    &["self_call_shared_secret", "cluster_hmac_non_inference", "node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
+    &["node_token_no_cert", "addon_shared_secret_refused", "cluster_hmac_v1"];
 pub(crate) const GATEWAY_LANE_COMPARATORS: &[&str] = &["node_token_with_cert", "addon_exchanged_token", "operator_client_cert", "cluster_hmac_v2"];
 /// Counted REFUSALS, not admissions: a `noo` CLI older than the
 /// break-glass removal signing with the controller secret. Every count is
@@ -3738,6 +3738,11 @@ pub(crate) const GATEWAY_REFUSED_CONTROLLER_LANE: &str = "controller_shared_secr
 /// A fleet-secret HMAC that did not come from a
 /// node (a controller service still holding the node credential).
 pub(crate) const GATEWAY_REFUSED_FLEET_OFF_NODE_LANE: &str = "fleet_secret_off_node_refused";
+/// A fleet-secret HMAC on the inference surface, REFUSED. The
+/// `NOO_SELF_CALL_SHARED_SECRET` bridge that once admitted it is deleted
+/// (the lane `self_call_shared_secret` is no longer counted); every count
+/// is a caller without a service key of its own, whose calls all fail.
+pub(crate) const GATEWAY_REFUSED_SELF_CALL_LANE: &str = "self_call_shared_secret_refused";
 /// A v1 cluster token REFUSED because `NOO_CLUSTER_TOKEN_V1=0` closed the
 /// gate — on the gateway (`/metrics`, by caller) and on each node (its
 /// `legacy_lanes`). Never part of `cluster_hmac_v1`, which is admissions
@@ -3896,13 +3901,19 @@ pub(crate) fn legacy_lanes_check(metrics: Option<&str>, fleet: &[Value], now_uni
     let (refused, refused_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (c_refused, c_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_CONTROLLER_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (f_refused, f_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_FLEET_OFF_NODE_LANE).map(Vec::as_slice).unwrap_or(&[]));
+    let (s_refused, s_who) = lane_breakdown(g.lanes.get(GATEWAY_REFUSED_SELF_CALL_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let (v1_refused, v1_who) = lane_breakdown(g.lanes.get(V1_REFUSED_LANE).map(Vec::as_slice).unwrap_or(&[]));
     let node_v1_who = if node_v1_refused.is_empty() { String::new() } else { format!(" ({})", node_v1_refused.join(", ")) };
-    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
+    let detail = format!("{detail}; {GATEWAY_REFUSED_LANE} {refused}{refused_who}; {GATEWAY_REFUSED_CONTROLLER_LANE} {c_refused}{c_who}; {GATEWAY_REFUSED_FLEET_OFF_NODE_LANE} {f_refused}{f_who}; {GATEWAY_REFUSED_SELF_CALL_LANE} {s_refused}{s_who}; {V1_REFUSED_LANE} gateway refused (by caller) {v1_refused}{v1_who}, nodes refused (by node) {node_v1_refused_n}{node_v1_who}");
     if f_refused > 0 {
         return warn(NAME,
             format!("a non-node caller signed with the fleet secret and was REFUSED {f_refused} time(s){f_who} — {detail}"),
             Some("noo security service-key provision <consumer>   # a controller service presents its own key, never the node credential".into()));
+    }
+    if s_refused > 0 {
+        return warn(NAME,
+            format!("a caller signed with the fleet secret on the inference surface and was REFUSED {s_refused} time(s){s_who} — {detail}"),
+            Some("noo security service-key issue <consumer>   # the caller named above has no key of its own; the shared secret never buys inference".into()));
     }
     if c_refused > 0 {
         return warn(NAME,
@@ -8869,16 +8880,16 @@ mod tests {
     #[test]
     fn the_lane_metrics_parse_per_lane_and_caller() {
         let text = lane_metrics(1_790_000_000, &[
-            r#"noo_legacy_lane_uses_total{caller="trellion",door="controller",lane="self_call_shared_secret"} 10"#,
-            r#"noo_legacy_lane_uses_total{caller="worker",door="controller",lane="self_call_shared_secret"} 2"#,
-            r#"noo_legacy_lane_uses_total{caller="trellion",kind="controller",lane="cluster_hmac_non_inference",route_class="graph"} 3"#,
-            r#"noo_legacy_lane_uses_total{caller="trellion",kind="controller",lane="cluster_hmac_non_inference",route_class="rag"} 4"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",door="cluster",lane="self_call_shared_secret_refused"} 10"#,
+            r#"noo_legacy_lane_uses_total{caller="worker",door="cluster",lane="self_call_shared_secret_refused"} 2"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",lane="addon_shared_secret_refused",route_class="graph"} 3"#,
+            r#"noo_legacy_lane_uses_total{caller="trellion",lane="addon_shared_secret_refused",route_class="rag"} 4"#,
             r#"noo_legacy_lane_uses_total{lane="node_token_no_cert",node="host9",route_class="cluster"} 5"#,
         ]);
         let g = parse_legacy_lane_metrics(&text);
         assert_eq!(g.start_unix, Some(1_790_000_000));
-        assert_eq!(g.lanes["self_call_shared_secret"], vec![("trellion".to_string(), 10), ("worker".to_string(), 2)]);
-        assert_eq!(g.lanes["cluster_hmac_non_inference"], vec![("trellion".to_string(), 7)], "route classes fold into the caller");
+        assert_eq!(g.lanes["self_call_shared_secret_refused"], vec![("trellion".to_string(), 10), ("worker".to_string(), 2)]);
+        assert_eq!(g.lanes["addon_shared_secret_refused"], vec![("trellion".to_string(), 7)], "route classes fold into the caller");
         assert_eq!(g.lanes["node_token_no_cert"], vec![("host9".to_string(), 5)]);
     }
 
@@ -8912,13 +8923,34 @@ mod tests {
     fn any_gateway_lane_in_use_warns_naming_it_and_its_caller() {
         let now = 1_790_000_000;
         let text = lane_metrics(now - 86_400, &[
-            r#"noo_legacy_lane_uses_total{caller="evolve",kind="controller",lane="cluster_hmac_non_inference",route_class="hofstadter"} 12"#,
+            r#"noo_legacy_lane_uses_total{caller="host9",lane="cluster_hmac_v1",route_class="cluster"} 12"#,
         ]);
         let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0 });
         let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes))], now);
         assert_eq!(c.verdict, Verdict::Warn);
-        assert!(c.detail.contains("in use: cluster_hmac_non_inference"), "{}", c.detail);
-        assert!(c.detail.contains("cluster_hmac_non_inference 12 (evolve 12)"), "{}", c.detail);
+        assert!(c.detail.contains("in use: cluster_hmac_v1 (gateway admitted)"), "{}", c.detail);
+        assert!(c.detail.contains("cluster_hmac_v1 12 (host9 12)"), "{}", c.detail);
+    }
+
+    /// The retired self-call bridge is a REFUSAL now: a count warns naming
+    /// the caller and the key to mint, and is never "in use" (nothing
+    /// admitted it). The two retired admission lanes are no longer read.
+    #[test]
+    fn a_refused_self_call_warns_with_the_service_key_and_retired_lanes_are_not_read() {
+        let now = 1_790_000_000;
+        let text = lane_metrics(now - 86_400, &[
+            r#"noo_legacy_lane_uses_total{caller="host9",door="cluster",lane="self_call_shared_secret_refused"} 5"#,
+        ]);
+        let lanes = serde_json::json!({ "since_unix": now - 86_400, "static_token": 0, "whois_non_controller": 0 });
+        let c = legacy_lanes_check(Some(&text), &[lane_node("host3", now, Some(lanes.clone()))], now);
+        assert_eq!(c.verdict, Verdict::Warn, "{}", c.detail);
+        assert!(c.detail.contains("REFUSED 5 time(s) (host9 5)"), "{}", c.detail);
+        assert!(!c.detail.contains("in use:"), "{}", c.detail);
+        assert!(c.remedy.as_deref().unwrap_or("").contains("noo security service-key issue"), "{:?}", c.remedy);
+        let quiet = legacy_lanes_check(Some(&lane_metrics(now - 86_400, &[])), &[lane_node("host3", now, Some(lanes))], now);
+        assert_eq!(quiet.verdict, Verdict::Ok, "{}", quiet.detail);
+        assert!(quiet.detail.contains("self_call_shared_secret_refused 0"), "{}", quiet.detail);
+        assert!(!quiet.detail.contains("cluster_hmac_non_inference") && !quiet.detail.contains("self_call_shared_secret "), "{}", quiet.detail);
     }
 
     /// An add-on's shared-secret HMAC is REFUSED by the
@@ -9043,6 +9075,7 @@ mod tests {
             let needle = format!("= \"{lane}\";");
             assert!(gw.contains(&needle) || refused.contains(&needle), "the gateway declares no lane {lane}");
         }
+        assert!(gw.contains(&format!("= \"{GATEWAY_REFUSED_SELF_CALL_LANE}\";")), "the gateway declares no lane {GATEWAY_REFUSED_SELF_CALL_LANE}");
         assert!(gw.contains("pub const METRIC: &str = \"noo_legacy_lane_uses_total\";"));
         let core = include_str!("../../../gateway-rust/src/routes/core.rs");
         assert!(core.contains("noo_gateway_start_time_seconds {}"), "the start gauge's rendering moved");

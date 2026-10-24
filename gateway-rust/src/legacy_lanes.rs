@@ -3,15 +3,25 @@
 
 //! Legacy credential lanes, OBSERVED.
 //!
-//! Four ways in are kept only for callers nobody has proven are gone:
+//! Two ways in are still ADMITTED, kept only for callers nobody has proven
+//! are gone; the rest of what this module counts is refusals and comparators:
 //!
-//! | lane | what admits the request |
+//! | lane | what happens |
 //! |---|---|
-//! | `self_call_shared_secret` | a controller- or fleet-secret HMAC buying inference (transitional bridge, `NOO_SELF_CALL_SHARED_SECRET`) |
-//! | `cluster_hmac_non_inference` | a controller-secret HMAC (or a fleet HMAC in the legacy full-access mode) resolving to `ClusterKind::Internal` on any other route. The add-ons' HMAC is no longer admitted here: it is REFUSED first and counted as `addon_shared_secret_refused` (`addon_hmac_refusal.rs`) |
-//! | `node_token_no_cert` | a fleet-secret HMAC resolving to `ClusterKind::Node` with no client certificate on the connection |
-//! | `cluster_hmac_v1` | a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0`, and then counted as `cluster_hmac_v1_refused` instead |
+//! | `node_token_no_cert` | ADMITTED: a fleet-secret HMAC resolving to `ClusterKind::Node` with no client certificate on the connection (mTLS not enforcing) |
+//! | `cluster_hmac_v1` | ADMITTED: a fleet-secret HMAC in the v1 wire form, which is not bound to its request (the v2 form is the comparator `cluster_hmac_v2`); refused once `NOO_CLUSTER_TOKEN_V1=0`, and then counted as `cluster_hmac_v1_refused` instead |
+//! | `self_call_shared_secret_refused` | REFUSED: a fleet-secret HMAC on the inference surface (`/v1/*`, `/api/external/*`). The shared secret never buys inference; the `NOO_SELF_CALL_SHARED_SECRET` bridge that once could is deleted |
+//! | `cli_shared_secret_refused` | REFUSED: a controller-secret HMAC signed by an old `noo` CLI (`controller_door`) |
+//! | `controller_shared_secret_refused`, `fleet_secret_off_node_refused`, `fleet_token_no_cert_refused`, `addon_shared_secret_refused` | REFUSED: see `controller_hmac_refusal.rs` and `addon_hmac_refusal.rs` |
+//! | `node_token_with_cert`, `cluster_hmac_v2`, `addon_exchanged_token`, `operator_client_cert` | comparators: the good case of the lane they sit beside |
 //! | (node side) `static_token` / `whois_non_controller` | reported by each node agent on its heartbeat as `legacy_lanes` |
+//!
+//! Retired lanes, no longer counted: `self_call_shared_secret` (the
+//! `NOO_SELF_CALL_SHARED_SECRET` bridge: 0 uses live, and the fleet door
+//! refuses the inference surface before the bridge could be consulted) and
+//! `cluster_hmac_non_inference` (a shared-secret HMAC resolving to
+//! `ClusterKind::Internal`: the controller door admits nothing and the fleet
+//! door only ever grants `Node`, so nothing can set it).
 //!
 //! The `noo` CLI is no longer on any of these lanes. Its controller-secret
 //! actors (`cli`, `cli-posture`, `cli-onboard`, `cli-break-glass`) are
@@ -19,15 +29,13 @@
 //! decision 2026-10-03: no break-glass, no onboard bootstrap). Each refusal
 //! is counted under the same family as
 //! `noo_legacy_lane_uses_total{lane="cli_shared_secret_refused",caller,route_class}`
-//! ([`LANE_CLI_REFUSED`]), so an old binary still in use is visible by name
-//! — and `cluster_hmac_non_inference` holds only the add-ons' fallback.
+//! ([`LANE_CLI_REFUSED`]), so an old binary still in use is visible by name.
 //!
-//! Apart from that one refused lane, this module decides nothing and
+//! Apart from the refused lanes, this module decides nothing and
 //! refuses nothing. It classifies an
 //! ADMITTED request into the lanes it used and counts them under one
 //! Prometheus family, `noo_legacy_lane_uses_total{lane=…}`, beside the
-//! comparator lanes that are the replacement (`node_token_with_cert`,
-//! `addon_exchanged_token`, `operator_client_cert`) so a ratio is visible. `noo cluster verify
+//! comparator lanes that are the replacement so a ratio is visible. `noo cluster verify
 //! --controller` reads the counters back as its `legacy lanes` row.
 //!
 //! Every label is bounded: route paths are bucketed ([`route_class`]),
@@ -46,17 +54,20 @@ use std::time::{Duration, Instant};
 /// The one metric family every lane is counted under.
 pub const METRIC: &str = "noo_legacy_lane_uses_total";
 
-pub const LANE_SELF_CALL: &str = "self_call_shared_secret";
-pub const LANE_HMAC_NON_INFERENCE: &str = "cluster_hmac_non_inference";
+/// REFUSED, not admitted: a fleet-secret HMAC on the inference surface. The
+/// shared secret never buys inference (the `NOO_SELF_CALL_SHARED_SECRET`
+/// bridge is deleted). Every count is a caller that must present its own
+/// service key.
+pub const LANE_SELF_CALL_REFUSED: &str = "self_call_shared_secret_refused";
 pub const LANE_NODE_NO_CERT: &str = "node_token_no_cert";
 /// Comparator: the good case of [`LANE_NODE_NO_CERT`].
 pub const LANE_NODE_WITH_CERT: &str = "node_token_with_cert";
-/// Comparator: the add-on's own exchanged token, the replacement for
-/// [`LANE_HMAC_NON_INFERENCE`] when the caller is an add-on.
+/// Comparator: the add-on's own exchanged token, the replacement for the
+/// add-on HMAC fallback (now refused as `addon_shared_secret_refused`).
 pub const LANE_ADDON_EXCHANGED: &str = "addon_exchanged_token";
 /// Comparator: a posture write on an operator client certificate plus a
-/// token bound to it — the replacement for the CLI's
-/// `cli-posture` use of [`LANE_HMAC_NON_INFERENCE`].
+/// token bound to it — the replacement for the CLI's `cli-posture` HMAC
+/// (now refused as `cli_shared_secret_refused`).
 pub const LANE_OPERATOR_CERT: &str = "operator_client_cert";
 /// A fleet-secret HMAC in the v1 wire form (`<actor>:<ts>:<hmac>`): signed
 /// over actor and time only, so a captured header replays on any route for
@@ -93,14 +104,11 @@ impl HmacDoor {
     }
 }
 
-/// An HMAC-authenticated request the middleware has decided to ADMIT.
+/// A fleet-secret HMAC request (a `ClusterKind::Node` admission) the
+/// middleware has decided to ADMIT. The inference surface is refused before
+/// this is built, and the fleet door never grants `Internal`.
 #[derive(Debug, Clone)]
 pub struct HmacAdmission<'a> {
-    pub door: HmacDoor,
-    /// The kind it resolved to was `ClusterKind::Internal` (full access).
-    pub internal: bool,
-    /// `/v1/*` or `/api/external/*`.
-    pub inference: bool,
     pub path: &'a str,
     /// The actor field of the token — a claim, not a proof.
     pub actor: &'a str,
@@ -174,41 +182,30 @@ pub fn bounded_name(label: &'static str, raw: &str) -> String {
     clean
 }
 
-/// The lanes an admitted HMAC request used. Pure except for the bounded
-/// name set; the caller records and logs what this returns.
+/// The lanes an admitted fleet-secret HMAC request used. Pure except for
+/// the bounded name set; the caller records and logs what this returns.
 pub fn hmac_lane_uses(a: &HmacAdmission<'_>) -> Vec<LaneUse> {
-    let mut out = Vec::new();
-    let caller = bounded_name("caller", a.actor);
-    if a.inference {
-        out.push(LaneUse {
-            lane: LANE_SELF_CALL,
-            labels: vec![("door", a.door.as_str().into()), ("caller", caller.clone())],
-        });
-    } else if a.internal {
-        out.push(LaneUse {
-            lane: LANE_HMAC_NON_INFERENCE,
-            labels: vec![
-                ("kind", a.door.as_str().into()),
-                ("route_class", route_class(a.path).into()),
-                ("caller", caller.clone()),
-            ],
-        });
+    // ClusterKind::Node: the fleet secret proved "a node". Was the node's
+    // certificate on the connection too?
+    let used = match a.presented_node {
+        Some(node) => LaneUse {
+            lane: LANE_NODE_WITH_CERT,
+            labels: vec![("node", bounded_name("node", node))],
+        },
+        None => LaneUse {
+            lane: LANE_NODE_NO_CERT,
+            labels: vec![("node", bounded_name("node", a.actor)), ("route_class", route_class(a.path).into())],
+        },
+    };
+    vec![used]
+}
+
+/// A fleet-secret HMAC on the inference surface, refused.
+pub fn self_call_refusal_use(actor: &str, door: HmacDoor) -> LaneUse {
+    LaneUse {
+        lane: LANE_SELF_CALL_REFUSED,
+        labels: vec![("door", door.as_str().into()), ("caller", bounded_name("caller", actor))],
     }
-    if !a.internal {
-        // ClusterKind::Node: the fleet secret proved "a node". Was the
-        // node's certificate on the connection too?
-        match a.presented_node {
-            Some(node) => out.push(LaneUse {
-                lane: LANE_NODE_WITH_CERT,
-                labels: vec![("node", bounded_name("node", node))],
-            }),
-            None => out.push(LaneUse {
-                lane: LANE_NODE_NO_CERT,
-                labels: vec![("node", bounded_name("node", a.actor)), ("route_class", route_class(a.path).into())],
-            }),
-        }
-    }
-    out
 }
 
 /// The comparator for the add-on HMAC fallback: an exchanged add-on token
@@ -316,9 +313,8 @@ pub fn log_due(key: &str, every: Duration) -> bool {
 
 /// How often the node-token-without-a-certificate WARN repeats per node.
 pub const NODE_NO_CERT_LOG_EVERY: Duration = Duration::from_secs(3600);
-/// How often the HMAC-on-a-non-inference-route DEBUG repeats per
-/// (kind, route class, caller).
-pub const HMAC_NON_INFERENCE_LOG_EVERY: Duration = Duration::from_secs(600);
+/// How often the inference-surface refusal WARN repeats per (door, caller).
+pub const SELF_CALL_REFUSED_LOG_EVERY: Duration = Duration::from_secs(600);
 /// How often the v1-token INFO repeats per caller.
 pub const HMAC_V1_LOG_EVERY: Duration = Duration::from_secs(3600);
 /// How often the v1 request detail (method, path, body-hash header, token
@@ -328,7 +324,7 @@ pub const HMAC_V1_DETAIL_LOG_EVERY: Duration = Duration::from_secs(300);
 pub const CLI_REFUSED_LOG_EVERY: Duration = Duration::from_secs(600);
 
 /// Count every use, and log the lanes that have no per-request log of their
-/// own (the self-call lane logs at its door, every time, already).
+/// own.
 pub async fn observe(metrics: &crate::metrics::MetricsState, uses: &[LaneUse], peer: &PeerFacts) {
     for u in uses {
         let mut labels: HashMap<String, String> =
@@ -347,14 +343,16 @@ pub async fn observe(metrics: &crate::metrics::MetricsState, uses: &[LaneUse], p
                     );
                 }
             }
-            LANE_HMAC_NON_INFERENCE => {
-                let key = format!("{LANE_HMAC_NON_INFERENCE}|{}|{}|{}", u.label("kind"), u.label("route_class"), u.label("caller"));
-                if log_due(&key, HMAC_NON_INFERENCE_LOG_EVERY) {
-                    tracing::debug!(
-                        kind = u.label("kind"), route_class = u.label("route_class"), caller = u.label("caller"),
-                        peer = %peer.describe(),
-                        "legacy lane: a shared-secret HMAC was admitted as Internal on a non-inference \
-                         route (an add-on here is on its HMAC fallback, not its own key)"
+            LANE_SELF_CALL_REFUSED => {
+                let key = format!("{LANE_SELF_CALL_REFUSED}|{}|{}", u.label("door"), u.label("caller"));
+                if log_due(&key, SELF_CALL_REFUSED_LOG_EVERY) {
+                    tracing::warn!(
+                        door = u.label("door"), caller = u.label("caller"), peer = %peer.describe(),
+                        "REFUSED: a shared-secret HMAC on the inference surface — the shared secret \
+                         never buys inference; the caller must present its own service key (mint \
+                         one with `noo security service-key issue <consumer>`) (once per caller \
+                         per 10 min; the count is \
+                         noo_legacy_lane_uses_total{{lane=\"self_call_shared_secret_refused\"}})"
                     );
                 }
             }
@@ -406,8 +404,8 @@ mod tests {
     use super::*;
     use crate::metrics::MetricsState;
 
-    fn adm<'a>(door: HmacDoor, internal: bool, inference: bool, path: &'a str, actor: &'a str, cert: Option<&'a str>) -> HmacAdmission<'a> {
-        HmacAdmission { door, internal, inference, path, actor, presented_node: cert }
+    fn adm<'a>(path: &'a str, actor: &'a str, cert: Option<&'a str>) -> HmacAdmission<'a> {
+        HmacAdmission { path, actor, presented_node: cert }
     }
 
     async fn rendered(uses: &[LaneUse]) -> String {
@@ -428,40 +426,24 @@ mod tests {
         assert_eq!(route_class("/"), "other");
     }
 
-    /// Lane 1: either secret buying inference.
+    /// The retired self-call lane is a REFUSAL now, counted per door and
+    /// caller; an admission is only ever a node token with or without a cert.
     #[tokio::test]
-    async fn the_self_call_lane_counts_per_door() {
-        let c = hmac_lane_uses(&adm(HmacDoor::Controller, true, true, "/v1/chat/completions", "trellion", None));
-        assert_eq!(c.len(), 1);
-        let out = rendered(&c).await;
-        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="trellion",door="controller",lane="self_call_shared_secret"} 1"#), "{out}");
-        // A node on the fleet secret buying embeddings: lane 1 AND lane 3.
-        let n = hmac_lane_uses(&adm(HmacDoor::Cluster, false, true, "/api/external/embeddings", "host3", None));
-        let out = rendered(&n).await;
-        assert!(out.contains(r#"door="cluster",lane="self_call_shared_secret""#), "{out}");
-        assert!(out.contains(r#"lane="node_token_no_cert",node="host3",route_class="inference""#), "{out}");
-    }
-
-    /// Lane 2: Internal on anything but inference, bucketed by class.
-    #[tokio::test]
-    async fn the_hmac_non_inference_lane_counts_by_kind_and_route_class() {
-        let u = hmac_lane_uses(&adm(HmacDoor::Controller, true, false, "/api/v1/graph/extract", "trellion", None));
-        assert_eq!(u.len(), 1);
-        let out = rendered(&u).await;
-        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="trellion",kind="controller",lane="cluster_hmac_non_inference",route_class="graph"} 1"#), "{out}");
-        // The legacy full-access mode: a fleet HMAC resolving Internal.
-        let l = hmac_lane_uses(&adm(HmacDoor::Cluster, true, false, "/api/cluster/placements", "x", None));
-        assert_eq!(l[0].lane, LANE_HMAC_NON_INFERENCE);
-        assert_eq!(l[0].label("kind"), "cluster");
-        assert!(l.iter().all(|u| u.lane != LANE_NODE_NO_CERT), "an Internal caller is not a node token");
+    async fn the_self_call_refusal_counts_per_door_and_is_never_an_admission() {
+        let u = self_call_refusal_use("host3", HmacDoor::Cluster);
+        let out = rendered(&[u.clone(), u]).await;
+        assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="host3",door="cluster",lane="self_call_shared_secret_refused"} 2"#), "{out}");
+        for u in hmac_lane_uses(&adm("/api/embed", "host3", None)) {
+            assert_eq!(u.lane, LANE_NODE_NO_CERT);
+        }
     }
 
     /// Lane 3 and its comparator.
     #[tokio::test]
     async fn node_tokens_count_with_and_without_a_certificate() {
-        let without = hmac_lane_uses(&adm(HmacDoor::Cluster, false, false, "/api/cluster/nodes/host9/heartbeat", "host9", None));
+        let without = hmac_lane_uses(&adm("/api/cluster/nodes/host9/heartbeat", "host9", None));
         assert_eq!(without, vec![LaneUse { lane: LANE_NODE_NO_CERT, labels: vec![("node", "host9".into()), ("route_class", "cluster".into())] }]);
-        let with = hmac_lane_uses(&adm(HmacDoor::Cluster, false, false, "/api/cluster/nodes/host9/heartbeat", "host9", Some("host9")));
+        let with = hmac_lane_uses(&adm("/api/cluster/nodes/host9/heartbeat", "host9", Some("host9")));
         assert_eq!(with, vec![LaneUse { lane: LANE_NODE_WITH_CERT, labels: vec![("node", "host9".into())] }]);
         let out = rendered(&[without[0].clone(), without[0].clone(), with[0].clone()]).await;
         assert!(out.contains(r#"noo_legacy_lane_uses_total{lane="node_token_no_cert",node="host9",route_class="cluster"} 2"#), "{out}");
@@ -478,13 +460,13 @@ mod tests {
     }
 
     /// The CLI's controller-secret HMAC is refused and counted as a refusal,
-    /// never as an admitted `cluster_hmac_non_inference` use.
+    /// never as an admitted use of a retired lane.
     #[tokio::test]
     async fn an_old_cli_is_counted_as_refused() {
         let u = cli_refusal_use("cli-posture", "/api/security/posture");
         let out = rendered(&[u.clone(), u]).await;
         assert!(out.contains(r#"noo_legacy_lane_uses_total{caller="cli-posture",lane="cli_shared_secret_refused",route_class="security"} 2"#), "{out}");
-        assert!(!out.contains("cluster_hmac_non_inference"), "a refusal is not an admitted use: {out}");
+        assert!(!out.contains("cluster_hmac_non_inference") && !out.contains(r#"lane="self_call_shared_secret""#), "a refusal is not an admitted use: {out}");
     }
 
     /// A v1 token refused at a closed gate is its own lane: the admitted
@@ -535,19 +517,19 @@ mod tests {
     /// The doors call this module. A classification nobody calls is the
     /// silent-success shape: every test here green, no counter on /metrics.
     #[test]
-    fn both_hmac_doors_and_the_addon_token_path_record_their_lanes() {
+    fn the_fleet_door_and_the_addon_token_path_record_their_lanes() {
         let src = include_str!("auth.rs");
         let body = src.split("pub async fn require_any_auth(").nth(1).expect("the middleware")
             .split("\npub async fn ").next().unwrap();
-        // Each ADMITTING door classifies AND records before it admits: the
-        // text from its HmacDoor to the door's `return Ok(` must hold the
-        // observe(). The controller door admits nothing;
+        // The ADMITTING door (the fleet door) classifies AND records before
+        // it admits: the text from its HmacAdmission to the door's
+        // `return Ok(` must hold the observe(). The controller door admits nothing;
         // its refusal records through controller_hmac_refusal::refuse
         // (pinned by auth.rs `the_controller_door_admits_nothing`).
-        assert!(!body.contains("door: crate::legacy_lanes::HmacDoor::Controller,"),
-            "the controller door classifies an admission again — it admits nothing");
-        let after = body.split("door: crate::legacy_lanes::HmacDoor::Cluster,").nth(1)
-            .expect("the Cluster door classifies no lane");
+        assert_eq!(body.matches("crate::legacy_lanes::HmacAdmission {").count(), 1,
+            "exactly one door (the fleet door) classifies an admission — the controller door admits nothing");
+        let after = body.split("crate::legacy_lanes::HmacAdmission {").nth(1)
+            .expect("the fleet door classifies no lane");
         let until_admit = after.split("return Ok(").next().unwrap();
         assert!(until_admit.contains("crate::legacy_lanes::observe(&state.metrics, &uses, &peer).await"),
             "the Cluster door classifies but never records its lane");

@@ -407,13 +407,6 @@ services:
       # NOO_NATS_LEGACY_SHARED_CREDS were retired by an earlier change — no
       # service is handed either; tests/test_nats_legacy_principal_env.py.)
       - NOO_NATS_ALLOW_ANONYMOUS=${NOO_NATS_ALLOW_ANONYMOUS:-}
-      # an earlier change. OPEN while unset — a shared-secret token still buys
-      # inference, and each acceptance warns naming the caller so "who has no
-      # key yet" is answerable before this closes. Delivered now, closed
-      # later: a posture key the running gateway does not know cannot be set
-      # (it 400s), so the env must reach the container a release ahead of the
-      # decision.
-      - NOO_SELF_CALL_SHARED_SECRET=${NOO_SELF_CALL_SHARED_SECRET:-}
       # CUTOVER: gateway connects as noo_app, a NON-SUPERUSER holding only
       # SELECT/INSERT/UPDATE/DELETE (migration 033). PGVECTOR_URL and
       # PAGEINDEX_DSN below deliberately stay `pai`: the entrypoint resolves
