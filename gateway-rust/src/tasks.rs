@@ -274,24 +274,24 @@ pub async fn create_task(db: &sqlx::PgPool, new: NewTask<'_>) -> Result<Task> {
     };
     let parent_uuid = new.parent.and_then(|p| uuid::Uuid::parse_str(&p.id).ok());
     let channel = new.parent.map(|p| p.channel.as_str()).unwrap_or("task");
-    sqlx::query(
-        "INSERT INTO noo_tasks (id, objective, owner_uuid, state, conversation_id, thread_id, channel, model, loop_budget, parent_id, role, budget_default, token_budget, created_via) \
-         VALUES ($1, $2, (SELECT user_uuid FROM noo_users WHERE username = $3), 'open', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+    crate::repo::tasks::insert(
+        db,
+        &crate::repo::tasks::NewTaskRow {
+            id,
+            objective: new.objective,
+            owner: new.owner,
+            conversation_id: conversation,
+            thread_id: &thread,
+            channel,
+            model: new.model,
+            loop_budget: budget as i32,
+            parent_id: parent_uuid,
+            role: new.role,
+            budget_default,
+            token_budget: new.token_budget.filter(|b| *b > 0),
+            created_via: new.created_via,
+        },
     )
-    .bind(id)
-    .bind(new.objective)
-    .bind(new.owner)
-    .bind(conversation)
-    .bind(&thread)
-    .bind(channel)
-    .bind(new.model)
-    .bind(budget as i32)
-    .bind(parent_uuid)
-    .bind(new.role)
-    .bind(budget_default)
-    .bind(new.token_budget.filter(|b| *b > 0))
-    .bind(new.created_via)
-    .execute(db)
     .await?;
     // i143 D: the first event of an add-on's task (a no-op for any other).
     crate::task_events::emit_state(db, &id.to_string(), "open", None).await;
@@ -306,11 +306,7 @@ pub async fn apply_node_budget(db: &sqlx::PgPool, task: &Task, node: &str) -> Re
     }
     let Some(b) = node_loop_budget(db, node).await else { return Ok(task.loop_budget) };
     let uuid = uuid::Uuid::parse_str(&task.id)?;
-    sqlx::query("UPDATE noo_tasks SET loop_budget = $2, updated_at = now() WHERE id = $1 AND budget_default")
-        .bind(uuid)
-        .bind(b as i32)
-        .execute(db)
-        .await?;
+    crate::repo::tasks::set_loop_budget_if_default(db, uuid, b as i32).await?;
     Ok(b)
 }
 
@@ -434,15 +430,7 @@ pub async fn list_via(db: &sqlx::PgPool, owner: &str, via: &str, state: Option<&
 /// path (it records the `revoked` event), so it is honoured at the task's next
 /// checkpoint like any stop. Returns the ids it stopped.
 pub async fn stop_via(db: &sqlx::PgPool, owner: &str, via: &str) -> Result<Vec<String>> {
-    let live: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id FROM noo_tasks \
-         WHERE owner_uuid = (SELECT user_uuid FROM noo_users WHERE username = $1) AND created_via = $2 \
-         AND state IN ('open','running','checkpointed')",
-    )
-    .bind(owner)
-    .bind(via)
-    .fetch_all(db)
-    .await?;
+    let live: Vec<uuid::Uuid> = crate::repo::tasks::live_ids_via(db, owner, via).await?;
     let mut stopped = Vec::new();
     for id in live {
         let id = id.to_string();
@@ -503,7 +491,7 @@ pub async fn claim_idempotency(db: &sqlx::PgPool, owner: &str, via: &str, key: &
 /// Remove a task that lost an idempotency race before it was ever started.
 pub async fn discard_unstarted(db: &sqlx::PgPool, id: &str) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query("DELETE FROM noo_tasks WHERE id = $1 AND state = 'open'").bind(uuid).execute(db).await?;
+    crate::repo::tasks::delete_if_open(db, uuid).await?;
     Ok(())
 }
 
@@ -524,12 +512,7 @@ pub async fn for_conversation(db: &sqlx::PgPool, conversation_id: &str, owner: &
 
 async fn set_state(db: &sqlx::PgPool, id: &str, state: &str, node: Option<&str>) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query("UPDATE noo_tasks SET state = $2, node = COALESCE($3, node), updated_at = now() WHERE id = $1")
-        .bind(uuid)
-        .bind(state)
-        .bind(node)
-        .execute(db)
-        .await?;
+    crate::repo::tasks::set_state(db, uuid, state, node).await?;
     Ok(())
 }
 
@@ -691,17 +674,7 @@ async fn tools_used(db: &sqlx::PgPool, conversation_id: &str) -> i64 {
 /// use it without the two calling each other forever.
 async fn finish_row(db: &sqlx::PgPool, id: &str, ok: bool, text: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    let (state, col) = if ok { ("done", "result") } else { ("failed", "error") };
-    let n = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE noo_tasks SET state = $2, {col} = $3, updated_at = now() \
-         WHERE id = $1 AND state IN ('open','running','checkpointed')"
-    )))
-    .bind(uuid)
-    .bind(state)
-    .bind(text)
-    .execute(db)
-    .await?
-    .rows_affected();
+    let n = crate::repo::tasks::finish(db, uuid, ok, text).await?;
     if n > 0 {
         // i143 D: `result` (the answer, or null on failure) then the final
         // `state`. Here, not in `finish`, so a parent settled by
@@ -723,19 +696,12 @@ pub async fn stop(db: &sqlx::PgPool, id: &str) -> Result<bool> {
 /// follows the revoked one.
 pub async fn stop_with(db: &sqlx::PgPool, id: &str, reason: &str) -> Result<bool> {
     let uuid = uuid::Uuid::parse_str(id)?;
-    let live: Option<String> = sqlx::query_scalar("SELECT state FROM noo_tasks WHERE id = $1 AND state IN ('open','running','checkpointed')")
-        .bind(uuid)
-        .fetch_optional(db)
-        .await?;
+    let live: Option<String> = crate::repo::tasks::live_state_of(db, uuid).await?;
     if live.is_none() {
         return Ok(false);
     }
     crate::task_events::emit_revoked(db, id, reason).await;
-    let n = sqlx::query("UPDATE noo_tasks SET state = 'stopped', updated_at = now() WHERE id = $1 AND state IN ('open','running','checkpointed')")
-        .bind(uuid)
-        .execute(db)
-        .await?
-        .rows_affected();
+    let n = crate::repo::tasks::stop_live(db, uuid).await?;
     if n > 0 {
         crate::task_events::emit_final_state(db, id, Some(reason)).await;
     }
@@ -752,15 +718,7 @@ pub async fn checkpoint(state: &AppState, id: &str, loops: u32, note: Option<&st
         finish(&state.db, id, false, &format!("loop budget of {} exhausted", task.loop_budget), true).await?;
     }
     let uuid = uuid::Uuid::parse_str(id)?;
-    sqlx::query(
-        "UPDATE noo_tasks SET loops = $2, last_checkpoint = now(), last_note = COALESCE($3, last_note), \
-         state = CASE WHEN state = 'running' THEN 'checkpointed' ELSE state END, updated_at = now() WHERE id = $1",
-    )
-    .bind(uuid)
-    .bind(loops as i32)
-    .bind(note)
-    .execute(&state.db)
-    .await?;
+    crate::repo::tasks::checkpoint(&state.db, uuid, loops as i32, note).await?;
     if let (Some(n), Some(owner)) = (note.filter(|n| !n.trim().is_empty()), task.owner.as_deref()) {
         let env = crate::agent_messages::Envelope::new(owner, "thread", "note", json!({"text": n, "task_id": id, "loop": loops}), Some(&task.thread_id), vec![])
             .with_from(crate::agent_messages::Identity::new(Some(owner), task.node.as_deref(), Some(owner), Some("task")));
@@ -856,7 +814,7 @@ pub async fn mark_queued(db: &sqlx::PgPool, id: &str, node: &str) -> Result<()> 
 /// runner takes it.
 pub async fn mark_running(db: &sqlx::PgPool, id: &str, node: Option<&str>) -> Result<()> {
     let before = match uuid::Uuid::parse_str(id) {
-        Ok(u) => sqlx::query_scalar::<_, String>("SELECT state FROM noo_tasks WHERE id = $1").bind(u).fetch_optional(db).await.ok().flatten(),
+        Ok(u) => crate::repo::tasks::state_of(db, u).await.ok().flatten(),
         Err(_) => None,
     };
     set_state(db, id, "running", node).await?;

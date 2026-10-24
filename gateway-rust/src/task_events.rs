@@ -149,11 +149,7 @@ pub fn decide(status: Option<u16>, body: Option<&Value>, sent: i64, earliest: i6
 /// is dropped, so `final` is true exactly once.
 pub async fn emit(db: &sqlx::PgPool, task_id: &str, kind: &str, data: Value) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
-    let via: Option<String> = sqlx::query_scalar::<_, Option<String>>("SELECT created_via FROM noo_tasks WHERE id = $1")
-        .bind(uuid)
-        .fetch_optional(db)
-        .await?
-        .flatten();
+    let via: Option<String> = crate::repo::tasks::created_via(db, uuid).await?;
     let Some(addon) = via.as_deref().and_then(addon_of) else { return Ok(()) };
     let mut tx = db.begin().await?;
     sqlx::query(
@@ -216,12 +212,7 @@ pub async fn emit_revoked(db: &sqlx::PgPool, task_id: &str, reason: &str) {
 /// nothing (`final` is true exactly once).
 pub async fn emit_final_state(db: &sqlx::PgPool, task_id: &str, why: Option<&str>) {
     let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return };
-    let state: Option<String> = sqlx::query_scalar("SELECT state FROM noo_tasks WHERE id = $1")
-        .bind(uuid)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+    let state: Option<String> = crate::repo::tasks::state_of(db, uuid).await.ok().flatten();
     if let Some(s) = state.filter(|s| is_terminal(s)) {
         emit_logged(db, task_id, "state", state_data(&s, why)).await;
     }
@@ -275,12 +266,9 @@ pub async fn emit_finished(db: &sqlx::PgPool, task_id: &str, ok: bool, text: &st
 
 async fn is_addon_task(db: &sqlx::PgPool, task_id: &str) -> bool {
     let Ok(uuid) = uuid::Uuid::parse_str(task_id) else { return false };
-    sqlx::query_scalar::<_, Option<String>>("SELECT created_via FROM noo_tasks WHERE id = $1")
-        .bind(uuid)
-        .fetch_optional(db)
+    crate::repo::tasks::created_via(db, uuid)
         .await
         .ok()
-        .flatten()
         .flatten()
         .is_some_and(|v| addon_of(&v).is_some())
 }

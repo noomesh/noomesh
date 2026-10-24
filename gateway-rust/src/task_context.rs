@@ -60,13 +60,9 @@ pub fn decide(current: i32, current_sha: Option<&str>, revision: i32, new_sha: &
 pub async fn submit(db: &sqlx::PgPool, task_id: &str, revision: i32, text: &str) -> Result<ContextOutcome> {
     let uuid = uuid::Uuid::parse_str(task_id)?;
     let mut tx = db.begin().await?;
-    let row = sqlx::query("SELECT state, context_revision FROM noo_tasks WHERE id = $1 FOR UPDATE")
-        .bind(uuid)
-        .fetch_optional(&mut *tx)
+    let (state, current): (String, i32) = crate::repo::tasks::lock_state_and_revision(&mut *tx, uuid)
         .await?
         .ok_or_else(|| anyhow!("task {task_id} not found"))?;
-    let state: String = row.try_get("state")?;
-    let current: i32 = row.try_get("context_revision")?;
     let sha = sha256_hex(text);
     let current_sha: Option<String> = if current > 0 {
         sqlx::query_scalar("SELECT sha256 FROM noo_task_context WHERE task_id = $1 AND revision = $2")
@@ -86,11 +82,7 @@ pub async fn submit(db: &sqlx::PgPool, task_id: &str, revision: i32, text: &str)
             .bind(&sha)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE noo_tasks SET context_revision = $2, updated_at = now() WHERE id = $1")
-            .bind(uuid)
-            .bind(revision)
-            .execute(&mut *tx)
-            .await?;
+        crate::repo::tasks::set_context_revision(&mut *tx, uuid, revision).await?;
     }
     tx.commit().await?;
     Ok(out)

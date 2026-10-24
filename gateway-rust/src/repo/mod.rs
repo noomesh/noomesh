@@ -62,5 +62,6 @@ pub mod heartbeat;
 pub mod kb_grants;
 pub mod prompt_skills;
 pub mod settings;
+pub mod tasks;
 pub mod prompt_skill_proposals;
 pub mod users;
