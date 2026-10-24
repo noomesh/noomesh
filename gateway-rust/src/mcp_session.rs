@@ -64,8 +64,8 @@ const MAX_SESSIONS: usize = 10_000;
 pub struct Session {
     pub account: String,
     pub consumer: String,
-    /// The connection label this session mints under:
-    /// `<label from the key>-<short suffix>`, a valid name segment.
+    /// The connection label this session mints under: `<type>-<session>`,
+    /// a valid name segment ([`session_label`], renamed by [`rename`]).
     pub label: String,
     pub opened: Instant,
     pub last_seen: Instant,
@@ -102,20 +102,68 @@ fn suffix() -> String {
     (0..6).map(|_| ALPHABET[r.random_range(0..ALPHABET.len())] as char).collect()
 }
 
-/// Build the label a session mints under: the key's label plus a suffix,
-/// capped so the whole thing remains one valid segment.
-pub fn session_label(consumer: &str) -> Option<String> {
-    let base = crate::auth::connection_label(consumer)?;
-    let base: String = base.chars().take(120).collect();
+/// Client kinds named by their own `clientInfo.name` often enough to get a
+/// short, stable type: `claude-code` → `claude`. Matched as a substring of
+/// the lowercased name, first match wins.
+const KNOWN_TYPES: &[&str] = &["claude", "codex", "cursor", "gemini"];
+
+/// Longest type kept, so `<type>-<session>` stays well inside a segment.
+const MAX_TYPE: usize = 32;
+
+/// Longest session part a caller may claim with [`rename`].
+pub const MAX_CLAIMED: usize = 64;
+
+/// The TYPE half of a session's name (`<account>/<type>-<session>`): what
+/// kind of client opened it. A known client's short name, else the
+/// client's own name made into a segment, else the key's label — the
+/// pre-type behaviour, for a client that sends no `clientInfo.name`.
+///
+/// The client name is self-reported and display-grade: it chooses the
+/// LABEL, never a permission. Two clients that both call themselves
+/// `claude` are still two sessions, told apart by the session half.
+pub fn session_type(consumer: &str, client_name: Option<&str>) -> Option<String> {
+    let cap = |s: String| -> String { s.chars().take(MAX_TYPE).collect::<String>().trim_end_matches('-').to_string() };
+    if let Some(name) = client_name.map(str::trim).filter(|n| !n.is_empty()) {
+        let lower = name.to_ascii_lowercase();
+        if let Some(t) = KNOWN_TYPES.iter().find(|t| lower.contains(*t)) {
+            return Some((*t).to_string());
+        }
+        if let Some(l) = crate::auth::connection_label(&lower).map(cap).filter(|l| !l.is_empty()) {
+            return Some(l);
+        }
+    }
+    crate::auth::connection_label(consumer).map(|l| l.chars().take(120).collect())
+}
+
+/// Build the label a session mints under: `<type>-<short suffix>`, one
+/// valid segment. The suffix is what [`rename`] replaces with a name the
+/// session chooses.
+pub fn session_label(consumer: &str, client_name: Option<&str>) -> Option<String> {
+    let base = session_type(consumer, client_name)?;
     let label = format!("{base}-{}", suffix());
     if crate::auth::valid_name_segment(&label) { Some(label) } else { None }
 }
 
-/// Open a session for `account` via `consumer`. `None` when the consumer
-/// name yields no usable label — the caller then falls back to the
-/// per-key path exactly as it would without a session.
-pub fn open_local(account: &str, consumer: &str) -> Option<(String, String)> {
-    let label = session_label(consumer)?;
+/// The label a session of type `ty` gets when it claims `wanted`:
+/// `<type>-<wanted>`, or `wanted` itself when it already starts with
+/// `<type>-` (claiming `claude-general` is not `claude-claude-general`).
+pub fn claimed_label(ty: &str, wanted: &str) -> Result<String, String> {
+    let wanted = wanted.trim();
+    if wanted.is_empty() || wanted.chars().count() > MAX_CLAIMED || !crate::auth::valid_name_segment(wanted) {
+        return Err(format!(
+            "a session name is 1–{MAX_CLAIMED} characters of A-Z a-z 0-9 _ - (got '{wanted}')"
+        ));
+    }
+    let label = if wanted.starts_with(&format!("{ty}-")) { wanted.to_string() } else { format!("{ty}-{wanted}") };
+    if crate::auth::valid_name_segment(&label) { Ok(label) } else { Err(format!("'{label}' is not a valid name")) }
+}
+
+/// Open a session for `account` via `consumer`, typed by the client's own
+/// `clientInfo.name`. `None` when neither yields a usable label — the
+/// caller then falls back to the per-key path exactly as it would without
+/// a session.
+pub fn open_local(account: &str, consumer: &str, client_name: Option<&str>) -> Option<(String, String)> {
+    let label = session_label(consumer, client_name)?;
     let id = new_id();
     let now = Instant::now();
     let mut map = registry().write().ok()?;
@@ -220,11 +268,11 @@ const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// a session the table does not know is one a restart would forget, so
 /// it is not handed out.
 pub async fn open(db: &sqlx::PgPool, account: &str, consumer: &str, display_name: Option<&str>) -> Option<(String, String)> {
-    let (id, label) = open_local(account, consumer)?;
     let display: Option<String> = display_name
         .map(str::trim)
         .filter(|d| !d.is_empty() && d.chars().count() <= 64 && !d.chars().any(char::is_control))
         .map(str::to_string);
+    let (id, label) = open_local(account, consumer, display.as_deref())?;
     let r = sqlx::query(
         "INSERT INTO noo_mcp_sessions (id_hash, account, consumer, label, display_name) VALUES ($1, $2, $3, $4, $5)",
     )
@@ -288,6 +336,79 @@ pub async fn resolve(db: &sqlx::PgPool, id: &str, consumer: &str) -> Result<Sess
     }
 }
 
+/// Rename the live session `<account>/<old>` to `<type>-<wanted>`, so other
+/// sessions can address it by a name its person chose (`owner/claude-general`)
+/// instead of the random suffix it opened with. Returns the new label.
+///
+/// The type is recomputed from the row (consumer + client name), so a
+/// session cannot rename itself into another client's type.
+///
+/// **A name is a mailbox.** Claiming a name another live session of the
+/// same account already holds JOINS it: both mint the same `sub`, so both
+/// read and send as that name. That is what lets one window's MCP
+/// connections (a client often holds one per door) and its inbox hook be
+/// one address. It stays inside one person's trust — sessions of an
+/// account are that person's — and the reply says how many sessions were
+/// already there, so a join is never silent. Renaming a shared name moves
+/// every session holding it.
+///
+/// Mail already sent to the old name stays addressed to it; the rename is
+/// for what comes next. Returns the new label and how many other live
+/// sessions already held it.
+pub async fn rename(db: &sqlx::PgPool, account: &str, old: &str, wanted: &str) -> Result<(String, i64), String> {
+    let ttl = IDLE_TTL.as_secs().to_string();
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT consumer, display_name FROM noo_mcp_sessions \
+         WHERE account = $1 AND label = $2 AND last_seen > now() - ($3 || ' seconds')::interval \
+         ORDER BY last_seen DESC LIMIT 1",
+    )
+    .bind(account)
+    .bind(old)
+    .bind(&ttl)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("session lookup failed: {e}"))?;
+    let Some((consumer, display)) = row else {
+        return Err(format!("no live MCP session is named '{account}/{old}' — connect through an MCP door first"));
+    };
+    let ty = session_type(&consumer, display.as_deref()).ok_or("this session has no type to name it under")?;
+    let label = claimed_label(&ty, wanted)?;
+    let holders: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM noo_mcp_sessions \
+         WHERE account = $1 AND label = $2 AND last_seen > now() - ($3 || ' seconds')::interval",
+    )
+    .bind(account)
+    .bind(&label)
+    .bind(&ttl)
+    .fetch_one(db)
+    .await
+    .map_err(|e| format!("session lookup failed: {e}"))?;
+    if label == old {
+        // Already this name: the others are everyone holding it but us.
+        return Ok((label, (holders - 1).max(0)));
+    }
+    let shared = holders;
+    sqlx::query("UPDATE noo_mcp_sessions SET label = $3 WHERE account = $1 AND label = $2")
+        .bind(account)
+        .bind(old)
+        .bind(&label)
+        .execute(db)
+        .await
+        .map_err(|e| format!("rename failed: {e}"))?;
+    rename_local(account, old, &label);
+    Ok((label, shared))
+}
+
+/// The cache half of [`rename`]: every cached session `<account>/<old>`
+/// mints under the new label from its next request.
+fn rename_local(account: &str, old: &str, new: &str) {
+    if let Ok(mut map) = registry().write() {
+        for s in map.values_mut().filter(|s| s.account == account && s.label == old) {
+            s.label = new.to_string();
+        }
+    }
+}
+
 /// Live sessions under `account`: last seen within the idle TTL, newest
 /// first. This is presence for a person's own windows. `display_name` is
 /// carried for humans and must not be used as a key by any caller.
@@ -344,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_session_is_a_valid_connection_under_its_account() {
-        let (id, label) = open_local("owner", "self:owner").expect("open");
+        let (id, label) = open_local("owner", "self:owner", None).expect("open");
         assert!(id.len() >= 20, "128 random bits, base64url");
         assert!(label.starts_with("self-owner-"), "{label}");
         assert!(crate::auth::valid_name_segment(&label));
@@ -356,8 +477,8 @@ mod tests {
     /// ONE key are two sessions with two labels — no per-device key.
     #[test]
     fn two_windows_on_one_key_are_two_sessions() {
-        let (a, la) = open_local("owner", "self:owner").unwrap();
-        let (b, lb) = open_local("owner", "self:owner").unwrap();
+        let (a, la) = open_local("owner", "self:owner", None).unwrap();
+        let (b, lb) = open_local("owner", "self:owner", None).unwrap();
         assert_ne!(a, b);
         assert_ne!(la, lb);
         assert_eq!(resolve_local(&a, "self:owner").unwrap().label, la);
@@ -367,7 +488,7 @@ mod tests {
     /// Provenance that can be transferred is not provenance.
     #[test]
     fn a_session_answers_only_to_the_key_that_opened_it() {
-        let (id, _) = open_local("owner", "self:owner").unwrap();
+        let (id, _) = open_local("owner", "self:owner", None).unwrap();
         assert_eq!(resolve_local(&id, "other-key").unwrap_err(), Refusal::WrongConsumer);
         assert!(resolve_local(&id, "self:owner").is_ok(), "…and still works for the right one");
         assert_eq!(resolve_local("not-a-session", "self:owner").unwrap_err(), Refusal::Unknown);
@@ -375,12 +496,49 @@ mod tests {
 
     #[test]
     fn a_consumer_with_no_label_opens_no_session() {
-        assert!(open_local("owner", ":::").is_none());
+        assert!(open_local("owner", ":::", None).is_none());
+    }
+
+    /// `<account>/<type>-<session>`: the type is what the client calls
+    /// itself, shortened for the clients people run, and the key's label
+    /// only when the client says nothing.
+    #[test]
+    fn a_session_label_is_type_then_session() {
+        let (_, l) = open_local("owner", "self:owner", Some("claude-code")).unwrap();
+        assert!(l.starts_with("claude-") && l.len() == "claude-".len() + 6, "{l}");
+        assert_eq!(session_type("k", Some("Codex MCP Client")).as_deref(), Some("codex"));
+        assert_eq!(session_type("k", Some("mcp-inspector")).as_deref(), Some("mcp-inspector"));
+        assert_eq!(session_type("self:owner", None).as_deref(), Some("self-owner"));
+        assert_eq!(session_type("self:owner", Some("  ")).as_deref(), Some("self-owner"));
+        assert_eq!(session_type("self:owner", Some("☃")).as_deref(), Some("self-owner"), "nothing usable → the key");
+        let long = "x".repeat(200);
+        assert!(session_type("k", Some(&long)).unwrap().len() <= MAX_TYPE);
+    }
+
+    /// A claimed name keeps the session's type and refuses anything that
+    /// would not be one plain segment.
+    #[test]
+    fn a_claimed_name_is_prefixed_with_the_type_once() {
+        assert_eq!(claimed_label("claude", "general").unwrap(), "claude-general");
+        assert_eq!(claimed_label("claude", "claude-general").unwrap(), "claude-general");
+        assert_eq!(claimed_label("codex", "claude-general").unwrap(), "codex-claude-general", "no switching type");
+        for bad in ["", "a/b", "has space", "dot.ted", "é", &"x".repeat(MAX_CLAIMED + 1)] {
+            assert!(claimed_label("claude", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_rename_reaches_every_cached_copy_of_the_session() {
+        let (id, old) = open_local("renamer", "self:renamer", Some("claude-code")).unwrap();
+        rename_local("renamer", &old, "claude-general");
+        assert_eq!(resolve_local(&id, "self:renamer").unwrap().label, "claude-general");
+        rename_local("someone-else", "claude-general", "claude-x");
+        assert_eq!(resolve_local(&id, "self:renamer").unwrap().label, "claude-general", "another account's rename is not ours");
     }
 
     #[test]
     fn an_idle_session_expires_and_is_removed() {
-        let (id, _) = open_local("owner", "self:owner").unwrap();
+        let (id, _) = open_local("owner", "self:owner", None).unwrap();
         {
             let mut map = registry().write().unwrap();
             map.get_mut(&id).unwrap().last_seen = Instant::now() - IDLE_TTL - Duration::from_secs(1);

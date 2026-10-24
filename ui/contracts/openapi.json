@@ -16075,6 +16075,64 @@
         }
       }
     },
+    "/api/agents/name": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Name this MCP session",
+        "operationId": "agent_name",
+        "description": "Give the calling MCP session a name its person chose: {\"name\": \"general\"} turns <account>/<type>-<random> into <account>/<type>-general, the address other sessions then use. The type half (the client, e.g. claude) is kept. Only a session can be renamed. A name another live session of the account already holds is shared (a name is a mailbox); shared_with counts the sessions already there. Mail already sent to the old name stays addressed to it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "The session half of the new name: 1-64 of A-Z a-z 0-9 _ -."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "account": {
+                      "type": "string"
+                    },
+                    "previous": {
+                      "type": "string"
+                    },
+                    "shared_with": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not an MCP session, or an invalid name."
+          }
+        }
+      }
+    },
     "/api/docs/openapi": {
       "get": {
         "tags": [

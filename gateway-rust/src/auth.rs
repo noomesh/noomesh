@@ -2715,8 +2715,10 @@ pub fn is_ops_api(method: &axum::http::Method, path: &str) -> bool {
     }
 }
 
-/// Agent mail writes a User may make: `POST /api/agents/messages` (send) and
-/// `POST /api/agents/messages/{id}/ack`. Exact pairs, not a prefix: a prefix
+/// Agent mail writes a User may make: `POST /api/agents/messages` (send),
+/// `POST /api/agents/messages/{id}/ack`, and `POST /api/agents/name` (name
+/// the caller's own MCP session; the handler renames only the session the
+/// credential IS, so it cannot touch a sibling). Exact pairs, not a prefix: a prefix
 /// would also open `/collaborate`, `/trust`, `/trust/remove`, `PUT /keys/{agent}`,
 /// `/peer/*` and any route added later. The handlers (`routes/agents.rs`)
 /// enforce ownership for a non-privileged caller: `from` must be the caller's
@@ -2726,7 +2728,7 @@ pub fn is_agent_message_write(method: &axum::http::Method, path: &str) -> bool {
     if *method != axum::http::Method::POST {
         return false;
     }
-    if path == "/api/agents/messages" {
+    if path == "/api/agents/messages" || path == "/api/agents/name" {
         return true;
     }
     match path.strip_prefix("/api/agents/messages/").and_then(|r| r.strip_suffix("/ack")) {
@@ -5668,7 +5670,7 @@ mod tests {
     fn a_user_may_send_and_ack_agent_mail_and_nothing_beside_it() {
         use axum::http::Method;
         let user = claims(&["read"], "user");
-        for (m, p) in [(Method::POST, "/api/agents/messages"), (Method::POST, "/api/agents/messages/msg_1/ack")] {
+        for (m, p) in [(Method::POST, "/api/agents/messages"), (Method::POST, "/api/agents/messages/msg_1/ack"), (Method::POST, "/api/agents/name")] {
             assert!(scope_allows(&user, &m, p), "{m} {p}");
             assert!(requester_allows(&RequesterCtx { sub: "u".into(), scopes: vec!["read".into()], role: Role::User, harness: None, act: None }, &m, p));
         }
@@ -5685,6 +5687,9 @@ mod tests {
             (Method::PUT, "/api/agents/messages"),
             (Method::DELETE, "/api/agents/messages"),
             (Method::PUT, "/api/agents/messages/msg_1/ack"),
+            (Method::PUT, "/api/agents/name"),
+            (Method::POST, "/api/agents/name/x"),
+            (Method::POST, "/api/agents/names"),
         ] {
             assert!(!scope_allows(&user, &m, p), "{m} {p} must not be open to a User");
         }
