@@ -117,10 +117,10 @@ pub const POSTURE_CATALOG: &[PostureKey] = &[
     // buying inference) until it was retired: the fleet door refuses the
     // inference surface unconditionally (`auth.rs`, counted as
     // `self_call_shared_secret_refused`) and the controller door admits
-    // nothing. Nothing reads the flag any more. A stale row in
-    // `noo_security_posture` is now an unknown key, which
-    // `apply_security_posture` skips (it is not a retired-bridge boot
-    // refusal either: there is nothing left to hold open).
+    // nothing. Nothing reads the flag any more. It is a RETIRED_INERT_KEYS
+    // entry: boot deletes a stale row at a closed value and warns about one
+    // still set open (it is not a retired-bridge boot refusal: there is
+    // nothing left to hold open).
     //
     // `NOO_CONTROLLER_SECRET` is not retired by this: its one remaining job
     // is the gateway's boot guard (no controller secret, no start).
@@ -272,7 +272,25 @@ pub fn retired_value_opens(key: &str, value: &str) -> bool {
 /// Retired posture keys that never became a [`RetiredBridge`] — their
 /// arm went with the thing they bridged to, so no value changes anything and
 /// no boot refusal guards them. `NOO_NATS_LEGACY_SHARED_CREDS`: the server no longer defines the shared bus user it opened.
-pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS"];
+/// `NOO_SELF_CALL_SHARED_SECRET`: the self-call bridge is deleted; a shared secret never buys inference.
+pub const RETIRED_INERT_KEYS: &[&str] = &["NOO_NATS_LEGACY_SHARED_CREDS", "NOO_SELF_CALL_SHARED_SECRET"];
+
+/// Does `value` read as ON for a [`RETIRED_INERT_KEYS`] row? Such a row is
+/// never deleted at boot (the operator believed something was open); it is
+/// reported instead, with the one write that closes it.
+fn inert_value_on(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// The [`RETIRED_INERT_KEYS`] rows still set ON: boot keeps them and warns
+/// (`noo security posture set <key> 0`, then the next start deletes the
+/// row). Pure, so the choice is tested.
+pub fn retired_inert_rows_held_open(rows: &[(String, String)]) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|(k, v)| RETIRED_INERT_KEYS.contains(&k.as_str()) && inert_value_on(v))
+        .cloned()
+        .collect()
+}
 
 /// The posture rows boot DELETES: a retired key (a [`RetiredBridge`] or a
 /// [`RETIRED_INERT_KEYS`] entry) holding a value that does NOT open it. Such
@@ -287,8 +305,7 @@ pub fn retired_rows_to_clear(rows: &[(String, String)]) -> Vec<(String, String)>
             if retired_bridge(k).is_some() {
                 return !retired_value_opens(k, v);
             }
-            RETIRED_INERT_KEYS.contains(&k.as_str())
-                && !matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            RETIRED_INERT_KEYS.contains(&k.as_str()) && !inert_value_on(v)
         })
         .cloned()
         .collect()
@@ -460,6 +477,11 @@ pub async fn apply_security_posture(db: &PgPool) {
         Ok(rows) => {
             let pairs: Vec<(String, String)> = rows.iter().map(|(k, v, ..)| (k.clone(), v.clone())).collect();
             clear_retired_rows(db, &pairs).await;
+            for (key, value) in retired_inert_rows_held_open(&pairs) {
+                tracing::warn!(key = %key, value = %value,
+                    "a RETIRED posture row is still set on: nothing reads it, so it changes nothing. \
+                     Close it with `noo security posture set {} 0`; the next gateway start deletes the row", key);
+            }
             let mut applied = 0u32;
             let mut open_bridges: Vec<BridgeStanding> = Vec::new();
             for (key, value, age_days, from_update) in rows {
@@ -678,6 +700,7 @@ mod tests {
             row("NOO_BUS_PRINCIPAL", "optional"),
             row("NOO_BOOTSTRAP_ACCEPT_UNSIGNED_FETCH", "1"),
             row("NOO_SELF_CALL_SHARED_SECRET", "0"),
+            row("NOO_SELF_CALL_SHARED_SECRET", "1"),
             row("NOO_EXEC_APPROVAL_MODE", "approval"),
             row("NOO_APPROVAL_BREAK_GLASS", "0"),
             row("NOO_APPROVAL_BREAK_GLASS", "1"),
@@ -688,15 +711,21 @@ mod tests {
                 row("NOO_NATS_LEGACY_SHARED_CREDS", "0"),
                 row("NOO_CLUSTER_LEGACY_FULL_ACCESS", "0"),
                 row("NOO_BUS_PRINCIPAL", "required"),
+                row("NOO_SELF_CALL_SHARED_SECRET", "0"),
                 row("NOO_APPROVAL_BREAK_GLASS", "0"),
             ]
         );
+        // The retired self-call bridge (see #371) held on is reported, never
+        // silently deleted, and no other row is.
+        assert_eq!(retired_inert_rows_held_open(&rows), vec![row("NOO_SELF_CALL_SHARED_SECRET", "1")]);
         assert!(retired_rows_to_clear(&[row("NOO_NATS_LEGACY_SHARED_CREDS", "1")]).is_empty(),
             "a retired key held open is left for verify's FAIL, never silently deleted");
         let src = include_str!("posture.rs");
         let apply = &src[src.find("pub async fn apply_security_posture").unwrap()..];
         assert!(apply[..apply.find("let mut applied").unwrap()].contains("clear_retired_rows(db, &pairs).await"),
             "boot no longer clears inert retired rows");
+        assert!(apply[..apply.find("let mut applied").unwrap()].contains("retired_inert_rows_held_open(&pairs)"),
+            "boot no longer reports an inert retired row held on");
     }
     use serde_json::json;
 

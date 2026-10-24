@@ -39,6 +39,9 @@ source "$_LIBDIR/lib-config.sh"
 # the add-on profiles recreates every core consumer and leaves the add-ons
 # on the old secrets (noo-trellion-intel, 2026-09-14 → 18).
 source "$_LIBDIR/lib-addons.sh"
+# A retired key left in .env or the sops store is inert; say so (start and
+# rebuild do the same).
+warn_retired_env_keys
 load_config || echo "warning: config load reported problems (continuing)" >&2
 # Stuck-in-Created self-heal for recreates (the 2026-08-20 74-min wedge).
 source "$_LIBDIR/lib-created-guard.sh"
