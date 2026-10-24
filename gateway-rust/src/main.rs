@@ -155,6 +155,7 @@ mod jwks;
 mod mcp_session;
 mod role_provision;
 mod system_provision;
+mod system_provision_cli;
 mod startup_tasks;
 mod repo;
 mod ingest_loop;
@@ -315,6 +316,18 @@ async fn main() -> Result<()> {
                 .init();
             std::process::exit(harness::probe::main(&argv[3..]).await);
         }
+    }
+
+    // `provision-system`: the broker, once, for the one system the request on
+    // stdin names (`noo addons enable --provision-only`, via `docker exec -i`).
+    // Its report is stdout, so logs go to stderr; no config file, no
+    // listener, no AppState. See system_provision_cli.
+    if std::env::args().nth(1).as_deref() == Some("provision-system") {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+        std::process::exit(system_provision_cli::main().await);
     }
 
     // Structured logging (matches Python structlog output)

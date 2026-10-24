@@ -4753,6 +4753,49 @@ pub(crate) fn addon_pins_check(ec: i32, v: &Value) -> Check {
     ok("add-on pins", format!("{} verified for {stack} (key {})", rows.len(), keys.join(", ")))
 }
 
+/// The `provisioned add-ons` row: one line per add-on whose database was
+/// provisioned without switching it on, worded exactly as `noo addons show`
+/// words it. `None` when there is none (no row at all, not a green one).
+pub(crate) fn provisioned_addons_check(root: &std::path::Path) -> Option<Check> {
+    let declared = crate::commands::addons::declared_map_at(&root.join("noomesh.yaml")).unwrap_or_default();
+    let marks = crate::addons::provisioned::read_all(root);
+    provisioned_addons_row(&crate::addons::provisioned::only(&marks, &declared))
+}
+
+pub(crate) fn provisioned_addons_row(only: &[&crate::addons::provisioned::Marker]) -> Option<Check> {
+    if only.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = only
+        .iter()
+        .map(|m| format!("{}: {} (schema {})", m.addon, crate::addons::provisioned::WORDS, m.schema))
+        .collect();
+    Some(ok("provisioned add-ons", lines.join("; ")))
+}
+
+#[cfg(test)]
+mod provisioned_addons_tests {
+    use super::{provisioned_addons_row, Verdict};
+    use crate::addons::provisioned::Marker;
+
+    #[test]
+    fn a_provisioned_addon_reads_as_provisioned_with_services_not_started() {
+        let m = Marker {
+            addon: "pai-voice".into(),
+            schema: "pai_voice".into(),
+            role: "noo_pai_voice".into(),
+            ddl_role: "noo_pai_voice_ddl".into(),
+            version: "0.1.0".into(),
+            lock_sha256: String::new(),
+            provisioned_at: 0,
+        };
+        let c = provisioned_addons_row(&[&m]).expect("a row");
+        assert_eq!(c.verdict, Verdict::Ok);
+        assert!(c.detail.contains("pai-voice: provisioned (services not started)"), "{}", c.detail);
+        assert!(provisioned_addons_row(&[]).is_none(), "no provisioned add-on, no row");
+    }
+}
+
 /// An enabled system (evolve, trellion) whose credentials
 /// are not in the store. Nothing is broken YET — the running gateway
 /// provisioned before the switch flipped — but the next restart is a
@@ -5137,6 +5180,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 checks.push(addon_pins_check(ec, &pins));
             }
             Err(e) => checks.push(fail("add-on pins", format!("which add-ons are on is unknown: {e}"), "noo addons list")),
+        }
+        // Add-ons whose schema and roles exist (`--provision-only`) while no
+        // service of theirs is composed: said as such, never as "off".
+        if let Some(c) = provisioned_addons_check(&crate::envfile::repo_root()) {
+            checks.push(c);
         }
         let missing: Vec<&str> = MONITORING_LEAVES
             .iter()

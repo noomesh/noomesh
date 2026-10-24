@@ -224,7 +224,7 @@ pub fn entitlement_install(g: &Globals, args: &[String]) -> Result<i32, Unhandle
         enable_unlocked(
             &crate::commands::addons::config_path(),
             &unlock_names,
-            &mut crate::commands::addon_enable::Live { g, force: false, lock: None },
+            &mut crate::commands::addon_enable::Live { g, force: false, lock: None, require_system: false },
         )
     } else {
         (Vec::new(), Vec::new(), crate::commands::addon_enable::PrincipalStep::Unchanged)

@@ -12,6 +12,7 @@ pub mod at_rest;
 pub mod at_rest_volume;
 pub mod channel;
 pub mod addon_enable;
+pub mod addon_provision;
 pub mod addon_pins;
 pub mod backups;
 pub mod agents;
