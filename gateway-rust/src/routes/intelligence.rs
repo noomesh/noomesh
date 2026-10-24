@@ -19,6 +19,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::measured::{put_into, put_keyed_into, Measured};
 use crate::state::AppState;
 use crate::heartbeat_actions;
 use super::{AppJson, AppError, AppResult};
@@ -838,16 +839,18 @@ async fn heartbeat_history(
     .fetch_all(&state.db)
     .await?;
 
-    let total = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM noo_heartbeat_runs \
-         WHERE ($1::text IS NULL OR task_id = $1) \
-           AND ($2::text IS NULL OR status = $2)"
-    )
-    .bind(&params.task_id)
-    .bind(&params.status)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let total = Measured::from_result_in(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM noo_heartbeat_runs \
+             WHERE ($1::text IS NULL OR task_id = $1) \
+               AND ($2::text IS NULL OR status = $2)"
+        )
+        .bind(&params.task_id)
+        .bind(&params.status)
+        .fetch_one(&state.db)
+        .await,
+        "cannot count noo_heartbeat_runs",
+    );
 
     let runs: Vec<Value> = runs.iter().map(|(run_id, task_id, task_name, action, started_at, completed_at, status, result_text, error, duration_ms, channels, artifacts)| {
         json!({
@@ -865,7 +868,9 @@ async fn heartbeat_history(
             "artifacts": artifacts,
         })
     }).collect();
-    Ok(Json(json!({"runs": runs, "total": total, "offset": offset, "limit": limit})))
+    let mut body = json!({"runs": runs, "offset": offset, "limit": limit});
+    put_into(&mut body, "total", total);
+    Ok(Json(body))
 }
 
 /// List available heartbeat actions with descriptions and config schemas.
@@ -1134,13 +1139,16 @@ pub(super) async fn heartbeat_status(State(state): State<Arc<AppState>>) -> AppR
     }).collect();
 
     // Count recent runs (last 24h) for a quick pulse.
-    let recent_runs = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM noo_heartbeat_runs \
-         WHERE started_at > NOW() - INTERVAL '24 hours'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let recent_runs = Measured::from_result_in(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM noo_heartbeat_runs \
+             WHERE started_at > NOW() - INTERVAL '24 hours'"
+        )
+        .fetch_one(&state.db)
+        .await,
+        "cannot read noo_heartbeat_runs",
+    );
+    let any_recent_runs = recent_runs.value.is_some_and(|n| n > 0);
 
     // Real loop liveness — present once the scheduler loop has ticked.
     let hb_snapshot = crate::loop_health::snapshot();
@@ -1148,39 +1156,34 @@ pub(super) async fn heartbeat_status(State(state): State<Arc<AppState>>) -> AppR
     let (hb_running, hb_running_detail) =
         crate::loop_health::describe("heartbeat_scheduler", hb_loop);
 
-    Ok(Json(json!({
-        // Only the loop registry knows whether the scheduler is running. The
-        // old fallback answered with `has_future_runs`, which is a different
-        // fact (tasks are *scheduled*) and reported "running" for a scheduler
-        // that had never started. Absent a tick record the answer is unknown.
-        "running": hb_running,
-        "running_detail": hb_running_detail,
+    // Only the loop registry knows whether the scheduler is running; absent a
+    // tick record the answer is unknown (null), not "running".
+    //
+    // Cron parsing happens in the Python worker_pool subprocess, which this
+    // process cannot introspect. What IS observable is whether it demonstrably
+    // worked: a task with a future `next_run` was scheduled by a working
+    // croniter. Report that evidence, and null when there is none.
+    let mut body = json!({
         "loop_last_tick_age_secs": hb_loop.map(|l| l.age_secs),
         "enabled": enabled_count > 0,
         "task_count": task_count,
         "enabled_count": enabled_count,
-        "recent_runs_24h": recent_runs,
         "tasks": task_summaries,
-        // Cron parsing happens in the Python worker_pool subprocess (where
-        // `croniter` is a hard dependency). The Rust gateway cannot introspect
-        // Python imports, so it must not assert either answer: this was a
-        // literal `true`, which reported "available" even on an install where
-        // the worker pool was missing entirely.
-        //
-        // What IS observable is whether cron parsing has demonstrably worked:
-        // a task with a future `next_run` could only have been scheduled by a
-        // working croniter. So report that evidence, and `null` when there is
-        // none — never a guess.
-        "croniter_available": if has_future_runs { Some(true) } else { None::<bool> },
-        "croniter_detail": if has_future_runs {
+        "scheduler_initialized": has_future_runs || any_recent_runs,
+        "waiting_review": crate::task_guard::review_count(&state.db).await,
+    });
+    put_into(&mut body, "running", Measured::noted(hb_running, hb_running_detail));
+    put_into(&mut body, "recent_runs_24h", recent_runs);
+    put_into(&mut body, "croniter_available", Measured::noted(
+        if has_future_runs { Some(true) } else { None },
+        if has_future_runs {
             "at least one task has a computed next_run, so cron parsing works"
         } else {
             "unknown — cron parsing runs in the Python worker pool and no task \
              currently has a computed next_run to prove it works"
         },
-        "scheduler_initialized": has_future_runs || recent_runs > 0,
-        "waiting_review": crate::task_guard::review_count(&state.db).await,
-    })))
+    ));
+    Ok(Json(body))
 }
 
 /// GET /api/agent/loops — liveness of every always-on background loop
@@ -2033,36 +2036,29 @@ async fn autonomy_status(State(state): State<Arc<AppState>>) -> AppResult {
         .filter(|l| l.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true))
         .count();
 
-    // Audit entries. `noo_autonomy_audit` has no migration and no writer in
-    // this repo — the count was `.unwrap_or(0)`, so the endpoint has always
-    // reported a confident "autonomy has taken 0 actions". That is not a
-    // measurement; it is the absence of one. Report null and say why.
-    let (audit_entries, audit_detail) = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM noo_autonomy_audit"
-    )
-    .fetch_one(&state.db)
-    .await
+    // `noo_autonomy_audit` has no migration and no writer in this repo, so an
+    // unreadable store is "not tracked", never "0 actions taken".
+    let audit = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM noo_autonomy_audit")
+        .fetch_one(&state.db)
+        .await
     {
-        Ok(n) => (Some(n), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "not tracked — no autonomy audit store is readable ({e}); \
-                 fired actions are visible in the gateway logs only"
-            )),
-        ),
+        Ok(n) => Measured::of(n),
+        Err(e) => Measured::unmeasured(format!(
+            "not tracked — no autonomy audit store is readable {}; fired \
+             actions are visible in the gateway logs only",
+            crate::measured::ref_note(&e)
+        )),
     };
 
-    Ok(Json(json!({
+    let mut body = json!({
         "enabled": enabled,
-        "running": running,
-        "running_detail": running_detail,
         "locations_total": locations_total,
         "locations_enabled": locations_enabled,
-        "audit_entries": audit_entries,
-        "audit_detail": audit_detail,
         "locations": location_summaries,
-    })))
+    });
+    put_into(&mut body, "running", Measured::noted(running, running_detail));
+    put_keyed_into(&mut body, "audit_entries", "audit_detail", audit);
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]

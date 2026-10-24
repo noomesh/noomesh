@@ -57,6 +57,7 @@ fn print_flat(body: &serde_json::Value) {
             }
             serde_json::Value::Array(_) => {}
             serde_json::Value::String(s) => rows.push((label, ui::state(s))),
+            serde_json::Value::Null => rows.push((label, ui::state("not reported"))),
             v => rows.push((label, v.to_string())),
         }
     }

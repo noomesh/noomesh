@@ -174,6 +174,7 @@ mod controller_hmac_refusal;
 mod operator_auth;
 mod log_gate;
 mod loop_health;
+mod measured;
 mod ops;
 mod erasure_archive;
 mod agent_roles;

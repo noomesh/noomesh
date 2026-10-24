@@ -139,11 +139,8 @@ async fn agents_roles() -> AppJson {
 /// Reads the `personas` section of noomesh.yaml. Each entry has at minimum
 /// `persona_id` and `name`.
 ///
-/// `active` used to be a hardcoded `false` on every entry — the doc comment
-/// even admitted the reason ("always false in Rust since coordinators live in
-/// Python"), which is an admission that the field was an assertion about a
-/// process this one cannot see, not a measurement. A persona in active use was
-/// reported as inactive. It is now `null` with an `active_detail` reason.
+/// `active` is `null` with an `active_detail` reason: persona activation lives
+/// in the Python coordinator, which this process cannot see.
 async fn persona_list(
     State(state): State<Arc<AppState>>,
 ) -> AppResult {
@@ -172,7 +169,7 @@ async fn persona_list(
         "personas": summaries,
         "active_detail": "null — persona activation lives in the Python \
             coordinator's session state and is not observable from the Rust \
-            gateway. Previously reported as false for every persona.",
+            gateway.",
     })))
 }
 

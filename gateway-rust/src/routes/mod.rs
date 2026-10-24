@@ -202,7 +202,7 @@ fn internal_response(msg: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(internal_body(&r))).into_response()
 }
 
-fn short_ref() -> String {
+pub(crate) fn short_ref() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 

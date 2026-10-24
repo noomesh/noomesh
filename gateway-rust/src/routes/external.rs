@@ -48,6 +48,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::coordinator;
+use crate::measured::{put_into, put_keyed_into, Measured};
 use crate::service_keys::{record_external_request, Consumer};
 use crate::state::AppState;
 use crate::usage::UsageActor;
@@ -1173,23 +1174,30 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or(false);
     let emb_model = emb.model.clone();
 
-    // `"dimension": 768` was a literal while the model name came from env — a
-    // consumer pointed at a 1024-dim model would allocate wrong-width vectors
-    // and only find out on insert. EMBEDDING_DIM (env → services.embedding_dim)
-    // is the configured truth; embedding_client uses 0 as its "unknown / don't
-    // check" sentinel, which becomes null here rather than a guess.
-    let (emb_dimension, emb_dimension_detail) = if emb.dims > 0 {
-        (json!(emb.dims), Value::Null)
+    // EMBEDDING_DIM (env -> services.embedding_dim) is the configured width;
+    // embedding_client uses 0 as its "unknown / don't check" sentinel, which is
+    // null here rather than a guess.
+    let emb_dimension = if emb.dims > 0 {
+        Measured::of(emb.dims)
     } else {
-        (
-            Value::Null,
-            json!(
-                "unknown — EMBEDDING_DIM (services.embedding_dim) is not \
-                 configured, and the gateway does not probe the endpoint for \
-                 its width here. Previously reported as a hardcoded 768."
-            ),
+        Measured::unmeasured(
+            "unknown — EMBEDDING_DIM (services.embedding_dim) is not configured, \
+             and the gateway does not probe the endpoint for its width here.",
         )
     };
+    let mut embeddings = json!({
+        "openai_compatible": true,
+        "models": ["default", emb_model],
+        // i145: what a consumer may send as `model` — a space name (or its
+        // model's name). Vectors from different spaces never mix.
+        "spaces": crate::embedding_spaces::all()
+    });
+    put_into(&mut embeddings, "available", Measured::noted(Some(emb_ok), if emb_ok {
+        format!("{} responded to a health probe", emb.health_url())
+    } else {
+        format!("{} did not respond OK to a health probe", emb.health_url())
+    }));
+    put_keyed_into(&mut embeddings, "dimension", "dimension_detail", emb_dimension);
 
     // rerank is available iff some alive mesh node advertises the capability.
     // (The co-located NOO_RERANK_URL path is gone — see `rerank_target`.)
@@ -1202,21 +1210,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
             "openai_compatible": true,
             "models": chat_models
         },
-        "embeddings": {
-            "available": emb_ok,
-            "available_detail": if emb_ok {
-                json!(format!("{} responded to a health probe", emb.health_url()))
-            } else {
-                json!(format!("{} did not respond OK to a health probe", emb.health_url()))
-            },
-            "openai_compatible": true,
-            "models": ["default", emb_model],
-            "dimension": emb_dimension,
-            "dimension_detail": emb_dimension_detail,
-            // i145: what a consumer may send as `model` — a space name (or its
-            // model's name). Vectors from different spaces never mix.
-            "spaces": crate::embedding_spaces::all()
-        },
+        "embeddings": embeddings,
         "rerank": {
             "available": rerank_ok,
             "models": rerank_models

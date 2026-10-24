@@ -49,6 +49,10 @@ export function useJobs() {
     queryFn: async () => {
       const { data, error } = await client.GET('/api/jobs');
       if (error) throw new Error('Jobs API unavailable');
+      // The gateway answers 200 {jobs: [], count: null, error} when it cannot
+      // read the queue; that is an unknown queue, not an empty one.
+      const unreadable = (data as { error?: string } | undefined)?.error;
+      if (unreadable) throw new Error(unreadable);
       return (data?.jobs ?? []).map(
         (j): Job => ({
           id: j.job_id ?? '',
