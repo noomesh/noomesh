@@ -117,6 +117,11 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "at-rest", "create-volume"], "[--size <GiB>] [--pcrs 7|none|auto] [--defer-recovery-key] [--dry-run]", "Create the TPM-unlocked encrypted state volume; shows its recovery key once"),
     (&["security", "at-rest", "seal"], "[--pcrs 7|none|auto] [--dry-run]", "Seal the age key to this TPM; unsealed into RAM at boot, plaintext kept until finalize"),
     (&["security", "at-rest", "finalize"], "[--dry-run] [-y|--yes]", "Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts"),
+    (&["security", "at-rest", "migrate"], "[--dry-run] [--rollback] [--yes] [--confirm-offbox <phrase>]", "Move this controller's state onto the encrypted volume: backup first, resumable, reversible"),
+    (&["security", "at-rest", "wipe-plaintext"], "[--dry-run] [--hours <N>] [--confirm <phrase>]", "Delete the old plaintext state after a verified migration and a day of healthy running"),
+    (&["security", "at-rest", "recovery-key"], "[--dry-run]", "Enroll a new recovery key, shown once; the old one is removed only after you confirm"),
+    (&["security", "at-rest", "reenroll"], "[--pcrs 7|none|auto] [--dry-run]", "Re-enroll the TPM after a firmware or Secure Boot change (PCR 7 with Secure Boot on) and reseal the age key"),
+    (&["security", "at-rest", "preflight-firmware"], "[--json]", "Check the recovery key and a fresh backup before a BIOS or firmware update; prints what to do after"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
     (&["security", "posture", "set"], "<key> <value>", "Set a posture gate; needs an operator cert (`pki issue-client`); restart to apply"),
     (&["security", "posture", "apply-profile"], "<profile> [--include-bridges]", "Apply a posture profile (needs an operator cert); leaves rollout bridges; restart to apply"),
@@ -530,12 +535,25 @@ mod tests {
         }
         assert_eq!(
             super::subcommands_under(&["security", "at-rest"]),
-            vec!["status", "opt-out", "opt-in", "create-volume", "seal", "finalize"]
+            vec!["status", "opt-out", "opt-in", "create-volume", "seal", "finalize", "migrate", "wipe-plaintext", "recovery-key", "reenroll", "preflight-firmware"]
         );
         // i10a PR-C: the volume, with the deferral that is the only way to run it without a terminal.
         let (syntax, desc) = super::lookup(&["security", "at-rest", "create-volume"]).expect("at-rest create-volume");
         assert!(syntax.contains("--defer-recovery-key") && syntax.contains("--size <GiB>"), "{syntax}");
         assert!(desc.contains("recovery key once"), "{desc}");
+        // i10a PR-D: the migration, and the separate verb that deletes.
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "migrate"]).expect("at-rest migrate");
+        assert!(syntax.contains("--dry-run") && syntax.contains("--rollback"), "{syntax}");
+        assert!(desc.contains("backup first"), "{desc}");
+        let (syntax, desc) = super::lookup(&["security", "at-rest", "wipe-plaintext"]).expect("at-rest wipe-plaintext");
+        assert!(syntax.contains("--confirm") && syntax.contains("--hours"), "{syntax}");
+        assert!(desc.contains("Delete"), "{desc}");
+        // i10a PR-E: rotation, re-enrollment, firmware preflight.
+        let (_, d) = super::lookup(&["security", "at-rest", "recovery-key"]).expect("at-rest recovery-key");
+        assert!(d.contains("only after you confirm"), "{d}");
+        let (syntax, _) = super::lookup(&["security", "at-rest", "reenroll"]).expect("at-rest reenroll");
+        assert!(syntax.contains("--pcrs 7|none|auto"), "{syntax}");
+        assert!(super::lookup(&["security", "at-rest", "preflight-firmware"]).is_some());
     }
 }
 

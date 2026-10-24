@@ -533,6 +533,11 @@ const NATIVE: &[(&[&str], Handler)] = &[
     // i10a PR-B: the age key sealed to the TPM (root half: noo-hostd at-rest).
     (&["security", "at-rest", "seal"], commands::at_rest_seal),
     (&["security", "at-rest", "finalize"], commands::at_rest_finalize),
+    (&["security", "at-rest", "migrate"], commands::security_at_rest_migrate),
+    (&["security", "at-rest", "wipe-plaintext"], commands::security_at_rest_wipe_plaintext),
+    (&["security", "at-rest", "recovery-key"], commands::security_at_rest_recovery_key),
+    (&["security", "at-rest", "reenroll"], commands::security_at_rest_reenroll),
+    (&["security", "at-rest", "preflight-firmware"], commands::security_at_rest_preflight_firmware),
     (&["security", "posture", "list"], commands::security_posture_list),
     (&["security", "tailnet", "policy"], commands::tailnet_policy),
     (&["security", "posture", "set"], commands::security_posture_set),

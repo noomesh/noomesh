@@ -71,6 +71,10 @@ fn etc_noo() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/noo"))
 }
 
+pub(crate) fn hostd_bin_path() -> String {
+    hostd_bin()
+}
+
 fn hostd_bin() -> String {
     std::env::var("NOO_HOSTD_BIN").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| HOSTD_BIN.to_string())
 }
@@ -302,7 +306,7 @@ pub(crate) fn volume_check(
                 "{MAPPER_PATH} is open and mounted at {} ({} GiB{free}), but this install's state root is {state_root}: the state is not on it yet",
                 v.mountpoint, v.size_gib
             ),
-            Some("moving existing state onto it is a later 0.6.11 step (at-rest migrate); until then it stays in the clear".into()),
+            Some("noo security at-rest migrate --dry-run".into()),
         );
     }
     check(
@@ -318,7 +322,7 @@ pub(crate) fn recovery_check(v: Option<&Volume>, ack: Option<&AcceptedState>) ->
     let Some(v) = v else {
         return check(RECOVERY_ROW, Verdict::Ok, "no encrypted state volume here, so no recovery key".into(), None);
     };
-    let later = "make one and store it offline with the recovery-key verb (a later 0.6.11 step)";
+    let later = "noo security at-rest recovery-key   (makes a new one; store it off this machine)";
     if v.recovery == "deferred" {
         return check(
             RECOVERY_ROW,
@@ -380,7 +384,9 @@ pub(crate) fn rows_live(proc_mounts: &str, flags: Option<&Value>, decision: Opti
         None => Live { open: false, mounted: false, free: None },
     };
     let ack = flags.and_then(|b| flag_from(b, RECOVERY_SETTING));
-    vec![volume_check(v.as_ref(), live, &state_root, decision, tpm), recovery_check(v.as_ref(), ack.as_ref())]
+    let mut rows = vec![volume_check(v.as_ref(), live, &state_root, decision, tpm), recovery_check(v.as_ref(), ack.as_ref())];
+    rows.extend(crate::commands::at_rest_recovery::volume_binding_check(v.as_ref(), tpm.secure_boot));
+    rows
 }
 
 // ── the root half: plan, argv, result ───────────────────────────────────
@@ -596,7 +602,7 @@ pub(crate) fn setup_fresh(s: &mut dyn FreshSteps, mut plan: CreatePlan) -> Resul
     }
     if let Some(p) = s.state_in_use() {
         return Ok(FreshOutcome::Skipped(format!(
-            "{p} already holds data, so this is not a fresh install: moving existing state onto an encrypted volume is a later 0.6.11 step (at-rest migrate). Nothing was changed"
+            "{p} already holds data, so this is not a fresh install: move it onto an encrypted volume with `noo security at-rest migrate`. Nothing was changed"
         )));
     }
     let need = (plan.size_gib + MARGIN_GIB) * GIB;
@@ -685,7 +691,7 @@ fn read_answer(label: &str) -> Option<String> {
 /// Show the key on this terminal and have the person retype its first and
 /// last groups. True = acknowledged. An empty answer gives up (the row then
 /// warns until a new key is made).
-fn reveal_on_terminal(key: &str) -> bool {
+pub(crate) fn reveal_on_terminal(key: &str) -> bool {
     println!();
     ui::warned(RECOVERY_KEY_WARNING);
     println!();
@@ -831,9 +837,9 @@ pub fn security_at_rest_create_volume(g: &Globals, args: &[String]) -> Result<i3
             )),
         }
     } else if created.deferred {
-        ui::warned("no recovery key yet: the volume unlocks by this machine's TPM only until one is made (a later 0.6.11 step)");
+        ui::warned("no recovery key yet: the volume unlocks by this machine's TPM only until one is made: noo security at-rest recovery-key");
     } else {
-        ui::warned("the recovery key was not acknowledged: verify will warn until a new one is made and stored (a later 0.6.11 step)");
+        ui::warned("the recovery key was not acknowledged: verify will warn until a new one is made and stored: noo security at-rest recovery-key");
     }
     if g.json {
         println!(
@@ -866,7 +872,7 @@ pub fn security_at_rest_create_volume(g: &Globals, args: &[String]) -> Result<i3
         println!(
             "{}",
             ui::note(&format!(
-                "it is empty: this install's state is still at {state_root}, in the clear. Moving it is a later 0.6.11 step (at-rest migrate)."
+                "it is empty: this install's state is still at {state_root}, in the clear. Move it with `noo security at-rest migrate`."
             ))
         );
     }
