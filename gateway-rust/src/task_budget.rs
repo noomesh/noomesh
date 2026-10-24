@@ -245,9 +245,6 @@ pub async fn allowance_use(db: &sqlx::PgPool, username: &str) -> Result<Option<A
     Ok(Some(AllowanceSpend { period, limit, spent }))
 }
 
-/// The accounting UPDATE: one statement, atomic, returning the new total.
-pub use crate::repo::tasks::ADD_SPENT_SQL;
-
 /// Add one loop's tokens to the task. Returns the new total, or `None` for
 /// an unknown task.
 pub async fn add_spent(db: &sqlx::PgPool, task_id: &str, tokens: i64) -> Result<Option<i64>> {
@@ -566,8 +563,8 @@ mod tests {
     /// The accounting UPDATE is one atomic statement that adds and returns.
     #[test]
     fn accounting_adds_atomically_and_returns_the_total() {
-        assert!(ADD_SPENT_SQL.contains("tokens_spent = tokens_spent + $2"));
-        assert!(ADD_SPENT_SQL.contains("RETURNING tokens_spent"));
+        assert!(crate::repo::tasks::ADD_SPENT_SQL.contains("tokens_spent = tokens_spent + $2"));
+        assert!(crate::repo::tasks::ADD_SPENT_SQL.contains("RETURNING tokens_spent"));
         assert_eq!(loop_tokens(120, 30), 150);
         assert_eq!(loop_tokens(0, 0), 0);
         assert_eq!(loop_tokens(u64::MAX, 1), i64::MAX);
