@@ -22,8 +22,11 @@ G1  No file-backed NAME — tier-1, and since an earlier change the tier-2
     pointer form `${NAME:+/run/secrets/<target>}` that yields only a path.
 G2  Every top-level secret is referenced; every service-level secret has a
     pointer the container's reader actually reads (its language manifest,
-    or a native consumer), a uid that is the image's user, and mode 0400;
-    every pointer names a file the service is given.
+    or a native consumer) and an `x-noo-uid` that is the image's user (the
+    launcher hands the host file to it, 0400); every pointer names a file
+    the service is given. No entry carries compose's own uid/gid/mode: they
+    apply in Swarm only and Compose v5 warns three lines per secret per
+    service on every start (960 lines in one `noo onboard`, 2026-10-24).
 G4  The launcher writes no secret to disk: `lib-secrets.sh` and the three
     launchers have no redirection into `secrets/` and no `mkdir` of a
     runtime secrets directory. (The only writes are into the tmpfs-checked
@@ -248,11 +251,14 @@ def test_g2_each_delivery_is_owner_only_to_the_image_user() -> None:
         assert name in OWNED_UIDS, f"{name} takes a compose secret but has no known image uid here — add it to OWNED_UIDS with the measured uid"
         for s in entries:
             seen += 1
-            uid, gid, mode = str(s.get("uid")), str(s.get("gid")), s.get("mode")
-            if uid != OWNED_UIDS[name] or gid != OWNED_UIDS[name] or int(mode) != 0o400:
-                bad.append(f"{name}/{s['target']}: uid={uid} gid={gid} mode={mode}")
+            uid = str(s.get("x-noo-uid"))
+            if uid != OWNED_UIDS[name]:
+                bad.append(f"{name}/{s['target']}: x-noo-uid={uid}")
+            swarm = {k for k in ("uid", "gid", "mode") if k in s}
+            if swarm:
+                bad.append(f"{name}/{s['target']}: carries {sorted(swarm)} (Swarm-only; Compose v5 warns on every start)")
     assert seen >= 30, seen
-    assert not bad, f"a secret file is not 0400 to its image's user: {bad}"
+    assert not bad, f"a secret entry is not declared for its image's user, or carries Swarm-only keys: {bad}"
 
 
 # One-release bridges: an OLD pointer name aimed at a NEW file, for an image

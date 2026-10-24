@@ -446,25 +446,25 @@ services:
     # v5.0.2), so intel inherits every entry and replaces `noo_gateway_key`
     # with its own key's source — see docker-compose.trellion-intel.yml.
     secrets:
-      - { source: redis_password, target: redis_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: redis_password, target: redis_password, x-noo-uid: "65532" }
       # The worker's NATS password: the one-release fallback (see the anchor).
-      - { source: nats_worker_password, target: nats_worker_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: nats_worker_password, target: nats_worker_password, x-noo-uid: "65532" }
       # trellion's OWN NATS password. trellion-intel re-sources this target
       # from its own password, like noo_gateway_key and noo_bus_key.
-      - { source: nats_trellion_password, target: nats_addon_password, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: nats_trellion_password, target: nats_addon_password, x-noo-uid: "65532" }
       # This container's own bus-principal key; intel
       # re-sources the target from its own key, like noo_gateway_key.
-      - { source: noo_bus_key_trellion, target: noo_bus_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_node_agent_token, target: noo_node_agent_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: noo_svc_key_trellion, target: noo_gateway_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: pgpass_trellion, target: pgpass, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: telegram_bot_token, target: telegram_bot_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_bearer_token, target: google_chat_bearer_token, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_chat_credentials_json, target: google_chat_credentials_json, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: anthropic_api_key, target: anthropic_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: openai_api_key, target: openai_api_key, uid: "65532", gid: "65532", mode: 0400 }
-      - { source: google_api_key, target: google_api_key, uid: "65532", gid: "65532", mode: 0400 }
+      - { source: noo_bus_key_trellion, target: noo_bus_key, x-noo-uid: "65532" }
+      - { source: noo_audit_hmac_key, target: noo_audit_hmac_key, x-noo-uid: "65532" }
+      - { source: noo_node_agent_token, target: noo_node_agent_token, x-noo-uid: "65532" }
+      - { source: noo_svc_key_trellion, target: noo_gateway_key, x-noo-uid: "65532" }
+      - { source: pgpass_trellion, target: pgpass, x-noo-uid: "65532" }
+      - { source: telegram_bot_token, target: telegram_bot_token, x-noo-uid: "65532" }
+      - { source: google_chat_bearer_token, target: google_chat_bearer_token, x-noo-uid: "65532" }
+      - { source: google_chat_credentials_json, target: google_chat_credentials_json, x-noo-uid: "65532" }
+      - { source: anthropic_api_key, target: anthropic_api_key, x-noo-uid: "65532" }
+      - { source: openai_api_key, target: openai_api_key, x-noo-uid: "65532" }
+      - { source: google_api_key, target: google_api_key, x-noo-uid: "65532" }
     volumes:
       - ./noomesh.yaml:/app/noomesh.yaml
       - ./docker-compose.override.yml:/app/docker-compose.override.yml
