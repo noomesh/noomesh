@@ -249,7 +249,7 @@ pub fn parse_exec_decision(action_id: &str) -> Option<(&'static str, String)> {
 /// user-facing ack. Card clicks are operator actions by construction —
 /// the card is only ever posted to NOO_APPROVAL_GCHAT_SPACE, the
 /// operator's own space (same trust model as decide_cluster_proposal,
-/// where the HTTP-surface require_operator gate does not apply because
+/// where the HTTP-surface Operator extractor does not apply because
 /// chat identity IS the operator's). The blocked tool call polls the same
 /// row and proceeds/refuses on the flip.
 pub async fn decide_exec_approval(

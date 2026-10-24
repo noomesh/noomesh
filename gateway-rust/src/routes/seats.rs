@@ -57,11 +57,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::bootstrap::{
-    bootstrap_admin_guard, cluster_ca_candidates, cluster_ca_fingerprint_from, controller_url,
+    cluster_ca_candidates, cluster_ca_fingerprint_from, controller_url,
     enroll_url, valid_node_name, validate_ttl, BIRTH_PROOF_HEADER,
 };
 use super::{AppError, AppResult};
-use crate::auth::{ClusterNode, RequesterCtx};
+use crate::auth::ClusterNode;
+use crate::authz::OperatorOrInternal;
 use crate::auth_refresh::{generate_seat_token, hash_token};
 use crate::birth_proof::Purpose;
 use crate::state::AppState;
@@ -105,12 +106,12 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// >= Operator, or the controller's own cluster HMAC — never a node.
 ///
-/// `bootstrap_admin_guard` already refuses a sub-operator JWT; the extra arm
+/// The `OperatorOrInternal` extractor already refuses a sub-operator JWT; the extra arm
 /// refuses a `Node`-kind cluster token even if the middleware's allow-list
 /// were ever to let one past. A node has no business minting, listing or
 /// staging seats.
 fn seat_admin_guard(
-    ctx: &Option<Extension<RequesterCtx>>,
+    op: &OperatorOrInternal,
     cluster: &Option<Extension<ClusterNode>>,
 ) -> Result<String, AppError> {
     if let Some(Extension(c)) = cluster {
@@ -118,7 +119,7 @@ fn seat_admin_guard(
             return Err(AppError::Forbidden(format!("node '{}' may not manage kiosk seats", c.0)));
         }
     }
-    bootstrap_admin_guard(ctx)
+    Ok(op.actor("cluster-cli"))
 }
 
 /// Does an enrolled NODE hold this name? A seat may not take it: the two
@@ -190,11 +191,11 @@ pub(crate) async fn mint_seat_token(
 /// the gateway does not hold it.
 async fn seat_token_create(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Json(body): Json<CreateSeatTokenBody>,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     let seat = body.seat_name.trim().to_string();
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("seat_name must be <= 64 chars of [a-zA-Z0-9._-]".into()));
@@ -238,10 +239,10 @@ async fn seat_token_create(
 /// GET /api/cluster/seat-tokens — issuance metadata, never hashes.
 async fn seat_tokens_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
+    let _ = seat_admin_guard(&op, &cluster)?;
     type Row = (uuid::Uuid, String, String, String, chrono::DateTime<chrono::Utc>,
                 chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, bool);
     let rows: Vec<Row> = sqlx::query_as(
@@ -286,10 +287,10 @@ fn token_status(revoked: bool, used: bool, expired: bool) -> &'static str {
 async fn seat_token_revoke(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     let id: uuid::Uuid = id.parse().map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
     let updated = sqlx::query("UPDATE noo_seat_tokens SET revoked = true WHERE id = $1")
         .bind(id)
@@ -516,10 +517,10 @@ async fn seat_enroll(
 /// verify` read, and the ONLY place either learns a seat exists.
 async fn seats_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
+    let _ = seat_admin_guard(&op, &cluster)?;
     type Row = (String, String, Option<Value>, Option<String>, chrono::DateTime<chrono::Utc>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<Value>, Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>,
@@ -561,12 +562,12 @@ async fn seats_list(
 /// CLI. Upsert; the seat's sync timer collects it.
 async fn seat_bundle_put(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Path(seat): Path<String>,
     body: Bytes,
 ) -> AppResult {
-    let by = seat_admin_guard(&ctx, &cluster)?;
+    let by = seat_admin_guard(&op, &cluster)?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }
@@ -595,11 +596,11 @@ async fn seat_bundle_put(
 /// CLI's combined wait judges both with one function.
 async fn seat_bundle_status(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     cluster: Option<Extension<ClusterNode>>,
     Path(seat): Path<String>,
 ) -> AppResult {
-    let _ = seat_admin_guard(&ctx, &cluster)?;
+    let _ = seat_admin_guard(&op, &cluster)?;
     if !valid_node_name(&seat) {
         return Err(AppError::BadRequest("invalid seat name".into()));
     }

@@ -65,6 +65,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::RequesterCtx;
+use crate::authz::OperatorOrInternal;
 use crate::auth_refresh::{generate_bootstrap_token, hash_token, BOOTSTRAP_TOKEN_PREFIX};
 use crate::state::AppState;
 use super::{AppError, AppResult};
@@ -146,25 +147,6 @@ pub(crate) const MAX_RAIL_BODY: usize = 768 * 1024 * 1024;
 /// caller — an attacker probing tokens learns nothing about WHY one failed
 /// (in particular, not that a guessed value corresponds to a real token).
 const DENIED_MSG: &str = "bootstrap token rejected";
-
-/// >= Operator or cluster-HMAC. Mirrors the sibling enrollment surface
-/// > (`mint_join_key` accepts internal callers; `users_admin_read_guard` admits
-/// > `None`): the shared cluster secret is the host operator CLI / the
-/// > coordinator agent, and the design explicitly wants chat-driven
-/// > onboarding. Sub-operator JWTs are refused even on GET — `scope_allows`
-/// > admits every GET, so without this a read-tier account could enumerate
-/// > token issuance metadata.
-pub(crate) fn bootstrap_admin_guard(
-    ctx: &Option<Extension<RequesterCtx>>,
-) -> Result<String, AppError> {
-    match ctx {
-        None => Ok("cluster-cli".to_string()),
-        Some(Extension(r)) if r.role >= crate::auth::Role::Operator => Ok(r.sub.clone()),
-        Some(_) => Err(AppError::Forbidden(
-            "operator role required for bootstrap-token management".into(),
-        )),
-    }
-}
 
 /// TTL validation: default 1h, hard max 24h ("short-lived
 /// (default 1h, max 24h) — narrow attack window"). Out-of-range values are
@@ -469,10 +451,10 @@ struct CreateTokenBody {
 /// logs. Losing the response means minting a new token, by design.
 async fn bootstrap_token_create(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let by = bootstrap_admin_guard(&ctx)?;
+    let by = op.actor("cluster-cli");
     // An absent body means "all defaults" (mint_join_key precedent), but a
     // PRESENT body that doesn't deserialize is a 400 — `Option<Json<T>>`
     // would silently swallow `{"ttl_seconds": "1h"}` into the defaults, and
@@ -647,9 +629,8 @@ async fn bootstrap_token_create(
 /// GET /api/security/bootstrap-tokens — issuance metadata, NEVER hashes.
 async fn bootstrap_tokens_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    let _ = bootstrap_admin_guard(&ctx)?;
     let rows: Vec<(
         uuid::Uuid,
         String,
@@ -716,9 +697,9 @@ async fn bootstrap_tokens_list(
 async fn bootstrap_token_revoke(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    ctx: Option<Extension<RequesterCtx>>,
+    op: OperatorOrInternal,
 ) -> AppResult {
-    let by = bootstrap_admin_guard(&ctx)?;
+    let by = op.actor("cluster-cli");
     let id: uuid::Uuid = id
         .parse()
         .map_err(|_| AppError::BadRequest("invalid token id (expected a UUID)".into()))?;
@@ -1497,8 +1478,7 @@ fn read_self_birth_cert() -> Option<String> {
 /// receipts and apply reports against (i67). Read-only: the cert is a host
 /// file, and nothing here can change it. `noo cluster provision <self>`
 /// compares the fingerprint with `/etc/noo/birth.crt` before staging.
-async fn self_node_identity(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    let _ = bootstrap_admin_guard(&ctx)?;
+async fn self_node_identity(_op: OperatorOrInternal) -> AppResult {
     let self_id = crate::self_node::self_node_id();
     let cert = self_id.as_deref()
         .and_then(|id| self_birth_cert(id, Some(id), read_self_birth_cert).flatten());
@@ -2019,17 +1999,16 @@ mod tests {
     }
 
     // ── Guards ──────────────────────────────────────────────────
+    //
+    // The operator-or-cluster-HMAC gate is the `OperatorOrInternal` extractor
+    // (`authz::tests` drives it through a router); the actor name a call with
+    // no user context is recorded under is pinned here.
 
     #[test]
-    fn guard_admits_operator_and_cluster_hmac_refuses_user() {
+    fn a_call_with_no_user_is_recorded_as_the_cluster_cli() {
         use crate::auth::Role;
-        assert_eq!(bootstrap_admin_guard(&None).unwrap(), "cluster-cli");
-        assert_eq!(bootstrap_admin_guard(&role_ctx(Role::Operator)).unwrap(), "tester");
-        assert_eq!(bootstrap_admin_guard(&role_ctx(Role::Admin)).unwrap(), "tester");
-        assert!(matches!(
-            bootstrap_admin_guard(&role_ctx(Role::User)),
-            Err(AppError::Forbidden(_))
-        ));
+        assert_eq!(OperatorOrInternal(None).actor("cluster-cli"), "cluster-cli");
+        assert_eq!(OperatorOrInternal(role_ctx(Role::Operator).map(|e| e.0)).actor("cluster-cli"), "tester");
     }
 
     // ── Source assertions (no DB harness exists — repo convention) ──

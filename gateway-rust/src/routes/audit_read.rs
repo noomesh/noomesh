@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{AppError, AppResult};
-use crate::auth::{RequesterCtx, Role};
+use crate::authz::OperatorOrInternal;
 use crate::state::AppState;
 
 /// Rows returned when `limit` is absent / the most a caller may ask for.
@@ -107,16 +107,9 @@ type Row = (
 /// verify; `GET /api/security/audit/verify` does.
 async fn security_audit_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<RequesterCtx>>,
+    reader: OperatorOrInternal,
     Query(p): Query<ListParams>,
 ) -> AppResult {
-    if let Some(axum::Extension(r)) = &ctx {
-        if r.role < Role::Operator {
-            return Err(AppError::Forbidden(
-                "reading the security audit log is operator-only (Operator role or above)".into(),
-            ));
-        }
-    }
     let now = Utc::now();
     let since = p
         .since
@@ -181,8 +174,8 @@ async fn security_audit_list(
         .collect();
 
     // Who read the log. Written after the read, so it never lists itself.
-    let (reader, act) = match &ctx {
-        Some(axum::Extension(r)) => (r.sub.clone(), r.act.as_ref().map(|a| json!(a))),
+    let (reader, act) = match &reader.0 {
+        Some(r) => (r.sub.clone(), r.act.as_ref().map(|a| json!(a))),
         None => ("cluster".to_string(), None),
     };
     super::core::audit_event(

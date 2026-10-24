@@ -1997,26 +1997,24 @@ fn the_audit_keys_of_by_type_are_allow_listed_and_the_rest_fold_into_other() {
 
 #[test]
 fn the_staged_names_listing_is_operator_and_up_and_restore_by_run_is_too() {
-    use crate::routes::knowledge::prune_operator_gate;
+    use crate::authz::operator_or_internal_ok;
     let mk = |role, scopes: &[&str]| RequesterCtx { sub: "u".into(), scopes: scopes.iter().map(|s| s.to_string()).collect(), role, harness: None, act: None };
     let user = mk(Role::User, &["read"]);
     let op = mk(Role::Operator, &["read", "write"]);
     let admin = mk(Role::Admin, &["read", "write", "admin"]);
-    assert!(prune_operator_gate(&ctx_of(&user)).is_err(), "a User must not list staged entity names");
-    assert!(prune_operator_gate(&ctx_of(&op)).is_ok());
-    assert!(prune_operator_gate(&ctx_of(&admin)).is_ok());
-    assert!(prune_operator_gate(&None).is_ok(), "a controller service has no account and is admitted to prune/restore too");
-    let err = prune_operator_gate(&ctx_of(&user)).unwrap_err();
-    assert_eq!(axum::response::IntoResponse::into_response(err).status(), StatusCode::FORBIDDEN);
+    assert!(!operator_or_internal_ok(Some(&user)), "a User must not list staged entity names");
+    assert!(operator_or_internal_ok(Some(&op)));
+    assert!(operator_or_internal_ok(Some(&admin)));
+    assert!(operator_or_internal_ok(None), "a controller service has no account and is admitted to prune/restore too");
     // the restore (POST) is closed to a User at the front door, as before; a run_id restore is the same route
     let p = "/api/v1/graph/prune/restore";
     assert!(!crate::auth::requester_allows(&user, &axum::http::Method::POST, p));
     assert!(crate::auth::requester_allows(&op, &axum::http::Method::POST, p));
-    // and the handler really calls the gate before reading anything
+    // and the handler takes the extractor, which runs before its body reads anything
     let src = include_str!("../routes/knowledge.rs");
     let start = src.find("async fn graph_prune_staged(").unwrap();
     let body = &src[start..start + 900];
-    assert!(body.contains("prune_operator_gate(&ctx)?;") && body.find("prune_operator_gate").unwrap() < body.find(".graph_prune_staged(").unwrap());
+    assert!(body.contains("_op: OperatorOrInternal,") && body.find("_op: OperatorOrInternal").unwrap() < body.find(".graph_prune_staged(").unwrap());
 }
 
 async fn prune_tables(db: &PgPool) {

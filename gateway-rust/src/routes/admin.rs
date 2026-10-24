@@ -31,6 +31,7 @@ use crate::measured::{put, put_into, Measured};
 use crate::state::AppState;
 use crate::redis_or_unavailable::redis_or_unavailable;
 use super::{logs_search, AppJson, AppError, AppResult};
+use crate::authz::{Operator, OperatorOrInternal};
 
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -567,10 +568,9 @@ struct AuditStatsParams {
 /// Mirrors the Python `security_audit_history()` endpoint.
 async fn security_audit_history(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<AuditHistoryParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let limit = params.limit.unwrap_or(20).min(200);
 
     let rows = sqlx::query_as::<_, (
@@ -630,10 +630,9 @@ async fn security_audit_history(
 /// version uses the right column.
 async fn security_audit_stats(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<AuditStatsParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let minutes = params.minutes.unwrap_or(5).clamp(1, 1440);
     let interval = format!("{minutes} minutes");
 
@@ -685,15 +684,8 @@ async fn security_audit_stats(
 /// answer lists row ids and says which keys this gateway holds.
 async fn security_audit_verify(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    if let Some(axum::Extension(r)) = &ctx {
-        if r.role < crate::auth::Role::Operator {
-            return Err(AppError::Forbidden(
-                "audit verification is operator-only (Operator role or above)".into(),
-            ));
-        }
-    }
     let report = crate::audit_integrity::verify_db(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("cannot read noo_security_audit: {e}")))?;
@@ -2138,10 +2130,9 @@ struct ViolationParams {
 /// Matches Python response: {violations: {...}, risk_level, period_hours}.
 async fn security_violations(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Query(params): Query<ViolationParams>,
 ) -> AppResult {
-    super::operator_read_guard(&ctx)?;
     let period_hours = params.period_hours.unwrap_or(24);
 
     // Try to read violation counters from Redis (matching Python SecurityManager keys)
@@ -2268,8 +2259,7 @@ async fn security_pki_rotate_expiring() -> AppJson {
 /// ~/.config/mesh/pki). Reports existence, subject, issuer, and
 /// not_after for each cert found. Matches the Python pki.manager
 /// get_status() response shape.
-async fn security_pki_status(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    super::operator_read_guard(&ctx)?;
+async fn security_pki_status(_op: OperatorOrInternal) -> AppResult {
     let pki_dir = std::env::var("NOO_PKI_DIR")
         .ok()
         .filter(|p| std::path::Path::new(p).join("ca.crt").exists())
@@ -2583,24 +2573,6 @@ async fn approval_pending(
     }
 }
 
-/// Approvals are operator-only: RequesterCtx is attached exclusively on
-/// JWT auth, so cluster-HMAC callers cannot use these dashboard routes.
-/// The CLI decides via POST /api/approval/{id}/decide, which since phase 3
-/// applies the same rule — a named operator, not the shared cluster HMAC.
-/// See `decide_actor`.
-fn require_operator(
-    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-) -> Result<String, AppError> {
-    match ctx {
-        Some(axum::Extension(r)) if r.role >= crate::auth::Role::Operator => {
-            Ok(r.sub.clone())
-        }
-        _ => Err(AppError::Forbidden(
-            "approval decisions require a logged-in operator (Operator role or above)".into(),
-        )),
-    }
-}
-
 /// An approval decision is a human's. The gate exists so a person decides every
 /// high-risk action; a model that could decide its own pending request would make
 /// the gate decoration. So the decision routes accept only a PERSON's credential
@@ -2637,10 +2609,11 @@ fn decider_refusal(origin: &crate::task_guard::Origin) -> Result<(), AppError> {
 async fn approval_approve(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<String>,
+    operator: Operator,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let requester = require_operator(&ctx)?;
+    let requester = operator.sub();
     require_human_decider(&state.db, &ctx).await?;
     let approved_by = body
         .as_ref()
@@ -2686,10 +2659,11 @@ async fn approval_approve(
 async fn approval_deny(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<String>,
+    operator: Operator,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let requester = require_operator(&ctx)?;
+    let requester = operator.sub();
     require_human_decider(&state.db, &ctx).await?;
     let reason = body
         .as_ref()
@@ -2778,7 +2752,7 @@ fn parse_decision(body: &Value) -> Result<(&'static str, Option<String>), AppErr
 /// - JWT with an operator scope (`admin`/`write`) → that subject. (A
 ///   read-scope JWT is refused here even though `require_any_auth`'s RBAC
 ///   already blocks non-operator POSTs — defense in depth, mirrors
-///   `require_operator` on the sibling /approve|/deny routes.)
+///   the `Operator` extractor on the sibling /approve|/deny routes.)
 /// - No `RequesterCtx` (shared-secret HMAC, service key) → **403**, always.
 ///   The `NOO_APPROVAL_BREAK_GLASS` posture gate that once let such a caller
 ///   decide as `cli-operator:break-glass` is RETIRED

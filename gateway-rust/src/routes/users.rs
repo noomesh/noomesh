@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthActor, RequesterCtx};
+use crate::authz::OperatorOrInternal;
 use crate::state::AppState;
 use super::{AppError, AppResult};
 
@@ -233,9 +234,8 @@ fn hash_password(pw: &str) -> Result<String, AppError> {
 /// legacy surface.
 async fn users_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::users::list_with_lock(&state.db).await?;
 
     let users: Vec<Value> = rows
@@ -550,11 +550,10 @@ async fn user_set_role(
 /// it read-only.
 async fn posture_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
     // Which security gates are open is operator information: it tells a
     // prober whether the external MCP door is open.
-    users_admin_read_guard(&ctx)?;
     // Previously `.unwrap_or_default()`. On any DB failure every gate then
     // reported `db_value: null, source: "env", pending_restart: false` — i.e.
     // "the running process matches the desired posture, nothing pending". On a
@@ -1370,9 +1369,8 @@ pub(crate) async fn erase_account(
 /// no archived content. Admin read.
 async fn erasure_archive_status(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     Ok(Json(crate::erasure_archive::status(&state.db).await?))
 }
 
@@ -1383,9 +1381,8 @@ async fn erasure_archive_status(
 /// GET /api/security/orgs
 async fn orgs_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         String,
@@ -1598,12 +1595,11 @@ async fn user_link_create(
 /// GET /api/security/users/{username}/links — all channel links for a user.
 async fn user_links_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Path(username): Path<String>,
 ) -> AppResult {
     // A user's channel links are an impersonation primitive on the chat
     // surface — operators only.
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         String,
@@ -1756,10 +1752,9 @@ async fn team_space_link(
 /// GET /api/security/teams/{team}/spaces — all spaces linked to a team.
 async fn team_spaces_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
     Path(team): Path<String>,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (String, String, Option<chrono::DateTime<chrono::Utc>>)>(
         "SELECT channel, channel_space_id, created_at FROM noo_channel_team_links \
          WHERE team = $1 ORDER BY created_at DESC",
@@ -1819,9 +1814,8 @@ async fn team_space_unlink(
 /// GET /api/security/role-grants
 async fn role_grants_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::kb_grants::list_grants_detailed(&state.db).await?;
 
     let grants: Vec<Value> = rows
@@ -1962,13 +1956,12 @@ async fn user_revoke_roles(
 /// GET /api/security/user-proposals
 async fn proposals_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    // Mirrors the legacy listing's `users_admin_read_guard` (the design step
+    // Mirrors the legacy listing's read gate, now the `OperatorOrInternal` extractor (the design step
     // 4): the queue carries usernames, requested scopes and requesters, so a
     // sub-operator account must not enumerate it. Cluster-HMAC (None) passes,
     // as it does on the legacy listing.
-    users_admin_read_guard(&ctx)?;
     let rows = proposal_rows(&state.db).await?;
 
     let proposals: Vec<Value> = rows
@@ -2029,9 +2022,8 @@ pub(crate) async fn proposal_row(db: &sqlx::PgPool, id: i64) -> Result<Option<Pr
 async fn proposal_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let row = proposal_row(&state.db, id).await?;
     let Some((id, action, payload, by, status, created, decided_by)) = row else {
         return Err(AppError::NotFound(format!("proposal {id} not found")));
@@ -2340,9 +2332,8 @@ async fn proposal_decide(
 /// GET /api/security/service-keys — never returns raw keys or hashes.
 async fn service_keys_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         String,
         Value,
@@ -2402,8 +2393,7 @@ async fn service_keys_list(
 /// service-key provision` reads it to show the operator what an add-on's
 /// declared grant opens, and to refuse a word the issuer would reject BEFORE
 /// minting anything. Operator-gated like the listing beside it.
-async fn service_key_scopes(ctx: Option<Extension<RequesterCtx>>) -> AppResult {
-    users_admin_read_guard(&ctx)?;
+async fn service_key_scopes(_op: OperatorOrInternal) -> AppResult {
     Ok(Json(scope_vocabulary()))
 }
 
@@ -3583,21 +3573,6 @@ async fn require_not_last_admin(
     Ok(())
 }
 
-/// Mirrors `_users_admin_error(body)` for reads: users admin is operator-only
-/// even on GETs (a read-scope user must not enumerate accounts); callers with
-/// no `RequesterCtx` are internal/cluster-HMAC and pass. An authenticated
-/// caller below Operator is `403` (the house convention, as `operator_guard`
-/// in mcp_registry.rs); a missing credential is `401` from the auth layer
-/// before this runs. It was `400`, which told a client its request was
-/// malformed rather than that it lacked the role.
-fn users_admin_read_guard(ctx: &Option<Extension<RequesterCtx>>) -> Result<(), AppError> {
-    match ctx {
-        None => Ok(()),
-        Some(Extension(r)) if is_operator(r) => Ok(()),
-        Some(_) => Err(AppError::Forbidden("operator role required".into())),
-    }
-}
-
 /// Mirrors `_users_admin_error(body, internal_ok=False)` for mutations:
 /// internal callers are redirected to the proposal queue so the agent cannot
 /// create accounts on its own; JWT callers need admin/write.
@@ -3796,9 +3771,8 @@ async fn unknown_team_roles(
 /// [ported from workers/users.py::_users_list (worker.api.users) 2026-07-18]
 async fn api_users_list(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = crate::repo::users::list_with_lock(&state.db).await?;
     let users: Vec<Value> = rows
         .into_iter()
@@ -4105,9 +4079,8 @@ async fn api_users_propose(
 /// [ported from workers/users.py::_users_proposals_list (worker.api.users.proposals) 2026-07-18]
 async fn api_users_proposals(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (
         i32,
         String,
@@ -4159,9 +4132,8 @@ async fn api_users_proposals(
 /// [ported from workers/kb.py::_kb_grants_list (worker.api.kb.grants) 2026-07-18]
 async fn api_kb_grants(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     // NOTE: pre-existing behaviour — a database error is swallowed into an
     // empty grant list rather than surfaced. Preserved deliberately so this
     // refactor changes nothing; it is the #247 silent-failure class and worth
@@ -4184,9 +4156,8 @@ async fn api_kb_grants(
 /// [ported from workers/kb.py::_kb_rules_list (worker.api.kb.rules) 2026-07-18]
 async fn api_kb_rules(
     State(state): State<Arc<AppState>>,
-    ctx: Option<Extension<RequesterCtx>>,
+    _op: OperatorOrInternal,
 ) -> AppResult {
-    users_admin_read_guard(&ctx)?;
     let rows = sqlx::query_as::<_, (i32, i32, String, Value, bool)>(
         "SELECT id, priority, match, roles, enabled FROM noo_kb_source_rules \
          ORDER BY priority, id",
@@ -4553,22 +4524,6 @@ mod tests {
     }
 
     use axum::response::IntoResponse;
-
-    /// `GET /api/security/erasure-archive` (and every users-admin read) answers an
-    /// authenticated caller below Operator `403`, not `400`; an Operator and
-    /// an internal (no-ctx) caller pass. 401 for no credential at all is the
-    /// auth layer's, before the handler runs.
-    #[test]
-    fn users_admin_read_guard_is_403_for_a_non_admin_and_open_to_operators() {
-        let status = |c| match super::users_admin_read_guard(&c) {
-            Ok(()) => axum::http::StatusCode::OK,
-            Err(e) => e.into_response().status(),
-        };
-        assert_eq!(status(role_ctx(crate::auth::Role::User)), axum::http::StatusCode::FORBIDDEN);
-        assert_eq!(status(role_ctx(crate::auth::Role::Operator)), axum::http::StatusCode::OK);
-        assert_eq!(status(role_ctx(crate::auth::Role::Admin)), axum::http::StatusCode::OK);
-        assert_eq!(status(None), axum::http::StatusCode::OK);
-    }
 
     /// The mutation guard refuses a non-admin the same way.
     fn declared() -> Vec<String> {
@@ -5525,12 +5480,13 @@ mod tests {
     #[test]
     fn security_users_list_is_read_guarded_like_the_legacy_surface() {
         use crate::auth::Role;
-        // Guard semantics (shared with the legacy handler, so they cannot drift).
-        assert!(users_admin_read_guard(&role_ctx(Role::User)).is_err());
-        assert!(users_admin_read_guard(&ctx(&["read"])).is_err());
-        assert!(users_admin_read_guard(&role_ctx(Role::Operator)).is_ok());
-        assert!(users_admin_read_guard(&role_ctx(Role::Admin)).is_ok());
-        assert!(users_admin_read_guard(&None).is_ok());
+        // Guard semantics: the `OperatorOrInternal` extractor (driven through a
+        // router in `authz::tests`); the same pure rule is asserted here.
+        assert!(!crate::authz::operator_or_internal_ok(role_ctx(Role::User).as_ref().map(|e| &e.0)));
+        assert!(!crate::authz::operator_or_internal_ok(ctx(&["read"]).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(role_ctx(Role::Operator).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(role_ctx(Role::Admin).as_ref().map(|e| &e.0)));
+        assert!(crate::authz::operator_or_internal_ok(None));
         // And the handler actually runs it (source check, like the other
         // surface-parity tests in this module).
         let src = include_str!("users.rs");
@@ -5540,8 +5496,8 @@ mod tests {
             .expect("users_list not found");
         let body = &body[..body.find("\n}\n").expect("no close for users_list")];
         assert!(
-            body.contains("users_admin_read_guard(&ctx)"),
-            "users_list must run the shared read guard"
+            body.contains("_op: OperatorOrInternal"),
+            "users_list must take the shared read extractor"
         );
     }
 

@@ -164,14 +164,12 @@ fn now_unix() -> f64 {
 // ── routes ───────────────────────────────────────────────────────────────
 
 /// GET /api/cluster/reservations — every lease the nodes report. Operator read.
-async fn reservations_list(State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<crate::auth::RequesterCtx>>) -> AppResult {
-    super::operator_read_guard(&ctx)?;
+async fn reservations_list(State(state): State<Arc<AppState>>, _op: crate::authz::OperatorOrInternal) -> AppResult {
     Ok(Json(json!({"reservations": all_reservations(&state).await})))
 }
 
 /// GET /api/cluster/reservations/{id}
-async fn reservation_get(State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<crate::auth::RequesterCtx>>, Path(id): Path<String>) -> AppResult {
-    super::operator_read_guard(&ctx)?;
+async fn reservation_get(State(state): State<Arc<AppState>>, _op: crate::authz::OperatorOrInternal, Path(id): Path<String>) -> AppResult {
     match find_reservation(&state, &id).await {
         Some(r) => Ok(Json(r)),
         None => Err(AppError::NotFound(format!("no reservation {id}"))),
@@ -179,8 +177,7 @@ async fn reservation_get(State(state): State<Arc<AppState>>, ctx: Option<axum::E
 }
 
 /// GET /api/cluster/workloads — what the verified add-on bundles declare.
-async fn workloads_list(ctx: Option<axum::Extension<crate::auth::RequesterCtx>>) -> AppResult {
-    super::operator_read_guard(&ctx)?;
+async fn workloads_list(_op: crate::authz::OperatorOrInternal) -> AppResult {
     let v: Vec<Value> = crate::addon_workloads::declared()
         .iter()
         .map(|d| json!({"workload": d.key(), "addon": d.addon, "name": d.name, "container": d.container, "gpu": d.gpu, "need_mb": d.need_mb,
@@ -274,10 +271,10 @@ async fn drain_and_stop(link: &crate::node_link::NodeLink, decl: &crate::addon_w
 /// audited (`reservation_take`).
 async fn reservation_take(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = super::cluster::gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let b = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     let key = b.get("workload").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let Some((addon, name)) = crate::addon_workloads::split_key(&key) else {
@@ -389,11 +386,11 @@ async fn reservation_take(
 /// by compare-and-set with `resume: now`.
 async fn reservation_release(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    operator: crate::authz::Operator,
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> AppResult {
-    let actor = super::cluster::gpu_hold_actor(&ctx)?;
+    let actor = operator.sub().to_string();
     let force = body.as_ref().and_then(|Json(b)| b.get("force")).and_then(Value::as_bool).unwrap_or(false);
     let Some(r) = find_reservation(&state, &id).await else {
         return Err(AppError::NotFound(format!("no reservation {id}")));
@@ -822,7 +819,7 @@ mod tests {
     fn take_and_release_are_gated_audited_and_never_strand_a_gpu() {
         let src = include_str!("reservations.rs").split("fn take_and_release_are_gated_audited_and_never_strand_a_gpu").next().unwrap();
         let take = src.split("async fn reservation_take(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
-        assert!(take.find("gpu_hold_actor(&ctx)?").unwrap() < take.find("body.map(").unwrap(), "operator gate before the body");
+        assert!(take.contains("operator: crate::authz::Operator"), "operator gate (an extractor, so it runs before the body)");
         let start = take.find("\"/start\"").expect("start");
         let rollback = take[start..].find("\"release\"").expect("a failed start releases");
         assert!(take[start + rollback..].contains("\"resume\": \"now\""), "the pool gets the GPU back at once");

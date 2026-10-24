@@ -30,6 +30,7 @@ use crate::measured::{put_into, Measured};
 use crate::memory::scope::{self, Audience};
 use crate::state::AppState;
 use super::{AppResult, AppError};
+use crate::authz::OperatorOrInternal;
 use super::delegation;
 use super::ops::WaitQuery;
 
@@ -56,7 +57,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/rag/status", get(rag_status))
         .route("/api/v1/docs", get(docs_list))
         // Document hold: operator-only (the global write rule for the POSTs,
-        // `hold_operator_gate` for the GET). Deliberately NOT in any add-on
+        // the `OperatorOrInternal` extractor for the GET). Deliberately NOT in any add-on
         // control scope.
         .route("/api/v1/docs/hold", post(docs_hold))
         .route("/api/v1/docs/unhold", post(docs_unhold))
@@ -244,20 +245,6 @@ fn retag_audit_row(body: &Value, response: &Value) -> (&'static str, &'static st
     )
 }
 
-/// The held-document listing names every held document; like the prune
-/// staging area it needs the Operator role (the POSTs are already gated by the
-/// front door's write rule). A caller with no account is a controller service.
-pub(crate) fn hold_operator_gate(
-    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-) -> Result<(), AppError> {
-    match ctx {
-        Some(c) if c.role < crate::auth::Role::Operator => Err(AppError::Forbidden(
-            "held documents are listed for the Operator role or above".into(),
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// While `docs.held_at` is absent (trellion not yet migrated to 105) every
 /// hold call is refused with the one "roll trellion first" sentence, before
 /// anything is sent to a worker.
@@ -345,10 +332,12 @@ async fn docs_purge(
 /// reason, held_at), paged, with the `total`. Operator only.
 async fn docs_held(
     State(state): State<Arc<AppState>>,
+    // The listing names every held document: Operator or above, or a caller
+    // with no account (a controller service).
+    _op: OperatorOrInternal,
     ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
     Query(q): Query<HeldQuery>,
 ) -> Result<delegation::StatusJson, AppError> {
-    hold_operator_gate(&ctx)?;
     if let Some(refusal) = hold_column_gate(&state).await {
         return Ok(refusal);
     }
@@ -1652,31 +1641,18 @@ struct StagedQuery {
     include_restored: bool,
 }
 
-/// Operator or above, or a caller with no account (a controller service, which
-/// the front door admits to `prune/restore` too). A User is refused.
-pub(crate) fn prune_operator_gate(
-    ctx: &Option<axum::Extension<crate::auth::RequesterCtx>>,
-) -> Result<(), AppError> {
-    match ctx {
-        Some(c) if c.role < crate::auth::Role::Operator => Err(AppError::Forbidden(
-            "the prune staging area lists entity names; it needs the Operator role or above".into(),
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// GET /api/v1/graph/prune/staged — list soft-deleted entities, newest
 /// first. Returns an empty list when the staging table doesn't exist yet
 /// (graph_prune has never run).
 async fn graph_prune_staged(
     State(state): State<Arc<AppState>>,
-    ctx: Option<axum::Extension<crate::auth::RequesterCtx>>,
+    // The listing carries canonical entity NAMES (up to 5,000 per cleanup run), so
+    // it is held to the tier `prune/restore` is: Operator and above, or a caller
+    // with no account (a controller service, which the front door admits to
+    // `prune/restore` too). A bare GET is otherwise open to a User at the front door.
+    _op: OperatorOrInternal,
     Query(params): Query<StagedQuery>,
 ) -> AppResult {
-    // The listing carries canonical entity NAMES (up to 5,000 per cleanup run), so
-    // it is held to the tier `prune/restore` is: Operator and above. A bare GET is
-    // otherwise open to a User at the front door.
-    prune_operator_gate(&ctx)?;
     let limit = params.limit.unwrap_or(200).clamp(1, 1000);
     let body = state
         .memory()
@@ -2344,13 +2320,11 @@ mod docs_audience_tests {
 
     #[test]
     fn held_listing_is_operator_only() {
-        let ctx = |role| Some(axum::Extension(crate::auth::RequesterCtx {
-            sub: "x".into(), scopes: vec![], role, harness: None, act: None,
-        }));
-        assert!(hold_operator_gate(&ctx(crate::auth::Role::User)).is_err());
-        assert!(hold_operator_gate(&ctx(crate::auth::Role::Operator)).is_ok());
-        assert!(hold_operator_gate(&ctx(crate::auth::Role::Admin)).is_ok());
-        assert!(hold_operator_gate(&None).is_ok(), "a controller service has no account");
+        // The refusal itself is the extractor (`authz::tests` drives it through
+        // a router); what is pinned here is that the route takes it.
+        let src = include_str!("knowledge.rs");
+        let at = src.find("async fn docs_held(").unwrap();
+        assert!(src[at..at + 400].contains("_op: OperatorOrInternal"));
     }
 
     #[test]
