@@ -390,6 +390,7 @@
       "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
         "properties": {
           "name": {
