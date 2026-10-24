@@ -80,6 +80,7 @@ MASK="${NOO_DEMO_MASK:-$ROOT/scripts/demo/mask.pl}"
 BOX="${NOO_DEMO_BOX:-}"
 T_RAW="$RAW"; T_MASKED="$MASKED"; T_EXIT="$EXIT_LOG"; T_MASK="$MASK"
 ENTER="true"
+INSTALL_SH="sh"   # the real film may pin a release here (NOO_DEMO_CLI_VERSION); the smoke tape has no install line
 BOXDIR=/tmp/demo
 bx() { docker exec -u you "$BOX" "$@"; }
 if [ -n "$BOX" ]; then
@@ -87,7 +88,12 @@ if [ -n "$BOX" ]; then
   [ "$(docker inspect -f '{{index .Config.Labels "noo-demo-box"}}' "$BOX" 2>/dev/null)" = "1" ] \
     || die "container '$BOX' is not a film box (no label noo-demo-box=1); make one with scripts/demo/studio.sh up"
   T_RAW="$BOXDIR/raw.log"; T_MASKED="$BOXDIR/masked.log"; T_EXIT="$BOXDIR/exit.log"; T_MASK="$BOXDIR/mask.pl"
-  ENTER="exec docker exec -it -u you -w /home/you -e TERM=xterm-256color $BOX bash --norc -i"
+  # The film shell gets what a login shell on a real box gets from pam_systemd:
+  # the user runtime dir and bus, so `systemctl --user` (noo-hostd's controller
+  # unit, installed by `noo onboard`) works. The box enables lingering for the
+  # user at boot (studio.sh), which starts that user manager.
+  BOX_UID="$(docker exec "$BOX" id -u you 2>/dev/null || echo 1000)"
+  ENTER="exec docker exec -it -u you -w /home/you -e TERM=xterm-256color -e XDG_RUNTIME_DIR=/run/user/$BOX_UID -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$BOX_UID/bus $BOX bash --norc -i"
 fi
 box_cleanup() { [ -z "$BOX" ] || docker exec -u root "$BOX" rm -rf "$BOXDIR" >/dev/null 2>&1 || true; }
 # Whatever happens, the raw log (it holds the real values) does not outlive the run.
@@ -111,7 +117,7 @@ fill() {
   sed -e "s|@INSTALL_URL@|${INSTALL_URL:-https://example.invalid/install.sh}|g" \
       -e "s|@PLAYBACK_SPEED@|${SPEED}|g" \
       -e "s|@RAW_LOG@|${T_RAW}|g" -e "s|@MASKED_LOG@|${T_MASKED}|g" -e "s|@MASK@|${T_MASK}|g" \
-      -e "s|@EXIT_LOG@|${T_EXIT}|g" -e "s|@ENTER@|${ENTER}|g" "$1" > "$2"
+      -e "s|@EXIT_LOG@|${T_EXIT}|g" -e "s|@ENTER@|${ENTER}|g" -e "s|@INSTALL_SH@|${INSTALL_SH}|g" "$1" > "$2"
 }
 
 # Every sensitive value found in the raw log must be absent from the masked log.
@@ -236,6 +242,11 @@ else
   repo="$(sed -n 's/^REPO="\${NOO_CLI_REPO:-\([^}]*\)}".*/\1/p' noo-cli/install.sh | head -1)"
   [ -n "$repo" ] || die "could not read the declared release repo from noo-cli/install.sh"
   INSTALL_URL="https://github.com/${repo}/releases/latest/download/install.sh"
+  # NOO_DEMO_CLI_VERSION=noo-cli-vX.Y.Z[-rc.N] pins the install (install.sh honours
+  # NOO_CLI_VERSION); the pin is typed on screen, so the film says what it installed.
+  if [ -n "${NOO_DEMO_CLI_VERSION:-}" ]; then
+    case "$NOO_DEMO_CLI_VERSION" in noo-cli-v[0-9]*) INSTALL_SH="NOO_CLI_VERSION=$NOO_DEMO_CLI_VERSION sh" ;; *) die "NOO_DEMO_CLI_VERSION must look like noo-cli-v0.6.11-rc.2 (got '$NOO_DEMO_CLI_VERSION')" ;; esac
+  fi
 fi
 echo "film will install from: $INSTALL_URL"
 # In box mode ask from inside the box: it is the stranger's view, and the recorder image has no curl.

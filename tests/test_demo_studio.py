@@ -222,3 +222,21 @@ def test_the_box_boots_systemd_and_runs_docker_as_a_unit():
     # the recorder's fallback starts the unit, not a hand-rolled daemon
     assert "systemctl start docker" in studio
     assert "useradd -m -s /bin/bash you" in studio and "usermod -aG docker you" in studio
+
+
+def test_the_box_has_a_user_session_and_the_take_can_pin_a_release():
+    """After #400, `noo onboard --ci` installs noo-hostd as a USER unit when
+    sudo is passwordless. A `docker exec` shell has no user manager, so the box
+    lingers `you` at boot (logind on, not masked) and the film shell carries
+    XDG_RUNTIME_DIR and the session bus, as pam_systemd gives a real login.
+    NOO_DEMO_CLI_VERSION pins the install on screen (an rc under test)."""
+    studio = (DEMO / "studio.sh").read_text()
+    assert "systemd-logind" not in studio.split("systemctl mask", 1)[1].split("\n", 1)[0], "logind must run: linger needs it"
+    assert "/var/lib/systemd/linger/you" in studio
+    assert 'systemctl is-active "user@' in studio
+    assert "NOO_DEMO_CLI_VERSION" in studio
+    rec = (DEMO / "record-onboarding.sh").read_text()
+    assert "-e XDG_RUNTIME_DIR=/run/user/$BOX_UID -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$BOX_UID/bus" in rec
+    assert 'INSTALL_SH="NOO_CLI_VERSION=$NOO_DEMO_CLI_VERSION sh"' in rec and "@INSTALL_SH@" in rec
+    tape = (DEMO / "onboarding.tape.in").read_text()
+    assert 'Type "curl -fsSL @INSTALL_URL@ | @INSTALL_SH@" Enter' in tape
