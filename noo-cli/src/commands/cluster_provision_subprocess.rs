@@ -520,7 +520,7 @@ fn resolve_sync_node(gateway_nodes: &[Value], inventory: &[(String, String, Stri
 pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let parsed = parse_sync_images_args(args)?;
     if let Err(why) = parsed.validate() {
-        fail(g.json, ExitCode::Usage, "usage", &format!("noo cluster sync-images: {why}"), Some("noo help cluster sync-images"));
+        fail(g.json, ExitCode::Usage, "usage", &format!("noo cluster sync-images: {why}"), Some("noo cluster sync-images --help"));
     }
     if parsed.stage_only {
         return Ok(crate::commands::image_stage::run_stage_only(g, &parsed.images, &parsed.arches, parsed.lock, parsed.all_images));
