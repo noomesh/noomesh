@@ -2060,13 +2060,11 @@ async fn messages_send(
         // propagated rather than swallowed for that reason: a database
         // that cannot answer "does this recipient exist" must surface as
         // a 500, not as "no such recipient".
-        let known: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM noo_users WHERE username = $1) \
-             OR EXISTS (SELECT 1 FROM noo_node_config WHERE node_id = $1)",
-        )
-        .bind(to_account)
-        .fetch_one(&state.db)
-        .await?;
+        let known: bool = crate::repo::users::exists(&state.db, to_account).await?
+            || sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM noo_node_config WHERE node_id = $1)")
+                .bind(to_account)
+                .fetch_one(&state.db)
+                .await?;
         if !known {
             // Previously accepted and stored. A message to a name nobody
             // holds sat in the table forever and the sender was told

@@ -299,7 +299,7 @@ pub async fn get_evolution(
 /// `noo_kb_teams.org_id`). None when unknown / single-org.
 async fn resolve_org(db: &PgPool, user_id: Option<&str>) -> Option<String> {
     let uid = user_id?;
-    let sql = if let Some(team) = uid.strip_prefix("team:") {
+    if let Some(team) = uid.strip_prefix("team:") {
         return sqlx::query_scalar::<_, Option<String>>(
             "SELECT org_id FROM noo_kb_teams WHERE name = $1",
         )
@@ -309,16 +309,8 @@ async fn resolve_org(db: &PgPool, user_id: Option<&str>) -> Option<String> {
         .ok()
         .flatten()
         .flatten();
-    } else {
-        "SELECT org_id FROM noo_users WHERE username = $1"
-    };
-    sqlx::query_scalar::<_, Option<String>>(sql)
-        .bind(uid)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .flatten()
+    }
+    crate::repo::users::org_of(db, uid).await.ok().flatten()
 }
 
 pub async fn fetch_temporal_context(

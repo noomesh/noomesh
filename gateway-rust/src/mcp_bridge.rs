@@ -143,9 +143,7 @@ fn audience_of(v: &Value) -> Vec<String> {
 /// A person's role and knowledge-base roles, for the audience rule.
 async fn identity(state: &AppState, user: Option<&str>) -> (Option<Role>, Vec<String>) {
     let Some(u) = user else { return (None, Vec::new()) };
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
-        .bind(u)
-        .fetch_optional(&state.db)
+    let role: Option<String> = crate::repo::users::enabled_role(&state.db, u)
         .await
         .ok()
         .flatten();

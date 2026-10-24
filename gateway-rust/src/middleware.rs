@@ -788,9 +788,7 @@ pub(crate) fn agent_send_stays_medium(
 }
 
 async fn user_role(db: &sqlx::PgPool, username: &str) -> Option<crate::auth::Role> {
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1 AND NOT disabled")
-        .bind(username)
-        .fetch_optional(db)
+    let role: Option<String> = crate::repo::users::enabled_role(db, username)
         .await
         .ok()
         .flatten();

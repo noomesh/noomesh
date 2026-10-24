@@ -451,9 +451,7 @@ async fn deliver_task(state: &Arc<AppState>, mut d: Due) {
     // The owner's role and scopes, as the add-on would see them on a request
     // from that person. A disabled owner still gets their events (the
     // revoked + final state ones above all).
-    let role = sqlx::query_scalar::<_, String>("SELECT role FROM noo_users WHERE username = $1")
-        .bind(&owner)
-        .fetch_optional(db)
+    let role = crate::repo::users::role_of(db, &owner)
         .await
         .ok()
         .flatten()

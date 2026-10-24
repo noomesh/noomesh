@@ -249,9 +249,7 @@ async fn harness_call(
                     // the account is DISABLED (confirmed, not a failed read),
                     // an add-on's task gets `revoked account_disabled` and its
                     // final `state`, and the task stops.
-                    let disabled: Option<bool> = sqlx::query_scalar("SELECT disabled FROM noo_users WHERE username = $1")
-                        .bind(user)
-                        .fetch_optional(&state.db)
+                    let disabled: Option<bool> = crate::repo::users::disabled_flag(&state.db, user)
                         .await
                         .ok()
                         .flatten();

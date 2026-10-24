@@ -160,9 +160,7 @@ pub async fn chat_decider(
              {channel_user_id}` and grant that account the operator role."
         ));
     };
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM noo_users WHERE username = $1")
-        .bind(&username)
-        .fetch_optional(db)
+    let role: Option<String> = crate::repo::users::role_of(db, &username)
         .await
         // Tier 2 (crate::egress): the database error is logged under a
         // reference; the chat gets the general sentence and that reference.
