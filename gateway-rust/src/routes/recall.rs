@@ -124,14 +124,14 @@ fn unwrap_status(mut v: serde_json::Value) -> Result<serde_json::Value, String> 
 /// null with a `_detail` saying why, never 0 (the store may hold thousands).
 fn unreachable_status(error: &str) -> serde_json::Value {
     let mut body = json!({
-        "started": false,
-        "enabled": false,
         "engine": "rust+offline",
         "videos": [],
         "lifecycle": {},
         "traversals": {},
         "error": error,
     });
+    put_into(&mut body, "started", Measured::<bool>::unmeasured("worker unreachable"));
+    put_into(&mut body, "enabled", Measured::<bool>::unmeasured("worker unreachable"));
     put_into(&mut body, "video_count", Measured::<u64>::unmeasured(error));
     put_into(&mut body, "total_records", Measured::<u64>::unmeasured(error));
     put_into(&mut body, "total_size_mb", Measured::<f64>::unmeasured(error));
