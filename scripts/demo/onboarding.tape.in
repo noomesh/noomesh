@@ -73,10 +73,9 @@ Sleep 2500ms
 Type "noo health" Enter
 Wait
 Sleep 2s
-# `noo stack status`, not `noo cluster status`: in the standalone profile the
-# node agent is a host binary under systemd, and the studio's box has no
-# systemd, so the box never registers its own node ("no nodes", take 7). A real
-# install shows the node a minute after onboard; the film does not wait.
+# `noo stack status`, not `noo cluster status`: the node registers about a
+# minute after onboard (the host agent's first heartbeat) and the film does not
+# wait for it. (Before the box had systemd it never registered: "no nodes", take 7.)
 Type "noo stack status" Enter
 Wait
 Sleep 3s
