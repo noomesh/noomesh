@@ -1818,6 +1818,11 @@ pub const RETIRED_STORE_KEYS: &[(&str, &str)] = &[
         "NOO_MCP_TOKEN_PREVIOUS",
         "the rotation grace value of the retired NOO_MCP_TOKEN; ignored",
     ),
+    (
+        "NOO_SELF_CALL_SHARED_SECRET",
+        "the self-call bridge's shared secret, retired in 0.6.11 (the bridge is gone); nothing \
+         reads it",
+    ),
 ];
 
 /// The command that removes every [`RETIRED_STORE_KEYS`] entry from the store.
@@ -6517,6 +6522,34 @@ mod tests {
             crate::usage::USAGE.iter().any(|(path, _, _)| path.join(" ") == RETIRED_REMOVE_CMD.trim_start_matches("noo ")),
             "{RETIRED_REMOVE_CMD} is not a CLI verb"
         );
+    }
+
+    /// 0.6.11-rc.1 move rehearsal: a 0.6.10 install whose .env still holds
+    /// an empty `NOO_SELF_CALL_SHARED_SECRET=` slot (the self-call bridge was
+    /// retired by #371) got an ERROR `blank-value` from the audit, failing
+    /// `cluster verify`. A retired slot is not a credential waiting for a
+    /// value: blank is silent, held is a `retired-key` warning.
+    #[test]
+    fn the_retired_self_call_secret_is_retired_not_a_blank_credential() {
+        let mut env = fixture_env().map.clone();
+        env.insert("NOO_SELF_CALL_SHARED_SECRET".into(), String::new());
+        let env = SecretStore::from_map(env, PathBuf::from("/fixture/.env"), true);
+        let f = audit_findings(&audit_rows(&fixture_sops(), &env), true, &|_| false);
+        assert!(
+            !f.iter().any(|x| x.key == "NOO_SELF_CALL_SHARED_SECRET"),
+            "a blank retired slot is not a finding: {:?}",
+            f.iter().filter(|x| x.key == "NOO_SELF_CALL_SHARED_SECRET").map(|x| x.kind).collect::<Vec<_>>()
+        );
+
+        let mut sops = fixture_sops().map.clone();
+        sops.insert("NOO_SELF_CALL_SHARED_SECRET".into(), "SENTINEL-selfcall-9911".into());
+        let sops = SecretStore::from_map(sops, PathBuf::from("/fixture/secrets/env.sops"), true);
+        let f = audit_findings(&audit_rows(&sops, &fixture_env()), true, &|_| false);
+        let mine: Vec<&Finding> = f.iter().filter(|x| x.key == "NOO_SELF_CALL_SHARED_SECRET").collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].kind, "retired-key");
+        assert_eq!(mine[0].severity, Severity::Warn);
+        assert!(!mine[0].message.contains("SENTINEL"), "a finding never carries the value");
     }
 
     #[test]
