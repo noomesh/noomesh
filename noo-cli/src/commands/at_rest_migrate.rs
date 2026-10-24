@@ -670,9 +670,12 @@ fn all_dirs(j: &Journal) -> Vec<(String, String, Option<String>)> {
 
 // ── cluster verify ──────────────────────────────────────────────────────
 
+/// `(failing check names, at-rest rows as (name, verdict, detail))`.
+type VerifyRows = (BTreeSet<String>, Vec<(String, String, String)>);
+
 /// `(failing check names, the at-rest rows as "name: verdict — detail")`.
 /// Err when the output cannot be read: a verdict from nothing is no verdict.
-fn verify_rows(ctx: &Ctx) -> Result<(BTreeSet<String>, Vec<(String, String, String)>), String> {
+fn verify_rows(ctx: &Ctx) -> Result<VerifyRows, String> {
     let o = run(&ctx.noo, &["cluster".into(), "verify".into(), "--controller".into(), "--json".into()], &ctx.root)?;
     let line = o.stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
     let v: Value = serde_json::from_str(line).map_err(|_| format!("the JSON of `noo cluster verify --controller` was not readable (exit {}): {}", o.code, o.tail()))?;
@@ -735,10 +738,13 @@ fn psql(ctx: &Ctx, sql: &str) -> Result<String, String> {
     Ok(o.stdout)
 }
 
+/// `(tables counted, exact row count per table, database size in bytes)`.
+type Counts = (Vec<String>, BTreeMap<String, u64>, u64);
+
 /// Exact counts of the ten busiest tables (from pg_stat_user_tables) and the
 /// database size. `tables` fixes which tables are counted: the "after"
 /// capture counts the same ones.
-fn capture_counts(ctx: &Ctx, tables: Option<Vec<String>>) -> Result<(Vec<String>, BTreeMap<String, u64>, u64), String> {
+fn capture_counts(ctx: &Ctx, tables: Option<Vec<String>>) -> Result<Counts, String> {
     let tables = match tables {
         Some(t) => t,
         None => psql(
