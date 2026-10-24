@@ -153,6 +153,20 @@ exit_check() {
   echo "exit check: every step in the film succeeded"
 }
 
+# gif_from_mp4 MP4 GIF: the GIF is made from the MP4, not by vhs. vhs's GIF
+# render computes ONE palette over every frame of the film, which holds all of
+# them in memory: a 20-minute take was killed at 7 GB and, uncapped, took a
+# 19 GiB WSL2 host down twice (2026-10-23/24). This streams instead: a palette
+# per frame (`stats_mode=single` + `paletteuse=new=1`), at a GIF-sized frame
+# rate and width. The MP4 keeps the full frames; the GIF is the preview.
+gif_from_mp4() {
+  local mp4="$1" gif="$2"
+  [ -s "$mp4" ] || { echo "no MP4 to make the GIF from: $mp4" >&2; return 1; }
+  ffmpeg -loglevel error -y -i "$mp4" \
+    -vf "fps=${NOO_DEMO_GIF_FPS:-12},scale=${NOO_DEMO_GIF_WIDTH:-1000}:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=bayer:bayer_scale=5" \
+    "$gif" || { echo "GIF render failed; the MP4 stands" >&2; return 1; }
+}
+
 finish() { # $1 base name (smoke|onboarding)
   local base="$1"
   local lc=0
@@ -227,6 +241,7 @@ box_prepare
 vhs "$OUT/onboarding.generated.tape"
 rm -f "$OUT/onboarding.generated.tape"
 box_collect
+gif_from_mp4 "$OUT/onboarding.mp4" "$OUT/onboarding.gif"
 finish onboarding
 
 # A contact sheet (one frame every 5 s) for the last look before publishing.
