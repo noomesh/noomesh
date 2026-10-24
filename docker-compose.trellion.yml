@@ -57,10 +57,11 @@ x-noo-addon:
   consumer: svc:trellion
   key: NOO_SVC_KEY_TRELLION
   containers: [noo-trellion]
-  scopes: [chat, embeddings, metrics]
+  scopes: [chat, embeddings, metrics, voice:transcribe]
   why: >-
     the knowledge pack's extraction and retrieval call the gateway's chat and
-    embeddings, and its counters post to the gateway's metrics door.
+    embeddings, its counters post to the gateway's metrics door, and its audio
+    ingest transcribes through the gateway's transcribe routes.
   # This add-on's OWN NATS principal (i70 residue). The name is the add-on
   # key; declaring it here is what makes `noo cluster nats-users render`
   # (and `noo upgrade --stack`, `noo addons enable`) render a `trellion`

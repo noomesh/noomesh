@@ -2499,7 +2499,7 @@ fn validate_key_scopes_with(scopes: &[String], declared: &[String]) -> Result<()
     if !bad.is_empty() {
         return Err(AppError::BadRequest(format!(
             "unknown scope(s): {bad:?}. Allowed: {SERVICE_KEY_SCOPES:?}, the control scopes \
-             (temporal, heartbeat, activities, channels:send, metrics, config:<section>) \
+             (temporal, heartbeat, activities, channels:send, metrics, voice:transcribe, config:<section>) \
              (+ {OPERATOR_ONLY_KEY_SCOPES:?}, operator-issued only).{}",
             addon_scope_hint(declared)
         )));

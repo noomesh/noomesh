@@ -7000,7 +7000,7 @@ mod tests {
         let keys = serde_json::json!({ "keys": [
             // superseded row with the wide grant must not mask the live one
             { "consumer": "svc:trellion", "active": true, "superseded_at": "2026-09-01T00:00:00Z",
-              "scopes": ["addon", "chat", "embeddings", "metrics"] },
+              "scopes": ["addon", "chat", "embeddings", "metrics", "voice:transcribe"] },
             { "consumer": "svc:trellion", "active": true, "superseded_at": null,
               "scopes": ["addon", "chat", "embeddings"] },
             { "consumer": "svc:evolve", "active": true, "superseded_at": null, "scopes": evolve_full },
@@ -7013,7 +7013,7 @@ mod tests {
 
         let fixed = serde_json::json!({ "keys": [
             { "consumer": "svc:trellion", "active": true, "superseded_at": null,
-              "scopes": ["addon", "chat", "embeddings", "metrics"] },
+              "scopes": ["addon", "chat", "embeddings", "metrics", "voice:transcribe"] },
         ]});
         assert_eq!(service_key_grants_check(&fixed, &required).verdict, Verdict::Ok,
             "a consumer with no key is the `service keys` row's business, not this one's");
