@@ -5445,6 +5445,11 @@ pub fn cluster_verify(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
         if let Some(c) = crate::commands::at_rest_seal::pcr_binding_row_live() {
             checks.push(c);
         }
+        // The data root must still be on the filesystem recorded for it: a
+        // missing data disk must never let postgres initialise an empty
+        // database (2026-10-24). The criterion is the shell library the
+        // launchers and hostd run.
+        checks.push(crate::commands::data_root::mount_row(&crate::envfile::repo_root()));
         checks.push(monitoring_web_config_check(compose.as_deref()));
         // The runtime images (redis + monitoring) are the family their keys
         // and data are handed to (0.6.1: the upstream family, restart loops).

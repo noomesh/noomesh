@@ -32,9 +32,27 @@ import (
 // started (lib-state-volume.sh check_state_volume_open). A directory that EXISTS means
 // the files are there (a hostd restart, not a reboot) and the step does nothing,
 // so a service an operator stopped by hand stays stopped.
+//
+// The data root. With restart: unless-stopped, dockerd starts the containers at
+// boot WITHOUT a launcher, so a data disk that did not come back leaves postgres
+// binding an empty directory on the root disk and initialising a NEW EMPTY
+// database there (the 2026-10-24 near miss). The step therefore runs
+// lib-data-root-mount.sh data_root_mount_boot_guard FIRST, whether or not the
+// secret directory is populated: when the data root is missing, unreadable or
+// not on the filesystem recorded in .noo-data-root-id, it stops the stack's
+// containers (postgres first), writes why to .noo-data-root-refused, starts
+// nothing and fails the attempt (retried: a slow disk may yet mount). It never
+// starts a container on that path. The race is real (dockerd is up before
+// this daemon), so the stop is a backstop; the launchers' check is the gate.
+// Hardening for later: a controller-only docker drop-in RequiresMountsFor=<data
+// root> would keep dockerd from starting at all, at the price of docker (and
+// everything on it) staying down while the disk is absent.
 
 const bootRestoreScript = `_noo_lib=%s
 . "$_noo_lib" 2>/dev/null || { echo "boot-restore: cannot source lib-secrets.sh" >&2; exit 2; }
+if . "$(dirname "$_noo_lib")/lib-data-root-mount.sh" 2>/dev/null; then
+  data_root_mount_boot_guard || { echo "boot-restore: the data root is not on its recorded filesystem — stateful containers stopped, nothing started (reason above, and in .noo-data-root-refused)" >&2; exit 3; }
+fi
 d="$(secret_rundir)"
 if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
   echo "boot-restore: $d is populated; nothing to do"

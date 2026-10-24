@@ -69,6 +69,7 @@ the binary's own usage table by `scripts/gen-cli-docs.py`.
 | Document | Description |
 |----------|-------------|
 | [operating/runbooks/at-rest-recovery.md](operating/runbooks/at-rest-recovery.md) | The TPM-unlocked state volume (i10a): the volume does not open at boot, recovery over ssh with the recovery key, re-enrolling the TPM after a firmware or boot-chain change |
+| [operating/runbooks/data-root-recovery.md](operating/runbooks/data-root-recovery.md) | The data disk is missing, unreadable or replaced: the launchers and hostd refuse to start the stack (no empty-database initdb), how to bring the disk back, when to re-record |
 | [operating/runbooks/backup-restore-secrets.md](operating/runbooks/backup-restore-secrets.md) | The two recovery artifacts, the restore drill, restoring a database or a whole controller, scheduled backups, passphrase rotation |
 | [operating/runbooks/nats-isolation.md](operating/runbooks/nats-isolation.md) | Grant changes on the node's NATS credential: render and reload the bus before upgrading an agent that needs a new subject |
 | [operating/runbooks/host-updates.md](operating/runbooks/host-updates.md) | Updating the OS without taking the mesh down: everyday vs platform packages, the hold command, canary → soak → controller, the pre-reboot check, and recovering a controller that does not boot |

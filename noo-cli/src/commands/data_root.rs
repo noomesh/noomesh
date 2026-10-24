@@ -422,6 +422,51 @@ pub(crate) fn link_notes(rendered: &Rendered, reported: Option<&Value>) -> Vec<S
     }
 }
 
+/// The verify row name for the data-root mount guard.
+pub(crate) const MOUNT_ROW: &str = "data root filesystem";
+
+/// What a `scripts/lib-data-root-mount.sh data_root_mount_report` exit code
+/// means for the verify row: 0 on its recorded filesystem (OK), 3 refused
+/// (FAIL: the launchers refuse too), 4 nothing recorded yet or not checkable
+/// (WARN), anything else the report could not run (WARN).
+pub(crate) fn mount_row_from(code: Option<i32>, evidence: &str) -> crate::commands::cluster_verify::Check {
+    use crate::commands::cluster_verify::{Check, Verdict};
+    let evidence = evidence.trim().to_string();
+    let recovery = "findmnt -T <data root>; lsblk -f; docs/operating/runbooks/data-root-recovery.md".to_string();
+    let (verdict, detail, remedy) = match code {
+        Some(0) => (Verdict::Ok, evidence, None),
+        Some(3) => (Verdict::Fail, format!("{evidence} (the launchers refuse to start; postgres would initialise an empty database)"), Some(recovery)),
+        Some(4) => (Verdict::Warn, evidence, Some("the next noo stack start records it".to_string())),
+        other => (
+            Verdict::Warn,
+            format!("the data-root mount check could not run (exit {}): {evidence}", other.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
+            None,
+        ),
+    };
+    Check { name: MOUNT_ROW, verdict, detail, remedy }
+}
+
+/// `noo cluster verify --controller` row: is the data root on the filesystem
+/// recorded for it? The criterion is `scripts/lib-data-root-mount.sh` (one
+/// home; the launchers and hostd run the same code), run read-only here.
+pub(crate) fn mount_row(install_root: &std::path::Path) -> crate::commands::cluster_verify::Check {
+    let lib = install_root.join("scripts").join("lib-data-root-mount.sh");
+    if !lib.is_file() {
+        return mount_row_from(None, &format!("{} is missing from this install", lib.display()));
+    }
+    match std::process::Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\" && data_root_mount_report")
+        .arg("noo")
+        .arg(&lib)
+        .current_dir(install_root)
+        .output()
+    {
+        Ok(o) => mount_row_from(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
+        Err(e) => mount_row_from(None, &e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -587,5 +632,17 @@ mod tests {
         assert_eq!(link_notes(&rendered("/data/noo"), Some(&rep)).len(), 1);
         // The root's target only counts when the bundle renders the reported root.
         assert!(data_root_conflict(&rendered("/opt/noo"), Some(&rep)).is_some());
+    }
+
+    #[test]
+    fn mount_row_maps_the_report_exit_codes() {
+        use crate::commands::cluster_verify::Verdict;
+        let ok = mount_row_from(Some(0), "/d is on its recorded filesystem (UUID a)");
+        assert_eq!((ok.name, ok.verdict), (MOUNT_ROW, Verdict::Ok));
+        let bad = mount_row_from(Some(3), "the data root /d is not on its recorded filesystem");
+        assert_eq!(bad.verdict, Verdict::Fail);
+        assert!(bad.detail.contains("not on its recorded filesystem") && bad.remedy.is_some());
+        assert_eq!(mount_row_from(Some(4), "no filesystem recorded yet").verdict, Verdict::Warn);
+        assert_eq!(mount_row_from(None, "boom").verdict, Verdict::Warn);
     }
 }

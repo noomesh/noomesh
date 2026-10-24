@@ -55,6 +55,10 @@ check_secrets_at_rest || exit 1
 # ...and a restart onto a closed encrypted state volume (i10a).
 source "$_LIBDIR/lib-state-volume.sh"
 check_state_volume_open || exit 1
+# ...and a start whose data root is not on the filesystem it was recorded on
+# (a missing data disk must never let postgres initialise an empty database).
+source "$_LIBDIR/lib-data-root-mount.sh"
+check_data_root_mount || exit 1
 
 # ── Distribution overlay (first-contact finding #43, unified in #43b) ───
 # Restart must speak dist too: without this, `restart --force` on a dist/

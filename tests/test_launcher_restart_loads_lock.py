@@ -92,6 +92,7 @@ def _install(tmp: Path, lock: str | None) -> tuple[Path, dict[str, str]]:
     (work / "noomesh.yaml").write_text("compose_env: {}\n")
     (work / "secrets").mkdir()
     (work / "secrets" / "env.sops").write_text("x\n")
+    (tmp / "data").mkdir(exist_ok=True)  # the data-root mount guard refuses a data root that is not there
     (work / ".env").write_text(
         f"NOO_INSTALL_MODE=dist\nNOO_IMAGE_TAG={TAG}\nNOO_DATA_ROOT={tmp / 'data'}\n"
         "NOO_BIND_MODE=local\nNOO_SECRETS_BACKEND=sops\n")
