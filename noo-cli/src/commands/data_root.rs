@@ -428,7 +428,9 @@ pub(crate) const MOUNT_ROW: &str = "data root filesystem";
 /// What a `scripts/lib-data-root-mount.sh data_root_mount_report` exit code
 /// means for the verify row: 0 on its recorded filesystem (OK), 3 refused
 /// (FAIL: the launchers refuse too), 4 nothing recorded yet or not checkable
-/// (WARN), anything else the report could not run (WARN).
+/// (WARN: macOS, which has no findmnt), 5 refused because it cannot be checked
+/// (FAIL: no findmnt on Linux, the launchers refuse until util-linux is
+/// installed), anything else the report could not run (WARN).
 pub(crate) fn mount_row_from(code: Option<i32>, evidence: &str) -> crate::commands::cluster_verify::Check {
     use crate::commands::cluster_verify::{Check, Verdict};
     let evidence = evidence.trim().to_string();
@@ -437,6 +439,11 @@ pub(crate) fn mount_row_from(code: Option<i32>, evidence: &str) -> crate::comman
         Some(0) => (Verdict::Ok, evidence, None),
         Some(3) => (Verdict::Fail, format!("{evidence} (the launchers refuse to start; postgres would initialise an empty database)"), Some(recovery)),
         Some(4) => (Verdict::Warn, evidence, Some("the next noo stack start records it".to_string())),
+        Some(5) => (
+            Verdict::Fail,
+            evidence,
+            Some("install util-linux (apt install util-linux / apk add util-linux), then noo stack start".to_string()),
+        ),
         other => (
             Verdict::Warn,
             format!("the data-root mount check could not run (exit {}): {evidence}", other.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
@@ -643,6 +650,9 @@ mod tests {
         assert_eq!(bad.verdict, Verdict::Fail);
         assert!(bad.detail.contains("not on its recorded filesystem") && bad.remedy.is_some());
         assert_eq!(mount_row_from(Some(4), "no filesystem recorded yet").verdict, Verdict::Warn);
+        let nofm = mount_row_from(Some(5), "findmnt is not installed, so which filesystem holds the data root /d cannot be checked");
+        assert_eq!(nofm.verdict, Verdict::Fail, "no findmnt on Linux: the launchers refuse, so verify fails");
+        assert!(nofm.remedy.as_deref().is_some_and(|r| r.contains("util-linux")));
         assert_eq!(mount_row_from(None, "boom").verdict, Verdict::Warn);
     }
 }
