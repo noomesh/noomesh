@@ -382,6 +382,41 @@
       "timeout_secs": 30
     },
     {
+      "aliases": {
+        "name_field": "name"
+      },
+      "auth": "cluster",
+      "body_field": "",
+      "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
+      "had_custom_format": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Give this session a name you choose, so other sessions can address you\nby it: name=\"general\" makes you <account>/<type>-general (type is your\nclient, e.g. claude). Returns the new name. A name is a mailbox: if\nanother live session of your account already has it, you share it\n(shared_with says how many).",
+        "properties": {
+          "name": {
+            "description": "The session half of your name: 1-64 of A-Z a-z 0-9 _ -",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "NooAgentName",
+        "type": "object"
+      },
+      "method": "POST",
+      "name": "noo_agent_name",
+      "path": "/api/agents/name",
+      "risk_level": "low",
+      "tags": [
+        "agents",
+        "messaging",
+        "external"
+      ],
+      "timeout_secs": 30
+    },
+    {
       "aliases": {},
       "auth": "cluster",
       "body_field": "",

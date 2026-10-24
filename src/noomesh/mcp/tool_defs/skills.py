@@ -287,6 +287,24 @@ class NooAgentWhoami(ToolDef):
 
 
 @register
+class NooAgentName(ToolDef):
+    """Give this session a name you choose, so other sessions can address you
+    by it: name="general" makes you <account>/<type>-general (type is your
+    client, e.g. claude). Returns the new name. A name is a mailbox: if
+    another live session of your account already has it, you share it
+    (shared_with says how many)."""
+
+    name: ClassVar[str] = "noo_agent_name"
+    description: ClassVar[str] = __doc__
+    method: ClassVar[HttpMethod] = HttpMethod.POST
+    path: ClassVar[str] = "/api/agents/name"
+    tags: ClassVar[List[str]] = ["agents", "messaging", "external"]
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW
+
+    name_field: str = Field(alias="name", description="The session half of your name: 1-64 of A-Z a-z 0-9 _ -")
+
+
+@register
 class NooAgentThread(ToolDef):
     """Read one conversation thread between agents (all messages in it)."""
 
