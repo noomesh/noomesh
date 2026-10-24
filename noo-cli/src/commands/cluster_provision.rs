@@ -1133,8 +1133,8 @@ pub(crate) fn parse_ttl_seconds(s: &str) -> Option<i64> {
 /// `noo cluster bootstrap-token create [--ttl 1h|30m|24h|3600] [--role R]
 /// [--cidr C]` — mint a single-use enrollment token and print the one-liner.
 /// `noo cluster bootstrap-token` with a wrong/missing subaction — a
-/// near-miss used to fall through to the Python-CLI passthrough and die in
-/// "set NOO_PY_CLI" advice that has nothing to do with the typo (live
+/// near-miss used to fall through to a Python CLI and die in
+/// unrelated advice that has nothing to do with the typo (live
 /// 2026-08-27: `bootstrap-token --node host5`, missing `create`). A group
 /// stub owns the prefix and prints the real usage instead (finding #89).
 pub fn cluster_bootstrap_token_usage(g: &Globals, _args: &[String]) -> Result<i32, Unhandled> {

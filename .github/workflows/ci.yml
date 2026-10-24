@@ -1036,12 +1036,12 @@ jobs:
         key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # noo-cli is the Rust front door: native commands dispatched by a
-  # first-match registry, everything else passed through to the Python CLI.
+  # first-match registry; everything else is a usage error (exit 2).
   # This job gates the dispatch/contract so a handler edit can't silently
   # break routing:
   #   - clippy (-D warnings) with the crate's documented pre-existing allows
-  #   - cargo test: registry-integrity + resolve() dispatch + passthrough
-  #     taxonomy + the onboard unit tests
+  #   - cargo test: registry-integrity + resolve() dispatch + the unknown-verb
+  #     contract + the onboard unit tests
   #   - tests/smoke.sh: gateway-free standalone contract on the built binary
   # `cargo fmt --check` is intentionally omitted: the ported handler modules
   # are not rustfmt-clean under default settings (the rust-gateway job also
@@ -1378,7 +1378,7 @@ jobs:
             grep -q "local-first AI agent mesh" <<<"$out"
 
             # 2. Native gateway command with no gateway: a clean, structured
-            #    exit 3 (gateway_unreachable) — never a crash or a passthrough.
+            #    exit 3 (gateway_unreachable) — never a crash.
             set +e
             out="$(noo health --json 2>&1)"
             rc=$?
@@ -1387,24 +1387,30 @@ jobs:
             grep -q "gateway_unreachable" <<<"$out"
           '
 
-    # PY_ONLY message contract: never-port commands must print the
-    # actionable "requires the Python install" message, exit 2.
-    # (Pick from the PY_ONLY list in noo-cli/src/passthrough.rs.) The retired
-    # `tui` gets its own assertion: native pointer, exit 1, no Python involved.
-    - name: PY_ONLY message contract
+    # Unknown-verb contract: a bare group and an unknown verb print a usage
+    # error and exit 2 on a box with no Python (nothing is ever exec'd). The
+    # retired `tui` gets its own assertion: native pointer, exit 1.
+    - name: Unknown-verb contract
       if: needs.scope.outputs.code == 'true' && needs.scope.outputs.deferred != 'true'
       run: |
         set -eux
         docker run --rm -v "${PWD}/noo-cli/target/release/noo":/usr/local/bin/noo:ro \
           ubuntu:24.04 bash -euxc '
-            # 3. A PY_ONLY command with no Python: friendly actionable message,
-            #    exit 2 — not a stack trace, not a silent failure.
+            # 3. A bare group: usage error, exit 2.
             set +e
             out="$(noo plugins 2>&1)"
             rc=$?
             set -e
             [ "$rc" -eq 2 ]
-            grep -q "requires the Python install" <<<"$out"
+            grep -qi "needs a subcommand" <<<"$out"
+            # 3a. An unknown verb: exit 2, named, never a Python hint.
+            set +e
+            out="$(noo definitelynotacommand 2>&1)"
+            rc=$?
+            set -e
+            [ "$rc" -eq 2 ]
+            grep -qi "unknown command" <<<"$out"
+            if grep -qi "python" <<<"$out"; then exit 1; fi
             # 3b. The RETIRED tui: native pointer message, exit 1.
             set +e
             out="$(noo tui 2>&1)"

@@ -154,10 +154,10 @@ def _rust_native_paths() -> set[str]:
 
 def test_every_python_command_has_a_rust_verb_under_the_same_words() -> None:
     """The refusal sends the operator to `noo <same words>`. If a Python
-    command had no native twin, that pointer would pass straight back to
-    Python and refuse again — so such a command must instead be routed
-    through the gateway with the operator's login, and this test is where
-    that decision gets forced."""
+    command had no native twin, that pointer would land on an unknown
+    command (the Rust `noo` execs no Python any more) — so such a command
+    must instead be routed through the gateway with the operator's login,
+    and this test is where that decision gets forced."""
     native = _rust_native_paths()
     paths = _python_command_paths()
     assert len(paths) > 100, f"walked only {len(paths)} Python commands"

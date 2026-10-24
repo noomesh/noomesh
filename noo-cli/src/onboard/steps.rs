@@ -1222,7 +1222,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
     // Interactive remediation. Install and join hand the REAL terminal to
     // subprocesses (sudo password prompts, the `tailscale up` login URL) —
     // the console runs them directly, the TUI suspends/resumes around
-    // them, and the web wizard (run_passthrough → None) keeps the manual
+    // them, and the web wizard (run_inherited → None) keeps the manual
     // path. This used to dead-end into "set it up later and re-run
     // 'noo onboard --reconfigure'"; the wizard can do both steps itself.
     let can_remediate = !ctx.non_interactive && !ctx.dry_run;
@@ -1237,7 +1237,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
         // piped into a shell. See crate::vendor.
         let ts_cmd = crate::vendor::install_script_cmd(crate::vendor::TAILSCALE_INSTALL_URL);
         ctx.info("Installing Tailscale from tailscale.com/install.sh (downloaded, checked, digest logged)");
-        let code = ctx.ui.run_passthrough(&["sh".into(), "-c".into(), ts_cmd]);
+        let code = ctx.ui.run_inherited(&["sh".into(), "-c".into(), ts_cmd]);
         installed = tailscale_installed();
         match code {
             None => ctx.warn(
@@ -1248,7 +1248,7 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
                 // Just installed: no peers depend on this daemon yet, so the
                 // restart that applies the switch costs nothing. An existing
                 // Tailscale is never restarted here (docs/security/telemetry.md).
-                if ctx.ui.run_passthrough(&["sh".into(), "-c".into(), crate::vendor::tailscale_nologs_linux_script()]) != Some(0) {
+                if ctx.ui.run_inherited(&["sh".into(), "-c".into(), crate::vendor::tailscale_nologs_linux_script()]) != Some(0) {
                     ctx.warn("Could not switch off tailscaled's log upload — see docs/security/telemetry.md, Host software.");
                 }
             }
@@ -1312,14 +1312,14 @@ pub fn tailscale(ctx: &mut Ctx) -> bool {
             ),
             true,
         ) {
-            let mut result = ctx.ui.run_passthrough(&argv);
+            let mut result = ctx.ui.run_inherited(&argv);
             if controller_tag && matches!(result, Some(c) if c != 0) {
                 // The login identity is not a tag owner (non-admin account):
                 // join untagged and let ensure_controller_tag take the API /
                 // console path with a clear message.
                 ctx.warn("tailscale refused --advertise-tags=tag:controller (this login is not a tag owner) — joining untagged; the tag is asserted next step.");
                 argv.retain(|a| !a.starts_with("--advertise-tags="));
-                result = ctx.ui.run_passthrough(&argv);
+                result = ctx.ui.run_inherited(&argv);
             }
             match result {
                 Some(0) => identity = tailscale_identity(),

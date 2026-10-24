@@ -2531,7 +2531,7 @@ pub fn cluster_sync_models(g: &Globals, _args: &[String]) -> Result<i32, Unhandl
 
 /// `noo cluster exec` — RETIRED 2026-09-11.
 ///
-/// It only ever existed as a `noo-py` verb that ssh'd into the node and ran
+/// It only ever existed as a Python-CLI verb that ssh'd into the node and ran
 /// a shell command. There is no rail replacement and that is deliberate:
 /// the node-agent exposes named operations (`/start`, `/stop`, `/restart`,
 /// `/pull`, `/clean`, `/logs/*`, skills) and NO arbitrary-exec endpoint. An

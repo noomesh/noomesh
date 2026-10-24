@@ -104,11 +104,11 @@ impl WizardUi for TuiUi {
         false
     }
 
-    /// Suspend/resume passthrough (the `$EDITOR`-from-a-TUI pattern): the
+    /// Suspend/resume pass-through (the `$EDITOR`-from-a-TUI pattern): the
     /// event loop leaves the alternate screen, hands the terminal to the
     /// subprocess (sudo prompts and login URLs render normally), and
     /// re-enters ratatui when it exits.
-    fn run_passthrough(&self, argv: &[String]) -> Option<i32> {
+    fn run_inherited(&self, argv: &[String]) -> Option<i32> {
         self.abort_check();
         if self
             .msgs
@@ -640,7 +640,7 @@ fn run_event_loop(msg_rx: Receiver<Msg>, ans_tx: Sender<String>, ui: Arc<TuiUi>)
                 // the answers channel until the code is sent.
                 ratatui::restore();
                 println!();
-                println!("\u{2500}\u{2500} wizard passthrough: {} \u{2500}\u{2500}", argv.join(" "));
+                println!("\u{2500}\u{2500} wizard child command: {} \u{2500}\u{2500}", argv.join(" "));
                 let code = match argv.split_first() {
                     Some((cmd, args)) => std::process::Command::new(cmd)
                         .args(args)
