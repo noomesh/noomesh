@@ -7,6 +7,7 @@
       "description": "Acknowledge (mark read) a message addressed to you.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Acknowledge (mark read) a message addressed to you.",
         "properties": {
           "message_id": {
@@ -39,6 +40,7 @@
       "description": "Read your account's agent messages, newest first: everything addressed\nto any name under your account (every window and label you run), plus\nthe threads those names take part in. Narrow with to= (one name) or\nthread=. Read state is per reader: unread=true shows what THIS\ncredential has not yet acknowledged, whatever a sibling window acked.\nAcknowledge with noo_agent_ack. Operators may name another account.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read your account's agent messages, newest first: everything addressed\nto any name under your account (every window and label you run), plus\nthe threads those names take part in. Narrow with to= (one name) or\nthread=. Read state is per reader: unread=true shows what THIS\ncredential has not yet acknowledged, whatever a sibling window acked.\nAcknowledge with noo_agent_ack. Operators may name another account.",
         "properties": {
           "all": {
@@ -141,6 +143,7 @@
       "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Send a message to another agent on the mesh. Addressed by agent id\n(e.g. \"host3/claude-code-1\"), or \"thread\" to post into an existing thread,\nor \"*\" to broadcast (operators and internal services only). Recorded and\ndelivered over NATS; the sender is the caller's identity \u2014 user, node and\nharness are derived from the credential, never from this call.",
         "properties": {
           "agent": {
@@ -268,6 +271,7 @@
       "description": "Read one conversation thread between agents (all messages in it).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Read one conversation thread between agents (all messages in it).",
         "properties": {
           "limit": {
@@ -313,6 +317,7 @@
       "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Your own agent name on this session \u2014 the address other sessions use to message you.",
         "properties": {},
         "title": "NooAgentWhoami",
@@ -336,6 +341,7 @@
       "description": "Run a prompt through the coordinator's agentic loop. The coordinator plans,\ncalls tools, and iterates until it has a complete answer. Returns the final\nresponse and a list of tool calls made during reasoning.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a prompt through the coordinator's agentic loop. The coordinator plans,\ncalls tools, and iterates until it has a complete answer. Returns the final\nresponse and a list of tool calls made during reasoning.",
         "properties": {
           "backend": {
@@ -414,6 +420,7 @@
       "description": "List all cluster nodes with hostname, IP, tier, GPU, status, and running backends.\nUse this to check which nodes are online and what models are loaded.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all cluster nodes with hostname, IP, tier, GPU, status, and running backends.\nUse this to check which nodes are online and what models are loaded.",
         "properties": {},
         "title": "PaiClusterStatus",
@@ -437,6 +444,7 @@
       "description": "Retrieve recent conversation context from the coordinator. Returns a\nsummary of recent interactions, useful for maintaining continuity across\nsessions and channels.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Retrieve recent conversation context from the coordinator. Returns a\nsummary of recent interactions, useful for maintaining continuity across\nsessions and channels.",
         "properties": {
           "channel": {
@@ -488,6 +496,7 @@
       "description": "Classify a query's intent type and confidence. Returns one of:\ncausal (why/cause/effect), definitional (what is/define),\nprocedural (how to/steps), comparative (vs/difference),\nexploratory (general). Confidence 0.0-1.0 indicates classification ambiguity.\nUse this to understand how the graph system would approach a query.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Classify a query's intent type and confidence. Returns one of:\ncausal (why/cause/effect), definitional (what is/define),\nprocedural (how to/steps), comparative (vs/difference),\nexploratory (general). Confidence 0.0-1.0 indicates classification ambiguity.\nUse this to understand how the graph system would approach a query.",
         "properties": {
           "query": {
@@ -520,6 +529,7 @@
       "description": "Get full details of a knowledge graph entity by its UUID: name, type,\nall connected entities (edges), and which document pages mention it.\nRequires an entity_id from noo_graph_search_entities.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get full details of a knowledge graph entity by its UUID: name, type,\nall connected entities (edges), and which document pages mention it.\nRequires an entity_id from noo_graph_search_entities.",
         "properties": {
           "entity_id": {
@@ -552,6 +562,7 @@
       "description": "Find the shortest reasoning path between two entities in the knowledge graph.\nUses BFS to find the chain of relationships connecting them (max 5 hops).\nReturns human-readable steps like: Python --[USED_IN]--> Data Science --[CAUSES]--> Job Growth.\nUse this to explain how two concepts are related.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find the shortest reasoning path between two entities in the knowledge graph.\nUses BFS to find the chain of relationships connecting them (max 5 hops).\nReturns human-readable steps like: Python --[USED_IN]--> Data Science --[CAUSES]--> Job Growth.\nUse this to explain how two concepts are related.",
         "properties": {
           "dst_entity_id": {
@@ -590,6 +601,7 @@
       "description": "Find seed entities and reasoning paths for a question.\n    This is the primary tool for graph-guided reasoning about a question.\n    Returns seed entities, hypotheses (chains of relationships), and candidate pages.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find seed entities and reasoning paths for a question.\nThis is the primary tool for graph-guided reasoning about a question.\nReturns seed entities, hypotheses (chains of relationships), and candidate pages.",
         "properties": {
           "max_hops": {
@@ -667,6 +679,7 @@
       "description": "Traverse the knowledge graph outward from an entity: find related entities\nwithin 1-3 hops. Returns connected entities and their relationship types\n(CAUSES, DEPENDS_ON, LIMITED_BY, RELATED_TO, etc.).\nOptionally filter by edge type to follow only specific relationships.\nFor intent-aware traversal, use noo_graph_traverse_with_intent instead.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Traverse the knowledge graph outward from an entity: find related entities\nwithin 1-3 hops. Returns connected entities and their relationship types\n(CAUSES, DEPENDS_ON, LIMITED_BY, RELATED_TO, etc.).\nOptionally filter by edge type to follow only specific relationships.\nFor intent-aware traversal, use noo_graph_traverse_with_intent instead.",
         "properties": {
           "entity_id": {
@@ -725,6 +738,7 @@
       "description": "Find knowledge clusters relevant to a query using vector search over cluster centroids.\nEach cluster is a labelled group of closely-related entities. Use this to discover which areas of the\nknowledge base are most relevant to a topic.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Find knowledge clusters relevant to a query using vector search over cluster centroids.\nEach cluster is a labelled group of closely-related entities. Use this to discover which areas of the\nknowledge base are most relevant to a topic.",
         "properties": {
           "query": {
@@ -772,6 +786,7 @@
       "description": "Search the knowledge graph for named entities (people, organizations, concepts,\ntechnologies, locations, events, products, standards, regulations).\nUses text matching with automatic semantic embedding fallback for broader coverage.\nReturns entity IDs, names, and types. Use the IDs with noo_graph_entity_detail,\nnoo_graph_neighbors, or noo_graph_traverse_with_intent for deeper exploration.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search the knowledge graph for named entities (people, organizations, concepts,\ntechnologies, locations, events, products, standards, regulations).\nUses text matching with automatic semantic embedding fallback for broader coverage.\nReturns entity IDs, names, and types. Use the IDs with noo_graph_entity_detail,\nnoo_graph_neighbors, or noo_graph_traverse_with_intent for deeper exploration.",
         "properties": {
           "query": {
@@ -817,6 +832,7 @@
       "description": "Search entities by meaning using graph-aware vector embeddings.\nUnlike noo_graph_search_entities (text matching), this finds conceptually\nsimilar entities even when names don't match -- e.g. searching 'parallel computing'\ncan find 'MPI', 'OpenMP', 'threading'. Requires entity embeddings to be computed.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search entities by meaning using graph-aware vector embeddings.\nUnlike noo_graph_search_entities (text matching), this finds conceptually\nsimilar entities even when names don't match -- e.g. searching 'parallel computing'\ncan find 'MPI', 'OpenMP', 'threading'. Requires entity embeddings to be computed.",
         "properties": {
           "query": {
@@ -862,6 +878,7 @@
       "description": "Get knowledge graph statistics: total entities, edges,\nentity types, and document coverage.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get knowledge graph statistics: total entities, edges,\nentity types, and document coverage.",
         "properties": {},
         "title": "PaiGraphStats",
@@ -885,6 +902,7 @@
       "description": "Walk the graph from a single entity, preferring edges relevant to the stated\n    intent (for example 'causal' or 'definitional'). Unlike noo_graph_neighbors,\n    which treats every edge alike, this favours the edges that matter for the\n    intent. Returns scored entities with traversal paths.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Walk the graph from a single entity, preferring edges relevant to the stated\nintent (for example 'causal' or 'definitional'). Unlike noo_graph_neighbors,\nwhich treats every edge alike, this favours the edges that matter for the\nintent. Returns scored entities with traversal paths.",
         "properties": {
           "entity_id": {
@@ -936,6 +954,7 @@
       "description": "Run a prompt through the cluster inference pipeline. Automatically resolves\na backend (local-first, cloud fallback). Returns the model's response text.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Run a prompt through the cluster inference pipeline. Automatically resolves\na backend (local-first, cloud fallback). Returns the model's response text.",
         "properties": {
           "backend": {
@@ -1045,6 +1064,7 @@
       "description": "Cancel a pending or running job. A user-tier account can cancel only jobs its own\naccount submitted.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Cancel a pending or running job. A user-tier account can cancel only jobs its own\naccount submitted.",
         "properties": {
           "job_id": {
@@ -1077,6 +1097,7 @@
       "description": "List all jobs in the scheduler queue (pending, running, completed).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List all jobs in the scheduler queue (pending, running, completed).",
         "properties": {},
         "title": "PaiJobList",
@@ -1100,6 +1121,7 @@
       "description": "Get the status of a specific job by ID.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get the status of a specific job by ID.",
         "properties": {
           "job_id": {
@@ -1132,6 +1154,7 @@
       "description": "Submit a job to the distributed scheduler. Returns a job_id to track with\nnoo_job_status. Use force_node to pin the job to one specific node; leave it\nunset to let the scheduler place it on the least-loaded eligible node.\n\nA user-tier account (the user door) may submit type \"inference\" only, with an\nobject payload up to 64 KiB; force_node is refused, priority is capped at 5,\ntimeout_sec at 600, and submits are limited to 30 per hour per account.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Submit a job to the distributed scheduler. Returns a job_id to track with\nnoo_job_status. Use force_node to pin the job to one specific node; leave it\nunset to let the scheduler place it on the least-loaded eligible node.\n\nA user-tier account (the user door) may submit type \"inference\" only, with an\nobject payload up to 64 KiB; force_node is refused, priority is capped at 5,\ntimeout_sec at 600, and submits are limited to 30 per hour per account.",
         "properties": {
           "backend": {
@@ -1230,6 +1253,7 @@
       "description": "Search conversation memory for past interactions. Returns semantically\nsimilar conversations ranked by relevance. Use this for recalling previous\nchats, decisions, and context \u2014 NOT for document/knowledge base queries.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Search conversation memory for past interactions. Returns semantically\nsimilar conversations ranked by relevance. Use this for recalling previous\nchats, decisions, and context \u2014 NOT for document/knowledge base queries.",
         "properties": {
           "query": {
@@ -1268,6 +1292,7 @@
       "description": "Cancel an operation you started.\n\nStops the gateway-side wait and marks it cancelled. It does NOT stop a worker run that has\nalready begun: the answer says what the worker will do (`cancel.worker_stopped` is false).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Cancel an operation you started.\n\nStops the gateway-side wait and marks it cancelled. It does NOT stop a worker run that has\nalready begun: the answer says what the worker will do (`cancel.worker_stopped` is false).",
         "properties": {
           "op_id": {
@@ -1299,6 +1324,7 @@
       "description": "List your operations, newest first (no results; fetch one with noo_op_status).",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "List your operations, newest first (no results; fetch one with noo_op_status).",
         "properties": {
           "limit": {
@@ -1364,6 +1390,7 @@
       "description": "Start a long-running operation and get its id immediately; poll it with noo_op_status.\n\n`type` is one of: graph.recluster, graph.extract_relations, snapshots.consolidate,\ngraph.navigate, graph.traverse, rag.ingest, docs.ingest. `params` is exactly the body the\ntype's own tool takes (e.g. {\"query\": \"...\"} for graph.navigate). You are held to the same\npermissions as that tool. Answers at once with {op_id, status, poll, poll_interval_ms}; it\nnever waits for the result.",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Start a long-running operation and get its id immediately; poll it with noo_op_status.\n\n`type` is one of: graph.recluster, graph.extract_relations, snapshots.consolidate,\ngraph.navigate, graph.traverse, rag.ingest, docs.ingest. `params` is exactly the body the\ntype's own tool takes (e.g. {\"query\": \"...\"} for graph.navigate). You are held to the same\npermissions as that tool. Answers at once with {op_id, status, poll, poll_interval_ms}; it\nnever waits for the result.",
         "properties": {
           "params": {
@@ -1408,6 +1435,7 @@
       "description": "Status, progress and (once finished) the result or error of an operation.\n\n`wait` (seconds, at most 25) holds the call until the operation finishes or the time is up, so\nyou can wait without polling in a loop. status is queued, running, succeeded, failed, cancelled\nor expired; a finished operation carries `result` (or `error`). Only the account that started an\noperation can read it: any other id is \"not found\".",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Status, progress and (once finished) the result or error of an operation.\n\n`wait` (seconds, at most 25) holds the call until the operation finishes or the time is up, so\nyou can wait without polling in a loop. status is queued, running, succeeded, failed, cancelled\nor expired; a finished operation carries `result` (or `error`). Only the account that started an\noperation can read it: any other id is \"not found\".",
         "properties": {
           "op_id": {
@@ -1455,6 +1483,7 @@
       "description": "Ingest documents (PDF/MD/HTML/TXT/JSON/CSV/XML/code) into PageIndex.\n    Splits into pages, embeds, and indexes for RAG search.\n\nLong-running: this starts an operation and waits a few seconds. If it finished you get the result; if not you get a handle {op_id, status, poll} -- call noo_op_status with that op_id (wait up to 25 seconds per call) until status is succeeded or failed. noo_op_cancel stops the gateway-side wait (the worker run itself may continue).",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Ingest documents (PDF/MD/HTML/TXT/JSON/CSV/XML/code) into PageIndex.\nSplits into pages, embeds, and indexes for RAG search.",
         "properties": {
           "roles": {
@@ -1534,6 +1563,7 @@
       "description": "Answer a question using the PageIndex knowledge base (ingested documents).\nUses vector search + knowledge graph to find relevant pages, then synthesizes\nan answer with [Source N] citations. Strategies: 'hybrid' (default, best quality),\n'lookup' (fast vector-only), 'graph_first' (entity-centric).\nUse this for factual questions about ingested content \u2014 NOT for conversation history.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Answer a question using the PageIndex knowledge base (ingested documents).\nUses vector search + knowledge graph to find relevant pages, then synthesizes\nan answer with [Source N] citations. Strategies: 'hybrid' (default, best quality),\n'lookup' (fast vector-only), 'graph_first' (entity-centric).\nUse this for factual questions about ingested content \u2014 NOT for conversation history.",
         "properties": {
           "question": {
@@ -1589,6 +1619,7 @@
       "description": "Show Postgres replication health: this controller's role\n(primary/standby), connected standbys with replay lag, and replication\nslot WAL retention (a dead standby's slot silently retains WAL \u2014 watch\nretained_wal). Use to answer 'is the standby in sync / is failover safe?'",
       "had_custom_format": false,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Show Postgres replication health: this controller's role\n(primary/standby), connected standbys with replay lag, and replication\nslot WAL retention (a dead standby's slot silently retains WAL \u2014 watch\nretained_wal). Use to answer 'is the standby in sync / is failover safe?'",
         "properties": {},
         "title": "PaiReplicationStatus",
@@ -1613,6 +1644,7 @@
       "description": "Get scheduler status: running/paused state, queue depth, active jobs.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Get scheduler status: running/paused state, queue depth, active jobs.",
         "properties": {},
         "title": "PaiSchedulerStatus",
@@ -1638,6 +1670,7 @@
       "description": "Recall YOUR OWN saved graph threads: the knowledge-graph walks your past\nquestions followed, saved automatically when you are signed in (turn saving\noff per account with `noo walks settings --save off`). With a query, returns\nthe threads nearest it, re-checked against the graph today: a walk through\nsomething you can no longer read, an edge that was removed, a deleted\ndocument or a superseded fact is dropped, never served stale. Without a\nquery, your most recent threads. Only ever your own, verbatim; never\nanother user's.",
       "had_custom_format": true,
       "input_schema": {
+        "additionalProperties": false,
         "description": "Recall YOUR OWN saved graph threads: the knowledge-graph walks your past\nquestions followed, saved automatically when you are signed in (turn saving\noff per account with `noo walks settings --save off`). With a query, returns\nthe threads nearest it, re-checked against the graph today: a walk through\nsomething you can no longer read, an edge that was removed, a deleted\ndocument or a superseded fact is dropped, never served stale. Without a\nquery, your most recent threads. Only ever your own, verbatim; never\nanother user's.",
         "properties": {
           "query": {
