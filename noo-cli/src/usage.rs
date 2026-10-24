@@ -119,7 +119,7 @@ pub const USAGE: &[(&[&str], &str, &str)] = &[
     (&["security", "at-rest", "finalize"], "[--dry-run] [-y|--yes]", "Remove the plaintext age key once a reboot unsealed it and a fresh backup decrypts"),
     (&["security", "at-rest", "migrate"], "[--dry-run] [--rollback] [--yes] [--confirm-offbox <phrase>]", "Move this controller's state onto the encrypted volume: backup first, reversible"),
     (&["security", "at-rest", "wipe-plaintext"], "[--dry-run] [--hours <N>] [--confirm <phrase>]", "Delete the old plaintext state after a verified migration and a day of healthy running"),
-    (&["security", "at-rest", "recovery-key"], "[--dry-run]", "Enroll a NEW recovery key for the encrypted state volume, shown once; the old one is removed only after you confirm it"),
+    (&["security", "at-rest", "recovery-key"], "[--dry-run]", "Enroll a new recovery key, shown once; the old one is removed only after you confirm"),
     (&["security", "at-rest", "reenroll"], "[--pcrs 7|none|auto] [--dry-run]", "Re-enroll the TPM after a firmware or Secure Boot change (PCR 7 with Secure Boot on) and reseal the age key"),
     (&["security", "at-rest", "preflight-firmware"], "[--json]", "Check the recovery key and a fresh backup before a BIOS or firmware update; prints what to do after"),
     (&["security", "posture", "list"], "", "List security posture gates: running vs desired value (operator-only)"),
