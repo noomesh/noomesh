@@ -18,8 +18,8 @@ data NVMe dropped off the bus; ext4 went read-only; postgres crash-looped).
 - `noo stack start|restart|rebuild` prints `REFUSED: not starting — the data
   root ... is not on its recorded filesystem` (or `does not exist`, `cannot be
   read`, `postgres was initialised ... but its data directory is empty`).
-- hostd's boot restore logs `the data root is not on its recorded filesystem —
-  stateful containers stopped, nothing started`, and the install
+- hostd's boot restore logs `the data-root guard refused ... stateful
+  containers stopped, nothing started`, and the install
   root holds `.noo-data-root-refused` with the reason and the containers it
   stopped.
 - `noo cluster verify --controller` shows `data root filesystem` as FAIL.
@@ -41,6 +41,17 @@ A disk that fell off the bus usually needs a cold power cycle (full power off,
 not a reboot). Check `lsblk -f` shows it, then `sudo mount <target>` (or let
 fstab do it) and `findmnt -T <data root>` shows the recorded UUID. Then
 `noo stack start`. Do not create the directory by hand to "make it pass".
+
+## No findmnt (Linux)
+
+`REFUSED: not starting — findmnt is not installed` means the host has no
+util-linux, so the check cannot see which filesystem holds the data root, and
+a check that cannot look does not pass. Install it (`apt install util-linux`,
+`apk add util-linux`), then `noo stack start`. `NOO_DATA_ROOT_RERECORD=1` does
+not apply (there is nothing to record), and hostd's boot retries do not help
+either. `noo cluster verify --controller` shows the row as FAIL with the same
+fix. macOS has no findmnt and is never a controller: there the check is
+skipped with a warning.
 
 ## 3. The disk was replaced, or the root moved on purpose
 

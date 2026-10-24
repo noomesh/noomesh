@@ -255,6 +255,80 @@ def test_report_is_read_only_and_carries_the_evidence(rig):
     assert "RC=3" in bad.stdout and UUID_A in bad.stdout and UUID_B in bad.stdout
 
 
+# ── no findmnt: refuse on Linux, skip on macOS ────────────────────────────
+
+
+def _path_without_findmnt(rig, uname: str | None = None) -> str:
+    """A PATH holding every tool the host has EXCEPT findmnt (the 0.6.11
+    rehearsal's alpine dind without util-linux), plus the rig's fakes
+    other than findmnt, and optionally a fake `uname -s`."""
+    nofm = rig["tmp"] / "nofindmnt-bin"
+    nofm.mkdir(exist_ok=True)
+    for d in ("/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if not Path(d).is_dir():
+            continue
+        for tool in Path(d).iterdir():
+            dest = nofm / tool.name
+            if tool.name == "findmnt" or dest.exists() or dest.is_symlink():
+                continue
+            dest.symlink_to(tool)
+    for fake in ("ls", "docker"):
+        dest = nofm / fake
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+        dest.symlink_to(rig["tmp"] / "bin" / fake)
+    if uname:
+        u = nofm / "uname"
+        if u.exists() or u.is_symlink():
+            u.unlink()
+        _exe(u, f"#!/bin/sh\necho {uname}\n")
+    path = str(nofm)
+    probe = subprocess.run(["bash", "-c", "command -v findmnt"], env={"PATH": path}, capture_output=True, text=True)
+    assert probe.returncode != 0, f"findmnt still on the test PATH: {probe.stdout}"
+    return path
+
+
+def test_no_findmnt_on_linux_refuses_names_util_linux_and_records_nothing(rig):
+    r = run(rig, PATH=_path_without_findmnt(rig, uname="Linux"))
+    assert "RC=1" in r.stdout, r.stderr
+    assert "REFUSED" in r.stderr and "findmnt is not installed" in r.stderr
+    assert "apt install util-linux" in r.stderr and "apk add util-linux" in r.stderr
+    assert "Retrying will not help" in r.stderr
+    assert not (rig["install"] / ".noo-data-root-id").exists()
+
+
+def test_no_findmnt_on_linux_is_not_bypassed_by_rerecord(rig):
+    run(rig)  # recorded on a host that had findmnt
+    before = record(rig)
+    r = run(rig, PATH=_path_without_findmnt(rig, uname="Linux"), NOO_DATA_ROOT_RERECORD="1")
+    assert "RC=1" in r.stdout, r.stderr
+    assert "util-linux" in r.stderr and "re-recorded" not in r.stderr
+    assert record(rig) == before, "the record changed without findmnt"
+
+
+def test_no_findmnt_on_darwin_skips_with_a_warning(rig):
+    r = run(rig, PATH=_path_without_findmnt(rig, uname="Darwin"))
+    assert "RC=0" in r.stdout, r.stderr
+    assert "WARNING: no findmnt" in r.stderr and "REFUSED" not in r.stderr
+    assert not (rig["install"] / ".noo-data-root-id").exists()
+    rep = run(rig, fn="data_root_mount_report", PATH=_path_without_findmnt(rig, uname="Darwin"))
+    assert "RC=4" in rep.stdout
+
+
+def test_no_findmnt_on_linux_reports_5_for_verify(rig):
+    r = run(rig, fn="data_root_mount_report", PATH=_path_without_findmnt(rig, uname="Linux"))
+    assert "RC=5" in r.stdout and "findmnt is not installed" in r.stdout
+
+
+def test_no_findmnt_on_linux_boot_guard_stops_the_stack_and_records_why(rig):
+    r = run(rig, fn="data_root_mount_boot_guard", PATH=_path_without_findmnt(rig, uname="Linux"), FAKE_PS="noo-redis noo-postgres")
+    assert "RC=1" in r.stdout, r.stderr
+    stops = [c for c in rig["dlog"].read_text().splitlines() if c.startswith("stop ")]
+    assert stops == ["stop noo-postgres", "stop noo-redis"], stops
+    why = (rig["install"] / ".noo-data-root-refused").read_text()
+    assert "findmnt is not installed" in why and "util-linux" in why and "Retrying will not help" in why
+
+
 # ── the boot path: stop, never start ──────────────────────────────────────
 
 

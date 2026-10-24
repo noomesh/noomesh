@@ -32,7 +32,17 @@
 #   data_root_mount_report       read-only (never records, never stops):
 #                                prints one evidence line on stdout. 0 = on
 #                                its recorded filesystem, 3 = refused,
-#                                4 = nothing recorded yet (not applicable).
+#                                4 = nothing recorded yet (not applicable),
+#                                5 = refused because it cannot be checked
+#                                (no findmnt on Linux: install util-linux).
+#
+# findmnt is REQUIRED on Linux. Without it the identity cannot be read, and a
+# check that cannot look must not pass: the launch is refused, naming the
+# package (util-linux), and NOO_DATA_ROOT_RERECORD=1 does not get past it
+# (there is nothing to record). The 0.6.11 rehearsal met this in an alpine
+# dind without util-linux; a real controller (Debian/Ubuntu) has it. macOS
+# (Darwin) has no findmnt and another mount model, and a Mac node is never a
+# controller: there the check is skipped with a WARNING, as before.
 #
 # Escape hatch for a DELIBERATE move (new disk, new data root):
 # NOO_DATA_ROOT_RERECORD=1 re-records the identity from what is mounted now,
@@ -46,6 +56,7 @@
 DRM_RECORD_FILE_DEFAULT=".noo-data-root-id"
 DRM_REFUSED_FILE_DEFAULT=".noo-data-root-refused"
 DRM_RUNBOOK="docs/operating/runbooks/data-root-recovery.md"
+DRM_FINDMNT_FIX="install util-linux (apt install util-linux / apk add util-linux)"
 
 _drm_env() {  # <KEY>: environment first, else the last KEY= line in ./.env
     local _v="${!1:-}"
@@ -110,7 +121,12 @@ _drm_evaluate() {
     kind="$(_drm_get id_kind "$rec")"
 
     if ! command -v findmnt >/dev/null 2>&1; then
-        DRM_VERDICT="skip"; DRM_MSG="no findmnt on this host: the data root's filesystem was not checked"; return 0
+        if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+            DRM_VERDICT="skip"; DRM_MSG="no findmnt on this host: the data root's filesystem was not checked"; return 0
+        fi
+        DRM_VERDICT="refuse"; DRM_KIND="nofindmnt"
+        DRM_MSG="findmnt is not installed, so which filesystem holds the data root $root cannot be checked"
+        return 0
     fi
 
     if [ ! -d "$root" ]; then
@@ -208,6 +224,15 @@ _drm_explain() {  # <root> <rec> <rec_root> <kind>
 
 _drm_refusal_text() {
     local root; root="$(_drm_env NOO_DATA_ROOT)"
+    if [ "$DRM_KIND" = "nofindmnt" ]; then
+        printf '%s\n' \
+"REFUSED: not starting — $DRM_MSG." \
+"  The stack refuses to start on a data root whose filesystem it cannot check: a data disk that did not mount would let postgres initialise a NEW EMPTY database on the root disk." \
+"  Nothing was created, changed or started. Retrying will not help: findmnt will not appear until it is installed." \
+"  fix:      $DRM_FINDMNT_FIX, then noo stack start" \
+"            (NOO_DATA_ROOT_RERECORD=1 does not apply: without findmnt there is nothing to record)"
+        return 0
+    fi
     printf '%s\n' \
 "REFUSED: not starting — $DRM_MSG." \
 "  expected: ${DRM_EXPECTED:-the filesystem recorded in $(_drm_record_file)}" \
@@ -256,7 +281,7 @@ _drm_run() {
             fi
             return 0 ;;
         refuse)
-            if [ "${NOO_DATA_ROOT_RERECORD:-}" = "1" ] && [ "$DRM_KIND" != "pg" ] && [ -d "$(_drm_env NOO_DATA_ROOT)" ] \
+            if [ "${NOO_DATA_ROOT_RERECORD:-}" = "1" ] && [ "$DRM_KIND" != "pg" ] && [ "$DRM_KIND" != "nofindmnt" ] && [ -d "$(_drm_env NOO_DATA_ROOT)" ] \
                && [ -n "$DRM_NOW_SOURCE$DRM_NOW_UUID" ] && _drm_timeout ls -A "$(_drm_env NOO_DATA_ROOT)" >/dev/null 2>&1; then
                 # Re-record only a data root that exists and lists; the postgres
                 # belt still applies afterwards on the next launch.
@@ -314,7 +339,9 @@ data_root_mount_report() {
     case "$DRM_VERDICT" in
         skip) echo "$DRM_MSG"; return 4 ;;
         record) echo "no filesystem recorded yet for $(_drm_env NOO_DATA_ROOT) (the next launch records it); mounted now: $(_drm_describe_now)"; return 4 ;;
-        refuse) echo "$DRM_MSG — expected ${DRM_EXPECTED:-?}; found ${DRM_FOUND:-?}"; return 3 ;;
+        refuse)
+            if [ "$DRM_KIND" = "nofindmnt" ]; then echo "$DRM_MSG; the launchers refuse to start"; return 5; fi
+            echo "$DRM_MSG — expected ${DRM_EXPECTED:-?}; found ${DRM_FOUND:-?}"; return 3 ;;
         *) echo "$DRM_MSG"; return 0 ;;
     esac
 }
