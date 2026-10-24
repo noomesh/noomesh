@@ -82,19 +82,7 @@ pub(crate) fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, String), String
     Ok((ts, id.to_string()))
 }
 
-type Row = (
-    String,
-    DateTime<Utc>,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+type Row = crate::repo::audit::ListRow;
 
 /// GET /api/security/audit/list
 ///
@@ -130,25 +118,15 @@ async fn security_audit_list(
     let event_type = p.event_type.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let actor = p.actor.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, outcome, \
-                request_id, details::text, chain_seq, entry_hash \
-           FROM noo_security_audit \
-          WHERE ($1::timestamptz IS NULL OR \"timestamp\" >= $1) \
-            AND ($2::text IS NULL OR event_type = $2) \
-            AND ($3::text IS NULL OR actor = $3) \
-            AND ($4::timestamptz IS NULL OR (\"timestamp\", id) < ($4::timestamptz, $5::uuid)) \
-          ORDER BY \"timestamp\" DESC, id DESC \
-          LIMIT $6",
-    )
-    .bind(since)
-    .bind(event_type)
-    .bind(actor)
-    .bind(cursor.as_ref().map(|c| c.0))
-    .bind(cursor.as_ref().map(|c| c.1.as_str()))
     // One extra row says whether another page exists.
-    .bind(limit + 1)
-    .fetch_all(&state.db)
+    let rows: Vec<Row> = crate::repo::audit::list(
+        &state.db,
+        since,
+        event_type,
+        actor,
+        cursor.as_ref().map(|c| (c.0, c.1.as_str())),
+        limit + 1,
+    )
     .await
     .map_err(|e| AppError::Internal(format!("cannot read noo_security_audit: {e}")))?;
 

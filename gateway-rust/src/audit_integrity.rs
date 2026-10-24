@@ -780,21 +780,7 @@ pub fn verify_all(rows: &[AuditRow], keys: &Keys) -> Report {
 
 // ── Database side ────────────────────────────────────────────────────────────
 
-type RowTuple = (
-    String,
-    chrono::DateTime<chrono::Utc>,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-);
+type RowTuple = crate::repo::audit::VerifyRow;
 
 fn to_row(t: RowTuple) -> AuditRow {
     AuditRow {
@@ -817,15 +803,11 @@ fn to_row(t: RowTuple) -> AuditRow {
 
 /// `details::text` is Postgres's jsonb rendering — the text the v2 writer
 /// hashed, because it asked Postgres for exactly that before signing.
-const SELECT_ROWS: &str = "SELECT id::text, \"timestamp\", event_type, severity, actor, resource, \
-     outcome, request_id, entry_hash, details::text, prev_hash, chain_seq, chain_hash \
-     FROM noo_security_audit";
+const SELECT_ROWS: &str = crate::repo::audit::SELECT_ROWS;
 
 /// Read the whole table and judge it with the keys this process holds.
 pub async fn verify_db(db: &sqlx::PgPool) -> Result<Report, sqlx::Error> {
-    let rows: Vec<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!("{SELECT_ROWS} ORDER BY \"timestamp\" ASC, id ASC")))
-        .fetch_all(db)
-        .await?;
+    let rows: Vec<RowTuple> = crate::repo::audit::all_for_verify(db).await?;
     let rows: Vec<AuditRow> = rows.into_iter().map(to_row).collect();
     let keys = Keys { current: current_key(), retired: retired_key() };
     let mut report = verify_all(&rows, &keys);
@@ -884,12 +866,11 @@ pub(crate) async fn ensure_checkpoint_with(
 
     let Some(current) = current else { return CheckpointOutcome::KeyMissing };
     let fp = fingerprint(&current);
-    let present = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM noo_security_audit WHERE event_type = $1 AND resource LIKE $2",
+    let present = crate::repo::audit::count_event_resource_like(
+        db,
+        CHECKPOINT_EVENT,
+        &format!("audit-key:{fp};%"),
     )
-    .bind(CHECKPOINT_EVENT)
-    .bind(format!("audit-key:{fp};%"))
-    .fetch_one(db)
     .await;
     match present {
         Ok(n) if n > 0 => return CheckpointOutcome::AlreadyPresent,
