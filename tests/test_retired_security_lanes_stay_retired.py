@@ -40,6 +40,7 @@ NOT_DELIVERED = {
     "NOO_GATEWAY_TLS_VERIFY": "retired noo_gateway toggle: from_env refuses it",
     "NOO_GATEWAY_TLS_CHECK_HOSTNAME": "retired noo_gateway toggle: from_env refuses it",
     "NOO_GATEWAY_SHARED_SECRET_FALLBACK": "retired noo_gateway rung: from_env refuses it",
+    "NOO_SELF_CALL_SHARED_SECRET": "retired bridge (#371): a shared secret never buys inference",
 }
 
 
@@ -100,3 +101,19 @@ def test_the_launcher_warns_about_the_retired_allowlist() -> None:
     for script in ("noomesh-start.sh", "noomesh-rebuild.sh"):
         text = (ROOT / "scripts" / script).read_text()
         assert re.search(r"^warn_retired_env_keys$", text, re.M), f"{script} never calls it"
+
+
+def test_a_leftover_self_call_secret_in_dot_env_is_named_by_the_launcher(tmp_path) -> None:
+    """#371 deleted the self-call bridge; a leftover .env line is inert, and
+    the launcher's real warn_retired_env_keys must say so and name the
+    replacement (a per-consumer service key)."""
+    import subprocess
+
+    (tmp_path / ".env").write_text("A=1\nNOO_SELF_CALL_SHARED_SECRET=1\n")
+    r = subprocess.run(
+        ["bash", "-c", f'source "{ROOT / "scripts" / "lib-addons.sh"}" && warn_retired_env_keys'],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "NOO_SELF_CALL_SHARED_SECRET, which is RETIRED and ignored" in r.stderr, r.stderr
+    assert "noo security service-key issue" in r.stderr, r.stderr
