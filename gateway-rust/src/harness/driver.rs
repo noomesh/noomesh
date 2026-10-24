@@ -1166,6 +1166,21 @@ pub async fn run_turn(ctx: &DriverCtx, client: reqwest::Client, req: &TurnReques
     run_turn_on(ctx, &rt, req).await
 }
 
+/// A turn whose CLI was killed as stalled before it made a single model
+/// call. No model call means no tool ran, so the turn did nothing on the
+/// node and the gateway may run it itself (i233 fix 1). Any other failure
+/// is not safe to re-run: the CLI may have acted.
+#[derive(Debug)]
+pub struct NeverReachedTheModel(pub String);
+
+impl std::fmt::Display for NeverReachedTheModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeverReachedTheModel {}
+
 pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &TurnRequest) -> Result<CoordinatorResult> {
     if let Err(r) = (ctx.jail_probe)() {
         tracing::error!(event = "harness_jail_refused", reason = %r, "harness_jail_refused: {}", r.note());
@@ -1181,7 +1196,11 @@ pub(crate) async fn run_turn_on<R: DriverRail>(ctx: &DriverCtx, rail: &R, req: &
     ws.finish();
     let (o, usage) = outcome?;
     if !o.succeeded() {
-        bail!("{} CLI: {}", ctx.kind.kind, o.failure());
+        let msg = format!("{} CLI: {}", ctx.kind.kind, o.failure());
+        if o.stalled.is_some() && usage.calls == 0 {
+            return Err(anyhow::Error::new(NeverReachedTheModel(msg)));
+        }
+        bail!("{msg}");
     }
     let response = o.stdout.trim().to_string();
     rail.save("user", &req.prompt).await;
@@ -1432,6 +1451,33 @@ mod tests {
         let c = rail.calls.lock().unwrap();
         let note = c.checkpoints[0].1.as_deref().unwrap();
         assert!(note.contains("stalled: no model call for"), "{note}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A turn whose CLI stalls before any model call is the one failure the
+    /// gateway may re-run itself: typed so harness_main can say so.
+    #[tokio::test]
+    async fn a_turn_stalled_before_any_model_call_is_retry_safe() {
+        let root = scratch("turn-stall");
+        let k = kind(&["sh", "-c", "sleep 30"], &[], &[]);
+        let mut ctx = ctx_for(&k, &root, "60");
+        ctx.stall = Duration::from_secs(1);
+        let rail = FakeRail::new();
+        let req = TurnRequest {
+            conversation_id: "c-stall".into(),
+            prompt: "hi".into(),
+            channel: "dashboard".into(),
+            max_iterations: 5,
+            model: None,
+            user: "alice".into(),
+            enable_thinking: false,
+            role_prompt: None,
+            stream: false,
+            token: TURN_TOKEN.into(),
+        };
+        let e = run_turn_on(&ctx, &rail, &req).await.unwrap_err();
+        assert!(e.downcast_ref::<NeverReachedTheModel>().is_some(), "{e}");
+        assert!(e.to_string().contains("stalled: no model call"), "{e}");
         let _ = std::fs::remove_dir_all(root);
     }
 

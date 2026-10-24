@@ -414,10 +414,14 @@ pub async fn role_of(state: &AppState, user: &str) -> Option<Role> {
 }
 
 /// Try to run this turn on a node. `Ok(None)` = not dispatched (no
-/// harness for the model's node, no user, the brake, or nobody acked):
-/// the caller runs the turn in process. `Ok(Some(result))` = the node
-/// ran it. `Err` = the node took it and failed or timed out — the turn
-/// is NOT re-run here, because its tools may already have executed.
+/// harness for the model's node, no user, the brake, nobody acked, or the
+/// harness said its CLI never reached the model): the caller runs the turn
+/// in process. `Ok(Some(result))` = the node ran it. `Err` = the node took
+/// it and failed or timed out — the turn is NOT re-run here, because its
+/// tools may already have executed. The one exception is the `retry_safe`
+/// error (i233): a vendor CLI killed before its first model call ran no
+/// tool, so the gateway runs the turn itself and the person gets an
+/// answer instead of a 15-minute failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_dispatch<S: TurnSink>(
     state: &AppState,
@@ -523,6 +527,10 @@ pub async fn try_dispatch<S: TurnSink>(
     let kind = terminal.get("type").and_then(|t| t.as_str()).unwrap_or("");
     if kind != HARNESS_RESULT_EVENT {
         let msg = terminal.get("text").and_then(|t| t.as_str()).unwrap_or("harness error");
+        if crate::websocket::retry_safe(&terminal) {
+            tracing::warn!(node = %node, conversation = conversation_id, error = %msg, "harness dispatch: the node's CLI never reached its model; running the turn in process");
+            return Ok(None);
+        }
         return Err(anyhow!("harness on {node}: {msg}"));
     }
     let result: CoordinatorResult = serde_json::from_value(terminal.get("result").cloned().unwrap_or(json!(null)))
