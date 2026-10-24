@@ -54,6 +54,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BOX=noo-demo-box
 REC=noo-demo-recorder
 VOL=noo-demo-docker
+# containerd's own root: with Docker as a systemd unit, dockerd uses the
+# containerd.io service (not an embedded one under /var/lib/docker), and its
+# snapshots cannot live on the box's overlay rootfs (overlay on overlay: every
+# container create failed with "failed to mount /tmp/containerd-mount…",
+# take 8). A second volume, removed with the first.
+CONTAINERD_VOL=noo-demo-containerd
 MEM="${NOO_STUDIO_MEM:-10g}"
 CPUS="${NOO_STUDIO_CPUS:-4}"
 BASE_IMAGE="${NOO_STUDIO_BASE_IMAGE:-ubuntu:24.04}"
@@ -172,6 +178,7 @@ cmd_up() {
   ensure_image "$BASE_IMAGE"
   build_box_image
   docker volume create "$VOL" >/dev/null
+  docker volume create "$CONTAINERD_VOL" >/dev/null
   # With the cache up, the box is born on the cache's network with ghcr.io
   # pointing at it; the CA is installed once Docker is in. Without it, the
   # box is exactly a stranger's machine on the default network.
@@ -192,7 +199,7 @@ cmd_up() {
     --privileged --cgroupns=private --memory "$MEM" --cpus "$CPUS" \
     --tmpfs /run --tmpfs /run/lock -e container=docker \
     "${via_cache[@]}" \
-    -v "$VOL":/var/lib/docker "$BOX_IMAGE" >/dev/null
+    -v "$VOL":/var/lib/docker -v "$CONTAINERD_VOL":/var/lib/containerd "$BOX_IMAGE" >/dev/null
   echo "box created; booting systemd and Docker inside it ..."
   box_wait_booted || { echo "the box did not boot; it is left for inspection ('$0 down' removes it)" >&2; exit 1; }
   if [ -n "$cache_ip" ]; then
@@ -253,6 +260,7 @@ cmd_down() {
     echo "removed $BOX"
   fi
   if docker volume inspect "$VOL" >/dev/null 2>&1; then docker volume rm "$VOL" >/dev/null && echo "removed volume $VOL"; fi
+  if docker volume inspect "$CONTAINERD_VOL" >/dev/null 2>&1; then docker volume rm "$CONTAINERD_VOL" >/dev/null && echo "removed volume $CONTAINERD_VOL"; fi
   echo "studio is down"
 }
 
