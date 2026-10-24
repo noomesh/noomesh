@@ -391,7 +391,7 @@ pub(crate) fn preflight_checks(p: &Preflight) -> Vec<Check> {
             PREFLIGHT_BACKUP,
             Verdict::Fail,
             "no backup found: a failed unlock with no recovery key and no backup loses the data",
-            Some("noo backups status; scripts/backup-controller.sh"),
+            Some("noo backups status"),
         ),
         Some(s) if s > FRESH_BACKUP_SECS => pc(
             PREFLIGHT_BACKUP,
