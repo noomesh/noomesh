@@ -26,6 +26,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::measured::{put_into, Measured};
 use crate::memory::scope::{self, Audience};
 use crate::state::AppState;
 use super::{AppResult, AppError};
@@ -1088,14 +1089,16 @@ pub(super) async fn graph_overview_for(
                       `min_degree` (or `entity_type`) — lower it to see them"),
             ),
         };
-        return Ok(json!({
+        // `stats` counts the arrays returned (both empty); the unknown is
+        // `entity_count`, null with a detail when the database would not answer.
+        let mut body = json!({
             "nodes": [], "edges": [],
             "stats": {"node_count": 0, "edge_count": 0, "min_degree": min_degree},
             "reason": reason,
-            // null, not 0, when the database would not answer.
-            "entity_count": entities.as_ref().ok(),
             "hint": hint,
-        }));
+        });
+        put_into(&mut body, "entity_count", Measured::from_result_in(entities.as_ref().map(|n| *n), "cannot count entities"));
+        return Ok(body);
     }
 
     let node_ids: Vec<String> = nodes.iter().map(|(id, _, _, _)| id.clone()).collect();
@@ -1254,15 +1257,15 @@ pub(super) async fn graph_clusters_overview_for(
                       view and needs no clustering"),
             ),
         };
-        return Ok(json!({
+        let mut body = json!({
             "nodes": [], "edges": [],
             "stats": {"node_count": 0, "edge_count": 0, "level": level},
             "reason": reason,
-            // null, not 0, when the database would not answer.
-            "entity_count": entities.as_ref().ok(),
-            "cluster_count": all_clusters.as_ref().ok(),
             "hint": hint,
-        }));
+        });
+        put_into(&mut body, "entity_count", Measured::from_result_in(entities.as_ref().map(|n| *n), "cannot count entities"));
+        put_into(&mut body, "cluster_count", Measured::from_result_in(all_clusters.as_ref().map(|n| *n), "cannot count clusters"));
+        return Ok(body);
     }
 
     let cluster_ids: Vec<String> = clusters.iter().map(|(id, _, _, _)| id.clone()).collect();
