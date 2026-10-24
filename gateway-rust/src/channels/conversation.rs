@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 /// Subject that owns conversation identity. See `workers/memory.py`.
-const RESOLVE_CONVERSATION: &str = "worker.memory.resolve_conversation";
+const RESOLVE_CONVERSATION: &str = crate::trellion_client::subjects::MEMORY_RESOLVE_CONVERSATION;
 
 /// Ask the memory plane for this chat context's stable conversation id.
 ///
@@ -53,10 +53,9 @@ pub async fn resolve(
     let resp = crate::bus_principal::with_internal(
         "channel-ingress",
         &["read", "write"],
-        crate::worker_client::request(
-            &state.nats,
+        crate::trellion_client::TrellionClient::new(&state.nats).call_raw(
             RESOLVE_CONVERSATION,
-            &json!({
+            json!({
                 "channel": channel,
                 "chat_context_id": context_id,
                 "metadata": metadata,

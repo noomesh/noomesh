@@ -62,7 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/memory/embed/stop", post(embed_stop))
 
         // ── NATS delegation (needs Python runtime) ──
-        .route("/api/memory/batch-index", post(delegate_post("worker.memory.batch_index")))
+        .route("/api/memory/batch-index", post(delegate_post(crate::trellion_client::subjects::MEMORY_BATCH_INDEX)))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1266,7 +1266,8 @@ pub(crate) async fn embed_conversation_batch(state: &AppState) -> Result<Value, 
     crate::bus_principal::with_internal(
         "memory-embed",
         &["read", "write"],
-        crate::worker_client::request(&state.nats, "worker.memory.batch_index", &payload),
+        crate::trellion_client::TrellionClient::new(&state.nats)
+            .call_raw(crate::trellion_client::subjects::MEMORY_BATCH_INDEX, payload),
     )
     .await
     .map_err(|e| e.to_string())
