@@ -97,22 +97,29 @@ exit $rc
                           env=_clean_env(HOME=str(tmp), NOO_BACKUP_OFFSITE=dest))
 
 
-def test_a_dir_target_that_does_not_exist_yet_is_created_0700(tmp_path: Path) -> None:
+def test_a_missing_dir_target_fails_and_nothing_is_created(tmp_path: Path) -> None:
+    # The parent exists and is writable (an unmounted share's mount point looks
+    # exactly like this): creating the target would put the "off-site" copy on
+    # the root disk and report it copied.
     target = tmp_path / "mnt" / "noomesh-pop-os"
     (tmp_path / "mnt").mkdir()
     r = _offsite(tmp_path, f"dir:{target}")
+    assert r.returncode != 0, r.stdout
+    assert not target.exists(), "the script created the target"
+    assert "NOTE=FAILED: target missing" in r.stdout and "mounted" in r.stdout
+    assert "NOO_BACKUP_OFFSITE_RESULT" not in r.stdout  # emitted by the caller, from the note
+    assert not (tmp_path / ".offsite-last").exists(), "a marker was written for a copy that did not happen"
+
+
+def test_an_existing_dir_target_is_copied_to_and_marked(tmp_path: Path) -> None:
+    target = tmp_path / "mnt"
+    target.mkdir()
+    r = _offsite(tmp_path, f"dir:{target}")
     assert r.returncode == 0, r.stderr
-    assert target.is_dir() and oct(target.stat().st_mode & 0o777) == "0o700"
-    assert (target / "pg_20261024_033000.sql.gz.enc").is_file(), "the dump was not copied"
+    assert (target / "pg_20261024_033000.sql.gz.enc").is_file()
     assert f"NOTE=copied 1 artifact(s) to dir:{target}" in r.stdout
     marker = (tmp_path / ".offsite-last").read_text(encoding="utf-8").split()
     assert marker[1] == "pg_20261024_033000.sql.gz.enc", "the newest-dump marker `noo backups status` reads"
-
-
-def test_a_dir_target_whose_parent_is_missing_is_a_failure(tmp_path: Path) -> None:
-    r = _offsite(tmp_path, f"dir:{tmp_path}/nope/deeper")
-    assert r.returncode != 0
-    assert "NOTE=FAILED:" in r.stdout and "cannot be created" in r.stdout
 
 
 def test_the_outcome_line_is_always_named(tmp_path: Path) -> None:

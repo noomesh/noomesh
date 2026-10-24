@@ -375,19 +375,12 @@ offsite_copy() {
         dir:*)
             local target="${dest#dir:}"
             if [ ! -d "$target" ]; then
-                # A target that does not exist YET is created (0700) when its
-                # parent is there and writable; anything else is a failure,
-                # never a quiet skip. (2026-10-24: the directory was never
-                # created and the run still reported success.)
-                local parent
-                parent="$(dirname -- "$target")"
-                if [ -d "$parent" ] && [ -w "$parent" ] && mkdir -m 0700 -- "$target" 2>/dev/null; then
-                    echo "  offsite: created $target"
-                else
-                    OFFSITE_NOTE="FAILED: $target does not exist and cannot be created (parent $parent missing or not writable; unmounted?)"
-                    echo "  offsite: FAILED — $target is not a directory and cannot be created (unmounted?)" >&2
-                    return 1
-                fi
+                # NEVER create it here. A missing target is most often an
+                # unmounted share, and mkdir would land on the root disk and
+                # report "copied" for a backup that never left the machine.
+                OFFSITE_NOTE="FAILED: target missing — is it mounted? ($target)"
+                echo "  offsite: FAILED — $target is not a directory — is it mounted?" >&2
+                return 1
             fi
             cp -- "${made[@]}" "$target/" || rc=$?
             ;;

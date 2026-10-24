@@ -695,6 +695,21 @@ pub fn backups_setup(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
 
 /// Record the decision, and say what it means in plain words.
 fn write_choice(g: &Globals, d: &Destination) -> Result<i32, Unhandled> {
+    // A `dir:` target must already exist. The backup never creates it (a
+    // missing one is usually an unmounted share, and creating it would put the
+    // "off-site" copy on this machine's own disk), so setup does not either:
+    // the operator makes it, on the mounted target, and runs setup again.
+    if let Destination::Dir(t) = d {
+        if !std::path::Path::new(t).is_dir() {
+            fail(
+                g.json,
+                ExitCode::Usage,
+                "target_missing",
+                &format!("{t} does not exist — is it mounted? Create it on the target yourself, then run setup again"),
+                Some("noo backups setup"),
+            );
+        }
+    }
     if let Err(e) = crate::envfile::set_env_value(OFFSITE_KEY, Some(&d.as_value())) {
         fail(g.json, ExitCode::Generic, "write_failed", &e, None);
     }
