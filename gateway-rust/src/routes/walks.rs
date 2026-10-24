@@ -32,6 +32,7 @@
 //! is a separate act). The setting lives in `noo_user_settings` and is erased
 //! with the account (`users.rs::erase_targets`).
 
+use crate::audit::{AuditEvent, AuditKind, Outcome, Severity};
 use std::sync::Arc;
 
 use axum::{
@@ -259,7 +260,7 @@ async fn walks_stats(
 
 // ───────────────────────────── the audited admin view ─────────────────────────────
 
-/// The `noo_security_audit` row for one admin view: `(event_type, severity,
+/// The `noo_security_audit` row for one admin view: `(kind, severity,
 /// resource, outcome, details)`. Pure so a test pins what is recorded: who
 /// looked at whose threads, how many came back, and the delegation if any.
 pub(crate) fn admin_view_audit_row(
@@ -267,14 +268,14 @@ pub(crate) fn admin_view_audit_row(
     user: &str,
     limit: i64,
     returned: usize,
-) -> (&'static str, &'static str, String, &'static str, Value) {
+) -> (AuditKind, Severity, String, Outcome, Value) {
     (
-        "walks_admin_view",
+        AuditKind::WalksAdminView,
         // A named admin reading another person's questions is exactly what an
         // audit log exists to make visible.
-        "warning",
+        Severity::Warning,
         format!("walks:{user}"),
-        "success",
+        Outcome::custom("success"),
         json!({
             "viewer": caller.account,
             "viewed_user": user,
@@ -322,13 +323,21 @@ pub(crate) async fn admin_view_core(
             })
         })
         .collect();
-    let (event, severity, resource, outcome, details) =
+    let (kind, severity, resource, outcome, details) =
         admin_view_audit_row(caller, user, limit, threads.len());
     // The operator's rule: an admin may read a user's threads only AUDITED.
     // So the row must land BEFORE the content leaves; if it cannot (no audit
     // key, the partition heal failed, the database refused), the view is
     // refused rather than served unaudited.
-    if !super::core::audit_event_required(db, event, severity, &caller.account, &resource, outcome, details).await {
+    if !crate::audit::record_required(
+        db,
+        AuditEvent::new(kind, &caller.account, &resource)
+            .outcome(outcome)
+            .severity(severity)
+            .details(details),
+    )
+    .await
+    {
         return Err(AppError::Unavailable(
             "the security audit log could not record this view, so it was not served; \
              check the gateway log for audit_write_* and retry"
@@ -376,7 +385,10 @@ mod tests {
         let mut c = caller();
         c.act = Some("agent-7".into());
         let (event, severity, resource, outcome, d) = admin_view_audit_row(&c, "alice", 50, 3);
-        assert_eq!((event, severity, resource.as_str(), outcome), ("walks_admin_view", "warning", "walks:alice", "success"));
+        assert_eq!(
+            (event, severity, resource.as_str(), outcome),
+            (AuditKind::WalksAdminView, Severity::Warning, "walks:alice", Outcome::custom("success"))
+        );
         assert_eq!(d["viewer"], "root");
         assert_eq!(d["viewed_user"], "alice");
         assert_eq!(d["returned"], 3);

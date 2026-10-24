@@ -551,10 +551,10 @@ mod tests {
         assert!(list.contains("crate::mcp_user_tasks::tool_list()"), "tools/list must advertise the task tools");
         assert!(!list.contains("user_role"), "the listing is not tier-filtered");
         let call = &handle[handle.find("\"tools/call\" =>").unwrap()..];
-        let audit = call.find("\"mcp_tool_call\"").expect("the door's audit row");
+        let audit = call.find("AuditKind::McpToolCall").expect("the door's audit row");
         let dispatch = call.find("crate::mcp_user_tasks::call(&state, &caller.user, name, args)").expect("dispatched as the account");
         assert!(audit < dispatch, "the call is audited before it runs");
-        assert_eq!(call.matches("audit_event(").count(), 1, "one audit path, not a second one for task tools");
+        assert_eq!(call.matches("audit::record(").count(), 1, "one audit path, not a second one for task tools");
     }
 
     /// Another account's task, an ownerless one and an unknown id all read

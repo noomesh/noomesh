@@ -9,6 +9,7 @@
 //!              embed start/stop/status (Redis flag + SQL counts).
 //! NATS delegation: batch-index.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -509,14 +510,10 @@ pub(crate) async fn cleanup(
         .as_ref()
         .map(|a| a.0 .0.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "data_delete",
-        "warning",
-        &who,
-        "memory:conversations",
-        "ok",
-        json!({ "removed": rows.len(), "max_age_days": max_age_days }),
+        AuditEvent::new(AuditKind::DataDelete, &who, "memory:conversations")
+            .details(json!({ "removed": rows.len(), "max_age_days": max_age_days })),
     )
     .await;
 

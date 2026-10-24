@@ -13,6 +13,7 @@
 //!              exec-approval status (env/config), approval CRUD (SQL)
 //! NATS delegation: PKI rotate-expiring (needs Python PKI manager)
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -1169,14 +1170,11 @@ async fn cancel_job(
     // leaves readable but a User must not be able to kill.
     if !job_mutable_by(owner, scope.as_deref()) {
         tracing::warn!(%job_id, %caller, %owner, "job_cancel_denied_not_owner");
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "job_cancel_denied",
-            "warning",
-            caller,
-            &job_id,
-            "denied_not_owner",
-            json!({"account": account_of(caller), "owner": owner}),
+            AuditEvent::new(AuditKind::JobCancelDenied, caller, &job_id)
+                .outcome(crate::audit::Outcome::custom("denied_not_owner"))
+                .details(json!({"account": account_of(caller), "owner": owner})),
         )
         .await;
         // 404, matching `get_job`: a caller who cannot see the job must not
@@ -1236,19 +1234,16 @@ async fn cancel_job(
     tracing::info!(job_id = %job_id, "job_cancelled");
     // Same rule as submit: the row attributes a person's cancel, not a cluster poke.
     if actor.is_some() {
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "job_cancel",
-        "info",
-        caller,
-        &job_id,
-        "cancelled",
-        json!({
+        AuditEvent::new(AuditKind::JobCancel, caller, &job_id)
+            .outcome(crate::audit::Outcome::custom("cancelled"))
+            .details(json!({
             "account": account_of(caller),
             "owner": owner,
             "prior_status": current_status,
             "node_id": node_id,
-        }),
+        })),
     )
     .await;
     }
@@ -1499,7 +1494,7 @@ async fn scheduler_submit_job(
     let owner = actor.as_ref().map(|Extension(a)| account_of(a.0.as_str())).unwrap_or("");
     // No requester = cluster-HMAC caller: internal, privileged, as before.
     let restricted = requester.as_ref().is_some_and(|Extension(r)| r.role < crate::auth::Role::Operator);
-    let audit = |outcome: &'static str, severity: &'static str, extra: Value| {
+    let audit = |outcome: &'static str, severity: crate::audit::Severity, extra: Value| {
         let db = state.db.clone();
         let sub = actor_sub.to_string();
         let account = account_of(actor_sub).to_string();
@@ -1516,7 +1511,14 @@ async fn scheduler_submit_job(
                 for (k, v) in e { o.insert(k.clone(), v.clone()); }
             }
             let resource = d.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            crate::routes::core::audit_event(&db, "job_submit", severity, &sub, &resource, outcome, d).await;
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::JobSubmit, &sub, &resource)
+                    .outcome(outcome)
+                    .severity(severity)
+                    .details(d),
+            )
+            .await;
         }
     };
 
@@ -1530,7 +1532,7 @@ async fn scheduler_submit_job(
             body.min_vram_gb,
             body.allow_queue_without_backend,
         ) {
-            audit("rejected", "warning", json!({"reason": e.to_string(), "priority": priority})).await;
+            audit("rejected", crate::audit::Severity::Warning, json!({"reason": e.to_string(), "priority": priority})).await;
             return Err(e);
         }
         let (p, k) = clamp_user_job_knobs(priority, knobs.0, knobs.1, knobs.2);
@@ -1544,7 +1546,7 @@ async fn scheduler_submit_job(
         {
             Ok(crate::cache::RateResult::Allowed { .. }) => {}
             Ok(crate::cache::RateResult::Limited { retry_after }) => {
-                audit("rate_limited", "warning", json!({"retry_after_secs": retry_after, "priority": priority})).await;
+                audit("rate_limited", crate::audit::Severity::Warning, json!({"retry_after_secs": retry_after, "priority": priority})).await;
                 return Err(AppError::TooManyRequests {
                     msg: format!(
                         "job submit limit reached: {USER_JOB_SUBMITS_PER_WINDOW} jobs per hour per account"
@@ -1561,7 +1563,7 @@ async fn scheduler_submit_job(
     }
 
     if let Some(resp) = route_by_executor(&state, job_type, &payload).await? {
-        audit("gateway_local", "info", json!({"priority": priority})).await;
+        audit("gateway_local", crate::audit::Severity::Info, json!({"priority": priority})).await;
         return Ok(resp);
     }
 
@@ -1594,7 +1596,7 @@ async fn scheduler_submit_job(
 
     match submit_job_to_redis(redis, job_type, &payload, priority, opts).await {
         Some(job_id) => {
-            audit("queued", "info", json!({"job_id": job_id, "priority": priority, "backend": body.backend, "force_node": body.force_node})).await;
+            audit("queued", crate::audit::Severity::Info, json!({"job_id": job_id, "priority": priority, "backend": body.backend, "force_node": body.force_node})).await;
             Ok(Json(json!({"job_id": job_id, "status": "queued"})))
         }
         None => Err(AppError::Internal("Failed to submit job to Redis".into())),
@@ -2852,17 +2854,14 @@ async fn approval_decide(
     tx.commit().await?;
 
     // Tamper-evident audit sink, same pattern as the sibling mutating routes.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "approval_decision",
-        "info",
-        &resolved_by,
-        &request_id,
-        new_status,
-        json!({
+        AuditEvent::new(AuditKind::ApprovalDecision, &resolved_by, &request_id)
+            .outcome(crate::audit::Outcome::from(new_status))
+            .details(json!({
             "tool_name": tool_name,
             "reason": reason,
-        }),
+        })),
     )
     .await;
     tracing::info!(
@@ -3028,14 +3027,11 @@ async fn mesh_stack_rebuild(
         .as_ref()
         .map(|e| e.0.sub.clone())
         .unwrap_or_else(|| "cluster-cli".to_string());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "stack_rebuild",
-        "warning",
-        &actor,
-        "mesh:stack",
-        if spool_path.is_some() { "queued_spool" } else { "spool_write_failed" },
-        json!({ "args": &args, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::StackRebuild, &actor, "mesh:stack")
+            .outcome(if spool_path.is_some() { crate::audit::Outcome::custom("queued_spool") } else { crate::audit::Outcome::custom("spool_write_failed") })
+            .details(json!({ "args": &args, "spool_command": &spool_path })),
     )
     .await;
 
@@ -4484,14 +4480,11 @@ async fn mesh_restart(
     }))
     .await;
     let actor = if admin.is_empty() { "admin".to_string() } else { admin };
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mesh_restart",
-        "warning",
-        &actor,
-        &service,
-        result,
-        json!({ "reason": reason, "provider": provider, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::MeshRestart, &actor, &service)
+            .outcome(crate::audit::Outcome::from(result))
+            .details(json!({ "reason": reason, "provider": provider, "spool_command": &spool_path })),
     )
     .await;
 
@@ -4601,14 +4594,11 @@ async fn mesh_rebuild(
     }))
     .await;
     let actor = if admin.is_empty() { "admin".to_string() } else { admin };
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mesh_rebuild",
-        "warning",
-        &actor,
-        &service,
-        result,
-        json!({ "reason": reason, "provider": provider, "spool_command": &spool_path }),
+        AuditEvent::new(AuditKind::MeshRebuild, &actor, &service)
+            .outcome(crate::audit::Outcome::from(result))
+            .details(json!({ "reason": reason, "provider": provider, "spool_command": &spool_path })),
     )
     .await;
 

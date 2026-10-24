@@ -8,6 +8,7 @@
 //!   agent roles (hardcoded definitions)
 //! NATS delegation: multi-agent collaboration, workflow execution, persona chat
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -2481,14 +2482,10 @@ async fn keys_put(
         .await
         .map_err(AppError::BadRequest)?;
     if who.privileged {
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "agent_key_registered",
-            "info",
-            &who.label,
-            &agent,
-            "ok",
-            json!({ "agent": agent, "by": who.label, "privileged": true }),
+            AuditEvent::new(AuditKind::AgentKeyRegistered, &who.label, &agent)
+                .details(json!({ "agent": agent, "by": who.label, "privileged": true })),
         )
         .await;
     }

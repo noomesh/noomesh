@@ -211,7 +211,7 @@ pub(crate) async fn insert_in_tx(
     genesis: bool,
 ) -> Result<Option<i64>, sqlx::Error> {
     let tail = fetch_tail(&mut *tx).await?;
-    let now = crate::routes::core::stored_now();
+    let now = crate::audit::stored_now();
     // Never earlier than the predecessor: keeps a partition's seq range contiguous.
     let ts = match &tail {
         Some((_, _, t)) if *t > now => *t,
@@ -407,7 +407,7 @@ pub(crate) async fn ensure_genesis_with(db: &sqlx::PgPool, key: Option<Vec<u8>>)
     for attempt in 0..2 {
         match try_genesis(db, &key).await {
             Ok(o) => return o,
-            Err(e) if attempt == 0 && crate::routes::core::is_missing_partition(&e) => {
+            Err(e) if attempt == 0 && crate::audit::is_missing_partition(&e) => {
                 crate::audit_partition::ensure_for_heal(db).await;
             }
             Err(e) => return GenesisOutcome::Failed(e.to_string()),

@@ -949,7 +949,7 @@ pub(crate) async fn ensure_checkpoint_with(
         "after_row_id": last_retired.as_ref().map(|r| r.id.clone()),
     })
     .to_string();
-    let written = crate::routes::core::write_audit_row(
+    let written = crate::audit::write_audit_row(
         db,
         &signing_key,
         CHECKPOINT_EVENT,
@@ -1040,7 +1040,7 @@ pub(crate) async fn ensure_hash_v2_marker_with(
                  and prev_hash as well; a v1 row after this one fails verification",
     })
     .to_string();
-    let written = crate::routes::core::write_audit_row(
+    let written = crate::audit::write_audit_row(
         db,
         &current,
         HASH_V2_MARKER_EVENT,
@@ -1772,7 +1772,7 @@ mod tests {
                 let h = row_hash_with(&key, et, "info", "proof", "gateway", "ok", "");
                 let id = uuid::Uuid::new_v4().to_string();
                 assert!(
-                    crate::routes::core::insert_signed_audit_row(
+                    crate::audit::insert_signed_audit_row(
                         &db, &id, chrono::Utc::now(), et, "info", "proof", "gateway", "ok", "{}",
                         None, &h, None
                     )
@@ -1817,7 +1817,7 @@ mod tests {
             let nk = nk.clone();
             async move {
                 assert!(
-                    crate::routes::core::write_audit_row(
+                    crate::audit::write_audit_row(
                         &db, &nk, et, "info", "proof", "gateway", "ok", "{}", None
                     )
                     .await
@@ -1869,7 +1869,7 @@ mod tests {
         assert_eq!(m2, MarkerOutcome::AlreadyPresent);
         for et in ["admin_action", "auth_failure"] {
             assert!(
-                crate::routes::core::write_audit_row(
+                crate::audit::write_audit_row(
                     &db, &nk, et, "warning", "alice", "gateway", "denied",
                     r#"{"zeta":1,"source_ip":"10.0.0.7","a":[1.50,{"y":null,"x":"é"}]}"#, None,
                 )

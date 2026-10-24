@@ -3,10 +3,10 @@
 
 //! Who and where an audit row came from, without touching 100 call sites.
 //!
-//! [`routes::core::audit_event`] has ~100 callers and, until now, recorded no
+//! [`audit::record`] has ~120 callers and, until now, recorded no
 //! source address: only the login rows (`audit_auth`) carried one. A request
 //! layer ([`origin_layer`]) puts the caller's address in a task-local for the
-//! whole handler, and `audit_event` folds it, and the conversation id of the
+//! whole handler, and `audit::record` folds it, and the conversation id of the
 //! agent turn it runs inside, into the row's `details` ([`with_origin`]).
 //!
 //! The address follows the SAME rule as the login rows and the rate limiter

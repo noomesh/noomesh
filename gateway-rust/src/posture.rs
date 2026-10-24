@@ -12,6 +12,7 @@
 //! Bootstrap-tier gates (TLS, secrets — needed *before* the DB is reachable)
 //! are NOT here; those stay in the secrets backend.
 
+use crate::audit::{AuditEvent, AuditKind};
 use sqlx::PgPool;
 
 /// What a posture key IS — and therefore whether a vetted profile may set it.
@@ -305,14 +306,10 @@ async fn clear_retired_rows(db: &PgPool, rows: &[(String, String)]) {
             .await;
         match deleted {
             Ok(r) if r.rows_affected() > 0 => {
-                crate::routes::core::audit_event(
+                crate::audit::record(
                     db,
-                    "security_posture_retired_row_removed",
-                    "info",
-                    "gateway-boot",
-                    &key,
-                    "ok",
-                    serde_json::json!({ "key": key, "value": value, "why": "retired key at a closed value — inert" }),
+                    AuditEvent::new(AuditKind::SecurityPostureRetiredRowRemoved, "gateway-boot", &key)
+                        .details(serde_json::json!({ "key": key, "value": value, "why": "retired key at a closed value — inert" })),
                 )
                 .await;
                 tracing::info!(key = %key, value = %value,

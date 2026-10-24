@@ -29,6 +29,7 @@
 //! agent's container proxy: the reservation names the node, the declaration
 //! names the container, nothing else is reachable.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{
@@ -361,7 +362,7 @@ async fn reservation_take(
             let _ = super::cluster::gpu_hold_op(&state, actor.clone(), &node, "release",
                 json!({"operation_id": id, "generation": generation, "force": false, "legacy": false, "resume": "now"}),
                 std::time::Duration::from_secs(90)).await;
-            audit(&state, "reservation_take", &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
+            audit(&state, AuditKind::ReservationTake, &actor, &node, "error", json!({"id": id, "workload": key, "step": "start", "detail": e})).await;
             return Err(AppError::Internal(format!("{key} did not start on {node}: {e}; the GPU was released back to the pool")));
         }
     };
@@ -373,7 +374,7 @@ async fn reservation_take(
         Ok(st) => ("reserved", st, String::new()),
         Err(e) => ("needs_attention", json!({}), e),
     };
-    audit(&state, "reservation_take", &actor, &node, if status == "reserved" { "ok" } else { "needs_attention" },
+    audit(&state, AuditKind::ReservationTake, &actor, &node, if status == "reserved" { "ok" } else { "needs_attention" },
         json!({"id": id, "workload": key, "hand_over": hand_over, "lease": lease, "detail": detail})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, status, "reservation_take");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "holder": actor, "status": status, "detail": detail,
@@ -408,7 +409,7 @@ async fn reservation_release(
             match drain_and_stop(&link, &decl, &id, force).await {
                 Ok(v) => steps["stopped"] = v,
                 Err(e) => {
-                    audit(&state, "reservation_release", &actor, &node, "error", json!({"id": id, "workload": key, "detail": e, "force": force})).await;
+                    audit(&state, AuditKind::ReservationRelease, &actor, &node, "error", json!({"id": id, "workload": key, "detail": e, "force": force})).await;
                     return Err(AppError::Conflict(format!("{key} did not stop on {node}: {e}; the reservation stays (force to release anyway)")));
                 }
             }
@@ -419,14 +420,25 @@ async fn reservation_release(
         json!({"operation_id": id, "generation": generation, "force": force, "legacy": false, "resume": "now"}),
         std::time::Duration::from_secs(90)).await?;
     let Json(released) = released;
-    audit(&state, "reservation_release", &actor, &node, "ok", json!({"id": id, "workload": key, "holder": holder, "force": force})).await;
+    audit(&state, AuditKind::ReservationRelease, &actor, &node, "ok", json!({"id": id, "workload": key, "holder": holder, "force": force})).await;
     tracing::info!(id = %id, workload = %key, node = %node, actor = %actor, force, "reservation_release");
     Ok(Json(json!({"id": id, "workload": key, "node": node, "status": "released", "steps": steps,
         "gpu_contention": released.get("gpu_contention").cloned().unwrap_or(json!({}))})))
 }
 
-async fn audit(state: &AppState, event: &str, actor: &str, node: &str, outcome: &str, details: Value) {
-    super::core::audit_event(&state.db, event, "info", actor, &format!("node:{node}"), outcome, details).await;
+async fn audit(
+    state: &AppState,
+    kind: AuditKind,
+    actor: &str,
+    node: &str,
+    outcome: impl Into<crate::audit::Outcome>,
+    details: Value,
+) {
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(kind, actor, &format!("node:{node}")).outcome(outcome).details(details),
+    )
+    .await;
 }
 
 /// `GET /api/addon-workloads/{addon}/{workload}/status`: how an add-on
@@ -824,7 +836,7 @@ mod tests {
         let rollback = take[start..].find("\"release\"").expect("a failed start releases");
         assert!(take[start + rollback..].contains("\"resume\": \"now\""), "the pool gets the GPU back at once");
         assert!(take.contains("\"needs_attention\""), "a ready timeout keeps the reservation and says so");
-        assert!(take.matches("audit(&state, \"reservation_take\"").count() >= 2);
+        assert!(take.matches("audit(&state, AuditKind::ReservationTake").count() >= 2);
         let rel = src.split("async fn reservation_release(").nth(1).unwrap().split("\nasync fn ").next().unwrap();
         assert!(rel.contains("holder != actor && !force"), "only the holder, or a force");
         assert!(rel.find("drain_and_stop(").unwrap() < rel.find("\"release\"").unwrap(), "the workload stops before the lease is released");

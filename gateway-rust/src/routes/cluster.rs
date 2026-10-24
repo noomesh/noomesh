@@ -3,6 +3,7 @@
 
 //! Cluster routes — node management, backends, GPU metrics.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -798,12 +799,12 @@ async fn node_forget(
             "no node named '{node_id}' in the registry, its config, its placements, its enrollments or the mesh — nothing to forget"
         )));
     }
-    crate::routes::core::audit_event(
-        &state.db, "node_forgotten", "warning", "gateway",
-        &format!("node:{node_id}"), "ok",
-        json!({ "node": node_id, "db_rows": deleted, "config_rows": config_rows,
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::NodeForgotten, "gateway", &format!("node:{node_id}"))
+            .details(json!({ "node": node_id, "db_rows": deleted, "config_rows": config_rows,
                 "placements": placements, "kv_purged": kv_purged,
-                "enrollments_revoked": enrollments_revoked }),
+                "enrollments_revoked": enrollments_revoked })),
     ).await;
     Ok(Json(json!({
         "status": "forgotten", "node": node_id,
@@ -2371,11 +2372,16 @@ pub(crate) async fn gpu_hold_op(
     tracing::info!(node_id = %node_id, op, ok, actor = %actor, force = payload["force"].as_bool().unwrap_or(false),
         legacy = payload["legacy"].as_bool().unwrap_or(false), operation_id = %payload["operation_id"].as_str().unwrap_or(""), "node_gpu_hold");
     let lease = result.as_ref().ok().and_then(|v| v.pointer("/gpu_contention/lease").cloned()).unwrap_or(Value::Null);
-    crate::routes::core::audit_event(
-        &state.db, &format!("node_gpu_{op}"), "info", &actor,
-        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
-        json!({"node": node_id, "op": op, "request": payload, "lease": lease,
-               "force": payload["force"], "legacy": payload["legacy"]}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(
+            if op == "hold" { AuditKind::NodeGpuHold } else { AuditKind::NodeGpuRelease },
+            &actor,
+            &format!("node:{node_id}"),
+        )
+        .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+        .details(json!({"node": node_id, "op": op, "request": payload, "lease": lease,
+               "force": payload["force"], "legacy": payload["legacy"]})),
     ).await;
     let mut out = result?;
     out["node"] = json!(node_id);
@@ -2456,10 +2462,11 @@ async fn node_bench(
     }
     let secs = started.elapsed().as_secs_f64();
     tracing::info!(node_id = %node_id, ok, actor = %actor, secs, "node_bench");
-    crate::routes::core::audit_event(
-        &state.db, "node_bench", "info", &actor,
-        &format!("node:{node_id}"), if ok { "ok" } else { "error" },
-        json!({"node": node_id, "secs": secs, "result": detail}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::NodeBench, &actor, &format!("node:{node_id}"))
+            .outcome(if ok { crate::audit::Outcome::Ok } else { crate::audit::Outcome::Error })
+            .details(json!({"node": node_id, "secs": secs, "result": detail})),
     ).await;
     response
 }
@@ -4656,15 +4663,15 @@ async fn model_class_put(
     tracing::info!(class = %declared.name, candidates = declared.candidates.len(), aliases = aliases.len(), unknown_nodes = ?unknown_nodes, "model_class_declared");
     // A class write changes routing for every consumer: audited like a
     // placement change or a node forget.
-    crate::routes::core::audit_event(
-        &state.db, "model_class_declared", "info", "gateway",
-        &format!("class:{}", declared.name), "ok",
-        json!({
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelClassDeclared, "gateway", &format!("class:{}", declared.name))
+            .details(json!({
             "class": declared.name,
             "candidates": declared.candidates.iter().map(|c| json!({"node": c.node_id, "backend": c.backend, "model": c.model, "degraded": c.degraded})).collect::<Vec<_>>(),
             "aliases": aliases,
             "unknown_nodes": unknown_nodes,
-        }),
+        })),
     ).await;
     let mut out = json!({"ok": true, "class": declared.name, "candidates": declared.candidates.len(), "aliases": aliases});
     if let Some(note) = unknown_nodes_note(&unknown_nodes) {
@@ -4712,10 +4719,10 @@ async fn model_class_delete(
         return Err(AppError::NotFound(format!("no declared class '{class}'")));
     }
     tracing::info!(class = %class, "model_class_removed");
-    crate::routes::core::audit_event(
-        &state.db, "model_class_removed", "info", "gateway",
-        &format!("class:{class}"), "ok",
-        json!({"class": class, "deleted": n}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelClassRemoved, "gateway", &format!("class:{class}"))
+            .details(json!({"class": class, "deleted": n})),
     ).await;
     Ok(Json(json!({"ok": true, "class": class, "deleted": n})))
 }
@@ -4750,9 +4757,10 @@ async fn model_alias_put(
         .map_err(|e| AppError::Internal(format!("model alias write: {e}")))?;
     let served = table.class(&class).is_some();
     tracing::info!(alias = %alias, class = %class, served, "model_alias_declared");
-    crate::routes::core::audit_event(
-        &state.db, "model_alias_declared", "info", "gateway",
-        &format!("alias:{alias}"), "ok", json!({"alias": alias, "class": class, "served": served}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelAliasDeclared, "gateway", &format!("alias:{alias}"))
+            .details(json!({"alias": alias, "class": class, "served": served})),
     ).await;
     let mut out = json!({"ok": true, "alias": alias, "class": class, "served": served});
     if !served {
@@ -4775,9 +4783,10 @@ async fn model_alias_delete(
         return Err(AppError::NotFound(format!("no declared alias '{alias}'")));
     }
     tracing::info!(alias = %alias, "model_alias_removed");
-    crate::routes::core::audit_event(
-        &state.db, "model_alias_removed", "info", "gateway",
-        &format!("alias:{alias}"), "ok", json!({"alias": alias}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::ModelAliasRemoved, "gateway", &format!("alias:{alias}"))
+            .details(json!({"alias": alias})),
     ).await;
     Ok(Json(json!({"ok": true, "alias": alias})))
 }
@@ -4921,10 +4930,10 @@ async fn embedding_space_put(
         es::set_cache(all);
     }
     tracing::info!(space = %rec.space, model = %rec.model, dims = ?rec.dims, created = existing.is_none(), "embedding_space_declared");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_space_declared", "info", "gateway",
-        &format!("embedding_space:{}", rec.space), "ok",
-        json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingSpaceDeclared, "gateway", &format!("embedding_space:{}", rec.space))
+            .details(json!({"space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})),
     ).await;
     Ok(Json(json!({"ok": true, "space": rec.space, "model": rec.model, "dims": rec.dims, "created": existing.is_none()})))
 }
@@ -4957,9 +4966,10 @@ async fn embedding_space_delete(
         es::set_cache(all);
     }
     tracing::info!(space = %space, "embedding_space_removed");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_space_removed", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingSpaceRemoved, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space})))
 }
@@ -5011,9 +5021,10 @@ async fn embedding_space_migration_start(
     refresh_embedding_spaces(&state).await;
     let st = if next_dims.is_some() { es::MIGRATION_FILLING } else { es::MIGRATION_PENDING };
     tracing::info!(space = %space, next_model = %model, next_dims = ?next_dims, state = st, "embedding_migration_started");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_started", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": model, "next_dims": next_dims, "state": st}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationStarted, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space, "next_model": model, "next_dims": next_dims, "state": st})),
     ).await;
     if next_dims.is_some() {
         return Ok((axum::http::StatusCode::OK, Json(json!({"ok": true, "space": space, "next_model": model, "next_dims": next_dims, "state": st}))));
@@ -5053,9 +5064,10 @@ async fn embedding_space_migration_complete(
     }
     refresh_embedding_spaces(&state).await;
     tracing::info!(space = %space, next_model = %next, "embedding_migration_cutover");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_cutover", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space, "next_model": next}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationCutover, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space, "next_model": next})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space, "next_model": next, "state": es::MIGRATION_CUTOVER})))
 }
@@ -5083,9 +5095,10 @@ async fn embedding_space_migration_cancel(
     }
     refresh_embedding_spaces(&state).await;
     tracing::info!(space = %space, "embedding_migration_cancelled");
-    crate::routes::core::audit_event(
-        &state.db, "embedding_migration_cancelled", "info", "gateway",
-        &format!("embedding_space:{space}"), "ok", json!({"space": space}),
+    crate::audit::record(
+        &state.db,
+        AuditEvent::new(AuditKind::EmbeddingMigrationCancelled, "gateway", &format!("embedding_space:{space}"))
+            .details(json!({"space": space})),
     ).await;
     Ok(Json(json!({"ok": true, "space": space})))
 }
@@ -5292,14 +5305,10 @@ async fn mint_join_key(
     // result}); the Rust-side convention is the noo_security_audit table.
     let actor = ctx.as_ref().map(|axum::Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "mint_join_key",
-        "warning",
-        &actor,
-        "cluster:tailscale",
-        "ok",
-        json!({"tag": tag, "reusable": reusable, "expiry_minutes": expiry_minutes}),
+        AuditEvent::new(AuditKind::MintJoinKey, &actor, "cluster:tailscale")
+            .details(json!({"tag": tag, "reusable": reusable, "expiry_minutes": expiry_minutes})),
     ).await;
 
     Ok(Json(json!({
@@ -5487,14 +5496,10 @@ async fn delete_tailscale_device(
 
     let actor = ctx.as_ref().map(|axum::Extension(r)| r.sub.clone())
         .unwrap_or_else(|| "gateway".into());
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "delete_tailscale_device",
-        "warning",
-        &actor,
-        "cluster:tailscale",
-        "ok",
-        json!({"device_id": dev_id, "device_name": dev_name, "ip": ip, "hostname": hostname}),
+        AuditEvent::new(AuditKind::DeleteTailscaleDevice, &actor, "cluster:tailscale")
+            .details(json!({"device_id": dev_id, "device_name": dev_name, "ip": ip, "hostname": hostname})),
     ).await;
 
     Ok(Json(json!({
@@ -6575,7 +6580,7 @@ mod heartbeat_carry_tests {
         let op = src.split("async fn gpu_hold_op(").nth(1).expect("gpu_hold_op")
             .split("\nasync fn ").next().unwrap();
         assert!(op.contains("GpuTransition::take(node_id)?"), "one transition per node at a time");
-        assert!(op.contains("audit_event("), "hold/release must be audited");
+        assert!(op.contains("audit::record("), "hold/release must be audited");
         assert!(op.contains("\"force\": payload[\"force\"]"), "the audit row says whether it was a force");
         let drain = op.find("set_node_draining(node_id, true)").expect("drain mark");
         let lanes = op.find("set_lanes_paused(node_id, &drain_lanes)").expect("GPU-lane mark");
@@ -6620,7 +6625,7 @@ mod heartbeat_carry_tests {
         assert!(h.contains("operator: crate::authz::Operator"), "the operator gate");
         assert!(h.contains(".request(reqwest::Method::POST, \"/bench\")"));
         assert!(h.contains(".timeout(NODE_BENCH_TIMEOUT)"));
-        assert!(h.contains("audit_event("), "a bench must be audited");
+        assert!(h.contains("audit::record("), "a bench must be audited");
         assert!(src.contains(".route(\"/api/cluster/nodes/{node_id}/bench\", post(node_bench))"));
         assert_eq!(src.matches("carry_reported(&mut data, &body, \"model_bench\");").count(), 2, "heartbeat and registration");
         assert!(src.contains("\"harness_profile\": harness_profile,"), "desired-config carries the resolved profile");
@@ -7296,13 +7301,13 @@ mod model_class_tests {
         let put = src.split("async fn model_class_put(").nth(1).unwrap().split("\n}\n").next().unwrap();
         let del = src.split("async fn model_class_delete(").nth(1).unwrap().split("\n}\n").next().unwrap();
         let get = src.split("async fn model_classes_get(").nth(1).unwrap().split("\n}\n").next().unwrap();
-        assert!(put.contains("audit_event(") && put.contains("\"model_class_declared\""), "PUT audits");
+        assert!(put.contains("audit::record(") && put.contains("AuditKind::ModelClassDeclared"), "PUT audits");
         assert!(put.contains("\"unknown_nodes\": unknown_nodes"), "the audit row names the unknown nodes");
-        assert!(del.contains("audit_event(") && del.contains("\"model_class_removed\""), "DELETE audits");
-        assert!(!get.contains("audit_event("), "GET is a read");
+        assert!(del.contains("audit::record(") && del.contains("AuditKind::ModelClassRemoved"), "DELETE audits");
+        assert!(!get.contains("audit::record("), "GET is a read");
         // The audit happens after the write succeeded, never before.
-        assert!(put.find("save_class(").unwrap() < put.find("audit_event(").unwrap());
-        assert!(del.find("delete_class(").unwrap() < del.find("audit_event(").unwrap());
+        assert!(put.find("save_class(").unwrap() < put.find("audit::record(").unwrap());
+        assert!(del.find("delete_class(").unwrap() < del.find("audit::record(").unwrap());
     }
 
     /// An alias is one class's: class B may not silently re-point A's alias.

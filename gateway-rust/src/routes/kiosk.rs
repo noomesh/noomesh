@@ -41,6 +41,7 @@
 //! verbatim. The display's own types are the contract; that is what makes
 //! "only what it draws" checkable rather than a matter of taste.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::{
@@ -539,9 +540,11 @@ async fn token_tailnet(
     let audit_denied = |reason: &'static str, ip: String| {
         let db = state.db.clone();
         async move {
-            super::core::audit_event(
-                &db, "kiosk_tailnet_mint_denied", "warning", "anonymous",
-                &format!("kiosk-mint:{ip}"), "denied", json!({ "reason": reason }),
+            crate::audit::record(
+                &db,
+                AuditEvent::new(AuditKind::KioskTailnetMintDenied, "anonymous", &format!("kiosk-mint:{ip}"))
+                    .outcome(crate::audit::Outcome::Denied)
+                    .details(json!({ "reason": reason })),
             )
             .await;
         }

@@ -12,6 +12,7 @@
 //! Its own module, away from `routes/admin.rs`, so the audit stats and verify
 //! routes there can be changed without touching this one.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::{extract::{Query, State}, routing::get, Json, Router};
@@ -178,14 +179,11 @@ async fn security_audit_list(
         Some(r) => (r.sub.clone(), r.act.as_ref().map(|a| json!(a))),
         None => ("cluster".to_string(), None),
     };
-    super::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "audit_log_read",
-        "info",
-        &reader,
-        "noo_security_audit",
-        "success",
-        json!({
+        AuditEvent::new(AuditKind::AuditLogRead, &reader, "noo_security_audit")
+            .outcome(crate::audit::Outcome::custom("success"))
+            .details(json!({
             "since": since.map(|t| t.to_rfc3339()),
             "event_type": event_type,
             "actor": actor,
@@ -193,7 +191,7 @@ async fn security_audit_list(
             "paged": cursor.is_some(),
             "returned": events.len(),
             "act": act,
-        }),
+        })),
     )
     .await;
 

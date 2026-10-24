@@ -14,6 +14,7 @@
 //!
 //! and [`posture_admission`], which the posture write routes call.
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, State};
@@ -127,14 +128,10 @@ async fn register(State(state): State<Arc<AppState>>, facts: CallerFacts) -> App
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("cannot register the operator certificate: {e}")))?;
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "operator_cert_registered",
-        "warning",
-        &format!("operator:{}", who.sub),
-        &tp,
-        "ok",
-        json!({ "operator": who.sub, "thumbprint": tp }),
+        AuditEvent::new(AuditKind::OperatorCertRegistered, &format!("operator:{}", who.sub), &tp)
+            .details(json!({ "operator": who.sub, "thumbprint": tp })),
     )
     .await;
     Ok(Json(json!({
@@ -210,14 +207,10 @@ async fn revoke(State(state): State<Arc<AppState>>, facts: CallerFacts, Json(bod
     }
     .map_err(|e| AppError::Internal(format!("cannot revoke: {e}")))?
     .rows_affected();
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "operator_cert_revoked",
-        "warning",
-        &by,
-        tp.or(op).unwrap_or(""),
-        "ok",
-        json!({ "thumbprint": tp, "operator": op, "kept": keep, "revoked": rows }),
+        AuditEvent::new(AuditKind::OperatorCertRevoked, &by, tp.or(op).unwrap_or(""))
+            .details(json!({ "thumbprint": tp, "operator": op, "kept": keep, "revoked": rows })),
     )
     .await;
     Ok(Json(json!({ "status": "ok", "revoked": rows })))

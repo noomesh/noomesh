@@ -9,6 +9,7 @@
 //!              gateway restart (writes a recreate command to the host-watcher spool).
 //! NATS delegation: prompt skill evolution (GA engine), persona lens
 
+use crate::audit::{AuditEvent, AuditKind};
 use std::sync::Arc;
 use axum::{
     Router,
@@ -734,27 +735,21 @@ async fn config_update_section(
     // Third wall: no credential-shaped key with a value, at any depth.
     let creds = credential_paths(&body);
     if !creds.is_empty() && refusal.is_none() {
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "config_update_refused",
-            "warning",
-            &actor_name(&actor),
-            &format!("config:{section}"),
-            "refused",
-            json!({ "section": section, "keys": creds, "reason": "credential-shaped key" }),
+            AuditEvent::new(AuditKind::ConfigUpdateRefused, &actor_name(&actor), &format!("config:{section}"))
+                .outcome(crate::audit::Outcome::custom("refused"))
+                .details(json!({ "section": section, "keys": creds, "reason": "credential-shaped key" })),
         )
         .await;
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(credential_write_refusal(&creds))).into_response();
     }
     if let Some(reason) = refusal {
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "config_update_refused",
-            "warning",
-            &actor_name(&actor),
-            &format!("config:{section}"),
-            "refused",
-            json!({ "section": section, "keys": top_level_keys(&body), "reason": reason }),
+            AuditEvent::new(AuditKind::ConfigUpdateRefused, &actor_name(&actor), &format!("config:{section}"))
+                .outcome(crate::audit::Outcome::custom("refused"))
+                .details(json!({ "section": section, "keys": top_level_keys(&body), "reason": reason })),
         )
         .await;
         tracing::warn!(target: "security", section = %section, actor = %actor_name(&actor),
@@ -784,14 +779,10 @@ async fn config_update_section(
 
     // Audit the config change (H-L1). Record the changed keys, not values —
     // config sections can hold sensitive data.
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "config_update",
-        "warning",
-        &actor_name(&actor),
-        &format!("config:{section}"),
-        "ok",
-        json!({ "section": section, "keys": top_level_keys(&body) }),
+        AuditEvent::new(AuditKind::ConfigUpdate, &actor_name(&actor), &format!("config:{section}"))
+            .details(json!({ "section": section, "keys": top_level_keys(&body) })),
     )
     .await;
 
@@ -862,14 +853,10 @@ async fn settings_update(
         return (status, err_body).into_response();
     }
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "config_update",
-        "warning",
-        &actor_name(&actor),
-        "config",
-        "ok",
-        json!({ "keys": top_level_keys(&body) }),
+        AuditEvent::new(AuditKind::ConfigUpdate, &actor_name(&actor), "config")
+            .details(json!({ "keys": top_level_keys(&body) })),
     )
     .await;
 
@@ -1891,14 +1878,10 @@ async fn settings_flags_set(
         .bind(&by)
         .execute(&state.db)
         .await?;
-        crate::routes::core::audit_event(
+        crate::audit::record(
             &state.db,
-            "setting_flag_set",
-            "info",
-            &by,
-            &format!("settings:string:{key}"),
-            "ok",
-            json!({ "setting": &key, "value": &raw, "by": &by }),
+            AuditEvent::new(AuditKind::SettingFlagSet, &by, &format!("settings:string:{key}"))
+                .details(json!({ "setting": &key, "value": &raw, "by": &by })),
         )
         .await;
         tracing::info!(setting = %key, value = %raw, by = %by, "setting_string_set");
@@ -1934,14 +1917,10 @@ async fn settings_flags_set(
     // reload (`crate::settings::spawn_refresh`).
     crate::settings::set_override(&key, val);
 
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        "setting_flag_set",
-        "info",
-        &by,
-        &format!("settings:flag:{key}"),
-        "ok",
-        json!({ "flag": &key, "value": on, "by": &by }),
+        AuditEvent::new(AuditKind::SettingFlagSet, &by, &format!("settings:flag:{key}"))
+            .details(json!({ "flag": &key, "value": on, "by": &by })),
     )
     .await;
     tracing::info!(flag = %key, value = on, by = %by, "setting_flag_set");
@@ -2257,14 +2236,14 @@ async fn prompt_skills_decide(
         Err(DecideError::Unchanged(st)) => return Err(AppError::Conflict(format!("proposal {id} is already {st}"))),
         Err(DecideError::Db(e)) => return Err(AppError::Internal(format!("could not record the decision: {e}"))),
     };
-    crate::routes::core::audit_event(
+    crate::audit::record(
         &state.db,
-        if trust == SkillTrust::Promoted { "prompt_skill_promoted" } else { "prompt_skill_rejected" },
-        "info",
-        &by,
-        &done.name,
-        "ok",
-        json!({"proposal_id": done.id, "content_sha": done.content_sha, "reason": reason}),
+        AuditEvent::new(
+            if trust == SkillTrust::Promoted { AuditKind::PromptSkillPromoted } else { AuditKind::PromptSkillRejected },
+            &by,
+            &done.name,
+        )
+        .details(json!({"proposal_id": done.id, "content_sha": done.content_sha, "reason": reason})),
     )
     .await;
     // The decision is in the table either way; if the live registry cannot be
@@ -2465,7 +2444,7 @@ mod tests {
         }
         assert!(!body_of("async fn prompt_skills_fitness(").contains("open_skill_proposal("), "a score move is not a new text");
         assert!(body_of("async fn prompt_skills_retire(").contains("withdraw("));
-        assert!(decide.contains("audit_event("), "every decision leaves an audit row");
+        assert!(decide.contains("audit::record("), "every decision leaves an audit row");
         assert!(decide.contains("refresh_skill_decisions("), "a decision takes effect in the live registry");
     }
 
