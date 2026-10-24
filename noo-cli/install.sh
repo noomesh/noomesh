@@ -13,7 +13,12 @@
 #
 # Environment overrides:
 #   NOO_CLI_VERSION   Pin a specific release tag (e.g. noo-cli-v0.1.0).
-#                     Default: latest noo-cli-v* release.
+#                     Default: the newest FINAL noo-cli-v* release; release
+#                     candidates (GitHub prereleases) and drafts are skipped.
+#   NOO_CLI_PRERELEASE=1
+#                     Let the default resolution pick a release candidate
+#                     when it is the newest noo-cli-v* release. Pinning one
+#                     with NOO_CLI_VERSION needs no flag.
 #   NOO_INSTALL_DIR   Install directory. Default: $HOME/.local/bin
 #                     Root-owned dirs (e.g. /usr/local/bin) work too: the
 #                     final placement uses sudo when the dir is unwritable.
@@ -287,6 +292,26 @@ download() {
 }
 
 # Fetch "$1" (url) to stdout. Transient failures retried like download().
+# Print the first noo-cli-v* tag in a GitHub releases listing (stdin, compact
+# or pretty JSON, newest first) that is not a draft and, unless
+# NOO_CLI_PRERELEASE=1, not a prerelease. The listing's own order is the
+# order: each release object names tag_name before draft and prerelease, and
+# nothing nested inside one (author, assets) carries those keys. A release
+# candidate is published as a prerelease, so a stranger installing during an
+# rc window gets the last final, as `noo upgrade` does (0.6.11-rc.1: it got
+# the rc).
+pick_cli_tag() {
+    tr ',' '\n' \
+        | sed -nE 's/.*"(tag_name|draft|prerelease)"[[:space:]]*:[[:space:]]*"?([^",}[:space:]]+)"?.*/\1 \2/p' \
+        | awk -v pre="${NOO_CLI_PRERELEASE:-0}" '
+            $1 == "tag_name"   { t = $2; d = ""; next }
+            $1 == "draft"      { d = $2; next }
+            $1 == "prerelease" {
+                if (t ~ /^noo-cli-v/ && d != "true" && ($2 == "false" || pre == "1")) { print t; exit }
+                t = ""
+            }'
+}
+
 fetch() {
     _url="$1"
     if have curl; then
@@ -524,20 +549,15 @@ else
         # releases API via curl is the default and the fallback.
         version=""
         if have gh; then
-            version="$(gh api "repos/${REPO}/releases?per_page=30" \
-                --jq '.[].tag_name' 2>/dev/null \
-                | grep -E '^noo-cli-v' | head -n1 || true)"
+            version="$(gh api "repos/${REPO}/releases?per_page=30" 2>/dev/null \
+                | pick_cli_tag || true)"
         fi
         if [ -z "$version" ]; then
-            # Grep the releases JSON for the first noo-cli-v* tag (namespaced
+            # The first final noo-cli-v* tag in the releases JSON (namespaced
             # tags keep noo-cli releases distinct from other components).
-            version="$(fetch "${GITHUB_API}?per_page=30" \
-                | grep '"tag_name"' \
-                | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-                | grep -E '^noo-cli-v' \
-                | head -n1 || true)"
+            version="$(fetch "${GITHUB_API}?per_page=30" | pick_cli_tag || true)"
         fi
-        [ -n "$version" ] || err "could not resolve a 'noo-cli-v*' release from ${GITHUB_API} — check the network (or an authenticated gh), or set NOO_CLI_VERSION to pin one"
+        [ -n "$version" ] || err "could not resolve a final 'noo-cli-v*' release from ${GITHUB_API} — check the network (or an authenticated gh), or set NOO_CLI_VERSION to pin one"
     fi
     bin_url="${GITHUB_DL}/${version}/${asset}"
     sum_url="${GITHUB_DL}/${version}/${asset}.sha256"
