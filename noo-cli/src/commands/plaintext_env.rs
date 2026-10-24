@@ -553,14 +553,15 @@ mod tests {
     /// roll moves: the slice refresh, the pin, the launcher.
     #[test]
     fn upgrade_refuses_a_plaintext_install_before_anything_moves() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let refuse = at("plaintext_env::AtRest::read(&root).controller_problem()");
-        for later in ["migrate_retired_yaml_gates(", "standalone::materialize(", "root.join(\"scripts/noomesh-start.sh\")"] {
+        use crate::commands::upgrade::phase_src;
+        let list = phase_src::list();
+        let at = |needle: &str| list.find(needle).unwrap_or_else(|| panic!("{needle} not in the phase list"));
+        let refuse = at("refuse_plaintext_install(");
+        for later in ["migrate_retired_yaml_gates(", "refresh_deploy_slice(", "launch_stack("] {
             assert!(refuse < at(later), "the plaintext refusal must come before `{later}`");
         }
+        assert!(phase_src::body("refuse_plaintext_install").contains("plaintext_env::AtRest::read(root).controller_problem()"),
+            "the refusal phase asks the at-rest reader");
     }
 
     /// Both commands in the remedy are real verbs (the hint lint checks the

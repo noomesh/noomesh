@@ -556,7 +556,7 @@ def test_a_release_candidate_meets_the_floor_as_its_release() -> None:
 @pytest.mark.parametrize("script,needle", [
     ("scripts/noomesh-start.sh", 'require_secrets_floor "." "$DIST_TAG" || exit 1'),
     ("scripts/noomesh-restart.sh", 'require_secrets_floor "." "$NOO_IMAGE_TAG" || exit 1'),
-    ("noo-cli/src/commands/upgrade.rs", "if !tag_meets_floor(&tag, &floor) {"),
+    ("noo-cli/src/commands/upgrade.rs", "if !tag_meets_floor(tag, &floor) {"),
 ])
 def test_the_floor_is_enforced_where_images_are_chosen(script: str, needle: str) -> None:
     assert needle in (ROOT / script).read_text(), f"{script} no longer enforces the secrets floor"
