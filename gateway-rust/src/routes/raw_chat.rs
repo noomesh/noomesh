@@ -983,7 +983,8 @@ mod budget_guard_tests {
         let e = budget_fits_thinking(&body(json!({"response_format": {"type": "json_object"}, "max_tokens": 64}))).unwrap_err();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert_eq!(e.kind, BUDGET_TOO_SMALL);
-        let public = serde_json::to_string(&e.body()).unwrap();
+        let public = e.public_message();
+        assert_eq!(e.body()["error"]["type"], BUDGET_TOO_SMALL);
         for must in ["max_tokens 64", "\"effort\": \"none\"", "reasoning_effort", "at least 256"] {
             assert!(public.contains(must), "{public}");
         }
