@@ -57,7 +57,9 @@ Sleep 800ms
 Type "# A fresh Ubuntu box. No checkout, no registry login." Enter
 Sleep 1500ms
 
-Type "curl -fsSL @INSTALL_URL@ | sh" Enter
+# @INSTALL_SH@ is `sh`, or `NOO_CLI_VERSION=<tag> sh` when NOO_DEMO_CLI_VERSION
+# pins the take to one release (an rc under test): the pin is on screen.
+Type "curl -fsSL @INSTALL_URL@ | @INSTALL_SH@" Enter
 Wait
 Sleep 1s
 Type "noo --version" Enter

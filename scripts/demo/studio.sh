@@ -47,7 +47,7 @@
 #   NOO_STUDIO_VHS_IMAGE    recorder image   (default ghcr.io/charmbracelet/vhs:latest)
 #   NOO_STUDIO_BASE_IMAGE   box base image (systemd + Docker go on top) (default ubuntu:24.04)
 #   NOO_STUDIO_CACHE_IMAGE  pull-through cache image             (default registry:3)
-#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES   passed through to the recorder
+#   NOO_DEMO_INSTALL_URL, NOO_DEMO_MASK_NAMES, NOO_DEMO_CLI_VERSION   passed through to the recorder
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -149,7 +149,8 @@ RUN apt-get update -qq \
  && useradd -m -s /bin/bash you && usermod -aG docker you \
  && echo 'you ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/you && chmod 440 /etc/sudoers.d/you \
  && systemctl enable docker >/dev/null 2>&1 \
- && systemctl mask systemd-logind.service getty@tty1.service tmp.mount >/dev/null 2>&1
+ && systemctl mask getty@tty1.service tmp.mount >/dev/null 2>&1 \
+ && mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/you
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 DOCKERFILE
@@ -160,7 +161,10 @@ box_wait_booted() {
   local i
   for i in $(seq 1 90); do
     if docker exec "$BOX" systemctl is-system-running >/dev/null 2>&1 || [ "$(docker exec "$BOX" systemctl is-system-running 2>/dev/null)" = degraded ]; then
-      docker exec "$BOX" docker info >/dev/null 2>&1 && return 0
+      # logind lingers `you` (touched at build): the user manager must be up so
+      # `systemctl --user` works for the film's shell, as after a real login.
+      docker exec "$BOX" docker info >/dev/null 2>&1 \
+        && docker exec "$BOX" systemctl is-active "user@$(docker exec "$BOX" id -u you)" >/dev/null 2>&1 && return 0
     fi
     sleep 2
   done
@@ -233,7 +237,7 @@ cmd_record() {
   # `docker exec` into the box); that socket is root on this host, and this
   # container is ours and short-lived. The host's docker CLI is mounted in.
   local passenv=() v
-  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES; do
+  for v in NOO_DEMO_INSTALL_URL NOO_DEMO_MASK_NAMES NOO_DEMO_CLI_VERSION; do
     [ -z "${!v:-}" ] || passenv+=(-e "$v=${!v}")
   done
   # The recorder is capped: vhs's render is the memory peak of a take, and an
