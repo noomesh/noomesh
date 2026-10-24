@@ -1109,7 +1109,7 @@ async fn native_rag_query(state: &AppState, call: &ToolCall, args: &Value) -> To
         request["roles"] = roles.clone();
     }
 
-    match worker_client::request_with_timeout(&state.nats, "worker.rag.query", &request, tool_timeout()).await {
+    match crate::trellion_client::TrellionClient::new(&state.nats).call_raw_with_timeout(crate::trellion_client::subjects::RAG_QUERY, request, tool_timeout()).await {
         Ok(response) => {
             let data = response.get("data").cloned().unwrap_or(response);
             if let Some(e) = data.get("error").and_then(|e| e.as_str()) {

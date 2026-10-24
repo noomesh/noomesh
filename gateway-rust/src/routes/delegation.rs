@@ -24,59 +24,24 @@ use serde_json::{json, Value};
 
 use crate::auth::RequesterCtx;
 use crate::state::AppState;
-use crate::worker_client;
+use crate::trellion_client::TrellionClient;
 
-pub(crate) type StatusJson = (StatusCode, Json<Value>);
+pub(crate) use crate::trellion_client::StatusJson;
 
-/// Map a successful NATS round-trip to an honest HTTP status (the worker
-/// may still have reported a failure inside the payload).
-///
-/// `pub(super)` (with the two helpers below): the memory-provider facade
-/// routes in knowledge.rs / snapshots.rs hand-roll what `delegate_post`
-/// did — attach requester, call, map status — with the facade in the
-/// middle, and MUST reuse these so their status contract cannot drift
-/// from the delegated routes'.
-pub(super) fn worker_ok(response: Value) -> StatusJson {
-    let payload = response.get("data").cloned().unwrap_or(response);
-    let status = match payload.get("error").and_then(|e| e.as_str()) {
-        None => StatusCode::OK,
-        Some(msg) if msg.starts_with("Worker error:") => StatusCode::INTERNAL_SERVER_ERROR,
-        Some(_) => StatusCode::BAD_REQUEST,
-    };
-    (status, Json(payload))
-}
+// `worker_ok` (the reply -> HTTP status contract) lives in `trellion_client`
+// next to the call shape it belongs to. Re-exported here because the facade
+// routes in knowledge.rs / snapshots.rs hand-roll attach -> call -> map with
+// the facade in the middle, and MUST reuse it so their status contract
+// cannot drift from the delegated routes'.
+pub(super) use crate::trellion_client::worker_ok;
 
 /// Attach the authenticated requester (if any) to a delegated body so
 /// Python workers can resolve KB roles / attribution. Cluster-HMAC and
 /// service-key callers carry no RequesterCtx and stay unrestricted.
+/// The one implementation is `trellion_client::attach_requester_ctx`.
 pub(super) fn attach_requester(body: &mut Value, ctx: &Option<axum::Extension<RequesterCtx>>) {
     if let Some(axum::Extension(r)) = ctx {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "_requester".into(),
-                // `role` is additive: Python readers use
-                // `.get()`, so old workers ignore it and new ones can prefer
-                // it over the scope strings.
-                // `sub` is the ACCOUNT, never the connection:
-                // the Python workers resolve KB roles and audience by
-                // username, and a compound subject would match no user and
-                // silently strip the session of every role it holds. The
-                // connection rides beside it for anything that wants the
-                // live session rather than the person.
-                json!({
-                    "sub": crate::auth::account_of(&r.sub),
-                    "connection": r.sub,
-                    "scopes": r.scopes,
-                    "role": r.role.as_str(),
-                    // The credential's signed `harness` claim (`mcp-external:
-                    // <consumer>` from the MCP door, `node:<id>` from a
-                    // node-hosted harness), null for an ordinary login. Not a
-                    // request header: the design's ingest provenance reads
-                    // it to say an upload came through the MCP door.
-                    "harness": r.harness,
-                }),
-            );
-        }
+        crate::trellion_client::attach_requester_ctx(body, r);
     }
 }
 
@@ -124,9 +89,9 @@ pub(super) fn worker_failed(e: &anyhow::Error, path: Option<&str>) -> StatusJson
 pub fn delegate_get(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Option<axum::Extension<RequesterCtx>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = StatusJson> + Send>> + Clone {
     move |State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<RequesterCtx>>| {
         Box::pin(async move {
-            let mut body = json!({});
-            attach_requester(&mut body, &ctx);
-            match worker_client::request(&state.nats, subject, &body).await {
+            let requester = ctx.as_ref().map(|e| &e.0);
+            let client = TrellionClient::new(&state.nats).with_requester(requester);
+            match client.call_raw(subject, json!({})).await {
                 Ok(response) => worker_ok(response),
                 Err(e) => worker_unavailable(e, None),
             }
@@ -136,10 +101,11 @@ pub fn delegate_get(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Opti
 
 /// Create a POST handler that delegates to a Python worker via NATS.
 pub fn delegate_post(subject: &'static str) -> impl Fn(State<Arc<AppState>>, Option<axum::Extension<RequesterCtx>>, Json<Value>) -> std::pin::Pin<Box<dyn std::future::Future<Output = StatusJson> + Send>> + Clone {
-    move |State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<RequesterCtx>>, Json(mut body): Json<Value>| {
+    move |State(state): State<Arc<AppState>>, ctx: Option<axum::Extension<RequesterCtx>>, Json(body): Json<Value>| {
         Box::pin(async move {
-            attach_requester(&mut body, &ctx);
-            match worker_client::request(&state.nats, subject, &body).await {
+            let requester = ctx.as_ref().map(|e| &e.0);
+            let client = TrellionClient::new(&state.nats).with_requester(requester);
+            match client.call_raw(subject, body).await {
                 Ok(response) => worker_ok(response),
                 Err(e) => worker_unavailable(e, None),
             }
@@ -191,24 +157,6 @@ mod tests {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{msg}");
             assert!(body["error"].as_str().unwrap().starts_with("Worker unavailable: "), "{body}");
         }
-    }
-
-    #[test]
-    fn worker_ok_maps_statuses() {
-        assert_eq!(worker_ok(json!({"answer": "hi"})).0, StatusCode::OK);
-        assert_eq!(
-            worker_ok(json!({"error": "question required"})).0,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            worker_ok(json!({"error": "Worker error: [Errno 36] File name too long"})).0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        // data envelope unwrapping still applies
-        assert_eq!(
-            worker_ok(json!({"data": {"error": "bad input"}})).0,
-            StatusCode::BAD_REQUEST
-        );
     }
 
     fn ctx(sub: &str) -> Option<axum::Extension<RequesterCtx>> {

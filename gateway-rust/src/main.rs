@@ -215,6 +215,7 @@ mod usage;
 mod verify;
 mod websocket;
 mod worker_client;
+mod trellion_client;
 mod worker_delegation;
 mod ws_agent;
 mod ws_collab;

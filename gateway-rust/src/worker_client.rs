@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026 PersonifAI LLC
 
-//! NATS-based worker delegation client with capability-aware fallback.
+//! NATS-based worker delegation TRANSPORT with capability-aware fallback.
+//!
+//! This module is the transport (request/reply, signing, fire-and-forget +
+//! DLQ, streams). The API the gateway's handlers and facades call is
+//! `crate::trellion_client::TrellionClient`, which owns requester
+//! attachment, the add-on refusal mapping and the subject constants;
+//! `request` / `request_with_timeout` are `pub(crate)` for it, the DLQ and
+//! the stream users.
 //!
 //! Sends requests to Python worker pool via NATS request/reply.
 //! Workers subscribe to `worker.{service}.{method}` subjects.
@@ -44,7 +51,7 @@ pub(crate) fn worker_timeout() -> Duration {
 const FAST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Send a request to a Python worker via NATS and await the response.
-pub async fn request(
+pub(crate) async fn request(
     nats: &async_nats::Client,
     subject: &str,
     payload: &Value,
@@ -53,7 +60,7 @@ pub async fn request(
 }
 
 /// Send a request with a custom timeout.
-pub async fn request_with_timeout(
+pub(crate) async fn request_with_timeout(
     nats: &async_nats::Client,
     subject: &str,
     payload: &Value,
@@ -93,13 +100,29 @@ pub async fn request_with_timeout(
     }
     let response = tokio::time::timeout(timeout, nats.send_request(subject.to_string(), request))
     .await
-    .map_err(|_| anyhow::anyhow!("Worker timeout on {subject}"))?
+    .map_err(|_| anyhow::Error::new(WorkerTimeout { subject: subject.to_string() }))?
     .map_err(|e| anyhow::anyhow!("NATS request failed: {e}"))?;
 
     let value: Value = serde_json::from_slice(&response.payload)?;
 
     reply_result(subject, value)
 }
+
+/// The NATS round-trip did not answer within the deadline. A typed error
+/// (its text is unchanged: `Worker timeout on <subject>`) so
+/// `trellion_client` can answer a 502 without matching on a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTimeout {
+    pub subject: String,
+}
+
+impl std::fmt::Display for WorkerTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker timeout on {}", self.subject)
+    }
+}
+
+impl std::error::Error for WorkerTimeout {}
 
 /// A worker refused the request on purpose: a policy or request-validity
 /// decision, not an outage. Carried as the `Err` payload so a route can

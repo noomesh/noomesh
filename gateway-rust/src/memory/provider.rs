@@ -59,31 +59,32 @@ use serde_json::{json, Value};
 
 use crate::metrics::MetricsState;
 use super::scope::{self, Audience};
+use crate::trellion_client::{subjects, TrellionClient};
 
 // ── NATS subjects (trellion's wire today) ────────────────────────────
 // Constants so the zero-behavior-change tests below can assert the exact
 // strings the pre-facade call sites used.
-const SUBJECT_KB_QUERY: &str = "worker.rag.query";
-const SUBJECT_KB_INGEST: &str = "worker.rag.ingest";
-const SUBJECT_KB_DEDUPLICATE: &str = "worker.rag.deduplicate";
-const SUBJECT_KB_RETAG: &str = "worker.rag.retag";
+const SUBJECT_KB_QUERY: &str = subjects::RAG_QUERY;
+const SUBJECT_KB_INGEST: &str = subjects::RAG_INGEST;
+const SUBJECT_KB_DEDUPLICATE: &str = subjects::RAG_DEDUPLICATE;
+const SUBJECT_KB_RETAG: &str = subjects::RAG_RETAG;
 /// Document hold: keep a document, out of embedding and search.
-const SUBJECT_KB_HOLD: &str = "worker.rag.hold";
-const SUBJECT_KB_UNHOLD: &str = "worker.rag.unhold";
-const SUBJECT_KB_HELD: &str = "worker.rag.held";
+const SUBJECT_KB_HOLD: &str = subjects::RAG_HOLD;
+const SUBJECT_KB_UNHOLD: &str = subjects::RAG_UNHOLD;
+const SUBJECT_KB_HELD: &str = subjects::RAG_HELD;
 /// Deletes the documents held under one reason. Batched in trellion, so a
 /// large purge is minutes, not seconds.
-const SUBJECT_KB_PURGE: &str = "worker.rag.purge";
+const SUBJECT_KB_PURGE: &str = subjects::RAG_PURGE;
 pub(crate) const KB_PURGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// The caller's KB role set — the ONE resolver (`workers/kb.py`), asked rather
 /// than re-implemented.
-const SUBJECT_KB_AUDIENCE: &str = "worker.rag.audience";
-const SUBJECT_GRAPH_RECLUSTER: &str = "worker.graph.recluster";
+const SUBJECT_KB_AUDIENCE: &str = subjects::RAG_AUDIENCE;
+const SUBJECT_GRAPH_RECLUSTER: &str = subjects::GRAPH_RECLUSTER;
 /// The junk-entity cleanup. `worker.rag.*` and not `worker.graph.*` on purpose:
 /// the validator and the cleanup are in trellion's OPEN tree, so the subject
 /// belongs on the base `ml` surface every install has, not the Intelligent
 /// tier's `worker.graph.*` family (`addons::is_trellion_intel_subject`).
-const SUBJECT_ENTITY_CLEANUP: &str = "worker.rag.entity_cleanup";
+const SUBJECT_ENTITY_CLEANUP: &str = subjects::RAG_ENTITY_CLEANUP;
 /// A scan of every entity (three correlated counts each) and then up to 5,000
 /// staged deletes in batches: minutes on a real graph, so not the 120 s default.
 pub(crate) const ENTITY_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -92,16 +93,16 @@ pub(crate) const ENTITY_CLEANUP_TIMEOUT: std::time::Duration = std::time::Durati
 /// single dispatcher with an `op` field — a subject that means one thing can
 /// be granted, revoked and traced on its own.
 const SUBJECT_GRAPH_INTEL: &[(&str, &str)] = &[
-    ("navigate", "worker.graph.navigate"),
-    ("traverse", "worker.graph.traverse"),
-    ("explain_path", "worker.graph.explain_path"),
-    ("semantic_search", "worker.graph.semantic_search"),
-    ("search_clusters", "worker.graph.search_clusters"),
-    ("classify_intent", "worker.graph.classify_intent"),
-    ("extract_relations", "worker.graph.extract_relations"),
-    ("recall_traversals", "worker.graph.recall_traversals"),
+    ("navigate", subjects::GRAPH_NAVIGATE),
+    ("traverse", subjects::GRAPH_TRAVERSE),
+    ("explain_path", subjects::GRAPH_EXPLAIN_PATH),
+    ("semantic_search", subjects::GRAPH_SEMANTIC_SEARCH),
+    ("search_clusters", subjects::GRAPH_SEARCH_CLUSTERS),
+    ("classify_intent", subjects::GRAPH_CLASSIFY_INTENT),
+    ("extract_relations", subjects::GRAPH_EXTRACT_RELATIONS),
+    ("recall_traversals", subjects::GRAPH_RECALL_TRAVERSALS),
     // a user's own saved threads (recall, list, show).
-    ("recall_walks", "worker.graph.recall_walks"),
+    ("recall_walks", subjects::GRAPH_RECALL_WALKS),
 ];
 /// Community detection clusters the whole graph and labels each cluster.
 /// Minutes, not seconds, and the default
@@ -925,7 +926,7 @@ impl NatsTrellion<'_> {
     /// NATS request/reply with the standard worker envelope handling.
     async fn request(&self, subject: &str, op: &str, body: &Value) -> anyhow::Result<Value> {
         self.count(op).await;
-        crate::worker_client::request(self.nats, subject, body).await
+        TrellionClient::new(self.nats).call_raw(subject, body.clone()).await
     }
 
     /// `request` with an explicit timeout, for the handful of subjects whose
@@ -940,7 +941,7 @@ impl NatsTrellion<'_> {
         timeout: std::time::Duration,
     ) -> anyhow::Result<Value> {
         self.count(op).await;
-        crate::worker_client::request_with_timeout(self.nats, subject, body, timeout).await
+        TrellionClient::new(self.nats).call_raw_with_timeout(subject, body.clone(), timeout).await
     }
 
     async fn kb_docs_list(

@@ -35,7 +35,7 @@ use crate::state::AppState;
 
 /// The only subject this route publishes. Inside the intel `worker.graph.*`
 /// family, so `addons::is_trellion_intel_subject` already gates it.
-pub(crate) const SUBJECT_INTEL_CONSOLE_PIECE: &str = "worker.graph.console_piece";
+pub(crate) const SUBJECT_INTEL_CONSOLE_PIECE: &str = crate::trellion_client::subjects::GRAPH_CONSOLE_PIECE;
 const INTEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// A piece is a few paragraphs of text. Anything near this is a bug upstream.
 const MAX_PIECE_BYTES: usize = 64 * 1024;
@@ -88,12 +88,8 @@ async fn respond(addon_id: &str, nats: Option<&async_nats::Client>) -> (StatusCo
             let Some(nats) = nats else {
                 return bad_gateway(addon, "no bus connection");
             };
-            match crate::worker_client::request_with_timeout(
-                nats,
-                SUBJECT_INTEL_CONSOLE_PIECE,
-                &json!({}),
-                INTEL_TIMEOUT,
-            )
+            match crate::trellion_client::TrellionClient::new(nats)
+                .call_raw_with_timeout(SUBJECT_INTEL_CONSOLE_PIECE, json!({}), INTEL_TIMEOUT)
             .await
             {
                 Ok(v) => v,
