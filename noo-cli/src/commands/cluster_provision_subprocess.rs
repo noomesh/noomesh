@@ -351,29 +351,80 @@ fn remote_build_sandbox_base(g: &Globals, node_id: &str) -> Result<(), String> {
 
 /// Parsed `sync-images` flags — extracted from the handler so the arg /
 /// image-list handling is unit-testable without a gateway or ssh.
+///
+/// The one image verb (i195 A7): phase 1 stages on the artifact rail, phase 2
+/// has each named node's agent pull. `--stage-only` stops after phase 1;
+/// `--lock`, `--arch` and `--all-images` are phase-1 selectors (they were
+/// `stage-images`'s flags).
 #[derive(Debug)]
 struct SyncImagesArgs {
     nodes: Vec<String>,
     images: Vec<String>,
     restart: bool,
+    /// `--restart` / `--no-restart` was spelled out (the default is restart).
+    restart_given: bool,
     all: bool,
+    stage_only: bool,
+    lock: bool,
+    arches: Vec<String>,
+    all_images: bool,
 }
 
 fn parse_sync_images_args(args: &[String]) -> Result<SyncImagesArgs, Unhandled> {
-    let mut a = SyncImagesArgs { nodes: Vec::new(), images: Vec::new(), restart: true, all: false };
+    let mut a = SyncImagesArgs {
+        nodes: Vec::new(), images: Vec::new(), restart: true, restart_given: false, all: false,
+        stage_only: false, lock: false, arches: Vec::new(), all_images: false,
+    };
     let mut iter = args.iter();
     while let Some(tok) = iter.next() {
         match tok.as_str() {
             "-i" | "--image" => a.images.push(iter.next().ok_or(Unhandled)?.clone()),
             "--images" => a.images.extend(split_image_list(iter.next().ok_or(Unhandled)?)),
-            "--restart" => a.restart = true,
-            "--no-restart" => a.restart = false,
+            "--restart" => { a.restart = true; a.restart_given = true }
+            "--no-restart" => { a.restart = false; a.restart_given = true }
             "--all" => a.all = true,
+            "--stage-only" => a.stage_only = true,
+            "--lock" => a.lock = true,
+            "--all-images" => a.all_images = true,
+            "--arch" => {
+                for x in iter.next().ok_or(Unhandled)?.split(',') {
+                    a.arches.push(crate::commands::image_stage::normalize_arch(x).ok_or(Unhandled)?.to_string());
+                }
+            }
             t if t.starts_with('-') => return Err(Unhandled),
             t => a.nodes.push(t.to_string()),
         }
     }
     Ok(a)
+}
+
+impl SyncImagesArgs {
+    /// Flag combinations with no sensible meaning are refused with the reason,
+    /// never guessed at.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.stage_only {
+            if !self.nodes.is_empty() || self.all {
+                return Err("--stage-only stops after staging on the artifact rail, so it takes no nodes and no --all; drop --stage-only to have nodes pull");
+            }
+            if self.restart_given {
+                return Err("--restart/--no-restart acts on a node's container after its pull, and --stage-only has no pull");
+            }
+            if self.all_images && !(self.lock || self.images.is_empty()) {
+                return Err("--all-images widens the lock's staged set; add --lock (it selects nothing when only -i images are staged)");
+            }
+        } else {
+            if self.lock && self.nodes.is_empty() && !self.all {
+                return Err("--lock stages the release images but nothing would pull them; name nodes (or --all), or use --stage-only to only stage");
+            }
+            if self.all_images {
+                return Err("--all-images stages controller-only images no node can pull; use it with --stage-only");
+            }
+            if !self.arches.is_empty() {
+                return Err("--arch applies to staging only, since each node pulls the tar for its own architecture; use it with --stage-only");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `--images a,b,c` → trimmed entries, empties dropped (`"a, ,b,"` → a, b).
@@ -456,7 +507,8 @@ fn resolve_sync_node(gateway_nodes: &[Value], inventory: &[(String, String, Stri
 }
 
 /// `noo cluster sync-images [NODES…] [-i/--image IMG]… [--images A,B,…]
-/// [--restart/--no-restart] [--all]` — export controller-built images into
+/// [--restart/--no-restart] [--all] [--stage-only] [--lock] [--arch a,b]
+/// [--all-images]` — export controller-built images into
 /// the artifact store and have each node's agent pull the digest-verified tar
 /// for its own architecture. No SSH at all as of
 /// 2026-09: the last two lanes were the arm64 node-agent cross-build (which
@@ -467,8 +519,28 @@ fn resolve_sync_node(gateway_nodes: &[Value], inventory: &[(String, String, Stri
 /// agent-side.
 pub fn cluster_sync_images(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
     let parsed = parse_sync_images_args(args)?;
-    let (node_args, images, restart, all_nodes) =
+    if let Err(why) = parsed.validate() {
+        fail(g.json, ExitCode::Usage, "usage", &format!("noo cluster sync-images: {why}"), Some("noo help cluster sync-images"));
+    }
+    if parsed.stage_only {
+        return Ok(crate::commands::image_stage::run_stage_only(g, &parsed.images, &parsed.arches, parsed.lock, parsed.all_images));
+    }
+    let lock_refs = if parsed.lock {
+        // Phase 1 from the lock, digest-verified; the nodes then pull exactly
+        // the node-bound release images it staged (plus any -i image).
+        let (lock, prefix, tag) = crate::commands::image_stage::read_controller_lock(g);
+        let arches = crate::commands::image_stage::fleet_arches_from_gateway(g);
+        let sum = crate::commands::image_stage::stage_lock(g, &lock, &prefix, &tag, &arches, false);
+        for f in &sum.failed {
+            ui::warned(f);
+        }
+        crate::commands::image_stage::lock_node_refs(&lock, &prefix, &tag)
+    } else {
+        Vec::new()
+    };
+    let (node_args, mut images, restart, all_nodes) =
         (parsed.nodes, parsed.images, parsed.restart, parsed.all);
+    images.extend(lock_refs);
 
     let targets: Vec<Value> = if all_nodes {
         online_nodes(g)
@@ -1340,6 +1412,55 @@ mod sync_images_tests {
     }
 
     // ── arg parsing ──
+
+    #[test]
+    fn stage_only_flag_parses_and_defaults_off() {
+        assert!(!parse_sync_images_args(&args(&["host8"])).unwrap().stage_only);
+        let a = parse_sync_images_args(&args(&["--stage-only"])).unwrap();
+        assert!(a.stage_only && a.nodes.is_empty());
+        assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn lock_flag_parses_and_nodes_may_pull_it() {
+        let a = parse_sync_images_args(&args(&["--lock", "host8"])).unwrap();
+        assert!(a.lock && !a.stage_only);
+        assert!(a.validate().is_ok(), "named nodes pull the staged lock set");
+        assert!(parse_sync_images_args(&args(&["--stage-only", "--lock"])).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn arch_flag_normalizes_splits_and_rejects_unknown() {
+        let a = parse_sync_images_args(&args(&["--stage-only", "--arch", "x86_64,aarch64"])).unwrap();
+        assert_eq!(a.arches, vec!["amd64", "arm64"]);
+        assert!(a.validate().is_ok());
+        assert!(parse_sync_images_args(&args(&["--stage-only", "--arch", "riscv"])).is_err());
+        assert!(parse_sync_images_args(&args(&["--stage-only", "--arch"])).is_err());
+    }
+
+    #[test]
+    fn all_images_flag_parses_with_lock_under_stage_only() {
+        let a = parse_sync_images_args(&args(&["--stage-only", "--lock", "--all-images"])).unwrap();
+        assert!(a.all_images && a.validate().is_ok());
+        // No -i: the lock is implied, so --all-images alone is meaningful.
+        assert!(parse_sync_images_args(&args(&["--stage-only", "--all-images"])).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn refused_combinations_say_why() {
+        for (tail, needle) in [
+            (&["--all-images", "host8"][..], "controller-only"),
+            (&["--arch", "amd64", "host8"][..], "own architecture"),
+            (&["--lock"][..], "nothing would pull"),
+            (&["--stage-only", "host8"][..], "takes no nodes"),
+            (&["--stage-only", "--all"][..], "takes no nodes"),
+            (&["--stage-only", "--no-restart"][..], "no pull"),
+            (&["--stage-only", "-i", "x", "--all-images"][..], "add --lock"),
+        ] {
+            let why = parse_sync_images_args(&args(tail)).unwrap().validate().unwrap_err();
+            assert!(why.contains(needle), "{tail:?}: {why}");
+        }
+    }
 
     #[test]
     fn bare_node_defaults_to_restart_and_empty_image_list() {

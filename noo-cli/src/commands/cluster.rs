@@ -20,7 +20,8 @@
 //!   fetches the files on the node itself.
 //! * Retired stubs that name their replacement instead of answering "unknown
 //!   command": exec, reconnect, clean-node, sync-models, up, scale, assign,
-//!   add-companion, add-monitor (i195 decision 1).
+//!   add-companion, add-monitor, stage-images (i195 decision 1; stage-images is
+//!   `sync-images --stage-only`).
 //!
 //! Nothing in this crate reaches a node over SSH. The controller-to-node
 //! shell lane is retired; `tests/test_no_controller_ssh.py` is the full-tree
@@ -1163,7 +1164,7 @@ pub fn cluster_place(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
                 if let Err(se) = crate::commands::image_stage::stage_and_record(g, &img, &arch, "place") {
                     crate::output::fail(g.json, crate::output::ExitCode::Generic, "image_not_staged",
                         &format!("could not stage {img} for {arch}: {se}"),
-                        Some(&format!("noo cluster stage-images -i {img} --arch {arch}")));
+                        Some(&format!("noo cluster sync-images --stage-only -i {img} --arch {arch}")));
                 }
             }
             // Placed again after staging, or the refusal surfaces through the
@@ -2466,6 +2467,23 @@ pub fn cluster_add_monitor(g: &Globals, _args: &[String]) -> Result<i32, Unhandl
 }
 
 // ── clean-node (RETIRED container-era verb) ─────────────────────────
+
+/// `noo cluster stage-images` — RETIRED (i195 A7). It was phase 1 of
+/// `sync-images` under its own name; `sync-images --stage-only` is the same
+/// operation with the same flags. Answers with the exact equivalent for one
+/// release, then goes. (`noo upgrade` stages through the shared function in
+/// image_stage.rs, not through this verb.)
+pub fn cluster_stage_images(g: &Globals, args: &[String]) -> Result<i32, Unhandled> {
+    let rest = if args.is_empty() { "--lock".to_string() } else { args.join(" ") };
+    let hint = format!("noo cluster sync-images --stage-only {rest}");
+    fail(
+        g.json,
+        ExitCode::Generic,
+        "retired_command",
+        "cluster stage-images is retired: it is phase 1 of sync-images, now one verb with --stage-only",
+        Some(&hint),
+    );
+}
 
 /// `noo cluster clean-node` — RETIRED (fu72 #4). The old body root-SSHed
 /// docker greps that match NOTHING on a pull-architecture node (native

@@ -111,14 +111,13 @@ pub use channels::{channels_export, channels_import, channels_status, channels_t
 pub use chat::chat;
 pub use nats_users::{cluster_nats_creds_rotate, cluster_nats_users_render};
 pub use cluster::{
-    cluster_add_companion, cluster_add_monitor, cluster_assign, cluster_clean_node,
+    cluster_add_companion, cluster_add_monitor, cluster_assign, cluster_clean_node, cluster_stage_images,
     cluster_clear_cooldowns, cluster_desired, cluster_down, cluster_fit, cluster_proposals, cluster_forget, cluster_init_secret,
     cluster_logs, cluster_show, cluster_place, cluster_restart_agent, cluster_maintenance,
     cluster_scale, cluster_set_config, cluster_status, cluster_sync_model_files,
     cluster_exec, cluster_reconnect, cluster_sync_models, cluster_unplace, cluster_up,
 };
 pub use browser::{browser_open, browser_status, browser_stop};
-pub use image_stage::cluster_stage_images;
 pub use cluster_provision::{
     cluster_invite,
     cluster_auto_place, cluster_bootstrap_token_create,
