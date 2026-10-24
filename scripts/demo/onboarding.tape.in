@@ -73,12 +73,18 @@ Sleep 2500ms
 Type "noo health" Enter
 Wait
 Sleep 2s
-Type "noo cluster status" Enter
+# `noo stack status`, not `noo cluster status`: in the standalone profile the
+# node agent is a host binary under systemd, and the studio's box has no
+# systemd, so the box never registers its own node ("no nodes", take 7). A real
+# install shows the node a minute after onboard; the film does not wait.
+Type "noo stack status" Enter
 Wait
 Sleep 3s
 
 Type "# Ask it something." Enter
 Sleep 1s
-Type `noo chat --message "in two lines, what can you do on this machine?"` Enter
+# A question the first (small) model answers well. "what can you do on this
+# machine?" got "please provide an image or description of the machine" (take 7).
+Type `noo chat --message "Say hello, then tell me in two lines what noomesh is."` Enter
 Wait
 Sleep 5s
