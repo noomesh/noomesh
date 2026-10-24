@@ -113,7 +113,7 @@ async fn resolve_embedding_model(state: &Arc<AppState>) -> Option<String> {
 /// someone. History is untouched: this is a read-time fix, and rewriting
 /// prior attribution would be the destructive way to get the same number.
 async fn storage_stats(State(state): State<Arc<AppState>>) -> AppResult {
-    let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+    let (total, embedded, unembedded, unique_users) = sqlx::query_as::<_, (i64, i64, i64, i64)>(
         "SELECT COUNT(*) AS total, \
                 COUNT(embedding) AS embedded, \
                 (COUNT(*) - COUNT(embedding)) AS unembedded, \
@@ -123,32 +123,23 @@ async fn storage_stats(State(state): State<Arc<AppState>>) -> AppResult {
                           ON l.channel_user_id = c.user_id) AS unique_users \
          FROM noo_entries"
     )
-    .fetch_optional(&state.db)
+    // An aggregate always returns exactly one row.
+    .fetch_one(&state.db)
     .await?;
 
     let emb_model = resolve_embedding_model(&state).await;
 
-    match row {
-        Some((total, embedded, unembedded, unique_users)) => Ok(Json(json!({
-            "storage": "postgresql",
-            "total_records": total,
-            "embedded_records": embedded,
-            "unembedded_records": unembedded,
-            "unique_users": unique_users,
-            // Was a literal `true`. Now derived from the same resolution
-            // /api/memory/embed-status reports.
-            "embeddings_enabled": emb_model.is_some(),
-            "embedding_model": emb_model,
-            "ready_for_indexing": unembedded > 0,
-        }))),
-        None => Ok(Json(json!({
-            "storage": "postgresql",
-            "total_records": 0,
-            "embedded_records": 0,
-            "unembedded_records": 0,
-            "unique_users": 0,
-        }))),
-    }
+    Ok(Json(json!({
+        "storage": "postgresql",
+        "total_records": total,
+        "embedded_records": embedded,
+        "unembedded_records": unembedded,
+        "unique_users": unique_users,
+        // Derived from the same resolution /api/memory/embed-status reports.
+        "embeddings_enabled": emb_model.is_some(),
+        "embedding_model": emb_model,
+        "ready_for_indexing": unembedded > 0,
+    })))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -401,7 +392,6 @@ async fn memory_status(State(state): State<Arc<AppState>>) -> AppResult {
                 "unique_users": users,
                 "oldest_record": oldest.map(|dt| dt.to_rfc3339()),
                 "newest_record": newest.map(|dt| dt.to_rfc3339()),
-                // Was a literal `true`; see resolve_embedding_model.
                 "embeddings_enabled": emb_model.is_some(),
                 "embedding_model": emb_model,
                 "ready_for_indexing": unembedded > 0,

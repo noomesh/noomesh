@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Sha256, Digest};
 
+use crate::measured::{put_into, put_keyed_into, Measured};
 use crate::state::AppState;
 use super::{AppError, AppJson, AppResult};
 use crate::node_link::NodeLink;
@@ -496,7 +497,7 @@ fn proactive_history_detail(e: &sqlx::Error) -> String {
          firings in process memory only, so this gateway cannot see them."
             .to_string()
     } else {
-        format!("unknown — cannot read noo_proactive_history: {e}")
+        crate::measured::not_measured_in("cannot read noo_proactive_history", e)
     }
 }
 
@@ -525,17 +526,8 @@ async fn proactive_status(
         })
         .unwrap_or(0);
 
-    // Check Redis for the Python agent's heartbeat.
-    //
-    // The old code collapsed "no Redis configured", "Redis unreachable" and
-    // "no heartbeat key" all into `running: false` — asserting the agent is
-    // stopped on missing evidence. The sibling autonomy status endpoint
-    // (intelligence.rs) defaults the SAME class of fact to `true` on missing
-    // evidence; the two lie in opposite directions. Both are now nullable
-    // with an explicit reason, so "we don't know" is representable.
-    //
-    // Note `Cache::get_string` returns Option<String> and cannot distinguish
-    // an absent key from a Redis error, so the detail names both.
+    // `Cache::get_string` returns Option<String> and cannot distinguish an
+    // absent key from a Redis error, so the detail names both.
     let (running, running_detail): (Option<bool>, String) = match state.redis.as_ref() {
         None => (
             None,
@@ -565,27 +557,19 @@ async fn proactive_status(
         },
     };
 
-    // history_entries was a literal 0 while the sibling /api/proactive/history
-    // route actually queries noo_proactive_history. Count it for real; the
-    // count is null (never 0) when the store cannot be read — see
-    // proactive_history_detail for why a missing table is NOT a truthful zero.
-    let (history_entries, history_detail) =
-        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM noo_proactive_history")
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(n) => (Some(n), None),
-            Err(e) => (None, Some(proactive_history_detail(&e))),
-        };
+    // null (never 0) when the store cannot be read.
+    let history = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM noo_proactive_history")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(n) => Measured::of(n),
+        Err(e) => Measured::unmeasured(proactive_history_detail(&e)),
+    };
 
-    Ok(Json(json!({
-        "running": running,
-        "running_detail": running_detail,
-        "rules_total": rules_total,
-        "rules_enabled": rules_enabled,
-        "history_entries": history_entries,
-        "history_detail": history_detail,
-    })))
+    let mut body = json!({ "rules_total": rules_total, "rules_enabled": rules_enabled });
+    put_into(&mut body, "running", Measured::noted(running, running_detail));
+    put_keyed_into(&mut body, "history_entries", "history_detail", history);
+    Ok(Json(body))
 }
 
 /// GET /api/proactive/rules — list proactive rules from YAML config.
@@ -957,10 +941,9 @@ async fn tools_list(
         },
         "available_on_nodes_detail": "null — per-node tool placement is not \
             tracked by the gateway; this list is the loaded schema registry, \
-            not a placement map. Previously emitted as [], which read as \
-            'no node can run this tool'.",
+            not a placement map.",
         "is_base_tool_detail": "null unless the registry entry carries the \
-            flag itself; previously hardcoded true for every tool.",
+            flag itself.",
     }))
 }
 
@@ -1211,10 +1194,8 @@ async fn browser_status(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Read active session count from Redis. Key name and value kept — but see
-    // the module comment: this counter's only writer is the Rust
-    // /sessions/start route, so it is a partial count, not "all live
-    // browsers". Callers were free to read it as the latter.
+    // Active session count from Redis. Its only writer is the Rust
+    // /sessions/start route, so it is a partial count, not "all live browsers".
     let (active_sessions, sessions_source) = if let Some(redis) = state.redis.as_ref() {
         match redis.get_string("noo:browser:session_count").await {
             Some(s) => match s.parse::<u32>() {
@@ -1222,9 +1203,8 @@ async fn browser_status(
                 Err(_) => (None, "unparseable"),
             },
             // Absent key and Redis error are indistinguishable through
-            // get_string; absent is the overwhelmingly common case for a
-            // counter only ever INCR'd by this gateway, so 0 is reported —
-            // but the detail below states the scope either way.
+            // get_string; absent is the common case for a counter only ever
+            // INCR'd by this gateway. The detail below states the scope.
             None => (Some(0), "redis-absent"),
         }
     } else {
@@ -1243,13 +1223,10 @@ async fn browser_status(
 
     // Check if Playwright binary exists (common install paths).
     //
-    // This probes the GATEWAY CONTAINER's filesystem. Browsers actually run in
-    // per-session containers on node-agents (see browser_start below, which
-    // POSTs noo-browser:latest to a node), so a fully working deployment
-    // reports playwright_installed=false and status="configured_not_installed"
-    // — the field asserted a fleet-wide fact from a local-only measurement.
-    // The measurement is kept (it is real for THIS process) but is now labelled
-    // for what it is; no remote probe is invented.
+    // This probes the GATEWAY CONTAINER's filesystem only. Browsers run in
+    // per-session containers on node-agents (see browser_start below), so a
+    // working deployment reports playwright_installed=false; the note on the
+    // field says so.
     let playwright_in_gateway_container = [
         "/usr/bin/playwright",
         "/usr/local/bin/playwright",
@@ -1265,22 +1242,18 @@ async fn browser_status(
         "not_configured"
     };
 
-    Ok(Json(json!({
-        "status": status,
-        "status_detail": "scoped to this gateway container only; \
-            \"configured_not_installed\" is expected and harmless in the normal \
-            deployment, where browsers run in noo-browser containers on \
-            node-agents rather than in the gateway.",
-        "browser_enabled": browser_enabled,
-        "playwright_installed": playwright_in_gateway_container,
-        "playwright_detail": "true/false for the GATEWAY CONTAINER's own \
-            filesystem (/usr/bin, /usr/local/bin, /app/node_modules/.bin). It \
-            says nothing about the node-agent containers that actually run \
-            browsers; remote availability is not probed.",
-        "active_sessions": active_sessions,
-        "active_sessions_detail": active_sessions_detail,
-        "engine": "rust",
-    })))
+    let mut body = json!({ "browser_enabled": browser_enabled, "engine": "rust" });
+    put_into(&mut body, "status", Measured::noted(Some(status),
+        "scoped to this gateway container only; \"configured_not_installed\" is \
+         expected and harmless in the normal deployment, where browsers run in \
+         noo-browser containers on node-agents rather than in the gateway."));
+    put_into(&mut body, "playwright_installed", Measured::noted(Some(playwright_in_gateway_container),
+        "true/false for the GATEWAY CONTAINER's own filesystem (/usr/bin, \
+         /usr/local/bin, /app/node_modules/.bin). It says nothing about the \
+         node-agent containers that actually run browsers; remote availability \
+         is not probed."));
+    put_into(&mut body, "active_sessions", Measured::noted(active_sessions, active_sessions_detail));
+    Ok(Json(body))
 }
 
 /// POST /api/tools/browser/sessions/start — start a new browser container.

@@ -27,6 +27,7 @@ use crate::auth::{account_of, scoped_account, scoped_user, AuthActor, ClusterNod
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::measured::{put, put_into, Measured};
 use crate::state::AppState;
 use super::{logs_search, AppJson, AppError, AppResult};
 
@@ -183,9 +184,7 @@ async fn logs_status(State(state): State<Arc<AppState>>) -> AppJson {
         }
     }
 
-    // Was a literal `true` — `noo logs status` therefore printed
-    // "node registry: available" even with NATS down. The registry lives in
-    // the `mesh_nodes` KV bucket, so ask for the bucket instead of asserting.
+    // The registry lives in the `mesh_nodes` KV bucket; ask for the bucket.
     let node_registry_available = state.js.get_key_value("mesh_nodes").await.is_ok();
 
     Json(json!({
@@ -472,6 +471,14 @@ async fn logs_node_container(
 // Native handlers — Cache stats (Redis)
 // ═══════════════════════════════════════════════════════════════
 
+/// One integer off a Redis INFO line: null with a reason when it does not parse.
+fn info_int(val: &str) -> Measured<i64> {
+    match val.trim().parse::<i64>() {
+        Ok(n) => Measured::of(n),
+        Err(_) => Measured::unmeasured(format!("Redis INFO sent a non-numeric value {val:?}")),
+    }
+}
+
 /// Redis cache statistics — key counts, memory usage, uptime.
 ///
 /// Fetches Redis INFO and parses key metrics (memory, hit/miss ratio,
@@ -496,12 +503,12 @@ pub(crate) async fn cache_stats(State(state): State<Arc<AppState>>) -> AppJson {
             if let Some((key, val)) = line.split_once(':') {
                 match key {
                     "used_memory_human" => { stats.insert("used_memory_human".into(), json!(val)); }
-                    "used_memory" => { stats.insert("used_memory_bytes".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "keyspace_hits" => { stats.insert("keyspace_hits".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "keyspace_misses" => { stats.insert("keyspace_misses".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "connected_clients" => { stats.insert("connected_clients".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "total_connections_received" => { stats.insert("total_connections_received".into(), json!(val.parse::<i64>().unwrap_or(0))); }
-                    "uptime_in_seconds" => { stats.insert("uptime_seconds".into(), json!(val.parse::<i64>().unwrap_or(0))); }
+                    "used_memory" => put(&mut stats, "used_memory_bytes", info_int(val)),
+                    "keyspace_hits" => put(&mut stats, "keyspace_hits", info_int(val)),
+                    "keyspace_misses" => put(&mut stats, "keyspace_misses", info_int(val)),
+                    "connected_clients" => put(&mut stats, "connected_clients", info_int(val)),
+                    "total_connections_received" => put(&mut stats, "total_connections_received", info_int(val)),
+                    "uptime_in_seconds" => put(&mut stats, "uptime_seconds", info_int(val)),
                     "maxmemory_human" => { stats.insert("maxmemory_human".into(), json!(val)); }
                     _ => {}
                 }
@@ -911,7 +918,11 @@ async fn list_jobs(
 pub(super) async fn list_jobs_for(state: Arc<AppState>, params: ListJobsParams) -> Value {
     let redis = match state.redis.as_ref() {
         Some(r) => r,
-        None => return json!({"jobs": [], "count": 0, "error": "Redis not connected"}),
+        None => {
+            let mut body = json!({"jobs": [], "error": "Redis not connected"});
+            put_into(&mut body, "count", Measured::<usize>::unmeasured("Redis is not connected, so the queue was not read"));
+            return body;
+        }
     };
 
     let limit = params.limit.unwrap_or(50).min(500);
@@ -1015,9 +1026,9 @@ async fn job_history(
     let redis = match state.redis.as_ref() {
         Some(r) => r,
         None => {
-            return Ok(Json(
-                json!({"history": [], "count": 0, "error": "Redis not connected"}),
-            ))
+            let mut body = json!({"history": [], "error": "Redis not connected"});
+            put_into(&mut body, "count", Measured::<usize>::unmeasured("Redis is not connected, so the history was not read"));
+            return Ok(Json(body));
         }
     };
 
@@ -1844,17 +1855,17 @@ pub(crate) async fn scheduler_status(
 
     let (engine, running, running_detail) = scheduler_running();
 
-    Json(json!({
+    let mut body = json!({
         "engine": engine,
-        "running": running,
-        "running_detail": running_detail,
         "paused": paused,
         "queue_depth": queue_depth,
         "active_jobs": active_jobs,
         "drained_nodes": drained_nodes,
         "background_queue_depth": bg_queue_depth,
         "history_size": history_size,
-    }))
+    });
+    put_into(&mut body, "running", Measured::noted(running, running_detail));
+    Json(body)
 }
 
 /// Pause the scheduler — no new jobs will be dispatched.
