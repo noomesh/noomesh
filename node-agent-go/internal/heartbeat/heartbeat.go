@@ -25,16 +25,10 @@ import (
 	"time"
 
 	"github.com/noomesh/noomesh/node-agent-go/internal/auth"
-	"github.com/noomesh/noomesh/node-agent-go/internal/backendleaves"
 	"github.com/noomesh/noomesh/node-agent-go/internal/config"
 	"github.com/noomesh/noomesh/node-agent-go/internal/dataroots"
 	"github.com/noomesh/noomesh/node-agent-go/internal/hardware"
-	"github.com/noomesh/noomesh/node-agent-go/internal/imagesource"
 	"github.com/noomesh/noomesh/node-agent-go/internal/metrics"
-	"github.com/noomesh/noomesh/node-agent-go/internal/modelpresence"
-	"github.com/noomesh/noomesh/node-agent-go/internal/refusals"
-	"github.com/noomesh/noomesh/node-agent-go/internal/sidecarimage"
-	"github.com/noomesh/noomesh/node-agent-go/internal/version"
 )
 
 // Reporter sends registration and heartbeat messages to the gateway controller.
@@ -308,60 +302,14 @@ func (r *Reporter) Register(caps hardware.Capabilities, hostIP string) bool {
 	r.caps = &caps
 	selfURL := agentURL(r.cfg)
 	payload := map[string]any{
-		"node_id":      r.cfg.NodeID,
-		"hostname":     r.cfg.NodeID,
-		"ip_address":   hostIP,
-		"capabilities": caps,
-		// Which node-agent binary this node is running, so the controller
-		// can tell rebuilt nodes from stale ones. "dev" = un-stamped build.
-		"app_version": version.String(),
-		// Whether this agent can actually tell the controller from a peer
-		// (TLS cert + key + cluster CA all configured). False means every
-		// fleet-secret holder — that is, every node — can drive this one's
-		// start/stop/pull/clean routes. The controller decides what to do
-		// about that; the agent's job is to stop it being invisible.
-		"peer_identity_enforced": auth.PeerIdentityEnforced(r.cfg),
-		// This agent admits the controller's leaf with no bearer. The gateway stops sending NOO_NODE_AGENT_TOKEN to this node
-		// only once it reads true here or on a heartbeat.
-		"controller_leaf_only": auth.ControllerLeafOnly(r.cfg),
-		// Which control transports this agent offers. Only the HTTPS
-		// listener exists today; the others are reserved for the
-		// node-initiated control plane. Absent = an older agent = listener only.
-		"control_transports": r.controlTransports(),
-		// The door leaves this node holds. The controller
-		// rebuilds the node record on registration; sending them here keeps
-		// the report from vanishing until the next beat.
-		"backend_leaves": backendleaves.Report(),
-		// The data roots this node resolves and mounts.
-		"data_roots": r.dataRoots(),
-		// Legacy credential lanes admitted since start.
-		"legacy_lanes": auth.LegacyLaneSnapshot(),
+		"node_id":    r.cfg.NodeID,
+		"hostname":   r.cfg.NodeID,
+		"ip_address": hostIP,
 	}
-	// Which image this process's stunnel sidecars run on:
-	// "published" or "fallback-alpine". Omitted until a sidecar has been
-	// started — nothing chosen is nothing to report.
-	if si := sidecarimage.Report(); si != "" {
-		payload["stunnel_image"] = si
-	}
-	// Where each image this process started a container from came from:
-	// "rail" | "local" | "registry" (internal/imagesource). `noo cluster
-	// verify` WARNs on anything that is not the rail. Omitted until a start.
-	if is := imagesource.Report(); is != nil {
-		payload["image_sources"] = is
-	}
-	// rail | legacy — NOO_IMAGE_SOURCE, the rollout switch.
-	payload["image_source_mode"] = imagesource.Mode()
-	// Backend container start times + health, so the
-	// record a registration rebuilds does not lose them until the next beat.
-	if bc := r.backendContainersReport(); bc != nil {
-		payload["backend_containers"] = bc
-	}
-	payload["model_presence"] = modelpresence.Report()
-	if ms := r.modelStats(); len(ms) > 0 {
-		payload["model_stats"] = ms
-	}
-	if gc := r.gpuContentionReport(); gc != nil {
-		payload["gpu_contention"] = gc
+	// The fields a registration shares with every beat are assembled by the
+	// same sections the heartbeat runs, so each is built in exactly one place.
+	for _, sec := range registerSections {
+		sec.add(r, payload)
 	}
 	setDialableAddress(payload, hostIP, selfURL)
 
@@ -487,211 +435,18 @@ func (r *Reporter) SendHeartbeat() {
 		// Models this node has locally (Ollama tags + GGUFs in MODELS_DIR), so
 		// the controller can place models by availability, not just capability.
 		"available_models": models,
-		// Node-agent build version — refreshed every heartbeat so a mid-session
-		// redeploy is reflected without waiting for re-registration.
-		"app_version": version.String(),
-
-		// Companion telemetry. The gateway has always persisted these
-		// (routes/cluster.rs — battery_pct/is_charging/network_type/
-		// thermal_state/active_sensors) but no agent ever sent them, so
-		// CompanionPolicy was gating on permanently-null fields and
-		// active_sensors only ever held whatever `add-companion` was told
-		// by hand.
-		//
-		// Reporting them every heartbeat makes the sensor list
-		// self-maintaining: plug in a webcam and the next heartbeat
-		// advertises it; unplug it and the coordinator stops routing tool
-		// calls to hardware that is gone. Sent by every tier — a worker
-		// reporting real thermals is useful, and the gateway ignores what
-		// it doesn't need.
-		// Capabilities, re-sent every heartbeat so the controller can heal a
-		// KV/DB record that lost them. Static per boot, so this is a cheap
-		// map copy rather than a re-probe.
-		"capabilities": r.caps,
-
-		// Report our own control-API URL. Without this the gateway falls
-		// back to {proto}://{ip}:8081 (routes/cluster.rs), which silently
-		// routes a second agent's traffic — sensor calls included — to the
-		// FIRST agent on that host.
-		"agent_url": selfURL,
-
+		// Report our own control-API URL (see agentURL).
+		"agent_url":      selfURL,
 		"active_sensors": sensors,
-		"battery_pct":    power.BatteryPct, // null on mains-powered hosts
-		"is_charging":    power.IsCharging,
-		"power_source":   power.PowerSource,
-		"network_type":   power.NetworkType,
-		"thermal_state":  power.ThermalState,
 	}
+	r.companionTelemetry(payload, power)
 	setDialableAddress(payload, hostIP, selfURL)
 
-	// This node's own view of its NATS bus (state, last-connected, whether
-	// the dispatch durable is bound). The key is OMITTED, not nulled, when
-	// this agent has no messaging subsystem — so the gateway can tell "this
-	// build does not report it" from "reported as down". An older agent
-	// binary produces the same absence, which is the honest answer.
-	if bus := r.natsStatus(); bus != nil {
-		payload["nats_status"] = bus
-	}
-	clk.mark("bus")
-	if r.pullEmbed != nil {
-		if pe := r.pullEmbed(); pe != nil {
-			payload["pull_embed"] = pe
+	for _, sec := range heartbeatSections {
+		sec.add(r, payload)
+		if sec.stage != "" {
+			clk.mark(sec.stage)
 		}
-	}
-
-	// Omitted, never empty: an older agent reports nothing here, and the
-	// controller must not read that as "every backend is container-managed".
-	if r.getRuntimes != nil {
-		if rt := r.getRuntimes(); len(rt) > 0 {
-			payload["backend_runtimes"] = rt
-		}
-	}
-	// What an adopted server has loaded, beside — never instead of — what
-	// it is placed to serve. Omitted when nothing is loaded or the
-	// agent has no adopted lane.
-	if r.getLoaded != nil {
-		if lm := r.getLoaded(); len(lm) > 0 {
-			payload["loaded_models"] = lm
-		}
-	}
-	clk.mark("runtimes")
-
-	// NotAfter of the cert this agent is PRESENTING: cert
-	// rotation used to be verified by "the node came back online", which a
-	// node still serving its old cert also satisfies. Reporting the served
-	// cert's expiry gives the controller positive proof the new cert is
-	// live. Omitted (not nulled) when unreadable — absence means an older
-	// agent or a TLS-less config, both honest answers.
-	if na := servedCertNotAfter(r.cfg.TLSCert); na > 0 {
-		payload["cert_not_after"] = na
-	}
-
-	// Desired-state instructions this node DECLINED (see internal/refusals).
-	//
-	// ALWAYS sent, INCLUDING empty — and that is the fix, not an oversight
-	// reversed. The gateway has always documented the three-way reading
-	// ("ABSENT is not EMPTY ... an agent that sends an empty list IS saying
-	// 'nothing refused', and that does clear it", routes/cluster.rs), but
-	// this side omitted the empty case, so the clearing branch was
-	// unreachable and a refusal that RESOLVED stayed on the node record
-	// forever. Found 2026-09-19: host3's harness refusal would have
-	// outlived its own fix. Absence still means "an agent too old to have
-	// this code", which is exactly what the gateway must not clear on.
-	payload["reconcile_refusals"] = refusals.List()
-
-	// Host services this node runs beside its containers (the
-	// harness). Omitted when unreported, never faked as stopped.
-	if r.hostState != nil {
-		if hs := r.hostState(); len(hs) > 0 {
-			payload["host_services"] = hs
-		}
-	}
-	clk.mark("host_services")
-
-	// The last measured model speed (POST /bench), beside host_services:
-	// the controller resolves a measured first_byte_secs from it. Omitted
-	// until a bench has run on this agent (kept in memory only).
-	if r.modelBench != nil {
-		if mb := r.modelBench(); mb != nil {
-			payload["model_bench"] = mb
-		}
-	}
-
-	// The confined-root daemon that performs privileged ops for this
-	// unprivileged agent. Omitted when unreported.
-	if r.hostdState != nil {
-		if hd := r.hostdState(); len(hd) > 0 {
-			payload["hostd"] = hd
-		}
-	}
-	clk.mark("hostd")
-
-	// The log shipper's own account (queued / shipped / last accepted /
-	// last error). Omitted only by an agent build without one.
-	if r.logShipState != nil {
-		if ls := r.logShipState(); len(ls) > 0 {
-			payload["log_ship"] = ls
-		}
-	}
-	clk.mark("log_ship")
-
-	// Posture, on every beat and not only at registration: a running agent
-	// requires a client certificate on its control API (there is no other
-	// way for it to be running), and `noo cluster verify` judges the node
-	// on this field from the record the heartbeat keeps fresh.
-	payload["peer_identity_enforced"] = auth.PeerIdentityEnforced(r.cfg)
-	// Capability, on every beat: this agent admits the
-	// controller's leaf with no bearer (auth.ControllerLeafOrToken), so the
-	// gateway drops NOO_NODE_AGENT_TOKEN for this node. An agent that omits
-	// it keeps receiving the bearer — both roll orders stay safe.
-	payload["controller_leaf_only"] = auth.ControllerLeafOnly(r.cfg)
-	payload["control_transports"] = r.controlTransports()
-
-	// The backend door leaves this node HOLDS under $NOO_PKI_DIR/services/
-	// per door service, the leaf's DNS SANs and NotAfter.
-	// ALWAYS sent, including empty — `{}` is "holds none", and absence is
-	// what an agent too old to report looks like, which `noo cluster
-	// verify`'s `backend doors` row reads as WARN, not as proof. Stat-cached:
-	// a beat re-parses only a leaf that changed on disk. The key beside each
-	// leaf is never opened.
-	payload["backend_leaves"] = backendleaves.Report()
-	clk.mark("backend_leaves")
-
-	// The data roots this node resolves and the host paths its managed
-	// backend containers mount, so a provision bundle can
-	// refuse to relocate a node off the root it runs on. Always sent.
-	payload["data_roots"] = r.dataRoots()
-	clk.mark("data_roots")
-
-	// Legacy credential lanes this agent admitted since it started
-	// {since_unix, static_token, whois_non_controller}.
-	// Every lane is always present, zeros included — absence reads as an
-	// agent too old to report, not as "0 uses". `noo cluster verify
-	// --controller`'s `legacy lanes` row reads it off the node record.
-	payload["legacy_lanes"] = auth.LegacyLaneSnapshot()
-
-	// The image the node's backend-door sidecars run on: "published", or
-	// "fallback-alpine" when no published stunnel image was reachable and
-	// every sidecar start installs stunnel from the alpine mirror (followup
-	// 1244 B; `noo cluster verify <node>` WARNs on it). Omitted until this
-	// process has started a sidecar.
-	if si := sidecarimage.Report(); si != "" {
-		payload["stunnel_image"] = si
-	}
-	// Where each image this process started a container from came from:
-	// "rail" | "local" | "registry" (internal/imagesource). `noo cluster
-	// verify` WARNs on anything that is not the rail. Omitted until a start.
-	if is := imagesource.Report(); is != nil {
-		payload["image_sources"] = is
-	}
-	// rail | legacy — NOO_IMAGE_SOURCE, the rollout switch.
-	payload["image_source_mode"] = imagesource.Mode()
-
-	// Per running backend container: start time and health. `noo cluster verify`'s `backend doors` row may read a door
-	// miss on a container started moments ago, health=starting, as
-	// `starting` rather than FAIL — only from this report. `{}` is sent
-	// (nothing running); omitted only when docker could not be listed or
-	// the provider is not installed, which the CLI reads as "not reported".
-	if bc := r.backendContainersReport(); bc != nil {
-		payload["backend_containers"] = bc
-	}
-	clk.mark("backend_containers")
-
-	// Per placed backend: does its model server HOLD the placement's model
-	// ALWAYS sent, `{}` included: absence of the key is
-	// what an older agent looks like, and the gateway reads that as
-	// unknown. A backend with no entry is one this tick could not check.
-	payload["model_presence"] = modelpresence.Report()
-	if ms := r.modelStats(); len(ms) > 0 {
-		payload["model_stats"] = ms
-	}
-
-	// Shared-GPU contention (internal/gpuyield): is something outside
-	// noomesh using the GPU, and are our GPU backends paused for it. The
-	// node stays online while yielded — this is how the controller learns
-	// WHY its backend is gone. Omitted only when the yield is not wired.
-	if gc := r.gpuContentionReport(); gc != nil {
-		payload["gpu_contention"] = gc
 	}
 
 	body, err := json.Marshal(payload)
