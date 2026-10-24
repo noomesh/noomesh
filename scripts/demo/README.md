@@ -122,6 +122,19 @@ not routed through the masker (the typed commands, and the prompt, which is forc
 - **Review before publishing.** `demo-out/contact-sheet.png` has one frame every
   5 seconds. The masker and the leak check catch the known kinds of value; your eyes
   catch the rest.
+- **The GIF is made from the MP4.** vhs renders a GIF with one palette over every frame, which
+  holds the whole film in memory: a 20-minute take was killed at a 7 GB cap and, uncapped, took a
+  19 GiB WSL2 host down twice (2026-10-23/24). The tape outputs the MP4 only; the recorder then
+  runs a streaming ffmpeg pass (one palette per frame, `NOO_DEMO_GIF_FPS` 12, `NOO_DEMO_GIF_WIDTH`
+  1000) for `onboarding.gif`. The recorder container is capped (`NOO_STUDIO_REC_MEM`, 6g) as a
+  backstop. Do not film on a WSL2 host that also runs a model: the box (10g) plus the render do not
+  fit beside it.
+- **What the cache does not cover.** The cache fronts ghcr.io only. The Ollama image comes from
+  Docker Hub, and the chat model `noo onboard` pulls comes from registry.ollama.ai; both go to
+  the internet on every fresh box. A cold `noo onboard` took 40 minutes on one host and stalled at
+  1.8 KB/s on the model pull on another, so the tape's wait is 60 minutes and a stalled pull is
+  not the film's fault. The cache volume can be seeded from another host:
+  `docker run --rm -v noo-demo-cache:/c alpine tar c -C /c . | ssh other 'docker volume create noo-demo-cache && docker run --rm -i -v noo-demo-cache:/c alpine tar x -C /c'`.
 - **Pace.** vhs films in real time, and a first-run image pull takes minutes.
   `--speed 2` plays the whole film faster; for a tighter cut, film in chunks
   (separate tapes) and speed up the waits with ffmpeg
