@@ -164,8 +164,7 @@ pub async fn chat_decider(
         .await
         // Tier 2 (crate::egress): the database error is logged under a
         // reference; the chat gets the general sentence and that reference.
-        .map_err(|e| crate::egress::error_reply("check your account", &e))?
-        .flatten();
+        .map_err(|e| crate::egress::error_reply("check your account", &e))?;
     let role: crate::auth::Role = role
         .as_deref()
         .unwrap_or("user")
