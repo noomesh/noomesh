@@ -409,7 +409,7 @@ type UnitVars struct {
 const unsealUnitTmpl = `# Written by 'noo-hostd at-rest seal-age-key' (i10a). Do not edit: reseal to change it.
 [Unit]
 Description=noomesh: unseal the SOPS age key from the TPM into RAM
-Documentation=https://github.com/noomesh/noomesh/blob/dev/docs/security/secrets.md
+Documentation=man:systemd-creds(1)
 Before=docker.service
 
 [Service]
