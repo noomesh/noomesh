@@ -14,7 +14,7 @@
 //! The add-on images stopped sending it first: with no key they refuse
 //! in-process and name the fix. This is the gateway's half: an HMAC whose
 //! actor is an add-on is answered 403 on EITHER shared-secret door, on every HTTP route, before any
-//! admission — the inference bridge, the lane count, the `Internal` / `Node`
+//! admission — the inference refusal, the lane count, the `Internal` / `Node`
 //! classification. Each refusal is counted as
 //! `noo_legacy_lane_uses_total{lane="addon_shared_secret_refused",door,caller,route_class}`
 //! and WARNed once per (door, caller, route class) per 10 minutes, so an old
@@ -195,7 +195,7 @@ mod tests {
     }
 
     /// BOTH shared-secret doors call this FIRST — before the inference
-    /// bridge, the lane count, the route check and the admission — and
+    /// refusal, the lane count, the route check and the admission — and
     /// return its 403. One door guarded would leave the other open while
     /// reading as done (the bridge's own lesson, auth.rs).
     #[test]

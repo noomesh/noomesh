@@ -73,35 +73,6 @@ pub fn controller_secret() -> Option<String> {
     crate::config::secret_env::secret_opt("NOO_CONTROLLER_SECRET")
 }
 
-/// Is the bridge still open? `NOO_SELF_CALL_SHARED_SECRET`.
-///
-/// CLOSED BY DEFAULT. It was open by default while the
-/// controller's own services still had no keys of their own; every one does
-/// now (`service keys` verify row), the controller secret buys nothing at
-/// all, and the live controller counted 0 `self_call_shared_secret` uses
-/// over the seven days before this change. What is left on this lane is the
-/// fleet secret on the inference surface, which only a node holds. Only an
-/// explicit
-/// opening value holds it open (a posture row, which `noo cluster verify`
-/// reports with its age).
-pub fn self_call_bridge_open() -> bool {
-    // A posture BRIDGE flag ("0" closes it), not a credential — despite the
-    // name. Posture applies it with `set_var` at boot (posture.rs), so it is
-    // read as plain env and is NOT in `secret_env::FILE_BACKED_SECRETS`: a
-    // `_FILE` for it would make preflight refuse on NAME + NAME_FILE the
-    // moment posture set the flag.
-    shared_secret_buys_inference(&std::env::var("NOO_SELF_CALL_SHARED_SECRET").unwrap_or_default())
-}
-
-/// The decision, pure so it can be tested without an environment.
-///
-/// Only an explicit opening value opens the bridge. Unset, empty, a closing
-/// value and a typo all leave it CLOSED: a shared secret buying inference is
-/// the exception that has to be asked for, not the default.
-pub fn shared_secret_buys_inference(flag: &str) -> bool {
-    matches!(flag.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "open")
-}
-
 /// A gateway with no controller secret does not serve.
 ///
 /// Without it every token signed with the fleet secret — the one every node
@@ -160,8 +131,10 @@ pub const NODE_ROUTES: &[(&str, &str)] = &[
     // embedding helper is `/api/embed` above, and the agent SERVES rerank to
     // the gateway rather than calling it — and the live controller counted
     // 0 fleet-secret admissions on the inference surface
-    // (`self_call_shared_secret`) for seven days. Left listed, a stolen
-    // fleet secret bought inference whenever the self-call bridge was open.
+    // (`self_call_shared_secret`, retired) for seven days. Left listed, a
+    // stolen fleet secret bought inference whenever the self-call bridge was
+    // open; the bridge is deleted and the fleet door refuses the inference
+    // surface outright (`self_call_shared_secret_refused`).
     ("POST", "/api/v1/rag/extract"),
     ("POST", "/api/v1/rag/build-edges"),
     ("POST", "/api/v1/graph/extract"),
@@ -3445,7 +3418,8 @@ pub async fn require_any_auth(
                 request.extensions_mut().insert(Consumer::all(&claims.sub));
             }
             // an exchanged add-on token off the inference
-            // surface — the comparator for `cluster_hmac_non_inference`.
+            // surface — the comparator for the add-on HMAC fallback (refused
+            // as `addon_shared_secret_refused`).
             if let Some(u) = crate::legacy_lanes::addon_token_use(&claims.sub, &path) {
                 crate::legacy_lanes::observe(&state.metrics, &[u], &crate::legacy_lanes::PeerFacts::default()).await;
             }
@@ -3568,6 +3542,18 @@ pub async fn require_any_auth(
                 }
             }
         }
+        // The inference surface (`/v1/*`, `/api/external/*`) is not a node
+        // route and the shared secret never buys it: refused, counted, and
+        // told to present a service key of its own. This was the
+        // `NOO_SELF_CALL_SHARED_SECRET` bridge (closed by default, 0 uses
+        // live); it is deleted, not merely closed. The controller door
+        // refuses the same surface for every caller
+        // (`controller_hmac_refusal::refuse`) and counts it there.
+        if is_inference_surface {
+            let u = crate::legacy_lanes::self_call_refusal_use(&actor, crate::legacy_lanes::HmacDoor::Cluster);
+            crate::legacy_lanes::observe(&state.metrics, std::slice::from_ref(&u), &peer).await;
+            return Err(StatusCode::FORBIDDEN);
+        }
         // Strict: the fleet secret proves "a node", nothing more. There is no
         // other arm: a gateway without a controller secret refused to start
         // (`boot_refusal`), and the bridge that once made every fleet token
@@ -3577,31 +3563,6 @@ pub async fn require_any_auth(
             return Err(StatusCode::FORBIDDEN);
         }
         let kind = ClusterKind::Node;
-        if is_inference_surface {
-            // the shared secret is a BRIDGE here, not a
-            // standing credential. Open, it still buys inference and says so,
-            // naming the actor — "who is still on the shared secret" is the
-            // question that decides when this may close. Closed, the caller
-            // must present its own `noo_service_keys` row.
-            //
-            // BOTH shared-secret doors carry this. They are the same
-            // decision, and guarding one would leave the other open while
-            // reading as done.
-            if !self_call_bridge_open() {
-                tracing::warn!(
-                    actor = %actor, path = %path,
-                    "inference refused: NOO_SELF_CALL_SHARED_SECRET is closed and this caller \
-                     presented a shared secret, not a per-consumer service key"
-                );
-                return Err(StatusCode::FORBIDDEN);
-            }
-            tracing::warn!(
-                actor = %actor, path = %path, peer = %peer.describe(),
-                "inference bought with the SHARED secret — this caller holds no key of its own \
-                 (a transitional bridge; mint one with `noo security service-key issue <consumer>`)"
-            );
-            request.extensions_mut().insert(Consumer::all("cluster"));
-        }
         // count the lane(s) this admission used — including
         // whether a node token came with the node's certificate.
         let presented_node = request
@@ -3610,11 +3571,8 @@ pub async fn require_any_auth(
             .and_then(|p| p.as_ref())
             .map(|p| p.node.clone());
         let uses = crate::legacy_lanes::hmac_lane_uses(&crate::legacy_lanes::HmacAdmission {
-            door: crate::legacy_lanes::HmacDoor::Cluster,
             // The fleet secret only ever grants `Node` (the design retired
-            // the full-access arm), so this door never admits `Internal`.
-            internal: false,
-            inference: is_inference_surface,
+            // the full-access arm), and the inference surface is refused above.
             path: &path,
             actor: &actor,
             presented_node: presented_node.as_deref(),
@@ -4290,39 +4248,6 @@ mod tests {
         assert!(
             super::mint_agent_jwt_with("a/b", Role::User, "c", None, 60, None, weak, None).is_none()
         );
-    }
-
-    /// the bridge is CLOSED by default — unset, empty, the
-    /// closing values and typos alike. Before, unset meant open, so every
-    /// install let a shared-secret token buy inference without anyone
-    /// having decided that.
-    #[test]
-    fn the_bridge_is_closed_unless_explicitly_opened() {
-        for closed in ["", "  ", "0", "false", "no", "off", "closed", " CLOSED ", "flase", "2"] {
-            assert!(!super::shared_secret_buys_inference(closed), "{closed:?} must leave the bridge closed");
-        }
-        for open in ["1", "true", "on", "open", "yes", " Open "] {
-            assert!(super::shared_secret_buys_inference(open), "{open:?} must open the bridge");
-        }
-    }
-
-    /// the design gives this bridge a 60-day window. A bridge with no life
-    /// is what #204 existed to stop.
-    #[test]
-    fn the_shared_secret_bridge_has_a_life() {
-        let entry = crate::posture::POSTURE_CATALOG
-            .iter()
-            .find(|e| e.key == "NOO_SELF_CALL_SHARED_SECRET")
-            .expect("the shared-secret bridge must be in the posture catalog");
-        match entry.kind {
-            crate::posture::PostureKind::Bridge { closed, window_days } => {
-                assert_eq!(closed, "0", "the catalog's closing value must match the reader");
-                assert!(!super::shared_secret_buys_inference(closed),
-                    "the reader must actually treat the catalog's closing value as closed");
-                assert!(window_days > 0, "a bridge with no window has no life");
-            }
-            _ => panic!("the shared secret must be a Bridge, not a Gate — it is a migration"),
-        }
     }
 
     // ── cluster_token_subject: identity that was always on the wire ────────
@@ -6273,7 +6198,7 @@ mod old_cli_refusal_tests {
     /// The controller door is the ONLY door a CLI actor is refused at, and
     /// the door admits nothing at all: the CLI and add-on
     /// refusals come first (their remedies are more specific), then every
-    /// other caller is refused. No inference bridge, no lane count of an
+    /// other caller is refused. No inference admission, no lane count of an
     /// admission, no Internal classification is left inside it.
     #[test]
     fn the_controller_door_admits_nothing() {
@@ -6307,7 +6232,7 @@ mod old_cli_refusal_tests {
     /// Second review: the fleet door's out-of-place check (a controller
     /// service leaf, or a keyless compose peer) runs FIRST — after the add-on
     /// refusal, before the certificate/actor check, `node_route_allowed` and
-    /// the inference bridge — and returns its refusal.
+    /// the inference refusal — and returns its refusal.
     #[test]
     fn the_fleet_door_refuses_an_out_of_place_token_before_anything_else() {
         let src = include_str!("auth.rs");
@@ -6369,7 +6294,7 @@ mod old_cli_refusal_tests {
         let out = metrics.render().await;
         assert!(out.contains("controller_shared_secret_refused") && out.contains("cli_shared_secret_refused")
             && out.contains("addon_shared_secret_refused"), "{out}");
-        assert!(!out.contains("cluster_hmac_non_inference") && !out.contains("self_call_shared_secret"), "{out}");
+        assert!(!out.contains("cluster_hmac_non_inference") && !out.contains(r#"lane="self_call_shared_secret""#), "{out}");
     }
 }
 
