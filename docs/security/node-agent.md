@@ -209,9 +209,10 @@ disk layout and free space — is behind the bearer.
 Small controller-to-node control calls no longer need the node's inbound
 `:8081` listener. A node that holds an outbound NATS connection answers them
 as NATS request/reply on `node.<id>.rpc.<op>` (followup i131, phase 1). The
-ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `clean`,
-`cleanup` (`images` | `logs`), `logs` (a container tail, or the container
-list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
+ops: `health`, `gpu`, `stats`, `models`, `start`, `stop`, `restart`, `reconcile`
+(a desired-state pass now; the gateway sends it after every placement write),
+`clean`, `cleanup` (`images` | `logs`), `logs` (a container tail, or the
+container list), `pull`, `skills.run`, `mcp.call`, `mcp.servers`. Each runs **the same
 handler the HTTPS route runs** (`internal/api/rpc.go` builds the request the
 route would have received and calls that handler), so status, headers and
 body are the HTTPS answer; `TestEveryOpAnswersWhatItsHTTPSRouteAnswers` pins
@@ -261,7 +262,7 @@ guards.
 | New node, controller NATS file from before this change (the subscription is denied) | The node detects the refusal (it flushes after subscribing and reads the server's async permission error), logs it with the remedy, does **not** advertise `nats_rpc`, and retries every minute; control stays on HTTPS |
 | A grant dropped later, or a reply/event publish denied | Any permission violation naming this node's subjects withdraws `nats_rpc` at the next heartbeat |
 | Gateway's bus is down | Routing, not a retry: nothing was sent, so the call goes over HTTPS |
-| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
+| Bus call fails (no responders, timeout) on `health`, `gpu`, `stats`, `models`, `logs`, `mcp.servers`, `reconcile` | One fall-back read over HTTPS, logged and counted (`control_calls.fallbacks`) |
 | Bus call fails on `start`, `stop`, `restart`, `clean`, `cleanup`, `pull`, `skills.run`, `mcp.call` | The node is reported unreachable, as the HTTPS path reports it. **Never retried over HTTPS**: the node may have run it |
 
 `NOO_CONTROL_OVER_BUS=0` on the gateway sends everything over HTTPS again.

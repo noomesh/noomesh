@@ -42,6 +42,7 @@ var rpcCases = []rpcCase{
 	{op: "start", method: "POST", path: "/start", body: `not json`},
 	{op: "stop", method: "POST", path: "/stop", body: `{"backend":"vllm"}`},
 	{op: "clean", method: "POST", path: "/clean", body: `{"deep":true}`},
+	{op: "reconcile", method: "POST", path: "/reconcile"},
 	{op: "pull", method: "POST", path: "/pull", body: `{"kind":"image","image":"x"}`},
 	{op: "pull", method: "POST", path: "/pull", body: `{"kind":"binary"}`},
 	{op: "pull", method: "POST", path: "/pull", body: `{"kind":"nope"}`},

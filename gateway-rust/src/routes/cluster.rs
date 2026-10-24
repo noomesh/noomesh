@@ -4144,6 +4144,30 @@ async fn placement_staging_refusal(state: &AppState, node_id: &str, backend: &st
 /// Before a running model placement is written the memory-fit check runs
 /// ([`crate::placement_fit`]): does-not-fit is a 409 naming the budget, each
 /// model and the shortfall, unless `force`; tight succeeds with a warning.
+/// Ask the node to reconcile now rather than at its next 5-minute tick
+/// (`POST /reconcile`, the `reconcile` control op; the agent coalesces
+/// nudges). Fire-and-forget: the placement is stored either way and the
+/// tick is the fallback, so a node that is off the bus, older than the op
+/// (404) or unreachable costs a log line and nothing else. Without this a
+/// harness kind change landed up to 5 min after `noo cluster place`
+/// (both awolf and mcmini, harness compare 2026-10-24).
+fn nudge_reconcile(state: Arc<AppState>, node_id: String) {
+    tokio::spawn(async move {
+        let link = match crate::node_link::NodeLink::for_node(&state, &node_id).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::info!(node = %node_id, error = %e, "reconcile_nudge_skipped");
+                return;
+            }
+        };
+        match link.request(reqwest::Method::POST, "/reconcile").send().await {
+            Ok(r) if r.status().is_success() => tracing::info!(node = %node_id, "reconcile_nudged"),
+            Ok(r) => tracing::info!(node = %node_id, status = r.status().as_u16(), "reconcile_nudge_declined"),
+            Err(e) => tracing::info!(node = %node_id, error = %e, "reconcile_nudge_failed"),
+        }
+    });
+}
+
 async fn placement_put(
     State(state): State<Arc<AppState>>,
     Path((node_id, backend)): Path<(String, String)>,
@@ -4313,6 +4337,7 @@ async fn placement_put(
     crate::role_capability::invalidate();
 
     tracing::info!(node = %node_id, backend = %backend, role = %role, desired = %desired, "placement_updated");
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({
         "ok": true, "node_id": node_id, "backend": backend, "role": role,
         "fit": fit_json, "warnings": fit_warnings,
@@ -4387,6 +4412,7 @@ async fn placement_delete(
     .map_err(|e| AppError::Internal(format!("placement delete: {e}")))?;
     crate::role_capability::invalidate();
 
+    nudge_reconcile(state.clone(), node_id.clone());
     Ok(Json(json!({"ok": true, "deleted": res.rows_affected()})))
 }
 

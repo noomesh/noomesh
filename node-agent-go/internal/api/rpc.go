@@ -45,6 +45,7 @@ var rpcOps = map[string]rpcOp{
 	"start":       {method: "POST", path: "/start", handler: func(s *Server) http.HandlerFunc { return s.handleStartBackend }},
 	"stop":        {method: "POST", path: "/stop", handler: func(s *Server) http.HandlerFunc { return s.handleStopBackend }},
 	"restart":     {method: "POST", path: "/restart", handler: func(s *Server) http.HandlerFunc { return s.handleRestart }},
+	"reconcile":   {method: "POST", path: "/reconcile", handler: func(s *Server) http.HandlerFunc { return s.handleReconcile }},
 	"clean":       {method: "POST", path: "/clean", handler: func(s *Server) http.HandlerFunc { return s.handleClean }},
 	"pull":        {method: "POST", path: "/pull", handler: func(s *Server) http.HandlerFunc { return s.handlePull }, async: true},
 	"skills.run":  {method: "POST", path: "/api/skills/run", handler: func(s *Server) http.HandlerFunc { return s.handleSkillRun }, async: true},

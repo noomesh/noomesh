@@ -293,6 +293,20 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// handleReconcile: POST /reconcile. Asks the reconciler for a pass now;
+// 202 when the nudge was taken (passes coalesce, so a repeat is harmless),
+// 503 before the reconciler is wired. It never waits for the pass: the
+// caller watches the node's reported state, as it does after a tick.
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if s.reconcileNudge == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "reconciler not wired yet"})
+		return
+	}
+	s.reconcileNudge()
+	slog.Info("reconcile.nudged", "by", "controller")
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "nudged"})
+}
+
 func (s *Server) handleClean(w http.ResponseWriter, r *http.Request) {
 	if s.docker == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "Docker not available"})
