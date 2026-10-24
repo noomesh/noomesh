@@ -125,8 +125,8 @@ not routed through the masker (the typed commands, and the prompt, which is forc
 - **The GIF is made from the MP4.** vhs renders a GIF with one palette over every frame, which
   holds the whole film in memory: a 20-minute take was killed at a 7 GB cap and, uncapped, took a
   19 GiB WSL2 host down twice (2026-10-23/24). The tape outputs the MP4 only; the recorder then
-  runs a streaming ffmpeg pass (one palette per frame, `NOO_DEMO_GIF_FPS` 12, `NOO_DEMO_GIF_WIDTH`
-  1000) for `onboarding.gif`. The recorder container is capped (`NOO_STUDIO_REC_MEM`, 6g) as a
+  runs a streaming ffmpeg pass (one palette per frame, `NOO_DEMO_GIF_FPS` 8, `NOO_DEMO_GIF_WIDTH`
+  800) for `onboarding.gif`. The recorder container is capped (`NOO_STUDIO_REC_MEM`, 6g) as a
   backstop. Do not film on a WSL2 host that also runs a model: the box (10g) plus the render do not
   fit beside it.
 - **What the cache does not cover.** The cache fronts ghcr.io only. The Ollama image comes from
@@ -136,9 +136,17 @@ not routed through the masker (the typed commands, and the prompt, which is forc
   not the film's fault. The cache volume can be seeded from another host:
   `docker run --rm -v noo-demo-cache:/c alpine tar c -C /c . | ssh other 'docker volume create noo-demo-cache && docker run --rm -i -v noo-demo-cache:/c alpine tar x -C /c'`.
 - **Pace.** vhs films in real time, and a first-run image pull takes minutes.
-  `--speed 2` plays the whole film faster; for a tighter cut, film in chunks
-  (separate tapes) and speed up the waits with ffmpeg
-  (`-filter:v "setpts=PTS/4"` on a clip).
+  `--speed 2` plays the whole film faster. For a tighter cut, `scripts/demo/cut.sh IN.mp4 OUT.mp4 EDITS`
+  speeds up the stretches that are only the network and captions them on screen
+  ("Pulling the stack images: ~13 GB, as fast as your network (8x)"), one edit per line
+  (`START END SPEED [CAPTION]`), without refilming. Take 7 (5.6 min at 2x) cut to 2.7 min that way.
+- **The GIF is the teaser, the MP4 is the film.** `NOO_DEMO_GIF_RANGE=START:SECONDS` makes the
+  GIF from one stretch; the defaults (`NOO_DEMO_GIF_FPS` 8, `NOO_DEMO_GIF_WIDTH` 800, whole take)
+  still make hundreds of MB from a five-minute take.
+- **What the film shows that a real install would not.** The studio's box has no systemd, and in
+  the standalone profile the node agent is a host binary under systemd, so the box never registers
+  its own node: `noo cluster status` reads "no nodes" there, while a real install shows the node a
+  minute after onboard. The tape films `noo stack status` instead.
 - The non-interactive wizard (`--ci --skip-tailscale`) is what is filmed because
   it is the path the release rehearsals exercise. An interactive take needs the
   wizard's prompts typed in; add them to the template after one dry take.

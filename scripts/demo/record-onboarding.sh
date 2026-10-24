@@ -160,10 +160,16 @@ exit_check() {
 # per frame (`stats_mode=single` + `paletteuse=new=1`), at a GIF-sized frame
 # rate and width. The MP4 keeps the full frames; the GIF is the preview.
 gif_from_mp4() {
-  local mp4="$1" gif="$2"
+  local mp4="$1" gif="$2" range=()
   [ -s "$mp4" ] || { echo "no MP4 to make the GIF from: $mp4" >&2; return 1; }
-  ffmpeg -loglevel error -y -i "$mp4" \
-    -vf "fps=${NOO_DEMO_GIF_FPS:-12},scale=${NOO_DEMO_GIF_WIDTH:-1000}:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=bayer:bayer_scale=5" \
+  # NOO_DEMO_GIF_RANGE=START:SECONDS makes a teaser of one stretch (a GIF of a
+  # whole five-minute take is hundreds of MB whatever the rate: take 7's was
+  # 577 MB at 12 fps/1000 px). The default is the whole take at 8 fps, 800 px.
+  if [ -n "${NOO_DEMO_GIF_RANGE:-}" ]; then
+    range=(-ss "${NOO_DEMO_GIF_RANGE%%:*}" -t "${NOO_DEMO_GIF_RANGE#*:}")
+  fi
+  ffmpeg -loglevel error -y "${range[@]}" -i "$mp4" \
+    -vf "fps=${NOO_DEMO_GIF_FPS:-8},scale=${NOO_DEMO_GIF_WIDTH:-800}:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=bayer:bayer_scale=5" \
     "$gif" || { echo "GIF render failed; the MP4 stands" >&2; return 1; }
 }
 
