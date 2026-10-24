@@ -360,7 +360,8 @@ def test_a_stack_roll_recreates_grafana() -> None:
     roll (`noo upgrade --stack`) runs the launcher with no service names,
     and that path force-recreates every service, grafana included."""
     upgrade = (ROOT / "noo-cli" / "src" / "commands" / "upgrade.rs").read_text()
-    body = upgrade.split("fn upgrade_stack(", 1)[1].split("\nfn ", 1)[0]
+    # The launcher invocation lives in the launch phase of the roll.
+    body = upgrade.split("fn launch_stack(", 1)[1].split("\n}\n", 1)[0]
     assert '.arg(root.join("scripts/noomesh-start.sh")).arg("--dist")\n' in body, "the roll names no services"
     start = (ROOT / "scripts" / "noomesh-start.sh").read_text()
     full = start.split('if [ ${#SERVICES[@]} -eq 0 ]', 1)

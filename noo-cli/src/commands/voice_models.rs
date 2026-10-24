@@ -597,10 +597,9 @@ mod tests {
     /// needs the mount sources) and onboard's add-ons step.
     #[test]
     fn every_voice_on_path_stages() {
-        let up = include_str!("upgrade.rs");
-        let body = &up[up.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in upgrade_stack"));
-        assert!(at("voice_models::stage_if_on(g)") < at("let mut status = launch();"), "stage before the launcher");
+        let body = crate::commands::upgrade::phase_src::list();
+        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        assert!(at("voice_models::stage_if_on(g)") < at("launch_stack("), "stage before the launcher");
         let addons = include_str!("addons.rs");
         assert!(addons.contains("(on && name == \"voice\").then(|| crate::commands::voice_models::stage_configured("), "enable stages");
         let onboard = include_str!("../onboard/mod.rs");

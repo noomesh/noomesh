@@ -298,17 +298,20 @@ mod tests {
     /// downed gateway after a failed roll does not hide it).
     #[test]
     fn the_preflight_runs_before_anything_moves() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in upgrade_stack"));
-        let pre = at("stack_db_compat::preflight(");
-        for later in ["pre_roll_key_verdict(", "addon_preflight(g, &root, &tag", "reconcile_audit_key(&root)", "write_stack_lock(g, &tag, &root",
-                      "standalone::materialize(&root)", "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
+        use crate::commands::upgrade::phase_src;
+        let list = phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        let pre = at("preflight_db_compat(");
+        for later in ["preflight_service_keys(", "addon_preflight(g, &roll.root, &roll.tag", "mint_audit_key(", "move_pin(",
+                      "refresh_deploy_slice(", "launch_stack("] {
             assert!(pre < at(later), "the rollback/DB preflight must run before `{later}`");
         }
-        assert!(at("fetch_stack_lock(g, &tag)") < pre, "it reads the target's signed lock, so the lock is fetched first");
-        assert!(!body.contains("allow_downgrade) ||") && !body[pre..at("pre_roll_key_verdict(")].contains("force"),
+        let phase = phase_src::body("preflight_db_compat");
+        let preflight = phase.find("stack_db_compat::preflight(").expect("the phase runs the preflight");
+        assert!(phase.find("fetch_stack_lock(g, tag)").expect("and fetches the lock") < preflight,
+            "it reads the target's signed lock, so the lock is fetched first");
+        assert!(!list.contains("allow_downgrade) ||") && !phase.contains("force") && !phase.contains("allow_downgrade")
+            && !list[pre..at("preflight_service_keys(")].contains("force"),
             "no flag bypasses it");
     }
 

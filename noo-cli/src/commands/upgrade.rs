@@ -22,6 +22,25 @@
 //!   3. a direct fetch, with `GH_TOKEN`/`GITHUB_TOKEN` when set.
 //! A private `NOO_CLI_REPO` with none of these fails with actionable guidance
 //! rather than a bare 404 — same posture as the installer.
+//!
+//! `--stack` (the controller roll, `upgrade_stack`) is a literal ordered list
+//! of phases; read that function for the order. In order:
+//!   1. `standalone_root`, `resolve_target_tag` — which install, which tag.
+//!   2. refusals, nothing written: `refuse_below_secrets_floor`,
+//!      `refuse_install_without_core_secrets`, `refuse_plaintext_install`,
+//!      `refuse_unrequested_downgrade`, then `announce_roll`.
+//!   3. `preflight_db_compat` (the target must run on the DB it will meet),
+//!      `preflight_service_keys`, `refuse_unlocked_dist_roll`,
+//!      `addon_preflight` — still nothing moves.
+//!   4. mint what the release needs: `mint_audit_key`, `mint_bus_keys`,
+//!      `mint_system_credentials`, `issue_pg_role_leaves`, `warn_door_node_id`.
+//!   5. prepare and pin: `migrate_retired_yaml_gates`,
+//!      `rerender_nats_users_for_roll`, `refresh_deploy_slice`, `move_pin`.
+//!   6. launcher inputs: service certs, grafana door, gateway PKI view, voice
+//!      models, add-on NATS principals.
+//!   7. node-image staging starts (overlapping), then `launch_stack`.
+//! The source-reading tests read the list for ORDER and the owning phase for
+//! CONTENT (`phase_src` at the bottom of this file).
 
 use std::process::Command;
 use crate::host_exec::which;
@@ -956,15 +975,146 @@ fn reconcile_addon_nats_principals(g: &Globals, root: &std::path::Path) {
     }
 }
 
+/// `noo upgrade --stack` as a LITERAL, ORDERED list of phases. Read this
+/// function for the order; each phase owns its own behaviour, messages and
+/// exit codes (all unchanged from when this was one 560-line body).
+///
+/// The invariants the order encodes (each is pinned by a source-reading test
+/// that reads THIS body, so reordering a line here fails it):
+///
+/// 1. Nothing moves before every refusal has run. Everything above the mint
+///    block (`mint_audit_key`) only reads, refuses, or pulls images by digest;
+///    the first phase that writes is `mint_audit_key`.
+/// 2. The rollback/DB preflight (`preflight_db_compat`) is the FIRST refusal
+///    that needs the network, ahead of the service-key check, so a downed
+///    gateway after a failed roll does not hide it. No flag bypasses it.
+/// 3. The missing-lock refusal precedes the add-on preflight, and the add-on
+///    pins land in the same step as stack.lock (`move_pin`).
+/// 4. Everything that mints (audit key, bus keys, system credentials, Postgres
+///    role leaves) runs before the slice refresh, the pin and the launcher.
+/// 5. Node images are staged from the verified lock after the last refusal
+///    that could abort the roll and BEFORE the launcher, overlapping it; the
+///    run is handed back to the caller (`run_fleet_stages`) to join.
+/// 6. The launcher is last. A failure after the pin moved says so.
+///
+/// Why the un-wrapped steps sit where they do (comments kept from the body):
+///
+/// - migrate_retired_yaml_gates (0.)
+///   0. Move any RETIRED gate key out of noomesh.yaml BEFORE the roll,
+///   while the old gateway is still up to accept the write.
+/// - rerender_nats_users_for_roll (0.5)
+///   0.5 Re-render users.conf WITHOUT the retired shared NATS user, before
+///   anything moves. The compose this
+///   binary materialises hands nats no NATS_USER/NATS_PASSWORD; a
+///   users.conf an older CLI rendered still names them, and NATS refuses
+///   to parse it — the stack-v0.2.78 outage. Store-first, idempotent,
+///   mints nothing; the HUP makes the RUNNING server drop the shared
+///   user now, which is safe because nothing may present it (verify
+///   with /connz?auth=1 first — the runbook's step). The launcher's
+///   pre-`up` check refuses the start if this did not happen.
+/// - reconcile_service_certs (2.5)
+///   2.5. Reconcile service certs a NEW release's compose expects but an
+///   upgraded (not freshly onboarded) install never issued — see
+///   reconcile_service_certs. Before the launcher, so the leaf exists
+///   before Docker can create the bind-mount source as root.
+/// - reconcile_grafana_door (2.55)
+///   2.55. Grafana single sign-on and its door: an install
+///   onboarded before this has no GRAFANA_ROOT_URL, so SSO is off. Before
+///   2.6, so a re-issued grafana leaf reaches pki/public/ in this roll.
+/// - sync_gateway_pki_view (2.6)
+///   2.6. The gateway's certificate-only view. A release
+///   with this compose mounts `pki/public/{nodes,services}` and
+///   `pki/sso` into the gateway instead of the PKI root; an upgraded
+///   install has never had `public/`. Laid down HERE, as the operator,
+///   before the launcher: its bind-source check refuses a missing
+///   source, and Docker would otherwise create it as root.
+/// - voice_models::stage_if_on (2.65)
+///   2.65. The voice add-on's models, while voice is on (i105): the
+///   containers mount them read-only and run offline, so the controller
+///   stages them here, before the launcher (whose bind check needs the
+///   mount sources). Best effort: a failure is printed with its
+///   `noo models pull` line and never aborts the roll.
+/// - reconcile_addon_nats_principals (2.66)
+///   2.66. Each declared add-on its own NATS principal (i70 residue). After
+///   step 1 (this release's trellion overlay) and step 2 (the add-on
+///   pins, so a licensed add-on's bundle is the one being rolled to),
+///   before the launcher recreates the add-ons with their password.
+/// - start_stage_release_images (2.7)
+///   2.7. Stage the release's node images on the artifact rail, while the
+///   old gateway still serves: it is controller-only work (registry pull +
+///   docker save) and used to sit AFTER the roll, ahead of the nodes
+///   phase. It uses the lock bytes verified above for `tag` (not .env,
+///   which still names the running release). Best-effort: a failure
+///   warns per image and is recorded for the nodes stage's
+///   lock_stage_blocker; it never aborts the roll. The prune below keeps
+///   `tag`, so it cannot delete what was just staged.
+///   It runs on a thread OVERLAPPING the launcher's compose pull/recreate
+///   and the caller's gateway health wait; it is handed back to
+///   run_fleet_stages to join. The failure paths below join it here.
+///
+/// The phase functions follow, in list order.
 fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_key_check: bool, allow_downgrade: bool)
     -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
 {
-    // repo_root() ranks a python-venv-derived root above the standalone
-    // home, so a STALE clone (e.g. ~/pai-assistant left from an early
-    // manual attempt) shadowed a healthy ~/.noo and --stack refused a
-    // machine that IS standalone (live on host1, 2026-08-23). For
-    // this command the standalone home is authoritative whenever the
-    // ranked root isn't one.
+    // What and whether: nothing below writes anything.
+    let root = standalone_root(g);
+    let tag = resolve_target_tag(g, tag_override);
+    refuse_below_secrets_floor(g, &tag);
+    refuse_install_without_core_secrets(g, &root);
+    refuse_plaintext_install(g, &root);
+    let roll = Roll { prev: pinned_tag(&root), root, tag };
+    refuse_unrequested_downgrade(g, &roll, tag_override, force);
+    announce_roll(&roll);
+    let target_stack_lock = preflight_db_compat(g, &roll);
+    preflight_service_keys(g, &roll, skip_gw_key_check);
+    refuse_unlocked_dist_roll(g, &roll, target_stack_lock.as_deref());
+    let addon_prep = addon_preflight(g, &roll.root, &roll.tag, target_stack_lock.as_deref(), allow_downgrade);
+
+    // Mint what this release needs, before anything moves.
+    mint_audit_key(g, &roll);
+    mint_bus_keys(g, &roll);
+    mint_system_credentials(g, &roll);
+    issue_pg_role_leaves(g);
+    warn_door_node_id(g, &roll);
+
+    // Prepare the install, then move the pin.
+    migrate_retired_yaml_gates(g, &roll.root);
+    rerender_nats_users_for_roll(g, &roll.root);
+    refresh_deploy_slice(g, &roll);
+    move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep);
+
+    // Everything the launcher's bind checks and the new compose expect.
+    reconcile_service_certs(g);
+    reconcile_grafana_door(g, &roll.root);
+    sync_gateway_pki_view(g);
+    crate::commands::voice_models::stage_if_on(g);
+    reconcile_addon_nats_principals(g, &roll.root);
+
+    // Stage node images (overlapping the launcher), then launch.
+    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag);
+    launch_stack(g, &roll, staging)
+}
+
+
+/// What one `noo upgrade --stack` roll is working on, resolved once and
+/// Handed to every phase that needs it (instead of four loose locals).
+struct Roll {
+    /// The standalone install being rolled.
+    root: std::path::PathBuf,
+    /// The stack tag being rolled TO (normalised).
+    tag: String,
+    /// The tag `.env` pins now ("" when unpinned).
+    prev: String,
+}
+
+/// Which install is rolled.
+/// Repo_root() ranks a python-venv-derived root above the standalone
+/// Home, so a STALE clone (e.g. ~/pai-assistant left from an early
+/// Manual attempt) shadowed a healthy ~/.noo and --stack refused a
+/// Machine that IS standalone (live on host1, 2026-08-23). For
+/// This command the standalone home is authoritative whenever the
+/// Ranked root isn't one.
+fn standalone_root(g: &Globals) -> std::path::PathBuf {
     let mut root = crate::envfile::repo_root();
     if !root.join(".noo-standalone").is_file() {
         if let Some(sh) = crate::envfile::standalone_home() {
@@ -979,7 +1129,12 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                       reconciler-owned gateways: see the split-recipe runbook"));
         }
     }
-    let tag = match tag_override {
+    root
+}
+
+/// Which tag is rolled to (explicit, or the newest COMPLETE published stack).
+fn resolve_target_tag(g: &Globals, tag_override: Option<&str>) -> String {
+    match tag_override {
         Some(t) => norm_stack_tag(t),
         None => {
             let baked = crate::onboard::standalone::STANDALONE_STACK_TAG;
@@ -1018,28 +1173,34 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                 }
             }
         }
-    };
+    }
+}
 
-    // The compose file this binary is about to materialise delivers the
-    // gateway's and worker's secrets as FILES; images below its
-    // `x-noo-secrets-floor` do not read them and would boot with no
-    // credentials. Refused BEFORE anything moves — slice, pin, lock — and
-    // regardless of --tag or --force: a rollback below the floor needs the CLI
-    // that shipped that release. The launcher refuses the same pairing again
-    // (scripts/lib-dist.sh require_secrets_floor); this is the early word.
+/// Refusal: the tag must be at or above the secrets floor.
+/// The compose file this binary is about to materialise delivers the
+/// Gateway's and worker's secrets as FILES; images below its
+/// `x-noo-secrets-floor` do not read them and would boot with no
+/// Credentials. Refused BEFORE anything moves — slice, pin, lock — and
+/// Regardless of --tag or --force: a rollback below the floor needs the CLI
+/// That shipped that release. The launcher refuses the same pairing again
+/// (scripts/lib-dist.sh require_secrets_floor); this is the early word.
+fn refuse_below_secrets_floor(g: &Globals, tag: &str) {
     if let Some(floor) = embedded_secrets_floor() {
-        if !tag_meets_floor(&tag, &floor) {
+        if !tag_meets_floor(tag, &floor) {
             fail(g.json, ExitCode::Generic, "below_secrets_floor",
                 &format!("{tag} is below {floor}, the oldest stack whose images read the secret \
                           files this CLI's compose file delivers — refusing to pair them"),
                 Some(&secrets_floor_remedy(&floor)));
         }
     }
+}
 
-    // Finding #99: an offboard-residue ~/.noo (env pin survives, secrets
-    // gone) sailed into a blank-password deploy. Refuse the stub HERE,
-    // before any pull — the launcher's require_core_secrets is the deep
-    // guard; this is the early, cheaper message.
+/// Refusal: an install with no core secrets is not rolled.
+/// Finding #99: an offboard-residue ~/.noo (env pin survives, secrets
+/// Gone) sailed into a blank-password deploy. Refuse the stub HERE,
+/// Before any pull — the launcher's require_core_secrets is the deep
+/// Guard; this is the early, cheaper message.
+fn refuse_install_without_core_secrets(g: &Globals, root: &std::path::Path) {
     {
         let env_text = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
         let backend = env_text.lines()
@@ -1056,55 +1217,81 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                       audit: noo offboard --check"));
         }
     }
-    // The plaintext .env backend is retired. An install still
-    // on it (or holding a secret in .env beside the store) is refused BEFORE
-    // anything moves, with the verbs that fix it — never auto-migrated here.
-    if let Some(why) = crate::commands::plaintext_env::AtRest::read(&root).controller_problem() {
+}
+
+/// Refusal: the retired plaintext `.env` backend is not rolled.
+/// The plaintext .env backend is retired. An install still
+/// On it (or holding a secret in .env beside the store) is refused BEFORE
+/// Anything moves, with the verbs that fix it — never auto-migrated here.
+fn refuse_plaintext_install(g: &Globals, root: &std::path::Path) {
+    if let Some(why) = crate::commands::plaintext_env::AtRest::read(root).controller_problem() {
         fail(g.json, ExitCode::Generic, "plaintext_secrets",
             &format!("{why} — refusing to roll a stack whose secrets are not all encrypted at rest; nothing was changed"),
             Some(crate::commands::plaintext_env::REMEDY));
     }
-    let prev = std::fs::read_to_string(root.join(".env")).unwrap_or_default()
+}
+
+/// The tag `.env` pins now (empty when unpinned).
+fn pinned_tag(root: &std::path::Path) -> String {
+    std::fs::read_to_string(root.join(".env")).unwrap_or_default()
         .lines().find_map(|l| l.trim().strip_prefix("NOO_IMAGE_TAG=").map(str::to_string))
-        .unwrap_or_default();
-    // "rolling v0.2.43 → v0.2.43" is not a roll, it is a re-apply, and printing
-    // it as an arrow reads as a typo in the operator's own command (2026-09-13).
-    // Re-applying the same tag is a legitimate and common act — it is how a
-    // recreate with new env is done — so it gets its own sentence.
-    // A roll BACKWARDS is never what `--stack` with no arguments means. The
-    // pin says where the controller is; the resolved tag can be older when
-    // the newest published stack is not yet complete on GHCR (see above) or
-    // when a stale binary's paired tag wins. Either way, silently downgrading
-    // a controller that is ahead — and pruning the newer images afterwards —
-    // is an outage with a green tick. An explicit --tag is a decision and is
-    // honoured with a loud word; --force overrides the rest.
-    if is_downgrade(&prev, &tag) && tag_override.is_none() && !force {
+        .unwrap_or_default()
+}
+
+/// `--stack` with no arguments never rolls BACKWARDS.
+/// A roll BACKWARDS is never what `--stack` with no arguments means. The
+/// Pin says where the controller is; the resolved tag can be older when
+/// The newest published stack is not yet complete on GHCR (see `resolve_target_tag`) or
+/// When a stale binary's paired tag wins. Either way, silently downgrading
+/// A controller that is ahead — and pruning the newer images afterwards —
+/// Is an outage with a green tick. An explicit --tag is a decision and is
+/// Honoured with a loud word; --force overrides the rest.
+fn refuse_unrequested_downgrade(g: &Globals, roll: &Roll, tag_override: Option<&str>, force: bool) {
+    let tag = &roll.tag;
+    let prev = &roll.prev;
+    if is_downgrade(prev, tag) && tag_override.is_none() && !force {
         fail(g.json, ExitCode::Generic, "stack_downgrade_refused",
             &format!("the controller is on {prev}; resolving `--stack` would roll it BACK to {tag}"),
             Some(&format!("that usually means {prev} is published but not yet complete on ghcr.io — \
                            wait a few minutes and re-run, or `noo upgrade --stack --tag {prev}` to \
                            re-apply it, or --force to downgrade on purpose")));
     }
+}
+
+/// Say what is about to happen.
+/// "rolling v0.2.43 → v0.2.43" is not a roll, it is a re-apply, and printing
+/// It as an arrow reads as a typo in the operator's own command (2026-09-13).
+/// Re-applying the same tag is a legitimate and common act — it is how a
+/// Recreate with new env is done — so it gets its own sentence.
+fn announce_roll(roll: &Roll) {
+    let root = &roll.root;
+    let tag = &roll.tag;
+    let prev = &roll.prev;
     if prev == tag {
         ui::step(&format!("re-applying {tag}  (install {}) — same tag, containers recreated",
             root.display()));
-    } else if is_downgrade(&prev, &tag) {
+    } else if is_downgrade(prev, tag) {
         ui::warned(&format!("rolling BACK {prev} → {tag}  (install {}) — an explicit downgrade",
             root.display()));
     } else {
         ui::step(&format!("rolling {} → {tag}  (install {})",
             if prev.is_empty() { "unpinned".into() } else { prev.clone() }, root.display()));
     }
+}
 
-    // -3. A rollback must be able to run on the database it will meet. The
-    //    target's signed lock (or this CLI's table, for releases that predate
-    //    the lock line) says which mesh migrations that release knows; a DB
-    //    stamped beyond them makes its gateway refuse to start. Refused HERE,
-    //    before any other stage, with nothing changed (rehearsal 0.6.7-rc.1
-    //    F2). The lock is fetched and verified first (read-only) because it
-    //    carries the head. No override: restoring a backup is what clears it.
-    let target_stack_lock = fetch_stack_lock(g, &tag);
-    if let Err((code, msg, fix)) = crate::commands::stack_db_compat::preflight(&prev, &tag, target_stack_lock.as_deref(), &|| {
+/// Refusal: the target must be able to run on the database it will meet. Returns the target's signed lock (None when the release predates locks).
+/// A rollback must be able to run on the database it will meet. The
+///    target's signed lock (or this CLI's table, for releases that predate
+///    the lock line) says which mesh migrations that release knows; a DB
+///    stamped beyond them makes its gateway refuse to start. Refused HERE,
+///    before any other stage, with nothing changed (rehearsal 0.6.7-rc.1
+///    F2). The lock is fetched and verified first (read-only) because it
+///    carries the head. No override: restoring a backup is what clears it.
+fn preflight_db_compat(g: &Globals, roll: &Roll) -> Option<String> {
+    let tag = &roll.tag;
+    let prev = &roll.prev;
+    let target_stack_lock = fetch_stack_lock(g, tag);
+    if let Err((code, msg, fix)) = crate::commands::stack_db_compat::preflight(prev, tag, target_stack_lock.as_deref(), &|| {
         crate::commands::db::mesh_stamp_from_postgres()
             .or_else(|| {
                 crate::http::get_json_try(g, "/api/db/migrations", true, 10).ok()
@@ -1114,23 +1301,28 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     }) {
         fail(g.json, ExitCode::Generic, code, &msg, Some(fix));
     }
+    target_stack_lock
+}
 
-    // -2. Every controller service must hold its own gateway key BEFORE the
-    //    roll: this release's gateway refuses the
-    //    controller-secret HMAC a keyless worker used to fall back to, and the
-    //    fallback itself is gone. FIRST, before any stage below mints or
-    //    moves anything, so its refusal can truly say "nothing was changed".
-    //    Two sources, both required: the store must hold each required
-    //    NOO_SVC_KEY_* (what compose delivers), and the running gateway must
-    //    list an active key for each consumer (what it will accept). A
-    //    gateway that ANSWERS but cannot be read fails CLOSED: refused unless
-    //    --skip-gateway-key-check, which skips only that listing — the store
-    //    check stays. A gateway that does NOT ANSWER (down) takes the same
-    //    store-only path automatically, with the warning. (The listing exposes no key prefix or fingerprint, so
-    //    the store's key cannot be compared with the row; an active row per
-    //    consumer is what can be shown.)
+/// Refusal: every controller service holds its own gateway key.
+/// Every controller service must hold its own gateway key BEFORE the
+///    roll: this release's gateway refuses the
+///    controller-secret HMAC a keyless worker used to fall back to, and the
+///    fallback itself is gone. FIRST, before any stage below mints or
+///    moves anything, so its refusal can truly say "nothing was changed".
+///    Two sources, both required: the store must hold each required
+///    NOO_SVC_KEY_* (what compose delivers), and the running gateway must
+///    list an active key for each consumer (what it will accept). A
+///    gateway that ANSWERS but cannot be read fails CLOSED: refused unless
+///    --skip-gateway-key-check, which skips only that listing — the store
+///    check stays. A gateway that does NOT ANSWER (down) takes the same
+///    store-only path automatically, with the warning. (The listing exposes no key prefix or fingerprint, so
+///    the store's key cannot be compared with the row; an active row per
+///    consumer is what can be shown.)
+fn preflight_service_keys(g: &Globals, roll: &Roll, skip_gw_key_check: bool) {
+    let root = &roll.root;
     let required = required_consumers();
-    let store_short = keyless_in_store(&root, &required);
+    let store_short = keyless_in_store(root, &required);
     let (db_short, gw_down) = read_gateway_key_shortfall(g, &required);
     match pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check, gw_down) {
         PreRollKeys::Go => {}
@@ -1147,40 +1339,49 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
              consumer holds a key this release accepts. Nothing was changed",
             Some("noo auth login   # then re-run: noo upgrade --stack (or add --skip-gateway-key-check to roll on the store check alone)")),
     }
+}
 
-    // -1z. Licensed add-ons release from their own repositories with their
-    //    own signed lock. Before anything below mints or moves, every add-on
-    //    declared on must have a lock for the TARGET tag that verifies
-    //    against the entitlement's trust anchor, lists the tag, matches the
-    //    target stack lock's base row, and is not a downgrade; its images are
-    //    pulled by digest here (pulls change nothing that runs). One that
-    //    cannot is a hold: the roll is refused naming it, with nothing
-    //    changed. The pins are written beside stack.lock in step 2.
-    // i57c: a dist install is pull-only and digest-pinned. A release with no
-    // signed lock has nothing to check its images against, so the roll is
-    // refused HERE, on its own, ahead of the add-on preflight (which used to
-    // be the only thing that happened to stop it).
+/// Refusal: a dist roll to a tag with no signed lock. Ahead of the add-on preflight.
+/// Licensed add-ons release from their own repositories with their
+///    own signed lock. Before anything below mints or moves, every add-on
+///    declared on must have a lock for the TARGET tag that verifies
+///    against the entitlement's trust anchor, lists the tag, matches the
+///    target stack lock's base row, and is not a downgrade; its images are
+///    pulled by digest here (pulls change nothing that runs). One that
+///    cannot is a hold: the roll is refused naming it, with nothing
+///    changed. The pins are written beside stack.lock in step 2.
+/// I57c: a dist install is pull-only and digest-pinned. A release with no
+/// Signed lock has nothing to check its images against, so the roll is
+/// Refused HERE, on its own, ahead of the add-on preflight (which used to
+/// Be the only thing that happened to stop it).
+/// (Add-on preflight, which follows in the phase list, is step -1z: see `addon_preflight`.)
+fn refuse_unlocked_dist_roll(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>) {
+    let root = &roll.root;
+    let tag = &roll.tag;
     if target_stack_lock.is_none() {
         let dotenv = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
         let mode = std::env::var("NOO_INSTALL_MODE").ok().filter(|v| !v.trim().is_empty())
             .or_else(|| dotenv.lines().rev().find_map(|l| l.trim().strip_prefix("NOO_INSTALL_MODE=").map(|v| v.trim().trim_matches('"').to_string())))
             .unwrap_or_default();
-        if let Some(why) = no_lock_refusal(&mode, &tag) {
+        if let Some(why) = no_lock_refusal(&mode, tag) {
             fail(g.json, ExitCode::Generic, "stack_lock_missing", &why,
                 Some("pick a published release: noo upgrade --check --stack"));
         }
-        warn_pulled_by_tag(g, &tag);
+        warn_pulled_by_tag(g, tag);
     }
-    let addon_prep = addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade);
+}
 
-    // -1. The audit log's signing key. A release whose
-    //    gateway signs audit rows ONLY with NOO_AUDIT_HMAC_KEY refuses every
-    //    row on an install that never had one — every install before it.
-    //    Minted here, before anything else moves, so a store that cannot be
-    //    written stops the roll with the slice, pin and stack untouched. Mint
-    //    only if absent: an existing key is never rotated (the gateway's
-    //    checkpoint hands the old rows over on its first boot with it).
-    match reconcile_audit_key(&root) {
+/// Mint the audit log signing key.
+/// The audit log's signing key. A release whose
+///    gateway signs audit rows ONLY with NOO_AUDIT_HMAC_KEY refuses every
+///    row on an install that never had one — every install before it.
+///    Minted here, before anything else moves, so a store that cannot be
+///    written stops the roll with the slice, pin and stack untouched. Mint
+///    only if absent: an existing key is never rotated (the gateway's
+///    checkpoint hands the old rows over on its first boot with it).
+fn mint_audit_key(g: &Globals, roll: &Roll) {
+    let root = &roll.root;
+    match reconcile_audit_key(root) {
         Ok(AuditKeyStage::AlreadyPresent) => {}
         Ok(AuditKeyStage::Minted) => if !g.json {
             ui::done("minted NOO_AUDIT_HMAC_KEY into the encrypted store (new in this release: the audit log's own signing key)");
@@ -1203,14 +1404,18 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                 Some("noo security secrets audit   # then re-run: noo upgrade --stack"));
         }
     }
+}
 
-    // -1a. The bus-principal keys. This release's gateway
-    //    signs worker.* messages per audience and its workers verify only
-    //    their own key — a store without them is a bus on which every
-    //    message is refused. Minted HERE, before anything moves, by the same
-    //    mint-only-if-absent writer as the audit key; the launcher below then
-    //    recreates the gateway and every verifier with them in one `up`.
-    match reconcile_bus_keys(&root) {
+/// Mint the bus-principal keys.
+/// The bus-principal keys. This release's gateway
+///    signs worker.* messages per audience and its workers verify only
+///    their own key — a store without them is a bus on which every
+///    message is refused. Minted HERE, before anything moves, by the same
+///    mint-only-if-absent writer as the audit key; the launcher below then
+///    recreates the gateway and every verifier with them in one `up`.
+fn mint_bus_keys(g: &Globals, roll: &Roll) {
+    let root = &roll.root;
+    match reconcile_bus_keys(root) {
         Ok(minted) if minted.is_empty() => {}
         Ok(minted) => if !g.json {
             ui::done(&format!("minted {} into the encrypted store (new in this release: one key per service, so no controller service holds a shared secret)", minted.join(", ")));
@@ -1228,11 +1433,15 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                 Some("noo security secrets audit   # then re-run: noo upgrade --stack"));
         }
     }
+}
 
-    // -1b. Enabled systems' credentials: mint what is absent
-    //    — never rotate — before anything moves, so the launcher's refusal is
-    //    a backstop and never a manual pre-roll step.
-    match crate::commands::systems::reconcile_credentials(&root) {
+/// Mint enabled systems' credentials.
+/// Enabled systems' credentials: mint what is absent
+///    — never rotate — before anything moves, so the launcher's refusal is
+///    a backstop and never a manual pre-roll step.
+fn mint_system_credentials(g: &Globals, roll: &Roll) {
+    let root = &roll.root;
+    match crate::commands::systems::reconcile_credentials(root) {
         Ok(minted) => for (name, keys) in minted.iter().filter(|(_, k)| !k.is_empty()) {
             if !g.json { ui::done(&format!("minted {} into the encrypted store ({name} is enabled)", keys.join(", "))); }
         },
@@ -1245,18 +1454,21 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             &format!("could not mint an enabled system's credentials: {e} — nothing was changed"),
             Some("noo systems status   # then re-run: noo upgrade --stack")),
     }
+}
 
-    // -1c. The Postgres role leaves (i132). This release's pg_hba requires a
-    //    client certificate whose CN is the role being asked for
-    //    (`clientcert=verify-full`) for noo, noo_app, noo_trellion and
-    //    noo_trellion_ddl, and its compose DSNs name `gateway/pg/<role>.*` or
-    //    `<leaf dir>/pg/<role>.*` inside what each container already mounts.
-    //    An install upgraded from before has only the shared leaves, so the
-    //    role leaves are
-    //    minted HERE, before anything moves: a leaf that cannot be issued
-    //    stops the roll with the slice, pin and running stack untouched,
-    //    because a Postgres that enforces the new rule in front of clients
-    //    that cannot present it is a database nobody can reach.
+/// Issue the Postgres role leaves.
+/// The Postgres role leaves (i132). This release's pg_hba requires a
+///    client certificate whose CN is the role being asked for
+///    (`clientcert=verify-full`) for noo, noo_app, noo_trellion and
+///    noo_trellion_ddl, and its compose DSNs name `gateway/pg/<role>.*` or
+///    `<leaf dir>/pg/<role>.*` inside what each container already mounts.
+///    An install upgraded from before has only the shared leaves, so the
+///    role leaves are
+///    minted HERE, before anything moves: a leaf that cannot be issued
+///    stops the roll with the slice, pin and running stack untouched,
+///    because a Postgres that enforces the new rule in front of clients
+///    that cannot present it is a database nobody can reach.
+fn issue_pg_role_leaves(g: &Globals) {
     match reconcile_pg_leaves(&crate::pki::ClusterCa::new(crate::pki::pki_dir())) {
         Ok(minted) => if !g.json && !minted.is_empty() {
             ui::done(&format!("issued {} Postgres client certificate(s) ({}) — new in this release: pg_hba now requires the certificate's CN to be the role", minted.len(), minted.join(", ")));
@@ -1273,15 +1485,19 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                 Some("noo security pki fix-modes   # then re-run: noo upgrade --stack"));
         }
     }
+}
 
-    // -1d. The four stunnel doors the controller's own node-agent dials
-    //    (ollama, ollama-embed, ollama-embed-cpu, llamacpp) now pin that agent
-    //    by this controller's node id (`checkHost = $NODE_ID`, appended at
-    //    start by compose) and REFUSE to start without a usable one, rather
-    //    than accept any cluster certificate again. An install whose .env has
-    //    no NODE_ID would come up with those doors down: say so now, with the
-    //    fix, while the old stack is still serving. Not a refusal of the roll:
-    //    most controllers run none of the four.
+/// Warning: the stunnel doors need a usable NODE_ID.
+/// The four stunnel doors the controller's own node-agent dials
+///    (ollama, ollama-embed, ollama-embed-cpu, llamacpp) now pin that agent
+///    by this controller's node id (`checkHost = $NODE_ID`, appended at
+///    start by compose) and REFUSE to start without a usable one, rather
+///    than accept any cluster certificate again. An install whose .env has
+///    no NODE_ID would come up with those doors down: say so now, with the
+///    fix, while the old stack is still serving. Not a refusal of the roll:
+///    most controllers run none of the four.
+fn warn_door_node_id(g: &Globals, roll: &Roll) {
+    let root = &roll.root;
     if !g.json {
         // The CLI loaded .env into its environment at startup, and the
         // launcher exports noomesh.yaml `compose_env:` the same way: the
@@ -1296,29 +1512,18 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             ));
         }
     }
+}
 
-    // 0. Move any RETIRED gate key out of noomesh.yaml BEFORE the roll,
-    //    while the old gateway is still up to accept the write.
-    migrate_retired_yaml_gates(g, &root);
-
-    // 0.5 Re-render users.conf WITHOUT the retired shared NATS user, before
-    //     anything moves. The compose this
-    //     binary materialises hands nats no NATS_USER/NATS_PASSWORD; a
-    //     users.conf an older CLI rendered still names them, and NATS refuses
-    //     to parse it — the stack-v0.2.78 outage. Store-first, idempotent,
-    //     mints nothing; the HUP makes the RUNNING server drop the shared
-    //     user now, which is safe because nothing may present it (verify
-    //     with /connz?auth=1 first — the runbook's step). The launcher's
-    //     pre-`up` check refuses the start if this did not happen.
-    rerender_nats_users_for_roll(g, &root);
-
-    // 1. Refresh the deploy slice to THIS binary's assets (compose/scripts
-    //    track the release; secrets/PKI/noomesh.yaml are never embedded so
-    //    never touched). materialize() is idempotent by design, and also
-    //    retires a file a PAST release shipped that this one does not
-    //     — print whatever it has to say, never fail the
-    //    roll over it.
-    match crate::onboard::standalone::materialize(&root) {
+/// Refresh the deploy slice to this binary's assets.
+/// Refresh the deploy slice to THIS binary's assets (compose/scripts
+///    track the release; secrets/PKI/noomesh.yaml are never embedded so
+///    never touched). materialize() is idempotent by design, and also
+///    retires a file a PAST release shipped that this one does not
+///     — print whatever it has to say, never fail the
+///    roll over it.
+fn refresh_deploy_slice(g: &Globals, roll: &Roll) {
+    let root = &roll.root;
+    match crate::onboard::standalone::materialize(root) {
         Ok(report) => {
             if !g.json {
                 for line in report.retired.iter().chain(&report.moved_aside).chain(&report.skipped) {
@@ -1331,65 +1536,41 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
                 &format!("could not refresh embedded assets: {e}"), None);
         }
     }
-    // 2. Move the pin.
-    // The signed digest lock for this tag, or an
-    // explicit "unpinned" when the release predates locks; and, in the same
-    // step, the add-on pins resolved for this tag in -1z.
-    write_stack_lock(g, &tag, &root, target_stack_lock.as_deref());
-    commit_addon_pins(g, &root, &tag, &addon_prep);
-    if let Err(e) = crate::onboard::standalone::upsert_env(&root, "NOO_IMAGE_TAG", &tag) {
+}
+
+/// Move the pin: stack.lock, the add-on pins, then NOO_IMAGE_TAG.
+/// Move the pin.
+/// The signed digest lock for this tag, or an
+/// Explicit "unpinned" when the release predates locks; and, in the same
+/// Step, the add-on pins resolved for this tag in -1z.
+fn move_pin(g: &Globals, roll: &Roll, target_stack_lock: Option<&str>, addon_prep: &[crate::addons::Prepared]) {
+    let root = &roll.root;
+    let tag = &roll.tag;
+    write_stack_lock(g, tag, root, target_stack_lock);
+    commit_addon_pins(g, root, tag, addon_prep);
+    if let Err(e) = crate::onboard::standalone::upsert_env(root, "NOO_IMAGE_TAG", tag) {
         fail(g.json, ExitCode::Generic, "pin_failed",
             &format!("could not update NOO_IMAGE_TAG in .env: {e}"), None);
     }
-    // 3. Relaunch. The tag is passed EXPLICITLY in the child environment:
-    //    the CLI loads .env into its own process env at startup
-    //    (ensure_repo_env), so the launcher child inherits the OLD
-    //    NOO_IMAGE_TAG — which outranks the freshly-updated .env in the
-    //    launcher's resolution order. Live 2026-08-23 (finding #30): the
-    //    pin moved to v0.1.76, the launcher deployed v0.1.75, and the
-    //    command printed "✓ stack now on v0.1.76" — a false success on the
-    //    exact hotfix the operator was waiting for.
-    // 2.5. Reconcile service certs a NEW release's compose expects but an
-    //    upgraded (not freshly onboarded) install never issued — see
-    //    reconcile_service_certs. Before the launcher, so the leaf exists
-    //    before Docker can create the bind-mount source as root.
-    reconcile_service_certs(g);
-    // 2.55. Grafana single sign-on and its door: an install
-    //    onboarded before this has no GRAFANA_ROOT_URL, so SSO is off. Before
-    //    2.6, so a re-issued grafana leaf reaches pki/public/ in this roll.
-    reconcile_grafana_door(g, &root);
-    // 2.6. The gateway's certificate-only view. A release
-    //    with this compose mounts `pki/public/{nodes,services}` and
-    //    `pki/sso` into the gateway instead of the PKI root; an upgraded
-    //    install has never had `public/`. Laid down HERE, as the operator,
-    //    before the launcher: its bind-source check refuses a missing
-    //    source, and Docker would otherwise create it as root.
-    sync_gateway_pki_view(g);
-    // 2.65. The voice add-on's models, while voice is on (i105): the
-    //    containers mount them read-only and run offline, so the controller
-    //    stages them here, before the launcher (whose bind check needs the
-    //    mount sources). Best effort: a failure is printed with its
-    //    `noo models pull` line and never aborts the roll.
-    crate::commands::voice_models::stage_if_on(g);
-    // 2.66. Each declared add-on its own NATS principal (i70 residue). After
-    //    step 1 (this release's trellion overlay) and step 2 (the add-on
-    //    pins, so a licensed add-on's bundle is the one being rolled to),
-    //    before the launcher recreates the add-ons with their password.
-    reconcile_addon_nats_principals(g, &root);
+}
 
-    // 2.7. Stage the release's node images on the artifact rail, while the
-    //    old gateway still serves: it is controller-only work (registry pull +
-    //    docker save) and used to sit AFTER the roll, ahead of the nodes
-    //    phase. It uses the lock bytes verified above for `tag` (not .env,
-    //    which still names the running release). Best-effort: a failure
-    //    warns per image and is recorded for the nodes stage's
-    //    lock_stage_blocker; it never aborts the roll. The prune below keeps
-    //    `tag`, so it cannot delete what was just staged.
-    //    It runs on a thread OVERLAPPING the launcher's compose pull/recreate
-    //    and the caller's gateway health wait; it is handed back to
-    //    run_fleet_stages to join. The failure paths below join it here.
-    let staging = crate::commands::image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag);
-
+/// Run the launcher (one retry, never for the partial-stack exit), then settle.
+/// Hands the node-image staging run back on success; joins it on the failure paths.
+///
+/// Relaunch. The tag is passed EXPLICITLY in the child environment:
+/// The CLI loads .env into its own process env at startup
+/// (ensure_repo_env), so the launcher child inherits the OLD
+/// NOO_IMAGE_TAG — which outranks the freshly-updated .env in the
+/// Launcher's resolution order. Live 2026-08-23 (finding #30): the
+/// Pin moved to v0.1.76, the launcher deployed v0.1.75, and the
+/// Command printed "✓ stack now on v0.1.76" — a false success on the
+/// Exact hotfix the operator was waiting for.
+fn launch_stack(g: &Globals, roll: &Roll, staging: crate::commands::image_stage::StageRun)
+    -> Result<(i32, Option<crate::commands::image_stage::StageRun>), Unhandled>
+{
+    let root = &roll.root;
+    let tag = &roll.tag;
+    let prev = &roll.prev;
     // The launcher's own output (compose pull/up progress) follows this
     // line; it is the one child whose stdout is shown as-is (guide §5).
     if !g.json { ui::step("starting the stack (launcher)"); }
@@ -1402,10 +1583,10 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
     let _ = std::fs::remove_file(&stuck_report);
     let launch = || std::process::Command::new("bash")
         .arg(root.join("scripts/noomesh-start.sh")).arg("--dist")
-        .env("NOO_IMAGE_TAG", &tag)
+        .env("NOO_IMAGE_TAG", tag)
         .env("NOO_STUCK_REPORT", &stuck_report)
         .env("NOO_CLI_BIN", &cli_bin)
-        .current_dir(&root)
+        .current_dir(root)
         .status();
     let mut status = launch();
     // One automatic retry: the first rail walk died on a GHCR blob timeout
@@ -1446,7 +1627,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             // Correcting it at the source rather than at each reader: the tag
             // just deployed is the truth, so say so once, here, where it
             // changes.
-            std::env::set_var("NOO_IMAGE_TAG", &tag);
+            std::env::set_var("NOO_IMAGE_TAG", tag);
             if !g.json {
                 ui::close_done(&format!("stack now on {tag}"));
                 ui::guide(&[("noo cluster verify --wait",
@@ -1496,7 +1677,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
             // this code actually wants to ask is "does any container use it",
             // and that is now the question it asks.
             let in_use = docker_image_ids_in_use();
-            let stale = superseded_images(&docker_image_lines(), &in_use, &tag, &prev);
+            let stale = superseded_images(&docker_image_lines(), &in_use, tag, prev);
             if !stale.is_empty() {
                 // Per-image, so one in-use image cannot report the whole batch
                 // as failed. The previous all-or-nothing status was the reason
@@ -1540,7 +1721,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL) => {
             let report = std::fs::read_to_string(&stuck_report).unwrap_or_default();
             let _ = std::fs::remove_file(&stuck_report);
-            ui::close_failed(&stuck_stack_message(&report, &tag), Some("noo upgrade --stack   # after the reboot"));
+            ui::close_failed(&stuck_stack_message(&report, tag), Some("noo upgrade --stack   # after the reboot"));
             if let Some(st) = staging.take() { st.finish(g); }
             Ok((1, None))
         }
@@ -1557,6 +1738,7 @@ fn upgrade_stack(g: &Globals, tag_override: Option<&str>, force: bool, skip_gw_k
         }
     }
 }
+
 
 /// The key the audit log signs with. Minted by `noo onboard` on a fresh
 /// install and by [`reconcile_audit_key`] on an upgraded one.
@@ -4711,14 +4893,14 @@ mod tests {
     /// supported roll reaches the launcher's refusal.
     #[test]
     fn system_credentials_are_minted_before_anything_in_the_roll_moves() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let mint = at("systems::reconcile_credentials(&root)");
-        for later in ["migrate_retired_yaml_gates(", "standalone::materialize(", "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
+        let list = super::phase_src::list();
+        let at = |needle: &str| list.find(needle).unwrap_or_else(|| panic!("{needle} not in the phase list"));
+        let mint = at("mint_system_credentials(");
+        for later in ["migrate_retired_yaml_gates(", "refresh_deploy_slice(", "move_pin(", "launch_stack("] {
             assert!(mint < at(later), "enabled systems' credentials must be minted before `{later}`");
         }
+        assert!(super::phase_src::body("mint_system_credentials").contains("systems::reconcile_credentials(root)"),
+            "the phase mints the enabled systems' credentials");
     }
 
     /// Node images are staged on a thread started from the verified lock
@@ -4728,25 +4910,31 @@ mod tests {
     /// gateway health wait (both branches) and before the stage record is read.
     #[test]
     fn upgrade_stack_stages_node_images_before_the_launcher_tests() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let spawn = at("image_stage::start_stage_release_images(g, target_stack_lock.clone(), &tag)");
-        assert!(at("fetch_stack_lock(g, &tag)") < spawn, "stage from a lock that has been fetched and verified");
-        for before in ["addon_preflight(", "reconcile_audit_key(&root)", "write_stack_lock(g, &tag", "NOO_IMAGE_TAG\", &tag", "sync_gateway_pki_view(g)"] {
+        // ORDER: the phase list. CONTENT: the launch phase.
+        let list = super::phase_src::list();
+        let at = |needle: &str| list.find(needle).unwrap_or_else(|| panic!("{needle} not in the phase list"));
+        let spawn = at("image_stage::start_stage_release_images(g, target_stack_lock.clone(), &roll.tag)");
+        let db = super::phase_src::body("preflight_db_compat");
+        assert!(db.find("fetch_stack_lock(g, tag)").expect("the lock is fetched") < db.find("stack_db_compat::preflight(").expect("and checked"),
+            "the lock is fetched and verified in the phase that returns it");
+        assert!(at("preflight_db_compat(") < spawn, "stage from a lock that has been fetched and verified");
+        for before in ["addon_preflight(", "mint_audit_key(", "move_pin(", "sync_gateway_pki_view(g)"] {
             assert!(at(before) < spawn, "`{before}` can abort or shape the roll and must run before staging");
         }
-        let launcher = at("let mut status = launch();");
-        assert!(spawn < launcher, "staging must start before the launcher runs, to overlap it");
-        // Inside upgrade_stack only the two failure paths join (launcher
+        let launcher_phase = at("launch_stack(");
+        assert!(spawn < launcher_phase, "staging must start before the launcher runs, to overlap it");
+        let body = super::phase_src::body("launch_stack");
+        let lat = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in launch_stack"));
+        let launcher = lat("let mut status = launch();");
+        // Inside the launch phase only the two failure paths join (launcher
         // failure; spawn error, whose fail() exits the process), each after the launcher.
         assert_eq!(body.matches("st.finish(g)").count(), 3, "join only on launcher failure (generic and partial-stack) and spawn error");
-        assert!(launcher < at("st.finish(g)"), "joined after the launcher returns");
-        let success = &body[at("Ok(s) if s.success() => {")..at("Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL)")];
+        assert!(launcher < lat("st.finish(g)"), "joined after the launcher returns");
+        let success = &body[lat("Ok(s) if s.success() => {")..lat("Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL)")];
         assert!(!success.contains("finish("), "the success arm hands the run back, it does not join");
         assert!(success.contains("Ok((0, staging.take()))"), "the live run is returned to the caller on success");
-        assert!(!body.contains("stage_after_roll") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
+        assert!(!list.contains("stage_after_roll") && !body.contains("stage_after_roll")
+            && !list.contains("image_stage::stage_release_images(") && !body.contains("image_stage::stage_release_images("), "no synchronous staging pass");
 
         // The caller joins after the gateway health wait, before the blocker read.
         let src = include_str!("upgrade.rs");
@@ -4848,14 +5036,13 @@ mod tests {
     /// boots without its key.
     #[test]
     fn the_audit_key_is_minted_before_anything_in_the_roll_moves() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let mint = at("reconcile_audit_key(&root)");
-        for later in ["migrate_retired_yaml_gates(", "standalone::materialize(", "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
+        let list = super::phase_src::list();
+        let at = |needle: &str| list.find(needle).unwrap_or_else(|| panic!("{needle} not in the phase list"));
+        let mint = at("mint_audit_key(");
+        for later in ["migrate_retired_yaml_gates(", "refresh_deploy_slice(", "move_pin(", "launch_stack("] {
             assert!(mint < at(later), "the audit key must be minted before `{later}`");
         }
+        assert!(super::phase_src::body("mint_audit_key").contains("reconcile_audit_key(root)"), "the phase mints the audit key");
     }
 
     #[test]
@@ -5598,12 +5785,11 @@ mod keyless_tests {
 
     #[test]
     fn the_check_runs_before_anything_moves() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        let check = body.find("match pre_roll_key_verdict(").expect("the pre-roll key check");
-        for later in ["match reconcile_audit_key(&root)", "crate::commands::systems::reconcile_credentials(&root)",
-                      "crate::onboard::standalone::materialize(&root)"] {
-            let at = body.find(later).unwrap_or_else(|| panic!("{later} missing"));
+        let list = super::phase_src::list();
+        assert!(super::phase_src::body("preflight_service_keys").contains("match pre_roll_key_verdict("), "the pre-roll key check");
+        let check = list.find("preflight_service_keys(").expect("the pre-roll key check is in the phase list");
+        for later in ["mint_audit_key(", "mint_system_credentials(", "refresh_deploy_slice("] {
+            let at = list.find(later).unwrap_or_else(|| panic!("{later} missing"));
             assert!(check < at, "the key check must run before `{later}` — its refusal says nothing was changed");
         }
     }
@@ -5620,10 +5806,11 @@ mod keyless_tests {
         assert_eq!(pre_roll_key_verdict(&none, None, true, false), PreRollKeys::GoUnverified);
         let worker = vec!["worker".to_string()];
         assert_eq!(pre_roll_key_verdict(&worker, None, true, false), PreRollKeys::Missing(worker.clone()), "the skip keeps the store check");
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let body = super::phase_src::body("preflight_service_keys");
         assert!(body.contains("pre_roll_key_verdict(&store_short, db_short.as_deref(), skip_gw_key_check, gw_down)"),
             "the pre-roll check must be steered by its own flag, not --force");
+        assert!(super::phase_src::list().contains("preflight_service_keys(g, &roll, skip_gw_key_check)"),
+            "and the list hands it that flag, not --force");
         assert_eq!(pre_roll_key_verdict(&worker, Some(&none), false, false), PreRollKeys::Missing(worker.clone()),
             "an active DB row is not enough: compose delivers from the store");
         let both = pre_roll_key_verdict(&worker, Some(&["trellion".to_string(), "worker".to_string()]), false, false);
@@ -5714,8 +5901,7 @@ mod keyless_tests {
         let m = stuck_stack_message("ollama-embed\nc5bba1c9\n", "v0.6.7");
         assert!(m.starts_with("stack up except ollama-embed;") && m.contains("reboot") && m.contains("`noo upgrade --stack`"), "{m}");
         assert!(stuck_stack_message("", "v0.6.7").starts_with("stack up except one service;"));
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let body = super::phase_src::body("launch_stack");
         let retry = body.find("launcher failed").unwrap();
         assert!(body[..retry].rfind("LAUNCHER_EXIT_STACK_PARTIAL").is_some_and(|i| retry - i < 300), "no retry for 75");
         assert!(body.contains("Ok(s) if s.code() == Some(LAUNCHER_EXIT_STACK_PARTIAL)"), "its own arm, before the generic failure");
@@ -5732,20 +5918,20 @@ mod keyless_tests {
     /// moves, and the add-on pins are written in the same step as stack.lock.
     #[test]
     fn the_addon_preflight_runs_before_anything_moves_and_pins_land_with_stack_lock() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} not in upgrade_stack"));
-        let pre = at("addon_preflight(g, &root, &tag");
-        assert!(body.contains("addon_preflight(g, &root, &tag, target_stack_lock.as_deref(), allow_downgrade)"),
+        let list = super::phase_src::list();
+        let at = |needle: &str| list.find(needle).unwrap_or_else(|| panic!("{needle} not in the phase list"));
+        let pre = at("addon_preflight(g, &roll.root, &roll.tag");
+        assert!(list.contains("addon_preflight(g, &roll.root, &roll.tag, target_stack_lock.as_deref(), allow_downgrade)"),
             "--allow-downgrade is the only way past the add-on downgrade rule on a roll");
-        for later in ["reconcile_audit_key(&root)", "systems::reconcile_credentials(&root)", "standalone::materialize(&root)",
-                      "NOO_IMAGE_TAG\", &tag", "root.join(\"scripts/noomesh-start.sh\")"] {
+        for later in ["mint_audit_key(", "mint_system_credentials(", "refresh_deploy_slice(", "move_pin(", "launch_stack("] {
             assert!(pre < at(later), "the add-on preflight must run before `{later}`");
         }
-        let lock = at("write_stack_lock(g, &tag, &root");
-        let pins = at("commit_addon_pins(g, &root, &tag");
-        assert!(lock < pins && pins < at("NOO_IMAGE_TAG\", &tag"), "add-on pins are written with stack.lock, before the tag moves");
+        // The pins land in the same phase as stack.lock, before the tag moves.
+        let pin = super::phase_src::body("move_pin");
+        let lock = pin.find("write_stack_lock(g, tag, root").expect("stack.lock is written by the pin phase");
+        let pins = pin.find("commit_addon_pins(g, root, tag").expect("the add-on pins are written by the pin phase");
+        assert!(lock < pins && pins < pin.find("upsert_env(root, \"NOO_IMAGE_TAG\", tag)").expect("the tag moves"), "add-on pins are written with stack.lock, before the tag moves");
+        assert!(list.contains("move_pin(g, &roll, target_stack_lock.as_deref(), &addon_prep)"), "the pin phase gets the prepared add-on pins");
     }
 
     /// i57c: a release with no lock refuses on a dist install (before anything
@@ -5800,11 +5986,12 @@ mod keyless_tests {
 
     #[test]
     fn the_missing_lock_refusal_precedes_the_addon_preflight() {
-        let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n}"));
-        assert!(at("no_lock_refusal(&mode") < at("addon_preflight(g, &root, &tag"));
-        assert!(body.contains("noo upgrade --check --stack"));
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n}"));
+        assert!(at("refuse_unlocked_dist_roll(") < at("addon_preflight("));
+        let refusal = super::phase_src::body("refuse_unlocked_dist_roll");
+        assert!(refusal.contains("no_lock_refusal(&mode, tag)"), "the refusal phase owns the missing-lock refusal");
+        assert!(refusal.contains("noo upgrade --check --stack"));
     }
 
     #[test]
@@ -5818,9 +6005,9 @@ mod keyless_tests {
     #[test]
     fn the_by_tag_advisory_is_printed_only_after_the_refusal_check() {
         let src = include_str!("upgrade.rs");
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
+        let body = super::phase_src::body("refuse_unlocked_dist_roll");
         let refusal = body.find("no_lock_refusal(&mode").unwrap();
-        let advisory = body.find("warn_pulled_by_tag(g, &tag)").unwrap();
+        let advisory = body.find("warn_pulled_by_tag(g, tag)").unwrap();
         assert!(refusal < advisory);
         let fetch = &src[src.find("fn fetch_stack_lock(").unwrap()..src.find("pub(crate) fn noop_message").unwrap()];
         assert!(!fetch.contains("images pulled by tag"), "fetch_stack_lock must stay silent");
@@ -5907,16 +6094,15 @@ mod pg_leaf_tests {
     /// launcher) and refuses rather than warns.
     #[test]
     fn the_role_leaf_stage_runs_before_anything_moves_and_refuses() {
-        let src = include_str!("upgrade.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
-        let body = &src[src.find("fn upgrade_stack(").expect("upgrade_stack")..];
-        let body = &body[..body.find("\nfn ").expect("end of upgrade_stack")];
-        let at = |n: &str| body.find(n).unwrap_or_else(|| panic!("{n} not in upgrade_stack"));
-        let stage = at("reconcile_pg_leaves(&crate::pki::ClusterCa::new(");
-        for later in ["crate::onboard::standalone::materialize(&root)", "write_stack_lock(g, &tag", "reconcile_service_certs(g)", "let mut status = launch();"] {
+        let list = super::phase_src::list();
+        let at = |n: &str| list.find(n).unwrap_or_else(|| panic!("{n} not in the phase list"));
+        let stage = at("issue_pg_role_leaves(");
+        for later in ["migrate_retired_yaml_gates(", "refresh_deploy_slice(", "move_pin(", "reconcile_service_certs(g)", "launch_stack("] {
             assert!(stage < at(later), "the role leaves must exist before `{later}`");
         }
-        assert!(body[stage..at("migrate_retired_yaml_gates(g, &root)")].contains("pg_role_leaf_failed"), "a missing leaf is a refusal, not a warning");
+        let phase = super::phase_src::body("issue_pg_role_leaves");
+        assert!(phase.contains("reconcile_pg_leaves(&crate::pki::ClusterCa::new("), "the phase issues the role leaves");
+        assert!(phase.contains("pg_role_leaf_failed"), "a missing leaf is a refusal, not a warning");
     }
 }
 
@@ -5932,10 +6118,31 @@ mod door_node_id_tests {
         for bad in ["", "  ", "auto", "a b", "x;y", "host8/../x", "$(id)"] {
             assert!(super::door_node_id_problem(bad).is_some(), "{bad:?}");
         }
-        let src = include_str!("upgrade.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap();
-        let body = &src[src.find("fn upgrade_stack(").unwrap()..];
-        let body = &body[..body.find("\nfn ").unwrap()];
-        assert!(body.contains("door_node_id_problem("), "the roll must call it");
+        assert!(super::phase_src::body("warn_door_node_id").contains("door_node_id_problem("), "the phase must call it");
+        assert!(super::phase_src::list().contains("warn_door_node_id("), "the roll must run the phase");
+    }
+}
+
+/// Test support: the non-test source of this file, sliced so a test asserts
+/// the ORDER of the phase list (`list`) or the CONTENT of the one phase that
+/// owns a behaviour (`body`). Slicing a phase, not "the rest of the file",
+/// means a needle can only be satisfied by the code it is about.
+#[cfg(test)]
+pub(crate) mod phase_src {
+    fn code() -> &'static str {
+        include_str!("upgrade.rs").split("#[cfg(test)]").next().expect("non-test source")
+    }
+
+    /// `fn <name>(` through the first column-0 closing brace.
+    pub(crate) fn body(name: &str) -> &'static str {
+        let code = code();
+        let start = code.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} not found in upgrade.rs"));
+        let rest = &code[start..];
+        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("end of fn {name}"))]
+    }
+
+    /// The ordered phase list of `noo upgrade --stack`.
+    pub(crate) fn list() -> &'static str {
+        body("upgrade_stack")
     }
 }
