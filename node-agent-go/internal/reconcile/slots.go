@@ -21,14 +21,22 @@ var slotKeys = map[string][]string{
 // backendSlots is each running placement's declared concurrency, read from
 // the env the backend is started with (allow-listed; the merged env for a
 // multi-role ollama, which effectivePlacements already produced).
+//
+// Only an engine with a slot key is read. The allow-list filter LOGS and
+// RECORDS every key it drops, and the harness placement carries
+// NOO_HARNESS_KIND by design (convergeHarness reads it; the harness is a
+// host service, never a container), so running the filter over it raised
+// "node refused 1 desired-state instruction" on every kind change while the
+// change itself went through (awolf, 2026-10-24, the harness compare).
 func backendSlots(effective []placement) map[string]int {
 	out := map[string]int{}
 	for _, p := range effective {
-		if p.DesiredState != "running" {
+		keys, engine := slotKeys[p.Backend]
+		if !engine || p.DesiredState != "running" {
 			continue
 		}
 		env := buildPlacementEnv(p)
-		for _, k := range slotKeys[p.Backend] {
+		for _, k := range keys {
 			n, err := strconv.Atoi(strings.TrimSpace(env[k]))
 			if err == nil && n > 0 {
 				out[p.Backend] = n
