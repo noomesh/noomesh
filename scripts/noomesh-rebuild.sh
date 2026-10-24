@@ -667,8 +667,9 @@ if [ "$START_STACK" = true ]; then
     if [ "${TRELLION_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_trellion_overlay)" stop trellion 2>/dev/null || true
     fi
-    # Licensed add-ons switched off: stop the services their overlay adds.
-    addons_stop_disabled
+    # Licensed add-ons switched off: stop the services their overlay OWNS;
+    # a core service found stopped afterwards fails the rebuild.
+    addons_stop_leftovers addons_stop_disabled || exit 1
     if [ "${VOICE_STOP_ON_OFF:-}" = "1" ]; then
         docker compose $COMPOSE_FILES -f "$(addons_voice_overlay)" stop whisper piper 2>/dev/null || true
     fi
