@@ -109,8 +109,9 @@ def _tree(tmp: Path, stale_store: bool) -> tuple[Path, dict]:
     (work / "noomesh.yaml").write_text("compose_env: {}\n")
     (work / "secrets").mkdir()
     (work / "secrets" / "env.sops").write_text("x\n")
+    (tmp / "data").mkdir(exist_ok=True)  # the data-root mount guard refuses a data root that is not there
     (work / ".env").write_text(
-        f"NOO_IMAGE_TAG={OLD}\nNOO_DATA_ROOT=/tmp/x\nNOO_BIND_MODE=local\nNOO_SECRETS_BACKEND=sops\n")
+        f"NOO_IMAGE_TAG={OLD}\nNOO_DATA_ROOT={tmp / 'data'}\nNOO_BIND_MODE=local\nNOO_SECRETS_BACKEND=sops\n")
     # The launcher reads its registry login from ${DOCKER_CONFIG:-$HOME/.docker};
     # a CI runner sets DOCKER_CONFIG itself, without ghcr.io, and the launcher
     # then goes pull-free (no pull phase at all). Inherit nothing of the

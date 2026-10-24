@@ -535,6 +535,10 @@ check_secrets_at_rest || exit 1
 # while that volume is not open: the services would start on an empty dir.
 source "$SCRIPT_DIR/lib-state-volume.sh"
 check_state_volume_open || exit 1
+# ...and a start whose data root is not on the filesystem it was recorded on
+# (a missing data disk must never let postgres initialise an empty database).
+source "$SCRIPT_DIR/lib-data-root-mount.sh"
+check_data_root_mount || exit 1
 
 # Parse arguments
 PROFILE=""

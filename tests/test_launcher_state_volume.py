@@ -172,6 +172,7 @@ def boot(glue, tmp_path):
     libdir = tmp_path / "scripts"
     libdir.mkdir()
     (libdir / "lib-state-volume.sh").write_text(LIB.read_text())
+    (libdir / "lib-data-root-mount.sh").write_text((SCRIPTS / "lib-data-root-mount.sh").read_text())
     marker = tmp_path / "secrets-written"
     lib_secrets = libdir / "lib-secrets.sh"
     lib_secrets.write_text(
