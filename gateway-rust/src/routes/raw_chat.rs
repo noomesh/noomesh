@@ -736,6 +736,7 @@ pub async fn chat_completions(
     if !body.is_object() {
         return Err(RawChatError::bad_request("the request body must be a JSON object with 'messages'"));
     }
+    budget_fits_thinking(body)?;
     let pin = node_pin(body, pin)?;
     let hint = coordinator::model_hint(body.get("model").and_then(Value::as_str)).map(str::to_string);
     let (class, cands) = resolve_candidates(state, hint.as_deref(), pin.node.as_deref(), pin.strict).await?;
@@ -750,6 +751,47 @@ pub async fn chat_completions(
         ("/v1/chat/completions".to_string(), b)
     })
     .await
+}
+
+/// The smallest `max_tokens` a structured-output request may carry while
+/// thinking stays on. Below it the answer is deterministic on a reasoning
+/// model: the whole budget goes to reasoning and the client gets
+/// `finish_reason: length` with empty `content` (gemma4 spends 60–100
+/// tokens thinking about a yes/no; noomesh-internal i183, 2026-10-22).
+pub const MIN_BUDGET_WITH_THINKING: u64 = 256;
+
+/// The OpenAI error `type` of that refusal.
+pub const BUDGET_TOO_SMALL: &str = "budget_too_small_for_thinking";
+
+/// Refuse up front what would come back empty: `response_format` set,
+/// thinking not turned off, `max_tokens` under [`MIN_BUDGET_WITH_THINKING`].
+/// A request with no `response_format` is not touched (a short plain answer
+/// with thinking on is the caller's call), nor one that disables reasoning
+/// in any spelling the gateway understands (`reasoning.effort` /
+/// `reasoning_effort` none or minimal, Ollama's `think: false`), nor one
+/// with no `max_tokens` at all. Judged on the request alone, before a
+/// backend is picked: the same body goes to every candidate, and the
+/// remedy names the fields, not the topology.
+pub fn budget_fits_thinking(body: &Value) -> Result<(), RawChatError> {
+    let structured = body.get("response_format").is_some_and(|f| !f.is_null());
+    let Some(max_tokens) = body.get("max_tokens").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    let thinking_off = coordinator::thinking::asks_no_reasoning(body)
+        || body.get("think").and_then(Value::as_bool) == Some(false);
+    if !structured || thinking_off || max_tokens >= MIN_BUDGET_WITH_THINKING {
+        return Ok(());
+    }
+    Err(RawChatError::request_refused(
+        StatusCode::BAD_REQUEST,
+        BUDGET_TOO_SMALL,
+        format!(
+            "max_tokens {max_tokens} is too small for a structured answer with thinking on: a reasoning model \
+             spends the budget thinking and returns finish_reason 'length' with empty content. Either set \
+             \"reasoning\": {{\"effort\": \"none\"}} (or \"reasoning_effort\": \"none\") so the budget goes to \
+             the answer, or raise max_tokens to at least {MIN_BUDGET_WITH_THINKING}."
+        ),
+    ))
 }
 
 /// The header naming the node a chat request prefers.
@@ -919,6 +961,71 @@ mod node_pin_tests {
         assert!(e.detail.contains("e2b"), "the detail keeps it for the operator");
         assert_eq!(refusal_error(Refusal::UnknownModel("m".into())).status, StatusCode::NOT_FOUND);
         assert_eq!(refusal_error(Refusal::NoCandidates("m".into())).status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod budget_guard_tests {
+    use super::*;
+
+    fn body(extra: Value) -> Value {
+        let mut b = json!({"model": "gemma4:12b", "messages": [{"role": "user", "content": "yes or no?"}]});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    }
+
+    /// The i183 probe: strict JSON, thinking on, 64 tokens → empty `length`
+    /// answer. Refused up front, naming both remedies and no topology.
+    #[test]
+    fn a_tiny_structured_budget_with_thinking_on_is_refused_with_the_remedy() {
+        let e = budget_fits_thinking(&body(json!({"response_format": {"type": "json_object"}, "max_tokens": 64}))).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.kind, BUDGET_TOO_SMALL);
+        let public = serde_json::to_string(&e.body()).unwrap();
+        for must in ["max_tokens 64", "\"effort\": \"none\"", "reasoning_effort", "at least 256"] {
+            assert!(public.contains(must), "{public}");
+        }
+        let schema = body(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "ok", "schema": {}}}, "max_tokens": 255}));
+        assert_eq!(budget_fits_thinking(&schema).unwrap_err().kind, BUDGET_TOO_SMALL);
+    }
+
+    #[test]
+    fn every_spelling_of_thinking_off_lets_a_tiny_budget_through() {
+        for off in [
+            json!({"reasoning": {"effort": "none"}}),
+            json!({"reasoning": {"effort": "minimal"}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning_effort": "MINIMAL"}),
+            json!({"think": false}),
+        ] {
+            let mut b = body(json!({"response_format": {"type": "json_object"}, "max_tokens": 64}));
+            for (k, v) in off.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            assert!(budget_fits_thinking(&b).is_ok(), "{off}");
+        }
+    }
+
+    /// Not the guard's business: no structured output asked, no budget set,
+    /// a budget that fits, a null `response_format`, or `think: true`
+    /// (explicit on, but the budget is large enough).
+    #[test]
+    fn plain_unbounded_and_large_requests_are_untouched() {
+        for ok in [
+            json!({"max_tokens": 64}),
+            json!({"response_format": {"type": "json_object"}}),
+            json!({"response_format": {"type": "json_object"}, "max_tokens": 256}),
+            json!({"response_format": null, "max_tokens": 64}),
+            json!({"response_format": {"type": "json_object"}, "max_tokens": 4096, "think": true}),
+            json!({"response_format": {"type": "json_object"}, "max_tokens": "64"}),
+        ] {
+            assert!(budget_fits_thinking(&body(ok.clone())).is_ok(), "{ok}");
+        }
+        // reasoning on by any explicit effort is still "on"
+        let on = body(json!({"response_format": {"type": "json_object"}, "max_tokens": 64, "reasoning_effort": "low"}));
+        assert!(budget_fits_thinking(&on).is_err());
     }
 }
 

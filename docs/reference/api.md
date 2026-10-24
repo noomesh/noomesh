@@ -300,7 +300,13 @@ model fault. For a bounded structured answer:
   prefer the `reasoning` form, it is the portable one.
 - **Budget with thinking on**: allow for the reasoning (gemma4 spends
   60–100 tokens on a yes/no) plus the answer; read `usage` and the
-  `finish_reason`.
+  `finish_reason`. The gateway refuses the one combination that can only
+  come back empty: `response_format` set, thinking not turned off, and
+  `max_tokens` under 256 → `400` with error `type`
+  `budget_too_small_for_thinking` and both remedies in the message (turn
+  reasoning off, or raise `max_tokens`). A request without
+  `response_format`, without `max_tokens`, or with reasoning off in any of
+  the spellings above is not touched.
 - **`response_format`** (`json_object`, `json_schema`) is honoured as
   Ollama's `format`, but grammar-constrained decoding on a large-vocabulary
   model such as gemma4 runs at seconds per token on today's nodes. For a
